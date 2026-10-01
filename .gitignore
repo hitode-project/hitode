@@ -1,0 +1,8 @@
+/target
+__pycache__/
+*.pyc
+# never commit samples, traces or captures
+/samples
+*.trace
+*.png
+*.bmp
