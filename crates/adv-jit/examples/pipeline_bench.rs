@@ -1,7 +1,10 @@
 //! Self-authored full-frame clear -> MMX blend -> REP copy -> checksum benchmark.
+#[path = "../tests/support/mod.rs"]
+mod oracle_support;
+use oracle_support::Machine;
 use std::time::Instant;
 
-use adv_jit::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+use adv_jit::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 
 const CODE: u32 = 0x10000;
@@ -108,20 +111,20 @@ fn bench(width: u32, height: u32, frames: usize, jit: bool) {
         expected_hash
     );
     if jit {
-        assert_eq!(m.stats.fallback_entries, 0);
+        assert_eq!(m.stats.interpreter_entries, 0);
     }
     let mean = timings.iter().sum::<f64>() / frames as f64;
     timings.sort_by(f64::total_cmp);
     let p95 = timings[(frames * 95).div_ceil(100).saturating_sub(1)];
     println!(
-        "{width}x{height} {} frames={frames} mean_ms={:.3} p95_ms={:.3} fps={:.1} checksum={checksum:08x} fnv={expected_hash:016x} bulk_bytes={} native_entries={} fallback_entries={} compile_ms={:.3}",
+        "{width}x{height} {} frames={frames} mean_ms={:.3} p95_ms={:.3} fps={:.1} checksum={checksum:08x} fnv={expected_hash:016x} bulk_bytes={} native_entries={} interpreter_entries={} compile_ms={:.3}",
         if jit { "jit" } else { "uc" },
         mean * 1000.0,
         p95 * 1000.0,
         1.0 / mean,
         m.stats.bulk_bytes,
         m.stats.native_entries,
-        m.stats.fallback_entries,
+        m.stats.interpreter_entries,
         m.stats.compile_time.as_secs_f64() * 1000.0
     );
 }

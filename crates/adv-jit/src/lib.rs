@@ -1,16 +1,24 @@
-//! x86-32 hot-region execution experiment. See the crate README for its scope.
+//! Shared-state x86-32 interpreter and hot-region JIT. See the README for scope.
 mod compile;
+mod compiler;
+mod cpu_profile;
+mod floating;
 mod host;
+pub mod interpreter;
+mod linking;
 mod machine;
 mod memory;
 #[cfg(feature = "pal")]
 pub mod pal;
+mod state;
 mod strings;
 mod virtual_memory;
 
+pub use cpu_profile::SegmentState;
 pub use host::{ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices, Resume, Wait};
 pub use machine::{ExecutionContext, Machine, ProfileSample, RunOutcome, Stats};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
+pub use state::{X87Register, X87State};
 
 /// Register order follows the x86 encoding: eax, ecx, edx, ebx, esp, ebp, esi, edi.
 #[repr(C)]
@@ -21,14 +29,24 @@ pub struct CpuState {
     pub eflags: u32,
     pub fs_base: u32,
     pub fault_addr: u32,
-    /// Execution budget: one unit per native basic block or fallback instruction.
+    /// Work budget: native basic block, interpreted instruction, or REP element.
     pub fuel: u64,
-    /// Raw XMM bits, shared with Unicorn at execution boundaries.
+    /// Raw XMM bits shared by native and interpreted execution.
     pub xmm: [[u8; 16]; 8],
-    /// Physical x87 mantissa bits exposed by MMX, synchronized at execution boundaries.
+    /// Native MMX cache of physical x87 significands. Pending writes are described
+    /// by mmx_mode and materialized into x87 at executor/context boundaries.
     pub mmx: [u64; 8],
-    /// Pending native MMX entry (bit 0) and EMMS (bit 1) for Unicorn's x87 state.
+    /// Deferred MMX entry (bit 0), EMMS (bit 1), tracked writes (bit 2),
+    /// and written physical slots (bits 8–15).
     pub mmx_mode: u32,
+    /// Canonical x87 state. Registers are physical R0–R7, independent of TOP.
+    pub x87: X87State,
+    /// Guest SSE control/status, including rounding, DAZ and FTZ.
+    pub mxcsr: u32,
+    pub segments: SegmentState,
+    /// Shared REP continuation; not a guest-visible architectural register.
+    #[doc(hidden)]
+    pub rep: Option<interpreter::RepContinuation>,
 }
 
 impl Default for CpuState {
@@ -43,6 +61,10 @@ impl Default for CpuState {
             xmm: [[0; 16]; 8],
             mmx: [0; 8],
             mmx_mode: 0,
+            x87: X87State::default(),
+            mxcsr: 0x1f80,
+            segments: SegmentState::default(),
+            rep: None,
         }
     }
 }

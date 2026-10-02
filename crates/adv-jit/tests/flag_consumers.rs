@@ -1,5 +1,7 @@
-use adv_jit::{CompileStrategy, CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CompileStrategy, CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -134,7 +136,7 @@ fn sbb_forms_match_results_all_flags_and_live_conditions_at_borrow_boundaries() 
                     }
                 }
             }
-            assert_eq!(jit.stats.fallback_entries, 0, "SBB form {form}");
+            assert_eq!(jit.stats.interpreter_entries, 0, "SBB form {form}");
         }
     }
 }
@@ -168,7 +170,7 @@ fn sbb_chain_uses_lazy_carry_preserved_by_inc_dec_then_feeds_setcc() {
                 );
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 
@@ -227,7 +229,7 @@ fn all_setcc_conditions_preserve_flags_and_high_register_bits_for_raw_and_lazy_f
                     "{strategy:?}, producer {producer}, {left:#x}, {right:#x}, {flags:#x}"
                 );
             }
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
@@ -293,7 +295,7 @@ fn setcc_can_write_a_page_without_read_permission_and_short_sbb_keeps_fallback()
     assert_eq!(jit.state.eflags, 0xed7);
     jit.protect(DATA, 4096, READ | WRITE).unwrap();
     assert_eq!(jit.memory().read(DATA, 1).unwrap(), [1]);
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 
     let bytes = assemble(|a| {
         a.sbb(al, cl).unwrap();
@@ -312,5 +314,5 @@ fn setcc_can_write_a_page_without_read_permission_and_short_sbb_keeps_fallback()
         jit.memory().read(DATA, 4).unwrap(),
         reference.memory().read(DATA, 4).unwrap()
     );
-    assert!(jit.stats.fallback_entries > 0);
+    assert!(jit.stats.interpreter_entries > 0);
 }

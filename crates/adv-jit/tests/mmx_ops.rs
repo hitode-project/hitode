@@ -1,5 +1,7 @@
-use adv_jit::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -101,7 +103,7 @@ fn packed_mmx_arithmetic_shuffles_and_saturation_match_unicorn() {
                 assert_eq!(jit.state.eflags, uc.state.eflags);
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0, "operation {operation}");
+        assert_eq!(jit.stats.interpreter_entries, 0, "operation {operation}");
     }
 }
 
@@ -137,13 +139,13 @@ fn mmx_shift_counts_at_and_above_lane_width_zero_the_result() {
                 jit.memory().read(DATA + 32, 8).unwrap(),
                 uc.memory().read(DATA + 32, 8).unwrap()
             );
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
 
 #[test]
-fn movd_and_emms_preserve_x87_state_across_native_fallback_boundaries() {
+fn movd_and_emms_preserve_x87_state_across_native_interpreter_boundaries() {
     let bytes = code(|a| {
         a.fld1().unwrap();
         a.movd(mm3, ebx).unwrap();

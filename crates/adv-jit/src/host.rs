@@ -1,4 +1,4 @@
-//! Shared host boundary for native and Unicorn execution. Handlers cannot re-enter
+//! Shared host boundary for native and interpreted execution. Handlers cannot re-enter
 //! the CPU; callbacks and waits are returned as explicit scheduler actions.
 use crate::{CpuState, Memory, READ, WRITE};
 use std::collections::BTreeMap;
@@ -104,9 +104,12 @@ pub trait HostServices {
 pub struct ApiMemory<'a> {
     pub(crate) inner: &'a mut Memory,
 }
-impl ApiMemory<'_> {
+impl<'a> ApiMemory<'a> {
+    pub fn new(inner: &'a mut Memory) -> Self {
+        Self { inner }
+    }
     fn check(&self, addr: u32, len: usize, permission: u8) -> Result<(), String> {
-        let r = self.inner.range(addr, len)?;
+        let r = self.inner.committed(addr, len)?;
         if !r.is_empty()
             && self.inner.perms[r.start / 4096..=(r.end - 1) / 4096]
                 .iter()
@@ -182,7 +185,6 @@ pub(crate) struct Bridge<'a> {
 
 /// Runtime integration hook. It runs with the CPU paused; true requests a scheduler park.
 pub(crate) trait RawTrap {
-    fn bind(&mut self, _uc: *mut unicorn_engine::Unicorn<'static, crate::machine::HookData>) {}
     fn call(
         &mut self,
         state: &mut CpuState,
@@ -203,7 +205,12 @@ pub(crate) fn call_raw(bridge: &mut Bridge<'_>, state: &mut CpuState, vector: u3
     match result {
         Ok(parked) => {
             bridge.parked = parked;
-            if parked || state.eip != pc || unsafe { &*bridge.memory }.epoch != before {
+            if parked
+                || state.eip != pc
+                || state.eflags & (1 << 8) != 0
+                || state.x87.status & 0x80 != 0
+                || unsafe { &*bridge.memory }.epoch != before
+            {
                 2
             } else {
                 0

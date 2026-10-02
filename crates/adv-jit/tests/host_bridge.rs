@@ -1,5 +1,7 @@
+mod support;
 use adv_jit::*;
 use iced_x86::{BlockEncoderOptions, code_asm::*};
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const API: u32 = 0x11000;
@@ -98,7 +100,7 @@ fn api_loop_stays_in_one_native_invocation_and_matches_unicorn() {
     assert_eq!(jit.state.regs, uc.state.regs);
     assert_eq!(js.log, us.log);
     assert_eq!(jit.stats.native_entries, 1);
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
     assert_eq!(jit.stats.host_calls, 1000);
     assert_eq!(jit.state.regs[3], 507500);
 }
@@ -174,7 +176,7 @@ fn nested_callbacks_can_wait_then_resume_in_the_right_order() {
         assert_eq!(m.state.regs[0], 223);
         assert_eq!(m.state.regs[4], STACK + 4);
         if !unicorn {
-            assert_eq!(m.stats.fallback_entries, 0);
+            assert_eq!(m.stats.interpreter_entries, 0);
         }
         results.push(services.log);
     }
@@ -220,7 +222,7 @@ fn relocated_api_trap_in_an_inline_hook_trampoline_keeps_its_identity() {
     assert_eq!(m.state.regs[0], 116);
     assert_eq!(m.stats.host_calls, 2);
     assert!(m.stats.invalidations > 0);
-    assert_eq!(m.stats.fallback_entries, 0);
+    assert_eq!(m.stats.interpreter_entries, 0);
 }
 
 #[test]
@@ -361,7 +363,7 @@ fn handler_code_write_exits_before_executing_stale_native_code() {
         assert_eq!(m.state.regs[0], 99);
         assert_eq!(m.stats.host_calls, 1);
         if !unicorn {
-            assert_eq!(m.stats.fallback_entries, 0);
+            assert_eq!(m.stats.interpreter_entries, 0);
             assert!(m.stats.invalidations >= 1);
         }
     }

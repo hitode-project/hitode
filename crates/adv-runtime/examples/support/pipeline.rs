@@ -1,7 +1,10 @@
 #![allow(dead_code)]
-use adv_jit::{CpuState, EXEC, Machine, READ, Region, WRITE};
+#[path = "../../../adv-jit/tests/support/mod.rs"]
+mod oracle_support;
+use adv_jit::{CpuState, EXEC, READ, Region, WRITE};
 use adv_runtime::{Graphics, IID_DDRAW7, Snapshot, api, install};
 use iced_x86::code_asm::*;
+use oracle_support::Machine;
 use std::collections::BTreeMap;
 
 pub const CODE: u32 = 0x10000;

@@ -1,6 +1,9 @@
 //! Full-frame pixel workloads expressed as authored x86 SSE2 and MMX instructions.
-use adv_jit::{CompileStrategy, CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+#[path = "../tests/support/mod.rs"]
+mod oracle_support;
+use adv_jit::{CompileStrategy, CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use oracle_support::Machine;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -175,7 +178,7 @@ fn main() {
     };
     pin();
     println!(
-        "kernel,resolution,jit_ms,unicorn_ms,host_rust_ms,speedup,jit_over_host,compile_ms,fallbacks"
+        "kernel,resolution,jit_ms,unicorn_ms,host_rust_ms,speedup,jit_over_host,compile_ms,interpreter_entries"
     );
     for (width, height) in [(1280, 720), (1920, 1080)] {
         let bytes = width * height * 4;
@@ -245,7 +248,7 @@ fn main() {
                 u / j,
                 j / h,
                 jit.stats.compile_time.as_secs_f64() * 1000.0,
-                jit.stats.fallback_entries
+                jit.stats.interpreter_entries
             );
         }
     }

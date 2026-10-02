@@ -1,5 +1,7 @@
-use adv_jit::{CompileStrategy, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const ROOT: u32 = CODE + 0x31;
@@ -120,7 +122,7 @@ fn both_strategies_match_unicorn_across_mmx_repeat_fpu_and_region_calls() {
         assert_eq!(jit.memory().read(WORK, 512).unwrap(), expected);
         assert_eq!(jit.memory().read(DOUBLE, 8).unwrap(), 1.0f64.to_le_bytes());
         assert!(jit.stats.native_entries > 0);
-        assert!(jit.stats.fallback_entries > 0);
+        assert!(jit.stats.interpreter_entries > 0);
         assert_eq!(jit.stats.bulk_bytes, 1024);
     }
 }
@@ -217,7 +219,11 @@ fn fast_repeat_preserves_partial_fault_and_resumes_after_page_repair() {
     assert_eq!(jit.state.regs[1], 512);
     assert_eq!(jit.memory().read(DST, 4096).unwrap(), &source[..4096]);
     assert_eq!(jit.stats.bulk_bytes, 0);
+    let mut changed_source = source.clone();
+    changed_source[..4096].fill(0x77);
     for m in [&mut jit, &mut reference] {
+        // Already copied elements must not be replayed after a later fault.
+        m.write(SRC, &changed_source[..4096]).unwrap();
         m.protect(DST + 4096, 4096, READ | WRITE).unwrap();
     }
     assert_eq!(jit.run(STOP, 10_000).unwrap(), RunOutcome::ReachedStop);
@@ -228,13 +234,13 @@ fn fast_repeat_preserves_partial_fault_and_resumes_after_page_repair() {
     assert_eq!(jit.state.regs, reference.state.regs);
     assert_eq!(jit.state.eflags & 0x8d5, reference.state.eflags & 0x8d5);
     assert_eq!(jit.memory().read(DST, 6144).unwrap(), source);
-    // A partially executed fallback stays in Unicorn until it completes.
-    assert_eq!(jit.stats.bulk_bytes, 0);
+    // After repair the native bulk helper can consume just the remaining 2 KiB.
+    assert_eq!(jit.stats.bulk_bytes, 2048);
     start(&mut jit, ROOT);
     jit.state.regs[1] = 1536;
     jit.state.regs[6] = SRC;
     jit.state.regs[7] = DST;
     assert_eq!(jit.run(STOP, 10_000).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(jit.memory().read(DST, 6144).unwrap(), source);
-    assert_eq!(jit.stats.bulk_bytes, 6144);
+    assert_eq!(jit.memory().read(DST, 6144).unwrap(), changed_source);
+    assert_eq!(jit.stats.bulk_bytes, 2048 + 6144);
 }

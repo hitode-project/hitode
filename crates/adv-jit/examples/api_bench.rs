@@ -102,9 +102,9 @@ fn main() {
         u64::from(ITERATIONS) * (samples as u64 + 1)
     );
     assert_eq!(api.stats.native_entries, samples as u64 + 1);
-    assert_eq!(api.stats.fallback_entries, 0);
+    assert_eq!(api.stats.interpreter_entries, 0);
     println!(
-        "iterations,samples,loop_ns,api_loop_ns,incremental_ns,native_entries_per_run,fallbacks"
+        "iterations,samples,loop_ns,api_loop_ns,incremental_ns,native_entries_per_run,interpreter_entries"
     );
     println!(
         "{ITERATIONS},{samples},{base:.2},{full:.2},{:.2},1,0",

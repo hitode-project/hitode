@@ -1,5 +1,7 @@
-use adv_jit::{CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x1f000;
@@ -94,7 +96,7 @@ fn integer_flags_match_unicorn_at_overflow_and_carry_boundaries() {
                 );
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0, "operation {operation}");
+        assert_eq!(jit.stats.interpreter_entries, 0, "operation {operation}");
     }
 }
 
@@ -123,7 +125,7 @@ fn direct_loop_and_memory_keep_execution_in_one_native_region() {
     }
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.stats.native_entries, 1);
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]
@@ -147,11 +149,11 @@ fn calls_returns_and_indirect_targets_stay_native() {
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.state.regs[0], 300);
     assert_eq!(jit.stats.native_entries, 1);
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]
-fn unsupported_instruction_falls_back_and_returns_without_replaying_writes() {
+fn interpreted_instruction_returns_without_replaying_native_writes() {
     let code = assemble(|a| {
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
@@ -169,7 +171,10 @@ fn unsupported_instruction_falls_back_and_returns_without_replaying_writes() {
     reset(&mut uc, regs, 2);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.memory().read(DATA, 4).unwrap(), 5u32.to_le_bytes());
-    assert_eq!(jit.stats.fallback_entries, 5);
+    // The cold interpreter may include successors in each window. Count real
+    // work while the memory and architectural comparisons catch any replay.
+    assert!(jit.stats.interpreter_entries >= 5);
+    assert!(jit.stats.interpreter_instructions >= 5);
     assert!(jit.stats.native_entries >= 5);
 }
 
@@ -239,7 +244,7 @@ fn guest_patch_exits_before_write_and_invalidates_the_active_region() {
 }
 
 #[test]
-fn fs_relative_access_agrees_across_native_and_fallback_execution() {
+fn fs_relative_access_agrees_across_native_and_interpreter_execution() {
     let code = assemble(|a| {
         a.mov(eax, dword_ptr(0x30).fs()).unwrap();
         a.bswap(eax).unwrap();
@@ -296,7 +301,7 @@ fn all_conditions_observe_lazy_flags_after_comparison() {
                 equal(&mut jit, &mut uc, 0x8d5);
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 
@@ -331,11 +336,11 @@ fn an_indirect_target_is_reloaded_after_a_pointer_patch() {
     }
     assert_eq!(jit.stats.compilations, 1);
     assert_eq!(jit.stats.native_entries, 2);
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]
-fn fallback_floating_state_survives_native_islands() {
+fn interpreted_floating_state_survives_native_islands() {
     let code = assemble(|a| {
         let mut top = a.create_label();
         a.fld1().unwrap();
@@ -359,7 +364,7 @@ fn fallback_floating_state_survives_native_islands() {
 }
 
 #[test]
-fn fallback_sse_state_survives_native_islands() {
+fn interpreted_sse_state_survives_native_islands() {
     let code = assemble(|a| {
         let mut top = a.create_label();
         a.pxor(xmm0, xmm0).unwrap();
@@ -451,7 +456,7 @@ fn bytecode_loads_sign_extension_and_partial_registers_match() {
         }
         equal(&mut jit, &mut uc, 0x8d5);
     }
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]
@@ -491,7 +496,7 @@ fn a_modified_return_address_misses_the_native_return_hint() {
     let mut uc = machine(&code, false);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.state.regs[0], 17);
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]
@@ -549,7 +554,7 @@ fn integer_sse2_lanes_match_unicorn_including_saturation_and_packing() {
             }
             equal(&mut jit, &mut uc, 0x8d5);
         }
-        assert_eq!(jit.stats.fallback_entries, 0, "SSE2 operation {op}");
+        assert_eq!(jit.stats.interpreter_entries, 0, "SSE2 operation {op}");
     }
 }
 
@@ -572,7 +577,7 @@ fn sse2_shift_counts_at_and_above_lane_width_zero_the_result() {
             m.write(DATA, &[0xfd; 16]).unwrap();
         }
         equal(&mut jit, &mut uc, 0x8d5);
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 

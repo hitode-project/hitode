@@ -1,5 +1,7 @@
 //! Local-only deterministic sample measurement. No sample code or assets are embedded.
-//! sample_bench <EXE> <jit|unicorn> [frames=120] [codepage=932] [PNG] [--profile] [--compile fast|speed]
+//! sample_bench <EXE> <jit|interpreter|unicorn> [frames=120] [codepage=932] [PNG] [--profile] [--compile fast|speed] [--sync-compilation]
+#[path = "../tests/support/cpu.rs"]
+mod backend;
 use adv_jit::CompileStrategy;
 use adv_runtime::boot::Runtime;
 use pal_machine::{Clock, RunResult};
@@ -23,8 +25,16 @@ fn run() -> Result<(), String> {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     let mut profile = false;
     let mut compile_strategy = CompileStrategy::Speed;
+    let mut region_linking = true;
+    let mut async_compilation = true;
     loop {
-        if args.last().is_some_and(|arg| arg == "--profile") {
+        if args.last().is_some_and(|arg| arg == "--sync-compilation") {
+            async_compilation = false;
+            args.pop();
+        } else if args.last().is_some_and(|arg| arg == "--no-region-linking") {
+            region_linking = false;
+            args.pop();
+        } else if args.last().is_some_and(|arg| arg == "--profile") {
             profile = true;
             args.pop();
         } else if args.len() >= 2 && args[args.len() - 2] == "--compile" {
@@ -40,12 +50,10 @@ fn run() -> Result<(), String> {
     }
     let exe = args
         .first()
-        .ok_or("sample_bench <EXE> <jit|unicorn> [frames=120] [codepage=932] [PNG]")?;
-    let jit = match args.get(1).map(String::as_str) {
-        Some("jit") => true,
-        Some("unicorn") => false,
-        _ => return Err("backend must be jit or unicorn".into()),
-    };
+        .ok_or("sample_bench <EXE> <jit|interpreter|unicorn> [frames=120] [codepage=932] [PNG]")?;
+    let backend = args.get(1).ok_or("missing backend")?.as_str();
+    let cpu = backend::Cpu::new(backend)?;
+    let jit = backend == "jit";
     let limit: u64 = args
         .get(2)
         .map_or(Ok(120), |s| s.parse())
@@ -61,10 +69,10 @@ fn run() -> Result<(), String> {
     let start = Instant::now();
     let overlay = format!(
         "target/sample-bench-data/{}-{}",
-        if jit { "jit" } else { "unicorn" },
+        backend,
         std::process::id()
     );
-    let mut runtime = Runtime::new(exe, overlay, jit, 640, 480)?;
+    let mut runtime = Runtime::with_cpu(exe, overlay, cpu, 640, 480)?;
     runtime.set_codepage(codepage);
     runtime.set_auto_dialog_ms(Some(50));
     runtime.set_frame_limit(Some(limit));
@@ -74,6 +82,11 @@ fn run() -> Result<(), String> {
         .machine
         .cpu
         .set_auto_compile_strategy(compile_strategy);
+    runtime.machine.cpu.set_region_linking(region_linking);
+    runtime
+        .machine
+        .cpu
+        .set_async_compilation(jit && async_compilation);
     runtime.machine.sys.clock = Clock::virtual_time();
     let clock_start = runtime.machine.sys.clock.now_us();
     let mut first_frame = None;
@@ -158,11 +171,11 @@ fn run() -> Result<(), String> {
         .copied()
         .unwrap_or(0.0);
     println!(
-        "backend,compile_strategy,frames,width,height,fnv1a64,wall_seconds,first_frame_seconds,guest_seconds,compile_seconds,native_entries,fallback_entries,steps,warm_frames,warm_frame_mean_ms,warm_frame_p95_ms,warm_fps,compilations,native_code_bytes,fallback_instructions"
+        "backend,compile_strategy,frames,width,height,fnv1a64,wall_seconds,first_frame_seconds,guest_seconds,compile_seconds,native_entries,interpreter_entries,steps,warm_frames,warm_frame_mean_ms,warm_frame_p95_ms,warm_fps,compilations,native_code_bytes,region_linking,linked_entries,interpreter_instructions,async_compilation,pending_compilations,stale_compilations,compile_failures,peak_pending_compilations"
     );
     println!(
-        "{},{},{},{},{},{hash:016x},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.4},{:.4},{:.2},{},{},{}",
-        if jit { "jit" } else { "unicorn" },
+        "{},{},{},{},{},{hash:016x},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.4},{:.4},{:.2},{},{},{},{},{},{},{},{},{},{}",
+        backend,
         if !jit {
             "-"
         } else {
@@ -179,7 +192,7 @@ fn run() -> Result<(), String> {
         (runtime.machine.sys.clock.now_us() - clock_start) as f64 / 1e6,
         stats.compile_time.as_secs_f64(),
         stats.native_entries,
-        stats.fallback_entries,
+        stats.interpreter_entries,
         steps,
         times.len(),
         mean * 1000.0,
@@ -187,10 +200,20 @@ fn run() -> Result<(), String> {
         if mean > 0.0 { 1.0 / mean } else { 0.0 },
         stats.compilations,
         stats.native_code_bytes,
-        stats.fallback_instructions
+        jit && region_linking && !profile,
+        stats.linked_entries,
+        stats.interpreter_instructions,
+        jit && async_compilation,
+        stats.pending_compilations,
+        stats.stale_compilations,
+        stats.compile_failures,
+        stats.peak_pending_compilations
     );
     if profile {
-        eprintln!("{}", runtime.report());
+        eprintln!(
+            "{}",
+            runtime.report_with_profile(&runtime.machine.cpu.profile())
+        );
     }
     Ok(())
 }

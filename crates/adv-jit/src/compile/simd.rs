@@ -73,7 +73,7 @@ impl Emitter<'_> {
     fn vector_pointer(&mut self, i: &Instruction, write: bool) -> Value {
         let addr = self.address(i);
         // Legacy SSE2 arithmetic memory operands and MOVDQA require alignment.
-        // Let Unicorn produce its architectural exception before changing state.
+        // Let the interpreter produce its architectural exception before changing state.
         if i.mnemonic() != M::Movdqu {
             let misaligned = self.b.ins().band_imm(addr, 15);
             let bad = self.b.ins().icmp_imm(IntCC::NotEqual, misaligned, 0);

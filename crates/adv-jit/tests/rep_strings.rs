@@ -1,4 +1,6 @@
-use adv_jit::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{EXEC, READ, Region, RunOutcome, WRITE};
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -76,7 +78,7 @@ fn forward_copies_and_fills_match_unicorn_for_aligned_unaligned_and_cross_page_r
                     jit.memory().read(DST, 0x10000).unwrap(),
                     uc.memory().read(DST, 0x10000).unwrap()
                 );
-                assert_eq!(jit.stats.fallback_entries, 0);
+                assert_eq!(jit.stats.interpreter_entries, 0);
                 assert_eq!(jit.stats.bulk_bytes, u64::from(count * width(operation)));
             }
         }
@@ -97,7 +99,7 @@ fn zero_count_ignores_invalid_addresses_and_direction_flag() {
             assert_eq!(jit.state.regs, uc.state.regs);
             assert_eq!(jit.state.eflags, uc.state.eflags);
             assert_eq!(jit.stats.bulk_bytes, 0);
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
@@ -119,7 +121,7 @@ fn backwards_and_overlapping_ranges_fall_back_without_changing_rep_semantics() {
             uc.memory().read(DST, 4096).unwrap()
         );
         assert_eq!(jit.stats.bulk_bytes, 0);
-        assert!(jit.stats.fallback_entries > 0);
+        assert!(jit.stats.interpreter_entries > 0);
     }
     for operation in 0..3 {
         for delta in [0i32, 1, -1, 4, -4] {
@@ -143,7 +145,7 @@ fn backwards_and_overlapping_ranges_fall_back_without_changing_rep_semantics() {
                 uc.memory().read(SRC, 4096).unwrap()
             );
             assert_eq!(jit.stats.bulk_bytes, 0);
-            assert!(jit.stats.fallback_entries > 0);
+            assert!(jit.stats.interpreter_entries > 0);
         }
     }
 }
@@ -291,7 +293,7 @@ fn large_repeats_yield_at_chunk_boundaries_and_resume_independent_contexts() {
     );
     assert_eq!(m.stats.bulk_calls, 5);
     assert_eq!(m.stats.bulk_bytes, 5 << 20);
-    assert_eq!(m.stats.fallback_entries, 0);
+    assert_eq!(m.stats.interpreter_entries, 0);
 }
 
 #[cfg(feature = "pal")]
@@ -344,7 +346,7 @@ fn bulk_deadline_stops_at_a_restartable_rep_then_finishes_after_rearming() {
         assert_eq!(bytes, [0x44; 16]);
     }
     assert_eq!(cpu.stats().bulk_bytes, u64::from(SIZE));
-    assert_eq!(cpu.stats().fallback_entries, 0);
+    assert_eq!(cpu.stats().interpreter_entries, 0);
 }
 
 #[cfg(feature = "pal")]
@@ -393,7 +395,7 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
 }
 
 #[test]
-fn unsupported_address_size_and_fs_segment_prefix_keep_unicorn_execution() {
+fn unsupported_native_address_size_and_fs_prefix_use_the_interpreter() {
     // Address-size 16 needs SI/DI/CX, and FS changes the MOVS source base.
     for bytes in [vec![0x67, 0xf3, 0xa4, 0xc3], vec![0x64, 0xf3, 0xa4, 0xc3]] {
         let mut jit = machine(0, true, 0x50000);
@@ -407,6 +409,6 @@ fn unsupported_address_size_and_fs_segment_prefix_keep_unicorn_execution() {
         assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(jit.state.regs, uc.state.regs);
         assert_eq!(jit.stats.bulk_bytes, 0);
-        assert!(jit.stats.fallback_entries > 0);
+        assert!(jit.stats.interpreter_entries > 0);
     }
 }

@@ -1,8 +1,10 @@
+mod support;
 use adv_jit::{
-    ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, CpuState, EXEC, HostServices, Machine,
-    READ, Region, Resume, RunOutcome, WRITE,
+    ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, CpuState, EXEC, HostServices, READ,
+    Region, Resume, RunOutcome, WRITE,
 };
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const SETUP: u32 = 0x11000;
@@ -39,14 +41,14 @@ fn pcm_code() -> Vec<u8> {
         a.ret().unwrap();
     })
 }
-fn machine(bytes: &[u8], native: bool, resident: bool) -> Machine {
+fn machine(bytes: &[u8], native: bool, linked: bool) -> Machine {
     let mut m = Machine::new(CODE, 0x40000).unwrap();
     m.protect(CODE, 0x40000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 8192, READ | EXEC).unwrap();
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     m.write(SCALE, &32768.0f32.to_le_bytes()).unwrap();
-    m.set_x87_residency(resident);
+    m.set_region_linking(linked);
     if native {
         m.add_region(Region::new(CODE, bytes.len())).unwrap();
     }
@@ -81,8 +83,19 @@ fn start(m: &mut Machine, source: u32, destination: u32, stack: u32) {
     };
 }
 
+fn assert_pcm_registers(actual: &Machine, oracle: &Machine, exceptions: u32) {
+    // FNSTSW AX exposes masked precision/denormal/invalid status. Unicorn
+    // omits these for FISTP, so assert the architectural result independently.
+    assert_eq!(actual.state.regs[0] & 0x3f, exceptions);
+    let mut actual_regs = actual.state.regs;
+    let mut oracle_regs = oracle.state.regs;
+    actual_regs[0] &= !0x3f;
+    oracle_regs[0] &= !0x3f;
+    assert_eq!(actual_regs, oracle_regs);
+}
+
 #[test]
-fn residency_matches_pcm_registers_and_fpu_status_with_off_and_unicorn() {
+fn shared_float_execution_matches_pcm_with_linking_and_oracle() {
     let bytes = pcm_code();
     let mut off = machine(&bytes, true, false);
     let mut on = machine(&bytes, true, true);
@@ -101,16 +114,18 @@ fn residency_matches_pcm_registers_and_fpu_status_with_off_and_unicorn() {
         assert_eq!(m.memory().read(OUT, SAMPLES * 4).unwrap(), expected(false));
     }
     assert_eq!(on.state.regs, off.state.regs);
-    assert_eq!(on.state.regs, uc.state.regs);
+    assert_pcm_registers(&on, &uc, 0x20);
     assert_eq!(on.state.eflags, off.state.eflags);
     assert_eq!(on.state.eflags, uc.state.eflags);
-    assert!(on.stats.x87_resident_runs > 0);
-    assert!(on.stats.fallback_entries * 3 < off.stats.fallback_entries);
-    assert_eq!(off.stats.x87_resident_runs, 0);
+    assert!(on.stats.interpreter_instructions > 0);
+    assert_eq!(
+        on.stats.interpreter_instructions,
+        off.stats.interpreter_instructions
+    );
 }
 
 #[test]
-fn resident_float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
+fn float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
     let bytes = pcm_code();
     let bits = [
         0x7fc0_1234u32,
@@ -146,16 +161,15 @@ fn resident_float_boundaries_keep_nan_infinity_denormal_results_and_reference_st
         off.memory().read(OUT, SAMPLES * 4).unwrap(),
         uc.memory().read(OUT, SAMPLES * 4).unwrap()
     );
-    assert_eq!(on.state.regs, uc.state.regs);
-    assert_eq!(off.state.regs, uc.state.regs);
+    assert_pcm_registers(&on, &uc, 0x23);
+    assert_pcm_registers(&off, &uc, 0x23);
     assert_eq!(on.state.mmx, uc.state.mmx);
-    // Preserve the reference engine's status without inventing exception bits
-    // that Unicorn itself does not expose for these masked conversions.
-    assert!(on.stats.x87_resident_runs > 0);
+    // Invalid, denormal and precision flags were checked independently above.
+    assert!(on.stats.interpreter_instructions > 0);
 }
 
 #[test]
-fn residency_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
+fn execution_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
     let bytes = pcm_code();
     let setup = code(|a| {
         a.fldcw(word_ptr(CW as i32)).unwrap();
@@ -173,12 +187,18 @@ fn residency_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
         m.state.eip = SETUP;
         m.state.regs[4] = STACK - index as u32 * 4096;
         assert_eq!(m.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        // GPR restart must preserve this thread's explicitly configured FPU.
+        // A fresh CpuState now resets the entire canonical CPU, including x87.
+        let floating = m.state.x87.clone();
+        let mxcsr = m.state.mxcsr;
         start(
             &mut m,
             SRC + index as u32 * 0x4000,
             OUT + index as u32 * 0x4000,
             STACK - index as u32 * 4096,
         );
+        m.state.x87 = floating;
+        m.state.mxcsr = mxcsr;
         contexts.push(m.save_context().unwrap());
     }
     let mut done = [false; 2];
@@ -203,11 +223,11 @@ fn residency_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
         m.memory().read(OUT + 0x4000, SAMPLES * 4).unwrap(),
         expected(true)
     );
-    assert!(m.stats.x87_resident_runs > 0);
+    assert!(m.stats.interpreter_instructions > 0);
 }
 
 #[test]
-fn active_residency_still_delivers_api_callback_and_return_pad_in_order() {
+fn interpreted_floating_execution_delivers_api_callback_and_return_pad_in_order() {
     const API: u32 = 0x12000;
     const PAD: u32 = STOP + 16;
     const CALLBACK_OUT: u32 = OUT + 0x4000;
@@ -277,8 +297,8 @@ fn active_residency_still_delivers_api_callback_and_return_pad_in_order() {
             Ok(ApiOutcome::Return(13))
         }
     }
-    for (native, resident) in [(true, false), (true, true), (false, false)] {
-        let mut m = machine(&bytes, native, resident);
+    for (native, linked) in [(true, false), (true, true), (false, false)] {
+        let mut m = machine(&bytes, native, linked);
         m.write(SETUP, &callback).unwrap();
         m.register_api(ApiSpec::new(
             1,
@@ -308,14 +328,14 @@ fn active_residency_still_delivers_api_callback_and_return_pad_in_order() {
             m.memory().read(CALLBACK_OUT, 256 * 4).unwrap(),
             &expected(false)[..256 * 4]
         );
-        if resident {
-            assert!(m.stats.x87_resident_runs > 0);
+        if linked {
+            assert!(m.stats.interpreter_instructions > 0);
         }
     }
 }
 
 #[test]
-fn resident_x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
+fn interpreted_x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
     let bytes = pcm_code();
     let mut machines = [
         machine(&bytes, true, false),
@@ -358,27 +378,27 @@ fn resident_x87_fault_keeps_restartable_stack_and_finishes_after_permission_repa
     assert_eq!(faults[0], faults[1]);
     assert_eq!(faults[1], faults[2]);
     assert_eq!(machines[0].state.regs, machines[1].state.regs);
-    assert_eq!(machines[1].state.regs, machines[2].state.regs);
-    assert!(machines[1].stats.x87_resident_runs > 0);
+    assert_pcm_registers(&machines[1], &machines[2], 0x20);
+    assert!(machines[1].stats.interpreter_instructions > 0);
 }
 
 #[test]
-fn code_version_change_resets_admission_and_active_code_writes_invalidate_before_native_reentry() {
+fn code_writes_invalidate_before_native_reentry() {
     let bytes = pcm_code();
     let mut m = machine(&bytes, true, true);
     m.write(SRC, &samples()).unwrap();
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    let resident_runs = m.stats.x87_resident_runs;
-    assert!(resident_runs > 0);
+    let interpreted_before = m.stats.interpreter_instructions;
+    assert!(interpreted_before > 0);
     m.write(CODE, &bytes).unwrap();
     start(&mut m, SRC, OUT, STACK);
     m.state.regs[1] = 16;
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(m.stats.x87_resident_runs, resident_runs);
+    assert!(m.stats.interpreter_instructions > interpreted_before);
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    let resident_runs = m.stats.x87_resident_runs;
+    let interpreted_before = m.stats.interpreter_instructions;
     m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
     // Protection changed the code version: readmit, then write the active code page.
     start(&mut m, SRC, OUT, STACK);
@@ -391,12 +411,12 @@ fn code_version_change_resets_admission_and_active_code_writes_invalidate_before
         &expected(false)[..32]
     );
     assert!(m.stats.invalidations > 0);
-    assert!(m.stats.x87_resident_runs > resident_runs);
+    assert!(m.stats.interpreter_instructions > interpreted_before);
 }
 
 #[cfg(feature = "pal")]
 #[test]
-fn resident_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss() {
+fn interpreted_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss() {
     use adv_jit::pal::JitCpu;
     use pal_cpu::{Backend, Exit, Guest, GuestExt, Prot, Reg, TrapAction, TrapHandler};
     use std::time::{Duration, Instant};
@@ -419,7 +439,6 @@ fn resident_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss() 
         a.ret().unwrap();
     });
     let mut cpu = JitCpu::new(STOP, true).unwrap();
-    cpu.set_x87_residency(true);
     for at in [CODE, STOP] {
         cpu.map(at, 4096, Prot::RX).unwrap();
     }
@@ -444,7 +463,7 @@ fn resident_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss() 
     }
     cpu.set_execution_budget(Some(Duration::from_secs(2)));
     assert_eq!(cpu.run(&mut NoTrap), Exit::Parked);
-    assert!(cpu.stats().x87_resident_runs > 0);
+    assert!(cpu.stats().interpreter_instructions > 0);
     for (reg, value) in [(Reg::Eip, CODE), (Reg::Esp, STACK), (Reg::Ecx, 5_000_000)] {
         cpu.set_reg(reg, value);
     }

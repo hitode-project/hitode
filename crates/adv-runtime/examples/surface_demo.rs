@@ -39,11 +39,11 @@ fn main() {
             .write_image_data(&rgba)
             .unwrap();
         println!(
-            "{name}: frame={} API={} native_entries={} fallback={} output={}",
+            "{name}: frame={} API={} native_entries={} interpreter_entries={} output={}",
             frame.frames,
             f.machine.stats.host_calls,
             f.machine.stats.native_entries,
-            f.machine.stats.fallback_entries,
+            f.machine.stats.interpreter_entries,
             path.display()
         );
     }

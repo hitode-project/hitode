@@ -1,4 +1,6 @@
-use adv_jit::{CompileStrategy, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -51,6 +53,8 @@ fn program(mut bytes: Vec<u8>, jit: bool) -> Machine {
     m
 }
 fn start(m: &mut Machine, count: u32, source: u32, destination: u32, backwards: bool) {
+    // This fixture starts a new guest instruction, rather than resuming a chunk.
+    m.state.rep = None;
     m.state.eip = CODE;
     m.state.regs = [
         VALUE,
@@ -134,7 +138,7 @@ fn all_repeat_conditions_widths_directions_and_alignment_match_unicorn() {
                             jit.memory().read(DST, 0x10000).unwrap(),
                             original_destination
                         );
-                        assert_eq!(jit.stats.fallback_entries, 0, "{form:?}, DF={backwards}");
+                        assert_eq!(jit.stats.interpreter_entries, 0, "{form:?}, DF={backwards}");
                         let compared = stop.map_or(count, |i| i + 1);
                         assert_eq!(jit.stats.bulk_bytes, u64::from(compared * form.width));
                     }
@@ -169,7 +173,7 @@ fn final_subtraction_flags_cover_carry_borrow_parity_sign_and_overflow() {
                 put(m, DST, form.width, right);
             }
             finish(&mut jit, &mut uc);
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
@@ -186,7 +190,7 @@ fn zero_count_has_no_memory_access_and_preserves_all_flags() {
             finish(&mut jit, &mut uc);
             assert_eq!(jit.state.eflags, 0x8d7 | if backwards { 0x400 } else { 0 });
             assert_eq!(jit.stats.bulk_bytes, 0);
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
@@ -224,7 +228,7 @@ fn stopping_element_before_a_denied_page_does_not_access_it() {
                 }
                 finish(&mut jit, &mut uc);
                 assert_eq!(jit.state.regs[1], 99);
-                assert_eq!(jit.stats.fallback_entries, 0);
+                assert_eq!(jit.stats.interpreter_entries, 0);
                 assert_eq!(jit.stats.bulk_bytes, u64::from(form.width));
             }
         }
@@ -232,7 +236,7 @@ fn stopping_element_before_a_denied_page_does_not_access_it() {
 }
 
 #[test]
-fn page_fault_progress_flags_and_repair_match_unicorn() {
+fn page_fault_restores_input_flags_and_preserves_completed_progress() {
     for form in forms() {
         for backwards in [false, true] {
             for deny_source in [false, true] {
@@ -262,19 +266,19 @@ fn page_fault_progress_flags_and_repair_match_unicorn() {
                     fill(m, form, 10, source, destination, backwards, None);
                     m.protect(denied, 4096, 0).unwrap();
                 }
-                // Baseline Unicorn leaves flags from the last completed compare
-                // on a REP fault, whereas Intel specifies restoring input flags.
-                // This conservative path delegates the entire instruction without
-                // prior native commits and therefore preserves that baseline.
+                let input_flags = jit.state.eflags;
+                // The oracle is useful for completed index/count progress, but
+                // Unicorn 2.1.5 does not implement Intel's input-EFLAGS restore
+                // on REP comparison faults. Assert that rule independently.
                 let expected = uc.run_unicorn(STOP, 1000).unwrap();
                 assert!(matches!(expected, RunOutcome::ReadFault { .. }));
                 assert_eq!(jit.run(STOP, 1000).unwrap(), expected);
                 assert_eq!(jit.state.regs, uc.state.regs);
-                assert_eq!(jit.state.eflags, uc.state.eflags);
+                assert_eq!(jit.state.eflags, input_flags);
                 assert_eq!(jit.state.eip, CODE);
                 assert_eq!(jit.state.regs[1], 7);
                 assert_eq!(jit.stats.bulk_bytes, 0);
-                assert!(jit.stats.fallback_entries > 0);
+                assert!(jit.stats.interpreter_entries > 0);
                 for m in [&mut jit, &mut uc] {
                     m.protect(denied, 4096, READ).unwrap();
                 }
@@ -286,7 +290,7 @@ fn page_fault_progress_flags_and_repair_match_unicorn() {
 }
 
 #[test]
-fn unaligned_denied_page_uses_the_unchanged_unicorn_fallback() {
+fn unaligned_denied_page_faults_before_the_first_comparison_and_restarts() {
     for form in forms().filter(|f| f.width > 1) {
         let mut jit = machine(form, true);
         let mut uc = machine(form, false);
@@ -295,19 +299,21 @@ fn unaligned_denied_page_uses_the_unchanged_unicorn_fallback() {
             fill(m, form, 4, SRC + 4095, DST + 4095, false, None);
             m.protect(DST + 4096, 4096, 0).unwrap();
         }
-        let actual = jit.run(STOP, 1000).unwrap();
-        let expected = uc.run_unicorn(STOP, 1000).unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(jit.state.regs, uc.state.regs);
-        assert_eq!(jit.state.eflags, uc.state.eflags);
-        // Unicorn currently permits unaligned CMPS/SCAS word/dword reads that straddle a
-        // denied page. The helper must not duplicate that permission weakness:
-        // no native comparison is committed before the unchanged UC fallback.
+        let before = jit.state.clone();
+        assert_eq!(
+            jit.run(STOP, 1000).unwrap(),
+            RunOutcome::ReadFault {
+                pc: CODE,
+                address: DST + 4095
+            }
+        );
+        assert_eq!(jit.state.regs, before.regs);
+        assert_eq!(jit.state.eflags, before.eflags);
+        assert_eq!(jit.state.eip, CODE);
+        // Unicorn can permit the straddling first read and fault at a later
+        // element, so its fault ordering/address is not the specification here.
         assert_eq!(jit.stats.bulk_bytes, 0);
-        assert!(jit.stats.fallback_entries > 0);
-        if actual == RunOutcome::ReachedStop {
-            continue;
-        }
+        assert!(jit.stats.interpreter_entries > 0);
         for m in [&mut jit, &mut uc] {
             m.protect(DST + 4096, 4096, READ).unwrap();
         }
@@ -316,7 +322,7 @@ fn unaligned_denied_page_uses_the_unchanged_unicorn_fallback() {
 }
 
 #[test]
-fn huge_counts_can_stop_early_and_long_unknown_spans_keep_the_fallback_budget() {
+fn huge_counts_can_stop_early_and_long_unknown_spans_preserve_element_budget() {
     for form in forms() {
         let mut jit = machine(form, true);
         let mut uc = machine(form, false);
@@ -326,7 +332,7 @@ fn huge_counts_can_stop_early_and_long_unknown_spans_keep_the_fallback_budget() 
         }
         finish(&mut jit, &mut uc);
         assert_eq!(jit.state.regs[1], u32::MAX - 1);
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
         assert_eq!(jit.stats.bulk_bytes, u64::from(form.width));
     }
     let form = Form {
@@ -341,7 +347,7 @@ fn huge_counts_can_stop_early_and_long_unknown_spans_keep_the_fallback_budget() 
         start(m, u32::MAX, 0xffff_ffff, 0x100000, false);
     }
     // As with other guarded REP helpers, one native attempt consumes one unit,
-    // then a single Unicorn iteration consumes the remaining unit.
+    // then one interpreted element consumes the remaining unit.
     assert_eq!(jit.run(STOP, 2).unwrap(), RunOutcome::Budget);
     assert_eq!(uc.run_unicorn(STOP, 1).unwrap(), RunOutcome::Budget);
     assert_eq!(jit.state.regs, uc.state.regs);
@@ -352,7 +358,7 @@ fn huge_counts_can_stop_early_and_long_unknown_spans_keep_the_fallback_budget() 
 }
 
 #[test]
-fn invalid_first_element_and_overflowing_addresses_keep_precise_uc_faults() {
+fn invalid_first_element_and_overflowing_addresses_keep_precise_faults() {
     for form in forms() {
         for bad_source in [false, true] {
             if bad_source && !form.cmps {
@@ -402,7 +408,7 @@ fn crt_strlen_with_unbounded_count_stops_natively_at_the_terminator() {
         finish(&mut jit, &mut uc);
         assert_eq!(jit.state.regs[0], length as u32);
         assert_eq!(jit.stats.bulk_bytes, length as u64 + 1);
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 
@@ -430,7 +436,7 @@ fn crt_memcmp_branches_use_last_comparison_flags_under_both_compile_strategies()
             }
             finish(&mut jit, &mut uc);
             assert_eq!(jit.state.regs[0], result);
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
             assert_eq!(jit.stats.bulk_bytes, if left == right { 32 } else { 13 });
         }
     }
@@ -463,11 +469,44 @@ fn finite_large_comparisons_commit_bounded_chunks_and_restore_independent_contex
         assert_eq!(m.state.eflags, 0x46 | if backwards { 0x400 } else { 0 });
     }
     assert_eq!(m.stats.bulk_bytes, 5 << 20);
-    assert_eq!(m.stats.fallback_entries, 0);
+    assert_eq!(m.stats.interpreter_entries, 0);
 }
 
 #[test]
-fn permissions_changed_between_chunks_fault_from_the_resumed_state() {
+fn native_comparison_fault_after_a_slice_restores_instruction_input_flags() {
+    let form = Form {
+        cmps: false,
+        equal: true,
+        width: 1,
+    };
+    let mut jit = machine(form, true);
+    jit.write(0x100000, &vec![VALUE as u8; 2 << 20]).unwrap();
+    start(&mut jit, 2 << 20, SRC, 0x100000, false);
+    let original_flags = jit.state.eflags;
+    assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
+    assert_eq!(jit.state.eflags, 0x46);
+    assert!(jit.state.rep.is_some());
+    let regs = jit.state.regs;
+    let context = jit.save_context().unwrap();
+    // Another instruction on this machine cannot replace the saved origin flags.
+    start(&mut jit, 0, SRC, DST, false);
+    assert_eq!(jit.run(STOP, 10).unwrap(), RunOutcome::ReachedStop);
+    jit.restore_context(&context).unwrap();
+    jit.protect(0x200000, 4096, 0).unwrap();
+    assert_eq!(
+        jit.run(STOP, 1000).unwrap(),
+        RunOutcome::ReadFault {
+            pc: CODE,
+            address: 0x200000
+        }
+    );
+    assert_eq!(jit.state.regs, regs);
+    assert_eq!(jit.state.eflags, original_flags);
+    assert_eq!(jit.state.eip, CODE);
+}
+
+#[test]
+fn comparison_can_resume_from_native_through_interpreter_back_to_native() {
     let form = Form {
         cmps: false,
         equal: true,
@@ -477,30 +516,37 @@ fn permissions_changed_between_chunks_fault_from_the_resumed_state() {
     jit.write(0x100000, &vec![VALUE as u8; 2 << 20]).unwrap();
     start(&mut jit, 2 << 20, SRC, 0x100000, false);
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    let mut uc = machine(form, false);
-    uc.state = jit.state.clone();
-    uc.write(STACK, &STOP.to_le_bytes()).unwrap();
-    for m in [&mut jit, &mut uc] {
-        m.protect(0x200000, 4096, 0).unwrap();
-    }
-    assert_eq!(
-        jit.run(STOP, 1000).unwrap(),
-        uc.run_unicorn(STOP, 1000).unwrap()
-    );
-    assert_eq!(jit.state.regs, uc.state.regs);
-    assert_eq!(jit.state.eflags, uc.state.eflags);
-    assert_eq!(jit.state.eip, CODE);
+    assert_eq!(jit.stats.bulk_bytes, 1 << 20);
+    // The guarded scan declines the inaccessible range without committing;
+    // the interpreter then commits exactly the next 256 readable elements.
+    jit.protect(0x201000, 4096, 0).unwrap();
+    assert_eq!(jit.run(STOP, 257).unwrap(), RunOutcome::Budget);
+    assert_eq!(jit.state.regs[1], (1 << 20) - 256);
+    assert_eq!(jit.state.regs[7], 0x200100);
+    assert_eq!(jit.stats.interpreter_instructions, 256);
+    assert_eq!(jit.stats.bulk_bytes, 1 << 20);
+    assert!(jit.state.rep.is_some());
+    // Changing an already compared byte would stop a replay from the old PC.
+    jit.write(0x100000, &[VALUE as u8 ^ 1]).unwrap();
+    jit.protect(0x201000, 4096, READ | WRITE).unwrap();
+    assert_eq!(jit.run(STOP, 10).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(jit.state.regs[1], 0);
+    assert_eq!(jit.state.regs[7], 0x300000);
+    assert_eq!(jit.state.eflags, 0x46);
+    assert!(jit.state.rep.is_none());
+    assert_eq!(jit.stats.interpreter_instructions, 256);
+    assert_eq!(jit.stats.bulk_bytes, (2 << 20) - 256);
 }
 
 #[test]
-fn sixteen_bit_addresses_and_segment_overrides_keep_the_fallback() {
+fn sixteen_bit_addresses_and_segment_overrides_use_the_interpreter() {
     for mut bytes in [vec![0x67, 0xf3, 0xa6], vec![0x64, 0xf3, 0xa6]] {
         // Zero count avoids a segment/address dependency while still checking that
         // these instruction forms have not been admitted to the bulk helper.
         let mut jit = program(std::mem::take(&mut bytes), true);
         start(&mut jit, 0, 0xffff_ffff, 0xffff_ffff, false);
         assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-        assert!(jit.stats.fallback_entries > 0);
+        assert!(jit.stats.interpreter_entries > 0);
         assert_eq!(jit.stats.bulk_bytes, 0);
     }
 }
@@ -525,7 +571,7 @@ fn comparing_executable_memory_observes_host_smc_updates() {
     assert_eq!(m.state.regs[1], 1);
     assert_eq!(m.stats.invalidations, 1);
     assert!(m.stats.compilations > compilations);
-    assert_eq!(m.stats.fallback_entries, 0);
+    assert_eq!(m.stats.interpreter_entries, 0);
 }
 
 #[cfg(feature = "pal")]
@@ -563,7 +609,7 @@ mod sparse_memory {
     }
 
     #[test]
-    fn unmapped_later_page_early_stop_and_fault_repair_match_force_unicorn() {
+    fn unmapped_later_page_early_stop_and_fault_repair_match_interpreter() {
         for form in forms() {
             for stop in [true, false] {
                 let mut jit = cpu(form, true);
@@ -595,7 +641,7 @@ mod sparse_memory {
                 assert_eq!(jit.reg(Reg::Eflags), uc.reg(Reg::Eflags));
                 if stop {
                     assert_eq!(actual, Exit::Parked);
-                    assert_eq!(jit.stats().fallback_entries, 0);
+                    assert_eq!(jit.stats().interpreter_entries, 0);
                 } else {
                     assert!(matches!(actual, Exit::Fault(_)));
                     assert_eq!(jit.reg(Reg::Eip), CODE);
@@ -664,6 +710,6 @@ mod sparse_memory {
         assert_eq!(cpu.reg(Reg::Ecx), 0);
         assert_eq!(cpu.reg(Reg::Edi), BUFFER + SIZE);
         assert_eq!(cpu.reg(Reg::Eflags), 0x46);
-        assert_eq!(cpu.stats().fallback_entries, 0);
+        assert_eq!(cpu.stats().interpreter_entries, 0);
     }
 }

@@ -16,6 +16,8 @@ struct Options {
     data_dir: PathBuf,
     jit: bool,
     compile_strategy: CompileStrategy,
+    region_linking: bool,
+    async_compilation: bool,
     codepage: u32,
     headless: bool,
     hidden: bool,
@@ -35,8 +37,10 @@ struct Options {
 
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
-  --backend jit|unicorn   shared guest backend (default: jit)\n\
-  --compile fast|speed    automatic JIT region policy (default: speed)\n\
+  --backend jit|interpreter   shared guest backend (default: jit)\n\
+  --compile fast|speed    automatic JIT region policy (default: fast)\n\
+  --no-region-linking     return to the dispatcher between native regions\n\
+  --sync-compilation      compile automatic regions on the execution thread\n\
   --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
   --headless              run without a host window\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
@@ -63,7 +67,9 @@ impl Options {
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
             jit: true,
-            compile_strategy: CompileStrategy::Speed,
+            compile_strategy: CompileStrategy::Fast,
+            region_linking: true,
+            async_compilation: true,
             codepage: 932,
             headless: false,
             hidden: false,
@@ -93,7 +99,7 @@ impl Options {
                 "--backend" => {
                     options.jit = match value()?.as_str() {
                         "jit" => true,
-                        "unicorn" => false,
+                        "interpreter" => false,
                         other => return Err(format!("unknown backend: {other}")),
                     }
                 }
@@ -111,6 +117,8 @@ impl Options {
                         _ => return Err("--compile must be fast or speed".into()),
                     };
                 }
+                "--no-region-linking" => options.region_linking = false,
+                "--sync-compilation" => options.async_compilation = false,
                 "--headless" => options.headless = true,
                 "--hidden" => options.hidden = true,
                 "--self-test-input" => options.self_test_input = true,
@@ -254,16 +262,16 @@ fn build_report(context: ReportContext<'_>) -> String {
     )).collect::<Vec<_>>().join(", ");
     format!(
         concat!(
-            "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
+            "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
             "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"fallback_entries\": {},\n",
-            "  \"compilations\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
+            "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
-        json(if options.jit { "jit" } else { "unicorn" }),
+        json(if options.jit { "jit" } else { "interpreter" }),
         if options.jit {
             json(match options.compile_strategy {
                 CompileStrategy::Fast => "fast",
@@ -272,6 +280,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         } else {
             "null".into()
         },
+        options.jit && options.region_linking && !options.profile,
         options.codepage,
         json(stop_reason),
         exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
@@ -286,8 +295,15 @@ fn build_report(context: ReportContext<'_>) -> String {
         inputs,
         runtime.machine.sys.host_calls,
         stats.native_entries,
-        stats.fallback_entries,
+        stats.interpreter_entries,
         stats.compilations,
+        options.jit && options.async_compilation,
+        stats.compile_time.as_secs_f64(),
+        stats.compile_requests,
+        stats.pending_compilations,
+        stats.peak_pending_compilations,
+        stats.stale_compilations,
+        stats.compile_failures,
         runtime.machine.sys.contexts.len(),
         runtime.machine.sys.tls_images.len(),
         modules,
@@ -300,7 +316,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         screenshot_error.map_or_else(|| "null".into(), json),
         performance.json(),
         audio.json(),
-        json(&runtime.report())
+        json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
     )
 }
 
@@ -325,6 +341,14 @@ fn run(options: Options) -> Result<u8, String> {
         .machine
         .cpu
         .set_auto_compile_strategy(options.compile_strategy);
+    runtime
+        .machine
+        .cpu
+        .set_region_linking(options.region_linking);
+    runtime
+        .machine
+        .cpu
+        .set_async_compilation(options.jit && options.async_compilation);
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
     runtime.machine.cpu.set_profiling(options.profile);
@@ -637,13 +661,13 @@ fn run(options: Options) -> Result<u8, String> {
     }
     let stats = runtime.machine.cpu.stats();
     println!(
-        "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} fallback_entries={} idle_waits={}",
+        "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
         exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
         frame.frames,
         started.elapsed().as_secs_f64(),
         runtime.machine.sys.host_calls,
         stats.native_entries,
-        stats.fallback_entries,
+        stats.interpreter_entries,
         idle_waits
     );
     if let Some(error) = failure {

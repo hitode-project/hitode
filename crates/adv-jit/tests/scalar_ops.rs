@@ -1,5 +1,7 @@
-use adv_jit::{CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -100,7 +102,7 @@ fn multiply_forms_match_unicorn_results_and_defined_flags() {
                 }
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0, "multiply form {form}");
+        assert_eq!(jit.stats.interpreter_entries, 0, "multiply form {form}");
     }
 }
 
@@ -139,7 +141,7 @@ fn shifts_match_unicorn_at_zero_one_and_masked_counts() {
                     }
                 }
                 assert_eq!(
-                    jit.stats.fallback_entries, 0,
+                    jit.stats.interpreter_entries, 0,
                     "shift {operation}, immediate {immediate}, count {count}"
                 );
             }
@@ -176,8 +178,9 @@ fn multiplication_memory_fault_is_atomic_and_short_forms_fall_back() {
     let regs = [0x1234_7fff, 2, 0xabcd_9876, 0, 0, 0, 0, 0];
     reset(&mut jit, regs, 2);
     reset(&mut uc, regs, 2);
-    differential(&mut jit, &mut uc, 0x8c5);
-    assert!(jit.stats.fallback_entries > 0);
+    // SHL by two leaves OF undefined; only its defined CF/SF/ZF/PF are an oracle.
+    differential(&mut jit, &mut uc, 0xc5);
+    assert!(jit.stats.interpreter_entries > 0);
 }
 
 #[test]
@@ -232,7 +235,7 @@ fn byte_and_word_compare_test_flags_and_branches_match_unicorn() {
                 }
             }
             assert_eq!(
-                jit.stats.fallback_entries, 0,
+                jit.stats.interpreter_entries, 0,
                 "subtract={subtract}, form={form}"
             );
         }

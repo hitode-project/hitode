@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use adv_jit::pal::JitCpu;
-use pal_cpu::{Guest, Prot};
+use pal_cpu::{Backend, Prot};
 use pal_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult};
 use pal_win32::{Win32, Win32Config};
 
@@ -12,8 +12,8 @@ use crate::graphics::{API_SPECS, DEVICE_METHODS, GuestMemory, SURFACE_METHODS};
 use crate::{Graphics, Snapshot, api};
 
 /// A running executable. Original game files are read-only; guest writes use `data_dir`.
-pub struct Runtime {
-    pub machine: Machine<JitCpu>,
+pub struct Runtime<B: Backend = JitCpu> {
+    pub machine: Machine<B>,
 }
 
 #[derive(Default)]
@@ -25,11 +25,31 @@ struct RunControl {
     frame_intervals: Vec<Duration>,
 }
 
-impl Runtime {
+impl Runtime<JitCpu> {
     pub fn new(
         exe_path: impl AsRef<Path>,
         data_dir: impl AsRef<Path>,
         jit: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        Self::with_cpu(
+            exe_path,
+            data_dir,
+            JitCpu::new(pal_machine::layout::PARK_ADDR, jit)?,
+            width,
+            height,
+        )
+    }
+}
+
+impl<B: Backend> Runtime<B> {
+    /// Supply a CPU backend without changing loader, devices, scheduler or API behavior.
+    /// Differential backends are injected by dev-only tests and tools.
+    pub fn with_cpu(
+        exe_path: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        cpu: B,
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
@@ -58,10 +78,6 @@ impl Runtime {
         register_graphics(&mut registry);
         crate::font::register(&mut registry);
         crate::sound::register(&mut registry);
-        let mut cpu = JitCpu::new(pal_machine::layout::PARK_ADDR, jit)?;
-        // Keep densely interleaved x87/integer guest loops in Unicorn briefly,
-        // avoiding repeated handoffs while preserving the original decoder.
-        cpu.set_x87_residency(jit);
         let mut machine = Machine::new(cpu, registry, Clock::real()).map_err(|e| e.to_string())?;
         machine.set_execution_budget(Some(Duration::from_secs(30)));
         Win32::install(&mut machine, cfg).map_err(|e| e.to_string())?;
@@ -293,12 +309,12 @@ impl Runtime {
     pub fn report(&self) -> String {
         let graphics = self.machine.ext.get::<Graphics<Snapshot>>();
         let mut report = format!(
-            "host calls: {}; frames: {}; surfaces: {}; bytes blitted: {}; JIT: {:?}\nmissing APIs: {}",
+            "host calls: {}; frames: {}; surfaces: {}; bytes blitted: {}; CPU: {}\nmissing APIs: {}",
             self.machine.sys.host_calls,
             graphics.stats.presentations,
             graphics.live_surfaces(),
             graphics.stats.bytes_blitted,
-            self.machine.cpu.stats(),
+            std::any::type_name::<B>(),
             self.missing_apis().join(", ")
         );
         let user = &self.machine.ext.get::<Win32>().user;
@@ -448,25 +464,35 @@ impl Runtime {
         for call in self.machine.sys.recent_calls() {
             report.push_str(&format!("\n  {call}"));
         }
-        let mut profile: Vec<_> = self.machine.cpu.profile().into_iter().collect();
-        profile.sort_by_key(|(_, s)| std::cmp::Reverse(s.native_ns + s.fallback_ns));
-        if !profile.is_empty() {
-            report.push_str(
-                "\nTop guest regions by elapsed execution time (includes synchronous host APIs):",
-            );
-            for (addr, sample) in profile.into_iter().take(20) {
-                let place = self
-                    .machine
-                    .sys
-                    .modules
-                    .iter()
-                    .find(|(_, m)| m.contains(addr))
-                    .map_or_else(
-                        || format!("{addr:#010x}"),
-                        |(_, m)| format!("{}+{:#x}", m.name, addr - m.base),
-                    );
-                report.push_str(&format!("\n  {place}: native {} entries {:.3} ms; fallback {} entries {} instructions {:.3} ms",sample.native_entries,sample.native_ns as f64/1e6,sample.fallback_entries,sample.fallback_instructions,sample.fallback_ns as f64/1e6));
-            }
+        report
+    }
+
+    pub fn report_with_profile(&self, samples: &BTreeMap<u32, adv_jit::ProfileSample>) -> String {
+        let mut report = self.report();
+        let mut samples: Vec<_> = samples.iter().collect();
+        samples.sort_by_key(|(_, s)| std::cmp::Reverse(s.native_ns + s.interpreter_ns));
+        if !samples.is_empty() {
+            report.push_str("\nGuest execution profile (includes synchronous API work):");
+        }
+        for (&address, sample) in samples.into_iter().take(20) {
+            let place = self
+                .machine
+                .sys
+                .modules
+                .iter()
+                .find(|(_, module)| module.contains(address))
+                .map_or_else(
+                    || format!("{address:#010x}"),
+                    |(_, module)| format!("{}+{:#x}", module.name, address - module.base),
+                );
+            report.push_str(&format!(
+                "\n  {place}: native {} entries {:.3} ms; interpreter {} entries {} units {:.3} ms",
+                sample.native_entries,
+                sample.native_ns as f64 / 1e6,
+                sample.interpreter_entries,
+                sample.interpreter_instructions,
+                sample.interpreter_ns as f64 / 1e6
+            ));
         }
         report
     }
@@ -548,8 +574,8 @@ pub fn register_graphics(registry: &mut Registry) {
 }
 
 /// Allocate shared surfaces and bind their vtables to the registry's actual thunks.
-pub fn install_graphics(
-    machine: &mut Machine<JitCpu>,
+pub fn install_graphics<B: Backend>(
+    machine: &mut Machine<B>,
     width: u32,
     height: u32,
 ) -> Result<(), String> {

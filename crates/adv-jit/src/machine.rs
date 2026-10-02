@@ -1,112 +1,42 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
-
-use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot, uc_error};
-use unicorn_engine::{RegisterX86 as R, UcHookId, Unicorn};
 
 use crate::compile::{self, Compiled};
 use crate::host::{Bridge, RejectServices};
 use crate::{ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices, Resume, Wait};
-use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, Region};
-
-mod registers;
-
-const GDT: u64 = 0xffff_0000;
-const XMM: [R; 8] = [
-    R::XMM0,
-    R::XMM1,
-    R::XMM2,
-    R::XMM3,
-    R::XMM4,
-    R::XMM5,
-    R::XMM6,
-    R::XMM7,
-];
-const REGS: [R; 8] = [
-    R::EAX,
-    R::ECX,
-    R::EDX,
-    R::EBX,
-    R::ESP,
-    R::EBP,
-    R::ESI,
-    R::EDI,
-];
-const ST: [R; 8] = [
-    R::ST0,
-    R::ST1,
-    R::ST2,
-    R::ST3,
-    R::ST4,
-    R::ST5,
-    R::ST6,
-    R::ST7,
-];
-
-pub(crate) fn export_mmx(
-    uc: &mut Unicorn<'static, HookData>,
-    state: &mut CpuState,
-) -> Result<(), String> {
-    if state.mmx_mode == 0 {
-        return Ok(());
-    }
-    if state.mmx_mode & 1 != 0 {
-        let sw = uc.reg_read(R::FPSW).map_err(error)?;
-        let top = ((sw >> 11) & 7) as usize;
-        for (index, bits) in state.mmx.iter().enumerate() {
-            let reg = ST[(index + 8 - top) & 7];
-            let mut extended = registers::read_st(uc, reg).map_err(error)?;
-            extended[..8].copy_from_slice(&bits.to_le_bytes());
-            uc.reg_write_long(reg, &extended).map_err(error)?;
-        }
-        uc.reg_write(R::FPSW, sw & !(7 << 11)).map_err(error)?;
-    }
-    uc.reg_write(R::FPTAG, if state.mmx_mode & 2 != 0 { 0xffff } else { 0 })
-        .map_err(error)?;
-    state.mmx_mode = 0;
-    Ok(())
-}
-
-pub(crate) fn import_mmx(
-    uc: &Unicorn<'static, HookData>,
-    state: &mut CpuState,
-) -> Result<(), String> {
-    let top = ((uc.reg_read(R::FPSW).map_err(error)? >> 11) & 7) as usize;
-    for (index, bits) in state.mmx.iter_mut().enumerate() {
-        let extended = registers::read_st(uc, ST[(index + 8 - top) & 7]).map_err(error)?;
-        *bits = u64::from_le_bytes(extended[..8].try_into().unwrap());
-    }
-    state.mmx_mode = 0;
-    Ok(())
-}
+use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
     pub compilations: u64,
+    pub compile_requests: u64,
+    pub compile_failures: u64,
+    pub stale_compilations: u64,
+    pub pending_compilations: usize,
+    pub peak_pending_compilations: usize,
     pub compile_time: Duration,
     pub native_code_bytes: usize,
     pub native_entries: u64,
+    /// Entries reached by a generated tail call without returning to run_inner.
+    pub linked_entries: u64,
+    pub interpreter_instructions: u64,
+    pub interpreter_entries: u64,
     pub native_blocks: u64,
-    pub fallback_entries: u64,
-    pub fallback_instructions: u64,
     pub invalidations: u64,
     pub host_calls: u64,
     pub callbacks: u64,
     pub waits: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    pub x87_short_handoffs: u64,
-    pub x87_resident_runs: u64,
-    pub x87_resident_instructions: u64,
 }
 
 #[derive(Default, Clone, Debug)]
 pub struct ProfileSample {
     pub native_entries: u64,
     pub native_ns: u64,
-    pub fallback_entries: u64,
-    pub fallback_instructions: u64,
-    pub fallback_ns: u64,
+    pub interpreter_entries: u64,
+    pub interpreter_instructions: u64,
+    pub interpreter_ns: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -117,31 +47,10 @@ pub enum RunOutcome {
     WriteFault { pc: u32, address: u32 },
     FetchFault { pc: u32, address: u32 },
     InvalidInstruction { pc: u32 },
+    UnsupportedInstruction { pc: u32, code: iced_x86::Code },
+    Trap { pc: u32, vector: u8 },
     Waiting(Wait),
     Parked,
-}
-
-pub(crate) struct HookData {
-    base: u32,
-    pub(crate) perms: Vec<u8>,
-    dirty: bool,
-    dirty_pages: BTreeSet<u32>,
-    hot: BTreeSet<u32>,
-    skip_first: bool,
-    resume_pc: u32,
-    resident_left: u64,
-    resident_active: bool,
-    deadline: Option<Instant>,
-    return_pad: Option<u32>,
-    stop: u32,
-    remaining: u64,
-    executed: u64,
-    trap: Option<u32>,
-    auto_hot: bool,
-    hits: std::collections::HashMap<u32, u32>,
-    request: Option<u32>,
-    attempted: BTreeSet<u32>,
-    last_mem_fault: Option<(MemType, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -162,37 +71,33 @@ struct Suspended {
     continuation: u64,
 }
 
-struct X87Site {
-    version: u64,
-    short_handoffs: u8,
-}
-
+/// Owns the guest CPU, decoded instructions and native cache. Both executors
+/// access the same state and address space; only this owner publishes links.
 pub struct Machine {
-    // Drop Unicorn before the allocation referenced by mem_map_ptr.
-    pub(crate) uc: Unicorn<'static, HookData>,
     pub(crate) memory: Memory,
     compiled: BTreeMap<u32, Compiled>,
     regions: BTreeMap<u32, Region>,
     entry_owner: BTreeMap<u32, u32>,
+    links: crate::linking::Table,
+    links_revision: u64,
+    region_linking: bool,
+    interpreter: crate::interpreter::Interpreter,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
-    x87_residency: bool,
-    x87_sites: BTreeMap<u32, X87Site>,
+    async_compilation: bool,
+    compiler: Option<crate::compiler::Worker>,
+    pending_regions: BTreeMap<u32, u64>,
+    automatic_regions: BTreeSet<u32>,
+    hits: HashMap<u32, u32>,
+    attempted: BTreeSet<u32>,
     cache_revision: u64,
-    hot_revision: u64,
-    hot_unicorn: bool,
     observed_epoch: u64,
     profiling: bool,
     pub(crate) deadline: Option<Instant>,
     pub profile: BTreeMap<u32, ProfileSample>,
-    write_hook: Option<UcHookId>,
-    hook_epoch: u64,
-    gdt_addr: u32,
-    fs_selector: u16,
-    fs_dpl: u64,
-    hot_hook: Option<UcHookId>,
-    fallback_hook: Option<UcHookId>,
-    uc_epoch: u64,
+    /// Bounded diagnostics for automatic compilation failures. Guest execution
+    /// continues in the interpreter; explicit compilation still returns errors.
+    pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
     apis: BTreeMap<u32, ApiSpec>,
     return_pad: Option<u32>,
@@ -203,40 +108,31 @@ pub struct Machine {
     pub stats: Stats,
 }
 
-/// Full per-thread execution state, including Unicorn's x87/MMX/MXCSR and host continuations.
+/// Full guest-owned per-thread CPU state and host continuations.
+#[derive(Clone)]
 pub struct ExecutionContext {
     cpu: CpuState,
-    unicorn: unicorn_engine::Context,
     callbacks: Vec<CallbackFrame>,
     suspended: Option<Suspended>,
     wake: Option<Resume>,
     deferred_fallback: Option<u32>,
 }
 
-fn error(e: impl std::fmt::Display) -> String {
-    e.to_string()
-}
-
-pub(crate) fn uc_prot(p: u8) -> Prot {
-    let mut out = Prot::NONE;
-    if p & 1 != 0 {
-        out |= Prot::READ;
+impl ExecutionContext {
+    pub fn cpu(&self) -> &CpuState {
+        &self.cpu
     }
-    if p & 2 != 0 {
-        out |= Prot::WRITE;
+    /// Changes apply on restore, including the full raw floating-point state.
+    pub fn cpu_mut(&mut self) -> &mut CpuState {
+        &mut self.cpu
     }
-    if p & 4 != 0 {
-        out |= Prot::EXEC;
-    }
-    out
 }
 
 impl Machine {
     pub fn save_context(&mut self) -> Result<ExecutionContext, String> {
-        self.export_cpu()?;
+        self.state.refresh_mmx();
         Ok(ExecutionContext {
             cpu: self.state.clone(),
-            unicorn: self.uc.context_init().map_err(error)?,
             callbacks: self.callbacks.clone(),
             suspended: self.suspended.clone(),
             wake: self.wake,
@@ -244,8 +140,8 @@ impl Machine {
         })
     }
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
-        self.uc.context_restore(&context.unicorn).map_err(error)?;
         self.state = context.cpu.clone();
+        self.state.refresh_mmx();
         self.callbacks = context.callbacks.clone();
         self.suspended = context.suspended.clone();
         self.wake = context.wake;
@@ -259,7 +155,7 @@ impl Machine {
         stop: u32,
         budget: u64,
         raw: &mut dyn crate::host::RawTrap,
-        unicorn_only: bool,
+        interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
         let apis = BTreeMap::new();
         let mut bridge = Bridge {
@@ -274,131 +170,45 @@ impl Machine {
             bulk_calls: 0,
             bulk_bytes: 0,
         };
-        let result = self.run_inner(stop, budget, &mut bridge, unicorn_only);
+        let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
         self.stats.host_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
-        self.update_write_hook()?;
         result
     }
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
-        Self::create(base, len, false)
+        Self::create(Memory::new(base, len)?)
     }
 
-    /// Reserve a stable 32-bit address space, committing only mapped guest pages.
+    /// Reserve all 4 GiB; only mapped guest pages consume physical memory.
     pub fn address_space() -> Result<Self, String> {
-        Self::create(0, GDT as usize, true)
+        Self::create(Memory::reserve(0, 1usize << 32)?)
     }
 
-    fn create(base: u32, len: usize, sparse: bool) -> Result<Self, String> {
-        if u64::from(base) + len as u64 > GDT {
-            return Err("window overlaps reserved GDT".into());
-        }
-        let memory = if sparse {
-            Memory::reserve(base, len)?
-        } else {
-            Memory::new(base, len)?
-        };
-        let data = HookData {
-            base,
-            perms: memory.perms.clone(),
-            dirty: false,
-            dirty_pages: BTreeSet::new(),
-            hot: BTreeSet::new(),
-            skip_first: false,
-            resume_pc: 0,
-            resident_left: 0,
-            resident_active: false,
-            deadline: None,
-            return_pad: None,
-            stop: 0,
-            remaining: 0,
-            executed: 0,
-            trap: None,
-            auto_hot: false,
-            hits: std::collections::HashMap::new(),
-            request: None,
-            attempted: BTreeSet::new(),
-            last_mem_fault: None,
-        };
-        let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, data).map_err(error)?;
-        // SAFETY: page-aligned allocation remains alive and stable until uc is dropped.
-        if !sparse {
-            unsafe {
-                uc.mem_map_ptr(
-                    u64::from(base),
-                    len as u64,
-                    Prot::NONE,
-                    memory.ptr.as_ptr().cast(),
-                )
-            }
-            .map_err(error)?;
-        }
-        uc.mem_map(GDT, 4096, Prot::READ | Prot::WRITE)
-            .map_err(error)?;
-        let mut gdt = [0u8; 32];
-        gdt[8..16].copy_from_slice(&descriptor(0, true).to_le_bytes());
-        gdt[16..24].copy_from_slice(&descriptor(0, false).to_le_bytes());
-        gdt[24..32].copy_from_slice(&descriptor(0, false).to_le_bytes());
-        uc.mem_write(GDT, &gdt).map_err(error)?;
-        let mut gdtr = [0u8; 24];
-        gdtr[8..16].copy_from_slice(&GDT.to_le_bytes());
-        gdtr[16..20].copy_from_slice(&31u32.to_le_bytes());
-        uc.reg_write_long(R::GDTR, &gdtr).map_err(error)?;
-        for (reg, selector) in [
-            (R::CS, 8),
-            (R::DS, 16),
-            (R::ES, 16),
-            (R::SS, 16),
-            (R::FS, 24),
-        ] {
-            uc.reg_write(reg, selector).map_err(error)?;
-        }
-        uc.reg_write(R::FPCW, 0x27f).map_err(error)?;
-        uc.reg_write(R::FPSW, 0).map_err(error)?;
-        uc.reg_write(R::FPTAG, 0xffff).map_err(error)?;
-        uc.reg_write(R::MXCSR, 0x1f80).map_err(error)?;
-        uc.add_intr_hook(|uc, vector| {
-            uc.get_data_mut().trap = Some(vector);
-            uc.emu_stop().expect("stop guest interrupt");
-        })
-        .map_err(error)?;
-        let bad = HookType::MEM_READ_UNMAPPED
-            | HookType::MEM_WRITE_UNMAPPED
-            | HookType::MEM_FETCH_UNMAPPED
-            | HookType::MEM_READ_PROT
-            | HookType::MEM_WRITE_PROT
-            | HookType::MEM_FETCH_PROT;
-        uc.add_mem_hook(bad, 1, 0, |uc, ty, addr, _, _| {
-            uc.get_data_mut().last_mem_fault = Some((ty, addr as u32));
-            false
-        })
-        .map_err(error)?;
+    fn create(memory: Memory) -> Result<Self, String> {
         Ok(Self {
-            uc,
             memory,
             compiled: BTreeMap::new(),
             regions: BTreeMap::new(),
             entry_owner: BTreeMap::new(),
+            links: crate::linking::Table::default(),
+            links_revision: 0,
+            region_linking: true,
+            interpreter: crate::interpreter::Interpreter::new(),
             auto_jit: false,
-            auto_compile_strategy: CompileStrategy::Speed,
-            x87_residency: false,
-            x87_sites: BTreeMap::new(),
+            auto_compile_strategy: CompileStrategy::Fast,
+            async_compilation: false,
+            compiler: None,
+            pending_regions: BTreeMap::new(),
+            automatic_regions: BTreeSet::new(),
+            hits: HashMap::new(),
+            attempted: BTreeSet::new(),
             cache_revision: 1,
-            hot_revision: 0,
-            hot_unicorn: false,
             observed_epoch: 0,
             profiling: false,
             deadline: None,
             profile: BTreeMap::new(),
-            write_hook: None,
-            hook_epoch: u64::MAX,
-            gdt_addr: GDT as u32,
-            fs_selector: 24,
-            fs_dpl: 0,
-            hot_hook: None,
-            fallback_hook: None,
-            uc_epoch: 0,
+            compile_errors: BTreeMap::new(),
             deferred_fallback: None,
             apis: BTreeMap::new(),
             return_pad: None,
@@ -408,52 +218,6 @@ impl Machine {
             state: CpuState::default(),
             stats: Stats::default(),
         })
-    }
-
-    pub(crate) fn update_write_hook(&mut self) -> Result<(), String> {
-        if self.hook_epoch == self.memory.epoch {
-            return Ok(());
-        }
-        let needed = self
-            .memory
-            .perms
-            .iter()
-            .any(|p| p & (EXEC | crate::WRITE) == EXEC | crate::WRITE);
-        if !needed {
-            if let Some(hook) = self.write_hook.take() {
-                self.uc.remove_hook(hook).map_err(error)?;
-            }
-        } else if self.write_hook.is_none() {
-            self.write_hook = Some(
-                self.uc
-                    .add_mem_hook(
-                        HookType::MEM_WRITE,
-                        u64::from(self.memory.base),
-                        u64::from(self.memory.base) + self.memory.len as u64 - 1,
-                        |uc, _, addr, size, _| {
-                            let d = uc.get_data_mut();
-                            if let Some(offset) = addr.checked_sub(u64::from(d.base)) {
-                                let first = offset as usize / 4096;
-                                let last = (offset as usize + size.saturating_sub(1)) / 4096;
-                                if (first..=last)
-                                    .any(|page| d.perms.get(page).is_some_and(|p| p & EXEC != 0))
-                                {
-                                    d.dirty = true;
-                                    for page in first..=last {
-                                        if d.perms.get(page).is_some_and(|p| p & EXEC != 0) {
-                                            d.dirty_pages.insert(d.base + page as u32 * 4096);
-                                        }
-                                    }
-                                }
-                            }
-                            false
-                        },
-                    )
-                    .map_err(error)?,
-            );
-        }
-        self.hook_epoch = self.memory.epoch;
-        Ok(())
     }
 
     #[cfg(feature = "pal")]
@@ -470,28 +234,38 @@ impl Machine {
             let offset = usize::from(selector >> 3) * 8;
             gdt[offset..offset + 8].copy_from_slice(&descriptor_dpl(0, code, dpl).to_le_bytes());
         }
-        self.uc.mem_write(u64::from(addr), &gdt).map_err(error)?;
-        let mut gdtr = [0u8; 24];
-        gdtr[8..16].copy_from_slice(&u64::from(addr).to_le_bytes());
-        gdtr[16..20].copy_from_slice(&127u32.to_le_bytes());
-        self.uc.reg_write_long(R::GDTR, &gdtr).map_err(error)?;
-        for (reg, selector) in [
-            (R::CS, 0x23),
-            (R::DS, 0x2b),
-            (R::ES, 0x2b),
-            (R::SS, 0x30),
-            (R::FS, 0x53),
-        ] {
-            self.uc.reg_write(reg, selector).map_err(error)?;
+        self.memory.write(addr, &gdt)?;
+        self.state.segments = crate::SegmentState {
+            selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
+            gdt_base: addr,
+            gdt_limit: 127,
+        };
+        Ok(())
+    }
+
+    #[cfg(feature = "pal")]
+    pub(crate) fn set_fs_base(&mut self, base: u32) -> Result<(), String> {
+        let segments = self.state.segments;
+        if segments.gdt_limit != 0 {
+            let offset = u32::from(segments.selectors[4] >> 3) * 8;
+            let addr = segments
+                .gdt_base
+                .checked_add(offset)
+                .ok_or("GDT address overflow")?;
+            self.memory
+                .write(addr, &descriptor_dpl(base, false, 3).to_le_bytes())?;
         }
-        self.gdt_addr = addr;
-        self.fs_selector = 0x53;
-        self.fs_dpl = 3;
+        self.state.fs_base = base;
         Ok(())
     }
 
     pub fn memory(&self) -> &Memory {
         &self.memory
+    }
+
+    /// Registered ABI signatures, also usable by independent validation backends.
+    pub fn api_specs(&self) -> impl Iterator<Item = &ApiSpec> {
+        self.apis.values()
     }
 
     pub fn register_api(&mut self, spec: ApiSpec) -> Result<(), String> {
@@ -540,46 +314,24 @@ impl Machine {
         }
     }
 
-    /// Loader/debugger write, intentionally independent of guest page permissions.
+    /// Loader/debugger writes bypass guest permissions and invalidate code.
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
-        self.memory.write(addr, bytes)?;
-        if !bytes.is_empty() {
-            self.uc
-                .ctl_remove_cache(u64::from(addr), u64::from(addr) + bytes.len() as u64)
-                .map_err(error)?;
-        }
-        Ok(())
+        self.memory.write(addr, bytes)
     }
-
     pub fn protect(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
-        // Validate before either executor's permissions change.
-        self.memory.range(addr, len)?;
-        if !addr.is_multiple_of(4096) || len == 0 || !len.is_multiple_of(4096) || perms & !7 != 0 {
-            return Err("invalid page permissions or alignment".into());
-        }
-        let mut uc_perms = Prot::NONE;
-        if perms & crate::READ != 0 {
-            uc_perms |= Prot::READ;
-        }
-        if perms & crate::WRITE != 0 {
-            uc_perms |= Prot::WRITE;
-        }
-        if perms & EXEC != 0 {
-            uc_perms |= Prot::EXEC;
-        }
-        self.uc
-            .mem_protect(u64::from(addr), len as u64, uc_perms)
-            .map_err(error)?;
-        self.memory.protect(addr, len, perms)?;
-        self.uc.get_data_mut().perms.clone_from(&self.memory.perms);
-        self.update_write_hook()
+        self.memory.protect(addr, len, perms)
     }
 
-    /// Compile explicitly selected hot code. Cold code is always available in Unicorn.
+    /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
         self.compiled.clear();
         self.regions.clear();
         self.entry_owner.clear();
+        self.pending_regions.clear();
+        self.automatic_regions.clear();
+        self.hits.clear();
+        self.attempted.clear();
+        self.stats.pending_compilations = 0;
         self.cache_revision += 1;
         self.add_region(region)
     }
@@ -595,6 +347,15 @@ impl Machine {
         let compiled = compile::compile(&region, &self.memory)?;
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
+        self.pending_regions.remove(&region.start);
+        self.stats.pending_compilations = self.pending_regions.len();
+        self.automatic_regions.remove(&region.start);
+        self.publish(region, compiled);
+        Ok(())
+    }
+
+    fn publish(&mut self, region: Region, compiled: Compiled) {
+        self.compile_errors.remove(&region.start);
         self.entry_owner.retain(|_, owner| *owner != region.start);
         for &pc in &compiled.entries {
             self.entry_owner.insert(pc, region.start);
@@ -603,7 +364,90 @@ impl Machine {
         self.regions.insert(region.start, region);
         self.stats.native_code_bytes = self.compiled.values().map(|c| c.code_size).sum();
         self.cache_revision += 1;
-        Ok(())
+    }
+
+    fn queue_region(&mut self, region: Region) -> Result<bool, String> {
+        if self.return_pad.is_some_and(|pad| {
+            u64::from(pad) >= u64::from(region.start)
+                && u64::from(pad) < u64::from(region.start) + region.len as u64
+        }) {
+            return Err("region overlaps callback return pad".into());
+        }
+        if self.pending_regions.contains_key(&region.start)
+            || self.pending_regions.len() >= crate::compiler::CAPACITY
+        {
+            return Ok(false);
+        }
+        let snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        if self.compiler.is_none() {
+            self.compiler = Some(
+                crate::compiler::Worker::new()
+                    .map_err(|e| format!("start compiler worker: {e}"))?,
+            );
+        }
+        match self.compiler.as_ref().unwrap().try_submit(snapshot) {
+            Ok(ticket) => {
+                self.stats.compile_requests += 1;
+                self.pending_regions.insert(region.start, ticket);
+                self.stats.pending_compilations = self.pending_regions.len();
+                self.stats.peak_pending_compilations = self
+                    .stats
+                    .peak_pending_compilations
+                    .max(self.pending_regions.len());
+                self.automatic_regions.insert(region.start);
+                self.regions.insert(region.start, region);
+                Ok(true)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err("compiler worker disconnected".into())
+            }
+        }
+    }
+
+    /// Publish only on the execution owner, outside generated code, after both
+    /// request identity and every captured code-page version have been checked.
+    fn collect_compilations(&mut self) -> Result<(), String> {
+        loop {
+            let Some(worker) = self.compiler.as_ref() else {
+                return Ok(());
+            };
+            let completion = match worker.try_recv() {
+                Ok(completion) => completion,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("compiler worker disconnected".into());
+                }
+            };
+            self.stats.compilations += 1;
+            self.stats.compile_time += completion.duration;
+            let start = completion.region.start;
+            if self.pending_regions.get(&start) != Some(&completion.ticket) {
+                self.stats.stale_compilations += 1;
+                continue;
+            }
+            self.pending_regions.remove(&start);
+            self.stats.pending_compilations = self.pending_regions.len();
+            if !completion.input.valid(&self.memory) {
+                self.stats.stale_compilations += 1;
+                for pc in &completion.region.entries {
+                    self.attempted.remove(pc);
+                }
+                continue;
+            }
+            match completion.result {
+                Ok(compiled) => self.publish(completion.region, compiled),
+                Err(error) => {
+                    // A compilation failure must leave the original guest code
+                    // executable by the interpreter; explicit compilation returns errors.
+                    self.stats.compile_failures += 1;
+                    self.compile_errors.insert(start, error);
+                    while self.compile_errors.len() > 64 {
+                        self.compile_errors.pop_first();
+                    }
+                }
+            }
+        }
     }
 
     fn refresh(&mut self) -> Result<(), String> {
@@ -624,10 +468,11 @@ impl Machine {
             self.cache_revision += 1;
             if let Some(region) = self.regions.get(&pc) {
                 for entry in &region.entries {
-                    self.uc.get_data_mut().attempted.remove(entry);
+                    self.attempted.remove(entry);
                 }
             }
         }
+        self.stats.native_code_bytes = self.compiled.values().map(|c| c.code_size).sum();
         let missing: Vec<_> = self
             .regions
             .values()
@@ -637,63 +482,63 @@ impl Machine {
             .cloned()
             .collect();
         for region in missing {
-            self.add_region(region)?;
+            if self.async_compilation && self.automatic_regions.contains(&region.start) {
+                self.queue_region(region)?;
+            } else {
+                self.add_region(region)?;
+            }
         }
         Ok(())
     }
 
     pub fn enable_auto_jit(&mut self, enabled: bool) {
         self.auto_jit = enabled;
-        if enabled && self.hot_hook.is_none() {
-            self.hot_hook = Some(
-                self.uc
-                    .add_block_hook(1, 0, |uc, addr, _| {
-                        let d = uc.get_data_mut();
-                        let pc = addr as u32;
-                        if d.auto_hot
-                            && !d.hot.contains(&pc)
-                            && !d.attempted.contains(&pc)
-                            && d.request.is_none()
-                        {
-                            let hits = d.hits.entry(pc).or_default();
-                            *hits = hits.saturating_add(1);
-                            if *hits >= 32 {
-                                d.request = Some(pc);
-                                uc.reg_write(R::EIP, addr).expect("hot block PC");
-                                uc.emu_stop().expect("promote hot guest block");
-                            }
-                        }
-                    })
-                    .expect("install hot block counter"),
-            );
-        }
     }
-    /// Select the policy for newly discovered automatic regions. Existing regions
-    /// retain their policy when invalidated or expanded with another entry point.
     pub fn set_auto_compile_strategy(&mut self, strategy: CompileStrategy) {
         self.auto_compile_strategy = strategy;
     }
-    /// Keep observed dense x87 loops in Unicorn for a bounded instruction window.
-    /// Disabled by default; arithmetic and memory semantics remain Unicorn's.
-    pub fn set_x87_residency(&mut self, enabled: bool) {
-        self.x87_residency = enabled;
-        if !enabled {
-            self.x87_sites.clear();
-        }
+    pub fn set_region_linking(&mut self, enabled: bool) {
+        self.region_linking = enabled;
     }
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
     }
+    /// Automatic hot-code promotion uses a bounded worker when enabled.
+    /// Explicit add_region remains synchronous for authored code and tests.
+    pub fn set_async_compilation(&mut self, enabled: bool) {
+        self.async_compilation = enabled;
+        if !enabled {
+            self.pending_regions.clear();
+            self.stats.pending_compilations = 0;
+            self.compiler = None;
+        }
+    }
 
-    fn discover(&mut self) -> Result<(), String> {
+    fn refresh_links(&mut self) {
+        if self.links_revision == self.cache_revision {
+            return;
+        }
+        self.links
+            .rebuild(self.entry_owner.iter().filter_map(|(&pc, owner)| {
+                self.compiled
+                    .get(owner)
+                    .map(|compiled| (pc, compiled.tail_entry))
+            }));
+        self.links_revision = self.cache_revision;
+    }
+    fn discover(&mut self, stop: u32) -> Result<(), String> {
         let pc = self.state.eip;
         if !self.auto_jit || self.entry_owner.contains_key(&pc) || !self.memory.executable(pc, 1) {
             return Ok(());
         }
-        if self.uc.get_data_mut().request.take() != Some(pc) {
+        if self.attempted.contains(&pc) {
             return Ok(());
         }
-        self.uc.get_data_mut().attempted.insert(pc);
+        let hits = self.hits.entry(pc).or_default();
+        *hits = hits.saturating_add(1);
+        if *hits < 32 {
+            return Ok(());
+        }
         // Small regions keep cold startup compilation bounded; loops remain linked inside them.
         let start = pc & !511;
         let mut region = self
@@ -711,37 +556,32 @@ impl Machine {
         if !region.entries.contains(&pc) {
             region.entries.push(pc);
         }
-        self.add_region(region)
+        let contains_boundary = |boundary: u32| {
+            u64::from(boundary) >= u64::from(region.start)
+                && u64::from(boundary) < u64::from(region.start) + region.len as u64
+        };
+        if contains_boundary(stop) || self.return_pad.is_some_and(contains_boundary) {
+            // Keep this small automatic window interpreted rather than absorb a
+            // continuation boundary into a native region's internal dispatch.
+            self.attempted.insert(pc);
+            return Ok(());
+        }
+        if self.async_compilation {
+            if self.queue_region(region)? {
+                self.attempted.insert(pc);
+            }
+        } else {
+            self.add_region(region)?;
+            self.attempted.insert(pc);
+        }
+        Ok(())
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
-        self.memory.map(addr, len, perms)?;
-        let offset = (addr - self.memory.base) as usize;
-        // SAFETY: reservation is stable and committed for the entire mapping.
-        if let Err(e) = unsafe {
-            self.uc.mem_map_ptr(
-                u64::from(addr),
-                len as u64,
-                uc_prot(perms),
-                self.memory.ptr.as_ptr().add(offset).cast(),
-            )
-        } {
-            self.memory.unmap(addr, len)?;
-            return Err(error(e));
-        }
-        self.uc.get_data_mut().perms.clone_from(&self.memory.perms);
-        self.update_write_hook()
+        self.memory.map(addr, len, perms)
     }
-
     pub fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
-        self.memory.pages(addr, len)?;
-        self.memory.committed(addr, len)?;
-        self.uc
-            .mem_unmap(u64::from(addr), len as u64)
-            .map_err(error)?;
-        self.memory.unmap(addr, len)?;
-        self.uc.get_data_mut().perms.clone_from(&self.memory.perms);
-        self.update_write_hook()
+        self.memory.unmap(addr, len)
     }
 
     pub fn run(&mut self, stop: u32, budget: u64) -> Result<RunOutcome, String> {
@@ -757,22 +597,12 @@ impl Machine {
         self.run_services(stop, budget, services, false)
     }
 
-    /// Same ABI, callback and wait machinery, with guest instructions executed by Unicorn.
-    pub fn run_unicorn_with_services(
-        &mut self,
-        stop: u32,
-        budget: u64,
-        services: &mut dyn HostServices,
-    ) -> Result<RunOutcome, String> {
-        self.run_services(stop, budget, services, true)
-    }
-
     fn run_services(
         &mut self,
         stop: u32,
         budget: u64,
         services: &mut dyn HostServices,
-        unicorn_only: bool,
+        interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
         let apis = self.apis.clone();
         let mut bridge = Bridge {
@@ -787,7 +617,7 @@ impl Machine {
             bulk_calls: 0,
             bulk_bytes: 0,
         };
-        let result = self.run_inner(stop, budget, &mut bridge, unicorn_only);
+        let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
         self.stats.host_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
@@ -858,7 +688,7 @@ impl Machine {
         stop: u32,
         budget: u64,
         bridge: &mut Bridge<'_>,
-        unicorn_only: bool,
+        interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
         if self.regions.values().any(|r| {
             u64::from(stop) >= u64::from(r.start)
@@ -866,6 +696,7 @@ impl Machine {
         }) {
             return Err("stop address must be outside the compiled region".into());
         }
+        self.state.refresh_mmx();
         self.state.fuel = budget;
         loop {
             if bridge.parked {
@@ -913,29 +744,32 @@ impl Machine {
             if self.state.fuel == 0 {
                 return Ok(RunOutcome::Budget);
             }
+            if self
+                .state
+                .rep
+                .as_ref()
+                .is_some_and(|rep| rep.pc != self.state.eip)
+            {
+                self.state.rep = None;
+            }
             self.refresh()?;
-            if !unicorn_only {
-                self.discover()?;
+            self.collect_compilations()?;
+            let single_step = self.state.eflags & (1 << 8) != 0;
+            // Pending x87 exceptions must reach a waiting x87/MMX instruction
+            // before it changes state. Native MMX assumes no pending #MF.
+            let pending_fpu = self.state.x87.status & 0x80 != 0;
+            if !interpreter_only && !single_step && !pending_fpu {
+                self.discover(stop)?;
             }
-            self.uc.get_data_mut().auto_hot = self.auto_jit && !unicorn_only;
-            if self.hot_revision != self.cache_revision || self.hot_unicorn != unicorn_only {
-                self.uc.get_data_mut().hot = if unicorn_only {
-                    BTreeSet::new()
-                } else {
-                    self.entry_owner.keys().copied().collect()
-                };
-                self.hot_revision = self.cache_revision;
-                self.hot_unicorn = unicorn_only;
-            }
-            if let Some(pad) = self.return_pad {
-                self.uc.get_data_mut().hot.insert(pad);
-            }
+            self.refresh_links();
             let native = self
                 .entry_owner
                 .get(&self.state.eip)
                 .and_then(|owner| self.compiled.get(owner))
                 .filter(|c| {
-                    !unicorn_only
+                    !interpreter_only
+                        && !single_step
+                        && !pending_fpu
                         && c.entries.contains(&self.state.eip)
                         && self.deferred_fallback != Some(self.state.eip)
                 });
@@ -943,22 +777,24 @@ impl Machine {
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
-                if let Some(raw) = bridge.raw.as_mut() {
-                    raw.bind(&mut self.uc);
-                }
-                let result = native.run(&mut self.state, &mut self.memory, bridge);
+                let (result, linked) = native.run(
+                    &mut self.state,
+                    &mut self.memory,
+                    bridge,
+                    (self.region_linking && !self.profiling).then_some(&self.links),
+                    stop,
+                    self.return_pad,
+                );
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
                     p.native_entries += 1;
                     p.native_ns += timer.elapsed().as_nanos() as u64;
                 }
-                self.stats.native_entries += 1;
+                self.stats.native_entries += 1 + linked;
+                self.stats.linked_entries += linked;
                 self.stats.native_blocks += before - self.state.fuel;
                 match result {
                     n if n == Exit::Host as u32 => {
-                        if bridge.raw.is_some() {
-                            self.update_write_hook()?;
-                        }
                         if let Some(outcome) = bridge.pending.take() {
                             let origin = Origin {
                                 esp: self.state.regs[4],
@@ -984,311 +820,95 @@ impl Machine {
                     }
                     n if n == Exit::Fallback as u32 => {
                         self.deferred_fallback = Some(self.state.eip);
+                        // Preserve the pending instruction across a scheduler
+                        // slice, even when its native guard consumed the last unit.
+                        if self.state.fuel == 0 {
+                            return Ok(RunOutcome::Budget);
+                        }
                     }
                     _ => return Err(format!("invalid native exit {result}")),
                 }
             }
+            use crate::interpreter::Step;
             let pc = self.state.eip;
             let timer = self.profiling.then(Instant::now);
-            let before = self.stats.fallback_instructions;
-            let fallback_result = self.fallback(stop);
+            // String instructions make bounded progress with their restart state
+            // in CpuState; deadlines and cache publication are checked between chunks.
+            let units = self.state.fuel.min(256) as u32;
+            let execution = self
+                .interpreter
+                .run_chunk(&mut self.state, &mut self.memory, units);
+            self.stats.interpreter_entries += 1;
+            self.stats.interpreter_instructions += u64::from(execution.units);
+            self.state.fuel -= u64::from(execution.units);
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
-                p.fallback_entries += 1;
-                p.fallback_instructions += self.stats.fallback_instructions - before;
-                p.fallback_ns += timer.elapsed().as_nanos() as u64;
+                p.interpreter_entries += 1;
+                p.interpreter_instructions += u64::from(execution.units);
+                p.interpreter_ns += timer.elapsed().as_nanos() as u64;
             }
-            if let Some(outcome) = fallback_result? {
-                return Ok(outcome);
-            }
-            if let Some(vector) = self.uc.get_data_mut().trap.take() {
-                if vector != 0x2e && bridge.raw.is_none() {
-                    return Err(format!("guest exception {vector} at {:#x}", self.state.eip));
+            self.deferred_fallback = None;
+            let step = match execution.step {
+                Step::InvalidInstruction { pc } if bridge.raw.is_some() => {
+                    Step::Trap { pc, vector: 6 }
                 }
-                bridge.memory = &mut self.memory;
-                if let Some(raw) = bridge.raw.as_mut() {
-                    raw.bind(&mut self.uc);
+                other => other,
+            };
+            match step {
+                Step::Executed => {}
+                Step::ReadFault { pc, address } => {
+                    self.state.fault_addr = address;
+                    return Ok(RunOutcome::ReadFault { pc, address });
                 }
-                // SAFETY: same live bridge/state contract as the native call site.
-                if bridge.raw.is_some() {
-                    crate::host::call_raw(bridge, &mut self.state, vector);
-                } else {
-                    unsafe {
-                        crate::host::host_call((bridge as *mut Bridge<'_>).cast(), &mut self.state);
+                Step::WriteFault { pc, address } => {
+                    self.state.fault_addr = address;
+                    return Ok(RunOutcome::WriteFault { pc, address });
+                }
+                Step::FetchFault { pc, address } => {
+                    self.state.fault_addr = address;
+                    return Ok(RunOutcome::FetchFault { pc, address });
+                }
+                Step::InvalidInstruction { pc } => {
+                    return Ok(RunOutcome::InvalidInstruction { pc });
+                }
+                Step::Unsupported { pc, code } => {
+                    return Ok(RunOutcome::UnsupportedInstruction { pc, code });
+                }
+                Step::Trap { pc, vector } => {
+                    if vector != 0x2e && bridge.raw.is_none() {
+                        return Ok(RunOutcome::Trap { pc, vector });
+                    }
+                    if execution.units == 0 {
+                        // A handler repeatedly returning to an unchanged fault
+                        // must still yield to the machine scheduler.
+                        self.state.fuel = self.state.fuel.saturating_sub(1);
+                    }
+                    bridge.memory = &mut self.memory;
+                    if bridge.raw.is_some() {
+                        crate::host::call_raw(bridge, &mut self.state, u32::from(vector));
+                    } else {
+                        // SAFETY: bridge and CPU are live and exclusively borrowed.
+                        unsafe {
+                            crate::host::host_call(
+                                (bridge as *mut Bridge<'_>).cast(),
+                                &mut self.state,
+                            );
+                        }
+                    }
+                    if let Some(outcome) = bridge.pending.take() {
+                        let origin = Origin {
+                            esp: self.state.regs[4],
+                            eip: self.state.eip,
+                        };
+                        self.apply_host(outcome?, origin)?;
                     }
                 }
-                if bridge.raw.is_some() {
-                    self.update_write_hook()?;
-                }
-                if let Some(outcome) = bridge.pending.take() {
-                    let origin = Origin {
-                        esp: self.state.regs[4],
-                        eip: self.state.eip,
-                    };
-                    self.apply_host(outcome?, origin)?;
-                }
-            }
-            if self.state.eip != pc {
-                self.deferred_fallback = None;
             }
         }
-    }
-
-    pub(crate) fn export_cpu(&mut self) -> Result<(), String> {
-        export_mmx(&mut self.uc, &mut self.state)?;
-        // Includes writes made by resumed callbacks and waits, not just API calls.
-        if self.uc_epoch != self.memory.epoch {
-            self.invalidate_guest_pages()?;
-        }
-        for (reg, value) in XMM.iter().zip(&self.state.xmm) {
-            self.uc.reg_write_long(*reg, value).map_err(error)?;
-        }
-        for (reg, value) in REGS.iter().zip(self.state.regs) {
-            self.uc.reg_write(*reg, u64::from(value)).map_err(error)?;
-        }
-        self.uc
-            .reg_write(R::EIP, u64::from(self.state.eip))
-            .map_err(error)?;
-        self.uc
-            .reg_write(R::EFLAGS, u64::from(self.state.eflags))
-            .map_err(error)?;
-        self.uc
-            .mem_write(
-                u64::from(self.gdt_addr) + u64::from(self.fs_selector >> 3) * 8,
-                &descriptor_dpl(self.state.fs_base, false, self.fs_dpl).to_le_bytes(),
-            )
-            .map_err(error)?;
-        self.uc
-            .reg_write(R::FS, u64::from(self.fs_selector))
-            .map_err(error)?;
-        Ok(())
-    }
-
-    fn import_cpu(&mut self) -> Result<(), String> {
-        import_mmx(&self.uc, &mut self.state)?;
-        for (reg, value) in XMM.iter().zip(&mut self.state.xmm) {
-            *value = registers::read_xmm(&self.uc, *reg).map_err(error)?;
-        }
-        for (reg, value) in REGS.iter().zip(&mut self.state.regs) {
-            *value = self.uc.reg_read(*reg).map_err(error)? as u32;
-        }
-        self.state.eip = self.uc.reg_read(R::EIP).map_err(error)? as u32;
-        self.state.eflags = self.uc.reg_read(R::EFLAGS).map_err(error)? as u32;
-        if self.uc.get_data().dirty {
-            let dirty = std::mem::take(&mut self.uc.get_data_mut().dirty_pages);
-            for page in dirty {
-                self.memory.touch(page, 4096);
-            }
-            self.uc.get_data_mut().dirty = false;
-            self.invalidate_guest_pages()?;
-        }
-        Ok(())
-    }
-
-    fn invalidate_guest_pages(&mut self) -> Result<(), String> {
-        // Unicorn translates the first guest address to its own RAM offset before
-        // invalidating a range. A sparse window can start unmapped, and adjacent
-        // guest mappings need not have adjacent RAM offsets, so invalidate per page.
-        let pages = std::mem::take(&mut self.memory.dirty_pages);
-        for page in pages {
-            if self.memory.executable(page, 4096) {
-                self.uc
-                    .ctl_remove_cache(u64::from(page), u64::from(page) + 4096)
-                    .map_err(error)?;
-            }
-        }
-        self.uc_epoch = self.memory.epoch;
-        Ok(())
-    }
-
-    fn fallback(&mut self, stop: u32) -> Result<Option<RunOutcome>, String> {
-        let pc = self.state.eip;
-        let site_version = if self.x87_residency && !self.uc.get_data().hot.is_empty() {
-            self.x87_site_version(pc)
-        } else {
-            None
-        };
-        let resident = site_version.is_some_and(|version| {
-            let site = self.x87_sites.entry(pc).or_insert(X87Site {
-                version,
-                short_handoffs: 0,
-            });
-            if site.version != version {
-                site.version = version;
-                site.short_handoffs = 0;
-            }
-            site.short_handoffs >= 32
-        });
-        self.export_cpu()?;
-        let d = self.uc.get_data_mut();
-        d.stop = stop;
-        d.skip_first = true;
-        d.resume_pc = self.state.eip;
-        d.resident_active = resident;
-        d.resident_left = if resident { 128 } else { 0 };
-        d.deadline = self.deadline;
-        d.return_pad = self.return_pad;
-        d.remaining = self.state.fuel;
-        d.executed = 0;
-        d.last_mem_fault = None;
-        if self.fallback_hook.is_none() {
-            self.fallback_hook = Some(
-                self.uc
-                    .add_code_hook(1, 0, |uc, addr, _| {
-                        let d = uc.get_data_mut();
-                        let first = std::mem::take(&mut d.skip_first);
-                        // Unicorn may restart the writing instruction after invalidating its own
-                        // translation. Wait for its next PC before handing control back to native.
-                        let handoff = if d.dirty {
-                            addr as u32 != d.resume_pc
-                        } else {
-                            d.resident_left == 0 && d.hot.contains(&(addr as u32))
-                        };
-                        let restart = !first && d.dirty && addr as u32 == d.resume_pc;
-                        let expired = d.resident_active
-                            && d.executed.is_multiple_of(32)
-                            && d.deadline.is_some_and(|at| Instant::now() >= at);
-                        if expired {
-                            d.remaining = 0;
-                        }
-                        if !restart
-                            && (d.remaining == 0
-                                || addr as u32 == d.stop
-                                || d.return_pad == Some(addr as u32)
-                                || (!first && handoff))
-                        {
-                            uc.emu_stop().expect("stop fallback");
-                        } else if !restart {
-                            d.remaining -= 1;
-                            d.executed += 1;
-                            d.resident_left = d.resident_left.saturating_sub(1);
-                        }
-                    })
-                    .map_err(error)?,
-            );
-        }
-        let result = self
-            .uc
-            .emu_start(u64::from(self.state.eip), u64::from(stop), 0, 0);
-        self.state.fuel = self.uc.get_data().remaining;
-        self.stats.fallback_entries += 1;
-        self.stats.fallback_instructions += self.uc.get_data().executed;
-        let executed = self.uc.get_data().executed;
-        let clean = !self.uc.get_data().dirty && self.uc.get_data().trap.is_none();
-        if resident {
-            self.stats.x87_resident_runs += 1;
-            self.stats.x87_resident_instructions += executed;
-        }
-        self.import_cpu()?;
-        if site_version.is_some()
-            && result.is_ok()
-            && clean
-            && (1..=16).contains(&executed)
-            && self.entry_owner.contains_key(&self.state.eip)
-        {
-            let site = self.x87_sites.get_mut(&pc).unwrap();
-            site.short_handoffs = site.short_handoffs.saturating_add(1);
-            self.stats.x87_short_handoffs += 1;
-        }
-        self.unicorn_result(result)
-    }
-
-    fn x87_site_version(&self, pc: u32) -> Option<u64> {
-        if !self.memory.executable(pc, 1) {
-            return None;
-        }
-        for offset in 0..15 {
-            let at = pc.checked_add(offset)?;
-            let opcode = *self.memory.read(at, 1).ok()?.first()?;
-            if (0xd8..=0xdf).contains(&opcode) {
-                let page = (pc - self.memory.base) as usize / 4096;
-                return Some(self.memory.versions[page]);
-            }
-            if !matches!(
-                opcode,
-                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67
-            ) {
-                return None;
-            }
-        }
-        None
-    }
-
-    fn unicorn_result(
-        &mut self,
-        result: Result<(), uc_error>,
-    ) -> Result<Option<RunOutcome>, String> {
-        let Err(err) = result else {
-            return Ok(None);
-        };
-        if let Some((ty, address)) = self.uc.get_data_mut().last_mem_fault.take() {
-            let pc = self.state.eip;
-            return Ok(Some(match ty {
-                MemType::READ_UNMAPPED | MemType::READ_PROT => {
-                    RunOutcome::ReadFault { pc, address }
-                }
-                MemType::WRITE_UNMAPPED | MemType::WRITE_PROT => {
-                    RunOutcome::WriteFault { pc, address }
-                }
-                _ => RunOutcome::FetchFault { pc, address },
-            }));
-        }
-        if err == uc_error::INSN_INVALID {
-            return Ok(Some(RunOutcome::InvalidInstruction { pc: self.state.eip }));
-        }
-        Err(format!("Unicorn at {:#x}: {err}", self.state.eip))
-    }
-
-    /// Differential/performance reference: no per-instruction hot-entry hook.
-    pub fn run_unicorn(
-        &mut self,
-        stop: u32,
-        instruction_budget: usize,
-    ) -> Result<RunOutcome, String> {
-        if instruction_budget == 0 {
-            return Ok(RunOutcome::Budget);
-        }
-        self.run_unicorn_inner(stop, instruction_budget)
-    }
-
-    /// Benchmark known terminating code without Unicorn's instruction-count hook.
-    pub fn run_unicorn_unbounded(&mut self, stop: u32) -> Result<RunOutcome, String> {
-        self.run_unicorn_inner(stop, 0)
-    }
-
-    fn run_unicorn_inner(
-        &mut self,
-        stop: u32,
-        instruction_budget: usize,
-    ) -> Result<RunOutcome, String> {
-        if let Some(hook) = self.fallback_hook.take() {
-            self.uc.remove_hook(hook).map_err(error)?;
-        }
-        self.uc.get_data_mut().auto_hot = false;
-        self.uc.get_data_mut().last_mem_fault = None;
-        self.export_cpu()?;
-        let result = self.uc.emu_start(
-            u64::from(self.state.eip),
-            u64::from(stop),
-            0,
-            instruction_budget,
-        );
-        self.import_cpu()?;
-        if let Some(outcome) = self.unicorn_result(result)? {
-            return Ok(outcome);
-        }
-        Ok(if self.state.eip == stop {
-            RunOutcome::ReachedStop
-        } else {
-            RunOutcome::Budget
-        })
     }
 }
 
-fn descriptor(base: u32, code: bool) -> u64 {
-    descriptor_dpl(base, code, 0)
-}
-
+#[cfg(feature = "pal")]
 fn descriptor_dpl(base: u32, code: bool, dpl: u64) -> u64 {
     let base = u64::from(base);
     0xffff
@@ -1297,4 +917,144 @@ fn descriptor_dpl(base: u32, code: bool, dpl: u64) -> u64 {
         | (((if code { 0x9b } else { 0x93 }) | (dpl << 5)) << 40)
         | (0xcf << 48)
         | ((base >> 24) << 56)
+}
+
+#[cfg(test)]
+mod asynchronous_tests {
+    use super::*;
+    use crate::{EXEC, READ, WRITE};
+
+    fn fixture() -> Machine {
+        let mut m = Machine::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
+        m.write(0x1000, &[0xb8, 1, 0, 0, 0, 0xc3]).unwrap();
+        m.protect(0x1000, 4096, READ | EXEC).unwrap();
+        m.write(0x4f00, &0x3000u32.to_le_bytes()).unwrap();
+        m.state.eip = 0x1000;
+        m.state.regs[4] = 0x4f00;
+        m.set_async_compilation(true);
+        m
+    }
+    fn collect_one(m: &mut Machine) {
+        let before = m.stats.compilations;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while m.stats.compilations == before {
+            m.collect_compilations().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "background compilation did not complete"
+            );
+            std::thread::yield_now();
+        }
+    }
+    #[test]
+    fn modification_during_background_compilation_discards_the_result() {
+        let mut m = fixture();
+        assert!(m.queue_region(Region::new(0x1000, 6)).unwrap());
+        m.write(0x1001, &42u32.to_le_bytes()).unwrap();
+        collect_one(&mut m);
+        assert_eq!(m.stats.stale_compilations, 1);
+        assert!(m.compiled.is_empty());
+        assert!(m.entry_owner.is_empty());
+        assert_eq!(m.stats.pending_compilations, 0);
+        assert!(m.queue_region(Region::new(0x1000, 6)).unwrap());
+        collect_one(&mut m);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 42);
+        assert_eq!(m.stats.native_entries, 1);
+    }
+    #[test]
+    fn explicit_replacement_cannot_be_overwritten_by_an_old_ticket() {
+        let mut m = fixture();
+        assert!(m.queue_region(Region::new(0x1000, 6)).unwrap());
+        m.write(0x1001, &77u32.to_le_bytes()).unwrap();
+        m.add_region(Region::new(0x1000, 6)).unwrap();
+        collect_one(&mut m);
+        assert_eq!(m.stats.stale_compilations, 1);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 77);
+        assert_eq!(m.stats.native_entries, 1);
+    }
+    #[test]
+    fn hot_code_keeps_executing_while_the_worker_compiles_it() {
+        let mut m = fixture();
+        m.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap(); // inc eax; jmp back
+        m.enable_auto_jit(true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while m.stats.native_entries == 0 {
+            assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
+            assert!(Instant::now() < deadline);
+        }
+        assert!(m.state.regs[0] > 32);
+        assert!(m.stats.interpreter_instructions > 0);
+        assert!(m.stats.compile_requests > 0);
+        assert!(m.stats.peak_pending_compilations <= crate::compiler::CAPACITY);
+    }
+    #[test]
+    fn automatic_regions_cannot_absorb_the_callback_return_pad() {
+        let mut m = fixture();
+        m.set_callback_return_pad(0x1080).unwrap();
+        m.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap();
+        m.enable_auto_jit(true);
+        assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
+        assert_eq!(m.stats.compile_requests, 0);
+        assert_eq!(m.state.regs[0], 500);
+        assert!(m.queue_region(Region::new(0x1000, 512)).is_err());
+    }
+    #[test]
+    fn automatic_discovery_preserves_a_stop_inside_its_nominal_window() {
+        let mut m = fixture();
+        m.write(0x1000, &[0x40, 0x83, 0xf8, 100, 0x75, 0xfa])
+            .unwrap();
+        m.enable_auto_jit(true);
+        assert_eq!(m.run(0x1006, 1000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 100);
+        assert_eq!(m.stats.compile_requests, 0);
+    }
+}
+
+#[cfg(all(test, feature = "pal"))]
+mod floating_boundary_tests {
+    use super::*;
+    use crate::{EXEC, READ, WRITE};
+
+    #[test]
+    fn raw_host_exception_exits_native_before_waiting_mmx() {
+        struct Handler(Vec<(u32, u32)>);
+        impl crate::host::RawTrap for Handler {
+            fn call(
+                &mut self,
+                state: &mut CpuState,
+                _: &mut Memory,
+                vector: u32,
+            ) -> Result<bool, String> {
+                self.0.push((vector, state.eip));
+                if vector == 0x2e {
+                    state.x87.control &= !1;
+                    state.x87.status = 0x81;
+                    Ok(false)
+                } else {
+                    assert_eq!(vector, 16);
+                    assert_eq!(state.regs[0], 1);
+                    Ok(true)
+                }
+            }
+        }
+        let mut m = Machine::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
+        m.write(0x1000, &[0xcd, 0x2e, 0x40, 0x0f, 0xef, 0xc0, 0xc3])
+            .unwrap();
+        m.protect(0x1000, 4096, READ | EXEC).unwrap();
+        m.state.eip = 0x1000;
+        m.add_region(Region::new(0x1000, 7)).unwrap();
+        let registers = m.state.x87.regs;
+        let mut handler = Handler(Vec::new());
+        assert_eq!(
+            m.run_traps(0x3000, 100, &mut handler, false).unwrap(),
+            RunOutcome::Parked
+        );
+        assert_eq!(handler.0, [(0x2e, 0x1002), (16, 0x1003)]);
+        assert_eq!(m.state.x87.regs, registers);
+        assert_eq!(m.stats.native_entries, 1);
+    }
 }

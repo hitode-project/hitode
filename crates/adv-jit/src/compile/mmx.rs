@@ -1,6 +1,14 @@
 //! MMX uses the low 64 bits of host vectors and preserves its x87 alias at boundaries.
 use super::*;
 
+/// A guest block's ordered MMX effects, composed while emitting instructions.
+/// Only a control/host/fault boundary needs the corresponding runtime value.
+pub(super) struct Effects {
+    base: Value,
+    and_mask: u32,
+    or_mask: u32,
+}
+
 pub(super) fn register(reg: R) -> Option<usize> {
     Some(match reg {
         R::MM0 => 0,
@@ -89,6 +97,30 @@ pub(super) fn supported(i: &Instruction) -> bool {
     has_mmx && (!shift || i.op1_kind() == OpKind::Immediate8)
 }
 impl Emitter<'_> {
+    pub(super) fn begin_mmx_block(&mut self) {
+        self.mmx_effects = self.mmx_mode.map(|var| Effects {
+            base: self.b.use_var(var),
+            and_mask: u32::MAX,
+            or_mask: 0,
+        });
+    }
+
+    pub(super) fn flush_mmx_effects(&mut self) {
+        let Some(effects) = &self.mmx_effects else {
+            return;
+        };
+        let mut value = effects.base;
+        if effects.and_mask != u32::MAX {
+            value = self.b.ins().band_imm(value, i64::from(effects.and_mask));
+        }
+        if effects.or_mask != 0 {
+            value = self.b.ins().bor_imm(value, i64::from(effects.or_mask));
+        }
+        self.b.def_var(self.mmx_mode.unwrap(), value);
+        // Do not consume the recipe: a failed guard and both conditional arms
+        // need the same prefix, while the successful path can keep composing.
+    }
+
     fn mmx_cast(&mut self, value: Value, ty: ir::Type) -> Value {
         if self.b.func.dfg.value_type(value) == ty {
             value
@@ -124,10 +156,7 @@ impl Emitter<'_> {
     }
     pub(super) fn mmx_instruction(&mut self, i: &Instruction) {
         if i.mnemonic() == M::Emms {
-            let var = self.mmx_mode.unwrap();
-            let old = self.b.use_var(var);
-            let mode = self.b.ins().bor_imm(old, 2);
-            self.b.def_var(var, mode);
+            self.mmx_effects.as_mut().unwrap().or_mask |= 2;
             return;
         }
         if i.mnemonic() == M::Movd {
@@ -264,7 +293,13 @@ impl Emitter<'_> {
                 result,
             );
         }
-        let entered = self.constant(1);
-        self.b.def_var(self.mmx_mode.unwrap(), entered);
+        // Compose the effect at compile time. Emitting AND/OR for every packed
+        // instruction produces a long dependency chain in pixel loops because
+        // Cranelift does not combine the alternating operations.
+        let effects = self.mmx_effects.as_mut().unwrap();
+        effects.and_mask &= !2;
+        effects.or_mask &= !2;
+        let written = register(i.op0_register()).map_or(0, |slot| 1 << (8 + slot));
+        effects.or_mask |= 5 | written;
     }
 }

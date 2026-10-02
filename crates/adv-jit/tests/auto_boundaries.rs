@@ -1,5 +1,7 @@
-use adv_jit::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -69,8 +71,8 @@ fn compare(jit: &mut Machine, uc: &mut Machine, root: u32) {
     assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
 }
 
-fn root_fallbacks(m: &Machine, root: u32) -> u64 {
-    m.profile.get(&root).map_or(0, |s| s.fallback_entries)
+fn root_interpreter_entries(m: &Machine, root: u32) -> u64 {
+    m.profile.get(&root).map_or(0, |s| s.interpreter_entries)
 }
 
 #[test]
@@ -94,16 +96,16 @@ fn automatic_tail_completes_seven_and_fifteen_byte_instructions_without_moving_t
         }
         jit.enable_auto_jit(true);
         compare(&mut jit, &mut uc, root);
-        let fallbacks = root_fallbacks(&jit, root);
+        let interpreted = root_interpreter_entries(&jit, root);
         assert!(jit.stats.native_entries > 0);
         assert!(
-            fallbacks <= 32,
-            "tail root remains in fallback: {fallbacks}"
+            interpreted <= 32,
+            "tail root remains in the interpreter: {interpreted}"
         );
         compare(&mut jit, &mut uc, root);
         assert_eq!(
-            root_fallbacks(&jit, root),
-            fallbacks,
+            root_interpreter_entries(&jit, root),
+            interpreted,
             "warm tail must stay native"
         );
         assert_eq!(
@@ -125,7 +127,7 @@ fn changing_only_a_tail_byte_on_the_next_page_invalidates_its_decoder_owner() {
     jit.enable_auto_jit(true);
     compare(&mut jit, &mut uc, root);
     assert_eq!(jit.state.regs[3] & 255, 1);
-    let fallbacks = root_fallbacks(&jit, root);
+    let interpreted = root_interpreter_entries(&jit, root);
 
     // A separate, warmed explicit region must not be invalidated by the tail edit.
     let unrelated = CODE + 0x2040;
@@ -139,7 +141,7 @@ fn changing_only_a_tail_byte_on_the_next_page_invalidates_its_decoder_owner() {
     }
     compare(&mut jit, &mut uc, root);
     assert_eq!(jit.state.regs[3] & 255, 0);
-    assert_eq!(root_fallbacks(&jit, root), fallbacks);
+    assert_eq!(root_interpreter_entries(&jit, root), interpreted);
     assert_eq!(jit.stats.compilations, compiles + 2);
     assert_eq!(
         jit.stats.invalidations, 2,
@@ -205,7 +207,7 @@ fn a_missing_tail_execute_page_faults_before_the_instruction_and_can_be_restored
         assert_eq!(jit.state.eip, root);
         assert_eq!(jit.state.regs, uc.state.regs);
         assert_eq!(jit.state.eflags, uc.state.eflags);
-        let fallbacks = root_fallbacks(&jit, root);
+        let interpreted = root_interpreter_entries(&jit, root);
         for m in [&mut jit, &mut uc] {
             if unmap {
                 m.map(CODE + 4096, 4096, READ | EXEC).unwrap();
@@ -216,8 +218,8 @@ fn a_missing_tail_execute_page_faults_before_the_instruction_and_can_be_restored
         }
         compare(&mut jit, &mut uc, root);
         assert_eq!(
-            root_fallbacks(&jit, root),
-            fallbacks,
+            root_interpreter_entries(&jit, root),
+            interpreted,
             "mapping/EXEC restoration must invalidate the truncated decode"
         );
     }
@@ -238,6 +240,6 @@ fn explicit_linear_and_reachable_regions_keep_their_original_byte_limit() {
         jit.add_region(region).unwrap();
         compare(&mut jit, &mut uc, root);
         assert_eq!(jit.stats.native_entries, 0);
-        assert!(root_fallbacks(&jit, root) > 0);
+        assert!(root_interpreter_entries(&jit, root) > 0);
     }
 }

@@ -1,6 +1,8 @@
-use adv_jit::{CompileStrategy, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const CONSUMER: u32 = CODE + 0x800;
@@ -133,7 +135,7 @@ fn read_and_write_fault_predecessors_keep_their_own_lazy_flags_pc_and_vector_sta
                 assert_eq!(jit.memory().read(BAD, 16).unwrap(), [0x5a; 16]);
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 
@@ -205,12 +207,12 @@ fn budget_merge_and_dispatch_save_state_before_another_region_consumes_it() {
                 );
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 
 #[test]
-fn fallback_exit_saves_each_predecessor_before_the_unsupported_instruction_runs() {
+fn cold_exit_saves_each_predecessor_before_the_interpreted_instruction_runs() {
     let bytes = assemble(CODE, |a| {
         let mut subtract = a.create_label();
         a.test(ecx, ecx).unwrap();
@@ -225,31 +227,36 @@ fn fallback_exit_saves_each_predecessor_before_the_unsupported_instruction_runs(
         a.setb(dl).unwrap();
         a.ret().unwrap();
     });
-    let fallback_pcs: Vec<_> = Decoder::with_ip(32, &bytes, u64::from(CODE), DecoderOptions::NONE)
-        .into_iter()
-        .filter(|i| i.mnemonic() == Mnemonic::Bswap)
-        .map(|i| i.ip32())
-        .collect();
+    let interpreted_pcs: Vec<_> =
+        Decoder::with_ip(32, &bytes, u64::from(CODE), DecoderOptions::NONE)
+            .into_iter()
+            .filter(|i| i.mnemonic() == Mnemonic::Bswap)
+            .map(|i| i.ip32())
+            .collect();
     for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
         let mut jit = machine(&bytes, Some(strategy));
-        for (selector, &pc) in fallback_pcs.iter().enumerate() {
+        for (selector, &pc) in interpreted_pcs.iter().enumerate() {
             for left in [0, u32::MAX, 0x7fff_ffff] {
                 let mut uc = machine(&bytes, None);
                 for m in [&mut jit, &mut uc] {
                     seed(m, selector as u32, left, 0x89ab_cdef);
                 }
-                let fallback_entries = jit.stats.fallback_entries;
-                let fallback_instructions = jit.stats.fallback_instructions;
+                let interpreter_entries = jit.stats.interpreter_entries;
+                let interpreter_instructions = jit.stats.interpreter_instructions;
                 assert_eq!(jit.run(STOP, 2).unwrap(), RunOutcome::Budget);
                 assert_eq!(uc.run_unicorn(pc, 1000).unwrap(), RunOutcome::ReachedStop);
                 assert_eq!(jit.state.eip, pc);
                 assert_eq!(jit.state.fuel, 0);
                 assert_eq!(jit.state.fault_addr, INITIAL_FAULT_ADDRESS);
-                assert_eq!(jit.stats.fallback_entries, fallback_entries + 1);
-                assert_eq!(jit.stats.fallback_instructions, fallback_instructions);
+                // Exhausting the native budget before BSWAP does not execute
+                // or count an interpreter instruction.
+                assert_eq!(jit.stats.interpreter_entries, interpreter_entries);
+                assert_eq!(jit.stats.interpreter_instructions, interpreter_instructions);
                 equal_state(&mut jit, &mut uc);
                 assert_eq!(jit.state.regs[2], 0x89ab_cdef, "BSWAP has not executed yet");
                 assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
+                assert!(jit.stats.interpreter_entries > interpreter_entries);
+                assert!(jit.stats.interpreter_instructions > interpreter_instructions);
                 assert_eq!(uc.run_unicorn(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
                 equal_state(&mut jit, &mut uc);
                 assert_eq!(jit.state.regs[2] & !255, 0xefcd_ab00);

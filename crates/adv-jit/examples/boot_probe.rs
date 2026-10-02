@@ -7,7 +7,11 @@ use pal_win32::{Win32, Win32Config};
 use std::path::PathBuf;
 fn main() -> Result<(), String> {
     let path = PathBuf::from(std::env::args().nth(1).ok_or("expected exe path")?);
-    let jit = std::env::args().nth(2).as_deref() != Some("unicorn");
+    let jit = match std::env::args().nth(2).as_deref() {
+        None | Some("jit") => true,
+        Some("interpreter") => false,
+        _ => return Err("backend must be jit or interpreter".into()),
+    };
     let parent = path.parent().ok_or("no parent")?;
     let name = path.file_name().ok_or("no exe name")?.to_string_lossy();
     let mut registry = Registry::default();

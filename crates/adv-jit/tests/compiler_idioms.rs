@@ -1,6 +1,8 @@
-use adv_jit::{CompileStrategy, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -83,7 +85,7 @@ fn leave32_restores_aligned_and_unaligned_frames_without_changing_lazy_flags() {
                 assert_eq!(jit.state.regs[5], 0xdead_beef);
             }
         }
-        assert_eq!(jit.stats.fallback_entries, 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
     }
 }
 
@@ -138,7 +140,7 @@ fn leave32_read_fault_commits_neither_stack_register_and_restarts_after_repair()
             );
             equal_registers_and_flags(&jit, &reference);
             assert_eq!(jit.state.fault_addr, frame);
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
             let mut uc = machine(&bytes, None);
             uc.state = reference.state.clone();
             for m in [&mut jit, &mut uc] {
@@ -158,7 +160,7 @@ fn leave32_read_fault_commits_neither_stack_register_and_restarts_after_repair()
             );
             assert_eq!(jit.state.regs[4], frame + 8);
             assert_eq!(jit.state.regs[5], 0x1234_5678);
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
@@ -202,13 +204,13 @@ fn cdq_preserves_raw_and_lazy_flags_and_sign_extends_only_eax() {
                     assert_eq!(jit.state.eflags, 0xed7);
                 }
             }
-            assert_eq!(jit.stats.fallback_entries, 0);
+            assert_eq!(jit.stats.interpreter_entries, 0);
         }
     }
 }
 
 #[test]
-fn word_leave_and_cwd_keep_unicorn_operand_size_semantics() {
+fn word_leave_and_cwd_match_oracle_operand_size_semantics() {
     for leave in [false, true] {
         let bytes = if leave {
             vec![0x66, 0xc9, 0xc3]
@@ -246,7 +248,7 @@ fn word_leave_and_cwd_keep_unicorn_operand_size_semantics() {
                     );
                 }
             }
-            assert!(jit.stats.fallback_entries > 0);
+            assert!(jit.stats.interpreter_entries > 0);
         }
     }
 }

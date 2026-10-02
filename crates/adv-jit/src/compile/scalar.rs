@@ -261,7 +261,7 @@ impl Emitter<'_> {
         let low = self.b.use_var(self.regs[0]);
         let high = self.b.use_var(self.regs[2]);
         // The quotient exceeds UINT32_MAX iff high >= divisor. This includes
-        // divisor zero. Unicorn raises the guest exception at the original PC.
+        // divisor zero. the interpreter raises the guest exception at the original PC.
         let bad = self
             .b
             .ins()

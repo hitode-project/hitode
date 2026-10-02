@@ -74,7 +74,9 @@ fn scattered_mapping_permissions_and_remapping_match_execution() {
             );
             cpu.unmap(at, 4096).unwrap();
         }
-        assert!(cpu.map(0xffff_0000, 4096, Prot::RW).is_err());
+        // No private reference-engine GDT reservation remains in this address space.
+        cpu.map(0xffff_0000, 4096, Prot::RW).unwrap();
+        cpu.unmap(0xffff_0000, 4096).unwrap();
         assert!(cpu.map(CODE + 1, 4096, Prot::RW).is_err());
         assert!(cpu.accessible(STACK, 4096, Prot::RW));
         assert!(!cpu.accessible(STACK + 4092, 8, Prot::READ));
@@ -166,7 +168,7 @@ fn raw_traps_obey_stdcall_cdecl_and_callback_pc_stack_changes() {
         assert_eq!(cpu.reg(Reg::Esp), STACK + 0x804);
         assert_eq!(calls.pcs, [API + 2, API + 18, API + 34, API + 50]);
         if jit {
-            assert_eq!(cpu.stats().fallback_entries, 0);
+            assert_eq!(cpu.stats().interpreter_entries, 0);
         }
     }
 }
@@ -188,6 +190,9 @@ fn trap_mapping_new_rwx_page_tracks_actual_guest_code_writes() {
     }
     for jit in [false, true] {
         let mut cpu = cpu(jit);
+        // This regression needs compiled code before the guest patch. Keep its
+        // warm-up deterministic instead of racing a background compilation.
+        cpu.set_async_compilation(false);
         cpu.map(CODE, 4096, Prot::RX).unwrap();
         cpu.map(API, 4096, Prot::RX).unwrap();
         cpu.write(API, &[0xcd, 0x2e, 0xc3]).unwrap();
@@ -227,7 +232,7 @@ fn trap_mapping_new_rwx_page_tracks_actual_guest_code_writes() {
         if jit {
             assert!(cpu.stats().invalidations >= 1);
             assert!(
-                cpu.stats().fallback_entries >= 1,
+                cpu.stats().interpreter_entries >= 1,
                 "guest writes to executable pages must leave native code"
             );
         }
@@ -250,7 +255,7 @@ fn host_patch_invalidates_both_warm_native_and_fallback_code() {
         cpu.map(DATA, 4096, Prot::RX).unwrap();
         cpu.map(API, 4096, Prot::RX).unwrap();
         cpu.write(DATA, &[0xb8, 1, 0, 0, 0, 0xc3]).unwrap();
-        // The 16-bit IMUL form stays in fallback; warm its Unicorn translation too.
+        // The 16-bit IMUL form stays in the interpreter; warm its decode too.
         cpu.write(DATA + 0x100, &[0x66, 0x69, 0xc0, 3, 0, 0xc3])
             .unwrap();
         cpu.write(API, &[0xcd, 0x2e, 0xc3]).unwrap();
@@ -585,7 +590,7 @@ fn invalidation_recompiles_all_regions_on_a_shared_page_and_leaves_others_warm()
     assert_eq!(cpu.reg(Reg::Eax), 15);
     assert_eq!(cpu.stats().compilations, 6);
     assert_eq!(cpu.stats().invalidations, 2);
-    assert_eq!(cpu.stats().fallback_entries, 0);
+    assert_eq!(cpu.stats().interpreter_entries, 0);
 }
 
 #[test]
@@ -643,7 +648,7 @@ fn setup_segments_uses_supplied_gdt_and_windows_selectors() {
 fn native_and_fallback_faults_keep_kind_address_and_faulting_pc() {
     const BAD: u32 = 0x0bad_0000;
     for jit in [false, true] {
-        for case in 0..6 {
+        for case in 0..5 {
             let mut cpu = cpu(jit);
             cpu.map(CODE, 4096, Prot::RX).unwrap();
             let (bytes, kind) = match case {
@@ -671,7 +676,6 @@ fn native_and_fallback_faults_keep_kind_address_and_faulting_pc() {
                     }),
                     FaultKind::Write(BAD),
                 ),
-                4 => (vec![0x0f, 0x0b], FaultKind::InvalidInstruction),
                 _ => (vec![0xc3], FaultKind::Fetch(BAD)),
             };
             cpu.write(CODE, &bytes).unwrap();
@@ -680,12 +684,12 @@ fn native_and_fallback_faults_keep_kind_address_and_faulting_pc() {
                     .add_region(adv_jit::Region::new(CODE, bytes.len()))
                     .unwrap();
             }
-            start(&mut cpu, if case == 5 { BAD } else { CODE });
+            start(&mut cpu, if case == 4 { BAD } else { CODE });
             cpu.set_reg(Reg::Eax, 0x1234);
             if case == 3 {
                 cpu.push_f64(1.25);
             }
-            let expected_pc = if case == 5 { BAD } else { CODE };
+            let expected_pc = if case == 4 { BAD } else { CODE };
             assert_eq!(
                 cpu.run(&mut UnexpectedTrap),
                 Exit::Fault(Fault {
@@ -732,6 +736,56 @@ fn native_and_fallback_faults_keep_kind_address_and_faulting_pc() {
                     pc: if prot == Prot::RW { BAD } else { CODE }
                 })
             );
+        }
+    }
+}
+
+#[test]
+fn invalid_opcode_exception_preserves_faulting_pc_and_can_resume_once() {
+    struct Recover {
+        next_pc: u32,
+        calls: usize,
+    }
+    impl TrapHandler for Recover {
+        fn on_trap(&mut self, cpu: &mut dyn Guest, vector: u8) -> TrapAction {
+            assert_eq!(vector, 6);
+            assert_eq!(cpu.reg(Reg::Eip), CODE);
+            assert_eq!(cpu.reg(Reg::Eax), 0x1234);
+            assert_eq!(cpu.reg(Reg::Esp), STACK + 0x800);
+            assert_eq!(cpu.read_u32(DATA).unwrap(), 0);
+            self.calls += 1;
+            cpu.set_reg(Reg::Eip, self.next_pc);
+            TrapAction::Continue
+        }
+    }
+    // UD2 and an invalid LOCK NOP decode both use the architectural #UD path.
+    for invalid in [[0x0f, 0x0b], [0xf0, 0x90]] {
+        for jit in [false, true] {
+            let mut cpu = cpu(jit);
+            cpu.map(CODE, 4096, Prot::RX).unwrap();
+            cpu.map(DATA, 4096, Prot::RW).unwrap();
+            let mut bytes = invalid.to_vec();
+            bytes.extend(assemble(CODE + 2, |a| {
+                a.inc(dword_ptr(DATA as i32)).unwrap();
+                a.ret().unwrap();
+            }));
+            cpu.write(CODE, &bytes).unwrap();
+            if jit {
+                cpu.machine_mut()
+                    .add_region(adv_jit::Region::new(CODE, bytes.len()))
+                    .unwrap();
+            }
+            start(&mut cpu, CODE);
+            cpu.set_reg(Reg::Eax, 0x1234);
+            let mut recover = Recover {
+                next_pc: CODE + 2,
+                calls: 0,
+            };
+            assert_eq!(cpu.run(&mut recover), Exit::Parked);
+            assert_eq!(recover.calls, 1);
+            assert_eq!(cpu.read_u32(DATA).unwrap(), 1);
+            assert_eq!(cpu.reg(Reg::Eax), 0x1234);
+            assert_eq!(cpu.reg(Reg::Esp), STACK + 0x804);
         }
     }
 }
@@ -848,7 +902,7 @@ fn host_double_return_refreshes_mmx_alias_cache_and_emms_empties_x87_stack() {
         cpu.push_f64(VALUE);
         assert_eq!(cpu.pop_f64().unwrap().to_bits(), VALUE.to_bits());
         if jit {
-            assert_eq!(cpu.stats().fallback_entries, 0);
+            assert_eq!(cpu.stats().interpreter_entries, 0);
         }
     }
 }

@@ -46,7 +46,7 @@ impl Memory {
         })
     }
 
-    pub(crate) fn reserve(base: u32, len: usize) -> Result<Self, String> {
+    pub fn reserve(base: u32, len: usize) -> Result<Self, String> {
         if !base.is_multiple_of(4096)
             || len == 0
             || !len.is_multiple_of(4096)
@@ -92,7 +92,7 @@ impl Memory {
         Ok(r)
     }
 
-    pub(crate) fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
+    pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
         let pages = self.pages(addr, len)?;
         if perms & !7 != 0 || self.mapped[pages.clone()].iter().any(|&v| v) {
             return Err("invalid or overlapping mapping".into());
@@ -105,7 +105,7 @@ impl Memory {
         self.protect(addr, len, perms)
     }
 
-    pub(crate) fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
+    pub fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
         let pages = self.pages(addr, len)?;
         self.committed(addr, len)?;
         self.reservation
@@ -151,7 +151,10 @@ impl Memory {
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
     }
 
-    pub(crate) fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
+    /// Host-side initialization or patch write. Bypasses guest permissions but
+    /// validates mappings and updates executable-page versions. Guest stores
+    /// must validate WRITE permission before using this operation.
+    pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         let range = self.committed(addr, bytes.len())?;
         if !range.is_empty()
             && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
@@ -171,7 +174,8 @@ impl Memory {
         Ok(())
     }
 
-    pub(crate) fn protect(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
+    /// Set guest permissions and invalidate dependent decoded/compiled code.
+    pub fn protect(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
         if !(addr as usize).is_multiple_of(PAGE_SIZE)
             || len == 0
             || !len.is_multiple_of(PAGE_SIZE)

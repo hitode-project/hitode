@@ -1,7 +1,10 @@
 //! Authored full-frame normalization stress: seven integer divisions per pixel.
+#[path = "../tests/support/mod.rs"]
+mod oracle_support;
+use oracle_support::Machine;
 use std::time::Instant;
 
-use adv_jit::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+use adv_jit::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 
 const CODE: u32 = 0x10000;
@@ -95,16 +98,16 @@ fn main() {
                 (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
             });
         if jit {
-            assert_eq!(m.stats.fallback_entries, 0);
+            assert_eq!(m.stats.interpreter_entries, 0);
         }
         println!(
-            "{} 800x600 divisions/frame={} mean_ms={:.3} p95_ms={:.3} fps={:.2} fnv={hash:016x} fallback={}",
+            "{} 800x600 divisions/frame={} mean_ms={:.3} p95_ms={:.3} fps={:.2} fnv={hash:016x} interpreter_entries={}",
             if jit { "jit" } else { "unicorn" },
             COUNT * 7,
             mean * 1000.0,
             p95 * 1000.0,
             1.0 / mean,
-            m.stats.fallback_entries
+            m.stats.interpreter_entries
         );
     }
 }

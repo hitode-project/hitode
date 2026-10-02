@@ -1,5 +1,7 @@
-use adv_jit::{CompileStrategy, CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{CompileStrategy, CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -109,7 +111,10 @@ fn unsigned_divide_matches_unicorn_and_rust_for_narrow_wide_and_eax_alias_source
                     }
                 }
             }
-            assert_eq!(jit.stats.fallback_entries, 0, "{strategy:?}, form {form}");
+            assert_eq!(
+                jit.stats.interpreter_entries, 0,
+                "{strategy:?}, form {form}"
+            );
         }
     }
 }
@@ -142,7 +147,7 @@ fn divide_source_fault_precedes_division_checks_and_preserves_all_registers() {
 }
 
 #[test]
-fn short_and_signed_divide_forms_remain_in_unicorn() {
+fn short_and_signed_divide_forms_execute_in_the_interpreter() {
     let bytes = code(|a| {
         a.div(cl).unwrap();
         a.mov(dx, 0).unwrap();
@@ -162,7 +167,7 @@ fn short_and_signed_divide_forms_remain_in_unicorn() {
         RunOutcome::ReachedStop
     );
     assert_eq!(jit.state.regs, reference.state.regs);
-    assert!(jit.stats.fallback_entries > 0);
+    assert!(jit.stats.interpreter_entries > 0);
 }
 
 #[cfg(feature = "pal")]
@@ -243,7 +248,7 @@ fn divide_zero_and_quotient_overflow_fall_back_at_original_pc_for_guest_exceptio
                     assert_eq!(cpu.reg(Reg::Eax), 91);
                     assert_eq!(cpu.reg(Reg::Edx), 73);
                     if jit {
-                        assert!(cpu.stats().fallback_entries > 0);
+                        assert!(cpu.stats().interpreter_entries > 0);
                     }
                 }
             }

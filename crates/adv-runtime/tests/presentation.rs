@@ -20,7 +20,7 @@ fn gdi_and_directdraw_render_guest_pixels_to_the_same_presenter() {
             assert_eq!(f.graphics.presenter.frames, 1);
             assert_eq!(f.graphics.stats.bytes_blitted, 64 * 32 * 4);
             if !unicorn {
-                assert_eq!(f.machine.stats.fallback_entries, 0);
+                assert_eq!(f.machine.stats.interpreter_entries, 0);
                 assert_eq!(f.machine.stats.native_entries, 1);
             }
             if ddraw {

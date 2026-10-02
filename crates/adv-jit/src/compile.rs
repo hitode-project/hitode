@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::offset_of;
 
@@ -12,18 +11,22 @@ use iced_x86::{
     Register as R,
 };
 
+use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 mod mmx;
 mod scalar;
 mod simd;
 
-type Entry = unsafe extern "C" fn(*mut CpuState, *mut u8, *const u8, *mut std::ffi::c_void) -> u32;
+type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
 pub(crate) struct Compiled {
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
     entry: Entry,
+    pub tail_entry: usize,
     pub pages: Vec<(usize, u64)>,
+    window_base: u32,
+    window_len: usize,
     pub entries: BTreeSet<u32>,
     pub code_size: usize,
     #[cfg(all(test, target_arch = "x86_64"))]
@@ -40,33 +43,141 @@ impl Drop for Compiled {
 
 impl Compiled {
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.pages
-            .iter()
-            .all(|&(page, version)| memory.versions[page] == version)
+        memory.base == self.window_base
+            && memory.len == self.window_len
+            && self
+                .pages
+                .iter()
+                .all(|&(page, version)| memory.versions.get(page) == Some(&version))
     }
     pub fn run(
         &self,
         state: &mut CpuState,
         memory: &mut Memory,
         bridge: &mut crate::host::Bridge<'_>,
-    ) -> u32 {
+        links: Option<&Table>,
+        stop: u32,
+        return_pad: Option<u32>,
+    ) -> (u32, u64) {
         bridge.memory = memory;
+        let (slots, mask) = links.map_or((std::ptr::null(), 0), Table::parts);
+        let mut context = NativeContext {
+            state,
+            perms: memory.perms.as_ptr(),
+            bridge: (bridge as *mut crate::host::Bridge<'_>).cast(),
+            slots,
+            mask,
+            remaining: crate::linking::CHAIN_LIMIT,
+            stop,
+            return_pad: return_pad.map_or(u64::MAX, u64::from),
+            linked_entries: 0,
+        };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
         // stable. Every guest access is range/permission checked by generated code.
-        unsafe {
-            (self.entry)(
-                state,
-                memory.ptr.as_ptr(),
-                memory.perms.as_ptr(),
-                (bridge as *mut crate::host::Bridge<'_>).cast(),
-            )
+        let result = unsafe { (self.entry)(&mut context, memory.ptr.as_ptr()) };
+        (result, context.linked_entries)
+    }
+}
+
+/// An immutable, Send compilation input. No guest allocation is borrowed or
+/// retained: only bounded instruction bytes and their page stamps are copied.
+#[derive(Clone, Debug)]
+pub(crate) struct Snapshot {
+    pub region: Region,
+    base: u32,
+    len: usize,
+    bytes: Vec<u8>,
+    pages: Vec<PageStamp>,
+}
+
+#[derive(Clone, Debug)]
+struct PageStamp {
+    page: usize,
+    version: u64,
+    permissions: u8,
+    mapped: bool,
+}
+
+impl Snapshot {
+    pub fn capture(region: &Region, memory: &Memory) -> Result<Self, String> {
+        if region.len == 0 || region.len > 16 * 1024 || !memory.executable(region.start, region.len)
+        {
+            return Err("region must contain 1..16384 executable bytes".into());
         }
+        let mut bytes = memory.read(region.start, region.len)?.to_vec();
+        let first = (region.start - memory.base) as usize / 4096;
+        let last = ((region.start - memory.base) as usize + region.len - 1) / 4096;
+        let mut pages: BTreeSet<usize> = (first..=last).collect();
+        if region.complete_tail {
+            for offset in region.len..region.len + 14 {
+                let Some(address) = u64::from(region.start)
+                    .checked_add(offset as u64)
+                    .and_then(|address| u32::try_from(address).ok())
+                else {
+                    break;
+                };
+                // Even an inaccessible tail page can determine whether a final
+                // instruction is truncated; retain its negative dependency.
+                if let Ok(range) = memory.range(address, 1) {
+                    pages.insert(range.start / 4096);
+                }
+                if !memory.executable(address, 1) {
+                    break;
+                }
+                bytes.push(memory.read(address, 1)?[0]);
+            }
+            if let Some(address) = u64::from(region.start)
+                .checked_add(bytes.len() as u64)
+                .and_then(|address| u32::try_from(address).ok())
+                && let Ok(range) = memory.range(address, 1)
+            {
+                pages.insert(range.start / 4096);
+            }
+        }
+        Ok(Self {
+            region: region.clone(),
+            base: memory.base,
+            len: memory.len,
+            bytes,
+            pages: pages
+                .into_iter()
+                .map(|page| PageStamp {
+                    page,
+                    version: memory.versions[page],
+                    permissions: memory.perms[page],
+                    mapped: memory.mapped[page],
+                })
+                .collect(),
+        })
+    }
+
+    pub fn valid(&self, memory: &Memory) -> bool {
+        memory.base == self.base
+            && memory.len == self.len
+            && self.pages.iter().all(|stamp| {
+                memory.versions.get(stamp.page) == Some(&stamp.version)
+                    && memory.perms.get(stamp.page) == Some(&stamp.permissions)
+                    && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
+            })
+    }
+
+    fn page_index(&self, address: u32) -> Option<usize> {
+        let offset = address.checked_sub(self.base)? as usize;
+        (offset < self.len).then_some(offset / 4096)
+    }
+
+    fn version(&self, page: usize) -> u64 {
+        self.pages
+            .iter()
+            .find(|stamp| stamp.page == page)
+            .expect("captured instruction dependency")
+            .version
     }
 }
 
 fn record_tail_dependencies(
     region: &Region,
-    memory: &Memory,
+    snapshot: &Snapshot,
     bytes: &[u8],
     offset: usize,
     decoder: &Decoder<'_>,
@@ -75,7 +186,7 @@ fn record_tail_dependencies(
     if !region.complete_tail {
         return;
     }
-    let start = (region.start - memory.base) as usize;
+    let start = (region.start - snapshot.base) as usize;
     let read_end = start + offset + decoder.position();
     pages.extend(start / 4096..=(read_end - 1) / 4096);
     if decoder.last_error() == DecoderError::NoMoreBytes {
@@ -85,44 +196,30 @@ fn record_tail_dependencies(
         if let Some(address) = u64::from(region.start)
             .checked_add(bytes.len() as u64)
             .and_then(|address| u32::try_from(address).ok())
-            && let Ok(range) = memory.range(address, 1)
+            && let Some(page) = snapshot.page_index(address)
         {
-            pages.insert(range.start / 4096);
+            pages.insert(page);
         }
     }
 }
 
 pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, String> {
-    if region.len == 0 || region.len > 16 * 1024 || !memory.executable(region.start, region.len) {
-        return Err("region must contain 1..16384 executable bytes".into());
-    }
-    let mut bytes = Cow::Borrowed(memory.read(region.start, region.len)?);
-    if region.complete_tail {
-        // Only instruction starts belong to the nominal region. A final x86
-        // instruction can consume at most 14 more executable bytes beyond it.
-        for offset in region.len..region.len + 14 {
-            let Some(address) = u64::from(region.start)
-                .checked_add(offset as u64)
-                .and_then(|address| u32::try_from(address).ok())
-            else {
-                break;
-            };
-            if !memory.executable(address, 1) {
-                break;
-            }
-            bytes.to_mut().push(memory.read(address, 1)?[0]);
-        }
-    }
-    let first_page = (region.start - memory.base) as usize / 4096;
+    compile_snapshot(&Snapshot::capture(region, memory)?)
+}
+
+pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
+    let region = &snapshot.region;
+    let bytes = &snapshot.bytes;
+    let first_page = (region.start - snapshot.base) as usize / 4096;
     let mut pages: BTreeSet<usize> =
-        (first_page..=((region.start - memory.base) as usize + region.len - 1) / 4096).collect();
+        (first_page..=((region.start - snapshot.base) as usize + region.len - 1) / 4096).collect();
     let mut instructions = BTreeMap::new();
     if !region.reachable {
         let mut decoder =
-            Decoder::with_ip(32, &bytes, u64::from(region.start), DecoderOptions::NONE);
+            Decoder::with_ip(32, bytes, u64::from(region.start), DecoderOptions::NONE);
         while decoder.can_decode() && decoder.ip() < u64::from(region.start) + region.len as u64 {
             let instruction = decoder.decode();
-            record_tail_dependencies(region, memory, &bytes, 0, &decoder, &mut pages);
+            record_tail_dependencies(region, snapshot, bytes, 0, &decoder, &mut pages);
             instructions.insert(instruction.ip32(), instruction);
         }
     }
@@ -162,7 +259,7 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
             && !instructions.contains_key(&(decoder.ip() as u32))
         {
             let i = decoder.decode();
-            record_tail_dependencies(region, memory, &bytes, offset, &decoder, &mut pages);
+            record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &mut pages);
             if i.op0_kind() == OpKind::NearBranch32 {
                 pending.push(i.near_branch32());
             }
@@ -222,18 +319,30 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         CompileStrategy::Speed => "speed",
         CompileStrategy::Fast => "none",
     };
-    let mut builder = JITBuilder::with_flags(&[("opt_level", opt_level)], default_libcall_names())
-        .map_err(|e| e.to_string())?;
+    let mut builder = JITBuilder::with_flags(
+        &[
+            ("opt_level", opt_level),
+            ("preserve_frame_pointers", "true"),
+        ],
+        default_libcall_names(),
+    )
+    .map_err(|e| e.to_string())?;
     builder.symbol("adv_host_call", crate::host::host_call as *const u8);
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     let mut module = JITModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
+    let dump_dir = std::env::var_os("ADV_JIT_DUMP_DIR");
+    if dump_dir.is_some() {
+        ctx.set_disasm(true);
+    }
     #[cfg(all(test, target_arch = "x86_64"))]
     ctx.set_disasm(true);
     ctx.func.signature = module.make_signature();
-    ctx.func.signature.params.extend([AbiParam::new(ptr_ty); 4]);
+    ctx.func.signature.call_conv = cranelift_codegen::isa::CallConv::Tail;
+    ctx.func.signature.params.extend([AbiParam::new(ptr_ty); 2]);
     ctx.func.signature.returns.push(AbiParam::new(types::I32));
+    let tail_signature = ctx.func.signature.clone();
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
@@ -258,6 +367,25 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         b.switch_to_block(prologue);
         b.seal_block(prologue);
         let params = b.block_params(prologue).to_vec();
+        let state = b.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            params[0],
+            offset_of!(NativeContext, state) as i32,
+        );
+        let perms = b.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            params[0],
+            offset_of!(NativeContext, perms) as i32,
+        );
+        let bridge = b.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            params[0],
+            offset_of!(NativeContext, bridge) as i32,
+        );
+        let tail_ref = b.import_signature(tail_signature);
         let regs: [Variable; 8] = std::array::from_fn(|_| b.declare_var(types::I32));
         let mut xmm = [None; 8];
         for instruction in instructions.values().filter(|i| supported(i)) {
@@ -269,7 +397,7 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
                     let value = b.ins().load(
                         types::I8X16,
                         MemFlags::new(),
-                        params[0],
+                        state,
                         (offset_of!(CpuState, xmm) + index * 16) as i32,
                     );
                     b.def_var(var, value);
@@ -293,7 +421,7 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
                     let bits = b.ins().load(
                         types::I64,
                         MemFlags::new(),
-                        params[0],
+                        state,
                         (offset_of!(CpuState, mmx) + index * 8) as i32,
                     );
                     let vector = b.ins().scalar_to_vector(types::I64X2, bits);
@@ -312,7 +440,7 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
             let value = b.ins().load(
                 types::I32,
                 MemFlags::new(),
-                params[0],
+                state,
                 offset_of!(CpuState, mmx_mode) as i32,
             );
             b.def_var(var, value);
@@ -328,13 +456,13 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         for (i, reg) in regs.iter().enumerate() {
             let v = b
                 .ins()
-                .load(types::I32, MemFlags::trusted(), params[0], (i * 4) as i32);
+                .load(types::I32, MemFlags::trusted(), state, (i * 4) as i32);
             b.def_var(*reg, v);
         }
         let f = b.ins().load(
             types::I32,
             MemFlags::trusted(),
-            params[0],
+            state,
             offset_of!(CpuState, eflags) as i32,
         );
         b.def_var(flags, f);
@@ -343,14 +471,14 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         let f = b.ins().load(
             types::I64,
             MemFlags::trusted(),
-            params[0],
+            state,
             offset_of!(CpuState, fuel) as i32,
         );
         b.def_var(fuel, f);
         let pc = b.ins().load(
             types::I32,
             MemFlags::trusted(),
-            params[0],
+            state,
             offset_of!(CpuState, eip) as i32,
         );
         let blocks: BTreeMap<_, _> = entries.iter().map(|&pc| (pc, b.create_block())).collect();
@@ -367,27 +495,31 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
             xmm,
             mmx,
             mmx_mode,
+            mmx_effects: None,
             flags,
             lazy,
             fuel,
-            state: params[0],
+            state,
             mem: params[1],
-            perms: params[2],
+            perms,
+            context: params[0],
+            tail_ref,
             ptr_ty,
-            base: memory.base,
-            len: memory.len,
+            base: snapshot.base,
+            len: snapshot.len,
             blocks,
             dispatch,
             shared_exit,
             pc: region.start,
             return_hint,
-            bridge: params[3],
+            bridge,
             host_ref,
             repeat_ref,
         };
         for (&start, &block) in &e.blocks.clone() {
             e.b.switch_to_block(block);
             e.pc = start;
+            e.begin_mmx_block();
             let budget = e.b.use_var(e.fuel);
             let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
             e.guard(zero, Exit::Budget, None);
@@ -414,6 +546,9 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
                 pc = instruction.next_ip32();
             }
         }
+        // Dispatch merges prologue/indirect predecessors, each already carrying
+        // its own mode. No individual guest block's recipe dominates this block.
+        e.mmx_effects = None;
         e.b.switch_to_block(dispatch);
         let target = e.b.block_params(dispatch)[0];
         let outside = e.b.create_block();
@@ -429,41 +564,167 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         // and one lazy-flags materialization instead of duplicating them at every
         // memory/budget guard. Fault addresses are still stored at the fault site.
         e.b.switch_to_block(shared_exit);
+        // Every predecessor has materialized its own MMX prefix. The last
+        // emitted guest block's compile-time recipe does not describe this merge.
+        e.mmx_effects = None;
         let reason = e.b.block_params(shared_exit)[0];
         let pc = e.b.block_params(shared_exit)[1];
         e.save_state(pc);
-        e.b.ins().return_(&[reason]);
+        e.chain_or_return(reason, pc);
         e.b.seal_all_blocks();
         e.b.finalize();
     }
     module
         .define_function(id, &mut ctx)
         .map_err(|e| format!("{e:?}"))?;
-    let code_size = ctx
+    if let Some(directory) = dump_dir {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        if let Some(code) = ctx.compiled_code().and_then(|code| code.vcode.as_ref()) {
+            std::fs::write(
+                directory.join(format!("region-{:08x}.vcode", region.start)),
+                code,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    let mut code_size = ctx
+        .compiled_code()
+        .map_or(0, |code| code.code_buffer().len());
+    #[cfg(all(test, target_arch = "x86_64"))]
+    let disasm = ctx
+        .compiled_code()
+        .and_then(|code| code.vcode.clone())
+        .unwrap_or_default();
+    // JIT allocations are not guaranteed to stay within x64's rel32 reach.
+    // Finalize the Tail entry first, then call its absolute address from the
+    // platform-ABI trampoline. Region-to-region transfers already use slots.
+    module.finalize_definitions().map_err(|e| e.to_string())?;
+    let tail_entry = module.get_finalized_function(id) as usize;
+    let mut wrapper = module.make_context();
+    wrapper.func.signature = module.make_signature();
+    wrapper
+        .func
+        .signature
+        .params
+        .extend([AbiParam::new(ptr_ty); 2]);
+    wrapper
+        .func
+        .signature
+        .returns
+        .push(AbiParam::new(types::I32));
+    let wrapper_id = module
+        .declare_function("guest_entry", Linkage::Local, &wrapper.func.signature)
+        .map_err(|e| e.to_string())?;
+    let callee = wrapper.func.import_signature(ctx.func.signature.clone());
+    {
+        let mut b = FunctionBuilder::new(&mut wrapper.func, &mut fb_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let args = b.block_params(entry).to_vec();
+        let address = b.ins().iconst(ptr_ty, tail_entry as i64);
+        let call = b.ins().call_indirect(callee, address, &args);
+        let result = b.inst_results(call)[0];
+        b.ins().return_(&[result]);
+        b.seal_all_blocks();
+        b.finalize();
+    }
+    module
+        .define_function(wrapper_id, &mut wrapper)
+        .map_err(|e| format!("{e:?}"))?;
+    code_size += wrapper
         .compiled_code()
         .map_or(0, |code| code.code_buffer().len());
     module.finalize_definitions().map_err(|e| e.to_string())?;
     // SAFETY: exact signature declared above, finalized memory is owned by module.
-    let entry =
-        unsafe { std::mem::transmute::<*const u8, Entry>(module.get_finalized_function(id)) };
+    let entry = unsafe {
+        std::mem::transmute::<*const u8, Entry>(module.get_finalized_function(wrapper_id))
+    };
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
     entries.retain(|pc| supported(&instructions[pc]));
     Ok(Compiled {
         module: Some(module),
         entry,
+        tail_entry,
         pages: pages
             .into_iter()
-            .map(|page| (page, memory.versions[page]))
+            .map(|page| (page, snapshot.version(page)))
             .collect(),
+        window_base: snapshot.base,
+        window_len: snapshot.len,
         entries,
         code_size,
         #[cfg(all(test, target_arch = "x86_64"))]
-        disasm: ctx
-            .compiled_code()
-            .and_then(|code| code.vcode.clone())
-            .unwrap_or_default(),
+        disasm,
     })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_copy_only_the_region_and_tail_and_keep_old_versions() {
+        let mut memory = Memory::new(0x10000, 0x10000).unwrap();
+        memory
+            .protect(0x10000, 0x10000, READ | WRITE | EXEC)
+            .unwrap();
+        memory.write(0x10000, &[0xb8, 1, 0, 0, 0, 0xc3]).unwrap();
+        let mut region = Region::new(0x10000, 6);
+        let strict = Snapshot::capture(&region, &memory).unwrap();
+        assert_eq!(strict.bytes.len(), 6);
+        region.complete_tail = true;
+        let old = Snapshot::capture(&region, &memory).unwrap();
+        assert_eq!(old.bytes.len(), 20);
+        assert!(old.valid(&memory));
+        // The compiler receives only the immutable old bytes, not this write.
+        memory.write(0x10001, &73u32.to_le_bytes()).unwrap();
+        assert!(!old.valid(&memory));
+        assert_eq!(old.bytes[1], 1);
+        let old_result = compile_snapshot(&old).unwrap();
+        assert!(!old_result.valid(&memory));
+        let fresh = Snapshot::capture(&region, &memory).unwrap();
+        assert!(compile_snapshot(&fresh).unwrap().valid(&memory));
+        memory.protect(0x10000, 4096, READ).unwrap();
+        assert!(!fresh.valid(&memory));
+        assert!(Snapshot::capture(&region, &memory).is_err());
+    }
+
+    #[test]
+    fn unmapped_tail_is_a_negative_dependency_of_the_compiled_result() {
+        let mut memory = Memory::reserve(0x10000, 8192).unwrap();
+        memory.map(0x10000, 4096, READ | EXEC).unwrap();
+        memory.write(0x10fff, &[0xb8]).unwrap();
+        let mut region = Region::new(0x10fff, 1);
+        region.complete_tail = true;
+        let old = Snapshot::capture(&region, &memory).unwrap();
+        assert_eq!(old.bytes, [0xb8]);
+        assert_eq!(old.pages.len(), 2);
+        let compiled = compile_snapshot(&old).unwrap();
+        assert!(compiled.valid(&memory));
+        memory.map(0x11000, 4096, READ | EXEC).unwrap();
+        memory.write(0x11000, &[91, 0, 0, 0]).unwrap();
+        assert!(!old.valid(&memory));
+        assert!(!compiled.valid(&memory));
+        let fresh = Snapshot::capture(&region, &memory).unwrap();
+        let compiled = compile_snapshot(&fresh).unwrap();
+        assert!(compiled.entries.contains(&0x10fff));
+        assert!(compiled.valid(&memory));
+    }
+
+    #[test]
+    fn maximum_prefix_length_at_a_page_edge_keeps_a_stamp_for_the_negative_page() {
+        let mut memory = Memory::new(0x10000, 8192).unwrap();
+        memory.protect(0x10000, 8192, READ | EXEC).unwrap();
+        memory.write(0x10ff1, &[0x66; 15]).unwrap();
+        let mut region = Region::new(0x10ff1, 1);
+        region.complete_tail = true;
+        let old = Snapshot::capture(&region, &memory).unwrap();
+        // A malformed prefix sequence must not ask for an uncaptured version.
+        compile_snapshot(&old).unwrap();
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -631,6 +892,7 @@ struct Emitter<'a> {
     xmm: [Option<Variable>; 8],
     mmx: [Option<Variable>; 8],
     mmx_mode: Option<Variable>,
+    mmx_effects: Option<mmx::Effects>,
     flags: Variable,
     fuel: Variable,
     // Last flag-producing instruction: lhs, rhs, result, kind (0=raw,1=add,2=sub,3=logic).
@@ -639,6 +901,8 @@ struct Emitter<'a> {
     state: Value,
     mem: Value,
     perms: Value,
+    context: Value,
+    tail_ref: ir::SigRef,
     ptr_ty: ir::Type,
     base: u32,
     len: usize,
@@ -653,6 +917,144 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
+    fn chain_or_return(&mut self, reason: Value, pc: Value) {
+        let returned = self.b.create_block();
+        let candidate = self.b.create_block();
+        let dispatch = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
+        self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
+        self.b.switch_to_block(candidate);
+        let slots = self.b.ins().load(
+            self.ptr_ty,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, slots) as i32,
+        );
+        let remaining = self.b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, remaining) as i32,
+        );
+        let stop = self.b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, stop) as i32,
+        );
+        let pad = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, return_pad) as i32,
+        );
+        let fuel = self.b.use_var(self.fuel);
+        let none = self.b.ins().icmp_imm(IntCC::Equal, slots, 0);
+        let limit = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
+        let is_stop = self.b.ins().icmp(IntCC::Equal, pc, stop);
+        let pc64 = self.b.ins().uextend(types::I64, pc);
+        let is_pad = self.b.ins().icmp(IntCC::Equal, pc64, pad);
+        let empty = self.b.ins().icmp_imm(IntCC::Equal, fuel, 0);
+        let bad = self.b.ins().bor(none, limit);
+        let bad = self.b.ins().bor(bad, is_stop);
+        let bad = self.b.ins().bor(bad, is_pad);
+        let bad = self.b.ins().bor(bad, empty);
+        let prepare = self.b.create_block();
+        self.b.ins().brif(bad, returned, &[], prepare, &[]);
+        self.b.switch_to_block(prepare);
+        let mask = self.b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, mask) as i32,
+        );
+        let high = self.b.ins().ushr_imm(pc, 16);
+        let mixed = self.b.ins().bxor(pc, high);
+        let mixed = self.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
+        let high = self.b.ins().ushr_imm(mixed, 16);
+        let hashed = self.b.ins().bxor(mixed, high);
+        let index = self.b.ins().band(hashed, mask);
+        let search = self.b.create_block();
+        self.b.append_block_param(search, types::I32);
+        self.b.append_block_param(search, types::I32);
+        let zero = self.constant(0);
+        self.b.ins().jump(search, &[index.into(), zero.into()]);
+        self.b.switch_to_block(search);
+        let index = self.b.block_params(search)[0];
+        let probes = self.b.block_params(search)[1];
+        let offset = self.b.ins().uextend(self.ptr_ty, index);
+        let offset = self
+            .b
+            .ins()
+            .imul_imm(offset, std::mem::size_of::<Slot>() as i64);
+        let address = self.b.ins().iadd(slots, offset);
+        let entry_address = self
+            .b
+            .ins()
+            .iadd_imm(address, offset_of!(Slot, entry) as i64);
+        let entry = self
+            .b
+            .ins()
+            .atomic_load(self.ptr_ty, MemFlags::trusted(), entry_address);
+        let absent = self.b.ins().icmp_imm(IntCC::Equal, entry, 0);
+        let occupied = self.b.create_block();
+        self.b.ins().brif(absent, returned, &[], occupied, &[]);
+        self.b.switch_to_block(occupied);
+        let key = self.b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            address,
+            offset_of!(Slot, pc) as i32,
+        );
+        let found = self.b.ins().icmp(IntCC::Equal, pc, key);
+        let hit = self.b.create_block();
+        let advance = self.b.create_block();
+        self.b.ins().brif(found, hit, &[], advance, &[]);
+        self.b.switch_to_block(advance);
+        let next = self.b.ins().iadd_imm(index, 1);
+        let next = self.b.ins().band(next, mask);
+        let probes = self.b.ins().iadd_imm(probes, 1);
+        let exhausted = self.b.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            probes,
+            crate::linking::PROBES as i64,
+        );
+        self.b.ins().brif(
+            exhausted,
+            returned,
+            &[],
+            search,
+            &[next.into(), probes.into()],
+        );
+        self.b.switch_to_block(hit);
+        let remaining = self.b.ins().iadd_imm(remaining, -1);
+        self.b.ins().store(
+            MemFlags::trusted(),
+            remaining,
+            self.context,
+            offset_of!(NativeContext, remaining) as i32,
+        );
+        let linked = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.context,
+            offset_of!(NativeContext, linked_entries) as i32,
+        );
+        let linked = self.b.ins().iadd_imm(linked, 1);
+        self.b.ins().store(
+            MemFlags::trusted(),
+            linked,
+            self.context,
+            offset_of!(NativeContext, linked_entries) as i32,
+        );
+        self.b
+            .ins()
+            .return_call_indirect(self.tail_ref, entry, &[self.context, self.mem]);
+        self.b.switch_to_block(returned);
+        self.b.ins().return_(&[reason]);
+    }
     fn constant(&mut self, value: u32) -> Value {
         self.b.ins().iconst(types::I32, i64::from(value))
     }
@@ -661,12 +1063,14 @@ impl Emitter<'_> {
         self.exit(reason, pc);
     }
     fn exit(&mut self, reason: Exit, pc: Value) {
+        self.flush_mmx_effects();
         let reason = self.constant(reason as u32);
         self.b
             .ins()
             .jump(self.shared_exit, &[reason.into(), pc.into()]);
     }
     fn save_state(&mut self, pc: Value) {
+        self.flush_mmx_effects();
         for (index, var) in self.mmx.iter().enumerate() {
             if let Some(var) = var {
                 let value = self.b.use_var(*var);
@@ -796,6 +1200,9 @@ impl Emitter<'_> {
             offset_of!(CpuState, fuel) as i32,
         );
         self.b.def_var(self.fuel, fuel);
+        // Host/REP helpers can edit canonical x87/MMX state, so restart the
+        // current prefix from the freshly reloaded pending mode.
+        self.begin_mmx_block();
     }
     fn host_call(&mut self, next: u32) {
         let pc = self.constant(next);
@@ -837,12 +1244,14 @@ impl Emitter<'_> {
     }
     fn direct(&mut self, pc: u32) {
         if let Some(&block) = self.blocks.get(&pc) {
+            self.flush_mmx_effects();
             self.b.ins().jump(block, &[]);
         } else {
             self.exit_const(Exit::Dispatch, pc);
         }
     }
     fn indirect(&mut self, target: Value) {
+        self.flush_mmx_effects();
         self.b.ins().jump(self.dispatch, &[target.into()]);
     }
     fn address(&mut self, i: &Instruction) -> Value {
@@ -904,7 +1313,7 @@ impl Emitter<'_> {
         if write {
             let code = self.b.ins().band_imm(combined.unwrap(), i64::from(EXEC));
             let code = self.b.ins().icmp_imm(IntCC::NotEqual, code, 0);
-            // Stop before the write. Unicorn executes it and the runtime invalidates
+            // Stop before the write. the interpreter executes it and the runtime invalidates
             // native regions before they can be entered again.
             self.guard(code, Exit::Fallback, None);
         }

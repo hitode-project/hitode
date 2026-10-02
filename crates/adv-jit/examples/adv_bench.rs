@@ -1,7 +1,10 @@
 //! Authored synthetic x86 workloads, without game code or resources.
 //! Run: cargo run --release -p adv-jit --example adv_bench -- [samples]
-use adv_jit::{CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+#[path = "../tests/support/mod.rs"]
+mod oracle_support;
+use adv_jit::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::{BlockEncoderOptions, code_asm::*};
+use oracle_support::Machine;
 use std::time::Instant;
 
 const CODE: u32 = 0x10000;
@@ -179,7 +182,7 @@ fn main() {
     assert!(samples > 0);
     pin();
     println!(
-        "workload,jit_ms,unicorn_ms,speedup,compile_ms,native_bytes,native_entries_per_call,fallback_entries_per_call,checksum"
+        "workload,jit_ms,unicorn_ms,speedup,compile_ms,native_bytes,native_entries_per_call,interpreter_entries_per_call,checksum"
     );
     for name in [
         "integer_loop",
@@ -225,7 +228,7 @@ fn main() {
             jit.stats.compile_time.as_secs_f64() * 1000.0,
             jit.stats.native_code_bytes,
             jit.stats.native_entries / (samples as u64 * calls + 1),
-            jit.stats.fallback_entries / (samples as u64 * calls + 1),
+            jit.stats.interpreter_entries / (samples as u64 * calls + 1),
             expected.0
         );
     }

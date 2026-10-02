@@ -182,7 +182,7 @@ fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
 }
 
 /// Full-range validation permits progress to be committed at a chunk boundary.
-/// Otherwise a faulting REP comparison must start in Unicorn with its original
+/// Otherwise a faulting REP comparison must start in the interpreter with its original
 /// flags: Intel restores the instruction's input EFLAGS on a CMPS/SCAS fault.
 fn compare_range(
     memory: &Memory,
@@ -241,6 +241,7 @@ fn comparison_flags(old: u32, left: u32, right: u32, width: u32) -> u32 {
 fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
     let count = state.regs[1];
     if count == 0 {
+        state.rep = None;
         return 0;
     }
     let width: u32 = match (operation - 6) % 3 {
@@ -341,7 +342,7 @@ fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
         if completed == limit {
             if !fully_checked {
                 // A very long unbounded CRT scan is conservative after this
-                // bounded attempt; replay it in Unicorn with its original flags.
+                // bounded attempt; replay it in the interpreter with its original flags.
                 return FALLBACK;
             }
             break MORE;
@@ -352,6 +353,7 @@ fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
     if cmps {
         state.regs[6] = source;
     }
+    crate::interpreter::RepContinuation::commit_native_compare(state, operation, outcome != 0);
     state.eflags = comparison_flags(state.eflags, left, right, width);
     bridge.bulk_calls += 1;
     bridge.bulk_bytes += u64::from(completed * width);

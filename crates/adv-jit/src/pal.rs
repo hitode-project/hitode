@@ -1,13 +1,13 @@
 //! Adapter to the existing PE loader, Win32 handlers and cooperative scheduler.
-use crate::machine::{HookData, uc_prot};
-use crate::{CompileStrategy, CpuState, ExecutionContext, Machine, Memory, RunOutcome, Stats};
+use crate::{
+    CompileStrategy, CpuState, ExecutionContext, Machine, Memory, RunOutcome, Stats, X87Register,
+};
 use pal_cpu::{
     Backend, Exit, Fault, FaultKind, Guest, MemFault, Prot, Reg, SegmentSetup, TrapAction,
     TrapHandler,
 };
 use std::cell::{Ref, RefCell, RefMut};
 use std::time::{Duration, Instant};
-use unicorn_engine::{RegisterX86 as R, Unicorn};
 
 pub struct JitCpu {
     inner: RefCell<Machine>,
@@ -19,6 +19,7 @@ impl JitCpu {
     pub fn new(park: u32, jit: bool) -> Result<Self, String> {
         let mut machine = Machine::address_space()?;
         machine.enable_auto_jit(jit);
+        machine.set_async_compilation(jit);
         Ok(Self {
             inner: RefCell::new(machine),
             park,
@@ -36,8 +37,11 @@ impl JitCpu {
     pub fn set_auto_compile_strategy(&mut self, strategy: CompileStrategy) {
         self.inner.get_mut().set_auto_compile_strategy(strategy);
     }
-    pub fn set_x87_residency(&mut self, enabled: bool) {
-        self.inner.get_mut().set_x87_residency(enabled);
+    pub fn set_region_linking(&mut self, enabled: bool) {
+        self.inner.get_mut().set_region_linking(enabled);
+    }
+    pub fn set_async_compilation(&mut self, enabled: bool) {
+        self.inner.get_mut().set_async_compilation(enabled);
     }
     pub fn profile(&self) -> std::collections::BTreeMap<u32, crate::ProfileSample> {
         self.inner.borrow().profile.clone()
@@ -50,17 +54,14 @@ impl JitCpu {
     }
     fn view<T>(&mut self, f: impl FnOnce(&mut View<'_>) -> T) -> T {
         let m = self.inner.get_mut();
-        let Machine {
-            state, memory, uc, ..
-        } = m;
-        f(&mut View { state, memory, uc })
+        let Machine { state, memory, .. } = m;
+        f(&mut View { state, memory })
     }
 }
 
 struct View<'a> {
     state: &'a mut CpuState,
     memory: &'a mut Memory,
-    uc: &'a mut Unicorn<'static, HookData>,
 }
 fn fault(addr: u32, len: usize) -> MemFault {
     MemFault {
@@ -84,6 +85,9 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn cpuid_features(&self) -> u32 {
+        crate::cpu_profile::cpuid(1, 0)[3]
+    }
     fn shared_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
         self.memory.read(addr, len).ok()
     }
@@ -93,37 +97,16 @@ impl Guest for View<'_> {
             .map_err(|_| fault(dst, len))
     }
     fn push_f64(&mut self, value: f64) {
-        let sw = self.uc.reg_read(R::FPSW).expect("x87 status");
-        let top = ((sw >> 11).wrapping_sub(1)) & 7;
-        self.uc
-            .reg_write(R::FPSW, (sw & !(7 << 11)) | (top << 11))
-            .expect("x87 top");
-        let tag = self.uc.reg_read(R::FPTAG).expect("x87 tag");
-        self.uc
-            .reg_write(
-                R::FPTAG,
-                (tag & !(3 << (top * 2))) | (pal_cpu::x87::tag_f64(value) << (top * 2)),
-            )
-            .expect("x87 tag");
-        self.uc
-            .reg_write_long(R::ST0, &pal_cpu::x87::encode_f64(value))
-            .expect("x87 result");
+        self.state.commit_mmx();
+        self.state
+            .x87
+            .push(X87Register(pal_cpu::x87::encode_f64(value)));
+        self.state.refresh_mmx();
     }
     fn pop_f64(&mut self) -> Option<f64> {
-        let sw = self.uc.reg_read(R::FPSW).expect("x87 status");
-        let top = (sw >> 11) & 7;
-        let tag = self.uc.reg_read(R::FPTAG).expect("x87 tag");
-        if (tag >> (top * 2)) & 3 == 3 {
-            return None;
-        }
-        let bytes = self.uc.reg_read_long(R::ST0).expect("x87 value");
-        self.uc
-            .reg_write(R::FPTAG, tag | (3 << (top * 2)))
-            .expect("x87 tag");
-        self.uc
-            .reg_write(R::FPSW, (sw & !(7 << 11)) | (((top + 1) & 7) << 11))
-            .expect("x87 top");
-        Some(pal_cpu::x87::decode_f64(&bytes))
+        self.state.commit_mmx();
+        let value = self.state.x87.pop()?;
+        Some(pal_cpu::x87::decode_f64(&value.0))
     }
     fn reg(&self, r: Reg) -> u32 {
         get(self.state, r)
@@ -154,79 +137,31 @@ impl Guest for View<'_> {
                 .all(|p| p & prot.0 == prot.0)
     }
     fn map(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
-        let err = fault(addr, size as usize);
         self.memory
             .map(addr, size as usize, prot.0)
-            .map_err(|_| err)?;
-        // SAFETY: the new committed range stays at this address for its whole mapping.
-        if unsafe {
-            self.uc.mem_map_ptr(
-                addr.into(),
-                size.into(),
-                uc_prot(prot.0),
-                self.memory
-                    .ptr
-                    .as_ptr()
-                    .add((addr - self.memory.base) as usize)
-                    .cast(),
-            )
-        }
-        .is_err()
-        {
-            let _ = self.memory.unmap(addr, size as usize);
-            return Err(err);
-        }
-        self.uc.get_data_mut().perms.clone_from(&self.memory.perms);
-        Ok(())
+            .map_err(|_| fault(addr, size as usize))
     }
     fn protect(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
-        let err = fault(addr, size as usize);
-        self.memory.pages(addr, size as usize).map_err(|_| err)?;
-        self.memory
-            .committed(addr, size as usize)
-            .map_err(|_| err)?;
-        if prot.0 & !7 != 0 {
-            return Err(err);
-        }
-        self.uc
-            .mem_protect(addr.into(), size.into(), uc_prot(prot.0))
-            .map_err(|_| err)?;
         self.memory
             .protect(addr, size as usize, prot.0)
-            .map_err(|_| err)?;
-        self.uc.get_data_mut().perms.clone_from(&self.memory.perms);
-        Ok(())
+            .map_err(|_| fault(addr, size as usize))
     }
     fn unmap(&mut self, addr: u32, size: u32) -> Result<(), MemFault> {
-        let err = fault(addr, size as usize);
-        self.memory.pages(addr, size as usize).map_err(|_| err)?;
         self.memory
-            .committed(addr, size as usize)
-            .map_err(|_| err)?;
-        self.uc
-            .mem_unmap(addr.into(), size.into())
-            .map_err(|_| err)?;
-        self.memory.unmap(addr, size as usize).map_err(|_| err)?;
-        self.uc.get_data_mut().perms.clone_from(&self.memory.perms);
-        Ok(())
+            .unmap(addr, size as usize)
+            .map_err(|_| fault(addr, size as usize))
     }
 }
 
 impl Guest for JitCpu {
+    fn cpuid_features(&self) -> u32 {
+        crate::cpu_profile::cpuid(1, 0)[3]
+    }
     fn push_f64(&mut self, v: f64) {
-        let m = self.inner.get_mut();
-        crate::machine::export_mmx(&mut m.uc, &mut m.state).expect("MMX/x87 boundary");
         self.view(|g| g.push_f64(v));
-        let m = self.inner.get_mut();
-        crate::machine::import_mmx(&m.uc, &mut m.state).expect("MMX/x87 result");
     }
     fn pop_f64(&mut self) -> Option<f64> {
-        let m = self.inner.get_mut();
-        crate::machine::export_mmx(&mut m.uc, &mut m.state).expect("MMX/x87 boundary");
-        let value = self.view(|g| g.pop_f64());
-        let m = self.inner.get_mut();
-        crate::machine::import_mmx(&m.uc, &mut m.state).expect("MMX/x87 result");
-        value
+        self.view(|g| g.pop_f64())
     }
     fn reg(&self, r: Reg) -> u32 {
         get(&self.inner.borrow().state, r)
@@ -258,49 +193,30 @@ impl Guest for JitCpu {
                 .all(|p| p & prot.0 == prot.0)
     }
     fn map(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
-        self.view(|g| g.map(addr, size, prot))?;
-        self.inner
-            .get_mut()
-            .update_write_hook()
-            .map_err(|_| fault(addr, size as usize))
+        self.view(|g| g.map(addr, size, prot))
     }
     fn protect(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
-        self.view(|g| g.protect(addr, size, prot))?;
-        self.inner
-            .get_mut()
-            .update_write_hook()
-            .map_err(|_| fault(addr, size as usize))
+        self.view(|g| g.protect(addr, size, prot))
     }
     fn unmap(&mut self, addr: u32, size: u32) -> Result<(), MemFault> {
-        self.view(|g| g.unmap(addr, size))?;
-        self.inner
-            .get_mut()
-            .update_write_hook()
-            .map_err(|_| fault(addr, size as usize))
+        self.view(|g| g.unmap(addr, size))
     }
 }
 
 struct Raw<'a> {
     handler: &'a mut dyn TrapHandler,
-    uc: *mut Unicorn<'static, HookData>,
 }
 impl crate::host::RawTrap for Raw<'_> {
-    fn bind(&mut self, uc: *mut Unicorn<'static, HookData>) {
-        self.uc = uc;
-    }
     fn call(
         &mut self,
         state: &mut CpuState,
         memory: &mut Memory,
         vector: u32,
     ) -> Result<bool, String> {
-        // SAFETY: uc is a disjoint Machine field; Unicorn is stopped at every raw call.
-        let uc = unsafe { &mut *self.uc };
-        crate::machine::export_mmx(uc, state)?;
+        state.commit_mmx();
         let action = self
             .handler
-            .on_trap(&mut View { state, memory, uc }, vector as u8);
-        crate::machine::import_mmx(uc, state)?;
+            .on_trap(&mut View { state, memory }, vector as u8);
         Ok(action == TrapAction::Park)
     }
 }
@@ -314,8 +230,10 @@ impl Backend for JitCpu {
             .map_err(|_| fault(seg.gdt_addr, 4096))
     }
     fn set_fs_base(&mut self, base: u32) -> Result<(), MemFault> {
-        self.inner.get_mut().state.fs_base = base;
-        Ok(())
+        self.inner
+            .get_mut()
+            .set_fs_base(base)
+            .map_err(|_| fault(base, 1))
     }
     fn park_addr(&self) -> u32 {
         self.park
@@ -356,10 +274,7 @@ impl Backend for JitCpu {
                     budget,
                 };
             }
-            let mut raw = Raw {
-                handler,
-                uc: std::ptr::null_mut(),
-            };
+            let mut raw = Raw { handler };
             let result = m.run_traps(self.park, 32_768, &mut raw, !self.jit);
             match result {
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
@@ -373,6 +288,12 @@ impl Backend for JitCpu {
                         Ok(RunOutcome::WriteFault { address, .. }) => FaultKind::Write(address),
                         Ok(RunOutcome::FetchFault { address, .. }) => FaultKind::Fetch(address),
                         Ok(RunOutcome::InvalidInstruction { .. }) => FaultKind::InvalidInstruction,
+                        Ok(RunOutcome::UnsupportedInstruction { pc, code }) => FaultKind::Other(
+                            format!("unsupported guest instruction {code:?} at {pc:#x}"),
+                        ),
+                        Ok(RunOutcome::Trap { vector, .. }) => {
+                            FaultKind::Other(format!("unhandled guest exception {vector}"))
+                        }
                         Err(e) => FaultKind::Other(e),
                         _ => FaultKind::Other("unexpected standalone wait".into()),
                     };

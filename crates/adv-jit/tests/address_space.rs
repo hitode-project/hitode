@@ -1,5 +1,7 @@
+mod support;
 use adv_jit::*;
 use iced_x86::code_asm::*;
+use support::Machine;
 
 #[test]
 fn scattered_regions_invalidate_only_the_modified_code_page() {
@@ -30,7 +32,7 @@ fn scattered_regions_invalidate_only_the_modified_code_page() {
     }
     assert_eq!(m.stats.compilations, 3);
     assert_eq!(m.stats.invalidations, 1);
-    assert_eq!(m.stats.fallback_entries, 0);
+    assert_eq!(m.stats.interpreter_entries, 0);
     m.unmap(dll, 4096).unwrap();
     assert!(m.memory().read(dll, 4).is_err());
     m.map(dll, 4096, READ | WRITE).unwrap();

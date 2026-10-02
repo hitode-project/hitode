@@ -1,5 +1,7 @@
-use adv_jit::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+mod support;
+use adv_jit::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+use support::Machine;
 
 const CODE: u32 = 0x10000;
 const ROOT: u32 = CODE + 0x31;
@@ -70,7 +72,7 @@ fn reachable_roots_follow_calls_branches_and_skip_embedded_dead_code() {
         assert_eq!(jit.state.regs[0], expected);
         assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
     }
-    assert_eq!(jit.stats.fallback_entries, 0);
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]

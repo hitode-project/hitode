@@ -113,10 +113,13 @@ fn execute(name: &str, backend: &str, hidden: bool) -> (String, Vec<u8>) {
 }
 
 #[test]
-fn real_pe_jit_matches_unicorn() {
-    let (_, reference) = execute("unicorn", "unicorn", false);
+fn real_pe_jit_matches_interpreter() {
+    let (_, reference) = execute("interpreter", "interpreter", false);
     let (report, jit) = execute("jit", "jit", false);
-    assert_eq!(jit, reference, "JIT and Unicorn guest GDI output differs");
+    assert_eq!(
+        jit, reference,
+        "JIT and Interpreter guest GDI output differs"
+    );
     assert!(number(&report, "native_entries") > 0.0);
     assert!(number(&report, "compilations") > 0.0);
 }
@@ -208,7 +211,7 @@ fn execute_audio(name: &str, backend: &str, native: bool) -> String {
 
 #[test]
 fn guest_pcm_fixture_plays_advances_and_stops_without_a_host_device() {
-    for backend in ["jit", "unicorn"] {
+    for backend in ["jit", "interpreter"] {
         let report = execute_audio(backend, backend, false);
         assert!(report.contains("\"device_requested\": false"));
     }
@@ -217,7 +220,7 @@ fn guest_pcm_fixture_plays_advances_and_stops_without_a_host_device() {
 #[test]
 #[ignore = "opens the real default sound device with one second of low-amplitude nonzero PCM"]
 fn native_audio_output_consumes_non_silent_guest_pcm() {
-    let report = execute_audio("native-device", "unicorn", true);
+    let report = execute_audio("native-device", "interpreter", true);
     assert!(report.contains("\"device_requested\": true"));
     assert!(number(&report, "starts") >= 1.0, "{report}");
     assert!(number(&report, "callbacks") > 0.0, "{report}");
@@ -227,7 +230,7 @@ fn native_audio_output_consumes_non_silent_guest_pcm() {
 #[test]
 fn frame_limit_stops_at_presentation_without_reporting_a_guest_exit() {
     let directory = fixtures();
-    for backend in ["jit", "unicorn"] {
+    for backend in ["jit", "interpreter"] {
         let report_path = directory.join(format!("frame-limit-{backend}.json"));
         let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
             .arg(directory.join("fixture_window.exe"))
@@ -260,7 +263,7 @@ fn frame_limit_stops_at_presentation_without_reporting_a_guest_exit() {
 
 #[test]
 fn hidden_native_frontend_delivers_input_and_waits() {
-    let (report, _) = execute("hidden", "unicorn", true);
+    let (report, _) = execute("hidden", "interpreter", true);
     assert!(number(&report, "idle_waits") > 0.0);
     assert!(number(&report, "idle_wait_seconds") > 0.0);
 }
@@ -270,7 +273,7 @@ fn host_queue_key_is_translated_to_exactly_one_guest_character() {
     // --self-test-input posts WM_KEYDOWN through PostMessageW. The fixture's
     // guest TranslateMessage must produce exactly one lowercase 'a'; a second
     // host translation would make the fixture fail with guest exit code 23.
-    execute("character-once", "unicorn", true);
+    execute("character-once", "interpreter", true);
 }
 
 #[test]
@@ -280,7 +283,13 @@ fn headless_limit_wakes_an_indefinite_event_wait() {
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
         .arg(directory.join("fixture_wait.exe"))
-        .args(["--backend", "unicorn", "--headless", "--seconds", "0.15"])
+        .args([
+            "--backend",
+            "interpreter",
+            "--headless",
+            "--seconds",
+            "0.15",
+        ])
         .arg("--report")
         .arg(&report_path)
         .output()
@@ -311,7 +320,13 @@ fn no_presentation_does_not_create_a_placeholder_screenshot() {
     }
     let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
         .arg(directory.join("fixture_wait.exe"))
-        .args(["--backend", "unicorn", "--headless", "--seconds", "0.15"])
+        .args([
+            "--backend",
+            "interpreter",
+            "--headless",
+            "--seconds",
+            "0.15",
+        ])
         .arg("--report")
         .arg(&report_path)
         .arg("--screenshot")
@@ -363,7 +378,7 @@ fn close_grace_interrupts_a_guest_close_handler_that_never_returns() {
     }
     let mut child = Command::new(env!("CARGO_BIN_EXE_adv-run"))
         .arg(directory.join("fixture_close.exe"))
-        .args(["--backend", "unicorn", "--hidden", "--seconds", "6"])
+        .args(["--backend", "interpreter", "--hidden", "--seconds", "6"])
         .arg("--report")
         .arg(&report_path)
         .arg("--trace")
@@ -445,7 +460,7 @@ fn stdin_control_wakes_idle_guest_and_reuses_capture_and_report_paths() {
             .arg(directory.join(exe))
             .args([
                 "--backend",
-                "unicorn",
+                "interpreter",
                 mode,
                 "--control-stdin",
                 "--width",
@@ -541,7 +556,7 @@ fn host_deadline_stops_a_continuously_ready_compute_context() {
         .args([
             "--headless",
             "--backend",
-            "unicorn",
+            "interpreter",
             "--seconds",
             "0.1",
             "--report",
@@ -563,9 +578,9 @@ fn host_deadline_stops_a_continuously_ready_compute_context() {
 }
 
 #[test]
-fn sliced_jit_and_unicorn_compute_exactly_the_unsliced_guest_results() {
+fn sliced_jit_and_interpreter_compute_exactly_the_unsliced_guest_results() {
     let directory = fixtures();
-    for (backend, jit) in [("jit", true), ("unicorn", false)] {
+    for (backend, jit) in [("jit", true), ("interpreter", false)] {
         let mut reference = adv_runtime::boot::Runtime::new(
             directory.join("fixture_slice.exe"),
             directory.join(format!("slice-reference-data-{backend}")),
