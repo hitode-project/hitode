@@ -1,5 +1,5 @@
 //! Full-frame pixel workloads expressed as authored x86 SSE2 and MMX instructions.
-use adv_jit::{CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+use adv_jit::{CompileStrategy, CpuState, EXEC, Machine, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use std::hint::black_box;
 use std::time::Instant;
@@ -94,7 +94,7 @@ fn mmx_code(alpha: bool) -> Vec<u8> {
     a.assemble(u64::from(CODE)).unwrap()
 }
 
-fn setup(code: &[u8], a: &[u8], b: &[u8], jit: bool) -> Machine {
+fn setup(code: &[u8], a: &[u8], b: &[u8], jit: bool, strategy: CompileStrategy) -> Machine {
     let mut m = Machine::new(CODE, 0x3000000).unwrap();
     m.protect(CODE, 0x3000000, READ | WRITE).unwrap();
     m.write(CODE, code).unwrap();
@@ -108,7 +108,9 @@ fn setup(code: &[u8], a: &[u8], b: &[u8], jit: bool) -> Machine {
     m.protect(CODE, 4096, READ | EXEC).unwrap();
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     if jit {
-        m.set_region(Region::new(CODE, code.len())).unwrap();
+        let mut region = Region::new(CODE, code.len());
+        region.compile_strategy = strategy;
+        m.set_region(region).unwrap();
     }
     m
 }
@@ -166,6 +168,11 @@ fn pin() {}
 fn main() {
     let samples: usize = std::env::args().nth(1).map_or(7, |v| v.parse().unwrap());
     assert!(samples > 0);
+    let strategy = match std::env::args().nth(2).as_deref() {
+        None | Some("speed") => CompileStrategy::Speed,
+        Some("fast") => CompileStrategy::Fast,
+        _ => panic!("pixel_bench [samples] [speed|fast]"),
+    };
     pin();
     println!(
         "kernel,resolution,jit_ms,unicorn_ms,host_rust_ms,speedup,jit_over_host,compile_ms,fallbacks"
@@ -183,8 +190,8 @@ fn main() {
         let b: Vec<_> = (0..bytes).map(|_| random()).collect();
         for (mmx, alpha) in [(false, false), (false, true), (true, false), (true, true)] {
             let code = if mmx { mmx_code(alpha) } else { code(alpha) };
-            let mut jit = setup(&code, &a, &b, true);
-            let mut uc = setup(&code, &a, &b, false);
+            let mut jit = setup(&code, &a, &b, true, strategy);
+            let mut uc = setup(&code, &a, &b, false, strategy);
             let mut expected = vec![0; bytes];
             host(&a, &b, &mut expected, alpha);
             call(&mut uc, bytes, false, mmx);

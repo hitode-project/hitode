@@ -1,5 +1,6 @@
 //! Scalar arithmetic and flag consumers used by profiled guest loops.
 use super::*;
+use iced_x86::Code;
 
 fn source32(i: &Instruction, operand: u32) -> bool {
     match i.op_kind(operand) {
@@ -51,6 +52,8 @@ pub(super) fn supported(i: &Instruction) -> bool {
             };
     }
     match i.mnemonic() {
+        M::Cdq => i.code() == Code::Cdq,
+        M::Leave => i.code() == Code::Leaved,
         M::Sbb => {
             i.op_count() == 2
                 && source32(i, 0)
@@ -148,6 +151,22 @@ impl Emitter<'_> {
     }
 
     pub(super) fn scalar_instruction(&mut self, i: &Instruction) {
+        if i.code() == Code::Cdq {
+            let value = self.b.use_var(self.regs[0]);
+            let sign = self.b.ins().sshr_imm(value, 31);
+            self.b.def_var(self.regs[2], sign);
+            return;
+        }
+        if i.code() == Code::Leaved {
+            let frame = self.b.use_var(self.regs[5]);
+            let pointer = self.pointer(frame, false, 4);
+            let saved_frame = self.b.ins().load(types::I32, MemFlags::new(), pointer, 0);
+            let stack = self.b.ins().iadd_imm(frame, 4);
+            // A faulting frame read must retain both architectural stack registers.
+            self.b.def_var(self.regs[5], saved_frame);
+            self.b.def_var(self.regs[4], stack);
+            return;
+        }
         if let Some(condition) = set_condition(i.mnemonic()) {
             let ptr = self.destination(i);
             let value = self.condition(condition);

@@ -356,6 +356,10 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         let blocks: BTreeMap<_, _> = entries.iter().map(|&pc| (pc, b.create_block())).collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
+        let shared_exit = b.create_block();
+        b.set_cold_block(shared_exit);
+        b.append_block_param(shared_exit, types::I32); // Exit reason.
+        b.append_block_param(shared_exit, types::I32); // Exact guest PC.
         b.ins().jump(dispatch, &[pc.into()]);
         let mut e = Emitter {
             b,
@@ -374,6 +378,7 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
             len: memory.len,
             blocks,
             dispatch,
+            shared_exit,
             pc: region.start,
             return_hint,
             bridge: params[3],
@@ -420,6 +425,14 @@ pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, Stri
         switch.emit(&mut e.b, target, outside);
         e.b.switch_to_block(outside);
         e.exit(Exit::Dispatch, target);
+        // SSA variables merge each predecessor's state here. Keep one writeback
+        // and one lazy-flags materialization instead of duplicating them at every
+        // memory/budget guard. Fault addresses are still stored at the fault site.
+        e.b.switch_to_block(shared_exit);
+        let reason = e.b.block_params(shared_exit)[0];
+        let pc = e.b.block_params(shared_exit)[1];
+        e.save_state(pc);
+        e.b.ins().return_(&[reason]);
         e.b.seal_all_blocks();
         e.b.finalize();
     }
@@ -631,6 +644,7 @@ struct Emitter<'a> {
     len: usize,
     blocks: BTreeMap<u32, ir::Block>,
     dispatch: ir::Block,
+    shared_exit: ir::Block,
     pc: u32,
     return_hint: Option<u32>,
     bridge: Value,
@@ -647,9 +661,10 @@ impl Emitter<'_> {
         self.exit(reason, pc);
     }
     fn exit(&mut self, reason: Exit, pc: Value) {
-        self.save_state(pc);
         let reason = self.constant(reason as u32);
-        self.b.ins().return_(&[reason]);
+        self.b
+            .ins()
+            .jump(self.shared_exit, &[reason.into(), pc.into()]);
     }
     fn save_state(&mut self, pc: Value) {
         for (index, var) in self.mmx.iter().enumerate() {

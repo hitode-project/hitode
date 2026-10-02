@@ -4,7 +4,7 @@ mod control;
 mod performance;
 mod window;
 
-use adv_runtime::{Snapshot, boot::Runtime};
+use adv_runtime::{CompileStrategy, Snapshot, boot::Runtime};
 use pal_machine::{RunResult, SliceResult};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ struct Options {
     exe: PathBuf,
     data_dir: PathBuf,
     jit: bool,
+    compile_strategy: CompileStrategy,
     codepage: u32,
     headless: bool,
     hidden: bool,
@@ -35,6 +36,7 @@ struct Options {
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|unicorn   shared guest backend (default: jit)\n\
+  --compile fast|speed    automatic JIT region policy (default: speed)\n\
   --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
   --headless              run without a host window\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
@@ -61,6 +63,7 @@ impl Options {
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
             jit: true,
+            compile_strategy: CompileStrategy::Speed,
             codepage: 932,
             headless: false,
             hidden: false,
@@ -99,6 +102,13 @@ impl Options {
                         "932" => 932,
                         "936" => 936,
                         _ => return Err("--codepage must be 932 or 936".into()),
+                    };
+                }
+                "--compile" => {
+                    options.compile_strategy = match value()?.as_str() {
+                        "fast" => CompileStrategy::Fast,
+                        "speed" => CompileStrategy::Speed,
+                        _ => return Err("--compile must be fast or speed".into()),
                     };
                 }
                 "--headless" => options.headless = true,
@@ -244,7 +254,7 @@ fn build_report(context: ReportContext<'_>) -> String {
     )).collect::<Vec<_>>().join(", ");
     format!(
         concat!(
-            "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
+            "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
             "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
@@ -254,6 +264,14 @@ fn build_report(context: ReportContext<'_>) -> String {
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "unicorn" }),
+        if options.jit {
+            json(match options.compile_strategy {
+                CompileStrategy::Fast => "fast",
+                CompileStrategy::Speed => "speed",
+            })
+        } else {
+            "null".into()
+        },
         options.codepage,
         json(stop_reason),
         exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
@@ -303,6 +321,10 @@ fn run(options: Options) -> Result<u8, String> {
         options.height,
     )?;
     runtime.set_codepage(options.codepage);
+    runtime
+        .machine
+        .cpu
+        .set_auto_compile_strategy(options.compile_strategy);
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
     runtime.machine.cpu.set_profiling(options.profile);
