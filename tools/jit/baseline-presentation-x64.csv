@@ -1,0 +1,5 @@
+pipeline,resolution,frame_ms,api_calls_per_frame,native_entries_per_frame,fallbacks,copies_after_render
+gdi,1280x720,0.9204,1,1,0,2
+ddraw,1280x720,1.0310,3,1,0,2
+gdi,1920x1080,2.7124,1,1,0,2
+ddraw,1920x1080,3.0325,3,1,0,2

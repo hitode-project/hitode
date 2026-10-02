@@ -1,0 +1,2 @@
+iterations,samples,loop_ns,api_loop_ns,incremental_ns,native_entries_per_run,fallbacks
+1000000,9,0.56,19.15,18.59,1,0
