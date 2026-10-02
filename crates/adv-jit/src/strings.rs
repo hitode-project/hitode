@@ -1,4 +1,4 @@
-//! Guarded bulk execution of forward REP copies and fills.
+//! Guarded bulk execution of REP copies, fills, comparisons and scans.
 use std::time::Instant;
 
 use iced_x86::{Code, Instruction, OpKind, Register};
@@ -13,12 +13,30 @@ pub(crate) const MORE: u32 = 2;
 pub(crate) const BUDGET: u32 = 3;
 
 pub(crate) fn operation(i: &Instruction) -> Option<u32> {
-    if !i.has_rep_prefix()
-        || i.has_repne_prefix()
+    if !(i.has_rep_prefix() || i.has_repne_prefix())
         || i.has_lock_prefix()
         || !matches!(i.segment_prefix(), Register::None | Register::DS)
-        || i.op0_kind() != OpKind::MemoryESEDI
     {
+        return None;
+    }
+    let compare = match i.code() {
+        Code::Cmpsb_m8_m8 => Some(6),
+        Code::Cmpsw_m16_m16 => Some(7),
+        Code::Cmpsd_m32_m32 => Some(8),
+        Code::Scasb_AL_m8 => Some(12),
+        Code::Scasw_AX_m16 => Some(13),
+        Code::Scasd_EAX_m32 => Some(14),
+        _ => None,
+    };
+    if let Some(operation) = compare {
+        if i.op1_kind() != OpKind::MemoryESEDI
+            || (operation < 12 && i.op0_kind() != OpKind::MemorySegESI)
+        {
+            return None;
+        }
+        return Some(operation + if i.has_repne_prefix() { 3 } else { 0 });
+    }
+    if i.has_repne_prefix() || i.op0_kind() != OpKind::MemoryESEDI {
         return None;
     }
     Some(match i.code() {
@@ -65,6 +83,9 @@ fn checked_range(
 fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
     if expired(bridge.deadline) {
         return BUDGET;
+    }
+    if (6..18).contains(&operation) {
+        return compare(bridge, state, operation);
     }
     let (copy, width) = match operation {
         0 => (true, 1),
@@ -158,6 +179,183 @@ fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
     bridge.bulk_calls += 1;
     bridge.bulk_bytes += u64::from(bytes);
     if state.regs[1] == 0 { 0 } else { MORE }
+}
+
+/// Full-range validation permits progress to be committed at a chunk boundary.
+/// Otherwise a faulting REP comparison must start in Unicorn with its original
+/// flags: Intel restores the instruction's input EFLAGS on a CMPS/SCAS fault.
+fn compare_range(
+    memory: &Memory,
+    address: u32,
+    count: u32,
+    width: u32,
+    backwards: bool,
+    deadline: Option<Instant>,
+) -> Result<(), u32> {
+    let bytes = count.checked_mul(width).ok_or(FALLBACK)?;
+    let start = if backwards {
+        address.checked_sub(bytes - width).ok_or(FALLBACK)?
+    } else {
+        address
+    };
+    checked_range(memory, start, bytes, false, deadline).map(|_| ())
+}
+
+/// Validate only the pages containing the next element and return how many
+/// subsequent elements stay within those pages. No later guest page is read.
+fn readable_elements(memory: &Memory, address: u32, width: u32, backwards: bool) -> Option<u32> {
+    let range = memory.range(address, width as usize).ok()?;
+    let first = range.start / 4096;
+    let last = (range.end - 1) / 4096;
+    if (first..=last).any(|page| !memory.mapped[page] || memory.perms[page] & READ == 0) {
+        return None;
+    }
+    let within_page = (range.start % 4096) as u32;
+    Some(if backwards {
+        within_page / width + 1
+    } else {
+        // An unaligned word/dword can straddle a page; both pages above were
+        // checked, but process just that one element before choosing a new span.
+        ((4096 - within_page) / width).max(1)
+    })
+}
+
+fn comparison_flags(old: u32, left: u32, right: u32, width: u32) -> u32 {
+    let mask = match width {
+        1 => 0xff,
+        2 => 0xffff,
+        _ => u32::MAX,
+    };
+    let sign = 1 << (width * 8 - 1);
+    let (left, right) = (left & mask, right & mask);
+    let result = left.wrapping_sub(right) & mask;
+    (old & !0x8d5)
+        | u32::from(left < right)
+        | (u32::from((result as u8).count_ones().is_multiple_of(2)) << 2)
+        | ((left ^ right ^ result) & 0x10)
+        | (u32::from(result == 0) << 6)
+        | (u32::from(result & sign != 0) << 7)
+        | (u32::from((left ^ right) & (left ^ result) & sign != 0) << 11)
+}
+
+fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
+    let count = state.regs[1];
+    if count == 0 {
+        return 0;
+    }
+    let width: u32 = match (operation - 6) % 3 {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    };
+    let cmps = operation < 12;
+    let equal_repeat = (operation - 6) % 6 < 3;
+    let backwards = state.eflags & (1 << 10) != 0;
+    let delta = if backwards {
+        width.wrapping_neg()
+    } else {
+        width
+    };
+    // SAFETY: the native executor is suspended and the bridge exclusively borrows
+    // the Machine's live memory. Comparisons do not write or dirty guest pages.
+    let memory = unsafe { &*bridge.memory };
+    let validated = compare_range(
+        memory,
+        state.regs[7],
+        count,
+        width,
+        backwards,
+        bridge.deadline,
+    )
+    .and_then(|()| {
+        if cmps {
+            compare_range(
+                memory,
+                state.regs[6],
+                count,
+                width,
+                backwards,
+                bridge.deadline,
+            )
+        } else {
+            Ok(())
+        }
+    });
+    let fully_checked = match validated {
+        Ok(()) => true,
+        Err(BUDGET) => return BUDGET,
+        Err(_) => false,
+    };
+    let limit = count.min(CHUNK_BYTES / width);
+    let (mut source, mut destination) = (state.regs[6], state.regs[7]);
+    let mut completed = 0;
+    let (mut left, mut right) = (0, 0);
+    let outcome = 'scan: loop {
+        if expired(bridge.deadline) {
+            if !fully_checked || completed == 0 {
+                return BUDGET;
+            }
+            break BUDGET;
+        }
+        let Some(mut span) = readable_elements(memory, destination, width, backwards) else {
+            // A non-validated scan has not changed any architectural state.
+            return FALLBACK;
+        };
+        if cmps {
+            let Some(source_span) = readable_elements(memory, source, width, backwards) else {
+                return FALLBACK;
+            };
+            span = span.min(source_span);
+        }
+        span = span.min(limit - completed);
+        for _ in 0..span {
+            // SAFETY: the page span above validates each entire element, including
+            // unaligned elements straddling two pages. Reads occur in guest order;
+            // a stopping comparison never reads the next element.
+            unsafe {
+                let read = |address: u32| {
+                    let pointer = memory.ptr.as_ptr().add((address - memory.base) as usize);
+                    match width {
+                        1 => u32::from(pointer.read()),
+                        2 => u32::from(u16::from_le(pointer.cast::<u16>().read_unaligned())),
+                        _ => u32::from_le(pointer.cast::<u32>().read_unaligned()),
+                    }
+                };
+                left = if cmps { read(source) } else { state.regs[0] };
+                right = read(destination);
+            }
+            completed += 1;
+            destination = destination.wrapping_add(delta);
+            if cmps {
+                source = source.wrapping_add(delta);
+            }
+            let equal = match width {
+                1 => left as u8 == right as u8,
+                2 => left as u16 == right as u16,
+                _ => left == right,
+            };
+            if equal != equal_repeat || completed == count {
+                break 'scan 0;
+            }
+        }
+        if completed == limit {
+            if !fully_checked {
+                // A very long unbounded CRT scan is conservative after this
+                // bounded attempt; replay it in Unicorn with its original flags.
+                return FALLBACK;
+            }
+            break MORE;
+        }
+    };
+    state.regs[1] -= completed;
+    state.regs[7] = destination;
+    if cmps {
+        state.regs[6] = source;
+    }
+    state.eflags = comparison_flags(state.eflags, left, right, width);
+    bridge.bulk_calls += 1;
+    bridge.bulk_bytes += u64::from(completed * width);
+    outcome
 }
 
 /// Called only by native code with the Machine's live bridge and saved CpuState.
