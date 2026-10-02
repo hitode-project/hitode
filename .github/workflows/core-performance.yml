@@ -1,0 +1,77 @@
+name: Core execution validation
+
+on:
+  push:
+    branches: [perf/tiered-execution-10x]
+  pull_request:
+    paths:
+      - 'crates/adv-jit/**'
+      - '.github/workflows/core-performance.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/core-ci
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record source and environment
+        run: |
+          rustc --version
+          cargo --version
+          uname -a
+          lscpu
+          tar -czf "$RUNNER_TEMP/adv-jit-source.tar.gz" crates/adv-jit Cargo.toml Cargo.lock
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: core-source-${{ github.sha }}
+          path: ${{ runner.temp }}/adv-jit-source.tar.gz
+          retention-days: 3
+      - name: Prepare isolated core crate
+        shell: python
+        run: |
+          import os, pathlib, re, shutil
+          source = pathlib.Path('crates/adv-jit')
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'adv-jit-core'
+          shutil.copytree(source, target)
+          manifest = (source / 'Cargo.toml').read_text()
+          manifest = manifest.replace('edition.workspace = true', 'edition = "2024"')
+          manifest = manifest.replace('publish.workspace = true', 'publish = false')
+          manifest = manifest.replace('pal = ["dep:pal-cpu"]', 'pal = []')
+          manifest = re.sub(r'^pal-(?:cpu|machine|win32)\s*=.*\n', '', manifest, flags=re.M)
+          manifest = manifest.replace('[lints]\nworkspace = true', '[workspace]')
+          (target / 'Cargo.toml').write_text(manifest)
+          shutil.copy('Cargo.lock', target / 'Cargo.lock')
+          # This is deliberately a core-only gate, not a full runtime test.
+          # Keep every independent integration test; print the excluded adapters.
+          for test in (target / 'tests').glob('*.rs'):
+              if re.search(r'\bpal_(?:cpu|machine|win32)\b|adv_jit::pal\b', test.read_text()):
+                  print('SKIP sibling-dependent test:', test.name)
+                  test.rename(test.with_suffix('.rs.disabled'))
+      - name: Test core library and independent integration tests
+        run: |
+          set -o pipefail
+          cargo test --release --manifest-path "$RUNNER_TEMP/adv-jit-core/Cargo.toml" --lib --tests 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
+      - name: Run synthetic execution benchmark when present
+        run: |
+          set -o pipefail
+          if test -f "$RUNNER_TEMP/adv-jit-core/examples/execution_bench.rs"; then
+            cargo run --release --manifest-path "$RUNNER_TEMP/adv-jit-core/Cargo.toml" --example execution_bench 2>&1 | tee "$RUNNER_TEMP/core-bench.txt"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: core-validation-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/core-tests.txt
+            ${{ runner.temp }}/core-bench.txt
+          if-no-files-found: ignore
+          retention-days: 14
