@@ -1,0 +1,5 @@
+"variant","profile_enabled","compilations","native_code_bytes","native_entries","native_blocks","fallback_entries","fallback_instructions","invalidations","bulk_calls","bulk_bytes","runtime_host_calls"
+"before-speed","true","171","5258179","3019742","42582572","308571","735855","1","55485","229419056","60686"
+"shared-speed","true","171","1157057","3019742","42582572","308571","735855","1","55485","229419056","60686"
+"shared-fast","true","171","1000736","3019742","42582572","308571","735855","1","55485","229419056","60686"
+"final","true","168","1161489","2763116","42540729","9977","103180","1","312176","231391400","60686"
