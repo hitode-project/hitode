@@ -25,6 +25,7 @@ pub(crate) struct Compiled {
     entry: Entry,
     pub tail_entry: usize,
     pub pages: Vec<(usize, u64)>,
+    input: Snapshot,
     window_base: u32,
     window_len: usize,
     pub entries: BTreeSet<u32>,
@@ -50,6 +51,20 @@ impl Compiled {
                 .iter()
                 .all(|&(page, version)| memory.versions.get(page) == Some(&version))
     }
+    /// A write to mutable data on an executable page is not necessarily a code
+    /// change. On the cold invalidation path, compare the immutable input before
+    /// discarding native code. Mapping/permission changes still invalidate, as do
+    /// all byte changes inside the captured region and its instruction tail.
+    pub fn revalidate(&mut self, memory: &Memory) -> bool {
+        if !self.input.same_code(memory) {
+            return false;
+        }
+        for (page, version) in &mut self.pages {
+            *version = memory.versions[*page];
+        }
+        true
+    }
+
     pub fn run(
         &self,
         state: &mut CpuState,
@@ -159,6 +174,18 @@ impl Snapshot {
                     && memory.perms.get(stamp.page) == Some(&stamp.permissions)
                     && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
             })
+    }
+
+    fn same_code(&self, memory: &Memory) -> bool {
+        memory.base == self.base
+            && memory.len == self.len
+            && self.pages.iter().all(|stamp| {
+                memory.perms.get(stamp.page) == Some(&stamp.permissions)
+                    && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
+            })
+            && memory
+                .read(self.region.start, self.bytes.len())
+                .is_ok_and(|bytes| bytes == self.bytes)
     }
 
     fn page_index(&self, address: u32) -> Option<usize> {
@@ -652,6 +679,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .into_iter()
             .map(|page| (page, snapshot.version(page)))
             .collect(),
+        input: snapshot.clone(),
         window_base: snapshot.base,
         window_len: snapshot.len,
         entries,

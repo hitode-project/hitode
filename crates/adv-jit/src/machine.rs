@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::compile::{self, Compiled};
@@ -10,6 +11,8 @@ use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 pub struct Stats {
     pub compilations: u64,
     pub compile_requests: u64,
+    pub tier_up_requests: u64,
+    pub tier_up_publications: u64,
     pub compile_failures: u64,
     pub stale_compilations: u64,
     pub pending_compilations: usize,
@@ -23,6 +26,7 @@ pub struct Stats {
     pub interpreter_entries: u64,
     pub native_blocks: u64,
     pub invalidations: u64,
+    pub code_revalidations: u64,
     pub host_calls: u64,
     pub callbacks: u64,
     pub waits: u64,
@@ -84,6 +88,9 @@ pub struct Machine {
     interpreter: crate::interpreter::Interpreter,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
+    tiered_compilation: bool,
+    native_heat: HashMap<u32, u64>,
+    tier_attempted: BTreeSet<u32>,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
     pending_regions: BTreeMap<u32, u64>,
@@ -99,7 +106,7 @@ pub struct Machine {
     /// continues in the interpreter; explicit compilation still returns errors.
     pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
-    apis: BTreeMap<u32, ApiSpec>,
+    apis: Arc<BTreeMap<u32, ApiSpec>>,
     return_pad: Option<u32>,
     callbacks: Vec<CallbackFrame>,
     suspended: Option<Suspended>,
@@ -197,6 +204,9 @@ impl Machine {
             interpreter: crate::interpreter::Interpreter::new(),
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
+            tiered_compilation: true,
+            native_heat: HashMap::new(),
+            tier_attempted: BTreeSet::new(),
             async_compilation: false,
             compiler: None,
             pending_regions: BTreeMap::new(),
@@ -210,7 +220,7 @@ impl Machine {
             profile: BTreeMap::new(),
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
-            apis: BTreeMap::new(),
+            apis: Arc::new(BTreeMap::new()),
             return_pad: None,
             callbacks: Vec::new(),
             suspended: None,
@@ -279,7 +289,7 @@ impl Machine {
             return Err("invalid or overlapping API registration".into());
         }
         self.write(spec.entry, &spec.stub())?;
-        self.apis.insert(spec.id, spec);
+        Arc::make_mut(&mut self.apis).insert(spec.id, spec);
         Ok(())
     }
 
@@ -329,6 +339,8 @@ impl Machine {
         self.entry_owner.clear();
         self.pending_regions.clear();
         self.automatic_regions.clear();
+        self.native_heat.clear();
+        self.tier_attempted.clear();
         self.hits.clear();
         self.attempted.clear();
         self.stats.pending_compilations = 0;
@@ -355,6 +367,8 @@ impl Machine {
     }
 
     fn publish(&mut self, region: Region, compiled: Compiled) {
+        self.native_heat.remove(&region.start);
+        self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
         self.entry_owner.retain(|_, owner| *owner != region.start);
         for &pc in &compiled.entries {
@@ -430,13 +444,23 @@ impl Machine {
             self.stats.pending_compilations = self.pending_regions.len();
             if !completion.input.valid(&self.memory) {
                 self.stats.stale_compilations += 1;
+                self.tier_attempted.remove(&start);
+                self.native_heat.remove(&start);
                 for pc in &completion.region.entries {
                     self.attempted.remove(pc);
                 }
                 continue;
             }
             match completion.result {
-                Ok(compiled) => self.publish(completion.region, compiled),
+                Ok(compiled) => {
+                    if completion.region.compile_strategy == CompileStrategy::Speed
+                        && self.compiled.contains_key(&start)
+                        && self.tier_attempted.contains(&start)
+                    {
+                        self.stats.tier_up_publications += 1;
+                    }
+                    self.publish(completion.region, compiled);
+                }
                 Err(error) => {
                     // A compilation failure must leave the original guest code
                     // executable by the interpreter; explicit compilation returns errors.
@@ -455,14 +479,21 @@ impl Machine {
             return Ok(());
         }
         self.observed_epoch = self.memory.epoch;
-        let stale: Vec<_> = self
-            .compiled
-            .iter()
-            .filter(|(_, c)| !c.valid(&self.memory))
-            .map(|(&pc, _)| pc)
-            .collect();
+        let mut stale = Vec::new();
+        for (&pc, compiled) in &mut self.compiled {
+            if compiled.valid(&self.memory) {
+                continue;
+            }
+            if compiled.revalidate(&self.memory) {
+                self.stats.code_revalidations += 1;
+            } else {
+                stale.push(pc);
+            }
+        }
         for pc in stale {
             self.compiled.remove(&pc);
+            self.native_heat.remove(&pc);
+            self.tier_attempted.remove(&pc);
             self.entry_owner.retain(|_, owner| *owner != pc);
             self.stats.invalidations += 1;
             self.cache_revision += 1;
@@ -497,6 +528,12 @@ impl Machine {
     pub fn set_auto_compile_strategy(&mut self, strategy: CompileStrategy) {
         self.auto_compile_strategy = strategy;
     }
+    /// Allow automatic Fast regions to be recompiled for sustained speed. This
+    /// only submits bounded asynchronous work; explicit regions are never tiered.
+    /// Disabling prevents new promotions; in-flight compilation may still publish.
+    pub fn set_tiered_compilation(&mut self, enabled: bool) {
+        self.tiered_compilation = enabled;
+    }
     pub fn set_region_linking(&mut self, enabled: bool) {
         self.region_linking = enabled;
     }
@@ -508,9 +545,67 @@ impl Machine {
     pub fn set_async_compilation(&mut self, enabled: bool) {
         self.async_compilation = enabled;
         if !enabled {
+            self.tier_attempted.clear();
             self.pending_regions.clear();
             self.stats.pending_compilations = 0;
             self.compiler = None;
+        }
+    }
+
+    fn record_native_work(&mut self, entry: u32, blocks: u64) {
+        const HOT_BLOCKS: u64 = 16_384;
+        if !self.auto_jit || !self.async_compilation || !self.tiered_compilation || blocks == 0 {
+            return;
+        }
+        let Some(&owner) = self.entry_owner.get(&entry) else {
+            return;
+        };
+        if !self.automatic_regions.contains(&owner)
+            // Reserve at least half the bounded queue for cold discoveries.
+            || self.pending_regions.len() >= crate::compiler::CAPACITY / 2
+            || self.pending_regions.contains_key(&owner)
+            || self.tier_attempted.contains(&owner)
+        {
+            return;
+        }
+        let Some(region) = self.regions.get(&owner) else {
+            return;
+        };
+        if region.compile_strategy != CompileStrategy::Fast
+            || !self
+                .compiled
+                .get(&owner)
+                .is_some_and(|c| c.valid(&self.memory))
+        {
+            return;
+        }
+        // Native chains are sampled at their Rust entry, not timed per guest
+        // instruction. This intentionally approximates heat without perturbing
+        // generated code or attributing wall time to a background compiler.
+        let heat = self.native_heat.entry(owner).or_default();
+        *heat = heat.saturating_add(blocks);
+        if *heat < HOT_BLOCKS {
+            return;
+        }
+        let old_region = region.clone();
+        let mut optimized = old_region.clone();
+        optimized.compile_strategy = CompileStrategy::Speed;
+        match self.queue_region(optimized) {
+            Ok(true) => {
+                // Keep Fast code AND its published metadata live while Speed is
+                // compiling. Failure must not demote hot code to interpretation.
+                self.regions.insert(owner, old_region);
+                self.tier_attempted.insert(owner);
+                self.stats.tier_up_requests += 1;
+            }
+            Ok(false) => {} // Cold compilation owns the bounded queue first.
+            Err(error) => {
+                self.tier_attempted.insert(owner);
+                self.compile_errors.insert(owner, error);
+                while self.compile_errors.len() > 64 {
+                    self.compile_errors.pop_first();
+                }
+            }
         }
     }
 
@@ -604,7 +699,9 @@ impl Machine {
         services: &mut dyn HostServices,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
-        let apis = self.apis.clone();
+        // Share immutable signatures: short scheduler slices must not deep-copy
+        // the complete API table and all module/name strings on every entry.
+        let apis = Arc::clone(&self.apis);
         let mut bridge = Bridge {
             apis: &apis,
             services,
@@ -793,6 +890,7 @@ impl Machine {
                 self.stats.native_entries += 1 + linked;
                 self.stats.linked_entries += linked;
                 self.stats.native_blocks += before - self.state.fuel;
+                self.record_native_work(pc, before - self.state.fuel);
                 match result {
                     n if n == Exit::Host as u32 => {
                         if let Some(outcome) = bridge.pending.take() {
@@ -835,9 +933,26 @@ impl Machine {
             // String instructions make bounded progress with their restart state
             // in CpuState; deadlines and cache publication are checked between chunks.
             let units = self.state.fuel.min(256) as u32;
-            let execution = self
-                .interpreter
-                .run_chunk(&mut self.state, &mut self.memory, units);
+            let (execution, last_units) =
+                if self.profiling || single_step || self.deferred_fallback.is_some() {
+                    let execution =
+                        self.interpreter
+                            .run_chunk(&mut self.state, &mut self.memory, units);
+                    (execution, execution.units)
+                } else {
+                    self.interpreter.run_block(
+                        &mut self.state,
+                        &mut self.memory,
+                        units,
+                        stop,
+                        self.return_pad,
+                        (!interpreter_only
+                            && !single_step
+                            && !pending_fpu
+                            && !self.entry_owner.is_empty())
+                        .then_some(&self.entry_owner),
+                    )
+                };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
             self.state.fuel -= u64::from(execution.units);
@@ -878,7 +993,9 @@ impl Machine {
                     if vector != 0x2e && bridge.raw.is_none() {
                         return Ok(RunOutcome::Trap { pc, vector });
                     }
-                    if execution.units == 0 {
+                    if last_units == 0 {
+                        // Prefix instructions in a batch must not hide the final
+                        // faulting instruction's zero-progress fuel charge.
                         // A handler repeatedly returning to an unchanged fault
                         // must still yield to the machine scheduler.
                         self.state.fuel = self.state.fuel.saturating_sub(1);
@@ -1056,5 +1173,76 @@ mod floating_boundary_tests {
         assert_eq!(handler.0, [(0x2e, 0x1002), (16, 0x1003)]);
         assert_eq!(m.state.x87.regs, registers);
         assert_eq!(m.stats.native_entries, 1);
+    }
+}
+
+#[cfg(test)]
+mod tiering_tests {
+    use super::*;
+    fn hot_machine() -> Machine {
+        let mut m = Machine::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
+            .unwrap();
+        m.write(0x1000, &[0x40, 0xc3]).unwrap();
+        m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
+        m.write(0x4f00, &0x3000u32.to_le_bytes()).unwrap();
+        let mut region = Region::new(0x1000, 2);
+        region.compile_strategy = CompileStrategy::Fast;
+        m.add_region(region).unwrap();
+        m.automatic_regions.insert(0x1000);
+        m.enable_auto_jit(true);
+        m.set_async_compilation(true);
+        m.state.eip = 0x1000;
+        m.state.regs[4] = 0x4f00;
+        m
+    }
+    fn collect(m: &mut Machine) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !m.pending_regions.is_empty() {
+            m.collect_compilations().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    #[test]
+    fn speed_compilation_keeps_fast_code_live_and_publishes_once() {
+        let mut m = hot_machine();
+        let entry = m.compiled[&0x1000].tail_entry;
+        m.record_native_work(0x1000, 16_383);
+        assert_eq!(m.stats.tier_up_requests, 0);
+        m.record_native_work(0x1000, 1);
+        assert_eq!(m.stats.tier_up_requests, 1);
+        assert_eq!(m.compiled[&0x1000].tail_entry, entry);
+        assert_eq!(m.regions[&0x1000].compile_strategy, CompileStrategy::Fast);
+        m.record_native_work(0x1000, 100_000);
+        assert_eq!(m.stats.tier_up_requests, 1);
+        collect(&mut m);
+        assert_eq!(m.regions[&0x1000].compile_strategy, CompileStrategy::Speed);
+        assert_eq!(m.stats.tier_up_publications, 1);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 1);
+    }
+    #[test]
+    fn stale_optimized_code_is_never_published() {
+        let mut m = hot_machine();
+        m.record_native_work(0x1000, 16_384);
+        m.write(0x1000, &[0x43, 0xc3]).unwrap();
+        collect(&mut m);
+        assert_eq!(m.stats.tier_up_publications, 0);
+        assert_eq!(m.stats.stale_compilations, 1);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 0);
+        assert_eq!(m.state.regs[3], 1);
+    }
+    #[test]
+    fn tiering_can_be_disabled_and_never_rewrites_explicit_regions() {
+        let mut m = hot_machine();
+        m.set_tiered_compilation(false);
+        m.record_native_work(0x1000, 100_000);
+        assert_eq!(m.stats.tier_up_requests, 0);
+        m.set_tiered_compilation(true);
+        m.automatic_regions.clear();
+        m.record_native_work(0x1000, 100_000);
+        assert_eq!(m.stats.tier_up_requests, 0);
     }
 }

@@ -5,7 +5,7 @@
 //! faults and unsupported forms therefore leave the instruction restartable.
 //! Undefined arithmetic flags are preserved rather than borrowed from the host.
 //! GS, segment/control registers and far transfers remain outside the flat model.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic as M, OpKind,
@@ -111,6 +111,7 @@ impl RepContinuation {
 /// Integer interpreter with a bounded cache shared by all entries in a memory.
 pub struct Interpreter {
     cache: HashMap<u32, Cached>,
+    blocks: HashMap<u32, DecodedBlock>,
     capacity: usize,
     decodes: u64,
 }
@@ -130,6 +131,7 @@ impl Interpreter {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             cache: HashMap::new(),
+            blocks: HashMap::new(),
             capacity,
             decodes: 0,
         }
@@ -137,6 +139,7 @@ impl Interpreter {
 
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.blocks.clear();
     }
 
     /// Number of decodes, including invalid, unsupported and inaccessible code.
@@ -165,10 +168,6 @@ impl Interpreter {
             };
         }
         let pc = state.eip;
-        if state.rep.as_ref().is_some_and(|r| r.pc != pc) {
-            state.rep = None;
-        }
-        let debug = state.eflags & (1 << 8) != 0;
         let decoded = if let Some(entry) = self.cache.get(&pc).filter(|e| e.valid(memory)) {
             entry.decoded
         } else {
@@ -183,87 +182,172 @@ impl Interpreter {
             }
             decoded
         };
-        let instruction = match decoded {
-            Decoded::Ready(i) => i,
-            Decoded::Stop(result) => {
-                return Execution {
-                    step: result,
-                    units: 0,
-                };
-            }
-            Decoded::Extended(i) => {
-                let step = crate::floating::execute(&i, state, memory)
-                    .unwrap_or(Step::Unsupported { pc, code: i.code() });
-                let completed = step == Step::Executed;
-                return Execution {
-                    step: if completed && debug {
-                        Step::Trap { pc, vector: 1 }
-                    } else {
-                        step
-                    },
-                    units: u32::from(completed),
-                };
-            }
-        };
-        if let Action::String(operation) = instruction.action {
-            return run_string(
-                state,
-                memory,
-                operation,
-                instruction.next,
-                max_units.min(256),
-                debug,
-            );
+        execute_decoded(decoded, state, memory, max_units)
+    }
+
+    /// Execute one bounded predecoded basic block. This is internal to Machine:
+    /// public step/run_chunk retain their single-instruction/REP contract.
+    pub(crate) fn run_block(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        max_units: u32,
+        stop: u32,
+        return_pad: Option<u32>,
+        native_entries: Option<&BTreeMap<u32, u32>>,
+    ) -> (Execution, u32) {
+        if max_units == 0 || self.capacity == 0 {
+            let execution = self.run_chunk(state, memory, max_units);
+            return (execution, execution.units);
         }
-        state.rep = None;
-        let mut tx = Transaction {
-            regs: state.regs,
-            flags: state.eflags,
-            eip: instruction.next,
-            fs_base: state.fs_base,
-            segments: state.segments,
-            pc,
-            write: None,
-            more_writes: Vec::new(),
-        };
-        let trap = match tx.execute(instruction.action, memory) {
-            Ok(trap) => trap,
-            Err(result) => {
-                return Execution {
-                    step: result,
-                    units: 0,
-                };
+        let pc = state.eip;
+        if !self
+            .blocks
+            .get(&pc)
+            .is_some_and(|block| block.valid(memory))
+        {
+            let block = DecodedBlock::fetch(memory, pc, &mut self.decodes);
+            // A block holds at most 32 instructions. Bound this independent cache
+            // in blocks, without clearing the public single-step decode cache.
+            if self.blocks.len() >= self.capacity.div_ceil(32) {
+                self.blocks.clear();
             }
-        };
-        for (address, width, value) in tx.write.into_iter().chain(tx.more_writes) {
-            // Permissions, mapping and the complete byte range were validated.
-            // The exclusive borrow prevents their changing between check/write.
-            if memory
-                .write(address, &value.to_le_bytes()[..width as usize])
-                .is_err()
+            self.blocks.insert(pc, block);
+        }
+        let block = &self.blocks[&pc];
+        let epoch = memory.epoch;
+        let mut units = 0;
+        let mut last_units = 0;
+        for &decoded in &block.instructions {
+            if units == max_units || state.eip == stop || return_pad == Some(state.eip) {
+                break;
+            }
+            // A native entry may lie in the middle of this cached fallthrough
+            // (notably the next REP after an x87 fallback). Do not interpret it.
+            if units != 0 && native_entries.is_some_and(|entries| entries.contains_key(&state.eip))
             {
-                return Execution {
-                    step: Step::WriteFault { pc, address },
-                    units: 0,
-                };
+                break;
+            }
+            let execution = execute_decoded(decoded, state, memory, max_units - units);
+            units += execution.units;
+            last_units = execution.units;
+            if execution.step != Step::Executed {
+                return (
+                    Execution {
+                        step: execution.step,
+                        units,
+                    },
+                    last_units,
+                );
+            }
+            // A guest store can patch the NEXT instruction in this very block.
+            // Never execute another cached instruction after executable memory
+            // changes, even when the block's original bytes validated on entry.
+            if memory.epoch != epoch {
+                break;
             }
         }
-        state.regs = tx.regs;
-        state.eflags = tx.flags;
-        state.eip = tx.eip;
-        Execution {
-            step: trap.map_or_else(
-                || {
-                    if debug {
-                        Step::Trap { pc, vector: 1 }
-                    } else {
-                        Step::Executed
-                    }
-                },
-                |vector| Step::Trap { pc, vector },
-            ),
-            units: 1,
+        (
+            Execution {
+                step: Step::Executed,
+                units,
+            },
+            last_units,
+        )
+    }
+}
+
+fn execute_decoded(
+    decoded: Decoded,
+    state: &mut CpuState,
+    memory: &mut Memory,
+    max_units: u32,
+) -> Execution {
+    let pc = state.eip;
+    if state.rep.as_ref().is_some_and(|r| r.pc != pc) {
+        state.rep = None;
+    }
+    let debug = state.eflags & (1 << 8) != 0;
+    let instruction = match decoded {
+        Decoded::Ready(i) => i,
+        Decoded::Stop(result) => {
+            return Execution {
+                step: result,
+                units: 0,
+            };
         }
+        Decoded::Extended(i) => {
+            let step = crate::floating::execute(&i, state, memory)
+                .unwrap_or(Step::Unsupported { pc, code: i.code() });
+            let completed = step == Step::Executed;
+            return Execution {
+                step: if completed && debug {
+                    Step::Trap { pc, vector: 1 }
+                } else {
+                    step
+                },
+                units: u32::from(completed),
+            };
+        }
+    };
+    if let Action::String(operation) = instruction.action {
+        return run_string(
+            state,
+            memory,
+            operation,
+            instruction.next,
+            max_units.min(256),
+            debug,
+        );
+    }
+    state.rep = None;
+    let mut tx = Transaction {
+        regs: state.regs,
+        flags: state.eflags,
+        eip: instruction.next,
+        fs_base: state.fs_base,
+        segments: state.segments,
+        pc,
+        write: None,
+        more_writes: Vec::new(),
+    };
+    let trap = match tx.execute(instruction.action, memory) {
+        Ok(trap) => trap,
+        Err(result) => {
+            return Execution {
+                step: result,
+                units: 0,
+            };
+        }
+    };
+    for (address, width, value) in tx.write.into_iter().chain(tx.more_writes) {
+        // Permissions, mapping and the complete byte range were validated.
+        // The exclusive borrow prevents their changing between check/write.
+        if memory
+            .write(address, &value.to_le_bytes()[..width as usize])
+            .is_err()
+        {
+            return Execution {
+                step: Step::WriteFault { pc, address },
+                units: 0,
+            };
+        }
+    }
+    state.regs = tx.regs;
+    state.eflags = tx.flags;
+    state.eip = tx.eip;
+    Execution {
+        step: trap.map_or_else(
+            || {
+                if debug {
+                    Step::Trap { pc, vector: 1 }
+                } else {
+                    Step::Executed
+                }
+            },
+            |vector| Step::Trap { pc, vector },
+        ),
+        units: 1,
     }
 }
 
@@ -283,7 +367,6 @@ struct Predecoded {
 #[derive(Clone, Copy)]
 struct Page {
     address: u32,
-    version: Option<u64>,
     permissions: u8,
     mapped: bool,
 }
@@ -294,16 +377,15 @@ impl Page {
         let index = memory.range(address, 1).ok().map(|r| r.start / PAGE_SIZE);
         Self {
             address,
-            version: index.map(|p| memory.versions[p]),
             permissions: index.map_or(0, |p| memory.perms[p]),
             mapped: index.is_some_and(|p| memory.mapped[p]),
         }
     }
     fn matches(self, memory: &Memory) -> bool {
         let current = Self::at(memory, self.address);
-        self.version == current.version
-            && self.permissions == current.permissions
-            && self.mapped == current.mapped
+        // Byte equality is checked by the cache owner. A version-only change
+        // (e.g. data elsewhere on this executable page) must not force redecoding.
+        self.permissions == current.permissions && self.mapped == current.mapped
     }
 }
 
@@ -383,6 +465,74 @@ fn fetch(memory: &Memory, pc: u32) -> Cached {
         Decoded::Extended(instruction)
     };
     entry
+}
+
+/// A contiguous basic block, including its terminating instruction. Validation
+/// retains byte comparison (cross-Memory/external-executor safety) and negative
+/// page dependencies. Only the frequency of validation changes, not its contract.
+struct DecodedBlock {
+    pc: u32,
+    instructions: Vec<Decoded>,
+    bytes: Vec<u8>,
+    pages: [Option<Page>; 2],
+}
+
+impl DecodedBlock {
+    fn valid(&self, memory: &Memory) -> bool {
+        self.pages.iter().flatten().all(|page| page.matches(memory))
+            && memory
+                .read(self.pc, self.bytes.len())
+                .is_ok_and(|bytes| bytes == self.bytes)
+    }
+
+    fn fetch(memory: &Memory, start: u32, decodes: &mut u64) -> Self {
+        let mut block = Self {
+            pc: start,
+            instructions: Vec::new(),
+            bytes: Vec::new(),
+            pages: [None; 2],
+        };
+        let mut pc = start;
+        let mut end = u64::from(start);
+        for _ in 0..32 {
+            *decodes += 1;
+            let entry = fetch(memory, pc);
+            for page in entry.pages.into_iter().flatten() {
+                if block.pages[0].is_none() {
+                    block.pages[0] = Some(page);
+                } else if block.pages[0].unwrap().address != page.address {
+                    block.pages[1] = Some(page);
+                }
+            }
+            end = end.max(u64::from(pc) + u64::from(entry.len));
+            block.instructions.push(entry.decoded);
+            let Decoded::Ready(instruction) = entry.decoded else {
+                break;
+            };
+            // Do not speculate across transfers, a restartable REP, or a flags
+            // change that can enable single stepping for the following instruction.
+            if matches!(
+                instruction.action,
+                Action::Branch(..)
+                    | Action::Loop(..)
+                    | Action::Call(..)
+                    | Action::Ret(..)
+                    | Action::Int(..)
+                    | Action::Ud2
+                    | Action::String(..)
+                    | Action::PopFlags(..)
+            ) || instruction.next <= pc
+            {
+                break;
+            }
+            pc = instruction.next;
+        }
+        block.bytes = memory
+            .read(start, (end - u64::from(start)) as usize)
+            .unwrap_or(&[])
+            .to_vec();
+        block
+    }
 }
 
 #[derive(Clone, Copy)]
