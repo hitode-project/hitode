@@ -1,0 +1,30 @@
+[package]
+name = "adv-jit"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Experimental x86-32 hot-region JIT with a shared-memory Unicorn fallback"
+
+[dependencies]
+libc = "0.2"
+pal-cpu = { path = "../../../pal-hle/crates/pal-cpu", default-features = false, optional = true }
+cranelift-codegen = "0.125"
+cranelift-frontend = "0.125"
+cranelift-jit = "0.125"
+cranelift-module = "0.125"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
+
+[features]
+pal = ["dep:pal-cpu"]
+
+[dev-dependencies]
+pal-machine = { path = "../../../pal-hle/crates/pal-machine" }
+pal-win32 = { path = "../../../pal-hle/crates/pal-win32" }
+
+[[example]]
+name = "boot_probe"
+required-features = ["pal"]
+
+[lints]
+workspace = true

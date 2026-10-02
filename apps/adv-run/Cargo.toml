@@ -1,0 +1,19 @@
+[package]
+name = "adv-run"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Run an x86 Windows guest through the ADV runtime"
+
+[dependencies]
+adv-runtime = { path = "../../crates/adv-runtime" }
+pal-machine = { path = "../../../pal-hle/crates/pal-machine" }
+png = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+pal-audio = { path = "../../../pal-hle/crates/pal-audio", features = ["device"] }
+log = "0.4"
+windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[lints]
+workspace = true

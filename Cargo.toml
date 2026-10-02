@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/adv-jit", "crates/adv-runtime", "apps/adv-run"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.dev.package.unicorn-engine-sys]
+opt-level = 3
+debug = false
+
+[profile.release]
+debug = "line-tables-only"

@@ -1,0 +1,6 @@
+LIBRARY fixture_probe
+EXPORTS
+    ProbeAdd @1
+    ProbeReadTls @2
+    ProbeSetTls @3
+    ProbeBase @4

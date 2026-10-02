@@ -1,0 +1,23 @@
+[package]
+name = "adv-runtime"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Guest GDI/DirectDraw software surfaces and a common presentation boundary"
+
+[dependencies]
+adv-jit = { path = "../adv-jit", features = ["pal"] }
+pal-cpu = { path = "../../../pal-hle/crates/pal-cpu", default-features = false }
+pal-machine = { path = "../../../pal-hle/crates/pal-machine" }
+pal-win32 = { path = "../../../pal-hle/crates/pal-win32" }
+pal-audio = { path = "../../../pal-hle/crates/pal-audio" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Foundation"] }
+
+[dev-dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
+png = "0.17"
+
+[lints]
+workspace = true

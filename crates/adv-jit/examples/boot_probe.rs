@@ -1,0 +1,35 @@
+//! Minimal loader probe; graphics and interactive frontend live in adv-run.
+use adv_jit::pal::JitCpu;
+use pal_machine::layout::PARK_ADDR;
+use pal_machine::loader::HostDir;
+use pal_machine::{Clock, Machine, Registry};
+use pal_win32::{Win32, Win32Config};
+use std::path::PathBuf;
+fn main() -> Result<(), String> {
+    let path = PathBuf::from(std::env::args().nth(1).ok_or("expected exe path")?);
+    let jit = std::env::args().nth(2).as_deref() != Some("unicorn");
+    let parent = path.parent().ok_or("no parent")?;
+    let name = path.file_name().ok_or("no exe name")?.to_string_lossy();
+    let mut registry = Registry::default();
+    pal_win32::register(&mut registry);
+    let mut m = Machine::new(
+        JitCpu::new(PARK_ADDR, jit)?,
+        registry,
+        Clock::virtual_time(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut config = Win32Config::new(parent, &name, PathBuf::from("target/probe-data"));
+    config.auto_dialog_ms = Some(50);
+    Win32::install(&mut m, config).map_err(|e| e.to_string())?;
+    let exe = m
+        .load(
+            &HostDir::new(parent, "C:\\Game"),
+            &format!("C:\\Game\\{name}"),
+        )
+        .map_err(|e| e.to_string())?;
+    m.start_process(exe).map_err(|e| e.to_string())?;
+    m.sys.call_limit = Some(50000);
+    let result = m.run_virtual(5_000_000);
+    println!("result={result:?}\nstats={:?}", m.cpu.stats());
+    Ok(())
+}
