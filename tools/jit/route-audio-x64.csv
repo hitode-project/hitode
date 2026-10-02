@@ -1,0 +1,3 @@
+"backend","residency","rate","channels","bits","bytes","pcm_fnv1a64"
+"jit","true","44100","2","16","1516696","0c19710c7a0a5043"
+"unicorn","false","44100","2","16","1516696","0c19710c7a0a5043"

@@ -1,0 +1,3 @@
+targets,iterations,native_entries,dispatch_ms,tail_ms,dispatch_ns_per_entry,tail_ns_per_entry,speedup,code_bytes
+1,200000,400001,5.235300,2.430900,13.088,6.077,2.154,3036
+64,200000,400001,19.071900,13.186800,47.680,32.967,1.446,90222
