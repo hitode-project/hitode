@@ -438,6 +438,73 @@ impl Memory {
         }
     }
 
+    /// Prepare a native guest memory operand before changing its registers or
+    /// flags. Validate the full range first, then resolve lazy file reads and
+    /// stage every COW snapshot before installing any private page. Prepared
+    /// file reads/stores cannot encounter a later first-touch IO failure while
+    /// the same execution owner retains this memory borrow.
+    ///
+    /// This does not expose an ordinary shared Rust slice. PCM still requires
+    /// matching byte atomics; executable-page stores stay in the cold lane.
+    pub fn prepare_native_access(
+        &mut self,
+        addr: u32,
+        len: usize,
+        write: bool,
+    ) -> Result<(), String> {
+        let range = self.committed(addr, len)?;
+        if !range.is_empty() {
+            let required = if write { WRITE } else { READ };
+            let permissions = &self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE];
+            if permissions.iter().any(|p| p & required == 0) {
+                return Err("native guest access permission fault".into());
+            }
+            if write && permissions.iter().any(|p| p & EXEC != 0) {
+                return Err("native executable-page stores require the cold lane".into());
+            }
+        }
+        self.prepare_file_range(&range, write)
+    }
+
+    fn prepare_file_range(
+        &mut self,
+        range: &std::ops::Range<usize>,
+        write: bool,
+    ) -> Result<(), String> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let mut private = Vec::new();
+        for (&index, storage) in self
+            .shared_pages
+            .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+        {
+            if let SharedPage::File {
+                page,
+                copy_on_write,
+            } = storage
+            {
+                if write && *copy_on_write {
+                    private.push((index, crate::backend::FilePage::new(page.snapshot()?)));
+                } else {
+                    page.prepare()?;
+                }
+            }
+        }
+        for (index, prepared) in private {
+            let Some(SharedPage::File {
+                page,
+                copy_on_write,
+            }) = self.shared_pages.get_mut(&index)
+            else {
+                unreachable!()
+            };
+            *page = prepared;
+            *copy_on_write = false;
+        }
+        Ok(())
+    }
+
     pub(crate) fn copy(&mut self, source: u32, destination: u32, len: usize) -> Result<(), String> {
         let src = self.committed(source, len)?;
         let dst = self.committed(destination, len)?;
@@ -504,34 +571,7 @@ impl Memory {
         // fallible page read and private COW snapshot before committing bytes,
         // so a later I/O failure cannot leave a restarted scalar store half done.
         if overlays && !range.is_empty() {
-            let mut private = Vec::new();
-            for (&index, storage) in self
-                .shared_pages
-                .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-            {
-                if let SharedPage::File {
-                    page,
-                    copy_on_write,
-                } = storage
-                {
-                    if *copy_on_write {
-                        private.push((index, crate::backend::FilePage::new(page.snapshot()?)));
-                    } else {
-                        page.prepare()?;
-                    }
-                }
-            }
-            for (index, prepared) in private {
-                let Some(SharedPage::File {
-                    page,
-                    copy_on_write,
-                }) = self.shared_pages.get_mut(&index)
-                else {
-                    unreachable!()
-                };
-                *page = prepared;
-                *copy_on_write = false;
-            }
+            self.prepare_file_range(&range, true)?;
         }
         if !range.is_empty()
             && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
@@ -763,6 +803,94 @@ mod linear_audio_tests {
 mod file_page_tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn native_preparation_checks_all_permissions_before_io_or_cow_detach() {
+        let calls = Rc::new(Cell::new(0));
+        let reads = calls.clone();
+        let first = crate::backend::FilePage::lazy(move || {
+            reads.set(reads.get() + 1);
+            Ok([0x17; PAGE_SIZE])
+        });
+        let second = crate::backend::FilePage::new([0x29; PAGE_SIZE]);
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        memory
+            .map_file_pages(
+                0x10000,
+                &[first.clone(), second.clone()],
+                READ | WRITE,
+                true,
+            )
+            .unwrap();
+        memory.protect(0x11000, PAGE_SIZE, READ).unwrap();
+        assert!(memory.prepare_native_access(0x10ffe, 4, true).is_err());
+        assert_eq!(calls.get(), 0);
+        assert!(!first.initialized());
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(true));
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(true));
+        assert!(!first.dirty());
+        assert!(!second.dirty());
+        // A read must not detach a COPY page or mark either original page dirty.
+        memory.prepare_native_access(0x10ffe, 4, false).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(true));
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(true));
+        assert!(!first.dirty());
+        assert!(!second.dirty());
+    }
+
+    #[test]
+    fn native_preparation_io_failure_preserves_all_cow_views_and_prepared_stores_do_no_io() {
+        let fail = Rc::new(Cell::new(true));
+        let injected = fail.clone();
+        let calls = Rc::new(Cell::new(0));
+        let reads = calls.clone();
+        let first = crate::backend::FilePage::new([0x17; PAGE_SIZE]);
+        let second = crate::backend::FilePage::lazy(move || {
+            reads.set(reads.get() + 1);
+            if injected.get() {
+                Err("injected native prepare IO failure".into())
+            } else {
+                Ok([0x29; PAGE_SIZE])
+            }
+        });
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        memory
+            .map_file_pages(
+                0x10000,
+                &[first.clone(), second.clone()],
+                READ | WRITE,
+                true,
+            )
+            .unwrap();
+        memory
+            .map_file_pages(0x20000, &[first.clone(), second.clone()], READ, false)
+            .unwrap();
+        assert!(memory.prepare_native_access(0x10ffe, 4, true).is_err());
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(true));
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(true));
+        assert_eq!(&first.snapshot().unwrap()[PAGE_SIZE - 2..], &[0x17; 2]);
+        assert!(!first.dirty());
+        assert!(!second.initialized());
+        fail.set(false);
+        memory.prepare_native_access(0x10ffe, 4, true).unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(false));
+        assert_eq!(memory.file_page_copy_on_write(0x11000), Some(false));
+        assert!(!first.dirty());
+        assert!(!second.dirty());
+        fail.set(true); // A prepared store cannot call the fallible initializer.
+        memory.write(0x10ffe, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(calls.get(), 2);
+        let mut changed = [0; 4];
+        let mut original = [0; 4];
+        memory.read_into(0x10ffe, &mut changed).unwrap();
+        memory.read_into(0x20ffe, &mut original).unwrap();
+        assert_eq!(changed, [1, 2, 3, 4]);
+        assert_eq!(original, [0x17, 0x17, 0x29, 0x29]);
+        assert!(!first.dirty());
+        assert!(!second.dirty());
+    }
 
     #[test]
     fn file_aliases_are_lazy_cow_is_per_page_and_bulk_helpers_stay_coherent() {
