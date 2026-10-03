@@ -52,6 +52,13 @@ pub const HOST_MODULES: &[&str] = &[
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
+fn begin_initialization(env: &mut adv_machine::Env<'_>, id: usize) {
+    crate::modules_mut(env.ext)
+        .get_mut(id)
+        .lifetime
+        .attach_started = true;
+}
+
 /// Guest-visible file access for the loader. `path` is exactly what the guest asked for
 /// (an import descriptor name, possibly relative, or a LoadLibrary argument).
 pub trait FileSource {
@@ -455,15 +462,13 @@ impl<'a> Loader<'a> {
         self.modules.get_mut(id).lifetime.mapped = true;
 
         self.modules.get_mut(id).lifetime.callbacks = tls_callbacks.clone();
-        // Startup's generic initializer chain runs before any application call;
-        // the dynamic frontend separately clears/marks pending attach entries.
-        self.modules.get_mut(id).lifetime.attach_started = true;
         for cb in tls_callbacks {
             self.inits.push(InitCall {
                 target: cb,
                 args: vec![base, DLL_PROCESS_ATTACH, 0],
                 what: format!("TLS callback of {key}"),
                 failure_exit: None,
+                begin: Some((begin_initialization, id)),
             });
         }
         let m = self.modules.get(id);
@@ -473,6 +478,7 @@ impl<'a> Loader<'a> {
                 args: vec![base, DLL_PROCESS_ATTACH, 0],
                 what: format!("DllMain of {key}"),
                 failure_exit: Some(0xc0000142),
+                begin: Some((begin_initialization, id)),
             });
         }
         self.modules.complete_ldr(self.cpu, id)?;

@@ -90,6 +90,11 @@ pub struct Sys {
     pub tls_images: Vec<TlsImage>,
     /// Initializers still to run on the main context (see [`Machine::start_process`]).
     pub process_init: VecDeque<InitCall>,
+    /// Frontend-supplied boundary calls after image initialization and before
+    /// the application entry point (for example, releasing its startup gate).
+    pub process_ready: Vec<InitCall>,
+    /// Frontend termination policy when the process entry point returns.
+    pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
     /// The last host calls, for failure reports.
     pub recent: RecentCalls,
     /// Host calls handled so far.
@@ -329,6 +334,19 @@ impl Sys {
 
     pub fn current_context(&self) -> &Context {
         &self.contexts[self.current as usize]
+    }
+
+    /// Stop peers before an OS frontend runs process termination callbacks.
+    /// No callback policy is embedded here; suspended host continuations drop
+    /// with their context and thread objects become signaled through State::Done.
+    pub fn terminate_other_contexts(&mut self, exit_code: u32) {
+        for context in &mut self.contexts {
+            if context.id != self.current && !context.is_done() {
+                context.state = State::Done { exit_code };
+                context.frames.clear();
+                context.start = None;
+            }
+        }
     }
 
     /// Grant already blocked event waits now, without running their continuations.
@@ -574,16 +592,25 @@ pub const INTERNAL_MODULE: &str = "<machine>";
 fn process_start(env: &mut Env<'_>) -> Outcome {
     fn next(env: &mut Env<'_>, last: u32) -> Outcome {
         match env.sys.process_init.pop_front() {
-            None => Outcome::Return(last),
+            None => match env.sys.process_return {
+                Some(finish) => finish(env, last),
+                None => Outcome::ExitProcess(last),
+            },
             Some(c) => {
                 log::debug!("process init: {} at {:#010x}", c.what, c.target);
+                if let Some((begin, token)) = c.begin {
+                    begin(env, token);
+                }
                 let failure_exit = c.failure_exit;
                 Outcome::call(c.target, c.args, move |env, r| {
                     let v = r.value();
                     if v == 0
                         && let Some(status) = failure_exit
                     {
-                        return Outcome::ExitProcess(status);
+                        return match env.sys.process_return {
+                            Some(finish) => finish(env, status),
+                            None => Outcome::ExitProcess(status),
+                        };
                     }
                     next(env, v)
                 })
@@ -998,6 +1025,8 @@ impl<B: Backend> Machine<B> {
             images: Images::default(),
             tls_images: Vec::new(),
             process_init: VecDeque::new(),
+            process_ready: Vec::new(),
+            process_return: None,
             recent: RecentCalls::new(32),
             host_calls: 0,
             call_limit: None,
@@ -1133,11 +1162,15 @@ impl<B: Backend> Machine<B> {
         name: &str,
     ) -> Result<CtxId, MemFault> {
         self.cpu.write_u32(PEB_ADDR + peb::IMAGE_BASE, base)?;
+        self.sys
+            .process_init
+            .extend(self.sys.process_ready.drain(..));
         self.sys.process_init.push_back(InitCall {
             target: entry,
             args: vec![],
             what: format!("entry of {name}"),
             failure_exit: None,
+            begin: None,
         });
         let start = self
             .sys
@@ -1239,11 +1272,16 @@ impl<B: Backend> Machine<B> {
             Parked::ExitThread(code) => {
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
-                if id == 0 {
+                if self.sys.contexts.iter().all(Context::is_done) {
                     return Some(RunResult::Exited(code));
                 }
             }
-            Parked::ExitProcess(code) => return Some(RunResult::Exited(code)),
+            Parked::ExitProcess(code) => {
+                ctx.state = State::Done { exit_code: code };
+                ctx.frames.clear();
+                self.sys.terminate_other_contexts(code);
+                return Some(RunResult::Exited(code));
+            }
             Parked::Fail(msg) => return Some(self.fail(msg)),
             Parked::Exception(v) => {
                 return Some(self.fail(format!("unhandled CPU exception/interrupt {v:#x}")));

@@ -1,4 +1,7 @@
 # policy	qualified export	omission category
+Guest	<win32>!startup_enter	personality-internal guest entry
+Guest	<win32>!startup_leave	personality-internal guest entry
+Guest	<win32>!thread_start	personality-internal guest entry
 Guest	ddraw.dll!AddRef	internal common COM dispatch
 Guest	ddraw.dll!QueryInterface	internal common COM dispatch
 Guest	ddraw.dll!Release	internal common COM dispatch
@@ -86,6 +89,9 @@ Guest	ws2_32.dll!#111	ordinal alias (WinMD is name-based)
 Guest	ws2_32.dll!#112	ordinal alias (WinMD is name-based)
 Guest	ws2_32.dll!#115	ordinal alias (WinMD is name-based)
 Guest	ws2_32.dll!#116	ordinal alias (WinMD is name-based)
+Native	<win32>!startup_enter	personality-internal guest entry
+Native	<win32>!startup_leave	personality-internal guest entry
+Native	<win32>!thread_start	personality-internal guest entry
 Native	ddraw.dll!AddRef	internal common COM dispatch
 Native	ddraw.dll!QueryInterface	internal common COM dispatch
 Native	ddraw.dll!Release	internal common COM dispatch

@@ -12,22 +12,135 @@ use adv_runtime::boot::Runtime;
 mod backend;
 
 #[test]
-fn repeated_load_dependency_release_failed_attach_and_pin_match_windows() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let directory = root.join("target/fixtures-module-lifecycle-tests");
-    let build = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(root.join("tools/fixtures/build-module-lifecycle.ps1"))
-        .arg("-OutputDirectory")
-        .arg(&directory)
-        .output()
+fn startup_gate_and_primary_thread_exit_match_windows() {
+    let directory = fixtures();
+    let exe = directory.join("fixture_thread_exit.exe");
+    let _ = std::fs::remove_file(directory.join("thread-exit.bin"));
+    let mut child = Command::new(&exe)
+        .current_dir(&directory)
+        .creation_flags(0x0800_0000)
+        .spawn()
         .unwrap();
-    assert!(
-        build.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(19));
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("native thread exit timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let golden = std::fs::read(directory.join("thread-exit.bin")).unwrap();
+    assert_eq!(
+        golden,
+        [0u32, 0, 7]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
     );
+    for name in ["jit", "interpreter", "unicorn"] {
+        let data = directory.join("thread-exit").join(name);
+        let _ = std::fs::remove_file(data.join("overlay/thread-exit.bin"));
+        let mut runtime =
+            Runtime::with_cpu(&exe, &data, backend::Cpu::new(name).unwrap(), 64, 32).unwrap();
+        runtime.machine.sys.clock = adv_machine::Clock::virtual_time();
+        runtime.machine.cpu.set_async_compilation(false);
+        let result = runtime.machine.run_virtual(10_000_000);
+        assert!(
+            matches!(result, RunResult::Exited(19)),
+            "{name}: {result:?}; {:?}",
+            runtime.machine.sys.recent_calls()
+        );
+        assert_eq!(
+            std::fs::read(data.join("overlay/thread-exit.bin")).unwrap(),
+            golden,
+            "{name}: worker ran before initialization or primary thread ended the process"
+        );
+    }
+}
+
+#[test]
+fn thread_and_process_notifications_match_windows_including_disabled_tls_modules() {
+    let directory = fixtures();
+    let _ = std::fs::remove_file(directory.join("module-notifications.bin"));
+    let exe = directory.join("fixture_module_notifications.exe");
+    let mut child = Command::new(&exe)
+        .current_dir(&directory)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("native notifications timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let decode = |bytes: Vec<u8>| {
+        bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let golden = decode(std::fs::read(directory.join("module-notifications.bin")).unwrap());
+    assert!(golden.ends_with(&[0x50100, 0x50280, 0x10280]));
+    for name in ["jit", "interpreter", "unicorn"] {
+        let data = directory.join("notifications").join(name);
+        let _ = std::fs::remove_file(data.join("overlay/module-notifications.bin"));
+        let mut runtime =
+            Runtime::with_cpu(&exe, &data, backend::Cpu::new(name).unwrap(), 64, 32).unwrap();
+        runtime.machine.sys.clock = adv_machine::Clock::virtual_time();
+        runtime.machine.cpu.set_async_compilation(false);
+        let result = runtime.machine.run_virtual(10_000_000);
+        assert!(
+            matches!(result, RunResult::Exited(0)),
+            "{name}: {result:?}; {:?}",
+            runtime.machine.sys.recent_calls()
+        );
+        let actual = decode(std::fs::read(data.join("overlay/module-notifications.bin")).unwrap());
+        assert_eq!(
+            actual, golden,
+            "{name}: thread/process notification sequence differs from Windows"
+        );
+    }
+}
+
+fn fixtures() -> std::path::PathBuf {
+    static DIRECTORY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let directory = root.join("target/fixtures-module-lifecycle-tests");
+            let build = Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(root.join("tools/fixtures/build-module-lifecycle.ps1"))
+                .arg("-OutputDirectory")
+                .arg(&directory)
+                .output()
+                .unwrap();
+            assert!(
+                build.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            );
+            directory
+        })
+        .clone()
+}
+
+#[test]
+fn repeated_load_dependency_release_failed_attach_and_pin_match_windows() {
+    let directory = fixtures();
+    let _ = std::fs::remove_file(directory.join("module-lifecycle.bin"));
     let exe = directory.join("fixture_module_lifecycle.exe");
     let mut child = Command::new(&exe)
         .current_dir(&directory)
@@ -61,6 +174,7 @@ fn repeated_load_dependency_release_failed_attach_and_pin_match_windows() {
     );
     for name in ["jit", "interpreter", "unicorn"] {
         let data = directory.join(name);
+        let _ = std::fs::remove_file(data.join("overlay/module-lifecycle.bin"));
         let mut runtime =
             Runtime::with_cpu(&exe, &data, backend::Cpu::new(name).unwrap(), 64, 32).unwrap();
         runtime.machine.sys.clock = adv_machine::Clock::virtual_time();

@@ -45,6 +45,7 @@ fn initializer_failure_policy_is_owned_by_the_frontend_and_stops_process_entry()
             args: vec![],
             what: "frontend initializer with no API-specific name".into(),
             failure_exit: Some(0xc0000142),
+            begin: None,
         });
         machine
             .start_main(0x400000, 0x400010, 0x10000, "authored")

@@ -162,7 +162,7 @@ fn ensure_worker(env: &mut Env<'_>) -> bool {
         env.sys.objects.close(wake);
         return false;
     }
-    let id = match env.sys.spawn(env.cpu, "MM", entry, &[], 0x10_0000) {
+    let id = match crate::kernel32::spawn_thread(env, "multimedia callbacks", entry, 0, 0x10_0000) {
         Ok(id) => id,
         Err(_) => {
             env.sys.objects.close(wake);

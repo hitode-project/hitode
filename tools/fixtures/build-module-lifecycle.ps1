@@ -30,4 +30,10 @@ foreach ($variant in $variants) {
 }
 Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module_lifecycle.c'), "/Fo$OutputDirectory/module_lifecycle.obj"))
 Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_lifecycle.exe", "$OutputDirectory/module_lifecycle.obj", 'kernel32.lib'))
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module_notifications.c'), "/Fo$OutputDirectory/module_notifications.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_notifications.exe", "$OutputDirectory/module_notifications.obj", 'kernel32.lib'))
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'startup_thread_dll.c'), "/Fo$OutputDirectory/startup_thread.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/dll', '/base:0x18000000', '/entry:DllMain@12', "/out:$OutputDirectory/lifecycle_startup.dll", "/implib:$OutputDirectory/lifecycle_startup.lib", "$OutputDirectory/startup_thread.obj", 'kernel32.lib'))
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'thread_exit.c'), "/Fo$OutputDirectory/thread_exit.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_thread_exit.exe", "$OutputDirectory/thread_exit.obj", 'lifecycle_startup.lib', 'kernel32.lib'))
 Write-Output "Built x86 module lifecycle fixtures in $OutputDirectory"

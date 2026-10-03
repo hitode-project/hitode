@@ -10,6 +10,7 @@ pub use handle::ProcessHandle;
 mod memory;
 mod module;
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
+pub(crate) use module::{install_startup, spawn_thread};
 mod nlsapi;
 mod osversion;
 mod process;

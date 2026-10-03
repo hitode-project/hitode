@@ -136,6 +136,35 @@ impl Modules {
         &self.list[&id]
     }
 
+    pub fn try_get(&self, id: ModuleId) -> Option<&Module> {
+        self.list.get(&id)
+    }
+
+    /// Dependency-first initialization order; callers reverse it for detach.
+    pub fn initialization_order(&self) -> Vec<ModuleId> {
+        let mut seen = BTreeSet::new();
+        let mut result = Vec::new();
+        for (id, _) in self.iter() {
+            let mut pending = vec![(id, false)];
+            while let Some((id, visited)) = pending.pop() {
+                if visited {
+                    result.push(id);
+                } else if self.try_get(id).is_some() && seen.insert(id) {
+                    pending.push((id, true));
+                    pending.extend(
+                        self.get(id)
+                            .lifetime
+                            .dependencies
+                            .iter()
+                            .rev()
+                            .map(|&dependency| (dependency, false)),
+                    );
+                }
+            }
+        }
+        result
+    }
+
     pub fn get_mut(&mut self, id: ModuleId) -> &mut Module {
         self.list.get_mut(&id).expect("live module id")
     }

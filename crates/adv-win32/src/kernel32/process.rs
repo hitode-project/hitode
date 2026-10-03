@@ -10,7 +10,7 @@ use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 
 fn exit_process(env: &mut Env<'_>) -> Outcome {
-    Outcome::ExitProcess(env.arg(0))
+    super::module::exit_process(env, env.arg(0))
 }
 
 fn terminate_process(env: &mut Env<'_>) -> Outcome {
@@ -273,11 +273,11 @@ fn create_thread(env: &mut Env<'_>) -> Outcome {
         return Outcome::Fail("CreateThread(CREATE_SUSPENDED) not implemented".into());
     }
     let name = format!("T{}", env.sys.contexts.len());
-    match env.sys.spawn(
-        env.cpu,
+    match super::module::spawn_thread(
+        env,
         &name,
         start,
-        &[param],
+        param,
         if stack == 0 { 0x10_0000 } else { stack },
     ) {
         Ok(id) => {
@@ -410,7 +410,9 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "ExitProcess", 1, exit_process);
     stdcall(reg, K32, "TerminateProcess", 2, terminate_process);
-    stdcall(reg, K32, "ExitThread", 1, |e| Outcome::ExitThread(e.arg(0)));
+    stdcall(reg, K32, "ExitThread", 1, |e| {
+        super::module::exit_thread(e, e.arg(0))
+    });
     stdcall(reg, K32, "CreateThread", 6, create_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);
     stdcall(reg, K32, "SetThreadPriority", 2, |_| Outcome::Return(1));

@@ -80,6 +80,15 @@ fn auto_reset_grant_cannot_be_stolen_or_revoked_before_waiter_resumes() {
     );
     assert!(machine.sys.reset_event(event));
     assert_eq!(machine.sys.context(0).state_name(), "Ready");
+    assert!(matches!(
+        machine.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    assert_eq!(machine.sys.context(0).state_name(), "Done");
+    assert_eq!(machine.sys.context(1).state_name(), "Blocked");
+    assert!(machine.sys.set_event(event));
     assert!(matches!(machine.run(), RunResult::Exited(0)));
 }
 

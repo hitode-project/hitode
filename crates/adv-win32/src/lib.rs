@@ -84,6 +84,8 @@ pub struct Win32 {
     pub statics: HashMap<&'static str, u32>,
     /// Common waitable mutex; guest initializer continuations retain ownership.
     pub(crate) loader_lock: Option<u32>,
+    pub(crate) exiting_threads: std::collections::BTreeSet<adv_machine::CtxId>,
+    pub(crate) process_exiting: bool,
 }
 
 /// Standard handles (the values old Windows consoles used).
@@ -110,12 +112,15 @@ impl Win32 {
             unhandled_filter: 0,
             statics: HashMap::new(),
             loader_lock: None,
+            exiting_threads: Default::default(),
+            process_exiting: false,
             user: user32::User::new(&mut m.sys.objects, cfg.screen, cfg.auto_dialog_ms)
                 .ok_or(MemFault { addr: 0, len: 0 })?,
             gdi: gdi32::Gdi::default(),
             cfg,
         };
         m.ext.insert(w);
+        kernel32::install_startup(m)?;
         m.ext.insert(heaps);
         gdi32::font::install(m);
         user32::install(m)?;

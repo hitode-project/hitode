@@ -12,7 +12,11 @@ pub struct InitCall {
     /// Optional process status if this initializer returns zero. The image/OS
     /// frontend chooses the policy; the machine never interprets API names.
     pub failure_exit: Option<u32>,
+    /// Optional frontend observation immediately before entering guest code.
+    pub begin: Option<(InitBegin, usize)>,
 }
+
+pub type InitBegin = fn(&mut crate::Env<'_>, usize);
 
 /// Static TLS of one image (`__declspec(thread)` data).
 #[derive(Clone, Debug)]

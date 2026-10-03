@@ -13,6 +13,9 @@ use super::K32;
 use crate::util::{IntOrStr, cstr, err, put_cstr, put_wstr, set_last_error, wstr};
 use crate::{Win32, stdcall};
 
+mod notifications;
+pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn_thread};
+
 fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
     match outcome {
         Outcome::Call { target, args, then } => Outcome::call(target, args, move |env, resume| {
@@ -48,9 +51,9 @@ fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
     }
 }
 
-fn locked(env: &mut Env<'_>, operation: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Outcome {
-    let handle = match env.ext.get::<Win32>().loader_lock {
-        Some(handle) => handle,
+fn loader_mutex(env: &mut Env<'_>) -> Option<u32> {
+    match env.ext.get::<Win32>().loader_lock {
+        Some(handle) => Some(handle),
         None => {
             let handle = env.sys.objects.insert(Object::Mutex {
                 owner: None,
@@ -58,11 +61,17 @@ fn locked(env: &mut Env<'_>, operation: impl FnOnce(&mut Env<'_>) -> Outcome + '
             });
             if handle == 0 {
                 set_last_error(env, err::NOT_ENOUGH_MEMORY);
-                return Outcome::Return(0);
+                return None;
             }
             env.ext.get_mut::<Win32>().loader_lock = Some(handle);
-            handle
+            Some(handle)
         }
+    }
+}
+
+fn locked(env: &mut Env<'_>, operation: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Outcome {
+    let Some(handle) = loader_mutex(env) else {
+        return Outcome::Return(0);
     };
     if env.sys.try_acquire_objects(&[handle], false).is_some() {
         let result = operation(env);
@@ -141,6 +150,7 @@ fn detach_calls(env: &Env<'_>, id: ModuleId) -> VecDeque<InitCall> {
             args: vec![module.base, 0, 0],
             what: format!("detach {}", module.name),
             failure_exit: None,
+            begin: None,
         })
         .collect()
 }
@@ -169,12 +179,10 @@ fn run_inits(
         None => Outcome::Return(ret),
         Some(c) => {
             log::debug!("LoadLibrary init: {}", c.what);
-            let module = adv_os::modules(env.ext).by_handle(c.args[0]).unwrap();
-            let is_dllmain = adv_os::modules(env.ext).get(module).entry == c.target;
-            adv_os::modules_mut(env.ext)
-                .get_mut(module)
-                .lifetime
-                .attach_started = true;
+            let is_dllmain = c.failure_exit.is_some();
+            if let Some((begin, token)) = c.begin {
+                begin(env, token);
+            }
             Outcome::call(c.target, c.args, move |env, resume| {
                 if is_dllmain && resume.value() == 0 {
                     let ids = match adv_os::modules_mut(env.ext).release(env.cpu, root) {
@@ -482,6 +490,27 @@ fn sizeof_resource(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    stdcall(
+        reg,
+        notifications::INTERNAL,
+        notifications::THREAD_START,
+        2,
+        notifications::thread_start,
+    );
+    stdcall(
+        reg,
+        notifications::INTERNAL,
+        "startup_enter",
+        0,
+        notifications::startup_enter,
+    );
+    stdcall(
+        reg,
+        notifications::INTERNAL,
+        "startup_leave",
+        0,
+        notifications::startup_leave,
+    );
     stdcall(reg, K32, "LoadLibraryA", 1, |e| {
         let n = arg_a(e, 0);
         locked(e, move |e| load_library(e, n))
@@ -518,7 +547,12 @@ pub(super) fn register(reg: &mut Registry) {
                 set_last_error(e, err::MOD_NOT_FOUND);
                 return Outcome::Return(0);
             };
-            adv_os::modules_mut(e.ext).get_mut(id).lifetime.thread_calls = false;
+            let module = adv_os::modules_mut(e.ext).get_mut(id);
+            // The native fixture keeps notifications for a dynamically loaded
+            // static-TLS DLL even though this call reports success.
+            if module.lifetime.tls_index.is_none() {
+                module.lifetime.thread_calls = false;
+            }
             Outcome::Return(1)
         })
     });

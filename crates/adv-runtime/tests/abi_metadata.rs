@@ -7,7 +7,11 @@ fn omission_reason(name: &str) -> &'static str {
         "codec ABI outside Windows SDK"
     } else if export.starts_with('#') {
         "ordinal alias (WinMD is name-based)"
-    } else if export.starts_with('<') || export.starts_with("__pal_") {
+    } else if export.starts_with('<')
+        || export.starts_with("__pal_")
+        || module == "<win32>"
+            && matches!(export, "startup_enter" | "startup_leave" | "thread_start")
+    {
         "personality-internal guest entry"
     } else if module == "ddraw.dll"
         && [
