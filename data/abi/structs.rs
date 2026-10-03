@@ -13,7 +13,9 @@ const _: () = assert!(core::mem::offset_of!(FILETIME, dwHighDateTime) == 4);
 impl crate::GuestArg for FILETIME {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 2;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
+        args.pod()
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -40,7 +42,9 @@ const _: () = assert!(core::mem::offset_of!(SYSTEMTIME, wMilliseconds) == 14);
 impl crate::GuestArg for SYSTEMTIME {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 4;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
+        args.pod()
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -55,7 +59,9 @@ const _: () = assert!(core::mem::offset_of!(POINT, y) == 4);
 impl crate::GuestArg for POINT {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 2;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
+        args.pod()
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -74,7 +80,9 @@ const _: () = assert!(core::mem::offset_of!(RECT, bottom) == 12);
 impl crate::GuestArg for RECT {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 4;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
+        args.pod()
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -91,5 +99,7 @@ const _: () = assert!(core::mem::offset_of!(SECURITY_ATTRIBUTES, bInheritHandle)
 impl crate::GuestArg for SECURITY_ATTRIBUTES {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 3;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
+        args.pod()
+    }
 }

@@ -1,5 +1,5 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
-use adv_abi::Registry;
+use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
 use adv_machine::{Conv, Env, Machine, Outcome};
@@ -290,6 +290,25 @@ pub fn register(reg: &mut Registry) {
             );
         }
     }
+}
+
+/// The same no-driver failure used before the device personality is installed.
+/// Kept in the DirectSound front; runtime compatibility assembly owns no API behavior.
+pub fn register_unavailable(registry: &mut Registry) {
+    registry.register(unavailable_create_ABI);
+    registry.register(unavailable_create8_ABI);
+    registry.add("dsound.dll", "#1", unavailable_create_ABI.conv, unavailable_create_ABI.handler);
+}
+
+#[win32(dsound, name = "DirectSoundCreate", level = safe_fail)]
+fn unavailable_create(env: &mut Env<'_>, _device: GuestPtr<()>, output: GuestPtr<u32>, _outer: GuestPtr<()>) -> Outcome {
+    if let Err(error) = env.cpu.write_u32(output.addr(), 0) { return Outcome::Fail(error.to_string()); }
+    Outcome::Return(0x8878_0078)
+}
+
+#[win32(dsound, name = "DirectSoundCreate8", level = safe_fail)]
+fn unavailable_create8(env: &mut Env<'_>, device: GuestPtr<()>, output: GuestPtr<u32>, outer: GuestPtr<()>) -> Outcome {
+    unavailable_create(env, device, output, outer)
 }
 pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     let trace = std::env::var_os("ADV_AUDIO_TRACE")

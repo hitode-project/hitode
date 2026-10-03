@@ -2,6 +2,7 @@
 //! ([`controls`]) and dialogs ([`dialog`]), plus resources, input state, monitors and the
 //! formatting/message-box helpers Game.exe uses.
 
+pub mod compat;
 pub mod controls;
 pub mod dialog;
 pub mod host_input;
@@ -361,7 +362,12 @@ pub fn register(reg: &mut Registry) {
     menu::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     // WINAPIV is cdecl with a two-argument mandatory prefix, not a fixed signature.
-    reg.add(USER32, "wsprintfA", Conv::CdeclVariadic { fixed: 2 }, wsprintf_a);
+    reg.add(
+        USER32,
+        "wsprintfA",
+        Conv::CdeclVariadic { fixed: 2 },
+        wsprintf_a,
+    );
     s(reg, "wvsprintfA", 3, wvsprintf_a);
     s(reg, "MessageBoxA", 4, message_box_a);
     s(reg, "MessageBeep", 1, |_| Outcome::Return(1));

@@ -2,15 +2,10 @@
 //! Windows ACM is used solely by the repository's native differential fixture.
 use std::collections::BTreeMap;
 
-use adv_abi::Registry;
+use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Guest, GuestExt, Prot};
+use adv_device::codec::{Codec, Decoder, DecoderConfig, PcmEncoding};
 use adv_machine::{Conv, Env, Outcome};
-use symphonia::core::audio::{Channels, SampleBuffer};
-use symphonia::core::codecs::{
-    CODEC_TYPE_ADPCM_IMA_WAV, CODEC_TYPE_ADPCM_MS, CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_U8,
-    CodecParameters, Decoder, DecoderOptions,
-};
-use symphonia::core::formats::Packet;
 
 const INVALID_HANDLE: u32 = 5;
 const NO_MEMORY: u32 = 7;
@@ -124,29 +119,23 @@ impl Format {
         }
         Ok(format)
     }
-    fn decoder(&self) -> Result<Box<dyn Decoder>, u32> {
+    fn decoder(&self) -> Result<Decoder, u32> {
         let codec = match (self.tag, self.bits) {
-            (1, 8) => CODEC_TYPE_PCM_U8,
-            (1, 16) => CODEC_TYPE_PCM_S16LE,
-            (2, _) => CODEC_TYPE_ADPCM_MS,
-            (0x11, _) => CODEC_TYPE_ADPCM_IMA_WAV,
+            (1, 8) => Codec::PcmU8,
+            (1, 16) => Codec::PcmS16Le,
+            (2, _) => Codec::MicrosoftAdpcm,
+            (0x11, _) => Codec::ImaAdpcm,
             _ => return Err(NOT_POSSIBLE),
         };
-        let mut parameters = CodecParameters::new();
-        parameters
-            .for_codec(codec)
-            .with_sample_rate(self.rate)
-            .with_channels(if self.channels == 1 {
-                Channels::FRONT_LEFT
-            } else {
-                Channels::FRONT_LEFT | Channels::FRONT_RIGHT
-            })
-            .with_bits_per_sample(u32::from(self.bits))
-            .with_frames_per_block(u64::from(self.frames_per_block))
-            .with_max_frames_per_packet(self.packet_frames() as u64);
-        symphonia::default::get_codecs()
-            .make(&parameters, &DecoderOptions::default())
-            .map_err(|_| NOT_POSSIBLE)
+        Decoder::new(DecoderConfig {
+            codec,
+            sample_rate: self.rate,
+            channels: self.channels,
+            bits_per_sample: self.bits,
+            frames_per_block: self.frames_per_block,
+            max_frames_per_packet: self.packet_frames(),
+        })
+        .map_err(|_| NOT_POSSIBLE)
     }
     fn packet_frames(&self) -> usize {
         if self.tag == 1 {
@@ -203,9 +192,8 @@ impl Header {
 struct Stream {
     source: Format,
     destination: Format,
-    decoder: Box<dyn Decoder>,
+    decoder: Decoder,
     headers: BTreeMap<u32, Header>,
-    timestamp: u64,
 }
 #[derive(Default)]
 struct Acm {
@@ -330,15 +318,13 @@ fn open(e: &mut Env<'_>) -> Result<(), u32> {
             destination,
             decoder,
             headers: BTreeMap::new(),
-            timestamp: 0,
         },
     );
     e.cpu
         .write_u32(output, handle)
         .map_err(|_| INVALID_PARAMETER)
 }
-fn size(e: &mut Env<'_>) -> Result<(), u32> {
-    let (handle, input, output, flags) = (e.arg(0), e.arg(1), e.arg(2), e.arg(3));
+fn size_impl(e: &mut Env<'_>, handle: u32, input: u32, output: u32, flags: u32) -> Result<(), u32> {
     if output == 0 || !e.cpu.accessible(output, 4, Prot::WRITE) {
         return Err(INVALID_PARAMETER);
     }
@@ -445,7 +431,6 @@ fn convert(e: &mut Env<'_>) -> Result<(), u32> {
     write_word(e.cpu, address, 36, 0)?;
     if flags & 16 != 0 {
         stream.decoder.reset();
-        stream.timestamp = 0;
     }
     let source_block = usize::from(stream.source.block);
     let output_block =
@@ -477,21 +462,16 @@ fn convert(e: &mut Env<'_>) -> Result<(), u32> {
     } else {
         source_block
     };
+    let encoding = if stream.destination.bits == 16 {
+        PcmEncoding::S16Le
+    } else {
+        PcmEncoding::U8
+    };
     for chunk in source.chunks(chunks) {
-        let packet = Packet::new_from_slice(0, stream.timestamp, frames as u64, chunk);
-        let audio = stream.decoder.decode(&packet).map_err(|_| NOT_POSSIBLE)?;
-        if stream.destination.bits == 16 {
-            let mut buffer = SampleBuffer::<i16>::new(audio.capacity() as u64, *audio.spec());
-            buffer.copy_interleaved_ref(audio);
-            for sample in buffer.samples() {
-                output.extend_from_slice(&sample.to_le_bytes());
-            }
-        } else {
-            let mut buffer = SampleBuffer::<u8>::new(audio.capacity() as u64, *audio.spec());
-            buffer.copy_interleaved_ref(audio);
-            output.extend_from_slice(buffer.samples());
-        }
-        stream.timestamp += frames as u64;
+        stream
+            .decoder
+            .decode_into(chunk, frames as u64, encoding, &mut output)
+            .map_err(|_| NOT_POSSIBLE)?;
     }
     if output.len() != blocks * output_block {
         return Err(NOT_POSSIBLE);
@@ -508,12 +488,11 @@ fn convert(e: &mut Env<'_>) -> Result<(), u32> {
         (header.status | DONE | PREPARED) & !0x100000,
     )
 }
-fn close(e: &mut Env<'_>) -> Result<(), u32> {
-    if e.arg(1) != 0 {
+fn close_impl(e: &mut Env<'_>, handle: u32, flags: u32) -> Result<(), u32> {
+    if flags != 0 {
         return Err(INVALID_FLAG);
     }
     ensure(e);
-    let handle = e.arg(0);
     e.ext
         .get_mut::<Acm>()
         .streams
@@ -532,9 +511,20 @@ pub fn register(registry: &mut Registry) {
     }
     add!("acmFormatSuggest", 5, suggest);
     add!("acmStreamOpen", 8, open);
-    add!("acmStreamSize", 4, size);
+    registry.register(size_ABI);
     add!("acmStreamPrepareHeader", 3, prepare);
     add!("acmStreamConvert", 3, convert);
     add!("acmStreamUnprepareHeader", 3, unprepare);
-    add!("acmStreamClose", 2, close);
+    registry.register(close_ABI);
+}
+
+#[win32(msacm32, name = "acmStreamSize", level = implement)]
+fn size(env: &mut Env<'_>, stream: Handle, input: u32, output: GuestPtr<u32>, flags: u32) -> u32 {
+    size_impl(env, stream.0, input, output.addr(), flags)
+        .err()
+        .unwrap_or(0)
+}
+#[win32(msacm32, name = "acmStreamClose", level = implement)]
+fn close(env: &mut Env<'_>, stream: Handle, flags: u32) -> u32 {
+    close_impl(env, stream.0, flags).err().unwrap_or(0)
 }

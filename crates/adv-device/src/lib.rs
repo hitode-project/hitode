@@ -4,6 +4,7 @@ mod actor;
 #[cfg(feature = "device")]
 mod capture;
 pub mod clock;
+pub mod codec;
 #[cfg(feature = "device")]
 mod device;
 pub mod mixer;

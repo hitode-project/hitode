@@ -39,3 +39,4 @@ pub fn register(reg: &mut Registry) {
     time::register(reg);
     toolhelp::register(reg);
 }
+pub mod unsupported_process;

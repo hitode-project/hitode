@@ -26,12 +26,13 @@ RULES: dict[str, set[str]] = {
     "adv-dx": {"adv-os", "adv-device"},
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync"},
+    "adv-run": {"adv-shell"},
     "adv-tune": {"adv-abi", "adv-device"},
     # Test support: reachable only from dev-dependencies.
     "adv-unicorn": {"adv-cpu"},
     "adv-samples": {"adv-pe"},
 }
-ALIASES = {"adv-run": "adv-shell"}
+ALIASES: dict[str, str] = {}
 TEST_ONLY = {"adv-unicorn", "adv-samples"}
 TRANSITIONAL: dict[tuple[str, str], str] = {}
 

@@ -78,24 +78,18 @@ pub(crate) fn register(registry: &mut Registry) {
     ] {
         registry.add("gdi32.dll", name, Conv::Stdcall { argc }, font_call);
     }
-    registry.add(
-        "gdi32.dll",
-        "SelectObject",
-        Conv::Stdcall { argc: 2 },
-        select_object,
-    );
-    registry.add(
-        "gdi32.dll",
-        "DeleteObject",
-        Conv::Stdcall { argc: 1 },
-        delete_object,
-    );
-    registry.add(
-        "gdi32.dll",
-        "DeleteDC",
-        Conv::Stdcall { argc: 1 },
-        delete_dc,
-    );
+    for (name, handler) in [
+        ("SelectObject", select_object as Handler),
+        ("DeleteObject", delete_object as Handler),
+        ("DeleteDC", delete_dc as Handler),
+    ] {
+        // These decorators may delegate to graphics_call. Preserve the bound
+        // operation/argument descriptor instead of erasing it during wrapping.
+        let original = registry
+            .get("gdi32.dll", name)
+            .expect("GDI registered before fonts");
+        registry.add_with_data("gdi32.dll", name, original.conv, handler, original.data);
+    }
 }
 
 pub(crate) fn install<B: adv_cpu::backend::Backend>(machine: &mut adv_machine::Machine<B>) {

@@ -1,8 +1,6 @@
 //! Print measured host waits without timing assertions or changing guest time.
 #[cfg(windows)]
-#[path = "../src/window.rs"]
-#[allow(dead_code, unused_imports)]
-mod window;
+use adv_shell::window;
 
 #[cfg(windows)]
 fn main() {

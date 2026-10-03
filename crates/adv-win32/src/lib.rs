@@ -164,4 +164,8 @@ pub(crate) fn stdcall(reg: &mut Registry, module: &str, name: &str, argc: u8, h:
 }
 
 pub mod avifil32;
+pub mod compat;
+pub mod imm32;
+pub mod msacm32;
 pub mod msvcrt;
+pub mod ole32;

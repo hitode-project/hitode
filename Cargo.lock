@@ -53,6 +53,7 @@ dependencies = [
  "cpal",
  "log",
  "rubato",
+ "symphonia",
 ]
 
 [[package]]
@@ -107,12 +108,9 @@ dependencies = [
 name = "adv-run"
 version = "0.1.0"
 dependencies = [
- "adv-device",
  "adv-machine",
- "adv-os",
  "adv-runtime",
- "adv-sync",
- "log",
+ "adv-shell",
  "png",
  "windows-sys 0.60.2",
 ]
@@ -145,6 +143,20 @@ name = "adv-samples"
 version = "0.1.0"
 dependencies = [
  "adv-pe",
+]
+
+[[package]]
+name = "adv-shell"
+version = "0.1.0"
+dependencies = [
+ "adv-device",
+ "adv-machine",
+ "adv-os",
+ "adv-runtime",
+ "adv-sync",
+ "log",
+ "png",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -629,12 +641,6 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "extended"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
 name = "fallible-iterator"
@@ -1323,7 +1329,6 @@ dependencies = [
  "symphonia-codec-pcm",
  "symphonia-codec-vorbis",
  "symphonia-core",
- "symphonia-format-riff",
  "symphonia-metadata",
 ]
 
@@ -1367,18 +1372,6 @@ dependencies = [
  "bytemuck",
  "lazy_static",
  "log",
-]
-
-[[package]]
-name = "symphonia-format-riff"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2d7c3df0e7d94efb68401d81906eae73c02b40d5ec1a141962c592d0f11a96f"
-dependencies = [
- "extended",
- "log",
- "symphonia-core",
- "symphonia-metadata",
 ]
 
 [[package]]
