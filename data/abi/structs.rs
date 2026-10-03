@@ -13,9 +13,7 @@ const _: () = assert!(core::mem::offset_of!(FILETIME, dwHighDateTime) == 4);
 impl crate::GuestArg for FILETIME {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 2;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
-        args.pod()
-    }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -42,9 +40,7 @@ const _: () = assert!(core::mem::offset_of!(SYSTEMTIME, wMilliseconds) == 14);
 impl crate::GuestArg for SYSTEMTIME {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 4;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
-        args.pod()
-    }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -59,9 +55,7 @@ const _: () = assert!(core::mem::offset_of!(POINT, y) == 4);
 impl crate::GuestArg for POINT {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 2;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
-        args.pod()
-    }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -80,9 +74,7 @@ const _: () = assert!(core::mem::offset_of!(RECT, bottom) == 12);
 impl crate::GuestArg for RECT {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 4;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
-        args.pod()
-    }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -99,7 +91,380 @@ const _: () = assert!(core::mem::offset_of!(SECURITY_ATTRIBUTES, bInheritHandle)
 impl crate::GuestArg for SECURITY_ATTRIBUTES {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 3;
-    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> {
-        args.pod()
-    }
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DPRESENT_PARAMETERS {
+    pub BackBufferWidth: u32,
+    pub BackBufferHeight: u32,
+    pub BackBufferFormat: u32,
+    pub BackBufferCount: u32,
+    pub MultiSampleType: i32,
+    pub MultiSampleQuality: u32,
+    pub SwapEffect: i32,
+    pub hDeviceWindow: u32,
+    pub Windowed: i32,
+    pub EnableAutoDepthStencil: i32,
+    pub AutoDepthStencilFormat: u32,
+    pub Flags: u32,
+    pub FullScreen_RefreshRateInHz: u32,
+    pub PresentationInterval: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DPRESENT_PARAMETERS>() == 56);
+const _: () = assert!(core::mem::align_of::<D3DPRESENT_PARAMETERS>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, BackBufferWidth) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, BackBufferHeight) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, BackBufferFormat) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, BackBufferCount) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, MultiSampleType) == 16);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, MultiSampleQuality) == 20);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, SwapEffect) == 24);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, hDeviceWindow) == 28);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, Windowed) == 32);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, EnableAutoDepthStencil) == 36);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, AutoDepthStencilFormat) == 40);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, Flags) == 44);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, FullScreen_RefreshRateInHz) == 48);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENT_PARAMETERS, PresentationInterval) == 52);
+impl crate::GuestArg for D3DPRESENT_PARAMETERS {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 14;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DLOCKED_RECT {
+    pub Pitch: i32,
+    pub pBits: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DLOCKED_RECT>() == 8);
+const _: () = assert!(core::mem::align_of::<D3DLOCKED_RECT>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DLOCKED_RECT, Pitch) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DLOCKED_RECT, pBits) == 4);
+impl crate::GuestArg for D3DLOCKED_RECT {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 2;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DSURFACE_DESC {
+    pub Format: u32,
+    pub Type: i32,
+    pub Usage: u32,
+    pub Pool: i32,
+    pub MultiSampleType: i32,
+    pub MultiSampleQuality: u32,
+    pub Width: u32,
+    pub Height: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DSURFACE_DESC>() == 32);
+const _: () = assert!(core::mem::align_of::<D3DSURFACE_DESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, Format) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, Type) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, Usage) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, Pool) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, MultiSampleType) == 16);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, MultiSampleQuality) == 20);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, Width) == 24);
+const _: () = assert!(core::mem::offset_of!(D3DSURFACE_DESC, Height) == 28);
+impl crate::GuestArg for D3DSURFACE_DESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 8;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DVIEWPORT9 {
+    pub X: u32,
+    pub Y: u32,
+    pub Width: u32,
+    pub Height: u32,
+    pub MinZ: f32,
+    pub MaxZ: f32,
+}
+const _: () = assert!(core::mem::size_of::<D3DVIEWPORT9>() == 24);
+const _: () = assert!(core::mem::align_of::<D3DVIEWPORT9>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DVIEWPORT9, X) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DVIEWPORT9, Y) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DVIEWPORT9, Width) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DVIEWPORT9, Height) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DVIEWPORT9, MinZ) == 16);
+const _: () = assert!(core::mem::offset_of!(D3DVIEWPORT9, MaxZ) == 20);
+impl crate::GuestArg for D3DVIEWPORT9 {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 6;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DVERTEXBUFFER_DESC {
+    pub Format: u32,
+    pub Type: i32,
+    pub Usage: u32,
+    pub Pool: i32,
+    pub Size: u32,
+    pub FVF: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DVERTEXBUFFER_DESC>() == 24);
+const _: () = assert!(core::mem::align_of::<D3DVERTEXBUFFER_DESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DVERTEXBUFFER_DESC, Format) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DVERTEXBUFFER_DESC, Type) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DVERTEXBUFFER_DESC, Usage) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DVERTEXBUFFER_DESC, Pool) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DVERTEXBUFFER_DESC, Size) == 16);
+const _: () = assert!(core::mem::offset_of!(D3DVERTEXBUFFER_DESC, FVF) == 20);
+impl crate::GuestArg for D3DVERTEXBUFFER_DESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 6;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DINDEXBUFFER_DESC {
+    pub Format: u32,
+    pub Type: i32,
+    pub Usage: u32,
+    pub Pool: i32,
+    pub Size: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DINDEXBUFFER_DESC>() == 20);
+const _: () = assert!(core::mem::align_of::<D3DINDEXBUFFER_DESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DINDEXBUFFER_DESC, Format) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DINDEXBUFFER_DESC, Type) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DINDEXBUFFER_DESC, Usage) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DINDEXBUFFER_DESC, Pool) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DINDEXBUFFER_DESC, Size) == 16);
+impl crate::GuestArg for D3DINDEXBUFFER_DESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 5;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DDISPLAYMODE {
+    pub Width: u32,
+    pub Height: u32,
+    pub RefreshRate: u32,
+    pub Format: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DDISPLAYMODE>() == 16);
+const _: () = assert!(core::mem::align_of::<D3DDISPLAYMODE>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DDISPLAYMODE, Width) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DDISPLAYMODE, Height) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DDISPLAYMODE, RefreshRate) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DDISPLAYMODE, Format) == 12);
+impl crate::GuestArg for D3DDISPLAYMODE {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DDEVICE_CREATION_PARAMETERS {
+    pub AdapterOrdinal: u32,
+    pub DeviceType: i32,
+    pub hFocusWindow: u32,
+    pub BehaviorFlags: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DDEVICE_CREATION_PARAMETERS>() == 16);
+const _: () = assert!(core::mem::align_of::<D3DDEVICE_CREATION_PARAMETERS>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DDEVICE_CREATION_PARAMETERS, AdapterOrdinal) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DDEVICE_CREATION_PARAMETERS, DeviceType) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DDEVICE_CREATION_PARAMETERS, hFocusWindow) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DDEVICE_CREATION_PARAMETERS, BehaviorFlags) == 12);
+impl crate::GuestArg for D3DDEVICE_CREATION_PARAMETERS {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DVSHADERCAPS2_0 {
+    pub Caps: u32,
+    pub DynamicFlowControlDepth: i32,
+    pub NumTemps: i32,
+    pub StaticFlowControlDepth: i32,
+}
+const _: () = assert!(core::mem::size_of::<D3DVSHADERCAPS2_0>() == 16);
+const _: () = assert!(core::mem::align_of::<D3DVSHADERCAPS2_0>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DVSHADERCAPS2_0, Caps) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DVSHADERCAPS2_0, DynamicFlowControlDepth) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DVSHADERCAPS2_0, NumTemps) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DVSHADERCAPS2_0, StaticFlowControlDepth) == 12);
+impl crate::GuestArg for D3DVSHADERCAPS2_0 {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DPSHADERCAPS2_0 {
+    pub Caps: u32,
+    pub DynamicFlowControlDepth: i32,
+    pub NumTemps: i32,
+    pub StaticFlowControlDepth: i32,
+    pub NumInstructionSlots: i32,
+}
+const _: () = assert!(core::mem::size_of::<D3DPSHADERCAPS2_0>() == 20);
+const _: () = assert!(core::mem::align_of::<D3DPSHADERCAPS2_0>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DPSHADERCAPS2_0, Caps) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DPSHADERCAPS2_0, DynamicFlowControlDepth) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DPSHADERCAPS2_0, NumTemps) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DPSHADERCAPS2_0, StaticFlowControlDepth) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DPSHADERCAPS2_0, NumInstructionSlots) == 16);
+impl crate::GuestArg for D3DPSHADERCAPS2_0 {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 5;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DCAPS9 {
+    pub DeviceType: i32,
+    pub AdapterOrdinal: u32,
+    pub Caps: u32,
+    pub Caps2: u32,
+    pub Caps3: u32,
+    pub PresentationIntervals: u32,
+    pub CursorCaps: u32,
+    pub DevCaps: u32,
+    pub PrimitiveMiscCaps: u32,
+    pub RasterCaps: u32,
+    pub ZCmpCaps: u32,
+    pub SrcBlendCaps: u32,
+    pub DestBlendCaps: u32,
+    pub AlphaCmpCaps: u32,
+    pub ShadeCaps: u32,
+    pub TextureCaps: u32,
+    pub TextureFilterCaps: u32,
+    pub CubeTextureFilterCaps: u32,
+    pub VolumeTextureFilterCaps: u32,
+    pub TextureAddressCaps: u32,
+    pub VolumeTextureAddressCaps: u32,
+    pub LineCaps: u32,
+    pub MaxTextureWidth: u32,
+    pub MaxTextureHeight: u32,
+    pub MaxVolumeExtent: u32,
+    pub MaxTextureRepeat: u32,
+    pub MaxTextureAspectRatio: u32,
+    pub MaxAnisotropy: u32,
+    pub MaxVertexW: f32,
+    pub GuardBandLeft: f32,
+    pub GuardBandTop: f32,
+    pub GuardBandRight: f32,
+    pub GuardBandBottom: f32,
+    pub ExtentsAdjust: f32,
+    pub StencilCaps: u32,
+    pub FVFCaps: u32,
+    pub TextureOpCaps: u32,
+    pub MaxTextureBlendStages: u32,
+    pub MaxSimultaneousTextures: u32,
+    pub VertexProcessingCaps: u32,
+    pub MaxActiveLights: u32,
+    pub MaxUserClipPlanes: u32,
+    pub MaxVertexBlendMatrices: u32,
+    pub MaxVertexBlendMatrixIndex: u32,
+    pub MaxPointSize: f32,
+    pub MaxPrimitiveCount: u32,
+    pub MaxVertexIndex: u32,
+    pub MaxStreams: u32,
+    pub MaxStreamStride: u32,
+    pub VertexShaderVersion: u32,
+    pub MaxVertexShaderConst: u32,
+    pub PixelShaderVersion: u32,
+    pub PixelShader1xMaxValue: f32,
+    pub DevCaps2: u32,
+    pub MaxNpatchTessellationLevel: f32,
+    pub Reserved5: u32,
+    pub MasterAdapterOrdinal: u32,
+    pub AdapterOrdinalInGroup: u32,
+    pub NumberOfAdaptersInGroup: u32,
+    pub DeclTypes: u32,
+    pub NumSimultaneousRTs: u32,
+    pub StretchRectFilterCaps: u32,
+    pub VS20Caps: D3DVSHADERCAPS2_0,
+    pub PS20Caps: D3DPSHADERCAPS2_0,
+    pub VertexTextureFilterCaps: u32,
+    pub MaxVShaderInstructionsExecuted: u32,
+    pub MaxPShaderInstructionsExecuted: u32,
+    pub MaxVertexShader30InstructionSlots: u32,
+    pub MaxPixelShader30InstructionSlots: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DCAPS9>() == 304);
+const _: () = assert!(core::mem::align_of::<D3DCAPS9>() == 4);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, DeviceType) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, AdapterOrdinal) == 4);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, Caps) == 8);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, Caps2) == 12);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, Caps3) == 16);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, PresentationIntervals) == 20);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, CursorCaps) == 24);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, DevCaps) == 28);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, PrimitiveMiscCaps) == 32);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, RasterCaps) == 36);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, ZCmpCaps) == 40);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, SrcBlendCaps) == 44);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, DestBlendCaps) == 48);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, AlphaCmpCaps) == 52);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, ShadeCaps) == 56);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, TextureCaps) == 60);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, TextureFilterCaps) == 64);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, CubeTextureFilterCaps) == 68);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, VolumeTextureFilterCaps) == 72);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, TextureAddressCaps) == 76);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, VolumeTextureAddressCaps) == 80);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, LineCaps) == 84);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxTextureWidth) == 88);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxTextureHeight) == 92);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVolumeExtent) == 96);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxTextureRepeat) == 100);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxTextureAspectRatio) == 104);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxAnisotropy) == 108);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVertexW) == 112);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, GuardBandLeft) == 116);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, GuardBandTop) == 120);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, GuardBandRight) == 124);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, GuardBandBottom) == 128);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, ExtentsAdjust) == 132);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, StencilCaps) == 136);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, FVFCaps) == 140);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, TextureOpCaps) == 144);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxTextureBlendStages) == 148);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxSimultaneousTextures) == 152);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, VertexProcessingCaps) == 156);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxActiveLights) == 160);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxUserClipPlanes) == 164);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVertexBlendMatrices) == 168);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVertexBlendMatrixIndex) == 172);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxPointSize) == 176);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxPrimitiveCount) == 180);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVertexIndex) == 184);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxStreams) == 188);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxStreamStride) == 192);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, VertexShaderVersion) == 196);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVertexShaderConst) == 200);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, PixelShaderVersion) == 204);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, PixelShader1xMaxValue) == 208);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, DevCaps2) == 212);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxNpatchTessellationLevel) == 216);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, Reserved5) == 220);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MasterAdapterOrdinal) == 224);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, AdapterOrdinalInGroup) == 228);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, NumberOfAdaptersInGroup) == 232);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, DeclTypes) == 236);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, NumSimultaneousRTs) == 240);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, StretchRectFilterCaps) == 244);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, VS20Caps) == 248);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, PS20Caps) == 264);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, VertexTextureFilterCaps) == 284);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVShaderInstructionsExecuted) == 288);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxPShaderInstructionsExecuted) == 292);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxVertexShader30InstructionSlots) == 296);
+const _: () = assert!(core::mem::offset_of!(D3DCAPS9, MaxPixelShader30InstructionSlots) == 300);
+impl crate::GuestArg for D3DCAPS9 {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 76;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
