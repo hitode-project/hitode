@@ -206,6 +206,117 @@ impl Program {
         self.call("RegOpenKeyExW", &[I(HKCU), I(path), I(0), I(1), I(key)], 32);
         self.call("RegFlushKey", &[I(HKCU)], 32);
     }
+    fn metadata(&mut self, write: bool) -> u32 {
+        let path = self.name("Metadata Fixture");
+        let class = self.name("TypeX");
+        let key = self.word(0);
+        if write {
+            self.call(
+                "RegCreateKeyExW",
+                &[
+                    I(HKCU),
+                    I(path),
+                    I(0),
+                    I(class),
+                    I(0),
+                    I(0xf003f),
+                    I(0),
+                    I(key),
+                    I(0),
+                ],
+                0,
+            );
+            let name = self.name("mixedCase");
+            let data = self.word(0x87654321);
+            self.call(
+                "RegSetValueExW",
+                &[L(key), I(name), I(0), I(4), I(data), I(4)],
+                0,
+            );
+            let transient = self.name("Temporary");
+            let out = self.word(0);
+            self.call(
+                "RegCreateKeyExW",
+                &[
+                    L(key),
+                    I(transient),
+                    I(0),
+                    I(0),
+                    I(1),
+                    I(1),
+                    I(0),
+                    I(out),
+                    I(0),
+                ],
+                0,
+            );
+        } else {
+            self.call(
+                "RegOpenKeyExW",
+                &[I(HKCU), I(path), I(0), I(0xf003f), I(key)],
+                0,
+            );
+            let class_out = self.blob(&[0xcc; 32]);
+            let class_size = self.word(16);
+            let child_count = self.word(0xffffffff);
+            let value_count = self.word(0xffffffff);
+            self.call(
+                "RegQueryInfoKeyW",
+                &[
+                    L(key),
+                    I(class_out),
+                    I(class_size),
+                    I(0),
+                    I(child_count),
+                    I(0),
+                    I(0),
+                    I(value_count),
+                    I(0),
+                    I(0),
+                    I(0),
+                    I(0),
+                ],
+                0,
+            );
+            self.checks.extend([
+                ("persistent class length".into(), class_size, 5),
+                ("persistent class spelling".into(), class_out, 0x00790054),
+                ("volatile child excluded".into(), child_count, 0),
+                ("persistent value count".into(), value_count, 1),
+            ]);
+            let name_out = self.blob(&[0xcc; 32]);
+            let name_size = self.word(16);
+            let data_out = self.word(0);
+            let data_size = self.word(4);
+            self.call(
+                "RegEnumValueW",
+                &[
+                    L(key),
+                    I(0),
+                    I(name_out),
+                    I(name_size),
+                    I(0),
+                    I(0),
+                    I(data_out),
+                    I(data_size),
+                ],
+                0,
+            );
+            self.checks.extend([
+                ("persistent value name length".into(), name_size, 9),
+                ("persistent first spelling".into(), name_out, 0x0069006d),
+                ("persistent value data".into(), data_out, 0x87654321),
+            ]);
+        }
+        key
+    }
+    fn delete_metadata(&mut self, key: u32) {
+        let value = self.name("MIXEDcase");
+        self.call("RegDeleteValueW", &[L(key), I(value)], 0);
+        let path = self.name("metadata fixture");
+        self.call("RegDeleteKeyW", &[I(HKCU), I(path)], 0);
+        self.call("RegFlushKey", &[I(HKCU)], 0);
+    }
     fn run(&mut self) {
         let exit = self
             .runtime
@@ -235,6 +346,36 @@ impl Program {
                 "{name}"
             );
         }
+    }
+}
+
+#[test]
+fn metadata_spelling_classes_and_deletion_survive_runtime_reopen() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../target/registry-metadata-{unique}"));
+    std::fs::create_dir_all(&root).unwrap();
+    let exe = root.join("registry-test.exe");
+    std::fs::write(&exe, executable()).unwrap();
+    for backend in ["unicorn", "interpreter", "jit"] {
+        let data = root.join(backend);
+        let mut writer = Program::new(&exe, &data, backend);
+        writer.metadata(true);
+        writer.run();
+        drop(writer);
+        let mut reader = Program::new(&exe, &data, backend);
+        let key = reader.metadata(false);
+        reader.delete_metadata(key);
+        reader.run();
+        drop(reader);
+        let mut verify = Program::new(&exe, &data, backend);
+        let path = verify.name("Metadata Fixture");
+        let out = verify.word(0);
+        verify.call("RegOpenKeyExW", &[I(HKCU), I(path), I(0), I(1), I(out)], 2);
+        verify.run();
     }
 }
 
