@@ -2,8 +2,9 @@
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
-use adv_machine::{Conv, Env, Machine, Outcome};
+use adv_machine::{Conv, Env, Machine, Objects, Outcome};
 use adv_os::Heaps;
+use adv_os::com::{Com, ComIdentity, QueryError};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
 const NO_INTERFACE: u32 = 0x80004002;
+const OUT_OF_MEMORY: u32 = 0x8007000e;
 const INVALID_CALL: u32 = 0x88780032;
 const DEVICE: &[(&str, u8)] = &[
     ("QueryInterface", 3),
@@ -58,7 +60,6 @@ const NOTIFY: &[(&str, u8)] = &[
     ("Release", 1),
     ("SetNotificationPositions", 3),
 ];
-const IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
 const IID_DEVICE: [u8; 16] = [
     0x83, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -130,8 +131,10 @@ enum Kind {
     Notify(u32),
 }
 struct Object {
-    refs: u32,
     kind: Kind,
+    pointer: u32,
+    notify: u32,
+    buffer: Option<Buffer>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Lock {
@@ -242,12 +245,14 @@ pub struct AudioSourceStatus {
 pub struct Sound {
     pub enabled: bool,
     tables: [u32; 3],
-    objects: BTreeMap<u32, Object>,
-    buffers: BTreeMap<u32, Buffer>,
+    com: Com,
+    /// Non-owning iteration index; payload and all references live in Objects.
+    buffer_ids: BTreeMap<u64, ComIdentity<Object>>,
     pub audio: AudioControl,
     next_audio_id: u64,
     pending_release: BTreeMap<u64, (u32, bool)>,
     pending_notices: Vec<(u64, u32, u64, u64)>,
+    ready_notices: Vec<u32>,
     pub queued_samples: u64,
     pub nonzero_samples: u64,
     pub capture_digests: bool,
@@ -258,10 +263,20 @@ pub struct Sound {
     playback_clock: Arc<adv_device::clock::PlaybackClock>,
 }
 impl Sound {
-    pub fn source_status(&self, guest_now: u64) -> AudioSourceStatus {
+    fn buffer<'a>(&self, objects: &'a Objects, pointer: u32) -> Option<&'a Buffer> {
+        self.com.get::<Object>(objects, pointer)?.buffer.as_ref()
+    }
+
+    fn buffers<'a>(&'a self, objects: &'a Objects) -> impl Iterator<Item = &'a Buffer> {
+        self.buffer_ids
+            .values()
+            .filter_map(|&id| self.com.get_identity(objects, id)?.buffer.as_ref())
+    }
+
+    pub fn source_status(&self, objects: &Objects, guest_now: u64) -> AudioSourceStatus {
         let now = self.playback_clock.now_us(guest_now);
         let mut status = AudioSourceStatus::default();
-        for buffer in self.buffers.values().filter(|buffer| buffer.len != 0) {
+        for buffer in self.buffers(objects).filter(|buffer| buffer.len != 0) {
             status.buffers += 1;
             status.locked += u64::from(buffer.lock.is_some());
             if buffer.playing && (buffer.looping || buffer.progress(now) < u64::from(buffer.len)) {
@@ -297,17 +312,34 @@ pub fn register(reg: &mut Registry) {
 pub fn register_unavailable(registry: &mut Registry) {
     registry.register(unavailable_create_ABI);
     registry.register(unavailable_create8_ABI);
-    registry.add("dsound.dll", "#1", unavailable_create_ABI.conv, unavailable_create_ABI.handler);
+    registry.add(
+        "dsound.dll",
+        "#1",
+        unavailable_create_ABI.conv,
+        unavailable_create_ABI.handler,
+    );
 }
 
 #[win32(dsound, name = "DirectSoundCreate", level = safe_fail)]
-fn unavailable_create(env: &mut Env<'_>, _device: GuestPtr<()>, output: GuestPtr<u32>, _outer: GuestPtr<()>) -> Outcome {
-    if let Err(error) = env.cpu.write_u32(output.addr(), 0) { return Outcome::Fail(error.to_string()); }
+fn unavailable_create(
+    env: &mut Env<'_>,
+    _device: GuestPtr<()>,
+    output: GuestPtr<u32>,
+    _outer: GuestPtr<()>,
+) -> Outcome {
+    if let Err(error) = env.cpu.write_u32(output.addr(), 0) {
+        return Outcome::Fail(error.to_string());
+    }
     Outcome::Return(0x8878_0078)
 }
 
 #[win32(dsound, name = "DirectSoundCreate8", level = safe_fail)]
-fn unavailable_create8(env: &mut Env<'_>, device: GuestPtr<()>, output: GuestPtr<u32>, outer: GuestPtr<()>) -> Outcome {
+fn unavailable_create8(
+    env: &mut Env<'_>,
+    device: GuestPtr<()>,
+    output: GuestPtr<u32>,
+    outer: GuestPtr<()>,
+) -> Outcome {
     unavailable_create(env, device, output, outer)
 }
 pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
@@ -355,15 +387,17 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     }
     let audio = AudioControl::new(!m.sys.clock.is_virtual());
     let playback_clock = audio.playback_clock();
+    let com = Com::new(&mut m.sys.objects).ok_or("audio object namespace exhausted")?;
     m.ext.insert(Sound {
         enabled: false,
         tables,
-        objects: BTreeMap::new(),
-        buffers: BTreeMap::new(),
+        com,
+        buffer_ids: BTreeMap::new(),
         audio,
         next_audio_id: 1,
         pending_release: BTreeMap::new(),
         pending_notices: Vec::new(),
+        ready_notices: Vec::new(),
         queued_samples: 0,
         nonzero_samples: 0,
         capture_digests: false,
@@ -375,11 +409,9 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     });
     Ok(())
 }
-fn alloc(e: &mut Env<'_>, len: u32) -> Result<u32, String> {
+fn alloc(e: &mut Env<'_>, len: u32) -> Option<u32> {
     let heaps = e.ext.get_mut::<Heaps>();
-    heaps
-        .alloc(e.cpu, &mut e.sys.vm, heaps.process_heap, len, true)
-        .ok_or("audio heap exhausted".into())
+    heaps.alloc(e.cpu, &mut e.sys.vm, heaps.process_heap, len, true)
 }
 fn free(e: &mut Env<'_>, ptr: u32) {
     let heaps = e.ext.get_mut::<Heaps>();
@@ -387,42 +419,88 @@ fn free(e: &mut Env<'_>, ptr: u32) {
 }
 fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     let s = e.ext.get_mut::<Sound>();
-    let Some(obj) = s.objects.get_mut(&ptr) else {
+    let Some(released) = s.com.release::<Object>(&mut e.sys.objects, ptr) else {
         return 0;
     };
-    obj.refs -= 1;
-    let refs = obj.refs;
-    if refs != 0 {
-        return refs;
+    let Some(destroyed) = released.destroyed else {
+        return released.references;
+    };
+    if let Some(buffer) = destroyed.value.buffer {
+        s.buffer_ids.remove(&buffer.audio_id);
+        if buffer.storage != 0 {
+            let queued = s.audio.remove_pcm(buffer.audio_id);
+            s.pending_release
+                .insert(buffer.audio_id, (buffer.storage, queued));
+        }
     }
-    let kind = s.objects.remove(&ptr).unwrap().kind;
-    if let Some(buffer) = s.buffers.remove(&ptr)
-        && buffer.storage != 0
-    {
-        let queued = s.audio.remove_pcm(buffer.audio_id);
-        s.pending_release
-            .insert(buffer.audio_id, (buffer.storage, queued));
-    }
-    free(e, ptr);
-    if let Kind::Notify(parent) = kind {
-        release(e, parent);
+    for pointer in destroyed.interfaces {
+        free(e, pointer);
     }
     0
 }
-fn object(e: &mut Env<'_>, kind: Kind) -> Result<u32, String> {
+fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>, String> {
     let i = match kind {
         Kind::Device => 0,
         Kind::Buffer => 1,
-        Kind::Notify(_) => 2,
+        Kind::Notify(_) => unreachable!("notification is an alias of the buffer"),
     };
     let table = e.ext.get::<Sound>().tables[i];
-    let ptr = alloc(e, 4)?;
-    e.cpu.write_u32(ptr, table).map_err(|e| e.to_string())?;
-    e.ext
-        .get_mut::<Sound>()
-        .objects
-        .insert(ptr, Object { refs: 1, kind });
-    Ok(ptr)
+    let Some(ptr) = alloc(e, 4) else {
+        return Ok(None);
+    };
+    if let Err(error) = e.cpu.write_u32(ptr, table) {
+        free(e, ptr);
+        return Err(error.to_string());
+    }
+    let notify = if with_notify {
+        let Some(notify) = alloc(e, 4) else {
+            free(e, ptr);
+            return Ok(None);
+        };
+        if let Err(error) = e.cpu.write_u32(notify, e.ext.get::<Sound>().tables[2]) {
+            free(e, notify);
+            free(e, ptr);
+            return Err(error.to_string());
+        }
+        notify
+    } else {
+        0
+    };
+    let com = e.ext.get::<Sound>().com;
+    let (iid, iid8) = if matches!(kind, Kind::Device) {
+        (IID_DEVICE, IID_DEVICE8)
+    } else {
+        (IID_BUFFER, IID_BUFFER8)
+    };
+    let Some(id) = com.create(
+        &mut e.sys.objects,
+        ptr,
+        iid,
+        Object {
+            kind,
+            pointer: ptr,
+            notify,
+            buffer: None,
+        },
+    ) else {
+        if notify != 0 {
+            free(e, notify);
+        }
+        free(e, ptr);
+        return Ok(None);
+    };
+    if !com.register_interface(&mut e.sys.objects, id, iid8, ptr)
+        || (notify != 0 && !com.register_interface(&mut e.sys.objects, id, IID_NOTIFY, notify))
+    {
+        // The notify alias is registered last. A failed registration leaves its
+        // allocation outside the table and the unpublished owner holds one ref.
+        if notify != 0 {
+            free(e, notify);
+        }
+        release(e, ptr);
+        return Ok(None);
+    }
+    Ok(Some(ptr))
 }
 fn result(e: &mut Env<'_>) -> Result<u32, String> {
     e.ext.get::<Sound>().audio.sync_clock(e.sys.clock.now_us());
@@ -457,7 +535,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             Vec::new()
         };
         let s = e.ext.get_mut::<Sound>();
-        let snapshot = s.buffers.get(&a).map(|buf| {
+        let snapshot = s.buffer(&e.sys.objects, a).map(|buf| {
             (
                 buf.storage,
                 buf.len,
@@ -466,7 +544,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 buf.queued_frames,
             )
         });
-        let cursor = s.buffers.get(&a).map(|buf| buf.cursor(now));
+        let cursor = s.buffer(&e.sys.objects, a).map(|buf| buf.cursor(now));
         if let Some(trace) = s.trace.as_mut() {
             let _ = writeln!(
                 trace,
@@ -488,18 +566,23 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         if c != 0 {
             return Ok(0x80040110);
         }
-        let obj = object(e, Kind::Device)?;
+        let Some(obj) = object(e, Kind::Device, false)? else {
+            return Ok(OUT_OF_MEMORY);
+        };
         e.cpu.write_u32(b, obj).map_err(|e| e.to_string())?;
         return Ok(0);
     }
-    let Some(obj) = e.ext.get::<Sound>().objects.get(&a) else {
+    let com = e.ext.get::<Sound>().com;
+    let Some(obj) = com.get::<Object>(&e.sys.objects, a) else {
         return Ok(INVALID);
     };
-    let kind = obj.kind;
+    let kind = if a == obj.notify {
+        Kind::Notify(obj.pointer)
+    } else {
+        obj.kind
+    };
     if name == "AddRef" {
-        let o = e.ext.get_mut::<Sound>().objects.get_mut(&a).unwrap();
-        o.refs += 1;
-        return Ok(o.refs);
+        return Ok(com.add_ref::<Object>(&mut e.sys.objects, a).unwrap_or(0));
     }
     if name == "Release" {
         return Ok(release(e, a));
@@ -508,38 +591,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
         let mut iid = [0; 16];
         e.cpu.read(b, &mut iid).map_err(|e| e.to_string())?;
-        let parent = if let Kind::Notify(parent) = kind {
-            parent
-        } else {
-            a
-        };
-        let supported = iid == IUNKNOWN
-            || match kind {
-                Kind::Device => iid == IID_DEVICE || iid == IID_DEVICE8,
-                Kind::Buffer | Kind::Notify(_) => iid == IID_BUFFER || iid == IID_BUFFER8,
-            };
-        let ptr = if supported {
-            e.ext
-                .get_mut::<Sound>()
-                .objects
-                .get_mut(&parent)
-                .unwrap()
-                .refs += 1;
-            parent
-        } else if iid == IID_NOTIFY && matches!(kind, Kind::Buffer | Kind::Notify(_)) {
-            if e.ext.get::<Sound>().buffers[&parent].flags & 0x100 == 0 {
-                return Ok(NO_INTERFACE);
-            }
-            if matches!(kind, Kind::Notify(_)) {
-                e.ext.get_mut::<Sound>().objects.get_mut(&a).unwrap().refs += 1;
-                a
-            } else {
-                let ptr = object(e, Kind::Notify(a))?;
-                e.ext.get_mut::<Sound>().objects.get_mut(&a).unwrap().refs += 1;
-                ptr
-            }
-        } else {
-            return Ok(NO_INTERFACE);
+        let ptr = match com.query::<Object>(&mut e.sys.objects, a, iid) {
+            Ok(ptr) => ptr,
+            Err(QueryError::NoInterface) => return Ok(NO_INTERFACE),
+            Err(QueryError::ReferenceLimit) => return Ok(OUT_OF_MEMORY),
+            Err(QueryError::InvalidObject) => return Ok(INVALID),
         };
         e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
         return Ok(0);
@@ -590,19 +646,26 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 {
                     return Ok(INVALID);
                 }
+                let audio_id = e.ext.get::<Sound>().next_audio_id;
+                let Some(next_audio_id) = audio_id.checked_add(1) else {
+                    return Ok(OUT_OF_MEMORY);
+                };
+                let Some(ptr) = object(e, Kind::Buffer, flags & 0x100 != 0)? else {
+                    return Ok(OUT_OF_MEMORY);
+                };
                 let (storage, region) = if primary {
                     (0, None)
                 } else {
                     let mapped_len = adv_machine::vm::align_up(len, 4096);
-                    let base = e
-                        .sys
-                        .vm
-                        .reserve(mapped_len)
-                        .ok_or("audio address space exhausted")?;
+                    let Some(base) = e.sys.vm.reserve(mapped_len) else {
+                        release(e, ptr);
+                        return Ok(OUT_OF_MEMORY);
+                    };
                     let region = match e.cpu.map_shared_audio(base, mapped_len) {
                         Ok(region) => region,
                         Err(error) => {
                             let _ = e.sys.vm.free(e.cpu, base);
+                            release(e, ptr);
                             return Err(format!("shared audio mapping: {error}"));
                         }
                     };
@@ -610,15 +673,16 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 };
                 if !primary && format.bits == 8 {
                     let silence = vec![128; len as usize];
-                    e.cpu.write(storage, &silence).map_err(|e| e.to_string())?;
+                    if let Err(error) = e.cpu.write(storage, &silence) {
+                        e.sys
+                            .vm
+                            .free(e.cpu, storage)
+                            .map_err(|error| error.to_string())?;
+                        release(e, ptr);
+                        return Err(error.to_string());
+                    }
                 }
-                let ptr = object(e, Kind::Buffer)?;
                 let s = e.ext.get_mut::<Sound>();
-                let audio_id = s.next_audio_id;
-                s.next_audio_id = s
-                    .next_audio_id
-                    .checked_add(1)
-                    .ok_or("audio source IDs exhausted")?;
                 let voice = region
                     .map(|region| {
                         s.audio.add_ring(
@@ -634,34 +698,52 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                             },
                         )
                     })
-                    .transpose()?;
-                s.buffers.insert(
-                    ptr,
-                    Buffer {
-                        audio_id,
-                        voice,
-                        playback_clock: s.playback_clock.clone(),
-                        generation: 0,
-                        storage,
-                        len,
-                        flags,
-                        format,
-                        frequency: format.rate,
-                        volume: 0,
-                        pan: 0,
-                        playing: false,
-                        looping: false,
-                        base: 0,
-                        anchor: now,
-                        queued_frames: 0,
-                        notice_bytes: 0,
-                        notifications: Vec::new(),
-                        lock: None,
-                        trace_pcm: None,
-                        trace_generation: 0,
-                        trace_chunks: None,
-                    },
-                );
+                    .transpose();
+                let voice = match voice {
+                    Ok(voice) => voice,
+                    Err(error) => {
+                        if let Some(trace) = s.trace.as_mut() {
+                            let _ = writeln!(trace, "create-buffer rejected: {error}");
+                        }
+                        // add_ring publishes nothing on failure, so there is no
+                        // callback-owned alias requiring deferred retirement.
+                        if storage != 0 {
+                            e.sys
+                                .vm
+                                .free(e.cpu, storage)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        release(e, ptr);
+                        return Ok(OUT_OF_MEMORY);
+                    }
+                };
+                s.next_audio_id = next_audio_id;
+                let id = com.identity::<Object>(&e.sys.objects, ptr).unwrap();
+                com.get_identity_mut(&mut e.sys.objects, id).unwrap().buffer = Some(Buffer {
+                    audio_id,
+                    voice,
+                    playback_clock: s.playback_clock.clone(),
+                    generation: 0,
+                    storage,
+                    len,
+                    flags,
+                    format,
+                    frequency: format.rate,
+                    volume: 0,
+                    pan: 0,
+                    playing: false,
+                    looping: false,
+                    base: 0,
+                    anchor: now,
+                    queued_frames: 0,
+                    notice_bytes: 0,
+                    notifications: Vec::new(),
+                    lock: None,
+                    trace_pcm: None,
+                    trace_generation: 0,
+                    trace_chunks: None,
+                });
+                s.buffer_ids.insert(audio_id, id);
                 e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
                 Ok(0)
             }
@@ -698,8 +780,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         if b > 1024 {
             return Ok(INVALID);
         }
-        let len = e.ext.get::<Sound>().buffers[&parent].len;
-        if e.ext.get::<Sound>().buffers[&parent].playing {
+        let buffer = e.ext.get::<Sound>().buffer(&e.sys.objects, parent).unwrap();
+        let len = buffer.len;
+        if buffer.playing {
             return Ok(INVALID_CALL);
         }
         let mut entries = Vec::new();
@@ -716,28 +799,33 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }
             entries.push((offset, handle));
         }
-        e.ext
-            .get_mut::<Sound>()
-            .buffers
-            .get_mut(&parent)
+        let buffer = com
+            .get_mut::<Object>(&mut e.sys.objects, parent)
             .unwrap()
-            .notifications = entries;
+            .buffer
+            .as_mut()
+            .unwrap();
+        buffer.notifications = entries;
         let s = e.ext.get_mut::<Sound>();
-        let buffer = &s.buffers[&parent];
         s.audio
             .set_notifications(buffer.audio_id, buffer.notifications.clone());
         if let Some(trace) = s.trace.as_mut() {
             let _ = writeln!(
                 trace,
                 "notifications us={now} id={parent:08x} entries={:?}",
-                s.buffers[&parent].notifications
+                buffer.notifications
             );
         }
         return Ok(0);
     }
     let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
     let s = e.ext.get_mut::<Sound>();
-    let buf = s.buffers.get_mut(&a).unwrap();
+    let buf = com
+        .get_mut::<Object>(&mut e.sys.objects, a)
+        .unwrap()
+        .buffer
+        .as_mut()
+        .unwrap();
     let value = match name {
         "GetCaps" => {
             if e.cpu.read_u32(b).map_err(|e| e.to_string())? < 20 {
@@ -947,8 +1035,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             s.audio.change_generation(buf.audio_id, buf.generation);
             for &(offset, handle) in &buf.notifications {
                 if offset == u32::MAX {
-                    e.sys
-                        .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
+                    s.ready_notices.push(handle);
                 }
             }
             0
@@ -1046,6 +1133,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         }
         _ => return Err(format!("unimplemented audio method {full}")),
     };
+    for handle in s.ready_notices.drain(..) {
+        e.sys
+            .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
+    }
     Ok(value)
 }
 fn call(e: &mut Env<'_>) -> Outcome {
@@ -1055,7 +1146,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
     }
 }
 
-/// Queue a small owned PCM window; the device callback never borrows guest memory.
+/// Service device notifications and retirements. The callback owns a PCM read alias.
 pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     let guest_now = m.sys.clock.now_us();
     let s = m.ext.get_mut::<Sound>();
@@ -1091,11 +1182,17 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     }
     let mut next = None;
     if !s.playback_clock.uses_device_time() {
-        for buffer in s
-            .buffers
-            .values_mut()
-            .filter(|buffer| buffer.playing && buffer.len != 0)
-        {
+        for &identity in s.buffer_ids.values() {
+            let buffer = s
+                .com
+                .get_identity_mut(&mut m.sys.objects, identity)
+                .unwrap()
+                .buffer
+                .as_mut()
+                .unwrap();
+            if !buffer.playing || buffer.len == 0 {
+                continue;
+            }
             let progress = buffer.progress(now).min(if buffer.looping {
                 u64::MAX
             } else {
@@ -1115,20 +1212,24 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                     at < progress
                 };
                 if signal {
-                    m.sys
-                        .set_event_with_priority(event, adv_machine::WakePriority::Audio);
+                    s.ready_notices.push(event);
                     next = Some(guest_now);
                 }
             }
             buffer.notice_bytes = progress;
         }
+        for event in s.ready_notices.drain(..) {
+            m.sys
+                .set_event_with_priority(event, adv_machine::WakePriority::Audio);
+        }
     }
     s.pending_notices
         .retain(|&(source, event, due, generation)| {
             if !s
-                .buffers
-                .values()
-                .any(|buffer| buffer.audio_id == source && buffer.generation == generation)
+                .buffer_ids
+                .get(&source)
+                .and_then(|&id| s.com.get_identity(&m.sys.objects, id)?.buffer.as_ref())
+                .is_some_and(|buffer| buffer.generation == generation)
             {
                 return false;
             }
@@ -1149,7 +1250,14 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                 true
             }
         });
-    for buffer in s.buffers.values_mut() {
+    for &identity in s.buffer_ids.values() {
+        let buffer = s
+            .com
+            .get_identity_mut(&mut m.sys.objects, identity)
+            .unwrap()
+            .buffer
+            .as_mut()
+            .unwrap();
         if buffer.playing
             && !buffer.looping
             && buffer.len != 0
@@ -1163,8 +1271,7 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     // callback wakes execution when notifications/retirements are available.
     if !s.playback_clock.uses_device_time() {
         for buffer in s
-            .buffers
-            .values()
+            .buffers(&m.sys.objects)
             .filter(|buffer| buffer.playing && buffer.len != 0)
         {
             let progress = buffer.progress(now);
@@ -1199,6 +1306,9 @@ mod tests {
     const STACK: u32 = 0x600000;
 
     fn machine() -> Machine<JitCpu> {
+        machine_with_limits(adv_machine::ObjectLimits::default())
+    }
+    fn machine_with_limits(limits: adv_machine::ObjectLimits) -> Machine<JitCpu> {
         let mut reg = Registry::default();
         adv_win32::register(&mut reg);
         register(&mut reg);
@@ -1208,6 +1318,7 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
+        m.sys.objects = Objects::with_limits(limits);
         adv_win32::Win32::install(
             &mut m,
             adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
@@ -1289,6 +1400,166 @@ mod tests {
     }
 
     #[test]
+    fn notification_and_buffer_interfaces_share_identity_and_last_release() {
+        let mut m = machine();
+        let b = buffer(&mut m, Format::default(), 400);
+        let before = m.sys.objects.object_count();
+        let notify = query(&mut m, b, &IID_NOTIFY);
+        assert_ne!(notify, b);
+        assert_eq!(query(&mut m, b, &IID_NOTIFY), notify);
+        assert_eq!(query(&mut m, notify, &adv_os::com::IUNKNOWN), b);
+        assert_eq!(query(&mut m, b, &IID_BUFFER8), b);
+        assert_eq!(m.sys.objects.object_count(), before);
+        assert!(m.sys.objects.close(notify).is_none());
+        for (pointer, remaining) in [(b, 4), (notify, 3), (b, 2), (b, 1), (notify, 0)] {
+            assert_eq!(
+                invoke(&mut m, "IDirectSoundBuffer8::Release", &[pointer]),
+                remaining
+            );
+        }
+        assert_eq!(m.sys.objects.object_count(), before - 1);
+        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, b).is_none());
+        assert!(m.ext.get::<Heaps>().owner(b).is_none());
+        assert!(m.ext.get::<Heaps>().owner(notify).is_none());
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundNotify::AddRef", &[notify]),
+            INVALID
+        );
+        pump(&mut m).unwrap();
+        assert!(m.ext.get::<Sound>().pending_release.is_empty());
+    }
+
+    fn heap_next(m: &mut Machine<JitCpu>) -> u32 {
+        let heaps = m.ext.get_mut::<Heaps>();
+        let pointer = heaps
+            .alloc(&mut m.cpu, &mut m.sys.vm, heaps.process_heap, 4, false)
+            .unwrap();
+        assert!(heaps.free(&mut m.cpu, &mut m.sys.vm, heaps.process_heap, pointer));
+        pointer
+    }
+
+    #[test]
+    fn failed_device_and_notification_publication_reclaims_every_header() {
+        use adv_machine::ObjectLimits;
+        for limits in [
+            ObjectLimits {
+                objects: 0,
+                ..ObjectLimits::default()
+            },
+            ObjectLimits {
+                aliases: 0,
+                ..ObjectLimits::default()
+            },
+            ObjectLimits {
+                references: 1,
+                ..ObjectLimits::default()
+            },
+        ] {
+            let mut m = machine_with_limits(limits);
+            let next = heap_next(&mut m);
+            for _ in 0..64 {
+                m.cpu.write_u32(DATA + 128, 0xcccccccc).unwrap();
+                assert_eq!(
+                    invoke(&mut m, "DirectSoundCreate", &[0, DATA + 128, 0]),
+                    OUT_OF_MEMORY
+                );
+                assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+                assert_eq!(m.sys.objects.object_count(), 0);
+                assert_eq!(heap_next(&mut m), next);
+            }
+        }
+        for limits in [
+            ObjectLimits {
+                objects: 1,
+                ..ObjectLimits::default()
+            },
+            ObjectLimits {
+                aliases: 2,
+                ..ObjectLimits::default()
+            },
+            ObjectLimits {
+                references: 2,
+                ..ObjectLimits::default()
+            },
+        ] {
+            let mut m = machine_with_limits(limits);
+            let d = device(&mut m);
+            let next = heap_next(&mut m);
+            m.cpu.write(DATA + 64, &Format::default().bytes()).unwrap();
+            for (i, value) in [20, 0x100, 400, 0, DATA + 64].into_iter().enumerate() {
+                m.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
+            }
+            for _ in 0..64 {
+                assert_eq!(
+                    invoke(
+                        &mut m,
+                        "IDirectSound8::CreateSoundBuffer",
+                        &[d, DATA, DATA + 128, 0]
+                    ),
+                    OUT_OF_MEMORY
+                );
+                assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+                assert_eq!(m.sys.objects.object_count(), 1);
+                assert_eq!(heap_next(&mut m), next);
+                assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
+                assert!(m.ext.get::<Sound>().pending_release.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_ring_creation_reclaims_common_object_headers_and_mapping() {
+        let mut m = machine();
+        let d = device(&mut m);
+        m.cpu.write(DATA + 64, &Format::default().bytes()).unwrap();
+        for (i, value) in [20, 0x100, 400, 0, DATA + 64].into_iter().enumerate() {
+            m.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
+        }
+        let mut created = Vec::new();
+        for _ in 0..256 {
+            assert_eq!(
+                invoke(
+                    &mut m,
+                    "IDirectSound8::CreateSoundBuffer",
+                    &[d, DATA, DATA + 128, 0]
+                ),
+                0
+            );
+            created.push(m.cpu.read_u32(DATA + 128).unwrap());
+        }
+        let next_header = heap_next(&mut m);
+        let next_mapping = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+        m.sys.vm.free(&mut m.cpu, next_mapping).unwrap();
+        for _ in 0..32 {
+            assert_eq!(
+                invoke(
+                    &mut m,
+                    "IDirectSound8::CreateSoundBuffer",
+                    &[d, DATA, DATA + 128, 0]
+                ),
+                OUT_OF_MEMORY
+            );
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+            assert_eq!(m.sys.objects.object_count(), 257);
+            assert_eq!(heap_next(&mut m), next_header);
+            assert!(m.sys.vm.region(next_mapping).is_none());
+            assert!(m.cpu.read_u8(next_mapping).is_err());
+            let probe = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+            assert_eq!(probe, next_mapping);
+            m.sys.vm.free(&mut m.cpu, probe).unwrap();
+        }
+        for pointer in created {
+            assert_eq!(
+                invoke(&mut m, "IDirectSoundBuffer8::Release", &[pointer]),
+                0
+            );
+        }
+        pump(&mut m).unwrap();
+        assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
+        assert!(m.ext.get::<Sound>().pending_release.is_empty());
+    }
+
+    #[test]
     fn wrap_lock_aliases_guest_storage_and_rejects_invalid_unlock() {
         let mut m = machine();
         let b = buffer(
@@ -1323,7 +1594,14 @@ mod tests {
             invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[b, p1, 9, p2, 10]),
             0
         );
-        assert!(m.ext.get::<Sound>().buffers[&b].lock.is_none());
+        assert!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, b)
+                .unwrap()
+                .lock
+                .is_none()
+        );
         assert_eq!(
             invoke(
                 &mut m,
@@ -1332,7 +1610,14 @@ mod tests {
             ),
             INVALID
         );
-        assert!(m.ext.get::<Sound>().buffers[&b].lock.is_none());
+        assert!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, b)
+                .unwrap()
+                .lock
+                .is_none()
+        );
     }
     #[test]
     fn outstanding_write_lock_and_failed_unlock_do_not_freeze_playback() {
@@ -1436,7 +1721,12 @@ mod tests {
         ] {
             let mut m = machine();
             let b = buffer(&mut m, format, format.align() * 100);
-            let ptr = m.ext.get::<Sound>().buffers[&b].storage;
+            let ptr = m
+                .ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, b)
+                .unwrap()
+                .storage;
             let bytes = if format.bits == 8 {
                 vec![192; 100]
             } else {
@@ -1486,7 +1776,12 @@ mod tests {
             },
             100,
         );
-        let ptr = m.ext.get::<Sound>().buffers[&b].storage;
+        let ptr = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .storage;
         m.cpu.write(ptr, &[192; 100]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         pump(&mut m).unwrap();
@@ -1546,8 +1841,18 @@ mod tests {
         };
         let voice = buffer(&mut m, format, 1000);
         let music = buffer(&mut m, format, 1000);
-        let voice_storage = m.ext.get::<Sound>().buffers[&voice].storage;
-        let music_storage = m.ext.get::<Sound>().buffers[&music].storage;
+        let voice_storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, voice)
+            .unwrap()
+            .storage;
+        let music_storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, music)
+            .unwrap()
+            .storage;
         m.cpu.write(voice_storage, &[192; 1000]).unwrap();
         m.cpu.write(music_storage, &[160; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
@@ -1596,7 +1901,12 @@ mod tests {
             bits: 8,
         };
         let voice = buffer(&mut m, format, 30);
-        let storage = m.ext.get::<Sound>().buffers[&voice].storage;
+        let storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, voice)
+            .unwrap()
+            .storage;
         m.cpu.write(storage, &[192; 30]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         pump(&mut m).unwrap();
@@ -1624,7 +1934,12 @@ mod tests {
             },
             1000,
         );
-        let storage = m.ext.get::<Sound>().buffers[&voice].storage;
+        let storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, voice)
+            .unwrap()
+            .storage;
         m.cpu.write(storage, &[192; 500]).unwrap();
         m.cpu.write(storage + 500, &[64; 500]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
@@ -1657,8 +1972,18 @@ mod tests {
         };
         let voice = buffer(&mut m, format, 1000);
         let music = buffer(&mut m, format, 1000);
-        let voice_storage = m.ext.get::<Sound>().buffers[&voice].storage;
-        let music_storage = m.ext.get::<Sound>().buffers[&music].storage;
+        let voice_storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, voice)
+            .unwrap()
+            .storage;
+        let music_storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, music)
+            .unwrap()
+            .storage;
         m.cpu.write(voice_storage, &[192; 1000]).unwrap();
         m.cpu.write(music_storage, &[160; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
@@ -1666,7 +1991,12 @@ mod tests {
         pump(&mut m).unwrap();
         assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[voice]), 0);
         let next_voice = buffer(&mut m, format, 1000);
-        let next_storage = m.ext.get::<Sound>().buffers[&next_voice].storage;
+        let next_storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, next_voice)
+            .unwrap()
+            .storage;
         m.cpu.write(next_storage, &[64; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[next_voice, 0, 0, 0]);
         pump(&mut m).unwrap();
@@ -1688,7 +2018,7 @@ mod tests {
             1000,
         );
         let (source, storage) = {
-            let buffer = &m.ext.get::<Sound>().buffers[&voice];
+            let buffer = &m.ext.get::<Sound>().buffer(&m.sys.objects, voice).unwrap();
             (buffer.audio_id, buffer.storage)
         };
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 1]);
@@ -1702,7 +2032,13 @@ mod tests {
             0,
             "COM references are released exactly once"
         );
-        assert!(!m.ext.get::<Sound>().objects.contains_key(&voice));
+        assert!(
+            m.ext
+                .get::<Sound>()
+                .com
+                .get::<Object>(&m.sys.objects, voice)
+                .is_none()
+        );
         assert!(
             m.cpu.read_u8(storage).is_ok(),
             "mapping stays alive until the callback releases the alias"
@@ -1771,10 +2107,16 @@ mod tests {
             Some(WaitObject::Event { signaled: true, .. })
         ));
         assert_eq!(position(&mut m, b), 0);
-        assert!(!m.ext.get::<Sound>().buffers[&b].playing);
+        assert!(
+            !m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, b)
+                .unwrap()
+                .playing
+        );
         assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[b]), 1);
         assert_eq!(invoke(&mut m, "IDirectSoundNotify::Release", &[notify]), 0);
-        assert!(!m.ext.get::<Sound>().buffers.contains_key(&b));
+        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, b).is_none());
     }
     #[test]
     fn headless_streaming_stays_bounded_without_device_consumption() {
@@ -1788,7 +2130,12 @@ mod tests {
             },
             100,
         );
-        let ptr = m.ext.get::<Sound>().buffers[&b].storage;
+        let ptr = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .storage;
         m.cpu.write(ptr, &[192; 100]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         for _ in 0..1000 {
@@ -1833,6 +2180,12 @@ mod tests {
         m.spawn("audio-com", code, &[], 65536).unwrap();
         assert!(matches!(m.run(), adv_machine::RunResult::Exited(0)));
         assert_eq!(m.cpu.read_u32(DATA + 512).unwrap(), 0);
-        assert!(m.ext.get::<Sound>().buffers[&b].playing);
+        assert!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, b)
+                .unwrap()
+                .playing
+        );
     }
 }

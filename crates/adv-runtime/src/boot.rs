@@ -196,7 +196,7 @@ impl<B: Backend> Runtime<B> {
         self.machine
             .ext
             .get::<adv_dx::dsound::Sound>()
-            .source_status(self.machine.sys.clock.now_us())
+            .source_status(&self.machine.sys.objects, self.machine.sys.clock.now_us())
     }
 
     /// Hash the first four secondary-buffer starts for decoder differential checks.
