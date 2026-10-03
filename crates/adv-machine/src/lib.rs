@@ -34,7 +34,7 @@ use adv_cpu::backend::{
     TrapHandler,
 };
 
-pub use clock::Clock;
+pub use clock::{Clock, MAX_PASSIVE_STEP_US};
 pub use ext::Ext;
 use layout::*;
 pub use outcome::{Continuation, Outcome, Resume, WakeReason};
@@ -1206,6 +1206,7 @@ impl<B: Backend> Machine<B> {
         started: Instant,
         hard_budget: Option<Duration>,
     ) -> SliceResult {
+        self.sys.clock.begin_work();
         // Only a sliced host driver can service external channels on a soft
         // return. The synchronous run() API retains its run-until-blocked contract.
         self.cpu.set_host_interrupts(slice.is_some());
@@ -1249,6 +1250,7 @@ impl<B: Backend> Machine<B> {
                 self.sys.rr_last = last;
                 let soon = self.sys.clock.now_us() + 1000;
                 let t = self.sys.next_deadline().map_or(soon, |d| d.min(soon));
+                self.sys.clock.begin_wait(Some(t));
                 return SliceResult::Complete(RunResult::Idle {
                     next_deadline: Some(t),
                 });
@@ -1265,9 +1267,9 @@ impl<B: Backend> Machine<B> {
                     continue;
                 }
                 self.sys.trace.flush();
-                return SliceResult::Complete(RunResult::Idle {
-                    next_deadline: self.sys.next_deadline(),
-                });
+                let next_deadline = self.sys.next_deadline();
+                self.sys.clock.begin_wait(next_deadline);
+                return SliceResult::Complete(RunResult::Idle { next_deadline });
             };
             let id = selection.id;
             ran.resize(self.sys.contexts.len(), false);
@@ -1530,9 +1532,9 @@ impl<B: Backend> Machine<B> {
         {
             SliceResult::Yielded
         } else {
-            SliceResult::Complete(RunResult::Idle {
-                next_deadline: self.sys.next_deadline(),
-            })
+            let next_deadline = self.sys.next_deadline();
+            self.sys.clock.begin_wait(next_deadline);
+            SliceResult::Complete(RunResult::Idle { next_deadline })
         }
     }
 

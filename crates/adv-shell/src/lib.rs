@@ -405,6 +405,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
+            "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
@@ -449,6 +450,9 @@ fn build_report(context: ReportContext<'_>) -> String {
         options.time_skip,
         runtime.machine.sys.scheduling.active_time_skips,
         runtime.machine.sys.scheduling.active_time_skip_us,
+        runtime.machine.sys.clock.passive_stalls().0,
+        runtime.machine.sys.clock.passive_stalls().1,
+        adv_machine::MAX_PASSIVE_STEP_US,
         missing
             .iter()
             .map(|s| json(s))

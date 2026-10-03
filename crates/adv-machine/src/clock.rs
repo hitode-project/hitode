@@ -2,7 +2,47 @@
 //! every wait deadline read this clock, so a run can be made deterministic (virtual time)
 //! or recorded and replayed later.
 
+use std::cell::Cell;
 use std::time::Instant;
+
+/// Maximum unplanned wall-time advance. Expected idle waits are credited in
+/// full; time discarded after a stall is never repaid as catch-up work.
+pub const MAX_PASSIVE_STEP_US: u64 = 50_000;
+
+#[derive(Clone, Copy)]
+enum Allowance {
+    Working,
+    Until(u64),
+    UnboundedWait,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RealProgress {
+    observed_us: u64,
+    elapsed_us: u64,
+    clamps: u64,
+    discarded_us: u64,
+}
+impl RealProgress {
+    fn observe(&mut self, wall_us: u64, allowance: Allowance, origin_us: u64) -> u64 {
+        let delta = wall_us.saturating_sub(self.observed_us);
+        self.observed_us = self.observed_us.max(wall_us);
+        let limit = match allowance {
+            Allowance::Working => MAX_PASSIVE_STEP_US,
+            Allowance::Until(deadline) => deadline
+                .saturating_sub(origin_us.saturating_add(self.elapsed_us))
+                .saturating_add(MAX_PASSIVE_STEP_US),
+            Allowance::UnboundedWait => u64::MAX,
+        };
+        let accepted = delta.min(limit);
+        if accepted != delta {
+            self.clamps = self.clamps.saturating_add(1);
+            self.discarded_us = self.discarded_us.saturating_add(delta - accepted);
+        }
+        self.elapsed_us = self.elapsed_us.saturating_add(accepted);
+        self.elapsed_us
+    }
+}
 
 pub enum ClockMode {
     /// Wall-clock time since machine start.
@@ -20,6 +60,8 @@ pub struct Clock {
     /// Added to every reading so tick counts don't start at zero (some code treats 0 as unset).
     pub epoch_us: u64,
     active_skip_us: u64,
+    real_progress: Cell<RealProgress>,
+    allowance: Cell<Allowance>,
 }
 
 /// QueryPerformanceFrequency. 10 MHz, as on current Windows.
@@ -35,6 +77,8 @@ impl Clock {
             },
             epoch_us: 1_000_000,
             active_skip_us: 0,
+            real_progress: Cell::new(RealProgress::default()),
+            allowance: Cell::new(Allowance::Working),
         }
     }
 
@@ -43,6 +87,8 @@ impl Clock {
             mode: ClockMode::Virtual(0),
             epoch_us: 1_000_000,
             active_skip_us: 0,
+            real_progress: Cell::new(RealProgress::default()),
+            allowance: Cell::new(Allowance::Working),
         }
     }
 
@@ -59,14 +105,42 @@ impl Clock {
                     paused_at,
                     paused_for_us,
                 } => {
-                    paused_at
+                    let wall_us = (paused_at
                         .unwrap_or_else(Instant::now)
                         .duration_since(*started)
-                        .as_micros() as u64
-                        - paused_for_us
+                        .as_micros() as u64)
+                        .saturating_sub(*paused_for_us);
+                    let mut progress = self.real_progress.get();
+                    let elapsed = progress.observe(
+                        wall_us,
+                        self.allowance.get(),
+                        self.epoch_us.saturating_add(self.active_skip_us),
+                    );
+                    self.real_progress.set(progress);
+                    elapsed
                 }
                 ClockMode::Virtual(t) => *t,
             }
+    }
+
+    /// Account the host's planned idle interval. An indefinite object/input
+    /// wait permits elapsed wall time; no simulation was runnable in that time.
+    pub(crate) fn begin_wait(&mut self, deadline: Option<u64>) {
+        self.now_us();
+        self.allowance
+            .set(deadline.map_or(Allowance::UnboundedWait, Allowance::Until));
+    }
+
+    /// Settle the prior wait before running contexts again. An early input wake
+    /// consumes only actual elapsed time and leaves no future waiting credit.
+    pub(crate) fn begin_work(&mut self) {
+        self.now_us();
+        self.allowance.set(Allowance::Working);
+    }
+
+    pub fn passive_stalls(&self) -> (u64, u64) {
+        let progress = self.real_progress.get();
+        (progress.clamps, progress.discarded_us)
     }
 
     pub fn now_ms(&self) -> u32 {
@@ -118,6 +192,7 @@ impl Clock {
 
     /// Freeze guest-visible real time while the frontend is backgrounded.
     pub fn pause(&mut self) {
+        self.now_us();
         if let ClockMode::Real { paused_at, .. } = &mut self.mode {
             paused_at.get_or_insert_with(Instant::now);
         }
@@ -139,7 +214,77 @@ impl Clock {
 
 #[cfg(test)]
 mod tests {
-    use super::Clock;
+    use super::{Allowance, Clock, MAX_PASSIVE_STEP_US, RealProgress};
+
+    #[test]
+    fn passive_stalls_are_discarded_without_future_catch_up_or_clock_rewind() {
+        let mut progress = RealProgress::default();
+        assert_eq!(progress.observe(5000, Allowance::Working, 0), 5000);
+        assert_eq!(
+            progress.observe(2_005_000, Allowance::Working, 0),
+            5000 + MAX_PASSIVE_STEP_US
+        );
+        assert_eq!(
+            progress.observe(2_005_001, Allowance::Working, 0),
+            5001 + MAX_PASSIVE_STEP_US
+        );
+        assert_eq!(
+            progress.observe(2_000_000, Allowance::Working, 0),
+            5001 + MAX_PASSIVE_STEP_US
+        );
+        assert_eq!(progress.clamps, 1);
+        assert_eq!(progress.discarded_us, 2_000_000 - MAX_PASSIVE_STEP_US);
+    }
+
+    #[test]
+    fn intentional_long_waits_are_not_slowed_but_late_wakeup_is_bounded() {
+        let mut exact = RealProgress::default();
+        assert_eq!(
+            exact.observe(1_000_000, Allowance::Until(2_000_000), 1_000_000),
+            1_000_000
+        );
+        assert_eq!(exact.clamps, 0);
+        let mut late = RealProgress::default();
+        assert_eq!(
+            late.observe(4_000_000, Allowance::Until(2_000_000), 1_000_000),
+            1_000_000 + MAX_PASSIVE_STEP_US
+        );
+        assert_eq!(
+            late.observe(4_000_001, Allowance::Working, 1_000_000),
+            1_000_001 + MAX_PASSIVE_STEP_US
+        );
+        // Early input consumes actual elapsed time and cannot lend its unused
+        // idle allowance to a later stall while contexts are runnable.
+        let mut early = RealProgress::default();
+        assert_eq!(
+            early.observe(10_000, Allowance::Until(1_000_000), 0),
+            10_000
+        );
+        assert_eq!(
+            early.observe(800_000, Allowance::Working, 0),
+            10_000 + MAX_PASSIVE_STEP_US
+        );
+    }
+
+    #[test]
+    fn active_skip_and_background_pause_are_separate_from_passive_stalls() {
+        let mut clock = Clock::real();
+        let start = clock.now_us();
+        assert!(clock.skip_to(start + 10_000_000) > 9_000_000);
+        assert!(clock.now_us() >= start + 10_000_000);
+        assert_eq!(clock.passive_stalls(), (0, 0));
+        clock.pause();
+        let paused = clock.now_us();
+        assert_eq!(clock.skip_to(paused + 10_000_000), 0);
+        assert_eq!(clock.now_us(), paused);
+        clock.resume();
+        assert!(clock.now_us() >= paused);
+        let mut indefinite = RealProgress::default();
+        assert_eq!(
+            indefinite.observe(3_600_000_000, Allowance::UnboundedWait, 0),
+            3_600_000_000
+        );
+    }
 
     #[test]
     fn paused_real_clock_does_not_advance() {

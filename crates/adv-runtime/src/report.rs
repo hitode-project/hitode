@@ -262,6 +262,10 @@ impl<B: Backend> Runtime<B> {
             self.machine.sys.scheduling.active_time_skips,
             self.machine.sys.scheduling.active_time_skip_us
         ));
+        let (clamps, discarded_us) = self.machine.sys.clock.passive_stalls();
+        report.push_str(&format!(
+            "\nPassive stalls: {clamps}; discarded guest microseconds: {discarded_us}"
+        ));
         for window in user
             .windows
             .values()
