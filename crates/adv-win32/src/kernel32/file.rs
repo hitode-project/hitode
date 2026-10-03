@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Env, Object, Outcome};
+use adv_machine::{Env, Outcome};
 
 use super::K32;
 use crate::util::{
@@ -107,7 +107,11 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     };
     match result {
         Ok(file) => {
-            let h = env.sys.objects.insert(Object::Opaque(1));
+            let h = env.sys.objects.insert_host(FileObj {
+                file,
+                guest_path: guest.clone(),
+                access,
+            });
             log::debug!("CreateFile({guest}, {access:#x}, {disposition}) = {h:#x}");
             // ERROR_ALREADY_EXISTS is reported for CREATE_ALWAYS / OPEN_ALWAYS on success.
             let code = if exists && matches!(disposition, CREATE_ALWAYS | OPEN_ALWAYS) {
@@ -116,14 +120,6 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
                 0
             };
             set_last_error(env, code);
-            env.ext.get_mut::<Win32>().files.insert(
-                h,
-                FileObj {
-                    file,
-                    guest_path: guest,
-                    access,
-                },
-            );
             h
         }
         Err(e) => {
@@ -136,7 +132,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
 
 fn read_file(env: &mut Env<'_>) -> Outcome {
     let (h, buf, n, read_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let Some(f) = env.ext.get_mut::<Win32>().files.get_mut(&h) else {
+    let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
@@ -170,7 +166,7 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
         out_u32(env.cpu, written, n);
         return Outcome::Return(1);
     }
-    let Some(f) = env.ext.get_mut::<Win32>().files.get_mut(&h) else {
+    let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
@@ -188,7 +184,7 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
 
 /// Move `h`'s file pointer; the new position, or `None` with the last error set.
 fn seek(env: &mut Env<'_>, h: u32, dist: i64, method: u32) -> Option<u64> {
-    let Some(f) = env.ext.get_mut::<Win32>().files.get_mut(&h) else {
+    let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
         return None;
     };
@@ -245,10 +241,9 @@ fn set_file_pointer_ex(env: &mut Env<'_>) -> Outcome {
 }
 
 fn file_size(env: &mut Env<'_>, h: u32) -> Option<u64> {
-    env.ext
-        .get::<Win32>()
-        .files
-        .get(&h)
+    env.sys
+        .objects
+        .host::<FileObj>(h)
         .and_then(|f| f.file.metadata().ok())
         .map(|m| m.len())
 }
@@ -282,25 +277,9 @@ fn get_file_type(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
     Outcome::Return(match h {
         STD_INPUT | STD_OUTPUT | STD_ERROR => 2, // FILE_TYPE_CHAR
-        _ if env.ext.get::<Win32>().files.contains_key(&h) => 1,
+        _ if env.sys.objects.host::<FileObj>(h).is_some() => 1,
         _ => 0,
     })
-}
-
-fn close_handle(env: &mut Env<'_>) -> Outcome {
-    let h = env.arg(0);
-    let object = env.sys.objects.remove(h).is_some();
-    super::file_mapping::close(env, h);
-    let w = env.ext.get_mut::<Win32>();
-    let known = w.files.remove(&h).is_some()
-        | w.finds.remove(&h).is_some()
-        | w.thread_snapshots.remove(&h).is_some();
-    if object || known || matches!(h, STD_INPUT | STD_OUTPUT | STD_ERROR) || h >= 0xffff_fffe {
-        return Outcome::Return(1);
-    }
-    log::debug!("CloseHandle({h:#x}): unknown handle");
-    set_last_error(env, err::INVALID_HANDLE);
-    Outcome::Return(0)
 }
 
 fn filetime(t: Option<SystemTime>) -> u64 {
@@ -319,10 +298,9 @@ fn write_filetime(cpu: &mut dyn Guest, p: u32, ft: u64) {
 fn get_file_time(env: &mut Env<'_>) -> Outcome {
     let (h, c, a, m) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let Some(md) = env
-        .ext
-        .get::<Win32>()
-        .files
-        .get(&h)
+        .sys
+        .objects
+        .host::<FileObj>(h)
         .and_then(|f| f.file.metadata().ok())
     else {
         set_last_error(env, err::INVALID_HANDLE);
@@ -470,17 +448,12 @@ fn find_first_file(env: &mut Env<'_>, pat: String, data: u32, wide: bool) -> Out
         return Outcome::Return(INVALID_HANDLE_VALUE);
     }
     fill_find_data(env, data, &entries[0], wide);
-    let h = env.sys.objects.insert(Object::Opaque(2));
-    env.ext
-        .get_mut::<Win32>()
-        .finds
-        .insert(h, FindObj { entries, next: 1 });
-    Outcome::Return(h)
+    Outcome::Return(env.sys.objects.insert_host(FindObj { entries, next: 1 }))
 }
 
 fn find_next_file(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (h, data) = (env.arg(0), env.arg(1));
-    let Some(f) = env.ext.get_mut::<Win32>().finds.get_mut(&h) else {
+    let Some(f) = env.sys.objects.host_mut::<FindObj>(h) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
@@ -849,13 +822,12 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "FlushFileBuffers", 1, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetEndOfFile", 1, |e| {
         let h = e.arg(0);
-        let ok = e.ext.get_mut::<Win32>().files.get_mut(&h).is_some_and(|f| {
+        let ok = e.sys.objects.host_mut::<FileObj>(h).is_some_and(|f| {
             let pos = f.file.stream_position().unwrap_or(0);
             f.file.set_len(pos).is_ok()
         });
         Outcome::Return(u32::from(ok))
     });
-    stdcall(reg, K32, "CloseHandle", 1, close_handle);
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
     stdcall(reg, K32, "SetFileTime", 4, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetFileAttributesA", 1, |e| {
@@ -907,10 +879,11 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "FindNextFileW", 2, |e| find_next_file(e, true));
     stdcall(reg, K32, "FindClose", 1, |e| {
         let h = e.arg(0);
-        e.sys.objects.remove(h);
-        Outcome::Return(u32::from(
-            e.ext.get_mut::<Win32>().finds.remove(&h).is_some(),
-        ))
+        let find = e.sys.objects.host::<FindObj>(h).is_some();
+        if find {
+            e.sys.objects.close(h);
+        }
+        Outcome::Return(u32::from(find))
     });
     stdcall(reg, K32, "GetCurrentDirectoryA", 2, get_current_directory_a);
     stdcall(reg, K32, "SetCurrentDirectoryA", 1, |e| {

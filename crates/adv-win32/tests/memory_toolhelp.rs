@@ -183,7 +183,14 @@ fn thread_entries_reject_invalid_outputs_without_writes_or_consuming_records() {
         assert_eq!(t.word(DATA + 0x100 + 8), t.m.sys.context(0).tid);
         assert_eq!(t.word(DATA + 0x200 + 8), t.m.sys.context(1).tid);
         let handle = t.word(DATA);
-        assert_eq!(t.m.ext.get::<Win32>().thread_snapshots[&handle].1, 2);
+        assert_eq!(
+            t.m.sys
+                .objects
+                .host::<adv_win32::ThreadSnapshot>(handle)
+                .unwrap()
+                .cursor,
+            2
+        );
         t.assert_unchanged(out, &sentinel);
     }
 }

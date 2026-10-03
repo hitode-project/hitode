@@ -1,11 +1,11 @@
 //! Toolhelp snapshots enumerate guest contexts; host threads are never exposed.
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Object, Outcome};
+use adv_machine::{Env, Outcome};
 
 use super::K32;
 use crate::util::{err, set_last_error};
-use crate::{Win32, stdcall};
+use crate::{ThreadSnapshot, stdcall};
 
 fn create_snapshot(env: &mut Env<'_>) -> Outcome {
     // This implementation supports TH32CS_SNAPTHREAD, whose process argument is ignored
@@ -21,12 +21,11 @@ fn create_snapshot(env: &mut Env<'_>) -> Outcome {
         .filter(|c| !c.is_done())
         .map(|c| (c.tid, env.sys.pid))
         .collect();
-    let handle = env.sys.objects.insert(Object::Opaque(0));
-    env.ext
-        .get_mut::<Win32>()
-        .thread_snapshots
-        .insert(handle, (rows, 0));
-    Outcome::Return(handle)
+    Outcome::Return(
+        env.sys
+            .objects
+            .insert_host(ThreadSnapshot { rows, cursor: 0 }),
+    )
 }
 
 fn thread_entry(env: &mut Env<'_>, first: bool) -> Outcome {
@@ -43,12 +42,12 @@ fn thread_entry(env: &mut Env<'_>, first: bool) -> Outcome {
         set_last_error(env, 998); // ERROR_NOACCESS
         return Outcome::Return(0);
     }
-    let Some((rows, cursor)) = env.ext.get::<Win32>().thread_snapshots.get(&handle) else {
+    let Some(snapshot) = env.sys.objects.host::<ThreadSnapshot>(handle) else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
-    let index = if first { 0 } else { *cursor };
-    let Some(&(tid, pid)) = rows.get(index) else {
+    let index = if first { 0 } else { snapshot.cursor };
+    let Some(&(tid, pid)) = snapshot.rows.get(index) else {
         set_last_error(env, 18); // ERROR_NO_MORE_FILES
         return Outcome::Return(0);
     };
@@ -59,12 +58,11 @@ fn thread_entry(env: &mut Env<'_>, first: bool) -> Outcome {
         }
     }
     // Enumeration position changes only after a successful complete output.
-    env.ext
-        .get_mut::<Win32>()
-        .thread_snapshots
-        .get_mut(&handle)
+    env.sys
+        .objects
+        .host_mut::<ThreadSnapshot>(handle)
         .unwrap()
-        .1 = index + 1;
+        .cursor = index + 1;
     Outcome::Return(1)
 }
 

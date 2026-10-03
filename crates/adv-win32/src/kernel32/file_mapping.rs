@@ -12,7 +12,7 @@ use adv_cpu::backend::{FilePage, GuestExt, Prot};
 use adv_machine::{Env, Object, Outcome};
 
 use super::K32;
-use crate::{Win32, stdcall, util::set_last_error};
+use crate::{FileObj, Win32, stdcall, util::set_last_error};
 
 const PAGE: u64 = 4096;
 const GRANULE: u64 = 65536;
@@ -26,14 +26,26 @@ type Identity = (u64, u64);
 
 #[derive(Default)]
 struct Mappings {
-    handles: HashMap<u32, Handle>,
     names: HashMap<Vec<u16>, Named>,
     files: HashMap<Identity, Weak<Backing>>,
     views: BTreeMap<u32, View>,
 }
-struct Handle {
+/// A section object in the handle table. Its section counts open section objects, so a
+/// name stays bound while any exists.
+struct SectionHandle {
     section: Rc<Section>,
     access: u32,
+}
+impl SectionHandle {
+    fn new(section: Rc<Section>, access: u32) -> Self {
+        section.handles.set(section.handles.get() + 1);
+        Self { section, access }
+    }
+}
+impl Drop for SectionHandle {
+    fn drop(&mut self) {
+        self.section.handles.set(self.section.handles.get() - 1);
+    }
 }
 enum Named {
     Mapping(Weak<Section>),
@@ -280,7 +292,7 @@ fn file_backing(
     writable: bool,
     maximum: u64,
 ) -> Result<Rc<Backing>, u32> {
-    let source = env.ext.get::<Win32>().files.get(&handle).ok_or(6u32)?;
+    let source = env.sys.objects.host::<FileObj>(handle).ok_or(6u32)?;
     if source.access & (GENERIC_READ | 0x10000000) == 0
         || (writable && source.access & (GENERIC_WRITE | 0x10000000) == 0)
     {
@@ -316,7 +328,7 @@ fn file_backing(
         let new_id = identity(&target).map_err(|e| io_error(&e))?;
         // Reopen each matching file instance independently, preserving its own
         // access metadata and position. A different file at the same name stays.
-        for file in env.ext.get_mut::<Win32>().files.values_mut() {
+        for (_, file) in env.sys.objects.hosts_mut::<FileObj>() {
             if file.guest_path.eq_ignore_ascii_case(&guest_path)
                 && identity(&file.file).map_err(|e| io_error(&e))? == old_id
             {
@@ -341,7 +353,10 @@ fn file_backing(
         }
         target
     } else {
-        env.ext.get::<Win32>().files[&handle]
+        env.sys
+            .objects
+            .host::<FileObj>(handle)
+            .unwrap()
             .file
             .try_clone()
             .map_err(|e| io_error(&e))?
@@ -403,15 +418,10 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
         None
     };
     if let Some(existing) = existing {
-        existing.handles.set(existing.handles.get() + 1);
-        let handle = env.sys.objects.insert(Object::Opaque(0x4d4150));
-        state(env).handles.insert(
-            handle,
-            Handle {
-                section: existing,
-                access: ALL,
-            },
-        );
+        let handle = env
+            .sys
+            .objects
+            .insert_host(SectionHandle::new(existing, ALL));
         set_last_error(env, 183);
         return Outcome::Return(handle);
     }
@@ -429,7 +439,7 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
             }),
         )
     } else {
-        let Some(file_obj) = env.ext.get::<Win32>().files.get(&file) else {
+        let Some(file_obj) = env.sys.objects.host::<FileObj>(file) else {
             return fail(env, 6);
         };
         let size = match file_obj.file.metadata() {
@@ -453,21 +463,17 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
         backing,
         len: len.div_ceil(PAGE) * PAGE,
         protection,
-        handles: Cell::new(1),
+        handles: Cell::new(0),
     });
-    let handle = env.sys.objects.insert(Object::Opaque(0x4d4150));
     if let Some(name) = name {
         state(env)
             .names
             .insert(name, Named::Mapping(Rc::downgrade(&section)));
     }
-    state(env).handles.insert(
-        handle,
-        Handle {
-            section,
-            access: ALL,
-        },
-    );
+    let handle = env
+        .sys
+        .objects
+        .insert_host(SectionHandle::new(section, ALL));
     set_last_error(env, 0);
     Outcome::Return(handle)
 }
@@ -498,12 +504,11 @@ fn open(env: &mut Env<'_>, wide: bool) -> Outcome {
     if access & 0x20 != 0 {
         return fail(env, 50);
     }
-    let handle = env.sys.objects.insert(Object::Opaque(0x4d4150));
-    section.handles.set(section.handles.get() + 1);
-    state(env)
-        .handles
-        .insert(handle, Handle { section, access });
-    Outcome::Return(handle)
+    Outcome::Return(
+        env.sys
+            .objects
+            .insert_host(SectionHandle::new(section, access)),
+    )
 }
 
 fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
@@ -511,7 +516,7 @@ fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
     let offset = (u64::from(env.arg(2)) << 32) | u64::from(env.arg(3));
     let count = u64::from(env.arg(4));
     let base = if requested { env.arg(5) } else { 0 };
-    let Some(handle) = state(env).handles.get(&handle) else {
+    let Some(handle) = env.sys.objects.host::<SectionHandle>(handle) else {
         return fail(env, 6);
     };
     let section = handle.section.clone();
@@ -652,11 +657,9 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-pub(super) fn close(env: &mut Env<'_>, handle: u32) {
+/// Forget names whose objects are gone, after a handle closes.
+pub(super) fn prune(env: &mut Env<'_>) {
     if let Some(state) = env.ext.try_get_mut::<Mappings>() {
-        if let Some(handle) = state.handles.remove(&handle) {
-            handle.section.handles.set(handle.section.handles.get() - 1);
-        }
         state.prune(&env.sys.objects);
     }
 }

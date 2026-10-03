@@ -6,6 +6,7 @@
 //! guest computation or return a completed frame to the host. The normal scheduling
 //! lane remains round-robin, with a bounded preference for genuinely satisfied waits.
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use crate::outcome::{Continuation, DeferredContinuation, WakeReason};
@@ -171,7 +172,9 @@ impl Context {
     }
 }
 
-#[derive(Clone, Debug)]
+/// A kernel object. The scheduler waits on the first four; everything else a higher layer
+/// keeps behind a handle (files, enumerations, sections, ...) is a [`Object::Host`] payload,
+/// dropped when its last handle closes.
 pub enum Object {
     Event {
         manual_reset: bool,
@@ -188,10 +191,40 @@ pub enum Object {
         owner: Option<CtxId>,
         recursion: u32,
     },
-    /// Owned by the win32/pal layers (files, heaps, ...); never waitable here.
-    Opaque(u32),
+    /// Owned by a higher layer; never waitable here.
+    Host(Box<dyn Any>),
 }
 
+impl std::fmt::Debug for Object {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Event {
+                manual_reset,
+                signaled,
+            } => f
+                .debug_struct("Event")
+                .field("manual_reset", manual_reset)
+                .field("signaled", signaled)
+                .finish(),
+            Self::Thread { ctx } => f.debug_struct("Thread").field("ctx", ctx).finish(),
+            Self::Semaphore { count, max } => f
+                .debug_struct("Semaphore")
+                .field("count", count)
+                .field("max", max)
+                .finish(),
+            Self::Mutex { owner, recursion } => f
+                .debug_struct("Mutex")
+                .field("owner", owner)
+                .field("recursion", recursion)
+                .finish(),
+            Self::Host(_) => f.write_str("Host(..)"),
+        }
+    }
+}
+
+/// The process handle table. Several handles may name one object (duplicates, opens of a
+/// named object); the object goes away with its last handle. An object's identity is the
+/// handle it was created with.
 #[derive(Default)]
 pub struct Objects {
     map: HashMap<Handle, Object>,
@@ -209,22 +242,61 @@ impl Objects {
         self.references.insert(self.next, 1);
         self.next
     }
+    /// A handle to a new [`Object::Host`] holding `value`.
+    pub fn insert_host<T: Any>(&mut self, value: T) -> Handle {
+        self.insert(Object::Host(Box::new(value)))
+    }
     pub fn get(&self, h: Handle) -> Option<&Object> {
         self.map.get(self.targets.get(&h)?)
     }
     pub fn get_mut(&mut self, h: Handle) -> Option<&mut Object> {
         self.map.get_mut(self.targets.get(&h)?)
     }
-    pub fn remove(&mut self, h: Handle) -> Option<Object> {
+    /// The payload of `h` if it is a host object of type `T`.
+    pub fn host<T: Any>(&self, h: Handle) -> Option<&T> {
+        match self.get(h)? {
+            Object::Host(value) => value.downcast_ref(),
+            _ => None,
+        }
+    }
+    pub fn host_mut<T: Any>(&mut self, h: Handle) -> Option<&mut T> {
+        match self.get_mut(h)? {
+            Object::Host(value) => value.downcast_mut(),
+            _ => None,
+        }
+    }
+    /// Every live host object of type `T`, once each, by identity.
+    pub fn hosts<T: Any>(&self) -> impl Iterator<Item = (Handle, &T)> {
+        self.map.iter().filter_map(|(&id, object)| match object {
+            Object::Host(value) => Some((id, value.downcast_ref()?)),
+            _ => None,
+        })
+    }
+    pub fn hosts_mut<T: Any>(&mut self) -> impl Iterator<Item = (Handle, &mut T)> {
+        self.map
+            .iter_mut()
+            .filter_map(|(&id, object)| match object {
+                Object::Host(value) => Some((id, value.downcast_mut()?)),
+                _ => None,
+            })
+    }
+    /// Close one handle. `None` if `h` is not open; otherwise the object if this was its
+    /// last handle (for the caller to inspect or drop), or `Some(None)` if others remain.
+    pub fn close(&mut self, h: Handle) -> Option<Option<Object>> {
         let object = self.targets.remove(&h)?;
         let references = self.references.get_mut(&object).unwrap();
         *references -= 1;
         if *references == 0 {
             self.references.remove(&object);
-            self.map.remove(&object)
+            Some(self.map.remove(&object))
         } else {
-            self.map.get(&object).cloned()
+            Some(None)
         }
+    }
+    /// A new handle to the object `h` names (DuplicateHandle).
+    pub fn duplicate(&mut self, h: Handle) -> Option<Handle> {
+        let object = self.identity(h)?;
+        self.alias_identity(object)
     }
     pub fn identity(&self, h: Handle) -> Option<Handle> {
         self.targets.get(&h).copied()

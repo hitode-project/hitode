@@ -187,11 +187,10 @@ fn run() -> Result<(), String> {
     while started.elapsed() < Duration::from_secs(seconds) {
         let files: BTreeMap<_, _> = r
             .machine
-            .ext
-            .get::<adv_win32::Win32>()
-            .files
-            .iter()
-            .map(|(&id, file)| {
+            .sys
+            .objects
+            .hosts::<adv_win32::FileObj>()
+            .map(|(id, file)| {
                 let mut native = &file.file;
                 (id, (file.guest_path.clone(), native.stream_position().ok()))
             })

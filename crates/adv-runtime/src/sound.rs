@@ -423,11 +423,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         let ctx = e.sys.current;
         let caller = e.caller();
         let files: Vec<_> = if matches!(name, "Play" | "Stop" | "SetCurrentPosition" | "Release") {
-            e.ext
-                .get::<Win32>()
-                .files
-                .iter()
-                .map(|(&handle, file)| {
+            e.sys
+                .objects
+                .hosts::<adv_win32::FileObj>()
+                .map(|(handle, file)| {
                     let mut native = &file.file;
                     (
                         handle,

@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use adv_abi::Registry;
 use adv_cpu::backend::{Backend, Guest, GuestExt, MemFault};
 use adv_machine::layout::{PEB_ADDR, peb};
-use adv_machine::{Conv, Handle, Handler, Machine, Sys};
+use adv_machine::{Conv, Handler, Machine, Sys};
 
 use adv_os::{Codec, Heaps, OsConfig, Vfs, vfs};
 
@@ -54,7 +54,7 @@ impl Win32Config {
     }
 }
 
-/// Open file.
+/// Open file; a host object in the machine's handle table, like the others below.
 pub struct FileObj {
     pub file: std::fs::File,
     pub guest_path: String,
@@ -67,15 +67,17 @@ pub struct FindObj {
     pub next: usize,
 }
 
+/// Toolhelp thread snapshot: immutable (thread id, process id) rows and a cursor.
+pub struct ThreadSnapshot {
+    pub rows: Vec<(u32, u32)>,
+    pub cursor: usize,
+}
+
 pub struct Win32 {
     pub cfg: Win32Config,
     pub codec: Codec,
     pub vfs: Vfs,
     pub heaps: Heaps,
-    pub files: HashMap<Handle, FileObj>,
-    pub finds: HashMap<Handle, FindObj>,
-    /// Toolhelp thread snapshots: immutable (thread id, process id) rows and cursor.
-    pub thread_snapshots: HashMap<Handle, (Vec<(u32, u32)>, usize)>,
     pub tls_used: [bool; 64],
     /// HRSRC -> (data address, size).
     pub resources: HashMap<u32, (u32, u32)>,
@@ -105,9 +107,6 @@ impl Win32 {
             codec: Codec::new(cfg.os.codepage),
             vfs,
             heaps,
-            files: HashMap::new(),
-            finds: HashMap::new(),
-            thread_snapshots: HashMap::new(),
             tls_used: [false; 64],
             resources: HashMap::new(),
             next_hrsrc: 0x7e80_0000,

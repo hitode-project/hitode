@@ -1,12 +1,11 @@
 //! Multimedia file I/O for guest-owned memory and read-only VFS files.
 //! MMIO positions and RIFF sizes are byte offsets, never host pointers. Memory
 //! files retain the caller's storage and observe subsequent guest writes.
-use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Conv, Env, Object, Outcome};
+use adv_machine::{Conv, Env, Outcome};
 use adv_win32::{
     Win32,
     util::{cstr, wstr},
@@ -38,10 +37,9 @@ struct File {
     flags: u32,
     info: [u32; 18],
 }
-#[derive(Default)]
-struct Mmio {
-    files: BTreeMap<u32, File>,
-}
+/// An HMMIO in the handle table. The file is taken out while a call works on it, so the
+/// call can borrow guest memory and the rest of the environment freely.
+struct Hmmio(Option<File>);
 impl File {
     fn seek(&mut self, offset: i64, origin: u32) -> Option<u32> {
         let offset = if origin == 2 && matches!(self.source, Source::Memory { .. }) {
@@ -256,10 +254,7 @@ fn open(e: &mut Env<'_>) -> Outcome {
         }
         (Source::File(file), len)
     };
-    let handle = e.sys.objects.insert(Object::Opaque(1));
-    if e.ext.try_get::<Mmio>().is_none() {
-        e.ext.insert(Mmio::default());
-    }
+    let handle = e.sys.objects.insert_host(Hmmio(None));
     let mut file = File {
         source,
         len,
@@ -287,7 +282,7 @@ fn open(e: &mut Env<'_>) -> Outcome {
             );
         }
     }
-    e.ext.get_mut::<Mmio>().files.insert(handle, file);
+    put_back(e, handle, file);
     if info != 0 {
         let _ = e.cpu.write_u32(info + 12, 0);
     }
@@ -320,13 +315,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
         if flags & !0x10 != 0 {
             return Outcome::Return(10);
         }
-        let Some(file) = e
-            .ext
-            .try_get_mut::<Mmio>()
-            .and_then(|m| m.files.remove(&handle))
-        else {
+        let Some(file) = take(e, handle) else {
             return Outcome::Return(INVALID_HANDLE);
         };
+        e.sys.objects.close(handle);
         if let Source::Memory {
             address,
             owned: true,
@@ -338,15 +330,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 .heaps
                 .free(e.cpu, &mut e.sys.vm, 0, address);
         }
-        e.sys.objects.remove(handle);
         return Outcome::Return(0);
     }
-    // Remove temporarily to permit independent guest-memory access with no Ext borrow.
-    let Some(mut file) = e
-        .ext
-        .try_get_mut::<Mmio>()
-        .and_then(|m| m.files.remove(&handle))
-    else {
+    let Some(mut file) = take(e, handle) else {
         return Outcome::Return(
             if matches!(name.as_str(), "mmioSeek" | "mmioRead" | "mmioWrite") {
                 u32::MAX
@@ -439,8 +425,14 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
         _ => INVALID_PARAM,
     };
-    e.ext.get_mut::<Mmio>().files.insert(handle, file);
+    put_back(e, handle, file);
     Outcome::Return(value)
+}
+fn take(e: &mut Env<'_>, handle: u32) -> Option<File> {
+    e.sys.objects.host_mut::<Hmmio>(handle)?.0.take()
+}
+fn put_back(e: &mut Env<'_>, handle: u32, file: File) {
+    e.sys.objects.host_mut::<Hmmio>(handle).unwrap().0 = Some(file);
 }
 fn descend(e: &mut Env<'_>, file: &mut File) -> u32 {
     let Some(wanted) = words(e.cpu, e.arg(1), 5) else {
