@@ -33,6 +33,8 @@ foreach ($source in $sources) {
 Invoke-PatchChecked (Join-Path $LlvmBin 'clang.exe') @('--target=i686-pc-windows-msvc', '-c', (Join-Path $PSScriptRoot 'patch_target.s'), '-o', "$OutputDirectory/patch_target.obj")
 $base = @('/nologo', '/machine:x86', '/nodefaultlib', '/dynamicbase', '/base:0x400000', '/safeseh:no', '/timestamp:0', '/manifest:embed', "/manifestuac:level='asInvoker' uiAccess='false'", "/libpath:$WindowsSdk")
 $linker = Join-Path $LlvmBin 'lld-link.exe'
+Invoke-PatchChecked $compiler ($common + @('/DPATCH_VALUE=44', (Join-Path $PSScriptRoot 'patch_dllmain.c'), "/Fo$OutputDirectory/patch_dllmain_second.obj"))
 Invoke-PatchChecked $linker ($base + @('/dll', '/entry:DllMain@12', "/out:$OutputDirectory/fixture_patch_dllmain.dll", "$OutputDirectory/patch_dllmain.obj", 'kernel32.lib'))
+Invoke-PatchChecked $linker ($base + @('/dll', '/entry:DllMain@12', "/out:$OutputDirectory/fixture_patch_second.dll", "$OutputDirectory/patch_dllmain_second.obj", 'kernel32.lib'))
 Invoke-PatchChecked $linker ($base + @('/subsystem:console', '/entry:mainCRTStartup', "/def:$PSScriptRoot/patch_compat.def", "/out:$OutputDirectory/fixture_patch_compat.exe", "$OutputDirectory/patch_compat.obj", "$OutputDirectory/patch_crt.obj", "$OutputDirectory/patch_target.obj", "$OutputDirectory/buffer.obj", "$OutputDirectory/hook.obj", "$OutputDirectory/trampoline.obj", "$OutputDirectory/hde32.obj", 'kernel32.lib', 'ddraw.lib'))
 Write-Output "Built x86 patch fixtures in $OutputDirectory"

@@ -29,7 +29,7 @@ fn named_export(cpu: &dyn adv_cpu::backend::Guest, base: u32, name: &[u8]) -> u3
     panic!("missing fixture export {:?}", name);
 }
 
-const GOLDEN: &str = "iat=41\nminhook=16,trampoline=original,stdcall=balanced\nminhook-restored=1\ncom-vtable=QueryInterface,original=1\ndllmain-code=17->33\n";
+const GOLDEN: &str = "iat=41\nminhook=16,trampoline=original,stdcall=balanced\nminhook-restored=1\ncom-vtable=QueryInterface,original=1\ndllmain-code=17->33\ndllmain-stack=33->44->33->17,unloaded=1\n";
 
 fn fixtures() -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

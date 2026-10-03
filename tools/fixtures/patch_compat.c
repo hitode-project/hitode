@@ -121,9 +121,23 @@ void mainCRTStartup(void) {
     ((RELEASE_FN)(*(LPVOID **)draw)[2])(draw);
 
     for (i = 0; i < 128; ++i) check(patch_target() == 17);
-    check(LoadLibraryA("fixture_patch_dllmain.dll") != NULL);
-    for (i = 0; i < 16; ++i) check(patch_target() == 33);
-    record("dllmain-code=17->33\n");
+    {
+        HMODULE first = LoadLibraryA("fixture_patch_dllmain.dll");
+        HMODULE second;
+        check(first != NULL);
+        for (i = 0; i < 16; ++i) check(patch_target() == 33);
+        record("dllmain-code=17->33\n");
+        second = LoadLibraryA("fixture_patch_second.dll");
+        check(second != NULL);
+        for (i = 0; i < 16; ++i) check(patch_target() == 44);
+        check(FreeLibrary(second));
+        for (i = 0; i < 16; ++i) check(patch_target() == 33);
+        check(FreeLibrary(first));
+        for (i = 0; i < 16; ++i) check(patch_target() == 17);
+        check(GetModuleHandleA("fixture_patch_dllmain.dll") == NULL);
+        check(GetModuleHandleA("fixture_patch_second.dll") == NULL);
+        record("dllmain-stack=33->44->33->17,unloaded=1\n");
+    }
     check(CloseHandle(log_file));
     ExitProcess(0);
 }
