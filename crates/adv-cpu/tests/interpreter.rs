@@ -1,8 +1,9 @@
 use adv_cpu::interpreter::{Interpreter, Step};
 use adv_cpu::{CpuState, EXEC, Memory, READ, WRITE};
+use adv_unicorn::Guarded;
 use iced_x86::code_asm::*;
 use unicorn_engine::{
-    RegisterX86 as R, Unicorn,
+    RegisterX86 as R,
     unicorn_const::{Arch, Mode, Prot},
 };
 
@@ -59,14 +60,14 @@ fn state() -> CpuState {
 }
 
 struct Reference {
-    uc: Unicorn<'static, ()>,
+    uc: Guarded<'static, ()>,
     memory: Memory,
     interpreter: Interpreter,
 }
 
 impl Reference {
     fn new(bytes: &[u8]) -> Self {
-        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).unwrap();
+        let mut uc = Guarded::new(Arch::X86, Mode::MODE_32).unwrap();
         uc.mem_map(0, 0x30000, Prot::ALL).unwrap();
         uc.mem_write(u64::from(CODE), bytes).unwrap();
         Self {

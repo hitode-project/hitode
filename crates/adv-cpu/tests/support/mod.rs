@@ -7,10 +7,11 @@ use adv_cpu::{
     ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, CpuState, HostServices, Memory, Resume,
     RunOutcome, Wait,
 };
+use adv_unicorn::Guarded;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use unicorn_engine::{
-    RegisterX86 as R, Unicorn,
+    RegisterX86 as R,
     unicorn_const::{Arch, HookType, MemType, Mode, Prot, uc_error},
 };
 
@@ -66,7 +67,7 @@ struct Suspended {
 /// An independent reference executor with its own memory and architectural state.
 pub struct Oracle {
     // Unicorn must drop before the stable allocation used by mem_map_ptr.
-    uc: Unicorn<'static, HookData>,
+    uc: Guarded<'static, HookData>,
     memory: Memory,
     pub state: CpuState,
     pages: BTreeMap<u32, u8>,
@@ -117,7 +118,7 @@ impl Oracle {
             Memory::new(base, len)?
         };
         let mut uc =
-            Unicorn::new_with_data(Arch::X86, Mode::MODE_32, HookData::default()).map_err(error)?;
+            Guarded::new_with_data(Arch::X86, Mode::MODE_32, HookData::default()).map_err(error)?;
         let mut pages = BTreeMap::new();
         if !sparse {
             let pointer = memory.read(base, len)?.as_ptr().cast_mut().cast();
