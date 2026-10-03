@@ -328,6 +328,7 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
 }
 
 fn run(options: Options) -> Result<u8, String> {
+    window::initialize_dpi()?;
     let started = Instant::now();
     let mut runtime = Runtime::new(
         &options.exe,
