@@ -1,13 +1,14 @@
 //! Execution layer: shared-state x86-32 interpreter, hot-region JIT, and the guest CPU
 //! interface ([`backend`]) the machine layer drives. See the README for scope.
-pub mod backend;
 mod atomic_memory;
+pub mod backend;
 mod compile;
 mod compiler;
 mod cpu_profile;
+mod discovery;
 mod executor;
-mod floating;
 mod file_memory;
+mod floating;
 // Hardware fault primitives are dormant until validated Cranelift side tables
 // are connected. Other hosts retain the current checked execution lane.
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -114,6 +115,9 @@ pub struct Region {
     pub start: u32,
     pub len: usize,
     pub entries: Vec<u32>,
+    /// Transfers to these guest PCs leave this compilation unit. Automatic
+    /// discovery uses existing entries and bounded CFG edges as link frontiers.
+    pub frontier: Vec<u32>,
     /// Decode control flow from entries instead of scanning embedded data and padding.
     pub reachable: bool,
     /// Complete a final instruction whose start is inside this region. Automatic
@@ -128,6 +132,7 @@ impl Region {
             start,
             len,
             entries: Vec::new(),
+            frontier: Vec::new(),
             reachable: false,
             complete_tail: false,
             compile_strategy: CompileStrategy::Speed,

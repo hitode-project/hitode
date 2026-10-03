@@ -19,6 +19,9 @@ pub struct Stats {
     pub peak_pending_compilations: usize,
     pub compile_time: Duration,
     pub native_code_bytes: usize,
+    pub native_regions: usize,
+    pub cache_evictions: u64,
+    pub cache_rejections: u64,
     pub native_entries: u64,
     /// Entries reached by a generated tail call without returning to run_inner.
     pub linked_entries: u64,
@@ -87,6 +90,10 @@ pub struct Executor {
     hits: HashMap<u32, u32>,
     attempted: BTreeSet<u32>,
     cache_revision: u64,
+    cache_region_limit: usize,
+    cache_byte_limit: usize,
+    cache_clock: u64,
+    rejected_entries: BTreeMap<u32, Vec<(usize, u64)>>,
     observed_epoch: u64,
     profiling: bool,
     pub(crate) deadline: Option<Instant>,
@@ -211,6 +218,10 @@ impl Executor {
             hits: HashMap::new(),
             attempted: BTreeSet::new(),
             cache_revision: 1,
+            cache_region_limit: 4096,
+            cache_byte_limit: 32 * 1024 * 1024,
+            cache_clock: 0,
+            rejected_entries: BTreeMap::new(),
             observed_epoch: 0,
             profiling: false,
             deadline: None,
@@ -274,8 +285,12 @@ impl Executor {
 
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
+        self.links.rebuild(std::iter::empty());
+        self.cache_revision += 1;
         self.compiled.clear();
         self.stats.native_code_bytes = 0;
+        self.stats.native_regions = 0;
+        self.rejected_entries.clear();
         self.regions.clear();
         self.page_regions.clear();
         self.region_pages.clear();
@@ -303,32 +318,121 @@ impl Executor {
         Ok(())
     }
 
-    fn publish(&mut self, region: Region, compiled: Compiled) {
+    fn publish(&mut self, region: Region, mut compiled: Compiled) {
+        if self.cache_region_limit == 0 || compiled.code_size > self.cache_byte_limit {
+            self.stats.cache_rejections += 1;
+            for &pc in region.entries.iter().chain(std::iter::once(&region.start)) {
+                self.rejected_entries.insert(pc, compiled.pages.clone());
+            }
+            while self.rejected_entries.len() > 4096 {
+                let (pc, _) = self.rejected_entries.pop_first().unwrap();
+                self.attempted.remove(&pc);
+            }
+            if !self.compiled.contains_key(&region.start) {
+                self.forget_region(region.start);
+            }
+            return;
+        }
         self.native_heat.remove(&region.start);
         self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
         self.retire_compiled(region.start);
+        while self.compiled.len() >= self.cache_region_limit
+            || self.stats.native_code_bytes > self.cache_byte_limit - compiled.code_size
+        {
+            self.evict_oldest();
+        }
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        compiled.cache_stamp = self.cache_clock;
         for &pc in &compiled.entries {
             self.entry_owner.insert(pc, region.start);
         }
         self.stats.native_code_bytes += compiled.code_size;
         self.compiled.insert(region.start, compiled);
-        self.index_region(region);
+        self.stats.native_regions = self.compiled.len();
+        let pages = self.compiled[&region.start]
+            .pages
+            .iter()
+            .map(|&(page, _)| self.memory.base + (page * 4096) as u32)
+            .collect();
+        self.index_region_with_pages(region, Some(pages));
         self.cache_revision += 1;
     }
 
     fn retire_compiled(&mut self, start: u32) {
         if let Some(old) = self.compiled.remove(&start) {
+            // Only the execution owner reaches this path, after every generated
+            // call has returned. Remove all published raw targets before Drop
+            // unregisters unwind tables and releases executable memory.
+            self.links.rebuild(std::iter::empty());
+            self.cache_revision += 1;
             self.stats.native_code_bytes -= old.code_size;
             for entry in old.entries.iter() {
                 if self.entry_owner.get(entry) == Some(&start) {
                     self.entry_owner.remove(entry);
                 }
             }
+            self.stats.native_regions = self.compiled.len();
+        }
+    }
+
+    fn forget_region(&mut self, start: u32) {
+        if let Some(region) = self.regions.remove(&start) {
+            for pc in region.entries {
+                self.attempted.remove(&pc);
+                self.hits.remove(&pc);
+            }
+        }
+        if let Some(pages) = self.region_pages.remove(&start) {
+            for page in pages {
+                if let Some(owners) = self.page_regions.get_mut(&page) {
+                    owners.remove(&start);
+                    if owners.is_empty() {
+                        self.page_regions.remove(&page);
+                    }
+                }
+            }
+        }
+        self.attempted.remove(&start);
+        self.hits.remove(&start);
+        self.pending_regions.remove(&start);
+        self.stats.pending_compilations = self.pending_regions.len();
+        self.automatic_regions.remove(&start);
+        self.native_heat.remove(&start);
+        self.tier_attempted.remove(&start);
+    }
+
+    fn evict_oldest(&mut self) {
+        let owner = *self
+            .compiled
+            .iter()
+            .min_by_key(|(_, compiled)| compiled.cache_stamp)
+            .expect("every published native region has cache age")
+            .0;
+        self.retire_compiled(owner);
+        self.forget_region(owner);
+        self.stats.cache_evictions += 1;
+    }
+
+    /// Bound resident generated code by both region count and executable bytes.
+    /// Defaults are 4096 regions and 32 MiB. Zero disables native residency.
+    /// Eviction is owner-only, with recency sampled at Rust native entries;
+    /// individual Tail-linked callees do not add hot-path instrumentation.
+    pub fn set_code_cache_limits(&mut self, regions: usize, bytes: usize) {
+        self.cache_region_limit = regions;
+        self.cache_byte_limit = bytes;
+        self.rejected_entries.clear();
+        self.attempted.clear();
+        while self.compiled.len() > regions || self.stats.native_code_bytes > bytes {
+            self.evict_oldest();
         }
     }
 
     fn index_region(&mut self, region: Region) {
+        self.index_region_with_pages(region, None);
+    }
+
+    fn index_region_with_pages(&mut self, region: Region, dependencies: Option<BTreeSet<u32>>) {
         if let Some(old) = self.region_pages.remove(&region.start) {
             for page in old {
                 if let Some(owners) = self.page_regions.get_mut(&page) {
@@ -346,10 +450,13 @@ impl Executor {
             + region.len as u64
             + if region.complete_tail { 15 } else { 0 })
         .min(u64::from(self.memory.base) + self.memory.len as u64);
-        let mut pages = BTreeSet::new();
-        for page in (u64::from(region.start & !4095)..end).step_by(4096) {
-            let page = page as u32;
-            pages.insert(page);
+        let pages = dependencies.unwrap_or_else(|| {
+            (u64::from(region.start & !4095)..end)
+                .step_by(4096)
+                .map(|page| page as u32)
+                .collect()
+        });
+        for &page in &pages {
             self.page_regions
                 .entry(page)
                 .or_default()
@@ -627,6 +734,16 @@ impl Executor {
         if !self.auto_jit || self.entry_owner.contains_key(&pc) || !self.memory.executable(pc, 1) {
             return Ok(());
         }
+        if let Some(pages) = self.rejected_entries.get(&pc) {
+            if pages
+                .iter()
+                .all(|&(page, version)| self.memory.versions.get(page) == Some(&version))
+            {
+                return Ok(());
+            }
+            self.rejected_entries.remove(&pc);
+            self.attempted.remove(&pc);
+        }
         if self.attempted.contains(&pc) {
             return Ok(());
         }
@@ -635,33 +752,33 @@ impl Executor {
         if *hits < 32 {
             return Ok(());
         }
-        // Small regions keep cold startup compilation bounded; loops remain linked inside them.
-        let start = pc & !511;
-        let mut region = self
-            .regions
-            .values()
-            .find(|r| pc >= r.start && u64::from(pc) < u64::from(r.start) + r.len as u64)
-            .cloned()
-            .unwrap_or_else(|| {
-                let mut r = Region::new(start, 512);
-                r.reachable = true;
-                r.complete_tail = true;
-                r.compile_strategy = self.auto_compile_strategy;
-                r
-            });
-        if !region.entries.contains(&pc) {
-            region.entries.push(pc);
-        }
-        let contains_boundary = |boundary: u32| {
-            u64::from(boundary) >= u64::from(region.start)
-                && u64::from(boundary) < u64::from(region.start) + region.len as u64
-        };
-        if contains_boundary(stop) {
-            // Keep this small automatic window interpreted rather than absorb a
-            // stop boundary into a native region's internal dispatch.
+        let boundaries = self
+            .entry_owner
+            .keys()
+            .copied()
+            .chain(
+                self.pending_regions
+                    .keys()
+                    .filter_map(|owner| self.regions.get(owner))
+                    .flat_map(|region| {
+                        region
+                            .entries
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(region.start))
+                    }),
+            )
+            .collect();
+        let Some(region) = crate::discovery::discover(
+            &self.memory,
+            pc,
+            stop,
+            self.auto_compile_strategy,
+            &boundaries,
+        ) else {
             self.attempted.insert(pc);
             return Ok(());
-        }
+        };
         if self.async_compilation {
             if self.queue_region(region)? {
                 self.attempted.insert(pc);
@@ -736,7 +853,7 @@ impl Executor {
             let native = self
                 .entry_owner
                 .get(&self.state.eip)
-                .and_then(|owner| self.compiled.get(owner))
+                .and_then(|owner| self.compiled.get_mut(owner))
                 .filter(|c| {
                     !interpreter_only
                         && !single_step
@@ -745,6 +862,8 @@ impl Executor {
                         && self.deferred_fallback != Some(self.state.eip)
                 });
             if let Some(native) = native {
+                self.cache_clock = self.cache_clock.saturating_add(1);
+                native.cache_stamp = self.cache_clock;
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
                 // while a wall deadline is active, without charging extra work.
@@ -1028,14 +1147,311 @@ mod asynchronous_tests {
         assert!(m.stats.peak_pending_compilations <= crate::compiler::CAPACITY);
     }
     #[test]
-    fn automatic_discovery_preserves_a_stop_inside_its_nominal_window() {
+    fn automatic_discovery_compiles_up_to_a_stop_boundary() {
         let mut m = fixture();
         m.write(0x1000, &[0x40, 0x83, 0xf8, 100, 0x75, 0xfa])
             .unwrap();
         m.enable_auto_jit(true);
+        m.set_async_compilation(false);
         assert_eq!(m.run(0x1006, 1000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 100);
-        assert_eq!(m.stats.compile_requests, 0);
+        assert_eq!(m.stats.compilations, 1);
+        assert!(m.stats.native_entries > 0);
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+
+    fn machine() -> Executor {
+        let mut m = Executor::create(Memory::reserve(0x1000, 0x9000).unwrap()).unwrap();
+        m.map(0x1000, 0x9000, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        m.protect(0x9000, 4096, crate::READ | crate::WRITE).unwrap();
+        m.enable_auto_jit(true);
+        m.set_async_compilation(false);
+        m.state.regs[4] = 0x9f00;
+        m.write(0x9f00, &0x8000u32.to_le_bytes()).unwrap();
+        m
+    }
+
+    fn write(m: &mut Executor, pc: u32, emit: impl FnOnce(&mut CodeAssembler)) {
+        let mut a = CodeAssembler::new(32).unwrap();
+        emit(&mut a);
+        m.write(pc, &a.assemble(u64::from(pc)).unwrap()).unwrap();
+    }
+
+    fn discover(m: &mut Executor, pc: u32) {
+        m.state.eip = pc;
+        m.hits.insert(pc, 31);
+        m.discover(0x8000).unwrap();
+    }
+
+    #[test]
+    fn sparse_loop_merges_control_flow_and_ignores_padding_pages() {
+        let mut m = machine();
+        write(&mut m, 0x1000, |a| {
+            a.inc(eax).unwrap();
+            a.jmp(0x4000u64).unwrap();
+        });
+        write(&mut m, 0x4000, |a| {
+            a.dec(ecx).unwrap();
+            a.jnz(0x1000u64).unwrap();
+            a.ret().unwrap();
+        });
+        discover(&mut m, 0x1000);
+        assert_eq!(m.compiled.len(), 1);
+        assert!(m.entry_owner.contains_key(&0x4000));
+        assert_eq!(m.region_pages[&0x1000], BTreeSet::from([0x1000, 0x4000]));
+        m.refresh().unwrap();
+        let checks = m.stats.invalidation_candidates;
+        m.write(0x2000, &[42]).unwrap();
+        m.unmap(0x3000, 4096).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks);
+        m.state.regs[1] = 100;
+        assert_eq!(m.run(0x8000, 1000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 100);
+        assert_eq!(m.stats.compilations, 1);
+        assert_eq!(m.stats.interpreter_instructions, 0);
+    }
+
+    #[test]
+    fn overlapping_new_entry_preserves_old_native_code_and_invalidates_both() {
+        let mut m = machine();
+        // The immediate is also valid overlapping x86: INC EAX; RET.
+        m.write(0x1000, &[0xb8, 0x40, 0xc3, 0, 0, 0xc3]).unwrap();
+        discover(&mut m, 0x1000);
+        let entry = m.compiled[&0x1000].tail_entry;
+        let size = m.compiled[&0x1000].code_size;
+        discover(&mut m, 0x1001);
+        assert_eq!(m.compiled.len(), 2);
+        assert_eq!(m.compiled[&0x1000].tail_entry, entry);
+        assert_eq!(m.compiled[&0x1000].code_size, size);
+        assert_eq!(m.entry_owner[&0x1000], 0x1000);
+        assert_eq!(m.entry_owner[&0x1001], 0x1001);
+        m.state.regs[0] = 7;
+        assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 8);
+        m.write(0x1001, &[0x48]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidations, 2);
+        assert_eq!(m.stats.compilations, 4);
+        assert_eq!(
+            m.stats.native_code_bytes,
+            m.compiled.values().map(|c| c.code_size).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn new_fragment_links_to_existing_entry_without_recompiling_it() {
+        let mut m = machine();
+        write(&mut m, 0x1300, |a| {
+            a.add(eax, 3).unwrap();
+            a.ret().unwrap();
+        });
+        discover(&mut m, 0x1300);
+        let old_entry = m.compiled[&0x1300].tail_entry;
+        write(&mut m, 0x1100, |a| {
+            a.inc(eax).unwrap();
+            a.jmp(0x1300u64).unwrap();
+        });
+        discover(&mut m, 0x1100);
+        assert_eq!(m.regions[&0x1100].frontier, [0x1300]);
+        assert_eq!(m.compiled[&0x1300].tail_entry, old_entry);
+        assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 4);
+        assert_eq!(m.stats.linked_entries, 1);
+        assert_eq!(m.stats.interpreter_instructions, 0);
+    }
+
+    #[test]
+    fn direct_callees_inside_the_span_remain_separate_units() {
+        let mut m = machine();
+        write(&mut m, 0x1000, |a| {
+            a.call(0x1100u64).unwrap();
+            a.jmp(0x1300u64).unwrap();
+        });
+        write(&mut m, 0x1100, |a| {
+            a.add(eax, 2).unwrap();
+            a.ret().unwrap();
+        });
+        write(&mut m, 0x1300, |a| {
+            a.add(eax, 3).unwrap();
+            a.ret().unwrap();
+        });
+        discover(&mut m, 0x1000);
+        assert!(!m.entry_owner.contains_key(&0x1100));
+        assert!(m.regions[&0x1000].frontier.contains(&0x1100));
+        discover(&mut m, 0x1100);
+        m.state.eip = 0x1000;
+        assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 5);
+        assert_eq!(m.compiled.len(), 2);
+        assert_eq!(m.stats.interpreter_instructions, 0);
+    }
+
+    #[test]
+    fn span_and_instruction_limits_leave_executable_frontiers() {
+        let mut m = machine();
+        write(&mut m, 0x1000, |a| {
+            a.inc(eax).unwrap();
+            a.jmp(0x6000u64).unwrap();
+        });
+        write(&mut m, 0x6000, |a| {
+            a.inc(eax).unwrap();
+            a.ret().unwrap();
+        });
+        discover(&mut m, 0x1000);
+        assert!(m.regions[&0x1000].len < 512);
+        assert!(m.regions[&0x1000].frontier.contains(&0x6000));
+        discover(&mut m, 0x6000);
+        m.state.eip = 0x1000;
+        assert_eq!(m.run(0x8000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 2);
+        m.write(0x2000, &[0x40; 300]).unwrap();
+        m.write(0x212c, &[0xc3]).unwrap();
+        discover(&mut m, 0x2000);
+        assert_eq!(m.regions[&0x2000].len, 256);
+        assert!(m.regions[&0x2000].frontier.contains(&0x2100));
+        discover(&mut m, 0x2100);
+        m.state.eip = 0x2000;
+        m.state.regs[4] = 0x9f00;
+        assert_eq!(m.run(0x8000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 302);
+    }
+
+    #[test]
+    fn incomplete_fetch_keeps_a_negative_dependency_on_the_next_page() {
+        let mut m = machine();
+        m.write(0x1ffe, &[0xb8, 7, 0, 0, 0, 0xc3]).unwrap();
+        m.protect(0x2000, 4096, crate::READ).unwrap();
+        discover(&mut m, 0x1ffe);
+        assert!(m.region_pages[&0x1ffe].contains(&0x2000));
+        assert_eq!(
+            m.run(0x8000, 10).unwrap(),
+            RunOutcome::FetchFault {
+                pc: 0x1ffe,
+                address: 0x2000
+            }
+        );
+        m.protect(0x2000, 4096, crate::READ | crate::EXEC).unwrap();
+        m.state.eip = 0x1ffe;
+        assert_eq!(m.run(0x8000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 7);
+        assert!(m.stats.invalidations > 0);
+    }
+
+    #[test]
+    fn cache_count_limit_preserves_recent_code_and_clears_published_targets() {
+        let mut m = machine();
+        m.set_code_cache_limits(2, 1 << 20);
+        for pc in [0x1000, 0x1200, 0x1400] {
+            m.write(pc, &[0x40, 0xc3]).unwrap();
+        }
+        discover(&mut m, 0x1000);
+        discover(&mut m, 0x1200);
+        m.state.eip = 0x1000;
+        assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
+        let recent = m.compiled[&0x1000].tail_entry;
+        let revision = m.cache_revision;
+        discover(&mut m, 0x1400);
+        assert_eq!(m.compiled.len(), 2);
+        assert_eq!(m.stats.native_regions, 2);
+        assert_eq!(m.stats.cache_evictions, 1);
+        assert_eq!(m.compiled[&0x1000].tail_entry, recent);
+        assert!(!m.entry_owner.contains_key(&0x1200));
+        assert!(!m.region_pages.contains_key(&0x1200));
+        assert!(!m.regions.contains_key(&0x1200));
+        assert!(m.cache_revision > revision);
+        assert_ne!(m.links_revision, m.cache_revision);
+        m.set_code_cache_limits(0, 0);
+        assert!(m.compiled.is_empty());
+        assert!(m.entry_owner.is_empty());
+        assert!(m.page_regions.is_empty());
+        assert_eq!(m.stats.native_code_bytes, 0);
+        m.state.eip = 0x1200;
+        m.state.regs[4] = 0x9f00;
+        assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
+    }
+
+    #[test]
+    fn byte_budget_and_versioned_rejections_keep_residency_bounded() {
+        let mut m = machine();
+        for pc in [0x1000, 0x1200] {
+            m.write(pc, &[0x40, 0xc3]).unwrap();
+        }
+        discover(&mut m, 0x1000);
+        let size = m.stats.native_code_bytes;
+        m.set_code_cache_limits(8, size);
+        discover(&mut m, 0x1200);
+        assert!(m.stats.native_code_bytes <= size);
+        assert_eq!(m.stats.native_regions, 1);
+        assert_eq!(m.stats.cache_evictions, 1);
+        m.set_code_cache_limits(8, 1);
+        discover(&mut m, 0x1000);
+        assert_eq!(m.stats.cache_rejections, 1);
+        assert_eq!(m.stats.native_regions, 0);
+        let compilations = m.stats.compilations;
+        for _ in 0..64 {
+            discover(&mut m, 0x1000);
+        }
+        assert_eq!(m.stats.compilations, compilations);
+        assert!(m.rejected_entries.contains_key(&0x1000));
+        m.write(0x1000, &[0x48]).unwrap();
+        discover(&mut m, 0x1000);
+        assert_eq!(m.stats.compilations, compilations + 1);
+        m.set_code_cache_limits(8, 1 << 20);
+        discover(&mut m, 0x1000);
+        assert!(m.entry_owner.contains_key(&0x1000));
+        assert_eq!(m.stats.cache_rejections, 2);
+    }
+
+    #[test]
+    fn late_worker_publication_obeys_the_latest_cache_budget() {
+        let mut m = machine();
+        m.write(0x1000, &[0x40, 0xc3]).unwrap();
+        m.set_async_compilation(true);
+        m.hits.insert(0x1000, 31);
+        m.state.eip = 0x1000;
+        m.discover(0x8000).unwrap();
+        assert_eq!(m.stats.pending_compilations, 1);
+        m.set_code_cache_limits(0, 0);
+        let until = Instant::now() + Duration::from_secs(10);
+        while m.stats.pending_compilations != 0 {
+            m.collect_compilations().unwrap();
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(m.stats.cache_rejections, 1);
+        assert_eq!(m.stats.native_regions, 0);
+        assert!(m.regions.is_empty());
+        assert!(m.page_regions.is_empty());
+        let requests = m.stats.compile_requests;
+        for _ in 0..64 {
+            m.discover(0x8000).unwrap();
+        }
+        assert_eq!(m.stats.compile_requests, requests);
+    }
+
+    #[test]
+    fn padding_on_a_used_page_revalidates_only_decoded_instruction_bytes() {
+        let mut m = machine();
+        write(&mut m, 0x1000, |a| {
+            a.inc(eax).unwrap();
+            a.jmp(0x1300u64).unwrap();
+        });
+        m.write(0x1300, &[0xc3]).unwrap();
+        discover(&mut m, 0x1000);
+        m.refresh().unwrap();
+        let entry = m.compiled[&0x1000].tail_entry;
+        m.write(0x1200, &[0xcc]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.code_revalidations, 1);
+        assert_eq!(m.stats.invalidations, 0);
+        assert_eq!(m.compiled[&0x1000].tail_entry, entry);
     }
 }
 

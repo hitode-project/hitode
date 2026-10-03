@@ -39,6 +39,8 @@ pub(crate) struct Compiled {
     window_len: usize,
     pub entries: BTreeSet<u32>,
     pub code_size: usize,
+    /// Owner-side recency sampled at Rust entries, never read by generated code.
+    pub cache_stamp: u64,
     #[cfg(all(test, target_arch = "x86_64"))]
     disasm: String,
 }
@@ -107,11 +109,14 @@ impl Compiled {
 /// retained: only bounded instruction bytes and their page stamps are copied.
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
-    pub region: Region,
+    pub region: Box<Region>,
     base: u32,
     len: usize,
     bytes: Vec<u8>,
     pages: Vec<PageStamp>,
+    // Published reachable regions compare only their decoded instruction bytes.
+    // A pending snapshot still stamps the full bounded window conservatively.
+    covered: Option<Vec<(usize, usize)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,10 +164,11 @@ impl Snapshot {
             }
         }
         Ok(Self {
-            region: region.clone(),
+            region: Box::new(region.clone()),
             base: memory.base,
             len: memory.len,
             bytes,
+            covered: None,
             pages: pages
                 .into_iter()
                 .map(|page| PageStamp {
@@ -192,9 +198,43 @@ impl Snapshot {
                 memory.perms.get(stamp.page) == Some(&stamp.permissions)
                     && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
             })
-            && memory
-                .read_data(self.region.start, self.bytes.len())
-                .is_ok_and(|bytes| bytes == self.bytes)
+            && self.covered.as_ref().map_or_else(
+                || {
+                    memory
+                        .read_data(self.region.start, self.bytes.len())
+                        .is_ok_and(|bytes| bytes == self.bytes)
+                },
+                |ranges| {
+                    ranges.iter().all(|&(offset, len)| {
+                        memory
+                            .read_data(self.region.start + offset as u32, len)
+                            .is_ok_and(|bytes| bytes == &self.bytes[offset..offset + len])
+                    })
+                },
+            )
+    }
+
+    fn with_coverage(
+        &self,
+        instructions: &BTreeMap<u32, Instruction>,
+        pages: &BTreeSet<usize>,
+    ) -> Self {
+        let mut input = self.clone();
+        if self.region.reachable {
+            input.covered = Some(
+                instructions
+                    .values()
+                    .map(|instruction| {
+                        (
+                            (instruction.ip32() - self.region.start) as usize,
+                            instruction.len(),
+                        )
+                    })
+                    .collect(),
+            );
+            input.pages.retain(|stamp| pages.contains(&stamp.page));
+        }
+        input
     }
 
     fn page_index(&self, address: u32) -> Option<usize> {
@@ -217,15 +257,14 @@ fn record_tail_dependencies(
     bytes: &[u8],
     offset: usize,
     decoder: &Decoder<'_>,
+    instruction: &Instruction,
     pages: &mut BTreeSet<usize>,
 ) {
-    if !region.complete_tail {
-        return;
-    }
     let start = (region.start - snapshot.base) as usize;
+    let read_start = (instruction.ip32() - snapshot.base) as usize;
     let read_end = start + offset + decoder.position();
-    pages.extend(start / 4096..=(read_end - 1) / 4096);
-    if decoder.last_error() == DecoderError::NoMoreBytes {
+    pages.extend(read_start / 4096..=(read_end - 1) / 4096);
+    if region.complete_tail && decoder.last_error() == DecoderError::NoMoreBytes {
         // The next page's mapping/EXEC permission can make a previously
         // truncated instruction compilable, even if none of its bytes
         // could be read. Keep that negative dependency in the cache.
@@ -247,15 +286,26 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let region = &snapshot.region;
     let bytes = &snapshot.bytes;
     let first_page = (region.start - snapshot.base) as usize / 4096;
-    let mut pages: BTreeSet<usize> =
-        (first_page..=((region.start - snapshot.base) as usize + region.len - 1) / 4096).collect();
+    let mut pages: BTreeSet<usize> = if region.reachable {
+        BTreeSet::new()
+    } else {
+        (first_page..=((region.start - snapshot.base) as usize + region.len - 1) / 4096).collect()
+    };
     let mut instructions = BTreeMap::new();
     if !region.reachable {
         let mut decoder =
             Decoder::with_ip(32, bytes, u64::from(region.start), DecoderOptions::NONE);
         while decoder.can_decode() && decoder.ip() < u64::from(region.start) + region.len as u64 {
             let instruction = decoder.decode();
-            record_tail_dependencies(region, snapshot, bytes, 0, &decoder, &mut pages);
+            record_tail_dependencies(
+                region,
+                snapshot,
+                bytes,
+                0,
+                &decoder,
+                &instruction,
+                &mut pages,
+            );
             instructions.insert(instruction.ip32(), instruction);
         }
     }
@@ -274,7 +324,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         );
     }
     while let Some(target) = pending.pop() {
-        if instructions.contains_key(&target) {
+        if instructions.contains_key(&target) || region.frontier.contains(&target) {
             continue;
         }
         let Some(offset) = target
@@ -293,9 +343,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         while decoder.can_decode()
             && decoder.ip() < u64::from(region.start) + region.len as u64
             && !instructions.contains_key(&(decoder.ip() as u32))
+            && !region.frontier.contains(&(decoder.ip() as u32))
         {
             let i = decoder.decode();
-            record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &mut pages);
+            record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &i, &mut pages);
             if i.op0_kind() == OpKind::NearBranch32 {
                 pending.push(i.near_branch32());
             }
@@ -822,6 +873,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
     entries.retain(|pc| supported(&instructions[pc]));
+    let input = snapshot.with_coverage(&instructions, &pages);
     Ok(Compiled {
         module: Some(module),
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -832,11 +884,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .into_iter()
             .map(|page| (page, snapshot.version(page)))
             .collect(),
-        input: snapshot.clone(),
+        input,
         window_base: snapshot.base,
         window_len: snapshot.len,
         entries,
         code_size,
+        cache_stamp: 0,
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
     })

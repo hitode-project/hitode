@@ -94,7 +94,7 @@ impl Worker {
                     .unwrap_or_else(|_| Err("background compiler panicked".into()));
                     let completion = Completion {
                         ticket: job.ticket,
-                        region: job.input.region.clone(),
+                        region: (*job.input.region).clone(),
                         input: job.input,
                         result,
                         duration: started.elapsed(),
