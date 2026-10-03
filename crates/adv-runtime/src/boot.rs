@@ -1025,6 +1025,7 @@ mod tests {
             font: 0,
             needs_paint: false,
             created_us: 0,
+            initial_geometry_reported: false,
             destroying: false,
             control: ControlState::default(),
             auto_clicks: 0,
