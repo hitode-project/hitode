@@ -4,7 +4,9 @@
 //! Pixels belong to the shared surface store; a surface lends GDI a DC from the shared table.
 use std::collections::BTreeMap;
 
-use adv_device::surface::{self, PixelFormat, Presenter, Rect, SurfaceMemory, Surfaces};
+use adv_device::surface::{
+    self, BlitOptions, BlitRect, PixelFormat, Presenter, Rect, SurfaceMemory, Surfaces,
+};
 use adv_os::gdi::DeviceContexts;
 
 pub mod api {
@@ -977,13 +979,7 @@ impl DirectDraw {
                     if s.locked.is_some() {
                         return Ok(BUSY);
                     }
-                    let color = m.u32(a[5] + 80)?.to_le_bytes();
-                    let row: Vec<u8> = (0..dr.w)
-                        .flat_map(|_| color[..s.format.bytes() as usize].iter().copied())
-                        .collect();
-                    for y in dr.y..dr.y + dr.h {
-                        m.write(s.row(dr.x, y), &row)?;
-                    }
+                    surfaces.fill_raw(dst, dr, m.u32(a[5] + 80)?, m)?;
                     if surfaces.primary_id() == Some(dst) {
                         surfaces.present(dst, m)?;
                     }
@@ -998,7 +994,7 @@ impl DirectDraw {
                 if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
-                let Ok(mut sr) = rect(surfaces, src, a[3], m) else {
+                let Ok(sr) = rect(surfaces, src, a[3], m) else {
                     return Ok(INVALID);
                 };
                 let origin = if surfaces.primary_id() == Some(dst) {
@@ -1016,36 +1012,34 @@ impl DirectDraw {
                         i64::from(m.u32(a[1] + 8)? as i32) - i64::from(ox),
                         i64::from(m.u32(a[1] + 12)? as i32) - i64::from(oy),
                     );
-                    if right - left != i64::from(sr.w) || bottom - top != i64::from(sr.h) {
-                        return Ok(UNSUPPORTED);
+                    if right <= left || bottom <= top {
+                        return Ok(INVALID);
                     }
-                    let clipped_left = left.max(0);
-                    let clipped_top = top.max(0);
-                    let clipped_right = right.min(i64::from(surfaces[dst].width));
-                    let clipped_bottom = bottom.min(i64::from(surfaces[dst].height));
-                    if clipped_right <= clipped_left || clipped_bottom <= clipped_top {
-                        return Ok(0);
-                    }
-                    sr.x += (clipped_left - left) as u32;
-                    sr.y += (clipped_top - top) as u32;
-                    sr.w = (clipped_right - clipped_left) as u32;
-                    sr.h = (clipped_bottom - clipped_top) as u32;
-                    Rect {
-                        x: clipped_left as u32,
-                        y: clipped_top as u32,
-                        w: sr.w,
-                        h: sr.h,
+                    BlitRect {
+                        x: left,
+                        y: top,
+                        w: (right - left) as u32,
+                        h: (bottom - top) as u32,
                     }
                 } else {
                     let Ok(dr) = rect(surfaces, dst, a[1], m) else {
                         return Ok(INVALID);
                     };
-                    dr
+                    BlitRect {
+                        x: i64::from(dr.x),
+                        y: i64::from(dr.y),
+                        w: dr.w,
+                        h: dr.h,
+                    }
                 };
-                if dr.w != sr.w || dr.h != sr.h {
-                    return Ok(UNSUPPORTED);
+                if dr.x + i64::from(dr.w) <= 0
+                    || dr.y + i64::from(dr.h) <= 0
+                    || dr.x >= i64::from(surfaces[dst].width)
+                    || dr.y >= i64::from(surfaces[dst].height)
+                {
+                    return Ok(0);
                 }
-                surfaces.copy(src, sr, dst, dr, m)?;
+                surfaces.blit(src, sr, dst, dr, BlitOptions::default(), m)?;
                 if surfaces.primary_id() == Some(dst) {
                     surfaces.present(dst, m)?;
                 }

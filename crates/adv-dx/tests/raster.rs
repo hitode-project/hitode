@@ -1,0 +1,297 @@
+use adv_device::surface::{PixelFormat, Snapshot, SurfaceMemory, Surfaces};
+use adv_dx::ddraw::{DirectDraw, IID_DDRAW7, api as dd};
+use adv_os::gdi::{DeviceContexts, WINDOW_DC};
+use adv_win32::gdi32::raster::{Raster, api as gdi};
+use std::borrow::Cow;
+
+struct Memory(Vec<u8>);
+impl SurfaceMemory for Memory {
+    fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+        self.0
+            .get(addr as usize..addr as usize + len)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| "read bounds".into())
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+        self.writable(addr, data.len())?;
+        self.0[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+    fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
+        self.read(addr, len).map(|_| ())
+    }
+    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+        self.read(src, len)?;
+        self.writable(dst, len)?;
+        self.0
+            .copy_within(src as usize..src as usize + len, dst as usize);
+        Ok(())
+    }
+}
+struct Fixture {
+    memory: Memory,
+    surfaces: Surfaces<Snapshot>,
+    contexts: DeviceContexts,
+    ddraw: DirectDraw,
+    raster: Raster,
+    device: u32,
+}
+impl Fixture {
+    fn new() -> Self {
+        let mut f = Self {
+            memory: Memory(vec![0; 65536]),
+            surfaces: Surfaces::new(5, 4, 4096, 61440, Snapshot::default()).unwrap(),
+            contexts: DeviceContexts::default(),
+            ddraw: DirectDraw::new(
+                adv_dx::ddraw::API_SPECS
+                    .iter()
+                    .map(|&(id, _, _, _)| (id, id * 16))
+                    .collect(),
+            ),
+            raster: Raster::default(),
+            device: 0,
+        };
+        f.memory.write(16, &IID_DDRAW7).unwrap();
+        assert_eq!(f.dd(dd::DD_CREATE, &[0, 32, 16, 0]), 0);
+        f.device = f.memory.u32(32).unwrap();
+        f
+    }
+    fn dd(&mut self, id: u32, args: &[u32]) -> u32 {
+        self.ddraw
+            .call(
+                id,
+                args,
+                &mut self.surfaces,
+                &mut self.contexts,
+                &mut self.memory,
+            )
+            .unwrap()
+    }
+    fn gdi(&mut self, id: u32, args: &[u32]) -> u32 {
+        self.raster
+            .call(
+                id,
+                args,
+                &mut self.surfaces,
+                &mut self.contexts,
+                &mut self.memory,
+            )
+            .unwrap()
+    }
+    fn surface(&mut self, w: u32, h: u32, format: PixelFormat, primary: bool) -> (u32, u32, u32) {
+        let mut desc = [0u8; 108];
+        let (r, g, b) = format.masks();
+        for (offset, value) in [
+            (0, 108),
+            (4, if primary { 1 } else { 0x1007 }),
+            (8, h),
+            (12, w),
+            (76, 0x40),
+            (84, format.bytes() * 8),
+            (88, r),
+            (92, g),
+            (96, b),
+            (104, if primary { 0x200 } else { 0x40 }),
+        ] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        self.memory.write(64, &desc).unwrap();
+        assert_eq!(self.dd(dd::CREATE_SURFACE, &[self.device, 64, 32, 0]), 0);
+        let object = self.memory.u32(32).unwrap();
+        assert_eq!(self.dd(dd::LOCK, &[object, 0, 64, 0, 0]), 0);
+        let pixels = self.memory.u32(64 + 36).unwrap();
+        let pitch = self.memory.u32(64 + 16).unwrap();
+        assert_eq!(self.dd(dd::UNLOCK, &[object, 0]), 0);
+        (object, pixels, pitch)
+    }
+    fn rect(&mut self, addr: u32, values: [i32; 4]) {
+        for (i, value) in values.into_iter().enumerate() {
+            self.memory
+                .write(addr + i as u32 * 4, &value.to_le_bytes())
+                .unwrap();
+        }
+    }
+    fn dc(&mut self, object: u32) -> u32 {
+        assert_eq!(self.dd(dd::SURFACE_DC, &[object, 32]), 0);
+        self.memory.u32(32).unwrap()
+    }
+}
+
+#[test]
+fn directdraw_scaled_blt_keeps_clipper_phase_and_rejects_color_key_flags() {
+    let mut f = Fixture::new();
+    let (source, pixels, pitch) = f.surface(5, 4, PixelFormat::Bgra32, false);
+    let (primary, _, _) = f.surface(5, 4, PixelFormat::Bgra32, true);
+    for y in 0..4 {
+        for x in 0..5 {
+            f.memory
+                .write(
+                    pixels + y * pitch + x * 4,
+                    &[1 + x as u8 + y as u8 * 5, 0, 0, 0],
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(f.dd(dd::CREATE_CLIPPER, &[f.device, 0, 32, 0]), 0);
+    let clipper = f.memory.u32(32).unwrap();
+    assert_eq!(f.dd(dd::SET_CLIPPER, &[primary, clipper]), 0);
+    f.ddraw.configure_clipper(clipper, (10, 20));
+    f.rect(192, [0, 0, 4, 3]);
+    f.rect(208, [7, 19, 13, 24]);
+    assert_eq!(
+        f.dd(dd::BLT, &[primary, 208, source, 192, 0x01000000, 0]),
+        0
+    );
+    let values: Vec<_> = f
+        .surfaces
+        .presenter
+        .bgra
+        .chunks_exact(4)
+        .map(|p| p[0])
+        .collect();
+    assert_eq!(
+        values,
+        [
+            3, 3, 4, 0, 0, 8, 8, 9, 0, 0, 8, 8, 9, 0, 0, 13, 13, 14, 0, 0
+        ]
+    );
+    let before = f.surfaces.presenter.bgra.clone();
+    assert_eq!(
+        f.dd(dd::BLT, &[primary, 208, source, 192, 0x8000, 0]),
+        0x80004001
+    );
+    assert_eq!(f.surfaces.presenter.bgra, before);
+    assert_eq!(
+        f.dd(dd::BLT_FAST, &[primary, 0, 0, source, 0, 1]),
+        0x80004001
+    );
+    f.rect(208, [4, 14, 8, 17]); // Complete clip: no extra frame boundary.
+    let frames = f.surfaces.stats.presentations;
+    assert_eq!(f.dd(dd::BLT, &[primary, 208, source, 192, 0, 0]), 0);
+    assert_eq!(f.surfaces.stats.presentations, frames);
+}
+
+#[test]
+fn directdraw_overlapping_scaling_and_conversion_preserve_original_pixels() {
+    let mut f = Fixture::new();
+    let (source, pixels, pitch) = f.surface(5, 4, PixelFormat::Rgb565, false);
+    let raw = [0xf800u16, 0x7e0, 0x1f, 0xffff, 0];
+    for y in 0..4 {
+        for x in 0..5 {
+            f.memory
+                .write(pixels + y * pitch + x * 2, &raw[x as usize].to_le_bytes())
+                .unwrap();
+        }
+        f.memory
+            .write(pixels + y * pitch + 10, &[0xaa, 0xbb])
+            .unwrap();
+    }
+    f.rect(192, [0, 0, 3, 2]);
+    f.rect(208, [1, 1, 5, 4]);
+    assert_eq!(f.dd(dd::BLT, &[source, 208, source, 192, 0, 0]), 0);
+    for y in 1..4 {
+        assert_eq!(
+            f.memory.read(pixels + y * pitch, 12).unwrap().as_ref(),
+            &[0, 0xf8, 0, 0xf8, 0, 0xf8, 0xe0, 7, 0x1f, 0, 0xaa, 0xbb]
+        );
+    }
+    let (primary, _, _) = f.surface(5, 4, PixelFormat::Bgra32, true);
+    assert_eq!(f.dd(dd::BLT, &[primary, 0, source, 0, 0, 0]), 0);
+    let first = [
+        0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0,
+    ];
+    let changed = [
+        0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0,
+    ];
+    assert_eq!(&f.surfaces.presenter.bgra[..20], &first);
+    for y in 1..4 {
+        assert_eq!(&f.surfaces.presenter.bgra[y * 20..(y + 1) * 20], &changed);
+    }
+}
+
+#[test]
+fn gdi_stretch_modes_mirrors_and_clipping_use_the_shared_pixel_store() {
+    let mut f = Fixture::new();
+    let (source, pixels, _) = f.surface(4, 1, PixelFormat::Bgra32, false);
+    f.memory
+        .write(pixels, &[1, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0])
+        .unwrap();
+    f.gdi(gdi::GET_DC, &[0]);
+    let dc = f.dc(source);
+    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 3]), 1);
+    assert_eq!(
+        f.gdi(
+            gdi::STRETCHBLT,
+            &[
+                WINDOW_DC,
+                (-3i32) as u32,
+                0,
+                6,
+                1,
+                dc,
+                0,
+                0,
+                4,
+                1,
+                0x00cc0020
+            ]
+        ),
+        1
+    );
+    assert_eq!(
+        &f.surfaces.presenter.bgra[..12],
+        &[4, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0]
+    );
+    assert_eq!(
+        f.gdi(
+            gdi::STRETCHBLT,
+            &[
+                WINDOW_DC,
+                4,
+                0,
+                (-4i32) as u32,
+                1,
+                dc,
+                0,
+                0,
+                4,
+                1,
+                0x00cc0020
+            ]
+        ),
+        1
+    );
+    assert_eq!(
+        &f.surfaces.presenter.bgra[..16],
+        &[8, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0]
+    );
+    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 1]), 3);
+    assert_eq!(
+        f.gdi(
+            gdi::STRETCHBLT,
+            &[WINDOW_DC, 0, 0, 2, 1, dc, 0, 0, 4, 1, 0x00cc0020]
+        ),
+        1
+    );
+    assert_eq!(&f.surfaces.presenter.bgra[..8], &[0; 8]);
+    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 2]), 1);
+    assert_eq!(
+        f.gdi(
+            gdi::STRETCHBLT,
+            &[WINDOW_DC, 0, 0, 2, 1, dc, 0, 0, 4, 1, 0x00cc0020]
+        ),
+        1
+    );
+    assert_eq!(&f.surfaces.presenter.bgra[..8], &[3, 0, 0, 0, 12, 0, 0, 0]);
+    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 4]), 0);
+    assert_eq!(f.gdi(gdi::LAST_ERROR, &[]), 87);
+    let before = f.surfaces.presenter.bgra.clone();
+    assert_eq!(
+        f.gdi(
+            gdi::STRETCHBLT,
+            &[WINDOW_DC, 0, 0, 2, 1, dc, 3, 0, 4, 1, 0x00cc0020]
+        ),
+        0
+    );
+    assert_eq!(f.surfaces.presenter.bgra, before);
+}

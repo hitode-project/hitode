@@ -1,0 +1,412 @@
+use adv_device::surface::{
+    BlitOptions, BlitRect, PixelFormat, Rect, Sampling, Snapshot, SurfaceMemory, Surfaces,
+    frame_mailbox,
+};
+use std::borrow::Cow;
+
+struct Memory {
+    bytes: Vec<u8>,
+    owned_reads: bool,
+    denied: Option<(u32, usize)>,
+}
+impl Memory {
+    fn new(owned_reads: bool) -> Self {
+        Self {
+            bytes: vec![0; 65536],
+            owned_reads,
+            denied: None,
+        }
+    }
+}
+impl SurfaceMemory for Memory {
+    fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+        let data = self
+            .bytes
+            .get(addr as usize..addr as usize + len)
+            .ok_or("read bounds")?;
+        Ok(if self.owned_reads {
+            Cow::Owned(data.to_vec())
+        } else {
+            Cow::Borrowed(data)
+        })
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+        self.writable(addr, data.len())?;
+        self.bytes[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+    fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
+        self.read(addr, len)?;
+        if let Some((start, count)) = self.denied
+            && (addr as usize) < start as usize + count
+            && (start as usize) < addr as usize + len
+        {
+            return Err("write protected".into());
+        }
+        Ok(())
+    }
+    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+        self.read(src, len)?;
+        self.writable(dst, len)?;
+        self.bytes
+            .copy_within(src as usize..src as usize + len, dst as usize);
+        Ok(())
+    }
+}
+fn store() -> Surfaces<Snapshot> {
+    Surfaces::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
+}
+fn logical_pixels(s: &Surfaces<Snapshot>, id: u32, m: &Memory) -> Vec<Vec<u8>> {
+    let surface = &s[id];
+    (0..surface.height)
+        .flat_map(|y| {
+            (0..surface.width).map(move |x| {
+                m.read(surface.row(x, y), surface.format.bytes() as usize)
+                    .unwrap()
+                    .into_owned()
+            })
+        })
+        .collect()
+}
+fn pattern(s: &Surfaces<Snapshot>, id: u32, m: &mut Memory) {
+    let surface = &s[id];
+    for y in 0..surface.height {
+        for x in 0..surface.width {
+            let p = [1 + x as u8 + y as u8 * 5, 0x36, 0x98, 0xaa];
+            m.write(surface.row(x, y), &p[..surface.format.bytes() as usize])
+                .unwrap();
+        }
+        let padding = surface.pitch - surface.width * surface.format.bytes();
+        if padding != 0 {
+            m.write(
+                surface.row(0, y) + surface.width * surface.format.bytes(),
+                &[0xcc; 3][..padding as usize],
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn packed_formats_encode_known_pixels_without_an_owned_result() {
+    for (format, expected) in [
+        (PixelFormat::Rgb565, [0x21, 0xec, 0, 0]),
+        (PixelFormat::Rgb555, [0x01, 0x76, 0, 0]),
+    ] {
+        assert_eq!(format.encode([13, 135, 242, 99]), expected);
+    }
+    assert_eq!(
+        PixelFormat::Bgra32.encode([13, 135, 242, 99]),
+        [13, 135, 242, 99]
+    );
+    assert_eq!(PixelFormat::Rgb565.decode(&[0x1f, 0xf8]), [255, 0, 255, 0]);
+    assert_eq!(PixelFormat::Rgb555.decode(&[0xe0, 0x03]), [0, 255, 0, 0]);
+}
+
+#[test]
+fn cross_format_rows_preserve_pitch_orientation_and_permission_checks() {
+    for owned in [false, true] {
+        for bottom_up in [false, true] {
+            let mut m = Memory::new(owned);
+            let mut s = store();
+            let src = s
+                .create(3, 2, bottom_up, PixelFormat::Bgra32, &mut m)
+                .unwrap();
+            let dst = s
+                .create(3, 2, !bottom_up, PixelFormat::Rgb565, &mut m)
+                .unwrap();
+            for (y, row) in [
+                [0, 0, 255, 77, 0, 255, 0, 77, 255, 0, 0, 77],
+                [255, 255, 255, 77, 0, 0, 0, 77, 255, 0, 255, 77],
+            ]
+            .iter()
+            .enumerate()
+            {
+                m.write(s[src].row(0, y as u32), row).unwrap();
+                m.write(s[dst].row(0, y as u32) + 6, &[0xaa, 0xbb]).unwrap();
+            }
+            let rect = s[src].rect();
+            s.copy(src, rect, dst, rect, &mut m).unwrap();
+            assert_eq!(
+                m.read(s[dst].row(0, 0), 8).unwrap().as_ref(),
+                &[0, 0xf8, 0xe0, 7, 0x1f, 0, 0xaa, 0xbb]
+            );
+            assert_eq!(
+                m.read(s[dst].row(0, 1), 8).unwrap().as_ref(),
+                &[255, 255, 0, 0, 0x1f, 0xf8, 0xaa, 0xbb]
+            );
+            let back = s
+                .create(3, 2, bottom_up, PixelFormat::Rgb555, &mut m)
+                .unwrap();
+            s.copy(dst, rect, back, rect, &mut m).unwrap();
+            assert_eq!(
+                m.read(s[back].row(0, 0), 6).unwrap().as_ref(),
+                &[0, 0x7c, 0xe0, 3, 0x1f, 0]
+            );
+            m.denied = Some((s[dst].row(0, 0), 6));
+            let before = logical_pixels(&s, dst, &m);
+            assert_eq!(
+                s.copy(src, rect, dst, rect, &mut m).unwrap_err(),
+                "write protected"
+            );
+            assert_eq!(logical_pixels(&s, dst, &m), before);
+            assert!(
+                s.copy(src, Rect { x: 2, w: 2, ..rect }, dst, rect, &mut m)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn overlapping_copies_and_scaled_transfers_read_original_pixels() {
+    for format in [
+        PixelFormat::Bgra32,
+        PixelFormat::Rgb565,
+        PixelFormat::Rgb555,
+    ] {
+        for bottom_up in [false, true] {
+            for (sr, dr) in [
+                (
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 4,
+                        h: 3,
+                    },
+                    Rect {
+                        x: 1,
+                        y: 1,
+                        w: 4,
+                        h: 3,
+                    },
+                ),
+                (
+                    Rect {
+                        x: 1,
+                        y: 1,
+                        w: 4,
+                        h: 3,
+                    },
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 4,
+                        h: 3,
+                    },
+                ),
+                (
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 3,
+                        h: 2,
+                    },
+                    Rect {
+                        x: 1,
+                        y: 1,
+                        w: 4,
+                        h: 3,
+                    },
+                ),
+                (
+                    Rect {
+                        x: 1,
+                        y: 0,
+                        w: 4,
+                        h: 4,
+                    },
+                    Rect {
+                        x: 0,
+                        y: 1,
+                        w: 2,
+                        h: 2,
+                    },
+                ),
+            ] {
+                let mut m = Memory::new(false);
+                let mut s = store();
+                let id = s.create(5, 4, bottom_up, format, &mut m).unwrap();
+                pattern(&s, id, &mut m);
+                let original = logical_pixels(&s, id, &m);
+                let mut expected = original.clone();
+                for y in 0..dr.h {
+                    for x in 0..dr.w {
+                        let sx = sr.x + x * sr.w / dr.w;
+                        let sy = sr.y + y * sr.h / dr.h;
+                        expected[((dr.y + y) * 5 + dr.x + x) as usize] =
+                            original[(sy * 5 + sx) as usize].clone();
+                    }
+                }
+                s.copy(id, sr, id, dr, &mut m).unwrap();
+                assert_eq!(logical_pixels(&s, id, &m), expected);
+                if format != PixelFormat::Bgra32 {
+                    for y in 0..4 {
+                        assert_eq!(
+                            m.read(s[id].row(0, y) + 10, 2).unwrap().as_ref(),
+                            &[0xcc, 0xcc]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn clipped_scaling_keeps_the_original_sampling_phase_and_mirroring() {
+    let mut m = Memory::new(false);
+    let mut s = store();
+    let src = s.create(5, 4, true, PixelFormat::Bgra32, &mut m).unwrap();
+    let dst = s.create(3, 4, false, PixelFormat::Bgra32, &mut m).unwrap();
+    pattern(&s, src, &mut m);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 3,
+    };
+    let dr = BlitRect {
+        x: -3,
+        y: -1,
+        w: 6,
+        h: 5,
+    };
+    for mirror in [false, true] {
+        s.blit(
+            src,
+            rect,
+            dst,
+            dr,
+            BlitOptions {
+                mirror_x: mirror,
+                mirror_y: mirror,
+                ..Default::default()
+            },
+            &mut m,
+        )
+        .unwrap();
+        let values: Vec<u8> = logical_pixels(&s, dst, &m).iter().map(|p| p[0]).collect();
+        assert_eq!(
+            values,
+            if mirror {
+                vec![12, 12, 11, 7, 7, 6, 7, 7, 6, 2, 2, 1]
+            } else {
+                vec![3, 3, 4, 8, 8, 9, 8, 8, 9, 13, 13, 14]
+            }
+        );
+    }
+}
+
+#[test]
+fn shrink_modes_combine_removed_pixels_before_format_conversion() {
+    let mut m = Memory::new(false);
+    let mut s = store();
+    let src = s.create(2, 2, false, PixelFormat::Bgra32, &mut m).unwrap();
+    let dst = s.create(1, 1, false, PixelFormat::Rgb565, &mut m).unwrap();
+    m.write(
+        s[src].pixels,
+        &[
+            0x0f, 0xff, 0xf0, 0, 0x33, 0xff, 0xcc, 0, 0x55, 0xff, 0xaa, 0, 0xff, 0xff, 1, 0,
+        ],
+    )
+    .unwrap();
+    for (mode, expected) in [(Sampling::And, [0xe0, 7]), (Sampling::Or, [255, 255])] {
+        s.blit(
+            src,
+            s[src].rect(),
+            dst,
+            BlitRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            BlitOptions {
+                sampling: mode,
+                ..Default::default()
+            },
+            &mut m,
+        )
+        .unwrap();
+        assert_eq!(m.read(s[dst].pixels, 2).unwrap().as_ref(), &expected);
+    }
+}
+
+#[test]
+fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels() {
+    for format in [
+        PixelFormat::Bgra32,
+        PixelFormat::Rgb565,
+        PixelFormat::Rgb555,
+    ] {
+        for path in 0..3 {
+            let mut m = Memory::new(false);
+            let mut s = store();
+            let id = s.create(3, 2, true, format, &mut m).unwrap();
+            s.fill_raw(
+                id,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 3,
+                    h: 1,
+                },
+                if format == PixelFormat::Bgra32 {
+                    0x00ff0000
+                } else if format == PixelFormat::Rgb565 {
+                    0xf800
+                } else {
+                    0x7c00
+                },
+                &mut m,
+            )
+            .unwrap();
+            s.fill_raw(
+                id,
+                Rect {
+                    x: 0,
+                    y: 1,
+                    w: 3,
+                    h: 1,
+                },
+                0x1f,
+                &mut m,
+            )
+            .unwrap();
+            let (producer, mut consumer) = frame_mailbox();
+            if path == 1 {
+                s.set_deferred_presentation(true).unwrap();
+            }
+            if path == 2 {
+                s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+            }
+            s.present(id, &m).unwrap();
+            s.present(id, &m).unwrap();
+            let mut expected = [0, 0, 255, 0].repeat(3);
+            expected.extend_from_slice(&if format == PixelFormat::Bgra32 {
+                [31, 0, 0, 0].repeat(3)
+            } else {
+                [255, 0, 0, 0].repeat(3)
+            });
+            if path != 0 {
+                assert_eq!(s.stats.converted_pixels, 0);
+                assert_eq!(s.stats.coalesced_frames, 1);
+                s.fill_raw(id, s[id].rect(), 0, &mut m).unwrap();
+                s.delete(id);
+                assert!(s.capture_latest().unwrap());
+                assert!(!s.capture_latest().unwrap());
+            }
+            assert_eq!(s.presenter.bgra, expected);
+            assert_eq!(s.presenter.frames, 2);
+            if path == 2 {
+                assert!(consumer.update());
+                let mut snapshot = Snapshot::default();
+                consumer.current().snapshot(&mut snapshot).unwrap();
+                assert_eq!(snapshot.bgra, expected);
+                assert_eq!(snapshot.frames, 2);
+                assert!(!consumer.update());
+            }
+        }
+    }
+}

@@ -10,6 +10,7 @@ pub trait SurfaceMemory {
     fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String>;
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String>;
     fn writable(&self, addr: u32, len: usize) -> Result<(), String>;
+    /// Checked byte copy with memmove semantics when the ranges overlap.
     fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String>;
     fn u32(&self, addr: u32) -> Result<u32, String> {
         Ok(u32::from_le_bytes(
@@ -86,6 +87,25 @@ impl Default for PendingFrame {
     }
 }
 impl PendingFrame {
+    fn store(&mut self, surface: &Surface, pixels: &[u8], serial: u64) {
+        self.width = surface.width;
+        self.height = surface.height;
+        self.pitch = surface.pitch;
+        self.format = surface.format;
+        self.serial = serial;
+        self.pixels.resize(pixels.len(), 0);
+        if surface.bottom_up {
+            let pitch = surface.pitch as usize;
+            for y in 0..surface.height as usize {
+                self.pixels[y * pitch..(y + 1) * pitch].copy_from_slice(
+                    &pixels[(surface.height as usize - 1 - y) * pitch
+                        ..(surface.height as usize - y) * pitch],
+                );
+            }
+        } else {
+            self.pixels.copy_from_slice(pixels);
+        }
+    }
     /// Conversion is performed only by the display consumer, or an explicit capture.
     pub fn snapshot(&self, out: &mut Snapshot) -> Result<(), String> {
         if self.width == 0 {
@@ -161,24 +181,77 @@ impl PixelFormat {
             return p[..4].try_into().unwrap();
         }
         let v = u32::from(u16::from_le_bytes(p[..2].try_into().unwrap()));
-        let (r, g, b) = self.masks();
-        let channel = |mask: u32| {
-            let bits = mask >> mask.trailing_zeros();
-            ((v & mask) >> mask.trailing_zeros()) * 255 / bits
+        let (r, g) = match self {
+            Self::Rgb565 => ((v >> 11) & 31, ((v >> 5) & 63) * 255 / 63),
+            Self::Rgb555 => ((v >> 10) & 31, ((v >> 5) & 31) * 255 / 31),
+            Self::Bgra32 => unreachable!(),
         };
-        [channel(b) as u8, channel(g) as u8, channel(r) as u8, 0]
+        [
+            ((v & 31) * 255 / 31) as u8,
+            g as u8,
+            (r * 255 / 31) as u8,
+            0,
+        ]
     }
-    pub fn encode(self, p: [u8; 4]) -> Vec<u8> {
+    /// Packed pixel, padded to four bytes. Only the first `bytes()` bytes are stored.
+    pub fn encode(self, p: [u8; 4]) -> [u8; 4] {
         if self == Self::Bgra32 {
-            return p.to_vec();
+            return p;
         }
-        let (r, g, b) = self.masks();
-        let channel = |value: u8, mask: u32| {
-            (u32::from(value) * (mask >> mask.trailing_zeros()) / 255) << mask.trailing_zeros()
+        let r = u16::from(p[2]) * 31 / 255;
+        let b = u16::from(p[0]) * 31 / 255;
+        let value = match self {
+            Self::Rgb565 => r << 11 | (u16::from(p[1]) * 63 / 255) << 5 | b,
+            Self::Rgb555 => r << 10 | (u16::from(p[1]) * 31 / 255) << 5 | b,
+            Self::Bgra32 => unreachable!(),
         };
-        ((channel(p[2], r) | channel(p[1], g) | channel(p[0], b)) as u16)
-            .to_le_bytes()
-            .to_vec()
+        let [lo, hi] = value.to_le_bytes();
+        [lo, hi, 0, 0]
+    }
+}
+
+/// Destination bounds before clipping. Signed origins preserve the sampling phase
+/// when a front clips a scaled transfer against the surface edge.
+#[derive(Clone, Copy, Debug)]
+pub struct BlitRect {
+    pub x: i64,
+    pub y: i64,
+    pub w: u32,
+    pub h: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sampling {
+    #[default]
+    Nearest,
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlitOptions {
+    pub mirror_x: bool,
+    pub mirror_y: bool,
+    pub sampling: Sampling,
+}
+
+fn convert_bgra(s: &Surface, input: &[u8], output: &mut Vec<u8>) {
+    let stride = s.width as usize * 4;
+    output.resize(stride * s.height as usize, 0);
+    for (y, dst) in output.chunks_exact_mut(stride).enumerate() {
+        let row = if s.bottom_up {
+            s.height as usize - 1 - y
+        } else {
+            y
+        };
+        let src = &input[row * s.pitch as usize..];
+        if s.format == PixelFormat::Bgra32 {
+            dst.copy_from_slice(&src[..stride]);
+        } else {
+            for (pixel, raw) in dst.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+                pixel.copy_from_slice(&s.format.decode(raw));
+            }
+        }
     }
 }
 impl Surface {
@@ -263,6 +336,9 @@ pub struct Surfaces<P: Presenter> {
     pending_frame: Option<PendingFrame>,
     captured_serial: u64,
     conversion: Vec<u8>,
+    blit_row: Vec<u8>,
+    blit_sample: Vec<u8>,
+    blit_source: Vec<u8>,
     frame_mailbox: Option<(FrameProducer, adv_sync::WakeEvent)>,
 }
 
@@ -290,6 +366,9 @@ impl<P: Presenter> Surfaces<P> {
             pending_frame: None,
             captured_serial: 0,
             conversion: Vec::new(),
+            blit_row: Vec::new(),
+            blit_sample: Vec::new(),
+            blit_source: Vec::new(),
             frame_mailbox: None,
         })
     }
@@ -486,23 +565,7 @@ impl<P: Presenter> Surfaces<P> {
         let pixels = m.read(s.pixels, (s.pitch * s.height) as usize)?;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|frame| {
-                frame.width = s.width;
-                frame.height = s.height;
-                frame.pitch = s.pitch;
-                frame.format = s.format;
-                frame.serial = self.stats.presentations;
-                frame.pixels.resize(pixels.len(), 0);
-                if s.bottom_up {
-                    let pitch = s.pitch as usize;
-                    for y in 0..s.height as usize {
-                        frame.pixels[y * pitch..(y + 1) * pitch].copy_from_slice(
-                            &pixels[(s.height as usize - 1 - y) * pitch
-                                ..(s.height as usize - y) * pitch],
-                        );
-                    }
-                } else {
-                    frame.pixels.copy_from_slice(pixels.as_ref());
-                }
+                frame.store(s, pixels.as_ref(), self.stats.presentations);
             });
             self.stats.coalesced_frames += u64::from(overwritten);
             if !overwritten {
@@ -518,41 +581,23 @@ impl<P: Presenter> Surfaces<P> {
             {
                 self.stats.coalesced_frames += 1;
             }
-            let pending = self.pending_frame.get_or_insert_with(|| PendingFrame {
-                width: 0,
-                height: 0,
-                pitch: 0,
-                format: s.format,
-                serial: 0,
-                pixels: Vec::new(),
-            });
-            pending.width = s.width;
-            pending.height = s.height;
-            pending.pitch = s.pitch;
-            pending.format = s.format;
-            pending.serial = self.stats.presentations;
-            pending.pixels.clear();
-            pending.pixels.extend_from_slice(&pixels);
+            self.pending_frame
+                .get_or_insert_with(PendingFrame::default)
+                .store(s, pixels.as_ref(), self.stats.presentations);
             return Ok(());
         }
         self.stats.host_captures += 1;
         self.captured_serial = self.stats.presentations;
-        if s.format != PixelFormat::Bgra32 {
-            // Conversion is one output buffer; the guest pixel store remains shared.
-            let mut converted = vec![0; s.width as usize * s.height as usize * 4];
-            self.stats.converted_pixels += u64::from(s.width) * u64::from(s.height);
-            for y in 0..s.height as usize {
-                for x in 0..s.width as usize {
-                    let offset = y * s.pitch as usize + x * s.format.bytes() as usize;
-                    converted[(y * s.width as usize + x) * 4..(y * s.width as usize + x + 1) * 4]
-                        .copy_from_slice(&s.format.decode(&pixels[offset..]));
-                }
+        if s.format != PixelFormat::Bgra32 || s.bottom_up {
+            convert_bgra(s, pixels.as_ref(), &mut self.conversion);
+            if s.format != PixelFormat::Bgra32 {
+                self.stats.converted_pixels += u64::from(s.width) * u64::from(s.height);
             }
             return self.presenter.present(FrameView {
                 width: s.width,
                 height: s.height,
                 pitch: s.width * 4,
-                bgra: &converted,
+                bgra: &self.conversion,
                 serial: self.stats.presentations,
             });
         }
@@ -564,13 +609,73 @@ impl<P: Presenter> Surfaces<P> {
             serial: self.stats.presentations,
         })
     }
-    /// Copy a rectangle between surfaces, converting when their formats differ.
+    /// Fill a rectangle with a packed pixel in the destination's own format.
+    pub fn fill_raw(
+        &mut self,
+        dst: u32,
+        rect: Rect,
+        value: u32,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        let d = self
+            .surfaces
+            .get(&dst)
+            .ok_or("unknown destination surface")?
+            .clone();
+        if rect.x.checked_add(rect.w).is_none_or(|x| x > d.width)
+            || rect.y.checked_add(rect.h).is_none_or(|y| y > d.height)
+        {
+            return Err("destination rectangle outside surface".into());
+        }
+        if rect.w == 0 || rect.h == 0 {
+            return Ok(());
+        }
+        let bytes = d.format.bytes() as usize;
+        let color = value.to_le_bytes();
+        self.blit_row.resize(rect.w as usize * bytes, 0);
+        for pixel in self.blit_row.chunks_exact_mut(bytes) {
+            pixel.copy_from_slice(&color[..bytes]);
+        }
+        for y in rect.y..rect.y + rect.h {
+            m.write(d.row(rect.x, y), &self.blit_row)?;
+        }
+        self.surfaces.get_mut(&dst).unwrap().version += 1;
+        Ok(())
+    }
+
+    /// Copy or scale a rectangle, converting when the formats differ.
     pub fn copy(
         &mut self,
         src: u32,
         sr: Rect,
         dst: u32,
         dr: Rect,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        self.blit(
+            src,
+            sr,
+            dst,
+            BlitRect {
+                x: i64::from(dr.x),
+                y: i64::from(dr.y),
+                w: dr.w,
+                h: dr.h,
+            },
+            BlitOptions::default(),
+            m,
+        )
+    }
+
+    /// Scale from an in-bounds source rectangle into a destination rectangle that
+    /// may extend beyond the surface. Clipping does not change the scale or phase.
+    pub fn blit(
+        &mut self,
+        src: u32,
+        sr: Rect,
+        dst: u32,
+        dr: BlitRect,
+        options: BlitOptions,
         m: &mut dyn SurfaceMemory,
     ) -> Result<(), String> {
         let s = self
@@ -583,36 +688,178 @@ impl<P: Presenter> Surfaces<P> {
             .get(&dst)
             .ok_or("unknown destination surface")?
             .clone();
-        if sr.w != dr.w || sr.h != dr.h {
-            return Err("scaling not implemented".into());
+        if sr.x.checked_add(sr.w).is_none_or(|right| right > s.width)
+            || sr
+                .y
+                .checked_add(sr.h)
+                .is_none_or(|bottom| bottom > s.height)
+        {
+            return Err("source rectangle outside surface".into());
         }
-        // Copy bottom to top for downward overlapping same-surface transfers.
-        for row in 0..sr.h {
-            let y = if src == dst && dr.y > sr.y {
-                sr.h - 1 - row
-            } else {
-                row
-            };
-            if s.format == d.format {
+        let right =
+            dr.x.checked_add(i64::from(dr.w))
+                .ok_or("destination overflow")?
+                .min(i64::from(d.width));
+        let bottom =
+            dr.y.checked_add(i64::from(dr.h))
+                .ok_or("destination overflow")?
+                .min(i64::from(d.height));
+        let left = dr.x.max(0);
+        let top = dr.y.max(0);
+        if sr.w == 0 || sr.h == 0 || dr.w == 0 || dr.h == 0 || right <= left || bottom <= top {
+            return Ok(());
+        }
+        let clipped = Rect {
+            x: left as u32,
+            y: top as u32,
+            w: (right - left) as u32,
+            h: (bottom - top) as u32,
+        };
+        let ox = (left - dr.x) as u32;
+        let oy = (top - dr.y) as u32;
+        let sb = s.format.bytes() as usize;
+        let db = d.format.bytes() as usize;
+        let unscaled = sr.w == dr.w && sr.h == dr.h;
+        if unscaled && !options.mirror_x && !options.mirror_y && s.format == d.format {
+            // Logical row order is independent of top-down/bottom-up storage.
+            for row in 0..clipped.h {
+                let y = if src == dst && clipped.y > sr.y + oy {
+                    clipped.h - 1 - row
+                } else {
+                    row
+                };
                 m.copy(
-                    s.row(sr.x, sr.y + y),
-                    d.row(dr.x, dr.y + y),
-                    (sr.w * s.format.bytes()) as usize,
+                    s.row(sr.x + ox, sr.y + oy + y),
+                    d.row(clipped.x, clipped.y + y),
+                    clipped.w as usize * sb,
                 )?;
-            } else {
-                let input = m
-                    .read(s.row(sr.x, sr.y + y), (sr.w * s.format.bytes()) as usize)?
-                    .into_owned();
-                let output: Vec<u8> = input
-                    .chunks_exact(s.format.bytes() as usize)
-                    .flat_map(|p| d.format.encode(s.format.decode(p)))
-                    .collect();
-                m.write(d.row(dr.x, dr.y + y), &output)?;
+            }
+        } else {
+            // A scaled/mirrored overlap can overwrite pixels needed by a later
+            // sample in either direction. Preserve the complete original rectangle.
+            let overlap = src == dst
+                && clipped.x < sr.x + sr.w
+                && sr.x < clipped.x + clipped.w
+                && clipped.y < sr.y + sr.h
+                && sr.y < clipped.y + clipped.h;
+            let input_stride = sr.w as usize * sb;
+            if overlap {
+                self.blit_source.resize(input_stride * sr.h as usize, 0);
+                for y in 0..sr.h {
+                    let row = m.read(s.row(sr.x, sr.y + y), input_stride)?;
+                    self.blit_source[y as usize * input_stride..(y as usize + 1) * input_stride]
+                        .copy_from_slice(row.as_ref());
+                }
+            }
+            self.blit_sample.resize(clipped.w as usize * sb, 0);
+            if s.format != d.format {
+                self.blit_row.resize(clipped.w as usize * db, 0);
+            }
+            let mut previous = None;
+            for y in 0..clipped.h {
+                let rows = sample_range(oy + y, sr.h, dr.h, options.sampling);
+                if previous != Some(rows) {
+                    self.blit_sample.fill(if options.sampling == Sampling::And {
+                        255
+                    } else {
+                        0
+                    });
+                    for sy in rows.0..rows.1 {
+                        let sy = if options.mirror_y { sr.h - 1 - sy } else { sy };
+                        if overlap {
+                            sample_row(
+                                &self.blit_source
+                                    [sy as usize * input_stride..(sy as usize + 1) * input_stride],
+                                &mut self.blit_sample,
+                                sb,
+                                ox,
+                                sr.w,
+                                dr.w,
+                                options,
+                            );
+                        } else {
+                            let input = m.read(s.row(sr.x, sr.y + sy), input_stride)?;
+                            sample_row(
+                                input.as_ref(),
+                                &mut self.blit_sample,
+                                sb,
+                                ox,
+                                sr.w,
+                                dr.w,
+                                options,
+                            );
+                        }
+                    }
+                    if s.format != d.format {
+                        for (input, output) in self
+                            .blit_sample
+                            .chunks_exact(sb)
+                            .zip(self.blit_row.chunks_exact_mut(db))
+                        {
+                            output.copy_from_slice(&d.format.encode(s.format.decode(input))[..db]);
+                        }
+                    }
+                    previous = Some(rows);
+                }
+                let output = if s.format == d.format {
+                    &self.blit_sample
+                } else {
+                    &self.blit_row
+                };
+                m.write(d.row(clipped.x, clipped.y + y), output)?;
             }
         }
         self.surfaces.get_mut(&dst).unwrap().version += 1;
-        self.stats.bytes_blitted += u64::from(sr.w) * u64::from(sr.h) * u64::from(d.format.bytes());
+        self.stats.bytes_blitted +=
+            u64::from(clipped.w) * u64::from(clipped.h) * u64::from(d.format.bytes());
         Ok(())
+    }
+}
+
+fn sample_range(at: u32, src: u32, dst: u32, sampling: Sampling) -> (u32, u32) {
+    let start = if src == dst {
+        at
+    } else {
+        (u64::from(at) * u64::from(src) / u64::from(dst)) as u32
+    };
+    let end = if sampling == Sampling::Nearest || src <= dst {
+        start + 1
+    } else {
+        (u64::from(at + 1) * u64::from(src) / u64::from(dst)) as u32
+    };
+    (start, end)
+}
+
+fn sample_row(
+    input: &[u8],
+    output: &mut [u8],
+    bytes: usize,
+    offset: u32,
+    src_width: u32,
+    dst_width: u32,
+    options: BlitOptions,
+) {
+    if src_width == dst_width && !options.mirror_x && options.sampling == Sampling::Nearest {
+        let start = offset as usize * bytes;
+        output.copy_from_slice(&input[start..start + output.len()]);
+        return;
+    }
+    for (x, pixel) in output.chunks_exact_mut(bytes).enumerate() {
+        let (start, end) = sample_range(offset + x as u32, src_width, dst_width, options.sampling);
+        for sx in start..end {
+            let sx = if options.mirror_x {
+                src_width - 1 - sx
+            } else {
+                sx
+            } as usize
+                * bytes;
+            let sample = &input[sx..sx + bytes];
+            match options.sampling {
+                Sampling::Nearest => pixel.copy_from_slice(sample),
+                Sampling::And => pixel.iter_mut().zip(sample).for_each(|(p, s)| *p &= s),
+                Sampling::Or => pixel.iter_mut().zip(sample).for_each(|(p, s)| *p |= s),
+            }
+        }
     }
 }
 
