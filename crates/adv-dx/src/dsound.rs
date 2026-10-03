@@ -5,7 +5,7 @@ use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
 use adv_machine::{Conv, Env, Machine, Outcome};
 use adv_os::Heaps;
 use std::collections::BTreeMap;
-use std::io::{Seek, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 const INVALID: u32 = 0x80070057;
@@ -445,7 +445,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 .objects
                 .hosts::<adv_os::vfs::FileObj>()
                 .map(|(handle, file)| {
-                    let mut native = &file.file;
+                    let native = &file.file;
                     (
                         handle,
                         file.guest_path.clone(),

@@ -18,6 +18,7 @@ pub mod module;
 pub mod nls;
 pub mod registry;
 pub mod synthetic;
+pub mod system_files;
 pub mod vfs;
 
 use std::path::PathBuf;

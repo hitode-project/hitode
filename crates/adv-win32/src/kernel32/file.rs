@@ -3,7 +3,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::SystemTime;
 
-use adv_abi::Registry;
+use adv_abi::{Registry, WideStr, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Env, Outcome};
 
@@ -22,6 +22,21 @@ const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+
+fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u8]>>, ()> {
+    let files = env
+        .ext
+        .get_or_default::<adv_os::system_files::SystemFiles>();
+    files.open(env.cpu, env.sys, path).map_err(|error| {
+        log::warn!("synthetic file {path}: {error}");
+    })
+}
+
+#[win32(kernel32, name = "GetSystemDirectoryW", level = implement)]
+fn system_directory_w(env: &mut Env<'_>, output: WideStr, capacity: u32) -> u32 {
+    let path: Vec<u16> = "C:\\Windows\\system32".encode_utf16().collect();
+    put_wstr(env.cpu, output.0.addr(), capacity, &path).unwrap_or(path.len() as u32 + 1)
+}
 
 fn path_a(env: &Env<'_>, p: u32) -> String {
     env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, p))
@@ -50,8 +65,41 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
 /// and creation disposition, register the handle, and set the last error. Returns the
 /// handle or `INVALID_HANDLE_VALUE`.
 pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32 {
+    let guest = env.ext.get::<Win32>().vfs.normalize(path);
+    match system_file(env, &guest) {
+        Ok(Some(bytes)) => {
+            if disposition == CREATE_NEW {
+                set_last_error(env, err::FILE_EXISTS);
+                return INVALID_HANDLE_VALUE;
+            }
+            if access & (GENERIC_WRITE | 0x1000_0000 | 0x10000) != 0
+                || !matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS)
+            {
+                set_last_error(env, err::ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+            let handle = env.sys.objects.insert_host(FileObj {
+                file: adv_os::vfs::FileStream::read_only(bytes),
+                guest_path: guest,
+                access,
+            });
+            set_last_error(
+                env,
+                if disposition == OPEN_ALWAYS {
+                    err::ALREADY_EXISTS
+                } else {
+                    0
+                },
+            );
+            return handle;
+        }
+        Err(()) => {
+            set_last_error(env, err::ACCESS_DENIED);
+            return INVALID_HANDLE_VALUE;
+        }
+        Ok(None) => {}
+    }
     let w = env.ext.get::<Win32>();
-    let guest = w.vfs.normalize(path);
     let existing = w.vfs.lookup(&guest);
     let write = access & GENERIC_WRITE != 0
         || matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING);
@@ -108,7 +156,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     match result {
         Ok(file) => {
             let h = env.sys.objects.insert_host(FileObj {
-                file,
+                file: file.into(),
                 guest_path: guest.clone(),
                 access,
             });
@@ -325,6 +373,10 @@ fn attributes(is_dir: bool) -> u32 {
 }
 
 fn get_file_attributes(env: &mut Env<'_>, path: String) -> Outcome {
+    let guest = env.ext.get::<Win32>().vfs.normalize(&path);
+    if matches!(system_file(env, &guest), Ok(Some(_))) {
+        return Outcome::Return(FILE_ATTRIBUTE_ARCHIVE | 1);
+    }
     match env.ext.get::<Win32>().vfs.lookup(&path) {
         Some(p) => Outcome::Return(attributes(p.is_dir())),
         None => {
@@ -335,6 +387,11 @@ fn get_file_attributes(env: &mut Env<'_>, path: String) -> Outcome {
 }
 
 fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
+    let guest = env.ext.get::<Win32>().vfs.normalize(&path);
+    if matches!(system_file(env, &guest), Ok(Some(_))) {
+        set_last_error(env, err::ACCESS_DENIED);
+        return Outcome::Return(0);
+    }
     let w = env.ext.get::<Win32>();
     if w.vfs.is_base_only(&path) {
         log::warn!("DeleteFile({path}): refusing to delete a game file");
@@ -901,6 +958,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetSystemDirectoryA", 2, |e| {
         put_dir(e, "C:\\Windows\\system32")
     });
+    reg.register(system_directory_w_ABI);
     stdcall(reg, K32, "GetTempPathA", 2, |e| {
         let (cap, buf) = (e.arg(0), e.arg(1));
         let p = format!(

@@ -14,6 +14,8 @@ use std::time::SystemTime;
 use crate::OsConfig;
 
 mod portable_saves;
+mod stream;
+pub use stream::FileStream;
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
@@ -26,7 +28,7 @@ pub struct DirEntry {
 /// An open guest file: a host object in the machine's handle table. Every personality
 /// that opens or traces files shares this one type.
 pub struct FileObj {
-    pub file: std::fs::File,
+    pub file: FileStream,
     pub guest_path: String,
     pub access: u32,
 }

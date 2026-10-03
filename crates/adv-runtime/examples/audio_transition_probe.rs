@@ -13,7 +13,7 @@ use adv_runtime::boot::Runtime;
 use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
-    io::{BufRead, Seek, Write},
+    io::{BufRead, Write},
     time::{Duration, Instant},
 };
 
@@ -191,7 +191,7 @@ fn run() -> Result<(), String> {
             .objects
             .hosts::<adv_win32::FileObj>()
             .map(|(id, file)| {
-                let mut native = &file.file;
+                let native = &file.file;
                 (id, (file.guest_path.clone(), native.stream_position().ok()))
             })
             .collect();

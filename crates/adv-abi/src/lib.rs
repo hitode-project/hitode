@@ -124,23 +124,6 @@ impl Registry {
             .level = Some(api.level);
     }
 
-    /// Visible DLL function names, including diagnostic exports. COM method
-    /// descriptors are not DLL exports. Ordinal-only registrations retain #N.
-    pub fn export_names(&self, module: &str) -> Vec<String> {
-        let mut names = std::collections::BTreeSet::new();
-        for signature in signature::signatures() {
-            if signature.module.eq_ignore_ascii_case(module) {
-                names.insert(signature.name.to_owned());
-            }
-        }
-        for (dll, name) in self.fns.keys() {
-            if dll.eq_ignore_ascii_case(module) && !name.contains("::") {
-                names.insert(name.clone());
-            }
-        }
-        names.into_iter().collect()
-    }
-
     pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
         self.add(module, name, conv, handler);
         self.set_trace(module, name, true);
@@ -228,7 +211,7 @@ impl Registry {
         names.extend(
             self.fns
                 .keys()
-                .filter(|(m, _)| *m == module)
+                .filter(|(m, name)| *m == module && !name.contains("::"))
                 .map(|(_, n)| n.clone()),
         );
         names.sort();

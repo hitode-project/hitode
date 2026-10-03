@@ -188,7 +188,14 @@ impl<'a> Loader<'a> {
             }
             return Ok(id);
         }
-        if system || self.sys.thunks.resolver().replaces_module(&key) {
+        if system {
+            return if is_host_module(self.sys, &key) {
+                self.load_host(key, path)
+            } else {
+                Err(LoadError::NotFound(path.to_owned()))
+            };
+        }
+        if self.sys.thunks.resolver().replaces_module(&key) {
             return self.load_host(key, path);
         }
         if let Some((resolved, bytes)) =
@@ -217,34 +224,7 @@ impl<'a> Loader<'a> {
             .map(|(_, m)| align_up(m.base + m.size, GRANULE))
             .max()
             .unwrap_or(HOST_MODULE_BASE);
-        let registry =
-            (self.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<adv_abi::Registry>();
-        let names = registry.map(|r| r.export_names(&key)).unwrap_or_default();
-        let mut known_ordinals: std::collections::BTreeMap<String, u16> =
-            adv_abi::ordinals::exports(&key)
-                .map(|(ordinal, name)| (name.to_owned(), ordinal))
-                .collect();
-        let explicit_ordinals: std::collections::BTreeSet<u16> = names
-            .iter()
-            .filter_map(|name| name.strip_prefix('#')?.parse().ok())
-            .collect();
-        known_ordinals.retain(|_, ordinal| !explicit_ordinals.contains(ordinal));
-        let mut exports = Vec::with_capacity(names.len());
-        for name in names {
-            let thunk = self.sys.thunks.publish(self.cpu, &key, &name)?;
-            let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
-            self.cpu.read(thunk, &mut bytes)?;
-            let ordinal = name.strip_prefix('#').and_then(|n| n.parse().ok());
-            exports.push(crate::synthetic::Export {
-                ordinal: ordinal.or_else(|| known_ordinals.get(&name).copied()),
-                name: ordinal.is_none().then_some(name),
-                target: crate::synthetic::Target::Code(bytes),
-            });
-        }
-        let image = crate::synthetic::build(base, &key, &exports).map_err(|err| LoadError::Pe {
-            path: key.clone(),
-            err,
-        })?;
+        let image = system_image(self.cpu, self.sys, &key, base)?;
         let size = image.bytes.len() as u32;
         if base
             .checked_add(size)
@@ -673,6 +653,43 @@ impl FileSource for HostDir {
         let p = self.host_path(path)?;
         p.is_file().then(|| std::fs::read(p).ok()).flatten()
     }
+}
+
+/// Build the immutable system file and mapped module from the same catalog.
+pub(crate) fn system_image(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    key: &str,
+    base: u32,
+) -> Result<crate::synthetic::Image, LoadError> {
+    let registry =
+        (sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<adv_abi::Registry>();
+    let names = registry.map(|r| r.exports(key)).unwrap_or_default();
+    let mut known_ordinals: std::collections::BTreeMap<String, u16> =
+        adv_abi::ordinals::exports(key)
+            .map(|(ordinal, name)| (name.to_owned(), ordinal))
+            .collect();
+    let explicit_ordinals: std::collections::BTreeSet<u16> = names
+        .iter()
+        .filter_map(|name| name.strip_prefix('#')?.parse().ok())
+        .collect();
+    known_ordinals.retain(|_, ordinal| !explicit_ordinals.contains(ordinal));
+    let mut exports = Vec::with_capacity(names.len());
+    for name in names {
+        let thunk = sys.thunks.publish(cpu, key, &name)?;
+        let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
+        cpu.read(thunk, &mut bytes)?;
+        let ordinal = name.strip_prefix('#').and_then(|n| n.parse().ok());
+        exports.push(crate::synthetic::Export {
+            ordinal: ordinal.or_else(|| known_ordinals.get(&name).copied()),
+            name: ordinal.is_none().then_some(name),
+            target: crate::synthetic::Target::Code(bytes),
+        });
+    }
+    crate::synthetic::build(base, key, &exports).map_err(|err| LoadError::Pe {
+        path: key.to_owned(),
+        err,
+    })
 }
 
 #[cfg(test)]

@@ -70,6 +70,7 @@ struct Section {
 }
 struct Backing {
     file: RefCell<Option<File>>,
+    virtual_data: Option<std::sync::Arc<[u8]>>,
     file_len: Cell<u64>,
     writable: Cell<bool>,
     pages: RefCell<BTreeMap<u64, Rc<FilePage>>>,
@@ -221,6 +222,19 @@ impl Backing {
 
     fn load_page(&self, index: u64) -> std::io::Result<[u8; 4096]> {
         let mut bytes = [0; 4096];
+        if let Some(data) = &self.virtual_data {
+            let start = usize::try_from(
+                index
+                    .checked_mul(PAGE)
+                    .ok_or(std::io::ErrorKind::InvalidInput)?,
+            )
+            .map_err(|_| std::io::ErrorKind::InvalidInput)?;
+            if let Some(source) = data.get(start..) {
+                let length = source.len().min(bytes.len());
+                bytes[..length].copy_from_slice(&source[..length]);
+            }
+            return Ok(bytes);
+        }
         if let Some(file) = self.file.borrow().as_ref() {
             // A cloned Windows FD shares its cursor. Restore it even after an
             // I/O error; all guest operations use this same execution worker.
@@ -298,7 +312,25 @@ fn file_backing(
     {
         return Err(5);
     }
-    let old_id = identity(&source.file).map_err(|e| io_error(&e))?;
+    if let Some(data) = source.file.memory_bytes().cloned() {
+        if writable || maximum > data.len() as u64 {
+            return Err(5);
+        }
+        let key = (u64::MAX, data.as_ptr() as usize as u64);
+        if let Some(backing) = state(env).files.get(&key).and_then(Weak::upgrade) {
+            return Ok(backing);
+        }
+        let backing = Rc::new(Backing {
+            file: RefCell::new(None),
+            file_len: Cell::new(data.len() as u64),
+            virtual_data: Some(data),
+            writable: Cell::new(false),
+            pages: RefCell::new(BTreeMap::new()),
+        });
+        state(env).files.insert(key, Rc::downgrade(&backing));
+        return Ok(backing);
+    }
+    let old_id = identity(source.file.host().ok_or(6u32)?).map_err(|e| io_error(&e))?;
     let guest_path = source.guest_path.clone();
     let length = source.file.metadata().map_err(|e| io_error(&e))?.len();
     if !writable && maximum > length {
@@ -330,7 +362,7 @@ fn file_backing(
         // access metadata and position. A different file at the same name stays.
         for (_, file) in env.sys.objects.hosts_mut::<FileObj>() {
             if file.guest_path.eq_ignore_ascii_case(&guest_path)
-                && identity(&file.file).map_err(|e| io_error(&e))? == old_id
+                && identity(file.file.host().ok_or(6u32)?).map_err(|e| io_error(&e))? == old_id
             {
                 let position = file.file.stream_position().map_err(|e| io_error(&e))?;
                 let mut replacement = std::fs::OpenOptions::new()
@@ -341,7 +373,7 @@ fn file_backing(
                 replacement
                     .seek(SeekFrom::Start(position))
                     .map_err(|e| io_error(&e))?;
-                file.file = replacement;
+                file.file = replacement.into();
             }
         }
         if let Some(backing) = &backing {
@@ -358,6 +390,8 @@ fn file_backing(
             .host::<FileObj>(handle)
             .unwrap()
             .file
+            .host()
+            .ok_or(6u32)?
             .try_clone()
             .map_err(|e| io_error(&e))?
     };
@@ -367,6 +401,7 @@ fn file_backing(
     let id = identity(&file).map_err(|e| io_error(&e))?;
     let backing = Rc::new(Backing {
         file: RefCell::new(Some(file)),
+        virtual_data: None,
         file_len: Cell::new(length.max(maximum)),
         writable: Cell::new(writable),
         pages: RefCell::new(BTreeMap::new()),
@@ -433,6 +468,7 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
             maximum,
             Rc::new(Backing {
                 file: RefCell::new(None),
+                virtual_data: None,
                 file_len: Cell::new(0),
                 writable: Cell::new(false),
                 pages: RefCell::new(BTreeMap::new()),
@@ -850,6 +886,7 @@ mod tests {
         second.mark_dirty();
         let backing = Backing {
             file: RefCell::new(Some(file)),
+            virtual_data: None,
             file_len: Cell::new(8192),
             writable: Cell::new(true),
             pages: RefCell::new(BTreeMap::from([(0, first.clone()), (1, second.clone())])),
