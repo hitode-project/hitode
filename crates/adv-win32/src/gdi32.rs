@@ -102,20 +102,13 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
             text_color: 0,
             bk_color: 0xff_ffff,
             bk_mode: 2,
+            modes: adv_os::gdi::DcModes::default(),
         },
     )
 }
 
 pub fn release_dc(env: &mut Env<'_>, hdc: u32) -> bool {
-    let released = env
-        .ext
-        .get_mut::<Win32>()
-        .gdi
-        .remove_external_dc(&mut env.sys.objects, hdc);
-    if released {
-        font::retire_dc(env, hdc);
-    }
-    released
+    env.ext.get_mut::<Win32>().gdi.remove_external_dc(&mut env.sys.objects, hdc)
 }
 
 /// A font object with the given height and face (for dialog fonts).

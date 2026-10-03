@@ -3,7 +3,7 @@
 //! one process object. Ids come from the surface store, which numbers surfaces and DCs together.
 use adv_machine::Objects;
 mod objects;
-pub use objects::{Gdi, GdiObj, LogFont, stock_object};
+pub use objects::{DcModes, Gdi, GdiObj, LogFont, stock_object};
 
 /// The window DC: always present, it draws into the primary surface.
 pub const WINDOW_DC: u32 = 1;
@@ -68,6 +68,23 @@ impl DeviceContexts {
         self.get(objects, dc).is_some()
     }
 
+    pub fn stretch_mode(&self, objects: &Objects, dc: u32) -> u32 {
+        match self.gdi.get(objects, dc) {
+            Some(GdiObj::Dc { modes, .. }) => modes.stretch,
+            _ => 1,
+        }
+    }
+
+    pub fn set_stretch_mode(&mut self, objects: &mut Objects, dc: u32, mode: u32) -> Option<u32> {
+        if dc == WINDOW_DC && !self.gdi.register_external_dc(objects, dc, 0) {
+            return None;
+        }
+        match self.gdi.get_mut(objects, dc)? {
+            GdiObj::Dc { modes, .. } => Some(std::mem::replace(&mut modes.stretch, mode)),
+            _ => None,
+        }
+    }
+
     /// Whether any DC other than `except` selects `bitmap`.
     pub fn selects(&self, objects: &Objects, bitmap: u32, except: Option<u32>) -> bool {
         // Each raster DC has one alias. Exclude its borrowed payload by address.
@@ -98,9 +115,21 @@ mod tests {
         );
         assert!(raster.selects(&objects, 91, None));
         assert!(!raster.selects(&objects, 91, Some(17)));
+        assert_eq!(raster.set_stretch_mode(&mut objects, 17, 3), Some(1));
+        let Some(GdiObj::Dc { modes, .. }) = logical.get_mut(&mut objects, 17) else {
+            panic!("DC")
+        };
+        assert_eq!(modes.stretch, 3);
+        modes.poly_fill = 2;
         assert_eq!(raster.remove(&mut objects, 17), Some(91));
         assert!(logical.get(&objects, 17).is_none());
         assert_eq!(objects.object_count(), 0);
+        assert!(raster.create(&mut objects, 17, STOCK_BITMAP));
+        assert_eq!(raster.stretch_mode(&objects, 17), 1);
+        assert!(
+            matches!(logical.get(&objects, 17), Some(GdiObj::Dc { modes, .. }) if modes.poly_fill == 1)
+        );
+        raster.remove(&mut objects, 17).unwrap();
         assert!(raster.create(&mut objects, 21, 93));
         logical.remove(&mut objects, 21).unwrap();
         assert!(!raster.contains(&objects, 21));

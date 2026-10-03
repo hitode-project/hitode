@@ -8,7 +8,7 @@ use adv_device::text::{
     GlyphFormat, GlyphRequest, Pitch, Precision, Quality, Text, TextError, Transform,
 };
 use adv_machine::Machine;
-use std::{borrow::Cow, collections::BTreeMap};
+use std::borrow::Cow;
 
 #[cfg(test)]
 #[path = "font/tests.rs"]
@@ -25,22 +25,8 @@ pub struct DrawingProvider {
     pub contains_bitmap: fn(&Env<'_>, u32) -> bool,
     pub call: Handler,
 }
-#[derive(Clone, Copy)]
-struct DcState {
-    map_mode: i32,
-    poly_fill: i32,
-}
-impl Default for DcState {
-    fn default() -> Self {
-        Self {
-            map_mode: 1,
-            poly_fill: 1,
-        }
-    }
-}
 #[derive(Default)]
 struct Fonts {
-    dcs: BTreeMap<u32, DcState>,
     drawing: Option<DrawingProvider>,
     text: Text,
 }
@@ -81,11 +67,7 @@ pub fn set_drawing_provider<B: adv_cpu::backend::Backend>(
 pub fn cache_stats<B: adv_cpu::backend::Backend>(machine: &Machine<B>) -> text::CacheStats {
     machine.ext.get::<Fonts>().text.stats()
 }
-pub fn retire_dc(env: &mut Env<'_>, dc: u32) {
-    if let Some(fonts) = env.ext.try_get_mut::<Fonts>() {
-        fonts.dcs.remove(&dc);
-    }
-}
+
 fn drawing(env: &Env<'_>) -> Option<DrawingProvider> {
     env.ext.get::<Fonts>().drawing
 }
@@ -143,23 +125,41 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteDC", level = implement)]
 fn delete_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
-    let result = if drawing_dc(env, dc.0) {
+    if drawing_dc(env, dc.0) {
         (drawing(env).unwrap().call)(env)
     } else {
         super::delete_dc(env)
-    };
-    if matches!(result, Outcome::Return(1)) {
-        retire_dc(env, dc.0);
     }
-    result
 }
 fn reject_dc(env: &mut Env<'_>, dc: u32) -> bool {
-    if !valid_dc(env, dc) {
-        set_last_error(env, 6);
-        true
-    } else {
-        false
+    if matches!(
+        env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc),
+        Some(GdiObj::Dc { .. })
+    ) {
+        return false;
     }
+    if !drawing_dc(env, dc) {
+        set_last_error(env, 6);
+        return true;
+    }
+    if !env
+        .ext
+        .get_mut::<Win32>()
+        .gdi
+        .register_external_dc(&mut env.sys.objects, dc, 0)
+    {
+        set_last_error(env, 8);
+        return true;
+    }
+    false
+}
+fn modes<'a>(env: &'a mut Env<'_>, dc: u32) -> &'a mut adv_os::gdi::DcModes {
+    let Some(GdiObj::Dc { modes, .. }) =
+        env.ext.get::<Win32>().gdi.get_mut(&mut env.sys.objects, dc)
+    else {
+        unreachable!("validated DC")
+    };
+    modes
 }
 #[win32(gdi32, name = "SetMapMode", level = state)]
 fn set_map_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> i32 {
@@ -170,28 +170,14 @@ fn set_map_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> i32 {
         set_last_error(env, if (2..=8).contains(&mode) { 120 } else { 87 });
         return 0;
     }
-    std::mem::replace(
-        &mut env
-            .ext
-            .get_mut::<Fonts>()
-            .dcs
-            .entry(dc.0)
-            .or_default()
-            .map_mode,
-        mode,
-    )
+    std::mem::replace(&mut modes(env, dc.0).map, mode)
 }
 #[win32(gdi32, name = "GetMapMode", level = state)]
 fn get_map_mode(env: &mut Env<'_>, dc: Handle) -> i32 {
     if reject_dc(env, dc.0) {
         return 0;
     }
-    env.ext
-        .get_mut::<Fonts>()
-        .dcs
-        .entry(dc.0)
-        .or_default()
-        .map_mode
+    modes(env, dc.0).map
 }
 #[win32(gdi32, name = "SetPolyFillMode", level = state)]
 fn set_poly_fill(env: &mut Env<'_>, dc: Handle, mode: i32) -> i32 {
@@ -202,29 +188,16 @@ fn set_poly_fill(env: &mut Env<'_>, dc: Handle, mode: i32) -> i32 {
         set_last_error(env, 87);
         return 0;
     }
-    std::mem::replace(
-        &mut env
-            .ext
-            .get_mut::<Fonts>()
-            .dcs
-            .entry(dc.0)
-            .or_default()
-            .poly_fill,
-        mode,
-    )
+    std::mem::replace(&mut modes(env, dc.0).poly_fill, mode)
 }
 #[win32(gdi32, name = "GetPolyFillMode", level = state)]
 fn get_poly_fill(env: &mut Env<'_>, dc: Handle) -> i32 {
     if reject_dc(env, dc.0) {
         return 0;
     }
-    env.ext
-        .get_mut::<Fonts>()
-        .dcs
-        .entry(dc.0)
-        .or_default()
-        .poly_fill
+    modes(env, dc.0).poly_fill
 }
+
 fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
     let gdi = &env.ext.get::<Win32>().gdi;
     let font = match gdi.get(&env.sys.objects, dc) {

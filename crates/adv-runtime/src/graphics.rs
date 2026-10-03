@@ -340,9 +340,6 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
                     .set_external_bitmap(&mut env.sys.objects, dc, bitmap);
             }
         }
-        if let Some(dc) = removed {
-            adv_win32::gdi32::font::retire_dc(env, dc);
-        }
     }
     if presented != before {
         env.sys.frame = presented as u32;

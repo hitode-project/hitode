@@ -4,6 +4,22 @@ use std::{cell::Cell, rc::Rc};
 const STOCK_BASE: u32 = 0x0190_0010;
 const SYSTEM_FONT: u32 = 13;
 
+#[derive(Clone, Copy, Debug)]
+pub struct DcModes {
+    pub map: i32,
+    pub poly_fill: i32,
+    pub stretch: u32,
+}
+impl Default for DcModes {
+    fn default() -> Self {
+        Self {
+            map: 1,
+            poly_fill: 1,
+            stretch: 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LogFont {
     pub height: i32,
@@ -45,6 +61,7 @@ pub enum GdiObj {
         text_color: u32,
         bk_color: u32,
         bk_mode: u32,
+        modes: DcModes,
     },
     Region,
 }
@@ -118,6 +135,7 @@ impl Gdi {
                 text_color: 0,
                 bk_color: 0xff_ffff,
                 bk_mode: 2,
+                modes: DcModes::default(),
             },
         )
     }

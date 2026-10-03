@@ -5,7 +5,6 @@ use adv_device::surface::{
     BlitOptions, BlitRect, PixelFormat, Presenter, Rect, Sampling, SurfaceMemory, Surfaces, size,
 };
 use adv_os::gdi::{DeviceContexts, STOCK_BITMAP, WINDOW_DC};
-use std::collections::BTreeMap;
 
 pub mod api {
     pub const GET_DC: u32 = 100;
@@ -41,7 +40,6 @@ pub const API_SPECS: &[(u32, &str, &str, u8)] = &[
 #[derive(Default)]
 pub struct Raster {
     last_error: u32,
-    stretch_modes: BTreeMap<u32, Sampling>,
 }
 
 impl Raster {
@@ -116,29 +114,16 @@ impl Raster {
                 }
                 dcs.select(objects, a[0], a[1]).unwrap()
             }
-            api::DELETE_DC => {
-                self.stretch_modes.remove(&a[0]);
-                u32::from(dcs.remove(objects, a[0]).is_some())
-            }
+            api::DELETE_DC => u32::from(dcs.remove(objects, a[0]).is_some()),
             api::SET_STRETCH_MODE => {
                 if a[0] != WINDOW_DC && !dcs.contains(objects, a[0]) {
                     return Ok(self.fail(6));
                 }
-                let mode = match a[1] {
-                    1 => Sampling::And,
-                    2 => Sampling::Or,
-                    3 => Sampling::Nearest,
-                    _ => return Ok(self.fail(87)),
-                };
-                match self
-                    .stretch_modes
-                    .insert(a[0], mode)
-                    .unwrap_or(Sampling::And)
-                {
-                    Sampling::And => 1,
-                    Sampling::Or => 2,
-                    Sampling::Nearest => 3,
+                if !(1..=3).contains(&a[1]) {
+                    return Ok(self.fail(87));
                 }
+                dcs.set_stretch_mode(objects, a[0], a[1])
+                    .unwrap_or_else(|| self.fail(8))
             }
             api::DELETE_OBJECT => {
                 if dcs.selects(objects, a[0], None) || surfaces.primary_id() == Some(a[0]) {
@@ -264,11 +249,11 @@ impl Raster {
                 let options = BlitOptions {
                     mirror_x: (w < 0) != (sw < 0),
                     mirror_y: (h < 0) != (sh < 0),
-                    sampling: self
-                        .stretch_modes
-                        .get(&a[0])
-                        .copied()
-                        .unwrap_or(Sampling::And),
+                    sampling: match dcs.stretch_mode(objects, a[0]) {
+                        2 => Sampling::Or,
+                        3 => Sampling::Nearest,
+                        _ => Sampling::And,
+                    },
                 };
                 surfaces.blit(src, sr, dst, dr, options, m)?;
                 if a[0] == WINDOW_DC {
