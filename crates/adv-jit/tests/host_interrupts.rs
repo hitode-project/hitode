@@ -228,7 +228,7 @@ fn pal_budget_stop_disable_and_fault_priorities_preserve_original_outcomes() {
                 cpu.run(&mut handler),
                 Exit::Fault(Fault {
                     pc: CODE + 2,
-                        kind: FaultKind::Read(0x2dead000)
+                    kind: FaultKind::Read(0x2dead000)
                 })
             );
         }
@@ -240,7 +240,7 @@ fn pal_budget_stop_disable_and_fault_priorities_preserve_original_outcomes() {
             cpu.run(&mut handler),
             Exit::Fault(Fault {
                 pc: CODE + 2,
-                    kind: FaultKind::Read(0x2dead000)
+                kind: FaultKind::Read(0x2dead000)
             })
         );
         assert!(wake.interrupt_flag().load(Ordering::Acquire));

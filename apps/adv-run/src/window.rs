@@ -1,4 +1,5 @@
 use adv_runtime::Snapshot;
+pub use pal_host::WakeEvent;
 use std::time::Duration;
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -32,8 +33,8 @@ mod native {
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::{
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
-        CreateWaitableTimerExW, SetEvent, SetWaitableTimerEx, TIMER_ALL_ACCESS,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateWaitableTimerExW,
+        SetWaitableTimerEx, TIMER_ALL_ACCESS,
     };
     use windows_sys::Win32::UI::HiDpi::*;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -212,38 +213,6 @@ mod native {
         Ok(())
     }
 
-    struct WakeHandle(HANDLE);
-    // SAFETY: this owned kernel event is only signalled or waited on. Windows
-    // supports both across threads; Arc keeps the handle live during every call.
-    unsafe impl Send for WakeHandle {}
-    unsafe impl Sync for WakeHandle {}
-    impl Drop for WakeHandle {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-    #[derive(Clone)]
-    pub struct WakeEvent(std::sync::Arc<WakeHandle>);
-    impl WakeEvent {
-        pub fn new() -> Result<Self, String> {
-            // SAFETY: an unnamed auto-reset kernel event has no external pointers.
-            let handle = unsafe { CreateEventW(null(), 0, 0, null()) };
-            if handle.is_null() {
-                return Err(format!("CreateEventW failed: {}", unsafe {
-                    GetLastError()
-                }));
-            }
-            Ok(Self(std::sync::Arc::new(WakeHandle(handle))))
-        }
-        pub fn signal(&self) {
-            unsafe {
-                SetEvent(self.0.0);
-            }
-        }
-    }
-
     unsafe extern "system" fn procedure(
         hwnd: HWND,
         message: u32,
@@ -369,6 +338,41 @@ mod native {
     }
 
     impl Window {
+        /// Align the next display opportunity to the compositor's QPC vblank
+        /// phase. This timer is owned by UI and never wakes or blocks the guest.
+        pub fn next_refresh(&self) -> std::time::Instant {
+            use windows_sys::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
+            use windows_sys::Win32::System::Performance::{
+                QueryPerformanceCounter, QueryPerformanceFrequency,
+            };
+            let mut timing = DWM_TIMING_INFO {
+                cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+                ..Default::default()
+            };
+            let (mut counter, mut frequency) = (0i64, 0i64);
+            let now = std::time::Instant::now();
+            // The Windows 8.1+ API requires a null HWND, including windowed apps.
+            if unsafe { DwmGetCompositionTimingInfo(null_mut(), &mut timing) } >= 0
+                && unsafe { QueryPerformanceCounter(&mut counter) } != 0
+                && unsafe { QueryPerformanceFrequency(&mut frequency) } != 0
+                && frequency > 0
+                && counter >= 0
+                && timing.qpcRefreshPeriod > 0
+            {
+                let counter = counter as u64;
+                let period = timing.qpcRefreshPeriod;
+                let ticks = if timing.qpcVBlank > counter {
+                    timing.qpcVBlank - counter
+                } else {
+                    period - (counter - timing.qpcVBlank) % period
+                };
+                let delay = Duration::from_secs_f64(ticks as f64 / frequency as f64);
+                if delay <= Duration::from_millis(100) {
+                    return now + delay;
+                }
+            }
+            now + Duration::from_nanos(16_666_667)
+        }
         pub fn new(title: &str, width: u32, height: u32, hidden: bool) -> Result<Self, String> {
             initialize_dpi()?;
             let class: Vec<u16> = "AdvGuestHost\0".encode_utf16().collect();
@@ -508,6 +512,7 @@ mod native {
             Ok(())
         }
 
+        #[allow(dead_code)] // Also used by the standalone wait_probe example.
         pub fn wait(&mut self, duration: Option<Duration>) -> Result<WaitOutcome, String> {
             self.wait_with_wake(duration, None)
         }
@@ -550,7 +555,7 @@ mod native {
                 count += 1;
             }
             if let Some(wake) = wake {
-                handles[count] = wake.0.0;
+                handles[count] = wake.as_raw_handle();
                 count += 1;
             }
             let result = unsafe {
@@ -774,7 +779,7 @@ mod native {
 }
 
 #[cfg(windows)]
-pub use native::{WakeEvent, Window, initialize_dpi};
+pub use native::{Window, initialize_dpi};
 
 #[cfg(not(windows))]
 pub fn initialize_dpi() -> Result<(), String> {
@@ -782,20 +787,12 @@ pub fn initialize_dpi() -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-#[derive(Clone)]
-pub struct WakeEvent;
-#[cfg(not(windows))]
-impl WakeEvent {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self)
-    }
-    pub fn signal(&self) {}
-}
-
-#[cfg(not(windows))]
 pub struct Window;
 #[cfg(not(windows))]
 impl Window {
+    pub fn next_refresh(&self) -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_nanos(16_666_667)
+    }
     pub fn new(_: &str, _: u32, _: u32, _: bool) -> Result<Self, String> {
         Err("native window requires Windows; use --headless".into())
     }

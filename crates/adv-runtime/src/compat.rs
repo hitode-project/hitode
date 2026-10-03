@@ -4,6 +4,8 @@ use pal_machine::{Conv, Env, Outcome, Registry};
 use pal_win32::{Win32, util::set_last_error};
 
 pub fn register(r: &mut Registry) {
+    crate::mmio::register(r);
+    crate::acm::register(r);
     if std::env::var_os("ADV_PRINTF_DIAG_PATH").is_some() {
         r.add(
             "user32.dll",
@@ -231,24 +233,45 @@ fn message_wait(
     deadline: Option<u64>,
     mask: u32,
 ) -> Outcome {
-    use pal_machine::{Object, Wait};
+    use pal_machine::{Object, Resume, Wait, WakeReason};
     let now = e.sys.clock.now_us();
     let ctx = e.sys.current;
-    let mut ready = Vec::new();
     for &h in &handles {
-        let value = match e.sys.objects.get(h) {
-            Some(Object::Event { signaled, .. }) => *signaled,
-            Some(Object::Mutex { owner, .. }) => owner.is_none() || *owner == Some(ctx),
-            Some(Object::Semaphore { count, .. }) => *count > 0,
-            Some(Object::Thread { ctx }) => e.sys.contexts[*ctx as usize].is_done(),
-            _ => {
-                set_last_error(e, 6);
-                return Outcome::Return(u32::MAX);
-            }
-        };
-        ready.push(value);
+        if !matches!(
+            e.sys.objects.get(h),
+            Some(
+                Object::Event { .. }
+                    | Object::Mutex { .. }
+                    | Object::Semaphore { .. }
+                    | Object::Thread { .. }
+            )
+        ) {
+            set_last_error(e, 6);
+            return Outcome::Return(u32::MAX);
+        }
     }
-    let queued = pal_win32::user32::message::queue_status(e).1 & mask != 0;
+    let (input, notification) = pal_win32::user32::message::message_wait_events(e, mask);
+    // The native fixture establishes input priority over ready handles for
+    // MsgWait; ordinary WaitForMultipleObjects preserves handle-array order.
+    let wait_handles: Vec<_> = std::iter::once(input)
+        .chain(handles.iter().copied())
+        .collect();
+    let result = |index: u32, abandoned: bool| {
+        if abandoned {
+            0x80 + index - 1
+        } else if all {
+            0
+        } else if index == 0 {
+            handles.len() as u32
+        } else {
+            index - 1
+        }
+    };
+    if let Some(WakeReason::Objects { index, abandoned }) =
+        e.sys.try_acquire_objects(&wait_handles, all)
+    {
+        return Outcome::Return(result(index, abandoned));
+    }
     let user = &mut e.ext.get_mut::<Win32>().user;
     let q = user.queue(ctx);
     let timer = if mask & 0x10 != 0 {
@@ -258,55 +281,33 @@ fn message_wait(
     } else {
         None
     };
-    if all {
-        if queued && ready.iter().all(|&v| v) {
-            for &h in &handles {
-                e.sys.try_acquire(h);
-            }
-            return Outcome::Return(0);
-        }
-    } else {
-        // Native USER32 reports new queue input before signaled kernel
-        // objects; inspecting the queue then exposes the lowest ready handle.
-        if queued {
-            return Outcome::Return(handles.len() as u32);
-        }
-        if let Some(i) = ready.iter().position(|&v| v) {
-            e.sys.try_acquire(handles[i]);
-            return Outcome::Return(i as u32);
-        }
-    }
     if deadline.is_some_and(|t| now >= t) {
         return Outcome::Return(0x102);
     }
-    let wait = if handles.is_empty() {
-        let mut event = q.event;
-        if event == 0 {
-            event = e.sys.objects.insert(Object::Event {
-                manual_reset: true,
-                signaled: false,
-            });
-            e.ext.get_mut::<Win32>().user.queue(ctx).event = event;
-        }
-        e.sys.reset_event(event);
-        Wait::Object {
-            handle: event,
-            deadline: [deadline, timer].into_iter().flatten().min(),
-        }
-    } else {
-        // Match the existing cooperative multiple-object wait's bounded polling;
-        // the common message-only wait above sleeps directly on the queue event.
-        Wait::Until(
-            deadline
-                .into_iter()
-                .chain(timer)
-                .chain([now + 1000])
-                .min()
-                .unwrap(),
-        )
+    let wait = Wait::Objects {
+        handles: wait_handles,
+        all,
+        deadline: [deadline, timer].into_iter().flatten().min(),
+        notification: Some(notification),
     };
-    Outcome::block(wait, move |e, _| {
-        message_wait(e, handles, all, deadline, mask)
+    let count = handles.len() as u32;
+    Outcome::block(wait, move |e, wake| {
+        match wake {
+            // The object was already acquired when the wait became ready.
+            // A later ResetEvent or waiter must not revoke/steal that grant.
+            Resume::Woke(WakeReason::Objects { index, abandoned }) => {
+                Outcome::Return(if abandoned {
+                    0x80 + index - 1
+                } else if all {
+                    0
+                } else if index == 0 {
+                    count
+                } else {
+                    index - 1
+                })
+            }
+            _ => message_wait(e, handles, all, deadline, mask),
+        }
     })
 }
 

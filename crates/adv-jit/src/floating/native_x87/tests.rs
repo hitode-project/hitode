@@ -293,9 +293,15 @@ fn shared_device_pages_never_enter_the_native_raw_pointer_lane() {
     let alias = memory.map_shared_audio(DATA, 8192).unwrap();
     memory.write(DATA, &0.25f32.to_le_bytes()).unwrap();
     memory.write(DATA + 4, &32768.0f32.to_le_bytes()).unwrap();
-    let mut state = CpuState { eip: CODE, ..CpuState::default() };
+    let mut state = CpuState {
+        eip: CODE,
+        ..CpuState::default()
+    };
     let before = state.clone();
-    assert_eq!(execute(&operations, &mut state, &mut memory, 5, u32::MAX, None), None);
+    assert_eq!(
+        execute(&operations, &mut state, &mut memory, 5, u32::MAX, None),
+        None
+    );
     assert_eq!(state, before);
     assert_eq!(alias.load_u8(8), 0);
 }

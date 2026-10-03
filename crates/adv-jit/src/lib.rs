@@ -8,9 +8,9 @@ pub mod interpreter;
 mod linking;
 mod machine;
 mod memory;
-mod shared_memory;
 #[cfg(feature = "pal")]
 pub mod pal;
+mod shared_memory;
 mod state;
 mod strings;
 mod virtual_memory;

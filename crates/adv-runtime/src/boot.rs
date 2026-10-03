@@ -26,6 +26,23 @@ struct RunControl {
 }
 
 impl Runtime<JitCpu> {
+    pub fn with_codec(
+        exe: impl AsRef<Path>,
+        data: impl AsRef<Path>,
+        jit: bool,
+        width: u32,
+        height: u32,
+        codec: crate::vorbis::Policy,
+    ) -> Result<Self, String> {
+        Self::with_cpu_and_codec(
+            exe,
+            data,
+            JitCpu::new(pal_machine::layout::PARK_ADDR, jit)?,
+            width,
+            height,
+            codec,
+        )
+    }
     pub fn new(
         exe_path: impl AsRef<Path>,
         data_dir: impl AsRef<Path>,
@@ -53,6 +70,24 @@ impl<B: Backend> Runtime<B> {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        Self::with_cpu_and_codec(
+            exe_path,
+            data_dir,
+            cpu,
+            width,
+            height,
+            crate::vorbis::Policy::Guest,
+        )
+    }
+
+    pub fn with_cpu_and_codec(
+        exe_path: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        cpu: B,
+        width: u32,
+        height: u32,
+        codec: crate::vorbis::Policy,
+    ) -> Result<Self, String> {
         let exe_path = exe_path
             .as_ref()
             .canonicalize()
@@ -71,6 +106,8 @@ impl<B: Backend> Runtime<B> {
         };
         cfg.write_game = false;
         let files = pal_win32::Vfs::new(&cfg);
+        let selection = crate::vorbis::select_policy_with_reason(&files, exe_name, codec)?;
+        let codec = selection.policy;
         let mut registry = Registry::default();
         pal_win32::register(&mut registry);
         crate::crt::register(&mut registry);
@@ -78,12 +115,15 @@ impl<B: Backend> Runtime<B> {
         register_graphics(&mut registry);
         crate::font::register(&mut registry);
         crate::sound::register(&mut registry);
+        crate::vorbis::register(&mut registry, codec);
         let mut machine = Machine::new(cpu, registry, Clock::real()).map_err(|e| e.to_string())?;
+        machine.ext.insert(selection);
         // An interactive process can make progress while remaining Ready across
         // indefinitely many slices. A cumulative hard run budget must be explicit;
         // step_for still bounds guest execution by its soft slice and quantum.
         machine.set_execution_budget(None);
         Win32::install(&mut machine, cfg).map_err(|e| e.to_string())?;
+        crate::vorbis::install(&mut machine, codec)?;
         // Load images before allocating the graphics arena, preserving their preferred bases.
         let exe = machine.load(&files, exe_name).map_err(|e| e.to_string())?;
         crate::crt::install(&mut machine)?;
@@ -142,12 +182,18 @@ impl<B: Backend> Runtime<B> {
     }
 
     pub fn audio_stream(&self) -> pal_audio::AudioStream {
+        self.machine.ext.get::<crate::sound::Sound>().audio.stream()
+    }
+
+    /// Queue and missing-PCM observations, independent of audible sample values.
+    pub fn audio_pcm_metrics(&self) -> pal_audio::PcmMetrics {
+        self.audio_stream().metrics()
+    }
+    pub fn audio_source_status(&self) -> crate::AudioSourceStatus {
         self.machine
             .ext
             .get::<crate::sound::Sound>()
-            .mixer
-            .clone()
-            .into()
+            .source_status(self.machine.sys.clock.now_us())
     }
 
     /// Hash the first four secondary-buffer starts for decoder differential checks.
@@ -163,9 +209,100 @@ impl<B: Backend> Runtime<B> {
         &self.machine.ext.get::<crate::sound::Sound>().digests
     }
 
-    /// Last completed frame, packed top-down BGRA8.
+    /// Last captured completed frame, packed top-down BGRA8. Frontends which enable
+    /// deferred capture call `capture_latest_frame` at their display deadline.
     pub fn frame(&self) -> &Snapshot {
         &self.machine.ext.get::<Graphics<Snapshot>>().presenter
+    }
+
+    pub fn presented_frames(&self) -> u64 {
+        self.machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .stats
+            .presentations
+    }
+
+    pub fn set_deferred_presentation(&mut self, enabled: bool) -> Result<(), String> {
+        self.machine
+            .ext
+            .get_mut::<Graphics<Snapshot>>()
+            .set_deferred_presentation(enabled)
+    }
+    pub fn set_frame_mailbox(
+        &mut self,
+        mailbox: crate::graphics::FrameProducer,
+        wake: pal_host::WakeEvent,
+    ) {
+        self.machine
+            .ext
+            .get_mut::<Graphics<Snapshot>>()
+            .set_frame_mailbox(mailbox, wake);
+    }
+    pub fn set_host_keys(&mut self, keys: std::sync::Arc<pal_host::input::KeyState>) {
+        self.machine.ext.get_mut::<Win32>().user.host_keys = Some(keys);
+    }
+
+    /// Opt-in receipt observation for ordered diagnostic control. It does not
+    /// alter guest queues, physical key state or scheduling.
+    pub fn enable_input_receipts(&mut self) {
+        self.machine
+            .ext
+            .get_mut::<Win32>()
+            .user
+            .input_tracking
+            .get_or_insert_with(Default::default);
+    }
+    pub fn latest_input_receipt(&self) -> u64 {
+        self.machine
+            .ext
+            .get::<Win32>()
+            .user
+            .input_tracking
+            .as_ref()
+            .map_or(0, |tracking| tracking.latest())
+    }
+    pub fn input_receipt_completed(&mut self, receipt: u64, full_or_idle_boundary: bool) -> bool {
+        let frame = self.machine.sys.frame;
+        let context = self
+            .machine
+            .ext
+            .get::<Win32>()
+            .user
+            .input_tracking
+            .as_ref()
+            .and_then(|tracking| tracking.context(receipt));
+        let target_boundary = context.is_some_and(|ctx| {
+            self.machine
+                .sys
+                .contexts
+                .get(ctx as usize)
+                .is_none_or(|context| !context.is_ready())
+                || (full_or_idle_boundary && self.machine.sys.current == ctx)
+        });
+        self.machine
+            .ext
+            .get_mut::<Win32>()
+            .user
+            .input_tracking
+            .as_mut()
+            .is_none_or(|tracking| {
+                tracking.fence_reached(receipt, frame, full_or_idle_boundary, target_boundary)
+            })
+    }
+
+    pub fn has_pending_frame(&self) -> bool {
+        self.machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .has_pending_frame()
+    }
+
+    pub fn capture_latest_frame(&mut self) -> Result<bool, String> {
+        self.machine
+            .ext
+            .get_mut::<Graphics<Snapshot>>()
+            .capture_latest()
     }
 
     /// End a bounded diagnostic run immediately after this presentation count.
@@ -383,7 +520,8 @@ impl<B: Backend> Runtime<B> {
                 report.push_str(&format!(" {wait:?}"));
                 let deadline = match wait {
                     pal_machine::Wait::Until(deadline) => Some(*deadline),
-                    pal_machine::Wait::Object { deadline, .. } => *deadline,
+                    pal_machine::Wait::Object { deadline, .. }
+                    | pal_machine::Wait::Objects { deadline, .. } => *deadline,
                     pal_machine::Wait::Yield => None,
                 };
                 if let Some(deadline) = deadline {

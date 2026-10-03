@@ -1,11 +1,11 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
-use pal_audio::mixer::{Mixer, MixerHandle, PcmBlock};
+use pal_audio::{AudioControl, AudioEvent, RingState, ring::RingConfig};
 use pal_cpu::{Backend, Guest, GuestExt, Prot};
 use pal_machine::{Conv, Env, Machine, Outcome, Registry};
 use pal_win32::Win32;
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
@@ -139,7 +139,16 @@ struct Lock {
     p2: u32,
     n2: u32,
 }
+struct ChunkDump {
+    writer: std::io::BufWriter<std::fs::File>,
+    path: std::path::PathBuf,
+    bytes: u64,
+}
 struct Buffer {
+    audio_id: u64,
+    voice: Option<Arc<RingState>>,
+    playback_clock: Arc<pal_audio::clock::PlaybackClock>,
+    generation: u64,
     storage: u32,
     len: u32,
     flags: u32,
@@ -157,6 +166,7 @@ struct Buffer {
     lock: Option<Lock>,
     trace_pcm: Option<Vec<u8>>,
     trace_generation: u64,
+    trace_chunks: Option<ChunkDump>,
 }
 impl Buffer {
     fn stereo_gain(&self) -> [f32; 2] {
@@ -182,6 +192,14 @@ impl Buffer {
             }
     }
     fn cursor(&self, now: u64) -> u32 {
+        if self.playback_clock.uses_device_time()
+            && let Some(position) = self
+                .voice
+                .as_ref()
+                .and_then(|voice| voice.cursor(now, self.generation))
+        {
+            return position;
+        }
         if self.len == 0 {
             0
         } else if self.looping {
@@ -212,18 +230,46 @@ pub struct PcmDigest {
     pub fnv1a64: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioSourceStatus {
+    pub buffers: u64,
+    pub playing: u64,
+    pub looping: u64,
+    pub locked: u64,
+}
+
 pub(crate) struct Sound {
     pub enabled: bool,
     tables: [u32; 3],
     objects: BTreeMap<u32, Object>,
     buffers: BTreeMap<u32, Buffer>,
-    pub mixer: MixerHandle,
+    pub audio: AudioControl,
+    next_audio_id: u64,
+    pending_release: BTreeMap<u64, (u32, bool)>,
+    pending_notices: Vec<(u64, u32, u64, u64)>,
     pub queued_samples: u64,
     pub nonzero_samples: u64,
     pub capture_digests: bool,
     pub digests: Vec<PcmDigest>,
     trace: Option<std::io::BufWriter<std::fs::File>>,
     trace_pcm_dir: Option<std::path::PathBuf>,
+    trace_pcm_chunks: bool,
+    playback_clock: Arc<pal_audio::clock::PlaybackClock>,
+}
+impl Sound {
+    pub(crate) fn source_status(&self, guest_now: u64) -> AudioSourceStatus {
+        let now = self.playback_clock.now_us(guest_now);
+        let mut status = AudioSourceStatus::default();
+        for buffer in self.buffers.values().filter(|buffer| buffer.len != 0) {
+            status.buffers += 1;
+            status.locked += u64::from(buffer.lock.is_some());
+            if buffer.playing && (buffer.looping || buffer.progress(now) < u64::from(buffer.len)) {
+                status.playing += 1;
+                status.looping += u64::from(buffer.looping);
+            }
+        }
+        status
+    }
 }
 pub(crate) fn register(reg: &mut Registry) {
     for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
@@ -287,18 +333,25 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         }
         tables[i] = table;
     }
+    let audio = AudioControl::new(!m.sys.clock.is_virtual());
+    let playback_clock = audio.playback_clock();
     m.ext.insert(Sound {
         enabled: false,
         tables,
         objects: BTreeMap::new(),
         buffers: BTreeMap::new(),
-        mixer: Arc::new(Mutex::new(Mixer::default())),
+        audio,
+        next_audio_id: 1,
+        pending_release: BTreeMap::new(),
+        pending_notices: Vec::new(),
         queued_samples: 0,
         nonzero_samples: 0,
         capture_digests: false,
         digests: Vec::new(),
         trace,
         trace_pcm_dir,
+        trace_pcm_chunks: std::env::var_os("ADV_AUDIO_DUMP_CHUNKS").is_some(),
+        playback_clock,
     });
     Ok(())
 }
@@ -324,16 +377,14 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
         return refs;
     }
     let kind = s.objects.remove(&ptr).unwrap().kind;
-    let storage = s.buffers.remove(&ptr).map(|buffer| buffer.storage);
-    if storage.is_some() {
-        s.mixer.lock().unwrap().remove_pcm(u64::from(ptr));
+    if let Some(buffer) = s.buffers.remove(&ptr)
+        && buffer.storage != 0
+    {
+        let queued = s.audio.remove_pcm(buffer.audio_id);
+        s.pending_release
+            .insert(buffer.audio_id, (buffer.storage, queued));
     }
     free(e, ptr);
-    if let Some(storage) = storage
-        && storage != 0
-    {
-        free(e, storage);
-    }
     if let Kind::Notify(parent) = kind {
         release(e, parent);
     }
@@ -355,12 +406,17 @@ fn object(e: &mut Env<'_>, kind: Kind) -> Result<u32, String> {
     Ok(ptr)
 }
 fn result(e: &mut Env<'_>) -> Result<u32, String> {
+    e.ext.get::<Sound>().audio.sync_clock(e.sys.clock.now_us());
     let full = e.sys.thunks.get(e.thunk).name.clone();
     let name = full.split("::").last().unwrap();
     let a = e.arg(0);
     let b = e.arg(1);
     let c = e.arg(2);
-    let now = e.sys.clock.now_us();
+    let now = e
+        .ext
+        .get::<Sound>()
+        .playback_clock
+        .now_us(e.sys.clock.now_us());
     if e.ext.get::<Sound>().trace.is_some() {
         let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
         let ctx = e.sys.current;
@@ -516,15 +572,58 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 {
                     return Ok(INVALID);
                 }
-                let storage = if primary { 0 } else { alloc(e, len)? };
+                let (storage, region) = if primary {
+                    (0, None)
+                } else {
+                    let mapped_len = pal_machine::vm::align_up(len, 4096);
+                    let base = e
+                        .sys
+                        .vm
+                        .reserve(mapped_len)
+                        .ok_or("audio address space exhausted")?;
+                    let region = match e.cpu.map_shared_audio(base, mapped_len) {
+                        Ok(region) => region,
+                        Err(error) => {
+                            let _ = e.sys.vm.free(e.cpu, base);
+                            return Err(format!("shared audio mapping: {error}"));
+                        }
+                    };
+                    (base, Some(region))
+                };
                 if !primary && format.bits == 8 {
                     let silence = vec![128; len as usize];
                     e.cpu.write(storage, &silence).map_err(|e| e.to_string())?;
                 }
                 let ptr = object(e, Kind::Buffer)?;
-                e.ext.get_mut::<Sound>().buffers.insert(
+                let s = e.ext.get_mut::<Sound>();
+                let audio_id = s.next_audio_id;
+                s.next_audio_id = s
+                    .next_audio_id
+                    .checked_add(1)
+                    .ok_or("audio source IDs exhausted")?;
+                let voice = region
+                    .map(|region| {
+                        s.audio.add_ring(
+                            audio_id,
+                            RingConfig {
+                                view: region.read_alias,
+                                bytes: len,
+                                channels: format.channels,
+                                bits: format.bits,
+                                frequency: format.rate,
+                                output_rate: 44100,
+                                notifications: Vec::new(),
+                            },
+                        )
+                    })
+                    .transpose()?;
+                s.buffers.insert(
                     ptr,
                     Buffer {
+                        audio_id,
+                        voice,
+                        playback_clock: s.playback_clock.clone(),
+                        generation: 0,
                         storage,
                         len,
                         flags,
@@ -542,6 +641,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         lock: None,
                         trace_pcm: None,
                         trace_generation: 0,
+                        trace_chunks: None,
                     },
                 );
                 e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
@@ -605,6 +705,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             .unwrap()
             .notifications = entries;
         let s = e.ext.get_mut::<Sound>();
+        let buffer = &s.buffers[&parent];
+        s.audio
+            .set_notifications(buffer.audio_id, buffer.notifications.clone());
         if let Some(trace) = s.trace.as_mut() {
             let _ = writeln!(
                 trace,
@@ -680,10 +783,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 return Ok(INVALID);
             }
             buf.volume = b as i32;
-            s.mixer
-                .lock()
-                .unwrap()
-                .set_stereo_gain(u64::from(a), buf.stereo_gain());
+            s.audio.set_stereo_gain(buf.audio_id, buf.stereo_gain());
             0
         }
         "SetPan" => {
@@ -691,10 +791,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 return Ok(INVALID);
             }
             buf.pan = b as i32;
-            s.mixer
-                .lock()
-                .unwrap()
-                .set_stereo_gain(u64::from(a), buf.stereo_gain());
+            s.audio.set_stereo_gain(buf.audio_id, buf.stereo_gain());
             0
         }
         "SetFrequency" => {
@@ -707,7 +804,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             buf.frequency = freq;
             buf.queued_frames = 0;
             buf.notice_bytes = u64::from(buf.base);
-            s.mixer.lock().unwrap().flush_pcm(u64::from(a));
+            s.audio.set_frequency(buf.audio_id, freq)?;
+            buf.generation = buf.generation.wrapping_add(1);
+            s.audio.change_generation(buf.audio_id, buf.generation);
             0
         }
         "SetFormat" => {
@@ -729,7 +828,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             buf.anchor = now;
             buf.queued_frames = 0;
             buf.notice_bytes = u64::from(buf.base);
-            s.mixer.lock().unwrap().flush_pcm(u64::from(a));
+            s.audio.set_position(buf.audio_id, buf.base);
+            buf.generation = buf.generation.wrapping_add(1);
+            s.audio.change_generation(buf.audio_id, buf.generation);
             0
         }
         "Play" => {
@@ -739,12 +840,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if !buf.looping && buf.len != 0 && buf.progress(now) >= u64::from(buf.len) {
                 buf.playing = false;
                 buf.base = 0;
+                s.audio.stop_ring(buf.audio_id);
+                s.audio.set_position(buf.audio_id, 0);
             }
             if !buf.playing {
                 // A fresh start is a new playback generation. A naturally ended
                 // buffer can retain unconsumed PCM in the device latency window;
                 // it must not survive reuse of the same DirectSound object.
-                s.mixer.lock().unwrap().flush_pcm(u64::from(a));
+                buf.generation = buf.generation.wrapping_add(1);
                 if let Some(trace) = s.trace.as_mut() {
                     let mut bytes = vec![0; buf.len as usize];
                     if buf.len != 0 {
@@ -779,6 +882,17 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                             trace,
                             "dump us={now} id={a:08x} generation={generation} path={path:?}"
                         );
+                        if s.trace_pcm_chunks {
+                            let path = dir.join(format!("chunks-{now}-{a:08x}-{generation}.pcm"));
+                            let file = std::fs::File::create(&path).map_err(|error| {
+                                format!("cannot write audio chunks {path:?}: {error}")
+                            })?;
+                            buf.trace_chunks = Some(ChunkDump {
+                                writer: std::io::BufWriter::new(file),
+                                path,
+                                bytes: 0,
+                            });
+                        }
                     }
                     buf.trace_pcm = Some(bytes);
                     let _ = trace.flush();
@@ -805,14 +919,18 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }
             buf.playing = true;
             buf.looping = args[3] & 1 != 0;
+            s.audio.play_ring(buf.audio_id, buf.looping, buf.generation);
             0
         }
         "Stop" => {
             buf.stop(now);
-            s.mixer.lock().unwrap().flush_pcm(u64::from(a));
+            s.audio.stop_ring(buf.audio_id);
+            buf.generation = buf.generation.wrapping_add(1);
+            s.audio.change_generation(buf.audio_id, buf.generation);
             for &(offset, handle) in &buf.notifications {
                 if offset == u32::MAX {
-                    e.sys.set_event(handle);
+                    e.sys
+                        .set_event_with_priority(handle, pal_machine::WakePriority::Audio);
                 }
             }
             0
@@ -870,6 +988,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 }
             }
             buf.lock = Some(lock);
+            s.audio.written(buf.audio_id, offset, n1 + n2);
             0
         }
         "Unlock" => {
@@ -878,7 +997,33 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }) {
                 return Ok(INVALID);
             }
-            buf.lock = None;
+            if let Some(lock) = buf.lock.take()
+                && let Some(dump) = buf.trace_chunks.as_mut()
+            {
+                let file_offset = dump.bytes;
+                for (address, len) in [(lock.p1, c), (lock.p2, args[4])] {
+                    if len != 0 {
+                        let mut bytes = vec![0; len as usize];
+                        e.cpu
+                            .read(address, &mut bytes)
+                            .map_err(|error| error.to_string())?;
+                        dump.writer
+                            .write_all(&bytes)
+                            .map_err(|error| error.to_string())?;
+                        dump.bytes += u64::from(len);
+                    }
+                }
+                if let Some(trace) = s.trace.as_mut() {
+                    let _ = writeln!(
+                        trace,
+                        "dma-write us={now} id={a:08x} generation={} byte_offset={} count={} file_offset={file_offset} path={:?}",
+                        buf.trace_generation,
+                        lock.p1 - buf.storage,
+                        c + args[4],
+                        dump.path
+                    );
+                }
+            }
             0
         }
         _ => return Err(format!("unimplemented audio method {full}")),
@@ -894,172 +1039,134 @@ fn call(e: &mut Env<'_>) -> Outcome {
 
 /// Queue a small owned PCM window; the device callback never borrows guest memory.
 pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
-    let now = m.sys.clock.now_us();
+    let guest_now = m.sys.clock.now_us();
     let s = m.ext.get_mut::<Sound>();
-    if !s.enabled {
-        return Ok(None);
+    s.audio.sync_clock(guest_now);
+    for (&source, (_, queued)) in &mut s.pending_release {
+        if !*queued {
+            *queued = s.audio.remove_pcm(source);
+        }
+    }
+    (s.queued_samples, s.nonzero_samples) = s.audio.stream().rendered_samples();
+    let now = s.playback_clock.now_us(guest_now);
+    for event in s.audio.take_events() {
+        match event {
+            AudioEvent::Notification {
+                source,
+                generation,
+                event,
+                due_us,
+            } => {
+                if s.playback_clock.uses_device_time() {
+                    s.pending_notices.push((source, event, due_us, generation));
+                }
+            }
+            AudioEvent::Released { source } => {
+                if let Some((storage, _)) = s.pending_release.remove(&source) {
+                    m.sys
+                        .vm
+                        .free(&mut m.cpu, storage)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
     }
     let mut next = None;
-    let mut events = Vec::new();
-    // Guest reads and PCM conversion must stay outside the device queue lock.
-    // The callback uses try_lock, so a long producer critical section emits silence.
-    s.mixer.lock().unwrap().sync_clock(now);
-    for (&id, buf) in &mut s.buffers {
-        if !buf.playing || buf.len == 0 {
-            continue;
-        }
-        let progress = if buf.looping {
-            buf.progress(now)
-        } else {
-            buf.progress(now).min(u64::from(buf.len))
-        };
-        let old = buf.notice_bytes;
-        let total = u64::from(buf.len);
-        for &(offset, event) in &buf.notifications {
-            if offset == u32::MAX {
-                continue;
+    if !s.playback_clock.uses_device_time() {
+        for buffer in s
+            .buffers
+            .values_mut()
+            .filter(|buffer| buffer.playing && buffer.len != 0)
+        {
+            let progress = buffer.progress(now).min(if buffer.looping {
+                u64::MAX
+            } else {
+                u64::from(buffer.len)
+            });
+            let total = u64::from(buffer.len);
+            for &(offset, event) in &buffer.notifications {
+                let signal = if offset == u32::MAX {
+                    !buffer.looping && progress >= total
+                } else {
+                    let at = buffer.notice_bytes / total * total + u64::from(offset);
+                    let at = if at < buffer.notice_bytes {
+                        at + total
+                    } else {
+                        at
+                    };
+                    at < progress
+                };
+                if signal {
+                    m.sys
+                        .set_event_with_priority(event, pal_machine::WakePriority::Audio);
+                    next = Some(guest_now);
+                }
             }
-            let first = (old / total) * total + u64::from(offset);
-            let first = if first < old { first + total } else { first };
-            if first < progress {
+            buffer.notice_bytes = progress;
+        }
+    }
+    s.pending_notices
+        .retain(|&(source, event, due, generation)| {
+            if !s
+                .buffers
+                .values()
+                .any(|buffer| buffer.audio_id == source && buffer.generation == generation)
+            {
+                return false;
+            }
+            if due <= now {
+                m.sys
+                    .set_event_with_priority(event, pal_machine::WakePriority::Audio);
                 if let Some(trace) = s.trace.as_mut() {
                     let _ = writeln!(
                         trace,
-                        "notice us={now} id={id:08x} generation={} old={old} progress={progress} offset={offset} event={event:08x}",
-                        buf.trace_generation
+                        "dma-notice us={now} source={source} event={event:08x} due={due}"
                     );
                 }
-                events.push(event);
-            }
-        }
-        buf.notice_bytes = progress;
-        if !buf.looping && progress >= total {
-            buf.playing = false;
-            buf.base = 0;
-            s.mixer.lock().unwrap().end_pcm(u64::from(id));
-            if let Some(trace) = s.trace.as_mut() {
-                let _ = writeln!(
-                    trace,
-                    "end us={now} id={id:08x} generation={} progress={progress} frames={}",
-                    buf.trace_generation, buf.queued_frames
-                );
-            }
-            events.extend(
-                buf.notifications
-                    .iter()
-                    .filter(|n| n.0 == u32::MAX)
-                    .map(|n| n.1),
-            );
-            continue;
-        }
-        next = Some(now + 10_000);
-        // A software DirectSound Lock grants a write region; it does not pause
-        // playback. Verified with the native Windows audio_unlock_probe fixture.
-        let elapsed_frames = now.saturating_sub(buf.anchor) * u64::from(buf.frequency) / 1_000_000;
-        if buf.queued_frames + u64::from(buf.frequency) / 20 < elapsed_frames {
-            if let Some(trace) = s.trace.as_mut() {
-                let _ = writeln!(
-                    trace,
-                    "late us={now} id={id:08x} generation={} frames={} elapsed={elapsed_frames}",
-                    buf.trace_generation, buf.queued_frames
-                );
-            }
-            buf.queued_frames = elapsed_frames;
-            s.mixer.lock().unwrap().flush_pcm(u64::from(id));
-        }
-        let mut end = elapsed_frames + u64::from(buf.frequency) / 25;
-        if !buf.looping {
-            end = end.min(u64::from((buf.len - buf.base) / buf.format.align()));
-        }
-        let count = end
-            .saturating_sub(buf.queued_frames)
-            .min(u64::from(buf.frequency) / 10) as usize;
-        if count == 0 {
-            continue;
-        }
-        let align = buf.format.align() as usize;
-        let start = (u64::from(buf.base) + buf.queued_frames * align as u64) % total;
-        let mut bytes = vec![0; count * align];
-        let mut copied = 0;
-        let mut offset = start as usize;
-        while copied < bytes.len() {
-            let len = (buf.len as usize - offset).min(bytes.len() - copied);
-            m.cpu
-                .read(
-                    buf.storage + offset as u32,
-                    &mut bytes[copied..copied + len],
-                )
-                .map_err(|e| e.to_string())?;
-            copied += len;
-            offset = 0;
-        }
-        let mut samples = Vec::with_capacity(count * 2);
-        for frame in bytes.chunks_exact(align) {
-            let sample = |channel: usize| {
-                let at = channel * usize::from(buf.format.bits) / 8;
-                if buf.format.bits == 8 {
-                    (f32::from(frame[at]) - 128.0) / 128.0
-                } else {
-                    f32::from(i16::from_le_bytes([frame[at], frame[at + 1]])) / 32768.0
-                }
-            };
-            let l = sample(0);
-            let r = if buf.format.channels == 2 {
-                sample(1)
+                next = Some(guest_now);
+                false
             } else {
-                l
-            };
-            samples.extend([l, r]);
-        }
-        let nonzero = samples.iter().filter(|v| v.abs() > 0.00001).count();
-        if let Some(trace) = s.trace.as_mut() {
-            let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
-                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-            });
-            let changed = buf.trace_pcm.as_ref().map_or(0, |snapshot| {
-                bytes
-                    .iter()
-                    .enumerate()
-                    .filter(|(n, byte)| **byte != snapshot[(start as usize + n) % snapshot.len()])
-                    .count()
-            });
-            let _ = writeln!(
-                trace,
-                "pcm us={now} id={id:08x} generation={} storage={:08x} offset={start} frames={} count={count} hash={hash:016x} nonzero={nonzero} changed={changed}",
-                buf.trace_generation, buf.storage, buf.queued_frames
-            );
-        }
-        let len = samples.len();
-        let block = PcmBlock {
-            stream_id: u64::from(id),
-            guest_pts_us: buf.anchor + buf.queued_frames * 1_000_000 / u64::from(buf.frequency),
-            sample_rate: buf.frequency,
-            channels: 2,
-            samples,
-        };
-        let mut mixer = s.mixer.lock().unwrap();
-        let accepted = mixer.push_pcm(block).is_ok();
-        if accepted {
-            mixer.set_stereo_gain(u64::from(id), buf.stereo_gain());
-            buf.queued_frames += count as u64;
-            s.queued_samples += len as u64;
-            s.nonzero_samples += nonzero as u64;
-        }
-        drop(mixer);
-        if let Some(trace) = s.trace.as_mut() {
-            let _ = writeln!(
-                trace,
-                "queue us={now} id={id:08x} generation={} accepted={accepted} frames={}",
-                buf.trace_generation, buf.queued_frames
-            );
+                let deadline = guest_now + due - now;
+                next = Some(next.map_or(deadline, |previous: u64| previous.min(deadline)));
+                true
+            }
+        });
+    for buffer in s.buffers.values_mut() {
+        if buffer.playing
+            && !buffer.looping
+            && buffer.len != 0
+            && buffer.progress(now) >= u64::from(buffer.len)
+        {
+            buffer.playing = false;
+            buffer.base = 0;
         }
     }
-    if !events.is_empty() {
-        // Resume an event waiter without adding a second audio polling interval.
-        next = Some(now);
-    }
-    for event in events {
-        m.sys.set_event(event);
+    // A headless virtual device needs only the next source boundary. The real
+    // callback wakes execution when notifications/retirements are available.
+    if !s.playback_clock.uses_device_time() {
+        for buffer in s
+            .buffers
+            .values()
+            .filter(|buffer| buffer.playing && buffer.len != 0)
+        {
+            let progress = buffer.progress(now);
+            let total = u64::from(buffer.len);
+            let mut boundary = if buffer.looping { None } else { Some(total) };
+            for &(offset, _) in &buffer.notifications {
+                if offset == u32::MAX {
+                    continue;
+                }
+                let at = progress / total * total + u64::from(offset);
+                let at = if at <= progress { at + total } else { at };
+                boundary = Some(boundary.map_or(at, |old| old.min(at)));
+            }
+            if let Some(boundary) = boundary {
+                let frames = boundary.saturating_sub(progress) / u64::from(buffer.format.align());
+                let delay = (frames * 1_000_000).div_ceil(u64::from(buffer.frequency));
+                let deadline = guest_now + delay.max(1);
+                next = Some(next.map_or(deadline, |old| old.min(deadline)));
+            }
+        }
     }
     Ok(next)
 }
@@ -1244,7 +1351,13 @@ mod tests {
             0
         );
         pump(&mut m).unwrap();
-        assert_eq!(m.ext.get::<Sound>().nonzero_samples, 80);
+        let stream = m.ext.get::<Sound>().audio.stream();
+        let mut out = [0.0; 40];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(
+            out, [0.5; 40],
+            "outstanding Lock writes must be device-visible"
+        );
         advance(&mut m, 25_000);
         assert_eq!(position(&mut m, b), 25);
         assert_eq!(
@@ -1290,7 +1403,7 @@ mod tests {
         assert_eq!(position(&mut m, b), 396);
     }
     #[test]
-    fn unsigned_mono_and_signed_stereo_pcm_reach_the_owned_mixer() {
+    fn unsigned_mono_and_signed_stereo_pcm_are_read_from_shared_guest_memory() {
         for format in [
             Format {
                 rate: 1000,
@@ -1318,17 +1431,29 @@ mod tests {
             };
             m.cpu.write(ptr, &bytes).unwrap();
             invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
-            assert!(pump(&mut m).unwrap().is_some());
-            // Owned blocks survive subsequent guest writes; the callback does no guest I/O.
-            m.cpu.write(ptr, &vec![0; bytes.len()]).unwrap();
-            let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+            assert!(
+                pump(&mut m).unwrap().is_none(),
+                "a static loop needs no execution-side polling"
+            );
+            let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
             let mut out = [0.0; 40];
             stream.read_stereo(&mut out, 1000);
             for frame in out.as_chunks::<2>().0 {
                 assert_eq!(frame[0], 0.5);
                 assert_eq!(frame[1], if format.channels == 1 { 0.5 } else { -0.25 });
             }
-            assert_eq!(m.ext.get::<Sound>().nonzero_samples, 80);
+            m.cpu
+                .write(
+                    ptr,
+                    &vec![if format.bits == 8 { 128 } else { 0 }; bytes.len()],
+                )
+                .unwrap();
+            stream.read_stereo(&mut out, 1000);
+            assert_eq!(
+                out, [0.0; 40],
+                "guest writes stay visible through the independent read alias"
+            );
+            assert_eq!(stream.rendered_samples(), (80, 40));
         }
     }
     #[test]
@@ -1347,7 +1472,7 @@ mod tests {
         m.cpu.write(ptr, &[192; 100]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut first = [0.0; 20];
         stream.read_stereo(&mut first, 1000);
         assert_eq!(first, [0.5; 20]);
@@ -1366,17 +1491,18 @@ mod tests {
         let mut faded = [0.0; 40];
         stream.read_stereo(&mut faded, 1000);
         assert!(
-            faded.iter().all(|value| (*value - 0.05).abs() < 1e-6),
+            faded.iter().all(|value| *value >= 0.049 && *value <= 0.5)
+                && faded[10..].iter().all(|value| (*value - 0.05).abs() < 1e-6),
             "volume change introduced a silent gap: {faded:?}"
         );
         assert_eq!(
             invoke(&mut m, "IDirectSoundBuffer8::SetPan", &[b, 10000]),
             0
         );
-        let mut panned = [0.0; 10];
+        let mut panned = [0.0; 20];
         stream.read_stereo(&mut panned, 1000);
         assert!(
-            panned
+            panned[10..]
                 .as_chunks::<2>()
                 .0
                 .iter()
@@ -1387,9 +1513,10 @@ mod tests {
             "IDirectSoundBuffer8::SetVolume",
             &[b, (-10000i32) as u32],
         );
-        let mut muted = [1.0; 10];
+        let mut muted = [1.0; 20];
         stream.read_stereo(&mut muted, 1000);
-        assert_eq!(muted, [0.0; 10]);
+        assert!(muted.iter().all(|value| *value >= 0.0 && *value <= 0.05));
+        assert_eq!(muted[10..], [0.0; 10]);
     }
     #[test]
     fn stop_seek_and_buffer_reuse_cannot_emit_an_older_voice_generation() {
@@ -1408,7 +1535,7 @@ mod tests {
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[music, 0, 0, 1]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out, [0.75; 20]);
@@ -1461,11 +1588,11 @@ mod tests {
         m.cpu.write(storage, &[64; 30]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 80];
         stream.read_stereo(&mut out, 1000);
-        assert_eq!(out[..60], [0.0; 60]);
-        assert_eq!(out[60..], [-0.5; 20]);
+        assert_eq!(out[..60], [-0.5; 60]);
+        assert_eq!(out[60..], [0.0; 20]);
     }
     #[test]
     fn seeking_a_playing_voice_discards_prefetch_from_the_previous_cursor() {
@@ -1484,7 +1611,7 @@ mod tests {
         m.cpu.write(storage + 500, &[64; 500]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out, [0.5; 20]);
@@ -1525,10 +1652,53 @@ mod tests {
         m.cpu.write(next_storage, &[64; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[next_voice, 0, 0, 0]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out, [-0.25; 20]);
+    }
+    #[test]
+    fn a_single_release_reclaims_its_mapping_after_a_saturated_command_lane_recovers() {
+        let mut m = machine();
+        let voice = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            1000,
+        );
+        let (source, storage) = {
+            let buffer = &m.ext.get::<Sound>().buffers[&voice];
+            (buffer.audio_id, buffer.storage)
+        };
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 1]);
+        let audio = m.ext.get::<Sound>().audio.clone();
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        for _ in 0..7000 {
+            audio.set_gain(source, 0.5);
+        }
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Release", &[voice]),
+            0,
+            "COM references are released exactly once"
+        );
+        assert!(!m.ext.get::<Sound>().objects.contains_key(&voice));
+        assert!(
+            m.cpu.read_u8(storage).is_ok(),
+            "mapping stays alive until the callback releases the alias"
+        );
+        let mut output = [0.0; 512];
+        for _ in 0..8 {
+            reader.read(&mut output, 0);
+            pump(&mut m).unwrap();
+        }
+        assert!(m.ext.get::<Sound>().pending_release.is_empty());
+        assert!(
+            m.cpu.read_u8(storage).is_err(),
+            "the pending removal is retried internally, without a second Release call"
+        );
     }
     #[test]
     fn notifications_wrap_and_natural_stop_signal_real_events() {
@@ -1610,7 +1780,7 @@ mod tests {
         assert!(m.ext.get::<Sound>().nonzero_samples > 19000);
         assert_eq!(position(&mut m, b), 0);
         assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[b]), 0);
-        assert!(!m.ext.get::<Sound>().mixer.lock().unwrap().active());
+        assert!(!m.ext.get::<Sound>().audio.active());
     }
     #[test]
     fn guest_calls_com_vtable_and_stdcall_restores_stack() {

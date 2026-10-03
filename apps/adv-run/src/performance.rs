@@ -55,6 +55,7 @@ pub struct Performance {
     step_max: Duration,
     pump_total: Duration,
     pump_max: Duration,
+    ui_metrics_dropped_total: u64,
     observed_serial: u64,
     observations: u64,
     serial_skipped: u64,
@@ -87,15 +88,27 @@ impl Performance {
             measurement_start_frame: serial,
             observed_serial: serial,
             last_host_serial: serial,
+            // This channel-health counter is cumulative for the process,
+            // independent of when delayed metrics reach the measurement window.
+            ui_metrics_dropped_total: self.ui_metrics_dropped_total,
             ..Self::default()
         };
     }
     pub fn soft_yield(&mut self) {
         self.soft_yields += 1;
     }
-    pub fn pump(&mut self, elapsed: Duration) {
+    pub fn pump(&mut self, elapsed: Duration, completed: Instant) {
+        if self
+            .measurement_start
+            .is_some_and(|start| completed < start)
+        {
+            return;
+        }
         self.pump_total += elapsed;
         self.pump_max = self.pump_max.max(elapsed);
+    }
+    pub fn set_ui_metrics_dropped(&mut self, total: u64) {
+        self.ui_metrics_dropped_total = total;
     }
     pub fn step(&mut self, elapsed: Duration, serial: u64) {
         self.steps += 1;
@@ -120,6 +133,14 @@ impl Performance {
         }
     }
     pub fn present(&mut self, serial: u64, elapsed: Duration, completed: Instant) {
+        // UI delivery may lag behind reset-metrics. Its timestamp, rather than
+        // queue arrival, determines which observation window owns the sample.
+        if self
+            .measurement_start
+            .is_some_and(|start| completed < start)
+        {
+            return;
+        }
         if serial == 0 || serial == self.last_host_serial {
             self.host_repaints += 1;
             self.host_repaint_total += elapsed;
@@ -156,6 +177,7 @@ impl Performance {
                 "{{\n    \"measurement_start_frame\": {}, \"measurement_elapsed_seconds\": {},\n",
                 "    \"runtime_steps\": {}, \"runtime_soft_yields\": {}, \"runtime_step_seconds\": {:.6}, \"runtime_step_max_seconds\": {:.6},\n",
                 "    \"cold_step_seconds_before_first_observation\": {:.6}, \"event_pump_seconds\": {:.6}, \"event_pump_max_seconds\": {:.6},\n",
+                "    \"ui_metrics_dropped_total\": {},\n",
                 "    \"frame_observations\": {}, \"guest_serial_skipped_between_observations\": {}, \"guest_serial_delta_max\": {},\n",
                 "    \"warm_steps_producing_available_frames\": {},\n",
                 "    \"warm_active_runtime_between_frame_observations\": {},\n",
@@ -176,6 +198,7 @@ impl Performance {
             self.cold_step_total.as_secs_f64(),
             self.pump_total.as_secs_f64(),
             self.pump_max.as_secs_f64(),
+            self.ui_metrics_dropped_total,
             self.observations,
             self.serial_skipped,
             self.serial_delta_max,
@@ -200,12 +223,55 @@ impl Performance {
 mod tests {
     use super::*;
     #[test]
+    fn delayed_ui_delivery_cannot_reenter_a_reset_measurement_window() {
+        let mut stats = Performance::default();
+        let old = Instant::now();
+        stats.reset(100);
+        let new = stats.measurement_start.unwrap();
+        stats.present(
+            99,
+            Duration::from_millis(50),
+            old - Duration::from_millis(1),
+        );
+        stats.present(
+            101,
+            Duration::from_millis(1),
+            new + Duration::from_millis(2),
+        );
+        assert_eq!(stats.host_presentations, 1);
+        assert_eq!(stats.host_present_total, Duration::from_millis(1));
+        assert!(stats.host_intervals.recent.is_empty());
+    }
+    #[test]
+    fn reset_filters_delayed_pump_metrics_and_preserves_total_channel_drops() {
+        let mut stats = Performance::default();
+        let old = Instant::now() - Duration::from_millis(1);
+        stats.set_ui_metrics_dropped(15);
+        stats.reset(100);
+        let boundary = stats.measurement_start.unwrap();
+        stats.pump(Duration::from_secs(1), old);
+        assert_eq!(stats.pump_total, Duration::ZERO);
+        stats.pump(Duration::from_millis(2), boundary);
+        stats.pump(
+            Duration::from_millis(3),
+            boundary + Duration::from_millis(1),
+        );
+        assert_eq!(stats.pump_total, Duration::from_millis(5));
+        assert_eq!(stats.pump_max, Duration::from_millis(3));
+        assert!(stats.json().contains("\"ui_metrics_dropped_total\": 15"));
+        stats.set_ui_metrics_dropped(20);
+        stats.reset(101);
+        assert!(stats.json().contains("\"ui_metrics_dropped_total\": 20"));
+        assert_eq!(stats.pump_total, Duration::ZERO);
+    }
+    #[test]
     fn resetting_measurement_excludes_prior_frames_and_the_first_partial_interval() {
         let mut stats = Performance::default();
         let now = Instant::now();
         stats.step(Duration::from_secs(2), 100);
         stats.present(100, Duration::from_millis(2), now);
         stats.reset(100);
+        let now = stats.measurement_start.unwrap();
         stats.step(Duration::from_millis(5), 100);
         stats.present(100, Duration::from_millis(1), now);
         stats.step(Duration::from_millis(3), 101);

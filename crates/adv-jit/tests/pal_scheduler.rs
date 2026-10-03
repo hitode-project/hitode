@@ -182,8 +182,15 @@ fn pal_double_return_retains_f64_precision_x87_stack_and_integer_registers() {
         registry.add("test", "double", Conv::Cdecl { argc: 0 }, |_| {
             Outcome::ReturnF64(f64::from_bits(1.0f64.to_bits() + 1))
         });
-        registry.add("test", "done", Conv::Cdecl { argc: 0 }, |_| Outcome::ExitProcess(0));
-        let mut m = Machine::new(JitCpu::new(PARK_ADDR, jit).unwrap(), registry, Clock::virtual_time()).unwrap();
+        registry.add("test", "done", Conv::Cdecl { argc: 0 }, |_| {
+            Outcome::ExitProcess(0)
+        });
+        let mut m = Machine::new(
+            JitCpu::new(PARK_ADDR, jit).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
         m.cpu.map(CODE, 4096, Prot::RX).unwrap();
         m.cpu.map(DATA, 4096, Prot::RW).unwrap();
         let double = m.resolve_import("test", "double").unwrap();

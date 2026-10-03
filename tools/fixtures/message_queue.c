@@ -7,9 +7,23 @@ API BOOL WINAPI PostThreadMessageA(DWORD, UINT, WPARAM, LPARAM);
 API BOOL WINAPI PostMessageA(HWND, UINT, WPARAM, LPARAM);
 API DWORD WINAPI MsgWaitForMultipleObjects(DWORD, const HANDLE *, BOOL, DWORD, DWORD);
 API DWORD WINAPI GetQueueStatus(UINT);
+API DWORD WINAPI WaitForMultipleObjects(DWORD, const HANDLE *, BOOL, DWORD);
+API BOOL WINAPI ResetEvent(HANDLE);
+API BOOL WINAPI GetExitCodeThread(HANDLE, DWORD *);
 typedef struct { MSG message; DWORD private_value; } NATIVE_MSG;
 static DWORD test_number;
 static DWORD main_thread;
+static HANDLE grant_events[9], grant_arrived;
+static DWORD grant_mode;
+static DWORD WINAPI grant_waiter(void *unused) {
+    NATIVE_MSG out = {0};
+    (void)unused;
+    PeekMessageA(&out.message, 0, 0, 0, 1);
+    SetEvent(grant_arrived);
+    if (grant_mode == 0)
+        return WaitForMultipleObjects(9, grant_events, 0, 1000);
+    return MsgWaitForMultipleObjects(9, grant_events, grant_mode == 2, 1000, 8);
+}
 static DWORD WINAPI delayed_post(void *unused) {
     (void)unused;
     Sleep(10);
@@ -22,6 +36,42 @@ static void check(DWORD actual, DWORD expected) {
 }
 static DWORD wait(const HANDLE *events, DWORD count, BOOL all, DWORD mask) {
     return MsgWaitForMultipleObjects(count, events, all, 0, mask);
+}
+static void grant_checks(void) {
+    DWORD mode, i, tid, code;
+    HANDLE thread;
+    for (mode = 0; mode < 3; ++mode) {
+        grant_mode = mode;
+        grant_arrived = CreateEventA(NULL, 0, 0, NULL);
+        for (i = 0; i < 9; ++i) grant_events[i] = CreateEventA(NULL, 0, 0, NULL);
+        thread = CreateThread(NULL, 0, grant_waiter, NULL, 0, &tid);
+        check(WaitForSingleObject(grant_arrived, 1000), 0);
+        Sleep(20); /* Let the waiter enter its wait, also on native Windows. */
+        if (mode != 2) {
+            SetEvent(grant_events[7]);
+            check(WaitForSingleObject(grant_events[7], 0), 0x102);
+            ResetEvent(grant_events[7]); /* Must not revoke a completed grant. */
+            SetEvent(grant_events[2]);
+            check(WaitForSingleObject(thread, 1000), 0);
+            check(GetExitCodeThread(thread, &code), 1);
+            check(code, 7);
+            check(WaitForSingleObject(grant_events[2], 0), 0);
+        } else {
+            for (i = 0; i < 9; ++i) SetEvent(grant_events[i]);
+            check(WaitForSingleObject(thread, 0), 0x102); /* Input is still absent. */
+            check(WaitForSingleObject(grant_events[3], 0), 0); /* No partial reservation. */
+            check(PostThreadMessageA(tid, 0x506, 31, 0), 1);
+            Sleep(20); /* USER32 re-enters its object wait after the input wake. */
+            check(WaitForSingleObject(thread, 0), 0x102); /* One object is now missing. */
+            SetEvent(grant_events[3]);
+            check(WaitForSingleObject(thread, 1000), 0);
+            check(GetExitCodeThread(thread, &code), 1);
+            check(code, 0);
+            for (i = 0; i < 9; ++i) check(WaitForSingleObject(grant_events[i], 0), 0x102);
+        }
+        CloseHandle(thread); CloseHandle(grant_arrived);
+        for (i = 0; i < 9; ++i) CloseHandle(grant_events[i]);
+    }
 }
 void mainCRTStartup(void) {
     NATIVE_MSG out = {0};
@@ -123,5 +173,6 @@ void mainCRTStartup(void) {
         check(WaitForSingleObject(thread, 1000), 0);
         CloseHandle(thread);
     }
+    grant_checks();
     ExitProcess(0);
 }

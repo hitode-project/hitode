@@ -1,6 +1,10 @@
 //! Read-only interactive audio diagnostic. All guest writes stay in the given overlay.
 //! audio_transition_probe <EXE> <jit|jit-sync|interpreter|unicorn> <SECONDS> <OVERLAY>
 //! stdin: click X Y, down VK, up VK, capture PATH, report PATH, trace PATH|off, close.
+//! ADV_AUDIO_CAPTURE optionally writes 44.1 kHz stereo f32 mixer output, plus
+//! a .timeline.txt file. This synchronous pull diagnostic uses no device.
+//! ADV_AUDIO_TRACE + ADV_AUDIO_DUMP_DIR + ADV_AUDIO_DUMP_CHUNKS also record
+//! accepted source chunks before conversion, gain and resampling.
 #[path = "../tests/support/cpu.rs"]
 mod backend;
 use adv_runtime::boot::Runtime;
@@ -12,6 +16,75 @@ use std::{
     io::{BufRead, Seek, Write},
     time::{Duration, Instant},
 };
+
+struct MixerCapture {
+    audio: pal_audio::AudioStream,
+    output: std::io::BufWriter<std::fs::File>,
+    timeline: std::io::BufWriter<std::fs::File>,
+    origin: Option<u64>,
+    frames: u64,
+}
+
+impl MixerCapture {
+    fn open(audio: pal_audio::AudioStream) -> Result<Option<Self>, String> {
+        let Some(path) = std::env::var_os("ADV_AUDIO_CAPTURE") else {
+            return Ok(None);
+        };
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let output = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        let timeline = std::fs::File::create(path.with_extension("timeline.txt"))
+            .map_err(|e| e.to_string())?;
+        Ok(Some(Self {
+            audio,
+            output: std::io::BufWriter::new(output),
+            timeline: std::io::BufWriter::new(timeline),
+            origin: None,
+            frames: 0,
+        }))
+    }
+
+    fn drain_to(&mut self, now: u64) -> Result<(), String> {
+        // The first sound pump initializes the mixer clock to this instant.
+        // Subsequent pulls consume exactly the elapsed guest frames. Disk writes
+        // follow read_stereo, whose mixer lock is already released.
+        let Some(origin) = self.origin else {
+            self.origin = Some(now);
+            writeln!(
+                self.timeline,
+                "capture start_us={now} rate=44100 channels=2 bits=f32le"
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        };
+        let end = now.saturating_sub(origin) * 44_100 / 1_000_000;
+        let mut samples = [0.0f32; 4096 * 2];
+        let mut bytes = [0u8; 4096 * 2 * 4];
+        while self.frames < end {
+            let count = (end - self.frames).min(4096) as usize;
+            self.audio.read_stereo(&mut samples[..count * 2], 44_100);
+            for (sample, output) in samples[..count * 2]
+                .iter()
+                .zip(bytes.as_chunks_mut::<4>().0)
+            {
+                output.copy_from_slice(&sample.to_le_bytes());
+            }
+            self.output
+                .write_all(&bytes[..count * 2 * 4])
+                .map_err(|e| e.to_string())?;
+            writeln!(
+                self.timeline,
+                "pull guest_us={now} first_frame={} count={count}",
+                self.frames
+            )
+            .map_err(|e| e.to_string())?;
+            self.frames += count as u64;
+        }
+        Ok(())
+    }
+}
 
 fn diagnostic_report(r: &Runtime<backend::Cpu>) -> String {
     let mut report = r.report();
@@ -98,6 +171,7 @@ fn run() -> Result<(), String> {
     r.set_audio_enabled(true);
     r.set_auto_dialog_ms(Some(50));
     r.enable_audio_pcm_digests();
+    let mut mixer_capture = MixerCapture::open(r.audio_stream())?;
     let seconds = args[2].parse::<u64>().map_err(|_| "invalid seconds")?;
     let started = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -201,7 +275,7 @@ fn run() -> Result<(), String> {
             println!("ok us={} {line}", r.machine.sys.clock.now_us());
             std::io::stdout().flush().map_err(|e| e.to_string())?;
         }
-        match r.step_for(Duration::from_millis(8)) {
+        let sleep = match r.step_for(Duration::from_millis(8)) {
             SliceResult::Complete(RunResult::Failed(e)) => {
                 r.machine.sys.trace.flush();
                 dump_failed_stacks(&r, &args[3]);
@@ -214,9 +288,15 @@ fn run() -> Result<(), String> {
             SliceResult::Complete(RunResult::Idle { next_deadline }) => {
                 let now = r.machine.sys.clock.now_us();
                 let delay = next_deadline.map_or(10_000, |at| at.saturating_sub(now).min(10_000));
-                std::thread::sleep(Duration::from_micros(delay));
+                Some(Duration::from_micros(delay))
             }
-            SliceResult::Yielded => {}
+            SliceResult::Yielded => None,
+        };
+        if let Some(capture) = mixer_capture.as_mut() {
+            capture.drain_to(r.machine.sys.clock.now_us())?;
+        }
+        if let Some(delay) = sleep {
+            std::thread::sleep(delay);
         }
     }
     r.machine.sys.trace.flush();

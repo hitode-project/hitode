@@ -15,3 +15,7 @@ debug = false
 
 [profile.release]
 debug = "line-tables-only"
+
+[patch.crates-io]
+cpal = { path = "../pal-hle/vendor/cpal" }
+symphonia-codec-adpcm = { path = "../pal-hle/vendor/symphonia-codec-adpcm" }

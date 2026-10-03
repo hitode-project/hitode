@@ -69,7 +69,11 @@ impl AudioOutput {
                     "{{\"device_requested\": true, \"device_running\": {}, ",
                     "\"starts\": {}, \"stops\": {}, \"callbacks\": {}, ",
                     "\"non_silent_samples\": {}, \"lock_misses\": {}, ",
-                    "\"device_errors\": {}, \"device_changes\": {}}}"
+                    "\"device_errors\": {}, \"device_changes\": {}, ",
+                    "\"device_sample_rate\": {}, \"device_channels\": {}, ",
+                    "\"output_frames\": {}, \"max_callback_frames\": {}, ",
+                    "\"native_clock_callbacks\": {}, \"device_consumed_frames\": {}, \"device_queued_frames\": {}, ",
+                    "\"hardware_muted\": {}, \"capture_dropped\": {}}}"
                 ),
                 output.is_running(),
                 metrics.starts.load(Relaxed),
@@ -78,7 +82,16 @@ impl AudioOutput {
                 metrics.non_silent_samples.load(Relaxed),
                 metrics.lock_misses.load(Relaxed),
                 metrics.device_errors.load(Relaxed),
-                metrics.device_changes.load(Relaxed)
+                metrics.device_changes.load(Relaxed),
+                metrics.device_sample_rate.load(Relaxed),
+                metrics.device_channels.load(Relaxed),
+                metrics.output_frames.load(Relaxed),
+                metrics.max_callback_frames.load(Relaxed),
+                metrics.native_clock_callbacks.load(Relaxed),
+                metrics.device_consumed_frames.load(Relaxed),
+                metrics.device_queued_frames.load(Relaxed),
+                metrics.hardware_muted.load(Relaxed),
+                metrics.capture_dropped.load(Relaxed)
             )
         }
         #[cfg(not(windows))]

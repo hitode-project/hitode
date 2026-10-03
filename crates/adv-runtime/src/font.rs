@@ -34,6 +34,12 @@ pub(crate) struct Fonts {
     delete_dc: Handler,
     #[cfg(windows)]
     native: BTreeMap<FontSpec, NativeFont>,
+    #[cfg(windows)]
+    glyphs: BTreeMap<GlyphKey, std::sync::Arc<Glyph>>,
+    #[cfg(windows)]
+    glyph_bytes: usize,
+    #[cfg(windows)]
+    glyph_hits: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +107,12 @@ pub(crate) fn install<B: pal_cpu::Backend>(machine: &mut pal_machine::Machine<B>
         delete_dc: original.get("gdi32.dll", "DeleteDC").unwrap().handler,
         #[cfg(windows)]
         native: BTreeMap::new(),
+        #[cfg(windows)]
+        glyphs: BTreeMap::new(),
+        #[cfg(windows)]
+        glyph_bytes: 0,
+        #[cfg(windows)]
+        glyph_hits: 0,
     });
 }
 
@@ -246,7 +258,6 @@ fn font_call(env: &mut Env<'_>) -> Outcome {
                 }
             };
         }
-        let native = &fonts.native[&spec];
         let format = args[2];
         if format & !0x1ff != 0 || !matches!(format & 0x7f, 0..=6) {
             set_last_error(env, 87);
@@ -259,18 +270,47 @@ fn font_call(env: &mut Env<'_>) -> Outcome {
         }
         // The ANSI entry point performs the selected font's charset conversion,
         // including unmapped character handling, rather than the process ACP.
-        let glyph = native.glyph(
-            args[1],
+        let key = GlyphKey {
+            font: spec.clone(),
+            code: args[1],
             format,
-            &matrix,
-            args[4],
-            args[5] != 0,
-            name.ends_with('A'),
-        );
+            matrix,
+            ansi: name.ends_with('A'),
+        };
+        let fonts = env.ext.get_mut::<Fonts>();
+        // This cache is below the guest API thunk, so guest IAT/inline hooks still
+        // execute. Cache immutable host results, never guest output pointers.
+        let glyph = if let Some(glyph) = fonts.glyphs.get(&key) {
+            fonts.glyph_hits += 1;
+            Ok(std::sync::Arc::clone(glyph))
+        } else {
+            fonts.native[&spec]
+                .glyph(key.code, format, &matrix, u32::MAX, true, key.ansi)
+                .map(|glyph| {
+                    let glyph = std::sync::Arc::new(glyph);
+                    const CACHE_BYTES: usize = 8 * 1024 * 1024;
+                    if glyph.bytes.len() <= CACHE_BYTES {
+                        if fonts.glyphs.len() >= 4096
+                            || fonts.glyph_bytes + glyph.bytes.len() > CACHE_BYTES
+                        {
+                            fonts.glyphs.clear();
+                            fonts.glyph_bytes = 0;
+                        }
+                        fonts.glyph_bytes += glyph.bytes.len();
+                        fonts.glyphs.insert(key, std::sync::Arc::clone(&glyph));
+                    }
+                    glyph
+                })
+        };
         match glyph {
             Ok(glyph) => {
+                let fetch = args[5] != 0 && args[4] != 0 && format & 0x7f != 0;
+                if fetch && args[4] < glyph.size {
+                    set_last_error(env, 87);
+                    return Outcome::Return(GDI_ERROR);
+                }
                 if env.cpu.write(args[3], &glyph.metrics).is_err()
-                    || (args[5] != 0
+                    || (fetch
                         && !glyph.bytes.is_empty()
                         && env.cpu.write(args[5], &glyph.bytes).is_err())
                 {
@@ -300,6 +340,16 @@ struct Glyph {
     metrics: [u8; 20],
     bytes: Vec<u8>,
     size: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GlyphKey {
+    font: FontSpec,
+    code: u32,
+    format: u32,
+    matrix: [u8; 16],
+    ansi: bool,
 }
 
 #[cfg(windows)]
@@ -613,6 +663,36 @@ mod tests {
             let mut bytes = vec![0; size as usize];
             machine.cpu.read(buffer, &mut bytes).unwrap();
             assert!(bytes.iter().any(|&b| b != 0));
+            let hits = machine.ext.get::<Fonts>().glyph_hits;
+            machine
+                .cpu
+                .write(buffer, &vec![0xa5; size as usize])
+                .unwrap();
+            // A cached size query must not write the caller's zero-capacity buffer.
+            assert_eq!(
+                invoke(
+                    &mut machine,
+                    data,
+                    "GetGlyphOutlineA",
+                    &[dc, u32::from(b'A'), format, metrics, 0, buffer, matrix]
+                ),
+                size
+            );
+            let mut queried = vec![0; size as usize];
+            machine.cpu.read(buffer, &mut queried).unwrap();
+            assert!(queried.iter().all(|&byte| byte == 0xa5));
+            assert_eq!(
+                invoke(
+                    &mut machine,
+                    data,
+                    "GetGlyphOutlineA",
+                    &[dc, u32::from(b'A'), format, metrics, size, buffer, matrix]
+                ),
+                size
+            );
+            machine.cpu.read(buffer, &mut queried).unwrap();
+            assert_eq!(queried, bytes);
+            assert_eq!(machine.ext.get::<Fonts>().glyph_hits, hits + 2);
             if format == 6 {
                 assert!(bytes.iter().all(|&b| b <= 64));
             }
@@ -655,6 +735,39 @@ mod tests {
             ),
             GDI_ERROR
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn glyph_cache_separates_transform_encoding_and_selected_font() {
+        let (mut machine, data, dc) = fixture();
+        let matrix = data + 128;
+        let mut transform = [0u8; 16];
+        transform[2..4].copy_from_slice(&1i16.to_le_bytes());
+        transform[14..16].copy_from_slice(&1i16.to_le_bytes());
+        machine.cpu.write(matrix, &transform).unwrap();
+        let query = |machine: &mut Machine<JitCpu>, name: &str| {
+            invoke(
+                machine,
+                data,
+                name,
+                &[dc, u32::from(b'A'), 6, data + 160, 0, 0, matrix],
+            )
+        };
+        let original = query(&mut machine, "GetGlyphOutlineW");
+        assert_ne!(original, GDI_ERROR);
+        assert_eq!(query(&mut machine, "GetGlyphOutlineW"), original);
+        assert_eq!(machine.ext.get::<Fonts>().glyph_hits, 1);
+        assert_eq!(query(&mut machine, "GetGlyphOutlineA"), original);
+        assert_eq!(machine.ext.get::<Fonts>().glyphs.len(), 2);
+        transform[2..4].copy_from_slice(&2i16.to_le_bytes());
+        machine.cpu.write(matrix, &transform).unwrap();
+        assert!(query(&mut machine, "GetGlyphOutlineW") > original);
+        assert_eq!(machine.ext.get::<Fonts>().glyphs.len(), 3);
+        invoke(&mut machine, data, "SelectObject", &[dc, STOCK_FONT]);
+        assert_ne!(query(&mut machine, "GetGlyphOutlineW"), GDI_ERROR);
+        assert_eq!(machine.ext.get::<Fonts>().glyphs.len(), 4);
+        assert_eq!(machine.ext.get::<Fonts>().glyph_hits, 1);
     }
 
     #[test]

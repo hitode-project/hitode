@@ -1,6 +1,7 @@
 //! Native presentation and deadline-driven input for a guest PE process.
 mod audio;
 mod control;
+mod frontend;
 mod performance;
 mod window;
 
@@ -33,6 +34,7 @@ struct Options {
     profile: bool,
     control_stdin: bool,
     audio: bool,
+    codec: adv_runtime::vorbis::Policy,
 }
 
 const HELP: &str = "adv-run <EXE> [options]\n\
@@ -43,6 +45,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
   --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
   --headless              run without a host window\n\
+  --codec guest|native    whole-module Vorbis provider (default: native)\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
@@ -85,6 +88,7 @@ impl Options {
             profile: false,
             control_stdin: false,
             audio: false,
+            codec: adv_runtime::vorbis::Policy::Native,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -125,6 +129,13 @@ impl Options {
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
                 "--audio" => options.audio = true,
+                "--codec" => {
+                    options.codec = match value()?.as_str() {
+                        "guest" => adv_runtime::vorbis::Policy::Guest,
+                        "native" => adv_runtime::vorbis::Policy::Native,
+                        _ => return Err("--codec must be guest or native".into()),
+                    }
+                }
                 "--width" => options.width = value()?.parse().map_err(|_| "invalid width")?,
                 "--height" => options.height = value()?.parse().map_err(|_| "invalid height")?,
                 "--frames" => {
@@ -255,6 +266,52 @@ fn build_report(context: ReportContext<'_>) -> String {
     } = context;
     let frame = runtime.frame();
     let stats = runtime.machine.cpu.stats();
+    let mut codec = adv_runtime::vorbis::stats(&runtime.machine).map_or_else(
+        || "{\"provider\": \"guest\"}".into(),
+        |s| format!(concat!("{{\"provider\": \"native\", \"opens\": {}, \"failed_opens\": {}, ",
+            "\"clears\": {}, \"active_streams\": {}, \"decoded_packets\": {}, \"decoded_frames\": {}, ",
+            "\"guest_callbacks\": {}, \"read_callbacks\": {}, \"seek_callbacks\": {}, \"tell_callbacks\": {}, ",
+            "\"close_callbacks\": {}, \"callback_bytes\": {}, \"metadata_scans\": {}}}"),
+            s.opens, s.failed_opens, s.clears, s.active_streams, s.decoded_packets, s.decoded_frames,
+            s.guest_callbacks, s.read_callbacks, s.seek_callbacks, s.tell_callbacks, s.close_callbacks, s.callback_bytes, s.metadata_scans),
+    );
+    if let Some(selection) = runtime
+        .machine
+        .ext
+        .try_get::<adv_runtime::vorbis::Selection>()
+    {
+        codec.pop();
+        codec.push_str(&format!(
+            ", \"selection_reason\": {}}}",
+            selection
+                .reason
+                .as_deref()
+                .map_or_else(|| "null".into(), json)
+        ));
+    }
+    let pcm = runtime.audio_pcm_metrics();
+    let sources = runtime.audio_source_status();
+    let pcm_metrics = format!(
+        concat!(
+            "{{\"queued_blocks\": {}, \"queued_source_frames\": {}, \"playback_starts\": {}, ",
+            "\"flushes\": {}, \"ends\": {}, \"removals\": {}, \"max_stream_queue_us\": {}, ",
+            "\"missing_stream_frames\": {}, \"missing_output_frames\": {}, ",
+            "\"buffers\": {}, \"playing\": {}, \"looping\": {}, \"locked\": {}}}"
+        ),
+        pcm.queued_blocks,
+        pcm.queued_source_frames,
+        pcm.playback_starts,
+        pcm.flushes,
+        pcm.ends,
+        pcm.removals,
+        pcm.max_stream_queue_us,
+        pcm.missing_stream_frames,
+        pcm.missing_output_frames,
+        sources.buffers,
+        sources.playing,
+        sources.looping,
+        sources.locked,
+    );
     let missing = runtime.missing_apis();
     let modules = runtime.machine.sys.modules.iter().map(|(_, module)| format!(
         "{{\"name\": {}, \"kind\": {}, \"base\": \"{:#010x}\", \"size\": {}, \"exports\": {}}}",
@@ -268,7 +325,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"runtime\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -286,7 +343,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
         started.elapsed().as_secs_f64(),
         first_frame_seconds.map_or_else(|| "null".into(), |seconds| format!("{seconds:.6}")),
-        frame.frames,
+        runtime.presented_frames(),
         frame.width,
         frame.height,
         checksum(&frame.bgra),
@@ -316,6 +373,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         screenshot_error.map_or_else(|| "null".into(), json),
         performance.json(),
         audio.json(),
+        pcm_metrics,
+        codec,
         json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
     )
 }
@@ -329,15 +388,67 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
 
 fn run(options: Options) -> Result<u8, String> {
     window::initialize_dpi()?;
+    let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
+    let keys = std::sync::Arc::new(pal_host::input::KeyState::default());
+    if options.headless {
+        return run_execution(options, None, wake, keys);
+    }
+    let mut window = window::Window::new(
+        &format!(
+            "ADV — {}",
+            options
+                .exe
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+        options.width,
+        options.height,
+        options.hidden,
+    )?;
+    let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
+    let completion_wake = ui.wake();
+    let (mut tx, mut rx) = pal_host::spsc::channel(1);
+    let execution = std::thread::Builder::new()
+        .name("adv-execution".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_execution(options, Some(worker), wake, keys)
+            }))
+            .unwrap_or_else(|_| Err("execution worker panicked".into()));
+            let _ = tx.push(result);
+            completion_wake.signal();
+        })
+        .map_err(|e| e.to_string())?;
+    let result = ui.run(&mut window, &mut rx);
+    drop(ui);
+    execution
+        .join()
+        .map_err(|_| "execution worker panicked".to_owned())?;
+    result?
+}
+
+fn run_execution(
+    options: Options,
+    mut window: Option<frontend::Worker>,
+    wake: window::WakeEvent,
+    keys: std::sync::Arc<pal_host::input::KeyState>,
+) -> Result<u8, String> {
     let started = Instant::now();
-    let mut runtime = Runtime::new(
+    let mut runtime = Runtime::with_codec(
         &options.exe,
         &options.data_dir,
         options.jit,
         options.width,
         options.height,
+        options.codec,
     )?;
     runtime.set_codepage(options.codepage);
+    runtime.machine.cpu.set_waker(wake.clone())?;
+    runtime
+        .audio_stream()
+        .set_waker(wake.clone())
+        .map_err(|_| "audio wake event was already registered".to_owned())?;
     runtime
         .machine
         .cpu
@@ -365,29 +476,19 @@ fn run(options: Options) -> Result<u8, String> {
         ));
         runtime.machine.sys.trace.all = true;
     }
-    let mut window = if options.headless {
-        None
-    } else {
-        Some(window::Window::new(
-            &format!(
-                "ADV — {}",
-                options
-                    .exe
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ),
-            options.width,
-            options.height,
-            options.hidden,
-        )?)
-    };
-    let mut serial = u64::MAX;
+    runtime.set_host_keys(keys.clone());
+    if let Some(worker) = window.as_mut() {
+        let producer = worker.take_frames();
+        runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
+    }
     let mut audio = audio::AudioOutput::new(options.audio, options.headless, &runtime);
     let mut control = options
         .control_stdin
-        .then(control::Control::start)
+        .then(|| control::Control::start(wake.clone(), keys.clone()))
         .transpose()?;
+    if control.is_some() {
+        runtime.enable_input_receipts();
+    }
     let mut idle_waits = 0u64;
     let mut wait_time = Duration::ZERO;
     let mut performance = performance::Performance::default();
@@ -399,8 +500,32 @@ fn run(options: Options) -> Result<u8, String> {
     let mut exit_code = None;
     let stop_reason;
     loop {
+        wake.take_interrupt();
+        if window.as_ref().is_some_and(frontend::Worker::stopped) {
+            return Err("UI stopped while the guest was running".into());
+        }
+        if let Some(w) = window.as_mut() {
+            for event in w.pump(&mut performance) {
+                match event {
+                    window::Event::Input {
+                        message,
+                        wparam,
+                        lparam,
+                    } => {
+                        inputs += u64::from(runtime.post_input(message, wparam, lparam));
+                    }
+                    window::Event::Close => {
+                        runtime.post_input(0x10, 0, 0);
+                        close_at.get_or_insert_with(Instant::now);
+                    }
+                    window::Event::Repaint => {}
+                    window::Event::FocusLost => inputs += runtime.release_input() as u64,
+                }
+            }
+        }
         if let Some(controller) = control.as_mut() {
             for command in controller.drain() {
+                let receipt_before = runtime.latest_input_receipt();
                 let result = match command {
                     control::Command::Click(x, y) => {
                         let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
@@ -427,9 +552,27 @@ fn run(options: Options) -> Result<u8, String> {
                             Err("key has no guest target window".into())
                         }
                     }
-                    control::Command::Capture(path) => save_frame(&path, runtime.frame())
-                        .map(|_| format!("capture {}", path.display())),
+                    control::Command::KeyDown(key) | control::Command::KeyUp(key) => {
+                        let pressed = matches!(command, control::Command::KeyDown(_));
+                        let posted = runtime.post_input(
+                            if pressed { 0x100 } else { 0x101 },
+                            key,
+                            if pressed { 1 } else { 0xc0000001 },
+                        );
+                        inputs += u64::from(posted);
+                        if posted {
+                            Ok(format!("key-{} {key}", if pressed { "down" } else { "up" }))
+                        } else {
+                            Err("key has no guest target window".into())
+                        }
+                    }
+                    control::Command::Capture(path) => {
+                        runtime.capture_latest_frame()?;
+                        save_frame(&path, runtime.frame())
+                            .map(|_| format!("capture {}", path.display()))
+                    }
                     control::Command::Report(path) => {
+                        runtime.capture_latest_frame()?;
                         runtime.machine.sys.trace.flush();
                         let snapshot = build_report(ReportContext {
                             options: &options,
@@ -449,7 +592,7 @@ fn run(options: Options) -> Result<u8, String> {
                         write_report(&path, &snapshot).map(|_| format!("report {}", path.display()))
                     }
                     control::Command::ResetMetrics => {
-                        let serial = runtime.frame().frames;
+                        let serial = runtime.presented_frames();
                         performance.reset(serial);
                         Ok(format!("reset-metrics start_frame={serial}"))
                     }
@@ -463,29 +606,14 @@ fn run(options: Options) -> Result<u8, String> {
                     }
                     control::Command::Error(error) => Err(error),
                 };
+                let receipt = runtime.latest_input_receipt();
+                controller.note_input_receipt(if receipt != receipt_before {
+                    receipt
+                } else {
+                    0
+                });
                 control::acknowledge(result);
             }
-        }
-        if let Some(w) = window.as_mut() {
-            let pump_started = Instant::now();
-            for event in w.pump() {
-                match event {
-                    window::Event::Input {
-                        message,
-                        wparam,
-                        lparam,
-                    } => {
-                        inputs += u64::from(runtime.post_input(message, wparam, lparam));
-                    }
-                    window::Event::Close => {
-                        runtime.post_input(0x10, 0, 0);
-                        close_at.get_or_insert_with(Instant::now);
-                    }
-                    window::Event::Repaint => serial = u64::MAX,
-                    window::Event::FocusLost => inputs += runtime.release_input() as u64,
-                }
-            }
-            performance.pump(pump_started.elapsed());
         }
         if options
             .seconds
@@ -513,23 +641,28 @@ fn run(options: Options) -> Result<u8, String> {
                 .set_execution_budget(Some(remaining.max(Duration::from_millis(1))));
         }
         let step_started = Instant::now();
+        let interrupts_before = runtime.machine.sys.scheduling.external_interrupts;
+        let frame_yields_before = runtime.machine.sys.scheduling.frame_host_yields;
         let outcome = runtime.step_for(SOFT_SLICE);
+        if let Some(controller) = control.as_mut() {
+            let ordinary = runtime.machine.sys.scheduling.external_interrupts == interrupts_before;
+            let full_or_idle = runtime.machine.sys.scheduling.frame_host_yields
+                == frame_yields_before
+                || matches!(&outcome, SliceResult::Complete(RunResult::Idle { .. }));
+            let input_completed = ordinary
+                && controller
+                    .awaited_input_receipt()
+                    .is_none_or(|receipt| runtime.input_receipt_completed(receipt, full_or_idle));
+            controller.after_guest_step(input_completed);
+        }
         let step_elapsed = step_started.elapsed();
         audio.update();
-        let frame = runtime.frame();
-        performance.step(step_elapsed, frame.frames);
-        if first_frame_seconds.is_none() && frame.frames > 0 {
+        let presented = runtime.presented_frames();
+        performance.step(step_elapsed, presented);
+        if first_frame_seconds.is_none() && presented > 0 {
             first_frame_seconds = runtime
                 .first_frame_time()
                 .map(|at| at.saturating_duration_since(started).as_secs_f64());
-        }
-        if frame.frames != serial && frame.width != 0 && !frame.bgra.is_empty() {
-            if let Some(w) = window.as_mut() {
-                let present_started = Instant::now();
-                w.present(frame)?;
-                performance.present(frame.frames, present_started.elapsed(), Instant::now());
-            }
-            serial = frame.frames;
         }
         let outcome = match outcome {
             SliceResult::Yielded => {
@@ -540,7 +673,7 @@ fn run(options: Options) -> Result<u8, String> {
         };
         match outcome {
             RunResult::Exited(code) => {
-                if options.frames.is_some_and(|limit| frame.frames >= limit) {
+                if options.frames.is_some_and(|limit| presented >= limit) {
                     stop_reason = "frame_limit";
                     break;
                 }
@@ -568,7 +701,7 @@ fn run(options: Options) -> Result<u8, String> {
             RunResult::Idle { next_deadline } => {
                 if options
                     .frames
-                    .is_some_and(|limit| runtime.frame().frames >= limit)
+                    .is_some_and(|limit| runtime.presented_frames() >= limit)
                 {
                     stop_reason = "frame_limit";
                     break;
@@ -609,24 +742,13 @@ fn run(options: Options) -> Result<u8, String> {
                 }
                 delay = audio.wait_duration(delay);
                 let wait_started = Instant::now();
-                let wake = if let Some(w) = window.as_mut() {
-                    if let Some(controller) = control.as_ref() {
-                        if controller.has_pending() {
-                            window::WaitOutcome::Input
-                        } else {
-                            w.wait_with_wake(delay, Some(controller.wake()))?
-                        }
-                    } else {
-                        w.wait(delay)?
-                    }
-                } else if let Some(controller) = control.as_mut() {
-                    if controller.wait(delay) {
-                        window::WaitOutcome::Input
-                    } else {
-                        window::WaitOutcome::Deadline
-                    }
+                // Every producer signals this same retained event. No UI/frame or
+                // stdin-specific blocking loop can hide another channel's wake.
+                let pending = control.as_ref().is_some_and(control::Control::has_pending);
+                let signaled = pending || wake.wait(delay).map_err(|e| e.to_string())?;
+                let wake = if signaled {
+                    window::WaitOutcome::Input
                 } else {
-                    std::thread::sleep(delay.unwrap_or(Duration::from_secs(1)));
                     window::WaitOutcome::Deadline
                 };
                 let waited = wait_started.elapsed();
@@ -637,6 +759,7 @@ fn run(options: Options) -> Result<u8, String> {
         }
     }
     runtime.machine.sys.trace.flush();
+    runtime.capture_latest_frame()?;
     let frame = runtime.frame();
     let screenshot_error = options
         .screenshot

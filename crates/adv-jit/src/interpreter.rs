@@ -1369,12 +1369,14 @@ impl Transaction {
             });
         }
         let mut bytes = [0; 4];
-        bytes[..width as usize].copy_from_slice(&memory.read_data(address, width as usize).map_err(
-            |_| Step::ReadFault {
-                pc: self.pc,
-                address,
-            },
-        )?);
+        bytes[..width as usize].copy_from_slice(
+            &memory
+                .read_data(address, width as usize)
+                .map_err(|_| Step::ReadFault {
+                    pc: self.pc,
+                    address,
+                })?,
+        );
         Ok(u32::from_le_bytes(bytes))
     }
     fn read(&self, memory: &Memory, operand: Operand) -> Result<u32, Step> {

@@ -1,0 +1,539 @@
+//! Synchronous 32-bit ACM streams. Symphonia is the only production decoder;
+//! Windows ACM is used solely by the repository's native differential fixture.
+use std::collections::BTreeMap;
+
+use pal_cpu::{Guest, GuestExt, Prot};
+use pal_machine::{Conv, Env, Outcome, Registry};
+use symphonia::core::audio::{Channels, SampleBuffer};
+use symphonia::core::codecs::{
+    CODEC_TYPE_ADPCM_IMA_WAV, CODEC_TYPE_ADPCM_MS, CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_U8,
+    CodecParameters, Decoder, DecoderOptions,
+};
+use symphonia::core::formats::Packet;
+
+const INVALID_HANDLE: u32 = 5;
+const NO_MEMORY: u32 = 7;
+const NOT_SUPPORTED: u32 = 8;
+const INVALID_FLAG: u32 = 10;
+const INVALID_PARAMETER: u32 = 11;
+const NOT_POSSIBLE: u32 = 512;
+const UNPREPARED: u32 = 514;
+const PREPARED: u32 = 0x20000;
+const DONE: u32 = 0x10000;
+const HEADER_BYTES: usize = 84;
+const MAX_CONVERT_BYTES: usize = 65536;
+const MAX_STREAMS: usize = 128;
+const MS_COEFFICIENTS: [(i16, i16); 7] = [
+    (256, 0),
+    (512, -256),
+    (0, 0),
+    (192, 64),
+    (240, 0),
+    (460, -208),
+    (392, -232),
+];
+
+#[derive(Clone, Debug)]
+struct Format {
+    tag: u16,
+    channels: u16,
+    rate: u32,
+    block: u16,
+    bits: u16,
+    frames_per_block: u16,
+}
+impl Format {
+    fn read(cpu: &dyn Guest, address: u32) -> Result<Self, u32> {
+        let mut base = [0; 16];
+        if !cpu.accessible(address, 16, Prot::READ) {
+            return Err(INVALID_PARAMETER);
+        }
+        cpu.read(address, &mut base)
+            .map_err(|_| INVALID_PARAMETER)?;
+        let word = |at| u16::from_le_bytes(base[at..at + 2].try_into().unwrap());
+        let mut format = Self {
+            tag: word(0),
+            channels: word(2),
+            rate: u32::from_le_bytes(base[4..8].try_into().unwrap()),
+            block: word(12),
+            bits: word(14),
+            frames_per_block: 1,
+        };
+        if !matches!(format.channels, 1 | 2)
+            || format.rate == 0
+            || format.block == 0
+            || format.rate.checked_mul(u32::from(format.block)).is_none()
+        {
+            return Err(NOT_POSSIBLE);
+        }
+        if format.tag == 1 {
+            if !matches!(format.bits, 8 | 16) || format.block != format.channels * (format.bits / 8)
+            {
+                return Err(NOT_POSSIBLE);
+            }
+            return Ok(format);
+        }
+        if !matches!(format.tag, 2 | 0x11) || format.bits != 4 {
+            return Err(NOT_POSSIBLE);
+        }
+        let extra_size = address.checked_add(16).ok_or(INVALID_PARAMETER)?;
+        if !cpu.accessible(extra_size, 2, Prot::READ) {
+            return Err(INVALID_PARAMETER);
+        }
+        let extra_len = cpu.read_u16(extra_size).map_err(|_| INVALID_PARAMETER)? as usize;
+        if !(2..=1024).contains(&extra_len) {
+            return Err(NOT_POSSIBLE);
+        }
+        let mut extra = vec![0; extra_len];
+        let extra_address = address.checked_add(18).ok_or(INVALID_PARAMETER)?;
+        if !cpu.accessible(extra_address, extra_len as u32, Prot::READ) {
+            return Err(INVALID_PARAMETER);
+        }
+        cpu.read(extra_address, &mut extra)
+            .map_err(|_| INVALID_PARAMETER)?;
+        format.frames_per_block = u16::from_le_bytes(extra[..2].try_into().unwrap());
+        let ch = usize::from(format.channels);
+        let block = usize::from(format.block);
+        let expected = if format.tag == 0x11 {
+            if block < 4 * ch || (block - 4 * ch) % (4 * ch) != 0 {
+                return Err(NOT_POSSIBLE);
+            }
+            ((block - 4 * ch) * 2 / ch) + 1
+        } else {
+            // Symphonia's MS decoder supports the seven standard coefficients.
+            // Different predictors are rejected instead of silently substituted.
+            if block < 7 * ch
+                || extra_len < 32
+                || u16::from_le_bytes(extra[2..4].try_into().unwrap()) != 7
+            {
+                return Err(NOT_POSSIBLE);
+            }
+            for (i, &(a, b)) in MS_COEFFICIENTS.iter().enumerate() {
+                let at = 4 + i * 4;
+                if i16::from_le_bytes(extra[at..at + 2].try_into().unwrap()) != a
+                    || i16::from_le_bytes(extra[at + 2..at + 4].try_into().unwrap()) != b
+                {
+                    return Err(NOT_POSSIBLE);
+                }
+            }
+            ((block - 7 * ch) * 2 / ch) + 2
+        };
+        if expected != usize::from(format.frames_per_block) || expected == 0 {
+            return Err(NOT_POSSIBLE);
+        }
+        Ok(format)
+    }
+    fn decoder(&self) -> Result<Box<dyn Decoder>, u32> {
+        let codec = match (self.tag, self.bits) {
+            (1, 8) => CODEC_TYPE_PCM_U8,
+            (1, 16) => CODEC_TYPE_PCM_S16LE,
+            (2, _) => CODEC_TYPE_ADPCM_MS,
+            (0x11, _) => CODEC_TYPE_ADPCM_IMA_WAV,
+            _ => return Err(NOT_POSSIBLE),
+        };
+        let mut parameters = CodecParameters::new();
+        parameters
+            .for_codec(codec)
+            .with_sample_rate(self.rate)
+            .with_channels(if self.channels == 1 {
+                Channels::FRONT_LEFT
+            } else {
+                Channels::FRONT_LEFT | Channels::FRONT_RIGHT
+            })
+            .with_bits_per_sample(u32::from(self.bits))
+            .with_frames_per_block(u64::from(self.frames_per_block))
+            .with_max_frames_per_packet(self.packet_frames() as u64);
+        symphonia::default::get_codecs()
+            .make(&parameters, &DecoderOptions::default())
+            .map_err(|_| NOT_POSSIBLE)
+    }
+    fn packet_frames(&self) -> usize {
+        if self.tag == 1 {
+            MAX_CONVERT_BYTES / usize::from(self.block)
+        } else {
+            usize::from(self.frames_per_block)
+        }
+    }
+    fn pcm_bytes(&self) -> [u8; 18] {
+        let mut bytes = [0; 18];
+        bytes[..2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.channels.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.rate.to_le_bytes());
+        bytes[8..12].copy_from_slice(&(self.rate * u32::from(self.block)).to_le_bytes());
+        bytes[12..14].copy_from_slice(&self.block.to_le_bytes());
+        bytes[14..16].copy_from_slice(&self.bits.to_le_bytes());
+        bytes
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Header {
+    status: u32,
+    src: u32,
+    src_len: u32,
+    dst: u32,
+    dst_len: u32,
+}
+impl Header {
+    fn read(cpu: &dyn Guest, address: u32) -> Result<Self, u32> {
+        let mut bytes = [0; HEADER_BYTES];
+        cpu.read(address, &mut bytes)
+            .map_err(|_| INVALID_PARAMETER)?;
+        let word = |at| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        if word(0) < HEADER_BYTES as u32 || !cpu.accessible(address, HEADER_BYTES as u32, Prot::RW)
+        {
+            return Err(INVALID_PARAMETER);
+        }
+        Ok(Self {
+            status: word(4),
+            src: word(12),
+            src_len: word(16),
+            dst: word(28),
+            dst_len: word(32),
+        })
+    }
+    fn buffers_valid(&self, cpu: &dyn Guest) -> bool {
+        (self.src_len == 0 || (self.src != 0 && cpu.accessible(self.src, self.src_len, Prot::READ)))
+            && (self.dst_len == 0
+                || (self.dst != 0 && cpu.accessible(self.dst, self.dst_len, Prot::WRITE)))
+    }
+}
+
+struct Stream {
+    source: Format,
+    destination: Format,
+    decoder: Box<dyn Decoder>,
+    headers: BTreeMap<u32, Header>,
+    timestamp: u64,
+}
+#[derive(Default)]
+struct Acm {
+    streams: BTreeMap<u32, Stream>,
+    next: u32,
+}
+
+fn ensure(e: &mut Env<'_>) {
+    if e.ext.try_get::<Acm>().is_none() {
+        e.ext.insert(Acm {
+            next: 0xac00_0001,
+            ..Default::default()
+        });
+    }
+}
+fn write_word(cpu: &mut dyn Guest, address: u32, offset: u32, value: u32) -> Result<(), u32> {
+    cpu.write_u32(address.checked_add(offset).ok_or(INVALID_PARAMETER)?, value)
+        .map_err(|_| INVALID_PARAMETER)
+}
+fn supported(source: &Format, destination: &Format) -> bool {
+    destination.tag == 1
+        && source.channels == destination.channels
+        && source.rate == destination.rate
+        && (source.tag == 1 || destination.bits == 16)
+}
+
+fn suggest(e: &mut Env<'_>) -> Result<(), u32> {
+    let flags = e.arg(4);
+    if flags & !0xf0000 != 0 {
+        return Err(INVALID_FLAG);
+    }
+    if e.arg(0) != 0 {
+        return Err(INVALID_HANDLE);
+    }
+    let source = Format::read(e.cpu, e.arg(1))?;
+    let address = e.arg(2);
+    let available = e.arg(3);
+    if available < 16 || !e.cpu.accessible(address, available.min(18), Prot::RW) {
+        return Err(INVALID_PARAMETER);
+    }
+    let channels = if flags & 0x20000 != 0 {
+        e.cpu.read_u16(address + 2).map_err(|_| INVALID_PARAMETER)?
+    } else {
+        source.channels
+    };
+    let rate = if flags & 0x40000 != 0 {
+        e.cpu.read_u32(address + 4).map_err(|_| INVALID_PARAMETER)?
+    } else {
+        source.rate
+    };
+    let bits = if flags & 0x80000 != 0 {
+        e.cpu
+            .read_u16(address + 14)
+            .map_err(|_| INVALID_PARAMETER)?
+    } else {
+        16
+    };
+    if (flags & 0x10000 != 0 && e.cpu.read_u16(address).map_err(|_| INVALID_PARAMETER)? != 1)
+        || channels != source.channels
+        || rate != source.rate
+        || !matches!(bits, 8 | 16)
+        || (source.tag != 1 && bits != 16)
+    {
+        return Err(NOT_POSSIBLE);
+    }
+    let destination = Format {
+        tag: 1,
+        channels,
+        rate,
+        block: channels * (bits / 8),
+        bits,
+        frames_per_block: 1,
+    };
+    if rate.checked_mul(u32::from(destination.block)).is_none() {
+        return Err(NOT_POSSIBLE);
+    }
+    e.cpu
+        .write(
+            address,
+            &destination.pcm_bytes()[..available.min(18) as usize],
+        )
+        .map_err(|_| INVALID_PARAMETER)
+}
+fn open(e: &mut Env<'_>) -> Result<(), u32> {
+    let flags = e.arg(7);
+    if flags & !7 != 0 {
+        return Err(INVALID_FLAG);
+    }
+    if e.arg(1) != 0 {
+        return Err(INVALID_HANDLE);
+    }
+    if flags & 2 != 0 || e.arg(4) != 0 {
+        return Err(NOT_SUPPORTED);
+    }
+    if e.arg(5) != 0 || e.arg(6) != 0 {
+        return Err(INVALID_PARAMETER);
+    }
+    let source = Format::read(e.cpu, e.arg(2))?;
+    let destination = Format::read(e.cpu, e.arg(3))?;
+    if !supported(&source, &destination) {
+        return Err(NOT_POSSIBLE);
+    }
+    let decoder = source.decoder()?;
+    if flags & 1 != 0 {
+        return Ok(());
+    }
+    let output = e.arg(0);
+    if output == 0 || !e.cpu.accessible(output, 4, Prot::WRITE) {
+        return Err(INVALID_PARAMETER);
+    }
+    ensure(e);
+    let acm = e.ext.get_mut::<Acm>();
+    if acm.streams.len() >= MAX_STREAMS || acm.next == u32::MAX {
+        return Err(NO_MEMORY);
+    }
+    let handle = acm.next;
+    acm.next += 1;
+    acm.streams.insert(
+        handle,
+        Stream {
+            source,
+            destination,
+            decoder,
+            headers: BTreeMap::new(),
+            timestamp: 0,
+        },
+    );
+    e.cpu
+        .write_u32(output, handle)
+        .map_err(|_| INVALID_PARAMETER)
+}
+fn size(e: &mut Env<'_>) -> Result<(), u32> {
+    let (handle, input, output, flags) = (e.arg(0), e.arg(1), e.arg(2), e.arg(3));
+    if output == 0 || !e.cpu.accessible(output, 4, Prot::WRITE) {
+        return Err(INVALID_PARAMETER);
+    }
+    e.cpu.write_u32(output, 0).map_err(|_| INVALID_PARAMETER)?;
+    if flags > 1 {
+        return Err(INVALID_FLAG);
+    }
+    if input == 0 {
+        return Err(INVALID_PARAMETER);
+    }
+    ensure(e);
+    let stream = e
+        .ext
+        .get::<Acm>()
+        .streams
+        .get(&handle)
+        .ok_or(INVALID_HANDLE)?;
+    let src = u64::from(stream.source.block);
+    let dst = u64::from(stream.source.frames_per_block) * u64::from(stream.destination.block);
+    let value = if flags == 0 {
+        u64::from(input).div_ceil(src) * dst
+    } else {
+        u64::from(input).div_ceil(dst) * src
+    };
+    let value = u32::try_from(value).map_err(|_| NOT_POSSIBLE)?;
+    e.cpu
+        .write_u32(output, value)
+        .map_err(|_| INVALID_PARAMETER)
+}
+fn prepare(e: &mut Env<'_>) -> Result<(), u32> {
+    let (handle, address, flags) = (e.arg(0), e.arg(1), e.arg(2));
+    if flags != 0 {
+        return Err(INVALID_FLAG);
+    }
+    ensure(e);
+    if !e.ext.get::<Acm>().streams.contains_key(&handle) {
+        return Err(INVALID_HANDLE);
+    }
+    let header = Header::read(e.cpu, address)?;
+    let stream = e.ext.get_mut::<Acm>().streams.get_mut(&handle).unwrap();
+    if stream.headers.contains_key(&address) {
+        return Ok(());
+    }
+    if header.status & PREPARED != 0 || !header.buffers_valid(e.cpu) {
+        return Err(INVALID_PARAMETER);
+    }
+    stream.headers.insert(address, header);
+    write_word(e.cpu, address, 4, header.status | PREPARED)
+}
+fn unprepare(e: &mut Env<'_>) -> Result<(), u32> {
+    let (handle, address, flags) = (e.arg(0), e.arg(1), e.arg(2));
+    if flags != 0 {
+        return Err(INVALID_FLAG);
+    }
+    ensure(e);
+    let header = Header::read(e.cpu, address)?;
+    let stream = e
+        .ext
+        .get_mut::<Acm>()
+        .streams
+        .get_mut(&handle)
+        .ok_or(INVALID_HANDLE)?;
+    let prepared = stream.headers.get(&address).ok_or(UNPREPARED)?;
+    if (header.src, header.dst, header.src_len, header.dst_len)
+        != (
+            prepared.src,
+            prepared.dst,
+            prepared.src_len,
+            prepared.dst_len,
+        )
+    {
+        return Err(INVALID_PARAMETER);
+    }
+    stream.headers.remove(&address);
+    write_word(e.cpu, address, 4, header.status & !PREPARED)
+}
+
+fn convert(e: &mut Env<'_>) -> Result<(), u32> {
+    let (handle, address, flags) = (e.arg(0), e.arg(1), e.arg(2));
+    if flags & !(4 | 16 | 32) != 0 {
+        return Err(INVALID_FLAG);
+    }
+    ensure(e);
+    let header = Header::read(e.cpu, address)?;
+    let stream = e
+        .ext
+        .get_mut::<Acm>()
+        .streams
+        .get_mut(&handle)
+        .ok_or(INVALID_HANDLE)?;
+    let prepared = stream.headers.get(&address).ok_or(UNPREPARED)?;
+    if header.status & PREPARED == 0 {
+        return Err(UNPREPARED);
+    }
+    if header.src != prepared.src
+        || header.dst != prepared.dst
+        || header.src_len > prepared.src_len
+        || header.dst_len != prepared.dst_len
+        || !header.buffers_valid(e.cpu)
+    {
+        return Err(INVALID_PARAMETER);
+    }
+    write_word(e.cpu, address, 20, 0)?;
+    write_word(e.cpu, address, 36, 0)?;
+    if flags & 16 != 0 {
+        stream.decoder.reset();
+        stream.timestamp = 0;
+    }
+    let source_block = usize::from(stream.source.block);
+    let output_block =
+        usize::from(stream.source.frames_per_block) * usize::from(stream.destination.block);
+    let blocks = (header.src_len as usize / source_block)
+        .min(header.dst_len as usize / output_block)
+        .min(MAX_CONVERT_BYTES / source_block);
+    if blocks == 0
+        && header.src_len != 0
+        && stream.source.tag != 1
+        && flags & 32 != 0
+        && flags & 4 == 0
+    {
+        return Err(NOT_POSSIBLE);
+    }
+    let used = blocks * source_block;
+    let mut source = vec![0; used];
+    e.cpu
+        .read(header.src, &mut source)
+        .map_err(|_| INVALID_PARAMETER)?;
+    let mut output = Vec::with_capacity(blocks * output_block);
+    let frames = if stream.source.tag == 1 {
+        blocks
+    } else {
+        usize::from(stream.source.frames_per_block)
+    };
+    let chunks = if stream.source.tag == 1 {
+        used.max(1)
+    } else {
+        source_block
+    };
+    for chunk in source.chunks(chunks) {
+        let packet = Packet::new_from_slice(0, stream.timestamp, frames as u64, chunk);
+        let audio = stream.decoder.decode(&packet).map_err(|_| NOT_POSSIBLE)?;
+        if stream.destination.bits == 16 {
+            let mut buffer = SampleBuffer::<i16>::new(audio.capacity() as u64, *audio.spec());
+            buffer.copy_interleaved_ref(audio);
+            for sample in buffer.samples() {
+                output.extend_from_slice(&sample.to_le_bytes());
+            }
+        } else {
+            let mut buffer = SampleBuffer::<u8>::new(audio.capacity() as u64, *audio.spec());
+            buffer.copy_interleaved_ref(audio);
+            output.extend_from_slice(buffer.samples());
+        }
+        stream.timestamp += frames as u64;
+    }
+    if output.len() != blocks * output_block {
+        return Err(NOT_POSSIBLE);
+    }
+    e.cpu
+        .write(header.dst, &output)
+        .map_err(|_| INVALID_PARAMETER)?;
+    write_word(e.cpu, address, 20, used as u32)?;
+    write_word(e.cpu, address, 36, output.len() as u32)?;
+    write_word(
+        e.cpu,
+        address,
+        4,
+        (header.status | DONE | PREPARED) & !0x100000,
+    )
+}
+fn close(e: &mut Env<'_>) -> Result<(), u32> {
+    if e.arg(1) != 0 {
+        return Err(INVALID_FLAG);
+    }
+    ensure(e);
+    let handle = e.arg(0);
+    e.ext
+        .get_mut::<Acm>()
+        .streams
+        .remove(&handle)
+        .ok_or(INVALID_HANDLE)?;
+    Ok(())
+}
+
+pub fn register(registry: &mut Registry) {
+    macro_rules! add {
+        ($name:literal, $argc:literal, $handler:ident) => {
+            registry.add("msacm32.dll", $name, Conv::Stdcall { argc: $argc }, |env| {
+                Outcome::Return($handler(env).err().unwrap_or(0))
+            });
+        };
+    }
+    add!("acmFormatSuggest", 5, suggest);
+    add!("acmStreamOpen", 8, open);
+    add!("acmStreamSize", 4, size);
+    add!("acmStreamPrepareHeader", 3, prepare);
+    add!("acmStreamConvert", 3, convert);
+    add!("acmStreamUnprepareHeader", 3, unprepare);
+    add!("acmStreamClose", 2, close);
+}

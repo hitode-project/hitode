@@ -452,6 +452,12 @@ fn stdin_control_wakes_idle_guest_and_reuses_capture_and_report_paths() {
         ("fixture_control.exe", "--hidden"),
         ("fixture_compute.exe", "--headless"),
         ("fixture_compute.exe", "--hidden"),
+        ("fixture_live_input.exe", "--headless"),
+        ("fixture_live_input.exe", "--hidden"),
+        ("fixture_copied_message.exe", "--headless"),
+        ("fixture_copied_message.exe", "--hidden"),
+        ("fixture_self_input.exe", "--headless"),
+        ("fixture_self_input.exe", "--hidden"),
     ] {
         let directory = fixtures();
         let report_path = directory.join(format!("control-{exe}-{mode}.json"));
@@ -532,6 +538,33 @@ fn stdin_control_wakes_idle_guest_and_reuses_capture_and_report_paths() {
                 "control wait busy-polled the guest"
             );
         }
+        // Held Ctrl must survive multiple guest timer callbacks, then release.
+        writeln!(input, "key-down 17").unwrap();
+        input.flush().unwrap();
+        assert!(ack(&receiver).starts_with("control ok key-down"));
+        std::thread::sleep(Duration::from_millis(50));
+        for (command, expected) in [
+            (
+                format!("capture {}", png_path.display()),
+                [0x33, 0xaa, 0x11, 255],
+            ),
+            (
+                format!("key-up 17\ncapture {}", png_path.display()),
+                [0x11, 0x33, 0xaa, 255],
+            ),
+        ] {
+            writeln!(input, "{command}").unwrap();
+            input.flush().unwrap();
+            if command.starts_with("key-up") {
+                assert!(ack(&receiver).starts_with("control ok key-up"));
+            }
+            assert!(ack(&receiver).starts_with("control ok capture"));
+            let decoder = png::Decoder::new(std::fs::File::open(&png_path).unwrap());
+            let mut reader = decoder.read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size()];
+            reader.next_frame(&mut pixels).unwrap();
+            assert_eq!(&pixels[..4], &expected, "{exe} {mode} {command}");
+        }
         writeln!(input, "key 256\nkey 0x41\nclose").unwrap();
         input.flush().unwrap();
         assert!(ack(&receiver).starts_with("control error"));
@@ -545,6 +578,63 @@ fn stdin_control_wakes_idle_guest_and_reuses_capture_and_report_paths() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn failed_input_without_a_window_does_not_block_diagnostic_report_or_close() {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    let directory = fixtures();
+    let path = directory.join("control-no-window.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_adv-run"))
+        .arg(directory.join("fixture_wait.exe"))
+        .args([
+            "--backend",
+            "interpreter",
+            "--headless",
+            "--control-stdin",
+            "--seconds",
+            "5",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if let Ok(line) = line
+                && line.starts_with("control ")
+                && sender.send(line).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "key-up 17\nreport {}\nclose", path.display()).unwrap();
+    input.flush().unwrap();
+    let first = receiver.recv_timeout(Duration::from_secs(6)).unwrap();
+    assert!(
+        first.starts_with("control error key has no guest target window"),
+        "{first}"
+    );
+    let report = receiver.recv_timeout(Duration::from_secs(6)).unwrap();
+    assert!(report.starts_with("control ok report"), "{report}");
+    let close = receiver.recv_timeout(Duration::from_secs(6)).unwrap();
+    assert!(close.starts_with("control ok close"), "{close}");
+    let text = std::fs::read_to_string(path).unwrap();
+    assert_eq!(number(&text, "input_messages"), 0.0);
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
