@@ -6,6 +6,10 @@ use std::sync::Arc;
 /// backing allocation for this object's lifetime and support concurrent byte
 /// atomic stores by the guest owner. Loads never lock, allocate, or perform IO.
 /// Wide mixed-size atomics and ordinary concurrent Rust writes are forbidden.
+/// A CPU may map another view at a stable linear guest address, but native
+/// word/SIMD accesses to that view must lower to matching byte atomics. A guest
+/// unmap/protection change only affects the CPU view; this read view retains its
+/// independent storage and OS read-only protection until its last owner drops.
 pub trait SharedReadView: Send + Sync {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {

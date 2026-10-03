@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const READ: u8 = 1;
@@ -11,6 +12,9 @@ pub const WRITE: u8 = 2;
 pub const EXEC: u8 = 4;
 /// Internal execution barrier; never exposed as a guest protection flag.
 pub(crate) const SHARED: u8 = 8;
+/// A shared PCM page has a stable alias at base + guest offset. Access must
+/// still use only matching byte atomics, even for guest word/vector operations.
+pub(crate) const AUDIO: u8 = 16;
 
 enum SharedPage {
     Audio {
@@ -30,9 +34,7 @@ impl SharedPage {
                 storage,
                 offset: base,
             } => {
-                for (index, byte) in out.iter_mut().enumerate() {
-                    *byte = storage.load_u8(base + offset + index);
-                }
+                crate::backend::SharedReadView::copy_into(storage.as_ref(), base + offset, out);
             }
             Self::File { page, .. } => return page.read_into(offset, out),
         }
@@ -45,9 +47,7 @@ impl SharedPage {
                 storage,
                 offset: base,
             } => {
-                for (index, &byte) in bytes.iter().enumerate() {
-                    storage.store_u8(*base + offset + index, byte);
-                }
+                storage.store_bytes(*base + offset, bytes);
             }
             Self::File {
                 page,
@@ -186,16 +186,25 @@ impl Memory {
             .reservation
             .as_ref()
             .ok_or("unmapping requires reserved address space")?;
-        // Overlay pages never committed a page in the linear reservation. Only
-        // decommit ordinary spans; removing an overlay leaves its Arc alias live.
+        // File overlays are not linear. PCM pages have their own section views
+        // in the reservation, whose removal cannot invalidate a callback alias.
         let mut start = pages.start;
         while start < pages.end {
-            if self.shared_pages.contains_key(&start) {
+            if self
+                .shared_pages
+                .get(&start)
+                .is_some_and(SharedPage::file_page)
+            {
                 start += 1;
                 continue;
             }
             let mut end = start + 1;
-            while end < pages.end && !self.shared_pages.contains_key(&end) {
+            while end < pages.end
+                && !self
+                    .shared_pages
+                    .get(&end)
+                    .is_some_and(SharedPage::file_page)
+            {
                 end += 1;
             }
             reservation.decommit(start * PAGE_SIZE, (end - start) * PAGE_SIZE)?;
@@ -279,7 +288,16 @@ impl Memory {
             let page = at / PAGE_SIZE;
             let len = (PAGE_SIZE - at % PAGE_SIZE).min(range.end - at);
             let output = &mut destination[at - range.start..at - range.start + len];
-            if let Some(storage) = self.shared_pages.get(&page) {
+            if self.perms[page] & AUDIO != 0 {
+                for (index, byte) in output.iter_mut().enumerate() {
+                    // SAFETY: committed linear PCM views stay live for this
+                    // memory borrow. Guest and callback use matching AtomicU8.
+                    *byte = unsafe {
+                        (&*self.ptr.as_ptr().add(at + index).cast::<AtomicU8>())
+                            .load(Ordering::Relaxed)
+                    };
+                }
+            } else if let Some(storage) = self.shared_pages.get(&page) {
                 storage.read_into(at % PAGE_SIZE, output)?;
             } else {
                 // SAFETY: committed ordinary page, valid non-aliasing output.
@@ -363,6 +381,8 @@ impl Memory {
             return Err("overlapping shared audio mapping".into());
         }
         let storage = SharedAllocation::new(len)?;
+        #[cfg(windows)]
+        storage.map_linear(self.reservation.as_ref().unwrap(), pages.start * PAGE_SIZE)?;
         for (index, page) in pages.clone().enumerate() {
             self.shared_pages.insert(
                 page,
@@ -373,7 +393,7 @@ impl Memory {
             );
         }
         self.mapped[pages.clone()].fill(true);
-        self.perms[pages].fill(READ | WRITE | SHARED);
+        self.perms[pages].fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
         self.touch(addr, len);
         Ok(storage)
     }
@@ -526,7 +546,16 @@ impl Memory {
                 let page = at / PAGE_SIZE;
                 let len = (PAGE_SIZE - at % PAGE_SIZE).min(range.end - at);
                 let input = &bytes[at - range.start..at - range.start + len];
-                if let Some(storage) = self.shared_pages.get_mut(&page) {
+                if self.perms[page] & AUDIO != 0 {
+                    for (index, &byte) in input.iter().enumerate() {
+                        // SAFETY: validated live writable OS view and only
+                        // byte-atomic stores, including split word/SIMD writes.
+                        unsafe {
+                            (&*self.ptr.as_ptr().add(at + index).cast::<AtomicU8>())
+                                .store(byte, Ordering::Relaxed)
+                        };
+                    }
+                } else if let Some(storage) = self.shared_pages.get_mut(&page) {
                     storage.write(at % PAGE_SIZE, input)?;
                 } else {
                     // SAFETY: committed ordinary subrange and exclusive borrow.
@@ -572,7 +601,7 @@ impl Memory {
             return Err("executable file views are not supported".into());
         }
         for page in &mut self.perms[range.start / PAGE_SIZE..range.end / PAGE_SIZE] {
-            *page = perms | (*page & SHARED);
+            *page = perms | (*page & (SHARED | AUDIO));
         }
         self.touch(addr, len);
         Ok(())
@@ -601,6 +630,132 @@ impl Drop for Memory {
                 Layout::from_size_align(self.len, PAGE_SIZE).unwrap(),
             )
         };
+    }
+}
+
+#[cfg(all(test, windows))]
+mod linear_audio_tests {
+    use super::*;
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryInfo {
+        base: usize,
+        allocation: usize,
+        allocation_protection: u32,
+        partition: u16,
+        region: usize,
+        state: u32,
+        protection: u32,
+        kind: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualQuery(address: *const u8, info: *mut MemoryInfo, len: usize) -> usize;
+    }
+    fn query(memory: &Memory, address: u32) -> MemoryInfo {
+        let mut info = MemoryInfo::default();
+        let offset = memory.range(address, 1).unwrap().start;
+        // SAFETY: query-only inspection of this live reserved address window.
+        assert_ne!(
+            unsafe {
+                VirtualQuery(
+                    memory.ptr.as_ptr().add(offset),
+                    &mut info,
+                    std::mem::size_of::<MemoryInfo>(),
+                )
+            },
+            0
+        );
+        info
+    }
+
+    #[test]
+    fn linear_pcm_alias_is_stable_page_aligned_atomic_and_independently_owned() {
+        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
+        let ptr = memory.ptr;
+        // Neither the guest address nor its offset is 64KB aligned.
+        let storage = memory.map_shared_audio(0x12000, 0x3000).unwrap();
+        assert_eq!(memory.ptr, ptr);
+        let info = query(&memory, 0x12000);
+        assert_eq!(info.state, 0x1000); // MEM_COMMIT
+        assert_eq!(info.kind, 0x40000); // MEM_MAPPED
+        assert_eq!(info.protection, 4); // PAGE_READWRITE CPU alias
+        assert_eq!(memory.perms[2], READ | WRITE | SHARED | AUDIO);
+        memory.write(0x12000, &[0x37, 0x91]).unwrap();
+        assert_eq!(storage.load_u8(0), 0x37);
+        // Same operations the native lowering may perform: only AtomicU8, and
+        // all bounds/permissions are checked before obtaining a linear pointer.
+        unsafe {
+            (&*ptr.as_ptr().add(0x2001).cast::<AtomicU8>()).store(0xaa, Ordering::Relaxed);
+        }
+        assert_eq!(storage.load_u8(1), 0xaa);
+        let mut bytes = [0; 2];
+        memory.read_into(0x12000, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x37, 0xaa]);
+        assert!(memory.read(0x12000, 2).is_err());
+        memory.protect(0x12000, 0x3000, 0).unwrap();
+        assert_eq!(memory.perms[2], SHARED | AUDIO);
+        assert_eq!(query(&memory, 0x12000).protection, 4); // guest protection is software-owned
+        assert_eq!(storage.load_u8(0), 0x37);
+        memory.protect(0x12000, 0x3000, READ | WRITE).unwrap();
+        memory.write(0x13000, &[0x55]).unwrap();
+        memory.unmap(0x13000, 4096).unwrap();
+        assert_eq!(query(&memory, 0x13000).state, 0x2000); // placeholder remains reserved
+        assert_eq!(query(&memory, 0x12000).kind, 0x40000);
+        memory.map(0x13000, 4096, READ | WRITE).unwrap();
+        memory.write(0x13000, &[0xee]).unwrap();
+        assert_eq!(storage.load_u8(4096), 0x55);
+        drop(memory);
+        assert_eq!(storage.load_u8(0), 0x37);
+        assert_eq!(storage.load_u8(1), 0xaa);
+        assert_eq!(storage.load_u8(4096), 0x55);
+    }
+
+    #[test]
+    fn audio_reuses_a_private_hole_without_moving_or_losing_its_neighbours() {
+        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
+        memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
+        let pattern: Vec<_> = (0..0x8000).map(|i| (i % 251) as u8).collect();
+        memory.write(0x10000, &pattern).unwrap();
+        memory.protect(0x10000, 0x2000, READ | EXEC).unwrap();
+        let ptr = memory.ptr;
+        let version = memory.versions[0];
+        memory.unmap(0x12000, 0x2000).unwrap();
+        let alias = memory.map_shared_audio(0x12000, 0x2000).unwrap();
+        assert_eq!(memory.ptr, ptr);
+        assert_eq!(memory.read(0x10000, 0x2000).unwrap(), &pattern[..0x2000]);
+        assert_eq!(memory.read(0x14000, 0x4000).unwrap(), &pattern[0x4000..]);
+        assert_eq!(memory.perms[0], READ | EXEC);
+        assert_eq!(memory.versions[0], version); // intact code need not be invalidated
+        assert!(query(&memory, 0x10000).kind == 0x20000); // private
+        assert_eq!(query(&memory, 0x12000).kind, 0x40000);
+        memory.write(0x12000, &[0x7a]).unwrap();
+        assert_eq!(alias.load_u8(0), 0x7a);
+        memory.unmap(0x12000, 0x2000).unwrap();
+        memory.map(0x12000, 0x2000, READ | WRITE).unwrap();
+        assert_eq!(memory.read(0x12000, 0x2000).unwrap(), &[0; 0x2000]);
+        assert_eq!(memory.read(0x10000, 0x2000).unwrap(), &pattern[..0x2000]);
+        assert_eq!(memory.read(0x14000, 0x4000).unwrap(), &pattern[0x4000..]);
+        assert_eq!(alias.load_u8(0), 0x7a);
+    }
+
+    #[test]
+    fn failed_section_mapping_keeps_the_reservation_available_and_neighbours_intact() {
+        let mut memory = Memory::reserve(0x10000, 0x5000).unwrap();
+        memory.map(0x10000, 0x5000, READ | WRITE).unwrap();
+        memory.write(0x10000, &[0x17]).unwrap();
+        memory.write(0x14000, &[0x73]).unwrap();
+        memory.unmap(0x11000, 0x3000).unwrap();
+        let reservation = memory.reservation.as_ref().unwrap();
+        assert!(
+            reservation
+                .map_section(0x1000, 0x3000, (-3isize) as *mut std::ffi::c_void)
+                .is_err()
+        );
+        assert_eq!(memory.read(0x10000, 1).unwrap(), &[0x17]);
+        assert_eq!(memory.read(0x14000, 1).unwrap(), &[0x73]);
+        memory.map(0x11000, 0x3000, READ | WRITE).unwrap();
+        assert_eq!(memory.read(0x11000, 0x3000).unwrap(), &[0; 0x3000]);
     }
 }
 

@@ -35,6 +35,7 @@ impl SharedAllocation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn store_u8(&self, index: usize, value: u8) {
         assert!(index < self.len);
         // SAFETY: same stable storage and byte-width access as load_u8; this
@@ -44,6 +45,36 @@ impl SharedAllocation {
                 .store(value, Ordering::Relaxed)
         };
     }
+
+    #[cfg(windows)]
+    pub(crate) fn map_linear(
+        &self,
+        reservation: &crate::virtual_memory::Reservation,
+        offset: usize,
+    ) -> Result<(), String> {
+        reservation.map_section(offset, self.len, self.mapping.handle.as_ptr())
+    }
+
+    pub(crate) fn store_bytes(&self, offset: usize, input: &[u8]) {
+        assert!(
+            offset
+                .checked_add(input.len())
+                .is_some_and(|end| end <= self.len)
+        );
+        // SAFETY: the range is checked once and every write remains a matching
+        // AtomicU8 store through the independently retained writable OS view.
+        for (index, &byte) in input.iter().enumerate() {
+            unsafe {
+                (&*self
+                    .mapping
+                    .write
+                    .as_ptr()
+                    .add(offset + index)
+                    .cast::<AtomicU8>())
+                    .store(byte, Ordering::Relaxed)
+            };
+        }
+    }
 }
 
 impl crate::backend::SharedReadView for SharedAllocation {
@@ -52,6 +83,23 @@ impl crate::backend::SharedReadView for SharedAllocation {
     }
     fn load_u8(&self, index: usize) -> u8 {
         self.load_u8(index)
+    }
+    fn copy_into(&self, offset: usize, destination: &mut [u8]) {
+        let count = self.len.saturating_sub(offset).min(destination.len());
+        for (index, byte) in destination[..count].iter_mut().enumerate() {
+            // SAFETY: checked in-range byte-atomic access through the read-only
+            // OS alias. No ordinary Rust reference to shared data is produced.
+            *byte = unsafe {
+                (&*self
+                    .mapping
+                    .read
+                    .as_ptr()
+                    .add(offset + index)
+                    .cast::<AtomicU8>())
+                    .load(Ordering::Relaxed)
+            };
+        }
+        destination[count..].fill(0);
     }
 }
 
@@ -83,7 +131,7 @@ mod os {
     pub(super) struct Mapping {
         pub read: NonNull<u8>,
         pub write: NonNull<u8>,
-        handle: NonNull<c_void>,
+        pub(super) handle: NonNull<c_void>,
     }
     impl Mapping {
         pub fn new(len: usize) -> Result<Self, String> {
