@@ -140,12 +140,15 @@ fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
         return BUDGET;
     }
     let bytes = len.min(CHUNK_BYTES);
+    if copy && memory.rep_alias_hazard(src, dst, bytes as usize) {
+        return FALLBACK;
+    }
     if memory.shared_range(dst, bytes as usize)
         || (copy && memory.shared_range(src, bytes as usize))
     {
         // Dedicated device storage must never reach the raw-pointer bulk paths.
         // Preserve full-range permission validation and bounded REP progress;
-        // the memory helpers use matching byte atomics throughout the overlay.
+        // Audio helpers use byte atomics; worker-owned file views use page copies.
         let result = if copy {
             memory.copy(src, dst, bytes as usize)
         } else {

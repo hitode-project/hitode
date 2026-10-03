@@ -79,6 +79,19 @@ impl Cpu {
     }
 }
 impl Guest for Cpu {
+    fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
+        self.guest().file_page_copy_on_write(addr)
+    }
+    fn map_file_pages(
+        &mut self,
+        addr: u32,
+        pages: &[std::rc::Rc<pal_cpu::FilePage>],
+        prot: Prot,
+        copy_on_write: bool,
+    ) -> Result<(), MemFault> {
+        self.guest_mut()
+            .map_file_pages(addr, pages, prot, copy_on_write)
+    }
     fn cpuid_features(&self) -> u32 {
         self.guest().cpuid_features()
     }

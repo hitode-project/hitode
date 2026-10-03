@@ -94,6 +94,20 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
+        self.memory.file_page_copy_on_write(addr)
+    }
+    fn map_file_pages(
+        &mut self,
+        addr: u32,
+        pages: &[std::rc::Rc<pal_cpu::FilePage>],
+        prot: Prot,
+        copy_on_write: bool,
+    ) -> Result<(), MemFault> {
+        self.memory
+            .map_file_pages(addr, pages, prot.0, copy_on_write)
+            .map_err(|_| fault(addr, pages.len() * 4096))
+    }
     fn cpuid_features(&self) -> u32 {
         crate::cpu_profile::cpuid(1, 0)[3]
     }
@@ -171,6 +185,18 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
+        self.machine().memory.file_page_copy_on_write(addr)
+    }
+    fn map_file_pages(
+        &mut self,
+        addr: u32,
+        pages: &[std::rc::Rc<pal_cpu::FilePage>],
+        prot: Prot,
+        copy_on_write: bool,
+    ) -> Result<(), MemFault> {
+        self.view(|g| g.map_file_pages(addr, pages, prot, copy_on_write))
+    }
     fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<pal_cpu::SharedRegion, MemFault> {
         self.view(|g| g.map_shared_audio(addr, len))
     }
