@@ -518,8 +518,8 @@ impl User {
         h
     }
 
-    fn remove_window(&mut self, hwnd: u32) {
-        self.menus.remove_window(hwnd, &mut self.objects);
+    fn remove_window(&mut self, hwnd: u32, objects: &mut adv_machine::Objects) {
+        self.menus.remove_window(hwnd, objects);
         let Some(w) = self.windows.remove(&hwnd) else {
             return;
         };
@@ -832,7 +832,7 @@ pub fn create_window(
     let menu = match super::menu::attach_creation(env, hwnd, p.menu, child) {
         Ok(menu) => menu,
         Err(error) => {
-            user_mut(env).remove_window(hwnd);
+            env.ext.get_mut::<crate::Win32>().user.remove_window(hwnd, &mut env.sys.objects);
             set_last_error(env, error);
             return then(env, 0);
         }
@@ -984,9 +984,9 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
             .map(|&h| [h, wm::NCDESTROY, 0, 0])
             .collect();
         send_all(env, msgs, move |env| {
-            let u = user_mut(env);
+            let u = &mut env.ext.get_mut::<crate::Win32>().user;
             for h in all.iter().rev() {
-                u.remove_window(*h);
+                u.remove_window(*h, &mut env.sys.objects);
             }
             then(env, true)
         })
