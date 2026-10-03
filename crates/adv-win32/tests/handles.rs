@@ -3,7 +3,7 @@ use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::{PAGE, PARK_ADDR};
-use adv_machine::{Clock, Machine, Object, RunResult};
+use adv_machine::{Clock, Machine, Object, ObjectLimits, Objects, RunResult};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{FileObj, Win32, Win32Config};
 
@@ -30,6 +30,7 @@ impl Test {
     fn new(name: &str) -> Self {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
+        adv_win32::compat::register(&mut registry);
         let mut m = Machine::new(
             UnicornCpu::new(PARK_ADDR).unwrap(),
             registry,
@@ -58,6 +59,9 @@ impl Test {
 
     /// Call `name` and store its result at `save`.
     fn call(&mut self, name: &str, args: &[Arg], save: u32) -> &mut Self {
+        self.call_in("kernel32.dll", name, args, save)
+    }
+    fn call_in(&mut self, dll: &str, name: &str, args: &[Arg], save: u32) -> &mut Self {
         for arg in args.iter().rev() {
             match arg {
                 Value(value) => {
@@ -68,7 +72,7 @@ impl Test {
                 }
             }
         }
-        let thunk = self.m.resolve_import("kernel32.dll", name).unwrap();
+        let thunk = self.m.resolve_import(dll, name).unwrap();
         self.a.call(thunk).mov_mem_eax(save);
         self
     }
@@ -115,6 +119,112 @@ impl Test {
         self.m.cpu.read(address, &mut bytes).unwrap();
         bytes
     }
+}
+
+#[test]
+fn exhausted_object_table_reports_api_errors_without_side_effects_or_invalid_waits() {
+    let mut t = Test::new("exhausted");
+    t.m.sys.objects = Objects::with_limits(ObjectLimits {
+        objects: 1,
+        ..ObjectLimits::default()
+    });
+    t.m.cpu.write_u32(OUT + 0x80, 0xabcdef01).unwrap();
+    t.call(
+        "CreateEventA",
+        &[Value(0), Value(0), Value(0), Value(NAME)],
+        OUT,
+    )
+    .call("GetLastError", &[], OUT + 4)
+    .call(
+        "CreateFileA",
+        &[
+            Value(PATH),
+            Value(0x40000000),
+            Value(0),
+            Value(0),
+            Value(2),
+            Value(0),
+            Value(0),
+        ],
+        OUT + 8,
+    )
+    .call("GetLastError", &[], OUT + 12)
+    .call(
+        "CreateFileMappingA",
+        &[
+            Value(u32::MAX),
+            Value(0),
+            Value(4),
+            Value(0),
+            Value(4096),
+            Value(NAME),
+        ],
+        OUT + 16,
+    )
+    .call("GetLastError", &[], OUT + 20)
+    .call("CreateToolhelp32Snapshot", &[Value(4), Value(0)], OUT + 24)
+    .call("GetLastError", &[], OUT + 28)
+    .duplicate(CURRENT_PROCESS, Value(CURRENT_PROCESS), OUT + 0x80, 2)
+    .call("GetLastError", &[], OUT + 32)
+    .call_in(
+        "user32.dll",
+        "MsgWaitForMultipleObjects",
+        &[Value(0), Value(0), Value(0), Value(10), Value(0xff)],
+        OUT + 36,
+    )
+    .call("GetLastError", &[], OUT + 40)
+    .call_in(
+        "winmm.dll",
+        "mmioOpenA",
+        &[Value(PATH), Value(DATA), Value(0)],
+        OUT + 44,
+    );
+    t.run();
+    for offset in [4, 12, 20, 28, 32, 40] {
+        assert_eq!(t.word(OUT + offset), 8, "error at {offset}");
+    }
+    for offset in [0, 16, 44, 0xfc] {
+        assert_eq!(t.word(OUT + offset), 0, "return at {offset}");
+    }
+    for offset in [8, 24, 36] {
+        assert_eq!(t.word(OUT + offset), u32::MAX, "return at {offset}");
+    }
+    assert_eq!(t.word(OUT + 0x80), 0xabcdef01);
+    assert_eq!(t.word(DATA + 12), 258);
+    let cfg = &t.m.ext.get::<Win32>().cfg;
+    assert!(
+        !cfg.os.data_dir.join("overlay/data.bin").exists(),
+        "failed CreateFile must not truncate/copy the overlay"
+    );
+    assert_eq!(t.m.sys.objects.object_count(), 1);
+}
+
+#[test]
+fn timer_and_message_wake_partial_allocations_roll_back() {
+    let mut t = Test::new("partial-wake");
+    t.m.sys.objects = Objects::with_limits(ObjectLimits {
+        objects: 2,
+        ..ObjectLimits::default()
+    });
+    t.call_in(
+        "winmm.dll",
+        "timeSetEvent",
+        &[Value(10), Value(1), Value(CODE), Value(0), Value(0)],
+        OUT,
+    )
+    .call_in(
+        "user32.dll",
+        "MsgWaitForMultipleObjects",
+        &[Value(0), Value(0), Value(0), Value(10), Value(0xff)],
+        OUT + 4,
+    )
+    .call("GetLastError", &[], OUT + 8);
+    t.run();
+    assert_eq!(t.word(OUT), 0);
+    assert_eq!(t.word(OUT + 4), u32::MAX);
+    assert_eq!(t.word(OUT + 8), 8);
+    assert_eq!(t.m.sys.objects.object_count(), 1);
+    assert_eq!(t.m.sys.contexts.len(), 1);
 }
 
 #[test]

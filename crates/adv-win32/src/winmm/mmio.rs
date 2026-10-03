@@ -190,6 +190,9 @@ fn open(e: &mut Env<'_>) -> Outcome {
     if fields[2] != 0 || flags & (0x100 | 0x200 | 0x4000 | 0x20000) != 0 {
         return open_error(e, info, 272);
     }
+    if !e.sys.objects.can_insert() {
+        return open_error(e, info, 258); // MMIOERR_OUTOFMEMORY
+    }
     let (source, len) = if fields[1] == MEM {
         let capacity = fields[5];
         if capacity > i32::MAX as u32 || fields[12] != 0 {

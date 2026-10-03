@@ -294,6 +294,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     recursion: 0,
                 })
             });
+            if handle == 0 {
+                return Outcome::Fail("CRT lock allocation exhausted the object table".into());
+            }
             if name == "_lock" {
                 if e.sys.try_acquire(handle) {
                     return Outcome::Return(0);

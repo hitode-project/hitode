@@ -31,7 +31,10 @@ fn close_handle(env: &mut Env<'_>) -> Outcome {
 /// A new handle to what `source` names in this process.
 fn duplicate(env: &mut Env<'_>, source: u32) -> Result<u32, u32> {
     match source {
-        CURRENT_PROCESS => Ok(env.sys.objects.insert_host(ProcessHandle)),
+        CURRENT_PROCESS => match env.sys.objects.insert_host(ProcessHandle) {
+            0 => Err(err::NOT_ENOUGH_MEMORY),
+            handle => Ok(handle),
+        },
         CURRENT_THREAD => {
             let ctx = env.sys.current;
             let thread = env.sys.context(ctx).thread_handle;
@@ -42,11 +45,24 @@ fn duplicate(env: &mut Env<'_>, source: u32) -> Result<u32, u32> {
                     .objects
                     .alias_identity(identity)
                     .ok_or(err::NOT_ENOUGH_MEMORY)?,
-                None => env.sys.objects.insert(Object::Thread { ctx }),
+                None => match env.sys.objects.insert(Object::Thread { ctx }) {
+                    0 => return Err(err::NOT_ENOUGH_MEMORY),
+                    handle => handle,
+                },
             })
         }
         STD_INPUT | STD_OUTPUT | STD_ERROR => Ok(source),
-        _ => env.sys.objects.duplicate(source).ok_or(err::INVALID_HANDLE),
+        _ => {
+            let identity = env
+                .sys
+                .objects
+                .identity(source)
+                .ok_or(err::INVALID_HANDLE)?;
+            env.sys
+                .objects
+                .alias_identity(identity)
+                .ok_or(err::NOT_ENOUGH_MEMORY)
+        }
     }
 }
 

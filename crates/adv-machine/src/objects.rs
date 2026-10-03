@@ -307,6 +307,15 @@ impl Objects {
         self.entries.len()
     }
 
+    /// Preflight a default-namespace insertion before external side effects.
+    /// Valid until the next mutation of this exclusively owned table.
+    pub fn can_insert(&self) -> bool {
+        self.entries.len() < self.limits.objects
+            && self.limits.references != 0
+            && self.next_object.checked_add(1).is_some()
+            && self.next_alias(0).is_some()
+    }
+
     /// Total anonymous and alias references, for ownership diagnostics.
     pub fn strong_count<T: Any>(&self, id: Identity<T>) -> Option<u32> {
         Some(self.entry(id)?.references())

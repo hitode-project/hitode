@@ -457,8 +457,16 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
             .sys
             .objects
             .insert_host(SectionHandle::new(existing, ALL));
+        if handle == 0 {
+            return fail(env, 8);
+        }
         set_last_error(env, 183);
         return Outcome::Return(handle);
+    }
+    // Extending a backing file is irreversible within this call. Refuse table
+    // exhaustion before file_backing can grow it.
+    if !env.sys.objects.can_insert() {
+        return fail(env, 8);
     }
     let (len, backing) = if file == u32::MAX {
         if maximum == 0 {
@@ -540,11 +548,14 @@ fn open(env: &mut Env<'_>, wide: bool) -> Outcome {
     if access & 0x20 != 0 {
         return fail(env, 50);
     }
-    Outcome::Return(
-        env.sys
-            .objects
-            .insert_host(SectionHandle::new(section, access)),
-    )
+    let handle = env
+        .sys
+        .objects
+        .insert_host(SectionHandle::new(section, access));
+    if handle == 0 {
+        return fail(env, 8);
+    }
+    Outcome::Return(handle)
 }
 
 fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
@@ -740,6 +751,9 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
         }
     }
     let handle = env.sys.objects.insert(object);
+    if handle == 0 {
+        return fail(env, 8);
+    }
     if let Some(name) = name {
         let identity = env.sys.objects.identity(handle).unwrap();
         state(env)

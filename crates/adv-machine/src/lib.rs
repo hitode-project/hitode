@@ -153,7 +153,12 @@ impl Sys {
         stack_size: u32,
     ) -> Result<CtxId, MemFault> {
         let id = self.contexts.len() as CtxId;
-        assert!(id < MAX_CONTEXTS, "too many guest contexts");
+        if id >= MAX_CONTEXTS || !self.objects.can_insert() {
+            return Err(MemFault {
+                addr: 0,
+                len: stack_size,
+            });
+        }
         let stack_size = stack_size.max(0x1_0000);
         let base = self.vm.alloc_with_guard(cpu, stack_size, PAGE, Prot::RW)?;
         let (lo, hi) = (base + PAGE, base + PAGE + stack_size);

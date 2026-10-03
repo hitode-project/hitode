@@ -21,11 +21,15 @@ fn create_snapshot(env: &mut Env<'_>) -> Outcome {
         .filter(|c| !c.is_done())
         .map(|c| (c.tid, env.sys.pid))
         .collect();
-    Outcome::Return(
-        env.sys
-            .objects
-            .insert_host(ThreadSnapshot { rows, cursor: 0 }),
-    )
+    let handle = env
+        .sys
+        .objects
+        .insert_host(ThreadSnapshot { rows, cursor: 0 });
+    if handle == 0 {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+        return Outcome::Return(u32::MAX);
+    }
+    Outcome::Return(handle)
 }
 
 fn thread_entry(env: &mut Env<'_>, first: bool) -> Outcome {

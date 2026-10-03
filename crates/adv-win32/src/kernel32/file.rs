@@ -65,6 +65,11 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
 /// and creation disposition, register the handle, and set the last error. Returns the
 /// handle or `INVALID_HANDLE_VALUE`.
 pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32 {
+    // Check ownership capacity before creating or truncating an overlay file.
+    if !env.sys.objects.can_insert() {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
     let guest = env.ext.get::<Win32>().vfs.normalize(path);
     match system_file(env, &guest) {
         Ok(Some(bytes)) => {
@@ -505,7 +510,12 @@ fn find_first_file(env: &mut Env<'_>, pat: String, data: u32, wide: bool) -> Out
         return Outcome::Return(INVALID_HANDLE_VALUE);
     }
     fill_find_data(env, data, &entries[0], wide);
-    Outcome::Return(env.sys.objects.insert_host(FindObj { entries, next: 1 }))
+    let handle = env.sys.objects.insert_host(FindObj { entries, next: 1 });
+    if handle == 0 {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+        return Outcome::Return(INVALID_HANDLE_VALUE);
+    }
+    Outcome::Return(handle)
 }
 
 fn find_next_file(env: &mut Env<'_>, wide: bool) -> Outcome {

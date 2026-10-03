@@ -147,18 +147,29 @@ fn ensure_worker(env: &mut Env<'_>) -> bool {
         Ok(entry) => entry,
         Err(_) => return false,
     };
-    let id = match env.sys.spawn(env.cpu, "MM", entry, &[], 0x10_0000) {
-        Ok(id) => id,
-        Err(_) => return false,
-    };
     let wake = env.sys.objects.insert(Object::Event {
         manual_reset: false,
         signaled: false,
     });
+    if wake == 0 {
+        return false;
+    }
     let complete = env.sys.objects.insert(Object::Event {
         manual_reset: true,
         signaled: true,
     });
+    if complete == 0 {
+        env.sys.objects.close(wake);
+        return false;
+    }
+    let id = match env.sys.spawn(env.cpu, "MM", entry, &[], 0x10_0000) {
+        Ok(id) => id,
+        Err(_) => {
+            env.sys.objects.close(wake);
+            env.sys.objects.close(complete);
+            return false;
+        }
+    };
     let timers = state(env);
     timers.worker = Some(id);
     timers.wake = wake;

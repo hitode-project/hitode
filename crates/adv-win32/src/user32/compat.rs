@@ -192,7 +192,10 @@ fn message_wait(
             return Outcome::Return(u32::MAX);
         }
     }
-    let (input, notification) = crate::user32::message::message_wait_events(e, mask);
+    let Some((input, notification)) = crate::user32::message::message_wait_events(e, mask) else {
+        set_last_error(e, 8);
+        return Outcome::Return(u32::MAX);
+    };
     // The native fixture establishes input priority over ready handles for
     // MsgWait; ordinary WaitForMultipleObjects preserves handle-array order.
     let wait_handles: Vec<_> = std::iter::once(input)

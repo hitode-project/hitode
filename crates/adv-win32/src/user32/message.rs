@@ -384,30 +384,32 @@ fn queue_changed(env: &mut Env<'_>, ctx: adv_machine::CtxId) {
 
 /// Arm the input condition and deadline invalidation after MsgWait checks its
 /// queue. Waiting does not itself mark any input old.
-pub fn message_wait_events(env: &mut Env<'_>, mask: u32) -> (u32, u32) {
+pub fn message_wait_events(env: &mut Env<'_>, mask: u32) -> Option<(u32, u32)> {
     let ctx = env.sys.current;
-    for notification in [false, true] {
-        let q = user_mut(env).queue(ctx);
-        let handle = if notification {
-            q.message_wait_notification
-        } else {
-            q.message_wait_event
-        };
-        if handle == 0 {
+    let q = user_mut(env).queue(ctx);
+    let original = [q.message_wait_event, q.message_wait_notification];
+    let mut handles = original;
+    for index in 0..2 {
+        if handles[index] == 0 {
             let handle = env.sys.objects.insert(Object::Event {
-                manual_reset: !notification,
+                manual_reset: index == 0,
                 signaled: false,
             });
-            let q = user_mut(env).queue(ctx);
-            if notification {
-                q.message_wait_notification = handle;
-            } else {
-                q.message_wait_event = handle;
+            if handle == 0 {
+                for previous in 0..index {
+                    if original[previous] == 0 {
+                        env.sys.objects.close(handles[previous]);
+                    }
+                }
+                return None;
             }
+            handles[index] = handle;
         }
     }
     let changed = queue_status_for(env, ctx).1;
     let q = user_mut(env).queue(ctx);
+    q.message_wait_event = handles[0];
+    q.message_wait_notification = handles[1];
     q.message_wait_mask = mask;
     let (input, notification) = (q.message_wait_event, q.message_wait_notification);
     env.sys.reset_event(notification);
@@ -416,7 +418,7 @@ pub fn message_wait_events(env: &mut Env<'_>, mask: u32) -> (u32, u32) {
     } else {
         env.sys.reset_event(input);
     }
-    (input, notification)
+    Some((input, notification))
 }
 
 const QS_POSTMESSAGE: u32 = 0x8;
@@ -746,6 +748,10 @@ fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
         return get_message(env, out, f);
     }
     let event = queue_event(env);
+    if event == 0 {
+        crate::util::set_last_error(env, crate::util::err::NOT_ENOUGH_MEMORY);
+        return Outcome::Return(u32::MAX);
+    }
     let deadline = next_deadline(env, f);
     Outcome::block_timed(
         Wait::Object {
@@ -762,6 +768,9 @@ pub fn wait_for_message(
     then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
     let event = queue_event(env);
+    if event == 0 {
+        return Outcome::Fail("message wake allocation exhausted the object table".into());
+    }
     let deadline = next_deadline(
         env,
         Filter {
@@ -840,6 +849,10 @@ fn wait_message(env: &mut Env<'_>) -> Outcome {
     .is_some()
     {
         return Outcome::Return(1);
+    }
+    if queue_event(env) == 0 {
+        crate::util::set_last_error(env, crate::util::err::NOT_ENOUGH_MEMORY);
+        return Outcome::Return(0);
     }
     wait_for_message(env, |_| Outcome::Return(1))
 }
