@@ -155,6 +155,7 @@ version = "0.1.0"
 dependencies = [
  "adv-abi",
  "adv-cpu",
+ "adv-device",
  "adv-machine",
  "adv-os",
  "adv-pe",

@@ -1,4 +1,5 @@
-//! Device-independent audio engine with execution/audio ownership transfer.
+//! Device layer: the audio engine (with execution/audio ownership transfer) and the
+//! software surfaces every graphics front draws into.
 mod actor;
 #[cfg(feature = "device")]
 mod capture;
@@ -9,6 +10,7 @@ pub mod mixer;
 mod owned;
 mod resample;
 pub mod ring;
+pub mod surface;
 pub use actor::{AudioControl, AudioEvent, RingState};
 #[cfg(feature = "device")]
 pub use device::{Metrics, Output};

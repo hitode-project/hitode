@@ -9,7 +9,9 @@
 //!   [`registry`] is the private virtual registry; every personality layer shares them.
 //!   The process's [`Heaps`] are their own `Ext` entry, and an open file is a
 //!   [`vfs::FileObj`] in the machine's handle table, so any personality can reach both.
+//! * [`gdi`] is the device-context table that GDI and DirectDraw share.
 
+pub mod gdi;
 pub mod heap;
 pub mod loader;
 pub mod module;

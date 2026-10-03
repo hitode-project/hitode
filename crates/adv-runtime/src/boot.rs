@@ -10,7 +10,7 @@ use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, SliceResult};
 use adv_os::Process;
 use adv_win32::{Win32, Win32Config};
 
-use crate::graphics::{API_SPECS, DEVICE_METHODS, GuestMemory, SURFACE_METHODS};
+use crate::graphics::{DEVICE_METHODS, GuestMemory, SURFACE_METHODS, api_specs};
 use crate::{Graphics, Snapshot, api};
 
 /// A running executable. Original game files are read-only; guest writes use `data_dir`.
@@ -705,7 +705,7 @@ pub fn register_graphics(registry: &mut Registry) {
             );
         }
     }
-    for &(id, module, name, argc) in API_SPECS {
+    for &(id, module, name, argc) in api_specs() {
         // PAL's GetLastError follows each context's TEB, including file and heap calls.
         if id != api::LAST_ERROR {
             registry.add(module, name, Conv::Stdcall { argc }, graphics_call);
@@ -743,7 +743,7 @@ pub fn install_graphics<B: Backend>(
             );
         }
     }
-    for &(id, module, name, _) in API_SPECS {
+    for &(id, module, name, _) in api_specs() {
         if id != api::LAST_ERROR {
             entries.insert(
                 id,
@@ -767,9 +767,8 @@ pub fn install_graphics<B: Backend>(
 
 pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
     let thunk = env.sys.thunks.get(env.thunk);
-    let Some(&(id, _, _, argc)) = API_SPECS
-        .iter()
-        .find(|(_, module, name, _)| *module == thunk.module && *name == thunk.name)
+    let Some(&(id, _, _, argc)) =
+        api_specs().find(|(_, module, name, _)| *module == thunk.module && *name == thunk.name)
     else {
         return Outcome::Fail("unknown graphics thunk".into());
     };

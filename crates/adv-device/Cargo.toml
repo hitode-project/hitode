@@ -1,6 +1,6 @@
 [package]
 name = "adv-device"
-description = "Device layer: PCM mixing, resampling and audio output"
+description = "Device layer: software surfaces, PCM mixing, resampling and audio output"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

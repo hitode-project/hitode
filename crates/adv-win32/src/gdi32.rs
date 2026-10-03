@@ -12,6 +12,7 @@ use crate::util::{cstr, out_u32, zero};
 use crate::{Win32, stdcall};
 
 mod palette;
+pub mod raster;
 
 const GDI32: &str = "gdi32.dll";
 
