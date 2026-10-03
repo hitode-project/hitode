@@ -1,69 +1,68 @@
-//! Adapter to the existing PE loader, Win32 handlers and cooperative scheduler.
+//! CPU backend adapter for a caller-owned trap dispatcher.
 use crate::backend::{
     Backend, Exit, Fault, FaultKind, Guest, MemFault, Prot, Reg, SegmentSetup, TrapAction,
     TrapHandler,
 };
 use crate::{
-    CompileStrategy, CpuState, ExecutionContext, Machine, Memory, RunOutcome, Stats, X87Register,
+    CompileStrategy, CpuState, ExecutionContext, Executor, Memory, RunOutcome, Stats, X87Register,
 };
-use std::cell::{Ref, RefCell, RefMut};
 use std::time::{Duration, Instant};
 
 pub struct JitCpu {
-    inner: RefCell<Machine>,
+    inner: Executor,
     park: u32,
     budget: Option<Duration>,
     jit: bool,
 }
 impl JitCpu {
     pub fn new(park: u32, jit: bool) -> Result<Self, String> {
-        let mut machine = Machine::address_space()?;
+        let mut machine = Executor::address_space()?;
         machine.enable_auto_jit(jit);
         machine.set_async_compilation(jit);
         Ok(Self {
-            inner: RefCell::new(machine),
+            inner: machine,
             park,
             budget: Some(Duration::from_secs(5)),
             jit,
         })
     }
     pub fn stats(&self) -> Stats {
-        self.inner.borrow().stats.clone()
+        self.inner.stats.clone()
     }
     pub fn set_profiling(&mut self, enabled: bool) {
-        self.inner.get_mut().set_profiling(enabled);
+        self.inner.set_profiling(enabled);
     }
     /// Choose the compilation policy before running automatically discovered code.
     pub fn set_auto_compile_strategy(&mut self, strategy: CompileStrategy) {
-        self.inner.get_mut().set_auto_compile_strategy(strategy);
+        self.inner.set_auto_compile_strategy(strategy);
     }
     pub fn set_region_linking(&mut self, enabled: bool) {
-        self.inner.get_mut().set_region_linking(enabled);
+        self.inner.set_region_linking(enabled);
     }
     pub fn set_async_compilation(&mut self, enabled: bool) {
-        self.inner.get_mut().set_async_compilation(enabled);
+        self.inner.set_async_compilation(enabled);
     }
     /// Install the execution owner's retained event before the first guest run.
     /// Compiler completion and native/interpreted safepoints use the same wake.
     pub fn set_waker(&mut self, wake: adv_sync::WakeEvent) -> Result<(), String> {
-        let m = self.inner.get_mut();
+        let m = &mut self.inner;
         let flag = wake.interrupt_flag();
         m.set_completion_waker(std::sync::Arc::new(move || wake.signal()))?;
         m.set_host_interrupt_flag(flag);
         Ok(())
     }
     pub fn profile(&self) -> std::collections::BTreeMap<u32, crate::ProfileSample> {
-        self.inner.borrow().profile.clone()
+        self.inner.profile.clone()
     }
-    pub fn machine(&self) -> Ref<'_, Machine> {
-        self.inner.borrow()
+    pub fn executor(&self) -> &Executor {
+        &self.inner
     }
-    pub fn machine_mut(&mut self) -> RefMut<'_, Machine> {
-        self.inner.borrow_mut()
+    pub fn executor_mut(&mut self) -> &mut Executor {
+        &mut self.inner
     }
     fn view<T>(&mut self, f: impl FnOnce(&mut View<'_>) -> T) -> T {
-        let m = self.inner.get_mut();
-        let Machine { state, memory, .. } = m;
+        let m = &mut self.inner;
+        let Executor { state, memory, .. } = m;
         f(&mut View { state, memory })
     }
 }
@@ -94,6 +93,9 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn last_indirect_branch(&self) -> Option<crate::IndirectBranch> {
+        self.state.last_indirect_branch.observed()
+    }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.memory.file_page_copy_on_write(addr)
     }
@@ -130,9 +132,14 @@ impl Guest for View<'_> {
         })
     }
     fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
-        crate::ApiMemory { inner: self.memory }
-            .copy(src, dst, len)
-            .map_err(|_| fault(dst, len))
+        let len32 = u32::try_from(len).map_err(|_| fault(src, len))?;
+        if !self.accessible(src, len32, Prot::READ) {
+            return Err(fault(src, len));
+        }
+        if !self.accessible(dst, len32, Prot::WRITE) {
+            return Err(fault(dst, len));
+        }
+        self.memory.copy(src, dst, len).map_err(|_| fault(dst, len))
     }
     fn push_f64(&mut self, value: f64) {
         self.state.commit_mmx();
@@ -189,8 +196,11 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn last_indirect_branch(&self) -> Option<crate::IndirectBranch> {
+        self.inner.state.last_indirect_branch.observed()
+    }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
-        self.machine().memory.file_page_copy_on_write(addr)
+        self.executor().memory.file_page_copy_on_write(addr)
     }
     fn map_file_pages(
         &mut self,
@@ -218,14 +228,13 @@ impl Guest for JitCpu {
         self.view(|g| g.pop_f64())
     }
     fn reg(&self, r: Reg) -> u32 {
-        get(&self.inner.borrow().state, r)
+        get(&self.inner.state, r)
     }
     fn set_reg(&mut self, r: Reg, v: u32) {
-        set(&mut self.inner.get_mut().state, r, v)
+        set(&mut self.inner.state, r, v)
     }
     fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), MemFault> {
         self.inner
-            .borrow()
             .memory
             .read_into(addr, buf)
             .map_err(|_| fault(addr, buf.len()))
@@ -234,7 +243,7 @@ impl Guest for JitCpu {
         self.view(|g| g.write(addr, b))
     }
     fn accessible(&self, addr: u32, len: u32, prot: Prot) -> bool {
-        let m = self.inner.borrow();
+        let m = &self.inner;
         let Ok(r) = m.memory.committed(addr, len as usize) else {
             return false;
         };
@@ -257,7 +266,7 @@ impl Guest for JitCpu {
 struct Raw<'a> {
     handler: &'a mut dyn TrapHandler,
 }
-impl crate::host::RawTrap for Raw<'_> {
+impl crate::ExecutionTrap for Raw<'_> {
     fn guest_time_us(&mut self) -> Option<u64> {
         self.handler.guest_time_us()
     }
@@ -279,15 +288,11 @@ impl Backend for JitCpu {
     type Context = Option<ExecutionContext>;
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault> {
         self.inner
-            .get_mut()
             .setup_wow64_segments(seg.gdt_addr)
             .map_err(|_| fault(seg.gdt_addr, 4096))
     }
     fn set_fs_base(&mut self, base: u32) -> Result<(), MemFault> {
-        self.inner
-            .get_mut()
-            .set_fs_base(base)
-            .map_err(|_| fault(base, 1))
+        self.inner.set_fs_base(base).map_err(|_| fault(base, 1))
     }
     fn park_addr(&self) -> u32 {
         self.park
@@ -298,14 +303,12 @@ impl Backend for JitCpu {
     fn save(&self, c: &mut Self::Context) {
         *c = Some(
             self.inner
-                .borrow_mut()
                 .save_context()
                 .expect("save complete guest context"),
         );
     }
     fn restore(&mut self, c: &Self::Context) {
         self.inner
-            .get_mut()
             .restore_context(c.as_ref().expect("initialized context"))
             .expect("restore complete guest context");
     }
@@ -316,13 +319,13 @@ impl Backend for JitCpu {
         self.budget
     }
     fn set_host_interrupts(&mut self, enabled: bool) {
-        self.inner.get_mut().set_host_interrupts(enabled);
+        self.inner.set_host_interrupts(enabled);
     }
     fn run(&mut self, handler: &mut dyn TrapHandler) -> Exit {
         let start = Instant::now();
-        self.inner.get_mut().deadline = self.budget.and_then(|b| start.checked_add(b));
+        self.inner.deadline = self.budget.and_then(|b| start.checked_add(b));
         loop {
-            let m = self.inner.get_mut();
+            let m = &mut self.inner;
             if m.state.eip == self.park {
                 return Exit::Parked;
             }
@@ -335,7 +338,7 @@ impl Backend for JitCpu {
                 };
             }
             let mut raw = Raw { handler };
-            let result = m.run_traps(self.park, 32_768, &mut raw, !self.jit);
+            let result = m.run_with_traps(self.park, 32_768, &mut raw, !self.jit);
             match result {
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;
@@ -366,7 +369,7 @@ impl Backend for JitCpu {
                             FaultKind::Other(format!("unhandled guest exception {vector}"))
                         }
                         Err(e) => FaultKind::Other(e),
-                        _ => FaultKind::Other("unexpected standalone wait".into()),
+                        _ => FaultKind::Other("unexpected CPU execution outcome".into()),
                     };
                     return Exit::Fault(Fault {
                         kind,
@@ -377,7 +380,7 @@ impl Backend for JitCpu {
         }
     }
     fn invalidate_code(&mut self, addr: u32, len: u32) {
-        let m = self.inner.get_mut();
+        let m = &mut self.inner;
         if m.memory.range(addr, len as usize).is_ok() {
             m.memory.touch(addr, len as usize);
         }

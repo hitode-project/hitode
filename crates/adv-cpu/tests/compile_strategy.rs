@@ -1,7 +1,7 @@
 mod support;
 use adv_cpu::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const ROOT: u32 = CODE + 0x31;
@@ -19,15 +19,15 @@ fn assemble(at: u32, build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(u64::from(at)).unwrap()
 }
 
-fn machine() -> Machine {
-    let mut m = Machine::new(CODE, 0x40000).unwrap();
+fn machine() -> Executor {
+    let mut m = Executor::new(CODE, 0x40000).unwrap();
     m.protect(CODE, 0x40000, READ | WRITE).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     m
 }
 
-fn start(m: &mut Machine, pc: u32) {
+fn start(m: &mut Executor, pc: u32) {
     m.state.eip = pc;
     m.state.eflags = 0x8d7;
     m.state.regs[4] = STACK;

@@ -27,19 +27,18 @@ fn fixture(code: &[u8], native: bool) -> (JitCpu, SharedRegion) {
     cpu.write(CODE, code).unwrap();
     cpu.write(STACK, &STOP.to_le_bytes()).unwrap();
     let shared = cpu.map_shared_audio(DATA, 8192).unwrap();
-    let mut machine = cpu.machine_mut();
+    let machine = cpu.executor_mut();
     machine.state.eip = CODE;
     machine.state.regs[4] = STACK;
     if native {
         machine.add_region(Region::new(CODE, code.len())).unwrap();
     }
-    drop(machine);
     (cpu, shared)
 }
 
 fn run(cpu: &mut JitCpu) {
     assert_eq!(
-        cpu.machine_mut().run(STOP, 1_000_000).unwrap(),
+        cpu.executor_mut().run(STOP, 1_000_000).unwrap(),
         RunOutcome::ReachedStop
     );
 }
@@ -51,7 +50,7 @@ fn alias_survives_protect_partial_unmap_address_reuse_and_machine_destruction() 
     assert_eq!(old.len, 8192);
     cpu.write(DATA, &[0x12, 0x34]).unwrap();
     cpu.write(DATA + 4096, &[0x56]).unwrap();
-    assert!(cpu.machine().memory().read(DATA, 1).is_err());
+    assert!(cpu.executor().memory().read(DATA, 1).is_err());
     cpu.protect(DATA, 8192, Prot(0)).unwrap();
     assert!(!cpu.accessible(DATA, 1, Prot::READ));
     assert_eq!(old.read_alias.load_u8(0), 0x12);
@@ -89,11 +88,11 @@ fn native_integer_mmx_sse_and_x87_accesses_exit_before_raw_memory() {
     });
     for native in [false, true] {
         let (mut cpu, shared) = fixture(&code, native);
-        cpu.machine_mut().state.mmx[0] = 0x8123_4567_89ab_cdef;
-        cpu.machine_mut().state.mmx_mode = 1;
-        cpu.machine_mut().state.xmm[0] = [0xa5; 16];
+        cpu.executor_mut().state.mmx[0] = 0x8123_4567_89ab_cdef;
+        cpu.executor_mut().state.mmx_mode = 1;
+        cpu.executor_mut().state.xmm[0] = [0xa5; 16];
         run(&mut cpu);
-        let machine = cpu.machine();
+        let machine = cpu.executor();
         assert_eq!(machine.state.regs[0], 0x1234_5678);
         assert_eq!(machine.state.mmx[1], 0x8123_4567_89ab_cdef);
         assert_eq!(machine.state.xmm[1], [0xa5; 16]);
@@ -125,15 +124,15 @@ fn native_rep_copy_fill_and_comparison_use_byte_atomic_storage() {
         let (mut cpu, shared) = fixture(code, true);
         let source: Vec<_> = (0..8192).map(|i| (i % 251) as u8).collect();
         cpu.write(SOURCE, &source).unwrap();
-        cpu.machine_mut().state.regs[0] = 0x7654_3210;
-        cpu.machine_mut().state.regs[1] = if kind == 2 { 8192 } else { 2048 };
-        cpu.machine_mut().state.regs[6] = SOURCE;
-        cpu.machine_mut().state.regs[7] = DATA;
+        cpu.executor_mut().state.regs[0] = 0x7654_3210;
+        cpu.executor_mut().state.regs[1] = if kind == 2 { 8192 } else { 2048 };
+        cpu.executor_mut().state.regs[6] = SOURCE;
+        cpu.executor_mut().state.regs[7] = DATA;
         if kind == 2 {
             cpu.write(DATA, &source).unwrap();
         }
         run(&mut cpu);
-        assert_eq!(cpu.machine().state.regs[1], 0);
+        assert_eq!(cpu.executor().state.regs[1], 0);
         let mut actual = vec![0; 8192];
         shared.read_alias.copy_into(0, &mut actual);
         if kind == 1 {
@@ -172,7 +171,7 @@ fn protected_cross_page_store_faults_without_partial_commit_then_restarts() {
     let (mut cpu, shared) = fixture(&code, true);
     cpu.protect(DATA + 4096, 4096, Prot::READ).unwrap();
     assert_eq!(
-        cpu.machine_mut().run(STOP, 100).unwrap(),
+        cpu.executor_mut().run(STOP, 100).unwrap(),
         RunOutcome::WriteFault {
             pc: CODE,
             address: DATA + 4094

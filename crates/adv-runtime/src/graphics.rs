@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_cpu::{ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices};
 use adv_dx::ddraw::DirectDraw;
 use adv_machine::{Conv, Env, Machine, Outcome};
 use adv_os::gdi::{DeviceContexts, WINDOW_DC};
@@ -62,42 +61,6 @@ impl SurfaceMemory for GuestMemory<'_> {
     fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
         self.0.copy_memory(src, dst, len).map_err(|e| e.to_string())
     }
-}
-
-/// Guest memory of the standalone `adv_cpu::Machine`.
-struct ApiGuest<'a, 'b>(&'a mut ApiMemory<'b>);
-impl SurfaceMemory for ApiGuest<'_, '_> {
-    fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-        self.0.read(addr, len)
-    }
-    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
-        self.0.write(addr, data)
-    }
-    fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
-        self.0.writable(addr, len)
-    }
-    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-        self.0.copy(src, dst, len)
-    }
-}
-
-/// Returns id -> guest entry. COM vtables use these exact same API thunks.
-pub fn install(machine: &mut adv_cpu::Machine, base: u32) -> Result<BTreeMap<u32, u32>, String> {
-    let mut entries = BTreeMap::new();
-    for (index, &(id, module, name, argc)) in api_specs().enumerate() {
-        let entry = base
-            .checked_add(index as u32 * 16)
-            .ok_or("API address overflow")?;
-        machine.register_api(ApiSpec::new(
-            id,
-            module,
-            name,
-            entry,
-            Convention::Stdcall(argc),
-        ))?;
-        entries.insert(id, entry);
-    }
-    Ok(entries)
 }
 
 /// The surface store with both fronts. Dereferences to the store for presentation.
@@ -174,13 +137,6 @@ impl<P: Presenter> Graphics<P> {
     }
 }
 
-impl<P: Presenter> HostServices for Graphics<P> {
-    fn call(&mut self, c: ApiCall<'_>, m: &mut ApiMemory<'_>) -> Result<ApiOutcome, String> {
-        let v = self.handle(c.spec.id, c.args, &mut ApiGuest(m))?;
-        Ok(ApiOutcome::Return(v))
-    }
-}
-
 #[derive(Default)]
 /// Frame accounting of a run, updated by every presentation.
 pub(crate) struct RunControl {
@@ -192,7 +148,7 @@ pub(crate) struct RunControl {
 }
 
 /// Graphics registrations replace the Win32 state-only drawing handlers.
-pub(crate) fn register_graphics(registry: &mut Registry) {
+pub fn register_graphics(registry: &mut Registry) {
     registry.add(
         "user32.dll",
         "BeginPaint",
@@ -204,28 +160,40 @@ pub(crate) fn register_graphics(registry: &mut Registry) {
         ("IDirectDrawSurface7", SURFACE_METHODS),
     ] {
         for method in methods {
+            let signature = adv_abi::signature::lookup_com(interface, method)
+                .expect("DirectDraw vtable slot is in generated Win32Metadata");
             registry.add(
                 "ddraw.dll",
                 &format!("{interface}::{method}"),
-                Conv::Cdecl { argc: 0 },
+                signature.conv.expect("DirectDraw method has a supported x86 convention"),
                 unsupported_graphics,
             );
         }
     }
     for &(id, module, name, argc) in api_specs() {
-        // PAL's GetLastError follows each context's TEB, including file and heap calls.
+        // GetLastError follows each context's TEB, including file and heap calls.
         if id != api::LAST_ERROR {
-            registry.add(module, name, Conv::Stdcall { argc }, graphics_call);
+            assert!(
+                usize::from(argc) <= MAX_GRAPHICS_ARGS,
+                "graphics ABI exceeds argument buffer"
+            );
+            registry.add_with_data(
+                module,
+                name,
+                Conv::Stdcall { argc },
+                graphics_call,
+                u64::from(id) | (u64::from(argc) << 32),
+            );
         }
     }
 }
 
 /// Allocate shared surfaces and bind their vtables to the registry's actual thunks.
-pub(crate) fn install_graphics<B: Backend>(
+pub fn install_graphics<B: Backend>(
     machine: &mut Machine<B>,
     width: u32,
     height: u32,
-) -> Result<(), String> {
+) -> Result<BTreeMap<u32, u32>, String> {
     machine.ext.insert(RunControl::default());
     if width == 0 || height == 0 || width > 16384 || height > 16384 {
         return Err("invalid surface dimensions".into());
@@ -267,19 +235,33 @@ pub(crate) fn install_graphics<B: Backend>(
         frames: 0,
     };
     machine.ext.insert(Graphics::new(
-        width, height, arena, arena_len, entries, snapshot,
+        width,
+        height,
+        arena,
+        arena_len,
+        entries.clone(),
+        snapshot,
     )?);
-    Ok(())
+    Ok(entries)
 }
 
+const MAX_GRAPHICS_ARGS: usize = 16;
+
 pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
-    let thunk = env.sys.thunks.get(env.thunk);
-    let Some(&(id, _, _, argc)) =
-        api_specs().find(|(_, module, name, _)| *module == thunk.module && *name == thunk.name)
-    else {
-        return Outcome::Fail("unknown graphics thunk".into());
-    };
-    let args: Vec<u32> = (0..u32::from(argc)).map(|i| env.arg(i)).collect();
+    let binding = env.sys.thunks.get(env.thunk).f.data;
+    let id = binding as u32;
+    let argc = (binding >> 32) as usize;
+    if argc > MAX_GRAPHICS_ARGS {
+        return Outcome::Fail("invalid graphics ABI binding".into());
+    }
+    let mut words = [0; MAX_GRAPHICS_ARGS];
+    for (index, word) in words[..argc].iter_mut().enumerate() {
+        *word = match env.cpu.arg(index as u32) {
+            Ok(value) => value,
+            Err(error) => return Outcome::Fail(format!("graphics argument {index}: {error}")),
+        };
+    }
+    let args = &words[..argc];
     let hwnd = match id {
         api::GET_DC => Some(args[0]),
         api::COOPERATIVE if args[2] == 8 => Some(args[1]),
@@ -308,7 +290,7 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
         }
     }
     let before = graphics.stats.presentations;
-    let out = graphics.handle(id, &args, &mut GuestMemory(env.cpu));
+    let out = graphics.handle(id, args, &mut GuestMemory(env.cpu));
     let presented = graphics.stats.presentations;
     if let Ok(value) = &out {
         // Raster storage stays in Graphics; USER32/GDI object metadata must

@@ -1,4 +1,4 @@
-//! Native loop cost with and without a synchronous guest API round trip.
+//! Native loop cost with and without a synchronous raw CPU trap round trip.
 use adv_cpu::*;
 use iced_x86::code_asm::*;
 use std::time::Instant;
@@ -10,12 +10,26 @@ const STACK: u32 = 0x2f000;
 const ITERATIONS: u32 = 1_000_000;
 
 struct Services;
-impl HostServices for Services {
-    fn call(&mut self, c: ApiCall<'_>, _: &mut ApiMemory<'_>) -> Result<ApiOutcome, String> {
-        Ok(ApiOutcome::Return(c.args[0].wrapping_add(7)))
+impl ExecutionTrap for Services {
+    fn call(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        vector: u32,
+    ) -> Result<bool, String> {
+        assert_eq!(vector, 0x2e);
+        let arg = u32::from_le_bytes(
+            memory
+                .read_data(state.regs[4] + 4, 4)?
+                .as_ref()
+                .try_into()
+                .unwrap(),
+        );
+        state.regs[0] = arg.wrapping_add(7);
+        Ok(false)
     }
 }
-fn setup(api: bool) -> Machine {
+fn setup(api: bool) -> Executor {
     let mut a = CodeAssembler::new(32).unwrap();
     let mut top = a.create_label();
     a.mov(ecx, ITERATIONS).unwrap();
@@ -33,17 +47,10 @@ fn setup(api: bool) -> Machine {
     a.jnz(top).unwrap();
     a.ret().unwrap();
     let code = a.assemble(u64::from(CODE)).unwrap();
-    let mut m = Machine::new(CODE, 0x20000).unwrap();
+    let mut m = Executor::new(CODE, 0x20000).unwrap();
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
     m.write(CODE, &code).unwrap();
-    m.register_api(ApiSpec::new(
-        1,
-        "bench",
-        "add7",
-        API,
-        Convention::Stdcall(1),
-    ))
-    .unwrap();
+    m.write(API, &[0xcd, 0x2e, 0xc2, 4, 0]).unwrap();
     m.protect(CODE, 0x2000, READ | EXEC).unwrap();
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
@@ -51,11 +58,11 @@ fn setup(api: bool) -> Machine {
         .unwrap();
     m
 }
-fn run(m: &mut Machine) {
+fn run(m: &mut Executor) {
     m.state.eip = CODE;
     m.state.regs[4] = STACK;
     assert_eq!(
-        m.run_with_services(STOP, u64::from(ITERATIONS) * 10, &mut Services)
+        m.run_with_traps(STOP, u64::from(ITERATIONS) * 10, &mut Services, false)
             .unwrap(),
         RunOutcome::ReachedStop
     );
@@ -98,7 +105,7 @@ fn main() {
     }
     let (base, full) = (times[0][samples / 2], times[1][samples / 2]);
     assert_eq!(
-        api.stats.host_calls,
+        api.stats.trap_calls,
         u64::from(ITERATIONS) * (samples as u64 + 1)
     );
     assert_eq!(api.stats.native_entries, samples as u64 + 1);

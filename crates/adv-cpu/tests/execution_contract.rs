@@ -1,11 +1,11 @@
 //! Production execution contracts; this file never constructs a reference engine.
-use adv_cpu::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+use adv_cpu::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
 
 const CODE: u32 = 0x1000;
 const STOP: u32 = 0x3000;
 
-fn machine(bytes: &[u8]) -> Machine {
-    let mut m = Machine::new(CODE, 0x4000).unwrap();
+fn machine(bytes: &[u8]) -> Executor {
+    let mut m = Executor::new(CODE, 0x4000).unwrap();
     m.protect(CODE, 0x4000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 0x1000, READ | EXEC).unwrap();
@@ -93,7 +93,7 @@ fn pending_x87_exception_cannot_be_bypassed_by_cached_mmx() {
 
 #[test]
 fn complete_guest_address_space_includes_the_final_page() {
-    let mut m = Machine::address_space().unwrap();
+    let mut m = Executor::address_space().unwrap();
     m.map(0xffff_f000, 4096, READ | WRITE).unwrap();
     m.write(u32::MAX, &[0x5a]).unwrap();
     assert_eq!(m.memory().read(u32::MAX, 1).unwrap(), &[0x5a]);
@@ -170,7 +170,7 @@ fn raw_api_enabling_single_step_exits_native_before_the_next_instruction() {
     let mut cpu = JitCpu::new(STOP, true).unwrap();
     cpu.map(CODE, 4096, Prot::RX).unwrap();
     cpu.write(CODE, &[0xcd, 0x2e, 0x40, 0x40]).unwrap();
-    cpu.machine_mut().set_region(Region::new(CODE, 4)).unwrap();
+    cpu.executor_mut().set_region(Region::new(CODE, 4)).unwrap();
     cpu.set_reg(Reg::Eip, CODE);
     let mut debugger = Debugger { traps: Vec::new() };
     assert_eq!(cpu.run(&mut debugger), Exit::Parked);

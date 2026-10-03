@@ -16,7 +16,7 @@ fn prepare(m: &mut Machine<Cpu>) {
     let mut region = adv_cpu::Region::new(CODE, 512);
     region.reachable = true;
     region.entries = vec![CODE, PROC, PROC + 32, PROC + 128];
-    m.cpu.machine_mut().add_region(region).unwrap();
+    m.cpu.executor_mut().add_region(region).unwrap();
 }
 
 const CODE: u32 = 0x0040_0000;

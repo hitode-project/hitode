@@ -110,6 +110,11 @@ pub enum TrapAction {
 
 /// Registers and memory as seen from inside a trap handler.
 pub trait Guest {
+    /// Most recent committed indirect transfer for fetch-fault diagnostics.
+    /// Backends without this observation return None.
+    fn last_indirect_branch(&self) -> Option<crate::IndirectBranch> {
+        None
+    }
     /// Virtual CPU feature bits from CPUID leaf 1 EDX. API layers must use
     /// these capabilities rather than detecting the host CPU or assuming a backend.
     fn cpuid_features(&self) -> u32 {

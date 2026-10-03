@@ -156,7 +156,7 @@ pub(crate) fn execute(
     memory: &mut Memory,
     max_units: u32,
     stop: u32,
-    return_pad: Option<u32>,
+    boundary: Option<u32>,
 ) -> Option<u32> {
     let f = &state.x87;
     if state.mmx_mode != 0
@@ -171,7 +171,7 @@ pub(crate) fn execute(
     let count = instructions
         .iter()
         .take(MAX_OPERATIONS.min(max_units as usize))
-        .take_while(|i| i.pc != stop && Some(i.pc) != return_pad)
+        .take_while(|i| i.pc != stop && Some(i.pc) != boundary)
         .count();
     if count < 3 || instructions[0].pc != state.eip {
         return None;

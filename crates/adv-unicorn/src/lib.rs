@@ -426,6 +426,13 @@ impl Guest for Engine<'_> {
             }
             offset += count;
         }
+        // Host-side writes can patch an already translated instruction. Unicorn's
+        // mem_write does not evict its translation cache; match the Guest write
+        // contract of the production backend before resuming guest execution.
+        if !data.is_empty() {
+            self.ctl_remove_cache(u64::from(addr), end)
+                .map_err(|_| fault)?;
+        }
         Ok(())
     }
     fn map_file_pages(

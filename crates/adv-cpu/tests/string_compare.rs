@@ -1,6 +1,6 @@
 mod support;
 use adv_cpu::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -37,11 +37,11 @@ fn instruction(form: Form) -> Vec<u8> {
     });
     bytes
 }
-fn machine(form: Form, jit: bool) -> Machine {
+fn machine(form: Form, jit: bool) -> Executor {
     program(instruction(form), jit)
 }
-fn program(mut bytes: Vec<u8>, jit: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x9f0000).unwrap();
+fn program(mut bytes: Vec<u8>, jit: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x9f0000).unwrap();
     m.protect(CODE, 0x9f0000, READ | WRITE).unwrap();
     bytes.push(0xc3);
     m.write(CODE, &bytes).unwrap();
@@ -52,7 +52,7 @@ fn program(mut bytes: Vec<u8>, jit: bool) -> Machine {
     }
     m
 }
-fn start(m: &mut Machine, count: u32, source: u32, destination: u32, backwards: bool) {
+fn start(m: &mut Executor, count: u32, source: u32, destination: u32, backwards: bool) {
     // This fixture starts a new guest instruction, rather than resuming a chunk.
     m.state.rep = None;
     m.state.eip = CODE;
@@ -69,12 +69,12 @@ fn start(m: &mut Machine, count: u32, source: u32, destination: u32, backwards: 
     m.state.eflags = 0x8d7 | if backwards { 0x400 } else { 0 };
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
 }
-fn put(m: &mut Machine, address: u32, width: u32, value: u32) {
+fn put(m: &mut Executor, address: u32, width: u32, value: u32) {
     m.write(address, &value.to_le_bytes()[..width as usize])
         .unwrap();
 }
 fn fill(
-    m: &mut Machine,
+    m: &mut Executor,
     form: Form,
     count: u32,
     source: u32,
@@ -103,7 +103,7 @@ fn fill(
         );
     }
 }
-fn finish(jit: &mut Machine, uc: &mut Machine) {
+fn finish(jit: &mut Executor, uc: &mut Executor) {
     assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
         uc.run_unicorn(STOP, 4_000_000).unwrap(),
@@ -595,7 +595,7 @@ mod sparse_memory {
         bytes.push(0xc3);
         cpu.write(CODE, &bytes).unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(Region::new(CODE, bytes.len()))
                 .unwrap();
         }

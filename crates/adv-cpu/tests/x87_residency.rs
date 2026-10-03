@@ -1,10 +1,7 @@
 mod support;
-use adv_cpu::{
-    ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, CpuState, EXEC, HostServices, READ,
-    Region, Resume, RunOutcome, WRITE,
-};
+use adv_cpu::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const SETUP: u32 = 0x11000;
@@ -41,8 +38,8 @@ fn pcm_code() -> Vec<u8> {
         a.ret().unwrap();
     })
 }
-fn machine(bytes: &[u8], native: bool, linked: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x40000).unwrap();
+fn machine(bytes: &[u8], native: bool, linked: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x40000).unwrap();
     m.protect(CODE, 0x40000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 8192, READ | EXEC).unwrap();
@@ -73,7 +70,7 @@ fn expected(truncate: bool) -> Vec<u8> {
         })
         .collect()
 }
-fn start(m: &mut Machine, source: u32, destination: u32, stack: u32) {
+fn start(m: &mut Executor, source: u32, destination: u32, stack: u32) {
     m.write(stack, &STOP.to_le_bytes()).unwrap();
     m.state = CpuState {
         regs: [0, SAMPLES as u32, 0, 0, stack, 0, source, destination],
@@ -83,7 +80,7 @@ fn start(m: &mut Machine, source: u32, destination: u32, stack: u32) {
     };
 }
 
-fn assert_pcm_registers(actual: &Machine, oracle: &Machine, exceptions: u32) {
+fn assert_pcm_registers(actual: &Executor, oracle: &Executor, exceptions: u32) {
     // FNSTSW AX exposes masked precision/denormal/invalid status. Unicorn
     // omits these for FISTP, so assert the architectural result independently.
     assert_eq!(actual.state.regs[0] & 0x3f, exceptions);
@@ -227,114 +224,6 @@ fn execution_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
 }
 
 #[test]
-fn interpreted_floating_execution_delivers_api_callback_and_return_pad_in_order() {
-    const API: u32 = 0x12000;
-    const PAD: u32 = STOP + 16;
-    const CALLBACK_OUT: u32 = OUT + 0x4000;
-    let bytes = code(|a| {
-        let mut top = a.create_label();
-        let mut skip = a.create_label();
-        a.set_label(&mut top).unwrap();
-        a.mov(eax, dword_ptr(esi)).unwrap();
-        a.add(ebx, eax).unwrap();
-        a.fld(dword_ptr(esi)).unwrap();
-        a.fmul(dword_ptr(SCALE as i32)).unwrap();
-        a.fistp(dword_ptr(edi)).unwrap();
-        a.cmp(ecx, 2000).unwrap();
-        a.jne(skip).unwrap();
-        a.call(u64::from(API)).unwrap();
-        a.set_label(&mut skip).unwrap();
-        a.add(esi, 4).unwrap();
-        a.add(edi, 4).unwrap();
-        a.dec(ecx).unwrap();
-        a.jnz(top).unwrap();
-        a.ret().unwrap();
-    });
-    let callback = code_at(SETUP, |a| {
-        a.push(ecx).unwrap();
-        a.push(esi).unwrap();
-        a.push(edi).unwrap();
-        a.push(ebx).unwrap();
-        a.mov(ecx, 256).unwrap();
-        a.mov(esi, SRC).unwrap();
-        a.mov(edi, CALLBACK_OUT).unwrap();
-        a.call(u64::from(CODE)).unwrap();
-        a.pop(ebx).unwrap();
-        a.pop(edi).unwrap();
-        a.pop(esi).unwrap();
-        a.pop(ecx).unwrap();
-        a.mov(eax, 13).unwrap();
-        a.ret().unwrap();
-    });
-    #[derive(Default)]
-    struct Services {
-        calls: usize,
-        resumes: usize,
-    }
-    impl HostServices for Services {
-        fn call(
-            &mut self,
-            _: ApiCall<'_>,
-            memory: &mut ApiMemory<'_>,
-        ) -> Result<ApiOutcome, String> {
-            assert_eq!(memory.u32(OUT + 48 * 4)? as i32, -8);
-            self.calls += 1;
-            Ok(ApiOutcome::Callback {
-                target: SETUP,
-                args: vec![],
-                convention: Convention::Stdcall(0),
-                continuation: 7,
-            })
-        }
-        fn resume(
-            &mut self,
-            token: u64,
-            reason: Resume,
-            _: &mut ApiMemory<'_>,
-        ) -> Result<ApiOutcome, String> {
-            assert_eq!((token, reason), (7, Resume::Returned(13)));
-            self.resumes += 1;
-            Ok(ApiOutcome::Return(13))
-        }
-    }
-    for (native, linked) in [(true, false), (true, true), (false, false)] {
-        let mut m = machine(&bytes, native, linked);
-        m.write(SETUP, &callback).unwrap();
-        m.register_api(ApiSpec::new(
-            1,
-            "test",
-            "callback",
-            API,
-            Convention::Stdcall(0),
-        ))
-        .unwrap();
-        m.protect(API, 4096, READ | EXEC).unwrap();
-        m.set_callback_return_pad(PAD).unwrap();
-        if native {
-            m.add_region(Region::new(SETUP, callback.len())).unwrap();
-        }
-        m.write(SRC, &samples()).unwrap();
-        start(&mut m, SRC, OUT, STACK);
-        let mut services = Services::default();
-        let outcome = if native {
-            m.run_with_services(STOP, 100_000, &mut services)
-        } else {
-            m.run_unicorn_with_services(STOP, 100_000, &mut services)
-        };
-        assert_eq!(outcome.unwrap(), RunOutcome::ReachedStop);
-        assert_eq!((services.calls, services.resumes), (1, 1));
-        assert_eq!(m.memory().read(OUT, SAMPLES * 4).unwrap(), expected(false));
-        assert_eq!(
-            m.memory().read(CALLBACK_OUT, 256 * 4).unwrap(),
-            &expected(false)[..256 * 4]
-        );
-        if linked {
-            assert!(m.stats.interpreter_instructions > 0);
-        }
-    }
-}
-
-#[test]
 fn interpreted_x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
     let bytes = pcm_code();
     let mut machines = [
@@ -448,7 +337,7 @@ fn interpreted_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss
     cpu.write(SRC, &0.25f32.to_le_bytes()).unwrap();
     cpu.write(SCALE, &32768.0f32.to_le_bytes()).unwrap();
     cpu.write_u32(STACK, STOP).unwrap();
-    cpu.machine_mut()
+    cpu.executor_mut()
         .add_region(Region::new(CODE, bytes.len()))
         .unwrap();
     for (reg, value) in [

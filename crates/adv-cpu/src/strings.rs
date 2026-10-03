@@ -80,7 +80,7 @@ fn checked_range(
     Ok(range.start)
 }
 
-fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
+fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
     if expired(bridge.deadline) {
         return BUDGET;
     }
@@ -121,7 +121,7 @@ fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
             return FALLBACK;
         }
     }
-    // SAFETY: Machine supplies its live, exclusively borrowed shared allocation;
+    // SAFETY: Executor supplies its live, exclusively borrowed shared allocation;
     // generated code has stopped and no trap or scheduler runs during this call.
     let memory = unsafe { &mut *bridge.memory };
     let dst_offset = match checked_range(memory, dst, len, true, bridge.deadline) {
@@ -265,7 +265,7 @@ fn comparison_flags(old: u32, left: u32, right: u32, width: u32) -> u32 {
         | (u32::from((left ^ right) & (left ^ result) & sign != 0) << 11)
 }
 
-fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
+fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
     let count = state.regs[1];
     if count == 0 {
         state.rep = None;
@@ -285,7 +285,7 @@ fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
         width
     };
     // SAFETY: the native executor is suspended and the bridge exclusively borrows
-    // the Machine's live memory. Comparisons do not write or dirty guest pages.
+    // the Executor's live memory. Comparisons do not write or dirty guest pages.
     let memory = unsafe { &*bridge.memory };
     let validated = compare_range(
         memory,
@@ -387,14 +387,14 @@ fn compare(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
     outcome
 }
 
-/// Called only by native code with the Machine's live bridge and saved CpuState.
+/// Called only by native code with the Executor's live bridge and saved CpuState.
 pub(crate) unsafe extern "C" fn repeat(
     bridge: *mut std::ffi::c_void,
     state: *mut CpuState,
     operation: u32,
 ) -> u32 {
     // SAFETY: same ABI/lifetime contract as host_call; validation precedes all writes.
-    let (bridge, state) = unsafe { (&mut *bridge.cast::<crate::host::Bridge<'_>>(), &mut *state) };
+    let (bridge, state) = unsafe { (&mut *bridge.cast::<crate::trap::Bridge<'_>>(), &mut *state) };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         execute(bridge, state, operation)
     }))

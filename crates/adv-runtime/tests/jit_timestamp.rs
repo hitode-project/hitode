@@ -1,6 +1,5 @@
 use adv_cpu::{
-    ApiCall, ApiMemory, ApiOutcome, EXEC, HostServices, Machine, READ, Region, RunOutcome,
-    TSC_FREQ, WRITE,
+    CpuState, EXEC, ExecutionTrap, Executor, Memory, READ, Region, RunOutcome, TSC_FREQ, WRITE,
 };
 use adv_machine::Clock;
 use iced_x86::code_asm::*;
@@ -20,9 +19,9 @@ fn code(reads: u32) -> Vec<u8> {
     assembler.ret().unwrap();
     assembler.assemble(u64::from(CODE)).unwrap()
 }
-fn machine(native: bool, reads: u32) -> Machine {
+fn machine(native: bool, reads: u32) -> Executor {
     let bytes = code(reads);
-    let mut machine = Machine::new(CODE, 0x10000).unwrap();
+    let mut machine = Executor::new(CODE, 0x10000).unwrap();
     machine.protect(CODE, 0x10000, READ | WRITE).unwrap();
     machine.write(CODE, &bytes).unwrap();
     machine.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -37,7 +36,7 @@ fn machine(native: bool, reads: u32) -> Machine {
     }
     machine
 }
-fn ticks(machine: &Machine, index: u32) -> u64 {
+fn ticks(machine: &Executor, index: u32) -> u64 {
     u64::from_le_bytes(
         machine
             .memory()
@@ -50,22 +49,26 @@ fn ticks(machine: &Machine, index: u32) -> u64 {
 struct FixedClock {
     now: u64,
     reads: u32,
+    trap: Option<u32>,
 }
-impl HostServices for FixedClock {
+impl ExecutionTrap for FixedClock {
     fn guest_time_us(&mut self) -> Option<u64> {
         self.reads += 1;
         Some(self.now)
     }
-    fn call(&mut self, _: ApiCall<'_>, _: &mut ApiMemory<'_>) -> Result<ApiOutcome, String> {
-        panic!("no API in fixture")
+    fn call(&mut self, state: &mut CpuState, _: &mut Memory, vector: u32) -> Result<bool, String> {
+        assert_eq!(vector, 1, "fixture contains no host API");
+        assert_eq!(state.eip, CODE + 2, "single-step trap follows RDTSC");
+        self.trap = Some(vector);
+        Ok(true)
     }
 }
 struct OwnerClock(Clock);
-impl HostServices for OwnerClock {
+impl ExecutionTrap for OwnerClock {
     fn guest_time_us(&mut self) -> Option<u64> {
         Some(self.0.guest_now_us())
     }
-    fn call(&mut self, _: ApiCall<'_>, _: &mut ApiMemory<'_>) -> Result<ApiOutcome, String> {
+    fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
         panic!("no API in fixture")
     }
 }
@@ -78,9 +81,12 @@ fn consecutive_native_and_interpreted_reads_preserve_flags_and_other_registers()
         let mut clock = FixedClock {
             now: 4_294_968,
             reads: 0,
+            trap: None,
         };
         assert_eq!(
-            machine.run_with_services(STOP, 100, &mut clock).unwrap(),
+            machine
+                .run_with_traps(STOP, 100, &mut clock, false)
+                .unwrap(),
             RunOutcome::ReachedStop
         );
         assert_eq!(
@@ -114,18 +120,25 @@ fn restored_contexts_and_executor_changes_share_one_monotonic_counter() {
     let mut clock = FixedClock {
         now: 1_000_000,
         reads: 0,
+        trap: None,
     };
-    machine.run_with_services(STOP, 100, &mut clock).unwrap();
+    machine
+        .run_with_traps(STOP, 100, &mut clock, false)
+        .unwrap();
     assert_eq!(ticks(&machine, 0), TSC_FREQ);
     machine.restore_context(&saved).unwrap();
     machine
         .add_region(Region::new(CODE, code(1).len()))
         .unwrap();
-    machine.run_with_services(STOP, 100, &mut clock).unwrap();
+    machine
+        .run_with_traps(STOP, 100, &mut clock, false)
+        .unwrap();
     assert_eq!(ticks(&machine, 0), TSC_FREQ + 1);
     machine.restore_context(&saved).unwrap();
     clock.now += 10;
-    machine.run_with_services(STOP, 100, &mut clock).unwrap();
+    machine
+        .run_with_traps(STOP, 100, &mut clock, false)
+        .unwrap();
     assert_eq!(ticks(&machine, 0), TSC_FREQ + 10_000);
     assert_eq!(clock.reads, 3);
 }
@@ -137,7 +150,9 @@ fn virtual_clock_progress_jump_and_qpc_ratio_use_the_execution_owner() {
         let saved = machine.save_context().unwrap();
         let mut clock = OwnerClock(Clock::virtual_time());
         let before = clock.0.now_us();
-        machine.run_with_services(STOP, 100, &mut clock).unwrap();
+        machine
+            .run_with_traps(STOP, 100, &mut clock, false)
+            .unwrap();
         assert_eq!(clock.0.now_us(), before + 3);
         assert_eq!(
             ticks(&machine, 2),
@@ -146,7 +161,9 @@ fn virtual_clock_progress_jump_and_qpc_ratio_use_the_execution_owner() {
         let deadline = clock.0.now_us() + 10_000;
         clock.0.advance_to(deadline);
         machine.restore_context(&saved).unwrap();
-        machine.run_with_services(STOP, 100, &mut clock).unwrap();
+        machine
+            .run_with_traps(STOP, 100, &mut clock, false)
+            .unwrap();
         assert_eq!(ticks(&machine, 0), (deadline + 1) * 1000);
     }
 }
@@ -160,7 +177,9 @@ fn paused_real_owner_excludes_host_pause_duration() {
         clock.0.pause();
         let paused = clock.0.now_us();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        machine.run_with_services(STOP, 100, &mut clock).unwrap();
+        machine
+            .run_with_traps(STOP, 100, &mut clock, false)
+            .unwrap();
         assert_eq!(clock.0.now_us(), paused);
         assert_eq!(
             [ticks(&machine, 0), ticks(&machine, 1), ticks(&machine, 2)],
@@ -169,7 +188,9 @@ fn paused_real_owner_excludes_host_pause_duration() {
         clock.0.resume();
         let resumed = clock.0.qpc() * (TSC_FREQ / adv_machine::clock::QPC_FREQ);
         machine.restore_context(&saved).unwrap();
-        machine.run_with_services(STOP, 100, &mut clock).unwrap();
+        machine
+            .run_with_traps(STOP, 100, &mut clock, false)
+            .unwrap();
         assert!(ticks(&machine, 0) >= resumed);
         assert!(
             ticks(&machine, 2) <= clock.0.qpc() * (TSC_FREQ / adv_machine::clock::QPC_FREQ) + 999
@@ -185,14 +206,13 @@ fn single_step_completes_rdtsc_then_reports_debug_trap() {
     let mut clock = FixedClock {
         now: 1_000_000,
         reads: 0,
+        trap: None,
     };
     assert_eq!(
-        machine.run_with_services(STOP, 1, &mut clock).unwrap(),
-        RunOutcome::Trap {
-            pc: CODE,
-            vector: 1
-        }
+        machine.run_with_traps(STOP, 1, &mut clock, false).unwrap(),
+        RunOutcome::Parked
     );
+    assert_eq!(clock.trap, Some(1));
     assert_eq!(machine.state.eip, CODE + 2);
     assert_eq!(machine.state.regs[0], TSC_FREQ as u32);
     assert_eq!(machine.state.regs[2], 0);
@@ -212,16 +232,16 @@ fn standalone_default_clock_reads_progress_without_host_cpu_frequency() {
 }
 
 #[test]
-fn pal_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
+fn machine_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
     use adv_abi::Registry;
     use adv_cpu::JitCpu;
     use adv_cpu::backend::{Guest, Prot};
-    use adv_machine::{Machine as PalMachine, RunResult};
+    use adv_machine::{Machine as GuestMachine, RunResult};
     for native in [false, true] {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
         let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, native).unwrap();
-        let mut machine = PalMachine::new(cpu, registry, Clock::virtual_time()).unwrap();
+        let mut machine = GuestMachine::new(cpu, registry, Clock::virtual_time()).unwrap();
         let qpc = machine
             .resolve_import("kernel32.dll", "QueryPerformanceCounter")
             .unwrap();
@@ -243,11 +263,11 @@ fn pal_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.write(CODE, &bytes).unwrap();
         machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
-        machine.cpu.machine_mut().set_async_compilation(false);
+        machine.cpu.executor_mut().set_async_compilation(false);
         if native {
             machine
                 .cpu
-                .machine_mut()
+                .executor_mut()
                 .add_region(Region::new(CODE, bytes.len()))
                 .unwrap();
         }

@@ -4,7 +4,7 @@
 mod oracle_support;
 use adv_cpu::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::{BlockEncoderOptions, code_asm::*};
-use oracle_support::Machine;
+use oracle_support::Executor;
 use std::time::Instant;
 
 const CODE: u32 = 0x10000;
@@ -131,8 +131,8 @@ fn workload(name: &str) -> Workload {
     }
 }
 
-fn setup(w: &Workload, jit: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x300000).unwrap();
+fn setup(w: &Workload, jit: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x300000).unwrap();
     m.protect(CODE, 0x300000, READ | WRITE).unwrap();
     m.write(CODE, &w.code).unwrap();
     m.write(DATA, &w.data).unwrap();
@@ -147,7 +147,7 @@ fn setup(w: &Workload, jit: bool) -> Machine {
     m
 }
 
-fn call(m: &mut Machine, w: &Workload, jit: bool) -> (u32, u32) {
+fn call(m: &mut Executor, w: &Workload, jit: bool) -> (u32, u32) {
     m.state = CpuState {
         regs: w.regs,
         eip: CODE,

@@ -1,4 +1,4 @@
-use adv_cpu::{CompileStrategy, EXEC, Machine, READ, Region, RunOutcome, WRITE};
+use adv_cpu::{CompileStrategy, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 
 const MAIN: u32 = 0x10000;
@@ -12,7 +12,7 @@ fn assemble(at: u32, f: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(at as u64).unwrap()
 }
 
-fn setup(strategy: CompileStrategy, linked: bool) -> Machine {
+fn setup(strategy: CompileStrategy, linked: bool) -> Executor {
     let caller = assemble(MAIN, |a| {
         let mut again = a.create_label();
         a.set_label(&mut again).unwrap();
@@ -26,7 +26,7 @@ fn setup(strategy: CompileStrategy, linked: bool) -> Machine {
         a.paddb(xmm0, xmm1).unwrap();
         a.ret().unwrap();
     });
-    let mut m = Machine::new(MAIN, 0x10000).unwrap();
+    let mut m = Executor::new(MAIN, 0x10000).unwrap();
     m.protect(MAIN, 0x10000, READ | WRITE).unwrap();
     for (pc, bytes) in [(MAIN, caller), (CALLEE, callee)] {
         m.write(pc, &bytes).unwrap();
@@ -41,7 +41,7 @@ fn setup(strategy: CompileStrategy, linked: bool) -> Machine {
     m
 }
 
-fn seed(m: &mut Machine, iterations: u32) {
+fn seed(m: &mut Executor, iterations: u32) {
     m.state.eip = MAIN;
     m.state.regs = [0, iterations, 0x7654_3210, 0, STACK, 0, 0, 0];
     m.state.eflags = 0x203;

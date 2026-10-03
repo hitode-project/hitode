@@ -1,12 +1,12 @@
-//! Regression contracts for the Machine-only predecoded basic-block executor.
+//! Regression contracts for the Executor-only predecoded basic-block executor.
 use adv_cpu::interpreter::{Interpreter, Step};
-use adv_cpu::{EXEC, Machine, Memory, READ, RunOutcome, WRITE};
+use adv_cpu::{EXEC, Executor, Memory, READ, RunOutcome, WRITE};
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x13000;
 const STACK: u32 = 0x14f00;
-fn machine(code: &[u8]) -> Machine {
-    let mut m = Machine::new(CODE, 0x5000).unwrap();
+fn machine(code: &[u8]) -> Executor {
+    let mut m = Executor::new(CODE, 0x5000).unwrap();
     m.protect(CODE, 0x5000, READ | WRITE).unwrap();
     m.write(CODE, code).unwrap();
     m.write(STACK, &STOP.to_le_bytes()).unwrap();

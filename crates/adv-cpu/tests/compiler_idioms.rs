@@ -2,7 +2,7 @@ mod support;
 use adv_cpu::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -15,8 +15,8 @@ fn code(f: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(u64::from(CODE)).unwrap()
 }
 
-fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
-    let mut m = Machine::new(CODE, 0x20000).unwrap();
+fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
+    let mut m = Executor::new(CODE, 0x20000).unwrap();
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -35,7 +35,7 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
     m
 }
 
-fn seed(m: &mut Machine, left: u32, right: u32, frame: u32) {
+fn seed(m: &mut Executor, left: u32, right: u32, frame: u32) {
     m.state.regs = [
         left,
         0xa1b2_c3d4,
@@ -51,7 +51,7 @@ fn seed(m: &mut Machine, left: u32, right: u32, frame: u32) {
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
 }
 
-fn equal_registers_and_flags(jit: &Machine, uc: &Machine) {
+fn equal_registers_and_flags(jit: &Executor, uc: &Executor) {
     assert_eq!(jit.state.regs, uc.state.regs);
     assert_eq!(jit.state.eip, uc.state.eip);
     assert_eq!(jit.state.eflags, uc.state.eflags);

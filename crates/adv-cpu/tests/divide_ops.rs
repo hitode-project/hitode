@@ -1,7 +1,7 @@
 mod support;
 use adv_cpu::{CompileStrategy, CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -13,8 +13,8 @@ fn code(build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     build(&mut a);
     a.assemble(u64::from(CODE)).unwrap()
 }
-fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
-    let mut m = Machine::new(CODE, 0x20000).unwrap();
+fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
+    let mut m = Executor::new(CODE, 0x20000).unwrap();
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -26,7 +26,7 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
     }
     m
 }
-fn reset(m: &mut Machine, low: u32, high: u32, divisor: u32, address: u32) {
+fn reset(m: &mut Executor, low: u32, high: u32, divisor: u32, address: u32) {
     m.state = CpuState {
         regs: [
             low,
@@ -235,7 +235,7 @@ fn divide_zero_and_quotient_overflow_fall_back_at_original_pc_for_guest_exceptio
                     if jit {
                         let mut r = Region::new(CODE, bytes.len());
                         r.compile_strategy = strategy;
-                        cpu.machine_mut().add_region(r).unwrap();
+                        cpu.executor_mut().add_region(r).unwrap();
                     }
                     let mut recover = Recover {
                         expected: [low, high, divisor],

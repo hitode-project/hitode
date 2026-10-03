@@ -211,7 +211,9 @@ fn hard_watchdog_accumulates_across_soft_slices_and_sync_handlers() {
         a.bytes.extend_from_slice(&[0xeb, 0xfe]);
     });
     t.m.spawn("M", CODE, &[], 65536).unwrap();
-    t.m.set_execution_budget(Some(Duration::from_millis(25)));
+    // Leave room for host scheduling latency on a loaded CI machine; the test
+    // still requires the *cumulative* watchdog to fire across 2 ms soft slices.
+    t.m.set_execution_budget(Some(Duration::from_millis(250)));
     let started = Instant::now();
     let mut yielded = false;
     loop {

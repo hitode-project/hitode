@@ -153,8 +153,8 @@ fn raw_traps_obey_stdcall_cdecl_and_callback_pc_stack_changes() {
             main.entries.push(CODE + 0x100);
             let mut stubs = adv_cpu::Region::new(API, 0x60);
             stubs.entries.extend([API + 16, API + 32, API + 48]);
-            cpu.machine_mut().add_region(main).unwrap();
-            cpu.machine_mut().add_region(stubs).unwrap();
+            cpu.executor_mut().add_region(main).unwrap();
+            cpu.executor_mut().add_region(stubs).unwrap();
         }
         start(&mut cpu, CODE);
         let mut calls = Calls {
@@ -212,10 +212,10 @@ fn trap_mapping_new_rwx_page_tracks_actual_guest_code_writes() {
         )
         .unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, 0x100))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(API, 3))
                 .unwrap();
         }
@@ -270,13 +270,13 @@ fn host_patch_invalidates_both_warm_native_and_fallback_code() {
         )
         .unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, 0x100))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(DATA, 0x120))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(API, 3))
                 .unwrap();
         }
@@ -286,7 +286,7 @@ fn host_patch_invalidates_both_warm_native_and_fallback_code() {
             cpu.reg(Reg::Eax),
             73 * 47,
             "jit={jit}, host calls={}, mov immediate={}, multiply immediate={}",
-            cpu.stats().host_calls,
+            cpu.stats().trap_calls,
             cpu.read_u32(DATA + 1).unwrap(),
             cpu.read_u16(DATA + 0x103).unwrap()
         );
@@ -356,10 +356,10 @@ fn full_context_switch_preserves_x87_xmm_mxcsr_control_and_fs() {
         )
         .unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, 0x40))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(SAVE, 0x60))
                 .unwrap();
         }
@@ -424,10 +424,10 @@ fn full_context_switch_preserves_mmx_registers() {
         )
         .unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, 0x20))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE + 0x100, 0x20))
                 .unwrap();
         }
@@ -531,10 +531,10 @@ fn raw_double_return_and_pop_preserve_existing_guest_x87_stack() {
         )
         .unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, 0x80))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(API, 3))
                 .unwrap();
         }
@@ -575,7 +575,7 @@ fn invalidation_recompiles_changed_region_and_revalidates_unchanged_same_page_co
     cpu.write(DATA + 0x100, &[0xb8, 3, 0, 0, 0, 0xc3]).unwrap();
     cpu.write(API, &[0xb8, 5, 0, 0, 0, 0xc3]).unwrap();
     for (at, len) in [(CODE, main.len()), (DATA, 6), (DATA + 0x100, 6), (API, 6)] {
-        cpu.machine_mut()
+        cpu.executor_mut()
             .add_region(adv_cpu::Region::new(at, len))
             .unwrap();
     }
@@ -629,7 +629,7 @@ fn setup_segments_uses_supplied_gdt_and_windows_selectors() {
         });
         cpu.write(CODE, &bytes).unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, bytes.len()))
                 .unwrap();
         }
@@ -680,7 +680,7 @@ fn native_and_fallback_faults_keep_kind_address_and_faulting_pc() {
             };
             cpu.write(CODE, &bytes).unwrap();
             if jit {
-                cpu.machine_mut()
+                cpu.executor_mut()
                     .add_region(adv_cpu::Region::new(CODE, bytes.len()))
                     .unwrap();
             }
@@ -718,7 +718,7 @@ fn native_and_fallback_faults_keep_kind_address_and_faulting_pc() {
             cpu.write(CODE, &bytes).unwrap();
             start(&mut cpu, if prot == Prot::RW { BAD } else { CODE });
             if jit {
-                cpu.machine_mut()
+                cpu.executor_mut()
                     .add_region(adv_cpu::Region::new(CODE, bytes.len()))
                     .unwrap();
             }
@@ -771,7 +771,7 @@ fn invalid_opcode_exception_preserves_faulting_pc_and_can_resume_once() {
             }));
             cpu.write(CODE, &bytes).unwrap();
             if jit {
-                cpu.machine_mut()
+                cpu.executor_mut()
                     .add_region(adv_cpu::Region::new(CODE, bytes.len()))
                     .unwrap();
             }
@@ -808,7 +808,7 @@ fn every_interrupt_vector_reaches_raw_handler_and_can_resume() {
         let bytes = [0xcc, 0xcd, 0x80, 0xcd, 0x2e, 0xc3];
         cpu.write(CODE, &bytes).unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, bytes.len()))
                 .unwrap();
         }
@@ -840,7 +840,7 @@ fn division_exception_can_be_recovered_by_handler_pc_change() {
         cpu.map(CODE, 4096, Prot::RX).unwrap();
         cpu.write(CODE, &[0xf7, 0xf3, 0xc3]).unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, 3))
                 .unwrap();
         }
@@ -883,10 +883,10 @@ fn host_double_return_refreshes_mmx_alias_cache_and_emms_empties_x87_stack() {
         });
         cpu.write(CODE, &bytes).unwrap();
         if jit {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(CODE, bytes.len()))
                 .unwrap();
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(adv_cpu::Region::new(API, 3))
                 .unwrap();
         }

@@ -1,7 +1,7 @@
 //! Self-authored full-frame clear -> MMX blend -> REP copy -> checksum benchmark.
 #[path = "../tests/support/mod.rs"]
 mod oracle_support;
-use oracle_support::Machine;
+use oracle_support::Executor;
 use std::time::Instant;
 
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
@@ -70,7 +70,7 @@ fn bench(width: u32, height: u32, frames: usize, jit: bool) {
     a.jnz(check).unwrap();
     a.ret().unwrap();
     let bytes = a.assemble(u64::from(CODE)).unwrap();
-    let mut m = Machine::new(CODE, (end - CODE) as usize).unwrap();
+    let mut m = Executor::new(CODE, (end - CODE) as usize).unwrap();
     m.protect(CODE, (end - CODE) as usize, READ | WRITE)
         .unwrap();
     m.write(CODE, &bytes).unwrap();
@@ -80,7 +80,7 @@ fn bench(width: u32, height: u32, frames: usize, jit: bool) {
     if jit {
         m.add_region(Region::new(CODE, bytes.len())).unwrap();
     }
-    let run = |m: &mut Machine| {
+    let run = |m: &mut Executor| {
         m.state.eip = CODE;
         m.state.regs[4] = stack;
         m.write(stack, &STOP.to_le_bytes()).unwrap();

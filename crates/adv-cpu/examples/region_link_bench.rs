@@ -4,7 +4,7 @@
 mod oracle_support;
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use oracle_support::Machine;
+use oracle_support::Executor;
 use std::time::Instant;
 
 const CODE: u32 = 0x10000;
@@ -30,8 +30,8 @@ fn code(at: u32, f: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(at as u64).unwrap()
 }
 
-fn setup(targets: u32) -> Machine {
-    let mut m = Machine::new(CODE, 0x30000).unwrap();
+fn setup(targets: u32) -> Executor {
+    let mut m = Executor::new(CODE, 0x30000).unwrap();
     m.protect(CODE, 0x30000, READ | WRITE).unwrap();
     let main = code(CODE, |a| {
         let mut again = a.create_label();
@@ -72,7 +72,7 @@ fn setup(targets: u32) -> Machine {
     m
 }
 
-fn seed(m: &mut Machine, iterations: u32) {
+fn seed(m: &mut Executor, iterations: u32) {
     m.state.regs = [0, iterations, 0, 0, STACK, 0, 0, 0];
     m.state.eip = CODE;
     m.state.eflags = 0x202;

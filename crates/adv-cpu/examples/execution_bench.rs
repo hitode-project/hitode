@@ -1,8 +1,8 @@
 //! Self-authored execution-boundary workloads, not a whole-game speedup claim.
 //! Run the identical file on both revisions; compare medians on the same CPU.
 use adv_cpu::{
-    ApiCall, ApiMemory, ApiOutcome, ApiSpec, CompileStrategy, Convention, EXEC, HostServices,
-    Machine, READ, Region, RunOutcome, WRITE,
+    CompileStrategy, CpuState, EXEC, ExecutionTrap, Executor, Memory, READ, Region, RunOutcome,
+    WRITE,
 };
 use iced_x86::code_asm::*;
 use std::hint::black_box;
@@ -15,25 +15,22 @@ const STACK: u32 = 0x3f000;
 const ITERATIONS: u32 = 100_000;
 
 struct Services;
-impl HostServices for Services {
-    fn call(&mut self, _: ApiCall<'_>, _: &mut ApiMemory<'_>) -> Result<ApiOutcome, String> {
-        Ok(ApiOutcome::Return(7))
+impl ExecutionTrap for Services {
+    fn call(&mut self, state: &mut CpuState, _: &mut Memory, vector: u32) -> Result<bool, String> {
+        assert_eq!(vector, 0x2e);
+        state.regs[0] = 7;
+        Ok(false)
     }
 }
 
-fn setup(bytes: &[u8], apis: u32, native: Option<CompileStrategy>, auto: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x30000).unwrap();
+fn setup(bytes: &[u8], apis: u32, native: Option<CompileStrategy>, auto: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x30000).unwrap();
     m.protect(CODE, 0x30000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     for id in 0..apis {
-        m.register_api(ApiSpec::new(
-            id,
-            "bench.dll",
-            &format!("api_{id}"),
-            APIS + id * 16,
-            Convention::Stdcall(0),
-        ))
-        .unwrap();
+        let mut thunk = [0x90; 16];
+        thunk[..3].copy_from_slice(&[0xcd, 0x2e, 0xc3]);
+        m.write(APIS + id * 16, &thunk).unwrap();
     }
     m.protect(CODE, 4096, READ | EXEC).unwrap();
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
@@ -47,18 +44,18 @@ fn setup(bytes: &[u8], apis: u32, native: Option<CompileStrategy>, auto: bool) -
     m
 }
 
-fn run(m: &mut Machine) {
+fn run(m: &mut Executor) {
     m.state.eip = CODE;
     m.state.regs[4] = STACK;
     assert_eq!(
-        m.run_with_services(STOP, 100_000_000, &mut Services)
+        m.run_with_traps(STOP, 100_000_000, &mut Services, false)
             .unwrap(),
         RunOutcome::ReachedStop
     );
     black_box(m.state.regs);
 }
 
-fn record(name: &str, samples: usize, repetitions: usize, m: &mut Machine, expected: u32) {
+fn record(name: &str, samples: usize, repetitions: usize, m: &mut Executor, expected: u32) {
     // Equal priming on both versions; automatic compilation is included in cold_ms.
     let cold = Instant::now();
     run(m);

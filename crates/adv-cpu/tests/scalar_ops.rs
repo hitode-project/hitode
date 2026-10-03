@@ -1,7 +1,7 @@
 mod support;
 use adv_cpu::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -13,8 +13,8 @@ fn assemble(build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     build(&mut a);
     a.assemble(u64::from(CODE)).unwrap()
 }
-fn machine(bytes: &[u8], jit: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x20000).unwrap();
+fn machine(bytes: &[u8], jit: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x20000).unwrap();
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -24,7 +24,7 @@ fn machine(bytes: &[u8], jit: bool) -> Machine {
     }
     m
 }
-fn reset(m: &mut Machine, regs: [u32; 8], flags: u32) {
+fn reset(m: &mut Executor, regs: [u32; 8], flags: u32) {
     m.state = CpuState {
         regs,
         eflags: flags,
@@ -34,7 +34,7 @@ fn reset(m: &mut Machine, regs: [u32; 8], flags: u32) {
     m.state.regs[4] = STACK;
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
 }
-fn differential(jit: &mut Machine, uc: &mut Machine, flags_mask: u32) {
+fn differential(jit: &mut Executor, uc: &mut Executor, flags_mask: u32) {
     assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
         uc.run_unicorn(STOP, 10000).unwrap(),

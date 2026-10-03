@@ -1,6 +1,6 @@
 //! A 1 GHz guest reference counter, independent of host ISA and instruction
 //! retirement rate. PAL supplies its sole guest clock; standalone callers can
-//! inject the same microsecond source through HostServices.
+//! inject the same microsecond source through the raw trap boundary.
 use std::time::Instant;
 
 /// Explicit virtual TSC frequency. This is not a host CPU speed claim.

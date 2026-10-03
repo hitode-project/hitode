@@ -11,14 +11,9 @@ fn main() {
     std::fs::create_dir_all(&out).unwrap();
     for ddraw in [false, true] {
         let mut f = fixture(ddraw, 640, 360, false);
-        assert_eq!(
-            f.machine
-                .run_with_services(STOP, 2_000_000, &mut f.graphics)
-                .unwrap(),
-            RunOutcome::ReachedStop
-        );
-        assert_eq!(f.graphics.presenter.bgra, f.expected);
-        let frame = &f.graphics.presenter;
+        assert_eq!(f.run().unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(f.graphics().presenter.bgra, f.expected);
+        let frame = &f.graphics().presenter;
         let mut rgba = frame.bgra.clone();
         for p in rgba.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
@@ -41,9 +36,9 @@ fn main() {
         println!(
             "{name}: frame={} API={} native_entries={} interpreter_entries={} output={}",
             frame.frames,
-            f.machine.stats.host_calls,
-            f.machine.stats.native_entries,
-            f.machine.stats.interpreter_entries,
+            f.machine.sys.host_calls,
+            f.machine.cpu.stats().native_entries,
+            f.machine.cpu.stats().interpreter_entries,
             path.display()
         );
     }

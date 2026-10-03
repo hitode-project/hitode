@@ -191,7 +191,7 @@ impl Interpreter {
         execute_decoded(decoded, state, memory, max_units, None)
     }
 
-    /// Execute one bounded predecoded basic block. This is internal to Machine:
+    /// Execute one bounded predecoded basic block. This is internal to Executor:
     /// public step/run_chunk retain their single-instruction/REP contract.
     pub(crate) fn run_block(
         &mut self,
@@ -199,10 +199,9 @@ impl Interpreter {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        return_pad: Option<u32>,
         native: Option<(&BTreeMap<u32, u32>, u64)>,
     ) -> (Execution, u32) {
-        if max_units == 0 || state.eip == stop || return_pad == Some(state.eip) {
+        if max_units == 0 || state.eip == stop {
             return (
                 Execution {
                     step: Step::Executed,
@@ -220,7 +219,7 @@ impl Interpreter {
         {
             let block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
             if self.capacity == 0 {
-                return block.execute(state, memory, max_units, stop, return_pad);
+                return block.execute(state, memory, max_units, stop);
             }
             // Bound each independent cache in entries. A larger block working set
             // avoids flushing hot floating fallback sequences during discovery.
@@ -229,7 +228,7 @@ impl Interpreter {
             }
             self.blocks.insert(pc, block);
         }
-        self.blocks[&pc].execute(state, memory, max_units, stop, return_pad)
+        self.blocks[&pc].execute(state, memory, max_units, stop)
     }
 }
 
@@ -312,6 +311,7 @@ fn execute_decoded(
         pc,
         write: None,
         more_writes: Vec::new(),
+        indirect_branch: None,
     };
     let trap = match tx.execute(instruction.action, memory) {
         Ok(trap) => trap,
@@ -338,6 +338,9 @@ fn execute_decoded(
     state.regs = tx.regs;
     state.eflags = tx.flags;
     state.eip = tx.eip;
+    if let Some(branch) = tx.indirect_branch {
+        state.last_indirect_branch = branch;
+    }
     Execution {
         step: trap.map_or_else(
             || {
@@ -578,7 +581,6 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        return_pad: Option<u32>,
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
         let mut result = Execution {
@@ -588,8 +590,7 @@ impl DecodedBlock {
         let mut last_units = 0;
         let mut deferred_mmx = false;
         for &(pc, decoded) in &self.instructions {
-            if result.units == max_units || state.eip != pc || pc == stop || return_pad == Some(pc)
-            {
+            if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
             let execution = execute_decoded(
@@ -911,6 +912,7 @@ fn run_string(
             pc,
             write: None,
             more_writes: Vec::new(),
+            indirect_branch: None,
         };
         let source_index = Reg {
             index: 6,
@@ -1366,6 +1368,7 @@ struct Transaction {
     pc: u32,
     write: Option<(u32, u8, u32)>,
     more_writes: Vec<(u32, u8, u32)>,
+    indirect_branch: Option<crate::IndirectBranch>,
 }
 
 fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
@@ -1722,6 +1725,13 @@ impl Transaction {
             Action::Branch(target, condition) => {
                 if condition == ConditionCode::None || condition_true(condition, self.flags) {
                     self.eip = self.read(memory, target)?;
+                    if !matches!(target, Operand::Immediate(_)) {
+                        self.indirect_branch = Some(crate::IndirectBranch {
+                            source: self.pc,
+                            target: self.eip,
+                            kind: crate::IndirectBranchKind::Jump,
+                        });
+                    }
                 }
             }
             Action::Set(dst, condition) => self.store(
@@ -1817,17 +1827,29 @@ impl Transaction {
                     self.eip = self.read(memory, target)?;
                 }
             }
-            Action::Call(target) => {
-                let target = self.read(memory, target)?;
+            Action::Call(operand) => {
+                let target = self.read(memory, operand)?;
                 let address = self.regs[4].wrapping_sub(4);
                 self.store(memory, Self::stack_operand(address), self.eip)?;
                 self.regs[4] = address;
                 self.eip = target;
+                if !matches!(operand, Operand::Immediate(_)) {
+                    self.indirect_branch = Some(crate::IndirectBranch {
+                        source: self.pc,
+                        target,
+                        kind: crate::IndirectBranchKind::Call,
+                    });
+                }
             }
             Action::Ret(bytes) => {
                 let target = self.read_mem(memory, self.regs[4], 4)?;
                 self.regs[4] = self.regs[4].wrapping_add(4 + u32::from(bytes));
                 self.eip = target;
+                self.indirect_branch = Some(crate::IndirectBranch {
+                    source: self.pc,
+                    target,
+                    kind: crate::IndirectBranchKind::Return,
+                });
             }
             Action::Leave(width) => {
                 let address = self.regs[5];
@@ -2190,37 +2212,19 @@ mod tests {
             ..CpuState::default()
         };
         let mut state = make();
-        let (result, _) = interpreter.run_block(
-            &mut state,
-            &mut memory,
-            256,
-            code + 4,
-            None,
-            Some((&native, 0)),
-        );
+        let (result, _) =
+            interpreter.run_block(&mut state, &mut memory, 256, code + 4, Some((&native, 0)));
         assert_eq!(result.units, 2);
         let decodes = interpreter.decode_count();
         state = make();
-        let (result, _) = interpreter.run_block(
-            &mut state,
-            &mut memory,
-            256,
-            code + 4,
-            None,
-            Some((&native, 0)),
-        );
+        let (result, _) =
+            interpreter.run_block(&mut state, &mut memory, 256, code + 4, Some((&native, 0)));
         assert_eq!(result.units, 2);
         assert_eq!(interpreter.decode_count(), decodes);
         native.insert(code + 4, code + 4);
         state = make();
-        let (result, last_units) = interpreter.run_block(
-            &mut state,
-            &mut memory,
-            256,
-            code + 32,
-            None,
-            Some((&native, 1)),
-        );
+        let (result, last_units) =
+            interpreter.run_block(&mut state, &mut memory, 256, code + 32, Some((&native, 1)));
         assert_eq!(result.step, Step::Executed);
         assert_eq!(result.units, 2);
         assert_eq!(last_units, 1);
@@ -2229,14 +2233,8 @@ mod tests {
         let decodes = interpreter.decode_count();
         for _ in 0..100 {
             state = make();
-            let (result, _) = interpreter.run_block(
-                &mut state,
-                &mut memory,
-                256,
-                code + 32,
-                None,
-                Some((&native, 1)),
-            );
+            let (result, _) =
+                interpreter.run_block(&mut state, &mut memory, 256, code + 32, Some((&native, 1)));
             assert_eq!(result.units, 2);
         }
         assert_eq!(interpreter.decode_count(), decodes);

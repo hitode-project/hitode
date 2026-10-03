@@ -2,13 +2,13 @@ mod support;
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
 const STACK: u32 = 0x1f800;
 
-fn setup(fault: bool) -> Machine {
+fn setup(fault: bool) -> Executor {
     let mut a = CodeAssembler::new(32).unwrap();
     a.mov(eax, -101).unwrap();
     a.cdq().unwrap();
@@ -16,7 +16,7 @@ fn setup(fault: bool) -> Machine {
     a.add(ebx, eax).unwrap();
     a.ret().unwrap();
     let bytes = a.assemble(CODE as u64).unwrap();
-    let mut m = Machine::new(CODE, 0x10000).unwrap();
+    let mut m = Executor::new(CODE, 0x10000).unwrap();
     m.protect(CODE, 0x10000, READ | WRITE).unwrap();
     m.write(CODE, &bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();

@@ -1,7 +1,7 @@
 mod support;
 use adv_cpu::{CompileStrategy, CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -26,8 +26,8 @@ fn assemble(build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     build(&mut a);
     a.assemble(u64::from(CODE)).unwrap()
 }
-fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
-    let mut m = Machine::new(CODE, 0x20000).unwrap();
+fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
+    let mut m = Executor::new(CODE, 0x20000).unwrap();
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -39,7 +39,7 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
     }
     m
 }
-fn reset(m: &mut Machine, left: u32, right: u32, flags: u32, address: u32) {
+fn reset(m: &mut Executor, left: u32, right: u32, flags: u32, address: u32) {
     m.state = CpuState {
         regs: [
             left,
@@ -57,7 +57,7 @@ fn reset(m: &mut Machine, left: u32, right: u32, flags: u32, address: u32) {
     };
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
 }
-fn compare(jit: &mut Machine, reference: &mut Machine) {
+fn compare(jit: &mut Executor, reference: &mut Executor) {
     assert_eq!(jit.run(STOP, 10_000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
         reference.run_unicorn(STOP, 10_000).unwrap(),

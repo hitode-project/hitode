@@ -3,7 +3,7 @@
 mod oracle_support;
 use adv_cpu::{CompileStrategy, CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use oracle_support::Machine;
+use oracle_support::Executor;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -97,8 +97,8 @@ fn mmx_code(alpha: bool) -> Vec<u8> {
     a.assemble(u64::from(CODE)).unwrap()
 }
 
-fn setup(code: &[u8], a: &[u8], b: &[u8], jit: bool, strategy: CompileStrategy) -> Machine {
-    let mut m = Machine::new(CODE, 0x3000000).unwrap();
+fn setup(code: &[u8], a: &[u8], b: &[u8], jit: bool, strategy: CompileStrategy) -> Executor {
+    let mut m = Executor::new(CODE, 0x3000000).unwrap();
     m.protect(CODE, 0x3000000, READ | WRITE).unwrap();
     m.write(CODE, code).unwrap();
     m.write(A, a).unwrap();
@@ -118,7 +118,7 @@ fn setup(code: &[u8], a: &[u8], b: &[u8], jit: bool, strategy: CompileStrategy) 
     m
 }
 
-fn call(m: &mut Machine, bytes: usize, jit: bool, mmx: bool) {
+fn call(m: &mut Executor, bytes: usize, jit: bool, mmx: bool) {
     m.state = CpuState {
         regs: [
             0,

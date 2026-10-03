@@ -223,7 +223,7 @@ fn real_minhook_iat_com_and_dllmain_match_native_windows() {
                 .cpu
                 .jit_mut()
                 .unwrap()
-                .machine_mut()
+                .executor_mut()
                 .add_region(adv_cpu::Region::new(target, 6))
                 .unwrap();
         }

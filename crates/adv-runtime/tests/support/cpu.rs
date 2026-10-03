@@ -79,6 +79,9 @@ impl Cpu {
     }
 }
 impl Guest for Cpu {
+    fn last_indirect_branch(&self) -> Option<adv_cpu::IndirectBranch> {
+        self.guest().last_indirect_branch()
+    }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.guest().file_page_copy_on_write(addr)
     }

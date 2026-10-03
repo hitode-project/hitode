@@ -1,6 +1,6 @@
 mod support;
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
@@ -18,8 +18,8 @@ fn instruction(operation: u32) -> Vec<u8> {
         _ => vec![0xf3, 0xab],
     }
 }
-fn machine(operation: u32, jit: bool, len: usize) -> Machine {
-    let mut m = Machine::new(CODE, len).unwrap();
+fn machine(operation: u32, jit: bool, len: usize) -> Executor {
+    let mut m = Executor::new(CODE, len).unwrap();
     m.protect(CODE, len, READ | WRITE).unwrap();
     let mut bytes = instruction(operation);
     bytes.push(0xc3);
@@ -31,16 +31,16 @@ fn machine(operation: u32, jit: bool, len: usize) -> Machine {
     }
     m
 }
-fn start(m: &mut Machine, count: u32, src: u32, dst: u32, flags: u32) {
+fn start(m: &mut Executor, count: u32, src: u32, dst: u32, flags: u32) {
     start_with_stack(m, count, src, dst, flags, STACK);
 }
-fn start_with_stack(m: &mut Machine, count: u32, src: u32, dst: u32, flags: u32, stack: u32) {
+fn start_with_stack(m: &mut Executor, count: u32, src: u32, dst: u32, flags: u32, stack: u32) {
     m.state.eip = CODE;
     m.state.regs = [0xa1b2_c3d4, count, 0x1234, 0x2345, stack, 0x3456, src, dst];
     m.state.eflags = flags;
     m.write(stack, &STOP.to_le_bytes()).unwrap();
 }
-fn init(m: &mut Machine) {
+fn init(m: &mut Executor) {
     let bytes: Vec<u8> = (0..0x10000).map(|i| (i * 37 + i / 13) as u8).collect();
     m.write(SRC, &bytes).unwrap();
     m.write(DST, &[0x6d; 0x10000]).unwrap();
@@ -315,7 +315,7 @@ fn bulk_deadline_stops_at_a_restartable_rep_then_finishes_after_rearming() {
     cpu.map(STACK & !4095, 4096, Prot::RW).unwrap();
     cpu.map(BUFFER, SIZE, Prot::RW).unwrap();
     cpu.write(CODE, &[0xf3, 0xaa, 0xc3]).unwrap();
-    cpu.machine_mut().add_region(Region::new(CODE, 3)).unwrap();
+    cpu.executor_mut().add_region(Region::new(CODE, 3)).unwrap();
     cpu.write_u32(STACK, STOP).unwrap();
     cpu.set_reg(Reg::Esp, STACK);
     cpu.set_reg(Reg::Eip, CODE);
@@ -367,7 +367,7 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
     cpu.map(STACK & !4095, 4096, Prot::RW).unwrap();
     cpu.map(DST, 4096, Prot::RW).unwrap();
     cpu.write(CODE, &[0xcd, 0x2e, 0xf3, 0xaa, 0xc3]).unwrap();
-    cpu.machine_mut().add_region(Region::new(CODE, 5)).unwrap();
+    cpu.executor_mut().add_region(Region::new(CODE, 5)).unwrap();
     cpu.write_u32(STACK, STOP).unwrap();
     cpu.set_reg(Reg::Esp, STACK);
     cpu.set_reg(Reg::Eip, CODE);
@@ -389,7 +389,7 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
     cpu.read(DST, &mut bytes).unwrap();
     assert_eq!(bytes, [0; 16]);
     assert_eq!(cpu.stats().bulk_bytes, 0);
-    assert_eq!(cpu.stats().host_calls, 1);
+    assert_eq!(cpu.stats().trap_calls, 1);
 }
 
 #[test]

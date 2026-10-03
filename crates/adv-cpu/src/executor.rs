@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::compile::{self, Compiled};
-use crate::host::{Bridge, RejectServices};
-use crate::{ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices, Resume, Wait};
+use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
 #[derive(Default, Clone, Debug)]
@@ -27,10 +26,11 @@ pub struct Stats {
     pub interpreter_entries: u64,
     pub native_blocks: u64,
     pub invalidations: u64,
+    /// Region candidates checked after changes to their code pages only.
+    pub invalidation_candidates: u64,
     pub code_revalidations: u64,
-    pub host_calls: u64,
-    pub callbacks: u64,
-    pub waits: u64,
+    /// Raw traps delivered to the caller-owned handler.
+    pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
 }
@@ -55,34 +55,17 @@ pub enum RunOutcome {
     InvalidInstruction { pc: u32 },
     UnsupportedInstruction { pc: u32, code: iced_x86::Code },
     Trap { pc: u32, vector: u8 },
-    Waiting(Wait),
     Parked,
-}
-
-#[derive(Clone, Copy)]
-struct Origin {
-    esp: u32,
-    eip: u32,
-}
-#[derive(Clone)]
-struct CallbackFrame {
-    origin: Origin,
-    continuation: u64,
-    return_esp: u32,
-}
-#[derive(Clone)]
-struct Suspended {
-    origin: Origin,
-    wait: Wait,
-    continuation: u64,
 }
 
 /// Owns the guest CPU, decoded instructions and native cache. Both executors
 /// access the same state and address space; only this owner publishes links.
-pub struct Machine {
+pub struct Executor {
     pub(crate) memory: Memory,
     compiled: BTreeMap<u32, Compiled>,
     regions: BTreeMap<u32, Region>,
+    page_regions: BTreeMap<u32, BTreeSet<u32>>,
+    region_pages: BTreeMap<u32, BTreeSet<u32>>,
     entry_owner: BTreeMap<u32, u32>,
     links: crate::linking::Table,
     links_revision: u64,
@@ -112,23 +95,15 @@ pub struct Machine {
     /// continues in the interpreter; explicit compilation still returns errors.
     pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
-    apis: Arc<BTreeMap<u32, ApiSpec>>,
-    return_pad: Option<u32>,
-    callbacks: Vec<CallbackFrame>,
-    suspended: Option<Suspended>,
-    wake: Option<Resume>,
     timestamp: crate::timestamp::Counter,
     pub state: CpuState,
     pub stats: Stats,
 }
 
-/// Full guest-owned per-thread CPU state and host continuations.
+/// Full per-thread CPU state and resumable executor progress.
 #[derive(Clone)]
 pub struct ExecutionContext {
     cpu: CpuState,
-    callbacks: Vec<CallbackFrame>,
-    suspended: Option<Suspended>,
-    wake: Option<Resume>,
     deferred_fallback: Option<u32>,
 }
 
@@ -142,50 +117,58 @@ impl ExecutionContext {
     }
 }
 
-impl Machine {
-    pub fn save_context(&mut self) -> Result<ExecutionContext, String> {
-        self.state.refresh_mmx();
+impl Executor {
+    pub fn save_context(&self) -> Result<ExecutionContext, String> {
+        let mut cpu = self.state.clone();
+        cpu.refresh_mmx();
         Ok(ExecutionContext {
-            cpu: self.state.clone(),
-            callbacks: self.callbacks.clone(),
-            suspended: self.suspended.clone(),
-            wake: self.wake,
+            cpu,
             deferred_fallback: self.deferred_fallback,
         })
     }
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
-        self.callbacks = context.callbacks.clone();
-        self.suspended = context.suspended.clone();
-        self.wake = context.wake;
         self.deferred_fallback = context.deferred_fallback;
         Ok(())
     }
 
-    pub(crate) fn run_traps(
+    /// Execute with a caller-owned raw trap handler. The execution layer has no
+    /// API signatures, callbacks, waits or host continuations.
+    pub fn run_with_traps(
         &mut self,
         stop: u32,
         budget: u64,
-        raw: &mut dyn crate::host::RawTrap,
+        handler: &mut dyn ExecutionTrap,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
-        let apis = BTreeMap::new();
+        self.run_execution(stop, budget, Some(handler), interpreter_only)
+    }
+
+    fn run_execution(
+        &mut self,
+        stop: u32,
+        budget: u64,
+        handler: Option<&mut dyn ExecutionTrap>,
+        interpreter_only: bool,
+    ) -> Result<RunOutcome, String> {
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
-            apis: &apis,
-            services: &mut RejectServices,
             memory: &mut self.memory,
-            pending: None,
+            error: None,
+            trap: None,
             calls: 0,
-            raw: Some(raw),
+            handler,
             parked: false,
             deadline: self.deadline,
             bulk_calls: 0,
             bulk_bytes: 0,
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
-        self.stats.host_calls += bridge.calls;
+        // Export canonical floating state at every public CPU boundary. Context
+        // saves can then borrow immutably without hiding MMX updates in RefCell.
+        self.state.refresh_mmx();
+        self.stats.trap_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
         self.timestamp = bridge.timestamp;
@@ -205,6 +188,8 @@ impl Machine {
             memory,
             compiled: BTreeMap::new(),
             regions: BTreeMap::new(),
+            page_regions: BTreeMap::new(),
+            region_pages: BTreeMap::new(),
             entry_owner: BTreeMap::new(),
             links: crate::linking::Table::default(),
             links_revision: 0,
@@ -232,11 +217,6 @@ impl Machine {
             profile: BTreeMap::new(),
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
-            apis: Arc::new(BTreeMap::new()),
-            return_pad: None,
-            callbacks: Vec::new(),
-            suspended: None,
-            wake: None,
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
@@ -284,57 +264,6 @@ impl Machine {
         &self.memory
     }
 
-    /// Registered ABI signatures, also usable by independent validation backends.
-    pub fn api_specs(&self) -> impl Iterator<Item = &ApiSpec> {
-        self.apis.values()
-    }
-
-    pub fn register_api(&mut self, spec: ApiSpec) -> Result<(), String> {
-        if spec.convention.argc() > 16
-            || self.apis.contains_key(&spec.id)
-            || self.apis.values().any(|a| {
-                u64::from(a.entry) < u64::from(spec.entry) + 16
-                    && u64::from(spec.entry) < u64::from(a.entry) + 16
-            })
-        {
-            return Err("invalid or overlapping API registration".into());
-        }
-        self.write(spec.entry, &spec.stub())?;
-        Arc::make_mut(&mut self.apis).insert(spec.id, spec);
-        Ok(())
-    }
-
-    pub fn set_callback_return_pad(&mut self, address: u32) -> Result<(), String> {
-        if !self.memory.executable(address, 1)
-            || self.regions.values().any(|r| {
-                u64::from(address) >= u64::from(r.start)
-                    && u64::from(address) < u64::from(r.start) + r.len as u64
-            })
-        {
-            return Err("callback return pad must be executable and outside the hot region".into());
-        }
-        self.return_pad = Some(address);
-        Ok(())
-    }
-
-    /// Queue a matching wake-up. The continuation runs on the next run_with_services.
-    pub fn wake(&mut self, reason: Resume) -> bool {
-        let matches = self
-            .suspended
-            .as_ref()
-            .is_some_and(|s| match (s.wait, reason) {
-                (Wait::Event(a), Resume::Signaled(b)) => a == b,
-                (Wait::Until(deadline), Resume::Deadline(now)) => now >= deadline,
-                _ => false,
-            });
-        if matches && self.wake.is_none() {
-            self.wake = Some(reason);
-            true
-        } else {
-            false
-        }
-    }
-
     /// Loader/debugger writes bypass guest permissions and invalidate code.
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         self.memory.write(addr, bytes)
@@ -346,7 +275,10 @@ impl Machine {
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
         self.compiled.clear();
+        self.stats.native_code_bytes = 0;
         self.regions.clear();
+        self.page_regions.clear();
+        self.region_pages.clear();
         self.entry_owner.clear();
         self.pending_regions.clear();
         self.automatic_regions.clear();
@@ -360,12 +292,6 @@ impl Machine {
     }
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
-        if self.return_pad.is_some_and(|p| {
-            u64::from(p) >= u64::from(region.start)
-                && u64::from(p) < u64::from(region.start) + region.len as u64
-        }) {
-            return Err("region overlaps callback return pad".into());
-        }
         let start = Instant::now();
         let compiled = compile::compile(&region, &self.memory)?;
         self.stats.compilations += 1;
@@ -381,23 +307,59 @@ impl Machine {
         self.native_heat.remove(&region.start);
         self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
-        self.entry_owner.retain(|_, owner| *owner != region.start);
+        self.retire_compiled(region.start);
         for &pc in &compiled.entries {
             self.entry_owner.insert(pc, region.start);
         }
+        self.stats.native_code_bytes += compiled.code_size;
         self.compiled.insert(region.start, compiled);
-        self.regions.insert(region.start, region);
-        self.stats.native_code_bytes = self.compiled.values().map(|c| c.code_size).sum();
+        self.index_region(region);
         self.cache_revision += 1;
     }
 
-    fn queue_region(&mut self, region: Region) -> Result<bool, String> {
-        if self.return_pad.is_some_and(|pad| {
-            u64::from(pad) >= u64::from(region.start)
-                && u64::from(pad) < u64::from(region.start) + region.len as u64
-        }) {
-            return Err("region overlaps callback return pad".into());
+    fn retire_compiled(&mut self, start: u32) {
+        if let Some(old) = self.compiled.remove(&start) {
+            self.stats.native_code_bytes -= old.code_size;
+            for entry in old.entries.iter() {
+                if self.entry_owner.get(entry) == Some(&start) {
+                    self.entry_owner.remove(entry);
+                }
+            }
         }
+    }
+
+    fn index_region(&mut self, region: Region) {
+        if let Some(old) = self.region_pages.remove(&region.start) {
+            for page in old {
+                if let Some(owners) = self.page_regions.get_mut(&page) {
+                    owners.remove(&region.start);
+                    if owners.is_empty() {
+                        self.page_regions.remove(&page);
+                    }
+                }
+            }
+        }
+        // Include an incomplete instruction's following page: adding EXEC there
+        // can make a previously truncated instruction compilable. Keep the index
+        // for temporarily unmapped/unexecutable regions so restoration is seen.
+        let end = (u64::from(region.start)
+            + region.len as u64
+            + if region.complete_tail { 15 } else { 0 })
+        .min(u64::from(self.memory.base) + self.memory.len as u64);
+        let mut pages = BTreeSet::new();
+        for page in (u64::from(region.start & !4095)..end).step_by(4096) {
+            let page = page as u32;
+            pages.insert(page);
+            self.page_regions
+                .entry(page)
+                .or_default()
+                .insert(region.start);
+        }
+        self.region_pages.insert(region.start, pages);
+        self.regions.insert(region.start, region);
+    }
+
+    fn queue_region(&mut self, region: Region) -> Result<bool, String> {
         if self.pending_regions.contains_key(&region.start)
             || self.pending_regions.len() >= crate::compiler::CAPACITY
         {
@@ -412,7 +374,7 @@ impl Machine {
             }
             self.compiler = Some(worker);
         }
-        match self.compiler.as_ref().unwrap().try_submit(snapshot) {
+        match self.compiler.as_mut().unwrap().try_submit(snapshot) {
             Ok(ticket) => {
                 self.stats.compile_requests += 1;
                 self.pending_regions.insert(region.start, ticket);
@@ -422,7 +384,7 @@ impl Machine {
                     .peak_pending_compilations
                     .max(self.pending_regions.len());
                 self.automatic_regions.insert(region.start);
-                self.regions.insert(region.start, region);
+                self.index_region(region);
                 Ok(true)
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
@@ -436,7 +398,7 @@ impl Machine {
     /// request identity and every captured code-page version have been checked.
     fn collect_compilations(&mut self) -> Result<(), String> {
         loop {
-            let Some(worker) = self.compiler.as_ref() else {
+            let Some(worker) = self.compiler.as_mut() else {
                 return Ok(());
             };
             let completion = match worker.try_recv() {
@@ -492,39 +454,40 @@ impl Machine {
             return Ok(());
         }
         self.observed_epoch = self.memory.epoch;
-        let mut stale = Vec::new();
-        for (&pc, compiled) in &mut self.compiled {
-            if compiled.valid(&self.memory) {
-                continue;
-            }
-            if compiled.revalidate(&self.memory) {
-                self.stats.code_revalidations += 1;
-            } else {
-                stale.push(pc);
+        let mut affected = BTreeSet::new();
+        for page in std::mem::take(&mut self.memory.dirty_pages) {
+            if let Some(owners) = self.page_regions.get(&page) {
+                affected.extend(owners.iter().copied());
             }
         }
-        for pc in stale {
-            self.compiled.remove(&pc);
-            self.native_heat.remove(&pc);
-            self.tier_attempted.remove(&pc);
-            self.entry_owner.retain(|_, owner| *owner != pc);
-            self.stats.invalidations += 1;
-            self.cache_revision += 1;
-            if let Some(region) = self.regions.get(&pc) {
-                for entry in &region.entries {
-                    self.attempted.remove(entry);
+        let mut missing = Vec::new();
+        for pc in affected {
+            if let Some(compiled) = self.compiled.get_mut(&pc) {
+                self.stats.invalidation_candidates += 1;
+                if compiled.valid(&self.memory) {
+                    continue;
+                }
+                if compiled.revalidate(&self.memory) {
+                    self.stats.code_revalidations += 1;
+                    continue;
+                }
+                self.retire_compiled(pc);
+                self.native_heat.remove(&pc);
+                self.tier_attempted.remove(&pc);
+                self.stats.invalidations += 1;
+                self.cache_revision += 1;
+                if let Some(region) = self.regions.get(&pc) {
+                    for entry in &region.entries {
+                        self.attempted.remove(entry);
+                    }
                 }
             }
+            if let Some(region) = self.regions.get(&pc)
+                && self.memory.executable(region.start, region.len)
+            {
+                missing.push(region.clone());
+            }
         }
-        self.stats.native_code_bytes = self.compiled.values().map(|c| c.code_size).sum();
-        let missing: Vec<_> = self
-            .regions
-            .values()
-            .filter(|r| {
-                !self.compiled.contains_key(&r.start) && self.memory.executable(r.start, r.len)
-            })
-            .cloned()
-            .collect();
         for region in missing {
             if self.async_compilation && self.automatic_regions.contains(&region.start) {
                 self.queue_region(region)?;
@@ -693,9 +656,9 @@ impl Machine {
             u64::from(boundary) >= u64::from(region.start)
                 && u64::from(boundary) < u64::from(region.start) + region.len as u64
         };
-        if contains_boundary(stop) || self.return_pad.is_some_and(contains_boundary) {
+        if contains_boundary(stop) {
             // Keep this small automatic window interpreted rather than absorb a
-            // continuation boundary into a native region's internal dispatch.
+            // stop boundary into a native region's internal dispatch.
             self.attempted.insert(pc);
             return Ok(());
         }
@@ -718,106 +681,7 @@ impl Machine {
     }
 
     pub fn run(&mut self, stop: u32, budget: u64) -> Result<RunOutcome, String> {
-        self.run_with_services(stop, budget, &mut RejectServices)
-    }
-
-    pub fn run_with_services(
-        &mut self,
-        stop: u32,
-        budget: u64,
-        services: &mut dyn HostServices,
-    ) -> Result<RunOutcome, String> {
-        self.run_services(stop, budget, services, false)
-    }
-
-    fn run_services(
-        &mut self,
-        stop: u32,
-        budget: u64,
-        services: &mut dyn HostServices,
-        interpreter_only: bool,
-    ) -> Result<RunOutcome, String> {
-        // Share immutable signatures: short scheduler slices must not deep-copy
-        // the complete API table and all module/name strings on every entry.
-        let apis = Arc::clone(&self.apis);
-        let mut bridge = Bridge {
-            timestamp: std::mem::take(&mut self.timestamp),
-            apis: &apis,
-            services,
-            memory: &mut self.memory,
-            pending: None,
-            calls: 0,
-            raw: None,
-            parked: false,
-            deadline: self.deadline,
-            bulk_calls: 0,
-            bulk_bytes: 0,
-        };
-        let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
-        self.stats.host_calls += bridge.calls;
-        self.stats.bulk_calls += bridge.bulk_calls;
-        self.stats.bulk_bytes += bridge.bulk_bytes;
-        self.timestamp = bridge.timestamp;
-        result
-    }
-
-    fn apply_host(&mut self, outcome: ApiOutcome, origin: Origin) -> Result<(), String> {
-        match outcome {
-            ApiOutcome::Return(value) => {
-                self.state.regs[0] = value;
-                self.state.regs[4] = origin.esp;
-                self.state.eip = origin.eip;
-            }
-            ApiOutcome::Callback {
-                target,
-                args,
-                convention,
-                continuation,
-            } => {
-                if args.len() != convention.argc() {
-                    return Err("callback ABI argument count mismatch".into());
-                }
-                let pad = self
-                    .return_pad
-                    .ok_or("callback return pad is not configured")?;
-                let bytes = (args.len() as u32 + 1)
-                    .checked_mul(4)
-                    .ok_or("callback stack overflow")?;
-                let esp = origin
-                    .esp
-                    .checked_sub(bytes)
-                    .ok_or("callback stack underflow")?;
-                let mut memory = ApiMemory {
-                    inner: &mut self.memory,
-                };
-                memory.writable(esp, bytes as usize)?;
-                memory.put_u32(esp, pad)?;
-                for (n, value) in args.iter().enumerate() {
-                    memory.put_u32(esp + 4 + n as u32 * 4, *value)?;
-                }
-                let return_esp = match convention {
-                    Convention::Stdcall(_) => origin.esp,
-                    Convention::Cdecl(_) => esp + 4,
-                };
-                self.callbacks.push(CallbackFrame {
-                    origin,
-                    continuation,
-                    return_esp,
-                });
-                self.state.regs[4] = esp;
-                self.state.eip = target;
-                self.stats.callbacks += 1;
-            }
-            ApiOutcome::Wait { wait, continuation } => {
-                self.suspended = Some(Suspended {
-                    origin,
-                    wait,
-                    continuation,
-                });
-                self.stats.waits += 1;
-            }
-        }
-        Ok(())
+        self.run_execution(stop, budget, None, false)
     }
 
     pub(crate) fn run_inner(
@@ -844,42 +708,6 @@ impl Machine {
             }
             if self.deadline.is_some_and(|t| Instant::now() >= t) {
                 return Ok(RunOutcome::Budget);
-            }
-            if let Some(waiting) = &self.suspended {
-                if let Some(reason) = self.wake.take() {
-                    let pending = self.suspended.take().unwrap();
-                    let out = bridge.services.resume(
-                        pending.continuation,
-                        reason,
-                        &mut ApiMemory {
-                            inner: &mut self.memory,
-                        },
-                    )?;
-                    self.apply_host(out, pending.origin)?;
-                    continue;
-                }
-                return Ok(RunOutcome::Waiting(waiting.wait));
-            }
-            if self.return_pad == Some(self.state.eip) {
-                let frame = self.callbacks.pop().ok_or("unexpected callback return")?;
-                if self.state.regs[4] != frame.return_esp {
-                    return Err("callback returned with wrong stack convention".into());
-                }
-                let value = self.state.regs[0];
-                self.state.regs[4] = frame.origin.esp;
-                self.state.eip = frame.origin.eip;
-                let out = bridge.services.resume(
-                    frame.continuation,
-                    Resume::Returned(value),
-                    &mut ApiMemory {
-                        inner: &mut self.memory,
-                    },
-                )?;
-                self.apply_host(out, frame.origin)?;
-                continue;
-            }
-            if self.state.eip == stop {
-                return Ok(RunOutcome::ReachedStop);
             }
             if self.state.fuel == 0 {
                 return Ok(RunOutcome::Budget);
@@ -937,7 +765,6 @@ impl Machine {
                     compile::NativeRun {
                         links: (self.region_linking && !self.profiling).then_some(&self.links),
                         stop,
-                        return_pad: self.return_pad,
                         interrupt: if self.host_interrupts {
                             self.interrupt.as_ref()
                         } else {
@@ -957,13 +784,12 @@ impl Machine {
                 self.stats.native_blocks += completed;
                 self.record_native_work(pc, completed);
                 match result {
-                    n if n == Exit::Host as u32 => {
-                        if let Some(outcome) = bridge.pending.take() {
-                            let origin = Origin {
-                                esp: self.state.regs[4],
-                                eip: self.state.eip,
-                            };
-                            self.apply_host(outcome?, origin)?;
+                    n if n == Exit::Trap as u32 => {
+                        if let Some(error) = bridge.error.take() {
+                            return Err(error);
+                        }
+                        if let Some((pc, vector)) = bridge.trap.take() {
+                            return Ok(RunOutcome::Trap { pc, vector });
                         }
                         continue;
                     }
@@ -1023,7 +849,6 @@ impl Machine {
                     &mut self.memory,
                     units,
                     stop,
-                    self.return_pad,
                     (!interpreter_only
                         && !single_step
                         && !pending_fpu
@@ -1053,7 +878,7 @@ impl Machine {
                         Step::Executed
                     }
                 }
-                Step::InvalidInstruction { pc } if bridge.raw.is_some() => {
+                Step::InvalidInstruction { pc } if bridge.handler.is_some() => {
                     Step::Trap { pc, vector: 6 }
                 }
                 other => other,
@@ -1080,7 +905,7 @@ impl Machine {
                     return Ok(RunOutcome::UnsupportedInstruction { pc, code });
                 }
                 Step::Trap { pc, vector } => {
-                    if vector != 0x2e && bridge.raw.is_none() {
+                    if bridge.handler.is_none() {
                         return Ok(RunOutcome::Trap { pc, vector });
                     }
                     if last_units == 0 {
@@ -1091,23 +916,9 @@ impl Machine {
                         self.state.fuel = self.state.fuel.saturating_sub(1);
                     }
                     bridge.memory = &mut self.memory;
-                    if bridge.raw.is_some() {
-                        crate::host::call_raw(bridge, &mut self.state, u32::from(vector));
-                    } else {
-                        // SAFETY: bridge and CPU are live and exclusively borrowed.
-                        unsafe {
-                            crate::host::host_call(
-                                (bridge as *mut Bridge<'_>).cast(),
-                                &mut self.state,
-                            );
-                        }
-                    }
-                    if let Some(outcome) = bridge.pending.take() {
-                        let origin = Origin {
-                            esp: self.state.regs[4],
-                            eip: self.state.eip,
-                        };
-                        self.apply_host(outcome?, origin)?;
+                    crate::trap::call_trap(bridge, &mut self.state, u32::from(vector));
+                    if let Some(error) = bridge.error.take() {
+                        return Err(error);
                     }
                 }
             }
@@ -1130,8 +941,8 @@ mod asynchronous_tests {
     use super::*;
     use crate::{EXEC, READ, WRITE};
 
-    fn fixture() -> Machine {
-        let mut m = Machine::new(0x1000, 0x4000).unwrap();
+    fn fixture() -> Executor {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
         m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
         m.write(0x1000, &[0xb8, 1, 0, 0, 0, 0xc3]).unwrap();
         m.protect(0x1000, 4096, READ | EXEC).unwrap();
@@ -1161,7 +972,7 @@ mod asynchronous_tests {
         assert_eq!(m.stats.pending_compilations, 0);
         m.set_completion_waker(Arc::new(|| {})).unwrap();
     }
-    fn collect_one(m: &mut Machine) {
+    fn collect_one(m: &mut Executor) {
         let before = m.stats.compilations;
         let deadline = Instant::now() + Duration::from_secs(10);
         while m.stats.compilations == before {
@@ -1217,17 +1028,6 @@ mod asynchronous_tests {
         assert!(m.stats.peak_pending_compilations <= crate::compiler::CAPACITY);
     }
     #[test]
-    fn automatic_regions_cannot_absorb_the_callback_return_pad() {
-        let mut m = fixture();
-        m.set_callback_return_pad(0x1080).unwrap();
-        m.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap();
-        m.enable_auto_jit(true);
-        assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
-        assert_eq!(m.stats.compile_requests, 0);
-        assert_eq!(m.state.regs[0], 500);
-        assert!(m.queue_region(Region::new(0x1000, 512)).is_err());
-    }
-    #[test]
     fn automatic_discovery_preserves_a_stop_inside_its_nominal_window() {
         let mut m = fixture();
         m.write(0x1000, &[0x40, 0x83, 0xf8, 100, 0x75, 0xfa])
@@ -1247,7 +1047,7 @@ mod floating_boundary_tests {
     #[test]
     fn raw_host_exception_exits_native_before_waiting_mmx() {
         struct Handler(Vec<(u32, u32)>);
-        impl crate::host::RawTrap for Handler {
+        impl crate::ExecutionTrap for Handler {
             fn call(
                 &mut self,
                 state: &mut CpuState,
@@ -1266,7 +1066,7 @@ mod floating_boundary_tests {
                 }
             }
         }
-        let mut m = Machine::new(0x1000, 0x4000).unwrap();
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
         m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
         m.write(0x1000, &[0xcd, 0x2e, 0x40, 0x0f, 0xef, 0xc0, 0xc3])
             .unwrap();
@@ -1276,7 +1076,7 @@ mod floating_boundary_tests {
         let registers = m.state.x87.regs;
         let mut handler = Handler(Vec::new());
         assert_eq!(
-            m.run_traps(0x3000, 100, &mut handler, false).unwrap(),
+            m.run_with_traps(0x3000, 100, &mut handler, false).unwrap(),
             RunOutcome::Parked
         );
         assert_eq!(handler.0, [(0x2e, 0x1002), (16, 0x1003)]);
@@ -1287,7 +1087,7 @@ mod floating_boundary_tests {
     #[test]
     fn batched_fault_prefix_charges_the_same_fuel_as_single_instruction_execution() {
         struct Repair(usize);
-        impl crate::host::RawTrap for Repair {
+        impl crate::ExecutionTrap for Repair {
             fn call(
                 &mut self,
                 state: &mut CpuState,
@@ -1303,7 +1103,7 @@ mod floating_boundary_tests {
             }
         }
         let make = |profile| {
-            let mut m = Machine::new(0x1000, 0x4000).unwrap();
+            let mut m = Executor::new(0x1000, 0x4000).unwrap();
             m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
             // INC EBX; IDIV ECX; RET. The handler repairs ECX without moving EIP.
             m.write(0x1000, &[0x43, 0xf7, 0xf9, 0xc3]).unwrap();
@@ -1322,7 +1122,7 @@ mod floating_boundary_tests {
         for m in [&mut batched, &mut single] {
             let handler = if m.profiling { &mut b } else { &mut a };
             assert_eq!(
-                m.run_traps(0x3000, 2, handler, true).unwrap(),
+                m.run_with_traps(0x3000, 2, handler, true).unwrap(),
                 RunOutcome::Budget
             );
             assert_eq!(m.state.eip, 0x1001);
@@ -1334,7 +1134,7 @@ mod floating_boundary_tests {
         for m in [&mut batched, &mut single] {
             let handler = if m.profiling { &mut b } else { &mut a };
             assert_eq!(
-                m.run_traps(0x3000, 2, handler, true).unwrap(),
+                m.run_with_traps(0x3000, 2, handler, true).unwrap(),
                 RunOutcome::ReachedStop
             );
             assert_eq!(m.state.regs[0], 3);
@@ -1349,8 +1149,8 @@ mod floating_boundary_tests {
 #[cfg(test)]
 mod tiering_tests {
     use super::*;
-    fn hot_machine() -> Machine {
-        let mut m = Machine::new(0x1000, 0x4000).unwrap();
+    fn hot_machine() -> Executor {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
         m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
             .unwrap();
         m.write(0x1000, &[0x40, 0xc3]).unwrap();
@@ -1366,7 +1166,7 @@ mod tiering_tests {
         m.state.regs[4] = 0x4f00;
         m
     }
-    fn collect(m: &mut Machine) {
+    fn collect(m: &mut Executor) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !m.pending_regions.is_empty() {
             m.collect_compilations().unwrap();
@@ -1422,8 +1222,8 @@ mod native_deadline_tests {
     use super::*;
     use crate::{EXEC, READ, WRITE};
 
-    fn machine(code: &[u8]) -> Machine {
-        let mut m = Machine::new(0x1000, 0x5000).unwrap();
+    fn machine(code: &[u8]) -> Executor {
+        let mut m = Executor::new(0x1000, 0x5000).unwrap();
         m.protect(0x1000, 0x5000, READ | WRITE).unwrap();
         m.write(0x1000, code).unwrap();
         m.protect(0x1000, 0x1000, READ | EXEC).unwrap();
@@ -1483,6 +1283,80 @@ mod native_deadline_tests {
         assert_eq!(m.run(0x4000, 10000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 8);
         assert_eq!(m.state.fuel, 9999);
+    }
+
+    #[test]
+    fn invalidation_visits_only_regions_on_changed_pages() {
+        let mut m = Executor::create(Memory::reserve(0, 0x40000).unwrap()).unwrap();
+        for page in 1..=16 {
+            let address = page * 4096;
+            m.map(address, 4096, crate::READ | crate::WRITE | crate::EXEC)
+                .unwrap();
+            m.write(address, &[0x40, 0xc3]).unwrap();
+            m.add_region(Region::new(address, 2)).unwrap();
+        }
+        m.refresh().unwrap();
+        let checks = m.stats.invalidation_candidates;
+        let compilations = m.stats.compilations;
+        let entries: Vec<_> = m
+            .compiled
+            .iter()
+            .map(|(&pc, c)| (pc, c.tail_entry))
+            .collect();
+        m.map(0x30000, 4096, crate::READ | crate::WRITE).unwrap();
+        m.protect(0x30000, 4096, crate::READ).unwrap();
+        m.unmap(0x30000, 4096).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks);
+        assert_eq!(m.stats.compilations, compilations);
+        // Mutable data on a code page checks one region without recompiling it.
+        m.write(0x1080, &[42]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidation_candidates, checks + 1);
+        assert_eq!(m.stats.code_revalidations, 1);
+        assert_eq!(m.stats.compilations, compilations);
+        m.write(0x1000, &[0x48]).unwrap();
+        m.refresh().unwrap();
+        assert_eq!(m.stats.invalidations, 1);
+        assert_eq!(m.stats.compilations, compilations + 1);
+        for (pc, entry) in entries.into_iter().filter(|(pc, _)| *pc != 0x1000) {
+            assert_eq!(m.compiled[&pc].tail_entry, entry);
+        }
+        assert!(m.memory.dirty_pages.is_empty());
+        assert_eq!(
+            m.stats.native_code_bytes,
+            m.compiled.values().map(|c| c.code_size).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn invalidation_index_survives_protection_and_partial_unmap() {
+        let mut m = Executor::create(Memory::reserve(0, 0x10000).unwrap()).unwrap();
+        m.map(0x1000, 8192, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        // MOV EAX, imm32 crosses a page; RET is on the second page.
+        m.write(0x1ffe, &[0xb8, 7, 0, 0, 0, 0xc3]).unwrap();
+        let mut region = Region::new(0x1ffe, 2);
+        region.complete_tail = true;
+        region.reachable = true;
+        m.add_region(region).unwrap();
+        m.refresh().unwrap();
+        m.protect(0x2000, 4096, crate::READ).unwrap();
+        m.refresh().unwrap();
+        let after_protect = m.stats.compilations;
+        m.protect(0x2000, 4096, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        m.refresh().unwrap();
+        assert!(m.stats.compilations > after_protect);
+        m.unmap(0x1000, 4096).unwrap();
+        m.refresh().unwrap();
+        assert!(!m.compiled.contains_key(&0x1ffe));
+        m.map(0x1000, 4096, crate::READ | crate::WRITE | crate::EXEC)
+            .unwrap();
+        m.write(0x1ffe, &[0xb8, 9]).unwrap();
+        m.refresh().unwrap();
+        assert!(m.compiled.contains_key(&0x1ffe));
+        assert!(m.page_regions[&0x2000].contains(&0x1ffe));
     }
 
     // This source is copied unchanged into baseline and candidate for the probe.

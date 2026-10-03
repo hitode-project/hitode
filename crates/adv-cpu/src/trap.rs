@@ -1,0 +1,98 @@
+//! Raw CPU trap boundary shared by native and interpreted execution.
+use crate::{CpuState, Memory};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+/// A caller-owned trap receiver. API decoding and all host continuation state
+/// belong to the machine and ABI layers, outside the execution layer.
+pub trait ExecutionTrap {
+    /// The execution owner's guest clock for RDTSC. This must not block,
+    /// allocate, perform IO, lock, or panic. None uses the standalone counter.
+    fn guest_time_us(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Receive an interrupt with the CPU paused. Software INT has committed
+    /// its next PC; CPU exceptions retain their faulting PC. True yields to
+    /// the caller, which owns all decisions about waiting and re-entry.
+    fn call(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        vector: u32,
+    ) -> Result<bool, String>;
+}
+
+pub(crate) struct Bridge<'a> {
+    pub timestamp: crate::timestamp::Counter,
+    pub memory: *mut Memory,
+    pub error: Option<String>,
+    pub trap: Option<(u32, u8)>,
+    pub calls: u64,
+    pub handler: Option<&'a mut dyn ExecutionTrap>,
+    pub parked: bool,
+    pub deadline: Option<std::time::Instant>,
+    pub bulk_calls: u64,
+    pub bulk_bytes: u64,
+}
+
+impl Bridge<'_> {
+    pub fn read_timestamp(&mut self) -> u64 {
+        let now = self.handler.as_mut().and_then(|h| h.guest_time_us());
+        self.timestamp.read(now)
+    }
+}
+
+/// SAFETY: generated code passes its live, exclusively borrowed Bridge. This
+/// reads only the owner's clock/counter, never guest memory or architectural flags.
+pub(crate) unsafe extern "C" fn read_timestamp(bridge: *mut u8) -> u64 {
+    unsafe { &mut *bridge.cast::<Bridge<'_>>() }.read_timestamp()
+}
+
+pub(crate) fn call_trap(bridge: &mut Bridge<'_>, state: &mut CpuState, vector: u32) -> u32 {
+    state.commit_mmx();
+    let Some(handler) = bridge.handler.as_mut() else {
+        bridge.trap = Some((state.eip, vector as u8));
+        return 1;
+    };
+    let before = unsafe { &*bridge.memory }.epoch;
+    let pc = state.eip;
+    bridge.calls += 1;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        handler.call(state, unsafe { &mut *bridge.memory }, vector)
+    }))
+    .unwrap_or_else(|_| Err("CPU trap handler panicked".into()));
+    match result {
+        Ok(parked) => {
+            bridge.parked = parked;
+            if parked
+                || state.eip != pc
+                || state.eflags & (1 << 8) != 0
+                || state.x87.status & 0x80 != 0
+                || unsafe { &*bridge.memory }.epoch != before
+            {
+                2
+            } else {
+                0
+            }
+        }
+        Err(error) => {
+            bridge.error = Some(error);
+            1
+        }
+    }
+}
+
+/// C ABI called by native INT 0x2e. No panic crosses generated code.
+pub(crate) unsafe extern "C" fn trap_call(
+    bridge: *mut std::ffi::c_void,
+    state: *mut CpuState,
+    pc: u32,
+) -> u32 {
+    // SAFETY: Executor creates both objects for this run and pauses native code here.
+    let (bridge, state) = unsafe { (&mut *bridge.cast::<Bridge<'_>>(), &mut *state) };
+    if bridge.handler.is_none() {
+        bridge.trap = Some((pc, 0x2e));
+        return 1;
+    }
+    call_trap(bridge, state, 0x2e)
+}

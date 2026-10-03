@@ -111,8 +111,8 @@ fn callback_event_wait_thread_join_and_fs_survive_real_scheduler_switches() {
             thunks
                 .entries
                 .extend((0..m.sys.thunks.len()).map(adv_machine::layout::thunk_addr));
-            m.cpu.machine_mut().add_region(code).unwrap();
-            m.cpu.machine_mut().add_region(thunks).unwrap();
+            m.cpu.executor_mut().add_region(code).unwrap();
+            m.cpu.executor_mut().add_region(thunks).unwrap();
         }
         m.spawn("M", CODE, &[], 0x1_0000).unwrap();
         let result = m.run_virtual(1_000_000);

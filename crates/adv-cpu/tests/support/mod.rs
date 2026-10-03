@@ -3,10 +3,7 @@
 
 mod registers;
 
-use adv_cpu::{
-    ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, CpuState, HostServices, Memory, Resume,
-    RunOutcome, Wait,
-};
+use adv_cpu::{CpuState, Memory, RunOutcome};
 use adv_unicorn::Guarded;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
@@ -42,26 +39,6 @@ struct HookData {
     fault: Option<(MemType, u32)>,
     trap: Option<u32>,
     dirty: BTreeSet<u32>,
-    executed: u64,
-    pad: Option<u32>,
-}
-
-#[derive(Clone)]
-struct Origin {
-    esp: u32,
-    eip: u32,
-}
-#[derive(Clone)]
-struct Callback {
-    origin: Origin,
-    token: u64,
-    return_esp: u32,
-}
-#[derive(Clone)]
-struct Suspended {
-    origin: Origin,
-    token: u64,
-    wait: Wait,
 }
 
 /// An independent reference executor with its own memory and architectural state.
@@ -72,14 +49,6 @@ pub struct Oracle {
     pub state: CpuState,
     pages: BTreeMap<u32, u8>,
     fpu: registers::FpuAdapter,
-    apis: BTreeMap<u32, ApiSpec>,
-    pad: Option<u32>,
-    callbacks: Vec<Callback>,
-    suspended: Option<Suspended>,
-    wake: Option<Resume>,
-    host_calls: u64,
-    callbacks_count: u64,
-    waits: u64,
 }
 
 fn error(e: impl std::fmt::Display) -> String {
@@ -180,14 +149,6 @@ impl Oracle {
             state: CpuState::default(),
             pages,
             fpu: registers::FpuAdapter::default(),
-            apis: BTreeMap::new(),
-            pad: None,
-            callbacks: Vec::new(),
-            suspended: None,
-            wake: None,
-            host_calls: 0,
-            callbacks_count: 0,
-            waits: 0,
         })
     }
     pub fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), String> {
@@ -312,223 +273,39 @@ impl Oracle {
     pub fn run_unicorn_unbounded(&mut self, stop: u32) -> Result<RunOutcome, String> {
         self.run_unicorn(stop, 0)
     }
-    fn invalidate_after_service(&mut self) -> Result<(), String> {
-        // Services can patch code through ApiMemory; invalidate executable UC pages.
-        for (&page, &bits) in &self.pages {
-            if bits & adv_cpu::EXEC != 0 {
-                self.uc
-                    .ctl_remove_cache(u64::from(page), u64::from(page) + 4096)
-                    .map_err(error)?;
-            }
-        }
-        Ok(())
-    }
-    fn apply(&mut self, out: ApiOutcome, origin: Origin) -> Result<(), String> {
-        match out {
-            ApiOutcome::Return(value) => {
-                self.state.regs[0] = value;
-                self.state.regs[4] = origin.esp;
-                self.state.eip = origin.eip;
-            }
-            ApiOutcome::Wait { wait, continuation } => {
-                self.waits += 1;
-                self.suspended = Some(Suspended {
-                    origin,
-                    token: continuation,
-                    wait,
-                });
-            }
-            ApiOutcome::Callback {
-                target,
-                args,
-                convention,
-                continuation,
-            } => {
-                self.callbacks_count += 1;
-                if args.len() != convention.argc() {
-                    return Err("callback ABI argument count mismatch".into());
-                }
-                let pad = self.pad.ok_or("callback return pad is not configured")?;
-                let size = (args.len() as u32 + 1)
-                    .checked_mul(4)
-                    .ok_or("callback stack overflow")?;
-                let esp = origin
-                    .esp
-                    .checked_sub(size)
-                    .ok_or("callback stack underflow")?;
-                let mut memory = ApiMemory::new(&mut self.memory);
-                memory.writable(esp, size as usize)?;
-                memory.put_u32(esp, pad)?;
-                for (n, arg) in args.into_iter().enumerate() {
-                    memory.put_u32(esp + 4 + n as u32 * 4, arg)?;
-                }
-                let return_esp = if matches!(convention, Convention::Cdecl(_)) {
-                    esp + 4
-                } else {
-                    origin.esp
-                };
-                self.callbacks.push(Callback {
-                    origin,
-                    token: continuation,
-                    return_esp,
-                });
-                self.state.regs[4] = esp;
-                self.state.eip = target;
-            }
-        }
-        self.invalidate_after_service()
-    }
-    pub fn wake(&mut self, reason: Resume) -> bool {
-        let matches = self
-            .suspended
-            .as_ref()
-            .is_some_and(|s| match (s.wait, reason) {
-                (Wait::Event(a), Resume::Signaled(b)) => a == b,
-                (Wait::Until(a), Resume::Deadline(b)) => b >= a,
-                _ => false,
-            });
-        if matches && self.wake.is_none() {
-            self.wake = Some(reason);
-            true
-        } else {
-            false
-        }
-    }
-    pub fn run_unicorn_with_services(
-        &mut self,
-        stop: u32,
-        budget: u64,
-        services: &mut dyn HostServices,
-    ) -> Result<RunOutcome, String> {
-        self.state.fuel = budget;
-        let hook = self
-            .uc
-            .add_code_hook(1, 0, |uc, address, _| {
-                if uc.get_data().pad == Some(address as u32) {
-                    uc.emu_stop().unwrap();
-                } else {
-                    uc.get_data_mut().executed += 1;
-                }
-            })
-            .map_err(error)?;
-        self.uc.get_data_mut().pad = self.pad;
-        let outcome = self.services_loop(stop, services);
-        self.uc.remove_hook(hook).map_err(error)?;
-        outcome
-    }
-    fn services_loop(
-        &mut self,
-        stop: u32,
-        services: &mut dyn HostServices,
-    ) -> Result<RunOutcome, String> {
-        loop {
-            if let Some(s) = &self.suspended {
-                let Some(reason) = self.wake.take() else {
-                    return Ok(RunOutcome::Waiting(s.wait));
-                };
-                let pending = self.suspended.take().unwrap();
-                let out = services.resume(
-                    pending.token,
-                    reason,
-                    &mut ApiMemory::new(&mut self.memory),
-                )?;
-                self.apply(out, pending.origin)?;
-                continue;
-            }
-            if self.pad == Some(self.state.eip) {
-                let frame = self.callbacks.pop().ok_or("unexpected callback return")?;
-                if self.state.regs[4] != frame.return_esp {
-                    return Err("callback returned with wrong stack convention".into());
-                }
-                let value = self.state.regs[0];
-                self.state.regs[4] = frame.origin.esp;
-                self.state.eip = frame.origin.eip;
-                let out = services.resume(
-                    frame.token,
-                    Resume::Returned(value),
-                    &mut ApiMemory::new(&mut self.memory),
-                )?;
-                self.apply(out, frame.origin)?;
-                continue;
-            }
-            if self.state.eip == stop {
-                return Ok(RunOutcome::ReachedStop);
-            }
-            if self.state.fuel == 0 {
-                return Ok(RunOutcome::Budget);
-            }
-            self.uc.get_data_mut().executed = 0;
-            let result = self.run_unicorn(stop, self.state.fuel as usize)?;
-            self.state.fuel = self.state.fuel.saturating_sub(self.uc.get_data().executed);
-            if let Some(vector) = self.uc.get_data_mut().trap.take() {
-                if vector != 0x2e {
-                    return Err(format!("guest exception {vector} at {:#x}", self.state.eip));
-                }
-                let spec = self
-                    .apis
-                    .get(&self.state.regs[0])
-                    .ok_or("unknown oracle API id")?
-                    .clone();
-                let mut memory = ApiMemory::new(&mut self.memory);
-                let args = (0..spec.convention.argc())
-                    .map(|n| memory.u32(self.state.regs[4] + 4 + n as u32 * 4))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let out = services.call(
-                    ApiCall {
-                        spec: &spec,
-                        args: &args,
-                    },
-                    &mut memory,
-                )?;
-                self.host_calls += 1;
-                let origin = Origin {
-                    esp: self.state.regs[4],
-                    eip: self.state.eip,
-                };
-                self.apply(out, origin)?;
-            } else if self.pad == Some(self.state.eip) {
-                continue;
-            } else {
-                return Ok(result);
-            }
-        }
-    }
 }
 
 /// Keeps existing differential fixtures' construction API while isolating UC entirely
-/// in their dev-only reference. Ordinary run/run_with_services dereference to production.
-pub struct Machine {
-    inner: adv_cpu::Machine,
+/// in their dev-only reference. Ordinary run dereferences to production.
+pub struct Executor {
+    inner: adv_cpu::Executor,
     oracle: Oracle,
     oracle_needs_sync: bool,
-    oracle_reported: (u64, u64, u64),
 }
-impl Deref for Machine {
-    type Target = adv_cpu::Machine;
+impl Deref for Executor {
+    type Target = adv_cpu::Executor;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
-impl DerefMut for Machine {
+impl DerefMut for Executor {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
-impl Machine {
+impl Executor {
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Ok(Self {
-            inner: adv_cpu::Machine::new(base, len)?,
+            inner: adv_cpu::Executor::new(base, len)?,
             oracle: Oracle::new(base, len)?,
             oracle_needs_sync: false,
-            oracle_reported: (0, 0, 0),
         })
     }
     pub fn address_space() -> Result<Self, String> {
         Ok(Self {
-            inner: adv_cpu::Machine::address_space()?,
+            inner: adv_cpu::Executor::address_space()?,
             oracle: Oracle::address_space()?,
             oracle_needs_sync: false,
-            oracle_reported: (0, 0, 0),
         })
     }
     pub fn write(&mut self, address: u32, bytes: &[u8]) -> Result<(), String> {
@@ -547,55 +324,11 @@ impl Machine {
         self.inner.unmap(address, len)?;
         self.oracle.unmap(address, len)
     }
-    pub fn register_api(&mut self, spec: ApiSpec) -> Result<(), String> {
-        self.inner.register_api(spec.clone())?;
-        self.oracle.write(spec.entry, &spec.stub())?;
-        self.oracle.apis.insert(spec.id, spec);
-        Ok(())
-    }
-    pub fn set_callback_return_pad(&mut self, address: u32) -> Result<(), String> {
-        self.inner.set_callback_return_pad(address)?;
-        self.oracle.pad = Some(address);
-        Ok(())
-    }
-    pub fn wake(&mut self, reason: Resume) -> bool {
-        if self.oracle.suspended.is_some() {
-            self.oracle.wake(reason)
-        } else {
-            self.inner.wake(reason)
-        }
-    }
     pub fn run(&mut self, stop: u32, budget: u64) -> Result<RunOutcome, String> {
         self.oracle_needs_sync = true;
         self.inner.run(stop, budget)
     }
-    pub fn run_with_services(
-        &mut self,
-        stop: u32,
-        budget: u64,
-        services: &mut dyn HostServices,
-    ) -> Result<RunOutcome, String> {
-        self.oracle_needs_sync = true;
-        self.inner.run_with_services(stop, budget, services)
-    }
     fn before_oracle(&mut self) -> Result<(), String> {
-        // Installers may register APIs through a borrowed production Machine.
-        // Use its single signature table rather than a copied argc/name mapping.
-        self.oracle.apis = self
-            .inner
-            .api_specs()
-            .map(|spec| (spec.id, spec.clone()))
-            .collect();
-        for spec in self.oracle.apis.values() {
-            let bytes = self.inner.memory().read(spec.entry, 16)?;
-            if bytes != self.oracle.memory.read(spec.entry, 16)? {
-                self.oracle.memory.write(spec.entry, bytes)?;
-                self.oracle
-                    .uc
-                    .ctl_remove_cache(u64::from(spec.entry), u64::from(spec.entry) + 16)
-                    .map_err(error)?;
-            }
-        }
         if self.oracle_needs_sync {
             for &page in self.oracle.pages.keys() {
                 let current = self.inner.memory().read(page, 4096)?;
@@ -614,22 +347,12 @@ impl Machine {
     }
     fn after_oracle(&mut self) -> Result<(), String> {
         self.inner.state = self.oracle.state.clone();
-        let (calls, callbacks, waits) = self.oracle_reported;
-        self.inner.stats.host_calls += self.oracle.host_calls - calls;
-        self.inner.stats.callbacks += self.oracle.callbacks_count - callbacks;
-        self.inner.stats.waits += self.oracle.waits - waits;
-        self.oracle_reported = (
-            self.oracle.host_calls,
-            self.oracle.callbacks_count,
-            self.oracle.waits,
-        );
         for page in std::mem::take(&mut self.oracle.uc.get_data_mut().dirty) {
             if self.oracle.pages.contains_key(&page) {
                 self.inner
                     .write(page, self.oracle.memory.read(page, 4096)?)?;
             }
         }
-        // Host services can write any mapped region, without a UC memory hook.
         Ok(())
     }
     pub fn run_unicorn(&mut self, stop: u32, budget: usize) -> Result<RunOutcome, String> {
@@ -641,27 +364,6 @@ impl Machine {
     pub fn run_unicorn_unbounded(&mut self, stop: u32) -> Result<RunOutcome, String> {
         self.before_oracle()?;
         let result = self.oracle.run_unicorn_unbounded(stop);
-        self.after_oracle()?;
-        result
-    }
-    pub fn run_unicorn_with_services(
-        &mut self,
-        stop: u32,
-        budget: u64,
-        services: &mut dyn HostServices,
-    ) -> Result<RunOutcome, String> {
-        self.before_oracle()?;
-        let result = self
-            .oracle
-            .run_unicorn_with_services(stop, budget, services);
-        // ApiMemory writes are outside UC's memory hook. Compare only committed
-        // pages, copying back changed pages instead of a 4GB address-space image.
-        for &page in self.oracle.pages.keys() {
-            let bytes = self.oracle.memory.read(page, 4096)?;
-            if bytes != self.inner.memory().read(page, 4096)? {
-                self.inner.write(page, bytes)?;
-            }
-        }
         self.after_oracle()?;
         result
     }

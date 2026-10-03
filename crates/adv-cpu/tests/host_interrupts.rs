@@ -1,4 +1,4 @@
-use adv_cpu::{EXEC, Machine, READ, Region, RunOutcome, WRITE};
+use adv_cpu::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +16,8 @@ fn assemble(at: u32, build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(u64::from(at)).unwrap()
 }
 
-fn machine(programs: &[(u32, Vec<u8>)], native: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x10000).unwrap();
+fn machine(programs: &[(u32, Vec<u8>)], native: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x10000).unwrap();
     m.protect(CODE, 0x10000, READ | WRITE).unwrap();
     for (at, bytes) in programs {
         m.write(*at, bytes).unwrap();
@@ -197,7 +197,7 @@ fn pal_budget_stop_disable_and_fault_priorities_preserve_original_outcomes() {
         });
         cpu.write(CODE, &bytes).unwrap();
         if native {
-            cpu.machine_mut()
+            cpu.executor_mut()
                 .add_region(Region::new(CODE, bytes.len()))
                 .unwrap();
         }

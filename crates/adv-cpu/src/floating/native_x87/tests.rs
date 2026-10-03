@@ -307,7 +307,7 @@ fn shared_device_pages_never_enter_the_native_raw_pointer_lane() {
 }
 
 #[test]
-fn budget_stop_and_return_pad_limit_the_prefix_before_any_later_store() {
+fn budget_stop_and_boundary_limit_the_prefix_before_any_later_store() {
     let bytes = pcm();
     let operations = prepare(&bytes);
     for (budget, stop, pad) in [

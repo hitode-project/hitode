@@ -1,7 +1,7 @@
 mod support;
 use adv_cpu::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x1f000;
@@ -14,8 +14,8 @@ fn assemble(f: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(u64::from(CODE)).unwrap()
 }
 
-fn machine(code: &[u8], jit: bool) -> Machine {
-    let mut m = Machine::new(CODE, 0x30000).unwrap();
+fn machine(code: &[u8], jit: bool) -> Executor {
+    let mut m = Executor::new(CODE, 0x30000).unwrap();
     m.protect(CODE, 0x30000, READ | WRITE).unwrap();
     m.write(CODE, code).unwrap();
     m.protect(CODE, 0x1000, READ | EXEC).unwrap();
@@ -27,7 +27,7 @@ fn machine(code: &[u8], jit: bool) -> Machine {
     m
 }
 
-fn reset(m: &mut Machine, mut regs: [u32; 8], flags: u32) {
+fn reset(m: &mut Executor, mut regs: [u32; 8], flags: u32) {
     regs[4] = STACK;
     m.state = CpuState {
         regs,
@@ -38,7 +38,7 @@ fn reset(m: &mut Machine, mut regs: [u32; 8], flags: u32) {
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
 }
 
-fn equal(jit: &mut Machine, uc: &mut Machine, mask: u32) {
+fn equal(jit: &mut Executor, uc: &mut Executor, mask: u32) {
     assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
         uc.run_unicorn(STOP, 1_000_000).unwrap(),

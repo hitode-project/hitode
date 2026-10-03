@@ -1,7 +1,7 @@
 //! Authored full-frame normalization stress: seven integer divisions per pixel.
 #[path = "../tests/support/mod.rs"]
 mod oracle_support;
-use oracle_support::Machine;
+use oracle_support::Executor;
 use std::time::Instant;
 
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
@@ -61,7 +61,7 @@ fn main() {
     let stack = stack_page + 0x800;
     let end = stack_page + 4096;
     for jit in [false, true] {
-        let mut m = Machine::new(CODE, (end - CODE) as usize).unwrap();
+        let mut m = Executor::new(CODE, (end - CODE) as usize).unwrap();
         m.protect(CODE, (end - CODE) as usize, READ | WRITE)
             .unwrap();
         m.write(CODE, &code).unwrap();

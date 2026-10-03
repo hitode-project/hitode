@@ -1,33 +1,90 @@
 #![allow(dead_code)]
-#[path = "../../../adv-cpu/tests/support/mod.rs"]
-mod oracle_support;
-use adv_cpu::{CpuState, EXEC, READ, Region, WRITE};
-use adv_runtime::{Graphics, IID_DDRAW7, Snapshot, api, install};
+// Authored graphics fixtures use the production machine/ABI path for every backend.
+#[path = "../../tests/support/cpu.rs"]
+mod cpu;
+use adv_abi::Registry;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
+use adv_cpu::{Region, RunOutcome};
+use adv_machine::{Clock, Conv, Env, Machine, Object, Outcome, RunResult, Wait};
+use adv_runtime::{Graphics, IID_DDRAW7, Snapshot, api, install_graphics, register_graphics};
 use iced_x86::code_asm::*;
-use oracle_support::Machine;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub const CODE: u32 = 0x10000;
-pub const API_BASE: u32 = 0x12000;
-pub const STOP: u32 = 0x18000;
+pub const LAUNCH: u32 = 0x17000;
 pub const DATA: u32 = 0x20000;
-pub const STACK: u32 = 0xf0000;
 pub const INPUT_A: u32 = 0x100000;
 pub const INPUT_B: u32 = 0x1000000;
-pub const HEAP: u32 = 0x2000000;
 pub const SURFACE_OUT: u32 = DATA + 0x208;
 pub const PRIMARY_OUT: u32 = DATA + 0x20c;
 pub const LOCK_DESC: u32 = DATA + 0x300;
 pub const BITMAP_OUT: u32 = DATA + 0x210;
 pub const DC_OUT: u32 = DATA + 0x214;
 pub const OLD_BITMAP: u32 = DATA + 0x218;
+const REQUEST: u32 = DATA + 0x800;
+const ARGC: u32 = REQUEST + 4;
+const RESULT: u32 = REQUEST + 8;
+const ARGS: u32 = REQUEST + 16;
+
+struct Gate(u32);
+fn completed(env: &mut Env<'_>) -> Outcome {
+    Outcome::block_then_return(
+        Wait::Object {
+            handle: env.ext.get::<Gate>().0,
+            deadline: None,
+        },
+        0,
+    )
+}
 
 pub struct Fixture {
-    pub machine: Machine,
-    pub graphics: Graphics<Snapshot>,
+    pub machine: Machine<cpu::Cpu>,
     pub expected: Vec<u8>,
     pub entries: BTreeMap<u32, u32>,
     pub frame_pc: u32,
+    started: bool,
+}
+impl Fixture {
+    pub fn graphics(&self) -> &Graphics<Snapshot> {
+        self.machine.ext.get()
+    }
+    pub fn graphics_mut(&mut self) -> &mut Graphics<Snapshot> {
+        self.machine.ext.get_mut()
+    }
+    pub fn read(&self, address: u32, len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        self.machine.cpu.read(address, &mut out).unwrap();
+        out
+    }
+    pub fn run(&mut self) -> Result<RunOutcome, String> {
+        self.run_entry(CODE, &[])
+    }
+    pub fn run_frame(&mut self) -> Result<RunOutcome, String> {
+        self.run_entry(self.frame_pc, &[])
+    }
+    fn run_entry(&mut self, entry: u32, args: &[u32]) -> Result<RunOutcome, String> {
+        assert!(args.len() <= 16);
+        self.machine.cpu.write_u32(REQUEST, entry).unwrap();
+        self.machine.cpu.write_u32(ARGC, args.len() as u32).unwrap();
+        for (i, value) in args.iter().enumerate() {
+            self.machine
+                .cpu
+                .write_u32(ARGS + i as u32 * 4, *value)
+                .unwrap();
+        }
+        if self.started {
+            self.machine.sys.set_event(self.machine.ext.get::<Gate>().0);
+        } else {
+            self.started = true;
+        }
+        match self.machine.run() {
+            RunResult::Idle {
+                next_deadline: None,
+            } => Ok(RunOutcome::ReachedStop),
+            other => Err(format!("graphics fixture failed: {other:?}")),
+        }
+    }
 }
 
 fn blend(a: &mut CodeAssembler, w: u32, h: u32) {
@@ -52,10 +109,33 @@ fn com(a: &mut CodeAssembler, slot: i32) {
 }
 
 pub fn fixture(ddraw: bool, w: u32, h: u32, bottom_up: bool) -> Fixture {
+    fixture_backend(ddraw, w, h, bottom_up, "jit")
+}
+pub fn fixture_backend(ddraw: bool, w: u32, h: u32, bottom_up: bool, backend: &str) -> Fixture {
     assert!((w * h).is_multiple_of(4));
-    let mut m = Machine::new(CODE, 0x4000000).unwrap();
-    m.protect(CODE, 0x4000000, READ | WRITE).unwrap();
-    let entries = install(&mut m, API_BASE).unwrap();
+    let mut registry = Registry::default();
+    register_graphics(&mut registry);
+    registry.add(
+        "fixture.dll",
+        "Completed",
+        Conv::Cdecl { argc: 0 },
+        completed,
+    );
+    let mut m = Machine::new(
+        cpu::Cpu::new(backend).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    m.set_execution_budget(Some(Duration::from_secs(5)));
+    m.cpu.map(CODE, 0x4000000, Prot::RW).unwrap();
+    let entries = install_graphics(&mut m, w, h).unwrap();
+    let done = m.resolve_import("fixture.dll", "Completed").unwrap();
+    let gate = m.sys.objects.insert(Object::Event {
+        manual_reset: false,
+        signaled: false,
+    });
+    m.ext.insert(Gate(gate));
     let mut input_a = Vec::new();
     let mut input_b = Vec::new();
     let mut expected = Vec::new();
@@ -77,8 +157,8 @@ pub fn fixture(ddraw: bool, w: u32, h: u32, bottom_up: bool) -> Fixture {
             );
         }
     }
-    m.write(INPUT_A, &input_a).unwrap();
-    m.write(INPUT_B, &input_b).unwrap();
+    m.cpu.write(INPUT_A, &input_a).unwrap();
+    m.cpu.write(INPUT_B, &input_b).unwrap();
     if bottom_up {
         let original = expected.clone();
         for y in 0..h as usize {
@@ -96,7 +176,7 @@ pub fn fixture(ddraw: bool, w: u32, h: u32, bottom_up: bool) -> Fixture {
         bmi[8..12].copy_from_slice(&(if bottom_up { h as i32 } else { -(h as i32) }).to_le_bytes());
         bmi[12..14].copy_from_slice(&1u16.to_le_bytes());
         bmi[14..16].copy_from_slice(&32u16.to_le_bytes());
-        m.write(DATA, &bmi).unwrap();
+        m.cpu.write(DATA, &bmi).unwrap();
         a.push(0).unwrap();
         a.call(u64::from(entries[&api::GET_DC])).unwrap();
         a.mov(dword_ptr(DATA as i32 + 0x220), eax).unwrap();
@@ -127,18 +207,18 @@ pub fn fixture(ddraw: bool, w: u32, h: u32, bottom_up: bool) -> Fixture {
         a.call(u64::from(entries[&api::BITBLT])).unwrap();
         a.ret().unwrap();
     } else {
-        m.write(DATA, &IID_DDRAW7).unwrap();
+        m.cpu.write(DATA, &IID_DDRAW7).unwrap();
         let mut desc = [0u8; 124];
         for (p, v) in [(0, 124), (4, 7), (8, h), (12, w), (104, 0x40u32)] {
             desc[p..p + 4].copy_from_slice(&v.to_le_bytes());
         }
-        m.write(DATA + 0x40, &desc).unwrap();
+        m.cpu.write(DATA + 0x40, &desc).unwrap();
         desc.fill(0);
         for (p, v) in [(0, 124u32), (4, 1), (104, 0x200)] {
             desc[p..p + 4].copy_from_slice(&v.to_le_bytes());
         }
-        m.write(DATA + 0xc0, &desc).unwrap();
-        m.write(LOCK_DESC, &124u32.to_le_bytes()).unwrap();
+        m.cpu.write(DATA + 0xc0, &desc).unwrap();
+        m.cpu.write(LOCK_DESC, &124u32.to_le_bytes()).unwrap();
         for v in [0, DATA, DATA + 0x200, 0] {
             a.push(v).unwrap();
         }
@@ -180,51 +260,60 @@ pub fn fixture(ddraw: bool, w: u32, h: u32, bottom_up: bool) -> Fixture {
         )
         .unwrap();
     let frame_pc = code.label_ip(&frame).unwrap() as u32;
-    m.write(CODE, &code.inner.code_buffer).unwrap();
-    m.protect(CODE, 0x3000, READ | EXEC).unwrap();
-    m.protect(STOP, 4096, READ | EXEC).unwrap();
-    let region_end = entries.values().copied().max().unwrap() + 16;
-    let mut region = Region::new(CODE, (region_end - CODE) as usize);
-    region.entries = entries.values().copied().chain([frame_pc]).collect();
-    m.set_region(region).unwrap();
-    m.state = CpuState {
-        eip: CODE,
-        ..CpuState::default()
-    };
-    m.state.regs[4] = STACK;
-    m.write(STACK, &STOP.to_le_bytes()).unwrap();
-    let graphics =
-        Graphics::new(w, h, HEAP, 0x1800000, entries.clone(), Snapshot::default()).unwrap();
+    m.cpu.write(CODE, &code.inner.code_buffer).unwrap();
+    m.cpu.protect(CODE, 4096, Prot::RX).unwrap();
+    // A reusable real guest context calls the selected function, records EAX,
+    // then blocks on a kernel event. Every resume uses the machine continuation.
+    let mut launcher = CodeAssembler::new(32).unwrap();
+    let mut again = launcher.create_label();
+    let mut push_arg = launcher.create_label();
+    let mut call_target = launcher.create_label();
+    launcher.mov(ebp, esp).unwrap();
+    launcher.set_label(&mut again).unwrap();
+    launcher.mov(ecx, dword_ptr(ARGC)).unwrap();
+    launcher.mov(esi, ARGS).unwrap();
+    launcher.test(ecx, ecx).unwrap();
+    launcher.jz(call_target).unwrap();
+    launcher.set_label(&mut push_arg).unwrap();
+    launcher.dec(ecx).unwrap();
+    launcher.push(dword_ptr(esi + ecx * 4)).unwrap();
+    launcher.test(ecx, ecx).unwrap();
+    launcher.jnz(push_arg).unwrap();
+    launcher.set_label(&mut call_target).unwrap();
+    launcher.call(dword_ptr(REQUEST)).unwrap();
+    launcher.mov(dword_ptr(RESULT), eax).unwrap();
+    launcher.mov(esp, ebp).unwrap();
+    launcher.call(u64::from(done)).unwrap();
+    launcher.jmp(again).unwrap();
+    let launch = launcher.assemble(u64::from(LAUNCH)).unwrap();
+    m.cpu.write(LAUNCH, &launch).unwrap();
+    m.cpu.protect(LAUNCH, 4096, Prot::RX).unwrap();
+    if let Some(jit) = m.cpu.jit_mut() {
+        jit.set_async_compilation(false);
+        let mut region = Region::new(CODE, code.inner.code_buffer.len());
+        region.entries.push(frame_pc);
+        jit.executor_mut().add_region(region).unwrap();
+        jit.executor_mut()
+            .add_region(Region::new(LAUNCH, launch.len()))
+            .unwrap();
+    }
+    m.spawn("graphics fixture", LAUNCH, &[], 65536).unwrap();
     Fixture {
         machine: m,
-        graphics,
         expected,
         entries,
         frame_pc,
+        started: false,
     }
 }
 
 pub fn invoke(f: &mut Fixture, id: u32, args: &[u32]) -> u32 {
-    // Enter the real stdcall thunk with an ordinary guest call frame.
-    let stack_pointer = STACK - args.len() as u32 * 4;
-    f.machine.write(stack_pointer, &STOP.to_le_bytes()).unwrap();
-    for (i, &v) in args.iter().enumerate() {
-        f.machine
-            .write(stack_pointer + 4 + i as u32 * 4, &v.to_le_bytes())
-            .unwrap();
-    }
-    f.machine.state.eip = f.entries[&id];
-    f.machine.state.regs[4] = stack_pointer;
     assert_eq!(
-        f.machine
-            .run_with_services(STOP, 10000, &mut f.graphics)
-            .unwrap(),
-        adv_cpu::RunOutcome::ReachedStop
+        f.run_entry(f.entries[&id], args).unwrap(),
+        RunOutcome::ReachedStop
     );
-    assert_eq!(f.machine.state.regs[4], STACK + 4);
-    f.machine.state.regs[0]
+    f.machine.cpu.read_u32(RESULT).unwrap()
 }
-
-pub fn u32_at(m: &Machine, p: u32) -> u32 {
-    u32::from_le_bytes(m.memory().read(p, 4).unwrap().try_into().unwrap())
+pub fn u32_at(m: &Machine<cpu::Cpu>, p: u32) -> u32 {
+    m.cpu.read_u32(p).unwrap()
 }

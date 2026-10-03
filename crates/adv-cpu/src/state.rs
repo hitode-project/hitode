@@ -1,6 +1,32 @@
 //! Executor-independent floating state for the supported 32-bit flat machine.
 use crate::CpuState;
 
+/// The last committed indirect control transfer in this CPU context.
+/// This is diagnostic state, never an input to guest instruction semantics.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndirectBranch {
+    pub source: u32,
+    pub target: u32,
+    pub kind: IndirectBranchKind,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndirectBranchKind {
+    #[default]
+    None = 0,
+    Call = 1,
+    Jump = 2,
+    Return = 3,
+}
+
+impl IndirectBranch {
+    pub fn observed(self) -> Option<Self> {
+        (self.kind != IndirectBranchKind::None).then_some(self)
+    }
+}
+
 /// The exact little-endian x87 encoding, including the explicit integer bit.
 /// No host float conversion is involved in a context save or executor handoff.
 #[repr(transparent)]

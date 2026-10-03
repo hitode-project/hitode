@@ -2,7 +2,7 @@ mod support;
 use adv_cpu::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const CONSUMER: u32 = CODE + 0x800;
@@ -18,8 +18,8 @@ fn assemble(at: u32, f: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(u64::from(at)).unwrap()
 }
 
-fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
-    let mut m = Machine::new(CODE, 0x20000).unwrap();
+fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
+    let mut m = Executor::new(CODE, 0x20000).unwrap();
     m.protect(CODE, 0x20000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
@@ -39,7 +39,7 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Machine {
     m
 }
 
-fn seed(m: &mut Machine, selector: u32, left: u32, pointer: u32) {
+fn seed(m: &mut Executor, selector: u32, left: u32, pointer: u32) {
     m.state.regs = [
         left,
         selector,
@@ -78,7 +78,7 @@ fn prefix(a: &mut CodeAssembler, subtract: bool) {
     a.mov(ah, 0x3a).unwrap();
 }
 
-fn equal_state(jit: &mut Machine, uc: &mut Machine) {
+fn equal_state(jit: &mut Executor, uc: &mut Executor) {
     // Flush pending native MMX aliases exactly as a scheduler/context boundary does.
     jit.save_context().unwrap();
     uc.save_context().unwrap();

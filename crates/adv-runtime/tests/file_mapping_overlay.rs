@@ -54,7 +54,7 @@ impl Program {
         let code = self.code.assemble(u64::from(CODE)).unwrap();
         self.machine.cpu.write(CODE, &code).unwrap();
         if native {
-            let mut jit = self.machine.cpu.jit_mut().unwrap().machine_mut();
+            let jit = self.machine.cpu.jit_mut().unwrap().executor_mut();
             jit.set_async_compilation(false);
             jit.add_region(adv_cpu::Region::new(CODE, code.len()))
                 .unwrap();

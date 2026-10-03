@@ -4,25 +4,25 @@ pub mod backend;
 mod compile;
 mod compiler;
 mod cpu_profile;
+mod executor;
 mod floating;
-mod host;
 pub mod interpreter;
 mod linking;
-mod machine;
 mod memory;
 mod shared_memory;
 mod state;
 mod strings;
 mod timestamp;
+mod trap;
 mod virtual_memory;
 
 pub use backend::jit::JitCpu;
 pub use cpu_profile::SegmentState;
-pub use host::{ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices, Resume, Wait};
-pub use machine::{ExecutionContext, Machine, ProfileSample, RunOutcome, Stats};
+pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
-pub use state::{X87Register, X87State};
+pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
 pub use timestamp::TSC_FREQ;
+pub use trap::ExecutionTrap;
 
 /// Register order follows the x86 encoding: eax, ecx, edx, ebx, esp, ebp, esi, edi.
 #[repr(C)]
@@ -51,6 +51,8 @@ pub struct CpuState {
     /// Shared REP continuation; not a guest-visible architectural register.
     #[doc(hidden)]
     pub rep: Option<interpreter::RepContinuation>,
+    /// Last committed indirect call, jump or return, preserved across CPU contexts.
+    pub last_indirect_branch: IndirectBranch,
 }
 
 impl Default for CpuState {
@@ -69,6 +71,7 @@ impl Default for CpuState {
             mxcsr: 0x1f80,
             segments: SegmentState::default(),
             rep: None,
+            last_indirect_branch: IndirectBranch::default(),
         }
     }
 }
@@ -81,7 +84,7 @@ pub(crate) enum Exit {
     Budget = 2,
     ReadFault = 3,
     WriteFault = 4,
-    Host = 5,
+    Trap = 5,
     Interrupted = 6,
 }
 

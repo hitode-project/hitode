@@ -23,7 +23,6 @@ type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 pub(crate) struct NativeRun<'a> {
     pub links: Option<&'a Table>,
     pub stop: u32,
-    pub return_pad: Option<u32>,
     pub interrupt: &'a std::sync::atomic::AtomicBool,
 }
 
@@ -77,7 +76,7 @@ impl Compiled {
         &self,
         state: &mut CpuState,
         memory: &mut Memory,
-        bridge: &mut crate::host::Bridge<'_>,
+        bridge: &mut crate::trap::Bridge<'_>,
         controls: NativeRun<'_>,
     ) -> (u32, u64) {
         bridge.memory = memory;
@@ -85,13 +84,12 @@ impl Compiled {
         let mut context = NativeContext {
             state,
             perms: memory.perms.as_ptr(),
-            bridge: (bridge as *mut crate::host::Bridge<'_>).cast(),
+            bridge: (bridge as *mut crate::trap::Bridge<'_>).cast(),
             interrupt: controls.interrupt,
             slots,
             mask,
             remaining: crate::linking::CHAIN_LIMIT,
             stop: controls.stop,
-            return_pad: controls.return_pad.map_or(u64::MAX, u64::from),
             linked_entries: 0,
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
@@ -361,11 +359,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         default_libcall_names(),
     )
     .map_err(|e| e.to_string())?;
-    builder.symbol("adv_host_call", crate::host::host_call as *const u8);
+    builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol(
         "adv_read_timestamp",
-        crate::host::read_timestamp as *const u8,
+        crate::trap::read_timestamp as *const u8,
     );
     let mut module = JITModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
@@ -385,14 +383,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
     let mut fb_ctx = FunctionBuilderContext::new();
-    let mut host_signature = module.make_signature();
-    host_signature.params.extend([AbiParam::new(ptr_ty); 2]);
-    host_signature.returns.push(AbiParam::new(types::I32));
+    let mut trap_signature = module.make_signature();
+    trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
+    trap_signature.params.push(AbiParam::new(types::I32));
+    trap_signature.returns.push(AbiParam::new(types::I32));
     let host_id = module
-        .declare_function("adv_host_call", Linkage::Import, &host_signature)
+        .declare_function("adv_trap_call", Linkage::Import, &trap_signature)
         .map_err(|e| e.to_string())?;
-    let host_ref = module.declare_func_in_func(host_id, &mut ctx.func);
-    let mut repeat_signature = host_signature.clone();
+    let trap_ref = module.declare_func_in_func(host_id, &mut ctx.func);
+    let mut repeat_signature = module.make_signature();
+    repeat_signature.params.extend([AbiParam::new(ptr_ty); 2]);
+    repeat_signature.returns.push(AbiParam::new(types::I32));
     repeat_signature.params.push(AbiParam::new(types::I32));
     let repeat_id = module
         .declare_function("adv_repeat", Linkage::Import, &repeat_signature)
@@ -565,7 +566,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             pc: region.start,
             return_hint,
             bridge,
-            host_ref,
+            trap_ref,
             repeat_ref,
             timestamp_ref,
         };
@@ -799,7 +800,7 @@ mod tests {
             a.div(ecx).unwrap();
             a.ret().unwrap();
             let bytes = a.assemble(0x10000).unwrap();
-            let mut machine = crate::Machine::new(0x10000, 4096).unwrap();
+            let mut machine = crate::Executor::new(0x10000, 4096).unwrap();
             machine.write(0x10000, &bytes).unwrap();
             machine.protect(0x10000, 4096, READ | EXEC).unwrap();
             let compiled = compile(&Region::new(0x10000, bytes.len()), machine.memory()).unwrap();
@@ -971,7 +972,7 @@ struct Emitter<'a> {
     pc: u32,
     return_hint: Option<u32>,
     bridge: Value,
-    host_ref: ir::FuncRef,
+    trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
 }
@@ -1004,22 +1005,13 @@ impl Emitter<'_> {
             self.context,
             offset_of!(NativeContext, stop) as i32,
         );
-        let pad = self.b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.context,
-            offset_of!(NativeContext, return_pad) as i32,
-        );
         let fuel = self.b.use_var(self.fuel);
         let none = self.b.ins().icmp_imm(IntCC::Equal, slots, 0);
         let limit = self.b.ins().icmp_imm(IntCC::Equal, remaining, 0);
         let is_stop = self.b.ins().icmp(IntCC::Equal, pc, stop);
-        let pc64 = self.b.ins().uextend(types::I64, pc);
-        let is_pad = self.b.ins().icmp(IntCC::Equal, pc64, pad);
         let empty = self.b.ins().icmp_imm(IntCC::Equal, fuel, 0);
         let bad = self.b.ins().bor(none, limit);
         let bad = self.b.ins().bor(bad, is_stop);
-        let bad = self.b.ins().bor(bad, is_pad);
         let bad = self.b.ins().bor(bad, empty);
         let prepare = self.b.create_block();
         self.b.ins().brif(bad, returned, &[], prepare, &[]);
@@ -1281,10 +1273,14 @@ impl Emitter<'_> {
         // current prefix from the freshly reloaded pending mode.
         self.begin_mmx_block();
     }
-    fn host_call(&mut self, next: u32) {
+    fn trap_call(&mut self, next: u32) {
         let pc = self.constant(next);
         self.save_state(pc);
-        let call = self.b.ins().call(self.host_ref, &[self.bridge, self.state]);
+        let pc = self.constant(self.pc);
+        let call = self
+            .b
+            .ins()
+            .call(self.trap_ref, &[self.bridge, self.state, pc]);
         let result = self.b.inst_results(call)[0];
         self.reload_state();
         let done = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
@@ -1298,7 +1294,7 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eip) as i32,
         );
-        self.exit(Exit::Host, pc);
+        self.exit(Exit::Trap, pc);
         self.b.switch_to_block(resume);
         self.direct(next);
     }
@@ -1335,6 +1331,22 @@ impl Emitter<'_> {
         self.flush_mmx_effects();
         self.b.ins().jump(self.dispatch, &[target.into()]);
     }
+    fn record_indirect(&mut self, target: Value, kind: crate::IndirectBranchKind) {
+        // Only committed indirect transfers pay these plain state stores.
+        // No allocation, callback, clock read or Rust dispatch is introduced.
+        let base = offset_of!(CpuState, last_indirect_branch) as i32;
+        let source = self.constant(self.pc);
+        let kind = self.constant(kind as u32);
+        for (value, offset) in [
+            (source, offset_of!(crate::IndirectBranch, source)),
+            (target, offset_of!(crate::IndirectBranch, target)),
+            (kind, offset_of!(crate::IndirectBranch, kind)),
+        ] {
+            self.b
+                .ins()
+                .store(MemFlags::trusted(), value, self.state, base + offset as i32);
+        }
+    }
     fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
         let pending = self
             .b
@@ -1352,15 +1364,6 @@ impl Emitter<'_> {
                 offset_of!(NativeContext, stop) as i32,
             );
             let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc, stop);
-            pending = self.b.ins().band(pending, ordinary);
-            let pad = self.b.ins().load(
-                types::I64,
-                MemFlags::trusted(),
-                self.context,
-                offset_of!(NativeContext, return_pad) as i32,
-            );
-            let pc64 = self.b.ins().uextend(types::I64, pc);
-            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc64, pad);
             pending = self.b.ins().band(pending, ordinary);
         }
         let interrupted = self.b.create_block();
@@ -1746,7 +1749,7 @@ impl Emitter<'_> {
         }
         match i.mnemonic() {
             M::Int => {
-                self.host_call(i.next_ip32());
+                self.trap_call(i.next_ip32());
                 return true;
             }
             M::Nop => {}
@@ -1843,6 +1846,7 @@ impl Emitter<'_> {
                     if i.op0_kind() == OpKind::NearBranch32 {
                         self.direct(i.near_branch32());
                     } else {
+                        self.record_indirect(v, crate::IndirectBranchKind::Call);
                         self.indirect(v);
                     }
                     return true;
@@ -1860,6 +1864,7 @@ impl Emitter<'_> {
                 let sp = self.b.ins().iadd_imm(sp, 4 + adjustment);
                 self.b.def_var(self.regs[4], sp);
                 if i.mnemonic() == M::Ret {
+                    self.record_indirect(value, crate::IndirectBranchKind::Return);
                     if let Some(target) = self.return_hint {
                         // A small interpreter helper often has one caller in the region.
                         // Check the actual guest return address before taking this edge.
@@ -1886,6 +1891,7 @@ impl Emitter<'_> {
                     self.direct(i.near_branch32());
                 } else {
                     let target = self.read(i, 0);
+                    self.record_indirect(target, crate::IndirectBranchKind::Jump);
                     self.indirect(target);
                 }
                 return true;

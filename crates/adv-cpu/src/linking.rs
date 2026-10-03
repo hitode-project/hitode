@@ -83,6 +83,5 @@ pub(crate) struct NativeContext {
     pub mask: u32,
     pub remaining: u32,
     pub stop: u32,
-    pub return_pad: u64,
     pub linked_entries: u64,
 }

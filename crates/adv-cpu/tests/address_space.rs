@@ -1,12 +1,12 @@
 mod support;
 use adv_cpu::*;
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 #[test]
 fn scattered_regions_invalidate_only_the_modified_code_page() {
     let (entry, dll, stack, stop) = (0x400000u32, 0x60000000u32, 0x70000000u32, 0x7e100000u32);
-    let mut m = Machine::address_space().unwrap();
+    let mut m = Executor::address_space().unwrap();
     for p in [entry, dll, stop] {
         m.map(p, 4096, READ | EXEC).unwrap();
     }
@@ -42,7 +42,7 @@ fn scattered_regions_invalidate_only_the_modified_code_page() {
 #[test]
 fn context_switch_keeps_fpu_and_xmm_separate() {
     let (code, stop, stack, data) = (0x10000u32, 0x18000u32, 0x20000u32, 0x21000u32);
-    let mut m = Machine::new(code, 0x20000).unwrap();
+    let mut m = Executor::new(code, 0x20000).unwrap();
     m.protect(code, 0x20000, READ | WRITE).unwrap();
     // fld1 ; ret, then fstp dword [data] ; ret. Both are Unicorn-owned x87 operations.
     m.write(code, &[0xd9, 0xe8, 0xc3]).unwrap();

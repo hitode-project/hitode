@@ -1,22 +1,22 @@
 mod support;
 use adv_cpu::{EXEC, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
-use support::Machine;
+use support::Executor;
 
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x18000;
 const STACK: u32 = 0x20800;
 const ITERATIONS: u32 = 96;
 
-fn machine(sparse: bool) -> Machine {
+fn machine(sparse: bool) -> Executor {
     let mut m = if sparse {
-        let mut m = Machine::address_space().unwrap();
+        let mut m = Executor::address_space().unwrap();
         m.map(CODE, 0x3000, READ | EXEC).unwrap();
         m.map(STOP, 4096, READ | EXEC).unwrap();
         m.map(STACK & !4095, 4096, READ | WRITE).unwrap();
         m
     } else {
-        let mut m = Machine::new(CODE, 0x20000).unwrap();
+        let mut m = Executor::new(CODE, 0x20000).unwrap();
         m.protect(CODE, 0x20000, READ | WRITE).unwrap();
         m.protect(CODE, 0x3000, READ | EXEC).unwrap();
         m.protect(STOP, 4096, READ | EXEC).unwrap();
@@ -41,7 +41,7 @@ fn program(root: u32, instruction: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn start(m: &mut Machine, root: u32) {
+fn start(m: &mut Executor, root: u32) {
     m.state.eip = root;
     m.state.regs = [
         0,
@@ -58,7 +58,7 @@ fn start(m: &mut Machine, root: u32) {
     m.write(STACK + 0x20, &255u32.to_le_bytes()).unwrap();
 }
 
-fn compare(jit: &mut Machine, uc: &mut Machine, root: u32) {
+fn compare(jit: &mut Executor, uc: &mut Executor, root: u32) {
     for m in [&mut *jit, &mut *uc] {
         start(m, root);
     }
@@ -71,7 +71,7 @@ fn compare(jit: &mut Machine, uc: &mut Machine, root: u32) {
     assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
 }
 
-fn root_interpreter_entries(m: &Machine, root: u32) -> u64 {
+fn root_interpreter_entries(m: &Executor, root: u32) -> u64 {
     m.profile.get(&root).map_or(0, |s| s.interpreter_entries)
 }
 
