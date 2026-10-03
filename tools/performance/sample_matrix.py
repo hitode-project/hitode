@@ -54,7 +54,7 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError("output must be outside all game directories")
     output.mkdir(parents=True, exist_ok=False)
     environment = {k: v for k, v in os.environ.items()
-                   if not k.startswith(("ADV_AUDIO_", "ADV_PRINTF_DIAG_")) and k != "ADV_MMIO_TRACE"}
+                   if not k.startswith(("ADV_AUDIO_", "ADV_PRINTF_DIAG_")) and k not in ("ADV_MMIO_TRACE", "ADV_JIT_DUMP_DIR")}
     environment["ADV_AUDIO_MUTE_DEVICE"] = "1"
     metadata = {"binary": str(binary), "binary_sha256": digest(binary),
                 "manifest": str(args.manifest.resolve()), "seconds_per_sample": args.seconds,

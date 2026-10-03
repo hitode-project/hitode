@@ -16,7 +16,7 @@ INSTALLER = re.compile(r"^(?:setup|uninst(?:all)?|unins\d*|dxsetup)(?:[_. -]|$)"
 UTILITY = re.compile(r"^(?:config(?:_dl)?|filechecker|supporttools|curl|enc|sjistounicode|protect|.*update)(?:[_. -]|$)", re.I)
 BACKUP = re.compile(r"备份|backup|全パッチ集|修正补丁|(?:^|[/\\])补丁(?:[/\\]|$)", re.I)
 INJECT = {"CreateRemoteThread", "WriteProcessMemory", "ReadProcessMemory", "VirtualAllocEx", "VirtualProtectEx"}
-ENGINE = re.compile(r"kirikiri|krkr|TVP\(|PJADV|SoftPAL|ADVプレイヤ|WillPlus|Artemis|CatSystem|EntisGLS|Siglus|RealLive|YU-RIS|Buriko|Ethornell|Unity", re.I)
+ENGINE = re.compile(r"kirikiri|krkr|TVP\(|PJADV|SoftPAL|ADVプレイヤ|WillPlus|Artemis|Cat\s*System|EntisGLS|Siglus|RealLive|YU-RIS|Buriko|Ethornell|Majiro|Unity", re.I)
 MEDIA = {"ddraw.dll", "d3d8.dll", "d3d9.dll", "d3d11.dll", "dsound.dll", "opengl32.dll", "xaudio2_7.dll", "xaudio2_9.dll"}
 PE_EXTENSIONS = {".exe", ".dll", ".tpm", ".ax", ".ocx"}
 
@@ -128,6 +128,14 @@ def engine(row, companions):
     elif any(re.search(r"Artemis Engine Rev\.", s) for s in row.get("engine_strings", [])):
         family, confidence = "Artemis", "direct_identity_string"
         evidence += [{"kind": "engine_banner", "value": s} for s in row["engine_strings"] if "Artemis Engine Rev." in s]
+    elif any(re.search(r"Ethornell\s*-\s*BURIKO General Interpreter", s, re.I) for s in row.get("engine_strings", [])):
+        family, confidence = "Ethornell BGI", "direct_identity_string"
+        evidence += [{"kind": "engine_banner", "value": s} for s in row["engine_strings"]
+                     if re.search(r"Ethornell\s*-\s*BURIKO General Interpreter", s, re.I)]
+    elif any(re.search(r"\bMAJIRO\s*\(C\)|\bMAJIRO_RUNTIME\b", s, re.I) for s in row.get("engine_strings", [])):
+        family, confidence = "Majiro", "direct_identity_string"
+        evidence += [{"kind": "engine_identity", "value": s} for s in row["engine_strings"]
+                     if re.search(r"MajiroObj[XV]|\bMAJIRO_RUNTIME\b|\bMAJIRO\s*\(C\)", s, re.I)]
     elif any(n.endswith(".xp3") for n in companions):
         family, confidence = "Kirikiri family (inferred)", "inferred"
         evidence.append({"kind": "adjacent_package", "value": "*.xp3"})
