@@ -558,7 +558,7 @@ fn raw_double_return_and_pop_preserve_existing_guest_x87_stack() {
 }
 
 #[test]
-fn invalidation_recompiles_all_regions_on_a_shared_page_and_leaves_others_warm() {
+fn invalidation_recompiles_changed_region_and_revalidates_unchanged_same_page_code() {
     let mut cpu = cpu(true);
     cpu.map(CODE, 4096, Prot::RX).unwrap();
     cpu.map(API, 4096, Prot::RX).unwrap();
@@ -588,8 +588,10 @@ fn invalidation_recompiles_all_regions_on_a_shared_page_and_leaves_others_warm()
     start(&mut cpu, CODE);
     assert_eq!(cpu.run(&mut UnexpectedTrap), Exit::Parked);
     assert_eq!(cpu.reg(Reg::Eax), 15);
-    assert_eq!(cpu.stats().compilations, 6);
-    assert_eq!(cpu.stats().invalidations, 2);
+    // DATA changed, DATA+0x100 shares its page but its captured bytes did not.
+    assert_eq!(cpu.stats().compilations, 5);
+    assert_eq!(cpu.stats().invalidations, 1);
+    assert_eq!(cpu.stats().code_revalidations, 1);
     assert_eq!(cpu.stats().interpreter_entries, 0);
 }
 
