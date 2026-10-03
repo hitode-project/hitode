@@ -512,7 +512,7 @@ mod tests {
     use iced_x86::code_asm::*;
     fn machine(jit: bool) -> Machine<JitCpu> {
         let mut reg = Registry::default();
-        adv_win32::register(&mut reg);
+        crate::register(&mut reg);
         register(&mut reg);
         let mut m = Machine::new(
             JitCpu::new(adv_machine::layout::PARK_ADDR, jit).unwrap(),
@@ -520,9 +520,9 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
-        adv_win32::Win32::install(
+        crate::Win32::install(
             &mut m,
-            adv_win32::Win32Config::new(".", "crt-test.exe", "target/crt-test"),
+            crate::Win32Config::new(".", "crt-test.exe", "target/crt-test"),
         )
         .unwrap();
         install(&mut m).unwrap();

@@ -17,7 +17,7 @@ pub mod printf;
 pub mod user32;
 pub mod util;
 mod version;
-mod winmm;
+pub mod winmm;
 mod winsock;
 
 use std::collections::HashMap;
@@ -163,3 +163,5 @@ pub(crate) fn stdcall(reg: &mut Registry, module: &str, name: &str, argc: u8, h:
     reg.add(module, name, Conv::Stdcall { argc }, h);
 }
 
+pub mod avifil32;
+pub mod msvcrt;

@@ -1,12 +1,12 @@
 //! Small real-ABI GDI and DirectDraw paths on a shared guest pixel store.
 pub mod acm;
-pub mod avi;
+pub use adv_win32::avifil32 as avi;
 pub mod boot;
 pub mod compat;
-pub mod crt;
+pub use adv_win32::msvcrt as crt;
 mod font;
 mod graphics;
-pub mod mmio;
+pub use adv_win32::winmm::mmio;
 mod report;
 pub mod vorbis;
 pub use adv_abi::RunMode;

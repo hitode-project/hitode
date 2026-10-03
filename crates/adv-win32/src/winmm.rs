@@ -302,3 +302,4 @@ mod tests {
         assert_eq!(timers.due_id(3_600_010_000), Some(1));
     }
 }
+pub mod mmio;

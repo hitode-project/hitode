@@ -3,14 +3,14 @@
 //! files retain the caller's storage and observe subsequent guest writes.
 use std::io::{Read, Seek, SeekFrom};
 
+use crate::{
+    Win32,
+    util::{cstr, wstr},
+};
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
-use adv_win32::{
-    Win32,
-    util::{cstr, wstr},
-};
 
 const MEM: u32 = u32::from_le_bytes(*b"MEM ");
 const DOS: u32 = u32::from_le_bytes(*b"DOS ");

@@ -1,7 +1,7 @@
 //! AVIFile library lifetime. File/stream decoding is registered only as its
 //! persona is implemented; initialization does not claim those capabilities.
-use adv_abi::Registry;
-use adv_machine::{Conv, Env, Outcome};
+use adv_abi::{Registry, win32};
+use adv_machine::Env;
 
 #[derive(Default)]
 struct Library {
@@ -17,32 +17,21 @@ impl Library {
 }
 
 pub fn register(registry: &mut Registry) {
-    registry.add(
-        "avifil32.dll",
-        "AVIFileInit",
-        Conv::Stdcall { argc: 0 },
-        initialize,
-    );
-    registry.add(
-        "avifil32.dll",
-        "AVIFileExit",
-        Conv::Stdcall { argc: 0 },
-        release,
-    );
+    registry.register(initialize_ABI);
+    registry.register(release_ABI);
 }
-fn initialize(env: &mut Env<'_>) -> Outcome {
+#[win32(avifil32, name = "AVIFileInit", level = state)]
+fn initialize(env: &mut Env<'_>) {
     if env.ext.try_get::<Library>().is_none() {
         env.ext.insert(Library::default());
     }
     env.ext.get_mut::<Library>().initialize();
-    // The native function is void. This EAX is not an AVI success HRESULT.
-    Outcome::Return(0)
 }
-fn release(env: &mut Env<'_>) -> Outcome {
+#[win32(avifil32, name = "AVIFileExit", level = state)]
+fn release(env: &mut Env<'_>) {
     if let Some(library) = env.ext.try_get_mut::<Library>() {
         library.release();
     }
-    Outcome::Return(0)
 }
 
 #[cfg(test)]

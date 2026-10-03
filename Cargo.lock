@@ -175,6 +175,7 @@ dependencies = [
  "adv-sync",
  "adv-unicorn",
  "encoding_rs",
+ "iced-x86",
  "log",
 ]
 
