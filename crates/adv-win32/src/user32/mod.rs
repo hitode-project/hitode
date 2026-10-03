@@ -8,6 +8,7 @@ pub mod dialog;
 pub mod host_input;
 mod menu;
 pub mod message;
+mod resources;
 pub(crate) mod strings;
 pub mod window;
 
@@ -148,11 +149,11 @@ fn load_user_object(env: &mut Env<'_>, kind: &str, inst: u32, name: u32) -> Outc
         if name >= 0x1_0000 {
             return Outcome::Return(0);
         }
-        return Outcome::Return(window::SYSTEM_OBJECT_BASE + (name & 0xfff) * 4);
+        return stock_object(env, window::SYSTEM_OBJECT_BASE + (name & 0xfff) * 4);
     }
     let id = crate::kernel32::res_id(crate::kernel32::int_or_str(env, name, false));
     let key = format!("{kind} {inst:#x} {id:?}");
-    if let Some((&h, _)) = user(env).objects.iter().find(|(_, v)| **v == key) {
+    if let Some(h) = user(env).objects.find(&env.sys.objects, &key) {
         return Outcome::Return(h);
     }
     let ty = if kind == "cursor" {
@@ -164,7 +165,39 @@ fn load_user_object(env: &mut Env<'_>, kind: &str, inst: u32, name: u32) -> Outc
         log::debug!("Load {kind} {id:?}: not found");
         return Outcome::Return(0);
     }
-    Outcome::Return(user_mut(env).add_object(key))
+    create_user_object(env, key)
+}
+
+fn create_user_object(env: &mut Env<'_>, description: String) -> Outcome {
+    match env
+        .ext
+        .get_mut::<Win32>()
+        .user
+        .objects
+        .create(&mut env.sys.objects, description)
+    {
+        Some(handle) => Outcome::Return(handle),
+        None => {
+            crate::util::set_last_error(env, 8);
+            Outcome::Return(0)
+        }
+    }
+}
+
+fn stock_object(env: &mut Env<'_>, handle: u32) -> Outcome {
+    match env
+        .ext
+        .get_mut::<Win32>()
+        .user
+        .objects
+        .stock(&mut env.sys.objects, handle)
+    {
+        Some(handle) => Outcome::Return(handle),
+        None => {
+            crate::util::set_last_error(env, 8);
+            Outcome::Return(0)
+        }
+    }
 }
 
 fn load_cursor_a(env: &mut Env<'_>) -> Outcome {
@@ -194,14 +227,19 @@ fn create_icon_indirect(env: &mut Env<'_>) -> Outcome {
     let r = |i: u32| env.cpu.read_u32(p + 4 * i).unwrap_or(0);
     let (is_icon, mask, color) = (r(0), r(3), r(4));
     let kind = if is_icon != 0 { "icon" } else { "cursor" };
-    Outcome::Return(
-        user_mut(env).add_object(format!("{kind} indirect mask {mask:#x} color {color:#x}")),
+    create_user_object(
+        env,
+        format!("{kind} indirect mask {mask:#x} color {color:#x}"),
     )
 }
 
 fn destroy_user_object(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
-    user_mut(env).objects.remove(&h);
+    env.ext
+        .get_mut::<Win32>()
+        .user
+        .objects
+        .remove(&mut env.sys.objects, h);
     Outcome::Return(1)
 }
 
@@ -239,8 +277,8 @@ fn put_empty(env: &mut Env<'_>, buf: u32, cap: u32) -> Outcome {
 
 // ---- cursor and keyboard ----
 
-fn set_cursor(_env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
+fn set_cursor(env: &mut Env<'_>) -> Outcome {
+    stock_object(env, window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
 }
 
 fn show_cursor(env: &mut Env<'_>) -> Outcome {

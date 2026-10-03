@@ -369,9 +369,8 @@ pub struct User {
     /// Headless: click a dialog's default button after this many ms (None: never).
     pub auto_dialog_ms: Option<u32>,
     /// Cursors, icons and other USER objects: handle -> description.
-    pub objects: HashMap<u32, String>,
+    pub objects: super::resources::UserObjects,
     pub menus: super::menu::Menus,
-    pub next_object: u32,
     /// Key state by virtual-key code (bit 7: down, bit 0: toggled).
     pub keys: [u8; 256],
     /// Optional native frontend state, independently published from its input queue.
@@ -408,9 +407,8 @@ impl User {
             procs: SysProcs::default(),
             screen,
             auto_dialog_ms,
-            objects: HashMap::new(),
+            objects: super::resources::UserObjects::default(),
             menus: super::menu::Menus::default(),
-            next_object: 0x0007_0000,
             keys: [0; 256],
             host_keys: None,
             input_tracking: None,
@@ -574,13 +572,6 @@ impl User {
             hwnd = w.parent;
         }
         hwnd
-    }
-
-    pub fn add_object(&mut self, what: String) -> u32 {
-        let h = self.next_object;
-        self.next_object += 4;
-        self.objects.insert(h, what);
-        h
     }
 
     fn remove_window(&mut self, hwnd: u32, objects: &mut adv_machine::Objects) {
