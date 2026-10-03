@@ -6,6 +6,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
+mod unwind;
 
 // The VEH copies a frozen architectural checkpoint without allocation or drop.
 // A future owning field in CpuState must supply a different recovery mechanism.
@@ -37,20 +38,12 @@ impl UnwindRegistration {
         len: usize,
         info: &cranelift_codegen::isa::unwind::winx64::UnwindInfo,
     ) -> Result<Self, String> {
-        let mut bytes = vec![0; info.emit_size()];
-        info.emit(&mut bytes);
-        // Cranelift 0.125's Windows lowering does not describe its clobber save
-        // area correctly. Only accept the verified push-RBP / set-RBP recipe;
-        // functions needing SAVE_NONVOL/SAVE_XMM retain their software checks.
-        if bytes[0] != 1
-            || bytes[3] != 5
-            || bytes[2] != 2
-            || bytes[4..8] != [4, 3, 1, 0x50]
-            || unsafe { std::slice::from_raw_parts(code as *const u8, len.min(4)) }
-                != [0x55, 0x48, 0x89, 0xe5]
-        {
-            return Err("native unwind prologue is not verified".into());
-        }
+        let mut compiler_info = vec![0; info.emit_size()];
+        info.emit(&mut compiler_info);
+        let bytes = unwind::recipe(
+            unsafe { std::slice::from_raw_parts(code as *const u8, len) },
+            compiler_info[1],
+        )?;
         let registration =
             unsafe { adv_host_unwind_register(code, len, bytes.as_ptr(), bytes.len()) };
         std::ptr::NonNull::new(registration)
@@ -323,6 +316,7 @@ mod tests {
     }
     unsafe extern "C" {
         fn adv_host_unwind_lookup(pc: usize) -> i32;
+        fn adv_host_unwind_aligned(pc: usize) -> i32;
         fn adv_host_fault_probe(
             thunk: *const c_void,
             state: *mut c_void,
@@ -336,6 +330,8 @@ mod tests {
         unwind: Vec<UnwindRegistration>,
         entry: usize,
         body: usize,
+        linked_entry: Option<usize>,
+        body_unwind: cranelift_codegen::isa::unwind::winx64::UnwindInfo,
         len: usize,
         site: FaultSite,
         destroyed: Arc<AtomicBool>,
@@ -349,6 +345,9 @@ mod tests {
         }
     }
     fn code(access: Access, linked: bool, wide: bool) -> Code {
+        generated_code(access, linked, wide, false)
+    }
+    fn generated_code(access: Access, linked: bool, wide: bool, linked_fault: bool) -> Code {
         let mut module = JITModule::new(
             JITBuilder::with_flags(
                 &[("preserve_frame_pointers", "true"), ("unwind_info", "true")],
@@ -459,6 +458,10 @@ mod tests {
                 b.append_block_params_for_function_params(entry);
                 b.switch_to_block(entry);
                 let args = b.block_params(entry).to_vec();
+                if linked_fault {
+                    let value = b.ins().load(types::I32, MemFlags::new(), args[1], 0);
+                    b.ins().store(MemFlags::trusted(), value, args[0], 0);
+                }
                 b.ins().return_call(callee, &args);
                 b.seal_all_blocks();
                 b.finalize();
@@ -516,29 +519,32 @@ mod tests {
         };
         module.finalize_definitions().unwrap();
         let body = module.get_finalized_function(id) as usize;
+        let body_unwind = match &recipes
+            .iter()
+            .find(|(function, _, _)| *function == id)
+            .unwrap()
+            .2
+        {
+            cranelift_codegen::isa::unwind::UnwindInfo::WindowsX64(info) => info.clone(),
+            _ => unreachable!(),
+        };
         let unwind = recipes
             .into_iter()
-            .filter_map(|(id, len, recipe)| {
+            .map(|(id, len, recipe)| {
                 let cranelift_codegen::isa::unwind::UnwindInfo::WindowsX64(info) = recipe else {
                     panic!("Windows x64 unwind required")
                 };
-                let registration = unsafe {
+                unsafe {
                     UnwindRegistration::new(module.get_finalized_function(id) as usize, len, &info)
-                };
-                if (linked && id == entry_id) || wide {
-                    assert!(
-                        registration.is_err(),
-                        "clobber save recipes must stay unsupported"
-                    );
-                    None
-                } else {
-                    Some(registration.unwrap())
                 }
+                .unwrap()
             })
             .collect();
         Code {
             entry: module.get_finalized_function(entry_id) as usize,
             body,
+            linked_entry: linked.then(|| module.get_finalized_function(inner) as usize),
+            body_unwind,
             len,
             site: FaultSite {
                 host_pc: body + fault,
@@ -777,6 +783,164 @@ mod tests {
         assert_eq!(unsafe { adv_host_unwind_lookup(pc) }, 0);
         assert!(!code.destroyed.load(Ordering::Acquire));
         drop(code);
+    }
+
+    #[test]
+    fn rejected_fault_unwinds_real_tail_wrapper_and_simd_save_frames() {
+        for (access, linked, wide) in [(Access::Read, true, false), (Access::Write, false, true)] {
+            let memory = Reservation::new(4096).unwrap();
+            memory.commit(0, 4096).unwrap();
+            let code = code(access, linked, wide);
+            let mut site = code.site;
+            site.host_pc += 1;
+            let sites = [site];
+            let regions = [region(&code, &sites)];
+            let mut state = initial();
+            let checkpoint = Checkpoint::new(state.clone(), DATA);
+            let restriction =
+                unsafe { memory.temporary_protection(0, 4096, HostProtection::Read) }.unwrap();
+            let no_access = if access == Access::Read {
+                Some(
+                    unsafe { memory.temporary_protection(0, 4096, HostProtection::NoAccess) }
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let (result, handled) =
+                with_session(&mut state, &checkpoint, &regions, &memory, DATA, |state| {
+                    probe(&code, state, memory.ptr.as_ptr())
+                })
+                .unwrap();
+            assert_eq!(result.exception, ACCESS_VIOLATION);
+            assert_eq!(result.pc, code.site.host_pc);
+            assert_eq!(handled, 0);
+            assert_eq!(state.regs[0], 0xdeadbeef);
+            drop(no_access);
+            drop(restriction);
+        }
+    }
+
+    #[test]
+    fn linked_callee_own_fault_falls_through_its_complete_unwind_recipe() {
+        let memory = Reservation::new(4096).unwrap();
+        memory.commit(0, 4096).unwrap();
+        let code = generated_code(Access::Read, true, false, true);
+        let linked = code.linked_entry.unwrap();
+        assert_ne!(unsafe { adv_host_unwind_aligned(linked) }, 0);
+        let mut state = initial();
+        let before = state.clone();
+        let checkpoint = Checkpoint::new(state.clone(), DATA);
+        let sites = [code.site];
+        let regions = [region(&code, &sites)];
+        let restriction =
+            unsafe { memory.temporary_protection(0, 4096, HostProtection::NoAccess) }.unwrap();
+        let (result, handled) =
+            with_session(&mut state, &checkpoint, &regions, &memory, DATA, |state| {
+                probe(&code, state, memory.ptr.as_ptr())
+            })
+            .unwrap();
+        assert_eq!(result.exception, ACCESS_VIOLATION);
+        assert_ne!(result.pc, code.site.host_pc);
+        assert_eq!(handled, 0);
+        assert_eq!(state, before);
+        drop(restriction);
+    }
+
+    #[test]
+    fn byte_aligned_native_entry_has_dword_aligned_unwind_rva_and_returns_to_c_seh() {
+        let source = code(Access::Read, false, false);
+        let mut module = JITModule::new(JITBuilder::new(default_libcall_names()).unwrap());
+        let mut signature = module.make_signature();
+        signature
+            .params
+            .extend([AbiParam::new(module.target_config().pointer_type()); 2]);
+        signature.returns.push(AbiParam::new(types::I32));
+        let id = module
+            .declare_function("unaligned_entry", Linkage::Local, &signature)
+            .unwrap();
+        // This pure load/store body has no external relocations. Its internal
+        // branches remain relative to the bytecode when moved behind a NOP.
+        let mut bytes = vec![0x90];
+        bytes.extend(unsafe { std::slice::from_raw_parts(source.body as *const u8, source.len) });
+        module.define_function_bytes(id, 1, &bytes, &[]).unwrap();
+        module.finalize_definitions().unwrap();
+        let entry = module.get_finalized_function(id) as usize + 1;
+        assert_ne!(entry & 3, 0);
+        let unwind =
+            unsafe { UnwindRegistration::new(entry, source.len, &source.body_unwind) }.unwrap();
+        assert_ne!(unsafe { adv_host_unwind_aligned(entry) }, 0);
+        let memory = Reservation::new(4096).unwrap();
+        memory.commit(0, 4096).unwrap();
+        let restriction =
+            unsafe { memory.temporary_protection(0, 4096, HostProtection::NoAccess) }.unwrap();
+        let mut state = initial();
+        let mut result = ProbeResult::default();
+        unsafe {
+            adv_host_fault_probe(
+                entry as *const c_void,
+                (&mut state as *mut CpuState).cast(),
+                memory.ptr.as_ptr().cast(),
+                &mut result,
+            );
+        }
+        assert_eq!(result.exception, ACCESS_VIOLATION);
+        assert_eq!(result.pc, entry + source.site.host_pc - source.body);
+        assert_eq!(state.regs[0], 0xdeadbeef);
+        drop(restriction);
+        drop(unwind);
+        unsafe {
+            module.free_memory();
+        }
+    }
+
+    #[test]
+    fn concurrent_registration_recovery_and_rejected_faults_do_not_cross_owners() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..4 {
+                        let memory = Reservation::new(4096).unwrap();
+                        memory.commit(0, 4096).unwrap();
+                        let code = code(Access::Read, true, false);
+                        let mut wrong_site = code.site;
+                        wrong_site.host_pc += 1;
+                        let wrong = [wrong_site];
+                        let correct = [code.site];
+                        let restriction = unsafe {
+                            memory.temporary_protection(0, 4096, HostProtection::NoAccess)
+                        }
+                        .unwrap();
+                        for pass in 0..32 {
+                            let sites = if pass % 2 == 0 { &correct } else { &wrong };
+                            let regions = [region(&code, sites)];
+                            let mut state = initial();
+                            let checkpoint = Checkpoint::new(state.clone(), DATA);
+                            let (result, handled) = with_session(
+                                &mut state,
+                                &checkpoint,
+                                &regions,
+                                &memory,
+                                DATA,
+                                |state| probe(&code, state, memory.ptr.as_ptr()),
+                            )
+                            .unwrap();
+                            if pass % 2 == 0 {
+                                assert_eq!((result.exception, handled), (0, 1));
+                                assert_eq!(state.regs[0], 0x12345678);
+                            } else {
+                                assert_eq!((result.exception, handled), (ACCESS_VIOLATION, 0));
+                                assert_eq!(state.regs[0], 0xdeadbeef);
+                            }
+                        }
+                        drop(restriction);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]

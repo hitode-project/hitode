@@ -230,6 +230,13 @@ pub(crate) struct ProtectionScope<'a> {
     original: Vec<(usize, usize, u32)>,
 }
 #[cfg(windows)]
+impl ProtectionScope<'_> {
+    /// Commit an already validated policy change instead of restoring it.
+    pub(crate) fn retain(mut self) {
+        self.original.clear();
+    }
+}
+#[cfg(windows)]
 impl Drop for ProtectionScope<'_> {
     fn drop(&mut self) {
         for &(offset, len, protection) in self.original.iter().rev() {
@@ -550,14 +557,39 @@ impl Reservation {
             while at < pages.len() && pages[at] {
                 at += 1;
             }
-            let offset = base + start * 4096;
-            // SAFETY: private RW host pages tracked as committed, execution is
-            // stopped, and no callback can refer to ordinary private storage.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), (at - start) * 4096)
+            let mut offset = base + start * 4096;
+            let stop = base + at * 4096;
+            while offset < stop {
+                let ptr = unsafe { self.ptr.as_ptr().add(offset) };
+                let (count, protection) =
+                    unsafe { os::protection(ptr) }.ok_or("cannot query promoted private pages")?;
+                let count = count.min(stop - offset);
+                if count == 0 {
+                    return Err("empty promoted host span".into());
+                }
+                // The region map is already mutably borrowed, so construct the
+                // raw OS override without borrowing that map again. A stopped
+                // owner may snapshot NOACCESS bytes, then restore the policy.
+                let mut scope = ProtectionScope {
+                    reservation: self,
+                    original: Vec::new(),
+                };
+                if protection == HostProtection::NoAccess as u32 {
+                    if !unsafe { os::protect(ptr, count, HostProtection::Read as u32) } {
+                        return Err(format!(
+                            "read promoted guest pages: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    scope.original.push((offset, count, protection));
+                }
+                // SAFETY: committed private bytes temporarily readable while
+                // guest execution is stopped; no callback aliases this storage.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec();
+                drop(scope);
+                saved.push((offset, bytes, protection));
+                offset += count;
             }
-            .to_vec();
-            saved.push((offset, bytes));
         }
         if !unsafe { os::split(self.ptr.as_ptr().add(base), len) } {
             return Err(format!(
@@ -566,7 +598,7 @@ impl Reservation {
             ));
         }
         regions.get_mut(&base).unwrap().kind = Kind::Placeholder;
-        for (offset, bytes) in &saved {
+        for (offset, bytes, protection) in &saved {
             if let Err(error) = self.commit_regions(regions, *offset, offset + bytes.len()) {
                 // Undo the replacements, merge the original placeholder, then
                 // restore its original private reservation and committed spans.
@@ -599,7 +631,7 @@ impl Reservation {
                         kind: Kind::Private(original),
                     },
                 );
-                for (offset, bytes) in &saved {
+                for (offset, bytes, protection) in &saved {
                     assert!(
                         unsafe { os::commit(self.ptr.as_ptr().add(*offset), bytes.len()) },
                         "cannot restore guest pages"
@@ -611,6 +643,12 @@ impl Reservation {
                             bytes.len(),
                         )
                     };
+                    assert!(
+                        unsafe {
+                            os::protect(self.ptr.as_ptr().add(*offset), bytes.len(), *protection)
+                        },
+                        "cannot restore rollback page protection"
+                    );
                 }
                 return Err(error);
             }
@@ -621,6 +659,10 @@ impl Reservation {
                     bytes.len(),
                 )
             };
+            assert!(
+                unsafe { os::protect(self.ptr.as_ptr().add(*offset), bytes.len(), *protection) },
+                "cannot restore promoted page protection"
+            );
         }
         Ok(())
     }

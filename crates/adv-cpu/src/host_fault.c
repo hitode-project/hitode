@@ -46,7 +46,10 @@ void *adv_host_unwind_register(uintptr_t code, size_t code_size,
     SYSTEM_INFO system;
     GetSystemInfo(&system);
     uintptr_t end = code + code_size;
-    uintptr_t lowest = end > UINT32_MAX ? end - UINT32_MAX : 0;
+    /* Keep the dynamic table's base at the function itself. Allowing xdata
+     * below code makes Base..End span nearly 4GB and overlap unrelated dynamic
+     * tables; Windows may select that table before searching the right one. */
+    uintptr_t lowest = end;
     uintptr_t highest = code > UINTPTR_MAX - UINT32_MAX ? UINTPTR_MAX : code + UINT32_MAX;
     if (lowest < (uintptr_t)system.lpMinimumApplicationAddress)
         lowest = (uintptr_t)system.lpMinimumApplicationAddress;
@@ -66,8 +69,11 @@ void *adv_host_unwind_register(uintptr_t code, size_t code_size,
     void *storage = VirtualAlloc2(NULL, NULL, metadata_size, MEM_COMMIT | MEM_RESERVE,
                                  PAGE_READWRITE, &parameter, 1);
     if (!storage) return NULL;
-    uintptr_t base = code < (uintptr_t)storage ? code : (uintptr_t)storage;
-    if (end - base > UINT32_MAX || (uintptr_t)storage - base > UINT32_MAX) {
+    /* UnwindData's low bits encode indirection, so its RVA, not only its
+     * absolute address, must be DWORD aligned. Tail functions may start at
+     * an unaligned byte offset inside the JIT allocation. */
+    uintptr_t base = code & ~(uintptr_t)3;
+    if (end - base > UINT32_MAX || (uintptr_t)storage < end || (uintptr_t)storage - base > UINT32_MAX) {
         VirtualFree(storage, 0, MEM_RELEASE);
         SetLastError(ERROR_INVALID_ADDRESS);
         return NULL;
@@ -111,6 +117,12 @@ int adv_host_unwind_unregister(void *raw) {
 int adv_host_unwind_lookup(uintptr_t pc) {
     DWORD64 base;
     return RtlLookupFunctionEntry(pc, &base, NULL) != NULL;
+}
+
+int adv_host_unwind_aligned(uintptr_t pc) {
+    DWORD64 base;
+    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(pc, &base, NULL);
+    return function && !(function->UnwindData & 3);
 }
 
 uint64_t adv_host_fault_gpr(const void *raw, unsigned index) {

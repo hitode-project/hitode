@@ -91,9 +91,168 @@ pub struct Memory {
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: BTreeMap<usize, SharedPage>,
+    #[cfg(windows)]
+    native_protection: bool,
+    #[cfg(windows)]
+    native_read_exceptions: usize,
 }
 
 impl Memory {
+    #[cfg(windows)]
+    fn native_permission(perms: u8) -> crate::virtual_memory::HostProtection {
+        use crate::virtual_memory::HostProtection as P;
+        if perms & EXEC != 0 || perms & READ != 0 && perms & WRITE == 0 {
+            P::Read
+        } else if perms & WRITE != 0 {
+            P::ReadWrite
+        } else {
+            P::NoAccess
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_read_exception(perms: u8) -> bool {
+        perms & SHARED == 0 && perms & READ == 0 && perms & (WRITE | EXEC) != 0
+    }
+
+    #[cfg(windows)]
+    fn host_no_access(&self, range: &std::ops::Range<usize>) -> bool {
+        !range.is_empty()
+            && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
+                .iter()
+                .any(|&p| Self::native_permission(p) as u32 == 1)
+    }
+
+    fn host_copy_required(&self, range: &std::ops::Range<usize>) -> bool {
+        #[cfg(windows)]
+        {
+            self.native_protection && self.host_no_access(range)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = range;
+            false
+        }
+    }
+
+    #[cfg(windows)]
+    fn host_scope<'a>(
+        reservation: Option<&'a crate::virtual_memory::Reservation>,
+        perms: &[u8],
+        active: bool,
+        range: &std::ops::Range<usize>,
+        write: bool,
+    ) -> Result<Vec<crate::virtual_memory::ProtectionScope<'a>>, String> {
+        let mut scopes = Vec::new();
+        if !active || range.is_empty() {
+            return Ok(scopes);
+        }
+        let reservation = reservation.ok_or("native protection requires reserved memory")?;
+        let desired = if write {
+            crate::virtual_memory::HostProtection::ReadWrite
+        } else {
+            crate::virtual_memory::HostProtection::Read
+        };
+        let mut at = range.start / PAGE_SIZE;
+        let end = (range.end - 1) / PAGE_SIZE + 1;
+        while at < end {
+            let needs = |page: usize| {
+                let p = perms[page];
+                (p & SHARED == 0 || p & AUDIO != 0)
+                    && (if write {
+                        Self::native_permission(p) as u32 != 4
+                    } else {
+                        Self::native_permission(p) as u32 == 1
+                    })
+            };
+            if !needs(at) {
+                at += 1;
+                continue;
+            }
+            let start = at;
+            at += 1;
+            while at < end && needs(at) {
+                at += 1;
+            }
+            scopes.push(unsafe {
+                reservation.temporary_protection(
+                    start * PAGE_SIZE,
+                    (at - start) * PAGE_SIZE,
+                    desired,
+                )
+            }?);
+        }
+        Ok(scopes)
+    }
+
+    /// Enable host permission enforcement for reserved Windows memory. This is
+    /// opt-in until native sites carry complete precise recovery recipes.
+    /// Host initialization remains possible through scoped read/write copies.
+    pub fn enable_native_protection(&mut self) -> Result<(), String> {
+        #[cfg(not(windows))]
+        {
+            Err("native host protection is not available on this host".into())
+        }
+        #[cfg(windows)]
+        {
+            if self.native_protection {
+                return Ok(());
+            }
+            let reservation = self
+                .reservation
+                .as_ref()
+                .ok_or("native protection requires reserved memory")?;
+            let mut scopes = Vec::new();
+            let mut at = 0;
+            while at < self.perms.len() {
+                if !self.mapped[at] || self.perms[at] & SHARED != 0 && self.perms[at] & AUDIO == 0 {
+                    at += 1;
+                    continue;
+                }
+                let permission = Self::native_permission(self.perms[at]);
+                let start = at;
+                at += 1;
+                while at < self.perms.len()
+                    && self.mapped[at]
+                    && (self.perms[at] & SHARED == 0 || self.perms[at] & AUDIO != 0)
+                    && Self::native_permission(self.perms[at]) as u32 == permission as u32
+                {
+                    at += 1;
+                }
+                scopes.push(unsafe {
+                    reservation.temporary_protection(
+                        start * PAGE_SIZE,
+                        (at - start) * PAGE_SIZE,
+                        permission,
+                    )
+                }?);
+            }
+            for scope in scopes {
+                scope.retain();
+            }
+            self.native_protection = true;
+            Ok(())
+        }
+    }
+
+    /// Windows cannot express guest data-read denial on write-only or
+    /// execute-only pages. Native sites must retain software READ checks while
+    /// any ordinary page has that shape. Short address windows keep bounds.
+    #[allow(dead_code)] // Used by verified native sites in the next compiler handoff.
+    pub(crate) fn native_fault_reads_available(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.native_protection
+                && self.native_read_exceptions == 0
+                && self.base == 0
+                && self.len as u64 == 1 << 32
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         if !(base as usize).is_multiple_of(PAGE_SIZE)
             || len == 0
@@ -116,6 +275,10 @@ impl Memory {
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
+            #[cfg(windows)]
+            native_protection: false,
+            #[cfg(windows)]
+            native_read_exceptions: 0,
         })
     }
 
@@ -127,7 +290,17 @@ impl Memory {
         {
             return Err("invalid reservation".into());
         }
-        let reservation = crate::virtual_memory::Reservation::new(len)?;
+        // A full x86 window retains a final inaccessible tail for unaligned
+        // native operands crossing the 4GB limit. Small windows keep guards.
+        #[cfg(windows)]
+        let reserved_len = if base == 0 && len as u64 == 1 << 32 {
+            len + 16384
+        } else {
+            len
+        };
+        #[cfg(not(windows))]
+        let reserved_len = len;
+        let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
         Ok(Self {
             base,
             len,
@@ -139,6 +312,10 @@ impl Memory {
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
+            #[cfg(windows)]
+            native_protection: false,
+            #[cfg(windows)]
+            native_read_exceptions: 0,
         })
     }
 
@@ -176,7 +353,15 @@ impl Memory {
             .ok_or("mapping requires reserved address space")?
             .commit(pages.start * PAGE_SIZE, len)?;
         self.mapped[pages.clone()].fill(true);
-        self.protect(addr, len, perms)
+        if let Err(error) = self.protect(addr, len, perms) {
+            self.reservation
+                .as_ref()
+                .unwrap()
+                .decommit(pages.start * PAGE_SIZE, len)?;
+            self.mapped[pages].fill(false);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
@@ -211,6 +396,10 @@ impl Memory {
             start = end;
         }
         for page in pages.clone() {
+            #[cfg(windows)]
+            if Self::native_read_exception(self.perms[page]) {
+                self.native_read_exceptions -= 1;
+            }
             self.shared_pages.remove(&page);
         }
         self.mapped[pages.clone()].fill(false);
@@ -253,13 +442,17 @@ impl Memory {
         if self.overlays(&range) {
             return Err("shared bytes require an atomic copy".into());
         }
+        #[cfg(windows)]
+        if self.native_protection && self.host_no_access(&range) {
+            return Err("protected host bytes require read_into or read_data".into());
+        }
         // SAFETY: committed ordinary storage remains immutable for this borrow.
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
     }
 
     pub fn read_data(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
         let range = self.committed(addr, len)?;
-        if self.overlays(&range) {
+        if self.overlays(&range) || self.host_copy_required(&range) {
             let mut bytes = vec![0; len];
             self.read_into(addr, &mut bytes)?;
             return Ok(Cow::Owned(bytes));
@@ -272,6 +465,14 @@ impl Memory {
 
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
         let range = self.committed(addr, destination.len())?;
+        #[cfg(windows)]
+        let _host = Self::host_scope(
+            self.reservation.as_ref(),
+            &self.perms,
+            self.native_protection,
+            &range,
+            false,
+        )?;
         if !self.overlays(&range) {
             // SAFETY: committed ordinary storage and non-aliasing caller output.
             unsafe {
@@ -531,6 +732,22 @@ impl Memory {
         {
             self.touch(destination, len);
         }
+        #[cfg(windows)]
+        let _source_host = Self::host_scope(
+            self.reservation.as_ref(),
+            &self.perms,
+            self.native_protection,
+            &src,
+            false,
+        )?;
+        #[cfg(windows)]
+        let _destination_host = Self::host_scope(
+            self.reservation.as_ref(),
+            &self.perms,
+            self.native_protection,
+            &dst,
+            true,
+        )?;
         // SAFETY: committed ordinary ranges, exclusively borrowed memory, and
         // ptr::copy preserves memmove overlap semantics.
         unsafe {
@@ -580,6 +797,14 @@ impl Memory {
         {
             self.touch(addr, bytes.len());
         }
+        #[cfg(windows)]
+        let _host = Self::host_scope(
+            self.reservation.as_ref(),
+            &self.perms,
+            self.native_protection,
+            &range,
+            true,
+        )?;
         if overlays {
             let mut at = range.start;
             while at < range.end {
@@ -640,7 +865,35 @@ impl Memory {
         {
             return Err("executable file views are not supported".into());
         }
+        #[cfg(windows)]
+        if self.native_protection {
+            let reservation = self.reservation.as_ref().unwrap();
+            let pages = range.start / PAGE_SIZE..range.end / PAGE_SIZE;
+            let mut scopes = Vec::new();
+            for page in pages.clone() {
+                if self.perms[page] & SHARED != 0 && self.perms[page] & AUDIO == 0 {
+                    continue;
+                }
+                scopes.push(unsafe {
+                    reservation.temporary_protection(
+                        page * PAGE_SIZE,
+                        PAGE_SIZE,
+                        Self::native_permission(perms),
+                    )
+                }?);
+            }
+            for scope in scopes {
+                scope.retain();
+            }
+        }
         for page in &mut self.perms[range.start / PAGE_SIZE..range.end / PAGE_SIZE] {
+            #[cfg(windows)]
+            {
+                self.native_read_exceptions -= usize::from(Self::native_read_exception(*page));
+                self.native_read_exceptions += usize::from(Self::native_read_exception(
+                    perms | (*page & (SHARED | AUDIO)),
+                ));
+            }
             *page = perms | (*page & (SHARED | AUDIO));
         }
         self.touch(addr, len);
@@ -711,6 +964,178 @@ mod linear_audio_tests {
             0
         );
         info
+    }
+
+    #[test]
+    fn native_policy_host_copies_restore_readonly_noaccess_and_code_versions() {
+        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
+        memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
+        memory.write(0x10000, &[0x91, 0x37]).unwrap();
+        memory
+            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        memory.protect(0x11000, PAGE_SIZE, 0).unwrap();
+        memory.enable_native_protection().unwrap();
+        assert_eq!(query(&memory, 0x10000).protection, 2);
+        assert_eq!(query(&memory, 0x11000).protection, 1);
+        let version = memory.versions[0];
+        memory.write(0x10000, &[0x12, 0x34]).unwrap();
+        assert!(memory.versions[0] > version);
+        assert_eq!(query(&memory, 0x10000).protection, 2);
+        memory.write(0x11000, &[0x56, 0x78]).unwrap();
+        assert_eq!(query(&memory, 0x11000).protection, 1);
+        assert!(memory.read(0x11000, 2).is_err());
+        assert_eq!(&*memory.read_data(0x11000, 2).unwrap(), &[0x56, 0x78]);
+        assert_eq!(query(&memory, 0x11000).protection, 1);
+        memory.copy(0x11000, 0x10000, 2).unwrap();
+        assert_eq!(memory.read(0x10000, 2).unwrap(), &[0x56, 0x78]);
+        assert_eq!(query(&memory, 0x10000).protection, 2);
+        assert_eq!(query(&memory, 0x11000).protection, 1);
+        assert_eq!(memory.perms[0], READ | WRITE | EXEC);
+        assert_eq!(memory.perms[1], 0);
+    }
+
+    #[test]
+    fn native_policy_tracks_mapping_changes_and_unrepresentable_read_denials() {
+        let mut memory = Memory::reserve(0, 1usize << 32).unwrap();
+        memory.map(0x10000, PAGE_SIZE, READ | WRITE).unwrap();
+        memory.enable_native_protection().unwrap();
+        assert!(memory.native_fault_reads_available());
+        memory.protect(0x10000, PAGE_SIZE, WRITE).unwrap();
+        assert!(!memory.native_fault_reads_available());
+        assert_eq!(query(&memory, 0x10000).protection, 4);
+        memory.protect(0x10000, PAGE_SIZE, EXEC).unwrap();
+        assert!(!memory.native_fault_reads_available());
+        assert_eq!(query(&memory, 0x10000).protection, 2);
+        memory.unmap(0x10000, PAGE_SIZE).unwrap();
+        assert!(memory.native_fault_reads_available());
+        memory.map(0x20000, PAGE_SIZE, READ).unwrap();
+        assert_eq!(query(&memory, 0x20000).protection, 2);
+        memory.write(0x20000, &[0xab]).unwrap();
+        assert_eq!(query(&memory, 0x20000).protection, 2);
+        assert_eq!(query(&memory, u32::MAX).state, 0x2000);
+        let reservation = memory.reservation.as_ref().unwrap();
+        assert_eq!(reservation.len, (1usize << 32) + 16384);
+    }
+
+    #[test]
+    fn native_policy_pcm_callbacks_and_lazy_file_views_keep_independent_contracts() {
+        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
+        let pcm = memory.map_shared_audio(0x10000, PAGE_SIZE).unwrap();
+        let file = crate::backend::FilePage::new([0x37; PAGE_SIZE]);
+        memory
+            .map_file_pages(0x11000, std::slice::from_ref(&file), READ | WRITE, true)
+            .unwrap();
+        memory.enable_native_protection().unwrap();
+        memory.protect(0x10000, PAGE_SIZE, READ).unwrap();
+        memory.write(0x10000, &[0x91]).unwrap();
+        assert_eq!(pcm.load_u8(0), 0x91);
+        assert_eq!(query(&memory, 0x10000).protection, 2);
+        memory.prepare_native_access(0x11000, 1, true).unwrap();
+        memory.write(0x11000, &[0x12]).unwrap();
+        assert_eq!(file.snapshot().unwrap()[0], 0x37);
+        assert_eq!(memory.read_data(0x11000, 1).unwrap()[0], 0x12);
+        assert_eq!(query(&memory, 0x11000).state, 0x2000);
+        drop(memory);
+        assert_eq!(pcm.load_u8(0), 0x91);
+    }
+
+    #[test]
+    fn native_policy_private_hole_conversion_preserves_neighbour_host_permissions() {
+        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
+        memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
+        memory.write(0x10000, &[0x91]).unwrap();
+        memory.write(0x12000, &[0x37]).unwrap();
+        memory.unmap(0x11000, PAGE_SIZE).unwrap();
+        memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+        memory.protect(0x12000, PAGE_SIZE, 0).unwrap();
+        memory.enable_native_protection().unwrap();
+        let pcm = memory.map_shared_audio(0x11000, PAGE_SIZE).unwrap();
+        assert_eq!(query(&memory, 0x10000).protection, 2);
+        assert_eq!(query(&memory, 0x12000).protection, 1);
+        assert_eq!(memory.read_data(0x10000, 1).unwrap()[0], 0x91);
+        assert_eq!(memory.read_data(0x12000, 1).unwrap()[0], 0x37);
+        memory.write(0x11000, &[0x12]).unwrap();
+        assert_eq!(pcm.load_u8(0), 0x12);
+    }
+
+    #[test]
+    fn production_jit_with_native_permissions_keeps_smc_and_precise_checked_faults() {
+        use iced_x86::code_asm::*;
+        let code_at = 0x10000;
+        let data_at = 0x20000;
+        let stack_at = 0x30ff0;
+        let stop = 0x11000u32;
+        let mut assembler = CodeAssembler::new(32).unwrap();
+        assembler.mov(eax, dword_ptr(data_at)).unwrap();
+        assembler.inc(eax).unwrap();
+        assembler.mov(dword_ptr(code_at + 0x100), eax).unwrap();
+        assembler.ret().unwrap();
+        let code = assembler.assemble(code_at as u64).unwrap();
+        let mut states = Vec::new();
+        for native in [false, true] {
+            let mut executor = crate::Executor::address_space().unwrap();
+            executor
+                .memory
+                .map(code_at as u32, PAGE_SIZE * 2, READ | WRITE | EXEC)
+                .unwrap();
+            executor
+                .memory
+                .map(data_at as u32, PAGE_SIZE, READ | WRITE)
+                .unwrap();
+            executor
+                .memory
+                .map(stack_at & !4095, PAGE_SIZE, READ | WRITE)
+                .unwrap();
+            executor.memory.write(code_at as u32, &code).unwrap();
+            executor
+                .memory
+                .write(data_at as u32, &0x1234u32.to_le_bytes())
+                .unwrap();
+            executor
+                .memory
+                .write(stack_at, &stop.to_le_bytes())
+                .unwrap();
+            executor.memory.enable_native_protection().unwrap();
+            executor.state.eip = code_at as u32;
+            executor.state.regs[4] = stack_at;
+            if native {
+                executor
+                    .add_region(crate::Region::new(code_at as u32, code.len()))
+                    .unwrap();
+            }
+            assert_eq!(
+                executor.run(stop, 1000).unwrap(),
+                crate::RunOutcome::ReachedStop
+            );
+            assert_eq!(
+                executor.memory.read(code_at as u32 + 0x100, 4).unwrap(),
+                &0x1235u32.to_le_bytes()
+            );
+            assert_eq!(query(&executor.memory, code_at as u32).protection, 2);
+            states.push((
+                executor.state.regs,
+                executor.state.eflags,
+                executor.state.eip,
+            ));
+            executor
+                .memory
+                .protect(data_at as u32, PAGE_SIZE, 0)
+                .unwrap();
+            executor.state.eip = code_at as u32;
+            let before = executor.state.regs;
+            assert_eq!(
+                executor.run(stop, 1000).unwrap(),
+                crate::RunOutcome::ReadFault {
+                    pc: code_at as u32,
+                    address: data_at as u32
+                }
+            );
+            assert_eq!(executor.state.eip, code_at as u32);
+            assert_eq!(executor.state.regs, before);
+            assert_eq!(executor.state.fault_addr, data_at as u32);
+        }
+        assert_eq!(states[0], states[1]);
     }
 
     #[test]
