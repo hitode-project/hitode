@@ -4,6 +4,7 @@ use pal_cpu::{Backend, Guest, GuestExt, Prot};
 use pal_machine::{Conv, Env, Machine, Outcome, Registry};
 use pal_win32::Win32;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 const INVALID: u32 = 0x80070057;
@@ -154,6 +155,7 @@ struct Buffer {
     notice_bytes: u64,
     notifications: Vec<(u32, u32)>,
     lock: Option<Lock>,
+    trace_pcm: Option<Vec<u8>>,
 }
 impl Buffer {
     fn stereo_gain(&self) -> [f32; 2] {
@@ -219,6 +221,7 @@ pub(crate) struct Sound {
     pub nonzero_samples: u64,
     pub capture_digests: bool,
     pub digests: Vec<PcmDigest>,
+    trace: Option<std::io::BufWriter<std::fs::File>>,
 }
 pub(crate) fn register(reg: &mut Registry) {
     for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
@@ -274,6 +277,9 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         nonzero_samples: 0,
         capture_digests: false,
         digests: Vec::new(),
+        trace: std::env::var_os("ADV_AUDIO_TRACE")
+            .and_then(|path| std::fs::File::create(path).ok())
+            .map(std::io::BufWriter::new),
     });
     Ok(())
 }
@@ -336,6 +342,16 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
     let b = e.arg(1);
     let c = e.arg(2);
     let now = e.sys.clock.now_us();
+    if e.ext.get::<Sound>().trace.is_some() {
+        let args: [u32;8] = std::array::from_fn(|i|e.arg(i as u32));
+        let ctx=e.sys.current;
+        let s=e.ext.get_mut::<Sound>();
+        let snapshot=s.buffers.get(&a).map(|buf|(buf.storage,buf.len,buf.playing,buf.base,buf.queued_frames));
+        if let Some(trace)=s.trace.as_mut() {
+            let _=writeln!(trace,"api us={now} ctx={ctx} method={name} args={args:08x?} buffer={snapshot:?}");
+            if matches!(name,"Play"|"Stop"|"Release") {let _=trace.flush();}
+        }
+    }
     if matches!(name, "#1" | "DirectSoundCreate" | "DirectSoundCreate8") {
         e.cpu.write_u32(b, 0).map_err(|e| e.to_string())?;
         if !e.ext.get::<Sound>().enabled {
@@ -473,6 +489,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         notice_bytes: 0,
                         notifications: Vec::new(),
                         lock: None,
+                        trace_pcm: None,
                     },
                 );
                 e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
@@ -664,6 +681,17 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 buf.base = 0;
             }
             if !buf.playing {
+                // A fresh start is a new playback generation. A naturally ended
+                // buffer can retain unconsumed PCM in the device latency window;
+                // it must not survive reuse of the same DirectSound object.
+                s.mixer.lock().unwrap().flush_pcm(u64::from(a));
+                if let Some(trace)=s.trace.as_mut() {
+                    let mut bytes=vec![0;buf.len as usize];
+                    if buf.len != 0 {e.cpu.read(buf.storage,&mut bytes).map_err(|error|error.to_string())?;}
+                    let hash=bytes.iter().fold(0xcbf29ce484222325u64,|hash,byte|(hash^u64::from(*byte)).wrapping_mul(0x100000001b3));
+                    let _=writeln!(trace,"start us={now} id={a:08x} bytes={} hash={hash:016x}",buf.len);
+                    buf.trace_pcm=Some(bytes);
+                }
                 if s.capture_digests && s.digests.len() < 4 && buf.len != 0 {
                     let mut bytes = vec![0; buf.len as usize];
                     e.cpu
@@ -872,6 +900,11 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
             samples.extend([l, r]);
         }
         let nonzero = samples.iter().filter(|v| v.abs() > 0.00001).count();
+        if let Some(trace)=s.trace.as_mut() {
+            let hash=bytes.iter().fold(0xcbf29ce484222325u64,|hash,byte|(hash^u64::from(*byte)).wrapping_mul(0x100000001b3));
+            let changed=buf.trace_pcm.as_ref().map_or(0,|snapshot|bytes.iter().enumerate().filter(|(n,byte)|**byte!=snapshot[(start as usize+n)%snapshot.len()]).count());
+            let _=writeln!(trace,"pcm us={now} id={id:08x} storage={:08x} offset={start} frames={} count={count} hash={hash:016x} nonzero={nonzero} changed={changed}",buf.storage,buf.queued_frames);
+        }
         let len = samples.len();
         let block = PcmBlock {
             stream_id: u64::from(id),
@@ -1224,6 +1257,41 @@ mod tests {
         let mut muted = [1.0; 10];
         stream.read_stereo(&mut muted, 1000);
         assert_eq!(muted, [0.0; 10]);
+    }
+    #[test]
+    fn stop_seek_and_buffer_reuse_cannot_emit_an_older_voice_generation() {
+        let mut m=machine();
+        let format=Format {rate:1000,channels:1,bits:8};
+        let voice=buffer(&mut m,format,1000);let music=buffer(&mut m,format,1000);
+        let voice_storage=m.ext.get::<Sound>().buffers[&voice].storage;
+        let music_storage=m.ext.get::<Sound>().buffers[&music].storage;
+        m.cpu.write(voice_storage,&[192;1000]).unwrap();m.cpu.write(music_storage,&[160;1000]).unwrap();
+        invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);
+        invoke(&mut m,"IDirectSoundBuffer8::Play",&[music,0,0,1]);pump(&mut m).unwrap();
+        let stream:pal_audio::AudioStream=m.ext.get::<Sound>().mixer.clone().into();
+        let mut out=[0.0;20];stream.read_stereo(&mut out,1000);assert_eq!(out,[0.75;20]);
+        advance(&mut m,10_000);invoke(&mut m,"IDirectSoundBuffer8::Stop",&[voice]);
+        invoke(&mut m,"IDirectSoundBuffer8::Lock",&[voice,0,1000,DATA+128,DATA+132,0,0,2]);
+        let pointer=m.cpu.read_u32(DATA+128).unwrap();m.cpu.write(pointer,&[64;1000]).unwrap();
+        assert_eq!(invoke(&mut m,"IDirectSoundBuffer8::Unlock",&[voice,pointer,1000,0,0]),0);
+        invoke(&mut m,"IDirectSoundBuffer8::SetCurrentPosition",&[voice,0]);
+        invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);pump(&mut m).unwrap();
+        stream.read_stereo(&mut out,1000);assert_eq!(out,[-0.25;20]);
+        invoke(&mut m,"IDirectSoundBuffer8::Stop",&[voice]);
+        stream.read_stereo(&mut out,1000);assert_eq!(out,[0.25;20]);
+    }
+    #[test]
+    fn restarting_a_naturally_ended_buffer_discards_its_unconsumed_old_tail() {
+        let mut m=machine();let format=Format {rate:1000,channels:1,bits:8};
+        let voice=buffer(&mut m,format,30);let storage=m.ext.get::<Sound>().buffers[&voice].storage;
+        m.cpu.write(storage,&[192;30]).unwrap();invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);
+        pump(&mut m).unwrap();advance(&mut m,30_000);
+        // No callback has consumed the first generation and no pump has normalized
+        // natural completion yet. The new Play must not inherit its queued PCM.
+        m.cpu.write(storage,&[64;30]).unwrap();invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);
+        pump(&mut m).unwrap();let stream:pal_audio::AudioStream=m.ext.get::<Sound>().mixer.clone().into();
+        let mut out=[0.0;80];stream.read_stereo(&mut out,1000);
+        assert_eq!(out[..60],[0.0;60]);assert_eq!(out[60..],[-0.5;20]);
     }
     #[test]
     fn notifications_wrap_and_natural_stop_signal_real_events() {
