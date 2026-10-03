@@ -4,7 +4,7 @@ description = "Test support: locate the tester's own game copies under ADV_SAMPL
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license = "GPL-2.0-or-later"
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
