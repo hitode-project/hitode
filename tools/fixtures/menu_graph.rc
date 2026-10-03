@@ -1,0 +1,33 @@
+#pragma code_page(65001)
+101 MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&Open", 401
+        MENUITEM SEPARATOR
+        POPUP "Nested"
+        BEGIN
+            MENUITEM "Leaf", 402, CHECKED
+        END
+    END
+    MENUITEM "Exit", 403
+END
+MENU_STD MENU
+BEGIN
+    POPUP "Names"
+    BEGIN
+        MENUITEM "Named", 501
+    END
+END
+WIDE_NAME MENU
+BEGIN
+    MENUITEM "Wide name", 502
+END
+102 MENUEX
+BEGIN
+    POPUP "Extended", 900, 0, 0, 77
+    BEGIN
+        MENUITEM "Large ID", 65537, 0, 8
+    END
+    MENUITEM "End", 901
+END
