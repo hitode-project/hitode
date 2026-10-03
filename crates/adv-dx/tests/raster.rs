@@ -39,8 +39,15 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let mut f = Self {
-            objects: adv_machine::Objects::default(),
+        let mut f = Self::empty(adv_machine::Objects::default());
+        f.memory.write(16, &IID_DDRAW7).unwrap();
+        assert_eq!(f.dd(dd::DD_CREATE, &[0, 32, 16, 0]), 0);
+        f.device = f.memory.u32(32).unwrap();
+        f
+    }
+    fn empty(objects: adv_machine::Objects) -> Self {
+        Self {
+            objects,
             memory: Memory(vec![0; 65536]),
             surfaces: Surfaces::new(5, 4, 4096, 61440, Snapshot::default()).unwrap(),
             contexts: DeviceContexts::default(),
@@ -52,11 +59,7 @@ impl Fixture {
             ),
             raster: Raster::default(),
             device: 0,
-        };
-        f.memory.write(16, &IID_DDRAW7).unwrap();
-        assert_eq!(f.dd(dd::DD_CREATE, &[0, 32, 16, 0]), 0);
-        f.device = f.memory.u32(32).unwrap();
-        f
+        }
     }
     fn dd(&mut self, id: u32, args: &[u32]) -> u32 {
         self.ddraw
@@ -119,6 +122,106 @@ impl Fixture {
         assert_eq!(self.dd(dd::SURFACE_DC, &[object, 32]), 0);
         self.memory.u32(32).unwrap()
     }
+    fn query(&mut self, object: u32, iid: [u8; 16]) -> u32 {
+        self.memory.write(16, &iid).unwrap();
+        assert_eq!(self.dd(dd::QUERY, &[object, 16, 32]), 0);
+        self.memory.u32(32).unwrap()
+    }
+}
+
+#[test]
+fn failed_com_publication_reclaims_all_unpublished_interface_allocations() {
+    for limits in [
+        adv_machine::ObjectLimits {
+            objects: 0,
+            ..Default::default()
+        },
+        adv_machine::ObjectLimits {
+            references: 2,
+            ..Default::default()
+        },
+    ] {
+        let mut f = Fixture::empty(adv_machine::Objects::with_limits(limits));
+        f.memory.write(16, &IID_DDRAW7).unwrap();
+        // Enough retries to exhaust the guest arena if a partial old/new
+        // interface publication leaked even one allocation per failure.
+        for _ in 0..4096 {
+            f.memory.put_u32(32, 0xcccccccc).unwrap();
+            assert_eq!(f.dd(dd::DD_CREATE, &[0, 32, 16, 0]), 0x8007000e);
+            assert_eq!(f.memory.u32(32).unwrap(), 0);
+            assert_eq!(f.objects.object_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn directdraw_versions_share_canonical_unknown_and_one_reference_lifetime() {
+    let mut f = Fixture::new();
+    let device = f.device;
+    let old_iid = [
+        0x80, 0xdb, 0x14, 0x6c, 0x33, 0xa7, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
+    ];
+    let old = f.query(device, old_iid);
+    assert_ne!(old, device);
+    let from_old = f.query(old, adv_os::com::IUNKNOWN);
+    let from_new = f.query(device, adv_os::com::IUNKNOWN);
+    assert_eq!((from_old, from_new), (device, device));
+    assert_eq!(f.objects.object_count(), 1);
+    assert!(f.objects.close(old).is_none());
+    assert_eq!(f.dd(dd::RELEASE, &[from_old]), 3);
+    assert_eq!(f.dd(dd::RELEASE, &[from_new]), 2);
+    assert_eq!(f.dd(dd::RELEASE, &[device]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[old]), 0);
+    assert_eq!(f.objects.object_count(), 0);
+    assert_eq!(f.dd(dd::ADDREF, &[device]), 0x80070057);
+}
+
+#[test]
+fn attached_surface_has_stable_identity_and_parent_retains_it_until_release() {
+    let mut f = Fixture::new();
+    let mut desc = [0u8; 124];
+    for (at, value) in [(0, 124_u32), (4, 0x21), (20, 1), (104, 0x218)] {
+        desc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    f.memory.write(64, &desc).unwrap();
+    assert_eq!(f.dd(dd::CREATE_SURFACE, &[f.device, 64, 32, 0]), 0);
+    let parent = f.memory.u32(32).unwrap();
+    f.memory.put_u32(256, 4).unwrap();
+    assert_eq!(f.dd(dd::GET_ATTACHED, &[parent, 256, 32]), 0);
+    let first = f.memory.u32(32).unwrap();
+    assert_eq!(f.dd(dd::GET_ATTACHED, &[parent, 256, 32]), 0);
+    let second = f.memory.u32(32).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(f.dd(dd::RELEASE, &[first]), 2);
+    assert_eq!(f.dd(dd::RELEASE, &[second]), 1);
+    assert_eq!(f.objects.object_count(), 3);
+    assert_eq!(f.dd(dd::RELEASE, &[parent]), 0);
+    assert_eq!(f.objects.object_count(), 1);
+    assert_eq!(f.dd(dd::ADDREF, &[first]), 0x80070057);
+}
+
+#[test]
+fn surface_versions_and_clipper_replacement_release_their_retained_objects() {
+    let mut f = Fixture::new();
+    let (surface, _, _) = f.surface(2, 2, PixelFormat::Bgra32, false);
+    let old_iid = [
+        0x81, 0xdb, 0x14, 0x6c, 0x33, 0xa7, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
+    ];
+    let old = f.query(surface, old_iid);
+    let unknown = f.query(old, adv_os::com::IUNKNOWN);
+    assert_eq!(unknown, surface);
+    assert_eq!(f.dd(dd::RELEASE, &[unknown]), 2);
+    assert_eq!(f.dd(dd::RELEASE, &[old]), 1);
+    assert_eq!(f.dd(dd::CREATE_CLIPPER, &[f.device, 0, 32, 0]), 0);
+    let clipper = f.memory.u32(32).unwrap();
+    assert_eq!(f.dd(dd::SET_CLIPPER, &[surface, clipper]), 0);
+    assert_eq!(f.dd(dd::RELEASE, &[clipper]), 1);
+    assert_eq!(f.dd(dd::SET_CLIPPER, &[surface, clipper]), 0);
+    assert_eq!(f.dd(dd::SET_CLIPPER, &[surface, 0]), 0);
+    assert_eq!(f.dd(dd::ADDREF, &[clipper]), 0x80070057);
+    assert_eq!(f.objects.object_count(), 2);
+    assert_eq!(f.dd(dd::RELEASE, &[surface]), 0);
+    assert_eq!(f.objects.object_count(), 1);
 }
 
 #[test]
@@ -150,7 +253,9 @@ fn directdraw_scaled_blt_keeps_clipper_phase_and_rejects_color_key_flags() {
         .surfaces
         .presenter
         .bgra
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| p[0])
         .collect();
     assert_eq!(
