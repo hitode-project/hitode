@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_device::codec::{Codec, Decoder, DecoderConfig, PcmEncoding};
-use adv_machine::{Conv, Env, Outcome};
+use adv_machine::{Conv, Env, Namespace, Objects, Outcome};
 
 const INVALID_HANDLE: u32 = 5;
 const NO_MEMORY: u32 = 7;
@@ -197,16 +197,39 @@ struct Stream {
 }
 #[derive(Default)]
 struct Acm {
-    streams: BTreeMap<u32, Stream>,
-    next: u32,
+    namespace: Option<Namespace>,
+}
+
+impl Acm {
+    fn insert(&mut self, objects: &mut Objects, stream: Stream) -> Result<u32, u32> {
+        if self.namespace.is_none() {
+            self.namespace = objects.new_namespace_in(0xac00_0004, 0xacff_fffc);
+        }
+        let namespace = self.namespace.ok_or(NO_MEMORY)?;
+        if objects.alias_count(namespace) >= MAX_STREAMS {
+            return Err(NO_MEMORY);
+        }
+        objects.insert_host_in(namespace, stream).ok_or(NO_MEMORY)
+    }
+    fn get<'a>(&self, objects: &'a Objects, handle: u32) -> Option<&'a Stream> {
+        objects.owned(objects.lookup_alias::<Stream>(self.namespace?, handle)?)
+    }
+    fn get_mut<'a>(&self, objects: &'a mut Objects, handle: u32) -> Option<&'a mut Stream> {
+        let identity = objects.lookup_alias::<Stream>(self.namespace?, handle)?;
+        objects.owned_mut(identity)
+    }
+    fn remove(&self, objects: &mut Objects, handle: u32) -> Result<(), u32> {
+        self.get(objects, handle).ok_or(INVALID_HANDLE)?;
+        objects
+            .close_alias(self.namespace.unwrap(), handle)
+            .ok_or(INVALID_HANDLE)?;
+        Ok(())
+    }
 }
 
 fn ensure(e: &mut Env<'_>) {
     if e.ext.try_get::<Acm>().is_none() {
-        e.ext.insert(Acm {
-            next: 0xac00_0001,
-            ..Default::default()
-        });
+        e.ext.insert(Acm::default());
     }
 }
 fn write_word(cpu: &mut dyn Guest, address: u32, offset: u32, value: u32) -> Result<(), u32> {
@@ -306,23 +329,20 @@ fn open(e: &mut Env<'_>) -> Result<(), u32> {
     }
     ensure(e);
     let acm = e.ext.get_mut::<Acm>();
-    if acm.streams.len() >= MAX_STREAMS || acm.next == u32::MAX {
-        return Err(NO_MEMORY);
-    }
-    let handle = acm.next;
-    acm.next += 1;
-    acm.streams.insert(
-        handle,
+    let handle = acm.insert(
+        &mut e.sys.objects,
         Stream {
             source,
             destination,
             decoder,
             headers: BTreeMap::new(),
         },
-    );
-    e.cpu
-        .write_u32(output, handle)
-        .map_err(|_| INVALID_PARAMETER)
+    )?;
+    if e.cpu.write_u32(output, handle).is_err() {
+        acm.remove(&mut e.sys.objects, handle)?;
+        return Err(INVALID_PARAMETER);
+    }
+    Ok(())
 }
 fn size_impl(e: &mut Env<'_>, handle: u32, input: u32, output: u32, flags: u32) -> Result<(), u32> {
     if output == 0 || !e.cpu.accessible(output, 4, Prot::WRITE) {
@@ -339,8 +359,7 @@ fn size_impl(e: &mut Env<'_>, handle: u32, input: u32, output: u32, flags: u32) 
     let stream = e
         .ext
         .get::<Acm>()
-        .streams
-        .get(&handle)
+        .get(&e.sys.objects, handle)
         .ok_or(INVALID_HANDLE)?;
     let src = u64::from(stream.source.block);
     let dst = u64::from(stream.source.frames_per_block) * u64::from(stream.destination.block);
@@ -360,11 +379,15 @@ fn prepare(e: &mut Env<'_>) -> Result<(), u32> {
         return Err(INVALID_FLAG);
     }
     ensure(e);
-    if !e.ext.get::<Acm>().streams.contains_key(&handle) {
+    if e.ext.get::<Acm>().get(&e.sys.objects, handle).is_none() {
         return Err(INVALID_HANDLE);
     }
     let header = Header::read(e.cpu, address)?;
-    let stream = e.ext.get_mut::<Acm>().streams.get_mut(&handle).unwrap();
+    let stream = e
+        .ext
+        .get::<Acm>()
+        .get_mut(&mut e.sys.objects, handle)
+        .unwrap();
     if stream.headers.contains_key(&address) {
         return Ok(());
     }
@@ -383,9 +406,8 @@ fn unprepare(e: &mut Env<'_>) -> Result<(), u32> {
     let header = Header::read(e.cpu, address)?;
     let stream = e
         .ext
-        .get_mut::<Acm>()
-        .streams
-        .get_mut(&handle)
+        .get::<Acm>()
+        .get_mut(&mut e.sys.objects, handle)
         .ok_or(INVALID_HANDLE)?;
     let prepared = stream.headers.get(&address).ok_or(UNPREPARED)?;
     if (header.src, header.dst, header.src_len, header.dst_len)
@@ -411,9 +433,8 @@ fn convert(e: &mut Env<'_>) -> Result<(), u32> {
     let header = Header::read(e.cpu, address)?;
     let stream = e
         .ext
-        .get_mut::<Acm>()
-        .streams
-        .get_mut(&handle)
+        .get::<Acm>()
+        .get_mut(&mut e.sys.objects, handle)
         .ok_or(INVALID_HANDLE)?;
     let prepared = stream.headers.get(&address).ok_or(UNPREPARED)?;
     if header.status & PREPARED == 0 {
@@ -493,12 +514,7 @@ fn close_impl(e: &mut Env<'_>, handle: u32, flags: u32) -> Result<(), u32> {
         return Err(INVALID_FLAG);
     }
     ensure(e);
-    e.ext
-        .get_mut::<Acm>()
-        .streams
-        .remove(&handle)
-        .ok_or(INVALID_HANDLE)?;
-    Ok(())
+    e.ext.get::<Acm>().remove(&mut e.sys.objects, handle)
 }
 
 pub fn register(registry: &mut Registry) {
@@ -527,4 +543,56 @@ fn size(env: &mut Env<'_>, stream: Handle, input: u32, output: GuestPtr<u32>, fl
 #[win32(msacm32, name = "acmStreamClose", level = implement)]
 fn close(env: &mut Env<'_>, stream: Handle, flags: u32) -> u32 {
     close_impl(env, stream.0, flags).err().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_machine::ObjectLimits;
+
+    fn pcm() -> Stream {
+        let source = Format {
+            tag: 1,
+            channels: 1,
+            rate: 22050,
+            block: 2,
+            bits: 16,
+            frames_per_block: 1,
+        };
+        Stream {
+            decoder: source.decoder().unwrap(),
+            destination: source.clone(),
+            source,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn common_limits_and_stale_handles_do_not_corrupt_another_decoder() {
+        for limits in [
+            ObjectLimits {
+                objects: 1,
+                ..ObjectLimits::default()
+            },
+            ObjectLimits {
+                aliases: 1,
+                ..ObjectLimits::default()
+            },
+        ] {
+            let mut objects = Objects::with_limits(limits);
+            let mut acm = Acm::default();
+            let first = acm.insert(&mut objects, pcm()).unwrap();
+            assert_eq!(acm.insert(&mut objects, pcm()), Err(NO_MEMORY));
+            assert!(objects.close(first).is_none());
+            acm.get_mut(&mut objects, first).unwrap().source.rate = 11025;
+            assert_eq!(acm.get(&objects, first).unwrap().source.rate, 11025);
+            acm.remove(&mut objects, first).unwrap();
+            assert_eq!(objects.object_count(), 0);
+            let second = acm.insert(&mut objects, pcm()).unwrap();
+            assert_ne!(first, second);
+            assert_eq!(acm.remove(&mut objects, first), Err(INVALID_HANDLE));
+            assert_eq!(acm.get(&objects, second).unwrap().source.rate, 22050);
+            acm.remove(&mut objects, second).unwrap();
+        }
+    }
 }
