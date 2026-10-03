@@ -29,6 +29,8 @@ pub(crate) struct NativeRun<'a> {
 pub(crate) struct Compiled {
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    unwind: Vec<crate::host_fault::UnwindRegistration>,
     entry: Entry,
     pub tail_entry: usize,
     pub pages: Vec<(usize, u64)>,
@@ -45,6 +47,8 @@ impl Drop for Compiled {
     fn drop(&mut self) {
         // SAFETY: the entry pointer is private, run borrows self, and no generated
         // code can still be executing while this exclusive drop runs.
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        self.unwind.clear();
         unsafe { self.module.take().unwrap().free_memory() };
     }
 }
@@ -360,6 +364,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     )
     .map_err(|e| e.to_string())?;
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
     builder.symbol("adv_file_read", crate::file_memory::read as *const u8);
@@ -721,6 +727,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let mut code_size = ctx
         .compiled_code()
         .map_or(0, |code| code.code_buffer().len());
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let body_unwind = ctx
+        .compiled_code()
+        .unwrap()
+        .create_unwind_info(module.isa())
+        .map_err(|e| e.to_string())?
+        .ok_or("missing Windows body unwind")?;
     #[cfg(all(test, target_arch = "x86_64"))]
     let disasm = ctx
         .compiled_code()
@@ -766,16 +779,53 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     code_size += wrapper
         .compiled_code()
         .map_or(0, |code| code.code_buffer().len());
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let wrapper_unwind = wrapper
+        .compiled_code()
+        .unwrap()
+        .create_unwind_info(module.isa())
+        .map_err(|e| e.to_string())?
+        .ok_or("missing Windows wrapper unwind")?;
     module.finalize_definitions().map_err(|e| e.to_string())?;
     // SAFETY: exact signature declared above, finalized memory is owned by module.
     let entry = unsafe {
         std::mem::transmute::<*const u8, Entry>(module.get_finalized_function(wrapper_id))
     };
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let mut unwind = Vec::new();
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    for (address, length, info) in [
+        (
+            tail_entry,
+            ctx.compiled_code().unwrap().code_buffer().len(),
+            body_unwind,
+        ),
+        (
+            entry as usize,
+            wrapper.compiled_code().unwrap().code_buffer().len(),
+            wrapper_unwind,
+        ),
+    ] {
+        let cranelift_codegen::isa::unwind::UnwindInfo::WindowsX64(info) = info else {
+            return Err("unsupported Windows native unwind format".into());
+        };
+        match unsafe { crate::host_fault::UnwindRegistration::new(address, length, &info) } {
+            Ok(registration) => unwind.push(registration),
+            // A future unsupported prologue cannot enable hardware sites. Keep
+            // the current software-checked entry and retire any partial table.
+            Err(_) => {
+                unwind.clear();
+                break;
+            }
+        }
+    }
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
     entries.retain(|pc| supported(&instructions[pc]));
     Ok(Compiled {
         module: Some(module),
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        unwind,
         entry,
         tail_entry,
         pages: pages
@@ -861,6 +911,24 @@ mod snapshot_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    #[test]
+    fn production_owner_registers_body_and_wrapper_and_retires_tables_first() {
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &[0x90, 0xc3]).unwrap();
+        let mut compiled = compile(&Region::new(0x10000, 2), &memory).unwrap();
+        assert_eq!(compiled.unwind.len(), 2);
+        assert!(crate::host_fault::registered(compiled.tail_entry));
+        assert!(crate::host_fault::registered(compiled.entry as usize));
+        compiled.unwind.clear();
+        // Keep code allocations alive during inspection to prevent address
+        // recycling in simultaneous compiler tests.
+        assert!(!crate::host_fault::registered(compiled.tail_entry));
+        assert!(!crate::host_fault::registered(compiled.entry as usize));
+        drop(compiled);
+    }
     use iced_x86::code_asm::*;
 
     #[test]

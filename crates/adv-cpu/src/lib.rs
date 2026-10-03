@@ -14,6 +14,8 @@ mod file_memory;
 #[allow(dead_code)]
 mod host_fault;
 pub mod interpreter;
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+mod jit_memory;
 mod linking;
 mod memory;
 mod shared_memory;

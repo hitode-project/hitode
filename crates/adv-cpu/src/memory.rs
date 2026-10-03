@@ -1060,6 +1060,41 @@ mod linear_audio_tests {
     }
 
     #[test]
+    fn audio_read_denial_keeps_software_read_check_in_production_native_code() {
+        let mut executor = crate::Executor::address_space().unwrap();
+        let code = [0xa1, 0, 0, 2, 0, 0xc3];
+        executor
+            .memory
+            .map(0x10000, PAGE_SIZE, READ | EXEC)
+            .unwrap();
+        executor.memory.write(0x10000, &code).unwrap();
+        let pcm = executor
+            .memory
+            .map_shared_audio(0x20000, PAGE_SIZE)
+            .unwrap();
+        executor.memory.enable_native_protection().unwrap();
+        executor.memory.protect(0x20000, PAGE_SIZE, WRITE).unwrap();
+        pcm.store_u8(0, 0x91);
+        executor
+            .add_region(crate::Region::new(0x10000, code.len()))
+            .unwrap();
+        executor.state.eip = 0x10000;
+        executor.state.regs[0] = 0x12345678;
+        assert_eq!(
+            executor.run(0x11000, 1000).unwrap(),
+            crate::RunOutcome::ReadFault {
+                pc: 0x10000,
+                address: 0x20000
+            }
+        );
+        assert_eq!(executor.state.regs[0], 0x12345678);
+        assert_eq!(pcm.load_u8(0), 0x91);
+        // The capability only covers ordinary pages. SHARED classification and
+        // its READ checks remain mandatory before choosing any raw host load.
+        assert!(executor.memory.native_fault_reads_available());
+    }
+
+    #[test]
     fn production_jit_with_native_permissions_keeps_smc_and_precise_checked_faults() {
         use iced_x86::code_asm::*;
         let code_at = 0x10000;
