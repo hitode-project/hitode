@@ -822,7 +822,13 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
         };
         let selection = added
             .map(|(dc, _)| dc)
-            .or_else(|| if id == api::SELECT && *value != 0 { Some(args[0]) } else { None })
+            .or_else(|| {
+                if id == api::SELECT && *value != 0 {
+                    Some(args[0])
+                } else {
+                    None
+                }
+            })
             .and_then(|dc| graphics.dc_bitmap(dc).map(|bitmap| (dc, bitmap)));
         if (added.is_some() || removed.is_some() || selection.is_some())
             && let Some(win32) = env.ext.try_get_mut::<Win32>()
