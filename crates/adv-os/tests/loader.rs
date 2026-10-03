@@ -4,8 +4,9 @@
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::{HOST_MODULE_BASE, PARK_ADDR, THUNK_BASE, THUNK_SIZE, THUNK_STRIDE};
-use adv_machine::loader::HostDir;
-use adv_machine::{Clock, FileSource, Machine, ModuleKind, RunResult};
+use adv_machine::{Clock, Machine, RunResult};
+use adv_os::loader::HostDir;
+use adv_os::{FileSource, ModuleKind, Process};
 use adv_pe::Pe;
 use adv_unicorn::UnicornCpu;
 
@@ -76,7 +77,7 @@ fn engine_dll_from_bundled_directory_is_guest_unless_registered() {
     )
     .unwrap();
     let id = guest.load(&files, "PAL.dll").unwrap();
-    let module = guest.sys.modules.get(id);
+    let module = adv_os::modules(&guest.ext).get(id);
     assert_eq!(module.kind, ModuleKind::Image);
     assert_eq!(module.path, "dll\\PAL.dll");
     assert_eq!(
@@ -85,7 +86,7 @@ fn engine_dll_from_bundled_directory_is_guest_unless_registered() {
     );
     let mut host = machine();
     let id = host.load(&files, "PAL.dll").unwrap();
-    assert_eq!(host.sys.modules.get(id).kind, ModuleKind::Host);
+    assert_eq!(adv_os::modules(&host.ext).get(id).kind, ModuleKind::Host);
     // An explicit path must not accidentally select a dll/dll/ fallback.
     let mut explicit = Machine::new(
         UnicornCpu::new(PARK_ADDR).unwrap(),
@@ -94,12 +95,15 @@ fn engine_dll_from_bundled_directory_is_guest_unless_registered() {
     )
     .unwrap();
     let id = explicit.load(&files, "missing\\PAL.dll").unwrap();
-    assert_eq!(explicit.sys.modules.get(id).kind, ModuleKind::Host);
+    assert_eq!(
+        adv_os::modules(&explicit.ext).get(id).kind,
+        ModuleKind::Host
+    );
 }
 
 #[test]
 fn module_search_prefers_named_file_then_importer_then_bundle_and_rejects_bad_pe() {
-    use adv_machine::loader::{LoadError, module_file};
+    use adv_os::loader::{LoadError, module_file};
     struct Files(Vec<&'static str>);
     impl FileSource for Files {
         fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -141,12 +145,12 @@ fn old_va_delay_imports_bind_after_loader_relocation() {
     let mut m = machine();
     m.load(&Files, "main.exe").unwrap();
     let id = m.load(&Files, "legacy.dll").unwrap();
-    let base = m.sys.modules.get(id).base;
+    let base = adv_os::modules(&m.ext).get(id).base;
     assert_ne!(base, delay_fixture::BASE);
-    let kernel = m.sys.modules.by_name("kernel32.dll").unwrap();
+    let kernel = adv_os::modules(&m.ext).by_name("kernel32.dll").unwrap();
     assert_eq!(
         m.cpu.read_u32(base + delay_fixture::HMOD + 0x300).unwrap(),
-        m.sys.modules.get(kernel).base
+        adv_os::modules(&m.ext).get(kernel).base
     );
     for slot in [delay_fixture::IAT + 0x300, delay_fixture::IAT + 0x304] {
         assert!(is_thunk(m.cpu.read_u32(base + slot).unwrap()));
@@ -162,7 +166,7 @@ fn leyline_binds_imports_and_delay_imports() {
     let Some(files) = game("LL1") else { return };
     let mut m = machine();
     let exe = m.load(&files, "LeyLine.exe").unwrap();
-    let module = m.sys.modules.get(exe);
+    let module = adv_os::modules(&m.ext).get(exe);
     assert_eq!((module.base, module.kind), (0x40_0000, ModuleKind::Image));
 
     let pe = Pe::parse(&std::fs::read(files.host_path("LeyLine.exe").unwrap()).unwrap()).unwrap();
@@ -177,8 +181,8 @@ fn leyline_binds_imports_and_delay_imports() {
     assert_eq!(delay.len(), 1);
     let pal = &delay[0];
     let hmod = m.cpu.read_u32(base + pal.module_handle_rva).unwrap();
-    let pal_id = m.sys.modules.by_name("PAL.dll").unwrap();
-    assert_eq!(hmod, m.sys.modules.get(pal_id).base);
+    let pal_id = adv_os::modules(&m.ext).by_name("PAL.dll").unwrap();
+    assert_eq!(hmod, adv_os::modules(&m.ext).get(pal_id).base);
     assert!(
         hmod >= HOST_MODULE_BASE,
         "PAL.dll must be host-implemented, not the file in dll/"
@@ -214,7 +218,7 @@ fn leyline_runs_crt_init_until_first_unimplemented_call() {
         .read_u32(m.cpu.reg(adv_cpu::backend::Reg::Esp))
         .unwrap();
     assert_eq!(
-        m.sys.modules.containing(caller),
+        adv_os::modules(&m.ext).containing(caller),
         Some(exe),
         "caller {caller:#x}"
     );
@@ -226,7 +230,10 @@ fn resource_dlls_share_a_preferred_base() {
     let mut m = machine();
     let a = m.load(&files, "C:\\Game\\dll\\RESOURCE.dll").unwrap();
     let b = m.load(&files, "dll/fx.DLL").unwrap();
-    let (ma, mb) = (m.sys.modules.get(a), m.sys.modules.get(b));
+    let (ma, mb) = (
+        adv_os::modules(&m.ext).get(a),
+        adv_os::modules(&m.ext).get(b),
+    );
     assert_eq!(ma.base, 0x1000_0000);
     assert_ne!(mb.base, ma.base, "second image must be moved");
     for md in [ma, mb] {
@@ -255,7 +262,7 @@ fn tl2026_static_tls_and_detours_added_imports_skipped() {
         pe.dirs[adv_pe::dir::IMPORT] = original;
         let kept = import_names(&pe);
         for dll in now.iter().filter(|d| !kept.contains(d)) {
-            assert!(m.sys.modules.by_name(dll).is_none(), "{dll}");
+            assert!(adv_os::modules(&m.ext).by_name(dll).is_none(), "{dll}");
             assert!(
                 m.sys
                     .process_init
@@ -287,7 +294,7 @@ fn all_game_exes_load() {
         let exe = exe.as_str();
         let mut m = machine();
         let id = m.load(&files, exe).unwrap_or_else(|e| panic!("{exe}: {e}"));
-        let md = m.sys.modules.get(id);
+        let md = adv_os::modules(&m.ext).get(id);
         assert_eq!(md.base, 0x40_0000, "{exe}");
         // Code is mapped executable and not writable: a write through the guest faults.
         let text = md.base + 0x1000;

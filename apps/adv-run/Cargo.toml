@@ -10,6 +10,7 @@ description = "Run an x86 Windows guest through the ADV runtime"
 [dependencies]
 adv-runtime = { path = "../../crates/adv-runtime" }
 adv-machine = { path = "../../crates/adv-machine" }
+adv-os = { path = "../../crates/adv-os" }
 adv-sync = { path = "../../crates/adv-sync" }
 png = "0.17"
 

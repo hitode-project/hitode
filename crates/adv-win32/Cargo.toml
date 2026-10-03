@@ -12,6 +12,7 @@ adv-abi.workspace = true
 adv-sync = { path = "../adv-sync" }
 adv-cpu = { path = "../adv-cpu" }
 adv-machine.workspace = true
+adv-os.workspace = true
 adv-pe.workspace = true
 log.workspace = true
 encoding_rs.workspace = true

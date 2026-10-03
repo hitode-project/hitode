@@ -43,7 +43,7 @@ fn snr(reference: &[u8], actual: &[u8]) -> f64 {
 #[ignore = "read-only preflight against a locally installed authorized game"]
 fn real_codec_capability_preflight_reports_actual_provider() {
     let Some(game) = sample(NANA) else { return };
-    let files = adv_machine::loader::HostDir::new(game, "C:\\Game");
+    let files = adv_os::loader::HostDir::new(game, "C:\\Game");
     let selected =
         adv_runtime::vorbis::select_policy_with_reason(&files, "nana_chs.exe", Policy::Native)
             .unwrap();

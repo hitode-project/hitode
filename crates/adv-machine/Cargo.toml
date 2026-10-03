@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 adv-cpu = { path = "../adv-cpu" }
-adv-pe.workspace = true
 thiserror.workspace = true
 log.workspace = true
 
@@ -19,5 +18,3 @@ workspace = true
 [dev-dependencies]
 adv-abi.workspace = true
 adv-unicorn = { path = "../adv-unicorn" }
-adv-samples.workspace = true
-adv-pe.workspace = true

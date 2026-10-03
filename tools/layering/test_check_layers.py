@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from check_layers import TRANSITIONAL, violations
 
@@ -31,7 +32,9 @@ class LayeringTest(unittest.TestCase):
         self.assertTrue(check(("adv-new", "adv-sync", "normal")))
 
     def test_stale_transitional_edge_fails(self):
-        self.assertTrue(violations(CRATES, []))
+        stale = {("adv-machine", "adv-pe"): "moved long ago"}
+        with mock.patch.dict(TRANSITIONAL, stale):
+            self.assertTrue(violations({"adv-machine", "adv-pe"}, []))
 
 
 if __name__ == "__main__":

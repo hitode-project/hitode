@@ -7,6 +7,7 @@ use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, SliceResult};
+use adv_os::Process;
 use adv_win32::{Win32, Win32Config};
 
 use crate::graphics::{API_SPECS, DEVICE_METHODS, GuestMemory, SURFACE_METHODS};
@@ -545,10 +546,7 @@ impl<B: Backend> Runtime<B> {
             if let Some(caller) = context.blocked_stack().and_then(|stack| {
                 adv_cpu::backend::GuestExt::read_u32(&self.machine.cpu, stack).ok()
             }) {
-                let place = self
-                    .machine
-                    .sys
-                    .modules
+                let place = adv_os::modules(&self.machine.ext)
                     .iter()
                     .find(|(_, module)| module.contains(caller))
                     .map_or_else(
@@ -616,10 +614,7 @@ impl<B: Backend> Runtime<B> {
             report.push_str("\nGuest execution profile (includes synchronous API work):");
         }
         for (&address, sample) in samples.into_iter().take(20) {
-            let place = self
-                .machine
-                .sys
-                .modules
+            let place = adv_os::modules(&self.machine.ext)
                 .iter()
                 .find(|(_, module)| module.contains(address))
                 .map_or_else(

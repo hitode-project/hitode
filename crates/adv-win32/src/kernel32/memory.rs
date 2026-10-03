@@ -257,11 +257,9 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     let page = addr & !0xfff;
-    let image = env
-        .sys
-        .modules
+    let image = adv_os::modules(env.ext)
         .containing(addr)
-        .map(|id| env.sys.modules.get(id))
+        .map(|id| adv_os::modules(env.ext).get(id))
         .filter(|m| m.size != 0);
     let allocation = image
         .map(|m| (m.base, m.size))

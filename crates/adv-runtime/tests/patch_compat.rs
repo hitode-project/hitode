@@ -207,15 +207,12 @@ fn real_minhook_iat_com_and_dllmain_match_native_windows() {
         let data = directory.join(backend);
         let mut runtime =
             Runtime::with_cpu(&exe, &data, backend::Cpu::new(backend).unwrap(), 64, 32).unwrap();
-        let module = runtime
-            .machine
-            .sys
-            .modules
+        let module = adv_os::modules(&runtime.machine.ext)
             .by_name("fixture_patch_compat.exe")
             .unwrap();
         let target = named_export(
             &runtime.machine.cpu,
-            runtime.machine.sys.modules.get(module).base,
+            adv_os::modules(&runtime.machine.ext).get(module).base,
             b"PatchTarget",
         );
         if jit {

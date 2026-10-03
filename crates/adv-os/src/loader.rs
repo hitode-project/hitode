@@ -15,10 +15,11 @@ use adv_cpu::backend::{Guest, MemFault, Prot};
 use adv_pe::{ExportTarget, ImportName, Pe, PeError, file_flags, scn};
 use thiserror::Error;
 
-use crate::Sys;
-use crate::layout::{GRANULE, HOST_MODULE_BASE, HOST_MODULE_CAP, PAGE};
-use crate::module::{Module, ModuleId, ModuleKind, module_key};
-use crate::vm::align_up;
+use adv_machine::layout::{GRANULE, HOST_MODULE_BASE, HOST_MODULE_CAP, PAGE};
+use adv_machine::vm::align_up;
+use adv_machine::{Image, InitCall, Sys, TlsImage};
+
+use crate::module::{Module, ModuleId, ModuleKind, Modules, module_key};
 
 /// System modules always implemented by the host, even if a file with that name exists
 /// in the game directory. Engine modules are selected by the host registry instead.
@@ -101,23 +102,6 @@ pub enum LoadError {
     Mem(#[from] MemFault),
 }
 
-/// A guest function to call during process (or LoadLibrary) initialization.
-#[derive(Clone, Debug)]
-pub struct InitCall {
-    pub target: u32,
-    pub args: Vec<u32>,
-    /// For logs: "tls callback of X" / "DllMain of X" / "entry of X".
-    pub what: String,
-}
-
-/// Static TLS of one image (`__declspec(thread)` data).
-#[derive(Clone, Debug)]
-pub struct TlsImage {
-    pub index: u32,
-    pub template: Vec<u8>,
-    pub zero_fill: u32,
-}
-
 pub fn is_host_module(sys: &Sys, key: &str) -> bool {
     HOST_MODULES.contains(&key)
         || key.starts_with("api-ms-win-")
@@ -127,6 +111,7 @@ pub fn is_host_module(sys: &Sys, key: &str) -> bool {
 pub struct Loader<'a> {
     pub cpu: &'a mut dyn Guest,
     pub sys: &'a mut Sys,
+    pub modules: &'a mut Modules,
     pub files: &'a dyn FileSource,
     /// Initializers of newly loaded images, dependencies first.
     pub inits: Vec<InitCall>,
@@ -149,10 +134,16 @@ fn prot_of(characteristics: u32) -> Prot {
 }
 
 impl<'a> Loader<'a> {
-    pub fn new(cpu: &'a mut dyn Guest, sys: &'a mut Sys, files: &'a dyn FileSource) -> Self {
+    pub fn new(
+        cpu: &'a mut dyn Guest,
+        sys: &'a mut Sys,
+        modules: &'a mut Modules,
+        files: &'a dyn FileSource,
+    ) -> Self {
         Self {
             cpu,
             sys,
+            modules,
             files,
             inits: Vec::new(),
             importers: Vec::new(),
@@ -162,8 +153,8 @@ impl<'a> Loader<'a> {
     /// Load `path` (or bump the load count if it is already loaded).
     pub fn load(&mut self, path: &str) -> Result<ModuleId, LoadError> {
         let key = module_key(path);
-        if let Some(id) = self.sys.modules.by_name(&key) {
-            self.sys.modules.get_mut(id).load_count += 1;
+        if let Some(id) = self.modules.by_name(&key) {
+            self.modules.get_mut(id).load_count += 1;
             return Ok(id);
         }
         if is_host_module(self.sys, &key) {
@@ -184,11 +175,11 @@ impl<'a> Loader<'a> {
     }
 
     fn load_host(&mut self, key: String, path: &str) -> Result<ModuleId, LoadError> {
-        let n = self.sys.modules.host_count();
+        let n = self.modules.host_count();
         if n >= HOST_MODULE_CAP {
             return Err(LoadError::TooManyHostModules);
         }
-        Ok(self.sys.modules.add(Module {
+        Ok(self.modules.add(Module {
             name: key,
             path: path.to_owned(),
             kind: ModuleKind::Host,
@@ -252,7 +243,7 @@ impl<'a> Loader<'a> {
         }
         // Registered before binding so import cycles terminate. TLS is registered before
         // binding too, so the exe gets TLS index 0 as on Windows.
-        let id = self.sys.modules.add(Module {
+        let id = self.modules.add(Module {
             name: key.clone(),
             path: path.to_owned(),
             kind: ModuleKind::Image,
@@ -269,6 +260,11 @@ impl<'a> Loader<'a> {
             exports_by_ordinal,
             resources: pe.resources().map_err(pe_err)?,
             load_count: 1,
+        });
+        self.sys.images.add(Image {
+            name: key.clone(),
+            base,
+            size,
         });
 
         let mut tls_callbacks = Vec::new();
@@ -350,7 +346,7 @@ impl<'a> Loader<'a> {
                 what: format!("TLS callback of {key}"),
             });
         }
-        let m = self.sys.modules.get(id);
+        let m = self.modules.get(id);
         if m.is_dll && m.entry != 0 {
             self.inits.push(InitCall {
                 target: m.entry,
@@ -384,7 +380,7 @@ impl<'a> Loader<'a> {
         for m in delay {
             let dep = self.load(&m.dll)?;
             if m.module_handle_rva != 0 {
-                pe.set_u32(m.module_handle_rva, self.sys.modules.get(dep).base)
+                pe.set_u32(m.module_handle_rva, self.modules.get(dep).base)
                     .map_err(pe_err)?;
             }
             for imp in &m.imports {
@@ -397,7 +393,7 @@ impl<'a> Loader<'a> {
 
     /// Address of `sym` in module `m` (a thunk for host modules). Follows forwarders.
     pub fn resolve(&mut self, m: ModuleId, sym: &ImportName) -> Result<u32, LoadError> {
-        let module = self.sys.modules.get(m);
+        let module = self.modules.get(m);
         let name = sym.to_string();
         if module.kind == ModuleKind::Host {
             let key = module.name.clone();

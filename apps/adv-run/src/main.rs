@@ -313,7 +313,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         sources.locked,
     );
     let missing = runtime.missing_apis();
-    let modules = runtime.machine.sys.modules.iter().map(|(_, module)| format!(
+    let modules = adv_os::modules(&runtime.machine.ext).iter().map(|(_, module)| format!(
         "{{\"name\": {}, \"kind\": {}, \"base\": \"{:#010x}\", \"size\": {}, \"exports\": {}}}",
         json(&module.name), json(&format!("{:?}", module.kind)), module.base, module.size, module.exports_by_name.len()
     )).collect::<Vec<_>>().join(", ");

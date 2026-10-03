@@ -32,9 +32,7 @@ RULES: dict[str, set[str]] = {
 }
 ALIASES = {"adv-run": "adv-shell"}
 TEST_ONLY = {"adv-unicorn", "adv-samples"}
-TRANSITIONAL: dict[tuple[str, str], str] = {
-    ("adv-machine", "adv-pe"): "the loader moves to adv-os",
-}
+TRANSITIONAL: dict[tuple[str, str], str] = {}
 
 
 def role(name: str) -> str:

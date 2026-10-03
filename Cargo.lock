@@ -48,6 +48,18 @@ version = "0.1.0"
 dependencies = [
  "adv-abi",
  "adv-cpu",
+ "adv-unicorn",
+ "log",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "adv-os"
+version = "0.1.0"
+dependencies = [
+ "adv-abi",
+ "adv-cpu",
+ "adv-machine",
  "adv-pe",
  "adv-samples",
  "adv-unicorn",
@@ -70,6 +82,7 @@ version = "0.1.0"
 dependencies = [
  "adv-device",
  "adv-machine",
+ "adv-os",
  "adv-runtime",
  "adv-sync",
  "log",
@@ -85,6 +98,7 @@ dependencies = [
  "adv-cpu",
  "adv-device",
  "adv-machine",
+ "adv-os",
  "adv-pe",
  "adv-samples",
  "adv-sync",
@@ -127,6 +141,7 @@ dependencies = [
  "adv-abi",
  "adv-cpu",
  "adv-machine",
+ "adv-os",
  "adv-pe",
  "adv-sync",
  "adv-unicorn",

@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_machine::{Conv, Env, FileSource, Machine, Outcome};
+use adv_machine::{Conv, Env, Machine, Outcome};
+use adv_os::FileSource;
 use ogg::reading::{BasePacketReader, PageParser};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_VORBIS, CodecParameters, Decoder, DecoderOptions};
@@ -87,7 +88,7 @@ pub fn select_policy_with_reason(
     }
     let lower_symbols = lower_symbols(files);
     let mut verified_ordinal_layout = false;
-    if let Some((path, bytes)) = adv_machine::loader::module_file(files, "vorbisfile.dll", None) {
+    if let Some((path, bytes)) = adv_os::loader::module_file(files, "vorbisfile.dll", None) {
         if let Some(reason) = ordinal_layout_error(&bytes) {
             return Ok(Selection::guest(format!("{path}: {reason}")));
         }
@@ -154,8 +155,7 @@ pub fn select_policy_with_reason(
             if key == "vorbisfile.dll" {
                 if !verified_ordinal_layout {
                     let dir = path.rfind(['/', '\\']).map(|i| &path[..i]);
-                    if let Some((codec_path, bytes)) =
-                        adv_machine::loader::module_file(files, &dll, dir)
+                    if let Some((codec_path, bytes)) = adv_os::loader::module_file(files, &dll, dir)
                     {
                         if let Some(reason) = ordinal_layout_error(&bytes) {
                             return Ok(Selection::guest(format!("{codec_path}: {reason}")));
@@ -181,9 +181,7 @@ pub fn select_policy_with_reason(
                 }
             } else {
                 let dir = path.rfind(['/', '\\']).map(|i| &path[..i]);
-                if let Some((dependency_path, _)) =
-                    adv_machine::loader::module_file(files, &dll, dir)
-                {
+                if let Some((dependency_path, _)) = adv_os::loader::module_file(files, &dll, dir) {
                     pending.push(dependency_path);
                 }
             }
@@ -269,7 +267,7 @@ fn lower_symbols(files: &dyn FileSource) -> BTreeSet<String> {
         }
     }
     for dll in ["vorbis.dll", "ogg.dll"] {
-        if let Some((_, bytes)) = adv_machine::loader::module_file(files, dll, None)
+        if let Some((_, bytes)) = adv_os::loader::module_file(files, dll, None)
             && let Ok(pe) = adv_pe::Pe::parse(&bytes)
             && let Ok(exports) = pe.exports()
         {

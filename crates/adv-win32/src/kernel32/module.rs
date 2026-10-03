@@ -5,7 +5,8 @@ use std::collections::VecDeque;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Env, InitCall, Loader, ModuleId, ModuleKind, Outcome};
+use adv_machine::{Env, InitCall, Outcome};
+use adv_os::{Loader, ModuleId, ModuleKind, Modules};
 use adv_pe::{ImportName, ResId};
 
 use super::K32;
@@ -24,14 +25,14 @@ fn run_inits(mut inits: VecDeque<InitCall>, ret: u32) -> Outcome {
 }
 
 fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
-    let w = env.ext.get::<Win32>();
-    let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, &w.vfs);
+    let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
+    let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, modules, &w.vfs);
     let res = l.load(&name);
     let inits: VecDeque<InitCall> = std::mem::take(&mut l.inits).into();
     drop(l);
     match res {
         Ok(id) => {
-            let base = env.sys.modules.get(id).base;
+            let base = adv_os::modules(env.ext).get(id).base;
             log::info!("LoadLibrary({name}) = {base:#010x}");
             run_inits(inits, base)
         }
@@ -61,18 +62,18 @@ pub(crate) fn module_of(env: &Env<'_>, h: u32) -> Option<ModuleId> {
             .cpu
             .read_u32(adv_machine::layout::PEB_ADDR + adv_machine::layout::peb::IMAGE_BASE)
             .ok()?;
-        return env.sys.modules.by_handle(exe);
+        return adv_os::modules(env.ext).by_handle(exe);
     }
-    env.sys.modules.by_handle(h)
+    adv_os::modules(env.ext).by_handle(h)
 }
 
 fn get_module_handle(env: &mut Env<'_>, name: Option<String>) -> Outcome {
     let id = match &name {
         None => module_of(env, 0),
-        Some(n) => env.sys.modules.by_name(n),
+        Some(n) => adv_os::modules(env.ext).by_name(n),
     };
     match id {
-        Some(id) => Outcome::Return(env.sys.modules.get(id).base),
+        Some(id) => Outcome::Return(adv_os::modules(env.ext).get(id).base),
         None => {
             log::debug!("GetModuleHandle({name:?}): not loaded");
             set_last_error(env, err::MOD_NOT_FOUND);
@@ -87,19 +88,17 @@ fn get_module_handle_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     const FROM_ADDRESS: u32 = 4;
     let (flags, name, out) = (env.arg(0), env.arg(1), env.arg(2));
     let base = if flags & FROM_ADDRESS != 0 {
-        env.sys
-            .modules
+        adv_os::modules(env.ext)
             .iter()
             .find(|(_, m)| m.contains(name))
             .map(|(_, m)| m.base)
     } else if name == 0 {
-        module_of(env, 0).map(|id| env.sys.modules.get(id).base)
+        module_of(env, 0).map(|id| adv_os::modules(env.ext).get(id).base)
     } else {
         let n = if wide { arg_w(env, 1) } else { arg_a(env, 1) };
-        env.sys
-            .modules
+        adv_os::modules(env.ext)
             .by_name(&n)
-            .map(|id| env.sys.modules.get(id).base)
+            .map(|id| adv_os::modules(env.ext).get(id).base)
     };
     if out != 0 {
         let _ = env.cpu.write_u32(out, base.unwrap_or(0));
@@ -116,7 +115,7 @@ fn get_module_handle_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
 /// Guest path of a module.
 fn module_path(env: &Env<'_>, id: ModuleId) -> String {
     let w = env.ext.get::<Win32>();
-    let m = env.sys.modules.get(id);
+    let m = adv_os::modules(env.ext).get(id);
     match m.kind {
         ModuleKind::Host => format!("C:\\Windows\\system32\\{}", m.name),
         ModuleKind::Image if !m.is_dll => w.exe_path(),
@@ -165,7 +164,7 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::MOD_NOT_FOUND);
         return Outcome::Return(0);
     };
-    let m = env.sys.modules.get(id);
+    let m = adv_os::modules(env.ext).get(id);
     if m.kind == ModuleKind::Host
         && env
             .sys
@@ -180,13 +179,13 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::PROC_NOT_FOUND);
         return Outcome::Return(0);
     }
-    let w = env.ext.get::<Win32>();
-    let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, &w.vfs);
+    let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
+    let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, modules, &w.vfs);
     let r = l.resolve(id, &sym);
     drop(l);
     env.sys.trace.resolution(
         caller,
-        &env.sys.modules.get(id).name,
+        &adv_os::modules(env.ext).get(id).name,
         &sym,
         r.as_ref().copied().unwrap_or(0),
     );
@@ -229,7 +228,7 @@ pub(crate) fn find_resource_data(
     ty: &ResId,
     name: &ResId,
 ) -> Option<(u32, u32)> {
-    let m = env.sys.modules.get(module_of(env, h)?);
+    let m = adv_os::modules(env.ext).get(module_of(env, h)?);
     let (_, data) = m.resources.as_ref()?.find(ty, name, None)?;
     Some((m.base + data.rva, data.size))
 }
@@ -250,7 +249,7 @@ fn find_resource(
         set_last_error(env, err::MOD_NOT_FOUND);
         return Outcome::Return(0);
     };
-    let m = env.sys.modules.get(id);
+    let m = adv_os::modules(env.ext).get(id);
     let found = m.resources.as_ref().and_then(|r| r.find(&ty, &name, lang));
     let Some((_, data)) = found else {
         log::debug!("FindResource({}, {name:?}, {ty:?}): not found", m.name);

@@ -1,0 +1,23 @@
+[package]
+name = "adv-os"
+description = "OS layer: PE loading, the module table and guest file sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adv-cpu = { path = "../adv-cpu" }
+adv-machine.workspace = true
+adv-pe.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+adv-abi.workspace = true
+adv-unicorn = { path = "../adv-unicorn" }
+adv-samples.workspace = true

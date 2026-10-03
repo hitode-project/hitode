@@ -12,6 +12,7 @@ adv-abi = { path = "../adv-abi" }
 adv-sync = { path = "../adv-sync" }
 adv-cpu = { path = "../adv-cpu" }
 adv-machine = { path = "../adv-machine" }
+adv-os = { path = "../adv-os" }
 adv-win32 = { path = "../adv-win32" }
 adv-device = { path = "../adv-device" }
 adv-pe = { path = "../adv-pe" }

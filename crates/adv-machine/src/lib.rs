@@ -12,10 +12,9 @@
 pub mod clock;
 pub mod ext;
 pub mod layout;
-pub mod loader;
-pub mod module;
 pub mod outcome;
 pub mod patch;
+pub mod process;
 pub mod sched;
 pub mod scheduling;
 pub mod stats;
@@ -37,10 +36,9 @@ use adv_cpu::backend::{
 pub use clock::Clock;
 pub use ext::Ext;
 use layout::*;
-pub use loader::{FileSource, InitCall, LoadError, Loader, TlsImage};
-pub use module::{Module, ModuleId, ModuleKind, Modules};
 pub use outcome::{Continuation, Outcome, Resume, WakeReason};
 pub use patch::Detour;
+pub use process::{Image, Images, InitCall, TlsImage};
 use sched::{Context, Frame, Origin, ReadyResume, State};
 pub use sched::{CtxId, Handle, Object, Objects, Wait};
 pub use stats::{FrameRow, Stats};
@@ -67,7 +65,8 @@ pub struct Sys {
     pub completed_frames: u32,
     pub pid: u32,
     next_tid: u32,
-    pub modules: Modules,
+    /// Mapped guest images, for backtraces and profiles; the OS layer's loader fills it.
+    pub images: Images,
     /// Static TLS templates, by TLS index.
     pub tls_images: Vec<TlsImage>,
     /// Initializers still to run on the main context (see [`Machine::start_process`]).
@@ -639,13 +638,13 @@ struct Dispatch<'a> {
 
 /// Return addresses found by scanning the guest stack: values inside an image that follow
 /// a call instruction (`call rel32` or `call [mem]`). Heuristic, for diagnostics.
-pub fn guess_backtrace(cpu: &dyn Guest, modules: &Modules, esp: u32) -> Vec<u32> {
+pub fn guess_backtrace(cpu: &dyn Guest, images: &Images, esp: u32) -> Vec<u32> {
     let mut out = Vec::new();
     for i in 0..0x800 {
         let Ok(v) = cpu.read_u32(esp + 4 * i) else {
             break;
         };
-        if !modules.iter().any(|(_, m)| m.contains(v)) {
+        if images.containing(v).is_none() {
             continue;
         }
         let mut b = [0u8; 6];
@@ -687,7 +686,7 @@ impl Dispatch<'_> {
             .call_limit
             .is_some_and(|l| self.sys.host_calls >= l)
         {
-            let frames = guess_backtrace(cpu, &self.sys.modules, esp);
+            let frames = guess_backtrace(cpu, &self.sys.images, esp);
             let frames: Vec<String> = frames.iter().map(|a| format!("{a:#010x}")).collect();
             return Err(Parked::Fail(format!(
                 "host call limit reached; likely guest return addresses: {}",
@@ -888,7 +887,7 @@ impl<B: Backend> Machine<B> {
             completed_frames: 0,
             pid: 0x1000,
             next_tid: 0x1004,
-            modules: Modules::default(),
+            images: Images::default(),
             tls_images: Vec::new(),
             process_init: VecDeque::new(),
             recent: RecentCalls::new(32),
@@ -960,22 +959,17 @@ impl<B: Backend> Machine<B> {
         self.latency_scheduling = enabled;
     }
 
-    /// Load an image and its dependencies.
-    /// [`Machine::start_process`].
-    pub fn load(&mut self, files: &dyn FileSource, path: &str) -> Result<ModuleId, LoadError> {
-        let mut l = Loader::new(&mut self.cpu, &mut self.sys, files);
-        let id = l.load(path)?;
-        let inits = std::mem::take(&mut l.inits);
-        self.sys.process_init.extend(inits);
-        Ok(id)
-    }
-
-    /// Create the main context for `exe`: it runs the queued initializers (TLS callbacks,
-    /// DllMain of guest DLLs, dependencies first), then the exe's TLS callbacks and entry
-    /// point, and ends the process with the entry point's return value.
-    pub fn start_process(&mut self, exe: ModuleId) -> Result<CtxId, MemFault> {
-        let m = self.sys.modules.get(exe);
-        let (base, entry, stack, name) = (m.base, m.entry, m.stack_reserve, m.name.clone());
+    /// Create the main context for the exe mapped at `base`: it runs the queued
+    /// initializers (TLS callbacks, DllMain of guest DLLs, dependencies first), then the
+    /// exe's TLS callbacks and `entry`, and ends the process with the entry point's return
+    /// value. The OS layer's `start_process` finds these in its module table.
+    pub fn start_main(
+        &mut self,
+        base: u32,
+        entry: u32,
+        stack: u32,
+        name: &str,
+    ) -> Result<CtxId, MemFault> {
         self.cpu.write_u32(PEB_ADDR + peb::IMAGE_BASE, base)?;
         self.sys.process_init.push_back(InitCall {
             target: entry,
@@ -1488,15 +1482,10 @@ impl<B: Backend> Machine<B> {
             total as f64 / 1e6
         );
         for (addr, n, size) in p.into_iter().take(top) {
-            let place = self
-                .sys
-                .modules
-                .iter()
-                .find(|(_, m)| m.contains(addr))
-                .map_or_else(
-                    || format!("{addr:#010x}"),
-                    |(_, m)| format!("{}+{:#x} ({addr:#010x})", m.name, addr - m.base),
-                );
+            let place = self.sys.images.containing(addr).map_or_else(
+                || format!("{addr:#010x}"),
+                |m| format!("{}+{:#x} ({addr:#010x})", m.name, addr - m.base),
+            );
             let bytes = n * u64::from(size);
             s += &format!(
                 "  {:5.2}% {:12} runs x {:4} B  {place}\n",
