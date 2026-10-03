@@ -163,6 +163,3 @@ pub(crate) fn stdcall(reg: &mut Registry, module: &str, name: &str, argc: u8, h:
     reg.add(module, name, Conv::Stdcall { argc }, h);
 }
 
-pub(crate) fn cdecl(reg: &mut Registry, module: &str, name: &str, argc: u8, h: Handler) {
-    reg.add(module, name, Conv::Cdecl { argc }, h);
-}

@@ -10,7 +10,7 @@ pub mod message;
 pub(crate) mod strings;
 pub mod window;
 
-use adv_abi::Registry;
+use adv_abi::{Conv, Registry};
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
@@ -19,7 +19,7 @@ pub use window::User;
 
 use crate::printf::{StackArgs, format};
 use crate::util::{cstr, put_cstr};
-use crate::{Win32, cdecl, stdcall};
+use crate::{Win32, stdcall};
 
 pub const USER32: &str = "user32.dll";
 /// wsprintf's documented output limit.
@@ -360,7 +360,8 @@ pub fn register(reg: &mut Registry) {
     strings::register(reg);
     menu::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
-    cdecl(reg, USER32, "wsprintfA", 2, wsprintf_a);
+    // WINAPIV is cdecl with a two-argument mandatory prefix, not a fixed signature.
+    reg.add(USER32, "wsprintfA", Conv::CdeclVariadic { fixed: 2 }, wsprintf_a);
     s(reg, "wvsprintfA", 3, wvsprintf_a);
     s(reg, "MessageBoxA", 4, message_box_a);
     s(reg, "MessageBeep", 1, |_| Outcome::Return(1));

@@ -214,7 +214,7 @@ public static class AbiMetadata
         File.WriteAllText(Path.Combine(output, "structs.rs"), structs.ToString(), new UTF8Encoding(false));
 
         var com = new List<string> { "# Generated x86 COM vtable signatures: interface\tslot\tmethod\treturn kind\treturn type\tparameters (including this)" };
-        foreach (string name in new[] { "IDirectDraw", "IDirectDraw7", "IDirectDrawSurface", "IDirectDrawSurface7", "IDirectSound", "IDirectSound8", "IDirectSoundBuffer", "IDirectSoundBuffer8", "IDirect3D9", "IDirect3DDevice9" })
+        foreach (string name in new[] { "IDirectDraw", "IDirectDraw7", "IDirectDrawClipper", "IDirectDrawSurface", "IDirectDrawSurface7", "IDirectSound", "IDirectSound8", "IDirectSoundBuffer", "IDirectSoundBuffer8", "IDirectSoundNotify", "IDirect3D9", "IDirect3DDevice9" })
         {
             int slot = 0;
             foreach (var mh in ComMethods(r, types, types.Find(name)))

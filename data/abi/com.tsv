@@ -52,6 +52,15 @@ IDirectDraw7	26	TestCooperativeLevel	i32	Windows.Win32.Foundation.HRESULT	this:I
 IDirectDraw7	27	GetDeviceIdentifier	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDraw7*:ptr:1|param0:Windows.Win32.Graphics.DirectDraw.DDDEVICEIDENTIFIER2*:ptr:1|param1:u32:u32:1
 IDirectDraw7	28	StartModeTest	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDraw7*:ptr:1|param0:Windows.Win32.Foundation.SIZE*:ptr:1|param1:u32:u32:1|param2:u32:u32:1
 IDirectDraw7	29	EvaluateMode	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDraw7*:ptr:1|param0:u32:u32:1|param1:u32*:ptr:1
+IDirectDrawClipper	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+IDirectDrawClipper	1	AddRef	u32	u32	this:IDirectDrawClipper*:ptr:1
+IDirectDrawClipper	2	Release	u32	u32	this:IDirectDrawClipper*:ptr:1
+IDirectDrawClipper	3	GetClipList	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|param0:Windows.Win32.Foundation.RECT*:ptr:1|param1:Windows.Win32.Graphics.Gdi.RGNDATA*:ptr:1|param2:u32*:ptr:1
+IDirectDrawClipper	4	GetHWnd	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|param0:Windows.Win32.Foundation.HWND*:ptr:1
+IDirectDrawClipper	5	Initialize	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|param0:Windows.Win32.Graphics.DirectDraw.IDirectDraw:ptr:1|param1:u32:u32:1
+IDirectDrawClipper	6	IsClipListChanged	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|param0:Windows.Win32.Foundation.BOOL*:ptr:1
+IDirectDrawClipper	7	SetClipList	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|param0:Windows.Win32.Graphics.Gdi.RGNDATA*:ptr:1|param1:u32:u32:1
+IDirectDrawClipper	8	SetHWnd	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawClipper*:ptr:1|param0:u32:u32:1|param1:Windows.Win32.Foundation.HWND:handle:1
 IDirectDrawSurface	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:IDirectDrawSurface*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
 IDirectDrawSurface	1	AddRef	u32	u32	this:IDirectDrawSurface*:ptr:1
 IDirectDrawSurface	2	Release	u32	u32	this:IDirectDrawSurface*:ptr:1
@@ -205,6 +214,10 @@ IDirectSoundBuffer8	20	Restore	i32	Windows.Win32.Foundation.HRESULT	this:IDirect
 IDirectSoundBuffer8	21	SetFX	i32	Windows.Win32.Foundation.HRESULT	this:IDirectSoundBuffer8*:ptr:1|dwEffectsCount:u32:u32:1|pDSFXDesc:Windows.Win32.Media.Audio.DirectSound.DSEFFECTDESC*:ptr:1|pdwResultCodes:u32*:ptr:1
 IDirectSoundBuffer8	22	AcquireResources	i32	Windows.Win32.Foundation.HRESULT	this:IDirectSoundBuffer8*:ptr:1|dwFlags:u32:u32:1|dwEffectsCount:u32:u32:1|pdwResultCodes:u32*:ptr:1
 IDirectSoundBuffer8	23	GetObjectInPath	i32	Windows.Win32.Foundation.HRESULT	this:IDirectSoundBuffer8*:ptr:1|rguidObject:System.Guid*:ptr:1|dwIndex:u32:u32:1|rguidInterface:System.Guid*:ptr:1|ppObject:void**:ptr:1
+IDirectSoundNotify	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:IDirectSoundNotify*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+IDirectSoundNotify	1	AddRef	u32	u32	this:IDirectSoundNotify*:ptr:1
+IDirectSoundNotify	2	Release	u32	u32	this:IDirectSoundNotify*:ptr:1
+IDirectSoundNotify	3	SetNotificationPositions	i32	Windows.Win32.Foundation.HRESULT	this:IDirectSoundNotify*:ptr:1|dwPositionNotifies:u32:u32:1|pcPositionNotifies:Windows.Win32.Media.Audio.DirectSound.DSBPOSITIONNOTIFY*:ptr:1
 IDirect3D9	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:IDirect3D9*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
 IDirect3D9	1	AddRef	u32	u32	this:IDirect3D9*:ptr:1
 IDirect3D9	2	Release	u32	u32	this:IDirect3D9*:ptr:1

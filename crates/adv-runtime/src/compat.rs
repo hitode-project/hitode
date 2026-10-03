@@ -12,7 +12,7 @@ pub fn register(r: &mut Registry) {
         r.add(
             "user32.dll",
             "wsprintfA",
-            Conv::Cdecl { argc: 2 },
+            Conv::CdeclVariadic { fixed: 2 },
             diagnostic_wsprintf,
         );
         r.add(

@@ -37,7 +37,7 @@ const BUFFER: &[(&str, u8)] = &[
     ("GetPan", 2),
     ("GetFrequency", 2),
     ("GetStatus", 2),
-    ("Initialize", 4),
+    ("Initialize", 3),
     ("Lock", 8),
     ("Play", 4),
     ("SetCurrentPosition", 2),

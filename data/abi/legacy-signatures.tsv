@@ -1,0 +1,211 @@
+# policy	qualified export	omission category
+Guest	ddraw.dll!AddRef	internal common COM dispatch
+Guest	ddraw.dll!QueryInterface	internal common COM dispatch
+Guest	ddraw.dll!Release	internal common COM dispatch
+Guest	ddraw.dll!UnsupportedCOMMethod	internal common COM dispatch
+Guest	dsound.dll!#1	ordinal alias (WinMD is name-based)
+Guest	kernel32.dll!GetEnvironmentStringsA	SDK/export name alias
+Guest	kernel32.dll!InterlockedCompareExchange	SDK intrinsic absent from PInvoke metadata
+Guest	kernel32.dll!InterlockedDecrement	SDK intrinsic absent from PInvoke metadata
+Guest	kernel32.dll!InterlockedExchange	SDK intrinsic absent from PInvoke metadata
+Guest	kernel32.dll!InterlockedExchangeAdd	SDK intrinsic absent from PInvoke metadata
+Guest	kernel32.dll!InterlockedIncrement	SDK intrinsic absent from PInvoke metadata
+Guest	msvcr80.dll!__dllonexit	CRT outside Win32Metadata
+Guest	msvcr80.dll!__p__commode	CRT outside Win32Metadata
+Guest	msvcr80.dll!__p__fmode	CRT outside Win32Metadata
+Guest	msvcr80.dll!__set_app_type	CRT outside Win32Metadata
+Guest	msvcr80.dll!_decode_pointer	CRT outside Win32Metadata
+Guest	msvcr80.dll!_encode_pointer	CRT outside Win32Metadata
+Guest	msvcr80.dll!_encoded_null	CRT outside Win32Metadata
+Guest	msvcr80.dll!_initterm	CRT outside Win32Metadata
+Guest	msvcr80.dll!_initterm_e	CRT outside Win32Metadata
+Guest	msvcr80.dll!_lock	CRT outside Win32Metadata
+Guest	msvcr80.dll!_malloc_crt	CRT outside Win32Metadata
+Guest	msvcr80.dll!_unlock	CRT outside Win32Metadata
+Guest	msvcr80.dll!calloc	CRT outside Win32Metadata
+Guest	msvcr80.dll!free	CRT outside Win32Metadata
+Guest	msvcr80.dll!malloc	CRT outside Win32Metadata
+Guest	msvcr80.dll!realloc	CRT outside Win32Metadata
+Guest	msvcr90.dll!__dllonexit	CRT outside Win32Metadata
+Guest	msvcr90.dll!__p__commode	CRT outside Win32Metadata
+Guest	msvcr90.dll!__p__fmode	CRT outside Win32Metadata
+Guest	msvcr90.dll!__set_app_type	CRT outside Win32Metadata
+Guest	msvcr90.dll!_decode_pointer	CRT outside Win32Metadata
+Guest	msvcr90.dll!_encode_pointer	CRT outside Win32Metadata
+Guest	msvcr90.dll!_encoded_null	CRT outside Win32Metadata
+Guest	msvcr90.dll!_initterm	CRT outside Win32Metadata
+Guest	msvcr90.dll!_initterm_e	CRT outside Win32Metadata
+Guest	msvcr90.dll!_lock	CRT outside Win32Metadata
+Guest	msvcr90.dll!_malloc_crt	CRT outside Win32Metadata
+Guest	msvcr90.dll!_unlock	CRT outside Win32Metadata
+Guest	msvcr90.dll!calloc	CRT outside Win32Metadata
+Guest	msvcr90.dll!free	CRT outside Win32Metadata
+Guest	msvcr90.dll!malloc	CRT outside Win32Metadata
+Guest	msvcr90.dll!realloc	CRT outside Win32Metadata
+Guest	msvcrt.dll!_CIpow	CRT outside Win32Metadata
+Guest	msvcrt.dll!__dllonexit	CRT outside Win32Metadata
+Guest	msvcrt.dll!__p__commode	CRT outside Win32Metadata
+Guest	msvcrt.dll!__p__fmode	CRT outside Win32Metadata
+Guest	msvcrt.dll!__set_app_type	CRT outside Win32Metadata
+Guest	msvcrt.dll!_adjust_fdiv	CRT outside Win32Metadata
+Guest	msvcrt.dll!_errno	CRT outside Win32Metadata
+Guest	msvcrt.dll!_ftol	CRT outside Win32Metadata
+Guest	msvcrt.dll!_initterm	CRT outside Win32Metadata
+Guest	msvcrt.dll!_initterm_e	CRT outside Win32Metadata
+Guest	msvcrt.dll!_lock	CRT outside Win32Metadata
+Guest	msvcrt.dll!_unlock	CRT outside Win32Metadata
+Guest	msvcrt.dll!calloc	CRT outside Win32Metadata
+Guest	msvcrt.dll!ceil	CRT outside Win32Metadata
+Guest	msvcrt.dll!floor	CRT outside Win32Metadata
+Guest	msvcrt.dll!free	CRT outside Win32Metadata
+Guest	msvcrt.dll!frexp	CRT outside Win32Metadata
+Guest	msvcrt.dll!ldexp	CRT outside Win32Metadata
+Guest	msvcrt.dll!malloc	CRT outside Win32Metadata
+Guest	msvcrt.dll!memcmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!memcpy	CRT outside Win32Metadata
+Guest	msvcrt.dll!memmove	CRT outside Win32Metadata
+Guest	msvcrt.dll!memset	CRT outside Win32Metadata
+Guest	msvcrt.dll!qsort	CRT outside Win32Metadata
+Guest	msvcrt.dll!realloc	CRT outside Win32Metadata
+Guest	msvcrt.dll!strcmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!strlen	CRT outside Win32Metadata
+Guest	msvcrt.dll!toupper	CRT outside Win32Metadata
+Guest	oleaut32.dll!#149	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#150	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#2	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#3	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#4	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#5	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#6	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#7	ordinal alias (WinMD is name-based)
+Guest	user32.dll!<ButtonWndProc>	personality-internal guest entry
+Guest	user32.dll!<EditWndProc>	personality-internal guest entry
+Guest	user32.dll!<StaticWndProc>	personality-internal guest entry
+Guest	winmm.dll!__pal_multimedia_timer_worker	personality-internal guest entry
+Guest	ws2_32.dll!#111	ordinal alias (WinMD is name-based)
+Guest	ws2_32.dll!#112	ordinal alias (WinMD is name-based)
+Guest	ws2_32.dll!#115	ordinal alias (WinMD is name-based)
+Guest	ws2_32.dll!#116	ordinal alias (WinMD is name-based)
+Native	ddraw.dll!AddRef	internal common COM dispatch
+Native	ddraw.dll!QueryInterface	internal common COM dispatch
+Native	ddraw.dll!Release	internal common COM dispatch
+Native	ddraw.dll!UnsupportedCOMMethod	internal common COM dispatch
+Native	dsound.dll!#1	ordinal alias (WinMD is name-based)
+Native	kernel32.dll!GetEnvironmentStringsA	SDK/export name alias
+Native	kernel32.dll!InterlockedCompareExchange	SDK intrinsic absent from PInvoke metadata
+Native	kernel32.dll!InterlockedDecrement	SDK intrinsic absent from PInvoke metadata
+Native	kernel32.dll!InterlockedExchange	SDK intrinsic absent from PInvoke metadata
+Native	kernel32.dll!InterlockedExchangeAdd	SDK intrinsic absent from PInvoke metadata
+Native	kernel32.dll!InterlockedIncrement	SDK intrinsic absent from PInvoke metadata
+Native	msvcr80.dll!__dllonexit	CRT outside Win32Metadata
+Native	msvcr80.dll!__p__commode	CRT outside Win32Metadata
+Native	msvcr80.dll!__p__fmode	CRT outside Win32Metadata
+Native	msvcr80.dll!__set_app_type	CRT outside Win32Metadata
+Native	msvcr80.dll!_decode_pointer	CRT outside Win32Metadata
+Native	msvcr80.dll!_encode_pointer	CRT outside Win32Metadata
+Native	msvcr80.dll!_encoded_null	CRT outside Win32Metadata
+Native	msvcr80.dll!_initterm	CRT outside Win32Metadata
+Native	msvcr80.dll!_initterm_e	CRT outside Win32Metadata
+Native	msvcr80.dll!_lock	CRT outside Win32Metadata
+Native	msvcr80.dll!_malloc_crt	CRT outside Win32Metadata
+Native	msvcr80.dll!_unlock	CRT outside Win32Metadata
+Native	msvcr80.dll!calloc	CRT outside Win32Metadata
+Native	msvcr80.dll!free	CRT outside Win32Metadata
+Native	msvcr80.dll!malloc	CRT outside Win32Metadata
+Native	msvcr80.dll!realloc	CRT outside Win32Metadata
+Native	msvcr90.dll!__dllonexit	CRT outside Win32Metadata
+Native	msvcr90.dll!__p__commode	CRT outside Win32Metadata
+Native	msvcr90.dll!__p__fmode	CRT outside Win32Metadata
+Native	msvcr90.dll!__set_app_type	CRT outside Win32Metadata
+Native	msvcr90.dll!_decode_pointer	CRT outside Win32Metadata
+Native	msvcr90.dll!_encode_pointer	CRT outside Win32Metadata
+Native	msvcr90.dll!_encoded_null	CRT outside Win32Metadata
+Native	msvcr90.dll!_initterm	CRT outside Win32Metadata
+Native	msvcr90.dll!_initterm_e	CRT outside Win32Metadata
+Native	msvcr90.dll!_lock	CRT outside Win32Metadata
+Native	msvcr90.dll!_malloc_crt	CRT outside Win32Metadata
+Native	msvcr90.dll!_unlock	CRT outside Win32Metadata
+Native	msvcr90.dll!calloc	CRT outside Win32Metadata
+Native	msvcr90.dll!free	CRT outside Win32Metadata
+Native	msvcr90.dll!malloc	CRT outside Win32Metadata
+Native	msvcr90.dll!realloc	CRT outside Win32Metadata
+Native	msvcrt.dll!_CIpow	CRT outside Win32Metadata
+Native	msvcrt.dll!__dllonexit	CRT outside Win32Metadata
+Native	msvcrt.dll!__p__commode	CRT outside Win32Metadata
+Native	msvcrt.dll!__p__fmode	CRT outside Win32Metadata
+Native	msvcrt.dll!__set_app_type	CRT outside Win32Metadata
+Native	msvcrt.dll!_adjust_fdiv	CRT outside Win32Metadata
+Native	msvcrt.dll!_errno	CRT outside Win32Metadata
+Native	msvcrt.dll!_ftol	CRT outside Win32Metadata
+Native	msvcrt.dll!_initterm	CRT outside Win32Metadata
+Native	msvcrt.dll!_initterm_e	CRT outside Win32Metadata
+Native	msvcrt.dll!_lock	CRT outside Win32Metadata
+Native	msvcrt.dll!_unlock	CRT outside Win32Metadata
+Native	msvcrt.dll!calloc	CRT outside Win32Metadata
+Native	msvcrt.dll!ceil	CRT outside Win32Metadata
+Native	msvcrt.dll!floor	CRT outside Win32Metadata
+Native	msvcrt.dll!free	CRT outside Win32Metadata
+Native	msvcrt.dll!frexp	CRT outside Win32Metadata
+Native	msvcrt.dll!ldexp	CRT outside Win32Metadata
+Native	msvcrt.dll!malloc	CRT outside Win32Metadata
+Native	msvcrt.dll!memcmp	CRT outside Win32Metadata
+Native	msvcrt.dll!memcpy	CRT outside Win32Metadata
+Native	msvcrt.dll!memmove	CRT outside Win32Metadata
+Native	msvcrt.dll!memset	CRT outside Win32Metadata
+Native	msvcrt.dll!qsort	CRT outside Win32Metadata
+Native	msvcrt.dll!realloc	CRT outside Win32Metadata
+Native	msvcrt.dll!strcmp	CRT outside Win32Metadata
+Native	msvcrt.dll!strlen	CRT outside Win32Metadata
+Native	msvcrt.dll!toupper	CRT outside Win32Metadata
+Native	oleaut32.dll!#149	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#150	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#2	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#3	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#4	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#5	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#6	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#7	ordinal alias (WinMD is name-based)
+Native	user32.dll!<ButtonWndProc>	personality-internal guest entry
+Native	user32.dll!<EditWndProc>	personality-internal guest entry
+Native	user32.dll!<StaticWndProc>	personality-internal guest entry
+Native	vorbisfile.dll!#10	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#11	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#13	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#14	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#15	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#16	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#17	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#18	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#20	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#21	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#22	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#24	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#25	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#3	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#4	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#5	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#7	codec ABI outside Windows SDK
+Native	vorbisfile.dll!#8	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_clear	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_comment	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_info	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_open_callbacks	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_pcm_seek	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_pcm_tell	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_pcm_total	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_raw_tell	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_raw_total	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_read	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_seekable	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_serialnumber	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_streams	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_test_callbacks	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_test_open	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_time_seek	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_time_tell	codec ABI outside Windows SDK
+Native	vorbisfile.dll!ov_time_total	codec ABI outside Windows SDK
+Native	winmm.dll!__pal_multimedia_timer_worker	personality-internal guest entry
+Native	ws2_32.dll!#111	ordinal alias (WinMD is name-based)
+Native	ws2_32.dll!#112	ordinal alias (WinMD is name-based)
+Native	ws2_32.dll!#115	ordinal alias (WinMD is name-based)
+Native	ws2_32.dll!#116	ordinal alias (WinMD is name-based)

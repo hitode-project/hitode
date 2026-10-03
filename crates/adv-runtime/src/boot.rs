@@ -17,6 +17,20 @@ pub struct Runtime<B: Backend = JitCpu> {
     pub machine: Machine<B>,
 }
 
+/// Assemble API descriptors without loading guest code or opening host devices.
+/// The same registry drives loading, signature audits and diagnostic tools.
+pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
+    let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
+    crate::crt::register(&mut registry);
+    crate::compat::register(&mut registry);
+    register_graphics(&mut registry);
+    crate::font::register(&mut registry);
+    adv_dx::dsound::register(&mut registry);
+    crate::vorbis::register(&mut registry, codec);
+    registry
+}
+
 impl Runtime<JitCpu> {
     pub fn with_codec(
         exe: impl AsRef<Path>,
@@ -100,14 +114,7 @@ impl<B: Backend> Runtime<B> {
         let files = adv_os::Vfs::new(&cfg.os);
         let selection = crate::vorbis::select_policy_with_reason(&files, exe_name, codec)?;
         let codec = selection.policy;
-        let mut registry = Registry::default();
-        adv_win32::register(&mut registry);
-        crate::crt::register(&mut registry);
-        crate::compat::register(&mut registry);
-        register_graphics(&mut registry);
-        crate::font::register(&mut registry);
-        adv_dx::dsound::register(&mut registry);
-        crate::vorbis::register(&mut registry, codec);
+        let registry = api_registry(codec);
         let mut machine = Machine::new(cpu, registry, Clock::real()).map_err(|e| e.to_string())?;
         machine.ext.insert(selection);
         // An interactive process can make progress while remaining Ready across
