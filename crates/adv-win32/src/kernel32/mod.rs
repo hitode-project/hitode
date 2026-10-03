@@ -17,7 +17,7 @@ mod time;
 mod toolhelp;
 pub use time::filetime_now;
 
-use adv_machine::Registry;
+use adv_abi::Registry;
 
 pub(crate) const K32: &str = "kernel32.dll";
 

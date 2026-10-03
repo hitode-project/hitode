@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Conv, Env, Object, Outcome, Registry};
+use adv_machine::{Conv, Env, Object, Outcome};
 use adv_win32::{
     Win32,
     util::{cstr, wstr},

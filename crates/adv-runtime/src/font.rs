@@ -1,6 +1,7 @@
 //! Guest font selection and Windows GDI glyph extraction for software DCs.
 use crate::{Graphics, Snapshot};
-use adv_machine::{Conv, Env, Handler, Outcome, Registry};
+use adv_abi::Registry;
+use adv_machine::{Conv, Env, Handler, Outcome};
 use adv_win32::{
     Win32,
     gdi32::{GdiObj, LogFont},

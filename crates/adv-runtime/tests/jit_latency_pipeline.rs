@@ -2,9 +2,10 @@
 use adv_cpu::backend::asm::Asm;
 use std::time::{Duration, Instant};
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{Clock, Conv, Machine, Outcome, Registry, RunResult, SliceResult, Wait};
+use adv_machine::{Clock, Conv, Machine, Outcome, RunResult, SliceResult, Wait};
 
 type Cpu = adv_cpu::JitCpu;
 fn new_cpu() -> Cpu {

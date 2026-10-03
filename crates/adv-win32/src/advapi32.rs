@@ -6,8 +6,9 @@ use std::path::PathBuf;
 mod groups;
 mod store;
 
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 use crate::{Win32, stdcall};
 

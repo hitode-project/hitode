@@ -1,7 +1,8 @@
 //! Real guest API calls: explicit counts, ACP, DBCS boundaries and protected ranges.
+use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
-use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_machine::{Clock, Machine, RunResult};
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
 

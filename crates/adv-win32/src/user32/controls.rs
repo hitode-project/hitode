@@ -2,7 +2,8 @@
 //! They are host functions reached through thunks, like any window procedure, so guest
 //! subclassing (SetWindowLong(GWL_WNDPROC) + CallWindowProc) works on them.
 
-use adv_machine::{Env, Outcome, Registry};
+use adv_abi::Registry;
+use adv_machine::{Env, Outcome};
 
 use super::message::{call_proc, def_window_proc, post, send, validate};
 use super::window::{DWL_MSGRESULT, make_long, wm};

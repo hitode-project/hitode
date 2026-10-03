@@ -121,7 +121,7 @@ pub struct TlsImage {
 pub fn is_host_module(sys: &Sys, key: &str) -> bool {
     HOST_MODULES.contains(&key)
         || key.starts_with("api-ms-win-")
-        || sys.thunks.registry.has_module(key)
+        || sys.thunks.resolver().provides(key)
 }
 
 pub struct Loader<'a> {

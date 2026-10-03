@@ -1,8 +1,9 @@
 //! Winsock initialization lifetime only. Socket/network APIs remain unresolved
 //! until a faithful persona exists; this module never creates a host socket.
 use crate::util::{last_error, set_last_error};
+use adv_abi::Registry;
 use adv_cpu::backend::Prot;
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 const VERSION_NOT_SUPPORTED: u32 = 10092;
 const NOT_INITIALIZED: u32 = 10093;

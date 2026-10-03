@@ -1,4 +1,4 @@
-//! Host function registry and the guest thunk page.
+//! Host function binding and the guest thunk page.
 //!
 //! Every imported function the loader resolves (and every GetProcAddress result) gets an
 //! hookable thunk with a Win32 prologue and an explicit trap token. Unknown functions
@@ -6,6 +6,7 @@
 //! that fails loudly with the function's name, so the run stops at the first unimplemented
 //! call that is actually used.
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use adv_cpu::backend::asm::Asm;
@@ -44,57 +45,13 @@ pub struct HostFn {
     pub trace: bool,
 }
 
-/// Implementations by (lowercased module, name). Filled by the win32/pal crates.
-#[derive(Default)]
-pub struct Registry {
-    fns: HashMap<(String, String), HostFn>,
-}
-
-impl Registry {
-    pub fn add(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
-        self.fns.insert(
-            (module.to_ascii_lowercase(), name.to_owned()),
-            HostFn {
-                conv,
-                handler,
-                trace: false,
-            },
-        );
-    }
-
-    pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
-        self.add(module, name, conv, handler);
-        self.set_trace(module, name, true);
-    }
-
-    pub fn set_trace(&mut self, module: &str, name: &str, on: bool) {
-        if let Some(f) = self
-            .fns
-            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
-        {
-            f.trace = on;
-        }
-    }
-
-    pub fn get(&self, module: &str, name: &str) -> Option<HostFn> {
-        self.fns
-            .get(&(module.to_ascii_lowercase(), name.to_owned()))
-            .copied()
-    }
-
-    pub fn len(&self) -> usize {
-        self.fns.len()
-    }
-
-    /// Whether any function is registered for `module` (lowercased file name).
-    pub fn has_module(&self, module: &str) -> bool {
-        let m = module.to_ascii_lowercase();
-        self.fns.keys().any(|(k, _)| *k == m)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fns.is_empty()
-    }
+/// Where host implementations come from. The machine only binds what it is given; naming,
+/// signatures and stubs belong to the ABI layer (`adv_abi::Registry`).
+pub trait Resolver: Any {
+    /// Host implementation of `module!name` (`module` is a lowercase file name), if any.
+    fn host_fn(&self, module: &str, name: &str) -> Option<HostFn>;
+    /// Whether the host implements anything in `module` (lowercase file name).
+    fn provides(&self, module: &str) -> bool;
 }
 
 pub struct Thunk {
@@ -108,7 +65,9 @@ pub struct Thunk {
 pub const RETURN_PAD: u32 = 0;
 
 pub struct ThunkTable {
-    pub registry: Registry,
+    resolver: Box<dyn Resolver>,
+    /// Machine-internal functions, bound ahead of the resolver.
+    internal: HashMap<(String, String), HostFn>,
     thunks: Vec<Thunk>,
     by_name: HashMap<(String, String), u32>,
 }
@@ -123,7 +82,7 @@ fn return_pad(_: &mut Env<'_>) -> Outcome {
 }
 
 impl ThunkTable {
-    pub fn new(registry: Registry) -> Self {
+    pub fn new(resolver: Box<dyn Resolver>) -> Self {
         let pad = Thunk {
             module: String::new(),
             name: "<return pad>".into(),
@@ -135,10 +94,26 @@ impl ThunkTable {
             implemented: true,
         };
         Self {
-            registry,
+            resolver,
+            internal: HashMap::new(),
             thunks: vec![pad],
             by_name: HashMap::new(),
         }
+    }
+
+    pub fn resolver(&self) -> &dyn Resolver {
+        self.resolver.as_ref()
+    }
+
+    /// The resolver as its concrete type, to add implementations after the machine exists.
+    pub fn resolver_mut<T: Resolver>(&mut self) -> Option<&mut T> {
+        (self.resolver.as_mut() as &mut dyn Any).downcast_mut()
+    }
+
+    /// Bind a machine-internal function; it takes precedence over the resolver.
+    pub(crate) fn add_internal(&mut self, module: &str, name: &str, f: HostFn) {
+        self.internal
+            .insert((module.to_ascii_lowercase(), name.to_owned()), f);
     }
 
     /// A hook library can relocate the entry instructions or the entire thunk. The token
@@ -171,7 +146,12 @@ impl ThunkTable {
         }
         let index = self.thunks.len() as u32;
         assert!(index < THUNK_CAP, "thunk table full");
-        let (f, implemented) = match self.registry.get(module, name) {
+        let found = self
+            .internal
+            .get(&key)
+            .copied()
+            .or_else(|| self.resolver.host_fn(&key.0, name));
+        let (f, implemented) = match found {
             Some(f) => (f, true),
             // Unknown convention: it fails before returning, so `ret` is never reached.
             None => (

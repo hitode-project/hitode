@@ -9,8 +9,9 @@ pub mod message;
 pub(crate) mod strings;
 pub mod window;
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
-use adv_machine::{Env, Machine, Outcome, Registry};
+use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
 
 pub use window::User;

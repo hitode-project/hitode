@@ -14,8 +14,9 @@
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 
+use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Env, Object, Outcome, Registry, Wait};
+use adv_machine::{Env, Object, Outcome, Wait};
 
 use super::window::{self, Rect, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};

@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult};
+use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, SliceResult};
 use adv_win32::{Win32, Win32Config};
 
 use crate::graphics::{API_SPECS, DEVICE_METHODS, GuestMemory, SURFACE_METHODS};

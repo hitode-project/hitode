@@ -1,7 +1,8 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
+use adv_abi::Registry;
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
-use adv_machine::{Conv, Env, Machine, Outcome, Registry};
+use adv_machine::{Conv, Env, Machine, Outcome};
 use adv_win32::Win32;
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};

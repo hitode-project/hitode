@@ -17,6 +17,7 @@ log.workspace = true
 workspace = true
 
 [dev-dependencies]
+adv-abi.workspace = true
 adv-unicorn = { path = "../adv-unicorn" }
 adv-samples.workspace = true
 adv-pe.workspace = true

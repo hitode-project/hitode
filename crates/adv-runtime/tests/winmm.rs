@@ -44,7 +44,12 @@ fn run(backend: &str, executable: &str, profile: &Path, budget_probe: bool) {
     .unwrap();
     runtime.machine.sys.clock = Clock::virtual_time();
     if budget_probe {
-        let registry = &mut runtime.machine.sys.thunks.registry;
+        let registry = runtime
+            .machine
+            .sys
+            .thunks
+            .resolver_mut::<adv_abi::Registry>()
+            .unwrap();
         registry.add(
             "winmm.dll",
             "__test_audio_ready",

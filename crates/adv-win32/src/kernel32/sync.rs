@@ -1,8 +1,9 @@
 //! Synchronization. Guest threads are cooperative contexts, so atomics are trivially atomic;
 //! contended locks and waits block the context and let others run.
 
+use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Env, Object, Outcome, Registry, Resume, Wait, WakeReason};
+use adv_machine::{Env, Object, Outcome, Resume, Wait, WakeReason};
 
 use super::K32;
 use crate::util::{err, out_u32, set_last_error};

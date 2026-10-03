@@ -1,8 +1,9 @@
 //! Process-environment global atoms. No atom is installed in the host OS table.
 use std::collections::{BTreeMap, BTreeSet};
 
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 use crate::{Win32, stdcall, util::set_last_error};
 

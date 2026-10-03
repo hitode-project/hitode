@@ -4,8 +4,9 @@
 
 use std::collections::VecDeque;
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 use adv_pe::ResId;
 
 use super::message::{dispatch, next_any, send, wait_for_message};

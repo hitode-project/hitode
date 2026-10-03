@@ -1,7 +1,8 @@
 //! One virtual OS identity, shared by GetVersion[Ex] and VerifyVersionInfo.
 //! This is the existing Windows 7 SP1 x86 personality, not the host OS version.
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 use crate::{stdcall, util::set_last_error};
 

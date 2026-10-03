@@ -213,9 +213,10 @@ fn standalone_default_clock_reads_progress_without_host_cpu_frequency() {
 
 #[test]
 fn pal_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
+    use adv_abi::Registry;
     use adv_cpu::JitCpu;
     use adv_cpu::backend::{Guest, Prot};
-    use adv_machine::{Machine as PalMachine, Registry, RunResult};
+    use adv_machine::{Machine as PalMachine, RunResult};
     for native in [false, true] {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);

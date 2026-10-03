@@ -2,8 +2,9 @@
 //! Built-in labels use a fixed virtual en-US locale, independent of the host UI.
 use super::{user, user_mut};
 use crate::{stdcall, util::set_last_error};
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Default)]

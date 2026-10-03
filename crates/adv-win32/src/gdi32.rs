@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 use crate::util::{cstr, out_u32, zero};
 use crate::{Win32, stdcall};

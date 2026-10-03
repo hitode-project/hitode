@@ -1,6 +1,7 @@
 //! Length-bounded, in-place USER32 case conversion. Counts include embedded NULs.
+use adv_abi::Registry;
 use adv_cpu::backend::Prot;
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 use crate::{Codec, Win32, stdcall};
 

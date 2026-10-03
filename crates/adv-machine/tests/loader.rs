@@ -1,10 +1,11 @@
 //! Loader tests on the local sample corpus (`adv-samples`).
 //! Each test is skipped when its sample is missing.
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::{HOST_MODULE_BASE, PARK_ADDR, THUNK_BASE, THUNK_SIZE, THUNK_STRIDE};
 use adv_machine::loader::HostDir;
-use adv_machine::{Clock, FileSource, Machine, ModuleKind, Registry, RunResult};
+use adv_machine::{Clock, FileSource, Machine, ModuleKind, RunResult};
 use adv_pe::Pe;
 use adv_unicorn::UnicornCpu;
 

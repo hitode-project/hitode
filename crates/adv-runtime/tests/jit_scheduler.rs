@@ -1,8 +1,9 @@
+use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{Clock, Conv, Env, Machine, Object, Outcome, Registry, RunResult, Wait};
+use adv_machine::{Clock, Conv, Env, Machine, Object, Outcome, RunResult, Wait};
 
 const CODE: u32 = 0x0040_0000;
 const CALLBACK: u32 = CODE + 0x100;

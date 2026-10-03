@@ -1,6 +1,7 @@
 //! Small C-runtime services used by guest library DLLs. Library algorithms remain guest code.
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Reg};
-use adv_machine::{Conv, Env, Outcome, Registry};
+use adv_machine::{Conv, Env, Outcome};
 use adv_win32::Win32;
 use std::collections::HashMap;
 

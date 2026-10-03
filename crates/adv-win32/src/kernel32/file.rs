@@ -3,8 +3,9 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::SystemTime;
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Env, Object, Outcome, Registry};
+use adv_machine::{Env, Object, Outcome};
 
 use super::K32;
 use crate::util::{

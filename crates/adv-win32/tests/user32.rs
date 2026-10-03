@@ -1,10 +1,11 @@
 //! USER32 integration tests: x86 guest calls resolved imports and records callbacks in
 //! guest memory. No game files, host-side window injection, or mocked API handlers.
 
+use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_machine::{Clock, Machine, RunResult};
 use adv_unicorn::UnicornCpu;
 use adv_win32::user32::window::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,

@@ -52,10 +52,11 @@ fn fixtures() -> PathBuf {
 
 #[test]
 fn relocated_api_thunks_preserve_stack_registers_callbacks_and_float_returns() {
+    use adv_abi::Registry;
     use adv_cpu::backend::asm::Asm;
     use adv_cpu::backend::{Guest, GuestExt, Prot};
     use adv_machine::layout::THUNK_STRIDE;
-    use adv_machine::{Clock, Conv, Machine, Outcome, Registry, Wait};
+    use adv_machine::{Clock, Conv, Machine, Outcome, Wait};
     const CODE: u32 = 0x0040_0000;
     const RELOCATED: u32 = CODE + 0x400;
     const CALLBACK: u32 = CODE + 0x500;

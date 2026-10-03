@@ -9,6 +9,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "adv-abi"
+version = "0.1.0"
+dependencies = [
+ "adv-machine",
+]
+
+[[package]]
 name = "adv-cpu"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +46,7 @@ dependencies = [
 name = "adv-machine"
 version = "0.1.0"
 dependencies = [
+ "adv-abi",
  "adv-cpu",
  "adv-pe",
  "adv-samples",
@@ -73,6 +81,7 @@ dependencies = [
 name = "adv-runtime"
 version = "0.1.0"
 dependencies = [
+ "adv-abi",
  "adv-cpu",
  "adv-device",
  "adv-machine",
@@ -114,6 +123,7 @@ dependencies = [
 name = "adv-win32"
 version = "0.1.0"
 dependencies = [
+ "adv-abi",
  "adv-cpu",
  "adv-machine",
  "adv-pe",

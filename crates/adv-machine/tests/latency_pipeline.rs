@@ -1,8 +1,9 @@
 //! Complete trap/continuation and host-frame boundaries, using authored guest code.
+use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{Clock, Conv, Machine, Outcome, Registry, RunResult, SliceResult, Wait};
+use adv_machine::{Clock, Conv, Machine, Outcome, RunResult, SliceResult, Wait};
 use adv_unicorn::UnicornCpu;
 use std::time::{Duration, Instant};
 

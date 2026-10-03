@@ -1,7 +1,8 @@
 //! Guest machine core: address space, guest contexts, host-call dispatch, scheduler.
 //!
-//! * Host functions are plain `fn(&mut Env) -> Outcome` registered by name
-//!   ([`thunk::Registry`]). The loader binds imports to hookable guest thunks.
+//! * Host functions are plain `fn(&mut Env) -> Outcome`, found by name through a
+//!   [`thunk::Resolver`] (the ABI layer's registry). The loader binds imports to hookable
+//!   guest thunks.
 //! * A thunk trap runs the handler inside the CPU hook. `Return` and `Call` complete in-hook
 //!   (no emulation restart), except an optional real-time frame-boundary host yield.
 //!   Blocking, exit and failure also park the guest. [`Machine::run`] owns re-entry.
@@ -43,7 +44,7 @@ pub use patch::Detour;
 use sched::{Context, Frame, Origin, ReadyResume, State};
 pub use sched::{CtxId, Handle, Object, Objects, Wait};
 pub use stats::{FrameRow, Stats};
-pub use thunk::{Conv, Handler, Registry, ThunkTable};
+pub use thunk::{Conv, Handler, HostFn, Resolver, ThunkTable};
 pub use trace::{Trace, TraceRecord};
 pub use vm::Vm;
 
@@ -844,12 +845,16 @@ pub struct Machine<B: Backend> {
 impl<B: Backend> Machine<B> {
     /// Maps the host regions and installs segments. `cpu` must have been created with
     /// [`PARK_ADDR`] as its park address.
-    pub fn new(mut cpu: B, mut registry: Registry, clock: Clock) -> Result<Self, MemFault> {
-        registry.add(
+    pub fn new(mut cpu: B, resolver: impl Resolver, clock: Clock) -> Result<Self, MemFault> {
+        let mut thunks = ThunkTable::new(Box::new(resolver));
+        thunks.add_internal(
             INTERNAL_MODULE,
             "process_start",
-            Conv::Cdecl { argc: 0 },
-            process_start,
+            HostFn {
+                conv: Conv::Cdecl { argc: 0 },
+                handler: process_start,
+                trace: false,
+            },
         );
         assert_eq!(
             cpu.park_addr(),
@@ -874,7 +879,7 @@ impl<B: Backend> Machine<B> {
         let sys = Sys {
             clock,
             trace: Trace::default(),
-            thunks: ThunkTable::new(registry),
+            thunks,
             objects: Objects::default(),
             vm,
             contexts: Vec::new(),

@@ -1,6 +1,7 @@
 //! lstr* and small arithmetic helpers.
 
-use adv_machine::{Env, Outcome, Registry};
+use adv_abi::Registry;
+use adv_machine::{Env, Outcome};
 
 use super::K32;
 use crate::stdcall;

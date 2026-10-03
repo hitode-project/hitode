@@ -1,6 +1,7 @@
 //! Small non-rendering compatibility services needed by the first generic ADV sample.
+use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Conv, Env, Outcome, Registry};
+use adv_machine::{Conv, Env, Outcome};
 use adv_win32::{Win32, util::set_last_error};
 
 pub fn register(r: &mut Registry) {

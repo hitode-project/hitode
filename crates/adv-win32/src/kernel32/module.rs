@@ -3,8 +3,9 @@
 
 use std::collections::VecDeque;
 
+use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Env, InitCall, Loader, ModuleId, ModuleKind, Outcome, Registry};
+use adv_machine::{Env, InitCall, Loader, ModuleId, ModuleKind, Outcome};
 use adv_pe::{ImportName, ResId};
 
 use super::K32;
@@ -169,8 +170,8 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
         && env
             .sys
             .thunks
-            .registry
-            .get(&m.name, &sym.to_string())
+            .resolver()
+            .host_fn(&m.name, &sym.to_string())
             .is_none()
     {
         // Unimplemented host function: report "not found" so feature probes fall back.

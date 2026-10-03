@@ -4,8 +4,9 @@
 //! "FE2X" signature and an equally large second half; VerQueryValueA converts string values
 //! to ANSI into that second half, as Windows does.
 
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 use adv_pe::{Pe, ResId};
 
 use crate::util::{cstr, err, out_u32, set_last_error};

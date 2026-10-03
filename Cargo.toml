@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/adv-abi",
     "crates/adv-cpu",
     "crates/adv-device",
     "crates/adv-machine",
@@ -22,6 +23,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
+adv-abi = { path = "crates/adv-abi" }
 adv-pe = { path = "crates/adv-pe" }
 adv-machine = { path = "crates/adv-machine" }
 adv-samples = { path = "crates/adv-samples" }

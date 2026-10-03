@@ -1,6 +1,7 @@
 //! Toolhelp snapshots enumerate guest contexts; host threads are never exposed.
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Object, Outcome, Registry};
+use adv_machine::{Env, Object, Outcome};
 
 use super::K32;
 use crate::util::{err, set_last_error};

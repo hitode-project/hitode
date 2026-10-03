@@ -2,7 +2,8 @@
 //! import but that have no counterpart here (comdlg32, SensApi), plus guest-owned
 //! COM task memory and Automation strings.
 
-use adv_machine::{Env, Outcome, Registry};
+use adv_abi::Registry;
+use adv_machine::{Env, Outcome};
 
 mod ole_memory;
 

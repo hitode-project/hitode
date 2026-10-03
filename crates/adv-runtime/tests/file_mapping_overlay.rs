@@ -1,6 +1,7 @@
 //! Writable views must preserve source assets even in portable-save mode.
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
-use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_machine::{Clock, Machine, RunResult};
 use adv_win32::{Win32, Win32Config};
 use iced_x86::code_asm::*;
 use std::path::Path;

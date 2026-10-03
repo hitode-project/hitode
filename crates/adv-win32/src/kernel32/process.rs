@@ -1,7 +1,8 @@
 //! Process, thread, environment, version, and error-reporting functions.
 
+use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Reg};
-use adv_machine::{Env, Outcome, Registry};
+use adv_machine::{Env, Outcome};
 
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};

@@ -1,0 +1,14 @@
+[package]
+name = "adv-abi"
+description = "ABI layer: host function registry, calling conventions and (later) generated signatures and stubs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adv-machine.workspace = true
+
+[lints]
+workspace = true

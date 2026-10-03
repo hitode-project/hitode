@@ -6,12 +6,11 @@ use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{
-    Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult, Trace, Wait,
-};
+use adv_machine::{Clock, Conv, Env, Machine, Outcome, RunResult, SliceResult, Trace, Wait};
 use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x0040_0000;
@@ -422,12 +421,16 @@ fn guest_callback_can_block_on_another_context() {
 #[test]
 fn variadic_trace_marks_fixed_prefix_without_truncating_guest_arguments() {
     let mut t = T::new();
-    t.m.sys.thunks.registry.add_traced(
-        "test.dll",
-        "variadic",
-        Conv::CdeclVariadic { fixed: 3 },
-        |env| Outcome::Return(env.arg(3)),
-    );
+    t.m.sys
+        .thunks
+        .resolver_mut::<Registry>()
+        .unwrap()
+        .add_traced(
+            "test.dll",
+            "variadic",
+            Conv::CdeclVariadic { fixed: 3 },
+            |env| Outcome::Return(env.arg(3)),
+        );
     let (call, exit) = (t.f("variadic"), t.f("exit"));
     t.code(CODE, |a| {
         a.push_imm(42)

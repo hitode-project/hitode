@@ -1,11 +1,10 @@
 //! Event grants belong to blocked waits, not to a later scheduling poll.
 //! https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
+use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, Prot};
 use adv_machine::layout::PARK_ADDR;
-use adv_machine::{
-    Clock, Conv, Machine, Object, Outcome, Registry, Resume, RunResult, Wait, WakeReason,
-};
+use adv_machine::{Clock, Conv, Machine, Object, Outcome, Resume, RunResult, Wait, WakeReason};
 use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x0040_0000;
