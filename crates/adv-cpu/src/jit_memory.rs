@@ -11,6 +11,60 @@ unsafe extern "system" {
     fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
     fn VirtualProtect(address: *mut c_void, size: usize, protection: u32, old: *mut u32) -> i32;
     fn FlushInstructionCache(process: *mut c_void, address: *const c_void, len: usize) -> i32;
+    fn VirtualQuery(address: *const c_void, info: *mut c_void, len: usize) -> usize;
+}
+
+const PAGE: usize = 4096;
+#[repr(C)]
+#[derive(Default)]
+struct Info {
+    base: usize,
+    allocation: usize,
+    allocation_protection: u32,
+    partition: u16,
+    region: usize,
+    state: u32,
+    protection: u32,
+    kind: u32,
+}
+fn query(pointer: *const u8) -> io::Result<Info> {
+    let mut result = Info::default();
+    if unsafe {
+        VirtualQuery(
+            pointer.cast(),
+            (&mut result as *mut Info).cast(),
+            std::mem::size_of::<Info>(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result)
+}
+
+/// # Safety
+/// `code` belongs to this provider, remains finalized, and is not executing.
+/// Every code allocation owns exactly one disjoint read-only xdata tail page.
+pub(crate) unsafe fn unwind_storage(code: usize, size: usize) -> Result<(*mut u8, usize), String> {
+    let code_info = query(code as *const u8).map_err(|error| error.to_string())?;
+    let storage = code_info
+        .base
+        .checked_add(code_info.region)
+        .ok_or("unwind storage overflow")?;
+    let metadata = query(storage as *const u8).map_err(|error| error.to_string())?;
+    if code_info.protection != 0x20
+        || code_info.state != 0x1000
+        || code_info.kind != 0x20000
+        || code.checked_add(size).is_none_or(|end| end > storage)
+        || metadata.allocation != code_info.allocation
+        || metadata.base != storage
+        || metadata.state != 0x1000
+        || metadata.region != PAGE
+        || metadata.protection != 2
+    {
+        return Err("code provider has no private read-only xdata tail page".into());
+    }
+    Ok((storage as *mut u8, PAGE))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,7 +105,8 @@ impl WindowsMemory {
             (offset.checked_add(size)? <= allocation.len).then_some(offset)
         };
         for allocation in self.allocations.iter_mut().rev() {
-            if allocation.kind == kind
+            if kind != Kind::Code
+                && allocation.kind == kind
                 && !allocation.published
                 && let Some(offset) = fit(allocation)
             {
@@ -59,9 +114,12 @@ impl WindowsMemory {
                 return Ok(unsafe { allocation.base.as_ptr().add(offset) });
             }
         }
-        let len = size
+        let code_len = size
             .checked_add(align - 1)
-            .and_then(|n| n.checked_next_multiple_of(4096))
+            .and_then(|n| n.checked_next_multiple_of(PAGE))
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let len = code_len
+            .checked_add(if kind == Kind::Code { PAGE } else { 0 })
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         let base = NonNull::new(
             unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000, 4) }.cast::<u8>(),
@@ -75,6 +133,7 @@ impl WindowsMemory {
             published: false,
         };
         let offset = fit(&allocation).expect("new aligned JIT allocation must fit");
+        debug_assert!(kind != Kind::Code || offset + size <= code_len);
         allocation.used = offset + size;
         let pointer = unsafe { base.as_ptr().add(offset) };
         self.allocations.push(allocation);
@@ -126,14 +185,22 @@ impl JITMemoryProvider for WindowsMemory {
                 Kind::Writable => 4,
             };
             let mut old = 0;
+            let span = allocation.len
+                - if allocation.kind == Kind::Code {
+                    PAGE
+                } else {
+                    0
+                };
             if protection != 4
                 && unsafe {
-                    VirtualProtect(
-                        allocation.base.as_ptr().cast(),
-                        allocation.len,
-                        protection,
-                        &mut old,
-                    )
+                    VirtualProtect(allocation.base.as_ptr().cast(), span, protection, &mut old)
+                } == 0
+            {
+                return Err(ModuleError::Backend(io::Error::last_os_error().into()));
+            }
+            if allocation.kind == Kind::Code
+                && unsafe {
+                    VirtualProtect(allocation.base.as_ptr().add(span).cast(), PAGE, 2, &mut old)
                 } == 0
             {
                 return Err(ModuleError::Backend(io::Error::last_os_error().into()));
@@ -143,7 +210,7 @@ impl JITMemoryProvider for WindowsMemory {
                     FlushInstructionCache(
                         (-1isize) as *mut c_void,
                         allocation.base.as_ptr().cast(),
-                        allocation.len,
+                        span,
                     )
                 } == 0
             {
@@ -165,36 +232,6 @@ impl Drop for WindowsMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[repr(C)]
-    #[derive(Default)]
-    struct Info {
-        base: usize,
-        allocation: usize,
-        allocation_protection: u32,
-        partition: u16,
-        region: usize,
-        state: u32,
-        protection: u32,
-        kind: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn VirtualQuery(address: *const c_void, info: *mut c_void, len: usize) -> usize;
-    }
-    fn query(pointer: *const u8) -> Info {
-        let mut result = Info::default();
-        assert_ne!(
-            unsafe {
-                VirtualQuery(
-                    pointer.cast(),
-                    (&mut result as *mut Info).cast(),
-                    std::mem::size_of::<Info>(),
-                )
-            },
-            0
-        );
-        result
-    }
     #[test]
     fn finalization_separates_code_constants_data_and_later_publications() {
         let mut provider = WindowsMemory::default();
@@ -203,17 +240,23 @@ mod tests {
         let writable = provider.allocate_readwrite(64, 16).unwrap();
         assert_eq!(code as usize % 32, 0);
         assert_eq!(constant as usize % 64, 0);
-        assert_eq!(query(code).protection, 4);
+        assert_eq!(query(code).unwrap().protection, 4);
         provider.finalize(BranchProtection::None).unwrap();
-        assert_eq!(query(code).protection, 0x20);
-        assert_eq!(query(constant).protection, 2);
-        assert_eq!(query(writable).protection, 4);
+        assert_eq!(query(code).unwrap().protection, 0x20);
+        let (xdata, capacity) = unsafe { unwind_storage(code as usize, 64) }.unwrap();
+        assert_eq!(capacity, PAGE);
+        assert_eq!(query(xdata).unwrap().protection, 2);
+        assert_eq!(query(constant).unwrap().protection, 2);
+        assert_eq!(query(writable).unwrap().protection, 4);
         let next = provider.allocate_readexec(16, 16).unwrap();
-        assert_ne!(query(next).allocation, query(code).allocation);
-        assert_eq!(query(next).protection, 4);
-        assert_eq!(query(code).protection, 0x20);
+        assert_ne!(
+            query(next).unwrap().allocation,
+            query(code).unwrap().allocation
+        );
+        assert_eq!(query(next).unwrap().protection, 4);
+        assert_eq!(query(code).unwrap().protection, 0x20);
         provider.finalize(BranchProtection::None).unwrap();
-        assert_eq!(query(next).protection, 0x20);
+        assert_eq!(query(next).unwrap().protection, 0x20);
         unsafe {
             provider.free_memory();
         }
@@ -227,7 +270,7 @@ mod tests {
             // allocations can recycle the beginning of this former span.
             let pointer = provider.allocate_readexec(1024 * 1024, 16).unwrap();
             let interior = unsafe { pointer.add(768 * 1024) };
-            assert_eq!(query(interior).state, 0x1000);
+            assert_eq!(query(interior).unwrap().state, 0x1000);
             if explicit {
                 provider.finalize(BranchProtection::None).unwrap();
                 unsafe {
@@ -235,7 +278,7 @@ mod tests {
                 }
             }
             drop(provider);
-            assert_eq!(query(interior).state, 0x10000);
+            assert_eq!(query(interior).unwrap().state, 0x10000);
         }
     }
     #[test]

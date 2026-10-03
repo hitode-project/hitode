@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 typedef uintptr_t (*adv_fault_dispatch_t)(uint32_t, uintptr_t, uintptr_t,
                                         uintptr_t, void *);
@@ -34,71 +35,59 @@ void *adv_host_fault_install(adv_fault_dispatch_t dispatch) {
 typedef struct {
     RUNTIME_FUNCTION function;
     void *metadata;
+    size_t capacity;
 } adv_unwind_registration_t;
 
+/* One function owns one tail page. The first DWORD is a duplicate-registration
+ * marker; the xdata begins at +16, independently of code's byte alignment. */
+#define ADV_XDATA_HEADER 16
+
+static int adv_xdata_release(void *storage, size_t capacity) {
+    DWORD old;
+    if (!VirtualProtect(storage, capacity, PAGE_READWRITE, &old)) return 0;
+    *(volatile LONG *)storage = 0;
+    if (!VirtualProtect(storage, capacity, PAGE_READONLY, &old)) return 0;
+    return 1;
+}
+
 void *adv_host_unwind_register(uintptr_t code, size_t code_size,
-                              const void *metadata, size_t metadata_size) {
-    if (!code_size || !metadata_size || code_size > UINT32_MAX ||
-        metadata_size > UINT32_MAX || code > UINTPTR_MAX - code_size) {
+                              const void *metadata, size_t metadata_size,
+                              void *storage, size_t capacity) {
+    uintptr_t base = code & ~(uintptr_t)3;
+    uintptr_t xdata = (uintptr_t)storage + ADV_XDATA_HEADER;
+    if (!code_size || !metadata_size || !storage || capacity < ADV_XDATA_HEADER ||
+        metadata_size > capacity - ADV_XDATA_HEADER || code > UINTPTR_MAX - code_size ||
+        code + code_size - base > UINT32_MAX || xdata < code + code_size ||
+        xdata - base > UINT32_MAX || (xdata - base) & 3) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return NULL;
     }
-    SYSTEM_INFO system;
-    GetSystemInfo(&system);
-    uintptr_t end = code + code_size;
-    /* Keep the dynamic table's base at the function itself. Allowing xdata
-     * below code makes Base..End span nearly 4GB and overlap unrelated dynamic
-     * tables; Windows may select that table before searching the right one. */
-    uintptr_t lowest = end;
-    uintptr_t highest = code > UINTPTR_MAX - UINT32_MAX ? UINTPTR_MAX : code + UINT32_MAX;
-    if (lowest < (uintptr_t)system.lpMinimumApplicationAddress)
-        lowest = (uintptr_t)system.lpMinimumApplicationAddress;
-    if (highest > (uintptr_t)system.lpMaximumApplicationAddress)
-        highest = (uintptr_t)system.lpMaximumApplicationAddress;
-    uintptr_t granularity = system.dwAllocationGranularity;
-    lowest = (lowest + granularity - 1) & ~(granularity - 1);
-    highest = ((highest + 1) & ~(granularity - 1)) - 1;
-    if (lowest >= highest || highest - lowest < metadata_size) {
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return NULL;
-    }
-    MEM_ADDRESS_REQUIREMENTS requirements = { (void *)lowest, (void *)highest, 0 };
-    MEM_EXTENDED_PARAMETER parameter = { 0 };
-    parameter.Type = MemExtendedParameterAddressRequirements;
-    parameter.Pointer = &requirements;
-    void *storage = VirtualAlloc2(NULL, NULL, metadata_size, MEM_COMMIT | MEM_RESERVE,
-                                 PAGE_READWRITE, &parameter, 1);
-    if (!storage) return NULL;
-    /* UnwindData's low bits encode indirection, so its RVA, not only its
-     * absolute address, must be DWORD aligned. Tail functions may start at
-     * an unaligned byte offset inside the JIT allocation. */
-    uintptr_t base = code & ~(uintptr_t)3;
-    if (end - base > UINT32_MAX || (uintptr_t)storage < end || (uintptr_t)storage - base > UINT32_MAX) {
-        VirtualFree(storage, 0, MEM_RELEASE);
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return NULL;
-    }
-    CopyMemory(storage, metadata, metadata_size);
-    DWORD old;
-    if (!VirtualProtect(storage, metadata_size, PAGE_READONLY, &old)) {
-        DWORD error = GetLastError();
-        VirtualFree(storage, 0, MEM_RELEASE);
-        SetLastError(error);
-        return NULL;
-    }
+    /* Rust checked both code RX and this disjoint RO page against VirtualQuery
+     * and the same provider reservation before passing its exclusive slot. */
     adv_unwind_registration_t *registration = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                                         sizeof(*registration));
-    if (!registration) {
-        VirtualFree(storage, 0, MEM_RELEASE);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    if (!registration) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    DWORD old;
+    if (!VirtualProtect(storage, capacity, PAGE_READWRITE, &old)) {
+        HeapFree(GetProcessHeap(), 0, registration);
         return NULL;
     }
+    if (*(volatile LONG *)storage != 0) {
+        if (!VirtualProtect(storage, capacity, PAGE_READONLY, &old)) abort();
+        HeapFree(GetProcessHeap(), 0, registration);
+        SetLastError(ERROR_ALREADY_EXISTS);
+        return NULL;
+    }
+    *(volatile LONG *)storage = 1;
+    CopyMemory((void *)xdata, metadata, metadata_size);
+    if (!VirtualProtect(storage, capacity, PAGE_READONLY, &old)) abort();
     registration->metadata = storage;
+    registration->capacity = capacity;
     registration->function.BeginAddress = (DWORD)(code - base);
-    registration->function.EndAddress = (DWORD)(end - base);
-    registration->function.UnwindData = (DWORD)((uintptr_t)storage - base);
+    registration->function.EndAddress = (DWORD)(code + code_size - base);
+    registration->function.UnwindData = (DWORD)(xdata - base);
     if (!RtlAddFunctionTable(&registration->function, 1, base)) {
-        VirtualFree(storage, 0, MEM_RELEASE);
+        if (!adv_xdata_release(storage, capacity)) abort();
         HeapFree(GetProcessHeap(), 0, registration);
         SetLastError(ERROR_INVALID_DATA);
         return NULL;
@@ -109,7 +98,8 @@ void *adv_host_unwind_register(uintptr_t code, size_t code_size,
 int adv_host_unwind_unregister(void *raw) {
     adv_unwind_registration_t *registration = raw;
     if (!RtlDeleteFunctionTable(&registration->function)) return 0;
-    VirtualFree(registration->metadata, 0, MEM_RELEASE);
+    if (!adv_xdata_release(registration->metadata, registration->capacity)) return 0;
+    /* The provider retains both code and xdata until every table is retired. */
     HeapFree(GetProcessHeap(), 0, registration);
     return 1;
 }
