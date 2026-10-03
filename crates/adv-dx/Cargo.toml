@@ -1,0 +1,22 @@
+[package]
+name = "adv-dx"
+description = "Personality layer: COM device fronts (DirectDraw, DirectSound)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adv-abi.workspace = true
+adv-cpu = { path = "../adv-cpu" }
+adv-machine.workspace = true
+adv-os.workspace = true
+adv-device = { path = "../adv-device" }
+
+[dev-dependencies]
+adv-win32 = { path = "../adv-win32" }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
+
+[lints]
+workspace = true

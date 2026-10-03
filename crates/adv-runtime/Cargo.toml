@@ -15,6 +15,7 @@ adv-machine = { path = "../adv-machine" }
 adv-os = { path = "../adv-os" }
 adv-win32 = { path = "../adv-win32" }
 adv-device = { path = "../adv-device" }
+adv-dx = { path = "../adv-dx" }
 adv-pe = { path = "../adv-pe" }
 ogg = "0.9.2"
 symphonia = { version = "0.5.5", default-features = false, features = ["vorbis", "wav", "pcm", "adpcm"] }

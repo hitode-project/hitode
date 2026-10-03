@@ -4,6 +4,7 @@ members = [
     "crates/adv-abi",
     "crates/adv-cpu",
     "crates/adv-device",
+    "crates/adv-dx",
     "crates/adv-machine",
     "crates/adv-os",
     "crates/adv-pe",

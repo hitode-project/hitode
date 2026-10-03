@@ -239,7 +239,7 @@ pub struct AudioSourceStatus {
     pub locked: u64,
 }
 
-pub(crate) struct Sound {
+pub struct Sound {
     pub enabled: bool,
     tables: [u32; 3],
     objects: BTreeMap<u32, Object>,
@@ -258,7 +258,7 @@ pub(crate) struct Sound {
     playback_clock: Arc<adv_device::clock::PlaybackClock>,
 }
 impl Sound {
-    pub(crate) fn source_status(&self, guest_now: u64) -> AudioSourceStatus {
+    pub fn source_status(&self, guest_now: u64) -> AudioSourceStatus {
         let now = self.playback_clock.now_us(guest_now);
         let mut status = AudioSourceStatus::default();
         for buffer in self.buffers.values().filter(|buffer| buffer.len != 0) {
@@ -272,7 +272,7 @@ impl Sound {
         status
     }
 }
-pub(crate) fn register(reg: &mut Registry) {
+pub fn register(reg: &mut Registry) {
     for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
         reg.add("dsound.dll", name, Conv::Stdcall { argc: 3 }, call);
     }
@@ -291,7 +291,7 @@ pub(crate) fn register(reg: &mut Registry) {
         }
     }
 }
-pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
+pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     let trace = std::env::var_os("ADV_AUDIO_TRACE")
         .map(|path| {
             std::fs::File::create(&path)
@@ -1037,7 +1037,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
 }
 
 /// Queue a small owned PCM window; the device callback never borrows guest memory.
-pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
+pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     let guest_now = m.sys.clock.now_us();
     let s = m.ext.get_mut::<Sound>();
     s.audio.sync_clock(guest_now);

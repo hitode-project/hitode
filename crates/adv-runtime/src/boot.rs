@@ -116,7 +116,7 @@ impl<B: Backend> Runtime<B> {
         crate::compat::register(&mut registry);
         register_graphics(&mut registry);
         crate::font::register(&mut registry);
-        crate::sound::register(&mut registry);
+        adv_dx::dsound::register(&mut registry);
         crate::vorbis::register(&mut registry, codec);
         let mut machine = Machine::new(cpu, registry, Clock::real()).map_err(|e| e.to_string())?;
         machine.ext.insert(selection);
@@ -131,7 +131,7 @@ impl<B: Backend> Runtime<B> {
         crate::crt::install(&mut machine)?;
         install_graphics(&mut machine, width, height)?;
         crate::font::install(&mut machine);
-        crate::sound::install(&mut machine)?;
+        adv_dx::dsound::install(&mut machine)?;
         machine.start_process(exe).map_err(|e| e.to_string())?;
         Ok(Self { machine })
     }
@@ -159,7 +159,7 @@ impl<B: Backend> Runtime<B> {
         ) {
             return outcome;
         }
-        match crate::sound::pump(&mut self.machine) {
+        match adv_dx::dsound::pump(&mut self.machine) {
             Ok(Some(at)) => match outcome {
                 SliceResult::Complete(RunResult::Idle { next_deadline }) => {
                     SliceResult::Complete(RunResult::Idle {
@@ -180,11 +180,15 @@ impl<B: Backend> Runtime<B> {
 
     /// Optional PCM device emulation; native device output is owned by the frontend.
     pub fn set_audio_enabled(&mut self, enabled: bool) {
-        self.machine.ext.get_mut::<crate::sound::Sound>().enabled = enabled;
+        self.machine.ext.get_mut::<adv_dx::dsound::Sound>().enabled = enabled;
     }
 
     pub fn audio_stream(&self) -> adv_device::AudioStream {
-        self.machine.ext.get::<crate::sound::Sound>().audio.stream()
+        self.machine
+            .ext
+            .get::<adv_dx::dsound::Sound>()
+            .audio
+            .stream()
     }
 
     /// Queue and missing-PCM observations, independent of audible sample values.
@@ -194,7 +198,7 @@ impl<B: Backend> Runtime<B> {
     pub fn audio_source_status(&self) -> crate::AudioSourceStatus {
         self.machine
             .ext
-            .get::<crate::sound::Sound>()
+            .get::<adv_dx::dsound::Sound>()
             .source_status(self.machine.sys.clock.now_us())
     }
 
@@ -203,12 +207,12 @@ impl<B: Backend> Runtime<B> {
     pub fn enable_audio_pcm_digests(&mut self) {
         self.machine
             .ext
-            .get_mut::<crate::sound::Sound>()
+            .get_mut::<adv_dx::dsound::Sound>()
             .capture_digests = true;
     }
 
     pub fn audio_pcm_digests(&self) -> &[crate::PcmDigest] {
-        &self.machine.ext.get::<crate::sound::Sound>().digests
+        &self.machine.ext.get::<adv_dx::dsound::Sound>().digests
     }
 
     /// Last captured completed frame, packed top-down BGRA8. Frontends which enable
@@ -494,7 +498,7 @@ impl<B: Backend> Runtime<B> {
                 }
             }
         }
-        if let Some(sound) = self.machine.ext.try_get::<crate::sound::Sound>() {
+        if let Some(sound) = self.machine.ext.try_get::<adv_dx::dsound::Sound>() {
             report.push_str(&format!(
                 "\nAudio: enabled {}; queued {} samples; nonzero {}",
                 sound.enabled, sound.queued_samples, sound.nonzero_samples

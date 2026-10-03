@@ -43,6 +43,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-dx"
+version = "0.1.0"
+dependencies = [
+ "adv-abi",
+ "adv-cpu",
+ "adv-device",
+ "adv-machine",
+ "adv-os",
+ "adv-win32",
+ "iced-x86",
+]
+
+[[package]]
 name = "adv-machine"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +111,7 @@ dependencies = [
  "adv-abi",
  "adv-cpu",
  "adv-device",
+ "adv-dx",
  "adv-machine",
  "adv-os",
  "adv-pe",
