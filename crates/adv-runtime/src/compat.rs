@@ -6,6 +6,7 @@ use pal_win32::{Win32, util::set_last_error};
 pub fn register(r: &mut Registry) {
     crate::mmio::register(r);
     crate::acm::register(r);
+    crate::avi::register(r);
     if std::env::var_os("ADV_PRINTF_DIAG_PATH").is_some() {
         r.add(
             "user32.dll",
