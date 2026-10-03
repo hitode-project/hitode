@@ -70,7 +70,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
 }
 
 impl Emitter<'_> {
-    fn vector_pointer(&mut self, i: &Instruction, write: bool) -> Value {
+    fn vector_address(&mut self, i: &Instruction) -> Value {
         let addr = self.address(i);
         // Legacy SSE2 arithmetic memory operands and MOVDQA require alignment.
         // Let the interpreter produce its architectural exception before changing state.
@@ -79,13 +79,13 @@ impl Emitter<'_> {
             let bad = self.b.ins().icmp_imm(IntCC::NotEqual, misaligned, 0);
             self.guard(bad, Exit::Fallback, None);
         }
-        self.pointer(addr, write, 16)
+        addr
     }
 
     fn vector_read(&mut self, i: &Instruction, operand: u32) -> Value {
         if i.op_kind(operand) == OpKind::Memory {
-            let ptr = self.vector_pointer(i, false);
-            self.b.ins().load(types::I8X16, MemFlags::new(), ptr, 0)
+            let addr = self.vector_address(i);
+            self.direct_load(addr, types::I8X16)
         } else {
             self.b
                 .use_var(self.xmm[register(i.op_register(operand)).unwrap()].unwrap())
@@ -108,8 +108,8 @@ impl Emitter<'_> {
         if matches!(i.mnemonic(), M::Movdqa | M::Movdqu) {
             let value = self.vector_read(i, 1);
             if i.op0_kind() == OpKind::Memory {
-                let ptr = self.vector_pointer(i, true);
-                self.b.ins().store(MemFlags::new(), value, ptr, 0);
+                let addr = self.vector_address(i);
+                self.direct_store(addr, value);
             } else {
                 self.b.def_var(
                     self.xmm[register(i.op0_register()).unwrap()].unwrap(),

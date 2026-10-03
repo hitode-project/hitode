@@ -135,8 +135,7 @@ impl Emitter<'_> {
     fn mmx_read(&mut self, i: &Instruction, n: u32) -> Value {
         if i.op_kind(n) == OpKind::Memory {
             let addr = self.address(i);
-            let ptr = self.pointer(addr, false, 8);
-            let bits = self.b.ins().load(types::I64, MemFlags::new(), ptr, 0);
+            let bits = self.direct_load(addr, types::I64);
             let value = self.b.ins().scalar_to_vector(types::I64X2, bits);
             self.mmx_cast(value, types::I8X16)
         } else {
@@ -180,10 +179,9 @@ impl Emitter<'_> {
             let value = self.mmx_read(i, 1);
             if i.op0_kind() == OpKind::Memory {
                 let addr = self.address(i);
-                let ptr = self.pointer(addr, true, 8);
                 let value = self.mmx_cast(value, types::I64X2);
                 let bits = self.b.ins().extractlane(value, 0);
-                self.b.ins().store(MemFlags::new(), bits, ptr, 0);
+                self.direct_store(addr, bits);
             } else {
                 self.b.def_var(
                     self.mmx[register(i.op0_register()).unwrap()].unwrap(),

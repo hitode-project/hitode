@@ -361,6 +361,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     .map_err(|e| e.to_string())?;
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
+    builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
+    builder.symbol(
+        "adv_atomic_load_vector",
+        crate::atomic_memory::load_vector as *const u8,
+    );
     builder.symbol(
         "adv_read_timestamp",
         crate::trap::read_timestamp as *const u8,
@@ -399,6 +404,29 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_repeat", Linkage::Import, &repeat_signature)
         .map_err(|e| e.to_string())?;
     let repeat_ref = module.declare_func_in_func(repeat_id, &mut ctx.func);
+    let mut atomic_store_signature = module.make_signature();
+    atomic_store_signature.params.extend([
+        AbiParam::new(ptr_ty),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I32),
+    ]);
+    let atomic_store_id = module
+        .declare_function("adv_atomic_store", Linkage::Import, &atomic_store_signature)
+        .map_err(|e| e.to_string())?;
+    let atomic_store_ref = module.declare_func_in_func(atomic_store_id, &mut ctx.func);
+    let mut atomic_load_signature = module.make_signature();
+    atomic_load_signature
+        .params
+        .extend([AbiParam::new(ptr_ty); 2]);
+    let atomic_load_id = module
+        .declare_function(
+            "adv_atomic_load_vector",
+            Linkage::Import,
+            &atomic_load_signature,
+        )
+        .map_err(|e| e.to_string())?;
+    let atomic_load_ref = module.declare_func_in_func(atomic_load_id, &mut ctx.func);
     let mut timestamp_signature = module.make_signature();
     timestamp_signature.params.push(AbiParam::new(ptr_ty));
     timestamp_signature.returns.push(AbiParam::new(types::I64));
@@ -568,6 +596,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             bridge,
             trap_ref,
             repeat_ref,
+            atomic_store_ref,
+            atomic_load_ref,
             timestamp_ref,
         };
         for (&start, &block) in &e.blocks.clone() {
@@ -945,6 +975,12 @@ fn supported(i: &Instruction) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GuestPointer {
+    address: Value,
+    audio: Value,
+}
+
 struct Emitter<'a> {
     b: FunctionBuilder<'a>,
     regs: [Variable; 8],
@@ -974,6 +1010,8 @@ struct Emitter<'a> {
     bridge: Value,
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
+    atomic_store_ref: ir::FuncRef,
+    atomic_load_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
 }
 
@@ -1399,7 +1437,7 @@ impl Emitter<'_> {
         }
         addr
     }
-    fn pointer(&mut self, addr: Value, write: bool, size: usize) -> Value {
+    fn pointer(&mut self, addr: Value, write: bool, size: usize) -> GuestPointer {
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
         let bad =
             self.b
@@ -1427,16 +1465,26 @@ impl Emitter<'_> {
                 .b
                 .ins()
                 .icmp_imm(IntCC::NotEqual, mask, i64::from(permission));
-            // Keep the ordinary-page hot path's original guard count. Only the
-            // cold failure block distinguishes atomic-overlay fallback from a
-            // permission fault; neither path accesses the linear raw pointer.
+            // Retain the ordinary page guard. Only its cold path distinguishes
+            // linear AUDIO from a worker-owned file overlay.
             let ok = self.b.create_block();
             let fail = self.b.create_block();
             self.b.set_cold_block(fail);
             self.b.ins().brif(bad, fail, &[], ok, &[]);
             self.b.switch_to_block(fail);
+            let audio = self.b.ins().band_imm(p, i64::from(crate::memory::AUDIO));
+            let audio = self.b.ins().icmp_imm(IntCC::NotEqual, audio, 0);
+            let access = self.b.ins().band_imm(p, i64::from(permission));
+            let access = self.b.ins().icmp_imm(IntCC::NotEqual, access, 0);
+            let allowed = self.b.ins().band(audio, access);
+            let rejected = self.b.create_block();
+            self.b.set_cold_block(rejected);
+            self.b.ins().brif(allowed, ok, &[], rejected, &[]);
+            self.b.switch_to_block(rejected);
             let shared = self.b.ins().band_imm(p, i64::from(crate::memory::SHARED));
             let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let file = self.b.ins().icmp_imm(IntCC::Equal, audio, 0);
+            let shared = self.b.ins().band(shared, file);
             let fallback = self.constant(Exit::Fallback as u32);
             let fault = self.constant(reason as u32);
             let reason_value = self.b.ins().select(shared, fallback, fault);
@@ -1472,8 +1520,223 @@ impl Emitter<'_> {
             // native regions before they can be entered again.
             self.guard(code, Exit::Fallback, None);
         }
+        // File overlays have already exited above, so a shared bit here denotes
+        // byte-atomic AUDIO, including a mixed ordinary/AUDIO boundary element.
+        let audio = self
+            .b
+            .ins()
+            .band_imm(combined.unwrap(), i64::from(crate::memory::SHARED));
         let offset = self.b.ins().uextend(self.ptr_ty, offset);
-        self.b.ins().iadd(self.mem, offset)
+        let address = self.b.ins().iadd(self.mem, offset);
+        GuestPointer { address, audio }
+    }
+    /// Loads and plain stores can finish their shared access inside the original
+    /// page-guard cold path. No classification branch runs after an ordinary
+    /// guard succeeds. RMW stores retain pointer()'s early prevalidation because
+    /// their flags and value are computed between validation and writeback.
+    fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
+        let write = value.is_some();
+        let size = ty.bytes() as usize;
+        let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
+        let bad =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, offset, (self.len - size) as i64);
+        let reason = if write {
+            Exit::WriteFault
+        } else {
+            Exit::ReadFault
+        };
+        self.guard(bad, reason, Some(addr));
+        let end = self.b.ins().iadd_imm(offset, size as i64 - 1);
+        let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
+        let address = self.b.ins().iadd(self.mem, host_offset);
+        let atomic = self.b.create_block();
+        self.b.set_cold_block(atomic);
+        let done = self.b.create_block();
+        if !write {
+            self.b.append_block_param(done, ty);
+        }
+        let permission = if write { WRITE } else { READ };
+        let mut combined = None;
+        for position in [offset, end] {
+            let page = self.b.ins().ushr_imm(position, 12);
+            let page = self.b.ins().uextend(self.ptr_ty, page);
+            let at = self.b.ins().iadd(self.perms, page);
+            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
+            let mask = self
+                .b
+                .ins()
+                .band_imm(p, i64::from(permission | crate::memory::SHARED));
+            let bad = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, mask, i64::from(permission));
+            let ok = self.b.create_block();
+            self.b.ins().brif(bad, atomic, &[], ok, &[]);
+            self.b.switch_to_block(ok);
+            combined = Some(if let Some(old) = combined {
+                self.b.ins().bor(old, p)
+            } else {
+                p
+            });
+        }
+        if write {
+            let executable = self.b.ins().band_imm(combined.unwrap(), i64::from(EXEC));
+            let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
+            self.guard(executable, Exit::Fallback, None);
+        }
+        if let Some(value) = value {
+            self.b.ins().store(MemFlags::new(), value, address, 0);
+            self.b.ins().jump(done, &[]);
+        } else {
+            let result = self.b.ins().load(ty, MemFlags::new(), address, 0);
+            self.b.ins().jump(done, &[result.into()]);
+        }
+        self.b.switch_to_block(atomic);
+        // Either boundary guard can enter here. Revalidate *both* pages before
+        // any byte is read/written; this also rejects mixed file/AUDIO elements.
+        let mut combined = None;
+        for position in [offset, end] {
+            let page = self.b.ins().ushr_imm(position, 12);
+            let page = self.b.ins().uextend(self.ptr_ty, page);
+            let at = self.b.ins().iadd(self.perms, page);
+            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
+            let kind = self
+                .b
+                .ins()
+                .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
+            let file = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED));
+            self.guard(file, Exit::Fallback, None);
+            self.b.set_cold_block(self.b.current_block().unwrap());
+            let access = self.b.ins().band_imm(p, i64::from(permission));
+            let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
+            self.guard(missing, reason, Some(addr));
+            self.b.set_cold_block(self.b.current_block().unwrap());
+            combined = Some(if let Some(old) = combined {
+                self.b.ins().bor(old, p)
+            } else {
+                p
+            });
+        }
+        if write {
+            let executable = self.b.ins().band_imm(combined.unwrap(), i64::from(EXEC));
+            let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
+            self.guard(executable, Exit::Fallback, None);
+            self.b.set_cold_block(self.b.current_block().unwrap());
+        }
+        if let Some(value) = value {
+            self.store_atomic(address, value);
+            self.b.ins().jump(done, &[]);
+        } else {
+            let result = self.load_atomic(address, ty);
+            self.b.ins().jump(done, &[result.into()]);
+        }
+        self.b.switch_to_block(done);
+        (!write).then(|| self.b.block_params(done)[0])
+    }
+    fn direct_load(&mut self, addr: Value, ty: ir::Type) -> Value {
+        self.direct_memory(addr, ty, None).unwrap()
+    }
+    fn direct_store(&mut self, addr: Value, value: Value) {
+        let ty = self.b.func.dfg.value_type(value);
+        self.direct_memory(addr, ty, Some(value));
+    }
+    fn load_memory(&mut self, pointer: GuestPointer, ty: ir::Type) -> Value {
+        let ordinary = self.b.create_block();
+        let atomic = self.b.create_block();
+        self.b.set_cold_block(atomic);
+        let done = self.b.create_block();
+        self.b.append_block_param(done, ty);
+        self.b.ins().brif(pointer.audio, atomic, &[], ordinary, &[]);
+        self.b.switch_to_block(ordinary);
+        let value = self.b.ins().load(ty, MemFlags::new(), pointer.address, 0);
+        self.b.ins().jump(done, &[value.into()]);
+        self.b.switch_to_block(atomic);
+        let value = self.load_atomic(pointer.address, ty);
+        self.b.ins().jump(done, &[value.into()]);
+        self.b.switch_to_block(done);
+        self.b.block_params(done)[0]
+    }
+    fn load_atomic(&mut self, pointer: Value, ty: ir::Type) -> Value {
+        if ty.is_vector() {
+            // Sixteen inlined byte loads keep many GPR values live and make
+            // register allocation spill the ordinary copy loop. A bounded
+            // Relaxed helper loads into a private stack buffer instead.
+            let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+                ir::StackSlotKind::ExplicitSlot,
+                16,
+                4,
+            ));
+            let destination = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+            self.b
+                .ins()
+                .call(self.atomic_load_ref, &[pointer, destination]);
+            return self.b.ins().stack_load(ty, slot, 0);
+        }
+        let mut value = self.b.ins().iconst(ty, 0);
+        for index in 0..ty.bytes() {
+            let address = self.b.ins().iadd_imm(pointer, i64::from(index));
+            // Cranelift currently exposes SeqCst atomic loads only. They are
+            // stronger than the protocol's Relaxed loads, with the same byte
+            // width. The compiler cannot combine them into an ordinary wide load.
+            let byte = self
+                .b
+                .ins()
+                .atomic_load(types::I8, MemFlags::trusted(), address);
+            if ty == types::I8 {
+                value = byte;
+            } else {
+                let byte = self.b.ins().uextend(ty, byte);
+                let byte = self.b.ins().ishl_imm(byte, i64::from(index * 8));
+                value = self.b.ins().bor(value, byte);
+            }
+        }
+        value
+    }
+    fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
+        let ordinary = self.b.create_block();
+        let atomic = self.b.create_block();
+        self.b.set_cold_block(atomic);
+        let done = self.b.create_block();
+        self.b.ins().brif(pointer.audio, atomic, &[], ordinary, &[]);
+        self.b.switch_to_block(ordinary);
+        self.b
+            .ins()
+            .store(MemFlags::new(), value, pointer.address, 0);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(atomic);
+        self.store_atomic(pointer.address, value);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+    fn store_atomic(&mut self, pointer: Value, value: Value) {
+        let ty = self.b.func.dfg.value_type(value);
+        let (low, high) = if ty.is_vector() {
+            let bits = self.b.ins().bitcast(
+                types::I64X2,
+                MemFlags::new().with_endianness(ir::Endianness::Little),
+                value,
+            );
+            (
+                self.b.ins().extractlane(bits, 0),
+                self.b.ins().extractlane(bits, 1),
+            )
+        } else {
+            let low = if ty == types::I64 {
+                value
+            } else {
+                self.b.ins().uextend(types::I64, value)
+            };
+            (low, self.b.ins().iconst(types::I64, 0))
+        };
+        let width = self.constant(ty.bytes());
+        self.b
+            .ins()
+            .call(self.atomic_store_ref, &[pointer, low, high, width]);
     }
     fn read(&mut self, i: &Instruction, n: u32) -> Value {
         match i.op_kind(n) {
@@ -1498,11 +1761,7 @@ impl Emitter<'_> {
             OpKind::Memory => {
                 let addr = self.address(i);
                 let size = i.memory_size().size();
-                let ptr = self.pointer(addr, false, size);
-                let value = self
-                    .b
-                    .ins()
-                    .load(integer_type(size), MemFlags::new(), ptr, 0);
+                let value = self.direct_load(addr, integer_type(size));
                 if size == 4 {
                     value
                 } else {
@@ -1518,7 +1777,7 @@ impl Emitter<'_> {
             _ => unreachable!(),
         }
     }
-    fn destination(&mut self, i: &Instruction) -> Option<Value> {
+    fn destination(&mut self, i: &Instruction) -> Option<GuestPointer> {
         if i.op0_kind() == OpKind::Memory {
             let addr = self.address(i);
             Some(self.pointer(addr, true, i.memory_size().size()))
@@ -1526,7 +1785,7 @@ impl Emitter<'_> {
             None
         }
     }
-    fn write(&mut self, i: &Instruction, ptr: Option<Value>, value: Value) {
+    fn write(&mut self, i: &Instruction, ptr: Option<GuestPointer>, value: Value) {
         if let Some(ptr) = ptr {
             let size = i.memory_size().size();
             let value = if size == 4 {
@@ -1534,7 +1793,7 @@ impl Emitter<'_> {
             } else {
                 self.b.ins().ireduce(integer_type(size), value)
             };
-            self.b.ins().store(MemFlags::new(), value, ptr, 0);
+            self.store_memory(ptr, value);
         } else {
             let reg = i.op0_register();
             let var = self.regs[reg_index(reg.full_register32()).unwrap()];
@@ -1777,8 +2036,18 @@ impl Emitter<'_> {
                     let narrow = self.b.ins().ireduce(integer_type(size), v);
                     v = self.b.ins().sextend(types::I32, narrow);
                 }
-                let ptr = self.destination(i);
-                self.write(i, ptr, v);
+                if i.op0_kind() == OpKind::Memory {
+                    let addr = self.address(i);
+                    let size = i.memory_size().size();
+                    let narrow = if size == 4 {
+                        v
+                    } else {
+                        self.b.ins().ireduce(integer_type(size), v)
+                    };
+                    self.direct_store(addr, narrow);
+                } else {
+                    self.write(i, None, v);
+                }
             }
             M::Add
             | M::Sub
@@ -1840,7 +2109,7 @@ impl Emitter<'_> {
                 } else {
                     v
                 };
-                self.b.ins().store(MemFlags::new(), pushed, ptr, 0);
+                self.store_memory(ptr, pushed);
                 self.b.def_var(self.regs[4], sp);
                 if i.mnemonic() == M::Call {
                     if i.op0_kind() == OpKind::NearBranch32 {
@@ -1855,7 +2124,7 @@ impl Emitter<'_> {
             M::Pop | M::Ret => {
                 let sp = self.b.use_var(self.regs[4]);
                 let ptr = self.pointer(sp, false, 4);
-                let value = self.b.ins().load(types::I32, MemFlags::new(), ptr, 0);
+                let value = self.load_memory(ptr, types::I32);
                 let adjustment = if i.mnemonic() == M::Ret && i.op_count() != 0 {
                     i64::from(i.immediate16())
                 } else {

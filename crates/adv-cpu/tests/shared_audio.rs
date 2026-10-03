@@ -73,7 +73,7 @@ fn alias_survives_protect_partial_unmap_address_reuse_and_machine_destruction() 
 }
 
 #[test]
-fn native_integer_mmx_sse_and_x87_accesses_exit_before_raw_memory() {
+fn native_integer_mmx_and_sse_use_atomic_bytes_while_x87_keeps_its_helper() {
     let code = bytes(|a| {
         a.mov(dword_ptr(DATA as i32), 0x1234_5678).unwrap();
         a.mov(eax, dword_ptr(DATA as i32)).unwrap();
@@ -96,7 +96,11 @@ fn native_integer_mmx_sse_and_x87_accesses_exit_before_raw_memory() {
         assert_eq!(machine.state.regs[0], 0x1234_5678);
         assert_eq!(machine.state.mmx[1], 0x8123_4567_89ab_cdef);
         assert_eq!(machine.state.xmm[1], [0xa5; 16]);
-        assert!(machine.stats.interpreter_instructions >= 7);
+        if native {
+            assert!(machine.stats.interpreter_instructions < 7);
+        } else {
+            assert!(machine.stats.interpreter_instructions >= 7);
+        }
         let mut data = [0; 72];
         shared.read_alias.copy_into(0, &mut data);
         assert_eq!(&data[..4], &0x1234_5678u32.to_le_bytes());
@@ -133,6 +137,7 @@ fn native_rep_copy_fill_and_comparison_use_byte_atomic_storage() {
         }
         run(&mut cpu);
         assert_eq!(cpu.executor().state.regs[1], 0);
+        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
         let mut actual = vec![0; 8192];
         shared.read_alias.copy_into(0, &mut actual);
         if kind == 1 {
@@ -140,6 +145,298 @@ fn native_rep_copy_fill_and_comparison_use_byte_atomic_storage() {
         } else {
             assert_eq!(actual, source);
         }
+    }
+}
+
+#[test]
+fn native_element_widths_cross_audio_and_ordinary_page_boundaries() {
+    for width in [1, 2, 4, 8, 16] {
+        for address in [DATA - 1, DATA + 4095] {
+            let code = bytes(|a| {
+                match width {
+                    1 => {
+                        a.mov(byte_ptr(address as i32), al).unwrap();
+                        a.mov(cl, byte_ptr(address as i32)).unwrap();
+                    }
+                    2 => {
+                        a.mov(word_ptr(address as i32), ax).unwrap();
+                        a.mov(cx, word_ptr(address as i32)).unwrap();
+                    }
+                    4 => {
+                        a.mov(dword_ptr(address as i32), eax).unwrap();
+                        a.mov(ecx, dword_ptr(address as i32)).unwrap();
+                    }
+                    8 => {
+                        a.movq(qword_ptr(address as i32), mm0).unwrap();
+                        a.movq(mm1, qword_ptr(address as i32)).unwrap();
+                    }
+                    _ => {
+                        a.movdqu(ptr(address as i32), xmm0).unwrap();
+                        a.movdqu(xmm1, ptr(address as i32)).unwrap();
+                    }
+                }
+                a.ret().unwrap();
+            });
+            let (mut cpu, shared) = fixture(&code, true);
+            cpu.map(DATA - 4096, 4096, Prot::RW).unwrap();
+            let state = &mut cpu.executor_mut().state;
+            state.regs[0] = 0x8765_4321;
+            state.mmx[0] = 0xfedc_ba98_7654_3210;
+            state.mmx_mode = u32::from(width == 8);
+            state.xmm[0] = std::array::from_fn(|i| (i * 13 + 7) as u8);
+            run(&mut cpu);
+            let state = &cpu.executor().state;
+            let expected = match width {
+                1 | 2 | 4 => 0x8765_4321u32.to_le_bytes().to_vec(),
+                8 => 0xfedc_ba98_7654_3210u64.to_le_bytes().to_vec(),
+                _ => std::array::from_fn::<_, 16, _>(|i| (i * 13 + 7) as u8).to_vec(),
+            };
+            match width {
+                1 => assert_eq!(state.regs[1], 0x21),
+                2 => assert_eq!(state.regs[1], 0x4321),
+                4 => assert_eq!(state.regs[1], 0x8765_4321),
+                8 => assert_eq!(state.mmx[1], 0xfedc_ba98_7654_3210),
+                _ => assert_eq!(state.xmm[1], expected.as_slice()),
+            }
+            let mut actual = vec![0; width];
+            cpu.read(address, &mut actual).unwrap();
+            assert_eq!(actual, expected[..width]);
+            let first_audio = address.max(DATA);
+            for at in first_audio..address + width as u32 {
+                assert_eq!(
+                    shared.read_alias.load_u8((at - DATA) as usize),
+                    expected[(at - address) as usize]
+                );
+            }
+            assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+        }
+    }
+}
+
+#[test]
+fn protected_read_modify_write_and_vector_store_preserve_instruction_state() {
+    for vector in [false, true] {
+        let code = bytes(|a| {
+            if vector {
+                a.movdqu(ptr(DATA as i32 + 4094), xmm0).unwrap();
+            } else {
+                a.add(dword_ptr(DATA as i32 + 4094), eax).unwrap();
+            }
+            a.ret().unwrap();
+        });
+        let (mut cpu, shared) = fixture(&code, true);
+        cpu.write(DATA + 4094, &[0x7f; 16]).unwrap();
+        cpu.protect(DATA + 4096, 4096, Prot::READ).unwrap();
+        cpu.executor_mut().state.eflags = 0x8d7;
+        cpu.executor_mut().state.regs[0] = 1;
+        cpu.executor_mut().state.xmm[0] = [0xa5; 16];
+        let before = cpu.executor().state.clone();
+        assert_eq!(
+            cpu.executor_mut().run(STOP, 100).unwrap(),
+            RunOutcome::WriteFault {
+                pc: CODE,
+                address: DATA + 4094
+            }
+        );
+        let after = &cpu.executor().state;
+        assert_eq!(after.regs, before.regs);
+        assert_eq!(after.eflags, before.eflags);
+        assert_eq!(after.xmm, before.xmm);
+        assert_eq!(after.eip, CODE);
+        let mut actual = [0; 16];
+        shared.read_alias.copy_into(4094, &mut actual);
+        assert_eq!(actual, [0x7f; 16]);
+        cpu.protect(DATA + 4096, 4096, Prot::RW).unwrap();
+        run(&mut cpu);
+        shared.read_alias.copy_into(4094, &mut actual);
+        if vector {
+            assert_eq!(actual, [0xa5; 16]);
+        } else {
+            assert_eq!(&actual[..4], &0x7f7f_7f80u32.to_le_bytes());
+        }
+        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+    }
+}
+
+#[test]
+fn executable_audio_store_uses_the_self_modification_guard() {
+    let code = bytes(|a| {
+        a.mov(dword_ptr(DATA as i32), 0x1234_5678).unwrap();
+        a.ret().unwrap();
+    });
+    let (mut cpu, shared) = fixture(&code, true);
+    cpu.protect(DATA, 8192, Prot::RWX).unwrap();
+    run(&mut cpu);
+    let mut actual = [0; 4];
+    shared.read_alias.copy_into(0, &mut actual);
+    assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
+    assert!(cpu.executor().stats.interpreter_instructions > 0);
+}
+
+#[test]
+fn audio_rep_comparisons_match_interpreter_for_width_direction_and_stop_condition() {
+    for width in [1, 2, 4] {
+        for backwards in [false, true] {
+            for scan in [false, true] {
+                for equal_repeat in [false, true] {
+                    let mut code = vec![if equal_repeat { 0xf3 } else { 0xf2 }];
+                    if width == 2 {
+                        code.push(0x66);
+                    }
+                    code.push(match (scan, width) {
+                        (false, 1) => 0xa6,
+                        (false, _) => 0xa7,
+                        (true, 1) => 0xae,
+                        (true, _) => 0xaf,
+                    });
+                    code.push(0xc3);
+                    let mut outputs = vec![];
+                    for native in [false, true] {
+                        let (mut cpu, _) = fixture(&code, native);
+                        let mut data = vec![0; 8192];
+                        for chunk in data.chunks_exact_mut(width) {
+                            chunk.copy_from_slice(&0x8765_4321u32.to_le_bytes()[..width]);
+                        }
+                        cpu.write(SOURCE, &data).unwrap();
+                        if !equal_repeat {
+                            for byte in data.iter_mut().step_by(width) {
+                                *byte ^= 0x80;
+                            }
+                        }
+                        let first = if backwards { DATA + 4093 } else { DATA + 3 };
+                        let stop = if backwards {
+                            first - 17 * width as u32
+                        } else {
+                            first + 17 * width as u32
+                        };
+                        cpu.write(DATA, &data).unwrap();
+                        // Both operands start at the same unaligned byte. Copy
+                        // the selected comparison value there before the stop.
+                        let value = if equal_repeat {
+                            0x8765_4321u32
+                        } else {
+                            0x8765_43a1
+                        };
+                        for element in 0..33 {
+                            let address = if backwards {
+                                first - element * width as u32
+                            } else {
+                                first + element * width as u32
+                            };
+                            cpu.write(address, &value.to_le_bytes()[..width]).unwrap();
+                            if !scan {
+                                cpu.write(
+                                    SOURCE + (address - DATA),
+                                    &0x8765_4321u32.to_le_bytes()[..width],
+                                )
+                                .unwrap();
+                            }
+                        }
+                        let stopping = if equal_repeat {
+                            0x8765_43a1u32
+                        } else {
+                            0x8765_4321
+                        };
+                        cpu.write(stop, &stopping.to_le_bytes()[..width]).unwrap();
+                        let state = &mut cpu.executor_mut().state;
+                        state.regs[0] = 0x8765_4321;
+                        state.regs[1] = 33;
+                        state.regs[6] = SOURCE + (first - DATA);
+                        state.regs[7] = first;
+                        state.eflags = 0x8d7 | if backwards { 0x400 } else { 0 };
+                        run(&mut cpu);
+                        assert_eq!(cpu.executor().state.regs[1], 15);
+                        if native {
+                            assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+                        }
+                        outputs.push((cpu.executor().state.regs, cpu.executor().state.eflags));
+                    }
+                    assert_eq!(
+                        outputs[0], outputs[1],
+                        "width={width}, DF={backwards}, SCAS={scan}, REPE={equal_repeat}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_cross_page_native_load_preserves_integer_and_vector_destinations() {
+    for vector in [false, true] {
+        let code = bytes(|a| {
+            if vector {
+                a.movdqu(xmm0, ptr(DATA as i32 + 4094)).unwrap();
+            } else {
+                a.mov(eax, dword_ptr(DATA as i32 + 4094)).unwrap();
+            }
+            a.ret().unwrap();
+        });
+        let (mut cpu, _) = fixture(&code, true);
+        cpu.write(DATA + 4094, &[0xa5; 16]).unwrap();
+        cpu.protect(DATA + 4096, 4096, Prot(0)).unwrap();
+        cpu.executor_mut().state.regs[0] = 0x1234_5678;
+        cpu.executor_mut().state.xmm[0] = [0x12; 16];
+        let before = cpu.executor().state.clone();
+        assert_eq!(
+            cpu.executor_mut().run(STOP, 100).unwrap(),
+            RunOutcome::ReadFault {
+                pc: CODE,
+                address: DATA + 4094
+            }
+        );
+        assert_eq!(cpu.executor().state.regs, before.regs);
+        assert_eq!(cpu.executor().state.xmm, before.xmm);
+        cpu.protect(DATA + 4096, 4096, Prot::RW).unwrap();
+        run(&mut cpu);
+        if vector {
+            assert_eq!(cpu.executor().state.xmm[0], [0xa5; 16]);
+        } else {
+            assert_eq!(cpu.executor().state.regs[0], 0xa5a5_a5a5);
+        }
+        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+    }
+}
+
+#[test]
+fn shared_rep_chunks_preserve_budget_and_pending_interrupt_then_resume() {
+    for compare in [false, true] {
+        let code = if compare {
+            vec![0xf3, 0xa6, 0xc3]
+        } else {
+            vec![0xf3, 0xa4, 0xc3]
+        };
+        let (mut cpu, shared) = fixture(&code, true);
+        cpu.write(SOURCE, &[0x63; 8192]).unwrap();
+        if compare {
+            cpu.write(DATA, &[0x63; 8192]).unwrap();
+        }
+        let interrupt = Arc::new(AtomicBool::new(false));
+        cpu.executor_mut()
+            .set_host_interrupt_flag(interrupt.clone());
+        cpu.executor_mut().state.regs[1] = 8192;
+        cpu.executor_mut().state.regs[6] = SOURCE;
+        cpu.executor_mut().state.regs[7] = DATA;
+        assert_eq!(cpu.executor_mut().run(STOP, 1).unwrap(), RunOutcome::Budget);
+        assert_eq!(cpu.executor().state.regs[1], 4096);
+        assert_eq!(cpu.executor().state.regs[6], SOURCE + 4096);
+        assert_eq!(cpu.executor().state.regs[7], DATA + 4096);
+        assert_eq!(cpu.executor().state.eip, CODE);
+        let before = cpu.executor().state.clone();
+        interrupt.store(true, Ordering::Release);
+        assert_eq!(
+            cpu.executor_mut().run(STOP, 100).unwrap(),
+            RunOutcome::Interrupted
+        );
+        assert_eq!(cpu.executor().state.regs, before.regs);
+        assert_eq!(cpu.executor().state.eflags, before.eflags);
+        interrupt.store(false, Ordering::Release);
+        run(&mut cpu);
+        assert_eq!(cpu.executor().state.regs[1], 0);
+        assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+        let mut actual = [0; 8192];
+        shared.read_alias.copy_into(0, &mut actual);
+        assert_eq!(actual, [0x63; 8192]);
     }
 }
 
@@ -218,4 +515,53 @@ fn concurrent_callback_reads_never_observe_invalidated_or_reused_guest_storage()
     done.store(true, Ordering::Release);
     assert!(reader.join().unwrap() > 0);
     assert_eq!(shared.read_alias.load_u8(0), 0x11);
+}
+
+#[test]
+fn concurrent_callback_reads_accept_byte_mixtures_during_native_simd_stores() {
+    let code = bytes(|a| {
+        let mut again = a.create_label();
+        a.set_label(&mut again).unwrap();
+        a.movdqu(ptr(edi), xmm0).unwrap();
+        a.add(edi, 16).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(again).unwrap();
+        a.ret().unwrap();
+    });
+    let (mut cpu, shared) = fixture(&code, true);
+    cpu.write(DATA, &[0x11; 8192]).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let reader_ready = ready.clone();
+    let stop = done.clone();
+    let alias = shared.read_alias.clone();
+    let reader = std::thread::spawn(move || {
+        let mut loops = 0;
+        let mut data = [0; 128];
+        reader_ready.wait();
+        while !stop.load(Ordering::Acquire) {
+            alias.copy_into(loops % 8000, &mut data);
+            assert!(data.iter().all(|&byte| byte == 0x11 || byte == 0xee));
+            loops += 1;
+        }
+        loops
+    });
+    ready.wait();
+    for _ in 0..64 {
+        for pattern in [0xee, 0x11] {
+            let state = &mut cpu.executor_mut().state;
+            state.eip = CODE;
+            state.regs[1] = 512;
+            state.regs[4] = STACK;
+            state.regs[7] = DATA;
+            state.xmm[0] = [pattern; 16];
+            run(&mut cpu);
+        }
+    }
+    done.store(true, Ordering::Release);
+    assert!(reader.join().unwrap() > 0);
+    assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+    let mut actual = [0; 8192];
+    shared.read_alias.copy_into(0, &mut actual);
+    assert_eq!(actual, [0x11; 8192]);
 }

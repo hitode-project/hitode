@@ -1,4 +1,5 @@
 //! Guarded bulk execution of REP copies, fills, comparisons and scans.
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use iced_x86::{Code, Instruction, OpKind, Register};
@@ -8,6 +9,9 @@ use crate::{CpuState, EXEC, Memory, READ, WRITE};
 // One host operation stays bounded even for very large guest counts. Further chunks
 // re-enter the REP basic block, consuming fuel and checking the wall-clock deadline.
 const CHUNK_BYTES: u32 = 1 << 20;
+// Byte atomics cost more than ordinary memcpy. Return to the generated safepoint
+// frequently so a callback producer cannot delay stop/budget/interrupt handling.
+const SHARED_CHUNK_BYTES: u32 = 4096;
 pub(crate) const FALLBACK: u32 = 1;
 pub(crate) const MORE: u32 = 2;
 pub(crate) const BUDGET: u32 = 3;
@@ -139,13 +143,16 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     if expired(bridge.deadline) {
         return BUDGET;
     }
-    let bytes = len.min(CHUNK_BYTES);
+    let mut bytes = len.min(CHUNK_BYTES);
+    let shared = memory.shared_range(dst, bytes as usize)
+        || (copy && memory.shared_range(src, bytes as usize));
+    if shared {
+        bytes = bytes.min(SHARED_CHUNK_BYTES);
+    }
     if copy && memory.rep_alias_hazard(src, dst, bytes as usize) {
         return FALLBACK;
     }
-    if memory.shared_range(dst, bytes as usize)
-        || (copy && memory.shared_range(src, bytes as usize))
-    {
+    if shared {
         // Dedicated device storage must never reach the raw-pointer bulk paths.
         // Preserve full-range permission validation and bounded REP progress;
         // Audio helpers use byte atomics; worker-owned file views use page copies.
@@ -226,25 +233,57 @@ fn compare_range(
 
 /// Validate only the pages containing the next element and return how many
 /// subsequent elements stay within those pages. No later guest page is read.
-fn readable_elements(memory: &Memory, address: u32, width: u32, backwards: bool) -> Option<u32> {
+fn readable_elements(
+    memory: &Memory,
+    address: u32,
+    width: u32,
+    backwards: bool,
+) -> Option<(u32, bool)> {
     let range = memory.range(address, width as usize).ok()?;
     let first = range.start / 4096;
     let last = (range.end - 1) / 4096;
     if (first..=last).any(|page| {
         !memory.mapped[page]
             || memory.perms[page] & READ == 0
-            || memory.perms[page] & crate::memory::SHARED != 0
+            || (memory.perms[page] & crate::memory::SHARED != 0
+                && memory.perms[page] & crate::memory::AUDIO == 0)
     }) {
         return None;
     }
     let within_page = (range.start % 4096) as u32;
-    Some(if backwards {
+    let audio = (first..=last).any(|page| memory.perms[page] & crate::memory::AUDIO != 0);
+    let span = if backwards {
         within_page / width + 1
     } else {
         // An unaligned word/dword can straddle a page; both pages above were
         // checked, but process just that one element before choosing a new span.
         ((4096 - within_page) / width).max(1)
-    })
+    };
+    Some((span, audio))
+}
+
+/// The complete element and its pages were checked by readable_elements. A wide
+/// guest element on PCM is composed only from matching byte atomic accesses;
+/// concurrent readers may observe a mixture of bytes, as the PCM protocol allows.
+#[inline(always)]
+unsafe fn read_element<const AUDIO: bool>(memory: &Memory, address: u32, width: u32) -> u32 {
+    let pointer = unsafe { memory.ptr.as_ptr().add((address - memory.base) as usize) };
+    if AUDIO {
+        let mut value = 0;
+        for byte in 0..width {
+            let atom = unsafe { &*pointer.add(byte as usize).cast::<AtomicU8>() };
+            value |= u32::from(atom.load(Ordering::Relaxed)) << (byte * 8);
+        }
+        value
+    } else {
+        unsafe {
+            match width {
+                1 => u32::from(pointer.read()),
+                2 => u32::from(u16::from_le(pointer.cast::<u16>().read_unaligned())),
+                _ => u32::from_le(pointer.cast::<u32>().read_unaligned()),
+            }
+        }
+    }
 }
 
 fn comparison_flags(old: u32, left: u32, right: u32, width: u32) -> u32 {
@@ -263,6 +302,70 @@ fn comparison_flags(old: u32, left: u32, right: u32, width: u32) -> u32 {
         | (u32::from(result == 0) << 6)
         | (u32::from(result & sign != 0) << 7)
         | (u32::from((left ^ right) & (left ^ result) & sign != 0) << 11)
+}
+
+struct ScanProgress {
+    source: u32,
+    destination: u32,
+    completed: u32,
+    left: u32,
+    right: u32,
+}
+
+// Keep the byte-atomic alternatives out of the ordinary loop's optimization
+// unit. Width and access modes are fixed for a checked span; dispatch costs one
+// call per page, while no classification or width test runs for each element.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn scan_span<const WIDTH: u32, const SOURCE_AUDIO: bool, const DESTINATION_AUDIO: bool>(
+    memory: &Memory,
+    accumulator: u32,
+    cmps: bool,
+    equal_repeat: bool,
+    delta: u32,
+    count: u32,
+    span: u32,
+    progress: &mut ScanProgress,
+) -> bool {
+    let mut source = progress.source;
+    let mut destination = progress.destination;
+    let mut completed = progress.completed;
+    let mut left = progress.left;
+    let mut right = progress.right;
+    let mask = match WIDTH {
+        1 => 0xff,
+        2 => 0xffff,
+        _ => u32::MAX,
+    };
+    let mut stopped = false;
+    for _ in 0..span {
+        // SAFETY: readable_elements checked all complete elements in this span.
+        unsafe {
+            left = if cmps {
+                read_element::<SOURCE_AUDIO>(memory, source, WIDTH)
+            } else {
+                accumulator
+            };
+            right = read_element::<DESTINATION_AUDIO>(memory, destination, WIDTH);
+        }
+        completed += 1;
+        destination = destination.wrapping_add(delta);
+        if cmps {
+            source = source.wrapping_add(delta);
+        }
+        if ((left ^ right) & mask == 0) != equal_repeat || completed == count {
+            stopped = true;
+            break;
+        }
+    }
+    *progress = ScanProgress {
+        source,
+        destination,
+        completed,
+        left,
+        right,
+    };
+    stopped
 }
 
 fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
@@ -314,7 +417,7 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         Err(BUDGET) => return BUDGET,
         Err(_) => false,
     };
-    let limit = count.min(CHUNK_BYTES / width);
+    let mut limit = count.min(CHUNK_BYTES / width);
     let (mut source, mut destination) = (state.regs[6], state.regs[7]);
     let mut completed = 0;
     let (mut left, mut right) = (0, 0);
@@ -325,46 +428,83 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
             }
             break BUDGET;
         }
-        let Some(mut span) = readable_elements(memory, destination, width, backwards) else {
+        let Some((mut span, destination_audio)) =
+            readable_elements(memory, destination, width, backwards)
+        else {
             // A non-validated scan has not changed any architectural state.
             return FALLBACK;
         };
+        let mut source_audio = false;
         if cmps {
-            let Some(source_span) = readable_elements(memory, source, width, backwards) else {
+            let Some((source_span, audio)) = readable_elements(memory, source, width, backwards)
+            else {
                 return FALLBACK;
             };
             span = span.min(source_span);
+            source_audio = audio;
+        }
+        if source_audio || destination_audio {
+            limit = limit.min(completed + SHARED_CHUNK_BYTES / width);
         }
         span = span.min(limit - completed);
-        for _ in 0..span {
-            // SAFETY: the page span above validates each entire element, including
-            // unaligned elements straddling two pages. Reads occur in guest order;
-            // a stopping comparison never reads the next element.
-            unsafe {
-                let read = |address: u32| {
-                    let pointer = memory.ptr.as_ptr().add((address - memory.base) as usize);
-                    match width {
-                        1 => u32::from(pointer.read()),
-                        2 => u32::from(u16::from_le(pointer.cast::<u16>().read_unaligned())),
-                        _ => u32::from_le(pointer.cast::<u32>().read_unaligned()),
-                    }
-                };
-                left = if cmps { read(source) } else { state.regs[0] };
-                right = read(destination);
-            }
-            completed += 1;
-            destination = destination.wrapping_add(delta);
-            if cmps {
-                source = source.wrapping_add(delta);
-            }
-            let equal = match width {
-                1 => left as u8 == right as u8,
-                2 => left as u16 == right as u16,
-                _ => left == right,
+        let mut progress = ScanProgress {
+            source,
+            destination,
+            completed,
+            left,
+            right,
+        };
+        macro_rules! scan {
+            ($src:literal, $dst:literal) => {
+                match width {
+                    1 => scan_span::<1, $src, $dst>(
+                        memory,
+                        state.regs[0],
+                        cmps,
+                        equal_repeat,
+                        delta,
+                        count,
+                        span,
+                        &mut progress,
+                    ),
+                    2 => scan_span::<2, $src, $dst>(
+                        memory,
+                        state.regs[0],
+                        cmps,
+                        equal_repeat,
+                        delta,
+                        count,
+                        span,
+                        &mut progress,
+                    ),
+                    _ => scan_span::<4, $src, $dst>(
+                        memory,
+                        state.regs[0],
+                        cmps,
+                        equal_repeat,
+                        delta,
+                        count,
+                        span,
+                        &mut progress,
+                    ),
+                }
             };
-            if equal != equal_repeat || completed == count {
-                break 'scan 0;
-            }
+        }
+        let stopped = match (source_audio, destination_audio) {
+            (false, false) => scan!(false, false),
+            (false, true) => scan!(false, true),
+            (true, false) => scan!(true, false),
+            (true, true) => scan!(true, true),
+        };
+        ScanProgress {
+            source,
+            destination,
+            completed,
+            left,
+            right,
+        } = progress;
+        if stopped {
+            break 'scan 0;
         }
         if completed == limit {
             if !fully_checked {

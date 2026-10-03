@@ -42,6 +42,7 @@ fn code(operation: &str) -> Vec<u8> {
 
 fn main() {
     let samples: usize = std::env::args().nth(1).map_or(9, |n| n.parse().unwrap());
+    let filter = std::env::args().nth(2);
     assert!(samples > 0);
     #[cfg(windows)]
     {
@@ -51,8 +52,13 @@ fn main() {
         }
         assert_ne!(unsafe { SetProcessAffinityMask(GetCurrentProcess(), 1) }, 0);
     }
-    println!("operation,storage,bytes,median_ms,interpreter_instructions,native_entries");
+    println!(
+        "operation,storage,bytes,median_ms,interpreter_instructions,native_entries,native_code_bytes"
+    );
     for operation in ["dword_loop", "sse_loop", "rep_movsd", "rep_cmpsb"] {
+        if filter.as_deref().is_some_and(|filter| filter != operation) {
+            continue;
+        }
         let bytes = code(operation);
         for storage in ["ordinary", "pcm", "file", "file_cow"] {
             let mut cpu = JitCpu::new(STOP, false).unwrap();
@@ -64,9 +70,11 @@ fn main() {
             let file = storage.starts_with("file");
             let callback = if file {
                 let source: Vec<_> = expected
-                    .chunks_exact(4096)
+                    .as_chunks::<4096>()
+                    .0
+                    .iter()
                     .map(|p| {
-                        let data: [u8; 4096] = p.try_into().unwrap();
+                        let data = *p;
                         FilePage::lazy(move || Ok(data))
                     })
                     .collect();
@@ -150,10 +158,11 @@ fn main() {
             }
             times.sort_by(f64::total_cmp);
             println!(
-                "{operation},{storage},{BYTES},{:.4},{},{}",
+                "{operation},{storage},{BYTES},{:.4},{},{},{}",
                 times[samples / 2],
                 interpreted / samples as u64,
-                entries / samples as u64
+                entries / samples as u64,
+                cpu.stats().native_code_bytes
             );
         }
     }

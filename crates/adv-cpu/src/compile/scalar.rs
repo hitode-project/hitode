@@ -160,7 +160,7 @@ impl Emitter<'_> {
         if i.code() == Code::Leaved {
             let frame = self.b.use_var(self.regs[5]);
             let pointer = self.pointer(frame, false, 4);
-            let saved_frame = self.b.ins().load(types::I32, MemFlags::new(), pointer, 0);
+            let saved_frame = self.load_memory(pointer, types::I32);
             let stack = self.b.ins().iadd_imm(frame, 4);
             // A faulting frame read must retain both architectural stack registers.
             self.b.def_var(self.regs[5], saved_frame);

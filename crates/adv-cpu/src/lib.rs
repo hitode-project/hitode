@@ -1,6 +1,7 @@
 //! Execution layer: shared-state x86-32 interpreter, hot-region JIT, and the guest CPU
 //! interface ([`backend`]) the machine layer drives. See the README for scope.
 pub mod backend;
+mod atomic_memory;
 mod compile;
 mod compiler;
 mod cpu_profile;
