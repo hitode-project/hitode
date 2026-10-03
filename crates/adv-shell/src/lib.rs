@@ -492,6 +492,10 @@ fn run(options: Options) -> Result<u8, String> {
         service.shutdown();
         return result;
     }
+    // The shared worker cannot preempt an active compiler task. Interactive
+    // compilation uses measured work slices so presentation can run between
+    // jobs; headless compilation above retains the unrestricted policy.
+    background = background.with_work_policy(adv_sync::background::WorkPolicy::responsive(256));
     let mut window = window::Window::new(
         &format!(
             "ADV — {}",
