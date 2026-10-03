@@ -85,7 +85,7 @@ fn close_window(e: &mut Env<'_>, window: Handle) -> i32 {
 }
 fn icon_state(e: &mut Env<'_>, window: Handle, close: bool) -> i32 {
     let user = &mut e.ext.get_mut::<Win32>().user;
-    if let Some(window) = user.windows.get_mut(&window.0) {
+    if let Some(window) = user.windows.get_mut(&mut e.sys.objects, &window.0) {
         if close {
             window.style |= 0x20000000;
         } else {

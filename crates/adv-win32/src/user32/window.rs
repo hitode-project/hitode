@@ -1,6 +1,6 @@
 //! The window model: classes, windows, geometry, and the window-management API.
 //!
-//! Windows live in [`User`] on the host. A window procedure is a guest address, which may
+//! Windows live in the common object table. A window procedure is a guest address, which may
 //! be a host thunk (built-in classes, DefWindowProc, PAL's HLE windows), so messages are
 //! delivered the same way to both: an [`Outcome::Call`] on the current context (see
 //! [`super::message::send`]). Coordinates follow Win32: a top-level window's rect is in
@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{CtxId, Env, Handle, Outcome};
+use adv_machine::{CtxId, Env, Handle, Identity, Namespace, Objects, Outcome};
 use adv_os::Heaps;
 
 use super::message::{send, send_all};
@@ -222,6 +222,64 @@ pub struct Window {
     pub auto_clicks: u32,
 }
 
+/// Typed aliases and a non-owning traversal index over the common object table.
+/// Iterating windows does not scan unrelated file, audio or GDI objects.
+pub struct Windows {
+    namespace: Namespace,
+    index: BTreeMap<u32, Identity<Window>>,
+}
+impl Windows {
+    fn new(objects: &mut Objects) -> Option<Self> {
+        Some(Self {
+            namespace: objects.new_namespace()?,
+            index: BTreeMap::new(),
+        })
+    }
+    pub fn get<'a>(&self, objects: &'a Objects, hwnd: &u32) -> Option<&'a Window> {
+        objects.owned(*self.index.get(hwnd)?)
+    }
+    pub fn get_mut<'a>(&self, objects: &'a mut Objects, hwnd: &u32) -> Option<&'a mut Window> {
+        objects.owned_mut(*self.index.get(hwnd)?)
+    }
+    pub fn contains_key(&self, objects: &Objects, hwnd: &u32) -> bool {
+        self.get(objects, hwnd).is_some()
+    }
+    pub fn values<'a>(&'a self, objects: &'a Objects) -> impl Iterator<Item = &'a Window> {
+        self.index
+            .values()
+            .filter_map(|&identity| objects.owned(identity))
+    }
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+    pub fn for_each_mut(&self, objects: &mut Objects, mut apply: impl FnMut(&mut Window)) {
+        for &identity in self.index.values() {
+            if let Some(window) = objects.owned_mut(identity) {
+                apply(window);
+            }
+        }
+    }
+    pub fn insert(&mut self, objects: &mut Objects, hwnd: u32, window: Window) -> bool {
+        if !objects.insert_host_at(self.namespace, hwnd, window) {
+            return false;
+        }
+        self.index
+            .insert(hwnd, objects.lookup_alias(self.namespace, hwnd).unwrap());
+        true
+    }
+    fn remove(&mut self, objects: &mut Objects, hwnd: &u32) -> Option<Window> {
+        let Some(adv_machine::Object::Host(value)) = objects.close_alias(self.namespace, *hwnd)?
+        else {
+            return None;
+        };
+        self.index.remove(hwnd);
+        value.downcast::<Window>().ok().map(|window| *window)
+    }
+}
+
 impl Window {
     pub fn visible(&self) -> bool {
         self.style & WS_VISIBLE != 0
@@ -300,7 +358,7 @@ pub struct SysProcs {
 pub struct User {
     pub classes: Vec<Class>,
     next_atom: u16,
-    pub windows: BTreeMap<u32, Window>,
+    pub windows: Windows,
     /// Top-level windows in z-order (top first).
     pub top: Vec<u32>,
     next_hwnd: u32,
@@ -334,11 +392,15 @@ const HWND_STEP: u32 = 0x10;
 pub const HMONITOR_PRIMARY: u32 = 0x0001_0001;
 
 impl User {
-    pub fn new(screen: (i32, i32), auto_dialog_ms: Option<u32>) -> Self {
+    pub fn new(
+        objects: &mut Objects,
+        screen: (i32, i32),
+        auto_dialog_ms: Option<u32>,
+    ) -> Option<Self> {
         let mut u = Self {
             classes: Vec::new(),
             next_atom: 0xc000,
-            windows: BTreeMap::new(),
+            windows: Windows::new(objects)?,
             top: Vec::new(),
             next_hwnd: HWND_BASE,
             desktop: 0,
@@ -357,19 +419,22 @@ impl User {
             cursor_count: 0,
         };
         let desktop = u.add_class_raw("#32769", 0, 0, 0, 0);
-        u.desktop = u.alloc_hwnd();
+        u.desktop = u.alloc_hwnd()?;
         let rect = Rect::new(0, 0, screen.0, screen.1);
-        u.windows.insert(
+        if !u.windows.insert(
+            objects,
             u.desktop,
             Window::new(u.desktop, desktop, 0, WS_VISIBLE | WS_POPUP, 0, 0, rect, 0),
-        );
-        u
+        ) {
+            return None;
+        }
+        Some(u)
     }
 
-    fn alloc_hwnd(&mut self) -> u32 {
+    fn alloc_hwnd(&mut self) -> Option<u32> {
         let h = self.next_hwnd;
-        self.next_hwnd += HWND_STEP;
-        h
+        self.next_hwnd = self.next_hwnd.checked_add(HWND_STEP)?;
+        Some(h)
     }
 
     fn add_class_raw(
@@ -459,13 +524,13 @@ impl User {
     }
 
     /// Screen position of `hwnd`'s client-area origin.
-    pub fn client_origin(&self, hwnd: u32) -> (i32, i32) {
-        let Some(w) = self.windows.get(&hwnd) else {
+    pub fn client_origin(&self, objects: &Objects, hwnd: u32) -> (i32, i32) {
+        let Some(w) = self.windows.get(objects, &hwnd) else {
             return (0, 0);
         };
         let (l, t, _, _) = nc_insets(w.style, w.ex_style);
         let (px, py) = if w.parent != 0 {
-            self.client_origin(w.parent)
+            self.client_origin(objects, w.parent)
         } else {
             (0, 0)
         };
@@ -473,10 +538,10 @@ impl User {
     }
 
     /// Window rect in screen coordinates.
-    pub fn screen_rect(&self, hwnd: u32) -> Option<Rect> {
-        let w = self.windows.get(&hwnd)?;
+    pub fn screen_rect(&self, objects: &Objects, hwnd: u32) -> Option<Rect> {
+        let w = self.windows.get(objects, &hwnd)?;
         let (px, py) = if w.parent != 0 {
-            self.client_origin(w.parent)
+            self.client_origin(objects, w.parent)
         } else {
             (0, 0)
         };
@@ -484,11 +549,11 @@ impl User {
     }
 
     /// `hwnd` and all its descendants, parents before children.
-    pub fn subtree(&self, hwnd: u32) -> Vec<u32> {
+    pub fn subtree(&self, objects: &Objects, hwnd: u32) -> Vec<u32> {
         let mut out = vec![hwnd];
         let mut i = 0;
         while i < out.len() {
-            if let Some(w) = self.windows.get(&out[i]) {
+            if let Some(w) = self.windows.get(objects, &out[i]) {
                 out.extend(w.children.iter().copied());
             }
             i += 1;
@@ -496,13 +561,13 @@ impl User {
         out
     }
 
-    pub fn is_window(&self, hwnd: u32) -> bool {
-        hwnd != 0 && self.windows.contains_key(&hwnd)
+    pub fn is_window(&self, objects: &Objects, hwnd: u32) -> bool {
+        hwnd != 0 && self.windows.contains_key(objects, &hwnd)
     }
 
     /// The top-level ancestor of `hwnd`.
-    pub fn root(&self, mut hwnd: u32) -> u32 {
-        while let Some(w) = self.windows.get(&hwnd) {
+    pub fn root(&self, objects: &Objects, mut hwnd: u32) -> u32 {
+        while let Some(w) = self.windows.get(objects, &hwnd) {
             if w.parent == 0 {
                 break;
             }
@@ -520,11 +585,11 @@ impl User {
 
     fn remove_window(&mut self, hwnd: u32, objects: &mut adv_machine::Objects) {
         self.menus.remove_window(hwnd, objects);
-        let Some(w) = self.windows.remove(&hwnd) else {
+        let Some(w) = self.windows.remove(objects, &hwnd) else {
             return;
         };
         if w.parent != 0 {
-            if let Some(p) = self.windows.get_mut(&w.parent) {
+            if let Some(p) = self.windows.get_mut(objects, &w.parent) {
                 p.children.retain(|&c| c != hwnd);
             }
         } else {
@@ -636,14 +701,14 @@ fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) ->
         ClassKey::Name(n) => n.clone(),
         ClassKey::Atom(a) => format!("#{a}"),
     };
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     if u.find_class(&key, f[4])
         .is_some_and(|i| u.classes[i].instance == f[4])
     {
         set_last_error(env, 1410); // ERROR_CLASS_ALREADY_EXISTS
         return Outcome::Return(0);
     }
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let i = u.add_class_raw(&name, f[0], f[1], f[3], f[4]);
     let c = &mut u.classes[i];
     (c.cls_extra, c.icon, c.cursor, c.background, c.menu_name) = (f[2], f[5], f[6], f[7], f[8]);
@@ -656,11 +721,11 @@ fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) ->
 fn unregister_class_a(env: &mut Env<'_>) -> Outcome {
     let (name, inst) = (env.arg(0), env.arg(1));
     let key = ClassKey::read(env, name);
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(i) = u.find_class(&key, inst) else {
         return Outcome::Return(0);
     };
-    if u.classes[i].instance == 0 || u.windows.values().any(|w| w.class == i) {
+    if u.classes[i].instance == 0 || u.windows.values(&env.sys.objects).any(|w| w.class == i) {
         return Outcome::Return(0);
     }
     // Keep indices stable: blank the slot.
@@ -699,7 +764,7 @@ fn get_class_info_a(env: &mut Env<'_>) -> Outcome {
 fn get_class_name_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, buf, cap) = (env.arg(0), env.arg(1), env.arg(2));
     let u = user(env);
-    let Some(w) = u.windows.get(&hwnd) else {
+    let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     let name = env
@@ -766,7 +831,7 @@ pub fn create_window(
 ) -> Outcome {
     let ctx = env.sys.current;
     let now = env.sys.clock.now_us();
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(ci) = u.find_class(&p.class, p.instance) else {
         let name = match &p.class {
             ClassKey::Name(n) => n.clone(),
@@ -778,7 +843,7 @@ pub fn create_window(
     };
     let child = p.style & WS_CHILD != 0;
     let parent = if p.parent == u.desktop { 0 } else { p.parent };
-    if child && !u.windows.contains_key(&parent) {
+    if child && !u.windows.contains_key(&env.sys.objects, &parent) {
         set_last_error(env, 1406); // ERROR_TLW_WITH_WSCHILD
         return then(env, 0);
     }
@@ -804,7 +869,10 @@ pub fn create_window(
         u.classes[ci].wnd_extra,
         u.classes[ci].name.clone(),
     );
-    let hwnd = u.alloc_hwnd();
+    let Some(hwnd) = u.alloc_hwnd() else {
+        set_last_error(env, 8);
+        return then(env, 0);
+    };
     let mut win = Window::new(
         hwnd,
         ci,
@@ -815,15 +883,26 @@ pub fn create_window(
         Rect::new(x, y, w, h),
         ctx,
     );
-    win.owner = if child { 0 } else { u.root(p.parent) };
+    win.owner = if child {
+        0
+    } else {
+        u.root(&env.sys.objects, p.parent)
+    };
     win.id = if child { p.menu } else { 0 };
     win.instance = p.instance;
     win.text = p.text;
     win.extra = vec![0; wnd_extra as usize];
     win.created_us = now;
-    u.windows.insert(hwnd, win);
+    if !u.windows.insert(&mut env.sys.objects, hwnd, win) {
+        set_last_error(env, 8);
+        return then(env, 0);
+    }
     if child {
-        u.windows.get_mut(&parent).unwrap().children.push(hwnd);
+        u.windows
+            .get_mut(&mut env.sys.objects, &parent)
+            .unwrap()
+            .children
+            .push(hwnd);
     } else {
         u.top.insert(0, hwnd);
     }
@@ -832,7 +911,10 @@ pub fn create_window(
     let menu = match super::menu::attach_creation(env, hwnd, p.menu, child) {
         Ok(menu) => menu,
         Err(error) => {
-            env.ext.get_mut::<crate::Win32>().user.remove_window(hwnd, &mut env.sys.objects);
+            env.ext
+                .get_mut::<crate::Win32>()
+                .user
+                .remove_window(hwnd, &mut env.sys.objects);
             set_last_error(env, error);
             return then(env, 0);
         }
@@ -871,7 +953,7 @@ pub fn create_window(
             if r as i32 == -1 {
                 return destroy_window(env, hwnd, move |env, _| then(env, 0));
             }
-            let Some(win) = user(env).windows.get(&hwnd) else {
+            let Some(win) = user(env).windows.get(&env.sys.objects, &hwnd) else {
                 return then(env, 0);
             };
             let (cw, ch) = win.client_size();
@@ -887,9 +969,11 @@ pub fn create_window(
                     [hwnd, wm::SIZE, 0, make_long(cw, ch)],
                     [hwnd, wm::MOVE, 0, make_long(l, t)],
                 ]);
-                user_mut(env)
+                env.ext
+                    .get::<crate::Win32>()
+                    .user
                     .windows
-                    .get_mut(&hwnd)
+                    .get_mut(&mut env.sys.objects, &hwnd)
                     .unwrap()
                     .initial_geometry_reported = true;
             }
@@ -932,7 +1016,11 @@ pub fn temp_free(env: &mut Env<'_>, p: u32) {
 
 fn destroy_window_api(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    if !user(env).windows.get(&hwnd).is_some_and(|w| !w.destroying) {
+    if !user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| !w.destroying)
+    {
         set_last_error(env, 1400); // ERROR_INVALID_WINDOW_HANDLE
         return Outcome::Return(0);
     }
@@ -954,13 +1042,17 @@ pub fn destroy_window(
 }
 
 fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool) -> Outcome {
-    let u = user_mut(env);
-    if !u.windows.get(&hwnd).is_some_and(|w| !w.destroying) {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    if !u
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| !w.destroying)
+    {
         return then(env, false);
     }
     let owned = u.top.iter().copied().find(|t| {
         u.windows
-            .get(t)
+            .get(&env.sys.objects, t)
             .is_some_and(|w| w.owner == hwnd && !w.destroying)
     });
     if let Some(o) = owned {
@@ -971,13 +1063,13 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
             Box::new(move |env, _| destroy_boxed(env, hwnd, initialized, then)),
         );
     }
-    let w = u.windows.get_mut(&hwnd).unwrap();
+    let w = u.windows.get_mut(&mut env.sys.objects, &hwnd).unwrap();
     w.destroying = true;
     let was_visible = w.visible();
     let notify = (initialized && w.parent != 0 && w.ex_style & WS_EX_NOPARENTNOTIFY == 0)
         .then_some((w.parent, w.id));
     let finish: Then = Box::new(move |env| {
-        let all = user(env).subtree(hwnd);
+        let all = user(env).subtree(&env.sys.objects, hwnd);
         let msgs: VecDeque<[u32; 4]> = all
             .iter()
             .rev()
@@ -999,7 +1091,13 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
         }
     });
     let hide: Then = Box::new(move |env| {
-        if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+        if let Some(w) = env
+            .ext
+            .get::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut env.sys.objects, &hwnd)
+        {
             w.style &= !WS_VISIBLE;
         }
         if was_visible {
@@ -1030,15 +1128,19 @@ fn send_destroy_tree(env: &mut Env<'_>, hwnd: u32, then: Then) -> Outcome {
 }
 
 fn destroy_children(env: &mut Env<'_>, hwnd: u32, then: Then) -> Outcome {
-    let u = user_mut(env);
-    let next = u.windows.get(&hwnd).and_then(|w| {
-        w.children
-            .iter()
-            .copied()
-            .find(|c| u.windows.get(c).is_some_and(|c| !c.destroying))
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    let next = u.windows.get(&env.sys.objects, &hwnd).and_then(|w| {
+        w.children.iter().copied().find(|c| {
+            u.windows
+                .get(&env.sys.objects, c)
+                .is_some_and(|c| !c.destroying)
+        })
     });
     let Some(child) = next else { return then(env) };
-    u.windows.get_mut(&child).unwrap().destroying = true;
+    u.windows
+        .get_mut(&mut env.sys.objects, &child)
+        .unwrap()
+        .destroying = true;
     send_destroy_tree(
         env,
         child,
@@ -1071,9 +1173,9 @@ pub fn show_window(
     cmd: u32,
     then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
 ) -> Outcome {
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let (sw, sh) = u.screen;
-    let Some(w) = u.windows.get_mut(&hwnd) else {
+    let Some(w) = u.windows.get_mut(&mut env.sys.objects, &hwnd) else {
         return then(env, false);
     };
     let was = w.visible();
@@ -1143,8 +1245,8 @@ pub fn activate_window(
     hwnd: u32,
     then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
-    let u = user_mut(env);
-    let Some(thread) = u.windows.get(&hwnd).map(|w| w.thread) else {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    let Some(thread) = u.windows.get(&env.sys.objects, &hwnd).map(|w| w.thread) else {
         return then(env);
     };
     u.top.retain(|&t| t != hwnd);
@@ -1172,8 +1274,8 @@ pub fn set_focus(
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
     let ctx = env.sys.current;
-    let u = user_mut(env);
-    if hwnd != 0 && !u.windows.contains_key(&hwnd) {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    if hwnd != 0 && !u.windows.contains_key(&env.sys.objects, &hwnd) {
         return then(env, 0);
     }
     let q = u.queue(ctx);
@@ -1211,8 +1313,8 @@ pub fn set_window_pos(
     mut flags: u32,
     then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
 ) -> Outcome {
-    let u = user_mut(env);
-    let Some(w) = u.windows.get(&hwnd) else {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
         return then(env, false);
     };
     let old = w.rect;
@@ -1245,14 +1347,18 @@ pub fn set_window_pos(
         let r = |i: u32| env.cpu.read_u32(wp + 4 * i).unwrap_or(0) as i32;
         let (x, y, cx, cy) = (r(2), r(3), r(4), r(5));
         let flags = r(6) as u32;
-        let u = user_mut(env);
-        if let Some(w) = u.windows.get_mut(&hwnd) {
+        let u = &mut env.ext.get_mut::<crate::Win32>().user;
+        if let Some(w) = u.windows.get_mut(&mut env.sys.objects, &hwnd) {
             w.rect = Rect::new(x, y, cx, cy);
             if flags & SWP_NOSIZE == 0 {
                 w.needs_paint = true;
             }
         }
-        if flags & SWP_NOZORDER == 0 && u.windows.get(&hwnd).is_some_and(|w| w.parent == 0) {
+        if flags & SWP_NOZORDER == 0
+            && u.windows
+                .get(&env.sys.objects, &hwnd)
+                .is_some_and(|w| w.parent == 0)
+        {
             u.top.retain(|&t| t != hwnd);
             // HWND_TOP 0, HWND_BOTTOM 1, HWND_TOPMOST -1, HWND_NOTOPMOST -2, else after that window.
             let at = match after {
@@ -1284,8 +1390,13 @@ pub fn set_window_pos(
 }
 
 /// Default handling of WM_WINDOWPOSCHANGED: WM_MOVE and WM_SIZE.
-pub fn window_pos_changed_msgs(u: &User, hwnd: u32, flags: u32) -> Vec<[u32; 4]> {
-    let Some(w) = u.windows.get(&hwnd) else {
+pub fn window_pos_changed_msgs(
+    u: &User,
+    objects: &Objects,
+    hwnd: u32,
+    flags: u32,
+) -> Vec<[u32; 4]> {
+    let Some(w) = u.windows.get(objects, &hwnd) else {
         return Vec::new();
     };
     let mut m = Vec::new();
@@ -1343,10 +1454,12 @@ fn update_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     let paint = user(env)
         .windows
-        .get(&hwnd)
+        .get(&env.sys.objects, &hwnd)
         .is_some_and(|w| w.needs_paint && w.visible());
     if !paint {
-        return Outcome::Return(u32::from(user(env).windows.contains_key(&hwnd)));
+        return Outcome::Return(u32::from(
+            user(env).windows.contains_key(&env.sys.objects, &hwnd),
+        ));
     }
     send(env, hwnd, wm::PAINT, 0, 0, |_, _| Outcome::Return(1))
 }
@@ -1365,7 +1478,13 @@ fn set_active_window(env: &mut Env<'_>) -> Outcome {
 
 fn enable_window(env: &mut Env<'_>) -> Outcome {
     let (hwnd, enable) = (env.arg(0), env.arg(1) != 0);
-    let Some(w) = user_mut(env).windows.get_mut(&hwnd) else {
+    let Some(w) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    else {
         return Outcome::Return(0);
     };
     let was_disabled = !w.enabled();
@@ -1386,7 +1505,7 @@ fn enable_window(env: &mut Env<'_>) -> Outcome {
 
 fn get_window_rect(env: &mut Env<'_>) -> Outcome {
     let (hwnd, out) = (env.arg(0), env.arg(1));
-    let Some(r) = user(env).screen_rect(hwnd) else {
+    let Some(r) = user(env).screen_rect(&env.sys.objects, hwnd) else {
         return Outcome::Return(0);
     };
     Outcome::Return(u32::from(r.write(env.cpu, out)))
@@ -1394,7 +1513,7 @@ fn get_window_rect(env: &mut Env<'_>) -> Outcome {
 
 fn get_client_rect(env: &mut Env<'_>) -> Outcome {
     let (hwnd, out) = (env.arg(0), env.arg(1));
-    let Some(w) = user(env).windows.get(&hwnd) else {
+    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     let (cw, ch) = w.client_size();
@@ -1411,10 +1530,10 @@ fn screen_to_client(env: &mut Env<'_>) -> Outcome {
 
 fn map_point(env: &mut Env<'_>, sign: i32) -> Outcome {
     let (hwnd, p) = (env.arg(0), env.arg(1));
-    if !user(env).windows.contains_key(&hwnd) {
+    if !user(env).windows.contains_key(&env.sys.objects, &hwnd) {
         return Outcome::Return(0);
     }
-    let (ox, oy) = user(env).client_origin(hwnd);
+    let (ox, oy) = user(env).client_origin(&env.sys.objects, hwnd);
     let x = env.cpu.read_u32(p).unwrap_or(0) as i32 + sign * ox;
     let y = env.cpu.read_u32(p + 4).unwrap_or(0) as i32 + sign * oy;
     let _ = env.cpu.write_u32(p, x as u32);
@@ -1456,7 +1575,7 @@ pub const GWL_USERDATA: i32 = -21;
 
 fn get_window_long_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, idx) = (env.arg(0), env.arg(1) as i32);
-    let Some(w) = user(env).windows.get(&hwnd) else {
+    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         set_last_error(env, 1400);
         return Outcome::Return(0);
     };
@@ -1482,7 +1601,13 @@ fn get_window_long_a(env: &mut Env<'_>) -> Outcome {
 
 fn set_window_long_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, idx, v) = (env.arg(0), env.arg(1) as i32, env.arg(2));
-    let Some(w) = user_mut(env).windows.get_mut(&hwnd) else {
+    let Some(w) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    else {
         set_last_error(env, 1400);
         return Outcome::Return(0);
     };
@@ -1512,7 +1637,7 @@ fn set_window_long_a(env: &mut Env<'_>) -> Outcome {
 fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, idx) = (env.arg(0), env.arg(1) as i32);
     let u = user(env);
-    let Some(w) = u.windows.get(&hwnd) else {
+    let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     let c = &u.classes[w.class];
@@ -1534,8 +1659,8 @@ fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
 
 fn set_class_long_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, idx, v) = (env.arg(0), env.arg(1) as i32, env.arg(2));
-    let u = user_mut(env);
-    let Some(ci) = u.windows.get(&hwnd).map(|w| w.class) else {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    let Some(ci) = u.windows.get(&env.sys.objects, &hwnd).map(|w| w.class) else {
         return Outcome::Return(0);
     };
     let c = &mut u.classes[ci];
@@ -1552,7 +1677,7 @@ fn set_class_long_a(env: &mut Env<'_>) -> Outcome {
 
 fn get_parent(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let Some(w) = user(env).windows.get(&hwnd) else {
+    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     Outcome::Return(if w.style & WS_CHILD != 0 {
@@ -1565,7 +1690,7 @@ fn get_parent(env: &mut Env<'_>) -> Outcome {
 fn is_child(env: &mut Env<'_>) -> Outcome {
     let (parent, mut h) = (env.arg(0), env.arg(1));
     let u = user(env);
-    while let Some(w) = u.windows.get(&h) {
+    while let Some(w) = u.windows.get(&env.sys.objects, &h) {
         if w.parent == 0 {
             break;
         }
@@ -1580,13 +1705,13 @@ fn is_child(env: &mut Env<'_>) -> Outcome {
 fn get_window(env: &mut Env<'_>) -> Outcome {
     let (hwnd, cmd) = (env.arg(0), env.arg(1));
     let u = user(env);
-    let Some(w) = u.windows.get(&hwnd) else {
+    let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     let siblings = if w.parent == 0 {
         &u.top
     } else {
-        &u.windows[&w.parent].children
+        &u.windows.get(&env.sys.objects, &w.parent).unwrap().children
     };
     let pos = siblings.iter().position(|&s| s == hwnd);
     Outcome::Return(match cmd {
@@ -1605,7 +1730,10 @@ fn get_window(env: &mut Env<'_>) -> Outcome {
 fn is_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     Outcome::Return(u32::from(
-        user(env).windows.get(&hwnd).is_some_and(|w| !w.destroying),
+        user(env)
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .is_some_and(|w| !w.destroying),
     ))
 }
 
@@ -1613,7 +1741,7 @@ fn is_window_visible(env: &mut Env<'_>) -> Outcome {
     let mut hwnd = env.arg(0);
     let u = user(env);
     // Visible only if all ancestors are.
-    while let Some(w) = u.windows.get(&hwnd) {
+    while let Some(w) = u.windows.get(&env.sys.objects, &hwnd) {
         if !w.visible() {
             return Outcome::Return(0);
         }
@@ -1628,7 +1756,10 @@ fn is_window_visible(env: &mut Env<'_>) -> Outcome {
 fn is_window_enabled(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     Outcome::Return(u32::from(
-        user(env).windows.get(&hwnd).is_some_and(Window::enabled),
+        user(env)
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .is_some_and(Window::enabled),
     ))
 }
 
@@ -1637,7 +1768,7 @@ fn is_iconic(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(u32::from(
         user(env)
             .windows
-            .get(&hwnd)
+            .get(&env.sys.objects, &hwnd)
             .is_some_and(|w| w.style & WS_MINIMIZE != 0),
     ))
 }
@@ -1647,7 +1778,7 @@ fn is_zoomed(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(u32::from(
         user(env)
             .windows
-            .get(&hwnd)
+            .get(&env.sys.objects, &hwnd)
             .is_some_and(|w| w.style & WS_MAXIMIZE != 0),
     ))
 }
@@ -1668,14 +1799,18 @@ fn get_foreground_window(env: &mut Env<'_>) -> Outcome {
         u.top
             .iter()
             .copied()
-            .find(|t| u.windows.get(t).is_some_and(Window::visible))
+            .find(|t| {
+                u.windows
+                    .get(&env.sys.objects, t)
+                    .is_some_and(Window::visible)
+            })
             .unwrap_or(0),
     )
 }
 
 fn set_foreground_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    if !user(env).windows.contains_key(&hwnd) {
+    if !user(env).windows.contains_key(&env.sys.objects, &hwnd) {
         return Outcome::Return(0);
     }
     activate_window(env, hwnd, |_| Outcome::Return(1))
@@ -1687,7 +1822,11 @@ fn get_desktop_window(env: &mut Env<'_>) -> Outcome {
 
 fn get_window_thread_process_id(env: &mut Env<'_>) -> Outcome {
     let (hwnd, pid_out) = (env.arg(0), env.arg(1));
-    let Some(ctx) = user(env).windows.get(&hwnd).map(|w| w.thread) else {
+    let Some(ctx) = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map(|w| w.thread)
+    else {
         return Outcome::Return(0);
     };
     let pid = env.sys.pid;
@@ -1703,7 +1842,7 @@ fn find_window_a(env: &mut Env<'_>) -> Outcome {
     let title = (title != 0).then(|| env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, title)));
     let u = user(env);
     let found = u.top.iter().copied().find(|t| {
-        let w = &u.windows[t];
+        let w = u.windows.get(&env.sys.objects, t).unwrap();
         let c = &u.classes[w.class];
         let class_ok = match &class {
             None => true,
@@ -1832,7 +1971,8 @@ mod tests {
 
     #[test]
     fn class_lookup_prefers_local() {
-        let mut u = User::new((1920, 1080), None);
+        let mut objects = Objects::default();
+        let mut u = User::new(&mut objects, (1920, 1080), None).unwrap();
         u.add_system_classes(SysProcs {
             def_window: 1,
             def_dlg: 2,

@@ -245,7 +245,7 @@ fn set_cursor(_env: &mut Env<'_>) -> Outcome {
 
 fn show_cursor(env: &mut Env<'_>) -> Outcome {
     let show = env.arg(0) != 0;
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     u.cursor_count += if show { 1 } else { -1 };
     Outcome::Return(u.cursor_count as u32)
 }

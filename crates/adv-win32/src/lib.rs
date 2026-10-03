@@ -107,7 +107,8 @@ impl Win32 {
             next_hrsrc: 0x7e80_0000,
             unhandled_filter: 0,
             statics: HashMap::new(),
-            user: user32::User::new(cfg.screen, cfg.auto_dialog_ms),
+            user: user32::User::new(&mut m.sys.objects, cfg.screen, cfg.auto_dialog_ms)
+                .ok_or(MemFault { addr: 0, len: 0 })?,
             gdi: gdi32::Gdi::default(),
             cfg,
         };

@@ -231,10 +231,15 @@ impl T {
     }
 
     fn with_auto_dialog(auto_dialog_ms: Option<u32>) -> Self {
+        Self::with_limits(auto_dialog_ms, adv_machine::ObjectLimits::default())
+    }
+
+    fn with_limits(auto_dialog_ms: Option<u32>, limits: adv_machine::ObjectLimits) -> Self {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
         let cpu = UnicornCpu::new(PARK_ADDR).unwrap();
         let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+        m.sys.objects = adv_machine::Objects::with_limits(limits);
         m.cpu.map(CODE, 0x1_0000, Prot::RX).unwrap();
         m.cpu.map(DATA, 0x2_0000, Prot::RW).unwrap();
         m.cpu.write_u32(LOG_NEXT, LOG).unwrap();
@@ -380,6 +385,56 @@ impl T {
         }
         let result = self.call(a, api, &args);
         (msg, result)
+    }
+}
+
+#[test]
+fn window_capacity_failure_preserves_existing_windows_and_destroy_reclaims_capacity() {
+    use adv_machine::ObjectLimits;
+    for limits in [
+        ObjectLimits {
+            objects: 3,
+            ..ObjectLimits::default()
+        },
+        ObjectLimits {
+            aliases: 3,
+            ..ObjectLimits::default()
+        },
+    ] {
+        // Desktop + main thread leave room for exactly one guest window.
+        let mut t = T::with_limits(None, limits);
+        let mut main = Asm::new(CODE);
+        let procedure = t.wndproc(|_| {});
+        let class = t.class(&mut main, procedure);
+        let first = t.window(&mut main, class, WS_POPUP, I(0), 0);
+        let failed = t.window(&mut main, class, WS_CHILD, M(first), 42);
+        let error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+        let alive = t.call(&mut main, "IsWindow", &[M(first)]);
+        let closed = t.call(&mut main, "DestroyWindow", &[M(first)]);
+        let second = t.window(&mut main, class, WS_POPUP, I(0), 0);
+        let stale = t.call(&mut main, "IsWindow", &[M(first)]);
+        let final_close = t.call(&mut main, "DestroyWindow", &[M(second)]);
+        t.run(main);
+        assert_ne!(t.u32(first), 0);
+        assert_eq!(t.u32(failed), 0);
+        assert_eq!(t.u32(error), 8);
+        assert_eq!(t.u32(alive), 1);
+        assert_eq!(t.u32(closed), 1);
+        assert_ne!(t.u32(second), 0);
+        assert_ne!(t.u32(second), t.u32(first));
+        assert_eq!(t.u32(stale), 0);
+        assert_eq!(t.u32(final_close), 1);
+        assert_eq!(t.m.sys.objects.object_count(), 2);
+        let user = &t.m.ext.get::<Win32>().user;
+        assert_eq!(user.windows.len(), 1);
+        assert!(user.top.is_empty());
+        assert!(
+            user.windows
+                .get(&t.m.sys.objects, &user.desktop)
+                .unwrap()
+                .children
+                .is_empty()
+        );
     }
 }
 

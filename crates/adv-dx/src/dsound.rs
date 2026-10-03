@@ -1318,7 +1318,13 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
-        m.sys.objects = Objects::with_limits(limits);
+        // USER32's desktop is itself a common object; the requested budget
+        // below describes resources available to this DirectSound fixture.
+        m.sys.objects = Objects::with_limits(adv_machine::ObjectLimits {
+            objects: limits.objects.saturating_add(1),
+            aliases: limits.aliases.saturating_add(1),
+            ..limits
+        });
         adv_win32::Win32::install(
             &mut m,
             adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
@@ -1464,7 +1470,7 @@ mod tests {
                     OUT_OF_MEMORY
                 );
                 assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-                assert_eq!(m.sys.objects.object_count(), 0);
+                assert_eq!(m.sys.objects.object_count(), 1);
                 assert_eq!(heap_next(&mut m), next);
             }
         }
@@ -1499,7 +1505,7 @@ mod tests {
                     OUT_OF_MEMORY
                 );
                 assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-                assert_eq!(m.sys.objects.object_count(), 1);
+                assert_eq!(m.sys.objects.object_count(), 2);
                 assert_eq!(heap_next(&mut m), next);
                 assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
                 assert!(m.ext.get::<Sound>().pending_release.is_empty());
@@ -1540,7 +1546,7 @@ mod tests {
                 OUT_OF_MEMORY
             );
             assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-            assert_eq!(m.sys.objects.object_count(), 257);
+            assert_eq!(m.sys.objects.object_count(), 258);
             assert_eq!(heap_next(&mut m), next_header);
             assert!(m.sys.vm.region(next_mapping).is_none());
             assert!(m.cpu.read_u8(next_mapping).is_err());

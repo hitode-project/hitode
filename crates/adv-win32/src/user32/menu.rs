@@ -179,7 +179,7 @@ pub(super) fn attach_creation(
         }
         menu
     } else {
-        let win = &user(env).windows[&hwnd];
+        let win = &user(env).windows.get(&env.sys.objects, &hwnd).unwrap();
         let resource = user(env).menus.class_resources.get(&win.class).cloned();
         if let Some(resource) = resource {
             load_resource(env, win.instance, &resource)?
@@ -195,7 +195,7 @@ pub(super) fn attach_creation(
 
 fn get_system_menu(env: &mut Env<'_>) -> Outcome {
     let (hwnd, revert) = (env.arg(0), env.arg(1) != 0);
-    let Some(window) = user(env).windows.get(&hwnd) else {
+    let Some(window) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         set_last_error(env, 1400);
         return Outcome::Return(0);
     };
@@ -513,7 +513,7 @@ fn destroy_menu(env: &mut Env<'_>) -> Outcome {
 }
 fn get_menu(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let Some(win) = user(env).windows.get(&hwnd) else {
+    let Some(win) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return menu_error(env, 1400);
     };
     // USER32's shared slot is a control ID for a child, never an attachment.
@@ -525,7 +525,7 @@ fn get_menu(env: &mut Env<'_>) -> Outcome {
 }
 fn set_menu(env: &mut Env<'_>) -> Outcome {
     let (hwnd, menu) = (env.arg(0), env.arg(1));
-    let Some(win) = user(env).windows.get(&hwnd) else {
+    let Some(win) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return menu_error(env, 1400);
     };
     if win.parent != 0 {

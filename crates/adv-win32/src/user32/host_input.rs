@@ -10,7 +10,7 @@ use crate::Win32;
 /// its valid focus window; mouse messages use its valid capture window.
 pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
     let user = &mut env.ext.get_mut::<Win32>().user;
-    let Some((top, hwnd)) = target(user, message) else {
+    let Some((top, hwnd)) = target(user, &env.sys.objects, message) else {
         return false;
     };
     let mut lparam = lparam;
@@ -27,12 +27,12 @@ pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
         let y = ((lparam >> 16) as u16 as i16) as i32;
         // Frontend coordinates describe the displayed top-level client.
         // A captured child receives coordinates in its own client area.
-        let (ox, oy) = user.client_origin(top);
+        let (ox, oy) = user.client_origin(&env.sys.objects, top);
         user.cursor_pos = (x + ox, y + oy);
         if message == 0x20a || message == 0x20e {
             lparam = make_long(x + ox, y + oy);
         } else if hwnd != top {
-            let (tx, ty) = user.client_origin(hwnd);
+            let (tx, ty) = user.client_origin(&env.sys.objects, hwnd);
             lparam = make_long(x + ox - tx, y + oy - ty);
         }
         for (down, up, vk) in [(0x201, 0x202, 1), (0x204, 0x205, 2), (0x207, 0x208, 4)] {
@@ -56,8 +56,8 @@ pub fn release(env: &mut Env<'_>) -> usize {
         for key in &mut user.keys {
             *key &= 0x7f;
         }
-        let position = target(user, 0x200).map_or(0, |(top, _)| {
-            let (ox, oy) = user.client_origin(top);
+        let position = target(user, &env.sys.objects, 0x200).map_or(0, |(top, _)| {
+            let (ox, oy) = user.client_origin(&env.sys.objects, top);
             make_long(user.cursor_pos.0 - ox, user.cursor_pos.1 - oy)
         });
         (pressed, position)
@@ -85,13 +85,13 @@ pub fn release(env: &mut Env<'_>) -> usize {
 }
 
 /// (top-level window, target window) for `message`.
-fn target(user: &User, message: u32) -> Option<(u32, u32)> {
+fn target(user: &User, objects: &adv_machine::Objects, message: u32) -> Option<(u32, u32)> {
     let top = user.top.iter().copied().find(|h| {
         user.windows
-            .get(h)
+            .get(objects, h)
             .is_some_and(|w| w.visible() && !w.destroying)
     })?;
-    let thread = user.windows[&top].thread;
+    let thread = user.windows.get(objects, &top).unwrap().thread;
     let queue = user.queues.get(&thread);
     let candidate = if (0x100..=0x109).contains(&message) {
         queue.map(|q| q.focus)
@@ -101,19 +101,28 @@ fn target(user: &User, message: u32) -> Option<(u32, u32)> {
         None
     };
     let target = candidate
-        .filter(|&hwnd| valid_window(user, hwnd, thread))
+        .filter(|&hwnd| valid_window(user, objects, hwnd, thread))
         .unwrap_or(top);
     Some((top, target))
 }
 
-fn valid_window(user: &User, hwnd: u32, thread: adv_machine::CtxId) -> bool {
-    if !user.windows.get(&hwnd).is_some_and(|w| w.thread == thread) {
+fn valid_window(
+    user: &User,
+    objects: &adv_machine::Objects,
+    hwnd: u32,
+    thread: adv_machine::CtxId,
+) -> bool {
+    if !user
+        .windows
+        .get(objects, &hwnd)
+        .is_some_and(|w| w.thread == thread)
+    {
         return false;
     }
     let mut current = hwnd;
     // Bound malformed parent chains as well as checking inherited visibility.
     for _ in 0..=user.windows.len() {
-        let Some(window) = user.windows.get(&current) else {
+        let Some(window) = user.windows.get(objects, &current) else {
             return false;
         };
         if !window.visible() || !window.enabled() || window.destroying {

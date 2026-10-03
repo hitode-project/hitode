@@ -246,7 +246,7 @@ pub fn create_dialog(
     let child = t.style & WS_CHILD != 0;
     if t.style & DS_CENTER != 0 {
         let area = if owner != 0 && !child {
-            u.screen_rect(owner)
+            u.screen_rect(&env.sys.objects, owner)
                 .unwrap_or(Rect::new(0, 0, u.screen.0, u.screen.1))
         } else {
             Rect::new(0, 0, u.screen.0, u.screen.1 - 40)
@@ -256,7 +256,7 @@ pub fn create_dialog(
             area.top + (area.height() - h) / 2,
         );
     } else if !child && t.style & DS_ABSALIGN == 0 && owner != 0 {
-        let (ox, oy) = u.client_origin(owner);
+        let (ox, oy) = u.client_origin(&env.sys.objects, owner);
         (x, y) = (x + ox, y + oy);
     }
     let class_name = match &t.class {
@@ -289,7 +289,12 @@ pub fn create_dialog(
         if dlg == 0 {
             return then(env, 0);
         }
-        if let Some(w) = user_mut(env).windows.get_mut(&dlg)
+        if let Some(w) = env
+            .ext
+            .get::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut env.sys.objects, &dlg)
             && w.extra.len() >= 8
         {
             w.extra[DWL_DLGPROC as usize..DWL_DLGPROC as usize + 4]
@@ -302,12 +307,12 @@ pub fn create_dialog(
         let items: VecDeque<Item> = t.items.into_iter().collect();
         let after_font = move |env: &mut Env<'_>| {
             create_items(env, dlg, instance, items, (bx, by), font, move |env| {
-                let focus = first_tab_stop(user(env), dlg);
+                let focus = first_tab_stop(user(env), &env.sys.objects, dlg);
                 send(env, dlg, wm::INITDIALOG, focus, param, move |env, r| {
                     // EndDialog during INITDIALOG ends creation before showing or focusing.
                     if user(env)
                         .windows
-                        .get(&dlg)
+                        .get(&env.sys.objects, &dlg)
                         .is_some_and(|w| w.control.dialog_end.is_some())
                     {
                         return then(env, dlg);
@@ -388,13 +393,13 @@ fn create_items(
     })
 }
 
-fn first_tab_stop(u: &User, dlg: u32) -> u32 {
+fn first_tab_stop(u: &User, objects: &adv_machine::Objects, dlg: u32) -> u32 {
     u.windows
-        .get(&dlg)
+        .get(objects, &dlg)
         .and_then(|d| {
             d.children.iter().copied().find(|c| {
                 u.windows
-                    .get(c)
+                    .get(objects, c)
                     .is_some_and(|w| w.style & 0x0001_0000 != 0 && w.enabled() && w.visible())
             })
         })
@@ -402,14 +407,14 @@ fn first_tab_stop(u: &User, dlg: u32) -> u32 {
 }
 
 /// GetDlgItem.
-pub fn item(u: &User, dlg: u32, id: u32) -> u32 {
+pub fn item(u: &User, objects: &adv_machine::Objects, dlg: u32, id: u32) -> u32 {
     u.windows
-        .get(&dlg)
+        .get(objects, &dlg)
         .and_then(|d| {
             d.children
                 .iter()
                 .copied()
-                .find(|c| u.windows.get(c).is_some_and(|w| w.id == id))
+                .find(|c| u.windows.get(objects, c).is_some_and(|w| w.id == id))
         })
         .unwrap_or(0)
 }
@@ -475,12 +480,19 @@ fn dialog_box(
     proc: u32,
     param: u32,
 ) -> Outcome {
-    let owner = user(env).root(owner);
+    let owner = user(env).root(&env.sys.objects, owner);
     let owner_was_enabled = user(env)
         .windows
-        .get(&owner)
+        .get(&env.sys.objects, &owner)
         .is_some_and(window::Window::enabled);
-    if owner_was_enabled && let Some(w) = user_mut(env).windows.get_mut(&owner) {
+    if owner_was_enabled
+        && let Some(w) = env
+            .ext
+            .get::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut env.sys.objects, &owner)
+    {
         w.style |= window::WS_DISABLED;
     }
     create_dialog(env, inst, t, owner, proc, param, true, move |env, dlg| {
@@ -488,7 +500,13 @@ fn dialog_box(
             restore_owner(env, owner, owner_was_enabled);
             return Outcome::Return(u32::MAX);
         }
-        if let Some(w) = user_mut(env).windows.get_mut(&dlg) {
+        if let Some(w) = env
+            .ext
+            .get::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut env.sys.objects, &dlg)
+        {
             w.control.modal = true;
         }
         modal_loop(env, dlg, owner, owner_was_enabled)
@@ -496,7 +514,14 @@ fn dialog_box(
 }
 
 fn restore_owner(env: &mut Env<'_>, owner: u32, was_enabled: bool) {
-    if was_enabled && let Some(w) = user_mut(env).windows.get_mut(&owner) {
+    if was_enabled
+        && let Some(w) = env
+            .ext
+            .get::<crate::Win32>()
+            .user
+            .windows
+            .get_mut(&mut env.sys.objects, &owner)
+    {
         w.style &= !window::WS_DISABLED;
     }
 }
@@ -504,7 +529,7 @@ fn restore_owner(env: &mut Env<'_>, owner: u32, was_enabled: bool) {
 fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> Outcome {
     let state = user(env)
         .windows
-        .get(&dlg)
+        .get(&env.sys.objects, &dlg)
         .map(|w| (w.control.dialog_end, w.destroying));
     let finish = move |env: &mut Env<'_>, result: u32| {
         destroy_window(env, dlg, move |env, _| {
@@ -536,7 +561,13 @@ fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> O
 
 fn end_dialog(env: &mut Env<'_>) -> Outcome {
     let (dlg, result) = (env.arg(0), env.arg(1));
-    let Some(w) = user_mut(env).windows.get_mut(&dlg) else {
+    let Some(w) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &dlg)
+    else {
         return Outcome::Return(0);
     };
     w.control.dialog_end = Some(result);
@@ -545,29 +576,34 @@ fn end_dialog(env: &mut Env<'_>) -> Outcome {
 
 fn get_dlg_item(env: &mut Env<'_>) -> Outcome {
     let (dlg, id) = (env.arg(0), env.arg(1));
-    Outcome::Return(item(user(env), dlg, id))
+    Outcome::Return(item(user(env), &env.sys.objects, dlg, id))
 }
 
 fn get_dlg_ctrl_id(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    Outcome::Return(user(env).windows.get(&hwnd).map_or(0, |w| w.id))
+    Outcome::Return(
+        user(env)
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .map_or(0, |w| w.id),
+    )
 }
 
 fn send_dlg_item_message_a(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let h = item(user(env), dlg, id);
+    let h = item(user(env), &env.sys.objects, dlg, id);
     send(env, h, msg, wp, lp, |_, r| Outcome::Return(r))
 }
 
 fn set_dlg_item_text_a(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, text) = (env.arg(0), env.arg(1), env.arg(2));
-    let h = item(user(env), dlg, id);
+    let h = item(user(env), &env.sys.objects, dlg, id);
     send(env, h, wm::SETTEXT, 0, text, |_, r| Outcome::Return(r))
 }
 
 fn get_dlg_item_text_a(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let h = item(user(env), dlg, id);
+    let h = item(user(env), &env.sys.objects, dlg, id);
     if h == 0 {
         if cap > 0 {
             let _ = env.cpu.write(buf, &[0]);
@@ -585,7 +621,7 @@ fn set_dlg_item_int(env: &mut Env<'_>) -> Outcome {
         v.to_string()
     };
     let p = guest_cstr(env, &s);
-    let h = item(user(env), dlg, id);
+    let h = item(user(env), &env.sys.objects, dlg, id);
     send(env, h, wm::SETTEXT, 0, p, move |env, r| {
         window::temp_free(env, p);
         Outcome::Return(r)
@@ -597,7 +633,7 @@ fn get_dlg_item_int(env: &mut Env<'_>) -> Outcome {
     let u = user(env);
     let text = u
         .windows
-        .get(&item(u, dlg, id))
+        .get(&env.sys.objects, &item(u, &env.sys.objects, dlg, id))
         .map(|w| w.text.trim().to_owned())
         .unwrap_or_default();
     let v = if signed {
@@ -613,20 +649,27 @@ fn get_dlg_item_int(env: &mut Env<'_>) -> Outcome {
 
 fn check_dlg_button(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, check) = (env.arg(0), env.arg(1), env.arg(2));
-    let h = item(user(env), dlg, id);
+    let h = item(user(env), &env.sys.objects, dlg, id);
     send(env, h, 0xf1, check, 0, |_, _| Outcome::Return(1))
 }
 
 fn is_dlg_button_checked(env: &mut Env<'_>) -> Outcome {
     let (dlg, id) = (env.arg(0), env.arg(1));
-    let h = item(user(env), dlg, id);
+    let h = item(user(env), &env.sys.objects, dlg, id);
     send(env, h, 0xf0, 0, 0, |_, r| Outcome::Return(r))
 }
 
 fn check_radio_button(env: &mut Env<'_>) -> Outcome {
     let (dlg, first, last, check) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let msgs: VecDeque<[u32; 4]> = (first..=last)
-        .map(|id| [item(user(env), dlg, id), 0xf1, u32::from(id == check), 0])
+        .map(|id| {
+            [
+                item(user(env), &env.sys.objects, dlg, id),
+                0xf1,
+                u32::from(id == check),
+                0,
+            ]
+        })
         .filter(|m| m[0] != 0)
         .collect();
     super::message::send_all(env, msgs, |_| Outcome::Return(1))
@@ -634,7 +677,11 @@ fn check_radio_button(env: &mut Env<'_>) -> Outcome {
 
 fn map_dialog_rect(env: &mut Env<'_>) -> Outcome {
     let (dlg, p) = (env.arg(0), env.arg(1));
-    let Some((bx, by)) = user(env).windows.get(&dlg).map(|w| w.control.base_units) else {
+    let Some((bx, by)) = user(env)
+        .windows
+        .get(&env.sys.objects, &dlg)
+        .map(|w| w.control.base_units)
+    else {
         return Outcome::Return(0);
     };
     let Some(r) = Rect::read(env.cpu, p) else {
@@ -667,11 +714,11 @@ fn is_dialog_message_a(env: &mut Env<'_>) -> Outcome {
     let u = user(env);
     let for_dialog = m.hwnd == dlg
         || u.windows
-            .get(&m.hwnd)
-            .is_some_and(|w| u.root(w.hwnd) == dlg);
+            .get(&env.sys.objects, &m.hwnd)
+            .is_some_and(|w| u.root(&env.sys.objects, w.hwnd) == dlg);
     if for_dialog && m.msg == wm::KEYDOWN && (m.wparam == 0x0d || m.wparam == 0x1b) {
         let id = if m.wparam == 0x0d { 1 } else { 2 };
-        let ctl = item(u, dlg, id);
+        let ctl = item(u, &env.sys.objects, dlg, id);
         return send(env, dlg, wm::COMMAND, id, ctl, |_, _| Outcome::Return(1));
     }
     Outcome::Return(0)

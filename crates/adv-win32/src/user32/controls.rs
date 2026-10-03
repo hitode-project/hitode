@@ -34,7 +34,7 @@ fn args(env: &Env<'_>) -> (u32, u32, u32, u32) {
 
 fn button_proc(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = args(env);
-    let Some(w) = user(env).windows.get(&hwnd) else {
+    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     let kind = w.style & 0xf;
@@ -57,7 +57,13 @@ fn button_proc(env: &mut Env<'_>) -> Outcome {
             0
         }
         BM_SETSTYLE => {
-            if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+            if let Some(w) = env
+                .ext
+                .get::<crate::Win32>()
+                .user
+                .windows
+                .get_mut(&mut env.sys.objects, &hwnd)
+            {
                 w.style = (w.style & !0xffff) | (wp & 0xffff);
             }
             0
@@ -117,7 +123,13 @@ fn button_proc(env: &mut Env<'_>) -> Outcome {
 }
 
 fn set_button(env: &mut Env<'_>, hwnd: u32, f: impl FnOnce(u32) -> u32) {
-    if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+    if let Some(w) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    {
         w.control.button = f(w.control.button);
         w.needs_paint = true;
     }
@@ -125,26 +137,30 @@ fn set_button(env: &mut Env<'_>, hwnd: u32, f: impl FnOnce(u32) -> u32) {
 
 /// Check an auto radio button and uncheck the others in its group.
 fn check_radio(env: &mut Env<'_>, hwnd: u32) {
-    let u = user_mut(env);
-    let Some(parent) = u.windows.get(&hwnd).map(|w| w.parent) else {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    let Some(parent) = u.windows.get(&env.sys.objects, &hwnd).map(|w| w.parent) else {
         return;
     };
     let siblings = u
         .windows
-        .get(&parent)
+        .get(&env.sys.objects, &parent)
         .map(|p| p.children.clone())
         .unwrap_or_default();
     let Some(me) = siblings.iter().position(|&s| s == hwnd) else {
         return;
     };
     // The group runs from the previous WS_GROUP control to the next one.
-    let group = |h: &u32| u.windows.get(h).is_some_and(|w| w.style & WS_GROUP != 0);
+    let group = |h: &u32| {
+        u.windows
+            .get(&env.sys.objects, h)
+            .is_some_and(|w| w.style & WS_GROUP != 0)
+    };
     let start = (0..=me).rev().find(|&i| group(&siblings[i])).unwrap_or(0);
     let end = (me + 1..siblings.len())
         .find(|&i| group(&siblings[i]))
         .unwrap_or(siblings.len());
     for &s in &siblings[start..end] {
-        if let Some(w) = u.windows.get_mut(&s)
+        if let Some(w) = u.windows.get_mut(&mut env.sys.objects, &s)
             && w.style & 0xf == BS_AUTORADIOBUTTON
         {
             w.control.button = (w.control.button & !3) | u32::from(s == hwnd);
@@ -159,7 +175,7 @@ fn static_proc(env: &mut Env<'_>) -> Outcome {
         wm::NCHITTEST => {
             let notify = user(env)
                 .windows
-                .get(&hwnd)
+                .get(&env.sys.objects, &hwnd)
                 .is_some_and(|w| w.style & 0x100 != 0);
             Outcome::Return(if notify { 1 } else { u32::MAX })
         }
@@ -192,16 +208,19 @@ fn returns_directly(msg: u32) -> bool {
 
 fn def_dlg_proc_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = args(env);
-    let dlgproc = user(env).windows.get(&hwnd).map_or(0, |w| w.dlgproc());
+    let dlgproc = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map_or(0, |w| w.dlgproc());
     if dlgproc == 0 {
         return def_dlg_default(env, hwnd, msg, wp, lp);
     }
     call_proc(dlgproc, hwnd, msg, wp, lp, move |env, r| {
-        if r & 0xff != 0 && user(env).windows.contains_key(&hwnd) {
+        if r & 0xff != 0 && user(env).windows.contains_key(&env.sys.objects, &hwnd) {
             if returns_directly(msg) {
                 return Outcome::Return(r);
             }
-            let w = &user(env).windows[&hwnd];
+            let w = &user(env).windows.get(&env.sys.objects, &hwnd).unwrap();
             let res = w
                 .extra
                 .get(DWL_MSGRESULT as usize..4)
@@ -216,7 +235,7 @@ fn def_dlg_default(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32) -> 
     match msg {
         // Closing a dialog is cancelling it.
         wm::CLOSE => {
-            let cancel = super::dialog::item(user(env), hwnd, 2);
+            let cancel = super::dialog::item(user(env), &env.sys.objects, hwnd, 2);
             post(env, hwnd, wm::COMMAND, 2, cancel);
             Outcome::Return(0)
         }

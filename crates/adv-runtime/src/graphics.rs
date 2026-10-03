@@ -271,9 +271,9 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
     let geometry = hwnd
         .and_then(|hwnd| {
             env.ext.try_get_mut::<Win32>().and_then(|win32| {
-                win32.user.windows.get(&hwnd).map(|window| {
+                win32.user.windows.get(&env.sys.objects, &hwnd).map(|window| {
                     let (w, h) = window.client_size();
-                    (w, h, win32.user.client_origin(hwnd))
+                    (w, h, win32.user.client_origin(&env.sys.objects, hwnd))
                 })
             })
         })
@@ -398,7 +398,8 @@ pub(crate) fn unsupported_graphics(env: &mut Env<'_>) -> Outcome {
 
 fn begin_paint(env: &mut Env<'_>) -> Outcome {
     let (hwnd, paint) = (env.arg(0), env.arg(1));
-    let Some(window) = env.ext.get::<Win32>().user.windows.get(&hwnd) else {
+    let Some(window) = env.ext.get::<Win32>().user.windows.get(&env.sys.objects, &hwnd)
+    else {
         return Outcome::Return(0);
     };
     let (width, height) = window.client_size();

@@ -241,7 +241,11 @@ pub fn send(
     lparam: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let Some(proc) = user(env).windows.get(&hwnd).map(|w| w.proc) else {
+    let Some(proc) = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map(|w| w.proc)
+    else {
         return then(env, 0);
     };
     call_proc(proc, hwnd, msg, wparam, lparam, then)
@@ -300,13 +304,13 @@ fn post_kind(
     let ctx = if hwnd == 0 {
         env.sys.current
     } else {
-        match user(env).windows.get(&hwnd) {
+        match user(env).windows.get(&env.sys.objects, &hwnd) {
             Some(w) => w.thread,
             None => return false,
         }
     };
     let input_receipt = if input {
-        let u = user_mut(env);
+        let u = &mut env.ext.get_mut::<crate::Win32>().user;
         let vk = match msg {
             0x100 | 0x101 | 0x104 | 0x105 if wparam < 256 => Some(wparam as usize),
             0x201 | 0x202 => Some(1),
@@ -446,10 +450,10 @@ pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
 
 fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
     let now = env.sys.clock.now_us();
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let paint = u
         .windows
-        .values()
+        .values(&env.sys.objects)
         .any(|w| w.thread == ctx && w.needs_paint && w.visible() && !w.destroying);
     let q = u.queue(ctx);
     let generated = (u32::from(paint) * QS_PAINT)
@@ -487,14 +491,14 @@ struct Filter {
 }
 
 impl Filter {
-    fn matches(&self, u: &window::User, m: &Msg) -> bool {
-        self.matches_hwnd(u, m.hwnd) && self.range(m.msg)
+    fn matches(&self, u: &window::User, objects: &adv_machine::Objects, m: &Msg) -> bool {
+        self.matches_hwnd(u, objects, m.hwnd) && self.range(m.msg)
     }
-    fn matches_hwnd(&self, u: &window::User, hwnd: u32) -> bool {
+    fn matches_hwnd(&self, u: &window::User, objects: &adv_machine::Objects, hwnd: u32) -> bool {
         match self.hwnd {
             0 => true,
             u32::MAX => hwnd == 0,
-            h => hwnd == h || (hwnd != 0 && is_descendant(u, hwnd, h)),
+            h => hwnd == h || (hwnd != 0 && is_descendant(u, objects, hwnd, h)),
         }
     }
     fn range(&self, msg: u32) -> bool {
@@ -502,8 +506,13 @@ impl Filter {
     }
 }
 
-fn is_descendant(u: &window::User, mut h: u32, ancestor: u32) -> bool {
-    while let Some(w) = u.windows.get(&h) {
+fn is_descendant(
+    u: &window::User,
+    objects: &adv_machine::Objects,
+    mut h: u32,
+    ancestor: u32,
+) -> bool {
+    while let Some(w) = u.windows.get(objects, &h) {
         if w.parent == ancestor {
             return true;
         }
@@ -519,12 +528,14 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
     let now = env.sys.clock.now_us();
     let now_ms = env.sys.clock.now_ms();
     let frame = env.sys.frame;
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let mut found = None;
     {
         let posted = &u.queues.get(&ctx).map(|q| &q.posted);
         if let Some(posted) = posted {
-            found = posted.iter().position(|m| f.matches(u, m));
+            found = posted
+                .iter()
+                .position(|m| f.matches(u, &env.sys.objects, m));
         }
     }
     if let Some(i) = found {
@@ -563,12 +574,14 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
         });
     }
     if f.range(wm::PAINT) {
-        let paint = u.windows.values().find(|w| {
+        let paint = u.windows.values(&env.sys.objects).find(|w| {
             w.thread == ctx
                 && w.needs_paint
                 && w.visible()
                 && !w.destroying
-                && (f.hwnd == 0 || w.hwnd == f.hwnd || is_descendant(u, w.hwnd, f.hwnd))
+                && (f.hwnd == 0
+                    || w.hwnd == f.hwnd
+                    || is_descendant(u, &env.sys.objects, w.hwnd, f.hwnd))
         });
         if let Some(w) = paint {
             return Some(Msg {
@@ -588,7 +601,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
             .timers
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.due_us <= now && f.matches_hwnd(u, t.hwnd))
+            .filter(|(_, t)| t.due_us <= now && f.matches_hwnd(u, &env.sys.objects, t.hwnd))
             .min_by_key(|(_, t)| t.due_us)
             .map(|(i, _)| i);
         if let Some(i) = index {
@@ -627,10 +640,10 @@ fn next_deadline(env: &mut Env<'_>, f: Filter) -> Option<u64> {
         .get(&ctx)
         .into_iter()
         .flat_map(|q| &q.timers)
-        .filter(|t| f.range(wm::TIMER) && f.matches_hwnd(u, t.hwnd))
+        .filter(|t| f.range(wm::TIMER) && f.matches_hwnd(u, &env.sys.objects, t.hwnd))
         .map(|t| t.due_us)
         .min();
-    let dialog = headless_deadline(u, ctx);
+    let dialog = headless_deadline(u, &env.sys.objects, ctx);
     [timers, dialog].into_iter().flatten().min()
 }
 
@@ -640,10 +653,14 @@ const AUTO_CLICK_MAX: u32 = 3;
 
 /// A dialog-like window of `ctx` waiting for input, and its button to press: the default
 /// push button, else IDOK, else the first push button.
-fn headless_target(u: &window::User, ctx: adv_machine::CtxId) -> Option<(u32, u32)> {
+fn headless_target(
+    u: &window::User,
+    objects: &adv_machine::Objects,
+    ctx: adv_machine::CtxId,
+) -> Option<(u32, u32)> {
     u.auto_dialog_ms?;
     for &top in &u.top {
-        let w = &u.windows[&top];
+        let w = &u.windows.get(objects, &top).unwrap();
         if w.thread != ctx
             || !w.visible()
             || !w.enabled()
@@ -655,7 +672,7 @@ fn headless_target(u: &window::User, ctx: adv_machine::CtxId) -> Option<(u32, u3
         let buttons: Vec<&window::Window> = w
             .children
             .iter()
-            .map(|c| &u.windows[c])
+            .map(|c| u.windows.get(objects, c).unwrap())
             .filter(|c| {
                 u.classes[c.class].name.eq_ignore_ascii_case("button")
                     && c.style & 0xf <= 1
@@ -675,9 +692,13 @@ fn headless_target(u: &window::User, ctx: adv_machine::CtxId) -> Option<(u32, u3
     None
 }
 
-fn headless_deadline(u: &window::User, ctx: adv_machine::CtxId) -> Option<u64> {
-    let (top, _) = headless_target(u, ctx)?;
-    let w = &u.windows[&top];
+fn headless_deadline(
+    u: &window::User,
+    objects: &adv_machine::Objects,
+    ctx: adv_machine::CtxId,
+) -> Option<u64> {
+    let (top, _) = headless_target(u, objects, ctx)?;
+    let w = &u.windows.get(objects, &top).unwrap();
     let delay = u64::from(u.auto_dialog_ms?) * 1000;
     Some(w.created_us + delay * u64::from(w.auto_clicks + 1))
 }
@@ -687,17 +708,17 @@ fn headless_deadline(u: &window::User, ctx: adv_machine::CtxId) -> Option<u64> {
 fn headless_idle(env: &mut Env<'_>) -> bool {
     let ctx = env.sys.current;
     let now = env.sys.clock.now_us();
-    let u = user_mut(env);
-    let Some((top, button)) = headless_target(u, ctx) else {
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    let Some((top, button)) = headless_target(u, &env.sys.objects, ctx) else {
         return false;
     };
-    if headless_deadline(u, ctx).is_none_or(|d| now < d) {
+    if headless_deadline(u, &env.sys.objects, ctx).is_none_or(|d| now < d) {
         return false;
     }
-    let w = u.windows.get_mut(&top).unwrap();
+    let w = u.windows.get_mut(&mut env.sys.objects, &top).unwrap();
     w.auto_clicks += 1;
     let title = w.text.clone();
-    let b = &u.windows[&button];
+    let b = &u.windows.get(&env.sys.objects, &button).unwrap();
     let (bw, bh) = b.client_size();
     log::info!("headless: pressing [{}] in window \"{title}\"", b.text);
     let lp = make_long(bw / 2, bh / 2);
@@ -1026,7 +1047,7 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let ctx = if hwnd == 0 {
         env.sys.current
     } else {
-        let Some(w) = user(env).windows.get(&hwnd) else {
+        let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
             return Outcome::Return(0);
         };
         w.thread
@@ -1034,7 +1055,7 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let now = env.sys.clock.now_us();
     // USER_TIMER_MINIMUM is 10 ms.
     let interval_us = u64::from(ms.max(10)) * 1000;
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let q = u.queue(ctx);
     let id = if hwnd == 0 {
         0x7fff_0000 + q.timers.len() as u32 + 1
@@ -1060,7 +1081,7 @@ fn kill_timer(env: &mut Env<'_>) -> Outcome {
     let ctx = if hwnd == 0 {
         env.sys.current
     } else {
-        let Some(w) = user(env).windows.get(&hwnd) else {
+        let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
             return Outcome::Return(0);
         };
         w.thread
@@ -1099,14 +1120,20 @@ pub fn def_window_proc(
             } else {
                 env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, lp))
             };
-            if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+            if let Some(w) = env
+                .ext
+                .get::<crate::Win32>()
+                .user
+                .windows
+                .get_mut(&mut env.sys.objects, &hwnd)
+            {
                 w.text = text;
                 w.needs_paint = true;
             }
             1
         }
         wm::GETTEXT => {
-            let Some(w) = user(env).windows.get(&hwnd) else {
+            let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
                 return then(env, 0);
             };
             let bytes = env.ext.get::<Win32>().codec.encode(&w.text);
@@ -1117,18 +1144,27 @@ pub fn def_window_proc(
             }
         }
         wm::GETTEXTLENGTH => {
-            let Some(w) = user(env).windows.get(&hwnd) else {
+            let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
                 return then(env, 0);
             };
             env.ext.get::<Win32>().codec.encode(&w.text).len() as u32
         }
         wm::SETFONT => {
-            if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+            if let Some(w) = env
+                .ext
+                .get::<crate::Win32>()
+                .user
+                .windows
+                .get_mut(&mut env.sys.objects, &hwnd)
+            {
                 w.font = wp;
             }
             0
         }
-        wm::GETFONT => user(env).windows.get(&hwnd).map_or(0, |w| w.font),
+        wm::GETFONT => user(env)
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .map_or(0, |w| w.font),
         wm::PAINT => {
             validate(env, hwnd);
             0
@@ -1141,7 +1177,7 @@ pub fn def_window_proc(
         }
         wm::WINDOWPOSCHANGED => {
             let flags = env.cpu.read_u32(lp + 24).unwrap_or(0);
-            let msgs = window::window_pos_changed_msgs(user(env), hwnd, flags);
+            let msgs = window::window_pos_changed_msgs(user(env), &env.sys.objects, hwnd, flags);
             return send_all(env, msgs.into(), move |env| then(env, 0));
         }
         wm::SYSCOMMAND if wp & 0xfff0 == 0xf060 => {
@@ -1164,7 +1200,13 @@ pub fn def_window_proc(
 }
 
 pub fn validate(env: &mut Env<'_>, hwnd: u32) {
-    let ctx = if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+    let ctx = if let Some(w) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    {
         w.needs_paint = false;
         w.thread
     } else {
@@ -1183,14 +1225,13 @@ fn call_window_proc_a(env: &mut Env<'_>) -> Outcome {
 
 fn invalidate_rect(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let u = user_mut(env);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
     if hwnd == 0 {
-        for w in u.windows.values_mut() {
-            w.needs_paint = true;
-        }
+        u.windows
+            .for_each_mut(&mut env.sys.objects, |w| w.needs_paint = true);
         return Outcome::Return(1);
     }
-    match u.windows.get_mut(&hwnd) {
+    match u.windows.get_mut(&mut env.sys.objects, &hwnd) {
         Some(w) => {
             w.needs_paint = true;
             Outcome::Return(1)
@@ -1207,7 +1248,7 @@ fn validate_rect(env: &mut Env<'_>) -> Outcome {
 
 fn begin_paint(env: &mut Env<'_>) -> Outcome {
     let (hwnd, ps) = (env.arg(0), env.arg(1));
-    let Some(w) = user(env).windows.get(&hwnd) else {
+    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         return Outcome::Return(0);
     };
     let (cw, ch) = w.client_size();
@@ -1229,7 +1270,13 @@ fn end_paint(env: &mut Env<'_>) -> Outcome {
 
 fn redraw_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
+    if let Some(w) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    {
         w.needs_paint = true;
     }
     Outcome::Return(1)

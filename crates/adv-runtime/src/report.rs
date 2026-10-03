@@ -60,7 +60,7 @@ impl<B: Backend> Runtime<B> {
     pub fn guest_window_count(&self) -> usize {
         let user = &self.machine.ext.get::<Win32>().user;
         user.windows
-            .values()
+            .values(&self.machine.sys.objects)
             .filter(|window| window.hwnd != user.desktop)
             .count()
     }
@@ -268,7 +268,7 @@ impl<B: Backend> Runtime<B> {
         ));
         for window in user
             .windows
-            .values()
+            .values(&self.machine.sys.objects)
             .filter(|w| w.hwnd != user.desktop && w.visible())
         {
             let class = &user.classes[window.class].name;

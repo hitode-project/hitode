@@ -512,16 +512,21 @@ mod tests {
         };
         let user = &mut machine.ext.get_mut::<Win32>().user;
         user.top = vec![0x10020];
-        user.windows
-            .insert(0x10020, window(0x10020, 0, Rect::new(100, 50, 800, 600)));
-        user.windows.insert(
+        assert!(user.windows.insert(
+            &mut machine.sys.objects,
+            0x10020,
+            window(0x10020, 0, Rect::new(100, 50, 800, 600)),
+        ));
+        assert!(user.windows.insert(
+            &mut machine.sys.objects,
             0x10024,
             window(0x10024, 0x10020, Rect::new(20, 30, 100, 50)),
-        );
-        user.windows.insert(
+        ));
+        assert!(user.windows.insert(
+            &mut machine.sys.objects,
             0x10028,
             window(0x10028, 0x10020, Rect::new(40, 50, 100, 50)),
-        );
+        ));
         user.queue(0).focus = 0x10024;
         user.queue(0).capture = 0x10028;
         Runtime { machine }
@@ -534,7 +539,10 @@ mod tests {
         let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
         assert_eq!(user.queue(0).posted.pop_front().unwrap().hwnd, 0x10024);
         assert_eq!(user.keys[0x41] & 0x80, 0x80);
-        user.windows.get_mut(&0x10024).unwrap().style &= !adv_win32::user32::window::WS_VISIBLE;
+        user.windows
+            .get_mut(&mut runtime.machine.sys.objects, &0x10024)
+            .unwrap()
+            .style &= !adv_win32::user32::window::WS_VISIBLE;
         assert!(runtime.post_input(0x101, 0x41, 0xc0000001));
         let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
         assert_eq!(user.queue(0).posted.pop_front().unwrap().hwnd, 0x10020);
