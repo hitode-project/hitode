@@ -13,14 +13,21 @@ pub(super) fn relative<'a>(parts: &'a [String], user: &str) -> Option<&'a [Strin
     let is = |i: usize, s: &str| parts.get(i).is_some_and(|p| p.eq_ignore_ascii_case(s));
     let start = if is(0, "Users") && (is(1, user) || is(1, "Public")) && is(2, "Documents") {
         3
-    } else if is(0, "Users") && is(1, user) && is(2, "AppData") && (is(3, "Roaming") || is(3, "Local")) {
+    } else if is(0, "Users")
+        && is(1, user)
+        && is(2, "AppData")
+        && (is(3, "Roaming") || is(3, "Local"))
+    {
         4
     } else if is(0, "ProgramData") {
         1
     } else {
         return None;
     };
-    let offset = parts.get(start..)?.iter().position(|p| p.eq_ignore_ascii_case("save"))?;
+    let offset = parts
+        .get(start..)?
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case("save"))?;
     Some(&parts[start + offset..])
 }
 
@@ -47,7 +54,10 @@ pub(super) fn migrate(cfg: &Win32Config) -> io::Result<()> {
     if found {
         // Only after all copies succeed. Never import these backups again: otherwise
         // deleting a slot in the new layout could resurrect it on the next launch.
-        std::fs::write(marker, b"Legacy profile saves imported; game directory wins conflicts.\n")?;
+        std::fs::write(
+            marker,
+            b"Legacy profile saves imported; game directory wins conflicts.\n",
+        )?;
     }
     Ok(())
 }
@@ -58,10 +68,16 @@ fn find_saves(dir: &Path, game: &Path) -> io::Result<bool> {
         let entry = entry?;
         let ty = entry.file_type()?;
         if ty.is_symlink() {
-            return Err(io::Error::other("legacy save tree contains a symbolic link"));
+            return Err(io::Error::other(
+                "legacy save tree contains a symbolic link",
+            ));
         }
         if ty.is_dir() {
-            if entry.file_name().to_string_lossy().eq_ignore_ascii_case("save") {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("save")
+            {
                 let target = ci_path(game, &["save".into()]);
                 copy_missing(&entry.path(), &target)?;
                 found = true;
@@ -81,12 +97,18 @@ fn copy_missing(source: &Path, target: &Path) -> io::Result<()> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let dst = ci_path(target, &[name]);
         if ty.is_symlink() {
-            return Err(io::Error::other("legacy save tree contains a symbolic link"));
+            return Err(io::Error::other(
+                "legacy save tree contains a symbolic link",
+            ));
         } else if ty.is_dir() {
             copy_missing(&entry.path(), &dst)?;
         } else if ty.is_file() {
             let mut input = std::fs::File::open(entry.path())?;
-            let mut output = match std::fs::OpenOptions::new().write(true).create_new(true).open(&dst) {
+            let mut output = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dst)
+            {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dst.is_file() => continue,
                 Err(e) => return Err(e),

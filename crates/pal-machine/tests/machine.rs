@@ -10,7 +10,9 @@ use pal_cpu::asm::Asm;
 use pal_cpu::unicorn::UnicornCpu;
 use pal_cpu::{Backend, Guest, GuestExt, Prot};
 use pal_machine::layout::PARK_ADDR;
-use pal_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult, Trace, Wait};
+use pal_machine::{
+    Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult, Trace, Wait,
+};
 
 const CODE: u32 = 0x0040_0000;
 const PROC: u32 = CODE + 0x100;
@@ -21,8 +23,12 @@ const FLAG: u32 = 0x0041_0000;
 fn cdecl_float_return_pushes_x87_without_destroying_existing_stack() {
     use pal_cpu::GuestExt;
     let mut r = Registry::default();
-    r.add("test", "float", Conv::Cdecl { argc: 0 }, |_| Outcome::ReturnF32(1.25));
-    r.add("test", "done", Conv::Cdecl { argc: 0 }, |_| Outcome::ExitProcess(0));
+    r.add("test", "float", Conv::Cdecl { argc: 0 }, |_| {
+        Outcome::ReturnF32(1.25)
+    });
+    r.add("test", "done", Conv::Cdecl { argc: 0 }, |_| {
+        Outcome::ExitProcess(0)
+    });
     let cpu = UnicornCpu::new(PARK_ADDR).unwrap();
     let mut m = Machine::new(cpu, r, Clock::virtual_time()).unwrap();
     m.cpu.map(CODE, 0x1000, Prot::RWX).unwrap();
@@ -45,7 +51,11 @@ fn execution_budget_reports_running_context_pc_and_recent_calls() {
     let mut t = T::new();
     let (sleep, spawn) = (t.f("sleep"), t.f("spawn"));
     t.code(CODE, |a| {
-        a.push_imm(WORKER).call(spawn).push_imm(1000).call(sleep).ret();
+        a.push_imm(WORKER)
+            .call(spawn)
+            .push_imm(1000)
+            .call(sleep)
+            .ret();
     });
     t.code(WORKER, |a| {
         a.bytes.extend_from_slice(&[0xeb, 0xfe]); // no trap, Sleep or other cooperative scheduling point
@@ -55,14 +65,20 @@ fn execution_budget_reports_running_context_pc_and_recent_calls() {
     let guest_time = t.m.sys.clock.now_us();
     let start = Instant::now();
     let r = t.m.run_virtual(10_000_000);
-    let RunResult::Failed(error) = r else { panic!("expected watchdog failure, got {r:?}") };
+    let RunResult::Failed(error) = r else {
+        panic!("expected watchdog failure, got {r:?}")
+    };
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(error.ctx, 1);
     assert_eq!(error.pc, WORKER);
     assert!(error.message.contains("execution budget exhausted"));
     assert!(error.recent.iter().any(|s| s.contains("test.dll!spawn")));
     assert!(error.recent.iter().any(|s| s.contains("test.dll!sleep")));
-    assert_eq!(t.m.sys.clock.now_us(), guest_time, "watchdog must not advance guest time");
+    assert_eq!(
+        t.m.sys.clock.now_us(),
+        guest_time,
+        "watchdog must not advance guest time"
+    );
     assert!(!t.m.sys.context(0).is_done());
     assert!(!t.m.sys.context(1).is_done());
 }
@@ -81,7 +97,12 @@ fn execution_budget_is_shared_across_cooperating_contexts() {
         std::thread::sleep(Duration::from_millis(1));
         Outcome::block_then_return(Wait::Yield, 0)
     });
-    let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), registry, Clock::virtual_time()).unwrap();
+    let mut m = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
     m.ext.insert(0u32);
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
     let call = m.resolve_import("test", "yield").unwrap();
@@ -148,12 +169,15 @@ fn soft_slices_preempt_pure_computation_and_preserve_round_robin_cpu_state() {
     let mut yields = 0;
     let mut both_progressed = false;
     loop {
-        assert!(started.elapsed() < Duration::from_secs(6), "slices did not finish");
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "slices did not finish"
+        );
         match sliced.m.run_slice(Duration::from_millis(2)) {
             SliceResult::Yielded => {
                 yields += 1;
-                both_progressed |=
-                    sliced.m.cpu.read_u32(FLAG).unwrap() > 0 && sliced.m.cpu.read_u32(FLAG + 4).unwrap() > 0;
+                both_progressed |= sliced.m.cpu.read_u32(FLAG).unwrap() > 0
+                    && sliced.m.cpu.read_u32(FLAG + 4).unwrap() > 0;
             }
             SliceResult::Complete(RunResult::Exited(code)) => {
                 assert_eq!(code, 6_000_007);
@@ -162,13 +186,23 @@ fn soft_slices_preempt_pure_computation_and_preserve_round_robin_cpu_state() {
             other => panic!("unexpected slice outcome: {other:?}"),
         }
     }
-    assert!(yields >= 2 && both_progressed, "pure CPU contexts did not both advance");
+    assert!(
+        yields >= 2 && both_progressed,
+        "pure CPU contexts did not both advance"
+    );
     for offset in [0, 4, 8, 12, 16, 20] {
-        assert_eq!(sliced.m.cpu.read_u32(FLAG + offset).unwrap(), reference.m.cpu.read_u32(FLAG + offset).unwrap());
+        assert_eq!(
+            sliced.m.cpu.read_u32(FLAG + offset).unwrap(),
+            reference.m.cpu.read_u32(FLAG + offset).unwrap()
+        );
     }
     assert_eq!(sliced.m.cpu.read_u32(FLAG).unwrap(), ITERATIONS);
     assert_eq!(sliced.m.cpu.read_u32(FLAG + 4).unwrap(), ITERATIONS);
-    assert_eq!(sliced.m.sys.clock.now_us(), guest_time, "soft slices must not advance the virtual clock");
+    assert_eq!(
+        sliced.m.sys.clock.now_us(),
+        guest_time,
+        "soft slices must not advance the virtual clock"
+    );
 }
 
 #[test]
@@ -182,7 +216,10 @@ fn hard_watchdog_accumulates_across_soft_slices_and_sync_handlers() {
     let started = Instant::now();
     let mut yielded = false;
     loop {
-        assert!(started.elapsed() < Duration::from_secs(2), "soft slices renewed the hard watchdog");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "soft slices renewed the hard watchdog"
+        );
         match t.m.run_slice(Duration::from_millis(2)) {
             SliceResult::Yielded => yielded = true,
             SliceResult::Complete(RunResult::Failed(error)) => {
@@ -235,8 +272,15 @@ fn soft_slices_restore_inherited_and_explicit_backend_budgets() {
             a.push_imm(1).call(sleep).ret();
         });
         t.m.spawn("M", CODE, &[], 65536).unwrap();
-        assert!(matches!(t.m.run_slice(Duration::from_millis(20)), SliceResult::Complete(RunResult::Idle { .. })));
-        assert_eq!(t.m.cpu.execution_budget(), expected, "changed {policy} after an idle slice");
+        assert!(matches!(
+            t.m.run_slice(Duration::from_millis(20)),
+            SliceResult::Complete(RunResult::Idle { .. })
+        ));
+        assert_eq!(
+            t.m.cpu.execution_budget(),
+            expected,
+            "changed {policy} after an idle slice"
+        );
     }
 
     let mut t = T::new();
@@ -245,7 +289,10 @@ fn soft_slices_restore_inherited_and_explicit_backend_budgets() {
         a.cmp_mem_imm8(FLAG, 0).jz(CODE).push_imm(7).call(exit);
     });
     t.m.spawn("M", CODE, &[], 65536).unwrap();
-    assert!(matches!(t.m.run_slice(Duration::from_millis(2)), SliceResult::Yielded));
+    assert!(matches!(
+        t.m.run_slice(Duration::from_millis(2)),
+        SliceResult::Yielded
+    ));
     t.m.cpu.write_u32(FLAG, 1).unwrap();
     assert!(matches!(t.m.run(), RunResult::Exited(7)));
     assert_eq!(
@@ -270,7 +317,13 @@ fn spawn(env: &mut Env<'_>) -> Outcome {
 }
 
 fn wait(env: &mut Env<'_>) -> Outcome {
-    Outcome::block_then_return(Wait::Object { handle: env.arg(0), deadline: None }, 0)
+    Outcome::block_then_return(
+        Wait::Object {
+            handle: env.arg(0),
+            deadline: None,
+        },
+        0,
+    )
 }
 
 /// cdecl run_proc(proc, arg): calls guest proc(arg), returns its result + 100.
@@ -303,7 +356,12 @@ impl T {
         r.add("test.dll", "spawn", Conv::Stdcall { argc: 1 }, spawn);
         r.add("test.dll", "wait", Conv::Stdcall { argc: 1 }, wait);
         r.add_traced("test.dll", "run_proc", Conv::Cdecl { argc: 2 }, run_proc);
-        r.add("test.dll", "call_twice", Conv::Cdecl { argc: 1 }, call_twice);
+        r.add(
+            "test.dll",
+            "call_twice",
+            Conv::Cdecl { argc: 1 },
+            call_twice,
+        );
         r.add("test.dll", "exit", Conv::Stdcall { argc: 1 }, exit);
         let cpu = UnicornCpu::new(PARK_ADDR).unwrap();
         let mut m = Machine::new(cpu, r, Clock::virtual_time()).unwrap();
@@ -349,24 +407,42 @@ fn guest_callback_can_block_on_another_context() {
     t.m.spawn("M", CODE, &[], 0x1_0000).unwrap();
     let r = t.m.run_virtual(10_000_000);
     assert!(matches!(r, RunResult::Exited(107)), "{r:?}");
-    assert!(t.m.sys.clock.now_us() >= 1_000_000 + 5_000, "worker's 5 ms sleep elapsed in guest time");
+    assert!(
+        t.m.sys.clock.now_us() >= 1_000_000 + 5_000,
+        "worker's 5 ms sleep elapsed in guest time"
+    );
     assert!(t.m.sys.context(1).is_done());
     let trace = String::from_utf8(buf.borrow().clone()).unwrap();
-    assert_eq!(trace.trim_end(), format!("0\t0\ttest.dll!run_proc\t{PROC:x},0\t6b"));
+    assert_eq!(
+        trace.trim_end(),
+        format!("0\t0\ttest.dll!run_proc\t{PROC:x},0\t6b")
+    );
 }
 
 #[test]
 fn variadic_trace_marks_fixed_prefix_without_truncating_guest_arguments() {
     let mut t = T::new();
-    t.m.sys
-        .thunks
-        .registry
-        .add_traced("test.dll", "variadic", Conv::CdeclVariadic { fixed: 3 }, |env| Outcome::Return(env.arg(3)));
+    t.m.sys.thunks.registry.add_traced(
+        "test.dll",
+        "variadic",
+        Conv::CdeclVariadic { fixed: 3 },
+        |env| Outcome::Return(env.arg(3)),
+    );
     let (call, exit) = (t.f("variadic"), t.f("exit"));
     t.code(CODE, |a| {
-        a.push_imm(42).push_imm(3).push_imm(2).push_imm(1).call(call).add_esp(16);
+        a.push_imm(42)
+            .push_imm(3)
+            .push_imm(2)
+            .push_imm(1)
+            .call(call)
+            .add_esp(16);
         a.mov_mem_eax(FLAG);
-        a.push_imm(43).push_imm(6).push_imm(5).push_imm(4).call(call).add_esp(16);
+        a.push_imm(43)
+            .push_imm(6)
+            .push_imm(5)
+            .push_imm(4)
+            .call(call)
+            .add_esp(16);
         a.push_eax().call(exit);
     });
     let buf = Rc::new(RefCell::new(Vec::new()));
@@ -405,7 +481,11 @@ fn chained_guest_calls() {
     let mut t = T::new();
     let (call_twice, exit) = (t.f("call_twice"), t.f("exit"));
     t.code(CODE, |a| {
-        a.push_imm(PROC).call(call_twice).add_esp(4).push_eax().call(exit);
+        a.push_imm(PROC)
+            .call(call_twice)
+            .add_esp(4)
+            .push_eax()
+            .call(exit);
     });
     t.code(PROC, |a| {
         a.mov_eax_esp(4).add_eax_imm(10).ret();
@@ -438,7 +518,9 @@ fn unimplemented_import_fails_with_its_name() {
         a.call(missing);
     });
     t.m.spawn("M", CODE, &[], 0x1_0000).unwrap();
-    let RunResult::Failed(e) = t.m.run_virtual(1_000_000) else { panic!() };
+    let RunResult::Failed(e) = t.m.run_virtual(1_000_000) else {
+        panic!()
+    };
     assert!(e.message.contains("kernel32.dll!FlsAlloc"), "{e}");
 }
 
@@ -456,7 +538,9 @@ fn each_context_sees_its_own_teb() {
         a.push_imm(1).call(sleep).mov_eax_fs(0x18).ret();
     });
     t.m.spawn("M", CODE, &[], 0x1_0000).unwrap();
-    let RunResult::Exited(teb) = t.m.run_virtual(1_000_000) else { panic!() };
+    let RunResult::Exited(teb) = t.m.run_virtual(1_000_000) else {
+        panic!()
+    };
     assert_eq!(teb, t.m.sys.context(0).teb);
     assert_ne!(t.m.sys.context(0).teb, t.m.sys.context(1).teb);
 }
@@ -492,14 +576,32 @@ fn detour_replaces_a_guest_function_and_can_run_the_original() {
         }
         Outcome::Return(a * b)
     });
-    r.add("test", "done", Conv::Cdecl { argc: 0 }, |_| Outcome::ExitProcess(0));
-    let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), r, Clock::virtual_time()).unwrap();
+    r.add("test", "done", Conv::Cdecl { argc: 0 }, |_| {
+        Outcome::ExitProcess(0)
+    });
+    let mut m = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        r,
+        Clock::virtual_time(),
+    )
+    .unwrap();
     m.cpu.map(CODE, 0x1000, Prot::RWX).unwrap();
-    m.cpu.write(F, &[0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x03, 0x45, 0x0c, 0x5d, 0xc3]).unwrap();
+    m.cpu
+        .write(
+            F,
+            &[
+                0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x03, 0x45, 0x0c, 0x5d, 0xc3,
+            ],
+        )
+        .unwrap();
     let done = m.resolve_import("test", "done").unwrap();
     let mut a = Asm::new(CODE);
     for (i, (x, y)) in [(3, 4), (7, 4), (5, 6)].into_iter().enumerate() {
-        a.push_imm(y).push_imm(x).call(F).add_esp(8).mov_mem_eax(OUT + 4 * i as u32);
+        a.push_imm(y)
+            .push_imm(x)
+            .call(F)
+            .add_esp(8)
+            .mov_mem_eax(OUT + 4 * i as u32);
     }
     a.call(done);
     m.cpu.write(CODE, &a.bytes).unwrap();
@@ -509,7 +611,13 @@ fn detour_replaces_a_guest_function_and_can_run_the_original() {
     assert_eq!(d.entry, F);
     m.spawn("M", CODE, &[], 0x1_0000).unwrap();
     assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(0)));
-    let got: Vec<u32> = (0..3).map(|i| m.cpu.read_u32(OUT + 4 * i).unwrap()).collect();
-    assert_eq!(got, [12, 11, 30], "host, original through the trampoline, host");
+    let got: Vec<u32> = (0..3)
+        .map(|i| m.cpu.read_u32(OUT + 4 * i).unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        [12, 11, 30],
+        "host, original through the trampoline, host"
+    );
     assert_eq!(m.sys.thunks.get(d.thunk).name, "f");
 }

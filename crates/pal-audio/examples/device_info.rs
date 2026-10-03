@@ -2,8 +2,12 @@
 #[cfg(feature = "device")]
 fn main() {
     use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_output_device().expect("default output device");
-    let config = device.default_output_config().expect("default output configuration");
+    let device = cpal::default_host()
+        .default_output_device()
+        .expect("default output device");
+    let config = device
+        .default_output_config()
+        .expect("default output configuration");
     println!(
         "name={:?} rate={} channels={} sample={:?} buffer={:?}",
         device.name(),

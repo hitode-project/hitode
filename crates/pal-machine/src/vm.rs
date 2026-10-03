@@ -29,15 +29,25 @@ pub const fn align_up(v: u32, a: u32) -> u32 {
 
 impl Vm {
     pub fn new() -> Self {
-        Self { used: BTreeMap::new() }
+        Self {
+            used: BTreeMap::new(),
+        }
     }
 
     fn overlaps(&self, addr: u32, size: u32) -> bool {
         let end = u64::from(addr) + u64::from(size);
         // The region starting at or before `addr`, and any starting inside [addr, end).
-        let before =
-            self.used.range(..=addr).next_back().is_some_and(|(&s, &l)| u64::from(s) + u64::from(l) > u64::from(addr));
-        before || self.used.range(addr..).next().is_some_and(|(&s, _)| u64::from(s) < end)
+        let before = self
+            .used
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(&s, &l)| u64::from(s) + u64::from(l) > u64::from(addr));
+        before
+            || self
+                .used
+                .range(addr..)
+                .next()
+                .is_some_and(|(&s, _)| u64::from(s) < end)
     }
 
     fn find_free(&self, size: u32) -> Option<u32> {
@@ -90,8 +100,13 @@ impl Vm {
         guard: u32,
         prot: Prot,
     ) -> Result<u32, MemFault> {
-        let requested = size.checked_add(guard).ok_or(MemFault { addr: 0, len: size })?;
-        let addr = self.reserve(requested).ok_or(MemFault { addr: 0, len: requested })?;
+        let requested = size
+            .checked_add(guard)
+            .ok_or(MemFault { addr: 0, len: size })?;
+        let addr = self.reserve(requested).ok_or(MemFault {
+            addr: 0,
+            len: requested,
+        })?;
         let total = self.used[&addr];
         if let Err(error) = cpu.map(addr + guard, total - guard, prot) {
             self.used.remove(&addr);
@@ -107,7 +122,11 @@ impl Vm {
 
     /// `(start, size)` of the region containing `addr`.
     pub fn containing(&self, addr: u32) -> Option<(u32, u32)> {
-        self.used.range(..=addr).next_back().map(|(&b, &s)| (b, s)).filter(|&(b, s)| addr - b < s)
+        self.used
+            .range(..=addr)
+            .next_back()
+            .map(|(&b, &s)| (b, s))
+            .filter(|&(b, s)| addr - b < s)
     }
 
     /// Unmap and release the region starting at `addr`. Unmapped pages (guards) are skipped.
@@ -138,14 +157,24 @@ mod tests {
         }
         fn set_reg(&mut self, _: Reg, _: u32) {}
         fn read(&self, addr: u32, data: &mut [u8]) -> Result<(), MemFault> {
-            Err(MemFault { addr, len: data.len() as u32 })
+            Err(MemFault {
+                addr,
+                len: data.len() as u32,
+            })
         }
         fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), MemFault> {
-            Err(MemFault { addr, len: data.len() as u32 })
+            Err(MemFault {
+                addr,
+                len: data.len() as u32,
+            })
         }
         fn map(&mut self, addr: u32, len: u32, _: Prot) -> Result<(), MemFault> {
             self.requests.push((addr, len));
-            if std::mem::take(&mut self.fail_next) { Err(MemFault { addr, len }) } else { Ok(()) }
+            if std::mem::take(&mut self.fail_next) {
+                Err(MemFault { addr, len })
+            } else {
+                Ok(())
+            }
         }
         fn protect(&mut self, _: u32, _: u32, _: Prot) -> Result<(), MemFault> {
             Ok(())
@@ -181,7 +210,10 @@ mod tests {
             let mut vm = Vm::new();
             assert!(vm.reserve_at(DYN_START, GRANULE));
             let expected = DYN_START + GRANULE;
-            let mut guest = MappingGuest { fail_next: true, ..MappingGuest::default() };
+            let mut guest = MappingGuest {
+                fail_next: true,
+                ..MappingGuest::default()
+            };
             let allocate = |vm: &mut Vm, guest: &mut MappingGuest| {
                 if guard == 0 {
                     vm.alloc(guest, PAGE, Prot::RW)
@@ -205,8 +237,14 @@ mod tests {
             assert!(vm.reserve(size).is_none());
             assert!(vm.alloc(&mut guest, size, Prot::RW).is_err());
         }
-        assert!(vm.alloc_with_guard(&mut guest, u32::MAX, PAGE, Prot::RW).is_err());
-        assert!(vm.alloc_with_guard(&mut guest, u32::MAX - PAGE, PAGE, Prot::RW).is_err());
+        assert!(
+            vm.alloc_with_guard(&mut guest, u32::MAX, PAGE, Prot::RW)
+                .is_err()
+        );
+        assert!(
+            vm.alloc_with_guard(&mut guest, u32::MAX - PAGE, PAGE, Prot::RW)
+                .is_err()
+        );
         assert!(guest.requests.is_empty());
         assert_eq!(vm.alloc(&mut guest, PAGE, Prot::RW).unwrap(), DYN_START);
     }

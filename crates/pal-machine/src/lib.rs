@@ -28,7 +28,10 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use pal_cpu::asm::Asm;
-use pal_cpu::{Backend, Exit, Fault, Guest, GuestExt, MemFault, Prot, Reg, SegmentSetup, TrapAction, TrapHandler};
+use pal_cpu::{
+    Backend, Exit, Fault, Guest, GuestExt, MemFault, Prot, Reg, SegmentSetup, TrapAction,
+    TrapHandler,
+};
 
 pub use clock::Clock;
 pub use ext::Ext;
@@ -90,7 +93,10 @@ pub struct RecentCalls {
 
 impl RecentCalls {
     pub fn new(cap: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(cap), cap }
+        Self {
+            buf: VecDeque::with_capacity(cap),
+            cap,
+        }
     }
 
     pub fn push(&mut self, ctx: CtxId, thunk: u32, caller: u32) {
@@ -262,17 +268,35 @@ impl Sys {
         self.signal_waiters_with_priority(h, WakePriority::Normal);
     }
     pub fn prefer_ready_context(&mut self, context: CtxId, priority: WakePriority) {
-        if self.contexts.get(context as usize).is_some_and(|c| matches!(c.state, State::Ready { .. })) {
-            self.wakes.wake_as(context, self.clock.now_us(), None, priority);
+        if self
+            .contexts
+            .get(context as usize)
+            .is_some_and(|c| matches!(c.state, State::Ready { .. }))
+        {
+            self.wakes
+                .wake_as(context, self.clock.now_us(), None, priority);
         }
     }
     fn signal_waiters_with_priority(&mut self, h: Handle, priority: WakePriority) {
         let now = self.clock.now_us();
         for i in 0..self.contexts.len() {
             let waiting = match &self.contexts[i].state {
-                State::Blocked { wait: Wait::Object { handle, .. }, .. } => self.objects.same_object(*handle, h),
-                State::Blocked { wait: Wait::Objects { handles, notification, .. }, .. } => {
-                    handles.iter().any(|&handle| self.objects.same_object(handle, h))
+                State::Blocked {
+                    wait: Wait::Object { handle, .. },
+                    ..
+                } => self.objects.same_object(*handle, h),
+                State::Blocked {
+                    wait:
+                        Wait::Objects {
+                            handles,
+                            notification,
+                            ..
+                        },
+                    ..
+                } => {
+                    handles
+                        .iter()
+                        .any(|&handle| self.objects.same_object(handle, h))
                         || notification.is_some_and(|handle| self.objects.same_object(handle, h))
                 }
                 _ => false,
@@ -308,11 +332,19 @@ impl Sys {
 
     /// Acquire a wait set without partially consuming an unsatisfied WaitAll.
     pub fn try_acquire_objects(&mut self, handles: &[Handle], all: bool) -> Option<WakeReason> {
-        sched::poll_objects(&mut self.objects, &self.contexts, handles, self.current, all)
+        sched::poll_objects(
+            &mut self.objects,
+            &self.contexts,
+            handles,
+            self.current,
+            all,
+        )
     }
 
     fn poll_wait(&mut self, i: usize, now: u64) -> Option<WakeReason> {
-        let State::Blocked { wait, .. } = &self.contexts[i].state else { return None };
+        let State::Blocked { wait, .. } = &self.contexts[i].state else {
+            return None;
+        };
         match wait {
             Wait::Yield => Some(WakeReason::Timeout),
             Wait::Until(t) => (now >= *t).then_some(WakeReason::Timeout),
@@ -321,18 +353,35 @@ impl Sys {
                 if sched::poll_object(&mut self.objects, &self.contexts, handle, i as CtxId, true) {
                     Some(WakeReason::Signaled)
                 } else {
-                    deadline.is_some_and(|d| now >= d).then_some(WakeReason::Timeout)
+                    deadline
+                        .is_some_and(|d| now >= d)
+                        .then_some(WakeReason::Timeout)
                 }
             }
-            Wait::Objects { handles, all, deadline, notification } => {
-                sched::poll_objects(&mut self.objects, &self.contexts, handles, i as CtxId, *all)
-                    .or_else(|| {
-                        notification
-                            .filter(|&h| sched::poll_object(&mut self.objects, &self.contexts, h, i as CtxId, true))
-                            .map(|_| WakeReason::Notified)
-                    })
-                    .or_else(|| deadline.is_some_and(|d| now >= d).then_some(WakeReason::Timeout))
-            }
+            Wait::Objects {
+                handles,
+                all,
+                deadline,
+                notification,
+            } => sched::poll_objects(&mut self.objects, &self.contexts, handles, i as CtxId, *all)
+                .or_else(|| {
+                    notification
+                        .filter(|&h| {
+                            sched::poll_object(
+                                &mut self.objects,
+                                &self.contexts,
+                                h,
+                                i as CtxId,
+                                true,
+                            )
+                        })
+                        .map(|_| WakeReason::Notified)
+                })
+                .or_else(|| {
+                    deadline
+                        .is_some_and(|d| now >= d)
+                        .then_some(WakeReason::Timeout)
+                }),
         }
     }
 
@@ -366,7 +415,13 @@ impl Sys {
             self.scheduling.timed_wake(now, deadline);
         }
         self.wakes.wake(i as CtxId, now, deadline);
-        self.contexts[i].state = State::Ready { resume: Some(ReadyResume::Woke { then, origin, reason }) };
+        self.contexts[i].state = State::Ready {
+            resume: Some(ReadyResume::Woke {
+                then,
+                origin,
+                reason,
+            }),
+        };
     }
 
     /// Virtual time: let every yielding context resume before recognizing a
@@ -375,16 +430,16 @@ impl Sys {
     fn advance_if_only_polling(&mut self, polled: &mut [bool]) {
         if !self.clock.is_virtual()
             || !self.only_polling()
-            || !self
-                .contexts
-                .iter()
-                .enumerate()
-                .all(|(i, c)| !matches!(c.state, State::Ready { .. }) || polled.get(i) == Some(&true))
+            || !self.contexts.iter().enumerate().all(|(i, c)| {
+                !matches!(c.state, State::Ready { .. }) || polled.get(i) == Some(&true)
+            })
         {
             return;
         }
         let soon = self.clock.now_us() + 1000;
-        let t = self.next_deadline().map_or(soon, |deadline| deadline.min(soon));
+        let t = self
+            .next_deadline()
+            .map_or(soon, |deadline| deadline.min(soon));
         self.stats.total.polls += 1;
         self.clock.advance_to(t);
         polled.fill(false);
@@ -393,7 +448,11 @@ impl Sys {
 
     /// Some context is ready, and every ready one is only yielding (a polling loop).
     fn only_polling(&self) -> bool {
-        let mut ready = self.contexts.iter().filter(|c| matches!(c.state, State::Ready { .. })).peekable();
+        let mut ready = self
+            .contexts
+            .iter()
+            .filter(|c| matches!(c.state, State::Ready { .. }))
+            .peekable();
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
 
@@ -401,10 +460,14 @@ impl Sys {
         self.contexts
             .iter()
             .filter_map(|c| match &c.state {
-                State::Blocked { wait: Wait::Until(t), .. } => Some(*t),
-                State::Blocked { wait: Wait::Object { deadline, .. } | Wait::Objects { deadline, .. }, .. } => {
-                    *deadline
-                }
+                State::Blocked {
+                    wait: Wait::Until(t),
+                    ..
+                } => Some(*t),
+                State::Blocked {
+                    wait: Wait::Object { deadline, .. } | Wait::Objects { deadline, .. },
+                    ..
+                } => *deadline,
                 _ => None,
             })
             .min()
@@ -473,7 +536,12 @@ fn apply(
             return Err(Parked::Deferred { then, origin });
         }
         let thunk = origin.thunk;
-        out = then(&mut Env { cpu: &mut *cpu, sys: &mut *sys, ext: &mut *ext, thunk });
+        out = then(&mut Env {
+            cpu: &mut *cpu,
+            sys: &mut *sys,
+            ext: &mut *ext,
+            thunk,
+        });
     }
     match out {
         Outcome::Return(v) => {
@@ -511,11 +579,15 @@ fn apply(
                 .try_for_each(|&a| push(cpu, &mut sp, a))
                 .and_then(|()| push(cpu, &mut sp, thunk_addr(thunk::RETURN_PAD)));
             if let Err(e) = pushed {
-                return Err(Parked::Fail(format!("guest call to {target:#x}: stack write failed: {e}")));
+                return Err(Parked::Fail(format!(
+                    "guest call to {target:#x}: stack write failed: {e}"
+                )));
             }
             cpu.set_reg(Reg::Esp, sp);
             cpu.set_reg(Reg::Eip, target);
-            sys.contexts[sys.current as usize].frames.push(Frame { then, origin });
+            sys.contexts[sys.current as usize]
+                .frames
+                .push(Frame { then, origin });
             Ok(())
         }
         Outcome::Block { wait, then } => Err(Parked::Block { wait, then, origin }),
@@ -533,7 +605,14 @@ fn finish(cpu: &mut dyn Guest, sys: &mut Sys, origin: Origin, v: u64, wide: bool
         if let Conv::CdeclVariadic { fixed } = t.f.conv {
             sys.trace.note_variadic(&t.module, &t.name, fixed);
         }
-        let rec = TraceRecord { ctx: sys.current, frame: sys.frame, module: &t.module, name: &t.name, args, ret: v };
+        let rec = TraceRecord {
+            ctx: sys.current,
+            frame: sys.frame,
+            module: &t.module,
+            name: &t.name,
+            args,
+            ret: v,
+        };
         sys.trace.record(&rec);
     }
     cpu.set_reg(Reg::Eax, v as u32);
@@ -562,7 +641,9 @@ struct Dispatch<'a> {
 pub fn guess_backtrace(cpu: &dyn Guest, modules: &Modules, esp: u32) -> Vec<u32> {
     let mut out = Vec::new();
     for i in 0..0x800 {
-        let Ok(v) = cpu.read_u32(esp + 4 * i) else { break };
+        let Ok(v) = cpu.read_u32(esp + 4 * i) else {
+            break;
+        };
         if !modules.iter().any(|(_, m)| m.contains(v)) {
             continue;
         }
@@ -584,13 +665,27 @@ impl Dispatch<'_> {
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
         let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
-        let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all))
-            .then(|| (0..u32::from(f.conv.argc())).map(|i| cpu.arg(i).unwrap_or(0)).collect());
-        let origin = Origin { esp, ret_eip: cpu.reg(Reg::Eip), thunk: index, trace_args };
-        self.sys.recent.push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
+        let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all)).then(|| {
+            (0..u32::from(f.conv.argc()))
+                .map(|i| cpu.arg(i).unwrap_or(0))
+                .collect()
+        });
+        let origin = Origin {
+            esp,
+            ret_eip: cpu.reg(Reg::Eip),
+            thunk: index,
+            trace_args,
+        };
+        self.sys
+            .recent
+            .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
-        if self.sys.call_limit.is_some_and(|l| self.sys.host_calls >= l) {
+        if self
+            .sys
+            .call_limit
+            .is_some_and(|l| self.sys.host_calls >= l)
+        {
             let frames = guess_backtrace(cpu, &self.sys.modules, esp);
             let frames: Vec<String> = frames.iter().map(|a| format!("{a:#010x}")).collect();
             return Err(Parked::Fail(format!(
@@ -599,7 +694,12 @@ impl Dispatch<'_> {
             )));
         }
         let t0 = self.sys.stats.start();
-        let out = (f.handler)(&mut Env { cpu: &mut *cpu, sys: &mut *self.sys, ext: &mut *self.ext, thunk: index });
+        let out = (f.handler)(&mut Env {
+            cpu: &mut *cpu,
+            sys: &mut *self.sys,
+            ext: &mut *self.ext,
+            thunk: index,
+        });
         let r = apply(cpu, self.sys, self.ext, out, origin, self.yield_on_frame);
         self.sys.stats.host(t0, index, true);
         r
@@ -607,15 +707,24 @@ impl Dispatch<'_> {
 
     fn guest_return(&mut self, cpu: &mut dyn Guest) -> Result<(), Parked> {
         let eax = cpu.reg(Reg::Eax);
-        let Some(Frame { then, origin }) = self.sys.contexts[self.sys.current as usize].frames.pop() else {
+        let Some(Frame { then, origin }) =
+            self.sys.contexts[self.sys.current as usize].frames.pop()
+        else {
             // The context's entry function returned.
             return Err(Parked::ExitThread(eax));
         };
         cpu.set_reg(Reg::Esp, origin.esp);
         let thunk = origin.thunk;
         let t0 = self.sys.stats.start();
-        let out =
-            then(&mut Env { cpu: &mut *cpu, sys: &mut *self.sys, ext: &mut *self.ext, thunk }, Resume::Returned(eax));
+        let out = then(
+            &mut Env {
+                cpu: &mut *cpu,
+                sys: &mut *self.sys,
+                ext: &mut *self.ext,
+                thunk,
+            },
+            Resume::Returned(eax),
+        );
         let r = apply(cpu, self.sys, self.ext, out, origin, self.yield_on_frame);
         self.sys.stats.host(t0, thunk, true);
         r
@@ -644,7 +753,9 @@ impl TrapHandler for Dispatch<'_> {
                 && instruction[0] == 0x68
                 && instruction[5..] == [0xcd, pal_cpu::asm::TRAP_VECTOR]
                 && index.is_some_and(|i| {
-                    i != thunk::RETURN_PAD && i < self.sys.thunks.len() && instruction[1..5] == i.to_le_bytes()
+                    i != thunk::RETURN_PAD
+                        && i < self.sys.thunks.len()
+                        && instruction[1..5] == i.to_le_bytes()
                 });
             if valid {
                 cpu.set_reg(Reg::Esp, esp.wrapping_add(4));
@@ -657,7 +768,9 @@ impl TrapHandler for Dispatch<'_> {
             Ok(()) if self.yield_on_frame && self.sys.completed_frames != frame_before => {
                 // Return/Call has already committed its stack and continuation state.
                 // Parking here does not fabricate a Sleep or re-execute the host call.
-                self.parked = Some(Parked::HostYield { resume_eip: cpu.reg(Reg::Eip) });
+                self.parked = Some(Parked::HostYield {
+                    resume_eip: cpu.reg(Reg::Eip),
+                });
                 TrapAction::Park
             }
             Ok(()) => TrapAction::Continue,
@@ -699,7 +812,11 @@ pub struct MachineError {
 
 impl std::fmt::Display for MachineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "context {} at {:#010x}: {}", self.ctx, self.pc, self.message)
+        write!(
+            f,
+            "context {} at {:#010x}: {}",
+            self.ctx, self.pc, self.message
+        )
     }
 }
 
@@ -728,8 +845,17 @@ impl<B: Backend> Machine<B> {
     /// Maps the host regions and installs segments. `cpu` must have been created with
     /// [`PARK_ADDR`] as its park address.
     pub fn new(mut cpu: B, mut registry: Registry, clock: Clock) -> Result<Self, MemFault> {
-        registry.add(INTERNAL_MODULE, "process_start", Conv::Cdecl { argc: 0 }, process_start);
-        assert_eq!(cpu.park_addr(), PARK_ADDR, "backend park address must be layout::PARK_ADDR");
+        registry.add(
+            INTERNAL_MODULE,
+            "process_start",
+            Conv::Cdecl { argc: 0 },
+            process_start,
+        );
+        assert_eq!(
+            cpu.park_addr(),
+            PARK_ADDR,
+            "backend park address must be layout::PARK_ADDR"
+        );
         cpu.map(THUNK_BASE, THUNK_SIZE, Prot::RX)?;
         let mut pad = Asm::new(thunk_addr(thunk::RETURN_PAD));
         pad.trap().hlt();
@@ -783,7 +909,13 @@ impl<B: Backend> Machine<B> {
         })
     }
 
-    pub fn spawn(&mut self, name: &str, entry: u32, args: &[u32], stack_size: u32) -> Result<CtxId, MemFault> {
+    pub fn spawn(
+        &mut self,
+        name: &str,
+        entry: u32,
+        args: &[u32],
+        stack_size: u32,
+    ) -> Result<CtxId, MemFault> {
         self.sys.spawn(&mut self.cpu, name, entry, args, stack_size)
     }
 
@@ -805,7 +937,10 @@ impl<B: Backend> Machine<B> {
     /// stopping at the earliest timed wake. None disables both internal limits for
     /// A/B measurement. Unsliced and virtual-time execution retain their old policy.
     /// This never changes the hard watchdog allowance or any guest Sleep duration.
-    pub fn set_scheduling_quantum(&mut self, quantum: Option<Duration>) -> Result<(), &'static str> {
+    pub fn set_scheduling_quantum(
+        &mut self,
+        quantum: Option<Duration>,
+    ) -> Result<(), &'static str> {
         if quantum.is_some_and(|q| q.is_zero()) {
             return Err("scheduling quantum must be nonzero");
         }
@@ -837,8 +972,15 @@ impl<B: Backend> Machine<B> {
         let m = self.sys.modules.get(exe);
         let (base, entry, stack, name) = (m.base, m.entry, m.stack_reserve, m.name.clone());
         self.cpu.write_u32(PEB_ADDR + peb::IMAGE_BASE, base)?;
-        self.sys.process_init.push_back(InitCall { target: entry, args: vec![], what: format!("entry of {name}") });
-        let start = self.sys.thunks.resolve(&mut self.cpu, INTERNAL_MODULE, "process_start")?;
+        self.sys.process_init.push_back(InitCall {
+            target: entry,
+            args: vec![],
+            what: format!("entry of {name}"),
+        });
+        let start = self
+            .sys
+            .thunks
+            .resolve(&mut self.cpu, INTERNAL_MODULE, "process_start")?;
         self.spawn("M", start, &[], stack.max(DEFAULT_STACK))
     }
 
@@ -853,7 +995,9 @@ impl<B: Backend> Machine<B> {
             return Ok(());
         }
         if let Some(prev) = self.loaded {
-            let mut slot = self.regs[prev as usize].take().unwrap_or_else(|| self.cpu.new_context());
+            let mut slot = self.regs[prev as usize]
+                .take()
+                .unwrap_or_else(|| self.cpu.new_context());
             self.cpu.save(&mut slot);
             self.regs[prev as usize] = Some(slot);
         }
@@ -867,7 +1011,9 @@ impl<B: Backend> Machine<B> {
                 self.cpu.set_reg(Reg::Eip, eip);
             }
             (None, Some(r)) => self.cpu.restore(r),
-            (None, None) => unreachable!("context {id} has neither start state nor saved registers"),
+            (None, None) => {
+                unreachable!("context {id} has neither start state nor saved registers")
+            }
         }
         self.loaded = Some(id);
         Ok(())
@@ -894,12 +1040,23 @@ impl<B: Backend> Machine<B> {
                 ctx.yielded = false;
             }
             Parked::Deferred { then, origin } => {
-                ctx.state = State::Ready { resume: Some(ReadyResume::Deferred { then, origin }) };
+                ctx.state = State::Ready {
+                    resume: Some(ReadyResume::Deferred { then, origin }),
+                };
                 ctx.yielded = false;
             }
-            Parked::Block { wait: Wait::Yield, then, origin } => {
-                ctx.state =
-                    State::Ready { resume: Some(ReadyResume::Woke { then, origin, reason: WakeReason::Timeout }) };
+            Parked::Block {
+                wait: Wait::Yield,
+                then,
+                origin,
+            } => {
+                ctx.state = State::Ready {
+                    resume: Some(ReadyResume::Woke {
+                        then,
+                        origin,
+                        reason: WakeReason::Timeout,
+                    }),
+                };
                 ctx.yielded = true;
             }
             Parked::Block { wait, then, origin } => {
@@ -915,7 +1072,9 @@ impl<B: Backend> Machine<B> {
             }
             Parked::ExitProcess(code) => return Some(RunResult::Exited(code)),
             Parked::Fail(msg) => return Some(self.fail(msg)),
-            Parked::Exception(v) => return Some(self.fail(format!("unhandled CPU exception/interrupt {v:#x}"))),
+            Parked::Exception(v) => {
+                return Some(self.fail(format!("unhandled CPU exception/interrupt {v:#x}")));
+            }
         }
         None
     }
@@ -923,7 +1082,8 @@ impl<B: Backend> Machine<B> {
     /// Run guest contexts until all are blocked, the process exits, or something fails.
     pub fn run(&mut self) -> RunResult {
         if let Some(previous) = self.slice_backend_budget.take() {
-            self.cpu.set_execution_budget(self.execution_budget.unwrap_or(previous));
+            self.cpu
+                .set_execution_budget(self.execution_budget.unwrap_or(previous));
         }
         self.slice_elapsed = Duration::ZERO;
         // Without a Machine policy, preserve the original per-backend-run default.
@@ -941,12 +1101,16 @@ impl<B: Backend> Machine<B> {
     /// Without a Machine policy, inherit and later restore the backend's allowance.
     /// Host handlers and synchronous compilation can exceed the requested slice length.
     pub fn run_slice(&mut self, slice: Duration) -> SliceResult {
-        let previous = *self.slice_backend_budget.get_or_insert_with(|| self.cpu.execution_budget());
+        let previous = *self
+            .slice_backend_budget
+            .get_or_insert_with(|| self.cpu.execution_budget());
         let hard_budget = self.execution_budget.unwrap_or(previous);
         let started = Instant::now();
         let result = self.run_scheduler(Some(slice), started, hard_budget);
         match result {
-            SliceResult::Yielded => self.slice_elapsed = self.slice_elapsed.saturating_add(started.elapsed()),
+            SliceResult::Yielded => {
+                self.slice_elapsed = self.slice_elapsed.saturating_add(started.elapsed())
+            }
             SliceResult::Complete(_) => {
                 self.slice_elapsed = Duration::ZERO;
                 self.slice_backend_budget = None;
@@ -977,12 +1141,13 @@ impl<B: Backend> Machine<B> {
         let mut polled = vec![false; self.sys.contexts.len()];
         loop {
             if let Some(budget) = hard_budget {
-                let remaining = budget.saturating_sub(self.slice_elapsed.saturating_add(started.elapsed()));
+                let remaining =
+                    budget.saturating_sub(self.slice_elapsed.saturating_add(started.elapsed()));
                 if remaining.is_zero() {
                     self.sys.trace.flush();
-                    return SliceResult::Complete(
-                        self.fail(format!("guest execution budget exhausted ({budget:?} of host wall time)")),
-                    );
+                    return SliceResult::Complete(self.fail(format!(
+                        "guest execution budget exhausted ({budget:?} of host wall time)"
+                    )));
                 }
             }
             if slice.is_some_and(|limit| started.elapsed() >= limit) {
@@ -996,18 +1161,17 @@ impl<B: Backend> Machine<B> {
             // can wait (at most 1 ms) like the OS would schedule them.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
-                && self
-                    .sys
-                    .contexts
-                    .iter()
-                    .enumerate()
-                    .all(|(i, c)| !matches!(c.state, State::Ready { .. }) || ran.get(i) == Some(&true))
+                && self.sys.contexts.iter().enumerate().all(|(i, c)| {
+                    !matches!(c.state, State::Ready { .. }) || ran.get(i) == Some(&true)
+                })
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
                 let soon = self.sys.clock.now_us() + 1000;
                 let t = self.sys.next_deadline().map_or(soon, |d| d.min(soon));
-                return SliceResult::Complete(RunResult::Idle { next_deadline: Some(t) });
+                return SliceResult::Complete(RunResult::Idle {
+                    next_deadline: Some(t),
+                });
             }
             let contexts = &self.sys.contexts;
             let selection = self.sys.wakes.pick(
@@ -1018,7 +1182,9 @@ impl<B: Backend> Machine<B> {
             );
             let Some(selection) = selection else {
                 self.sys.trace.flush();
-                return SliceResult::Complete(RunResult::Idle { next_deadline: self.sys.next_deadline() });
+                return SliceResult::Complete(RunResult::Idle {
+                    next_deadline: self.sys.next_deadline(),
+                });
             };
             let id = selection.id;
             ran.resize(self.sys.contexts.len(), false);
@@ -1029,7 +1195,11 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Complete(self.fail(format!("context switch: {e}")));
             }
 
-            self.sys.scheduling.dispatch(selection.wake, self.sys.clock.now_us(), selection.promoted);
+            self.sys.scheduling.dispatch(
+                selection.wake,
+                self.sys.clock.now_us(),
+                selection.promoted,
+            );
             let frame_before = self.sys.completed_frames;
             // A woken context first finishes the host call it blocked in.
             let resume = match &mut self.sys.contexts[id as usize].state {
@@ -1039,22 +1209,43 @@ impl<B: Backend> Machine<B> {
             if let Some(resume) = resume {
                 let t0 = self.sys.stats.start();
                 let (out, origin) = match resume {
-                    ReadyResume::Woke { then, origin, reason } => {
+                    ReadyResume::Woke {
+                        then,
+                        origin,
+                        reason,
+                    } => {
                         let thunk = origin.thunk;
                         let out = then(
-                            &mut Env { cpu: &mut self.cpu, sys: &mut self.sys, ext: &mut self.ext, thunk },
+                            &mut Env {
+                                cpu: &mut self.cpu,
+                                sys: &mut self.sys,
+                                ext: &mut self.ext,
+                                thunk,
+                            },
                             Resume::Woke(reason),
                         );
                         (out, origin)
                     }
                     ReadyResume::Deferred { then, origin } => {
                         let thunk = origin.thunk;
-                        let out = then(&mut Env { cpu: &mut self.cpu, sys: &mut self.sys, ext: &mut self.ext, thunk });
+                        let out = then(&mut Env {
+                            cpu: &mut self.cpu,
+                            sys: &mut self.sys,
+                            ext: &mut self.ext,
+                            thunk,
+                        });
                         (out, origin)
                     }
                 };
                 let thunk = origin.thunk;
-                let applied = apply(&mut self.cpu, &mut self.sys, &mut self.ext, out, origin, latency_mode);
+                let applied = apply(
+                    &mut self.cpu,
+                    &mut self.sys,
+                    &mut self.ext,
+                    out,
+                    origin,
+                    latency_mode,
+                );
                 self.sys.stats.host(t0, thunk, false);
                 self.note_frame();
                 if let Err(p) = applied {
@@ -1072,17 +1263,16 @@ impl<B: Backend> Machine<B> {
             }
 
             // Continuations may have consumed wall time since the scheduler check.
-            let hard_remaining =
-                hard_budget.map(|budget| budget.saturating_sub(self.slice_elapsed.saturating_add(started.elapsed())));
+            let hard_remaining = hard_budget.map(|budget| {
+                budget.saturating_sub(self.slice_elapsed.saturating_add(started.elapsed()))
+            });
             let soft_remaining = slice.map(|limit| limit.saturating_sub(started.elapsed()));
             if hard_remaining.is_some_and(|remaining| remaining.is_zero()) {
                 self.sys.trace.flush();
-                return SliceResult::Complete(
-                    self.fail(format!(
-                        "guest execution budget exhausted ({:?} of host wall time)",
-                        hard_budget.unwrap()
-                    )),
-                );
+                return SliceResult::Complete(self.fail(format!(
+                    "guest execution budget exhausted ({:?} of host wall time)",
+                    hard_budget.unwrap()
+                )));
             }
             if soft_remaining.is_some_and(|remaining| remaining.is_zero()) {
                 self.sys.contexts[id as usize].yielded = false;
@@ -1101,10 +1291,9 @@ impl<B: Backend> Machine<B> {
                         && self.sys.contexts.iter().any(|c| c.id != id && !c.is_done())
                 })
                 .and_then(|quantum| {
-                    let wake = self
-                        .sys
-                        .next_deadline()
-                        .map(|deadline| Duration::from_micros(deadline.saturating_sub(self.sys.clock.now_us())));
+                    let wake = self.sys.next_deadline().map(|deadline| {
+                        Duration::from_micros(deadline.saturating_sub(self.sys.clock.now_us()))
+                    });
                     if !latency_mode {
                         Some(wake.map_or(quantum, |wake| quantum.min(wake)))
                     } else {
@@ -1113,7 +1302,10 @@ impl<B: Backend> Machine<B> {
                                 && matches!(
                                     c.state,
                                     State::Ready { .. }
-                                        | State::Blocked { wait: Wait::Object { .. } | Wait::Objects { .. }, .. }
+                                        | State::Blocked {
+                                            wait: Wait::Object { .. } | Wait::Objects { .. },
+                                            ..
+                                        }
                                 )
                         });
                         // Object signals may be produced inside a non-parking host call.
@@ -1127,7 +1319,8 @@ impl<B: Backend> Machine<B> {
                 // executing more guest code; never pass a zero timeout to a backend.
                 continue;
             }
-            let allowance = scheduling::Allowance::choose(hard_remaining, soft_remaining, reschedule);
+            let allowance =
+                scheduling::Allowance::choose(hard_remaining, soft_remaining, reschedule);
             if let Some(allowance) = allowance {
                 self.cpu.set_execution_budget(Some(allowance.duration));
             }
@@ -1135,11 +1328,18 @@ impl<B: Backend> Machine<B> {
             let run_started = Instant::now();
             let t0 = self.sys.stats.start();
             let frame_before = self.sys.completed_frames;
-            let mut d = Dispatch { sys: &mut self.sys, ext: &mut self.ext, parked: None, yield_on_frame: latency_mode };
+            let mut d = Dispatch {
+                sys: &mut self.sys,
+                ext: &mut self.ext,
+                parked: None,
+                yield_on_frame: latency_mode,
+            };
             let exit = self.cpu.run(&mut d);
             let parked = d.parked.take();
             if let Some(allowance) = allowance {
-                self.sys.scheduling.cpu_run(allowance.duration, run_started.elapsed());
+                self.sys
+                    .scheduling
+                    .cpu_run(allowance.duration, run_started.elapsed());
             }
             if let Some(t0) = t0 {
                 self.sys.stats.total.run_ns += t0.elapsed().as_nanos() as u64;
@@ -1155,7 +1355,9 @@ impl<B: Backend> Machine<B> {
                         return SliceResult::Complete(RunResult::Failed(MachineError {
                             ctx: id,
                             pc,
-                            message: format!("guest execution budget exhausted ({hard:?} of host wall time)"),
+                            message: format!(
+                                "guest execution budget exhausted ({hard:?} of host wall time)"
+                            ),
                             recent: self.sys.recent_calls(),
                         }));
                     }
@@ -1184,9 +1386,12 @@ impl<B: Backend> Machine<B> {
                 }
                 Exit::BudgetExceeded { pc, budget } => {
                     self.sys.trace.flush();
-                    let hard_expired =
-                        hard_budget.is_some_and(|hard| self.slice_elapsed.saturating_add(started.elapsed()) >= hard);
-                    if slice.is_some() && !hard_expired && allowance.is_some_and(|a| a.limit != scheduling::Limit::Hard)
+                    let hard_expired = hard_budget.is_some_and(|hard| {
+                        self.slice_elapsed.saturating_add(started.elapsed()) >= hard
+                    });
+                    if slice.is_some()
+                        && !hard_expired
+                        && allowance.is_some_and(|a| a.limit != scheduling::Limit::Hard)
                     {
                         self.sys.contexts[id as usize].yielded = false;
                         if allowance.is_some_and(|a| a.limit == scheduling::Limit::Reschedule)
@@ -1217,29 +1422,43 @@ impl<B: Backend> Machine<B> {
     /// Finish a frame handoff without masking hard failure or inventing a runnable
     /// context. An object signaled by the completed handler must be observed before
     /// deciding that the machine is idle.
-    fn frame_boundary(&mut self, last: Option<CtxId>, started: Instant, hard_budget: Option<Duration>) -> SliceResult {
+    fn frame_boundary(
+        &mut self,
+        last: Option<CtxId>,
+        started: Instant,
+        hard_budget: Option<Duration>,
+    ) -> SliceResult {
         self.sys.rr_last = last;
         if let Some(budget) = hard_budget
             && self.slice_elapsed.saturating_add(started.elapsed()) >= budget
         {
             self.sys.trace.flush();
-            return SliceResult::Complete(
-                self.fail(format!("guest execution budget exhausted ({budget:?} of host wall time)")),
-            );
+            return SliceResult::Complete(self.fail(format!(
+                "guest execution budget exhausted ({budget:?} of host wall time)"
+            )));
         }
         self.sys.scheduling.frame_host_yields += 1;
         self.sys.wake();
-        if self.sys.contexts.iter().any(|c| matches!(c.state, State::Ready { .. })) {
+        if self
+            .sys
+            .contexts
+            .iter()
+            .any(|c| matches!(c.state, State::Ready { .. }))
+        {
             SliceResult::Yielded
         } else {
-            SliceResult::Complete(RunResult::Idle { next_deadline: self.sys.next_deadline() })
+            SliceResult::Complete(RunResult::Idle {
+                next_deadline: self.sys.next_deadline(),
+            })
         }
     }
 
     /// Close the stats row when the PAL frame moved on.
     fn note_frame(&mut self) {
         let blocks = self.cpu.executed_blocks();
-        self.sys.stats.note_frame(self.sys.frame, self.sys.clock.now_us(), blocks);
+        self.sys
+            .stats
+            .note_frame(self.sys.frame, self.sys.clock.now_us(), blocks);
     }
 
     /// Count executed translation blocks for [`Stats`] (a measurement mode; it slows guest
@@ -1258,12 +1477,21 @@ impl<B: Backend> Machine<B> {
         let mut p = self.cpu.block_profile();
         let total: u64 = p.iter().map(|&(_, n, size)| n * u64::from(size)).sum();
         p.sort_by_key(|&(_, n, size)| std::cmp::Reverse(n * u64::from(size)));
-        let mut s = format!("guest blocks: {} distinct, {:.1} MB of code executed\n", p.len(), total as f64 / 1e6);
+        let mut s = format!(
+            "guest blocks: {} distinct, {:.1} MB of code executed\n",
+            p.len(),
+            total as f64 / 1e6
+        );
         for (addr, n, size) in p.into_iter().take(top) {
-            let place = self.sys.modules.iter().find(|(_, m)| m.contains(addr)).map_or_else(
-                || format!("{addr:#010x}"),
-                |(_, m)| format!("{}+{:#x} ({addr:#010x})", m.name, addr - m.base),
-            );
+            let place = self
+                .sys
+                .modules
+                .iter()
+                .find(|(_, m)| m.contains(addr))
+                .map_or_else(
+                    || format!("{addr:#010x}"),
+                    |(_, m)| format!("{}+{:#x} ({addr:#010x})", m.name, addr - m.base),
+                );
             let bytes = n * u64::from(size);
             s += &format!(
                 "  {:5.2}% {:12} runs x {:4} B  {place}\n",
@@ -1283,7 +1511,9 @@ impl<B: Backend> Machine<B> {
         let until_us = self.sys.clock.now_us() + budget_us;
         loop {
             match self.run() {
-                RunResult::Idle { next_deadline: Some(t) } if t <= until_us => self.sys.clock.advance_to(t),
+                RunResult::Idle {
+                    next_deadline: Some(t),
+                } if t <= until_us => self.sys.clock.advance_to(t),
                 other => return other,
             }
         }

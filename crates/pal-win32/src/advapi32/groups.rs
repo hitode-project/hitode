@@ -4,8 +4,9 @@ use pal_cpu::{GuestExt, Prot};
 use pal_machine::{Env, Outcome, Registry};
 
 use super::{
-    ACCESS_DENIED, INVALID_DATA, INVALID_PARAMETER, Key, KeyMetadata, MORE_DATA, NOACCESS, NOT_FOUND, QUERY, SET,
-    Value, VirtualRegistry, child_key, fold, name, output, state, string_type,
+    ACCESS_DENIED, INVALID_DATA, INVALID_PARAMETER, Key, KeyMetadata, MORE_DATA, NOACCESS,
+    NOT_FOUND, QUERY, SET, Value, VirtualRegistry, child_key, fold, name, output, state,
+    string_type,
 };
 use crate::{Win32, stdcall};
 
@@ -13,7 +14,11 @@ const ENUMERATE: u32 = 8;
 const NO_MORE_ITEMS: u32 = 259;
 fn range(env: &Env<'_>, ptr: u32, len: usize, optional: bool) -> Result<(), u32> {
     if ptr == 0 {
-        return if optional { Ok(()) } else { Err(INVALID_PARAMETER) };
+        return if optional {
+            Ok(())
+        } else {
+            Err(INVALID_PARAMETER)
+        };
     }
     if ptr.checked_add(len as u32).is_none() || !env.cpu.accessible(ptr, len as u32, Prot::WRITE) {
         return Err(NOACCESS);
@@ -51,7 +56,11 @@ fn value_data(env: &Env<'_>, value: Value, wide: bool) -> Result<Vec<u8>, u32> {
         if value.bytes.len() % 2 != 0 {
             return Err(INVALID_DATA);
         }
-        let units: Vec<_> = value.bytes.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let units: Vec<_> = value
+            .bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
         Ok(env.ext.get::<Win32>().codec.from_utf16(0, &units).0)
     } else {
         Ok(value.bytes)
@@ -64,20 +73,28 @@ fn child(parent: &Key, candidate: &Key) -> bool {
     let suffix = if parent.path.is_empty() {
         candidate.path.as_slice()
     } else {
-        if !candidate.path.starts_with(&parent.path) || candidate.path.get(parent.path.len()) != Some(&92) {
+        if !candidate.path.starts_with(&parent.path)
+            || candidate.path.get(parent.path.len()) != Some(&92)
+        {
             return false;
         }
         &candidate.path[parent.path.len() + 1..]
     };
     !suffix.is_empty() && !suffix.contains(&92)
 }
-fn children<'a>(registry: &'a VirtualRegistry, parent: &'a Key) -> impl Iterator<Item = (&'a Key, &'a KeyMetadata)> {
+fn children<'a>(
+    registry: &'a VirtualRegistry,
+    parent: &'a Key,
+) -> impl Iterator<Item = (&'a Key, &'a KeyMetadata)> {
     let root = parent.root;
     let mut prefix = parent.path.clone();
     if !prefix.is_empty() {
         prefix.push(92);
     }
-    let start = Key { root, path: prefix.clone() };
+    let start = Key {
+        root,
+        path: prefix.clone(),
+    };
     registry
         .metadata
         .range(start..)
@@ -86,7 +103,9 @@ fn children<'a>(registry: &'a VirtualRegistry, parent: &'a Key) -> impl Iterator
 }
 fn write_time(env: &mut Env<'_>, ptr: u32, value: u64) -> Result<(), u32> {
     if ptr != 0 {
-        env.cpu.write(ptr, &value.to_le_bytes()).map_err(|_| NOACCESS)?;
+        env.cpu
+            .write(ptr, &value.to_le_bytes())
+            .map_err(|_| NOACCESS)?;
     }
     Ok(())
 }
@@ -95,8 +114,15 @@ fn enum_key(env: &mut Env<'_>, wide: bool) -> Outcome {
         if env.arg(4) != 0 {
             return Err(INVALID_PARAMETER);
         }
-        let (hkey, index, buffer, name_size, class_out, class_size, time_out) =
-            (env.arg(0), env.arg(1) as usize, env.arg(2), env.arg(3), env.arg(5), env.arg(6), env.arg(7));
+        let (hkey, index, buffer, name_size, class_out, class_size, time_out) = (
+            env.arg(0),
+            env.arg(1) as usize,
+            env.arg(2),
+            env.arg(3),
+            env.arg(5),
+            env.arg(6),
+            env.arg(7),
+        );
         let opened = state(env).key(hkey)?;
         if opened.access & ENUMERATE == 0 {
             return Err(ACCESS_DENIED);
@@ -107,8 +133,10 @@ fn enum_key(env: &mut Env<'_>, wide: bool) -> Outcome {
             return Err(INVALID_PARAMETER);
         }
         range(env, time_out, 8, true)?;
-        let metadata =
-            children(state(env), &opened.key).nth(index).map(|(_, metadata)| metadata.clone()).ok_or(NO_MORE_ITEMS)?;
+        let metadata = children(state(env), &opened.key)
+            .nth(index)
+            .map(|(_, metadata)| metadata.clone())
+            .ok_or(NO_MORE_ITEMS)?;
         let (name, name_len) = text(env, &metadata.display_name, wide);
         let (class, class_len) = text(env, &metadata.class, wide);
         write_time(env, time_out, metadata.modified)?;
@@ -137,8 +165,15 @@ fn enum_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         if env.arg(4) != 0 {
             return Err(INVALID_PARAMETER);
         }
-        let (hkey, index, buffer, name_size, type_out, data_out, data_size) =
-            (env.arg(0), env.arg(1) as usize, env.arg(2), env.arg(3), env.arg(5), env.arg(6), env.arg(7));
+        let (hkey, index, buffer, name_size, type_out, data_out, data_size) = (
+            env.arg(0),
+            env.arg(1) as usize,
+            env.arg(2),
+            env.arg(3),
+            env.arg(5),
+            env.arg(6),
+            env.arg(7),
+        );
         let opened = state(env).key(hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
@@ -149,22 +184,31 @@ fn enum_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         if buffer == 0 {
             return Err(INVALID_PARAMETER);
         }
-        let value =
-            state(env).keys.get(&opened.key).and_then(|values| values.values().nth(index)).ok_or(NO_MORE_ITEMS)?;
+        let value = state(env)
+            .keys
+            .get(&opened.key)
+            .and_then(|values| values.values().nth(index))
+            .ok_or(NO_MORE_ITEMS)?;
         let raw_size = value.bytes.len();
         let convert = !wide && string_type(value.kind);
         let (kind, display_name, value) = (
             value.kind,
             value.display_name.clone(),
             if data_out != 0 || convert {
-                Some(Value { kind: value.kind, bytes: value.bytes.clone(), display_name: Vec::new() })
+                Some(Value {
+                    kind: value.kind,
+                    bytes: value.bytes.clone(),
+                    display_name: Vec::new(),
+                })
             } else {
                 None
             },
         );
         // Size-only binary/W calls never copy the payload. ANSI string sizes
         // require conversion; a real data copy owns at most one raw buffer.
-        let bytes = value.map(|value| value_data(env, value, wide)).transpose()?;
+        let bytes = value
+            .map(|value| value_data(env, value, wide))
+            .transpose()?;
         let data_len = bytes.as_ref().map_or(raw_size, Vec::len);
         let (name, name_len) = text(env, &display_name, wide);
         put_word(env, type_out, kind)?;
@@ -195,7 +239,8 @@ fn query_info(env: &mut Env<'_>, wide: bool) -> Outcome {
         if env.arg(3) != 0 {
             return Err(INVALID_PARAMETER);
         }
-        let (hkey, class_out, class_size, time_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(11));
+        let (hkey, class_out, class_size, time_out) =
+            (env.arg(0), env.arg(1), env.arg(2), env.arg(11));
         let opened = state(env).key(hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
@@ -208,17 +253,35 @@ fn query_info(env: &mut Env<'_>, wide: bool) -> Outcome {
         range(env, time_out, 8, true)?;
         let registry = state(env);
         let metadata = registry.metadata.get(&opened.key).ok_or(NOT_FOUND)?.clone();
-        let child_metadata: Vec<_> = children(registry, &opened.key).map(|(_, metadata)| metadata).collect();
+        let child_metadata: Vec<_> = children(registry, &opened.key)
+            .map(|(_, metadata)| metadata)
+            .collect();
         let values = registry.keys.get(&opened.key).ok_or(NOT_FOUND)?;
         // Native A/W QueryInfo both report the stored Unicode maxima, while
         // actual Enum A output lengths and value bytes are ACP-converted.
         let counts = [
             child_metadata.len(),
-            child_metadata.iter().map(|meta| meta.display_name.len()).max().unwrap_or(0),
-            child_metadata.iter().map(|meta| meta.class.len()).max().unwrap_or(0),
+            child_metadata
+                .iter()
+                .map(|meta| meta.display_name.len())
+                .max()
+                .unwrap_or(0),
+            child_metadata
+                .iter()
+                .map(|meta| meta.class.len())
+                .max()
+                .unwrap_or(0),
             values.len(),
-            values.values().map(|value| value.display_name.len()).max().unwrap_or(0),
-            values.values().map(|value| value.bytes.len()).max().unwrap_or(0),
+            values
+                .values()
+                .map(|value| value.display_name.len())
+                .max()
+                .unwrap_or(0),
+            values
+                .values()
+                .map(|value| value.bytes.len())
+                .max()
+                .unwrap_or(0),
             20,
         ]; // The private namespace's self-relative default security descriptor.
         let (class, class_len) = text(env, &metadata.class, wide);
@@ -247,15 +310,23 @@ fn query_info(env: &mut Env<'_>, wide: bool) -> Outcome {
             let limit = class_capacity - 1;
             let mut at = 0;
             while at < class_len {
-                let width = if codec.is_lead_byte(0, class[at]) { 2 } else { 1 };
+                let width = if codec.is_lead_byte(0, class[at]) {
+                    2
+                } else {
+                    1
+                };
                 if at + width > limit {
                     break;
                 }
                 at += width;
             }
             range(env, class_out, at + 1, false)?;
-            env.cpu.write(class_out, &class[..at]).map_err(|_| NOACCESS)?;
-            env.cpu.write(class_out + at as u32, &[0]).map_err(|_| NOACCESS)?;
+            env.cpu
+                .write(class_out, &class[..at])
+                .map_err(|_| NOACCESS)?;
+            env.cpu
+                .write(class_out + at as u32, &[0])
+                .map_err(|_| NOACCESS)?;
             put_word(env, class_size, at as u32)?;
             return Err(MORE_DATA);
         }
@@ -276,12 +347,19 @@ fn delete_value(env: &mut Env<'_>, wide: bool) -> Outcome {
             return Err(ACCESS_DENIED);
         }
         let registry = state(env);
-        let value =
-            registry.keys.get_mut(&opened.key).and_then(|values| values.remove(&value_name)).ok_or(NOT_FOUND)?;
+        let value = registry
+            .keys
+            .get_mut(&opened.key)
+            .and_then(|values| values.remove(&value_name))
+            .ok_or(NOT_FOUND)?;
         registry.total_bytes -= value.bytes.len();
         registry.total_values -= 1;
         registry.metadata_bytes -= 16 + (value_name.len() + value.display_name.len()) * 2;
-        registry.metadata.get_mut(&opened.key).ok_or(NOT_FOUND)?.modified = modified;
+        registry
+            .metadata
+            .get_mut(&opened.key)
+            .ok_or(NOT_FOUND)?
+            .modified = modified;
         if !registry.volatile_keys.contains(&opened.key) {
             registry.dirty = true;
         }
@@ -335,7 +413,11 @@ fn delete_key(env: &mut Env<'_>, wide: bool) -> Outcome {
 }
 pub(super) fn register(registry: &mut Registry) {
     for (name, argc, handler) in [
-        ("RegEnumKeyExA", 8, (|e: &mut Env<'_>| enum_key(e, false)) as pal_machine::Handler),
+        (
+            "RegEnumKeyExA",
+            8,
+            (|e: &mut Env<'_>| enum_key(e, false)) as pal_machine::Handler,
+        ),
         ("RegEnumKeyExW", 8, |e| enum_key(e, true)),
         ("RegEnumValueA", 8, |e| enum_value(e, false)),
         ("RegEnumValueW", 8, |e| enum_value(e, true)),

@@ -18,7 +18,10 @@ pub fn filetime_now(env: &mut Env<'_>) -> u64 {
         VIRTUAL_START_UNIX * 1_000_000 + clock.guest_now_us() - clock.epoch_us
     } else {
         let _ = clock.guest_now_us();
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0)
     };
     UNIX_EPOCH_FT + unix_us * 10
 }
@@ -59,7 +62,16 @@ pub fn filetime_to_systemtime(ft: u64) -> [u16; 8] {
     let sod = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     let dow = (days + 4).rem_euclid(7) as u16; // 1970-01-01 was a Thursday
-    [y as u16, m as u16, dow, d as u16, (sod / 3600) as u16, (sod / 60 % 60) as u16, (sod % 60) as u16, ms]
+    [
+        y as u16,
+        m as u16,
+        dow,
+        d as u16,
+        (sod / 3600) as u16,
+        (sod / 60 % 60) as u16,
+        (sod % 60) as u16,
+        ms,
+    ]
 }
 
 fn systemtime_to_filetime(st: [u16; 8]) -> u64 {
@@ -112,7 +124,15 @@ fn get_local_time(env: &mut Env<'_>) -> Outcome {
 /// day, hour, minute, second, ms). `'...'` is literal text (`''` a quote); names come out in
 /// English, as under an English user locale.
 fn format_picture(pic: &[u16], st: [u16; 8]) -> Vec<u16> {
-    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
     const MONTHS: [&str; 12] = [
         "January",
         "February",
@@ -134,7 +154,13 @@ fn format_picture(pic: &[u16], st: [u16; 8]) -> Vec<u16> {
         let c = pic[i];
         let run = pic[i..].iter().take_while(|&&u| u == c).count();
         i += run;
-        let num = |v: u32, pad: bool| if pad { format!("{v:02}") } else { v.to_string() };
+        let num = |v: u32, pad: bool| {
+            if pad {
+                format!("{v:02}")
+            } else {
+                v.to_string()
+            }
+        };
         let h12 = if hour % 12 == 0 { 12 } else { hour % 12 };
         match char::from_u32(u32::from(c)).unwrap_or('\u{fffd}') {
             '\'' => {
@@ -198,8 +224,13 @@ fn get_date_time_format_w(env: &mut Env<'_>, time: bool) -> Outcome {
     const DATE_LONGDATE: u32 = 2;
     const TIME_NOMINUTESORSECONDS: u32 = 1;
     const TIME_NOSECONDS: u32 = 2;
-    let (flags, st_p, pic_p, buf, cap) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
-    let st = if st_p != 0 { read_st(env.cpu, st_p) } else { local_systemtime(env) };
+    let (flags, st_p, pic_p, buf, cap) =
+        (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
+    let st = if st_p != 0 {
+        read_st(env.cpu, st_p)
+    } else {
+        local_systemtime(env)
+    };
     let pic: Vec<u16> = if pic_p != 0 {
         crate::util::wstr(env.cpu, pic_p)
     } else {
@@ -302,21 +333,73 @@ fn get_time_zone_information(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
-    stdcall(reg, K32, "GetSystemTimeAsFileTime", 1, get_system_time_as_file_time);
+    stdcall(
+        reg,
+        K32,
+        "GetSystemTimeAsFileTime",
+        1,
+        get_system_time_as_file_time,
+    );
     stdcall(reg, K32, "GetSystemTime", 1, get_system_time);
     stdcall(reg, K32, "GetLocalTime", 1, get_local_time);
     stdcall(reg, K32, "GetTickCount", 0, get_tick_count);
-    stdcall(reg, K32, "GetDateFormatW", 6, |e| get_date_time_format_w(e, false));
-    stdcall(reg, K32, "GetTimeFormatW", 6, |e| get_date_time_format_w(e, true));
-    stdcall(reg, K32, "QueryPerformanceCounter", 1, query_performance_counter);
-    stdcall(reg, K32, "QueryPerformanceFrequency", 1, query_performance_frequency);
+    stdcall(reg, K32, "GetDateFormatW", 6, |e| {
+        get_date_time_format_w(e, false)
+    });
+    stdcall(reg, K32, "GetTimeFormatW", 6, |e| {
+        get_date_time_format_w(e, true)
+    });
+    stdcall(
+        reg,
+        K32,
+        "QueryPerformanceCounter",
+        1,
+        query_performance_counter,
+    );
+    stdcall(
+        reg,
+        K32,
+        "QueryPerformanceFrequency",
+        1,
+        query_performance_frequency,
+    );
     stdcall(reg, K32, "Sleep", 1, sleep);
-    stdcall(reg, K32, "FileTimeToSystemTime", 2, file_time_to_system_time);
-    stdcall(reg, K32, "SystemTimeToFileTime", 2, system_time_to_file_time);
-    stdcall(reg, K32, "FileTimeToLocalFileTime", 2, file_time_to_local_file_time);
-    stdcall(reg, K32, "LocalFileTimeToFileTime", 2, local_file_time_to_file_time);
+    stdcall(
+        reg,
+        K32,
+        "FileTimeToSystemTime",
+        2,
+        file_time_to_system_time,
+    );
+    stdcall(
+        reg,
+        K32,
+        "SystemTimeToFileTime",
+        2,
+        system_time_to_file_time,
+    );
+    stdcall(
+        reg,
+        K32,
+        "FileTimeToLocalFileTime",
+        2,
+        file_time_to_local_file_time,
+    );
+    stdcall(
+        reg,
+        K32,
+        "LocalFileTimeToFileTime",
+        2,
+        local_file_time_to_file_time,
+    );
     stdcall(reg, K32, "CompareFileTime", 2, compare_file_time);
-    stdcall(reg, K32, "GetTimeZoneInformation", 1, get_time_zone_information);
+    stdcall(
+        reg,
+        K32,
+        "GetTimeZoneInformation",
+        1,
+        get_time_zone_information,
+    );
 }
 
 #[cfg(test)]
@@ -329,6 +412,9 @@ mod tests {
         let st = [2012, 7, 1, 30, 12, 34, 56, 789];
         let ft = systemtime_to_filetime(st);
         assert_eq!(filetime_to_systemtime(ft), st);
-        assert_eq!(filetime_to_systemtime(UNIX_EPOCH_FT), [1970, 1, 4, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            filetime_to_systemtime(UNIX_EPOCH_FT),
+            [1970, 1, 4, 1, 0, 0, 0, 0]
+        );
     }
 }

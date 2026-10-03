@@ -26,14 +26,23 @@ mod host {
     unsafe extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
         fn SetProcessAffinityMask(process: *mut c_void, mask: usize) -> i32;
-        fn GetProcessTimes(process: *mut c_void, c: *mut u64, e: *mut u64, k: *mut u64, u: *mut u64) -> i32;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            c: *mut u64,
+            e: *mut u64,
+            k: *mut u64,
+            u: *mut u64,
+        ) -> i32;
     }
     pub fn pin() {
         assert_ne!(unsafe { SetProcessAffinityMask(GetCurrentProcess(), 1) }, 0);
     }
     pub fn cpu_seconds() -> f64 {
         let (mut c, mut e, mut k, mut u) = (0, 0, 0, 0);
-        assert_ne!(unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) }, 0);
+        assert_ne!(
+            unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) },
+            0
+        );
         (k + u) as f64 * 1e-7
     }
 }
@@ -54,8 +63,9 @@ fn next(s: &mut u32) -> u32 {
 fn hash(cpu: &UnicornCpu, n: u32) -> u32 {
     let mut data = vec![0; n as usize * 4];
     cpu.read(OUTPUT, &mut data).unwrap();
-    data.chunks_exact(4)
-        .fold(2166136261u32, |h, v| (h ^ u32::from_le_bytes(v.try_into().unwrap())).wrapping_mul(16777619))
+    data.chunks_exact(4).fold(2166136261u32, |h, v| {
+        (h ^ u32::from_le_bytes(v.try_into().unwrap())).wrapping_mul(16777619)
+    })
 }
 fn call(cpu: &mut UnicornCpu, entry: u32, n: u32, rounds: u32) {
     let args = [STOP, OUTPUT, INPUT, n, rounds];
@@ -87,7 +97,10 @@ impl CopyBlend {
 }
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    assert!(!args.is_empty(), "workload_bench <packed-image-directory> [samples]");
+    assert!(
+        !args.is_empty(),
+        "workload_bench <packed-image-directory> [samples]"
+    );
     let root = Path::new(&args[0]);
     let samples: usize = args.get(1).map_or(3, |s| s.parse().unwrap());
     let metadata = std::fs::read_to_string(root.join("workload.txt")).unwrap();
@@ -99,17 +112,24 @@ fn main() {
     for line in lines {
         let (name, rva) = line.split_once(' ').unwrap();
         let entry = base + u32::from_str_radix(rva, 16).unwrap();
-        let (n, rounds) = if name.starts_with("blend") { (1280 * 720u32, 4u32) } else { (65536, 16) };
+        let (n, rounds) = if name.starts_with("blend") {
+            (1280 * 720u32, 4u32)
+        } else {
+            (65536, 16)
+        };
         let mut cpu = UnicornCpu::new(STOP + 0x100).unwrap();
-        cpu.map(base, (image.len() as u32).next_multiple_of(4096), Prot::RWX).unwrap();
+        cpu.map(base, (image.len() as u32).next_multiple_of(4096), Prot::RWX)
+            .unwrap();
         cpu.write(base, &image).unwrap();
         cpu.map(STACK - 0x10000, 0x10000, Prot::RW).unwrap();
         cpu.map(GDT, 0x1000, Prot::RW).unwrap();
         cpu.map(STOP, 0x1000, Prot::RX).unwrap();
         cpu.write(STOP, &[0xcd, 0x2e]).unwrap();
         cpu.setup_segments(SegmentSetup { gdt_addr: GDT }).unwrap();
-        cpu.map(INPUT, (n * 8).next_multiple_of(4096), Prot::RW).unwrap();
-        cpu.map(OUTPUT, (n * 4).next_multiple_of(4096), Prot::RW).unwrap();
+        cpu.map(INPUT, (n * 8).next_multiple_of(4096), Prot::RW)
+            .unwrap();
+        cpu.map(OUTPUT, (n * 4).next_multiple_of(4096), Prot::RW)
+            .unwrap();
         let mut seed = 0x13579bdf;
         let mut input: Vec<u32> = (0..n * 2).map(|_| next(&mut seed)).collect();
         if name == "dispatch_predictable" {
@@ -134,8 +154,15 @@ fn main() {
             if accelerated && name != "blend_sse2" {
                 continue;
             }
-            let backend = if accelerated { "host_blend_copy" } else { "unicorn_x86" };
-            let mut blend = CopyBlend { input: vec![0; n as usize * 8], output: vec![0; n as usize * 4] };
+            let backend = if accelerated {
+                "host_blend_copy"
+            } else {
+                "unicorn_x86"
+            };
+            let mut blend = CopyBlend {
+                input: vec![0; n as usize * 8],
+                output: vec![0; n as usize * 4],
+            };
             let mut operation = |cpu: &mut UnicornCpu| {
                 if accelerated {
                     blend.run(cpu, rounds);

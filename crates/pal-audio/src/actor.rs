@@ -78,16 +78,33 @@ impl RingState {
             position += delta * i128::from(frequency) * i128::from(align) / 1_000_000;
         }
         if looping {
-            Some(position.max(i128::from(minimum)).rem_euclid(i128::from(bytes)) as u32 / align * align)
+            Some(
+                position
+                    .max(i128::from(minimum))
+                    .rem_euclid(i128::from(bytes)) as u32
+                    / align
+                    * align,
+            )
         } else {
-            Some(if position >= i128::from(bytes) { 0 } else { position.max(0) as u32 / align * align })
+            Some(if position >= i128::from(bytes) {
+                0
+            } else {
+                position.max(0) as u32 / align * align
+            })
         }
     }
 }
 
 pub enum AudioEvent {
-    Notification { source: u64, generation: u64, event: u32, due_us: u64 },
-    Released { source: u64 },
+    Notification {
+        source: u64,
+        generation: u64,
+        event: u32,
+        due_us: u64,
+    },
+    Released {
+        source: u64,
+    },
 }
 pub(crate) enum Retired {
     Ring(Box<RingVoice>, Arc<RingState>),
@@ -114,8 +131,16 @@ enum Command {
     Suspend(bool),
 }
 enum Voice {
-    Ring { source: u64, voice: Box<RingVoice>, state: Arc<RingState>, generation: u64 },
-    Owned { source: u64, voice: Box<OwnedVoice> },
+    Ring {
+        source: u64,
+        voice: Box<RingVoice>,
+        state: Arc<RingState>,
+        generation: u64,
+    },
+    Owned {
+        source: u64,
+        voice: Box<OwnedVoice>,
+    },
 }
 impl Voice {
     fn source(&self) -> u64 {
@@ -225,7 +250,9 @@ impl AudioControl {
             rate: 44100,
             notification_retry: None,
         });
-        shared.engine.store(Box::into_raw(engine), Ordering::Release);
+        shared
+            .engine
+            .store(Box::into_raw(engine), Ordering::Release);
         let stream = crate::AudioStream { shared };
         Self {
             local: Rc::new(RefCell::new(Control {
@@ -256,10 +283,16 @@ impl AudioControl {
                 if local.backlog.len() == local.backlog.capacity() {
                     return Err(command);
                 }
-                self.stream.shared.pending_commands.fetch_add(1, Ordering::Release);
+                self.stream
+                    .shared
+                    .pending_commands
+                    .fetch_add(1, Ordering::Release);
                 local.backlog.push_back(command);
             } else {
-                self.stream.shared.pending_commands.fetch_add(1, Ordering::Release);
+                self.stream
+                    .shared
+                    .pending_commands
+                    .fetch_add(1, Ordering::Release);
                 if let Err(command) = local.commands.push(command) {
                     local.backlog.push_back(command);
                 }
@@ -317,12 +350,16 @@ impl AudioControl {
     }
     pub fn suspend(&self, suspended: bool) -> bool {
         self.stream.shared.clock.suspend_device(suspended);
-        self.stream.shared.suspended.store(suspended, Ordering::Release);
+        self.stream
+            .shared
+            .suspended
+            .store(suspended, Ordering::Release);
         self.send(Command::Suspend(suspended))
     }
     pub fn add_ring(&self, source: u64, mut config: RingConfig) -> Result<Arc<RingState>, String> {
         let local = self.local.borrow();
-        if !local.rings.contains_key(&source) && local.rings.len() + local.formats.len() >= SOURCES {
+        if !local.rings.contains_key(&source) && local.rings.len() + local.formats.len() >= SOURCES
+        {
             return Err("audio source limit".into());
         }
         drop(local);
@@ -334,11 +371,18 @@ impl AudioControl {
         if !self.send(Command::Ring(source, voice, state.clone())) {
             return Err("audio command limit".into());
         }
-        self.local.borrow_mut().rings.insert(source, (frequency, align));
+        self.local
+            .borrow_mut()
+            .rings
+            .insert(source, (frequency, align));
         Ok(state)
     }
     pub fn play_ring(&self, source: u64, looping: bool, generation: u64) -> bool {
-        let now = self.stream.shared.clock.now_us(self.local.borrow().guest_us);
+        let now = self
+            .stream
+            .shared
+            .clock
+            .now_us(self.local.borrow().guest_us);
         self.send(Command::Play(source, looping, generation, now))
     }
     pub fn change_generation(&self, source: u64, generation: u64) -> bool {
@@ -348,13 +392,25 @@ impl AudioControl {
         self.send(Command::Stop(source))
     }
     pub fn set_position(&self, source: u64, position: u32) -> bool {
-        let now = self.stream.shared.clock.now_us(self.local.borrow().guest_us);
+        let now = self
+            .stream
+            .shared
+            .clock
+            .now_us(self.local.borrow().guest_us);
         self.send(Command::Position(source, position, now))
     }
     pub fn written(&self, source: u64, offset: u32, len: u32) -> bool {
         if let Some(&(_, align)) = self.local.borrow().rings.get(&source) {
-            self.stream.shared.counters.queued_blocks.fetch_add(1, Ordering::Relaxed);
-            self.stream.shared.counters.queued_source_frames.fetch_add(u64::from(len / align), Ordering::Relaxed);
+            self.stream
+                .shared
+                .counters
+                .queued_blocks
+                .fetch_add(1, Ordering::Relaxed);
+            self.stream
+                .shared
+                .counters
+                .queued_source_frames
+                .fetch_add(u64::from(len / align), Ordering::Relaxed);
         }
         self.send(Command::Written(source, offset, len))
     }
@@ -388,7 +444,11 @@ impl AudioControl {
             return false;
         }
         self.local.borrow_mut().formats.remove(&source);
-        self.stream.shared.counters.flushes.fetch_add(1, Ordering::Relaxed);
+        self.stream
+            .shared
+            .counters
+            .flushes
+            .fetch_add(1, Ordering::Relaxed);
         true
     }
     pub fn remove_pcm(&self, source: u64) -> bool {
@@ -415,8 +475,12 @@ impl AudioControl {
         }
         let guest_now = self.local.borrow().guest_us;
         if self.stream.shared.clock.uses_device_time() {
-            block.guest_pts_us =
-                self.stream.shared.clock.now_us(guest_now).saturating_add(block.guest_pts_us.saturating_sub(guest_now));
+            block.guest_pts_us = self
+                .stream
+                .shared
+                .clock
+                .now_us(guest_now)
+                .saturating_add(block.guest_pts_us.saturating_sub(guest_now));
         }
         let source = block.stream_id;
         let existing = self.local.borrow().formats.get(&source).cloned();
@@ -438,11 +502,18 @@ impl AudioControl {
             let state = Arc::new(SourceState::default());
             state.queued_us.store(duration, Ordering::Relaxed);
             state.queued_blocks.store(1, Ordering::Relaxed);
-            let voice = match OwnedVoice::new(state.clone(), self.stream.shared.rate.load(Ordering::Acquire), block) {
+            let voice = match OwnedVoice::new(
+                state.clone(),
+                self.stream.shared.rate.load(Ordering::Acquire),
+                block,
+            ) {
                 Ok(voice) => voice,
                 Err((_, block)) => return Err(block),
             };
-            self.local.borrow_mut().formats.insert(source, (frequency, state));
+            self.local
+                .borrow_mut()
+                .formats
+                .insert(source, (frequency, state));
             Command::Owned(source, voice)
         };
         let new_source = matches!(&command, Command::Owned(..));
@@ -463,11 +534,27 @@ impl AudioControl {
             };
         }
         if new_source {
-            self.stream.shared.counters.playback_starts.fetch_add(1, Ordering::Relaxed);
+            self.stream
+                .shared
+                .counters
+                .playback_starts
+                .fetch_add(1, Ordering::Relaxed);
         }
-        self.stream.shared.counters.queued_blocks.fetch_add(1, Ordering::Relaxed);
-        self.stream.shared.counters.queued_source_frames.fetch_add(frames, Ordering::Relaxed);
-        self.stream.shared.counters.max_stream_queue_us.fetch_max(duration, Ordering::Relaxed);
+        self.stream
+            .shared
+            .counters
+            .queued_blocks
+            .fetch_add(1, Ordering::Relaxed);
+        self.stream
+            .shared
+            .counters
+            .queued_source_frames
+            .fetch_add(frames, Ordering::Relaxed);
+        self.stream
+            .shared
+            .counters
+            .max_stream_queue_us
+            .fetch_max(duration, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -496,7 +583,9 @@ impl Engine {
         }
         let mut processed = 0;
         while !self.retired.is_full() && self.notification_retry.is_none() {
-            let Some(command) = self.commands.pop() else { break };
+            let Some(command) = self.commands.pop() else {
+                break;
+            };
             processed += 1;
             let source = match &command {
                 Command::Ring(id, ..)
@@ -515,15 +604,26 @@ impl Engine {
                 Command::Pcm(b) => Some(b.stream_id),
                 _ => None,
             };
-            let at =
-                source.and_then(|id| self.voices.iter().position(|v| v.as_ref().is_some_and(|v| v.source() == id)));
+            let at = source.and_then(|id| {
+                self.voices
+                    .iter()
+                    .position(|v| v.as_ref().is_some_and(|v| v.source() == id))
+            });
             match command {
-                Command::Ring(source, voice, state) => {
-                    self.insert(Voice::Ring { source, voice, state, generation: 0 }, at)
-                }
+                Command::Ring(source, voice, state) => self.insert(
+                    Voice::Ring {
+                        source,
+                        voice,
+                        state,
+                        generation: 0,
+                    },
+                    at,
+                ),
                 Command::Owned(source, voice) => self.insert(Voice::Owned { source, voice }, at),
                 Command::Pcm(block) => {
-                    if let Some(Voice::Owned { voice, .. }) = at.and_then(|i| self.voices[i].as_mut()) {
+                    if let Some(Voice::Owned { voice, .. }) =
+                        at.and_then(|i| self.voices[i].as_mut())
+                    {
                         if let Err(block) = voice.push(block) {
                             voice.return_credit(&block);
                             self.retire(Retired::Pcm(block));
@@ -550,29 +650,49 @@ impl Engine {
                 command => {
                     if let Some(voice) = at.and_then(|i| self.voices[i].as_mut()) {
                         match (voice, command) {
-                            (Voice::Ring { voice, generation, .. }, Command::Play(_, looping, epoch, issued)) => {
+                            (
+                                Voice::Ring {
+                                    voice, generation, ..
+                                },
+                                Command::Play(_, looping, epoch, issued),
+                            ) => {
                                 *generation = epoch;
                                 voice.play(looping);
-                                if shared.clock.uses_device_time() && !shared.connected.load(Ordering::Acquire) {
+                                if shared.clock.uses_device_time()
+                                    && !shared.connected.load(Ordering::Acquire)
+                                {
                                     voice.detach(issued as f64);
                                 }
-                                shared.counters.playback_starts.fetch_add(1, Ordering::Relaxed);
+                                shared
+                                    .counters
+                                    .playback_starts
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
-                            (Voice::Ring { generation, .. }, Command::Epoch(_, epoch)) => *generation = epoch,
+                            (Voice::Ring { generation, .. }, Command::Epoch(_, epoch)) => {
+                                *generation = epoch
+                            }
                             (Voice::Ring { voice, .. }, Command::Stop(_)) => voice.stop(),
                             (Voice::Ring { voice, .. }, Command::Position(_, position, issued)) => {
                                 voice.set_position(position);
-                                if shared.clock.uses_device_time() && !shared.connected.load(Ordering::Acquire) {
+                                if shared.clock.uses_device_time()
+                                    && !shared.connected.load(Ordering::Acquire)
+                                {
                                     voice.detach(issued as f64);
                                 }
                             }
-                            (Voice::Ring { voice, .. }, Command::Written(_, offset, len)) => voice.written(offset, len),
+                            (Voice::Ring { voice, .. }, Command::Written(_, offset, len)) => {
+                                voice.written(offset, len)
+                            }
                             (Voice::Ring { voice, .. }, Command::Notices(_, entries)) => {
                                 let old = voice.set_notifications(entries);
                                 self.retire(Retired::Notices(old));
                             }
-                            (Voice::Ring { voice, .. }, Command::Gain(_, gain)) => voice.set_gain(gain),
-                            (Voice::Owned { voice, .. }, Command::Gain(_, gain)) => voice.set_gain(gain),
+                            (Voice::Ring { voice, .. }, Command::Gain(_, gain)) => {
+                                voice.set_gain(gain)
+                            }
+                            (Voice::Owned { voice, .. }, Command::Gain(_, gain)) => {
+                                voice.set_gain(gain)
+                            }
                             (Voice::Owned { voice, .. }, Command::Pause(_, paused)) => {
                                 voice.pause(paused, self.cursor_us)
                             }
@@ -580,20 +700,30 @@ impl Engine {
                                 voice.ended = true;
                                 shared.counters.ends.fetch_add(1, Ordering::Relaxed);
                             }
-                            (Voice::Ring { voice, .. }, Command::Retune(_, frequency, converter)) => {
+                            (
+                                Voice::Ring { voice, .. },
+                                Command::Retune(_, frequency, converter),
+                            ) => {
                                 let old = voice.retune(frequency, converter);
                                 self.retire(Retired::Converter(old));
                             }
-                            (Voice::Owned { voice, .. }, Command::Retune(_, frequency, converter)) => {
+                            (
+                                Voice::Owned { voice, .. },
+                                Command::Retune(_, frequency, converter),
+                            ) => {
                                 let old = voice.retune(frequency, converter);
                                 self.retire(Retired::Converter(old));
                             }
-                            (_, Command::Notices(_, entries)) => self.retire(Retired::Notices(entries)),
+                            (_, Command::Notices(_, entries)) => {
+                                self.retire(Retired::Notices(entries))
+                            }
                             _ => {}
                         }
                     } else {
                         match command {
-                            Command::Retune(_, _, converter) => self.retire(Retired::Converter(converter)),
+                            Command::Retune(_, _, converter) => {
+                                self.retire(Retired::Converter(converter))
+                            }
                             Command::Notices(_, entries) => self.retire(Retired::Notices(entries)),
                             _ => {}
                         }
@@ -603,8 +733,13 @@ impl Engine {
         }
         let active = self.voices.iter().flatten().filter(|v| v.active()).count() as u64;
         shared.desired_active.store(active, Ordering::Release);
-        shared.counters.active_sources.store(active, Ordering::Relaxed);
-        shared.pending_commands.fetch_sub(processed, Ordering::Release);
+        shared
+            .counters
+            .active_sources
+            .store(active, Ordering::Relaxed);
+        shared
+            .pending_commands
+            .fetch_sub(processed, Ordering::Release);
     }
     fn retire(&mut self, value: Retired) {
         let result = self.retired.push(value);
@@ -668,7 +803,12 @@ impl Engine {
             let mut missing = [0u64; 4];
             for voice in self.voices.iter_mut().flatten() {
                 match voice {
-                    Voice::Ring { source, voice, state, generation } => {
+                    Voice::Ring {
+                        source,
+                        voice,
+                        state,
+                        generation,
+                    } => {
                         let before = voice.missing_frames;
                         voice.render(output, channels, self.rate, &mut missing);
                         shared
@@ -679,8 +819,12 @@ impl Engine {
                         let due = pts + output.len() as f64 / f64::from(channels) * step;
                         state.sequence.fetch_add(1, Ordering::AcqRel);
                         std::sync::atomic::fence(Ordering::Release);
-                        state.position.store(voice.total_position(), Ordering::Relaxed);
-                        state.minimum_position.store(voice.minimum_position(), Ordering::Relaxed);
+                        state
+                            .position
+                            .store(voice.total_position(), Ordering::Relaxed);
+                        state
+                            .minimum_position
+                            .store(voice.minimum_position(), Ordering::Relaxed);
                         state.pts.store(due as u64, Ordering::Relaxed);
                         state.frequency.store(voice.frequency(), Ordering::Relaxed);
                         state.bytes.store(voice.bytes, Ordering::Relaxed);
@@ -708,32 +852,65 @@ impl Engine {
                         }
                     }
                     Voice::Owned { voice, .. } => {
-                        let count = voice.render(output, self.rate, channels, pts, &mut self.retired, &mut missing);
-                        shared.counters.missing_stream_frames.fetch_add(count, Ordering::Relaxed);
+                        let count = voice.render(
+                            output,
+                            self.rate,
+                            channels,
+                            pts,
+                            &mut self.retired,
+                            &mut missing,
+                        );
+                        shared
+                            .counters
+                            .missing_stream_frames
+                            .fetch_add(count, Ordering::Relaxed);
                     }
                 }
             }
-            shared
-                .counters
-                .missing_output_frames
-                .fetch_add(missing.iter().map(|b| u64::from(b.count_ones())).sum::<u64>(), Ordering::Relaxed);
+            shared.counters.missing_output_frames.fetch_add(
+                missing
+                    .iter()
+                    .map(|b| u64::from(b.count_ones()))
+                    .sum::<u64>(),
+                Ordering::Relaxed,
+            );
         }
         for sample in out.iter_mut() {
-            *sample = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
+            *sample = if sample.is_finite() {
+                sample.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
         }
-        shared.counters.output_samples.fetch_add(out.len() as u64, Ordering::Relaxed);
         shared
             .counters
-            .nonzero_samples
-            .fetch_add(out.iter().filter(|value| value.abs() > 0.00001).count() as u64, Ordering::Relaxed);
+            .output_samples
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
+        shared.counters.nonzero_samples.fetch_add(
+            out.iter().filter(|value| value.abs() > 0.00001).count() as u64,
+            Ordering::Relaxed,
+        );
         self.cursor_us += out.len() as f64 / f64::from(channels) * step;
-        let active = self.voices.iter().flatten().filter(|voice| voice.active()).count() as u64;
+        let active = self
+            .voices
+            .iter()
+            .flatten()
+            .filter(|voice| voice.active())
+            .count() as u64;
         shared.desired_active.store(active, Ordering::Release);
-        shared.counters.active_sources.store(active, Ordering::Relaxed);
+        shared
+            .counters
+            .active_sources
+            .store(active, Ordering::Relaxed);
         if active_before && shared.clock.uses_device_time() {
-            shared.active_until_us.store(self.cursor_us as u64, Ordering::Release);
+            shared
+                .active_until_us
+                .store(self.cursor_us as u64, Ordering::Release);
         }
-        shared.counters.audible_sources.store(audible, Ordering::Relaxed);
+        shared
+            .counters
+            .audible_sources
+            .store(audible, Ordering::Relaxed);
     }
 }
 
@@ -765,10 +942,14 @@ impl crate::AudioStream {
         !self.shared.suspended.load(Ordering::Acquire)
             && (self.shared.pending_commands.load(Ordering::Acquire) != 0
                 || self.shared.desired_active.load(Ordering::Acquire) != 0
-                || self.shared.clock.now_us(0) < self.shared.active_until_us.load(Ordering::Acquire))
+                || self.shared.clock.now_us(0)
+                    < self.shared.active_until_us.load(Ordering::Acquire))
     }
     fn claim(&self) -> Option<crate::DeviceReader> {
-        let ptr = self.shared.engine.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let ptr = self
+            .shared
+            .engine
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
         if ptr.is_null() {
             return None;
         }
@@ -806,7 +987,10 @@ impl crate::AudioStream {
         self.shared.rate.store(rate, Ordering::Release);
         reader.channels = channels;
         reader.device_origin_us = reader.engine.cursor_us;
-        reader.device_time = self.shared.clock.start_device(reader.engine.cursor_us as u64);
+        reader.device_time = self
+            .shared
+            .clock
+            .start_device(reader.engine.cursor_us as u64);
         if reader.device_time {
             self.shared.connected.store(true, Ordering::Release);
         }
@@ -832,11 +1016,11 @@ impl crate::DeviceReader {
         clock: Option<crate::DeviceClock>,
     ) -> crate::DeviceRead {
         if let Some(clock) = clock {
-            let consumed =
-                self.device_origin_us + clock.consumed_frames as f64 * 1_000_000.0 / f64::from(self.engine.rate);
+            let consumed = self.device_origin_us
+                + clock.consumed_frames as f64 * 1_000_000.0 / f64::from(self.engine.rate);
             if !self.native_clock {
-                self.engine.cursor_us =
-                    consumed + f64::from(clock.queued_frames) * 1_000_000.0 / f64::from(self.engine.rate);
+                self.engine.cursor_us = consumed
+                    + f64::from(clock.queued_frames) * 1_000_000.0 / f64::from(self.engine.rate);
                 self.native_clock = true;
             }
             if self.device_time {
@@ -852,8 +1036,16 @@ impl crate::DeviceReader {
             return crate::DeviceRead {
                 first_pts_us: first,
                 lock_miss: false,
-                missing_output_frames: self.shared.counters.missing_output_frames.load(Ordering::Relaxed),
-                missing_stream_frames: self.shared.counters.missing_stream_frames.load(Ordering::Relaxed),
+                missing_output_frames: self
+                    .shared
+                    .counters
+                    .missing_output_frames
+                    .load(Ordering::Relaxed),
+                missing_stream_frames: self
+                    .shared
+                    .counters
+                    .missing_stream_frames
+                    .load(Ordering::Relaxed),
             };
         }
         if self.device_time && !self.native_clock {
@@ -864,8 +1056,16 @@ impl crate::DeviceReader {
         crate::DeviceRead {
             first_pts_us: first,
             lock_miss: false,
-            missing_output_frames: self.shared.counters.missing_output_frames.load(Ordering::Relaxed),
-            missing_stream_frames: self.shared.counters.missing_stream_frames.load(Ordering::Relaxed),
+            missing_output_frames: self
+                .shared
+                .counters
+                .missing_output_frames
+                .load(Ordering::Relaxed),
+            missing_stream_frames: self
+                .shared
+                .counters
+                .missing_stream_frames
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -882,6 +1082,8 @@ impl Drop for crate::DeviceReader {
         }
         // Move the existing allocation, without allocating or dropping Engine.
         let engine = unsafe { std::mem::ManuallyDrop::take(&mut self.engine) };
-        self.shared.engine.store(Box::into_raw(engine), Ordering::Release);
+        self.shared
+            .engine
+            .store(Box::into_raw(engine), Ordering::Release);
     }
 }

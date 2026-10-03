@@ -13,7 +13,8 @@ use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot as UcPro
 use unicorn_engine::{RegisterX86, Unicorn};
 
 use crate::{
-    Backend, Exit, Fault, FaultKind, FilePage, Guest, MemFault, Prot, Reg, SegmentSetup, TrapAction, TrapHandler,
+    Backend, Exit, Fault, FaultKind, FilePage, Guest, MemFault, Prot, Reg, SegmentSetup,
+    TrapAction, TrapHandler,
 };
 
 struct FileBinding {
@@ -102,7 +103,8 @@ impl UnicornCpu {
             if d.budget_active && d.budget_expired.load(Ordering::Acquire) {
                 // Stop before executing any instruction in this block. An asynchronous
                 // uc_emu_stop can leave EIP at the block start after prefix stores ran.
-                uc.emu_stop().expect("stop guest at a resumable block boundary");
+                uc.emu_stop()
+                    .expect("stop guest at a resumable block boundary");
                 return;
             }
             if d.count_blocks {
@@ -114,7 +116,10 @@ impl UnicornCpu {
             }
         })?;
         uc.add_intr_hook(|uc, intno| {
-            let h = uc.get_data().handler.expect("guest trap outside Backend::run");
+            let h = uc
+                .get_data()
+                .handler
+                .expect("guest trap outside Backend::run");
             let park = uc.get_data().park;
             // SAFETY: `handler` is set only for the duration of `run`, which holds the
             // `&mut dyn TrapHandler` it was created from. The handler is disjoint from the CPU.
@@ -140,30 +145,47 @@ impl UnicornCpu {
             uc.get_data_mut().last_mem_fault = Some((ty, addr as u32));
             false
         })?;
-        uc.add_mem_hook(HookType::MEM_READ | HookType::MEM_WRITE, 1, 0, |uc, ty, addr, size, _| {
-            let start = (addr as u32) & !4095;
-            let end = (addr + size as u64).min(1u64 << 32);
-            for (&page, binding) in
-                uc.get_data().file_pages.range(start..).take_while(|(page, _)| u64::from(**page) < end)
-            {
-                if (ty == MemType::WRITE && !binding.protection.contains(Prot::WRITE)) || binding.prepare().is_err() {
-                    uc.get_data_mut().last_mem_fault = Some((
-                        if ty == MemType::WRITE { MemType::WRITE_UNMAPPED } else { MemType::READ_UNMAPPED },
-                        page,
-                    ));
-                    let _ = uc.emu_stop();
-                    return false;
-                }
-            }
-            if ty == MemType::WRITE {
-                for (_, binding) in
-                    uc.get_data_mut().file_pages.range_mut(start..).take_while(|(page, _)| u64::from(**page) < end)
+        uc.add_mem_hook(
+            HookType::MEM_READ | HookType::MEM_WRITE,
+            1,
+            0,
+            |uc, ty, addr, size, _| {
+                let start = (addr as u32) & !4095;
+                let end = (addr + size as u64).min(1u64 << 32);
+                for (&page, binding) in uc
+                    .get_data()
+                    .file_pages
+                    .range(start..)
+                    .take_while(|(page, _)| u64::from(**page) < end)
                 {
-                    binding.commit_write();
+                    if (ty == MemType::WRITE && !binding.protection.contains(Prot::WRITE))
+                        || binding.prepare().is_err()
+                    {
+                        uc.get_data_mut().last_mem_fault = Some((
+                            if ty == MemType::WRITE {
+                                MemType::WRITE_UNMAPPED
+                            } else {
+                                MemType::READ_UNMAPPED
+                            },
+                            page,
+                        ));
+                        let _ = uc.emu_stop();
+                        return false;
+                    }
                 }
-            }
-            true
-        })?;
+                if ty == MemType::WRITE {
+                    for (_, binding) in uc
+                        .get_data_mut()
+                        .file_pages
+                        .range_mut(start..)
+                        .take_while(|(page, _)| u64::from(**page) < end)
+                    {
+                        binding.commit_write();
+                    }
+                }
+                true
+            },
+        )?;
         // Unicorn starts with both control words zero: every FP exception unmasked and x87
         // precision control at 24 bits. A new Windows thread has 53-bit precision, round to
         // nearest and everything masked. Contexts start from a snapshot of this state.
@@ -171,7 +193,14 @@ impl UnicornCpu {
         uc.reg_write(RegisterX86::FPTAG, 0xffff)?;
         uc.reg_write(RegisterX86::FPCW, 0x27f)?;
         uc.reg_write(RegisterX86::MXCSR, 0x1f80)?;
-        Ok(Self { watchdog: None, uc, park, gdt: None, budget: Some(Duration::from_secs(5)), counted: false })
+        Ok(Self {
+            watchdog: None,
+            uc,
+            park,
+            gdt: None,
+            budget: Some(Duration::from_secs(5)),
+            counted: false,
+        })
     }
 
     fn write_gdt_entry(&mut self, index: u32, desc: u64) -> Result<(), MemFault> {
@@ -209,10 +238,20 @@ fn uc_prot(p: Prot) -> UcProt {
     v
 }
 
-fn materialize_file_page(uc: &mut Unicorn<'_, HookData>, address: u32, write: bool) -> Result<(), ()> {
+fn materialize_file_page(
+    uc: &mut Unicorn<'_, HookData>,
+    address: u32,
+    write: bool,
+) -> Result<(), ()> {
     let base = address & !4095;
-    let Some(binding) = uc.get_data().file_pages.get(&base) else { return Err(()) };
-    if binding.mapped || !binding.protection.contains(if write { Prot::WRITE } else { Prot::READ }) {
+    let Some(binding) = uc.get_data().file_pages.get(&base) else {
+        return Err(());
+    };
+    if binding.mapped
+        || !binding
+            .protection
+            .contains(if write { Prot::WRITE } else { Prot::READ })
+    {
         return Err(());
     }
     let (page, protection) = (binding.page.clone(), binding.protection);
@@ -220,14 +259,19 @@ fn materialize_file_page(uc: &mut Unicorn<'_, HookData>, address: u32, write: bo
     // operate on one worker. HookData retains the stable allocation until
     // unmapping; no Rust references to its data are exposed.
     let pointer = unsafe { page.foreign_pointer() }.map_err(|_| ())?;
-    unsafe { uc.mem_map_ptr(base.into(), 4096, uc_prot(protection), pointer.cast()) }.map_err(|_| ())?;
+    unsafe { uc.mem_map_ptr(base.into(), 4096, uc_prot(protection), pointer.cast()) }
+        .map_err(|_| ())?;
     uc.get_data_mut().file_pages.get_mut(&base).unwrap().mapped = true;
     Ok(())
 }
 
 /// A present, 32-bit, byte- or page-granular code/data segment descriptor.
 fn descriptor(base: u32, limit: u32, code: bool, dpl: u64) -> u64 {
-    let (limit, gran) = if limit > 0xfffff { (limit >> 12, 1u64) } else { (limit, 0) };
+    let (limit, gran) = if limit > 0xfffff {
+        (limit >> 12, 1u64)
+    } else {
+        (limit, 0)
+    };
     let (base, limit) = (u64::from(base), u64::from(limit));
     let typ: u64 = if code { 0xb } else { 0x3 };
     let access = typ | 1 << 4 | dpl << 5 | 1 << 7;
@@ -244,7 +288,10 @@ fn descriptor(base: u32, limit: u32, code: bool, dpl: u64) -> u64 {
 // Implemented on the raw engine so trap handlers can receive it directly as `&mut dyn Guest`.
 impl Guest for Unicorn<'_, HookData> {
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
-        self.get_data().file_pages.get(&(addr & !4095)).map(|page| page.copy_source.is_some())
+        self.get_data()
+            .file_pages
+            .get(&(addr & !4095))
+            .map(|page| page.copy_source.is_some())
     }
     fn cpuid_features(&self) -> u32 {
         // The default Unicorn x86 model supports the legacy features exposed by PAL.
@@ -253,11 +300,16 @@ impl Guest for Unicorn<'_, HookData> {
     fn push_f64(&mut self, value: f64) {
         let sw = self.reg_read(RegisterX86::FPSW).expect("x87 status");
         let top = ((sw >> 11).wrapping_sub(1)) & 7;
-        self.reg_write(RegisterX86::FPSW, (sw & !(7 << 11)) | (top << 11)).expect("x87 top");
+        self.reg_write(RegisterX86::FPSW, (sw & !(7 << 11)) | (top << 11))
+            .expect("x87 top");
         let tag = self.reg_read(RegisterX86::FPTAG).expect("x87 tag");
-        self.reg_write(RegisterX86::FPTAG, (tag & !(3 << (top * 2))) | (crate::x87::tag_f64(value) << (top * 2)))
-            .expect("x87 tag");
-        self.reg_write_long(RegisterX86::ST0, &crate::x87::encode_f64(value)).expect("x87 return");
+        self.reg_write(
+            RegisterX86::FPTAG,
+            (tag & !(3 << (top * 2))) | (crate::x87::tag_f64(value) << (top * 2)),
+        )
+        .expect("x87 tag");
+        self.reg_write_long(RegisterX86::ST0, &crate::x87::encode_f64(value))
+            .expect("x87 return");
     }
     fn pop_f64(&mut self) -> Option<f64> {
         let sw = self.reg_read(RegisterX86::FPSW).expect("x87 status");
@@ -267,8 +319,13 @@ impl Guest for Unicorn<'_, HookData> {
             return None;
         }
         let bytes = self.reg_read_long(RegisterX86::ST0).expect("x87 value");
-        self.reg_write(RegisterX86::FPTAG, tag | (3 << (top * 2))).expect("x87 tag");
-        self.reg_write(RegisterX86::FPSW, (sw & !(7 << 11)) | (((top + 1) & 7) << 11)).expect("x87 top");
+        self.reg_write(RegisterX86::FPTAG, tag | (3 << (top * 2)))
+            .expect("x87 tag");
+        self.reg_write(
+            RegisterX86::FPSW,
+            (sw & !(7 << 11)) | (((top + 1) & 7) << 11),
+        )
+        .expect("x87 top");
         Some(crate::x87::decode_f64(&bytes))
     }
     fn reg(&self, r: Reg) -> u32 {
@@ -278,7 +335,10 @@ impl Guest for Unicorn<'_, HookData> {
         self.reg_write(uc_reg(r), v.into()).expect("reg write");
     }
     fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), MemFault> {
-        let fault = MemFault { addr, len: buf.len() as u32 };
+        let fault = MemFault {
+            addr,
+            len: buf.len() as u32,
+        };
         if u64::from(addr) + buf.len() as u64 > 1u64 << 32 {
             return Err(fault);
         }
@@ -289,24 +349,34 @@ impl Guest for Unicorn<'_, HookData> {
             let count = (4096 - within).min(buf.len() - offset);
             if let Some(binding) = self.get_data().file_pages.get(&(address & !4095)) {
                 let page = binding.copy_source.as_ref().unwrap_or(&binding.page);
-                page.read_into(within, &mut buf[offset..offset + count]).map_err(|_| fault)?;
+                page.read_into(within, &mut buf[offset..offset + count])
+                    .map_err(|_| fault)?;
             } else {
-                self.mem_read(address.into(), &mut buf[offset..offset + count]).map_err(|_| fault)?;
+                self.mem_read(address.into(), &mut buf[offset..offset + count])
+                    .map_err(|_| fault)?;
             }
             offset += count;
         }
         Ok(())
     }
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), MemFault> {
-        let fault = MemFault { addr, len: data.len() as u32 };
-        if u64::from(addr) + data.len() as u64 > 1u64 << 32 || !self.accessible(addr, fault.len, Prot::default()) {
+        let fault = MemFault {
+            addr,
+            len: data.len() as u32,
+        };
+        if u64::from(addr) + data.len() as u64 > 1u64 << 32
+            || !self.accessible(addr, fault.len, Prot::default())
+        {
             return Err(fault);
         }
         // Resolve all first-touch reads and COPY shadows before modifying any
         // page. Host writes bypass protection, but never mapping validation.
         let end = u64::from(addr) + data.len() as u64;
-        for (_, binding) in
-            self.get_data().file_pages.range((addr & !4095)..).take_while(|(page, _)| u64::from(**page) < end)
+        for (_, binding) in self
+            .get_data()
+            .file_pages
+            .range((addr & !4095)..)
+            .take_while(|(page, _)| u64::from(**page) < end)
         {
             binding.prepare().map_err(|_| fault)?;
         }
@@ -317,26 +387,45 @@ impl Guest for Unicorn<'_, HookData> {
             let count = (4096 - within).min(data.len() - offset);
             if let Some(binding) = self.get_data_mut().file_pages.get_mut(&(address & !4095)) {
                 binding.commit_write();
-                binding.page.write(within, &data[offset..offset + count]).map_err(|_| fault)?;
+                binding
+                    .page
+                    .write(within, &data[offset..offset + count])
+                    .map_err(|_| fault)?;
             } else {
-                self.mem_write(address.into(), &data[offset..offset + count]).map_err(|_| fault)?;
+                self.mem_write(address.into(), &data[offset..offset + count])
+                    .map_err(|_| fault)?;
             }
             offset += count;
         }
         Ok(())
     }
-    fn map_file_pages(&mut self, addr: u32, pages: &[Rc<FilePage>], prot: Prot, copy: bool) -> Result<(), MemFault> {
+    fn map_file_pages(
+        &mut self,
+        addr: u32,
+        pages: &[Rc<FilePage>],
+        prot: Prot,
+        copy: bool,
+    ) -> Result<(), MemFault> {
         let size = pages
             .len()
             .checked_mul(4096)
             .and_then(|v| u32::try_from(v).ok())
-            .ok_or(MemFault { addr, len: u32::MAX })?;
+            .ok_or(MemFault {
+                addr,
+                len: u32::MAX,
+            })?;
         let fault = MemFault { addr, len: size };
-        if addr % 4096 != 0 || size == 0 || prot.0 & !3 != 0 || u64::from(addr) + u64::from(size) > 1u64 << 32 {
+        if addr % 4096 != 0
+            || size == 0
+            || prot.0 & !3 != 0
+            || u64::from(addr) + u64::from(size) > 1u64 << 32
+        {
             return Err(fault);
         }
         let regions = self.mem_regions().map_err(|_| fault)?;
-        if regions.iter().any(|r| r.begin < u64::from(addr) + u64::from(size) && r.end >= u64::from(addr))
+        if regions
+            .iter()
+            .any(|r| r.begin < u64::from(addr) + u64::from(size) && r.end >= u64::from(addr))
             || self
                 .get_data()
                 .file_pages
@@ -356,7 +445,12 @@ impl Guest for Unicorn<'_, HookData> {
             };
             self.get_data_mut().file_pages.insert(
                 address,
-                FileBinding { page, copy_source: copy.then(|| backing.clone()), protection: prot, mapped: false },
+                FileBinding {
+                    page,
+                    copy_source: copy.then(|| backing.clone()),
+                    protection: prot,
+                    mapped: false,
+                },
             );
         }
         Ok(())
@@ -366,7 +460,9 @@ impl Guest for Unicorn<'_, HookData> {
         if end > 1u64 << 32 {
             return false;
         }
-        let Ok(regions) = self.mem_regions() else { return false };
+        let Ok(regions) = self.mem_regions() else {
+            return false;
+        };
         let mut address = u64::from(addr);
         while address < end {
             let base = (address as u32) & !4095;
@@ -375,10 +471,11 @@ impl Guest for Unicorn<'_, HookData> {
                 if !binding.protection.contains(prot) {
                     return false;
                 }
-            } else if !regions
-                .iter()
-                .any(|r| r.begin <= address && r.end + 1 >= limit && r.perms & u32::from(prot.0) == u32::from(prot.0))
-            {
+            } else if !regions.iter().any(|r| {
+                r.begin <= address
+                    && r.end + 1 >= limit
+                    && r.perms & u32::from(prot.0) == u32::from(prot.0)
+            }) {
                 return false;
             }
             address = limit;
@@ -395,11 +492,16 @@ impl Guest for Unicorn<'_, HookData> {
         {
             return Err(MemFault { addr, len: size });
         }
-        self.mem_map(addr.into(), size.into(), uc_prot(prot)).map_err(|_| MemFault { addr, len: size })
+        self.mem_map(addr.into(), size.into(), uc_prot(prot))
+            .map_err(|_| MemFault { addr, len: size })
     }
     fn protect(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
         let fault = MemFault { addr, len: size };
-        if addr % 4096 != 0 || size == 0 || size % 4096 != 0 || !self.accessible(addr, size, Prot::default()) {
+        if addr % 4096 != 0
+            || size == 0
+            || size % 4096 != 0
+            || !self.accessible(addr, size, Prot::default())
+        {
             return Err(fault);
         }
         if prot.contains(Prot::EXEC)
@@ -416,18 +518,28 @@ impl Guest for Unicorn<'_, HookData> {
             let page = addr + i * 4096;
             if let Some(binding) = self.get_data().file_pages.get(&page) {
                 if binding.mapped {
-                    self.mem_protect(page.into(), 4096, uc_prot(prot)).map_err(|_| fault)?;
+                    self.mem_protect(page.into(), 4096, uc_prot(prot))
+                        .map_err(|_| fault)?;
                 }
-                self.get_data_mut().file_pages.get_mut(&page).unwrap().protection = prot;
+                self.get_data_mut()
+                    .file_pages
+                    .get_mut(&page)
+                    .unwrap()
+                    .protection = prot;
             } else {
-                self.mem_protect(page.into(), 4096, uc_prot(prot)).map_err(|_| fault)?;
+                self.mem_protect(page.into(), 4096, uc_prot(prot))
+                    .map_err(|_| fault)?;
             }
         }
         Ok(())
     }
     fn unmap(&mut self, addr: u32, size: u32) -> Result<(), MemFault> {
         let fault = MemFault { addr, len: size };
-        if addr % 4096 != 0 || size == 0 || size % 4096 != 0 || !self.accessible(addr, size, Prot::default()) {
+        if addr % 4096 != 0
+            || size == 0
+            || size % 4096 != 0
+            || !self.accessible(addr, size, Prot::default())
+        {
             return Err(fault);
         }
         for i in 0..size / 4096 {
@@ -449,7 +561,13 @@ impl Guest for UnicornCpu {
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.uc.file_page_copy_on_write(addr)
     }
-    fn map_file_pages(&mut self, addr: u32, pages: &[Rc<FilePage>], prot: Prot, copy: bool) -> Result<(), MemFault> {
+    fn map_file_pages(
+        &mut self,
+        addr: u32,
+        pages: &[Rc<FilePage>],
+        prot: Prot,
+        copy: bool,
+    ) -> Result<(), MemFault> {
         self.uc.map_file_pages(addr, pages, prot, copy)
     }
     fn cpuid_features(&self) -> u32 {
@@ -497,16 +615,27 @@ impl Backend for UnicornCpu {
         let zero = [0u8; (sel::GDT_ENTRIES * 8) as usize];
         self.write(seg.gdt_addr, &zero)?;
         self.write_gdt_entry(u32::from(sel::CS >> 3), descriptor(0, 0xffff_ffff, true, 3))?;
-        self.write_gdt_entry(u32::from(sel::DS >> 3), descriptor(0, 0xffff_ffff, false, 3))?;
-        self.write_gdt_entry(u32::from(sel::SS >> 3), descriptor(0, 0xffff_ffff, false, 0))?;
+        self.write_gdt_entry(
+            u32::from(sel::DS >> 3),
+            descriptor(0, 0xffff_ffff, false, 3),
+        )?;
+        self.write_gdt_entry(
+            u32::from(sel::SS >> 3),
+            descriptor(0, 0xffff_ffff, false, 0),
+        )?;
         self.write_gdt_entry(u32::from(sel::FS >> 3), descriptor(0, 0xfff, false, 3))?;
 
         // struct uc_x86_mmr { u16 selector; u64 base; u32 limit; u32 flags; } (C layout, 24 bytes)
         let mut mmr = [0u8; 24];
         mmr[8..16].copy_from_slice(&u64::from(seg.gdt_addr).to_le_bytes());
         mmr[16..20].copy_from_slice(&(sel::GDT_ENTRIES * 8 - 1).to_le_bytes());
-        let fault = MemFault { addr: seg.gdt_addr, len: sel::GDT_ENTRIES * 8 };
-        self.uc.reg_write_long(RegisterX86::GDTR, &mmr).map_err(|_| fault)?;
+        let fault = MemFault {
+            addr: seg.gdt_addr,
+            len: sel::GDT_ENTRIES * 8,
+        };
+        self.uc
+            .reg_write_long(RegisterX86::GDTR, &mmr)
+            .map_err(|_| fault)?;
         for (r, s) in [
             (RegisterX86::SS, sel::SS),
             (RegisterX86::CS, sel::CS),
@@ -522,7 +651,12 @@ impl Backend for UnicornCpu {
     fn set_fs_base(&mut self, base: u32) -> Result<(), MemFault> {
         self.write_gdt_entry(u32::from(sel::FS >> 3), descriptor(base, 0xfff, false, 3))?;
         // Reloading the selector refreshes the hidden base from the GDT.
-        self.uc.reg_write(RegisterX86::FS, sel::FS.into()).map_err(|_| MemFault { addr: base, len: 0x1000 })
+        self.uc
+            .reg_write(RegisterX86::FS, sel::FS.into())
+            .map_err(|_| MemFault {
+                addr: base,
+                len: 0x1000,
+            })
     }
 
     fn park_addr(&self) -> u32 {
@@ -578,12 +712,25 @@ impl Backend for UnicornCpu {
         let pc = self.uc.reg(Reg::Eip);
         match res {
             Ok(()) if pc == self.park => Exit::Parked,
-            Ok(()) if expired => Exit::BudgetExceeded { pc, budget: self.budget.unwrap() },
-            Ok(()) => Exit::Fault(Fault { kind: FaultKind::Other("emulation stopped".into()), pc }),
+            Ok(()) if expired => Exit::BudgetExceeded {
+                pc,
+                budget: self.budget.unwrap(),
+            },
+            Ok(()) => Exit::Fault(Fault {
+                kind: FaultKind::Other("emulation stopped".into()),
+                pc,
+            }),
             Err(e) => {
-                let addr = self.uc.get_data().last_mem_fault.map(|(_, a)| a).unwrap_or(0);
+                let addr = self
+                    .uc
+                    .get_data()
+                    .last_mem_fault
+                    .map(|(_, a)| a)
+                    .unwrap_or(0);
                 let kind = match e {
-                    uc_error::READ_UNMAPPED | uc_error::READ_PROT | uc_error::READ_UNALIGNED => FaultKind::Read(addr),
+                    uc_error::READ_UNMAPPED | uc_error::READ_PROT | uc_error::READ_UNALIGNED => {
+                        FaultKind::Read(addr)
+                    }
                     uc_error::WRITE_UNMAPPED | uc_error::WRITE_PROT | uc_error::WRITE_UNALIGNED => {
                         FaultKind::Write(addr)
                     }
@@ -599,7 +746,9 @@ impl Backend for UnicornCpu {
     }
 
     fn invalidate_code(&mut self, addr: u32, len: u32) {
-        let _ = self.uc.ctl_remove_cache(addr.into(), u64::from(addr) + u64::from(len));
+        let _ = self
+            .uc
+            .ctl_remove_cache(addr.into(), u64::from(addr) + u64::from(len));
     }
 
     fn set_block_counting(&mut self, on: bool) {
@@ -638,14 +787,21 @@ mod file_page_tests {
             let fail = Rc::new(Cell::new(true));
             let injected = fail.clone();
             let first = FilePage::new([0x11; 4096]);
-            let second =
-                FilePage::lazy(
-                    move || {
-                        if injected.get() { Err("transient read failure".into()) } else { Ok([0x22; 4096]) }
-                    },
-                );
+            let second = FilePage::lazy(move || {
+                if injected.get() {
+                    Err("transient read failure".into())
+                } else {
+                    Ok([0x22; 4096])
+                }
+            });
             let mut cpu = UnicornCpu::new(0x8000).unwrap();
-            cpu.map_file_pages(0x10000, &[first.clone(), second.clone()], Prot::READ | Prot::WRITE, copy).unwrap();
+            cpu.map_file_pages(
+                0x10000,
+                &[first.clone(), second.clone()],
+                Prot::READ | Prot::WRITE,
+                copy,
+            )
+            .unwrap();
             assert!(cpu.write(0x10ffe, &[1, 2, 3, 4]).is_err());
             let mut prefix = [0; 2];
             cpu.read(0x10ffe, &mut prefix).unwrap();
@@ -659,7 +815,10 @@ mod file_page_tests {
             let mut output = [0; 4];
             cpu.read(0x10ffe, &mut output).unwrap();
             assert_eq!(output, [1, 2, 3, 4]);
-            assert_eq!(&first.snapshot().unwrap()[4094..], if copy { &[0x11, 0x11] } else { &[1, 2] });
+            assert_eq!(
+                &first.snapshot().unwrap()[4094..],
+                if copy { &[0x11, 0x11] } else { &[1, 2] }
+            );
         }
     }
 
@@ -667,7 +826,8 @@ mod file_page_tests {
     fn host_write_validates_later_ordinary_mapping_before_detaching_copy_page() {
         let page = FilePage::new([0x55; 4096]);
         let mut cpu = UnicornCpu::new(0x8000).unwrap();
-        cpu.map_file_pages(0x10000, &[page], Prot::READ | Prot::WRITE, true).unwrap();
+        cpu.map_file_pages(0x10000, &[page], Prot::READ | Prot::WRITE, true)
+            .unwrap();
         assert!(cpu.write(0x10ffe, &[1, 2, 3, 4]).is_err());
         assert_eq!(cpu.file_page_copy_on_write(0x10000), Some(true));
         let mut prefix = [0; 2];

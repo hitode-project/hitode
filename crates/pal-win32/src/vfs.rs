@@ -111,22 +111,30 @@ impl Vfs {
 
     fn locate(&self, guest: &str) -> Option<Loc> {
         let n = self.normalize(guest);
-        let comps = |s: &str| s.split('\\').filter(|c| !c.is_empty()).map(str::to_owned).collect::<Vec<_>>();
-        if n.get(..self.game_root.len()).is_some_and(|p| p.eq_ignore_ascii_case(&self.game_root))
+        let comps = |s: &str| {
+            s.split('\\')
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        if n.get(..self.game_root.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(&self.game_root))
             && (n.len() == self.game_root.len() || n.as_bytes()[self.game_root.len()] == b'\\')
         {
             return Some(Loc::Game(comps(&n[self.game_root.len()..])));
         }
-        n.get(..2).filter(|d| d.eq_ignore_ascii_case("C:")).map(|_| {
-            let rel = comps(&n[2..]);
-            if self.portable_saves
-                && let Some(save) = portable_saves::relative(&rel, &self.user_name)
-            {
-                Loc::Game(save.to_vec())
-            } else {
-                Loc::Other(rel)
-            }
-        })
+        n.get(..2)
+            .filter(|d| d.eq_ignore_ascii_case("C:"))
+            .map(|_| {
+                let rel = comps(&n[2..]);
+                if self.portable_saves
+                    && let Some(save) = portable_saves::relative(&rel, &self.user_name)
+                {
+                    Loc::Game(save.to_vec())
+                } else {
+                    Loc::Other(rel)
+                }
+            })
     }
 
     /// Existing host file or directory for reading.
@@ -151,8 +159,13 @@ impl Vfs {
             Loc::Game(rel) => {
                 // Read-only replacements retain copy-on-write semantics. Ordinary saves
                 // and settings go straight into the game directory in portable mode.
-                let replaced = self.resources.as_ref().and_then(|p| ci_find(p, &rel)).is_some();
-                let base = if self.write_game && !replaced && ci_find(&self.overlay, &rel).is_none() {
+                let replaced = self
+                    .resources
+                    .as_ref()
+                    .and_then(|p| ci_find(p, &rel))
+                    .is_some();
+                let base = if self.write_game && !replaced && ci_find(&self.overlay, &rel).is_none()
+                {
                     &self.game_host
                 } else {
                     &self.overlay
@@ -209,7 +222,12 @@ impl Vfs {
                 let name = e.file_name().to_string_lossy().into_owned();
                 map.insert(
                     name.to_ascii_lowercase(),
-                    DirEntry { name, is_dir: md.is_dir(), size: md.len(), modified: md.modified().ok() },
+                    DirEntry {
+                        name,
+                        is_dir: md.is_dir(),
+                        size: md.len(),
+                        modified: md.modified().ok(),
+                    },
                 );
             }
         }
@@ -289,10 +307,16 @@ mod tests {
     fn normalize_paths() {
         let v = vfs(Path::new("/nonexistent"));
         assert_eq!(v.normalize("save\\..\\data.pac"), "C:\\Game\\data.pac");
-        assert_eq!(v.normalize("c:/Game/./dll/PAL.dll"), "C:\\Game\\dll\\PAL.dll");
+        assert_eq!(
+            v.normalize("c:/Game/./dll/PAL.dll"),
+            "C:\\Game\\dll\\PAL.dll"
+        );
         assert_eq!(v.normalize("\\Windows\\win.ini"), "C:\\Windows\\win.ini");
         assert_eq!(v.normalize("C:\\"), "C:\\");
-        assert_eq!(v.locate("C:\\時計\\save.dat"), Some(Loc::Other(vec!["時計".into(), "save.dat".into()])));
+        assert_eq!(
+            v.locate("C:\\時計\\save.dat"),
+            Some(Loc::Other(vec!["時計".into(), "save.dat".into()]))
+        );
     }
 
     #[test]
@@ -304,16 +328,36 @@ mod tests {
         let v = vfs(&tmp);
         // The root is a directory before anything was written (the overlay doesn't exist yet).
         assert!(v.is_dir(r"C:\Game\"));
-        assert_eq!(std::fs::read_to_string(v.lookup("config.INI").unwrap()).unwrap(), "base");
+        assert_eq!(
+            std::fs::read_to_string(v.lookup("config.INI").unwrap()).unwrap(),
+            "base"
+        );
         assert!(v.is_base_only("C:\\Game\\config.ini"));
         let w = v.write_path("C:\\GAME\\config.ini").unwrap();
         assert!(w.starts_with(tmp.join("data/overlay")));
         std::fs::write(&w, "new").unwrap();
-        assert_eq!(std::fs::read_to_string(v.lookup("config.ini").unwrap()).unwrap(), "new");
-        assert_eq!(std::fs::read_to_string(tmp.join("game/Config.ini")).unwrap(), "base");
+        assert_eq!(
+            std::fs::read_to_string(v.lookup("config.ini").unwrap()).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("game/Config.ini")).unwrap(),
+            "base"
+        );
         // Directory listings merge both layers without duplicates.
-        let names: Vec<String> = v.list("C:\\Game").unwrap().into_iter().map(|e| e.name).collect();
-        assert_eq!(names.iter().filter(|n| n.eq_ignore_ascii_case("config.ini")).count(), 1);
+        let names: Vec<String> = v
+            .list("C:\\Game")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("config.ini"))
+                .count(),
+            1
+        );
         assert!(names.iter().any(|n| n == "Save"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -335,11 +379,26 @@ mod tests {
         std::fs::write(v.write_path("config.INI").unwrap(), b"changed").unwrap();
         std::fs::write(v.write_path("story.dat").unwrap(), b"cow").unwrap();
         let reopened = Vfs::new(&cfg);
-        assert_eq!(std::fs::read(tmp.join("game/Save/Slot01.dat")).unwrap(), b"saved");
-        assert_eq!(std::fs::read(tmp.join("game/Config.ini")).unwrap(), b"changed");
-        assert_eq!(std::fs::read(reopened.lookup("SAVE/slot01.DAT").unwrap()).unwrap(), b"saved");
-        assert_eq!(std::fs::read(reopened.lookup("story.dat").unwrap()).unwrap(), b"cow");
-        assert_eq!(std::fs::read(tmp.join("resources/Story.dat")).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(tmp.join("game/Save/Slot01.dat")).unwrap(),
+            b"saved"
+        );
+        assert_eq!(
+            std::fs::read(tmp.join("game/Config.ini")).unwrap(),
+            b"changed"
+        );
+        assert_eq!(
+            std::fs::read(reopened.lookup("SAVE/slot01.DAT").unwrap()).unwrap(),
+            b"saved"
+        );
+        assert_eq!(
+            std::fs::read(reopened.lookup("story.dat").unwrap()).unwrap(),
+            b"cow"
+        );
+        assert_eq!(
+            std::fs::read(tmp.join("resources/Story.dat")).unwrap(),
+            b"replacement"
+        );
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
@@ -368,32 +427,57 @@ mod tests {
         cfg.write_game = true;
         let v = Vfs::new(&cfg);
         let guest = "c:/users/player/documents/Studio/Title/SAVE";
-        assert_path(v.lookup(&format!("{guest}/slot01.DAT")).unwrap(), game.join("Save/Slot01.dat"));
-        assert_eq!(std::fs::read(game.join("Save/Slot01.dat")).unwrap(), b"legacy slot");
-        assert_eq!(std::fs::read(game.join("Save/System.dat")).unwrap(), b"current system");
-        assert_eq!(std::fs::read(game.join("Save/screenshots/01.bmp")).unwrap(), b"thumbnail");
+        assert_path(
+            v.lookup(&format!("{guest}/slot01.DAT")).unwrap(),
+            game.join("Save/Slot01.dat"),
+        );
+        assert_eq!(
+            std::fs::read(game.join("Save/Slot01.dat")).unwrap(),
+            b"legacy slot"
+        );
+        assert_eq!(
+            std::fs::read(game.join("Save/System.dat")).unwrap(),
+            b"current system"
+        );
+        assert_eq!(
+            std::fs::read(game.join("Save/screenshots/01.bmp")).unwrap(),
+            b"thumbnail"
+        );
         assert_eq!(v.list(guest).unwrap().len(), 3);
         let new = v.write_path(&format!("{guest}/Slot02.dat")).unwrap();
         assert_path(new.clone(), game.join("Save/Slot02.dat"));
         std::fs::write(new, b"new slot").unwrap();
         assert!(!old.join("Slot02.dat").exists());
-        assert_path(v.lookup("save/slot02.dat").unwrap(), game.join("Save/Slot02.dat"));
+        assert_path(
+            v.lookup("save/slot02.dat").unwrap(),
+            game.join("Save/Slot02.dat"),
+        );
         // Deletion remains effective, while the original backup remains untouched.
         std::fs::remove_file(v.lookup(&format!("{guest}/Slot01.dat")).unwrap()).unwrap();
         let reopened = Vfs::new(&cfg);
         assert!(reopened.lookup(&format!("{guest}/Slot01.dat")).is_none());
-        assert_eq!(std::fs::read(old.join("Slot01.dat")).unwrap(), b"legacy slot");
+        assert_eq!(
+            std::fs::read(old.join("Slot01.dat")).unwrap(),
+            b"legacy slot"
+        );
         // Explicit isolated data keeps its previous layout and original files.
         cfg.write_game = false;
         let isolated = Vfs::new(&cfg);
-        assert_path(isolated.lookup(&format!("{guest}/Slot01.dat")).unwrap(), old.join("Slot01.dat"));
-        assert_path(isolated.write_path(&format!("{guest}/Slot03.dat")).unwrap(), old.join("Slot03.dat"));
+        assert_path(
+            isolated.lookup(&format!("{guest}/Slot01.dat")).unwrap(),
+            old.join("Slot01.dat"),
+        );
+        assert_path(
+            isolated.write_path(&format!("{guest}/Slot03.dat")).unwrap(),
+            old.join("Slot03.dat"),
+        );
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
     fn migration_failure_retains_legacy_mapping() {
-        let tmp = std::env::temp_dir().join(format!("pal-save-migration-failure-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("pal-save-migration-failure-{}", std::process::id()));
         let game = tmp.join("game");
         let data = game.join(".pal-runtime");
         let old = data.join("c/Users/Player/Documents/Title/save");
@@ -406,7 +490,10 @@ mod tests {
         let v = Vfs::new(&cfg);
         let guest = "C:/Users/Player/Documents/Title/save/slot.dat";
         assert_eq!(std::fs::read(v.lookup(guest).unwrap()).unwrap(), b"legacy");
-        assert_eq!(v.write_path(guest).unwrap().canonicalize().unwrap(), old.join("slot.dat").canonicalize().unwrap());
+        assert_eq!(
+            v.write_path(guest).unwrap().canonicalize().unwrap(),
+            old.join("slot.dat").canonicalize().unwrap()
+        );
         assert!(!data.join("portable-saves-v1").exists());
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -423,9 +510,15 @@ mod tests {
             "C:/Users/Public/Documents/Title/save/01.dat",
             "C:/ProgramData/Title/save/01.dat",
         ] {
-            assert!(matches!(v.locate(path), Some(Loc::Game(parts)) if parts[0].eq_ignore_ascii_case("save")));
+            assert!(
+                matches!(v.locate(path), Some(Loc::Game(parts)) if parts[0].eq_ignore_ascii_case("save"))
+            );
         }
-        for path in ["C:/Windows/save/01.dat", "C:/Other/save/01.dat", "C:/Users/Player/Documents/config.dat"] {
+        for path in [
+            "C:/Windows/save/01.dat",
+            "C:/Other/save/01.dat",
+            "C:/Users/Player/Documents/config.dat",
+        ] {
             assert!(matches!(v.locate(path), Some(Loc::Other(_))));
         }
     }
@@ -451,27 +544,52 @@ mod tests {
         let mut cfg = Win32Config::new(tmp.join("game"), "x.exe", tmp.join("data"));
         cfg.resource_dir = Some(tmp.join("resources"));
         let v = Vfs::new(&cfg);
-        assert_eq!(std::fs::read(v.lookup("story.dat").unwrap()).unwrap(), b"replacement");
-        assert_eq!(std::fs::read(v.lookup("only.dat").unwrap()).unwrap(), b"base only");
+        assert_eq!(
+            std::fs::read(v.lookup("story.dat").unwrap()).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(v.lookup("only.dat").unwrap()).unwrap(),
+            b"base only"
+        );
         assert!(v.is_base_only("story.dat"));
         assert!(v.lookup("sub/new.DAT").is_some());
         assert!(v.lookup("C:\\Windows\\Story.dat").is_none());
-        let names: Vec<_> = v.list(".").unwrap().into_iter().map(|e| e.name.to_ascii_lowercase()).collect();
+        let names: Vec<_> = v
+            .list(".")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_ascii_lowercase())
+            .collect();
         assert_eq!(names, ["only.dat", "story.dat", "sub"]);
         std::fs::write(v.write_path("story.dat").unwrap(), b"saved change").unwrap();
-        assert_eq!(std::fs::read(v.lookup("story.dat").unwrap()).unwrap(), b"saved change");
+        assert_eq!(
+            std::fs::read(v.lookup("story.dat").unwrap()).unwrap(),
+            b"saved change"
+        );
         assert!(!v.is_base_only("story.dat"));
         assert_eq!(
-            v.list(".").unwrap().into_iter().find(|e| e.name.eq_ignore_ascii_case("story.dat")).unwrap().size,
+            v.list(".")
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name.eq_ignore_ascii_case("story.dat"))
+                .unwrap()
+                .size,
             12
         );
         assert!(v.list("story.dat").is_none());
-        assert_eq!(std::fs::read(tmp.join("resources/STORY.DAT")).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(tmp.join("resources/STORY.DAT")).unwrap(),
+            b"replacement"
+        );
         // Removing the optional layer restores base reads; guest writes still win.
         cfg.resource_dir = None;
         let plain = Vfs::new(&cfg);
         assert!(plain.lookup("sub/new.dat").is_none());
-        assert_eq!(std::fs::read(plain.lookup("story.dat").unwrap()).unwrap(), b"saved change");
+        assert_eq!(
+            std::fs::read(plain.lookup("story.dat").unwrap()).unwrap(),
+            b"saved change"
+        );
         drop((v, plain));
         std::fs::remove_dir_all(tmp).unwrap();
     }

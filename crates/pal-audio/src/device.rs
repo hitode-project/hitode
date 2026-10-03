@@ -54,7 +54,9 @@ impl Output {
             retry_at: None,
             metrics: Arc::default(),
             capture,
-            mute: std::env::var("ADV_AUDIO_MUTE_DEVICE").ok().is_some_and(|value| value == "1"),
+            mute: std::env::var("ADV_AUDIO_MUTE_DEVICE")
+                .ok()
+                .is_some_and(|value| value == "1"),
         }
     }
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -89,7 +91,9 @@ impl Output {
     /// Call after the guest PCM pump. No polling thread exists while silent.
     pub fn update(&mut self) {
         self.drain_capture();
-        self.update_at(Instant::now(), || cpal::default_host().default_output_device());
+        self.update_at(Instant::now(), || {
+            cpal::default_host().default_output_device()
+        });
     }
     fn drain_capture(&mut self) {
         if let Some(capture) = self.capture.as_mut()
@@ -120,14 +124,22 @@ impl Output {
         self.next_check = Some(now + Duration::from_millis(500));
         let device = default_device();
         if self.stream.is_some() {
-            if self.device.as_ref().zip(device.as_ref()).is_some_and(|(old, new)| same_device(old, new)) {
+            if self
+                .device
+                .as_ref()
+                .zip(device.as_ref())
+                .is_some_and(|(old, new)| same_device(old, new))
+            {
                 return;
             }
             self.metrics.device_changes.fetch_add(1, Ordering::Relaxed);
             log::info!("default audio output changed; rebuilding stream");
             self.stop();
         }
-        let result = device.as_ref().ok_or_else(|| "no output device".to_string()).and_then(|d| self.start(d));
+        let result = device
+            .as_ref()
+            .ok_or_else(|| "no output device".to_string())
+            .and_then(|d| self.start(d));
         match result {
             Ok(stream) => {
                 self.stream = Some(stream);
@@ -174,10 +186,18 @@ impl Output {
         let errors = self.metrics.clone();
         let fault = self.fault.clone();
         let (rate, channels) = (config.sample_rate.0, config.channels);
-        self.metrics.device_sample_rate.store(u64::from(rate), Ordering::Relaxed);
-        self.metrics.device_channels.store(u64::from(channels), Ordering::Relaxed);
+        self.metrics
+            .device_sample_rate
+            .store(u64::from(rate), Ordering::Relaxed);
+        self.metrics
+            .device_channels
+            .store(u64::from(channels), Ordering::Relaxed);
         let mut reader = self.source.device_reader(rate, channels)?;
-        let mut capture = self.capture.as_mut().map(|capture| capture.begin(rate, channels, self.mute)).transpose()?;
+        let mut capture = self
+            .capture
+            .as_mut()
+            .map(|capture| capture.begin(rate, channels, self.mute))
+            .transpose()?;
         let mute = self.mute;
         self.metrics.hardware_muted.store(mute, Ordering::Relaxed);
         let started = Instant::now();
@@ -190,16 +210,24 @@ impl Output {
                     let callback = metrics.callbacks.fetch_add(1, Ordering::Relaxed);
                     let frames = out.len() as u64 / u64::from(channels);
                     metrics.output_frames.fetch_add(frames, Ordering::Relaxed);
-                    metrics.max_callback_frames.fetch_max(frames, Ordering::Relaxed);
+                    metrics
+                        .max_callback_frames
+                        .fetch_max(frames, Ordering::Relaxed);
                     let timestamp = info.timestamp();
                     let clock = info.device_clock().map(|clock| crate::DeviceClock {
                         consumed_frames: clock.consumed_frames,
                         queued_frames: clock.queued_frames,
                     });
                     if let Some(clock) = clock {
-                        metrics.native_clock_callbacks.fetch_add(1, Ordering::Relaxed);
-                        metrics.device_consumed_frames.store(clock.consumed_frames, Ordering::Relaxed);
-                        metrics.device_queued_frames.store(u64::from(clock.queued_frames), Ordering::Relaxed);
+                        metrics
+                            .native_clock_callbacks
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .device_consumed_frames
+                            .store(clock.consumed_frames, Ordering::Relaxed);
+                        metrics
+                            .device_queued_frames
+                            .store(u64::from(clock.queued_frames), Ordering::Relaxed);
                     }
                     let delay = timestamp
                         .playback
@@ -213,8 +241,11 @@ impl Output {
                             delay + offset,
                             clock.filter(|_| frame_offset == 0),
                         );
-                        metrics.lock_misses.fetch_add(u64::from(read.lock_miss), Ordering::Relaxed);
-                        offset += block.len() as u64 / u64::from(channels) * 1_000_000 / u64::from(rate);
+                        metrics
+                            .lock_misses
+                            .fetch_add(u64::from(read.lock_miss), Ordering::Relaxed);
+                        offset +=
+                            block.len() as u64 / u64::from(channels) * 1_000_000 / u64::from(rate);
                         if let Some(capture) = capture.as_mut() {
                             if block.len() <= 8192 {
                                 let mut packet = crate::capture::Packet {
@@ -227,21 +258,28 @@ impl Output {
                                     lock_miss: read.lock_miss,
                                     missing_output_frames: read.missing_output_frames,
                                     missing_stream_frames: read.missing_stream_frames,
-                                    device_consumed_frames: clock.map(|clock| clock.consumed_frames),
+                                    device_consumed_frames: clock
+                                        .map(|clock| clock.consumed_frames),
                                     device_queued_frames: clock.map(|clock| clock.queued_frames),
                                     data: [0.0; 8192],
                                 };
                                 packet.data[..block.len()].copy_from_slice(&scratch[..block.len()]);
-                                metrics
-                                    .capture_dropped
-                                    .fetch_add(u64::from(capture.push(packet).is_err()), Ordering::Relaxed);
+                                metrics.capture_dropped.fetch_add(
+                                    u64::from(capture.push(packet).is_err()),
+                                    Ordering::Relaxed,
+                                );
                             } else {
                                 metrics.capture_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         frame_offset += (block.len() / usize::from(channels)) as u32;
-                        let non_silent = scratch[..block.len()].iter().filter(|s| s.abs() > 0.00001).count();
-                        metrics.non_silent_samples.fetch_add(non_silent as u64, Ordering::Relaxed);
+                        let non_silent = scratch[..block.len()]
+                            .iter()
+                            .filter(|s| s.abs() > 0.00001)
+                            .count();
+                        metrics
+                            .non_silent_samples
+                            .fetch_add(non_silent as u64, Ordering::Relaxed);
                         convert_output(block, &scratch, mute);
                     }
                 },
@@ -255,9 +293,17 @@ impl Output {
     }
 }
 
-fn convert_output<T: cpal::SizedSample + cpal::FromSample<f32>>(out: &mut [T], samples: &[f32], muted: bool) {
+fn convert_output<T: cpal::SizedSample + cpal::FromSample<f32>>(
+    out: &mut [T],
+    samples: &[f32],
+    muted: bool,
+) {
     for (output, &sample) in out.iter_mut().zip(samples) {
-        *output = if muted { T::EQUILIBRIUM } else { T::from_sample(sample) };
+        *output = if muted {
+            T::EQUILIBRIUM
+        } else {
+            T::from_sample(sample)
+        };
     }
 }
 
@@ -288,7 +334,10 @@ fn same_device(a: &cpal::Device, b: &cpal::Device) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        a.name().ok().zip(b.name().ok()).is_some_and(|(a, b)| a == b)
+        a.name()
+            .ok()
+            .zip(b.name().ok())
+            .is_some_and(|(a, b)| a == b)
     }
 }
 
@@ -305,8 +354,15 @@ mod tests {
         let samples = [-1.0, -0.75, -0.25, 0.0, 0.25, 0.75, 1.0];
         let mut output = [T::EQUILIBRIUM; 7];
         convert_output(&mut output, &samples, false);
-        for (got, want) in output.iter().map(|sample| f32::from_sample(*sample)).zip(samples) {
-            assert!((got - want).abs() <= tolerance, "format conversion {got} {want}");
+        for (got, want) in output
+            .iter()
+            .map(|sample| f32::from_sample(*sample))
+            .zip(samples)
+        {
+            assert!(
+                (got - want).abs() <= tolerance,
+                "format conversion {got} {want}"
+            );
         }
         convert_output(&mut output, &samples, true);
         assert!(
@@ -352,7 +408,9 @@ mod tests {
         let now = Instant::now();
         output.update_at(now, || None);
         assert_eq!(output.next_wake(), Some(now + Duration::from_secs(1)));
-        output.update_at(now + Duration::from_millis(500), || panic!("retried too soon"));
+        output.update_at(now + Duration::from_millis(500), || {
+            panic!("retried too soon")
+        });
         output.update_at(now + Duration::from_secs(1), || None);
         assert_eq!(output.next_wake(), Some(now + Duration::from_secs(2)));
         output.suspend();
@@ -367,20 +425,34 @@ mod tests {
     fn device_loss_and_callback_error_reopen_the_real_stream() {
         let mut output = Output::new(source());
         let now = Instant::now();
-        let device = cpal::default_host().default_output_device().expect("test needs a default device");
+        let device = cpal::default_host()
+            .default_output_device()
+            .expect("test needs a default device");
         output.update_at(now, || Some(device.clone()));
         assert!(output.is_running());
         output.update_at(now + Duration::from_millis(500), || Some(device.clone()));
-        assert_eq!(output.metrics.starts.load(Ordering::Relaxed), 1, "same endpoint must not restart");
+        assert_eq!(
+            output.metrics.starts.load(Ordering::Relaxed),
+            1,
+            "same endpoint must not restart"
+        );
         output.update_at(now + Duration::from_secs(1), || None);
         assert!(!output.is_running());
         output.update_at(now + Duration::from_secs(2), || Some(device.clone()));
-        assert!(output.is_running(), "device restored after missing-device backoff");
+        assert!(
+            output.is_running(),
+            "device restored after missing-device backoff"
+        );
         output.fault.store(true, Ordering::Release);
-        output.update_at(now + Duration::from_millis(2100), || panic!("error recovery must back off"));
+        output.update_at(now + Duration::from_millis(2100), || {
+            panic!("error recovery must back off")
+        });
         assert!(!output.is_running());
         output.update_at(now + Duration::from_millis(2350), || Some(device));
-        assert!(output.is_running(), "callback failure must discard and reopen even the same endpoint");
+        assert!(
+            output.is_running(),
+            "callback failure must discard and reopen even the same endpoint"
+        );
         assert_eq!(output.metrics.starts.load(Ordering::Relaxed), 3);
         output.suspend();
         assert_eq!(output.metrics.stops.load(Ordering::Relaxed), 3);

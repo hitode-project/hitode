@@ -69,7 +69,10 @@ impl PlaybackClock {
                 };
                 // Device reopen and buffered callback timestamp jitter must not
                 // rewind a cursor that guest code has already observed.
-                return self.observed_us.fetch_max(current, Ordering::Relaxed).max(current);
+                return self
+                    .observed_us
+                    .fetch_max(current, Ordering::Relaxed)
+                    .max(current);
             }
         }
     }
@@ -115,14 +118,20 @@ impl PlaybackClock {
         if sequence & 1 != 0
             || self
                 .sequence
-                .compare_exchange(sequence, sequence.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(
+                    sequence,
+                    sequence.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_err()
         {
             return;
         }
         self.anchor_us.store(position_us, Ordering::Relaxed);
         self.host_us.store(host_us, Ordering::Relaxed);
-        self.sequence.store(sequence.wrapping_add(2), Ordering::Release);
+        self.sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
     }
 }
 
@@ -155,7 +164,11 @@ mod tests {
         assert_eq!(c.now_at(1, 507_000), 1_027_000);
         c.publish_at(1_040_000, 520_000);
         assert_eq!(c.now_at(99_000_000, 521_000), 1_041_000);
-        assert_eq!(c.now_at(0, 620_000), 1_140_000, "device absence extrapolates without guest jumps");
+        assert_eq!(
+            c.now_at(0, 620_000),
+            1_140_000,
+            "device absence extrapolates without guest jumps"
+        );
     }
     #[test]
     fn future_playback_timestamp_and_device_reopen_do_not_rewind() {

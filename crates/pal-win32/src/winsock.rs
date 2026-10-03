@@ -41,7 +41,11 @@ fn startup(env: &mut Env<'_>) -> Outcome {
     let version = negotiated(env.arg(0) as u16);
     let data = env.arg(1);
     if data == 0 {
-        return Outcome::Return(if version.is_none() { VERSION_NOT_SUPPORTED } else { FAULT });
+        return Outcome::Return(if version.is_none() {
+            VERSION_NOT_SUPPORTED
+        } else {
+            FAULT
+        });
     }
     if !env.cpu.accessible(data, DATA_BYTES, Prot::WRITE) {
         return Outcome::Return(FAULT);
@@ -53,7 +57,11 @@ fn startup(env: &mut Env<'_>) -> Outcome {
     // unused string suffixes and the deprecated vendor pointer untouched.
     let fields = [returned, 0x0202];
     for (index, value) in fields.into_iter().enumerate() {
-        if env.cpu.write(data + index as u32 * 2, &value.to_le_bytes()).is_err() {
+        if env
+            .cpu
+            .write(data + index as u32 * 2, &value.to_le_bytes())
+            .is_err()
+        {
             return Outcome::Return(FAULT);
         }
     }
@@ -62,8 +70,20 @@ fn startup(env: &mut Env<'_>) -> Outcome {
             return Outcome::Return(FAULT);
         }
     }
-    if env.cpu.write(data + 390, &(if legacy { 32767u16 } else { 0 }).to_le_bytes()).is_err()
-        || env.cpu.write(data + 392, &(if legacy { 65467u16 } else { 0 }).to_le_bytes()).is_err()
+    if env
+        .cpu
+        .write(
+            data + 390,
+            &(if legacy { 32767u16 } else { 0 }).to_le_bytes(),
+        )
+        .is_err()
+        || env
+            .cpu
+            .write(
+                data + 392,
+                &(if legacy { 65467u16 } else { 0 }).to_le_bytes(),
+            )
+            .is_err()
     {
         return Outcome::Return(FAULT);
     }
@@ -79,7 +99,11 @@ fn startup(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 fn cleanup(env: &mut Env<'_>) -> Outcome {
-    let Some(library) = env.ext.try_get_mut::<Library>().filter(|library| library.references != 0) else {
+    let Some(library) = env
+        .ext
+        .try_get_mut::<Library>()
+        .filter(|library| library.references != 0)
+    else {
         set_last_error(env, NOT_INITIALIZED);
         return Outcome::Return(u32::MAX);
     };

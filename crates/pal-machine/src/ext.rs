@@ -28,10 +28,14 @@ impl Ext {
     }
 
     pub fn try_get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.map.get_mut(&TypeId::of::<T>()).and_then(|b| b.downcast_mut())
+        self.map
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_mut())
     }
 
     pub fn try_get<T: 'static>(&self) -> Option<&T> {
-        self.map.get(&TypeId::of::<T>()).and_then(|b| b.downcast_ref())
+        self.map
+            .get(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_ref())
     }
 }

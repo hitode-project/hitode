@@ -151,7 +151,8 @@ pub trait Guest {
     ) -> Result<(), MemFault> {
         Err(MemFault {
             addr,
-            len: u32::try_from(pages.len().saturating_mul(file_page::FILE_PAGE_SIZE)).unwrap_or(u32::MAX),
+            len: u32::try_from(pages.len().saturating_mul(file_page::FILE_PAGE_SIZE))
+                .unwrap_or(u32::MAX),
         })
     }
     /// Whether a file page still awaits its first private COPY write.
@@ -207,7 +208,10 @@ pub trait GuestExt: Guest {
         while out.len() < max {
             // Don't cross a page boundary with one read: the next page may be unmapped.
             let a = addr.wrapping_add(out.len() as u32);
-            let n = chunk.len().min(0x1000 - (a as usize & 0xfff)).min(max - out.len());
+            let n = chunk
+                .len()
+                .min(0x1000 - (a as usize & 0xfff))
+                .min(max - out.len());
             self.read(a, &mut chunk[..n])?;
             if let Some(end) = chunk[..n].iter().position(|&b| b == 0) {
                 out.extend_from_slice(&chunk[..end]);

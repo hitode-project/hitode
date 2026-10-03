@@ -123,7 +123,8 @@ impl Win32 {
         let mut heaps = Heaps::default();
         let process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm)?;
         heaps.process_heap = process_heap;
-        m.cpu.write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
+        m.cpu
+            .write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
         let vfs = Vfs::new(&cfg);
         let w = Win32 {
             codec: Codec::new(cfg.codepage),
@@ -152,12 +153,21 @@ impl Win32 {
     }
 
     /// A guest copy of `bytes` from the process heap, created once per `key`.
-    pub fn static_bytes(&mut self, key: &'static str, cpu: &mut dyn Guest, sys: &mut Sys, bytes: &[u8]) -> u32 {
+    pub fn static_bytes(
+        &mut self,
+        key: &'static str,
+        cpu: &mut dyn Guest,
+        sys: &mut Sys,
+        bytes: &[u8],
+    ) -> u32 {
         if let Some(&p) = self.statics.get(key) {
             return p;
         }
         let h = self.heaps.process_heap;
-        let p = self.heaps.alloc(cpu, &mut sys.vm, h, bytes.len() as u32, false).unwrap_or(0);
+        let p = self
+            .heaps
+            .alloc(cpu, &mut sys.vm, h, bytes.len() as u32, false)
+            .unwrap_or(0);
         if p != 0 {
             let _ = cpu.write(p, bytes);
         }

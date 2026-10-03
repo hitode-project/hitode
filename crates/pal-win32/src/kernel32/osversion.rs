@@ -24,7 +24,10 @@ fn get_version_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     }
     let mut bytes = [0u8; 284];
     bytes[..4].copy_from_slice(&size.to_le_bytes());
-    for (index, value) in [VERSION[1], VERSION[0], VERSION[2], VERSION[3]].into_iter().enumerate() {
+    for (index, value) in [VERSION[1], VERSION[0], VERSION[2], VERSION[3]]
+        .into_iter()
+        .enumerate()
+    {
         bytes[4 + index * 4..8 + index * 4].copy_from_slice(&value.to_le_bytes());
     }
     for (index, byte) in b"Service Pack 1".iter().enumerate() {
@@ -130,9 +133,23 @@ fn verify(env: &mut Env<'_>, wide: bool) -> Outcome {
 }
 pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, super::K32, "GetVersion", 0, get_version);
-    stdcall(registry, super::K32, "GetVersionExA", 1, |e| get_version_ex(e, false));
-    stdcall(registry, super::K32, "GetVersionExW", 1, |e| get_version_ex(e, true));
-    stdcall(registry, super::K32, "VerSetConditionMask", 4, condition_mask);
-    stdcall(registry, super::K32, "VerifyVersionInfoA", 4, |e| verify(e, false));
-    stdcall(registry, super::K32, "VerifyVersionInfoW", 4, |e| verify(e, true));
+    stdcall(registry, super::K32, "GetVersionExA", 1, |e| {
+        get_version_ex(e, false)
+    });
+    stdcall(registry, super::K32, "GetVersionExW", 1, |e| {
+        get_version_ex(e, true)
+    });
+    stdcall(
+        registry,
+        super::K32,
+        "VerSetConditionMask",
+        4,
+        condition_mask,
+    );
+    stdcall(registry, super::K32, "VerifyVersionInfoA", 4, |e| {
+        verify(e, false)
+    });
+    stdcall(registry, super::K32, "VerifyVersionInfoW", 4, |e| {
+        verify(e, true)
+    });
 }

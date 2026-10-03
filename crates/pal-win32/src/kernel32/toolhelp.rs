@@ -13,9 +13,18 @@ fn create_snapshot(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::INVALID_PARAMETER);
         return Outcome::Return(u32::MAX);
     }
-    let rows = env.sys.contexts.iter().filter(|c| !c.is_done()).map(|c| (c.tid, env.sys.pid)).collect();
+    let rows = env
+        .sys
+        .contexts
+        .iter()
+        .filter(|c| !c.is_done())
+        .map(|c| (c.tid, env.sys.pid))
+        .collect();
     let handle = env.sys.objects.insert(Object::Opaque(0));
-    env.ext.get_mut::<Win32>().thread_snapshots.insert(handle, (rows, 0));
+    env.ext
+        .get_mut::<Win32>()
+        .thread_snapshots
+        .insert(handle, (rows, 0));
     Outcome::Return(handle)
 }
 
@@ -49,7 +58,12 @@ fn thread_entry(env: &mut Env<'_>, first: bool) -> Outcome {
         }
     }
     // Enumeration position changes only after a successful complete output.
-    env.ext.get_mut::<Win32>().thread_snapshots.get_mut(&handle).unwrap().1 = index + 1;
+    env.ext
+        .get_mut::<Win32>()
+        .thread_snapshots
+        .get_mut(&handle)
+        .unwrap()
+        .1 = index + 1;
     Outcome::Return(1)
 }
 

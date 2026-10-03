@@ -15,7 +15,9 @@ const ARENA: u32 = 0x10_0000;
 const LARGE: u32 = 0x8_0000;
 
 fn round(size: u32) -> Option<u32> {
-    size.max(1).checked_add(ALIGN - 1).map(|size| size & !(ALIGN - 1))
+    size.max(1)
+        .checked_add(ALIGN - 1)
+        .map(|size| size & !(ALIGN - 1))
 }
 
 fn zero_memory(cpu: &mut dyn Guest, addr: u32, len: u32) -> Result<(), MemFault> {
@@ -100,7 +102,9 @@ impl Heaps {
     }
 
     pub fn destroy(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32) -> bool {
-        let Some(h) = self.heaps.remove(&handle) else { return false };
+        let Some(h) = self.heaps.remove(&handle) else {
+            return false;
+        };
         for a in h.arenas.into_iter().chain(h.large.into_keys()) {
             let _ = vm.free(cpu, a);
         }
@@ -108,11 +112,22 @@ impl Heaps {
     }
 
     fn heap(&mut self, handle: u32) -> Option<&mut Heap> {
-        let handle = if handle == 0 { self.process_heap } else { handle };
+        let handle = if handle == 0 {
+            self.process_heap
+        } else {
+            handle
+        };
         self.heaps.get_mut(&handle)
     }
 
-    pub fn alloc(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32, size: u32, zero: bool) -> Option<u32> {
+    pub fn alloc(
+        &mut self,
+        cpu: &mut dyn Guest,
+        vm: &mut Vm,
+        handle: u32,
+        size: u32,
+        zero: bool,
+    ) -> Option<u32> {
         let h = self.heap(handle)?;
         let rsize = round(size)?;
         let addr = if rsize >= LARGE {
@@ -137,8 +152,12 @@ impl Heaps {
     }
 
     pub fn free(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32, addr: u32) -> bool {
-        let Some(h) = self.heap(handle) else { return false };
-        let Some((rsize, _)) = h.used.remove(&addr) else { return false };
+        let Some(h) = self.heap(handle) else {
+            return false;
+        };
+        let Some((rsize, _)) = h.used.remove(&addr) else {
+            return false;
+        };
         if h.large.remove(&addr).is_some() {
             let _ = vm.free(cpu, addr);
         } else {
@@ -154,7 +173,10 @@ impl Heaps {
 
     /// Which heap a block belongs to (for LocalFree/GlobalFree style APIs without a handle).
     pub fn owner(&self, addr: u32) -> Option<u32> {
-        self.heaps.iter().find(|(_, h)| h.used.contains_key(&addr)).map(|(&k, _)| k)
+        self.heaps
+            .iter()
+            .find(|(_, h)| h.used.contains_key(&addr))
+            .map(|(&k, _)| k)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -257,7 +279,10 @@ mod tests {
         fn read(&self, addr: u32, bytes: &mut [u8]) -> Result<(), MemFault> {
             self.read_calls.set(self.read_calls.get() + 1);
             self.max_read.set(self.max_read.get().max(bytes.len()));
-            let fault = MemFault { addr, len: bytes.len() as u32 };
+            let fault = MemFault {
+                addr,
+                len: bytes.len() as u32,
+            };
             if self.fail_read_call == Some(self.read_calls.get()) {
                 return Err(fault);
             }
@@ -267,7 +292,10 @@ mod tests {
         fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), MemFault> {
             self.write_calls += 1;
             self.max_write = self.max_write.max(bytes.len());
-            let fault = MemFault { addr, len: bytes.len() as u32 };
+            let fault = MemFault {
+                addr,
+                len: bytes.len() as u32,
+            };
             if self.fail_write_call == Some(self.write_calls) {
                 return Err(fault);
             }
@@ -305,12 +333,20 @@ mod tests {
         let pattern: Vec<_> = (0..10_017).map(|i| (i % 251) as u8).collect();
         guest.write(old, &pattern).unwrap();
         guest.reset_counts();
-        let new = heaps.realloc(&mut guest, &mut vm, 0, old, 21_000, true, false).unwrap();
+        let new = heaps
+            .realloc(&mut guest, &mut vm, 0, old, 21_000, true, false)
+            .unwrap();
         assert_ne!(new, old);
         assert_eq!(heaps.size(0, old), None);
         assert_eq!(heaps.size(0, new), Some(21_000));
         assert_eq!(guest.bytes(new, pattern.len()).unwrap(), pattern);
-        assert!(guest.bytes(new + pattern.len() as u32, 21_000 - pattern.len()).unwrap().iter().all(|&b| b == 0));
+        assert!(
+            guest
+                .bytes(new + pattern.len() as u32, 21_000 - pattern.len())
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0)
+        );
         assert!(guest.max_read.get() <= 4096 && guest.max_write <= 4096);
     }
 
@@ -328,7 +364,10 @@ mod tests {
             } else {
                 guest.fail_write_call = Some(2);
             }
-            assert_eq!(heaps.realloc(&mut guest, &mut vm, 0, old, size + 8192, false, false), None);
+            assert_eq!(
+                heaps.realloc(&mut guest, &mut vm, 0, old, size + 8192, false, false),
+                None
+            );
             let failed_new = guest.last_map;
             assert_ne!(failed_new, old);
             assert_eq!(heaps.size(0, old), Some(size));
@@ -338,7 +377,9 @@ mod tests {
             assert!(!guest.memory.contains_key(&failed_new));
             guest.fail_read_call = None;
             guest.fail_write_call = None;
-            let new = heaps.realloc(&mut guest, &mut vm, 0, old, size + 8192, false, false).unwrap();
+            let new = heaps
+                .realloc(&mut guest, &mut vm, 0, old, size + 8192, false, false)
+                .unwrap();
             assert_eq!(new, failed_new);
             assert_eq!(guest.bytes(new, size as usize).unwrap(), pattern);
         }
@@ -349,15 +390,27 @@ mod tests {
         let (mut guest, mut vm, mut heaps) = heap();
         let old = heaps.alloc(&mut guest, &mut vm, 0, 6, false).unwrap();
         guest.write(old, &[0xaa; 8]).unwrap();
-        assert_eq!(heaps.realloc(&mut guest, &mut vm, 0, old, 8, true, false), Some(old));
-        assert_eq!(guest.bytes(old, 8).unwrap(), [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0, 0]);
+        assert_eq!(
+            heaps.realloc(&mut guest, &mut vm, 0, old, 8, true, false),
+            Some(old)
+        );
+        assert_eq!(
+            guest.bytes(old, 8).unwrap(),
+            [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0, 0]
+        );
         guest.reset_counts();
         guest.fail_write_call = Some(2);
-        assert_eq!(heaps.realloc(&mut guest, &mut vm, 0, old, 5000, true, false), None);
+        assert_eq!(
+            heaps.realloc(&mut guest, &mut vm, 0, old, 5000, true, false),
+            None
+        );
         assert_eq!(heaps.size(0, old), Some(8));
         assert_eq!(guest.bytes(old, 6).unwrap(), [0xaa; 6]);
         guest.fail_write_call = None;
-        assert_eq!(heaps.realloc(&mut guest, &mut vm, 0, old, 5000, true, true), Some(old));
+        assert_eq!(
+            heaps.realloc(&mut guest, &mut vm, 0, old, 5000, true, true),
+            Some(old)
+        );
         assert!(guest.bytes(old + 8, 4992).unwrap().iter().all(|&b| b == 0));
     }
 
@@ -366,7 +419,10 @@ mod tests {
         let (mut guest, mut vm, mut heaps) = heap();
         let old = heaps.alloc(&mut guest, &mut vm, 0, 16, false).unwrap();
         assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, u32::MAX, false), None);
-        assert_eq!(heaps.realloc(&mut guest, &mut vm, 0, old, u32::MAX, false, false), None);
+        assert_eq!(
+            heaps.realloc(&mut guest, &mut vm, 0, old, u32::MAX, false, false),
+            None
+        );
         assert_eq!(heaps.size(0, old), Some(16));
         guest.reset_counts();
         guest.fail_write_call = Some(1);
@@ -375,7 +431,10 @@ mod tests {
         assert_eq!(vm.region(failed), None);
         assert_eq!(heaps.owner(failed), None);
         guest.fail_write_call = None;
-        assert_eq!(heaps.alloc(&mut guest, &mut vm, 0, LARGE, true), Some(failed));
+        assert_eq!(
+            heaps.alloc(&mut guest, &mut vm, 0, LARGE, true),
+            Some(failed)
+        );
         assert!(guest.max_write <= 4096);
     }
 }

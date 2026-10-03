@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use pal_cpu::asm::Asm;
 use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Backend, Exit, FaultKind, Guest, GuestExt, Prot, Reg, SegmentSetup, TrapAction, TrapHandler};
+use pal_cpu::{
+    Backend, Exit, FaultKind, Guest, GuestExt, Prot, Reg, SegmentSetup, TrapAction, TrapHandler,
+};
 
 const CODE: u32 = 0x0040_0000;
 const THUNKS: u32 = 0x0050_0000;
@@ -72,13 +74,20 @@ impl TrapHandler for Log {
 #[test]
 fn fast_path_call_returns_value() {
     let mut cpu = machine(|a| {
-        a.push_imm(21).call(thunk(DOUBLE)).add_esp(4).mov_ebx_eax().call(thunk(DONE));
+        a.push_imm(21)
+            .call(thunk(DOUBLE))
+            .add_esp(4)
+            .mov_ebx_eax()
+            .call(thunk(DONE));
     });
     let mut log = Log::default();
     assert_eq!(cpu.run(&mut log), Exit::Parked);
     assert_eq!(cpu.reg(Reg::Ebx), 42);
     assert_eq!(cpu.reg(Reg::Eip), PARK);
-    assert_eq!(log.traps.iter().map(|t| t.0).collect::<Vec<_>>(), [DOUBLE, DONE]);
+    assert_eq!(
+        log.traps.iter().map(|t| t.0).collect::<Vec<_>>(),
+        [DOUBLE, DONE]
+    );
 }
 
 #[test]
@@ -102,7 +111,11 @@ fn access_checks_include_permissions_gaps_and_overflow() {
 #[test]
 fn parked_call_is_completed_by_host() {
     let mut cpu = machine(|a| {
-        a.push_imm(5).call(thunk(BLOCK)).add_esp(4).mov_ebx_eax().call(thunk(DONE));
+        a.push_imm(5)
+            .call(thunk(BLOCK))
+            .add_esp(4)
+            .mov_ebx_eax()
+            .call(thunk(DONE));
     });
     let mut log = Log::default();
     assert_eq!(cpu.run(&mut log), Exit::Parked);
@@ -134,7 +147,11 @@ fn fs_base_is_per_context() {
     for (ctx, teb) in [(&c1, TEB1), (&c2, TEB2), (&c1, TEB1)] {
         cpu.restore(ctx);
         assert_eq!(cpu.run(&mut log), Exit::Parked);
-        assert_eq!(log.traps.last().unwrap().1, teb, "fs:[0x18] after restoring context");
+        assert_eq!(
+            log.traps.last().unwrap().1,
+            teb,
+            "fs:[0x18] after restoring context"
+        );
     }
 }
 
@@ -144,7 +161,9 @@ fn unmapped_read_faults_with_address() {
         a.mov_eax_mem(0x0bad_0000).call(thunk(DONE));
     });
     let exit = cpu.run(&mut Log::default());
-    let Exit::Fault(f) = exit else { panic!("expected fault, got {exit:?}") };
+    let Exit::Fault(f) = exit else {
+        panic!("expected fault, got {exit:?}")
+    };
     assert_eq!(f.kind, FaultKind::Read(0x0bad_0000));
     assert_eq!(f.pc, CODE);
 }
@@ -160,7 +179,10 @@ fn pure_loop_exhausts_wall_budget_at_its_pc() {
     let mut log = Log::default();
     assert_eq!(cpu.run(&mut log), Exit::BudgetExceeded { pc: CODE, budget });
     assert!(start.elapsed() >= budget);
-    assert!(start.elapsed() < Duration::from_secs(2), "watchdog did not stop promptly");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "watchdog did not stop promptly"
+    );
     assert_eq!(cpu.reg(Reg::Eip), CODE);
     assert!(log.traps.is_empty());
 }
@@ -220,7 +242,13 @@ fn zero_budget_stops_before_guest_execution() {
     });
     cpu.set_execution_budget(Some(Duration::ZERO));
     let mut log = Log::default();
-    assert_eq!(cpu.run(&mut log), Exit::BudgetExceeded { pc: CODE, budget: Duration::ZERO });
+    assert_eq!(
+        cpu.run(&mut log),
+        Exit::BudgetExceeded {
+            pc: CODE,
+            budget: Duration::ZERO
+        }
+    );
     assert!(log.traps.is_empty());
     cpu.set_execution_budget(None);
     assert_eq!(cpu.run(&mut log), Exit::Parked);
@@ -233,7 +261,12 @@ fn dense_traps_and_parks_complete_with_budget_enabled() {
         let mut cpu = machine(|a| {
             a.mov_ecx_imm(n);
             let top = a.here();
-            a.push_imm(21).call(thunk(target)).add_esp(4).dec_ecx().jnz(top).call(thunk(DONE));
+            a.push_imm(21)
+                .call(thunk(target))
+                .add_esp(4)
+                .dec_ecx()
+                .jnz(top)
+                .call(thunk(DONE));
         });
         cpu.set_execution_budget(Some(Duration::from_secs(2)));
         let mut log = Log::default();

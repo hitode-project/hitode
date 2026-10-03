@@ -56,7 +56,11 @@ pub enum Outcome {
     ReturnF64(f64),
     /// Call guest `target(args...)` on the current context. `then` receives its EAX.
     /// The stack is reset afterwards, so the guest callee's convention doesn't matter.
-    Call { target: u32, args: Vec<u32>, then: Continuation },
+    Call {
+        target: u32,
+        args: Vec<u32>,
+        then: Continuation,
+    },
     /// Suspend the current context until `wait` is satisfied, then run `then`.
     Block { wait: Wait, then: Continuation },
     /// Continue host work after handing a completed frame to the frontend. Real-time
@@ -76,11 +80,18 @@ impl Outcome {
         args: impl Into<Vec<u32>>,
         then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static,
     ) -> Self {
-        Outcome::Call { target, args: args.into(), then: Box::new(then) }
+        Outcome::Call {
+            target,
+            args: args.into(),
+            then: Box::new(then),
+        }
     }
 
     pub fn block(wait: Wait, then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static) -> Self {
-        Outcome::Block { wait, then: Box::new(then) }
+        Outcome::Block {
+            wait,
+            then: Box::new(then),
+        }
     }
 
     /// Block, then return `value` from the host call.
@@ -91,6 +102,8 @@ impl Outcome {
     /// Use after `Sys::complete_frame` to defer the following host work, preserving
     /// the current guest call without fabricating a guest wait.
     pub fn defer(then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Self {
-        Self::Defer { then: Box::new(then) }
+        Self::Defer {
+            then: Box::new(then),
+        }
     }
 }

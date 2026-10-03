@@ -20,11 +20,19 @@ pub(crate) struct Allowance {
 }
 
 impl Allowance {
-    pub fn choose(hard: Option<Duration>, host: Option<Duration>, reschedule: Option<Duration>) -> Option<Self> {
-        [(hard, Limit::Hard), (host, Limit::HostSlice), (reschedule, Limit::Reschedule)]
-            .into_iter()
-            .filter_map(|(duration, limit)| duration.map(|duration| Self { duration, limit }))
-            .min_by_key(|a| a.duration)
+    pub fn choose(
+        hard: Option<Duration>,
+        host: Option<Duration>,
+        reschedule: Option<Duration>,
+    ) -> Option<Self> {
+        [
+            (hard, Limit::Hard),
+            (host, Limit::HostSlice),
+            (reschedule, Limit::Reschedule),
+        ]
+        .into_iter()
+        .filter_map(|(duration, limit)| duration.map(|duration| Self { duration, limit }))
+        .min_by_key(|a| a.duration)
     }
 }
 
@@ -55,12 +63,24 @@ pub struct SchedulingStats {
 
 /// Only runnable peers (or waits whose signal can change inside guest execution)
 /// require a periodic quantum. Timed sleepers alone require just their deadline.
-pub(crate) fn reschedule_after(quantum: Duration, competitive: bool, wake: Option<Duration>) -> Option<Duration> {
-    [competitive.then_some(quantum), wake].into_iter().flatten().min()
+pub(crate) fn reschedule_after(
+    quantum: Duration,
+    competitive: bool,
+    wake: Option<Duration>,
+) -> Option<Duration> {
+    [competitive.then_some(quantum), wake]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 impl SchedulingStats {
-    pub(crate) fn dispatch(&mut self, stamp: Option<crate::wake_queue::WakeStamp>, now: u64, promoted: bool) {
+    pub(crate) fn dispatch(
+        &mut self,
+        stamp: Option<crate::wake_queue::WakeStamp>,
+        now: u64,
+        promoted: bool,
+    ) {
         self.wake_priority_dispatches += u64::from(promoted);
         if let Some(stamp) = stamp {
             let queued = now.saturating_sub(stamp.observed_us);
@@ -70,7 +90,8 @@ impl SchedulingStats {
             if let Some(deadline) = stamp.deadline_us {
                 let late = now.saturating_sub(deadline);
                 self.timed_dispatches += 1;
-                self.timed_dispatch_lateness_us_total = self.timed_dispatch_lateness_us_total.saturating_add(late);
+                self.timed_dispatch_lateness_us_total =
+                    self.timed_dispatch_lateness_us_total.saturating_add(late);
                 self.timed_dispatch_lateness_us_max = self.timed_dispatch_lateness_us_max.max(late);
             }
         }
@@ -85,7 +106,10 @@ impl SchedulingStats {
     }
 
     pub(crate) fn cpu_run(&mut self, requested: Duration, actual: Duration) {
-        let excess = actual.saturating_sub(requested).as_micros().min(u128::from(u64::MAX)) as u64;
+        let excess = actual
+            .saturating_sub(requested)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         self.bounded_cpu_runs += 1;
         self.cpu_budget_overrun_us_total = self.cpu_budget_overrun_us_total.saturating_add(excess);
         self.cpu_budget_overrun_us_max = self.cpu_budget_overrun_us_max.max(excess);
@@ -122,7 +146,11 @@ mod tests {
         assert_eq!(stats.wake_ready_queue_us_total, 1000);
         assert_eq!(stats.timed_dispatch_lateness_us_total, 1500);
         stats.dispatch(
-            Some(crate::wake_queue::WakeStamp { observed_us: 3000, deadline_us: None, priority: Default::default() }),
+            Some(crate::wake_queue::WakeStamp {
+                observed_us: 3000,
+                deadline_us: None,
+                priority: Default::default(),
+            }),
             3000,
             false,
         );
@@ -138,20 +166,32 @@ mod tests {
     }
     #[test]
     fn hard_deadline_wins_ties() {
-        assert_eq!(Allowance::choose(us(100), us(100), us(100)).unwrap().limit, Limit::Hard);
+        assert_eq!(
+            Allowance::choose(us(100), us(100), us(100)).unwrap().limit,
+            Limit::Hard
+        );
     }
     #[test]
     fn host_slice_wins_a_quantum_tie() {
-        assert_eq!(Allowance::choose(None, us(100), us(100)).unwrap().limit, Limit::HostSlice);
+        assert_eq!(
+            Allowance::choose(None, us(100), us(100)).unwrap().limit,
+            Limit::HostSlice
+        );
     }
     #[test]
     fn absent_quantum_preserves_existing_budget() {
-        assert_eq!(Allowance::choose(us(500), us(800), None).unwrap().limit, Limit::Hard);
+        assert_eq!(
+            Allowance::choose(us(500), us(800), None).unwrap().limit,
+            Limit::Hard
+        );
         assert!(Allowance::choose(None, None, None).is_none());
     }
     #[test]
     fn zero_is_observable_and_must_not_enter_cpu() {
-        assert_eq!(Allowance::choose(us(500), us(800), us(0)).unwrap().duration, Duration::ZERO);
+        assert_eq!(
+            Allowance::choose(us(500), us(800), us(0)).unwrap().duration,
+            Duration::ZERO
+        );
     }
     #[test]
     fn telemetry_distinguishes_lateness_and_backend_overrun() {

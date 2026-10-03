@@ -40,11 +40,22 @@ pub struct Consumer<T> {
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     assert!(capacity > 0 && capacity < usize::MAX);
     let shared = Arc::new(Shared {
-        slots: (0..=capacity).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect(),
+        slots: (0..=capacity)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect(),
         head: AtomicUsize::new(0),
         tail: AtomicUsize::new(0),
     });
-    (Producer { shared: shared.clone(), _single: PhantomData }, Consumer { shared, _single: PhantomData })
+    (
+        Producer {
+            shared: shared.clone(),
+            _single: PhantomData,
+        },
+        Consumer {
+            shared,
+            _single: PhantomData,
+        },
+    )
 }
 impl<T> Producer<T> {
     /// Never waits or allocates. On saturation ownership stays with the caller.
@@ -69,7 +80,11 @@ impl<T> Producer<T> {
     pub fn available(&self) -> usize {
         let tail = self.shared.tail.load(Ordering::Relaxed);
         let head = self.shared.head.load(Ordering::Acquire);
-        if tail >= head { self.shared.slots.len() - (tail - head) - 1 } else { head - tail - 1 }
+        if tail >= head {
+            self.shared.slots.len() - (tail - head) - 1
+        } else {
+            head - tail - 1
+        }
     }
 }
 impl<T> Consumer<T> {
@@ -79,7 +94,9 @@ impl<T> Consumer<T> {
             return None;
         }
         let value = unsafe { (*self.shared.slots[head].get()).assume_init_read() };
-        self.shared.head.store((head + 1) % self.shared.slots.len(), Ordering::Release);
+        self.shared
+            .head
+            .store((head + 1) % self.shared.slots.len(), Ordering::Release);
         Some(value)
     }
     pub fn is_empty(&self) -> bool {

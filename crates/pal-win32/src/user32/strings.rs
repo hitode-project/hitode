@@ -9,11 +9,19 @@ mod case_table;
 
 pub(crate) fn unit_case(unit: u16, upper: bool) -> u16 {
     if unit < 0x80 {
-        return if upper { (unit as u8).to_ascii_uppercase() } else { (unit as u8).to_ascii_lowercase() } as u16;
+        return if upper {
+            (unit as u8).to_ascii_uppercase()
+        } else {
+            (unit as u8).to_ascii_lowercase()
+        } as u16;
     }
     // Pin USER32's legacy invariant mapping instead of inheriting Rust's full
     // Unicode expansion rules or changing behavior with the Rust toolchain.
-    let table = if upper { case_table::UPPER } else { case_table::LOWER };
+    let table = if upper {
+        case_table::UPPER
+    } else {
+        case_table::LOWER
+    };
     let i = table.partition_point(|&(_, last, _, _)| last < unit);
     match table.get(i) {
         Some(&(first, _, stride, delta)) if unit >= first && (unit - first) % stride == 0 => {
@@ -28,7 +36,11 @@ fn ansi_case(bytes: &mut [u8], codec: Codec, upper: bool) {
     while i < bytes.len() {
         let byte = bytes[i];
         if byte < 0x80 {
-            bytes[i] = if upper { byte.to_ascii_uppercase() } else { byte.to_ascii_lowercase() };
+            bytes[i] = if upper {
+                byte.to_ascii_uppercase()
+            } else {
+                byte.to_ascii_lowercase()
+            };
             i += 1;
             continue;
         }
@@ -81,7 +93,11 @@ fn convert(env: &mut Env<'_>, wide: bool, upper: bool) -> Outcome {
             if offset + (n as u32) < bytes {
                 let mut boundary = 0;
                 while boundary < n {
-                    let width = if codec.is_lead_byte(0, scratch[boundary]) { 2 } else { 1 };
+                    let width = if codec.is_lead_byte(0, scratch[boundary]) {
+                        2
+                    } else {
+                        1
+                    };
                     if boundary + width > n {
                         n = boundary;
                         break;
@@ -101,10 +117,22 @@ fn convert(env: &mut Env<'_>, wide: bool, upper: bool) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     for (name, handler) in [
-        ("CharUpperBuffA", (|e: &mut Env<'_>| convert(e, false, true)) as pal_machine::Handler),
-        ("CharLowerBuffA", (|e: &mut Env<'_>| convert(e, false, false)) as pal_machine::Handler),
-        ("CharUpperBuffW", (|e: &mut Env<'_>| convert(e, true, true)) as pal_machine::Handler),
-        ("CharLowerBuffW", (|e: &mut Env<'_>| convert(e, true, false)) as pal_machine::Handler),
+        (
+            "CharUpperBuffA",
+            (|e: &mut Env<'_>| convert(e, false, true)) as pal_machine::Handler,
+        ),
+        (
+            "CharLowerBuffA",
+            (|e: &mut Env<'_>| convert(e, false, false)) as pal_machine::Handler,
+        ),
+        (
+            "CharUpperBuffW",
+            (|e: &mut Env<'_>| convert(e, true, true)) as pal_machine::Handler,
+        ),
+        (
+            "CharLowerBuffW",
+            (|e: &mut Env<'_>| convert(e, true, false)) as pal_machine::Handler,
+        ),
     ] {
         stdcall(reg, super::USER32, name, 2, handler);
     }
@@ -135,10 +163,16 @@ mod tests {
                 .enumerate()
                 .filter_map(|(unit, &expected)| {
                     let actual = super::unit_case(unit as u16, upper);
-                    (actual != expected).then_some(format!("{unit:04x}:{actual:04x}->{expected:04x}"))
+                    (actual != expected)
+                        .then_some(format!("{unit:04x}:{actual:04x}->{expected:04x}"))
                 })
                 .collect();
-            assert!(differences.is_empty(), "upper={upper} {} differences: {:?}", differences.len(), differences);
+            assert!(
+                differences.is_empty(),
+                "upper={upper} {} differences: {:?}",
+                differences.len(),
+                differences
+            );
         }
     }
 }

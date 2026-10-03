@@ -7,8 +7,8 @@ use pal_cpu::{Guest, GuestExt, Prot};
 use pal_machine::layout::PARK_ADDR;
 use pal_machine::{Clock, Machine, Registry, RunResult};
 use pal_win32::user32::window::{
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_NOPARENTNOTIFY,
-    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, wm,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, wm,
 };
 use pal_win32::{Win32, Win32Config};
 
@@ -176,16 +176,40 @@ fn posting_to_a_live_worker_succeeds_but_an_exited_thread_id_fails() {
 
     let tid = t.alloc(4);
     let mut main = Asm::new(CODE);
-    let thread = t.call(&mut main, "kernel32.dll!CreateThread", &[I(0), I(0), I(worker), I(0), I(0), I(tid)]);
+    let thread = t.call(
+        &mut main,
+        "kernel32.dll!CreateThread",
+        &[I(0), I(0), I(worker), I(0), I(0), I(tid)],
+    );
     // Let the worker create its queue and block in a genuine guest GetMessage.
     t.call(&mut main, "kernel32.dll!Sleep", &[I(0)]);
-    let live = t.call(&mut main, "PostThreadMessageA", &[M(tid), I(APP + 42), I(123), I(456)]);
-    t.call(&mut main, "kernel32.dll!WaitForSingleObject", &[M(thread), I(u32::MAX)]);
+    let live = t.call(
+        &mut main,
+        "PostThreadMessageA",
+        &[M(tid), I(APP + 42), I(123), I(456)],
+    );
+    t.call(
+        &mut main,
+        "kernel32.dll!WaitForSingleObject",
+        &[M(thread), I(u32::MAX)],
+    );
     let exit = t.alloc(4);
-    t.call(&mut main, "kernel32.dll!GetExitCodeThread", &[M(thread), I(exit)]);
-    let dead = t.call(&mut main, "PostThreadMessageA", &[M(tid), I(APP + 43), I(789), I(0)]);
+    t.call(
+        &mut main,
+        "kernel32.dll!GetExitCodeThread",
+        &[M(thread), I(exit)],
+    );
+    let dead = t.call(
+        &mut main,
+        "PostThreadMessageA",
+        &[M(tid), I(APP + 43), I(789), I(0)],
+    );
     let dead_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
-    let missing = t.call(&mut main, "PostThreadMessageA", &[I(u32::MAX), I(APP + 44), I(0), I(0)]);
+    let missing = t.call(
+        &mut main,
+        "PostThreadMessageA",
+        &[I(u32::MAX), I(APP + 44), I(0), I(0)],
+    );
     let missing_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
     t.run(main);
 
@@ -218,7 +242,11 @@ impl T {
         let mut cfg = Win32Config::new(root.join("game"), "user32-test.exe", root.join("data"));
         cfg.auto_dialog_ms = auto_dialog_ms;
         Win32::install(&mut m, cfg).unwrap();
-        Self { m, data: DATA + 0x100, proc: CODE + 0x8000 }
+        Self {
+            m,
+            data: DATA + 0x100,
+            proc: CODE + 0x8000,
+        }
     }
 
     fn alloc(&mut self, size: u32) -> u32 {
@@ -265,7 +293,12 @@ impl T {
     fn class(&mut self, a: &mut Asm, proc: u32) -> u32 {
         let name = self.text(&format!("User32Test{proc:x}"));
         let fields = [0, proc, 0, 0, CODE, 0, 0, 0, 0, name];
-        let wc = self.bytes(&fields.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+        let wc = self.bytes(
+            &fields
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
         self.call(a, "RegisterClassA", &[I(wc)]);
         name
     }
@@ -274,7 +307,20 @@ impl T {
         self.call(
             a,
             "CreateWindowExA",
-            &[I(0), I(class), I(0), I(style), I(20), I(30), I(120), I(80), parent, I(id), I(CODE), I(0)],
+            &[
+                I(0),
+                I(class),
+                I(0),
+                I(style),
+                I(20),
+                I(30),
+                I(120),
+                I(80),
+                parent,
+                I(id),
+                I(CODE),
+                I(0),
+            ],
         )
     }
 
@@ -311,10 +357,21 @@ impl T {
     }
 
     fn messages(&self) -> Vec<(u32, u32)> {
-        self.log().into_iter().map(|[hwnd, msg, _, _]| (hwnd, msg)).collect()
+        self.log()
+            .into_iter()
+            .map(|[hwnd, msg, _, _]| (hwnd, msg))
+            .collect()
     }
 
-    fn retrieve(&mut self, a: &mut Asm, api: &str, hwnd: Arg, min: u32, max: u32, remove: bool) -> (u32, u32) {
+    fn retrieve(
+        &mut self,
+        a: &mut Asm,
+        api: &str,
+        hwnd: Arg,
+        min: u32,
+        max: u32,
+        remove: bool,
+    ) -> (u32, u32) {
         let msg = self.alloc(28);
         let mut args = vec![I(msg), hwnd, I(min), I(max)];
         if api == "PeekMessageA" {
@@ -331,11 +388,19 @@ fn queue_status_distinguishes_pending_changed_and_range_filtered_observation() {
     let mut a = Asm::new(CODE);
     let tid = t.call(&mut a, "kernel32.dll!GetCurrentThreadId", &[]);
     t.retrieve(&mut a, "PeekMessageA", I(0), 0, 0, false);
-    t.call(&mut a, "PostThreadMessageA", &[M(tid), I(0x506), I(1), I(0)]);
+    t.call(
+        &mut a,
+        "PostThreadMessageA",
+        &[M(tid), I(0x506), I(1), I(0)],
+    );
     let first = t.call(&mut a, "GetQueueStatus", &[I(8)]);
     let again = t.call(&mut a, "GetQueueStatus", &[I(8)]);
     let allpost = t.call(&mut a, "GetQueueStatus", &[I(0x100)]);
-    t.call(&mut a, "PostThreadMessageA", &[M(tid), I(0x513), I(2), I(0)]);
+    t.call(
+        &mut a,
+        "PostThreadMessageA",
+        &[M(tid), I(0x513), I(2), I(0)],
+    );
     let (_, miss) = t.retrieve(&mut a, "PeekMessageA", I(0), 0x599, 0x599, false);
     let filtered = t.call(&mut a, "GetQueueStatus", &[I(0x108)]);
     let other_category = t.call(&mut a, "GetQueueStatus", &[I(1)]);
@@ -448,7 +513,10 @@ fn create_visible_windows_notifies_parent_then_shows_and_activates() {
     let log = t.log();
     assert_eq!(log[2], [parent, wm::SIZE, 0, 120 | (80 << 16)]);
     assert_eq!(log[3], [parent, wm::MOVE, 0, 20 | (30 << 16)]);
-    assert_eq!(log[12], [parent, wm::PARENTNOTIFY, wm::CREATE | (42 << 16), child]);
+    assert_eq!(
+        log[12],
+        [parent, wm::PARENTNOTIFY, wm::CREATE | (42 << 16), child]
+    );
     assert_eq!(log[19], [parent, wm::ACTIVATE, 0, other]);
     assert_eq!(log[20], [other, wm::ACTIVATE, 1, parent]);
 }
@@ -500,7 +568,11 @@ fn child_ex_noparentnotify_suppresses_creation_and_destruction_notification() {
 fn rejected_creation_only_destroys_the_initialized_parts() {
     for (reject_message, reject_result, expected) in [
         (wm::NCCREATE, 0, vec![wm::NCCREATE, wm::NCDESTROY]),
-        (wm::CREATE, u32::MAX, vec![wm::NCCREATE, wm::CREATE, wm::DESTROY, wm::NCDESTROY]),
+        (
+            wm::CREATE,
+            u32::MAX,
+            vec![wm::NCCREATE, wm::CREATE, wm::DESTROY, wm::NCDESTROY],
+        ),
     ] {
         let mut t = T::new();
         let handle = t.alloc(4);
@@ -522,7 +594,13 @@ fn rejected_creation_only_destroys_the_initialized_parts() {
         assert_eq!(t.u32(result), 0);
         assert_ne!(t.u32(handle), 0);
         assert_eq!(t.u32(alive), 0);
-        assert_eq!(t.messages(), expected.into_iter().map(|msg| (t.u32(handle), msg)).collect::<Vec<_>>());
+        assert_eq!(
+            t.messages(),
+            expected
+                .into_iter()
+                .map(|msg| (t.u32(handle), msg))
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -538,7 +616,9 @@ fn destroy_owned_first_and_all_children_before_parent_ncdestroy() {
     let owned = t.window(&mut a, class, WS_POPUP, M(parent), 0);
     a.mov_mem_imm(LOG_NEXT, LOG);
     let destroyed = t.call(&mut a, "DestroyWindow", &[M(parent)]);
-    let alive: Vec<_> = [parent, child, grandchild, owned].map(|h| t.call(&mut a, "IsWindow", &[M(h)])).into();
+    let alive: Vec<_> = [parent, child, grandchild, owned]
+        .map(|h| t.call(&mut a, "IsWindow", &[M(h)]))
+        .into();
     t.run(a);
     let (p, c, g, o) = (t.u32(parent), t.u32(child), t.u32(grandchild), t.u32(owned));
     assert_eq!(t.u32(destroyed), 1);
@@ -586,7 +666,13 @@ fn parent_destroy_handler_can_destroy_its_child_once() {
     assert_eq!(t.u32(nested_result), 1);
     assert_eq!(
         t.messages(),
-        [(p, wm::DESTROY), (p, wm::PARENTNOTIFY), (c, wm::DESTROY), (c, wm::NCDESTROY), (p, wm::NCDESTROY)]
+        [
+            (p, wm::DESTROY),
+            (p, wm::PARENTNOTIFY),
+            (c, wm::DESTROY),
+            (c, wm::NCDESTROY),
+            (p, wm::NCDESTROY)
+        ]
     );
 }
 
@@ -640,12 +726,23 @@ fn nested_send_message_returns_through_every_guest_callback() {
     let class = t.class(&mut a, proc);
     let hwnd = t.window(&mut a, class, WS_POPUP, I(0), 0);
     a.mov_mem_imm(LOG_NEXT, LOG);
-    let result = t.call(&mut a, "SendMessageA", &[M(hwnd), I(APP + 1), I(11), I(111)]);
+    let result = t.call(
+        &mut a,
+        "SendMessageA",
+        &[M(hwnd), I(APP + 1), I(11), I(111)],
+    );
     let before = t.m.sys.clock.now_us();
     t.run(a);
     let hwnd = t.u32(hwnd);
     assert_eq!(t.u32(result), 111);
-    assert_eq!(t.log(), [[hwnd, APP + 1, 11, 111], [hwnd, APP + 2, 22, 222], [hwnd, APP + 3, 33, 333]]);
+    assert_eq!(
+        t.log(),
+        [
+            [hwnd, APP + 1, 11, 111],
+            [hwnd, APP + 2, 22, 222],
+            [hwnd, APP + 3, 33, 333]
+        ]
+    );
     assert_eq!(t.m.sys.clock.now_us(), before + 5_000);
 }
 
@@ -741,7 +838,9 @@ fn empty_get_message_blocks_until_the_virtual_timer_deadline() {
     a.mov_mem_imm(marker, 0x1234);
     let before = t.m.sys.clock.now_us();
     t.start(a);
-    assert!(matches!(t.m.run(), RunResult::Idle { next_deadline: Some(t) } if t == before + 10_000));
+    assert!(
+        matches!(t.m.run(), RunResult::Idle { next_deadline: Some(t) } if t == before + 10_000)
+    );
     assert_eq!(t.u32(marker), 0);
     assert_eq!(t.m.sys.clock.now_us(), before);
     t.finish();
@@ -761,7 +860,9 @@ fn filtered_get_message_sleeps_with_unmatched_posted_messages() {
     let remaining = t.retrieve(&mut a, "PeekMessageA", I(0), 0, 0, true);
     let before = t.m.sys.clock.now_us();
     t.start(a);
-    assert!(matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 25_000));
+    assert!(
+        matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 25_000)
+    );
     assert_eq!(t.m.sys.clock.now_us(), before);
     t.finish();
     assert_eq!(t.u32(result), 1);
@@ -810,7 +911,14 @@ fn cross_thread_window_timer_wakes_and_runs_on_the_window_owner() {
     assert_eq!(t.u32(callback_thread), t.u32(owner_thread));
     assert_eq!(t.u32(killed), 1);
     assert_eq!(t.u32(worker_timer.1), 0);
-    assert!(t.m.ext.get::<Win32>().user.queues.values().all(|q| q.timers.is_empty()));
+    assert!(
+        t.m.ext
+            .get::<Win32>()
+            .user
+            .queues
+            .values()
+            .all(|q| q.timers.is_empty())
+    );
     assert_eq!(t.m.sys.clock.now_us(), before + 30_000);
 }
 
@@ -833,7 +941,9 @@ fn filtered_get_message_does_not_wake_for_excluded_timers() {
     a.ret();
     t.m.cpu.write(worker, &a.bytes).unwrap();
     t.m.spawn("message-poster", worker, &[], 0x1_0000).unwrap();
-    assert!(matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 30_000));
+    assert!(
+        matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 30_000)
+    );
     t.finish();
     assert_eq!(t.u32(result), 1);
     assert_eq!(t.words::<4>(msg), [t.u32(hwnd), APP, 1, 2]);
@@ -851,7 +961,14 @@ fn timer_filters_include_descendants_and_select_only_thread_timers() {
     t.call(&mut a, "SetTimer", &[M(child), I(42), I(10), I(0)]);
     let timer = t.call(&mut a, "SetTimer", &[I(0), I(0), I(25), I(0)]);
     let descendant = t.retrieve(&mut a, "GetMessageA", M(parent), wm::TIMER, wm::TIMER, true);
-    let thread = t.retrieve(&mut a, "GetMessageA", I(u32::MAX), wm::TIMER, wm::TIMER, true);
+    let thread = t.retrieve(
+        &mut a,
+        "GetMessageA",
+        I(u32::MAX),
+        wm::TIMER,
+        wm::TIMER,
+        true,
+    );
     let before = t.m.sys.clock.now_us();
     t.run(a);
     assert_eq!(t.u32(descendant.1), 1);
@@ -870,17 +987,39 @@ fn button_mouse_clicks_notify_parent_toggle_checkbox_and_respect_radio_groups() 
     let parent = t.window(&mut a, class, WS_POPUP, I(0), 0);
     let button = t.text("BUTTON");
     let checkbox = t.window(&mut a, button, WS_CHILD | 3, M(parent), 10);
-    let radios = [WS_GROUP, 0, WS_GROUP, 0].map(|group| t.window(&mut a, button, WS_CHILD | group | 9, M(parent), 20));
+    let radios = [WS_GROUP, 0, WS_GROUP, 0]
+        .map(|group| t.window(&mut a, button, WS_CHILD | group | 9, M(parent), 20));
     a.mov_mem_imm(LOG_NEXT, LOG);
     let mut checks = Vec::new();
     for hwnd in [checkbox, checkbox, radios[0], radios[2], radios[1]] {
-        t.call(&mut a, "SendMessageA", &[M(hwnd), I(wm::LBUTTONDOWN), I(1), I(0)]);
-        t.call(&mut a, "SendMessageA", &[M(hwnd), I(wm::LBUTTONUP), I(0), I(0)]);
-        checks.push(t.call(&mut a, "SendMessageA", &[M(hwnd), I(BM_GETCHECK), I(0), I(0)]));
+        t.call(
+            &mut a,
+            "SendMessageA",
+            &[M(hwnd), I(wm::LBUTTONDOWN), I(1), I(0)],
+        );
+        t.call(
+            &mut a,
+            "SendMessageA",
+            &[M(hwnd), I(wm::LBUTTONUP), I(0), I(0)],
+        );
+        checks.push(t.call(
+            &mut a,
+            "SendMessageA",
+            &[M(hwnd), I(BM_GETCHECK), I(0), I(0)],
+        ));
     }
-    let radio_checks = radios.map(|hwnd| t.call(&mut a, "SendMessageA", &[M(hwnd), I(BM_GETCHECK), I(0), I(0)]));
+    let radio_checks = radios.map(|hwnd| {
+        t.call(
+            &mut a,
+            "SendMessageA",
+            &[M(hwnd), I(BM_GETCHECK), I(0), I(0)],
+        )
+    });
     t.run(a);
-    assert_eq!(checks.into_iter().map(|p| t.u32(p)).collect::<Vec<_>>(), [1, 0, 1, 1, 1]);
+    assert_eq!(
+        checks.into_iter().map(|p| t.u32(p)).collect::<Vec<_>>(),
+        [1, 0, 1, 1, 1]
+    );
     assert_eq!(radio_checks.map(|p| t.u32(p)), [0, 1, 1, 0]);
     let parent = t.u32(parent);
     assert_eq!(
@@ -913,7 +1052,11 @@ fn bm_click_completes_checkbox_and_parent_notification_synchronously() {
     let checkbox = t.window(&mut a, button, WS_CHILD | 3, M(parent), 42);
     a.mov_mem_imm(LOG_NEXT, LOG);
     t.call(&mut a, "SendMessageA", &[M(checkbox), I(0xf5), I(0), I(0)]); // BM_CLICK
-    let check = t.call(&mut a, "SendMessageA", &[M(checkbox), I(BM_GETCHECK), I(0), I(0)]);
+    let check = t.call(
+        &mut a,
+        "SendMessageA",
+        &[M(checkbox), I(BM_GETCHECK), I(0), I(0)],
+    );
     let completed_ms = t.call(&mut a, "kernel32.dll!GetTickCount", &[]);
     let empty = t.retrieve(&mut a, "PeekMessageA", I(0), 0, 0, true);
     let before = t.m.sys.clock.now_us();
@@ -943,13 +1086,24 @@ fn dialog_templates_preserve_creation_data_and_extended_control_ids() {
         });
         let mut a = Asm::new(CODE);
         t.class(&mut a, control);
-        let template = t.bytes(&dialog_template(extended, Some(&format!("User32Test{control:x}"))));
-        let dlg = t.call(&mut a, "CreateDialogIndirectParamA", &[I(CODE), I(template), I(0), I(proc), I(0x1234)]);
+        let template = t.bytes(&dialog_template(
+            extended,
+            Some(&format!("User32Test{control:x}")),
+        ));
+        let dlg = t.call(
+            &mut a,
+            "CreateDialogIndirectParamA",
+            &[I(CODE), I(template), I(0), I(proc), I(0x1234)],
+        );
         let base = if extended { 0x1_0000 } else { 0 };
         let first = t.call(&mut a, "GetDlgItem", &[M(dlg), I(base + 41)]);
         let second = t.call(&mut a, "GetDlgItem", &[M(dlg), I(base + 42)]);
         let id = t.call(&mut a, "GetDlgCtrlID", &[M(second)]);
-        let font = t.call(&mut a, "SendMessageA", &[M(first), I(wm::GETFONT), I(0), I(0)]);
+        let font = t.call(
+            &mut a,
+            "SendMessageA",
+            &[M(first), I(wm::GETFONT), I(0), I(0)],
+        );
         t.call(&mut a, "DestroyWindow", &[M(dlg)]);
         let alive = t.call(&mut a, "IsWindow", &[M(first)]);
         t.run(a);
@@ -964,7 +1118,10 @@ fn dialog_templates_preserve_creation_data_and_extended_control_ids() {
         assert_eq!(t.m.cpu.read_u16(p).unwrap(), 4);
         assert_eq!(t.m.cpu.read_u16(p + 2).unwrap(), 0xabcd);
         assert_eq!(t.m.cpu.read_u16(p + 4).unwrap(), 0xef01);
-        assert!(t.log().contains(&[t.u32(dlg), wm::INITDIALOG, t.u32(first), 0x1234]));
+        assert!(
+            t.log()
+                .contains(&[t.u32(dlg), wm::INITDIALOG, t.u32(first), 0x1234])
+        );
     }
 }
 
@@ -1004,14 +1161,20 @@ fn modal_dialog_waits_for_timer_and_restores_its_owner_after_end_dialog() {
             a.ret_n(16);
         });
         let template = t.bytes(&dialog_template(extended, None));
-        let result = t.call(&mut a, "DialogBoxIndirectParamA", &[I(CODE), I(template), M(owner), I(proc), I(123)]);
+        let result = t.call(
+            &mut a,
+            "DialogBoxIndirectParamA",
+            &[I(CODE), I(template), M(owner), I(proc), I(123)],
+        );
         let enabled_after = t.call(&mut a, "IsWindowEnabled", &[M(owner)]);
         let alive_after = t.call(&mut a, "IsWindow", &[M(dlg)]);
         let marker = t.alloc(4);
         a.mov_mem_imm(marker, 1);
         let before = t.m.sys.clock.now_us();
         t.start(a);
-        assert!(matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 10_000));
+        assert!(
+            matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 10_000)
+        );
         assert_eq!(t.u32(marker), 0);
         assert_eq!(t.u32(enabled_inside), 0);
         t.finish();
@@ -1045,12 +1208,20 @@ fn end_dialog_during_initialization_returns_without_showing_or_activating() {
         });
         let template = t.bytes(&dialog_template(extended, None));
         let mut a = Asm::new(CODE);
-        let result = t.call(&mut a, "DialogBoxIndirectParamA", &[I(CODE), I(template), I(0), I(proc), I(0x77)]);
+        let result = t.call(
+            &mut a,
+            "DialogBoxIndirectParamA",
+            &[I(CODE), I(template), I(0), I(proc), I(0x77)],
+        );
         let alive = t.call(&mut a, "IsWindow", &[M(dlg)]);
         t.run(a);
         assert_eq!(t.u32(result), 0x77);
         assert_eq!(t.u32(alive), 0);
-        assert!(!t.log().iter().any(|m| matches!(m[1], wm::SHOWWINDOW | wm::ACTIVATE | wm::SETFOCUS)));
+        assert!(
+            !t.log()
+                .iter()
+                .any(|m| matches!(m[1], wm::SHOWWINDOW | wm::ACTIVATE | wm::SETFOCUS))
+        );
     }
 }
 
@@ -1079,14 +1250,24 @@ fn auto_dialog_clicks_the_default_button_after_its_virtual_deadline() {
         });
         let template = t.bytes(&dialog_template(extended, None));
         let mut a = Asm::new(CODE);
-        let result = t.call(&mut a, "DialogBoxIndirectParamA", &[I(CODE), I(template), I(0), I(proc), I(0)]);
+        let result = t.call(
+            &mut a,
+            "DialogBoxIndirectParamA",
+            &[I(CODE), I(template), I(0), I(proc), I(0)],
+        );
         let before = t.m.sys.clock.now_us();
         t.start(a);
-        assert!(matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 25_000));
+        assert!(
+            matches!(t.m.run(), RunResult::Idle { next_deadline: Some(at) } if at == before + 25_000)
+        );
         assert!(!t.log().iter().any(|m| m[1] == wm::COMMAND));
         t.finish();
         assert_eq!(t.u32(result), 0xbeef);
-        let commands: Vec<_> = t.log().into_iter().filter(|m| m[1] == wm::COMMAND).collect();
+        let commands: Vec<_> = t
+            .log()
+            .into_iter()
+            .filter(|m| m[1] == wm::COMMAND)
+            .collect();
         assert_eq!(commands, [[t.u32(dlg), wm::COMMAND, 42, t.u32(button)]]);
         assert_eq!(t.m.sys.clock.now_us(), before + 25_000);
     }
@@ -1098,41 +1279,102 @@ fn adjust_client_rect_and_window_moves_use_consistent_geometry() {
     let proc = t.wndproc(|_| {});
     let mut a = Asm::new(CODE);
     let class = t.class(&mut a, proc);
-    let adjusted = t.bytes(&[0_u32, 0, 200, 100].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+    let adjusted = t.bytes(
+        &[0_u32, 0, 200, 100]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
     let style = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
-    t.call(&mut a, "AdjustWindowRectEx", &[I(adjusted), I(style), I(0), I(WS_EX_CLIENTEDGE)]);
+    t.call(
+        &mut a,
+        "AdjustWindowRectEx",
+        &[I(adjusted), I(style), I(0), I(WS_EX_CLIENTEDGE)],
+    );
     let hwnd = t.call(
         &mut a,
         "CreateWindowExA",
-        &[I(WS_EX_CLIENTEDGE), I(class), I(0), I(style), I(20), I(30), I(220), I(143), I(0), I(0), I(CODE), I(0)],
+        &[
+            I(WS_EX_CLIENTEDGE),
+            I(class),
+            I(0),
+            I(style),
+            I(20),
+            I(30),
+            I(220),
+            I(143),
+            I(0),
+            I(0),
+            I(CODE),
+            I(0),
+        ],
     );
     let client = t.alloc(16);
     t.call(&mut a, "GetClientRect", &[M(hwnd), I(client)]);
     a.mov_mem_imm(LOG_NEXT, LOG);
     let flags = SWP_NOZORDER | SWP_NOACTIVATE;
-    t.call(&mut a, "SetWindowPos", &[M(hwnd), I(0), I(40), I(50), I(240), I(163), I(flags)]);
+    t.call(
+        &mut a,
+        "SetWindowPos",
+        &[M(hwnd), I(0), I(40), I(50), I(240), I(163), I(flags)],
+    );
     let moved = t.alloc(16);
     t.call(&mut a, "GetWindowRect", &[M(hwnd), I(moved)]);
-    t.call(&mut a, "SetWindowPos", &[M(hwnd), I(0), I(900), I(900), I(260), I(183), I(flags | SWP_NOMOVE)]);
+    t.call(
+        &mut a,
+        "SetWindowPos",
+        &[
+            M(hwnd),
+            I(0),
+            I(900),
+            I(900),
+            I(260),
+            I(183),
+            I(flags | SWP_NOMOVE),
+        ],
+    );
     let resized = t.alloc(16);
     t.call(&mut a, "GetWindowRect", &[M(hwnd), I(resized)]);
-    t.call(&mut a, "SetWindowPos", &[M(hwnd), I(0), I(60), I(70), I(999), I(999), I(flags | SWP_NOSIZE)]);
+    t.call(
+        &mut a,
+        "SetWindowPos",
+        &[
+            M(hwnd),
+            I(0),
+            I(60),
+            I(70),
+            I(999),
+            I(999),
+            I(flags | SWP_NOSIZE),
+        ],
+    );
     let repositioned = t.alloc(16);
     t.call(&mut a, "GetWindowRect", &[M(hwnd), I(repositioned)]);
-    t.call(&mut a, "MoveWindow", &[M(hwnd), I(80), I(90), I(280), I(203), I(0)]);
+    t.call(
+        &mut a,
+        "MoveWindow",
+        &[M(hwnd), I(80), I(90), I(280), I(203), I(0)],
+    );
     let final_rect = t.alloc(16);
     let final_client = t.alloc(16);
     t.call(&mut a, "GetWindowRect", &[M(hwnd), I(final_rect)]);
     t.call(&mut a, "GetClientRect", &[M(hwnd), I(final_client)]);
     t.run(a);
-    assert_eq!(t.words::<4>(adjusted).map(|v| v as i32), [-10, -33, 210, 110]);
+    assert_eq!(
+        t.words::<4>(adjusted).map(|v| v as i32),
+        [-10, -33, 210, 110]
+    );
     assert_eq!(t.words::<4>(client), [0, 0, 200, 100]);
     assert_eq!(t.words::<4>(moved), [40, 50, 280, 213]);
     assert_eq!(t.words::<4>(resized), [40, 50, 300, 233]);
     assert_eq!(t.words::<4>(repositioned), [60, 70, 320, 253]);
     assert_eq!(t.words::<4>(final_rect), [80, 90, 360, 293]);
     assert_eq!(t.words::<4>(final_client), [0, 0, 260, 160]);
-    let geometry: Vec<_> = t.log().into_iter().filter(|m| matches!(m[1], wm::MOVE | wm::SIZE)).collect();
+    let geometry: Vec<_> = t
+        .log()
+        .into_iter()
+        .filter(|m| matches!(m[1], wm::MOVE | wm::SIZE))
+        .collect();
     let hwnd = t.u32(hwnd);
     assert_eq!(
         geometry,

@@ -15,7 +15,10 @@ fn terminate_process(env: &mut Env<'_>) -> Outcome {
     if env.arg(0) == u32::MAX {
         return Outcome::ExitProcess(env.arg(1));
     }
-    Outcome::Fail(format!("TerminateProcess({:#x}) of another process", env.arg(0)))
+    Outcome::Fail(format!(
+        "TerminateProcess({:#x}) of another process",
+        env.arg(0)
+    ))
 }
 
 fn command_line_a(env: &mut Env<'_>) -> Outcome {
@@ -29,7 +32,11 @@ fn command_line_a(env: &mut Env<'_>) -> Outcome {
 fn command_line_w(env: &mut Env<'_>) -> Outcome {
     let w = env.ext.get_mut::<Win32>();
     let line = format!("\"{}\"", w.exe_path());
-    let bytes: Vec<u8> = line.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    let bytes: Vec<u8> = line
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
     Outcome::Return(w.static_bytes("cmdline_w", env.cpu, env.sys, &bytes))
 }
 
@@ -39,7 +46,10 @@ pub(super) fn environment(w: &Win32) -> Vec<String> {
         "ALLUSERSPROFILE=C:\\ProgramData".into(),
         format!("APPDATA=C:\\Users\\{}\\AppData\\Roaming", w.cfg.user_name),
         "COMPUTERNAME=PAL-HLE".into(),
-        format!("LOCALAPPDATA=C:\\Users\\{}\\AppData\\Local", w.cfg.user_name),
+        format!(
+            "LOCALAPPDATA=C:\\Users\\{}\\AppData\\Local",
+            w.cfg.user_name
+        ),
         "OS=Windows_NT".into(),
         "PATH=C:\\Windows\\system32;C:\\Windows".into(),
         "SystemDrive=C:".into(),
@@ -89,8 +99,9 @@ fn set_unhandled_exception_filter(env: &mut Env<'_>) -> Outcome {
 
 fn raise_exception(env: &mut Env<'_>) -> Outcome {
     let (code, flags, n, args) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let a: Vec<String> =
-        (0..n.min(15)).map(|i| format!("{:#x}", env.cpu.read_u32(args + 4 * i).unwrap_or(0))).collect();
+    let a: Vec<String> = (0..n.min(15))
+        .map(|i| format!("{:#x}", env.cpu.read_u32(args + 4 * i).unwrap_or(0)))
+        .collect();
     Outcome::Fail(format!(
         "RaiseException(code {code:#010x}, flags {flags:#x}, args [{}]) from {:#010x}: SEH dispatch not implemented",
         a.join(", "),
@@ -136,7 +147,12 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     let Some(scratch) = w.heaps.alloc(env.cpu, &mut env.sys.vm, 0, SCRATCH, true) else {
         return Outcome::Fail("RtlUnwind: out of memory".into());
     };
-    let flags = EXCEPTION_UNWINDING | if target == 0 { EXCEPTION_EXIT_UNWIND } else { 0 };
+    let flags = EXCEPTION_UNWINDING
+        | if target == 0 {
+            EXCEPTION_EXIT_UNWIND
+        } else {
+            0
+        };
     let record = if record == 0 {
         let r = scratch + RECORD;
         for (off, v) in [(0, STATUS_UNWIND), (4, flags), (0xc, ret)] {
@@ -165,7 +181,16 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     for (off, v) in regs {
         let _ = env.cpu.write_u32(c + off, v);
     }
-    unwind_step(env, Unwind { target, value, record, scratch, saved })
+    unwind_step(
+        env,
+        Unwind {
+            target,
+            value,
+            record,
+            scratch,
+            saved,
+        },
+    )
 }
 
 fn unwind_step(env: &mut Env<'_>, u: Unwind) -> Outcome {
@@ -180,7 +205,10 @@ fn unwind_step(env: &mut Env<'_>, u: Unwind) -> Outcome {
         return Outcome::Return(u.value);
     }
     if u.target != 0 && frame > u.target {
-        return Outcome::Fail(format!("RtlUnwind: frame {frame:#010x} is past target {:#010x}", u.target));
+        return Outcome::Fail(format!(
+            "RtlUnwind: frame {frame:#010x} is past target {:#010x}",
+            u.target
+        ));
     }
     let Ok(handler) = env.cpu.read_u32(frame + 4) else {
         return Outcome::Fail(format!("RtlUnwind: unreadable registration {frame:#010x}"));
@@ -188,7 +216,10 @@ fn unwind_step(env: &mut Env<'_>, u: Unwind) -> Outcome {
     let args = [u.record, frame, u.scratch + CONTEXT, u.scratch + DISPATCHER];
     Outcome::call(handler, args, move |env, r| {
         if r.value() != 1 {
-            log::warn!("RtlUnwind: handler {handler:#010x} returned {} (not ExceptionContinueSearch)", r.value());
+            log::warn!(
+                "RtlUnwind: handler {handler:#010x} returned {} (not ExceptionContinueSearch)",
+                r.value()
+            );
         }
         let next = env.cpu.read_u32(frame).unwrap_or(u32::MAX);
         let _ = env.cpu.write_u32(env.ctx().teb, next);
@@ -197,13 +228,20 @@ fn unwind_step(env: &mut Env<'_>, u: Unwind) -> Outcome {
 }
 
 fn output_debug_string_a(env: &mut Env<'_>) -> Outcome {
-    let s = env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, env.arg(0)));
+    let s = env
+        .ext
+        .get::<Win32>()
+        .codec
+        .decode(&cstr(env.cpu, env.arg(0)));
     log::info!("[guest] {}", s.trim_end());
     Outcome::Return(0)
 }
 
 fn output_debug_string_w(env: &mut Env<'_>) -> Outcome {
-    log::info!("[guest] {}", String::from_utf16_lossy(&wstr(env.cpu, env.arg(0))).trim_end());
+    log::info!(
+        "[guest] {}",
+        String::from_utf16_lossy(&wstr(env.cpu, env.arg(0))).trim_end()
+    );
     Outcome::Return(0)
 }
 
@@ -218,12 +256,19 @@ fn set_last_error_(env: &mut Env<'_>) -> Outcome {
 }
 
 fn create_thread(env: &mut Env<'_>) -> Outcome {
-    let (stack, start, param, flags, tid_out) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
+    let (stack, start, param, flags, tid_out) =
+        (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
     if flags & 4 != 0 {
         return Outcome::Fail("CreateThread(CREATE_SUSPENDED) not implemented".into());
     }
     let name = format!("T{}", env.sys.contexts.len());
-    match env.sys.spawn(env.cpu, &name, start, &[param], if stack == 0 { 0x10_0000 } else { stack }) {
+    match env.sys.spawn(
+        env.cpu,
+        &name,
+        start,
+        &[param],
+        if stack == 0 { 0x10_0000 } else { stack },
+    ) {
         Ok(id) => {
             let c = env.sys.context(id);
             let (tid, h) = (c.tid, c.thread_handle);
@@ -238,7 +283,9 @@ fn create_thread(env: &mut Env<'_>) -> Outcome {
 fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
     let (h, out) = (env.arg(0), env.arg(1));
     let code = match env.sys.objects.get(h) {
-        Some(pal_machine::Object::Thread { ctx }) => env.sys.context(*ctx).exit_code().unwrap_or(259), // STILL_ACTIVE
+        Some(pal_machine::Object::Thread { ctx }) => {
+            env.sys.context(*ctx).exit_code().unwrap_or(259)
+        } // STILL_ACTIVE
         _ => {
             set_last_error(env, err::INVALID_HANDLE);
             return Outcome::Return(0);
@@ -252,7 +299,15 @@ fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
 fn get_system_info(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     zero(env.cpu, p, 36);
-    for (off, v) in [(4, 0x1000), (8, 0x1_0000), (12, 0x7ffe_ffff), (16, 1), (20, 1), (24, 586), (28, 0x1_0000)] {
+    for (off, v) in [
+        (4, 0x1000),
+        (8, 0x1_0000),
+        (12, 0x7ffe_ffff),
+        (16, 1),
+        (20, 1),
+        (24, 586),
+        (28, 0x1_0000),
+    ] {
         let _ = env.cpu.write_u32(p + off, v);
     }
     let _ = env.cpu.write(p + 32, &[6, 0, 0x2a, 0x3a]); // wProcessorLevel 6, revision
@@ -262,7 +317,16 @@ fn get_system_info(env: &mut Env<'_>) -> Outcome {
 /// MEMORYSTATUS / MEMORYSTATUSEX with 2 GiB physical, 2 GiB virtual.
 fn global_memory_status(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
-    let v = [32u32, 30, 0x8000_0000, 0x6000_0000, 0xffff_ffff, 0xc000_0000, 0x7ffe_0000, 0x7000_0000];
+    let v = [
+        32u32,
+        30,
+        0x8000_0000,
+        0x6000_0000,
+        0xffff_ffff,
+        0xc000_0000,
+        0x7ffe_0000,
+        0x7000_0000,
+    ];
     for (i, x) in v.iter().enumerate() {
         let _ = env.cpu.write_u32(p + 4 * i as u32, *x);
     }
@@ -273,7 +337,17 @@ fn global_memory_status_ex(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     zero(env.cpu, p + 4, 60);
     let _ = env.cpu.write_u32(p + 4, 30);
-    for (i, v) in [0x8000_0000u64, 0x6000_0000, 0xffff_ffff, 0xc000_0000, 0x7ffe_0000, 0x7000_0000].iter().enumerate() {
+    for (i, v) in [
+        0x8000_0000u64,
+        0x6000_0000,
+        0xffff_ffff,
+        0xc000_0000,
+        0x7ffe_0000,
+        0x7000_0000,
+    ]
+    .iter()
+    .enumerate()
+    {
         let _ = env.cpu.write_u32(p + 8 + 8 * i as u32, *v as u32);
         let _ = env.cpu.write_u32(p + 12 + 8 * i as u32, (*v >> 32) as u32);
     }
@@ -311,10 +385,18 @@ pub(super) fn register(reg: &mut Registry) {
         set_last_error(e, err::INVALID_HANDLE);
         Outcome::Return(0)
     });
-    stdcall(reg, K32, "GetCurrentProcessId", 0, |e| Outcome::Return(e.sys.pid));
-    stdcall(reg, K32, "GetCurrentThreadId", 0, |e| Outcome::Return(e.ctx().tid));
-    stdcall(reg, K32, "GetCurrentProcess", 0, |_| Outcome::Return(u32::MAX));
-    stdcall(reg, K32, "GetCurrentThread", 0, |_| Outcome::Return(u32::MAX - 1));
+    stdcall(reg, K32, "GetCurrentProcessId", 0, |e| {
+        Outcome::Return(e.sys.pid)
+    });
+    stdcall(reg, K32, "GetCurrentThreadId", 0, |e| {
+        Outcome::Return(e.ctx().tid)
+    });
+    stdcall(reg, K32, "GetCurrentProcess", 0, |_| {
+        Outcome::Return(u32::MAX)
+    });
+    stdcall(reg, K32, "GetCurrentThread", 0, |_| {
+        Outcome::Return(u32::MAX - 1)
+    });
     stdcall(reg, K32, "ExitProcess", 1, exit_process);
     stdcall(reg, K32, "TerminateProcess", 2, terminate_process);
     stdcall(reg, K32, "ExitThread", 1, |e| Outcome::ExitThread(e.arg(0)));
@@ -325,7 +407,9 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetPriorityClass", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetPriorityClass", 1, |_| Outcome::Return(0x20));
     stdcall(reg, K32, "SetThreadAffinityMask", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "SetProcessAffinityMask", 2, |_| Outcome::Return(1));
+    stdcall(reg, K32, "SetProcessAffinityMask", 2, |_| {
+        Outcome::Return(1)
+    });
     stdcall(reg, K32, "GetCommandLineA", 0, command_line_a);
     stdcall(reg, K32, "GetCommandLineW", 0, command_line_w);
     stdcall(reg, K32, "GetStartupInfoA", 1, get_startup_info);
@@ -334,12 +418,30 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetStdHandle", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "GetConsoleMode", 2, |_| Outcome::Return(0));
-    stdcall(reg, K32, "GetConsoleCP", 0, |e| Outcome::Return(e.ext.get::<Win32>().codec.acp));
-    stdcall(reg, K32, "GetConsoleOutputCP", 0, |e| Outcome::Return(e.ext.get::<Win32>().codec.acp));
+    stdcall(reg, K32, "GetConsoleCP", 0, |e| {
+        Outcome::Return(e.ext.get::<Win32>().codec.acp)
+    });
+    stdcall(reg, K32, "GetConsoleOutputCP", 0, |e| {
+        Outcome::Return(e.ext.get::<Win32>().codec.acp)
+    });
     stdcall(reg, K32, "IsDebuggerPresent", 0, |_| Outcome::Return(0));
-    stdcall(reg, K32, "IsProcessorFeaturePresent", 1, is_processor_feature_present);
-    stdcall(reg, K32, "SetUnhandledExceptionFilter", 1, set_unhandled_exception_filter);
-    stdcall(reg, K32, "UnhandledExceptionFilter", 1, |_| Outcome::Return(0));
+    stdcall(
+        reg,
+        K32,
+        "IsProcessorFeaturePresent",
+        1,
+        is_processor_feature_present,
+    );
+    stdcall(
+        reg,
+        K32,
+        "SetUnhandledExceptionFilter",
+        1,
+        set_unhandled_exception_filter,
+    );
+    stdcall(reg, K32, "UnhandledExceptionFilter", 1, |_| {
+        Outcome::Return(0)
+    });
     stdcall(reg, K32, "RaiseException", 4, raise_exception);
     stdcall(reg, K32, "RtlUnwind", 4, rtl_unwind);
     stdcall(reg, K32, "SetErrorMode", 1, |_| Outcome::Return(0));

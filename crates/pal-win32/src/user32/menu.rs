@@ -49,7 +49,11 @@ impl Menus {
             if let Some(items) = self.menus.remove(&menu) {
                 objects.remove(&menu);
                 self.help_ids.remove(&menu);
-                pending.extend(items.iter().filter_map(|item| (item.submenu != 0).then_some(item.submenu)));
+                pending.extend(
+                    items
+                        .iter()
+                        .filter_map(|item| (item.submenu != 0).then_some(item.submenu)),
+                );
             }
         }
         true
@@ -64,7 +68,9 @@ impl Menus {
             if begin == 0 && !visited.insert(menu) {
                 continue;
             }
-            let Some(items) = self.menus.get(&menu) else { continue };
+            let Some(items) = self.menus.get(&menu) else {
+                continue;
+            };
             for (at, item) in items.iter().enumerate().skip(begin) {
                 if item.id == value {
                     return Some((menu, at));
@@ -89,7 +95,11 @@ impl Menus {
                 continue;
             }
             if let Some(items) = self.menus.get(&menu) {
-                pending.extend(items.iter().filter_map(|item| (item.submenu != 0).then_some(item.submenu)));
+                pending.extend(
+                    items
+                        .iter()
+                        .filter_map(|item| (item.submenu != 0).then_some(item.submenu)),
+                );
             }
         }
         false
@@ -105,7 +115,12 @@ pub(super) fn class_menu(env: &mut Env<'_>, class: usize, pointer: u32, wide: bo
     user_mut(env).menus.class_resources.insert(class, resource);
 }
 
-pub(super) fn attach_creation(env: &mut Env<'_>, hwnd: u32, menu: u32, child: bool) -> Result<u32, u32> {
+pub(super) fn attach_creation(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    menu: u32,
+    child: bool,
+) -> Result<u32, u32> {
     if child {
         return Ok(0);
     }
@@ -117,7 +132,11 @@ pub(super) fn attach_creation(env: &mut Env<'_>, hwnd: u32, menu: u32, child: bo
     } else {
         let win = &user(env).windows[&hwnd];
         let resource = user(env).menus.class_resources.get(&win.class).cloned();
-        if let Some(resource) = resource { load_resource(env, win.instance, &resource)? } else { 0 }
+        if let Some(resource) = resource {
+            load_resource(env, win.instance, &resource)?
+        } else {
+            0
+        }
     };
     if menu != 0 {
         user_mut(env).menus.attached.insert(hwnd, menu);
@@ -134,7 +153,8 @@ fn get_system_menu(env: &mut Env<'_>) -> Outcome {
     let style = window.style;
     // CS_NOCLOSE removes Close from the initial menu. A native TRUE reset
     // restores the unmodified default menu, including Close, for this window.
-    let no_close = user(env).classes[window.class].style & 0x200 != 0 && !user(env).menus.restored.contains(&hwnd);
+    let no_close = user(env).classes[window.class].style & 0x200 != 0
+        && !user(env).menus.restored.contains(&hwnd);
     let u = user_mut(env);
     if revert {
         u.menus.remove_system(hwnd, &mut u.objects);
@@ -149,16 +169,40 @@ fn get_system_menu(env: &mut Env<'_>) -> Outcome {
     }
     let menu = u.add_object("system menu".into());
     let enabled = |yes| if yes { 0 } else { 3 }; // MF_DISABLED | MF_GRAYED
-    let label = |id, flags, text: &str| Item { id, flags, text: text.encode_utf16().collect(), ..Item::default() };
+    let label = |id, flags, text: &str| Item {
+        id,
+        flags,
+        text: text.encode_utf16().collect(),
+        ..Item::default()
+    };
     let mut items = vec![
-        label(0xf120, enabled(style & (0x01000000 | 0x20000000) != 0), "&Restore"),
+        label(
+            0xf120,
+            enabled(style & (0x01000000 | 0x20000000) != 0),
+            "&Restore",
+        ),
         label(0xf010, enabled(style & 0x01000000 == 0), "&Move"),
-        label(0xf000, enabled(style & 0x40000 != 0 && style & 0x01000000 == 0), "&Size"),
-        label(0xf020, enabled(style & 0x20000 != 0 && style & 0x20000000 == 0), "Mi&nimize"),
-        label(0xf030, enabled(style & 0x10000 != 0 && style & 0x01000000 == 0), "Ma&ximize"),
+        label(
+            0xf000,
+            enabled(style & 0x40000 != 0 && style & 0x01000000 == 0),
+            "&Size",
+        ),
+        label(
+            0xf020,
+            enabled(style & 0x20000 != 0 && style & 0x20000000 == 0),
+            "Mi&nimize",
+        ),
+        label(
+            0xf030,
+            enabled(style & 0x10000 != 0 && style & 0x01000000 == 0),
+            "Ma&ximize",
+        ),
     ];
     if !no_close {
-        items.push(Item { flags: 0x800, ..Item::default() }); // separator
+        items.push(Item {
+            flags: 0x800,
+            ..Item::default()
+        }); // separator
         items.push(label(0xf060, 0x1000, "&Close\tAlt+F4"));
     }
     u.menus.owners.insert(hwnd, menu);
@@ -215,7 +259,11 @@ fn item_info(env: &mut Env<'_>, wide: bool, replace: bool) -> Outcome {
         set_last_error(env, 87);
         return Outcome::Return(0);
     }
-    let mut item = if replace { user(env).menus.menus[&menu][at].clone() } else { Item::default() };
+    let mut item = if replace {
+        user(env).menus.menus[&menu][at].clone()
+    } else {
+        Item::default()
+    };
     if mask & 1 != 0 {
         item.flags = (item.flags & !0x108b) | (read(12) & 0x108b);
     }
@@ -227,8 +275,18 @@ fn item_info(env: &mut Env<'_>, wide: bool, replace: bool) -> Outcome {
     }
     if mask & 4 != 0 {
         let submenu = read(20);
-        if submenu != 0 && (!user(env).menus.menus.contains_key(&submenu) || user(env).menus.reaches(submenu, menu)) {
-            set_last_error(env, if user(env).menus.menus.contains_key(&submenu) { 87 } else { 1401 });
+        if submenu != 0
+            && (!user(env).menus.menus.contains_key(&submenu)
+                || user(env).menus.reaches(submenu, menu))
+        {
+            set_last_error(
+                env,
+                if user(env).menus.menus.contains_key(&submenu) {
+                    87
+                } else {
+                    1401
+                },
+            );
             return Outcome::Return(0);
         }
         item.submenu = submenu;
@@ -311,19 +369,40 @@ fn get_item(env: &mut Env<'_>, wide: bool) -> Outcome {
         fields.push((44, item.bitmap));
     }
     let text = if wide {
-        item.text.iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<_>>()
+        item.text
+            .iter()
+            .flat_map(|u| u.to_le_bytes())
+            .collect::<Vec<_>>()
     } else {
-        env.ext.get::<crate::Win32>().codec.from_utf16(0, &item.text).0
+        env.ext
+            .get::<crate::Win32>()
+            .codec
+            .from_utf16(0, &item.text)
+            .0
     };
     if mask & 0x10 != 0 && item.flags & (0x4 | 0x100 | 0x800) != 0 {
         // Native legacy queries return a scalar for bitmap items and zero for
         // separators/owner-draw items. The caller's out/cch are not buffers.
-        fields.extend([(36, if item.flags & 0x4 != 0 { item.bitmap } else { 0 }), (40, 0)]);
+        fields.extend([
+            (
+                36,
+                if item.flags & 0x4 != 0 {
+                    item.bitmap
+                } else {
+                    0
+                },
+            ),
+            (40, 0),
+        ]);
     } else if mask & (0x40 | 0x10) != 0 {
         let out = env.cpu.read_u32(pointer + 36).unwrap_or(0);
         let capacity = env.cpu.read_u32(pointer + 40).unwrap_or(0) as usize;
         let width = if wide { 2 } else { 1 };
-        let n = if out == 0 { text.len() / width } else { (text.len() / width).min(capacity.saturating_sub(1)) };
+        let n = if out == 0 {
+            text.len() / width
+        } else {
+            (text.len() / width).min(capacity.saturating_sub(1))
+        };
         fields.push((40, n as u32));
         if out != 0 && capacity != 0 {
             let mut output = text[..n * width].to_vec();
@@ -367,17 +446,29 @@ fn create_menu(env: &mut Env<'_>) -> Outcome {
 fn destroy_menu(env: &mut Env<'_>) -> Outcome {
     let menu = env.arg(0);
     let u = user_mut(env);
-    if u.menus.destroy(menu, &mut u.objects) { Outcome::Return(1) } else { menu_error(env, 1401) }
+    if u.menus.destroy(menu, &mut u.objects) {
+        Outcome::Return(1)
+    } else {
+        menu_error(env, 1401)
+    }
 }
 fn get_menu(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let Some(win) = user(env).windows.get(&hwnd) else { return menu_error(env, 1400) };
+    let Some(win) = user(env).windows.get(&hwnd) else {
+        return menu_error(env, 1400);
+    };
     // USER32's shared slot is a control ID for a child, never an attachment.
-    Outcome::Return(if win.parent != 0 { win.id } else { user(env).menus.attached.get(&hwnd).copied().unwrap_or(0) })
+    Outcome::Return(if win.parent != 0 {
+        win.id
+    } else {
+        user(env).menus.attached.get(&hwnd).copied().unwrap_or(0)
+    })
 }
 fn set_menu(env: &mut Env<'_>) -> Outcome {
     let (hwnd, menu) = (env.arg(0), env.arg(1));
-    let Some(win) = user(env).windows.get(&hwnd) else { return menu_error(env, 1400) };
+    let Some(win) = user(env).windows.get(&hwnd) else {
+        return menu_error(env, 1400);
+    };
     if win.parent != 0 {
         return menu_error(env, 1436);
     }
@@ -398,7 +489,12 @@ fn get_submenu(env: &mut Env<'_>) -> Outcome {
         return menu_error(env, 1401);
     }
     Outcome::Return(
-        user(env).menus.menus.get(&menu).and_then(|items| items.get(at as usize)).map_or(0, |item| item.submenu),
+        user(env)
+            .menus
+            .menus
+            .get(&menu)
+            .and_then(|items| items.get(at as usize))
+            .map_or(0, |item| item.submenu),
     )
 }
 fn text(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Vec<u16>, u32> {
@@ -417,8 +513,12 @@ fn text(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Vec<u16>, u32> {
         }
         Err(206)
     } else {
-        let bytes = env.cpu.read_cstr(pointer, crate::util::MAX_STR).map_err(|_| 87u32)?;
-        if bytes.len() == crate::util::MAX_STR || pointer.checked_add(bytes.len() as u32).is_none() {
+        let bytes = env
+            .cpu
+            .read_cstr(pointer, crate::util::MAX_STR)
+            .map_err(|_| 87u32)?;
+        if bytes.len() == crate::util::MAX_STR || pointer.checked_add(bytes.len() as u32).is_none()
+        {
             return Err(206);
         }
         Ok(env.ext.get::<crate::Win32>().codec.to_utf16(0, &bytes))
@@ -431,9 +531,17 @@ fn legacy_insert(env: &mut Env<'_>, wide: bool, append: bool) -> Outcome {
     }
     let shift = u32::from(!append);
     let (flags, id, source) = (env.arg(1 + shift), env.arg(2 + shift), env.arg(3 + shift));
-    let target = if append { None } else { user(env).menus.locate(menu, env.arg(1), flags & 0x400 != 0) };
+    let target = if append {
+        None
+    } else {
+        user(env).menus.locate(menu, env.arg(1), flags & 0x400 != 0)
+    };
     let (menu, at) = target.unwrap_or((menu, user(env).menus.menus[&menu].len()));
-    let mut item = Item { id, flags: flags & !0x410, ..Item::default() };
+    let mut item = Item {
+        id,
+        flags: flags & !0x410,
+        ..Item::default()
+    };
     if flags & 0x10 != 0 {
         if !user(env).menus.menus.contains_key(&id) {
             return menu_error(env, 1401);
@@ -503,7 +611,10 @@ impl Template<'_> {
             return Err(13);
         }
         self.menus += 1;
-        let mut result = ParsedMenu { items: Vec::new(), help };
+        let mut result = ParsedMenu {
+            items: Vec::new(),
+            help,
+        };
         loop {
             self.items += 1;
             if self.items > 16384 {
@@ -519,7 +630,11 @@ impl Template<'_> {
                 let information = self.word()?;
                 (
                     u32::from(information & !0x90),
-                    if information & 0x10 == 0 { u32::from(self.word()?) } else { 0 },
+                    if information & 0x10 == 0 {
+                        u32::from(self.word()?)
+                    } else {
+                        0
+                    },
                     information,
                 )
             };
@@ -532,8 +647,15 @@ impl Template<'_> {
                 label.push(unit);
             }
             let popup = information & if self.extended { 1 } else { 0x10 } != 0;
-            let mut item = Item { id, flags, text: label, ..Item::default() };
-            if flags & 0x800 != 0 || (!self.extended && !popup && item.id == 0 && item.text.is_empty()) {
+            let mut item = Item {
+                id,
+                flags,
+                text: label,
+                ..Item::default()
+            };
+            if flags & 0x800 != 0
+                || (!self.extended && !popup && item.id == 0 && item.text.is_empty())
+            {
                 item.flags |= 0x800;
                 item.flags |= 3;
             }
@@ -572,11 +694,23 @@ fn build_menu(env: &mut Env<'_>, parsed: ParsedMenu, extended: bool) -> u32 {
     user_mut(env).menus.help_ids.insert(menu, parsed.help);
     menu
 }
-fn parse_template(cpu: &dyn pal_cpu::Guest, base: u32, len: u32) -> Result<(ParsedMenu, bool, usize), u32> {
+fn parse_template(
+    cpu: &dyn pal_cpu::Guest,
+    base: u32,
+    len: u32,
+) -> Result<(ParsedMenu, bool, usize), u32> {
     if base == 0 || len > 1024 * 1024 {
         return Err(13);
     }
-    let mut input = Template { cpu, base, len, at: 0, extended: false, items: 0, menus: 0 };
+    let mut input = Template {
+        cpu,
+        base,
+        len,
+        at: 0,
+        extended: false,
+        items: 0,
+        menus: 0,
+    };
     let version = input.word()?;
     let offset = input.word()?;
     if version > 1 {
@@ -601,7 +735,9 @@ fn load_template(env: &mut Env<'_>, base: u32, len: u32) -> Result<u32, u32> {
     Ok(build_menu(env, parsed, extended))
 }
 fn load_resource(env: &mut Env<'_>, instance: u32, name: &pal_pe::ResId) -> Result<u32, u32> {
-    let (base, len) = crate::kernel32::find_resource_data(env, instance, &pal_pe::ResId::Id(4), name).ok_or(1814u32)?;
+    let (base, len) =
+        crate::kernel32::find_resource_data(env, instance, &pal_pe::ResId::Id(4), name)
+            .ok_or(1814u32)?;
     load_template(env, base, len)
 }
 fn load_menu(env: &mut Env<'_>, wide: bool) -> Outcome {
@@ -621,12 +757,24 @@ fn load_indirect(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, super::USER32, "GetSystemMenu", 2, get_system_menu);
-    stdcall(reg, super::USER32, "InsertMenuItemA", 4, |e| item_info(e, false, false));
-    stdcall(reg, super::USER32, "InsertMenuItemW", 4, |e| item_info(e, true, false));
-    stdcall(reg, super::USER32, "SetMenuItemInfoA", 4, |e| item_info(e, false, true));
-    stdcall(reg, super::USER32, "SetMenuItemInfoW", 4, |e| item_info(e, true, true));
-    stdcall(reg, super::USER32, "GetMenuItemInfoA", 4, |e| get_item(e, false));
-    stdcall(reg, super::USER32, "GetMenuItemInfoW", 4, |e| get_item(e, true));
+    stdcall(reg, super::USER32, "InsertMenuItemA", 4, |e| {
+        item_info(e, false, false)
+    });
+    stdcall(reg, super::USER32, "InsertMenuItemW", 4, |e| {
+        item_info(e, true, false)
+    });
+    stdcall(reg, super::USER32, "SetMenuItemInfoA", 4, |e| {
+        item_info(e, false, true)
+    });
+    stdcall(reg, super::USER32, "SetMenuItemInfoW", 4, |e| {
+        item_info(e, true, true)
+    });
+    stdcall(reg, super::USER32, "GetMenuItemInfoA", 4, |e| {
+        get_item(e, false)
+    });
+    stdcall(reg, super::USER32, "GetMenuItemInfoW", 4, |e| {
+        get_item(e, true)
+    });
     stdcall(reg, super::USER32, "DeleteMenu", 3, |e| edit(e, 0));
     stdcall(reg, super::USER32, "RemoveMenu", 3, |e| edit(e, 3));
     stdcall(reg, super::USER32, "EnableMenuItem", 3, |e| edit(e, 1));
@@ -648,18 +796,26 @@ pub(super) fn register(reg: &mut Registry) {
                 .menus
                 .get(&e.arg(0))
                 .and_then(|items| items.get(e.arg(1) as usize))
-                .map_or(u32::MAX, |item| if item.submenu == 0 { item.id } else { u32::MAX }),
+                .map_or(
+                    u32::MAX,
+                    |item| if item.submenu == 0 { item.id } else { u32::MAX },
+                ),
         )
     });
     stdcall(reg, super::USER32, "GetMenuState", 3, |e| {
-        let Some((menu, at)) = user(e).menus.locate(e.arg(0), e.arg(1), e.arg(2) & 0x400 != 0) else {
+        let Some((menu, at)) = user(e)
+            .menus
+            .locate(e.arg(0), e.arg(1), e.arg(2) & 0x400 != 0)
+        else {
             return Outcome::Return(u32::MAX);
         };
         let item = &user(e).menus.menus[&menu][at];
         let flags = if item.submenu == 0 {
             item.flags
         } else {
-            (item.flags & 0xff) | 0x10 | ((user(e).menus.menus.get(&item.submenu).map_or(0, Vec::len) as u32) << 8)
+            (item.flags & 0xff)
+                | 0x10
+                | ((user(e).menus.menus.get(&item.submenu).map_or(0, Vec::len) as u32) << 8)
         };
         Outcome::Return(flags)
     });
@@ -673,10 +829,18 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, super::USER32, "LoadMenuW", 2, |e| load_menu(e, true));
     stdcall(reg, super::USER32, "LoadMenuIndirectA", 1, load_indirect);
     stdcall(reg, super::USER32, "LoadMenuIndirectW", 1, load_indirect);
-    stdcall(reg, super::USER32, "AppendMenuA", 4, |e| legacy_insert(e, false, true));
-    stdcall(reg, super::USER32, "AppendMenuW", 4, |e| legacy_insert(e, true, true));
-    stdcall(reg, super::USER32, "InsertMenuA", 5, |e| legacy_insert(e, false, false));
-    stdcall(reg, super::USER32, "InsertMenuW", 5, |e| legacy_insert(e, true, false));
+    stdcall(reg, super::USER32, "AppendMenuA", 4, |e| {
+        legacy_insert(e, false, true)
+    });
+    stdcall(reg, super::USER32, "AppendMenuW", 4, |e| {
+        legacy_insert(e, true, true)
+    });
+    stdcall(reg, super::USER32, "InsertMenuA", 5, |e| {
+        legacy_insert(e, false, false)
+    });
+    stdcall(reg, super::USER32, "InsertMenuW", 5, |e| {
+        legacy_insert(e, true, false)
+    });
 }
 
 #[cfg(test)]
@@ -691,13 +855,19 @@ mod tests {
         }
         fn set_reg(&mut self, _: Reg, _: u32) {}
         fn read(&self, addr: u32, out: &mut [u8]) -> Result<(), MemFault> {
-            let fault = MemFault { addr, len: out.len() as u32 };
+            let fault = MemFault {
+                addr,
+                len: out.len() as u32,
+            };
             let at = addr.checked_sub(BASE).ok_or(fault)? as usize;
             out.copy_from_slice(self.0.get(at..at + out.len()).ok_or(fault)?);
             Ok(())
         }
         fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), MemFault> {
-            Err(MemFault { addr, len: data.len() as u32 })
+            Err(MemFault {
+                addr,
+                len: data.len() as u32,
+            })
         }
         fn map(&mut self, addr: u32, len: u32, _: Prot) -> Result<(), MemFault> {
             Err(MemFault { addr, len })
@@ -715,11 +885,19 @@ mod tests {
     }
     #[test]
     fn malformed_and_short_templates_fail_before_building_menu_handles() {
-        for words in [&[0u16, 0][..], &[2, 0], &[1, 0, 0, 0], &[0, 0, 0x80, 1, b'x' as u16]] {
+        for words in [
+            &[0u16, 0][..],
+            &[2, 0],
+            &[1, 0, 0, 0],
+            &[0, 0, 0x80, 1, b'x' as u16],
+        ] {
             assert!(matches!(parse(words), Err(13)));
         }
         let guest = TemplateGuest(vec![0; 4]);
-        assert!(matches!(parse_template(&guest, BASE, 1024 * 1024 + 1), Err(13)));
+        assert!(matches!(
+            parse_template(&guest, BASE, 1024 * 1024 + 1),
+            Err(13)
+        ));
         assert!(matches!(parse_template(&guest, u32::MAX, 16), Err(13)));
     }
     #[test]
@@ -745,8 +923,26 @@ mod tests {
     fn cyclic_links_are_detected_and_destroy_visits_shared_submenus_once() {
         let mut menus = Menus::default();
         let mut objects = HashMap::new();
-        menus.menus.insert(1, vec![Item { submenu: 2, ..Item::default() }, Item { submenu: 2, ..Item::default() }]);
-        menus.menus.insert(2, vec![Item { submenu: 3, ..Item::default() }]);
+        menus.menus.insert(
+            1,
+            vec![
+                Item {
+                    submenu: 2,
+                    ..Item::default()
+                },
+                Item {
+                    submenu: 2,
+                    ..Item::default()
+                },
+            ],
+        );
+        menus.menus.insert(
+            2,
+            vec![Item {
+                submenu: 3,
+                ..Item::default()
+            }],
+        );
         menus.menus.insert(3, Vec::new());
         for handle in 1..=3 {
             objects.insert(handle, "menu".into());

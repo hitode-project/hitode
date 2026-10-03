@@ -28,15 +28,23 @@ fn main() {
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let stubs = manifest.join("../../tools/android/stubs").join(&target);
-    assert!(stubs.join("libpthread.a").is_file(), "missing empty libpthread.a stub in {}", stubs.display());
+    assert!(
+        stubs.join("libpthread.a").is_file(),
+        "missing empty libpthread.a stub in {}",
+        stubs.display()
+    );
     println!("cargo:rustc-link-search=native={}", stubs.display());
 
     let ndk = env::var_os("ANDROID_NDK_HOME")
         .or_else(|| env::var_os("ANDROID_NDK_ROOT"))
         .map(PathBuf::from)
         .expect("ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) must point at the NDK");
-    let builtins = find_builtins(&ndk, arch)
-        .unwrap_or_else(|| panic!("libclang_rt.builtins-{arch}-android.a not found under {}", ndk.display()));
+    let builtins = find_builtins(&ndk, arch).unwrap_or_else(|| {
+        panic!(
+            "libclang_rt.builtins-{arch}-android.a not found under {}",
+            ndk.display()
+        )
+    });
     println!("cargo:rustc-link-search=native={}", builtins.display());
     println!("cargo:rustc-link-lib=static=clang_rt.builtins-{arch}-android");
 }
@@ -51,7 +59,13 @@ fn find_builtins(ndk: &Path, arch: &str) -> Option<PathBuf> {
         for ver in clang.read_dir().into_iter().flatten().flatten() {
             let dir = ver.path().join("lib/linux");
             if dir.join(&file).is_file() {
-                let major: u32 = ver.file_name().to_string_lossy().split('.').next()?.parse().ok()?;
+                let major: u32 = ver
+                    .file_name()
+                    .to_string_lossy()
+                    .split('.')
+                    .next()?
+                    .parse()
+                    .ok()?;
                 found.push((major, dir));
             }
         }

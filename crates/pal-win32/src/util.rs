@@ -48,7 +48,9 @@ pub fn units_or_wstr(cpu: &dyn Guest, p: u32, len: i32) -> Vec<u16> {
     }
     let mut v = vec![0u8; len as usize * 2];
     let _ = cpu.read(p, &mut v);
-    v.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    v.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 
 pub fn write_units(cpu: &mut dyn Guest, p: u32, units: &[u16]) {
@@ -88,7 +90,9 @@ pub fn set_last_error(env: &mut Env<'_>, code: u32) {
 }
 
 pub fn last_error(env: &Env<'_>) -> u32 {
-    env.cpu.read_u32(env.ctx().teb + teb::LAST_ERROR).unwrap_or(0)
+    env.cpu
+        .read_u32(env.ctx().teb + teb::LAST_ERROR)
+        .unwrap_or(0)
 }
 
 /// Write `v` to guest `p` if `p` is not NULL.

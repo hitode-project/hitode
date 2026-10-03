@@ -17,7 +17,12 @@ struct Frames {
     period_us: u64,
 }
 
-fn timer_machine(quantum: Option<Duration>, frames: usize, workers: usize, period_us: u64) -> Machine<UnicornCpu> {
+fn timer_machine(
+    quantum: Option<Duration>,
+    frames: usize,
+    workers: usize,
+    period_us: u64,
+) -> Machine<UnicornCpu> {
     let mut registry = Registry::default();
     registry.add("test", "frame", Conv::Stdcall { argc: 0 }, |e| {
         let now = e.sys.clock.now_us();
@@ -31,7 +36,11 @@ fn timer_machine(quantum: Option<Duration>, frames: usize, workers: usize, perio
     let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), registry, Clock::real()).unwrap();
     m.set_scheduling_quantum(quantum).unwrap();
     m.set_execution_budget(Some(Duration::from_secs(10)));
-    m.ext.insert(Frames { target: frames, period_us, ..Frames::default() });
+    m.ext.insert(Frames {
+        target: frames,
+        period_us,
+        ..Frames::default()
+    });
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     let frame = m.resolve_import("test", "frame").unwrap();
@@ -43,7 +52,8 @@ fn timer_machine(quantum: Option<Duration>, frames: usize, workers: usize, perio
         let at = WORKER + worker as u32 * 16;
         let mut code = Asm::new(at);
         code.bytes.extend_from_slice(&[0xff, 0x05]); // inc dword [DATA+4*worker]
-        code.bytes.extend_from_slice(&(DATA + 4 * worker as u32).to_le_bytes());
+        code.bytes
+            .extend_from_slice(&(DATA + 4 * worker as u32).to_le_bytes());
         code.jmp(at);
         m.cpu.write(at, &code.bytes).unwrap();
         m.spawn("compute", at, &[], 65536).unwrap();
@@ -57,9 +67,18 @@ fn timed_context_can_finish_inside_the_same_host_slice() {
     // Broad timeout, not a shared-runner microsecond latency gate. The old policy
     // returns Yielded here with only one frame; it cannot re-enter the timer context.
     let out = m.run_slice(Duration::from_millis(500));
-    assert!(matches!(out, SliceResult::Complete(RunResult::Exited(0))), "{out:?}");
+    assert!(
+        matches!(out, SliceResult::Complete(RunResult::Exited(0))),
+        "{out:?}"
+    );
     assert_eq!(m.ext.get::<Frames>().times_us.len(), 3);
-    assert!(m.ext.get::<Frames>().times_us.windows(2).all(|w| w[1] - w[0] >= 2_000));
+    assert!(
+        m.ext
+            .get::<Frames>()
+            .times_us
+            .windows(2)
+            .all(|w| w[1] - w[0] >= 2_000)
+    );
     assert!(m.sys.scheduling.internal_preemptions >= 2);
     assert!(m.cpu.read_u32(DATA).unwrap() > 0);
 }
@@ -67,7 +86,10 @@ fn timed_context_can_finish_inside_the_same_host_slice() {
 #[test]
 fn opt_out_keeps_slice_only_policy() {
     let mut m = timer_machine(None, 3, 1, 2_000);
-    assert!(matches!(m.run_slice(Duration::from_millis(10)), SliceResult::Yielded));
+    assert!(matches!(
+        m.run_slice(Duration::from_millis(10)),
+        SliceResult::Yielded
+    ));
     assert_eq!(m.ext.get::<Frames>().times_us.len(), 1);
     assert_eq!(m.sys.scheduling.internal_preemptions, 0);
 }
@@ -92,7 +114,11 @@ fn real_pollers_all_get_a_turn_before_each_host_idle() {
     }
     for round in 1..=5 {
         assert!(matches!(m.run(), RunResult::Idle { .. }));
-        assert_eq!(*m.ext.get::<[u32; 3]>(), [round; 3], "host slept before completing round {round}");
+        assert_eq!(
+            *m.ext.get::<[u32; 3]>(),
+            [round; 3],
+            "host slept before completing round {round}"
+        );
     }
 }
 
@@ -122,7 +148,10 @@ fn internal_reschedules_do_not_renew_the_hard_watchdog() {
 fn zero_quantum_is_rejected_without_mutating_execution() {
     let mut m = timer_machine(None, 3, 1, 2_000);
     assert!(m.set_scheduling_quantum(Some(Duration::ZERO)).is_err());
-    assert!(matches!(m.run_slice(Duration::from_millis(10)), SliceResult::Yielded));
+    assert!(matches!(
+        m.run_slice(Duration::from_millis(10)),
+        SliceResult::Yielded
+    ));
     assert_eq!(m.sys.scheduling.internal_preemptions, 0);
 }
 
@@ -132,8 +161,14 @@ fn zero_quantum_is_rejected_without_mutating_execution() {
 #[ignore = "diagnostic wall-clock benchmark; run explicitly with --ignored --nocapture"]
 fn report_contended_frame_intervals() {
     for period_us in [1_000, 16_667] {
-        for (run, quantum) in
-            [None, Some(Duration::from_millis(1)), Some(Duration::from_millis(1)), None].into_iter().enumerate()
+        for (run, quantum) in [
+            None,
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut m = timer_machine(quantum, 33, 2, period_us);
             let start = Instant::now();
@@ -145,13 +180,26 @@ fn report_contended_frame_intervals() {
                 }
                 assert!(start.elapsed() < Duration::from_secs(5));
             }
-            let mut gaps: Vec<_> = m.ext.get::<Frames>().times_us.windows(2).map(|w| w[1] - w[0]).collect();
+            let mut gaps: Vec<_> = m
+                .ext
+                .get::<Frames>()
+                .times_us
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .collect();
             assert_eq!(gaps.len(), 32);
-            assert!(gaps.iter().all(|&gap| gap >= period_us), "guest Sleep was shortened");
+            assert!(
+                gaps.iter().all(|&gap| gap >= period_us),
+                "guest Sleep was shortened"
+            );
             gaps.sort_unstable();
             println!(
                 "LATENCY run={run} period_us={period_us} policy={} frames=33 samples=32 p50_us={} p95_us={} max_us={} worker0={} worker1={} diagnostics={:?}",
-                if quantum.is_some() { "deadline" } else { "slice-only" },
+                if quantum.is_some() {
+                    "deadline"
+                } else {
+                    "slice-only"
+                },
                 gaps[15],
                 gaps[30],
                 gaps[31],

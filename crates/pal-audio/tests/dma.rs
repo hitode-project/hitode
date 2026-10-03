@@ -40,13 +40,18 @@ fn no_alloc(mut action: impl FnMut()) {
     COUNT.with(|count| count.set(Some((0, 0))));
     action();
     let result = COUNT.with(|count| count.replace(None)).unwrap();
-    assert_eq!(result, (0, 0), "callback allocated or destroyed heap storage");
+    assert_eq!(
+        result,
+        (0, 0),
+        "callback allocated or destroyed heap storage"
+    );
 }
 fn sine(rate: u32, frequency: f64, frames: usize) -> Arc<View> {
     let values = (0..frames)
         .flat_map(|i| {
-            let sample =
-                ((i as f64 * std::f64::consts::TAU * frequency / f64::from(rate)).sin() * 12000.0).round() as i16;
+            let sample = ((i as f64 * std::f64::consts::TAU * frequency / f64::from(rate)).sin()
+                * 12000.0)
+                .round() as i16;
             sample.to_le_bytes()
         })
         .map(AtomicU8::new)
@@ -109,7 +114,13 @@ fn first_192khz_callback_and_loop_boundaries_preserve_waveform_without_allocatin
     let control = AudioControl::new(false);
     // Create and Play before opening the 192k device: initial 44.1k converter
     // must be replaced off the callback, never used at the wrong speed.
-    add(&control, 1, sine(44100, 1000.0, 44100), 44100, vec![(22050 * 2, 10)]);
+    add(
+        &control,
+        1,
+        sine(44100, 1000.0, 44100),
+        44100,
+        vec![(22050 * 2, 10)],
+    );
     control.written(1, 0, 88200);
     control.play_ring(1, true, 1);
     let mut reader = control.stream().device_reader(192000, 2).unwrap();
@@ -125,12 +136,26 @@ fn first_192khz_callback_and_loop_boundaries_preserve_waveform_without_allocatin
         })
         .collect();
     let stable = &mono[4096..];
-    let rms = (stable.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>() / stable.len() as f64).sqrt();
-    assert!((rms - 12000.0 / 32768.0 / 2.0f64.sqrt()).abs() < 0.0001, "amplitude {rms}");
-    let crossings = stable.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count();
+    let rms = (stable
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        / stable.len() as f64)
+        .sqrt();
+    assert!(
+        (rms - 12000.0 / 32768.0 / 2.0f64.sqrt()).abs() < 0.0001,
+        "amplitude {rms}"
+    );
+    let crossings = stable
+        .windows(2)
+        .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+        .count();
     let measured = crossings as f64 * 192000.0 / stable.len() as f64;
     assert!((measured - 1000.0).abs() < 1.0, "pitch {measured}");
-    let jump = stable.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0f32, f32::max);
+    let jump = stable
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .fold(0.0f32, f32::max);
     assert!(jump < 0.0121, "loop/resampler discontinuity {jump}");
     assert_eq!(control.stream().metrics().missing_output_frames, 0);
 }
@@ -171,7 +196,13 @@ fn hot_switch_new_source_frequency_seek_release_and_owned_pcm_allocate_only_off_
     });
     drop(first);
     let mut reader = control.stream().device_reader(192000, 2).unwrap();
-    add(&control, 2, sine(22050, 400.0, 22050), 22050, vec![(0, 11), (22050, 12)]);
+    add(
+        &control,
+        2,
+        sine(22050, 400.0, 22050),
+        22050,
+        vec![(0, 11), (22050, 12)],
+    );
     control.written(2, 0, 44100);
     control.play_ring(2, true, 1);
     control.set_frequency(1, 22050).unwrap();
@@ -199,7 +230,11 @@ fn hot_switch_new_source_frequency_seek_release_and_owned_pcm_allocate_only_off_
     });
     control.maintain();
     assert!(output.iter().all(|sample| sample.is_finite()));
-    assert_eq!(control.stream().metrics().missing_output_frames, 0, "natural PCM tail is not underflow");
+    assert_eq!(
+        control.stream().metrics().missing_output_frames,
+        0,
+        "natural PCM tail is not underflow"
+    );
 }
 
 #[test]
@@ -241,7 +276,11 @@ fn stream_reuse_silences_old_generation_but_full_preloaded_static_loops_keep_the
         reader.read(&mut output, 0);
     });
     assert_eq!(output[..600], [-0.5; 600]);
-    assert_eq!(output[600..], [0.0; 600], "previous role tail must not enter the new stream generation");
+    assert_eq!(
+        output[600..],
+        [0.0; 600],
+        "previous role tail must not enter the new stream generation"
+    );
     assert_eq!(control.stream().metrics().missing_output_frames, 300);
     drop(reader);
 
@@ -272,7 +311,11 @@ fn stream_reuse_silences_old_generation_but_full_preloaded_static_loops_keep_the
         assert_eq!(turn[..600], [-0.5; 600]);
         assert_eq!(turn[600..], [0.5; 1200]);
     }
-    assert_eq!(control.stream().metrics().missing_output_frames, 0, "a static loop's retained bytes are valid");
+    assert_eq!(
+        control.stream().metrics().missing_output_frames,
+        0,
+        "a static loop's retained bytes are valid"
+    );
 }
 
 #[test]
@@ -306,8 +349,14 @@ fn reopening_after_a_long_idle_gap_reanchors_time_without_skipping_the_new_voice
     control.play_ring(1, false, 2);
     let mut reader = control.stream().device_reader(1000, 2).unwrap();
     let result = reader.read(&mut output, 0);
-    assert!(result.first_pts_us >= 5_000_000, "reopened buffer uses the current device timeline");
-    assert_eq!(output, [0.5; 20], "host idle time must not advance the newly started source");
+    assert!(
+        result.first_pts_us >= 5_000_000,
+        "reopened buffer uses the current device timeline"
+    );
+    assert_eq!(
+        output, [0.5; 20],
+        "host idle time must not advance the newly started source"
+    );
     assert_eq!(control.stream().metrics().missing_output_frames, 0);
 }
 
@@ -323,7 +372,10 @@ fn saturated_commands_return_pcm_intact_and_pending_play_keeps_the_consumer_acti
             accepted += 1;
         }
     }
-    assert!(accepted > 2048 && accepted < 7000, "bounded queue must report saturation");
+    assert!(
+        accepted > 2048 && accepted < 7000,
+        "bounded queue must report saturation"
+    );
     let block = pal_audio::mixer::PcmBlock {
         stream_id: 2,
         guest_pts_us: 0,
@@ -331,7 +383,9 @@ fn saturated_commands_return_pcm_intact_and_pending_play_keeps_the_consumer_acti
         channels: 1,
         samples: vec![0.125; 441],
     };
-    let returned = control.push_pcm(block).expect_err("saturated PCM must be returned, not panicked or lost");
+    let returned = control
+        .push_pcm(block)
+        .expect_err("saturated PCM must be returned, not panicked or lost");
     assert_eq!(returned.samples, vec![0.125; 441]);
     let mut out = [0.0; 512];
     for _ in 0..5 {
@@ -341,13 +395,19 @@ fn saturated_commands_return_pcm_intact_and_pending_play_keeps_the_consumer_acti
         control.maintain();
     }
     assert!(control.stop_ring(1));
-    assert!(control.stream().active(), "pending Stop must keep command consumption alive");
+    assert!(
+        control.stream().active(),
+        "pending Stop must keep command consumption alive"
+    );
     no_alloc(|| {
         reader.read(&mut out, 0);
     });
     assert!(!control.stream().active());
     assert!(control.play_ring(1, true, 2));
-    assert!(control.stream().active(), "pending Play cannot be overwritten by consumer activity publication");
+    assert!(
+        control.stream().active(),
+        "pending Play cannot be overwritten by consumer activity publication"
+    );
     no_alloc(|| {
         reader.read(&mut out, 0);
     });
@@ -386,7 +446,10 @@ fn cursor_snapshot_is_coherent_while_the_callback_publishes() {
     let mut snapshots = 0;
     while !done.load(Ordering::Acquire) {
         if let Some(cursor) = state.cursor(1_000_000, 1) {
-            assert_eq!(cursor, 0, "position and timestamp must come from the same callback publication");
+            assert_eq!(
+                cursor, 0,
+                "position and timestamp must come from the same callback publication"
+            );
             snapshots += 1;
         }
     }
@@ -459,17 +522,31 @@ fn native_consumed_clock_does_not_treat_the_writable_buffer_as_already_played() 
         first = Some(reader.read_with_clock(
             &mut output,
             90000,
-            Some(pal_audio::DeviceClock { consumed_frames: 20, queued_frames: 30 }),
+            Some(pal_audio::DeviceClock {
+                consumed_frames: 20,
+                queued_frames: 30,
+            }),
         ));
     });
-    assert_eq!(first.unwrap().first_pts_us, 50000, "first write is after existing hardware padding");
-    assert_eq!(state.cursor(20000, 1), Some(50), "samples scheduled in the future have not advanced the play cursor");
+    assert_eq!(
+        first.unwrap().first_pts_us,
+        50000,
+        "first write is after existing hardware padding"
+    );
+    assert_eq!(
+        state.cursor(20000, 1),
+        Some(50),
+        "samples scheduled in the future have not advanced the play cursor"
+    );
     assert_eq!(state.cursor(55000, 1), Some(55));
     no_alloc(|| {
         reader.read_with_clock(
             &mut output,
             90000,
-            Some(pal_audio::DeviceClock { consumed_frames: 30, queued_frames: 30 }),
+            Some(pal_audio::DeviceClock {
+                consumed_frames: 30,
+                queued_frames: 30,
+            }),
         );
     });
     assert_eq!(state.cursor(65000, 1), Some(65));
@@ -479,16 +556,28 @@ fn native_consumed_clock_does_not_treat_the_writable_buffer_as_already_played() 
         reader.read_with_clock(
             &mut looped,
             90000,
-            Some(pal_audio::DeviceClock { consumed_frames: 40, queued_frames: 30 }),
+            Some(pal_audio::DeviceClock {
+                consumed_frames: 40,
+                queued_frames: 30,
+            }),
         );
     });
-    assert_eq!(state.cursor(1_165_000, 1), Some(165), "absolute phase must still wrap after actual loop consumption");
+    assert_eq!(
+        state.cursor(1_165_000, 1),
+        Some(165),
+        "absolute phase must still wrap after actual loop consumption"
+    );
 }
 
 #[test]
 fn an_ongoing_loop_advances_across_a_device_gap_while_a_new_play_starts_at_its_own_anchor() {
     let control = AudioControl::new(true);
-    let view = Arc::new(View((0..1000i16).flat_map(i16::to_le_bytes).map(AtomicU8::new).collect()));
+    let view = Arc::new(View(
+        (0..1000i16)
+            .flat_map(i16::to_le_bytes)
+            .map(AtomicU8::new)
+            .collect(),
+    ));
     control
         .add_ring(
             1,
@@ -542,8 +631,13 @@ fn owned_output(
     packets: bool,
 ) -> Vec<f32> {
     let control = AudioControl::new(false);
-    for (index, block) in
-        samples.chunks(if packets { 1024 * usize::from(source_channels) } else { samples.len() }).enumerate()
+    for (index, block) in samples
+        .chunks(if packets {
+            1024 * usize::from(source_channels)
+        } else {
+            samples.len()
+        })
+        .enumerate()
     {
         let first_frame = if packets { index * 1024 } else { 0 };
         let pts = first_frame as u64 * 1000 / u64::from(source_rate) * 1000;
@@ -559,8 +653,8 @@ fn owned_output(
     }
     control.end_pcm(1);
     let mut reader = control.stream().device_reader(rate, channels).unwrap();
-    let frames = (samples.len() as u64 / u64::from(source_channels) * u64::from(rate) / u64::from(source_rate))
-        as usize
+    let frames = (samples.len() as u64 / u64::from(source_channels) * u64::from(rate)
+        / u64::from(source_rate)) as usize
         + rate as usize / 10;
     let mut out = vec![0.0; frames * usize::from(channels)];
     let mut at = 0;
@@ -581,7 +675,12 @@ fn owned_output(
 #[test]
 fn owned_pcm_rounded_timestamps_join_and_real_overlap_is_trimmed() {
     let control = AudioControl::new(false);
-    for (pts, value, frames) in [(0, 0.25, 100), (99400, 0.5, 100), (150000, 0.75, 100), (100000, 1.0, 10)] {
+    for (pts, value, frames) in [
+        (0, 0.25, 100),
+        (99400, 0.5, 100),
+        (150000, 0.75, 100),
+        (100000, 1.0, 10),
+    ] {
         control
             .push_pcm(pal_audio::mixer::PcmBlock {
                 stream_id: 1,
@@ -622,17 +721,32 @@ fn owned_pcm_rounded_packets_match_one_block_at_all_output_rates() {
             let samples: Vec<_> = (0..16384)
                 .flat_map(|frame| {
                     (0..source_channels).map(move |channel| {
-                        (frame as f64 * std::f64::consts::TAU * 997.0 / f64::from(source_rate) + f64::from(channel))
-                            .sin() as f32
+                        (frame as f64 * std::f64::consts::TAU * 997.0 / f64::from(source_rate)
+                            + f64::from(channel))
+                        .sin() as f32
                             * 0.3
                     })
                 })
                 .collect();
-            for rate in [32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000] {
+            for rate in [
+                32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+            ] {
                 for channels in [1, 2, 6] {
-                    let expected = owned_output(rate, channels, source_rate, source_channels, &samples, false);
-                    let actual = owned_output(rate, channels, source_rate, source_channels, &samples, true);
-                    let delta = actual.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    let expected = owned_output(
+                        rate,
+                        channels,
+                        source_rate,
+                        source_channels,
+                        &samples,
+                        false,
+                    );
+                    let actual =
+                        owned_output(rate, channels, source_rate, source_channels, &samples, true);
+                    let delta = actual
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
                     assert!(
                         delta < 0.00001,
                         "source={source_rate}/{source_channels} output={rate}/{channels} packet delta={delta}"
@@ -645,14 +759,23 @@ fn owned_pcm_rounded_packets_match_one_block_at_all_output_rates() {
 
 #[test]
 fn owned_finite_pcm_keeps_the_resampler_tail() {
-    for rate in [32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000] {
+    for rate in [
+        32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+    ] {
         let mut samples = vec![0.0; 441];
         samples[440] = 0.5;
         let actual = owned_output(rate, 2, 44100, 1, &samples, false);
         samples.resize(1465, 0.0);
         let expected = owned_output(rate, 2, 44100, 1, &samples, false);
-        let delta = actual.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(delta < 0.000001, "finite owned tail at {rate}Hz differs by {delta}");
+        let delta = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            delta < 0.000001,
+            "finite owned tail at {rate}Hz differs by {delta}"
+        );
     }
 }
 
@@ -676,7 +799,10 @@ fn owned_finite_source_stays_active_until_its_filter_tail_is_drained() {
     no_alloc(|| {
         reader.read(&mut head, 0);
     });
-    assert!(control.active(), "logical EOF must not pause the device before the sinc tail");
+    assert!(
+        control.active(),
+        "logical EOF must not pause the device before the sinc tail"
+    );
     let mut tail = vec![0.0; 19200];
     no_alloc(|| {
         reader.read(&mut tail, 0);

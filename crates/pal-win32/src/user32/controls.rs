@@ -33,7 +33,9 @@ fn args(env: &Env<'_>) -> (u32, u32, u32, u32) {
 
 fn button_proc(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = args(env);
-    let Some(w) = user(env).windows.get(&hwnd) else { return Outcome::Return(0) };
+    let Some(w) = user(env).windows.get(&hwnd) else {
+        return Outcome::Return(0);
+    };
     let kind = w.style & 0xf;
     let (id, parent) = (w.id, w.parent);
     let r = match msg {
@@ -44,7 +46,13 @@ fn button_proc(env: &mut Env<'_>) -> Outcome {
             0
         }
         BM_SETSTATE => {
-            set_button(env, hwnd, |s| if wp != 0 { s | BST_PUSHED } else { s & !BST_PUSHED });
+            set_button(env, hwnd, |s| {
+                if wp != 0 {
+                    s | BST_PUSHED
+                } else {
+                    s & !BST_PUSHED
+                }
+            });
             0
         }
         BM_SETSTYLE => {
@@ -83,9 +91,14 @@ fn button_proc(env: &mut Env<'_>) -> Outcome {
                 _ => {}
             }
             // The parent learns about the click through WM_COMMAND.
-            return send(env, parent, wm::COMMAND, make_long(id as i32, BN_CLICKED as i32), hwnd, |_, _| {
-                Outcome::Return(0)
-            });
+            return send(
+                env,
+                parent,
+                wm::COMMAND,
+                make_long(id as i32, BN_CLICKED as i32),
+                hwnd,
+                |_, _| Outcome::Return(0),
+            );
         }
         wm::GETDLGCODE => match kind {
             0 => 0x2010,                  // DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON
@@ -112,13 +125,23 @@ fn set_button(env: &mut Env<'_>, hwnd: u32, f: impl FnOnce(u32) -> u32) {
 /// Check an auto radio button and uncheck the others in its group.
 fn check_radio(env: &mut Env<'_>, hwnd: u32) {
     let u = user_mut(env);
-    let Some(parent) = u.windows.get(&hwnd).map(|w| w.parent) else { return };
-    let siblings = u.windows.get(&parent).map(|p| p.children.clone()).unwrap_or_default();
-    let Some(me) = siblings.iter().position(|&s| s == hwnd) else { return };
+    let Some(parent) = u.windows.get(&hwnd).map(|w| w.parent) else {
+        return;
+    };
+    let siblings = u
+        .windows
+        .get(&parent)
+        .map(|p| p.children.clone())
+        .unwrap_or_default();
+    let Some(me) = siblings.iter().position(|&s| s == hwnd) else {
+        return;
+    };
     // The group runs from the previous WS_GROUP control to the next one.
     let group = |h: &u32| u.windows.get(h).is_some_and(|w| w.style & WS_GROUP != 0);
     let start = (0..=me).rev().find(|&i| group(&siblings[i])).unwrap_or(0);
-    let end = (me + 1..siblings.len()).find(|&i| group(&siblings[i])).unwrap_or(siblings.len());
+    let end = (me + 1..siblings.len())
+        .find(|&i| group(&siblings[i]))
+        .unwrap_or(siblings.len());
     for &s in &siblings[start..end] {
         if let Some(w) = u.windows.get_mut(&s)
             && w.style & 0xf == BS_AUTORADIOBUTTON
@@ -133,7 +156,10 @@ fn static_proc(env: &mut Env<'_>) -> Outcome {
     match msg {
         // SS_NOTIFY statics take mouse input, others are transparent to it.
         wm::NCHITTEST => {
-            let notify = user(env).windows.get(&hwnd).is_some_and(|w| w.style & 0x100 != 0);
+            let notify = user(env)
+                .windows
+                .get(&hwnd)
+                .is_some_and(|w| w.style & 0x100 != 0);
             Outcome::Return(if notify { 1 } else { u32::MAX })
         }
         wm::PAINT => {
@@ -175,7 +201,10 @@ fn def_dlg_proc_a(env: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(r);
             }
             let w = &user(env).windows[&hwnd];
-            let res = w.extra.get(DWL_MSGRESULT as usize..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+            let res = w
+                .extra
+                .get(DWL_MSGRESULT as usize..4)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
             return Outcome::Return(res);
         }
         def_dlg_default(env, hwnd, msg, wp, lp)

@@ -45,7 +45,11 @@ pub fn decode_f64(bytes: &[u8]) -> f64 {
     let exponent = sign_exp & 0x7fff;
     if exponent == 0x7fff {
         let fraction = mantissa & !(1u64 << 63);
-        let payload = if fraction == 0 { 0 } else { (fraction >> 11) | (1u64 << 51) };
+        let payload = if fraction == 0 {
+            0
+        } else {
+            (fraction >> 11) | (1u64 << 51)
+        };
         return f64::from_bits(sign | (0x7ffu64 << 52) | payload);
     }
     // An unnormal x87 encoding is not a number. Pseudo-denormals (E=0,J=1) have
@@ -61,11 +65,19 @@ pub fn decode_f64(bytes: &[u8]) -> f64 {
     let mut binary_exp = power - 63 + leading as i32;
     if binary_exp < -1022 {
         let shift = power + 1011;
-        let fraction = if shift >= 0 { mantissa << shift } else { round_shift(mantissa, (-shift) as u32) };
+        let fraction = if shift >= 0 {
+            mantissa << shift
+        } else {
+            round_shift(mantissa, (-shift) as u32)
+        };
         // Rounding may promote the largest subnormal to the smallest normal.
         return f64::from_bits(sign | fraction);
     }
-    let mut significand = if leading > 52 { round_shift(mantissa, leading - 52) } else { mantissa << (52 - leading) };
+    let mut significand = if leading > 52 {
+        round_shift(mantissa, leading - 52)
+    } else {
+        mantissa << (52 - leading)
+    };
     if significand == 1u64 << 53 {
         significand >>= 1;
         binary_exp += 1;
@@ -120,10 +132,19 @@ mod tests {
             bytes[8..].copy_from_slice(&exponent.to_le_bytes());
             bytes
         };
-        assert_eq!(decode_f64(&extended((1u64 << 63) + (1u64 << 10), 16383)).to_bits(), 1f64.to_bits());
-        assert_eq!(decode_f64(&extended((1u64 << 63) + 3 * (1u64 << 10), 16383)).to_bits(), 1f64.to_bits() + 2);
+        assert_eq!(
+            decode_f64(&extended((1u64 << 63) + (1u64 << 10), 16383)).to_bits(),
+            1f64.to_bits()
+        );
+        assert_eq!(
+            decode_f64(&extended((1u64 << 63) + 3 * (1u64 << 10), 16383)).to_bits(),
+            1f64.to_bits() + 2
+        );
         assert_eq!(decode_f64(&extended(1u64 << 63, 16383 - 1075)).to_bits(), 0);
-        assert_eq!(decode_f64(&extended((1u64 << 63) + 1, 16383 - 1075)).to_bits(), 1);
+        assert_eq!(
+            decode_f64(&extended((1u64 << 63) + 1, 16383 - 1075)).to_bits(),
+            1
+        );
         assert_eq!(decode_f64(&extended(u64::MAX, 16383 + 1023)), f64::INFINITY);
     }
 }

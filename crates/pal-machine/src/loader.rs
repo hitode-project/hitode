@@ -60,7 +60,11 @@ pub trait FileSource {
 /// Resolve only module files. Ordinary guest file operations retain their exact
 /// paths. Share this order with capability preflight so it inspects the same DLL
 /// the loader will use: named file, bare name next to its importer, then dll/.
-pub fn module_file(files: &dyn FileSource, path: &str, importer_dir: Option<&str>) -> Option<(String, Vec<u8>)> {
+pub fn module_file(
+    files: &dyn FileSource,
+    path: &str,
+    importer_dir: Option<&str>,
+) -> Option<(String, Vec<u8>)> {
     if let Some(bytes) = files.read(path) {
         return Some((path.to_owned(), bytes));
     }
@@ -115,7 +119,9 @@ pub struct TlsImage {
 }
 
 pub fn is_host_module(sys: &Sys, key: &str) -> bool {
-    HOST_MODULES.contains(&key) || key.starts_with("api-ms-win-") || sys.thunks.registry.has_module(key)
+    HOST_MODULES.contains(&key)
+        || key.starts_with("api-ms-win-")
+        || sys.thunks.registry.has_module(key)
 }
 
 pub struct Loader<'a> {
@@ -144,7 +150,13 @@ fn prot_of(characteristics: u32) -> Prot {
 
 impl<'a> Loader<'a> {
     pub fn new(cpu: &'a mut dyn Guest, sys: &'a mut Sys, files: &'a dyn FileSource) -> Self {
-        Self { cpu, sys, files, inits: Vec::new(), importers: Vec::new() }
+        Self {
+            cpu,
+            sys,
+            files,
+            inits: Vec::new(),
+            importers: Vec::new(),
+        }
     }
 
     /// Load `path` (or bump the load count if it is already loaded).
@@ -157,7 +169,9 @@ impl<'a> Loader<'a> {
         if is_host_module(self.sys, &key) {
             return self.load_host(key, path);
         }
-        if let Some((resolved, bytes)) = module_file(self.files, path, self.importers.last().map(String::as_str)) {
+        if let Some((resolved, bytes)) =
+            module_file(self.files, path, self.importers.last().map(String::as_str))
+        {
             if resolved != path {
                 log::info!("{path}: found as {resolved}");
             }
@@ -190,8 +204,16 @@ impl<'a> Loader<'a> {
         }))
     }
 
-    fn load_image(&mut self, key: String, path: &str, bytes: Vec<u8>) -> Result<ModuleId, LoadError> {
-        let pe_err = |err| LoadError::Pe { path: path.to_owned(), err };
+    fn load_image(
+        &mut self,
+        key: String,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<ModuleId, LoadError> {
+        let pe_err = |err| LoadError::Pe {
+            path: path.to_owned(),
+            err,
+        };
         let mut pe = Pe::parse(&bytes).map_err(pe_err)?;
         drop(bytes);
 
@@ -205,11 +227,19 @@ impl<'a> Loader<'a> {
             if relocs.is_empty() && (has_code || stripped) {
                 return Err(LoadError::NoRelocs(path.to_owned(), pe.image_base));
             }
-            self.sys.vm.reserve(size).ok_or_else(|| LoadError::NoSpace(path.to_owned(), size))?
+            self.sys
+                .vm
+                .reserve(size)
+                .ok_or_else(|| LoadError::NoSpace(path.to_owned(), size))?
         };
         if base != pe.image_base {
-            let n = pe.relocate(base.wrapping_sub(pe.image_base)).map_err(pe_err)?;
-            log::debug!("{key}: rebased {:#x} -> {base:#x} ({n} fixups)", pe.image_base);
+            let n = pe
+                .relocate(base.wrapping_sub(pe.image_base))
+                .map_err(pe_err)?;
+            log::debug!(
+                "{key}: rebased {:#x} -> {base:#x} ({n} fixups)",
+                pe.image_base
+            );
         }
 
         let mut exports_by_name = std::collections::HashMap::new();
@@ -229,7 +259,11 @@ impl<'a> Loader<'a> {
             base,
             size,
             is_dll: pe.is_dll(),
-            entry: if pe.entry_rva != 0 { base + pe.entry_rva } else { 0 },
+            entry: if pe.entry_rva != 0 {
+                base + pe.entry_rva
+            } else {
+                0
+            },
             stack_reserve: pe.stack_reserve,
             exports_by_name,
             exports_by_ordinal,
@@ -242,28 +276,52 @@ impl<'a> Loader<'a> {
             // The directory's VAs were fixed up with the rest of the image.
             let index = self.sys.tls_images.len() as u32;
             let len = tls.raw_end_va.saturating_sub(tls.raw_start_va);
-            let template = pe.slice(tls.raw_start_va.wrapping_sub(base), len).map_err(pe_err)?.to_vec();
+            let template = pe
+                .slice(tls.raw_start_va.wrapping_sub(base), len)
+                .map_err(pe_err)?
+                .to_vec();
             if tls.index_va != 0 {
-                pe.set_u32(tls.index_va.wrapping_sub(base), index).map_err(pe_err)?;
+                pe.set_u32(tls.index_va.wrapping_sub(base), index)
+                    .map_err(pe_err)?;
             }
             if !self.sys.contexts.is_empty() {
-                log::warn!("{key}: static TLS in a DLL loaded after threads started; existing threads lack it");
+                log::warn!(
+                    "{key}: static TLS in a DLL loaded after threads started; existing threads lack it"
+                );
             }
-            self.sys.tls_images.push(TlsImage { index, template, zero_fill: tls.zero_fill });
+            self.sys.tls_images.push(TlsImage {
+                index,
+                template,
+                zero_fill: tls.zero_fill,
+            });
             tls_callbacks = pe.tls_callbacks(&tls, base).map_err(pe_err)?;
         }
 
         // Detours' setdll prepends DLLs to the import table so Windows loads them first
         // (never part of the game as shipped) and keeps the original table in its header. Bind the original: the game runs as it shipped, and the added DLLs never load.
         if let Some(orig) = pe.detours_original_imports().map_err(pe_err)? {
-            let now: Vec<String> = pe.imports().map_err(pe_err)?.into_iter().map(|m| m.dll).collect();
+            let now: Vec<String> = pe
+                .imports()
+                .map_err(pe_err)?
+                .into_iter()
+                .map(|m| m.dll)
+                .collect();
             pe.dirs[pal_pe::dir::IMPORT] = orig;
-            let kept: Vec<String> = pe.imports().map_err(pe_err)?.into_iter().map(|m| m.dll).collect();
+            let kept: Vec<String> = pe
+                .imports()
+                .map_err(pe_err)?
+                .into_iter()
+                .map(|m| m.dll)
+                .collect();
             let added: Vec<&String> = now.iter().filter(|d| !kept.contains(d)).collect();
-            log::info!("{key}: rewritten by Detours setdll; binding the original imports, not loading {added:?}");
+            log::info!(
+                "{key}: rewritten by Detours setdll; binding the original imports, not loading {added:?}"
+            );
         }
 
-        let dir = path.rfind(['\\', '/']).map_or(String::new(), |i| path[..i].to_owned());
+        let dir = path
+            .rfind(['\\', '/'])
+            .map_or(String::new(), |i| path[..i].to_owned());
         self.importers.push(dir);
         let bound = self.bind(&mut pe, path, base);
         self.importers.pop();
@@ -273,11 +331,13 @@ impl<'a> Loader<'a> {
         self.cpu.map(base, size, Prot::RW)?;
         self.cpu.write(base, &pe.image)?;
         if pe.section_alignment >= PAGE {
-            self.cpu.protect(base, align_up(pe.size_of_headers.max(1), PAGE), Prot::READ)?;
+            self.cpu
+                .protect(base, align_up(pe.size_of_headers.max(1), PAGE), Prot::READ)?;
             for s in &pe.sections {
                 let len = align_up(s.mem_size(), PAGE);
                 if len != 0 {
-                    self.cpu.protect(base + s.virtual_address, len, prot_of(s.characteristics))?;
+                    self.cpu
+                        .protect(base + s.virtual_address, len, prot_of(s.characteristics))?;
                 }
             }
         }
@@ -303,7 +363,10 @@ impl<'a> Loader<'a> {
 
     /// Fill the IAT and delay-load IAT (and the delay descriptor's HMODULE slot).
     fn bind(&mut self, pe: &mut Pe, path: &str, base: u32) -> Result<(), LoadError> {
-        let pe_err = |err| LoadError::Pe { path: path.to_owned(), err };
+        let pe_err = |err| LoadError::Pe {
+            path: path.to_owned(),
+            err,
+        };
         for m in pe.imports().map_err(pe_err)? {
             let dep = self.load(&m.dll)?;
             for imp in &m.imports {
@@ -321,7 +384,8 @@ impl<'a> Loader<'a> {
         for m in delay {
             let dep = self.load(&m.dll)?;
             if m.module_handle_rva != 0 {
-                pe.set_u32(m.module_handle_rva, self.sys.modules.get(dep).base).map_err(pe_err)?;
+                pe.set_u32(m.module_handle_rva, self.sys.modules.get(dep).base)
+                    .map_err(pe_err)?;
             }
             for imp in &m.imports {
                 let addr = self.resolve(dep, &imp.name)?;
@@ -350,11 +414,17 @@ impl<'a> Loader<'a> {
                 let dep = self.load(dll)?;
                 let sym = match func.strip_prefix('#').and_then(|o| o.parse().ok()) {
                     Some(o) => ImportName::Ordinal(o),
-                    None => ImportName::Name { hint: 0, name: func.to_owned() },
+                    None => ImportName::Name {
+                        hint: 0,
+                        name: func.to_owned(),
+                    },
                 };
                 self.resolve(dep, &sym)
             }
-            None => Err(LoadError::MissingExport { module: module.name.clone(), name }),
+            None => Err(LoadError::MissingExport {
+                module: module.name.clone(),
+                name,
+            }),
         }
     }
 }
@@ -368,14 +438,20 @@ pub struct HostDir {
 
 impl HostDir {
     pub fn new(root: impl Into<std::path::PathBuf>, guest_root: &str) -> Self {
-        Self { root: root.into(), guest_root: guest_root.trim_end_matches(['\\', '/']).to_owned() }
+        Self {
+            root: root.into(),
+            guest_root: guest_root.trim_end_matches(['\\', '/']).to_owned(),
+        }
     }
 
     /// Host path for a guest path, if it is under the root and exists.
     pub fn host_path(&self, guest: &str) -> Option<std::path::PathBuf> {
         let g = guest.replace('/', "\\");
         let prefix = format!("{}\\", self.guest_root.replace('/', "\\"));
-        let rel = if g.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(&prefix)) {
+        let rel = if g
+            .get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(&prefix))
+        {
             &g[prefix.len()..]
         } else if g.contains(':') || g.starts_with('\\') {
             return None;
@@ -417,7 +493,10 @@ mod host_dir_tests {
         std::fs::write(root.join(name), b"test").unwrap();
         let files = HostDir::new(&root, "C:\\Game");
         assert_eq!(files.host_path(name), Some(root.join(name)));
-        assert_eq!(files.host_path(&format!("C:\\Game\\{name}")), Some(root.join(name)));
+        assert_eq!(
+            files.host_path(&format!("C:\\Game\\{name}")),
+            Some(root.join(name))
+        );
         assert_eq!(files.host_path("C:\\時計\\other.exe"), None);
         std::fs::remove_dir_all(root).unwrap();
     }

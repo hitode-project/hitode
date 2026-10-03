@@ -52,7 +52,14 @@ pub struct Registry {
 
 impl Registry {
     pub fn add(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
-        self.fns.insert((module.to_ascii_lowercase(), name.to_owned()), HostFn { conv, handler, trace: false });
+        self.fns.insert(
+            (module.to_ascii_lowercase(), name.to_owned()),
+            HostFn {
+                conv,
+                handler,
+                trace: false,
+            },
+        );
     }
 
     pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
@@ -61,13 +68,18 @@ impl Registry {
     }
 
     pub fn set_trace(&mut self, module: &str, name: &str, on: bool) {
-        if let Some(f) = self.fns.get_mut(&(module.to_ascii_lowercase(), name.to_owned())) {
+        if let Some(f) = self
+            .fns
+            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
+        {
             f.trace = on;
         }
     }
 
     pub fn get(&self, module: &str, name: &str) -> Option<HostFn> {
-        self.fns.get(&(module.to_ascii_lowercase(), name.to_owned())).copied()
+        self.fns
+            .get(&(module.to_ascii_lowercase(), name.to_owned()))
+            .copied()
     }
 
     pub fn len(&self) -> usize {
@@ -115,10 +127,18 @@ impl ThunkTable {
         let pad = Thunk {
             module: String::new(),
             name: "<return pad>".into(),
-            f: HostFn { conv: Conv::Cdecl { argc: 0 }, handler: return_pad, trace: false },
+            f: HostFn {
+                conv: Conv::Cdecl { argc: 0 },
+                handler: return_pad,
+                trace: false,
+            },
             implemented: true,
         };
-        Self { registry, thunks: vec![pad], by_name: HashMap::new() }
+        Self {
+            registry,
+            thunks: vec![pad],
+            by_name: HashMap::new(),
+        }
     }
 
     /// A hook library can relocate the entry instructions or the entire thunk. The token
@@ -127,7 +147,8 @@ impl ThunkTable {
         let mut a = Asm::new(thunk_addr(index));
         // mov edi,edi; push ebp; mov ebp,esp; pop ebp. The first five bytes are
         // ordinary relocatable instructions; the frame is gone before argument decoding.
-        a.bytes.extend_from_slice(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d]);
+        a.bytes
+            .extend_from_slice(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d]);
         a.push_imm(index);
         a.trap();
         match conv {
@@ -138,7 +159,12 @@ impl ThunkTable {
     }
 
     /// Thunk address for `module!name`, creating (and writing) it on first use.
-    pub fn resolve(&mut self, cpu: &mut dyn Guest, module: &str, name: &str) -> Result<u32, MemFault> {
+    pub fn resolve(
+        &mut self,
+        cpu: &mut dyn Guest,
+        module: &str,
+        name: &str,
+    ) -> Result<u32, MemFault> {
         let key = (module.to_ascii_lowercase(), name.to_owned());
         if let Some(&i) = self.by_name.get(&key) {
             return Ok(thunk_addr(i));
@@ -148,10 +174,22 @@ impl ThunkTable {
         let (f, implemented) = match self.registry.get(module, name) {
             Some(f) => (f, true),
             // Unknown convention: it fails before returning, so `ret` is never reached.
-            None => (HostFn { conv: Conv::Cdecl { argc: 0 }, handler: unimplemented, trace: false }, false),
+            None => (
+                HostFn {
+                    conv: Conv::Cdecl { argc: 0 },
+                    handler: unimplemented,
+                    trace: false,
+                },
+                false,
+            ),
         };
         cpu.write(thunk_addr(index), &Self::emit(index, f.conv))?;
-        self.thunks.push(Thunk { module: key.0.clone(), name: name.to_owned(), f, implemented });
+        self.thunks.push(Thunk {
+            module: key.0.clone(),
+            name: name.to_owned(),
+            f,
+            implemented,
+        });
         self.by_name.insert(key, index);
         Ok(thunk_addr(index))
     }

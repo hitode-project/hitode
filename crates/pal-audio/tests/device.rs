@@ -13,8 +13,9 @@ fn real_device_stops_callbacks_while_silent_and_restarts() {
     let metrics = output.metrics();
     output.update();
     assert!(!output.is_running());
-    let samples: Vec<f32> =
-        (0..4800).map(|i| (i as f32 * std::f32::consts::TAU * 440.0 / 48000.0).sin() * 0.02).collect();
+    let samples: Vec<f32> = (0..4800)
+        .map(|i| (i as f32 * std::f32::consts::TAU * 440.0 / 48000.0).sin() * 0.02)
+        .collect();
     for pts in [0, 1_000_000] {
         {
             let m = &mixer;
@@ -38,7 +39,11 @@ fn real_device_stops_callbacks_while_silent_and_restarts() {
         assert!(!output.is_running());
         let before = metrics.callbacks.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(250));
-        assert_eq!(before, metrics.callbacks.load(Ordering::Relaxed), "silent output must have zero callbacks");
+        assert_eq!(
+            before,
+            metrics.callbacks.load(Ordering::Relaxed),
+            "silent output must have zero callbacks"
+        );
     }
     assert_eq!(metrics.starts.load(Ordering::Relaxed), 2);
     assert_eq!(metrics.stops.load(Ordering::Relaxed), 2);

@@ -27,10 +27,22 @@ pub struct Consumer<T> {
     _single: PhantomData<Cell<()>>,
 }
 pub fn channel<T>(slots: [T; 3]) -> (Producer<T>, Consumer<T>) {
-    let shared = Arc::new(Shared { slots: slots.map(UnsafeCell::new), middle: AtomicUsize::new(2) });
+    let shared = Arc::new(Shared {
+        slots: slots.map(UnsafeCell::new),
+        middle: AtomicUsize::new(2),
+    });
     (
-        Producer { shared: shared.clone(), slot: 0, latest: None, _single: PhantomData },
-        Consumer { shared, slot: 1, _single: PhantomData },
+        Producer {
+            shared: shared.clone(),
+            slot: 0,
+            latest: None,
+            _single: PhantomData,
+        },
+        Consumer {
+            shared,
+            slot: 1,
+            _single: PhantomData,
+        },
     )
 }
 impl<T> Producer<T> {
@@ -48,7 +60,8 @@ impl<T: Sync> Producer<T> {
     /// Diagnostic access to the last published value. The consumer never writes;
     /// the immutable borrow prevents this producer from recycling any slot.
     pub fn latest(&self) -> Option<&T> {
-        self.latest.map(|slot| unsafe { &*self.shared.slots[slot].get() })
+        self.latest
+            .map(|slot| unsafe { &*self.shared.slots[slot].get() })
     }
 }
 impl<T> Consumer<T> {

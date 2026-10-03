@@ -24,7 +24,12 @@ impl Test {
     fn new() -> Self {
         let mut registry = Registry::default();
         pal_win32::register(&mut registry);
-        let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), registry, Clock::virtual_time()).unwrap();
+        let mut m = Machine::new(
+            UnicornCpu::new(PARK_ADDR).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
         let directory = std::env::temp_dir().join("pal-memory-toolhelp-tests");
         let mut cfg = Win32Config::new(&directory, "fixture.exe", &directory);
         cfg.write_game = false;
@@ -50,7 +55,10 @@ impl Test {
     }
 
     fn run(&mut self, mut a: Asm, worker: bool) {
-        let exit = self.m.resolve_import("kernel32.dll", "ExitProcess").unwrap();
+        let exit = self
+            .m
+            .resolve_import("kernel32.dll", "ExitProcess")
+            .unwrap();
         a.push_imm(0).call(exit);
         self.m.cpu.write(CODE, &a.bytes).unwrap();
         self.m.spawn("main", CODE, &[], 0x1_0000).unwrap();
@@ -70,7 +78,11 @@ impl Test {
 
     fn protected_output(&mut self, prot: Prot, cross_page: bool) -> (u32, Vec<u8>) {
         self.m.cpu.map(BAD, PAGE, prot).unwrap();
-        let (out, len) = if cross_page { (BAD + PAGE - 16, 16) } else { (BAD, 28) };
+        let (out, len) = if cross_page {
+            (BAD + PAGE - 16, 16)
+        } else {
+            (BAD, 28)
+        };
         let mut sentinel = vec![0xa5; len];
         sentinel[..4].copy_from_slice(&28u32.to_le_bytes());
         self.m.cpu.write(out, &sentinel).unwrap();
@@ -80,7 +92,10 @@ impl Test {
     fn assert_unchanged(&self, out: u32, sentinel: &[u8]) {
         let mut actual = vec![0; sentinel.len()];
         self.m.cpu.read(out, &mut actual).unwrap();
-        assert_eq!(actual, sentinel, "a failed output must not write even its mapped prefix");
+        assert_eq!(
+            actual, sentinel,
+            "a failed output must not write even its mapped prefix"
+        );
     }
 }
 
@@ -93,9 +108,17 @@ fn virtual_query_rejects_readonly_exec_and_unmapped_tail_outputs_atomically() {
         let mut a = Asm::new(CODE);
         t.call(&mut a, "VirtualQuery", &[V(CODE), V(out), V(28)], DATA);
         t.call(&mut a, "GetLastError", &[], DATA + 4);
-        t.call(&mut a, "VirtualQuery", &[V(CODE), V(DATA + 0x100), V(28)], DATA + 8);
+        t.call(
+            &mut a,
+            "VirtualQuery",
+            &[V(CODE), V(DATA + 0x100), V(28)],
+            DATA + 8,
+        );
         t.run(a, false);
-        assert_eq!([t.word(DATA), t.word(DATA + 4), t.word(DATA + 8)], [0, 998, 28]);
+        assert_eq!(
+            [t.word(DATA), t.word(DATA + 4), t.word(DATA + 8)],
+            [0, 998, 28]
+        );
         assert_eq!(t.word(DATA + 0x100), CODE);
         t.assert_unchanged(out, &sentinel);
     }
@@ -125,15 +148,36 @@ fn thread_entries_reject_invalid_outputs_without_writes_or_consuming_records() {
         t.call(&mut a, "CreateToolhelp32Snapshot", &[V(4), V(0)], DATA);
         t.call(&mut a, "Thread32First", &[S(DATA), V(out)], DATA + 4);
         t.call(&mut a, "GetLastError", &[], DATA + 8);
-        t.call(&mut a, "Thread32First", &[S(DATA), V(DATA + 0x100)], DATA + 12);
+        t.call(
+            &mut a,
+            "Thread32First",
+            &[S(DATA), V(DATA + 0x100)],
+            DATA + 12,
+        );
         t.call(&mut a, "Thread32Next", &[S(DATA), V(out)], DATA + 16);
         t.call(&mut a, "GetLastError", &[], DATA + 20);
-        t.call(&mut a, "Thread32Next", &[S(DATA), V(DATA + 0x200)], DATA + 24);
-        t.call(&mut a, "Thread32Next", &[S(DATA), V(DATA + 0x200)], DATA + 28);
+        t.call(
+            &mut a,
+            "Thread32Next",
+            &[S(DATA), V(DATA + 0x200)],
+            DATA + 24,
+        );
+        t.call(
+            &mut a,
+            "Thread32Next",
+            &[S(DATA), V(DATA + 0x200)],
+            DATA + 28,
+        );
         t.call(&mut a, "GetLastError", &[], DATA + 32);
         t.run(a, true);
-        assert_eq!([t.word(DATA + 4), t.word(DATA + 8), t.word(DATA + 12)], [0, 998, 1]);
-        assert_eq!([t.word(DATA + 16), t.word(DATA + 20), t.word(DATA + 24)], [0, 998, 1]);
+        assert_eq!(
+            [t.word(DATA + 4), t.word(DATA + 8), t.word(DATA + 12)],
+            [0, 998, 1]
+        );
+        assert_eq!(
+            [t.word(DATA + 16), t.word(DATA + 20), t.word(DATA + 24)],
+            [0, 998, 1]
+        );
         assert_eq!([t.word(DATA + 28), t.word(DATA + 32)], [0, 18]);
         assert_eq!(t.word(DATA + 0x100 + 8), t.m.sys.context(0).tid);
         assert_eq!(t.word(DATA + 0x200 + 8), t.m.sys.context(1).tid);

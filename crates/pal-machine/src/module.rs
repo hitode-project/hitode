@@ -94,7 +94,10 @@ impl Modules {
     }
 
     pub fn host_count(&self) -> u32 {
-        self.list.iter().filter(|m| m.kind == ModuleKind::Host).count() as u32
+        self.list
+            .iter()
+            .filter(|m| m.kind == ModuleKind::Host)
+            .count() as u32
     }
 }
 

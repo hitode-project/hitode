@@ -36,13 +36,18 @@ pub fn format(cpu: &dyn Guest, codec: &Codec, fmt: &[u8], args: &mut dyn Args) -
         let c = fmt[i];
         if c != b'%' {
             // Copy DBCS characters whole so a trail byte of 0x25 isn't taken for '%'.
-            let n = if codec.is_lead_byte(0, c) && i + 1 < fmt.len() { 2 } else { 1 };
+            let n = if codec.is_lead_byte(0, c) && i + 1 < fmt.len() {
+                2
+            } else {
+                1
+            };
             out.extend_from_slice(&fmt[i..i + n]);
             i += n;
             continue;
         }
         i += 1;
-        let (mut left, mut zero, mut plus, mut space, mut alt) = (false, false, false, false, false);
+        let (mut left, mut zero, mut plus, mut space, mut alt) =
+            (false, false, false, false, false);
         while let Some(&f) = fmt.get(i) {
             match f {
                 b'-' => left = true,
@@ -63,7 +68,12 @@ pub fn format(cpu: &dyn Guest, codec: &Codec, fmt: &[u8], args: &mut dyn Args) -
             while fmt.get(*i).is_some_and(u8::is_ascii_digit) {
                 *i += 1;
             }
-            (*i > s).then(|| std::str::from_utf8(&fmt[s..*i]).unwrap().parse().unwrap_or(0))
+            (*i > s).then(|| {
+                std::str::from_utf8(&fmt[s..*i])
+                    .unwrap()
+                    .parse()
+                    .unwrap_or(0)
+            })
         };
         let width = num(&mut i, args).unwrap_or(0);
         let prec = if fmt.get(i) == Some(&b'.') {
@@ -193,13 +203,22 @@ fn pad(s: &[u8], width: usize, left: bool, fill: u8) -> Vec<u8> {
         return s.to_vec();
     }
     let padding = vec![fill; width - s.len()];
-    if left { [s, &padding].concat() } else { [&padding, s].concat() }
+    if left {
+        [s, &padding].concat()
+    } else {
+        [&padding, s].concat()
+    }
 }
 
 fn pad_num(prefix: &str, digits: &str, width: usize, left: bool, zero: bool) -> Vec<u8> {
     let len = prefix.len() + digits.len();
     if zero && !left && len < width {
-        return [prefix.as_bytes(), &vec![b'0'; width - len], digits.as_bytes()].concat();
+        return [
+            prefix.as_bytes(),
+            &vec![b'0'; width - len],
+            digits.as_bytes(),
+        ]
+        .concat();
     }
     pad(format!("{prefix}{digits}").as_bytes(), width, left, b' ')
 }
@@ -211,7 +230,11 @@ mod tests {
     struct V(Vec<u32>);
     impl Args for V {
         fn next(&mut self) -> u32 {
-            if self.0.is_empty() { 0 } else { self.0.remove(0) }
+            if self.0.is_empty() {
+                0
+            } else {
+                self.0.remove(0)
+            }
         }
     }
 
@@ -242,13 +265,25 @@ mod tests {
     }
 
     fn f(fmt: &str, args: &[u32]) -> String {
-        String::from_utf8(format(&NoMem, &Codec::new(932), fmt.as_bytes(), &mut V(args.to_vec()))).unwrap()
+        String::from_utf8(format(
+            &NoMem,
+            &Codec::new(932),
+            fmt.as_bytes(),
+            &mut V(args.to_vec()),
+        ))
+        .unwrap()
     }
 
     #[test]
     fn integers() {
-        assert_eq!(f("%d|%5d|%-5d|%05d", &[-3i32, 42, 42, -42].map(|v| v as u32)), "-3|   42|42   |-0042");
-        assert_eq!(f("%x %X %08x %#x", &[255, 255, 0xbeef, 16]), "ff FF 0000beef 0x10");
+        assert_eq!(
+            f("%d|%5d|%-5d|%05d", &[-3i32, 42, 42, -42].map(|v| v as u32)),
+            "-3|   42|42   |-0042"
+        );
+        assert_eq!(
+            f("%x %X %08x %#x", &[255, 255, 0xbeef, 16]),
+            "ff FF 0000beef 0x10"
+        );
         assert_eq!(f("%u%%%c", &[u32::MAX, b'A' as u32]), "4294967295%A");
         assert_eq!(f("%.3d %I64d", &[7, 1, 1]), "007 4294967297");
     }

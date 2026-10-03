@@ -34,7 +34,11 @@ struct Timers {
 }
 impl Timers {
     fn next_due(&self) -> Option<u64> {
-        self.timers.values().filter(|timer| !timer.canceled).filter_map(|timer| timer.due).min()
+        self.timers
+            .values()
+            .filter(|timer| !timer.canceled)
+            .filter_map(|timer| timer.due)
+            .min()
     }
     fn due_id(&self, now: u64) -> Option<u32> {
         self.timers
@@ -48,7 +52,9 @@ impl Timers {
         timer.running = true;
         timer.due = if timer.flags & PERIODIC != 0 {
             let due = timer.due.unwrap();
-            Some(due.saturating_add((now.saturating_sub(due) / timer.interval + 1).saturating_mul(timer.interval)))
+            Some(due.saturating_add(
+                (now.saturating_sub(due) / timer.interval + 1).saturating_mul(timer.interval),
+            ))
         } else {
             None
         };
@@ -88,7 +94,8 @@ fn caps(env: &mut Env<'_>) -> Outcome {
     if output == 0 || size < 8 || !env.cpu.accessible(output, 8, Prot::WRITE) {
         return Outcome::Return(NOCANDO);
     }
-    if env.cpu.write_u32(output, MIN_MS).is_err() || env.cpu.write_u32(output + 4, MAX_MS).is_err() {
+    if env.cpu.write_u32(output, MIN_MS).is_err() || env.cpu.write_u32(output + 4, MAX_MS).is_err()
+    {
         return Outcome::Return(NOCANDO);
     }
     Outcome::Return(0)
@@ -143,8 +150,14 @@ fn ensure_worker(env: &mut Env<'_>) -> bool {
         Ok(id) => id,
         Err(_) => return false,
     };
-    let wake = env.sys.objects.insert(Object::Event { manual_reset: false, signaled: false });
-    let complete = env.sys.objects.insert(Object::Event { manual_reset: true, signaled: true });
+    let wake = env.sys.objects.insert(Object::Event {
+        manual_reset: false,
+        signaled: false,
+    });
+    let complete = env.sys.objects.insert(Object::Event {
+        manual_reset: true,
+        signaled: true,
+    });
     let timers = state(env);
     timers.worker = Some(id);
     timers.wake = wake;
@@ -152,7 +165,8 @@ fn ensure_worker(env: &mut Env<'_>) -> bool {
     true
 }
 fn set_event(env: &mut Env<'_>) -> Outcome {
-    let (delay, _resolution, target, user, flags) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let (delay, _resolution, target, user, flags) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     if !(MIN_MS..=MAX_MS).contains(&delay)
         || flags & !(PERIODIC | EVENT_SET | EVENT_PULSE | SYNCHRONOUS) != 0
         || state(env).timers.len() >= MAX_TIMERS
@@ -202,7 +216,13 @@ fn kill_event(env: &mut Env<'_>) -> Outcome {
     let (wake, complete) = (timers.wake, timers.complete);
     env.sys.set_event(wake);
     if wait {
-        Outcome::block_then_return(Wait::Object { handle: complete, deadline: None }, 0)
+        Outcome::block_then_return(
+            Wait::Object {
+                handle: complete,
+                deadline: None,
+            },
+            0,
+        )
     } else {
         Outcome::Return(0)
     }
@@ -221,7 +241,13 @@ fn worker(env: &mut Env<'_>) -> Outcome {
     env.sys.reset_event(wake);
     let Some(id) = state(env).due_id(now) else {
         let deadline = state(env).next_due();
-        return Outcome::block(Wait::Object { handle: wake, deadline }, |env, _| worker(env));
+        return Outcome::block(
+            Wait::Object {
+                handle: wake,
+                deadline,
+            },
+            |env, _| worker(env),
+        );
     };
     let timer = state(env).dispatch(id, now);
     let complete = state(env).complete;
@@ -237,7 +263,11 @@ fn worker(env: &mut Env<'_>) -> Outcome {
             finished(env, id)
         }
         _ if timer.target == 0 => finished(env, id),
-        _ => Outcome::call(timer.target, vec![id, 0, timer.user, 0, 0], move |env, _| finished(env, id)),
+        _ => Outcome::call(
+            timer.target,
+            vec![id, 0, timer.user, 0, 0],
+            move |env, _| finished(env, id),
+        ),
     }
 }
 

@@ -55,7 +55,14 @@ fn program(target: u32, n: u32) -> (Vec<u8>, Vec<u8>) {
     let mut a = Asm::new(CODE);
     a.mov_ecx_imm(n);
     let top = a.here();
-    a.push_ecx().push_imm(1).call(target).add_esp(4).pop_ecx().dec_ecx().jnz(top).call(DONE);
+    a.push_ecx()
+        .push_imm(1)
+        .call(target)
+        .add_esp(4)
+        .pop_ecx()
+        .dec_ecx()
+        .jnz(top)
+        .call(DONE);
     (a.bytes, t.bytes)
 }
 
@@ -94,7 +101,12 @@ fn bench_backend(name: &str, target: u32, n: u32, enabled: bool) -> f64 {
     cpu.set_reg(Reg::Eip, CODE);
     let t = Instant::now();
     run_backend(&mut cpu, target, n);
-    report(if enabled { "watchdog" } else { "off" }, name, n, t.elapsed())
+    report(
+        if enabled { "watchdog" } else { "off" },
+        name,
+        n,
+        t.elapsed(),
+    )
 }
 
 fn run_native(cpu: &mut Unicorn<'_, ()>, target: u32, n: u32, timeout: u64, count: usize) {
@@ -113,15 +125,23 @@ fn run_native(cpu: &mut Unicorn<'_, ()>, target: u32, n: u32, timeout: u64, coun
 
 fn bench_native(mode: &str, name: &str, target: u32, n: u32) -> f64 {
     let mut cpu = Unicorn::new(Arch::X86, Mode::MODE_32).unwrap();
-    cpu.mem_map(CODE.into(), 0x1000, UcProt::READ | UcProt::EXEC).unwrap();
-    cpu.mem_map(THUNKS.into(), 0x1000, UcProt::READ | UcProt::EXEC).unwrap();
-    cpu.mem_map((STACK_TOP - 0x10000).into(), 0x10000, UcProt::READ | UcProt::WRITE).unwrap();
+    cpu.mem_map(CODE.into(), 0x1000, UcProt::READ | UcProt::EXEC)
+        .unwrap();
+    cpu.mem_map(THUNKS.into(), 0x1000, UcProt::READ | UcProt::EXEC)
+        .unwrap();
+    cpu.mem_map(
+        (STACK_TOP - 0x10000).into(),
+        0x10000,
+        UcProt::READ | UcProt::WRITE,
+    )
+    .unwrap();
     // Match the production backend's flat segment descriptors (including SS.D/B).
     // Unicorn's initial segments otherwise produce different call/ret timings.
     let reference = setup(target, n);
     let mut gdt = [0; 128];
     reference.read(GDT, &mut gdt).unwrap();
-    cpu.mem_map(GDT.into(), 0x1000, UcProt::READ | UcProt::WRITE).unwrap();
+    cpu.mem_map(GDT.into(), 0x1000, UcProt::READ | UcProt::WRITE)
+        .unwrap();
     cpu.mem_write(GDT.into(), &gdt).unwrap();
     let mut mmr = [0; 24];
     mmr[8..16].copy_from_slice(&u64::from(GDT).to_le_bytes());
@@ -149,9 +169,11 @@ fn bench_native(mode: &str, name: &str, target: u32, n: u32) -> f64 {
     .unwrap();
     let timeout = if mode == "timeout" { 5_000_000 } else { 0 };
     let count = if mode == "count" { 1_000_000_000 } else { 0 };
-    cpu.reg_write(RegisterX86::ESP, (STACK_TOP - 0x100).into()).unwrap();
+    cpu.reg_write(RegisterX86::ESP, (STACK_TOP - 0x100).into())
+        .unwrap();
     run_native(&mut cpu, target, n, timeout, count);
-    cpu.reg_write(RegisterX86::ESP, (STACK_TOP - 0x100).into()).unwrap();
+    cpu.reg_write(RegisterX86::ESP, (STACK_TOP - 0x100).into())
+        .unwrap();
     let t = Instant::now();
     run_native(&mut cpu, target, n, timeout, count);
     report(mode, name, n, t.elapsed())
@@ -165,23 +187,44 @@ fn report(mode: &str, name: &str, n: u32, elapsed: Duration) -> f64 {
 
 fn main() {
     let group = std::env::args().nth(1).unwrap_or_else(|| "all".into());
-    assert!(["all", "watchdog", "native"].contains(&group.as_str()), "all|watchdog|native [samples]");
-    let samples: usize = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(5);
+    assert!(
+        ["all", "watchdog", "native"].contains(&group.as_str()),
+        "all|watchdog|native [samples]"
+    );
+    let samples: usize = std::env::args()
+        .nth(2)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(5);
     assert!(samples > 0);
     let mut results = std::collections::BTreeMap::<(String, &str), Vec<f64>>::new();
     for sample in 0..samples {
         println!("sample {}/{samples}", sample + 1);
-        for (name, target, n) in [("baseline", RET, 10_000_000), ("fast", FAST, 1_000_000), ("park", BLOCK, 200_000)] {
+        for (name, target, n) in [
+            ("baseline", RET, 10_000_000),
+            ("fast", FAST, 1_000_000),
+            ("park", BLOCK, 200_000),
+        ] {
             if group != "native" {
                 // Alternate pair order to reduce systematic thermal/frequency bias.
-                for enabled in if sample % 2 == 0 { [false, true] } else { [true, false] } {
+                for enabled in if sample % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
                     let ns = bench_backend(name, target, n, enabled);
-                    results.entry((if enabled { "watchdog" } else { "off" }.into(), name)).or_default().push(ns);
+                    results
+                        .entry((if enabled { "watchdog" } else { "off" }.into(), name))
+                        .or_default()
+                        .push(ns);
                 }
             }
             if group != "watchdog" {
                 for mode in ["native-off", "timeout", "count"] {
-                    let n = if target == BLOCK && mode == "timeout" { 100 } else { n };
+                    let n = if target == BLOCK && mode == "timeout" {
+                        100
+                    } else {
+                        n
+                    };
                     let ns = bench_native(mode, name, target, n);
                     results.entry((mode.into(), name)).or_default().push(ns);
                 }
@@ -191,6 +234,11 @@ fn main() {
     println!("\nmedian [min, max], ns/call; {samples} samples (warm-up excluded)");
     for ((mode, name), mut values) in results {
         values.sort_by(f64::total_cmp);
-        println!("{mode:12} {name:9} {:10.1} [{:.1}, {:.1}]", values[samples / 2], values[0], values[samples - 1]);
+        println!(
+            "{mode:12} {name:9} {:10.1} [{:.1}, {:.1}]",
+            values[samples / 2],
+            values[0],
+            values[samples - 1]
+        );
     }
 }

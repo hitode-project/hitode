@@ -66,14 +66,21 @@ impl Codec {
         let mut buf = [0u8; 4];
         for ch in s.chars() {
             let (e, _, bad) = self.encoding(cp).encode(ch.encode_utf8(&mut buf));
-            if bad { out.push(b'?') } else { out.extend_from_slice(&e) }
+            if bad {
+                out.push(b'?')
+            } else {
+                out.extend_from_slice(&e)
+            }
         }
         (out, true)
     }
 
     /// Guest ANSI bytes (ACP) to a Rust string, for paths and logs.
     pub fn decode(&self, bytes: &[u8]) -> String {
-        self.encoding(CP_ACP).decode_without_bom_handling(bytes).0.into_owned()
+        self.encoding(CP_ACP)
+            .decode_without_bom_handling(bytes)
+            .0
+            .into_owned()
     }
 
     /// Rust string to guest ANSI bytes (ACP).
@@ -83,7 +90,9 @@ impl Codec {
     }
 
     pub fn is_lead_byte(&self, cp: u32, b: u8) -> bool {
-        lead_byte_ranges(self.resolve(cp)).iter().any(|&(lo, hi)| (lo..=hi).contains(&b))
+        lead_byte_ranges(self.resolve(cp))
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&b))
     }
 }
 
@@ -99,7 +108,9 @@ pub fn ctype1(c: u16) -> u16 {
     const XDIGIT: u16 = 0x80;
     const ALPHA: u16 = 0x100;
     const DEFINED: u16 = 0x200;
-    let Some(ch) = char::from_u32(u32::from(c)) else { return DEFINED };
+    let Some(ch) = char::from_u32(u32::from(c)) else {
+        return DEFINED;
+    };
     let mut t = DEFINED;
     if ch.is_uppercase() {
         t |= UPPER | ALPHA;
@@ -125,7 +136,9 @@ pub fn ctype1(c: u16) -> u16 {
     if ch.is_control() {
         t |= CNTRL;
     }
-    if ch.is_ascii_punctuation() || (!ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control() && c > 0x7f) {
+    if ch.is_ascii_punctuation()
+        || (!ch.is_alphanumeric() && !ch.is_whitespace() && !ch.is_control() && c > 0x7f)
+    {
         t |= PUNCT;
     }
     t

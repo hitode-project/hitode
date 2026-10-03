@@ -74,10 +74,17 @@ impl InputTracking {
         self.latest
     }
     fn issue(&mut self, key: Option<(usize, u8, Option<u64>)>) -> u64 {
-        self.latest = self.latest.checked_add(1).expect("host input receipt overflow");
+        self.latest = self
+            .latest
+            .checked_add(1)
+            .expect("host input receipt overflow");
         let receipt = self.latest;
-        let key = key.map(|(vk, value, host)| (vk, host.unwrap_or((receipt << 8) | u64::from(value))));
-        let mut status = InputReceipt { key, ..Default::default() };
+        let key =
+            key.map(|(vk, value, host)| (vk, host.unwrap_or((receipt << 8) | u64::from(value))));
+        let mut status = InputReceipt {
+            key,
+            ..Default::default()
+        };
         if let Some((vk, observation)) = key {
             // A physical release may be polled before its queued WM_KEYUP is
             // drained. Only that new generation can acknowledge it in advance;
@@ -162,14 +169,19 @@ impl InputTracking {
         }
         let ready = self.receipts.get(&receipt).is_some_and(|status| {
             status.dispatched
-                || status.observed_frame.is_some_and(|observed| observed != frame || full_or_idle_boundary)
+                || status
+                    .observed_frame
+                    .is_some_and(|observed| observed != frame || full_or_idle_boundary)
                 || (!status.dispatching
-                    && status.dequeued_frame.is_some_and(|dequeued| dequeued != frame || full_or_idle_boundary))
+                    && status
+                        .dequeued_frame
+                        .is_some_and(|dequeued| dequeued != frame || full_or_idle_boundary))
                 || (!status.dispatching && target_boundary)
         });
         if ready {
             self.receipts.retain(|&id, _| id > receipt);
-            self.retrieved.retain(|_, message| message.input_receipt > receipt);
+            self.retrieved
+                .retain(|_, message| message.input_receipt > receipt);
         }
         ready
     }
@@ -177,7 +189,15 @@ impl InputTracking {
 
 impl Msg {
     fn guest_fields(&self) -> [u32; 7] {
-        [self.hwnd, self.msg, self.wparam, self.lparam, self.time, self.pt.0 as u32, self.pt.1 as u32]
+        [
+            self.hwnd,
+            self.msg,
+            self.wparam,
+            self.lparam,
+            self.time,
+            self.pt.0 as u32,
+            self.pt.1 as u32,
+        ]
     }
     fn write(&self, cpu: &mut dyn pal_cpu::Guest, p: u32) -> bool {
         let f = self.guest_fields();
@@ -220,7 +240,9 @@ pub fn send(
     lparam: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let Some(proc) = user(env).windows.get(&hwnd).map(|w| w.proc) else { return then(env, 0) };
+    let Some(proc) = user(env).windows.get(&hwnd).map(|w| w.proc) else {
+        return then(env, 0);
+    };
     call_proc(proc, hwnd, msg, wparam, lparam, then)
 }
 
@@ -233,9 +255,13 @@ pub fn call_proc(
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
     if proc == 0 {
-        return Outcome::Fail(format!("message {msg:#x} to window {hwnd:#x}: null window procedure"));
+        return Outcome::Fail(format!(
+            "message {msg:#x} to window {hwnd:#x}: null window procedure"
+        ));
     }
-    Outcome::call(proc, [hwnd, msg, wparam, lparam], move |env, r| then(env, r.value()))
+    Outcome::call(proc, [hwnd, msg, wparam, lparam], move |env, r| {
+        then(env, r.value())
+    })
 }
 
 /// Send `[hwnd, msg, wparam, lparam]` messages in order (skipping destroyed windows).
@@ -261,7 +287,14 @@ pub fn post_input(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u
     post_kind(env, hwnd, msg, wparam, lparam, true)
 }
 
-fn post_kind(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32, input: bool) -> bool {
+fn post_kind(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    msg: u32,
+    wparam: u32,
+    lparam: u32,
+    input: bool,
+) -> bool {
     let time = env.sys.clock.now_ms();
     let ctx = if hwnd == 0 {
         env.sys.current
@@ -280,7 +313,13 @@ fn post_kind(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32, i
             0x207 | 0x208 => Some(4),
             _ => None,
         };
-        let key = vk.map(|vk| (vk, u.keys[vk], u.host_keys.as_ref().map(|keys| keys.observation(vk as u32))));
+        let key = vk.map(|vk| {
+            (
+                vk,
+                u.keys[vk],
+                u.host_keys.as_ref().map(|keys| keys.observation(vk as u32)),
+            )
+        });
         u.input_tracking.as_mut().map_or(0, |tracking| {
             let receipt = tracking.issue(key);
             tracking.set_context(receipt, ctx);
@@ -292,10 +331,20 @@ fn post_kind(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32, i
     let posted = post_to_thread(
         env,
         ctx,
-        Msg { hwnd, msg, wparam, lparam, time, pt: user(env).cursor_pos, input, input_receipt },
+        Msg {
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+            time,
+            pt: user(env).cursor_pos,
+            input,
+            input_receipt,
+        },
     );
     if posted && input {
-        env.sys.prefer_ready_context(ctx, pal_machine::WakePriority::Input);
+        env.sys
+            .prefer_ready_context(ctx, pal_machine::WakePriority::Input);
     }
     posted
 }
@@ -311,8 +360,12 @@ fn post_to_thread(env: &mut Env<'_>, ctx: pal_machine::CtxId, m: Msg) -> bool {
 fn queue_changed(env: &mut Env<'_>, ctx: pal_machine::CtxId) {
     let changed = queue_status_for(env, ctx).1;
     let q = user_mut(env).queue(ctx);
-    let (event, input, notification, mask) =
-        (q.event, q.message_wait_event, q.message_wait_notification, q.message_wait_mask);
+    let (event, input, notification, mask) = (
+        q.event,
+        q.message_wait_event,
+        q.message_wait_notification,
+        q.message_wait_mask,
+    );
     if input != 0 {
         if changed & mask != 0 {
             env.sys.set_event(input);
@@ -334,9 +387,16 @@ pub fn message_wait_events(env: &mut Env<'_>, mask: u32) -> (u32, u32) {
     let ctx = env.sys.current;
     for notification in [false, true] {
         let q = user_mut(env).queue(ctx);
-        let handle = if notification { q.message_wait_notification } else { q.message_wait_event };
+        let handle = if notification {
+            q.message_wait_notification
+        } else {
+            q.message_wait_event
+        };
         if handle == 0 {
-            let handle = env.sys.objects.insert(Object::Event { manual_reset: !notification, signaled: false });
+            let handle = env.sys.objects.insert(Object::Event {
+                manual_reset: !notification,
+                signaled: false,
+            });
             let q = user_mut(env).queue(ctx);
             if notification {
                 q.message_wait_notification = handle;
@@ -384,9 +444,13 @@ pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
 fn queue_status_for(env: &mut Env<'_>, ctx: pal_machine::CtxId) -> (u32, u32) {
     let now = env.sys.clock.now_us();
     let u = user_mut(env);
-    let paint = u.windows.values().any(|w| w.thread == ctx && w.needs_paint && w.visible() && !w.destroying);
+    let paint = u
+        .windows
+        .values()
+        .any(|w| w.thread == ctx && w.needs_paint && w.visible() && !w.destroying);
     let q = u.queue(ctx);
-    let generated = (u32::from(paint) * QS_PAINT) | (u32::from(q.timers.iter().any(|t| t.due_us <= now)) * QS_TIMER);
+    let generated = (u32::from(paint) * QS_PAINT)
+        | (u32::from(q.timers.iter().any(|t| t.due_us <= now)) * QS_TIMER);
     let mut pending = generated;
     for m in &q.posted {
         pending |= posted_status(m);
@@ -405,7 +469,11 @@ fn observe_retrieval(env: &mut Env<'_>, f: Filter) {
     let ctx = env.sys.current;
     // Even a filtered miss observes QS_POSTMESSAGE. QS_ALLPOSTMESSAGE is
     // preserved until retrieval without a message-range filter (or GQS).
-    user_mut(env).queue(ctx).changed_status &= if f.min == 0 && f.max == 0 { 0 } else { QS_ALLPOSTMESSAGE };
+    user_mut(env).queue(ctx).changed_status &= if f.min == 0 && f.max == 0 {
+        0
+    } else {
+        QS_ALLPOSTMESSAGE
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -458,7 +526,11 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
     }
     if let Some(i) = found {
         let q = u.queue(ctx);
-        let m = if remove { q.posted.remove(i).unwrap() } else { q.posted[i] };
+        let m = if remove {
+            q.posted.remove(i).unwrap()
+        } else {
+            q.posted[i]
+        };
         q.last_time = m.time;
         q.last_pos = m.pt;
         if remove
@@ -569,7 +641,12 @@ fn headless_target(u: &window::User, ctx: pal_machine::CtxId) -> Option<(u32, u3
     u.auto_dialog_ms?;
     for &top in &u.top {
         let w = &u.windows[&top];
-        if w.thread != ctx || !w.visible() || !w.enabled() || w.destroying || w.auto_clicks >= AUTO_CLICK_MAX {
+        if w.thread != ctx
+            || !w.visible()
+            || !w.enabled()
+            || w.destroying
+            || w.auto_clicks >= AUTO_CLICK_MAX
+        {
             continue;
         }
         let buttons: Vec<&window::Window> = w
@@ -608,7 +685,9 @@ fn headless_idle(env: &mut Env<'_>) -> bool {
     let ctx = env.sys.current;
     let now = env.sys.clock.now_us();
     let u = user_mut(env);
-    let Some((top, button)) = headless_target(u, ctx) else { return false };
+    let Some((top, button)) = headless_target(u, ctx) else {
+        return false;
+    };
     if headless_deadline(u, ctx).is_none_or(|d| now < d) {
         return false;
     }
@@ -640,9 +719,11 @@ fn peek_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max, flags) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let f = Filter { hwnd, min, max };
     let remove = flags & PM_REMOVE != 0;
-    if let Some(m) =
-        next_message(env, f, remove).or_else(|| headless_idle(env).then(|| next_message(env, f, remove)).flatten())
-    {
+    if let Some(m) = next_message(env, f, remove).or_else(|| {
+        headless_idle(env)
+            .then(|| next_message(env, f, remove))
+            .flatten()
+    }) {
         write_message(env, m, out, remove);
         return Outcome::Return(1);
     }
@@ -665,14 +746,36 @@ fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
     }
     let event = queue_event(env);
     let deadline = next_deadline(env, f);
-    Outcome::block(Wait::Object { handle: event, deadline }, move |env, _| get_message(env, out, f))
+    Outcome::block(
+        Wait::Object {
+            handle: event,
+            deadline,
+        },
+        move |env, _| get_message(env, out, f),
+    )
 }
 
 /// Block until the current thread's queue may have something (WaitMessage, modal loops).
-pub fn wait_for_message(env: &mut Env<'_>, then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Outcome {
+pub fn wait_for_message(
+    env: &mut Env<'_>,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
     let event = queue_event(env);
-    let deadline = next_deadline(env, Filter { hwnd: 0, min: 0, max: 0 });
-    Outcome::block(Wait::Object { handle: event, deadline }, move |env, _| then(env))
+    let deadline = next_deadline(
+        env,
+        Filter {
+            hwnd: 0,
+            min: 0,
+            max: 0,
+        },
+    );
+    Outcome::block(
+        Wait::Object {
+            handle: event,
+            deadline,
+        },
+        move |env, _| then(env),
+    )
 }
 
 /// Arm the wake-up event after the caller found no matching message. Unmatched posted
@@ -682,7 +785,10 @@ fn queue_event(env: &mut Env<'_>) -> u32 {
     let q = user_mut(env).queue(ctx);
     let ev = q.event;
     let ev = if ev == 0 {
-        let h = env.sys.objects.insert(Object::Event { manual_reset: true, signaled: false });
+        let h = env.sys.objects.insert(Object::Event {
+            manual_reset: true,
+            signaled: false,
+        });
         user_mut(env).queue(ctx).event = h;
         h
     } else {
@@ -694,12 +800,44 @@ fn queue_event(env: &mut Env<'_>) -> u32 {
 
 /// Next message for modal loops run by the host (DialogBoxParam, MessageBox).
 pub fn next_any(env: &mut Env<'_>) -> Option<Msg> {
-    next_message(env, Filter { hwnd: 0, min: 0, max: 0 }, true)
-        .or_else(|| headless_idle(env).then(|| next_message(env, Filter { hwnd: 0, min: 0, max: 0 }, true)).flatten())
+    next_message(
+        env,
+        Filter {
+            hwnd: 0,
+            min: 0,
+            max: 0,
+        },
+        true,
+    )
+    .or_else(|| {
+        headless_idle(env)
+            .then(|| {
+                next_message(
+                    env,
+                    Filter {
+                        hwnd: 0,
+                        min: 0,
+                        max: 0,
+                    },
+                    true,
+                )
+            })
+            .flatten()
+    })
 }
 
 fn wait_message(env: &mut Env<'_>) -> Outcome {
-    if next_message(env, Filter { hwnd: 0, min: 0, max: 0 }, false).is_some() {
+    if next_message(
+        env,
+        Filter {
+            hwnd: 0,
+            min: 0,
+            max: 0,
+        },
+        false,
+    )
+    .is_some()
+    {
         return Outcome::Return(1);
     }
     wait_for_message(env, |_| Outcome::Return(1))
@@ -731,7 +869,13 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
     // A terminated context keeps its record for GetExitCodeThread, but its thread
     // id no longer names a live message target. Returning success here can make
     // a caller wait forever for a reply that the exited thread cannot produce.
-    let Some(ctx) = env.sys.contexts.iter().find(|c| c.tid == tid && !c.is_done()).map(|c| c.id) else {
+    let Some(ctx) = env
+        .sys
+        .contexts
+        .iter()
+        .find(|c| c.tid == tid && !c.is_done())
+        .map(|c| c.id)
+    else {
         crate::util::set_last_error(env, 1444); // ERROR_INVALID_THREAD_ID (winerror.h)
         return Outcome::Return(0);
     };
@@ -739,7 +883,16 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(u32::from(post_to_thread(
         env,
         ctx,
-        Msg { hwnd: 0, msg, wparam: wp, lparam: lp, time, pt: (0, 0), input: false, input_receipt: 0 },
+        Msg {
+            hwnd: 0,
+            msg,
+            wparam: wp,
+            lparam: lp,
+            time,
+            pt: (0, 0),
+            input: false,
+            input_receipt: 0,
+        },
     )))
 }
 
@@ -781,12 +934,19 @@ fn dispatch_message_a(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
     let m = Msg::read(env.cpu, address);
     let ctx = env.sys.current;
-    let m = user_mut(env).input_tracking.as_mut().map_or(m, |tracking| tracking.take(ctx, address, m));
+    let m = user_mut(env)
+        .input_tracking
+        .as_mut()
+        .map_or(m, |tracking| tracking.take(ctx, address, m));
     dispatch(env, m, |_, r| Outcome::Return(r))
 }
 
 /// DispatchMessage: timer callbacks, else the window procedure.
-pub fn dispatch(env: &mut Env<'_>, m: Msg, then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static) -> Outcome {
+pub fn dispatch(
+    env: &mut Env<'_>,
+    m: Msg,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     if m.input_receipt != 0
         && let Some(tracking) = &mut user_mut(env).input_tracking
     {
@@ -826,7 +986,11 @@ pub fn translate(env: &mut Env<'_>, m: &Msg) -> bool {
         _ => None,
     };
     let Some(ch) = ch else { return false };
-    let msg = if m.msg == wm::KEYDOWN { wm::CHAR } else { wm::SYSCHAR };
+    let msg = if m.msg == wm::KEYDOWN {
+        wm::CHAR
+    } else {
+        wm::SYSCHAR
+    };
     post(env, m.hwnd, msg, ch, m.lparam)
 }
 
@@ -848,7 +1012,9 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let ctx = if hwnd == 0 {
         env.sys.current
     } else {
-        let Some(w) = user(env).windows.get(&hwnd) else { return Outcome::Return(0) };
+        let Some(w) = user(env).windows.get(&hwnd) else {
+            return Outcome::Return(0);
+        };
         w.thread
     };
     let now = env.sys.clock.now_us();
@@ -856,9 +1022,19 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
     let interval_us = u64::from(ms.max(10)) * 1000;
     let u = user_mut(env);
     let q = u.queue(ctx);
-    let id = if hwnd == 0 { 0x7fff_0000 + q.timers.len() as u32 + 1 } else { id };
+    let id = if hwnd == 0 {
+        0x7fff_0000 + q.timers.len() as u32 + 1
+    } else {
+        id
+    };
     q.timers.retain(|t| !(t.hwnd == hwnd && t.id == id));
-    q.timers.push(Timer { hwnd, id, interval_us, due_us: now + interval_us, proc });
+    q.timers.push(Timer {
+        hwnd,
+        id,
+        interval_us,
+        due_us: now + interval_us,
+        proc,
+    });
     // PAL's game thread installs timers on the main thread's window. Wake an
     // already-blocked GetMessage so it recomputes its next timer deadline.
     queue_changed(env, ctx);
@@ -870,7 +1046,9 @@ fn kill_timer(env: &mut Env<'_>) -> Outcome {
     let ctx = if hwnd == 0 {
         env.sys.current
     } else {
-        let Some(w) = user(env).windows.get(&hwnd) else { return Outcome::Return(0) };
+        let Some(w) = user(env).windows.get(&hwnd) else {
+            return Outcome::Return(0);
+        };
         w.thread
     };
     let q = user_mut(env).queue(ctx);
@@ -902,7 +1080,11 @@ pub fn def_window_proc(
         wm::NCCREATE => 1,
         wm::CLOSE => return destroy_window(env, hwnd, move |env, _| then(env, 0)),
         wm::SETTEXT => {
-            let text = if lp == 0 { String::new() } else { env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, lp)) };
+            let text = if lp == 0 {
+                String::new()
+            } else {
+                env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, lp))
+            };
             if let Some(w) = user_mut(env).windows.get_mut(&hwnd) {
                 w.text = text;
                 w.needs_paint = true;
@@ -910,12 +1092,20 @@ pub fn def_window_proc(
             1
         }
         wm::GETTEXT => {
-            let Some(w) = user(env).windows.get(&hwnd) else { return then(env, 0) };
+            let Some(w) = user(env).windows.get(&hwnd) else {
+                return then(env, 0);
+            };
             let bytes = env.ext.get::<Win32>().codec.encode(&w.text);
-            if wp == 0 { 0 } else { put_cstr(env.cpu, lp, wp, &bytes).unwrap_or(wp - 1) }
+            if wp == 0 {
+                0
+            } else {
+                put_cstr(env.cpu, lp, wp, &bytes).unwrap_or(wp - 1)
+            }
         }
         wm::GETTEXTLENGTH => {
-            let Some(w) = user(env).windows.get(&hwnd) else { return then(env, 0) };
+            let Some(w) = user(env).windows.get(&hwnd) else {
+                return then(env, 0);
+            };
             env.ext.get::<Win32>().codec.encode(&w.text).len() as u32
         }
         wm::SETFONT => {
@@ -932,7 +1122,9 @@ pub fn def_window_proc(
         wm::ERASEBKGND => 1,
         wm::NCHITTEST => 1, // HTCLIENT
         wm::MOUSEACTIVATE => 1,
-        wm::ACTIVATE if wp & 0xffff != 0 => return window::set_focus(env, hwnd, move |env, _| then(env, 0)),
+        wm::ACTIVATE if wp & 0xffff != 0 => {
+            return window::set_focus(env, hwnd, move |env, _| then(env, 0));
+        }
         wm::WINDOWPOSCHANGED => {
             let flags = env.cpu.read_u32(lp + 24).unwrap_or(0);
             let msgs = window::window_pos_changed_msgs(user(env), hwnd, flags);
@@ -944,7 +1136,9 @@ pub fn def_window_proc(
         }
         wm::SYSKEYDOWN if wp == 0x73 => {
             // Alt+F4
-            return send(env, hwnd, wm::SYSCOMMAND, 0xf060, 0, move |env, _| then(env, 0));
+            return send(env, hwnd, wm::SYSCOMMAND, 0xf060, 0, move |env, _| {
+                then(env, 0)
+            });
         }
         m if (wm::CTLCOLORMSGBOX..=wm::CTLCOLORSTATIC).contains(&m) => {
             crate::gdi32::stock_object(0) // WHITE_BRUSH
@@ -999,7 +1193,9 @@ fn validate_rect(env: &mut Env<'_>) -> Outcome {
 
 fn begin_paint(env: &mut Env<'_>) -> Outcome {
     let (hwnd, ps) = (env.arg(0), env.arg(1));
-    let Some(w) = user(env).windows.get(&hwnd) else { return Outcome::Return(0) };
+    let Some(w) = user(env).windows.get(&hwnd) else {
+        return Outcome::Return(0);
+    };
     let (cw, ch) = w.client_size();
     validate(env, hwnd);
     let hdc = crate::gdi32::window_dc(env, hwnd);
@@ -1112,7 +1308,10 @@ mod receipt_tests {
         let mut tracking = InputTracking::default();
         tracking.observe_key(17, 0, 3);
         let synthetic = tracking.issue(Some((17, 0, Some(0))));
-        assert!(!tracking.completed(synthetic, 4, true), "old identical value is insufficient");
+        assert!(
+            !tracking.completed(synthetic, 4, true),
+            "old identical value is insufficient"
+        );
         let down = tracking.issue(Some((17, 0x80, Some(0x180))));
         tracking.observe_key(17, 0x180, 5);
         assert!(!tracking.completed(down, 5, false));
@@ -1123,7 +1322,10 @@ mod receipt_tests {
         let up = tracking.issue(Some((17, 0, Some(0x200))));
         assert!(!tracking.completed(up, 7, false));
         tracking.observe_key(17, 0x200, 8);
-        assert!(tracking.completed(up, 8, false), "repeated polls must preserve the first observation frame");
+        assert!(
+            tracking.completed(up, 8, false),
+            "repeated polls must preserve the first observation frame"
+        );
     }
 
     #[test]

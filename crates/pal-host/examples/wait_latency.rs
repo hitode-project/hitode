@@ -31,7 +31,10 @@ fn main() {
         for _ in 0..31 {
             let started = Instant::now();
             // The event stays alive and unsignaled throughout this single wait.
-            assert_eq!(unsafe { WaitForSingleObject(wake.as_raw_handle(), millis) }, 258);
+            assert_eq!(
+                unsafe { WaitForSingleObject(wake.as_raw_handle(), millis) },
+                258
+            );
             legacy.push(started.elapsed().saturating_sub(duration).as_secs_f64() * 1000.0);
             let started = Instant::now();
             assert!(!wake.wait(Some(duration)).unwrap());

@@ -7,7 +7,9 @@ use pal_cpu::{Guest, GuestExt};
 use pal_machine::{Env, Object, Outcome, Registry};
 
 use super::K32;
-use crate::util::{INVALID_HANDLE_VALUE, cstr, err, out_u32, put_cstr, put_wstr, set_last_error, wstr, zero};
+use crate::util::{
+    INVALID_HANDLE_VALUE, cstr, err, out_u32, put_cstr, put_wstr, set_last_error, wstr, zero,
+};
 use crate::vfs::{DirEntry, wildcard};
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 
@@ -50,15 +52,25 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     let w = env.ext.get::<Win32>();
     let guest = w.vfs.normalize(path);
     let existing = w.vfs.lookup(&guest);
-    let write = access & GENERIC_WRITE != 0 || matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING);
+    let write = access & GENERIC_WRITE != 0
+        || matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING);
     let exists = existing.as_ref().is_some_and(|p| p.is_file());
 
     let result = if !write {
         match (&existing, disposition) {
             (Some(p), _) if p.is_file() => std::fs::File::open(p),
-            (_, OPEN_ALWAYS) => w.vfs.write_path(&guest).map_or(Err(std::io::ErrorKind::NotFound.into()), |p| {
-                std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(p)
-            }),
+            (_, OPEN_ALWAYS) => {
+                w.vfs
+                    .write_path(&guest)
+                    .map_or(Err(std::io::ErrorKind::NotFound.into()), |p| {
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(p)
+                    })
+            }
             _ => Err(std::io::ErrorKind::NotFound.into()),
         }
     } else {
@@ -84,7 +96,12 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
                         return INVALID_HANDLE_VALUE;
                     }
                 }
-                std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(truncate).open(dst)
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(truncate)
+                    .open(dst)
             }
         }
     };
@@ -93,10 +110,20 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
             let h = env.sys.objects.insert(Object::Opaque(1));
             log::debug!("CreateFile({guest}, {access:#x}, {disposition}) = {h:#x}");
             // ERROR_ALREADY_EXISTS is reported for CREATE_ALWAYS / OPEN_ALWAYS on success.
-            let code =
-                if exists && matches!(disposition, CREATE_ALWAYS | OPEN_ALWAYS) { err::ALREADY_EXISTS } else { 0 };
+            let code = if exists && matches!(disposition, CREATE_ALWAYS | OPEN_ALWAYS) {
+                err::ALREADY_EXISTS
+            } else {
+                0
+            };
             set_last_error(env, code);
-            env.ext.get_mut::<Win32>().files.insert(h, FileObj { file, guest_path: guest, access });
+            env.ext.get_mut::<Win32>().files.insert(
+                h,
+                FileObj {
+                    file,
+                    guest_path: guest,
+                    access,
+                },
+            );
             h
         }
         Err(e) => {
@@ -218,7 +245,12 @@ fn set_file_pointer_ex(env: &mut Env<'_>) -> Outcome {
 }
 
 fn file_size(env: &mut Env<'_>, h: u32) -> Option<u64> {
-    env.ext.get::<Win32>().files.get(&h).and_then(|f| f.file.metadata().ok()).map(|m| m.len())
+    env.ext
+        .get::<Win32>()
+        .files
+        .get(&h)
+        .and_then(|f| f.file.metadata().ok())
+        .map(|m| m.len())
 }
 
 fn get_file_size(env: &mut Env<'_>) -> Outcome {
@@ -260,7 +292,9 @@ fn close_handle(env: &mut Env<'_>) -> Outcome {
     let object = env.sys.objects.remove(h).is_some();
     super::file_mapping::close(env, h);
     let w = env.ext.get_mut::<Win32>();
-    let known = w.files.remove(&h).is_some() | w.finds.remove(&h).is_some() | w.thread_snapshots.remove(&h).is_some();
+    let known = w.files.remove(&h).is_some()
+        | w.finds.remove(&h).is_some()
+        | w.thread_snapshots.remove(&h).is_some();
     if object || known || matches!(h, STD_INPUT | STD_OUTPUT | STD_ERROR) || h >= 0xffff_fffe {
         return Outcome::Return(1);
     }
@@ -270,7 +304,9 @@ fn close_handle(env: &mut Env<'_>) -> Outcome {
 }
 
 fn filetime(t: Option<SystemTime>) -> u64 {
-    let d = t.and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).unwrap_or_default();
+    let d = t
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .unwrap_or_default();
     116_444_736_000_000_000 + d.as_micros() as u64 * 10
 }
 
@@ -282,18 +318,32 @@ fn write_filetime(cpu: &mut dyn Guest, p: u32, ft: u64) {
 
 fn get_file_time(env: &mut Env<'_>) -> Outcome {
     let (h, c, a, m) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let Some(md) = env.ext.get::<Win32>().files.get(&h).and_then(|f| f.file.metadata().ok()) else {
+    let Some(md) = env
+        .ext
+        .get::<Win32>()
+        .files
+        .get(&h)
+        .and_then(|f| f.file.metadata().ok())
+    else {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
-    write_filetime(env.cpu, c, filetime(md.created().ok().or(md.modified().ok())));
+    write_filetime(
+        env.cpu,
+        c,
+        filetime(md.created().ok().or(md.modified().ok())),
+    );
     write_filetime(env.cpu, a, filetime(md.accessed().ok()));
     write_filetime(env.cpu, m, filetime(md.modified().ok()));
     Outcome::Return(1)
 }
 
 fn attributes(is_dir: bool) -> u32 {
-    if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_ARCHIVE }
+    if is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_ARCHIVE
+    }
 }
 
 fn get_file_attributes(env: &mut Env<'_>, path: String) -> Outcome {
@@ -326,7 +376,13 @@ fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
     }
 }
 
-fn copy_file(env: &mut Env<'_>, src: String, dst: String, fail_if_exists: bool, remove_src: bool) -> Outcome {
+fn copy_file(
+    env: &mut Env<'_>,
+    src: String,
+    dst: String,
+    fail_if_exists: bool,
+    remove_src: bool,
+) -> Outcome {
     let w = env.ext.get::<Win32>();
     let Some(from) = w.vfs.lookup(&src).filter(|p| p.is_file()) else {
         set_last_error(env, err::FILE_NOT_FOUND);
@@ -378,7 +434,12 @@ fn fill_find_data(env: &mut Env<'_>, p: u32, e: &DirEntry, wide: bool) {
     let _ = env.cpu.write_u32(p + 28, (e.size >> 32) as u32);
     let _ = env.cpu.write_u32(p + 32, e.size as u32);
     if wide {
-        put_wstr(env.cpu, p + 44, 260, &e.name.encode_utf16().collect::<Vec<_>>());
+        put_wstr(
+            env.cpu,
+            p + 44,
+            260,
+            &e.name.encode_utf16().collect::<Vec<_>>(),
+        );
     } else {
         let name = env.ext.get::<Win32>().codec.encode(&e.name);
         put_cstr(env.cpu, p + 44, 260, &name);
@@ -391,9 +452,18 @@ fn find_first_file(env: &mut Env<'_>, pat: String, data: u32, wide: bool) -> Out
     let w = env.ext.get::<Win32>();
     let full = w.vfs.normalize(&pat);
     let (dir, mask) = full.rsplit_once('\\').unwrap_or(("", &full));
-    let dir = if dir.len() == 2 { format!("{dir}\\") } else { dir.to_owned() };
-    let entries: Vec<DirEntry> =
-        w.vfs.list(&dir).unwrap_or_default().into_iter().filter(|e| wildcard(mask, &e.name)).collect();
+    let dir = if dir.len() == 2 {
+        format!("{dir}\\")
+    } else {
+        dir.to_owned()
+    };
+    let entries: Vec<DirEntry> = w
+        .vfs
+        .list(&dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| wildcard(mask, &e.name))
+        .collect();
     if entries.is_empty() {
         log::debug!("FindFirstFile({full}): no match");
         set_last_error(env, err::FILE_NOT_FOUND);
@@ -401,7 +471,10 @@ fn find_first_file(env: &mut Env<'_>, pat: String, data: u32, wide: bool) -> Out
     }
     fill_find_data(env, data, &entries[0], wide);
     let h = env.sys.objects.insert(Object::Opaque(2));
-    env.ext.get_mut::<Win32>().finds.insert(h, FindObj { entries, next: 1 });
+    env.ext
+        .get_mut::<Win32>()
+        .finds
+        .insert(h, FindObj { entries, next: 1 });
     Outcome::Return(h)
 }
 
@@ -469,7 +542,11 @@ fn put_dir(env: &mut Env<'_>, s: &str) -> Outcome {
 /// Guest path of a profile file: bare names live in the Windows directory.
 fn profile_path(env: &Env<'_>, p: u32) -> String {
     let name = path_a(env, p);
-    if name.contains(['\\', '/']) { name } else { format!("C:\\Windows\\{name}") }
+    if name.contains(['\\', '/']) {
+        name
+    } else {
+        format!("C:\\Windows\\{name}")
+    }
 }
 
 struct Ini {
@@ -477,8 +554,14 @@ struct Ini {
 }
 
 fn trim(b: &[u8]) -> &[u8] {
-    let s = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(b.len());
-    let e = b.iter().rposition(|c| !c.is_ascii_whitespace()).map_or(s, |i| i + 1);
+    let s = b
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(b.len());
+    let e = b
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(s, |i| i + 1);
     &b[s..e]
 }
 
@@ -492,24 +575,47 @@ fn section_name(line: &[u8]) -> Option<&[u8]> {
 
 impl Ini {
     fn load(env: &Env<'_>, guest: &str) -> Ini {
-        let data = env.ext.get::<Win32>().vfs.lookup(guest).and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
-        Ini { lines: data.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect() }
+        let data = env
+            .ext
+            .get::<Win32>()
+            .vfs
+            .lookup(guest)
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        Ini {
+            lines: data
+                .split(|&c| c == b'\n')
+                .map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec())
+                .collect(),
+        }
     }
 
     fn sections(&self) -> Vec<Vec<u8>> {
-        self.lines.iter().filter_map(|l| section_name(l)).map(<[u8]>::to_vec).collect()
+        self.lines
+            .iter()
+            .filter_map(|l| section_name(l))
+            .map(<[u8]>::to_vec)
+            .collect()
     }
 
     /// Line range of a section's body.
     fn section(&self, name: &[u8]) -> Option<(usize, usize)> {
-        let start = self.lines.iter().position(|l| section_name(l).is_some_and(|s| s.eq_ignore_ascii_case(name)))? + 1;
-        let end =
-            self.lines[start..].iter().position(|l| section_name(l).is_some()).map_or(self.lines.len(), |i| start + i);
+        let start = self
+            .lines
+            .iter()
+            .position(|l| section_name(l).is_some_and(|s| s.eq_ignore_ascii_case(name)))?
+            + 1;
+        let end = self.lines[start..]
+            .iter()
+            .position(|l| section_name(l).is_some())
+            .map_or(self.lines.len(), |i| start + i);
         Some((start, end))
     }
 
     fn entries(&self, section: &[u8]) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
-        let Some((s, e)) = self.section(section) else { return Vec::new() };
+        let Some((s, e)) = self.section(section) else {
+            return Vec::new();
+        };
         (s..e)
             .filter_map(|i| {
                 let l = &self.lines[i];
@@ -528,7 +634,10 @@ impl Ini {
     }
 
     fn get(&self, section: &[u8], key: &[u8]) -> Option<Vec<u8>> {
-        self.entries(section).into_iter().find(|(_, k, _)| k.eq_ignore_ascii_case(key)).map(|(_, _, v)| v)
+        self.entries(section)
+            .into_iter()
+            .find(|(_, k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, _, v)| v)
     }
 }
 
@@ -554,7 +663,8 @@ fn put_list(env: &mut Env<'_>, buf: u32, cap: u32, items: &[Vec<u8>]) -> u32 {
 }
 
 fn get_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
-    let (sec_p, key_p, def_p, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let (sec_p, key_p, def_p, buf, cap) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let file = profile_path(env, env.arg(5));
     let ini = Ini::load(env, &file);
     if sec_p == 0 {
@@ -567,7 +677,9 @@ fn get_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(put_list(env, buf, cap, &keys));
     }
     let key = cstr(env.cpu, key_p);
-    let v = ini.get(&sec, &key).unwrap_or_else(|| trim(&cstr(env.cpu, def_p)).to_vec());
+    let v = ini
+        .get(&sec, &key)
+        .unwrap_or_else(|| trim(&cstr(env.cpu, def_p)).to_vec());
     Outcome::Return(match put_cstr(env.cpu, buf, cap, &v) {
         Some(n) => n,
         None => cap.saturating_sub(1),
@@ -575,9 +687,15 @@ fn get_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_private_profile_int_a(env: &mut Env<'_>) -> Outcome {
-    let (sec, key, def) = (cstr(env.cpu, env.arg(0)), cstr(env.cpu, env.arg(1)), env.arg(2));
+    let (sec, key, def) = (
+        cstr(env.cpu, env.arg(0)),
+        cstr(env.cpu, env.arg(1)),
+        env.arg(2),
+    );
     let file = profile_path(env, env.arg(3));
-    let Some(v) = Ini::load(env, &file).get(&sec, &key) else { return Outcome::Return(def) };
+    let Some(v) = Ini::load(env, &file).get(&sec, &key) else {
+        return Outcome::Return(def);
+    };
     let s = String::from_utf8_lossy(&v);
     let s = s.trim();
     let (neg, digits) = s.strip_prefix('-').map_or((false, s), |r| (true, r));
@@ -598,15 +716,19 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
         None if key_p == 0 || val_p == 0 => {}
         None => {
             ini.lines.push([b"[", &sec[..], b"]"].concat());
-            ini.lines.push([&cstr(env.cpu, key_p)[..], b"=", &cstr(env.cpu, val_p)[..]].concat());
+            ini.lines
+                .push([&cstr(env.cpu, key_p)[..], b"=", &cstr(env.cpu, val_p)[..]].concat());
         }
         Some((s, e)) if key_p == 0 => {
             ini.lines.drain(s - 1..e);
         }
         Some((s, e)) => {
             let key = cstr(env.cpu, key_p);
-            let existing =
-                ini.entries(&sec).into_iter().find(|(_, k, _)| k.eq_ignore_ascii_case(&key)).map(|(i, _, _)| i);
+            let existing = ini
+                .entries(&sec)
+                .into_iter()
+                .find(|(_, k, _)| k.eq_ignore_ascii_case(&key))
+                .map(|(i, _, _)| i);
             match (existing, val_p) {
                 (Some(i), 0) => {
                     ini.lines.remove(i);
@@ -615,8 +737,12 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
                 (None, 0) => {}
                 (None, v) => {
                     // Append after the section's last non-empty line.
-                    let at = (s..e).rev().find(|&i| !trim(&ini.lines[i]).is_empty()).map_or(s, |i| i + 1);
-                    ini.lines.insert(at, [&key[..], b"=", &cstr(env.cpu, v)[..]].concat());
+                    let at = (s..e)
+                        .rev()
+                        .find(|&i| !trim(&ini.lines[i]).is_empty())
+                        .map_or(s, |i| i + 1);
+                    ini.lines
+                        .insert(at, [&key[..], b"=", &cstr(env.cpu, v)[..]].concat());
                 }
             }
         }
@@ -639,7 +765,11 @@ const DRIVE_FIXED: u32 = 3;
 
 /// Drive letter a root path names (the current drive for NULL / relative paths).
 fn drive_of(env: &Env<'_>, root: u32) -> Option<u8> {
-    let p = if root == 0 { Vec::new() } else { cstr(env.cpu, root) };
+    let p = if root == 0 {
+        Vec::new()
+    } else {
+        cstr(env.cpu, root)
+    };
     let d = match p.get(1) {
         Some(b':') => p[0],
         _ => env.ext.get::<Win32>().vfs.cwd.as_bytes()[0],
@@ -649,7 +779,11 @@ fn drive_of(env: &Env<'_>, root: u32) -> Option<u8> {
 
 fn get_drive_type(env: &mut Env<'_>) -> Outcome {
     let d = drive_of(env, env.arg(0));
-    Outcome::Return(if d == Some(b'C') { DRIVE_FIXED } else { DRIVE_NO_ROOT_DIR })
+    Outcome::Return(if d == Some(b'C') {
+        DRIVE_FIXED
+    } else {
+        DRIVE_NO_ROOT_DIR
+    })
 }
 
 /// GetVolumeInformationA(root, name, name_cap, serial, max_component, flags, fs, fs_cap).
@@ -774,7 +908,9 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "FindClose", 1, |e| {
         let h = e.arg(0);
         e.sys.objects.remove(h);
-        Outcome::Return(u32::from(e.ext.get_mut::<Win32>().finds.remove(&h).is_some()))
+        Outcome::Return(u32::from(
+            e.ext.get_mut::<Win32>().finds.remove(&h).is_some(),
+        ))
     });
     stdcall(reg, K32, "GetCurrentDirectoryA", 2, get_current_directory_a);
     stdcall(reg, K32, "SetCurrentDirectoryA", 1, |e| {
@@ -786,23 +922,51 @@ pub(super) fn register(reg: &mut Registry) {
         set_current_directory(e, p)
     });
     stdcall(reg, K32, "GetFullPathNameA", 4, get_full_path_name_a);
-    stdcall(reg, K32, "GetWindowsDirectoryA", 2, |e| put_dir(e, "C:\\Windows"));
-    stdcall(reg, K32, "GetSystemDirectoryA", 2, |e| put_dir(e, "C:\\Windows\\system32"));
+    stdcall(reg, K32, "GetWindowsDirectoryA", 2, |e| {
+        put_dir(e, "C:\\Windows")
+    });
+    stdcall(reg, K32, "GetSystemDirectoryA", 2, |e| {
+        put_dir(e, "C:\\Windows\\system32")
+    });
     stdcall(reg, K32, "GetTempPathA", 2, |e| {
         let (cap, buf) = (e.arg(0), e.arg(1));
-        let p = format!("C:\\Users\\{}\\AppData\\Local\\Temp\\", e.ext.get::<Win32>().cfg.user_name);
+        let p = format!(
+            "C:\\Users\\{}\\AppData\\Local\\Temp\\",
+            e.ext.get::<Win32>().cfg.user_name
+        );
         match put_cstr(e.cpu, buf, cap, p.as_bytes()) {
             Some(n) => Outcome::Return(n),
             None => Outcome::Return(p.len() as u32 + 1),
         }
     });
-    stdcall(reg, K32, "GetPrivateProfileStringA", 6, get_private_profile_string_a);
-    stdcall(reg, K32, "GetPrivateProfileIntA", 4, get_private_profile_int_a);
-    stdcall(reg, K32, "WritePrivateProfileStringA", 4, write_private_profile_string_a);
+    stdcall(
+        reg,
+        K32,
+        "GetPrivateProfileStringA",
+        6,
+        get_private_profile_string_a,
+    );
+    stdcall(
+        reg,
+        K32,
+        "GetPrivateProfileIntA",
+        4,
+        get_private_profile_int_a,
+    );
+    stdcall(
+        reg,
+        K32,
+        "WritePrivateProfileStringA",
+        4,
+        write_private_profile_string_a,
+    );
     stdcall(reg, K32, "WriteConsoleW", 5, |e| {
         let (buf, n, written) = (e.arg(1), e.arg(2), e.arg(3));
         let u = crate::util::units_or_wstr(e.cpu, buf, n as i32);
-        log::info!("[guest console] {}", String::from_utf16_lossy(&u).trim_end());
+        log::info!(
+            "[guest console] {}",
+            String::from_utf16_lossy(&u).trim_end()
+        );
         out_u32(e.cpu, written, n);
         Outcome::Return(1)
     });

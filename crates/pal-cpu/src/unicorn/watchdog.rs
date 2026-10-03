@@ -26,7 +26,10 @@ pub(super) struct Watchdog {
 
 impl Watchdog {
     pub(super) fn new(expired: Arc<AtomicBool>) -> Self {
-        let shared = Arc::new(Shared { expired, ..Shared::default() });
+        let shared = Arc::new(Shared {
+            expired,
+            ..Shared::default()
+        });
         let timer = shared.clone();
         let thread = thread::Builder::new()
             .name("pal-cpu-watchdog".into())
@@ -55,11 +58,16 @@ impl Watchdog {
                 }
             })
             .expect("spawn CPU watchdog");
-        Self { shared, thread: Some(thread) }
+        Self {
+            shared,
+            thread: Some(thread),
+        }
     }
 
     pub(super) fn arm(&self, budget: Duration) {
-        let deadline = Instant::now().checked_add(budget).expect("execution budget exceeds host clock range");
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .expect("execution budget exceeds host clock range");
         let mut state = self.shared.state.lock().unwrap();
         state.deadline = Some(deadline);
         self.shared.expired.store(false, Ordering::Release);
@@ -85,6 +93,10 @@ impl Drop for Watchdog {
             state.shutdown = true;
             self.shared.changed.notify_one();
         }
-        self.thread.take().unwrap().join().expect("CPU watchdog panicked");
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .expect("CPU watchdog panicked");
     }
 }

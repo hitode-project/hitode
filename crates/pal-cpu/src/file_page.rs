@@ -34,7 +34,9 @@ impl FilePage {
         })
     }
 
-    pub fn lazy(initializer: impl Fn() -> Result<[u8; FILE_PAGE_SIZE], String> + 'static) -> Rc<Self> {
+    pub fn lazy(
+        initializer: impl Fn() -> Result<[u8; FILE_PAGE_SIZE], String> + 'static,
+    ) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(PageState::Lazy(Box::new(initializer))),
             dirty: Cell::new(false),
@@ -93,12 +95,15 @@ impl FilePage {
             PageState::Loading => return Err("recursive file page initialization".into()),
             PageState::Lazy(_) => {}
         }
-        let PageState::Lazy(initializer) = self.state.replace(PageState::Loading) else { unreachable!() };
+        let PageState::Lazy(initializer) = self.state.replace(PageState::Loading) else {
+            unreachable!()
+        };
         // No RefCell borrow is held across I/O or callbacks. A transient failure
         // keeps the initializer so a restarted instruction can retry the read.
         match initializer() {
             Ok(bytes) => {
-                self.state.replace(PageState::Ready(Box::new(UnsafeCell::new(Bytes(bytes)))));
+                self.state
+                    .replace(PageState::Ready(Box::new(UnsafeCell::new(Bytes(bytes)))));
                 self.pointer()
             }
             Err(error) => {
@@ -150,7 +155,11 @@ mod tests {
         let count = calls.clone();
         let page = FilePage::lazy(move || {
             count.set(count.get() + 1);
-            if count.get() < 3 { Err("injected read failure".into()) } else { Ok([0x37; 4096]) }
+            if count.get() < 3 {
+                Err("injected read failure".into())
+            } else {
+                Ok([0x37; 4096])
+            }
         });
         let mut output = [0xa5; 4];
         assert!(page.read_into(0, &mut output).is_err());

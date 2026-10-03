@@ -22,10 +22,17 @@ fn allocate(env: &mut Env<'_>, size: u32) -> u32 {
     if size.checked_add(0xffff).is_none() {
         return 0;
     }
-    env.ext.get_mut::<Win32>().heaps.alloc(env.cpu, &mut env.sys.vm, 0, size, false).unwrap_or(0)
+    env.ext
+        .get_mut::<Win32>()
+        .heaps
+        .alloc(env.cpu, &mut env.sys.vm, 0, size, false)
+        .unwrap_or(0)
 }
 fn free(env: &mut Env<'_>, pointer: u32) {
-    env.ext.get_mut::<Win32>().heaps.free(env.cpu, &mut env.sys.vm, 0, pointer);
+    env.ext
+        .get_mut::<Win32>()
+        .heaps
+        .free(env.cpu, &mut env.sys.vm, 0, pointer);
 }
 fn task_alloc(env: &mut Env<'_>) -> Outcome {
     let pointer = allocate(env, env.arg(0));
@@ -38,7 +45,9 @@ fn task_free(env: &mut Env<'_>) -> Outcome {
     let pointer = env.arg(0);
     if pointer != 0 {
         if !state(env).task.remove(&pointer) {
-            return Outcome::Fail(format!("CoTaskMemFree: invalid task allocation {pointer:#x}"));
+            return Outcome::Fail(format!(
+                "CoTaskMemFree: invalid task allocation {pointer:#x}"
+            ));
         }
         free(env, pointer);
     }
@@ -54,7 +63,9 @@ fn task_realloc(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(pointer);
     }
     if !state(env).task.contains(&old) {
-        return Outcome::Fail(format!("CoTaskMemRealloc: invalid task allocation {old:#x}"));
+        return Outcome::Fail(format!(
+            "CoTaskMemRealloc: invalid task allocation {old:#x}"
+        ));
     }
     if size == 0 {
         state(env).task.remove(&old);
@@ -64,8 +75,12 @@ fn task_realloc(env: &mut Env<'_>) -> Outcome {
     if size.checked_add(0xffff).is_none() {
         return Outcome::Return(0);
     }
-    let pointer =
-        env.ext.get_mut::<Win32>().heaps.realloc(env.cpu, &mut env.sys.vm, 0, old, size, false, false).unwrap_or(0);
+    let pointer = env
+        .ext
+        .get_mut::<Win32>()
+        .heaps
+        .realloc(env.cpu, &mut env.sys.vm, 0, old, size, false, false)
+        .unwrap_or(0);
     if pointer != 0 {
         let memory = state(env);
         memory.task.remove(&old);
@@ -142,7 +157,10 @@ fn string_length(env: &mut Env<'_>, bytes: bool) -> Outcome {
     if pointer == 0 {
         return Outcome::Return(0);
     }
-    let Some(length) = pointer.checked_sub(4).and_then(|p| env.cpu.read_u32(p).ok()) else {
+    let Some(length) = pointer
+        .checked_sub(4)
+        .and_then(|p| env.cpu.read_u32(p).ok())
+    else {
         return Outcome::Fail(format!("SysStringLen: unreadable BSTR {pointer:#x}"));
     };
     Outcome::Return(if bytes { length } else { length / 2 })
@@ -160,8 +178,14 @@ fn string_realloc(env: &mut Env<'_>, counted: bool) -> Outcome {
     let pointer = if null {
         0
     } else {
-        let bytes = if counted { env.arg(2).checked_mul(2) } else { text_length(env, source) };
-        let Some(bytes) = bytes else { return Outcome::Return(0) };
+        let bytes = if counted {
+            env.arg(2).checked_mul(2)
+        } else {
+            text_length(env, source)
+        };
+        let Some(bytes) = bytes else {
+            return Outcome::Return(0);
+        };
         // Allocate/copy before retiring old, including source aliases of old.
         let pointer = new_string(env, source, bytes);
         if pointer == 0 {
@@ -188,7 +212,12 @@ pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, "ole32.dll", "CoTaskMemRealloc", 2, task_realloc);
     stdcall(registry, "ole32.dll", "CoTaskMemFree", 1, task_free);
     for (name, ordinal, argc, handler) in [
-        ("SysAllocString", "#2", 1, (|e: &mut Env<'_>| string_alloc(e, 0)) as pal_machine::Handler),
+        (
+            "SysAllocString",
+            "#2",
+            1,
+            (|e: &mut Env<'_>| string_alloc(e, 0)) as pal_machine::Handler,
+        ),
         ("SysReAllocString", "#3", 2, |e| string_realloc(e, false)),
         ("SysAllocStringLen", "#4", 2, |e| string_alloc(e, 1)),
         ("SysReAllocStringLen", "#5", 3, |e| string_realloc(e, true)),

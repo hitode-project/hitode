@@ -40,7 +40,10 @@ fn heap_destroy(env: &mut Env<'_>) -> Outcome {
 
 fn alloc(env: &mut Env<'_>, heap: u32, size: u32, zero: bool) -> u32 {
     let w = env.ext.get_mut::<Win32>();
-    let p = w.heaps.alloc(env.cpu, &mut env.sys.vm, heap, size, zero).unwrap_or(0);
+    let p = w
+        .heaps
+        .alloc(env.cpu, &mut env.sys.vm, heap, size, zero)
+        .unwrap_or(0);
     if p == 0 {
         set_last_error(env, err::NOT_ENOUGH_MEMORY);
     }
@@ -52,10 +55,17 @@ fn free(env: &mut Env<'_>, heap: u32, p: u32) -> bool {
         return true;
     }
     let w = env.ext.get_mut::<Win32>();
-    let heap = if heap == 0 { w.heaps.owner(p).unwrap_or(0) } else { heap };
+    let heap = if heap == 0 {
+        w.heaps.owner(p).unwrap_or(0)
+    } else {
+        heap
+    };
     let ok = w.heaps.free(env.cpu, &mut env.sys.vm, heap, p);
     if !ok {
-        log::warn!("free of unknown block {p:#x} (heap {heap:#x}) from {:#010x}", env.caller());
+        log::warn!(
+            "free of unknown block {p:#x} (heap {heap:#x}) from {:#010x}",
+            env.caller()
+        );
     }
     ok
 }
@@ -75,7 +85,10 @@ fn heap_realloc(env: &mut Env<'_>) -> Outcome {
     let w = env.ext.get_mut::<Win32>();
     let zero = flags & HEAP_ZERO_MEMORY != 0;
     let in_place = flags & HEAP_REALLOC_IN_PLACE_ONLY != 0;
-    let r = w.heaps.realloc(env.cpu, &mut env.sys.vm, h, p, size, zero, in_place).unwrap_or(0);
+    let r = w
+        .heaps
+        .realloc(env.cpu, &mut env.sys.vm, h, p, size, zero, in_place)
+        .unwrap_or(0);
     if r == 0 {
         set_last_error(env, err::NOT_ENOUGH_MEMORY);
     }
@@ -84,7 +97,13 @@ fn heap_realloc(env: &mut Env<'_>) -> Outcome {
 
 fn heap_size(env: &mut Env<'_>) -> Outcome {
     let (h, p) = (env.arg(0), env.arg(2));
-    Outcome::Return(env.ext.get_mut::<Win32>().heaps.size(h, p).unwrap_or(u32::MAX))
+    Outcome::Return(
+        env.ext
+            .get_mut::<Win32>()
+            .heaps
+            .size(h, p)
+            .unwrap_or(u32::MAX),
+    )
 }
 
 fn local_alloc(env: &mut Env<'_>) -> Outcome {
@@ -103,7 +122,17 @@ fn local_realloc(env: &mut Env<'_>) -> Outcome {
     let w = env.ext.get_mut::<Win32>();
     let heap = w.heaps.owner(p).unwrap_or(0);
     Outcome::Return(
-        w.heaps.realloc(env.cpu, &mut env.sys.vm, heap, p, size, flags & LMEM_ZEROINIT != 0, false).unwrap_or(0),
+        w.heaps
+            .realloc(
+                env.cpu,
+                &mut env.sys.vm,
+                heap,
+                p,
+                size,
+                flags & LMEM_ZEROINIT != 0,
+                false,
+            )
+            .unwrap_or(0),
     )
 }
 
@@ -228,8 +257,15 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     let page = addr & !0xfff;
-    let image = env.sys.modules.containing(addr).map(|id| env.sys.modules.get(id)).filter(|m| m.size != 0);
-    let allocation = image.map(|m| (m.base, m.size)).or_else(|| env.sys.vm.containing(addr));
+    let image = env
+        .sys
+        .modules
+        .containing(addr)
+        .map(|id| env.sys.modules.get(id))
+        .filter(|m| m.size != 0);
+    let allocation = image
+        .map(|m| (m.base, m.size))
+        .or_else(|| env.sys.vm.containing(addr));
     let info = if let Some(info) = super::file_mapping::query(env, addr) {
         info
     } else {
@@ -238,11 +274,16 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
                 let (base, size) = allocation.unwrap_or((page, PAGE));
                 let limit = u64::from(base) + u64::from(size);
                 let mut begin = page;
-                while begin >= base.saturating_add(PAGE) && page_protection(env, begin - PAGE) == Some(protection) {
+                while begin >= base.saturating_add(PAGE)
+                    && page_protection(env, begin - PAGE) == Some(protection)
+                {
                     begin -= PAGE;
                 }
                 let mut end = u64::from(page) + u64::from(PAGE);
-                while end < limit && end < 1u64 << 32 && page_protection(env, end as u32) == Some(protection) {
+                while end < limit
+                    && end < 1u64 << 32
+                    && page_protection(env, end as u32) == Some(protection)
+                {
                     end += u64::from(PAGE);
                 }
                 [
@@ -252,7 +293,11 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
                     (end - u64::from(begin)) as u32,
                     MEM_COMMIT,
                     protection,
-                    if image.is_some() { MEM_IMAGE } else { MEM_PRIVATE },
+                    if image.is_some() {
+                        MEM_IMAGE
+                    } else {
+                        MEM_PRIVATE
+                    },
                 ]
             }
             None => [page, 0, 0, PAGE, MEM_FREE, 0x01, 0],
@@ -300,12 +345,9 @@ fn virtual_protect(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, 487); // ERROR_INVALID_ADDRESS
         return Outcome::Return(0);
     };
-    if env
-        .sys
-        .vm
-        .containing(addr)
-        .is_none_or(|(base, size)| u64::from(page) + u64::from(len) > u64::from(base) + u64::from(size))
-    {
+    if env.sys.vm.containing(addr).is_none_or(|(base, size)| {
+        u64::from(page) + u64::from(len) > u64::from(base) + u64::from(size)
+    }) {
         set_last_error(env, 487);
         return Outcome::Return(0);
     }
@@ -326,15 +368,21 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "HeapSetInformation", 4, |_| Outcome::Return(1));
     stdcall(reg, K32, "HeapValidate", 3, |_| Outcome::Return(1));
     stdcall(reg, K32, "HeapCompact", 2, |_| Outcome::Return(0x10_0000));
-    stdcall(reg, K32, "GetProcessHeap", 0, |e| Outcome::Return(e.ext.get::<Win32>().heaps.process_heap));
+    stdcall(reg, K32, "GetProcessHeap", 0, |e| {
+        Outcome::Return(e.ext.get::<Win32>().heaps.process_heap)
+    });
     for p in ["Local", "Global"] {
         stdcall(reg, K32, &format!("{p}Alloc"), 2, local_alloc);
         stdcall(reg, K32, &format!("{p}Free"), 1, local_free);
         stdcall(reg, K32, &format!("{p}ReAlloc"), 3, local_realloc);
         stdcall(reg, K32, &format!("{p}Size"), 1, local_size);
-        stdcall(reg, K32, &format!("{p}Lock"), 1, |e| Outcome::Return(e.arg(0)));
+        stdcall(reg, K32, &format!("{p}Lock"), 1, |e| {
+            Outcome::Return(e.arg(0))
+        });
         stdcall(reg, K32, &format!("{p}Unlock"), 1, |_| Outcome::Return(1));
-        stdcall(reg, K32, &format!("{p}Handle"), 1, |e| Outcome::Return(e.arg(0)));
+        stdcall(reg, K32, &format!("{p}Handle"), 1, |e| {
+            Outcome::Return(e.arg(0))
+        });
     }
     stdcall(reg, K32, "VirtualAlloc", 4, virtual_alloc);
     stdcall(reg, K32, "VirtualFree", 3, virtual_free);

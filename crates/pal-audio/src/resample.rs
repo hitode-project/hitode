@@ -1,5 +1,7 @@
 //! Prepared off the callback thread. Processing uses only preallocated buffers.
-use rubato::{Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 pub(crate) struct Converter {
     inner: Option<SincFixedOut<f32>>,
@@ -33,9 +35,19 @@ impl Converter {
                 .map_err(|error| error.to_string())?,
             )
         };
-        let input = inner.as_ref().map_or_else(Vec::new, |inner| inner.input_buffer_allocate(true));
-        let output = inner.as_ref().map_or_else(Vec::new, |inner| inner.output_buffer_allocate(true));
-        Ok(Self { inner, input, output, at: 128, rate })
+        let input = inner
+            .as_ref()
+            .map_or_else(Vec::new, |inner| inner.input_buffer_allocate(true));
+        let output = inner
+            .as_ref()
+            .map_or_else(Vec::new, |inner| inner.output_buffer_allocate(true));
+        Ok(Self {
+            inner,
+            input,
+            output,
+            at: 128,
+            rate,
+        })
     }
     pub fn reset(&mut self) {
         if let Some(inner) = self.inner.as_mut() {
@@ -46,7 +58,9 @@ impl Converter {
     /// Causal sinc history plus a prepared output block. Zero-rate identity
     /// sources have no delayed filter tail.
     pub fn tail_frames(&self) -> u32 {
-        self.inner.as_ref().map_or(0, |inner| (inner.output_delay() * 2 + 128) as u32)
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| (inner.output_delay() * 2 + 128) as u32)
     }
     pub fn next(&mut self, mut source: impl FnMut() -> [f32; 2]) -> [f32; 2] {
         let Some(inner) = self.inner.as_mut() else {
@@ -59,7 +73,10 @@ impl Converter {
                 self.input[0][i] = sample[0];
                 self.input[1][i] = sample[1];
             }
-            if inner.process_into_buffer(&self.input, &mut self.output, None).is_err() {
+            if inner
+                .process_into_buffer(&self.input, &mut self.output, None)
+                .is_err()
+            {
                 // Validated buffers and immutable rates make this unreachable;
                 // retain bounded silence if a resampler ever rejects a block.
                 self.output[0].fill(0.0);
@@ -85,7 +102,9 @@ mod tests {
             let mut frames = 0;
             for i in 0..16000 {
                 let sample = converter.next(|| {
-                    let value = (input_frame as f64 * std::f64::consts::TAU * frequency / 48000.0).sin() as f32 * 0.5;
+                    let value = (input_frame as f64 * std::f64::consts::TAU * frequency / 48000.0)
+                        .sin() as f32
+                        * 0.5;
                     input_frame += 1;
                     [value, value]
                 });
@@ -97,9 +116,15 @@ mod tests {
             }
             let rms = (square / frames as f64).sqrt();
             if frequency == 1000.0 {
-                assert!((rms - 0.5 / 2.0f64.sqrt()).abs() < 0.0001, "audible amplitude {rms}");
+                assert!(
+                    (rms - 0.5 / 2.0f64.sqrt()).abs() < 0.0001,
+                    "audible amplitude {rms}"
+                );
             } else {
-                assert!(rms < 0.00003, "20 kHz must not fold to audible 4 kHz: {rms}");
+                assert!(
+                    rms < 0.00003,
+                    "20 kHz must not fold to audible 4 kHz: {rms}"
+                );
             }
         }
     }

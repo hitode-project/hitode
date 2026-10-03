@@ -21,11 +21,19 @@ pub enum Wait {
     /// Sleep until the given time.
     Until(u64),
     /// Wait for an object to become signaled, with an optional deadline.
-    Object { handle: Handle, deadline: Option<u64> },
+    Object {
+        handle: Handle,
+        deadline: Option<u64>,
+    },
     /// Atomically acquire any (lowest index) or all of a set of objects.
     /// A notification invalidates the caller's wait criteria without acquiring
     /// any member; USER32 uses it to refresh generated-input deadlines.
-    Objects { handles: Vec<Handle>, all: bool, deadline: Option<u64>, notification: Option<Handle> },
+    Objects {
+        handles: Vec<Handle>,
+        all: bool,
+        deadline: Option<u64>,
+        notification: Option<Handle>,
+    },
 }
 
 /// The host call a parked context is inside: where to return and what to finish.
@@ -46,8 +54,15 @@ pub(crate) struct Frame {
 }
 
 pub(crate) enum ReadyResume {
-    Woke { then: Continuation, origin: Origin, reason: WakeReason },
-    Deferred { then: DeferredContinuation, origin: Origin },
+    Woke {
+        then: Continuation,
+        origin: Origin,
+        reason: WakeReason,
+    },
+    Deferred {
+        then: DeferredContinuation,
+        origin: Origin,
+    },
 }
 
 impl ReadyResume {
@@ -112,7 +127,9 @@ impl Context {
     pub fn blocked_thunk(&self) -> Option<u32> {
         match &self.state {
             State::Blocked { origin, .. } => Some(origin.thunk),
-            State::Ready { resume: Some(resume) } => Some(resume.origin().thunk),
+            State::Ready {
+                resume: Some(resume),
+            } => Some(resume.origin().thunk),
             _ => None,
         }
     }
@@ -120,7 +137,9 @@ impl Context {
     pub fn blocked_args(&self) -> Option<&[u32]> {
         match &self.state {
             State::Blocked { origin, .. } => origin.trace_args.as_deref(),
-            State::Ready { resume: Some(resume) } => resume.origin().trace_args.as_deref(),
+            State::Ready {
+                resume: Some(resume),
+            } => resume.origin().trace_args.as_deref(),
             _ => None,
         }
     }
@@ -129,7 +148,9 @@ impl Context {
     pub fn blocked_stack(&self) -> Option<u32> {
         match &self.state {
             State::Blocked { origin, .. } => Some(origin.esp),
-            State::Ready { resume: Some(resume) } => Some(resume.origin().esp),
+            State::Ready {
+                resume: Some(resume),
+            } => Some(resume.origin().esp),
             _ => None,
         }
     }
@@ -212,7 +233,8 @@ impl Objects {
         self.references.contains_key(&object)
     }
     pub fn same_object(&self, first: Handle, second: Handle) -> bool {
-        self.identity(first).is_some_and(|object| self.identity(second) == Some(object))
+        self.identity(first)
+            .is_some_and(|object| self.identity(second) == Some(object))
     }
     /// Another live handle to the same retained object, including shared state.
     pub fn alias_identity(&mut self, object: Handle) -> Option<Handle> {
@@ -254,7 +276,10 @@ pub(crate) fn poll_object(
             }
             s
         }
-        Some(Object::Event { manual_reset, signaled }) => {
+        Some(Object::Event {
+            manual_reset,
+            signaled,
+        }) => {
             let s = *signaled;
             if s && consume && !*manual_reset {
                 *signaled = false;
@@ -281,22 +306,35 @@ pub(crate) fn poll_objects(
     };
     if all {
         let mut identities = std::collections::HashSet::new();
-        if handles.iter().any(|&handle| objects.identity(handle).is_none_or(|id| !identities.insert(id))) {
+        if handles.iter().any(|&handle| {
+            objects
+                .identity(handle)
+                .is_none_or(|id| !identities.insert(id))
+        }) {
             return None;
         }
-        if !handles.iter().all(|&h| poll_object(objects, contexts, h, waiter, false)) {
+        if !handles
+            .iter()
+            .all(|&h| poll_object(objects, contexts, h, waiter, false))
+        {
             return None;
         }
         let first_abandoned = handles.iter().position(|&h| abandoned(objects, h));
         for &h in handles {
             poll_object(objects, contexts, h, waiter, true);
         }
-        Some(WakeReason::Objects { index: first_abandoned.unwrap_or(0) as u32, abandoned: first_abandoned.is_some() })
+        Some(WakeReason::Objects {
+            index: first_abandoned.unwrap_or(0) as u32,
+            abandoned: first_abandoned.is_some(),
+        })
     } else {
         for (index, &h) in handles.iter().enumerate() {
             let abandoned = abandoned(objects, h);
             if poll_object(objects, contexts, h, waiter, true) {
-                return Some(WakeReason::Objects { index: index as u32, abandoned });
+                return Some(WakeReason::Objects {
+                    index: index as u32,
+                    abandoned,
+                });
             }
         }
         None

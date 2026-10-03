@@ -64,7 +64,12 @@ impl Run {
 fn unwind(target: Option<u32>) -> Run {
     let mut r = Registry::default();
     pal_win32::register(&mut r);
-    let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), r, Clock::virtual_time()).unwrap();
+    let mut m = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        r,
+        Clock::virtual_time(),
+    )
+    .unwrap();
     let tmp = std::env::temp_dir().join("pal-win32-test-seh");
     Win32::install(&mut m, Win32Config::new(&tmp, "test.exe", &tmp)).unwrap();
     m.cpu.map(CODE, 0x1000, Prot::RX).unwrap();
@@ -112,7 +117,16 @@ fn unwind(target: Option<u32>) -> Run {
     m.cpu.write(CODE + 0x200, &handlers).unwrap();
     m.spawn("seh", CODE, &[], 0x10000).unwrap();
     let result = m.run_virtual(1_000_000);
-    assert!(matches!(result, RunResult::Exited(_) | RunResult::Idle { next_deadline: None }), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            RunResult::Exited(_)
+                | RunResult::Idle {
+                    next_deadline: None
+                }
+        ),
+        "{result:?}"
+    );
     Run { m }
 }
 
@@ -121,11 +135,25 @@ fn rtl_unwind_calls_frames_above_the_target_and_resumes_after_the_call() {
     let r = unwind(Some(OUTER_FRAME));
     let (outer, inner) = (r.rd(OUTER_FRAME), r.rd(INNER_FRAME));
     assert_eq!(r.rd(SEQ), 1, "only the inner handler runs");
-    assert_eq!([r.rd(LOG), r.rd(LOG + 4), r.rd(LOG + 8), r.rd(LOG + 12)], [1, inner, 0xc000_0027, 2]);
+    assert_eq!(
+        [r.rd(LOG), r.rd(LOG + 4), r.rd(LOG + 8), r.rd(LOG + 12)],
+        [1, inner, 0xc000_0027, 2]
+    );
     let out: Vec<u32> = (0..7).map(|i| r.rd(OUT + 4 * i)).collect();
     // EAX = return value, callee-saved registers of the entry, chain at the target, and the
     // stack as the caller left it after the stdcall.
-    assert_eq!(out, [0x1234, 0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444, outer, inner]);
+    assert_eq!(
+        out,
+        [
+            0x1234,
+            0x1111_1111,
+            0x2222_2222,
+            0x3333_3333,
+            0x4444_4444,
+            outer,
+            inner
+        ]
+    );
 }
 
 #[test]
@@ -134,7 +162,10 @@ fn rtl_unwind_without_target_is_an_exit_unwind_of_the_whole_chain() {
     let (outer, inner) = (r.rd(OUTER_FRAME), r.rd(INNER_FRAME));
     assert_eq!(r.rd(SEQ), 2);
     assert_eq!([r.rd(LOG), r.rd(LOG + 4), r.rd(LOG + 12)], [1, inner, 6]);
-    assert_eq!([r.rd(LOG + 16), r.rd(LOG + 20), r.rd(LOG + 28)], [2, outer, 6]);
+    assert_eq!(
+        [r.rd(LOG + 16), r.rd(LOG + 20), r.rd(LOG + 28)],
+        [2, outer, 6]
+    );
     assert_eq!(r.rd(OUT), 0x1234);
     assert_eq!(r.rd(OUT + 4), 0x1111_1111);
     assert_eq!(r.rd(OUT + 20), r.rd(FS_BEFORE), "chain unwound to its end");

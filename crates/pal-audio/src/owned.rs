@@ -44,7 +44,11 @@ pub(crate) struct OwnedVoice {
     rendered_until: f64,
 }
 impl OwnedVoice {
-    pub fn new(state: Arc<SourceState>, rate: u32, block: PcmBlock) -> Result<Box<Self>, (String, PcmBlock)> {
+    pub fn new(
+        state: Arc<SourceState>,
+        rate: u32,
+        block: PcmBlock,
+    ) -> Result<Box<Self>, (String, PcmBlock)> {
         let frequency = block.sample_rate;
         let converter = match Converter::new(frequency, rate) {
             Ok(converter) => converter,
@@ -52,7 +56,11 @@ impl OwnedVoice {
         };
         let mut queue = VecDeque::with_capacity(128);
         let first_pts = Some(block.guest_pts_us as f64);
-        let queued = Queued { pts: block.guest_pts_us as f64, first_frame: 0, pcm: block };
+        let queued = Queued {
+            pts: block.guest_pts_us as f64,
+            first_frame: 0,
+            pcm: block,
+        };
         let timeline_end = queued.end();
         queue.push_back(queued);
         Ok(Box::new(Self {
@@ -93,7 +101,8 @@ impl OwnedVoice {
         if (pts - self.timeline_end).abs() <= 2_000.0 {
             pts = self.timeline_end;
         } else if pts < self.timeline_end {
-            first_frame = ((self.timeline_end - pts) * f64::from(block.sample_rate) / 1_000_000.0).round() as usize;
+            first_frame = ((self.timeline_end - pts) * f64::from(block.sample_rate) / 1_000_000.0)
+                .round() as usize;
             if first_frame >= block.samples.len() / usize::from(block.channels) {
                 return Err(block);
             }
@@ -101,7 +110,11 @@ impl OwnedVoice {
         }
         self.first_pts.get_or_insert(pts);
         self.ended = false;
-        let queued = Queued { pcm: block, pts, first_frame };
+        let queued = Queued {
+            pcm: block,
+            pts,
+            first_frame,
+        };
         self.timeline_end = queued.end();
         self.queue.push_back(queued);
         Ok(())
@@ -117,7 +130,8 @@ impl OwnedVoice {
                 || !self.ended
                 || self.rendered_until
                     < self.timeline_end
-                        + f64::from(self.converter.tail_frames()) * 1_000_000.0 / f64::from(self.converter.rate))
+                        + f64::from(self.converter.tail_frames()) * 1_000_000.0
+                            / f64::from(self.converter.rate))
     }
     pub fn shift_timeline(&mut self, delta: f64) {
         for block in &mut self.queue {
@@ -145,14 +159,20 @@ impl OwnedVoice {
         self.queue.pop_front().expect("prepared initial PCM").pcm
     }
     pub(crate) fn return_credit(&self, block: &PcmBlock) {
-        self.state.queued_us.fetch_sub(Self::duration(block), Ordering::Relaxed);
+        self.state
+            .queued_us
+            .fetch_sub(Self::duration(block), Ordering::Relaxed);
         self.state.queued_blocks.fetch_sub(1, Ordering::Release);
     }
     fn sample(queue: &VecDeque<Queued>, pts: f64) -> [f32; 2] {
-        let Some(block) = queue.iter().find(|block| pts + 0.000001 >= block.pts && pts + 0.000001 < block.end()) else {
+        let Some(block) = queue
+            .iter()
+            .find(|block| pts + 0.000001 >= block.pts && pts + 0.000001 < block.end())
+        else {
             return [0.0; 2];
         };
-        let frame = (((pts - block.pts).max(0.0) * f64::from(block.pcm.sample_rate) / 1_000_000.0).round() as usize)
+        let frame = (((pts - block.pts).max(0.0) * f64::from(block.pcm.sample_rate) / 1_000_000.0)
+            .round() as usize)
             .min(block.frames() - 1)
             + block.first_frame;
         let channels = usize::from(block.pcm.channels);
@@ -164,7 +184,8 @@ impl OwnedVoice {
         [sample(0), sample(1)]
     }
     pub fn duration(block: &PcmBlock) -> u64 {
-        block.samples.len() as u64 / u64::from(block.channels) * 1_000_000 / u64::from(block.sample_rate)
+        block.samples.len() as u64 / u64::from(block.channels) * 1_000_000
+            / u64::from(block.sample_rate)
     }
     pub fn render(
         &mut self,
@@ -188,13 +209,21 @@ impl OwnedVoice {
             // Sinc input prefetch may pass an entire block before its output
             // interval is presented. Retire only after presentation passes it;
             // otherwise coverage metrics would report legitimate history missing.
-            while self.queue.front().is_some_and(|block| block.end() <= time + 0.000001) && !retired.is_full() {
+            while self
+                .queue
+                .front()
+                .is_some_and(|block| block.end() <= time + 0.000001)
+                && !retired.is_full()
+            {
                 let block = self.queue.pop_front().unwrap().pcm;
                 self.return_credit(&block);
                 let result = retired.push(Retired::Pcm(block));
                 debug_assert!(result.is_ok());
             }
-            let covered = self.queue.iter().any(|block| time + 0.000001 >= block.pts && time + 0.000001 < block.end());
+            let covered = self
+                .queue
+                .iter()
+                .any(|block| time + 0.000001 >= block.pts && time + 0.000001 < block.end());
             if !covered
                 && self.first_pts.is_some_and(|first| time + 0.000001 >= first)
                 && (!self.ended || time + 0.000001 < self.timeline_end)
@@ -220,7 +249,8 @@ impl OwnedVoice {
                 output[1] += sample[1] * self.gain[1];
             }
         }
-        self.rendered_until = pts + out.len() as f64 / f64::from(channels) * 1_000_000.0 / f64::from(rate);
+        self.rendered_until =
+            pts + out.len() as f64 / f64::from(channels) * 1_000_000.0 / f64::from(rate);
         missing_frames
     }
 }

@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    INVALID_DATA, Key, KeyMetadata, MAX_KEYS, MAX_METADATA_BYTES, MAX_TOTAL_BYTES, MAX_VALUE_BYTES, MAX_VALUES,
-    NO_MEMORY, Value, VirtualRegistry,
+    INVALID_DATA, Key, KeyMetadata, MAX_KEYS, MAX_METADATA_BYTES, MAX_TOTAL_BYTES, MAX_VALUE_BYTES,
+    MAX_VALUES, NO_MEMORY, Value, VirtualRegistry,
 };
 
 const MAGIC: &[u8; 8] = b"PALREG02";
@@ -23,7 +23,11 @@ fn io_error(error: std::io::Error) -> u32 {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return 33;
     }
-    if error.kind() == std::io::ErrorKind::PermissionDenied { 5 } else { 29 } // ERROR_WRITE_FAULT
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        5
+    } else {
+        29
+    } // ERROR_WRITE_FAULT
 }
 
 fn lock(path: &Path) -> Result<File, u32> {
@@ -58,11 +62,15 @@ pub(super) fn load(path: PathBuf) -> VirtualRegistry {
         storage_lock = Some(lock(&path)?);
         let file = match File::open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VirtualRegistry::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(VirtualRegistry::default());
+            }
             Err(error) => return Err(io_error(error)),
         };
         let mut bytes = Vec::new();
-        file.take(MAX_FILE as u64 + 1).read_to_end(&mut bytes).map_err(io_error)?;
+        file.take(MAX_FILE as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_error)?;
         if bytes.len() > MAX_FILE {
             return Err(INVALID_DATA);
         }
@@ -71,7 +79,10 @@ pub(super) fn load(path: PathBuf) -> VirtualRegistry {
     let mut registry = match result {
         Ok(registry) => registry,
         Err(error) => {
-            log::warn!("virtual registry {}: load failed with {error}; preserving the original file", path.display());
+            log::warn!(
+                "virtual registry {}: load failed with {error}; preserving the original file",
+                path.display()
+            );
             let mut registry = VirtualRegistry::default();
             registry.load_error = Some(error);
             registry
@@ -105,7 +116,10 @@ impl<'a> Cursor<'a> {
             return Err(INVALID_DATA);
         }
         let bytes = self.take(len * 2)?;
-        let units: Vec<_> = bytes.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
         if units.contains(&0) {
             return Err(INVALID_DATA);
         }
@@ -137,7 +151,10 @@ fn decode(bytes: &[u8]) -> Result<VirtualRegistry, u32> {
     let mut seen = BTreeSet::new();
     for _ in 0..count {
         let root = cursor.word()?;
-        if !registry.keys.contains_key(&Key { root, path: Vec::new() }) {
+        if !registry.keys.contains_key(&Key {
+            root,
+            path: Vec::new(),
+        }) {
             return Err(INVALID_DATA);
         }
         let path = cursor.units(32_767)?;
@@ -147,7 +164,10 @@ fn decode(bytes: &[u8]) -> Result<VirtualRegistry, u32> {
         {
             return Err(INVALID_DATA);
         }
-        if path.split(|&unit| unit == 92).any(|part| part.len() > 255 || (!path.is_empty() && part.is_empty())) {
+        if path
+            .split(|&unit| unit == 92)
+            .any(|part| part.len() > 255 || (!path.is_empty() && part.is_empty()))
+        {
             return Err(INVALID_DATA);
         }
         let key = Key { root, path };
@@ -155,19 +175,33 @@ fn decode(bytes: &[u8]) -> Result<VirtualRegistry, u32> {
             return Err(INVALID_DATA);
         }
         if let Some(at) = key.path.iter().rposition(|&unit| unit == 92) {
-            if !registry.keys.contains_key(&Key { root, path: key.path[..at].to_vec() }) {
+            if !registry.keys.contains_key(&Key {
+                root,
+                path: key.path[..at].to_vec(),
+            }) {
                 return Err(INVALID_DATA);
             }
         }
-        let canonical_name = key.path.rsplit(|&unit| unit == 92).next().unwrap_or_default();
+        let canonical_name = key
+            .path
+            .rsplit(|&unit| unit == 92)
+            .next()
+            .unwrap_or_default();
         let metadata = if current {
             let display_name = cursor.units(255)?;
             if super::fold(&display_name) != canonical_name {
                 return Err(INVALID_DATA);
             }
-            KeyMetadata { display_name, class: cursor.units(16_383)?, modified: cursor.time()? }
+            KeyMetadata {
+                display_name,
+                class: cursor.units(16_383)?,
+                modified: cursor.time()?,
+            }
         } else {
-            KeyMetadata { display_name: canonical_name.to_vec(), ..KeyMetadata::default() }
+            KeyMetadata {
+                display_name: canonical_name.to_vec(),
+                ..KeyMetadata::default()
+            }
         };
         let nvalues = cursor.word()? as usize;
         if registry.total_values + nvalues > MAX_VALUES {
@@ -179,7 +213,11 @@ fn decode(bytes: &[u8]) -> Result<VirtualRegistry, u32> {
             if super::fold(&name) != name || values.contains_key(&name) {
                 return Err(INVALID_DATA);
             }
-            let display_name = if current { cursor.units(16_383)? } else { name.clone() };
+            let display_name = if current {
+                cursor.units(16_383)?
+            } else {
+                name.clone()
+            };
             if super::fold(&display_name) != name {
                 return Err(INVALID_DATA);
             }
@@ -188,7 +226,11 @@ fn decode(bytes: &[u8]) -> Result<VirtualRegistry, u32> {
             if len > MAX_VALUE_BYTES || registry.total_bytes + len > MAX_TOTAL_BYTES {
                 return Err(INVALID_DATA);
             }
-            let value = Value { kind, bytes: cursor.take(len)?.to_vec(), display_name };
+            let value = Value {
+                kind,
+                bytes: cursor.take(len)?.to_vec(),
+                display_name,
+            };
             registry.total_bytes += len;
             registry.total_values += 1;
             registry.metadata_bytes += 16 + (name.len() + value.display_name.len()) * 2;
@@ -215,7 +257,11 @@ fn units(bytes: &mut Vec<u8>, units: &[u16]) {
     bytes.extend(units.iter().flat_map(|unit| unit.to_le_bytes()));
 }
 fn encode(registry: &VirtualRegistry) -> Result<Vec<u8>, u32> {
-    let keys: Vec<_> = registry.keys.iter().filter(|(key, _)| !registry.volatile_keys.contains(*key)).collect();
+    let keys: Vec<_> = registry
+        .keys
+        .iter()
+        .filter(|(key, _)| !registry.volatile_keys.contains(*key))
+        .collect();
     let mut bytes = MAGIC.to_vec();
     bytes.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     for (key, values) in keys {
@@ -241,7 +287,9 @@ fn encode(registry: &VirtualRegistry) -> Result<Vec<u8>, u32> {
     Ok(bytes)
 }
 fn checksum(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |value, byte| (value ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+    bytes.iter().fold(0xcbf29ce484222325, |value, byte| {
+        (value ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[cfg(windows)]
@@ -265,7 +313,9 @@ fn replace(from: &Path, to: &Path) -> Result<(), u32> {
 fn replace(from: &Path, to: &Path) -> Result<(), u32> {
     std::fs::rename(from, to).map_err(io_error)?;
     if let Some(parent) = to.parent() {
-        File::open(parent).and_then(|file| file.sync_all()).map_err(io_error)?;
+        File::open(parent)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
     }
     Ok(())
 }
@@ -280,9 +330,16 @@ pub(super) fn flush(registry: &mut VirtualRegistry) -> Result<(), u32> {
     let bytes = encode(registry)?;
     let parent = path.parent().ok_or(29u32)?;
     std::fs::create_dir_all(parent).map_err(io_error)?;
-    let temp =
-        parent.join(format!("registry-v1.tmp-{}-{}", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&temp).map_err(io_error)?;
+    let temp = parent.join(format!(
+        "registry-v1.tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(io_error)?;
     let result = (|| {
         file.write_all(&bytes).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
@@ -314,7 +371,13 @@ mod tests {
     fn legacy_snapshot_migrates_names_and_retains_data_in_version_two() {
         let mut legacy = b"PALREG01".to_vec();
         legacy.extend_from_slice(&6u32.to_le_bytes());
-        for root in [0x8000_0000u32, 0x8000_0001, 0x8000_0002, 0x8000_0003, 0x8000_0005] {
+        for root in [
+            0x8000_0000u32,
+            0x8000_0001,
+            0x8000_0002,
+            0x8000_0003,
+            0x8000_0005,
+        ] {
             legacy.extend_from_slice(&root.to_le_bytes());
             units(&mut legacy, &[]);
             legacy.extend_from_slice(&0u32.to_le_bytes());
@@ -331,14 +394,23 @@ mod tests {
         let current = encode(&old).unwrap();
         assert_eq!(&current[..8], MAGIC);
         let new = decode(&current).unwrap();
-        let key = Key { root: 0x8000_0001, path: "CONFIG".encode_utf16().collect() };
+        let key = Key {
+            root: 0x8000_0001,
+            path: "CONFIG".encode_utf16().collect(),
+        };
         let metadata = new.metadata.get(&key).unwrap();
         assert_eq!(metadata.display_name, key.path);
         assert!(metadata.class.is_empty());
         assert_eq!(metadata.modified, 0);
         let value = new.keys.get(&key).unwrap().values().next().unwrap();
-        assert_eq!(value.display_name, "VALUE".encode_utf16().collect::<Vec<_>>());
-        assert_eq!((value.kind, value.bytes.as_slice()), (4, 0x12345678u32.to_le_bytes().as_slice()));
+        assert_eq!(
+            value.display_name,
+            "VALUE".encode_utf16().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (value.kind, value.bytes.as_slice()),
+            (4, 0x12345678u32.to_le_bytes().as_slice())
+        );
         assert_eq!(
             (new.total_values, new.total_bytes, new.metadata_bytes),
             (old.total_values, old.total_bytes, old.metadata_bytes)
@@ -347,8 +419,12 @@ mod tests {
 
     #[test]
     fn filesystem_write_failure_is_reported_and_preserves_existing_content() {
-        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/registry-io-{unique}"));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/registry-io-{unique}"));
         std::fs::create_dir_all(&directory).unwrap();
         let blocking = directory.join("registry");
         std::fs::write(&blocking, b"unrelated existing file").unwrap();
@@ -357,7 +433,10 @@ mod tests {
         registry.dirty = true;
         assert!(flush(&mut registry).is_err());
         assert!(registry.dirty, "failure must remain retryable");
-        assert_eq!(std::fs::read(&blocking).unwrap(), b"unrelated existing file");
+        assert_eq!(
+            std::fs::read(&blocking).unwrap(),
+            b"unrelated existing file"
+        );
         registry.dirty = false; // Do not deliberately repeat the same failing Drop IO.
     }
 

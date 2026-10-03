@@ -52,8 +52,15 @@ fn completed_frame_yields_without_losing_pc_registers_or_replaying_api() {
     assert_eq!(m.sys.frame, 1);
     assert_eq!(m.cpu.reg(Reg::Eax), 42);
     assert_ne!(m.cpu.reg(Reg::Eip), PARK_ADDR);
-    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0, "ran past the frame boundary");
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(42))));
+    assert_eq!(
+        m.cpu.read_u32(DATA).unwrap(),
+        0,
+        "ran past the frame boundary"
+    );
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Exited(42))
+    ));
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 42);
     assert_eq!(m.sys.frame, 1, "replayed the present handler");
     assert_eq!(m.sys.scheduling.frame_host_yields, 1);
@@ -82,7 +89,10 @@ fn frame_inside_guest_callback_preserves_continuation_and_stack() {
     m.spawn("renderer", CODE, &[], 65536).unwrap();
     prepare(&mut m);
     assert!(matches!(step(&mut m), SliceResult::Yielded));
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(10))));
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Exited(10))
+    ));
     assert_eq!(m.sys.frame, 1);
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 10);
 }
@@ -104,11 +114,17 @@ fn timed_host_continuation_can_present_then_resume_exactly_once() {
     });
     m.spawn("renderer", CODE, &[], 65536).unwrap();
     prepare(&mut m);
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Idle { .. })));
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Idle { .. })
+    ));
     std::thread::sleep(Duration::from_millis(2));
     assert!(matches!(step(&mut m), SliceResult::Yielded));
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(17))));
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Exited(17))
+    ));
     assert_eq!(m.sys.frame, 1);
 }
 
@@ -133,7 +149,10 @@ fn present_then_block_keeps_the_real_wait_and_exit_wins_over_host_yield() {
     });
     m.spawn("renderer", CODE, &[], 65536).unwrap();
     prepare(&mut m);
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Idle { .. })));
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Idle { .. })
+    ));
     let until = match m.sys.context(0).waiting_on() {
         Some(Wait::Until(t)) => *t,
         other => panic!("{other:?}"),
@@ -141,7 +160,10 @@ fn present_then_block_keeps_the_real_wait_and_exit_wins_over_host_yield() {
     while m.sys.clock.now_us() < until {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(23))));
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Exited(23))
+    ));
     assert_eq!(m.sys.frame, 2);
     assert_eq!(m.sys.scheduling.frame_host_yields, 1);
 }
@@ -187,7 +209,14 @@ fn disabled_policy_and_virtual_time_do_not_insert_frame_yields() {
             e.sys.complete_frame();
             Outcome::Return(5)
         });
-        let mut m = fixture(r, if virtual_time { Clock::virtual_time() } else { Clock::real() });
+        let mut m = fixture(
+            r,
+            if virtual_time {
+                Clock::virtual_time()
+            } else {
+                Clock::real()
+            },
+        );
         if !virtual_time {
             m.set_latency_scheduling(false);
         }
@@ -197,7 +226,10 @@ fn disabled_policy_and_virtual_time_do_not_insert_frame_yields() {
         });
         m.spawn("renderer", CODE, &[], 65536).unwrap();
         prepare(&mut m);
-        assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(5))));
+        assert!(matches!(
+            step(&mut m),
+            SliceResult::Complete(RunResult::Exited(5))
+        ));
         assert_eq!(m.sys.scheduling.frame_host_yields, 0);
     }
 }
@@ -222,7 +254,11 @@ fn timer_machine(policy: bool, workers: usize, period: u64, target: usize) -> Ma
     });
     let mut m = fixture(r, Clock::real());
     m.set_latency_scheduling(policy);
-    m.ext.insert(Frames { target, period, ..Frames::default() });
+    m.ext.insert(Frames {
+        target,
+        period,
+        ..Frames::default()
+    });
     let timer = m.resolve_import("test", "timer").unwrap();
     emit(&mut m, CODE, |a| {
         a.call(timer).jmp(CODE);
@@ -232,7 +268,8 @@ fn timer_machine(policy: bool, workers: usize, period: u64, target: usize) -> Ma
         let entry = PROC + 32 * i as u32;
         emit(&mut m, entry, |a| {
             a.bytes.extend_from_slice(&[0xff, 0x05]);
-            a.bytes.extend_from_slice(&(DATA + 4 * i as u32).to_le_bytes());
+            a.bytes
+                .extend_from_slice(&(DATA + 4 * i as u32).to_le_bytes());
             a.jmp(entry);
         });
         m.spawn("compute", entry, &[], 65536).unwrap();
@@ -252,13 +289,20 @@ fn run_timers(m: &mut Machine<Cpu>) {
     }
     let f = m.ext.get::<Frames>();
     assert_eq!(f.times.len(), f.target);
-    assert!(f.times.windows(2).all(|w| w[1] - w[0] >= f.period), "shortened guest wait");
+    assert!(
+        f.times.windows(2).all(|w| w[1] - w[0] >= f.period),
+        "shortened guest wait"
+    );
 }
 #[test]
 fn timed_sleepers_do_not_cause_pointless_quantum_polls() {
     let mut m = timer_machine(true, 1, 10_000, 3);
     run_timers(&mut m);
-    assert!(m.sys.scheduling.internal_preemptions <= 6, "{:?}", m.sys.scheduling);
+    assert!(
+        m.sys.scheduling.internal_preemptions <= 6,
+        "{:?}",
+        m.sys.scheduling
+    );
     assert!(m.cpu.read_u32(DATA).unwrap() > 0);
     assert!(m.sys.scheduling.timed_dispatches > 0);
 }
@@ -279,7 +323,13 @@ fn report_wake_priority_and_demand_driven_quantum() {
             for (round, policy) in [false, true, true, false].into_iter().enumerate() {
                 let mut m = timer_machine(policy, workers, period, 65);
                 run_timers(&mut m);
-                let mut gaps: Vec<_> = m.ext.get::<Frames>().times.windows(2).map(|w| w[1] - w[0]).collect();
+                let mut gaps: Vec<_> = m
+                    .ext
+                    .get::<Frames>()
+                    .times
+                    .windows(2)
+                    .map(|w| w[1] - w[0])
+                    .collect();
                 gaps.sort_unstable();
                 println!(
                     "WAKE round={round} policy={policy} workers={workers} period_us={period} p50_us={} p95_us={} p99_us={} cpu_runs={} stats={:?}",
@@ -318,7 +368,10 @@ fn report_present_handoff() {
             });
             m.spawn("renderer", CODE, &[], 65536).unwrap();
             prepare(&mut m);
-            assert!(matches!(m.run_slice(Duration::from_millis(8)), SliceResult::Yielded));
+            assert!(matches!(
+                m.run_slice(Duration::from_millis(8)),
+                SliceResult::Yielded
+            ));
             samples.push(m.ext.get::<PresentedAt>().0.unwrap().elapsed().as_nanos());
             assert_eq!(m.sys.frame, 1);
             if policy {
@@ -346,7 +399,13 @@ fn report_equal_work_throughput() {
                 if e.sys.try_acquire(handle) {
                     Outcome::Return(0)
                 } else {
-                    Outcome::block_then_return(Wait::Object { handle, deadline: None }, 0)
+                    Outcome::block_then_return(
+                        Wait::Object {
+                            handle,
+                            deadline: None,
+                        },
+                        0,
+                    )
                 }
             });
             let mut m = fixture(r, Clock::real());
@@ -398,7 +457,11 @@ fn starting_a_trace_frame_does_not_handoff_before_its_callback_commits() {
         e.sys.frame += 1;
         Outcome::call(PROC, [], |e, value| {
             assert_eq!(value.value(), 31);
-            assert_eq!(e.cpu.read_u32(DATA).unwrap(), 31, "task callback has not run");
+            assert_eq!(
+                e.cpu.read_u32(DATA).unwrap(),
+                31,
+                "task callback has not run"
+            );
             e.sys.complete_frame();
             Outcome::defer(|e| {
                 e.cpu.write_u32(DATA + 4, 77).unwrap();
@@ -421,12 +484,29 @@ fn starting_a_trace_frame_does_not_handoff_before_its_callback_commits() {
     assert_eq!(m.sys.frame, 1);
     assert_eq!(m.sys.completed_frames, 1);
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 31);
-    assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), 0, "started the following host work");
-    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 0, "returned to the guest too early");
+    assert_eq!(
+        m.cpu.read_u32(DATA + 4).unwrap(),
+        0,
+        "started the following host work"
+    );
+    assert_eq!(
+        m.cpu.read_u32(DATA + 8).unwrap(),
+        0,
+        "returned to the guest too early"
+    );
     assert_eq!(m.sys.context(0).state_name(), "Ready");
-    assert!(m.sys.context(0).blocked_stack().is_some(), "lost the deferred origin");
-    assert_eq!(m.sys.scheduling.wake_priority_dispatches, 0, "host deferral is not a wake");
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(31))));
+    assert!(
+        m.sys.context(0).blocked_stack().is_some(),
+        "lost the deferred origin"
+    );
+    assert_eq!(
+        m.sys.scheduling.wake_priority_dispatches, 0,
+        "host deferral is not a wake"
+    );
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Exited(31))
+    ));
     assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), 77);
     assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 31);
     assert_eq!(m.sys.host_calls, 1, "replayed the start-frame handler");
@@ -445,7 +525,14 @@ fn deferred_frame_continuations_stay_inline_without_the_real_time_policy() {
                 Outcome::Return(9)
             })
         });
-        let mut m = fixture(r, if mode == "virtual" { Clock::virtual_time() } else { Clock::real() });
+        let mut m = fixture(
+            r,
+            if mode == "virtual" {
+                Clock::virtual_time()
+            } else {
+                Clock::real()
+            },
+        );
         if mode == "disabled" {
             m.set_latency_scheduling(false);
         }
@@ -455,8 +542,15 @@ fn deferred_frame_continuations_stay_inline_without_the_real_time_policy() {
         });
         m.spawn("renderer", CODE, &[], 65536).unwrap();
         prepare(&mut m);
-        let result = if mode == "unsliced" { SliceResult::Complete(m.run()) } else { step(&mut m) };
-        assert!(matches!(result, SliceResult::Complete(RunResult::Exited(9))), "{mode}: {result:?}");
+        let result = if mode == "unsliced" {
+            SliceResult::Complete(m.run())
+        } else {
+            step(&mut m)
+        };
+        assert!(
+            matches!(result, SliceResult::Complete(RunResult::Exited(9))),
+            "{mode}: {result:?}"
+        );
         assert_eq!(m.sys.completed_frames, 1);
         assert_eq!(m.cpu.read_u32(DATA).unwrap(), 9);
         assert_eq!(m.sys.scheduling.frame_host_yields, 0);
@@ -535,17 +629,31 @@ fn frame_inside_nested_callbacks_survives_a_peer_context_switch() {
     let initial_esp = m.sys.context(0).stack_hi - 0x14;
     assert!(matches!(step(&mut m), SliceResult::Yielded));
     assert_eq!(m.sys.completed_frames, 1);
-    assert_eq!(m.cpu.read_u32(DATA + 28).unwrap(), 0, "ran beyond presentation");
-    assert!(matches!(step(&mut m), SliceResult::Complete(RunResult::Exited(13))));
+    assert_eq!(
+        m.cpu.read_u32(DATA + 28).unwrap(),
+        0,
+        "ran beyond presentation"
+    );
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Exited(13))
+    ));
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 13);
     assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), 8);
     assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), m.sys.context(0).teb);
     assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), m.sys.context(peer).teb);
     assert_eq!(m.cpu.read_u32(DATA + 28).unwrap(), 1.25f32.to_bits());
     assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 9.5f32.to_bits());
-    assert_eq!(m.cpu.read_u32(DATA + 36).unwrap(), m.cpu.read_u32(DATA + 40).unwrap());
+    assert_eq!(
+        m.cpu.read_u32(DATA + 36).unwrap(),
+        m.cpu.read_u32(DATA + 40).unwrap()
+    );
     assert_eq!(m.cpu.reg(Reg::Esp), initial_esp + 4);
-    assert_eq!(*m.ext.get::<[u32; 6]>(), [1; 6], "handler or continuation replayed");
+    assert_eq!(
+        *m.ext.get::<[u32; 6]>(),
+        [1; 6],
+        "handler or continuation replayed"
+    );
 }
 
 #[test]
@@ -555,20 +663,39 @@ fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
     r.add("test", "wait", Conv::Stdcall { argc: 1 }, |e| {
         let handle = e.arg(0);
         assert!(!e.sys.try_acquire(handle));
-        Outcome::block(Wait::Object { handle, deadline: None }, move |e, wake| {
-            assert_eq!(wake, Resume::Woke(WakeReason::Signaled));
-            e.ext.get_mut::<Vec<u32>>().push(0);
-            Outcome::block(Wait::Object { handle, deadline: None }, |_, _| Outcome::Fail("event woke twice".into()))
-        })
+        Outcome::block(
+            Wait::Object {
+                handle,
+                deadline: None,
+            },
+            move |e, wake| {
+                assert_eq!(wake, Resume::Woke(WakeReason::Signaled));
+                e.ext.get_mut::<Vec<u32>>().push(0);
+                Outcome::block(
+                    Wait::Object {
+                        handle,
+                        deadline: None,
+                    },
+                    |_, _| Outcome::Fail("event woke twice".into()),
+                )
+            },
+        )
     });
     r.add("test", "signal", Conv::Stdcall { argc: 1 }, |e| {
         let handle = e.arg(0);
         e.ext.get_mut::<Vec<u32>>().push(1);
         assert!(e.sys.set_event(handle));
         assert_eq!(e.sys.context(0).state_name(), "Ready");
-        assert!(!e.sys.try_acquire(handle), "signaler stole the granted signal");
+        assert!(
+            !e.sys.try_acquire(handle),
+            "signaler stole the granted signal"
+        );
         assert!(e.sys.reset_event(handle));
-        assert_eq!(*e.ext.get::<Vec<u32>>(), [1], "SetEvent ran guest work inline");
+        assert_eq!(
+            *e.ext.get::<Vec<u32>>(),
+            [1],
+            "SetEvent ran guest work inline"
+        );
         Outcome::Return(0)
     });
     r.add("test", "normal", Conv::Stdcall { argc: 0 }, |e| {
@@ -577,7 +704,10 @@ fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
     });
     let mut m = fixture(r, Clock::real());
     m.ext.insert(Vec::<u32>::new());
-    let event = m.sys.objects.insert(Object::Event { manual_reset: false, signaled: false });
+    let event = m.sys.objects.insert(Object::Event {
+        manual_reset: false,
+        signaled: false,
+    });
     let wait = m.resolve_import("test", "wait").unwrap();
     let signal = m.resolve_import("test", "signal").unwrap();
     let normal = m.resolve_import("test", "normal").unwrap();
@@ -607,7 +737,11 @@ fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(*m.ext.get::<Vec<u32>>(), [1, 0, 2], "wake rewound or bypassed the normal lane");
+    assert_eq!(
+        *m.ext.get::<Vec<u32>>(),
+        [1, 0, 2],
+        "wake rewound or bypassed the normal lane"
+    );
     assert_eq!(m.sys.scheduling.wake_dispatches, 1);
     assert_eq!(m.sys.scheduling.wake_priority_dispatches, 1);
     assert_eq!(m.sys.scheduling.timed_dispatches, 0);
@@ -629,7 +763,9 @@ fn completed_frames_do_not_mask_failure_or_a_deferred_watchdog_expiration() {
             Outcome::defer(|_| panic!("expired watchdog ran the deferred continuation"))
         });
         let mut m = fixture(r, Clock::real());
-        let frame = m.resolve_import("test", if slow { "slow_frame" } else { "fail_frame" }).unwrap();
+        let frame = m
+            .resolve_import("test", if slow { "slow_frame" } else { "fail_frame" })
+            .unwrap();
         emit(&mut m, CODE, |a| {
             a.call(frame).ret();
         });

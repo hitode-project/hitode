@@ -20,7 +20,15 @@ pub struct TraceRecord<'a> {
 impl TraceRecord<'_> {
     pub fn to_line(&self) -> String {
         let args: Vec<String> = self.args.iter().map(|a| format!("{a:x}")).collect();
-        format!("{}\t{}\t{}!{}\t{}\t{:x}", self.ctx, self.frame, self.module, self.name, args.join(","), self.ret)
+        format!(
+            "{}\t{}\t{}!{}\t{}\t{:x}",
+            self.ctx,
+            self.frame,
+            self.module,
+            self.name,
+            args.join(","),
+            self.ret
+        )
     }
 }
 
@@ -34,7 +42,11 @@ pub struct Trace {
 
 impl Trace {
     pub fn to_writer(w: Box<dyn Write>) -> Self {
-        Self { sink: Some(w), all: false, variadic_noted: HashSet::new() }
+        Self {
+            sink: Some(w),
+            all: false,
+            variadic_noted: HashSet::new(),
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -43,9 +55,18 @@ impl Trace {
 
     /// Diagnostic-only dynamic import metadata. Comment records leave completed
     /// calls in their existing five-column format. Disabled tracing allocates nothing.
-    pub fn resolution(&mut self, caller: u32, module: &str, symbol: &dyn std::fmt::Display, address: u32) {
+    pub fn resolution(
+        &mut self,
+        caller: u32,
+        module: &str,
+        symbol: &dyn std::fmt::Display,
+        address: u32,
+    ) {
         if let Some(w) = &mut self.sink {
-            let _ = writeln!(w, "# resolve\t{caller:08x}\t{module}!{symbol}\t{address:08x}");
+            let _ = writeln!(
+                w,
+                "# resolve\t{caller:08x}\t{module}!{symbol}\t{address:08x}"
+            );
         }
     }
 
@@ -58,8 +79,14 @@ impl Trace {
     /// A comment preserves the five-column oracle format and makes truncation explicit.
     pub fn note_variadic(&mut self, module: &str, name: &str, fixed: u8) {
         if let Some(w) = &mut self.sink {
-            if self.variadic_noted.insert((module.to_owned(), name.to_owned())) {
-                let _ = writeln!(w, "# signature\t{module}!{name}\tfixed_prefix={fixed}\tvariadic=true");
+            if self
+                .variadic_noted
+                .insert((module.to_owned(), name.to_owned()))
+            {
+                let _ = writeln!(
+                    w,
+                    "# signature\t{module}!{name}\tfixed_prefix={fixed}\tvariadic=true"
+                );
             }
         }
     }

@@ -52,7 +52,10 @@ fn leave_cs(env: &mut Env<'_>) -> Outcome {
     let cs = env.arg(0);
     let rec = env.cpu.read_u32(cs + CS_RECURSION).unwrap_or(0);
     if rec == 0 {
-        log::warn!("LeaveCriticalSection({cs:#x}) not held, from {:#010x}", env.caller());
+        log::warn!(
+            "LeaveCriticalSection({cs:#x}) not held, from {:#010x}",
+            env.caller()
+        );
         return Outcome::Return(0);
     }
     let lock = env.cpu.read_u32(cs + CS_LOCK_COUNT).unwrap_or(0);
@@ -75,7 +78,9 @@ fn interlocked(env: &mut Env<'_>, f: impl Fn(u32, u32, u32) -> (u32, u32)) -> Ou
 fn wait_result(r: Resume) -> Outcome {
     Outcome::Return(match r {
         Resume::Woke(WakeReason::Signaled) => WAIT_OBJECT_0,
-        Resume::Woke(WakeReason::Objects { index, abandoned }) => index + if abandoned { 0x80 } else { WAIT_OBJECT_0 },
+        Resume::Woke(WakeReason::Objects { index, abandoned }) => {
+            index + if abandoned { 0x80 } else { WAIT_OBJECT_0 }
+        }
         _ => WAIT_TIMEOUT,
     })
 }
@@ -83,7 +88,12 @@ fn wait_result(r: Resume) -> Outcome {
 fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
     if !matches!(
         env.sys.objects.get(h),
-        Some(Object::Event { .. } | Object::Mutex { .. } | Object::Semaphore { .. } | Object::Thread { .. })
+        Some(
+            Object::Event { .. }
+                | Object::Mutex { .. }
+                | Object::Semaphore { .. }
+                | Object::Thread { .. }
+        )
     ) {
         log::warn!("wait on unknown handle {h:#x} from {:#010x}", env.caller());
         set_last_error(env, err::INVALID_HANDLE);
@@ -96,7 +106,15 @@ fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
         return Outcome::Return(WAIT_TIMEOUT);
     }
     let deadline = (ms != INFINITE).then(|| env.sys.clock.now_us() + u64::from(ms) * 1000);
-    Outcome::block(Wait::Objects { handles: vec![h], all: false, deadline, notification: None }, |_, r| wait_result(r))
+    Outcome::block(
+        Wait::Objects {
+            handles: vec![h],
+            all: false,
+            deadline,
+            notification: None,
+        },
+        |_, r| wait_result(r),
+    )
 }
 
 fn wait_multiple(env: &mut Env<'_>) -> Outcome {
@@ -111,13 +129,23 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
             set_last_error(env, err::INVALID_PARAMETER);
             return Outcome::Return(WAIT_FAILED);
         };
-        if hs.contains(&h) || (all != 0 && hs.iter().any(|&other| env.sys.objects.same_object(other, h))) {
+        if hs.contains(&h)
+            || (all != 0
+                && hs
+                    .iter()
+                    .any(|&other| env.sys.objects.same_object(other, h)))
+        {
             set_last_error(env, err::INVALID_PARAMETER);
             return Outcome::Return(WAIT_FAILED);
         }
         if !matches!(
             env.sys.objects.get(h),
-            Some(Object::Event { .. } | Object::Mutex { .. } | Object::Semaphore { .. } | Object::Thread { .. })
+            Some(
+                Object::Event { .. }
+                    | Object::Mutex { .. }
+                    | Object::Semaphore { .. }
+                    | Object::Thread { .. }
+            )
         ) {
             set_last_error(env, err::INVALID_HANDLE);
             return Outcome::Return(WAIT_FAILED);
@@ -131,18 +159,36 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(WAIT_TIMEOUT);
     }
     let deadline = (ms != INFINITE).then(|| env.sys.clock.now_us() + u64::from(ms) * 1000);
-    Outcome::block(Wait::Objects { handles: hs, all: all != 0, deadline, notification: None }, |_, r| wait_result(r))
+    Outcome::block(
+        Wait::Objects {
+            handles: hs,
+            all: all != 0,
+            deadline,
+            notification: None,
+        },
+        |_, r| wait_result(r),
+    )
 }
 
 fn created(env: &mut Env<'_>, o: Object) -> Outcome {
-    let index = if matches!(o, Object::Mutex { .. }) { 2 } else { 3 };
+    let index = if matches!(o, Object::Mutex { .. }) {
+        2
+    } else {
+        3
+    };
     let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
     super::file_mapping::sync_created(env, o, env.arg(index), wide)
 }
 
 fn create_event(env: &mut Env<'_>) -> Outcome {
     let (manual, initial) = (env.arg(1) != 0, env.arg(2) != 0);
-    created(env, Object::Event { manual_reset: manual, signaled: initial })
+    created(
+        env,
+        Object::Event {
+            manual_reset: manual,
+            signaled: initial,
+        },
+    )
 }
 
 fn create_semaphore(env: &mut Env<'_>) -> Outcome {
@@ -171,7 +217,13 @@ fn create_mutex(env: &mut Env<'_>) -> Outcome {
     let owned = env.arg(1) != 0;
     let cur = env.sys.current;
     let owner = owned.then_some(cur);
-    created(env, Object::Mutex { owner, recursion: u32::from(owned) })
+    created(
+        env,
+        Object::Mutex {
+            owner,
+            recursion: u32::from(owned),
+        },
+    )
 }
 
 fn release_mutex(env: &mut Env<'_>) -> Outcome {
@@ -198,13 +250,19 @@ fn release_mutex(env: &mut Env<'_>) -> Outcome {
 
 /// SLIST_HEADER (x86): `Next` pointer, then `Depth` and `Sequence` u16s. Guest threads never
 /// run concurrently, so the lock-free list is plain pushes and pops.
-fn slist(env: &mut Env<'_>, head: u32, f: impl FnOnce(&mut Env<'_>, u32, u16) -> (u32, u16, u32)) -> Outcome {
+fn slist(
+    env: &mut Env<'_>,
+    head: u32,
+    f: impl FnOnce(&mut Env<'_>, u32, u16) -> (u32, u16, u32),
+) -> Outcome {
     let next = env.cpu.read_u32(head).unwrap_or(0);
     let ds = env.cpu.read_u32(head + 4).unwrap_or(0);
     let (next2, depth2, ret) = f(env, next, ds as u16);
     let seq2 = (ds >> 16).wrapping_add(1) & 0xffff;
     let _ = env.cpu.write_u32(head, next2);
-    let _ = env.cpu.write_u32(head + 4, u32::from(depth2) | (seq2 << 16));
+    let _ = env
+        .cpu
+        .write_u32(head + 4, u32::from(depth2) | (seq2 << 16));
     Outcome::Return(ret)
 }
 
@@ -224,16 +282,28 @@ pub(super) fn register(reg: &mut Registry) {
         let head = e.arg(0);
         slist(e, head, |e, next, depth| match next {
             0 => (0, 0, 0),
-            _ => (e.cpu.read_u32(next).unwrap_or(0), depth.saturating_sub(1), next),
+            _ => (
+                e.cpu.read_u32(next).unwrap_or(0),
+                depth.saturating_sub(1),
+                next,
+            ),
         })
     });
     stdcall(reg, K32, "InterlockedFlushSList", 1, |e| {
         let head = e.arg(0);
         slist(e, head, |_, next, _| (0, 0, next))
     });
-    stdcall(reg, K32, "QueryDepthSList", 1, |e| Outcome::Return(u32::from(e.cpu.read_u16(e.arg(0) + 4).unwrap_or(0))));
+    stdcall(reg, K32, "QueryDepthSList", 1, |e| {
+        Outcome::Return(u32::from(e.cpu.read_u16(e.arg(0) + 4).unwrap_or(0)))
+    });
     stdcall(reg, K32, "InitializeCriticalSection", 1, init_cs);
-    stdcall(reg, K32, "InitializeCriticalSectionAndSpinCount", 2, init_cs);
+    stdcall(
+        reg,
+        K32,
+        "InitializeCriticalSectionAndSpinCount",
+        2,
+        init_cs,
+    );
     stdcall(reg, K32, "InitializeCriticalSectionEx", 3, init_cs);
     stdcall(reg, K32, "DeleteCriticalSection", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "EnterCriticalSection", 1, |e| {
@@ -245,11 +315,21 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(u32::from(try_take(e, cs)))
     });
     stdcall(reg, K32, "LeaveCriticalSection", 1, leave_cs);
-    stdcall(reg, K32, "InterlockedIncrement", 1, |e| interlocked(e, |o, _, _| (o.wrapping_add(1), o.wrapping_add(1))));
-    stdcall(reg, K32, "InterlockedDecrement", 1, |e| interlocked(e, |o, _, _| (o.wrapping_sub(1), o.wrapping_sub(1))));
-    stdcall(reg, K32, "InterlockedExchange", 2, |e| interlocked(e, |o, v, _| (v, o)));
-    stdcall(reg, K32, "InterlockedExchangeAdd", 2, |e| interlocked(e, |o, v, _| (o.wrapping_add(v), o)));
-    stdcall(reg, K32, "InterlockedCompareExchange", 3, |e| interlocked(e, |o, x, c| (if o == c { x } else { o }, o)));
+    stdcall(reg, K32, "InterlockedIncrement", 1, |e| {
+        interlocked(e, |o, _, _| (o.wrapping_add(1), o.wrapping_add(1)))
+    });
+    stdcall(reg, K32, "InterlockedDecrement", 1, |e| {
+        interlocked(e, |o, _, _| (o.wrapping_sub(1), o.wrapping_sub(1)))
+    });
+    stdcall(reg, K32, "InterlockedExchange", 2, |e| {
+        interlocked(e, |o, v, _| (v, o))
+    });
+    stdcall(reg, K32, "InterlockedExchangeAdd", 2, |e| {
+        interlocked(e, |o, v, _| (o.wrapping_add(v), o))
+    });
+    stdcall(reg, K32, "InterlockedCompareExchange", 3, |e| {
+        interlocked(e, |o, x, c| (if o == c { x } else { o }, o))
+    });
     stdcall(reg, K32, "CreateEventA", 4, create_event);
     stdcall(reg, K32, "CreateEventW", 4, create_event);
     stdcall(reg, K32, "SetEvent", 1, |e| {
@@ -288,12 +368,20 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "TlsFree", 1, |e| {
         let i = e.arg(0) as usize;
         let w = e.ext.get_mut::<Win32>();
-        Outcome::Return(u32::from(i < 64 && std::mem::replace(&mut w.tls_used[i], false)))
+        Outcome::Return(u32::from(
+            i < 64 && std::mem::replace(&mut w.tls_used[i], false),
+        ))
     });
     stdcall(reg, K32, "TlsGetValue", 1, |e| {
         let i = e.arg(0);
         let teb = e.ctx().teb;
-        let v = if i < 64 { e.cpu.read_u32(teb + pal_machine::layout::teb::TLS_SLOTS + 4 * i).unwrap_or(0) } else { 0 };
+        let v = if i < 64 {
+            e.cpu
+                .read_u32(teb + pal_machine::layout::teb::TLS_SLOTS + 4 * i)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         set_last_error(e, 0);
         Outcome::Return(v)
     });
@@ -304,7 +392,9 @@ pub(super) fn register(reg: &mut Registry) {
             set_last_error(e, err::INVALID_PARAMETER);
             return Outcome::Return(0);
         }
-        let _ = e.cpu.write_u32(teb + pal_machine::layout::teb::TLS_SLOTS + 4 * i, v);
+        let _ = e
+            .cpu
+            .write_u32(teb + pal_machine::layout::teb::TLS_SLOTS + 4 * i, v);
         Outcome::Return(1)
     });
 }

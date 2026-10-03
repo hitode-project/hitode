@@ -41,7 +41,9 @@ enum Named {
 impl Mappings {
     fn prune(&mut self, objects: &pal_machine::Objects) {
         self.names.retain(|_, name| match name {
-            Named::Mapping(section) => section.upgrade().is_some_and(|section| section.handles.get() != 0),
+            Named::Mapping(section) => section
+                .upgrade()
+                .is_some_and(|section| section.handles.get() != 0),
             Named::Sync { identity, .. } => objects.has_identity(*identity),
         });
         self.files.retain(|_, backing| backing.strong_count() != 0);
@@ -100,7 +102,9 @@ fn io_error(error: &std::io::Error) -> u32 {
 }
 
 fn name(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Option<Vec<u16>>, u32> {
-    let Some(mut name) = raw_name(env, pointer, wide)? else { return Ok(None) };
+    let Some(mut name) = raw_name(env, pointer, wide)? else {
+        return Ok(None);
+    };
     let local: Vec<_> = "Local\\".encode_utf16().collect();
     let global: Vec<_> = "Global\\".encode_utf16().collect();
     let scope = if name.starts_with(&local) {
@@ -169,7 +173,10 @@ fn identity(file: &File) -> std::io::Result<Identity> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok((u64::from(info.volume), (u64::from(info.high_index) << 32) | u64::from(info.low_index)))
+    Ok((
+        u64::from(info.volume),
+        (u64::from(info.high_index) << 32) | u64::from(info.low_index),
+    ))
 }
 #[cfg(unix)]
 fn identity(file: &File) -> std::io::Result<Identity> {
@@ -189,7 +196,11 @@ impl Backing {
         }
         let backing = Rc::downgrade(self);
         let page = FilePage::lazy(move || {
-            backing.upgrade().ok_or("file mapping backing was retired")?.load_page(index).map_err(|e| e.to_string())
+            backing
+                .upgrade()
+                .ok_or("file mapping backing was retired")?
+                .load_page(index)
+                .map_err(|e| e.to_string())
         });
         self.pages.borrow_mut().insert(index, page.clone());
         page
@@ -223,7 +234,9 @@ impl Backing {
 
     fn flush(&self, start: u64, end: u64) -> std::io::Result<()> {
         let file = self.file.borrow();
-        let Some(file) = file.as_ref() else { return Ok(()) };
+        let Some(file) = file.as_ref() else {
+            return Ok(());
+        };
         let mut file = file;
         let saved = file.stream_position()?;
         let mut flushed = Vec::new();
@@ -260,7 +273,12 @@ impl Backing {
     }
 }
 
-fn file_backing(env: &mut Env<'_>, handle: u32, writable: bool, maximum: u64) -> Result<Rc<Backing>, u32> {
+fn file_backing(
+    env: &mut Env<'_>,
+    handle: u32,
+    writable: bool,
+    maximum: u64,
+) -> Result<Rc<Backing>, u32> {
     let source = env.ext.get::<Win32>().files.get(&handle).ok_or(6u32)?;
     if source.access & (GENERIC_READ | 0x10000000) == 0
         || (writable && source.access & (GENERIC_WRITE | 0x10000000) == 0)
@@ -286,7 +304,11 @@ fn file_backing(env: &mut Env<'_>, handle: u32, writable: bool, maximum: u64) ->
         if destination != selected {
             std::fs::copy(&selected, &destination).map_err(|e| io_error(&e))?;
         }
-        let target = std::fs::OpenOptions::new().read(true).write(true).open(&destination).map_err(|e| io_error(&e))?;
+        let target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&destination)
+            .map_err(|e| io_error(&e))?;
         if maximum > length {
             target.set_len(maximum).map_err(|e| io_error(&e))?;
         }
@@ -303,7 +325,9 @@ fn file_backing(env: &mut Env<'_>, handle: u32, writable: bool, maximum: u64) ->
                     .write(file.access & (GENERIC_WRITE | 0x10000000) != 0)
                     .open(&destination)
                     .map_err(|e| io_error(&e))?;
-                replacement.seek(SeekFrom::Start(position)).map_err(|e| io_error(&e))?;
+                replacement
+                    .seek(SeekFrom::Start(position))
+                    .map_err(|e| io_error(&e))?;
                 file.file = replacement;
             }
         }
@@ -316,7 +340,10 @@ fn file_backing(env: &mut Env<'_>, handle: u32, writable: bool, maximum: u64) ->
         }
         target
     } else {
-        env.ext.get::<Win32>().files[&handle].file.try_clone().map_err(|e| io_error(&e))?
+        env.ext.get::<Win32>().files[&handle]
+            .file
+            .try_clone()
+            .map_err(|e| io_error(&e))?
     };
     if let Some(backing) = backing {
         return Ok(backing);
@@ -348,7 +375,9 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
         return fail(env, 87);
     }
     if attributes != 0 {
-        if !env.cpu.accessible(attributes, 12, Prot::READ) || env.cpu.read_u32(attributes).unwrap_or(0) != 12 {
+        if !env.cpu.accessible(attributes, 12, Prot::READ)
+            || env.cpu.read_u32(attributes).unwrap_or(0) != 12
+        {
             return fail(env, 87);
         }
         if env.cpu.read_u32(attributes + 4).unwrap_or(1) != 0 {
@@ -357,7 +386,9 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
     }
     let existing = if let Some(name) = &name {
         match state(env).names.get(name) {
-            Some(Named::Mapping(section)) => section.upgrade().filter(|section| section.handles.get() != 0),
+            Some(Named::Mapping(section)) => section
+                .upgrade()
+                .filter(|section| section.handles.get() != 0),
             Some(Named::Sync { identity, .. }) => {
                 let id = *identity;
                 if env.sys.objects.has_identity(id) {
@@ -373,7 +404,13 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
     if let Some(existing) = existing {
         existing.handles.set(existing.handles.get() + 1);
         let handle = env.sys.objects.insert(Object::Opaque(0x4d4150));
-        state(env).handles.insert(handle, Handle { section: existing, access: ALL });
+        state(env).handles.insert(
+            handle,
+            Handle {
+                section: existing,
+                access: ALL,
+            },
+        );
         set_last_error(env, 183);
         return Outcome::Return(handle);
     }
@@ -391,7 +428,9 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
             }),
         )
     } else {
-        let Some(file_obj) = env.ext.get::<Win32>().files.get(&file) else { return fail(env, 6) };
+        let Some(file_obj) = env.ext.get::<Win32>().files.get(&file) else {
+            return fail(env, 6);
+        };
         let size = match file_obj.file.metadata() {
             Ok(info) => info.len(),
             Err(e) => return fail(env, io_error(&e)),
@@ -409,12 +448,25 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
     if len > u64::MAX - (PAGE - 1) {
         return fail(env, 87);
     }
-    let section = Rc::new(Section { backing, len: len.div_ceil(PAGE) * PAGE, protection, handles: Cell::new(1) });
+    let section = Rc::new(Section {
+        backing,
+        len: len.div_ceil(PAGE) * PAGE,
+        protection,
+        handles: Cell::new(1),
+    });
     let handle = env.sys.objects.insert(Object::Opaque(0x4d4150));
     if let Some(name) = name {
-        state(env).names.insert(name, Named::Mapping(Rc::downgrade(&section)));
+        state(env)
+            .names
+            .insert(name, Named::Mapping(Rc::downgrade(&section)));
     }
-    state(env).handles.insert(handle, Handle { section, access: ALL });
+    state(env).handles.insert(
+        handle,
+        Handle {
+            section,
+            access: ALL,
+        },
+    );
     set_last_error(env, 0);
     Outcome::Return(handle)
 }
@@ -427,7 +479,9 @@ fn open(env: &mut Env<'_>, wide: bool) -> Outcome {
         Err(e) => return fail(env, e),
     };
     let section = match state(env).names.get(&name) {
-        Some(Named::Mapping(section)) => section.upgrade().filter(|section| section.handles.get() != 0),
+        Some(Named::Mapping(section)) => section
+            .upgrade()
+            .filter(|section| section.handles.get() != 0),
         Some(Named::Sync { identity, .. }) => {
             let id = *identity;
             if env.sys.objects.has_identity(id) {
@@ -437,13 +491,17 @@ fn open(env: &mut Env<'_>, wide: bool) -> Outcome {
         }
         None => None,
     };
-    let Some(section) = section else { return fail(env, 2) };
+    let Some(section) = section else {
+        return fail(env, 2);
+    };
     if access & 0x20 != 0 {
         return fail(env, 50);
     }
     let handle = env.sys.objects.insert(Object::Opaque(0x4d4150));
     section.handles.set(section.handles.get() + 1);
-    state(env).handles.insert(handle, Handle { section, access });
+    state(env)
+        .handles
+        .insert(handle, Handle { section, access });
     Outcome::Return(handle)
 }
 
@@ -452,7 +510,9 @@ fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
     let offset = (u64::from(env.arg(2)) << 32) | u64::from(env.arg(3));
     let count = u64::from(env.arg(4));
     let base = if requested { env.arg(5) } else { 0 };
-    let Some(handle) = state(env).handles.get(&handle) else { return fail(env, 6) };
+    let Some(handle) = state(env).handles.get(&handle) else {
+        return fail(env, 6);
+    };
     let section = handle.section.clone();
     let rights = handle.access;
     if access & 0x20 != 0 {
@@ -471,8 +531,16 @@ fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
     if offset % GRANULE != 0 {
         return fail(env, 1132);
     }
-    let count = if count == 0 { section.len.saturating_sub(offset) } else { count };
-    if count == 0 || offset.checked_add(count).is_none_or(|end| end > section.len) {
+    let count = if count == 0 {
+        section.len.saturating_sub(offset)
+    } else {
+        count
+    };
+    if count == 0
+        || offset
+            .checked_add(count)
+            .is_none_or(|end| end > section.len)
+    {
         return fail(env, 87);
     }
     let span = count.div_ceil(PAGE) * PAGE;
@@ -530,11 +598,17 @@ fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
 
 fn flush(env: &mut Env<'_>) -> Outcome {
     let (address, count) = (env.arg(0), env.arg(1));
-    let Some((&base, view)) = state(env).views.range(..=address).next_back() else { return fail(env, 487) };
+    let Some((&base, view)) = state(env).views.range(..=address).next_back() else {
+        return fail(env, 487);
+    };
     if address - base >= view.len {
         return fail(env, 487);
     }
-    let count = if count == 0 { view.len - (address - base) } else { count };
+    let count = if count == 0 {
+        view.len - (address - base)
+    } else {
+        count
+    };
     if u64::from(address - base) + u64::from(count) > u64::from(view.len) {
         return fail(env, 487);
     }
@@ -550,9 +624,15 @@ fn flush(env: &mut Env<'_>) -> Outcome {
 
 fn unmap(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
-    let Some(view) = state(env).views.get(&address) else { return fail(env, 487) };
+    let Some(view) = state(env).views.get(&address) else {
+        return fail(env, 487);
+    };
     if !view.copy {
-        if let Err(e) = view.section.backing.flush(view.offset, view.offset + u64::from(view.len)) {
+        if let Err(e) = view
+            .section
+            .backing
+            .flush(view.offset, view.offset + u64::from(view.len))
+        {
             return fail(env, io_error(&e));
         }
     }
@@ -563,7 +643,10 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
     if let Some(state) = env.ext.try_get_mut::<Mappings>() {
         state.prune(&env.sys.objects);
         for backing in state.files.values().filter_map(Weak::upgrade) {
-            backing.pages.borrow_mut().retain(|_, page| page.dirty() || Rc::strong_count(page) > 1);
+            backing
+                .pages
+                .borrow_mut()
+                .retain(|_, page| page.dirty() || Rc::strong_count(page) > 1);
         }
     }
     Outcome::Return(1)
@@ -591,16 +674,25 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
     };
     if let Some(name) = &name {
         match state(env).names.get(name) {
-            Some(Named::Mapping(section)) if section.upgrade().is_some_and(|section| section.handles.get() != 0) => {
+            Some(Named::Mapping(section))
+                if section
+                    .upgrade()
+                    .is_some_and(|section| section.handles.get() != 0) =>
+            {
                 return fail(env, 6);
             }
-            Some(Named::Sync { identity, kind: existing }) => {
+            Some(Named::Sync {
+                identity,
+                kind: existing,
+            }) => {
                 let (id, existing) = (*identity, *existing);
                 if env.sys.objects.has_identity(id) {
                     if kind != existing {
                         return fail(env, 6);
                     }
-                    let Some(handle) = env.sys.objects.alias_identity(id) else { return fail(env, 8) };
+                    let Some(handle) = env.sys.objects.alias_identity(id) else {
+                        return fail(env, 8);
+                    };
                     set_last_error(env, 183);
                     return Outcome::Return(handle);
                 }
@@ -611,7 +703,9 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
     let handle = env.sys.objects.insert(object);
     if let Some(name) = name {
         let identity = env.sys.objects.identity(handle).unwrap();
-        state(env).names.insert(name, Named::Sync { identity, kind });
+        state(env)
+            .names
+            .insert(name, Named::Sync { identity, kind });
     }
     set_last_error(env, 0);
     Outcome::Return(handle)
@@ -619,7 +713,11 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
 
 fn page_protection(env: &Env<'_>, view: &View, base: u32, page: u32) -> u32 {
     let value = view.protections[((page - base) / 4096) as usize];
-    if value == 8 && env.cpu.file_page_copy_on_write(page) == Some(false) { 4 } else { value }
+    if value == 8 && env.cpu.file_page_copy_on_write(page) == Some(false) {
+        4
+    } else {
+        value
+    }
 }
 
 pub(super) fn contains(env: &Env<'_>, addr: u32) -> bool {
@@ -630,7 +728,12 @@ pub(super) fn contains(env: &Env<'_>, addr: u32) -> bool {
 }
 
 pub(super) fn query(env: &Env<'_>, addr: u32) -> Option<[u32; 7]> {
-    let (&base, view) = env.ext.try_get::<Mappings>()?.views.range(..=addr).next_back()?;
+    let (&base, view) = env
+        .ext
+        .try_get::<Mappings>()?
+        .views
+        .range(..=addr)
+        .next_back()?;
     if addr - base >= view.len {
         return None;
     }
@@ -641,14 +744,34 @@ pub(super) fn query(env: &Env<'_>, addr: u32) -> Option<[u32; 7]> {
     while begin > base && page_protection(env, view, base, begin - 4096) == protection {
         begin -= 4096;
     }
-    while end < u64::from(base) + u64::from(view.len) && page_protection(env, view, base, end as u32) == protection {
+    while end < u64::from(base) + u64::from(view.len)
+        && page_protection(env, view, base, end as u32) == protection
+    {
         end += PAGE;
     }
-    Some([begin, base, view.maximum, (end - u64::from(begin)) as u32, 0x1000, protection, 0x40000])
+    Some([
+        begin,
+        base,
+        view.maximum,
+        (end - u64::from(begin)) as u32,
+        0x1000,
+        protection,
+        0x40000,
+    ])
 }
 
-pub(super) fn protect(env: &mut Env<'_>, addr: u32, len: u32, value: u32) -> Option<Result<u32, u32>> {
-    let (&base, view) = env.ext.try_get::<Mappings>()?.views.range(..=addr).next_back()?;
+pub(super) fn protect(
+    env: &mut Env<'_>,
+    addr: u32,
+    len: u32,
+    value: u32,
+) -> Option<Result<u32, u32>> {
+    let (&base, view) = env
+        .ext
+        .try_get::<Mappings>()?
+        .views
+        .range(..=addr)
+        .next_back()?;
     if addr - base >= view.len {
         return None;
     }
@@ -680,8 +803,12 @@ pub(super) fn protect(env: &mut Env<'_>, addr: u32, len: u32, value: u32) -> Opt
 }
 
 pub(super) fn register(registry: &mut Registry) {
-    stdcall(registry, K32, "CreateFileMappingA", 6, |env| create(env, false));
-    stdcall(registry, K32, "CreateFileMappingW", 6, |env| create(env, true));
+    stdcall(registry, K32, "CreateFileMappingA", 6, |env| {
+        create(env, false)
+    });
+    stdcall(registry, K32, "CreateFileMappingW", 6, |env| {
+        create(env, true)
+    });
     stdcall(registry, K32, "OpenFileMappingA", 3, |env| open(env, false));
     stdcall(registry, K32, "OpenFileMappingW", 3, |env| open(env, true));
     stdcall(registry, K32, "MapViewOfFile", 5, |env| map(env, false));
@@ -696,21 +823,27 @@ mod tests {
 
     #[test]
     fn failed_flush_keeps_all_dirty_pages_and_cursor_for_retry() {
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/mapping-flush-tests");
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/mapping-flush-tests");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("retry-{}.bin", std::process::id()));
         std::fs::write(&path, [0u8; 8192]).unwrap();
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let fail = Rc::new(Cell::new(true));
         let injected = fail.clone();
         let first = FilePage::new([0x11; 4096]);
         first.mark_dirty();
-        let second =
-            FilePage::lazy(
-                move || {
-                    if injected.get() { Err("second page snapshot failure".into()) } else { Ok([0x22; 4096]) }
-                },
-            );
+        let second = FilePage::lazy(move || {
+            if injected.get() {
+                Err("second page snapshot failure".into())
+            } else {
+                Ok([0x22; 4096])
+            }
+        });
         second.mark_dirty();
         let backing = Backing {
             file: RefCell::new(Some(file)),
@@ -719,15 +852,37 @@ mod tests {
             pages: RefCell::new(BTreeMap::from([(0, first.clone()), (1, second.clone())])),
         };
         let retained = backing.file.borrow();
-        retained.as_ref().unwrap().seek(SeekFrom::Start(17)).unwrap();
+        retained
+            .as_ref()
+            .unwrap()
+            .seek(SeekFrom::Start(17))
+            .unwrap();
         drop(retained);
         assert!(backing.flush(0, 8192).is_err());
         assert!(first.dirty() && second.dirty());
-        assert_eq!(backing.file.borrow().as_ref().unwrap().stream_position().unwrap(), 17);
+        assert_eq!(
+            backing
+                .file
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .stream_position()
+                .unwrap(),
+            17
+        );
         fail.set(false);
         backing.flush(0, 8192).unwrap();
         assert!(!first.dirty() && !second.dirty());
-        assert_eq!(backing.file.borrow().as_ref().unwrap().stream_position().unwrap(), 17);
+        assert_eq!(
+            backing
+                .file
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .stream_position()
+                .unwrap(),
+            17
+        );
         let output = std::fs::read(&path).unwrap();
         assert_eq!(&output[..4096], &[0x11; 4096]);
         assert_eq!(&output[4096..], &[0x22; 4096]);

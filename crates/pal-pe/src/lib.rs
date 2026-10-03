@@ -81,7 +81,11 @@ pub struct Section {
 impl Section {
     /// Size in memory (virtual size, or raw size for linkers that leave it 0).
     pub fn mem_size(&self) -> u32 {
-        if self.virtual_size != 0 { self.virtual_size } else { self.raw_size }
+        if self.virtual_size != 0 {
+            self.virtual_size
+        } else {
+            self.raw_size
+        }
     }
 
     pub fn is_executable(&self) -> bool {
@@ -174,13 +178,21 @@ pub struct Pe {
 }
 
 fn le16(b: &[u8], off: usize) -> Result<u16> {
-    b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]])).ok_or(PeError::OutOfImage { rva: off as u32, len: 2 })
+    b.get(off..off + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+        .ok_or(PeError::OutOfImage {
+            rva: off as u32,
+            len: 2,
+        })
 }
 
 fn le32(b: &[u8], off: usize) -> Result<u32> {
     b.get(off..off + 4)
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-        .ok_or(PeError::OutOfImage { rva: off as u32, len: 4 })
+        .ok_or(PeError::OutOfImage {
+            rva: off as u32,
+            len: 4,
+        })
 }
 
 impl Pe {
@@ -217,7 +229,10 @@ impl Pe {
         let ndirs = (le32(file, oh + 92)? as usize).min(16);
         let mut dirs = [DataDir::default(); 16];
         for (i, d) in dirs.iter_mut().enumerate().take(ndirs) {
-            *d = DataDir { rva: le32(file, oh + 96 + 8 * i)?, size: le32(file, oh + 100 + 8 * i)? };
+            *d = DataDir {
+                rva: le32(file, oh + 96 + 8 * i)?,
+                size: le32(file, oh + 100 + 8 * i)?,
+            };
         }
         let mut pe = Pe {
             machine,
@@ -240,13 +255,18 @@ impl Pe {
             image: Vec::new(),
         };
         if pe.size_of_image == 0 || pe.size_of_image > 0x4000_0000 {
-            return Err(PeError::Malformed(format!("SizeOfImage {:#x}", pe.size_of_image)));
+            return Err(PeError::Malformed(format!(
+                "SizeOfImage {:#x}",
+                pe.size_of_image
+            )));
         }
 
         let sh = oh + opt_size;
         for i in 0..nsections {
             let s = sh + 40 * i;
-            let raw_name = file.get(s..s + 8).ok_or(PeError::Malformed("section table truncated".into()))?;
+            let raw_name = file
+                .get(s..s + 8)
+                .ok_or(PeError::Malformed("section table truncated".into()))?;
             let name_len = raw_name.iter().position(|&c| c == 0).unwrap_or(8);
             pe.sections.push(Section {
                 name: String::from_utf8_lossy(&raw_name[..name_len]).into_owned(),
@@ -264,15 +284,24 @@ impl Pe {
     fn map_image(&mut self, file: &[u8]) -> Result<()> {
         let pe = self;
         let mut image = vec![0u8; pe.size_of_image as usize];
-        let hdr = (pe.size_of_headers as usize).min(file.len()).min(image.len());
+        let hdr = (pe.size_of_headers as usize)
+            .min(file.len())
+            .min(image.len());
         image[..hdr].copy_from_slice(&file[..hdr]);
         for s in &pe.sections {
             // Windows rounds the raw pointer down to 512 when FileAlignment is at least that.
-            let off = if pe.file_alignment >= 0x200 { s.raw_offset & !0x1ff } else { s.raw_offset } as usize;
+            let off = if pe.file_alignment >= 0x200 {
+                s.raw_offset & !0x1ff
+            } else {
+                s.raw_offset
+            } as usize;
             let len = (s.raw_size.min(s.mem_size()) as usize).min(file.len().saturating_sub(off));
             let va = s.virtual_address as usize;
             if va + len > image.len() {
-                return Err(PeError::Malformed(format!("section {} exceeds SizeOfImage", s.name)));
+                return Err(PeError::Malformed(format!(
+                    "section {} exceeds SizeOfImage",
+                    s.name
+                )));
             }
             image[va..va + len].copy_from_slice(&file[off..off + len]);
         }
@@ -302,15 +331,27 @@ impl Pe {
     }
 
     pub fn set_u32(&mut self, rva: u32, v: u32) -> Result<()> {
-        let s = self.image.get_mut(rva as usize..rva as usize + 4).ok_or(PeError::OutOfImage { rva, len: 4 })?;
+        let s = self
+            .image
+            .get_mut(rva as usize..rva as usize + 4)
+            .ok_or(PeError::OutOfImage { rva, len: 4 })?;
         s.copy_from_slice(&v.to_le_bytes());
         Ok(())
     }
 
     /// NUL-terminated byte string at `rva`.
     pub fn cstr_at(&self, rva: u32) -> Result<&[u8]> {
-        let tail = self.image.get(rva as usize..).ok_or(PeError::OutOfImage { rva, len: 1 })?;
-        let n = tail.iter().position(|&c| c == 0).ok_or(PeError::OutOfImage { rva, len: tail.len() as u32 })?;
+        let tail = self
+            .image
+            .get(rva as usize..)
+            .ok_or(PeError::OutOfImage { rva, len: 1 })?;
+        let n = tail
+            .iter()
+            .position(|&c| c == 0)
+            .ok_or(PeError::OutOfImage {
+                rva,
+                len: tail.len() as u32,
+            })?;
         Ok(&tail[..n])
     }
 
@@ -350,7 +391,11 @@ impl Pe {
                 match v >> 12 {
                     0 => {}
                     3 => out.push(page + u32::from(v & 0xfff)),
-                    t => return Err(PeError::Malformed(format!("relocation type {t} at page {page:#x}"))),
+                    t => {
+                        return Err(PeError::Malformed(format!(
+                            "relocation type {t} at page {page:#x}"
+                        )));
+                    }
                 }
             }
             blk += size;
@@ -369,7 +414,12 @@ impl Pe {
     }
 
     /// Walk a thunk array (names at `names_rva`, slots at `iat_rva`).
-    fn thunks(&self, names_rva: u32, iat_rva: u32, name_va_base: Option<u32>) -> Result<Vec<Import>> {
+    fn thunks(
+        &self,
+        names_rva: u32,
+        iat_rva: u32,
+        name_va_base: Option<u32>,
+    ) -> Result<Vec<Import>> {
         let mut out = Vec::new();
         for i in 0.. {
             let t = self.u32_at(names_rva + 4 * i)?;
@@ -383,9 +433,15 @@ impl Pe {
                     Some(base) => self.va_to_rva_at(t, base)?,
                     None => t,
                 };
-                ImportName::Name { hint: self.u16_at(rva)?, name: self.string_at(rva + 2)? }
+                ImportName::Name {
+                    hint: self.u16_at(rva)?,
+                    name: self.string_at(rva + 2)?,
+                }
             };
-            out.push(Import { name, iat_rva: iat_rva + 4 * i });
+            out.push(Import {
+                name,
+                iat_rva: iat_rva + 4 * i,
+            });
         }
         Ok(out)
     }
@@ -398,13 +454,20 @@ impl Pe {
         }
         for i in 0.. {
             let desc = d.rva + 20 * i;
-            let (int, name, iat) = (self.u32_at(desc)?, self.u32_at(desc + 12)?, self.u32_at(desc + 16)?);
+            let (int, name, iat) = (
+                self.u32_at(desc)?,
+                self.u32_at(desc + 12)?,
+                self.u32_at(desc + 16)?,
+            );
             if name == 0 && iat == 0 {
                 break;
             }
             // Old linkers leave OriginalFirstThunk 0; the IAT then holds the names.
             let names = if int != 0 { int } else { iat };
-            out.push(ImportModule { dll: self.string_at(name)?, imports: self.thunks(names, iat, None)? });
+            out.push(ImportModule {
+                dll: self.string_at(name)?,
+                imports: self.thunks(names, iat, None)?,
+            });
         }
         Ok(out)
     }
@@ -414,12 +477,17 @@ impl Pe {
     /// original import table at +0x10). `None` when the image wasn't rewritten by Detours.
     pub fn detours_original_imports(&self) -> Result<Option<DataDir>> {
         const SIGNATURE: u32 = u32::from_le_bytes(*b"Dtr\0");
-        let Some(s) = self.sections.iter().find(|s| s.name == ".detour") else { return Ok(None) };
+        let Some(s) = self.sections.iter().find(|s| s.name == ".detour") else {
+            return Ok(None);
+        };
         let at = s.virtual_address;
         if self.u32_at(at + 4)? != SIGNATURE {
             return Ok(None);
         }
-        Ok(Some(DataDir { rva: self.u32_at(at + 0x10)?, size: self.u32_at(at + 0x14)? }))
+        Ok(Some(DataDir {
+            rva: self.u32_at(at + 0x10)?,
+            size: self.u32_at(at + 0x14)?,
+        }))
     }
 
     pub fn delay_imports(&self) -> Result<Vec<DelayImportModule>> {
@@ -442,16 +510,31 @@ impl Pe {
                 break;
             }
             if attrs & !1 != 0 {
-                return Err(PeError::Malformed(format!("delay import attributes {attrs:#x}")));
+                return Err(PeError::Malformed(format!(
+                    "delay import attributes {attrs:#x}"
+                )));
             }
             // grAttrs bit 0 set: fields are RVAs (VC7+); clear: VAs (VC6 delay loads).
-            let fix = |v: u32| if attrs & 1 != 0 || v == 0 { Ok(v) } else { self.va_to_rva_at(v, base) };
-            let (hmod, iat, int) =
-                (fix(self.u32_at(desc + 8)?)?, fix(self.u32_at(desc + 12)?)?, fix(self.u32_at(desc + 16)?)?);
+            let fix = |v: u32| {
+                if attrs & 1 != 0 || v == 0 {
+                    Ok(v)
+                } else {
+                    self.va_to_rva_at(v, base)
+                }
+            };
+            let (hmod, iat, int) = (
+                fix(self.u32_at(desc + 8)?)?,
+                fix(self.u32_at(desc + 12)?)?,
+                fix(self.u32_at(desc + 16)?)?,
+            );
             // Translate old-format name pointers before dereferencing the hint/name.
             // Ordinal thunks still use their high-bit encoding in either format.
             let imports = self.thunks(int, iat, (attrs & 1 == 0).then_some(base))?;
-            out.push(DelayImportModule { dll: self.string_at(fix(name)?)?, module_handle_rva: hmod, imports });
+            out.push(DelayImportModule {
+                dll: self.string_at(fix(name)?)?,
+                module_handle_rva: hmod,
+                imports,
+            });
         }
         Ok(out)
     }
@@ -498,7 +581,11 @@ impl Pe {
         let ordinal_base = self.u32_at(d.rva + 16)?;
         let nfuncs = self.u32_at(d.rva + 20)?;
         let nnames = self.u32_at(d.rva + 24)?;
-        let (funcs, names, ords) = (self.u32_at(d.rva + 28)?, self.u32_at(d.rva + 32)?, self.u32_at(d.rva + 36)?);
+        let (funcs, names, ords) = (
+            self.u32_at(d.rva + 28)?,
+            self.u32_at(d.rva + 32)?,
+            self.u32_at(d.rva + 36)?,
+        );
         let mut name_of = vec![None; nfuncs as usize];
         for i in 0..nnames {
             let idx = self.u16_at(ords + 2 * i)? as usize;
@@ -516,7 +603,11 @@ impl Pe {
             } else {
                 ExportTarget::Rva(rva)
             };
-            out.push(Export { ordinal: (ordinal_base + i as u32) as u16, name, target });
+            out.push(Export {
+                ordinal: (ordinal_base + i as u32) as u16,
+                name,
+                target,
+            });
         }
         Ok(out)
     }

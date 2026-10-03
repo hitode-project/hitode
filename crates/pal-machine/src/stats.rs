@@ -69,7 +69,11 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
         writeln!(
             w,
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            if self.frame == u32::MAX { -1 } else { i64::from(self.frame) },
+            if self.frame == u32::MAX {
+                -1
+            } else {
+                i64::from(self.frame)
+            },
             self.guest_us,
             self.run_ns,
             self.hook_ns,
@@ -104,7 +108,13 @@ pub struct Stats {
 
 impl Stats {
     pub fn new() -> Self {
-        Self { total: FrameRow { frame: u32::MAX, ..FrameRow::default() }, ..Self::default() }
+        Self {
+            total: FrameRow {
+                frame: u32::MAX,
+                ..FrameRow::default()
+            },
+            ..Self::default()
+        }
     }
 
     /// Start a timing, if enabled.
@@ -218,8 +228,11 @@ impl Stats {
             t.frontend_wakes as f64 / secs,
         );
         // Host work per frame: what a real-time frontend must fit into one frame interval.
-        let mut work: Vec<u64> =
-            self.frames.iter().map(|r| r.run_ns + r.resume_ns + r.frontend_render_ns + r.frontend_audio_ns).collect();
+        let mut work: Vec<u64> = self
+            .frames
+            .iter()
+            .map(|r| r.run_ns + r.resume_ns + r.frontend_render_ns + r.frontend_audio_ns)
+            .collect();
         if !work.is_empty() {
             let over = |ms: u64| work.iter().filter(|&&w| w > ms * 1_000_000).count();
             let (o16, o33) = (over(16), over(33));
@@ -240,8 +253,13 @@ impl Stats {
                 t.blocks as f64 / self.frames.len().max(1) as f64
             );
         }
-        let mut by_cost: Vec<(usize, (u64, u64))> =
-            self.per_thunk.iter().copied().enumerate().filter(|(_, c)| c.1 > 0).collect();
+        let mut by_cost: Vec<(usize, (u64, u64))> = self
+            .per_thunk
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, c)| c.1 > 0)
+            .collect();
         by_cost.sort_by_key(|&(_, (ns, _))| std::cmp::Reverse(ns));
         if !by_cost.is_empty() {
             s += "  host functions by time:\n";
@@ -280,7 +298,14 @@ mod tests {
         let (pre, f0) = (s.frames[0], s.frames[1]);
         assert_eq!((pre.frame, pre.host_calls, pre.blocks), (u32::MAX, 5, 10));
         assert_eq!(
-            (f0.frame, f0.guest_us, f0.host_calls, f0.run_ns, f0.blocks, f0.block_bytes),
+            (
+                f0.frame,
+                f0.guest_us,
+                f0.host_calls,
+                f0.run_ns,
+                f0.blocks,
+                f0.block_bytes
+            ),
             (0, 16_000, 7, 3_000, 30, 300)
         );
         let mut csv = Vec::new();

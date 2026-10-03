@@ -22,7 +22,9 @@ struct Environment {
 }
 
 fn fold(name: &[u16]) -> Vec<u16> {
-    name.iter().map(|&unit| crate::user32::strings::unit_case(unit, true)).collect()
+    name.iter()
+        .map(|&unit| crate::user32::strings::unit_case(unit, true))
+        .collect()
 }
 fn initialize(env: &mut Env<'_>) {
     if env.ext.try_get::<Environment>().is_some() {
@@ -32,11 +34,16 @@ fn initialize(env: &mut Env<'_>) {
     for entry in super::process::environment(env.ext.get::<Win32>()) {
         // The leading '=' of the per-drive current-directory entry is part of
         // its name, not the delimiter between its name and value.
-        let at = entry[usize::from(entry.starts_with('='))..].find('=').unwrap() + usize::from(entry.starts_with('='));
+        let at = entry[usize::from(entry.starts_with('='))..]
+            .find('=')
+            .unwrap()
+            + usize::from(entry.starts_with('='));
         let name: Vec<_> = entry[..at].encode_utf16().collect();
         let value: Vec<_> = entry[at + 1..].encode_utf16().collect();
         state.units += name.len() + value.len() + 2;
-        state.variables.insert(fold(&name), Variable { name, value });
+        state
+            .variables
+            .insert(fold(&name), Variable { name, value });
     }
     env.ext.insert(state);
 }
@@ -128,8 +135,13 @@ fn set(env: &mut Env<'_>, wide: bool) -> Outcome {
     initialize(env);
     let key = fold(&name);
     let state = env.ext.get_mut::<Environment>();
-    let old = state.variables.get(&key).map_or(0, |v| v.name.len() + v.value.len() + 2);
-    let new = value.as_ref().map_or(0, |value| name.len() + value.len() + 2);
+    let old = state
+        .variables
+        .get(&key)
+        .map_or(0, |v| v.name.len() + v.value.len() + 2);
+    let new = value
+        .as_ref()
+        .map_or(0, |value| name.len() + value.len() + 2);
     if state.units - old + new > MAX_ENV_UNITS {
         return error(env, 8);
     }
@@ -154,7 +166,9 @@ fn expand(env: &mut Env<'_>, wide: bool) -> Outcome {
     let mut at = 0;
     while at < input.len() {
         let end = if input[at] == u16::from(b'%') {
-            input[at + 1..].iter().position(|&unit| unit == u16::from(b'%'))
+            input[at + 1..]
+                .iter()
+                .position(|&unit| unit == u16::from(b'%'))
         } else {
             None
         };
@@ -203,7 +217,10 @@ fn strings(env: &mut Env<'_>, wide: bool) -> Outcome {
     }
     let bytes = encoded(env, &units, wide);
     let state = env.ext.get_mut::<Win32>();
-    let Some(pointer) = state.heaps.alloc(env.cpu, &mut env.sys.vm, 0, bytes.len() as u32, false) else {
+    let Some(pointer) = state
+        .heaps
+        .alloc(env.cpu, &mut env.sys.vm, 0, bytes.len() as u32, false)
+    else {
         return error(env, 8);
     };
     if env.cpu.write(pointer, &bytes).is_err() {
@@ -220,19 +237,54 @@ fn free_strings(env: &mut Env<'_>) -> Outcome {
         return error(env, 87);
     }
     let state = env.ext.get_mut::<Win32>();
-    Outcome::Return(u32::from(state.heaps.free(env.cpu, &mut env.sys.vm, 0, pointer)))
+    Outcome::Return(u32::from(state.heaps.free(
+        env.cpu,
+        &mut env.sys.vm,
+        0,
+        pointer,
+    )))
 }
 
 pub(super) fn register(registry: &mut Registry) {
-    stdcall(registry, super::K32, "GetEnvironmentVariableA", 3, |e| get(e, false));
-    stdcall(registry, super::K32, "GetEnvironmentVariableW", 3, |e| get(e, true));
-    stdcall(registry, super::K32, "SetEnvironmentVariableA", 2, |e| set(e, false));
-    stdcall(registry, super::K32, "SetEnvironmentVariableW", 2, |e| set(e, true));
-    stdcall(registry, super::K32, "ExpandEnvironmentStringsA", 3, |e| expand(e, false));
-    stdcall(registry, super::K32, "ExpandEnvironmentStringsW", 3, |e| expand(e, true));
-    stdcall(registry, super::K32, "GetEnvironmentStrings", 0, |e| strings(e, false));
-    stdcall(registry, super::K32, "GetEnvironmentStringsA", 0, |e| strings(e, false));
-    stdcall(registry, super::K32, "GetEnvironmentStringsW", 0, |e| strings(e, true));
-    stdcall(registry, super::K32, "FreeEnvironmentStringsA", 1, free_strings);
-    stdcall(registry, super::K32, "FreeEnvironmentStringsW", 1, free_strings);
+    stdcall(registry, super::K32, "GetEnvironmentVariableA", 3, |e| {
+        get(e, false)
+    });
+    stdcall(registry, super::K32, "GetEnvironmentVariableW", 3, |e| {
+        get(e, true)
+    });
+    stdcall(registry, super::K32, "SetEnvironmentVariableA", 2, |e| {
+        set(e, false)
+    });
+    stdcall(registry, super::K32, "SetEnvironmentVariableW", 2, |e| {
+        set(e, true)
+    });
+    stdcall(registry, super::K32, "ExpandEnvironmentStringsA", 3, |e| {
+        expand(e, false)
+    });
+    stdcall(registry, super::K32, "ExpandEnvironmentStringsW", 3, |e| {
+        expand(e, true)
+    });
+    stdcall(registry, super::K32, "GetEnvironmentStrings", 0, |e| {
+        strings(e, false)
+    });
+    stdcall(registry, super::K32, "GetEnvironmentStringsA", 0, |e| {
+        strings(e, false)
+    });
+    stdcall(registry, super::K32, "GetEnvironmentStringsW", 0, |e| {
+        strings(e, true)
+    });
+    stdcall(
+        registry,
+        super::K32,
+        "FreeEnvironmentStringsA",
+        1,
+        free_strings,
+    );
+    stdcall(
+        registry,
+        super::K32,
+        "FreeEnvironmentStringsW",
+        1,
+        free_strings,
+    );
 }

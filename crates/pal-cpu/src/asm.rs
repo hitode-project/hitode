@@ -10,7 +10,10 @@ pub struct Asm {
 
 impl Asm {
     pub fn new(base: u32) -> Self {
-        Self { base, bytes: Vec::new() }
+        Self {
+            base,
+            bytes: Vec::new(),
+        }
     }
 
     /// Guest address of the next emitted byte.
@@ -90,11 +93,15 @@ impl Asm {
     }
     /// `cmp dword [addr], imm8`
     pub fn cmp_mem_imm8(&mut self, addr: u32, v: i8) -> &mut Self {
-        self.emit(&[0x83, 0x3d]).emit(&addr.to_le_bytes()).emit(&[v as u8])
+        self.emit(&[0x83, 0x3d])
+            .emit(&addr.to_le_bytes())
+            .emit(&[v as u8])
     }
     /// `mov dword [addr], imm32`
     pub fn mov_mem_imm(&mut self, addr: u32, v: u32) -> &mut Self {
-        self.emit(&[0xc7, 0x05]).emit(&addr.to_le_bytes()).emit(&v.to_le_bytes())
+        self.emit(&[0xc7, 0x05])
+            .emit(&addr.to_le_bytes())
+            .emit(&v.to_le_bytes())
     }
     /// `mov eax, [esp + off]`
     pub fn mov_eax_esp(&mut self, off: u8) -> &mut Self {

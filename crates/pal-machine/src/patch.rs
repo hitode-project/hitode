@@ -32,8 +32,17 @@ impl<B: Backend> Machine<B> {
     /// whole instructions, at least [`JMP_LEN`] bytes, with no relative operands and no branch
     /// target inside them; callers only detour functions matched byte for byte, so this is a
     /// property of the matched code.
-    pub fn detour(&mut self, entry: u32, prologue: u32, module: &str, name: &str) -> Result<Detour, MemFault> {
-        assert!((JMP_LEN..=32).contains(&prologue), "detour prologue of {prologue} bytes");
+    pub fn detour(
+        &mut self,
+        entry: u32,
+        prologue: u32,
+        module: &str,
+        name: &str,
+    ) -> Result<Detour, MemFault> {
+        assert!(
+            (JMP_LEN..=32).contains(&prologue),
+            "detour prologue of {prologue} bytes"
+        );
         let thunk = self.sys.thunks.resolve(&mut self.cpu, module, name)?;
         let mut saved = vec![0u8; prologue as usize];
         self.cpu.read(entry, &mut saved)?;
@@ -50,6 +59,10 @@ impl<B: Backend> Machine<B> {
         j.bytes.resize(prologue as usize, 0xcc);
         self.cpu.write(entry, &j.bytes)?;
         self.cpu.invalidate_code(entry, prologue);
-        Ok(Detour { entry, original, thunk: (thunk - THUNK_BASE) / THUNK_STRIDE })
+        Ok(Detour {
+            entry,
+            original,
+            thunk: (thunk - THUNK_BASE) / THUNK_STRIDE,
+        })
     }
 }

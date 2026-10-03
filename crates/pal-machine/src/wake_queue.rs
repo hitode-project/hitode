@@ -36,10 +36,21 @@ impl WakeQueue {
     pub fn wake(&mut self, id: u32, observed_us: u64, deadline_us: Option<u64>) {
         self.wake_as(id, observed_us, deadline_us, WakePriority::Normal);
     }
-    pub fn wake_as(&mut self, id: u32, observed_us: u64, deadline_us: Option<u64>, priority: WakePriority) {
-        self.pending.resize(self.pending.len().max(id as usize + 1), None);
+    pub fn wake_as(
+        &mut self,
+        id: u32,
+        observed_us: u64,
+        deadline_us: Option<u64>,
+        priority: WakePriority,
+    ) {
+        self.pending
+            .resize(self.pending.len().max(id as usize + 1), None);
         // Re-observation must not renew the priority or lose the original wait.
-        let stamp = self.pending[id as usize].get_or_insert(WakeStamp { observed_us, deadline_us, priority });
+        let stamp = self.pending[id as usize].get_or_insert(WakeStamp {
+            observed_us,
+            deadline_us,
+            priority,
+        });
         stamp.priority = stamp.priority.min(priority);
     }
 
@@ -65,16 +76,29 @@ impl WakeQueue {
                 .filter(|&(id, _)| (id as usize) < count && ready(id))
                 .min_by_key(|&(id, stamp)| (stamp.priority, stamp.observed_us, id));
             if let Some((id, stamp)) = first
-                && (self.last_promoted.is_none() || (stamp.priority == WakePriority::Audio && self.urgent_run < 8))
+                && (self.last_promoted.is_none()
+                    || (stamp.priority == WakePriority::Audio && self.urgent_run < 8))
             {
-                self.urgent_run = if stamp.priority == WakePriority::Audio { self.urgent_run + 1 } else { 0 };
+                self.urgent_run = if stamp.priority == WakePriority::Audio {
+                    self.urgent_run + 1
+                } else {
+                    0
+                };
                 self.last_promoted = Some(id);
-                return Some(Selection { id, promoted: true, wake: self.pending[id as usize].take() });
+                return Some(Selection {
+                    id,
+                    promoted: true,
+                    wake: self.pending[id as usize].take(),
+                });
             }
         }
         let n = count as u32;
         let first = after.map_or(0, |id| id.wrapping_add(1)) % n;
-        let find = |skip: Option<u32>| (0..n).map(|k| (first + k) % n).find(|&id| Some(id) != skip && ready(id));
+        let find = |skip: Option<u32>| {
+            (0..n)
+                .map(|k| (first + k) % n)
+                .find(|&id| Some(id) != skip && ready(id))
+        };
         // Do not immediately give the promoted context a second turn when there
         // is another runnable context. Blocking or repeated waking does not
         // rewind the normal cursor or erase the normal lane's turn.
@@ -83,7 +107,11 @@ impl WakeQueue {
         self.urgent_run = 0;
         *after = Some(id);
         let wake = self.pending.get_mut(id as usize).and_then(Option::take);
-        Some(Selection { id, promoted: false, wake })
+        Some(Selection {
+            id,
+            promoted: false,
+            wake,
+        })
     }
 }
 

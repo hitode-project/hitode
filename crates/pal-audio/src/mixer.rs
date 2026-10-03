@@ -36,7 +36,9 @@ mod reference {
     use std::sync::Arc;
     impl PcmBlock {
         fn duration(&self) -> u64 {
-            self.samples.len() as u64 * 1_000_000 / u64::from(self.channels) / u64::from(self.sample_rate)
+            self.samples.len() as u64 * 1_000_000
+                / u64::from(self.channels)
+                / u64::from(self.sample_rate)
         }
     }
 
@@ -61,7 +63,8 @@ mod reference {
     impl Queued {
         fn end_us(&self) -> f64 {
             self.pts_us
-                + self.samples.len() as f64 / f64::from(self.channels) * 1_000_000.0 / f64::from(self.sample_rate)
+                + self.samples.len() as f64 / f64::from(self.channels) * 1_000_000.0
+                    / f64::from(self.sample_rate)
         }
     }
     impl Default for Stream {
@@ -147,9 +150,12 @@ mod reference {
                 self.initialized = true;
             } else {
                 let elapsed = guest_us.saturating_sub(self.guest_us) as f64;
-                self.filtered_skew_us += (skew - self.filtered_skew_us) * elapsed / (CLOCK_FILTER_US + elapsed);
-                let excess = (self.filtered_skew_us.abs() - CLOCK_JITTER_US).max(0.0) * self.filtered_skew_us.signum();
-                let adjustment = (-excess / 10_000_000.0).clamp(-MAX_RATE_ADJUSTMENT, MAX_RATE_ADJUSTMENT);
+                self.filtered_skew_us +=
+                    (skew - self.filtered_skew_us) * elapsed / (CLOCK_FILTER_US + elapsed);
+                let excess = (self.filtered_skew_us.abs() - CLOCK_JITTER_US).max(0.0)
+                    * self.filtered_skew_us.signum();
+                let adjustment =
+                    (-excess / 10_000_000.0).clamp(-MAX_RATE_ADJUSTMENT, MAX_RATE_ADJUSTMENT);
                 if adjustment != self.rate_adjustment {
                     // Rebase at the next sample, never at the guest clock: already consumed
                     // PCM cannot be replayed. Only the subsequent interpolation step changes.
@@ -203,7 +209,8 @@ mod reference {
                     // Overlap beyond timestamp rounding: keep only what is not queued yet. Returning
                     // the block would not be backpressure; the producer would retry it forever.
                     let ch = usize::from(block.channels);
-                    let frames = ((end - pts_us) * f64::from(block.sample_rate) / 1_000_000.0).round() as usize;
+                    let frames = ((end - pts_us) * f64::from(block.sample_rate) / 1_000_000.0)
+                        .round() as usize;
                     if frames * ch >= block.samples.len() {
                         return Ok(());
                     }
@@ -216,7 +223,8 @@ mod reference {
                 return Err(block);
             }
             self.metrics.queued_blocks += 1;
-            self.metrics.queued_source_frames += block.samples.len() as u64 / u64::from(block.channels);
+            self.metrics.queued_source_frames +=
+                block.samples.len() as u64 / u64::from(block.channels);
             self.metrics.max_stream_queue_us = self.metrics.max_stream_queue_us.max(queue_us);
             if s.first_pts_us.is_none() {
                 s.first_pts_us = Some(pts_us);
@@ -260,7 +268,11 @@ mod reference {
             self.metrics.removals += u64::from(self.streams.remove(&id).is_some());
         }
         pub fn active(&self) -> bool {
-            !self.suspended && self.streams.values().any(|s| s.paused.is_none() && !s.queue.is_empty())
+            !self.suspended
+                && self
+                    .streams
+                    .values()
+                    .any(|s| s.paused.is_none() && !s.queue.is_empty())
         }
 
         /// Linear interpolation; mono duplicates, stereo maps to L/R, extra output channels are silent.
@@ -282,11 +294,20 @@ mod reference {
                 let first = self.device_frames + (chunk * FRAMES) as u64;
                 let mut missing = [0u64; FRAMES / 64];
                 for s in self.streams.values_mut().filter(|s| s.paused.is_none()) {
-                    self.metrics.missing_stream_frames +=
-                        mix_stream(s, output, channels, self.device_origin_us, first, step_us, &mut missing);
+                    self.metrics.missing_stream_frames += mix_stream(
+                        s,
+                        output,
+                        channels,
+                        self.device_origin_us,
+                        first,
+                        step_us,
+                        &mut missing,
+                    );
                 }
-                self.metrics.missing_output_frames +=
-                    missing.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
+                self.metrics.missing_output_frames += missing
+                    .iter()
+                    .map(|word| u64::from(word.count_ones()))
+                    .sum::<u64>();
             }
             for sample in out.iter_mut() {
                 *sample = sample.clamp(-1.0, 1.0);
@@ -327,7 +348,8 @@ mod reference {
                 if let Some(first) = s.first_pts_us
                     && (!s.ended || !s.queue.is_empty())
                 {
-                    let begin = (at + ((first - time - EPS) / step_us).ceil().max(0.0) as usize).min(end);
+                    let begin =
+                        (at + ((first - time - EPS) / step_us).ceil().max(0.0) as usize).min(end);
                     for i in begin..end {
                         missing[i / 64] |= 1 << (i % 64);
                     }
@@ -337,7 +359,8 @@ mod reference {
                 continue;
             }
             let b = s.queue.front().unwrap();
-            let end = (at + ((b.end_us() - time - EPS) / step_us).ceil().max(1.0) as usize).min(frames);
+            let end =
+                (at + ((b.end_us() - time - EPS) / step_us).ceil().max(1.0) as usize).min(frames);
             let source_channels = usize::from(b.channels);
             let count = b.samples.len() / source_channels;
             let mut phase = (time - b.pts_us).max(0.0) * f64::from(b.sample_rate) / 1_000_000.0;
@@ -347,7 +370,10 @@ mod reference {
                     && next.sample_rate == b.sample_rate
                     && (next.pts_us - b.end_us()).abs() <= 1.0
             });
-            for (i, frame) in out[at * channels..end * channels].chunks_exact_mut(channels).enumerate() {
+            for (i, frame) in out[at * channels..end * channels]
+                .chunks_exact_mut(channels)
+                .enumerate()
+            {
                 // Rebase near integral source positions, where an ulp can select
                 // the neighboring sample. This also preserves non-finite handling
                 // at packet boundaries without scanning PCM on the callback.
@@ -370,7 +396,11 @@ mod reference {
                             next.map_or(a, |next| next.samples[source])
                         };
                         let value = a + (z - a) * fraction;
-                        if value.is_finite() { value * gains[channel] } else { 0.0 }
+                        if value.is_finite() {
+                            value * gains[channel]
+                        } else {
+                            0.0
+                        }
                     };
                     if channels == 1 {
                         frame[0] += (sample(0) + sample(1)) * 0.5;
@@ -403,13 +433,19 @@ mod reference {
                 }
                 let step_us = 1_000_000.0 / f64::from(rate) * (1.0 + self.rate_adjustment);
                 for (i, frame) in out.chunks_exact_mut(channels as usize).enumerate() {
-                    let time = self.device_origin_us + (self.device_frames + i as u64) as f64 * step_us;
+                    let time =
+                        self.device_origin_us + (self.device_frames + i as u64) as f64 * step_us;
                     let mut missing = false;
                     for s in self.streams.values_mut().filter(|s| s.paused.is_none()) {
-                        while s.queue.front().is_some_and(|b| b.end_us() <= time + 0.000001) {
+                        while s
+                            .queue
+                            .front()
+                            .is_some_and(|b| b.end_us() <= time + 0.000001)
+                        {
                             s.queue.pop_front();
                         }
-                        let unavailable = s.queue.front().is_none_or(|b| time + 0.000001 < b.pts_us);
+                        let unavailable =
+                            s.queue.front().is_none_or(|b| time + 0.000001 < b.pts_us);
                         if unavailable {
                             if s.first_pts_us.is_some_and(|pts| time + 0.000001 >= pts)
                                 && (!s.ended || !s.queue.is_empty())
@@ -420,7 +456,8 @@ mod reference {
                             continue;
                         }
                         let b = s.queue.front().unwrap();
-                        let pos = (time - b.pts_us).max(0.0) * f64::from(b.sample_rate) / 1_000_000.0;
+                        let pos =
+                            (time - b.pts_us).max(0.0) * f64::from(b.sample_rate) / 1_000_000.0;
                         let n = pos as usize;
                         let count = b.samples.len() / b.channels as usize;
                         if n >= count {
@@ -445,7 +482,11 @@ mod reference {
                                     .unwrap_or(a)
                             };
                             let v = a + (z - a) * pos.fract() as f32;
-                            if v.is_finite() { v * s.gain * channel_gain } else { 0.0 }
+                            if v.is_finite() {
+                                v * s.gain * channel_gain
+                            } else {
+                                0.0
+                            }
                         };
                         if channels == 1 {
                             frame[0] += (sample(0) + sample(1)) * 0.5;
@@ -466,7 +507,13 @@ mod reference {
         }
 
         fn block(id: u64, pts: u64, samples: Vec<f32>) -> PcmBlock {
-            PcmBlock { stream_id: id, guest_pts_us: pts, sample_rate: 1000, channels: 1, samples }
+            PcmBlock {
+                stream_id: id,
+                guest_pts_us: pts,
+                sample_rate: 1000,
+                channels: 1,
+                samples,
+            }
         }
         #[test]
         fn block_mix_matches_prior_frame_algorithm_across_packet_and_rate_boundaries() {
@@ -482,12 +529,21 @@ mod reference {
                     for packet in 0..18u64 {
                         let frames = rate as usize / 100;
                         let mut samples: Vec<_> = (0..frames * channels as usize)
-                            .map(|i| ((i + packet as usize * frames) as f32 * (id as f32 + 0.5) * 0.017).sin() * 0.3)
+                            .map(|i| {
+                                ((i + packet as usize * frames) as f32 * (id as f32 + 0.5) * 0.017)
+                                    .sin()
+                                    * 0.3
+                            })
                             .collect();
                         if packet == 2 {
                             samples[0] = f32::NAN;
                         }
-                        let pts = packet * 10_000 + if id % 3 == 0 && packet >= 6 { 8000 } else { id * 997 };
+                        let pts = packet * 10_000
+                            + if id % 3 == 0 && packet >= 6 {
+                                8000
+                            } else {
+                                id * 997
+                            };
                         assert!(
                             m.push_pcm(PcmBlock {
                                 stream_id: id,
@@ -524,7 +580,11 @@ mod reference {
                         );
                         maximum = maximum.max((a - b).abs());
                     }
-                    assert_eq!(block.metrics(), reference.metrics(), "coverage at callback {callback}");
+                    assert_eq!(
+                        block.metrics(),
+                        reference.metrics(),
+                        "coverage at callback {callback}"
+                    );
                     if callback == 5 {
                         for m in [&mut block, &mut reference] {
                             m.pause_pcm(5, false, 30_000);
@@ -536,7 +596,10 @@ mod reference {
                         }
                     }
                 }
-                assert!(maximum < 0.000002, "packet/block phase differs from prior timeline: {maximum}");
+                assert!(
+                    maximum < 0.000002,
+                    "packet/block phase differs from prior timeline: {maximum}"
+                );
             }
         }
         #[test]
@@ -545,7 +608,11 @@ mod reference {
             m.sync_clock(0);
             assert!(m.push_pcm(block(1, 20_000, vec![0.0; 10])).is_ok());
             m.mix(&mut [1.0; 30], 1000, 1);
-            assert_eq!(m.metrics().missing_stream_frames, 0, "pre-start silence and PCM zeros are covered");
+            assert_eq!(
+                m.metrics().missing_stream_frames,
+                0,
+                "pre-start silence and PCM zeros are covered"
+            );
             m.mix(&mut [1.0; 5], 1000, 1);
             assert_eq!(m.metrics().missing_stream_frames, 5);
             assert_eq!(m.metrics().missing_output_frames, 5);
@@ -562,7 +629,11 @@ mod reference {
             let mut out = [0.0; 15];
             m.mix(&mut out, 1000, 1);
             assert_eq!(out, [0.25; 15]);
-            assert_eq!(m.metrics().missing_stream_frames, 10, "two streams missing five frames each");
+            assert_eq!(
+                m.metrics().missing_stream_frames,
+                10,
+                "two streams missing five frames each"
+            );
             assert_eq!(m.metrics().missing_output_frames, 5);
         }
 
@@ -578,7 +649,11 @@ mod reference {
                     m.flush_pcm(1);
                 }
                 m.mix(&mut [1.0; 30], 1000, 1);
-                assert_eq!(m.metrics().missing_stream_frames, 0, "explicit stop and natural end are intentional");
+                assert_eq!(
+                    m.metrics().missing_stream_frames,
+                    0,
+                    "explicit stop and natural end are intentional"
+                );
             }
             let mut m = Mixer::default();
             m.sync_clock(0);
@@ -587,7 +662,11 @@ mod reference {
             m.mix(&mut [1.0; 50], 1000, 1);
             m.pause_pcm(1, false, 50_000);
             m.mix(&mut [1.0; 20], 1000, 1);
-            assert_eq!(m.metrics().missing_stream_frames, 0, "resume moves the scheduled first PTS too");
+            assert_eq!(
+                m.metrics().missing_stream_frames,
+                0,
+                "resume moves the scheduled first PTS too"
+            );
         }
 
         #[test]
@@ -595,7 +674,10 @@ mod reference {
             let mut m = Mixer::default();
             assert!(m.push_pcm(block(1, 0, vec![0.0; 10])).is_ok());
             assert!(m.push_pcm(block(1, 10_000, vec![0.0; 10])).is_ok());
-            assert!(m.push_pcm(block(1, 0, vec![0.0; 5])).is_ok(), "covered overlap accepted but not queued");
+            assert!(
+                m.push_pcm(block(1, 0, vec![0.0; 5])).is_ok(),
+                "covered overlap accepted but not queued"
+            );
             assert!(m.push_pcm(block(1, 0, vec![0.0; 2001])).is_err());
             m.flush_pcm(1);
             assert!(m.push_pcm(block(1, 30_000, vec![0.0; 5])).is_ok());
@@ -629,7 +711,8 @@ mod reference {
             let mut max_step = 0.0f32;
             let mut previous = 0.25;
             for callback in 0..120_000u64 {
-                let now = callback * 10_000 * 1_000_000 / (1_000_000 + ppm) as u64 + callback % 7 * 137;
+                let now =
+                    callback * 10_000 * 1_000_000 / (1_000_000 + ppm) as u64 + callback % 7 * 137;
                 m.sync_clock(now);
                 let end = (now + 100_000) * SOURCE_RATE / 1_000_000;
                 if end > produced {
@@ -661,8 +744,14 @@ mod reference {
                 }
             }
             assert_eq!(missing, 0, "clock drift {ppm} ppm must not introduce holes");
-            assert!(max_step < 0.0012, "clock drift {ppm} ppm introduced a discontinuity: {max_step}");
-            assert_eq!(m.resyncs, 0, "ordinary drift must not jump the PCM timeline");
+            assert!(
+                max_step < 0.0012,
+                "clock drift {ppm} ppm introduced a discontinuity: {max_step}"
+            );
+            assert_eq!(
+                m.resyncs, 0,
+                "ordinary drift must not jump the PCM timeline"
+            );
             assert!((m.clock_adjustment_ppm() + ppm as f64).abs() < 30.0);
         }
 
@@ -715,7 +804,10 @@ mod reference {
             // 50 ms of real overlap: the first 50 samples are dropped, never the whole block.
             assert!(m.push_pcm(block(3, 150_000, vec![1.0; 100])).is_ok());
             let s = &m.streams[&3];
-            assert_eq!((s.queue[2].pts_us, s.queue[2].samples.len()), (200_000.0, 50));
+            assert_eq!(
+                (s.queue[2].pts_us, s.queue[2].samples.len()),
+                (200_000.0, 50)
+            );
             // Entirely covered: accepted and discarded.
             assert!(m.push_pcm(block(3, 100_000, vec![1.0; 10])).is_ok());
             assert_eq!(m.streams[&3].queue.len(), 3);
@@ -726,8 +818,16 @@ mod reference {
             // No device: nothing mixes. A producer must not stall once its PCM is in the past.
             let mut m = Mixer::default();
             assert!(m.push_pcm(block(1 << 63, 0, vec![0.5; 2000])).is_ok());
-            assert!(m.push_pcm(block(1 << 63, 2_000_000, vec![0.5; 1000])).is_err(), "two-second bound");
-            assert!(m.push_pcm(block(1 << 63, 2_600_000, vec![0.5; 1000])).is_ok(), "first block expired");
+            assert!(
+                m.push_pcm(block(1 << 63, 2_000_000, vec![0.5; 1000]))
+                    .is_err(),
+                "two-second bound"
+            );
+            assert!(
+                m.push_pcm(block(1 << 63, 2_600_000, vec![0.5; 1000]))
+                    .is_ok(),
+                "first block expired"
+            );
             m.end_pcm(1 << 63);
             m.sync_clock(4_200_000);
             assert!(!m.active());

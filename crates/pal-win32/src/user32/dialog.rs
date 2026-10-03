@@ -10,8 +10,8 @@ use pal_pe::ResId;
 
 use super::message::{dispatch, next_any, send, wait_for_message};
 use super::window::{
-    self, ClassKey, CreateParams, DWL_DLGPROC, Rect, SW_HIDE, SW_SHOWNORMAL, User, WS_CHILD, WS_VISIBLE, create_window,
-    destroy_window, nc_insets, show_window, wm,
+    self, ClassKey, CreateParams, DWL_DLGPROC, Rect, SW_HIDE, SW_SHOWNORMAL, User, WS_CHILD,
+    WS_VISIBLE, create_window, destroy_window, nc_insets, show_window, wm,
 };
 use super::{USER32, user, user_mut};
 use crate::{Win32, stdcall};
@@ -162,10 +162,33 @@ pub fn parse_template(cpu: &dyn Guest, addr: u32) -> Option<Template> {
         // Native USER32 passes the size word too, for both template formats.
         let data = (extra > 0).then_some(c.at - 2);
         c.at += u32::from(extra);
-        items.push(Item { style, ex_style, x, y, cx, cy, id, class, title, data });
+        items.push(Item {
+            style,
+            ex_style,
+            x,
+            y,
+            cx,
+            cy,
+            id,
+            class,
+            title,
+            data,
+        });
     }
     let _ = c.u8();
-    Some(Template { style, ex_style, x, y, cx, cy, menu, class, title, font, items })
+    Some(Template {
+        style,
+        ex_style,
+        x,
+        y,
+        cx,
+        cy,
+        menu,
+        class,
+        title,
+        font,
+        items,
+    })
 }
 
 /// Dialog base units (average character width, height) for a template font.
@@ -222,11 +245,15 @@ pub fn create_dialog(
     let child = t.style & WS_CHILD != 0;
     if t.style & DS_CENTER != 0 {
         let area = if owner != 0 && !child {
-            u.screen_rect(owner).unwrap_or(Rect::new(0, 0, u.screen.0, u.screen.1))
+            u.screen_rect(owner)
+                .unwrap_or(Rect::new(0, 0, u.screen.0, u.screen.1))
         } else {
             Rect::new(0, 0, u.screen.0, u.screen.1 - 40)
         };
-        (x, y) = (area.left + (area.width() - w) / 2, area.top + (area.height() - h) / 2);
+        (x, y) = (
+            area.left + (area.width() - w) / 2,
+            area.top + (area.height() - h) / 2,
+        );
     } else if !child && t.style & DS_ABSALIGN == 0 && owner != 0 {
         let (ox, oy) = u.client_origin(owner);
         (x, y) = (x + ox, y + oy);
@@ -264,18 +291,24 @@ pub fn create_dialog(
         if let Some(w) = user_mut(env).windows.get_mut(&dlg)
             && w.extra.len() >= 8
         {
-            w.extra[DWL_DLGPROC as usize..DWL_DLGPROC as usize + 4].copy_from_slice(&dlgproc.to_le_bytes());
+            w.extra[DWL_DLGPROC as usize..DWL_DLGPROC as usize + 4]
+                .copy_from_slice(&dlgproc.to_le_bytes());
             w.control.base_units = (bx, by);
         }
-        let font =
-            t.font.as_ref().map_or(0, |(pt, face)| crate::gdi32::create_font(env, -(i32::from(*pt) * 4 / 3), face));
+        let font = t.font.as_ref().map_or(0, |(pt, face)| {
+            crate::gdi32::create_font(env, -(i32::from(*pt) * 4 / 3), face)
+        });
         let items: VecDeque<Item> = t.items.into_iter().collect();
         let after_font = move |env: &mut Env<'_>| {
             create_items(env, dlg, instance, items, (bx, by), font, move |env| {
                 let focus = first_tab_stop(user(env), dlg);
                 send(env, dlg, wm::INITDIALOG, focus, param, move |env, r| {
                     // EndDialog during INITDIALOG ends creation before showing or focusing.
-                    if user(env).windows.get(&dlg).is_some_and(|w| w.control.dialog_end.is_some()) {
+                    if user(env)
+                        .windows
+                        .get(&dlg)
+                        .is_some_and(|w| w.control.dialog_end.is_some())
+                    {
                         return then(env, dlg);
                     }
                     let show = move |env: &mut Env<'_>| {
@@ -292,7 +325,9 @@ pub fn create_dialog(
             })
         };
         if font != 0 {
-            return send(env, dlg, wm::SETFONT, font, 0, move |env, _| after_font(env));
+            return send(env, dlg, wm::SETFONT, font, 0, move |env, _| {
+                after_font(env)
+            });
         }
         after_font(env)
     })
@@ -307,7 +342,9 @@ fn create_items(
     font: u32,
     then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
-    let Some(it) = items.pop_front() else { return then(env) };
+    let Some(it) = items.pop_front() else {
+        return then(env);
+    };
     let class_name = match &it.class {
         SzOrOrd::Ord(o) => predefined_class(*o).to_owned(),
         SzOrOrd::Str(s) => s.clone(),
@@ -341,7 +378,8 @@ fn create_items(
         if ctl == 0 {
             log::warn!("dialog control {} could not be created", it.id);
         }
-        let next = move |env: &mut Env<'_>| create_items(env, dlg, instance, items, (bx, by), font, then);
+        let next =
+            move |env: &mut Env<'_>| create_items(env, dlg, instance, items, (bx, by), font, then);
         if ctl != 0 && font != 0 {
             return send(env, ctl, wm::SETFONT, font, 0, move |env, _| next(env));
         }
@@ -353,10 +391,11 @@ fn first_tab_stop(u: &User, dlg: u32) -> u32 {
     u.windows
         .get(&dlg)
         .and_then(|d| {
-            d.children
-                .iter()
-                .copied()
-                .find(|c| u.windows.get(c).is_some_and(|w| w.style & 0x0001_0000 != 0 && w.enabled() && w.visible()))
+            d.children.iter().copied().find(|c| {
+                u.windows
+                    .get(c)
+                    .is_some_and(|w| w.style & 0x0001_0000 != 0 && w.enabled() && w.visible())
+            })
         })
         .unwrap_or(0)
 }
@@ -365,7 +404,12 @@ fn first_tab_stop(u: &User, dlg: u32) -> u32 {
 pub fn item(u: &User, dlg: u32, id: u32) -> u32 {
     u.windows
         .get(&dlg)
-        .and_then(|d| d.children.iter().copied().find(|c| u.windows.get(c).is_some_and(|w| w.id == id)))
+        .and_then(|d| {
+            d.children
+                .iter()
+                .copied()
+                .find(|c| u.windows.get(c).is_some_and(|w| w.id == id))
+        })
         .unwrap_or(0)
 }
 
@@ -379,38 +423,62 @@ fn template_resource(env: &mut Env<'_>, instance: u32, name: u32) -> Option<u32>
 }
 
 fn create_dialog_param_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name, owner, proc, param) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let Some(t) = template_resource(env, inst, name).and_then(|a| parse_template(env.cpu, a)) else {
+    let (inst, name, owner, proc, param) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let Some(t) = template_resource(env, inst, name).and_then(|a| parse_template(env.cpu, a))
+    else {
         return Outcome::Return(0);
     };
-    create_dialog(env, inst, t, owner, proc, param, false, |_, h| Outcome::Return(h))
+    create_dialog(env, inst, t, owner, proc, param, false, |_, h| {
+        Outcome::Return(h)
+    })
 }
 
 fn create_dialog_indirect_param_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, tpl, owner, proc, param) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let Some(t) = parse_template(env.cpu, tpl) else { return Outcome::Return(0) };
-    create_dialog(env, inst, t, owner, proc, param, false, |_, h| Outcome::Return(h))
+    let (inst, tpl, owner, proc, param) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let Some(t) = parse_template(env.cpu, tpl) else {
+        return Outcome::Return(0);
+    };
+    create_dialog(env, inst, t, owner, proc, param, false, |_, h| {
+        Outcome::Return(h)
+    })
 }
 
 fn dialog_box_param_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name, owner, proc, param) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let Some(t) = template_resource(env, inst, name).and_then(|a| parse_template(env.cpu, a)) else {
+    let (inst, name, owner, proc, param) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let Some(t) = template_resource(env, inst, name).and_then(|a| parse_template(env.cpu, a))
+    else {
         return Outcome::Return(u32::MAX);
     };
     dialog_box(env, inst, t, owner, proc, param)
 }
 
 fn dialog_box_indirect_param_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, tpl, owner, proc, param) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let Some(t) = parse_template(env.cpu, tpl) else { return Outcome::Return(u32::MAX) };
+    let (inst, tpl, owner, proc, param) =
+        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let Some(t) = parse_template(env.cpu, tpl) else {
+        return Outcome::Return(u32::MAX);
+    };
     dialog_box(env, inst, t, owner, proc, param)
 }
 
 /// DialogBoxIndirectParam: disable the owner, create the dialog, run a modal loop until
 /// EndDialog, destroy it, re-enable the owner.
-fn dialog_box(env: &mut Env<'_>, inst: u32, t: Template, owner: u32, proc: u32, param: u32) -> Outcome {
+fn dialog_box(
+    env: &mut Env<'_>,
+    inst: u32,
+    t: Template,
+    owner: u32,
+    proc: u32,
+    param: u32,
+) -> Outcome {
     let owner = user(env).root(owner);
-    let owner_was_enabled = user(env).windows.get(&owner).is_some_and(window::Window::enabled);
+    let owner_was_enabled = user(env)
+        .windows
+        .get(&owner)
+        .is_some_and(window::Window::enabled);
     if owner_was_enabled && let Some(w) = user_mut(env).windows.get_mut(&owner) {
         w.style |= window::WS_DISABLED;
     }
@@ -433,7 +501,10 @@ fn restore_owner(env: &mut Env<'_>, owner: u32, was_enabled: bool) {
 }
 
 fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> Outcome {
-    let state = user(env).windows.get(&dlg).map(|w| (w.control.dialog_end, w.destroying));
+    let state = user(env)
+        .windows
+        .get(&dlg)
+        .map(|w| (w.control.dialog_end, w.destroying));
     let finish = move |env: &mut Env<'_>, result: u32| {
         destroy_window(env, dlg, move |env, _| {
             restore_owner(env, owner, owner_enabled);
@@ -455,14 +526,18 @@ fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> O
             user_mut(env).queue(ctx).quit = Some(m.wparam);
             finish(env, 0)
         }
-        Some(m) => dispatch(env, m, move |env, _| modal_loop(env, dlg, owner, owner_enabled)),
+        Some(m) => dispatch(env, m, move |env, _| {
+            modal_loop(env, dlg, owner, owner_enabled)
+        }),
         None => wait_for_message(env, move |env| modal_loop(env, dlg, owner, owner_enabled)),
     }
 }
 
 fn end_dialog(env: &mut Env<'_>) -> Outcome {
     let (dlg, result) = (env.arg(0), env.arg(1));
-    let Some(w) = user_mut(env).windows.get_mut(&dlg) else { return Outcome::Return(0) };
+    let Some(w) = user_mut(env).windows.get_mut(&dlg) else {
+        return Outcome::Return(0);
+    };
     w.control.dialog_end = Some(result);
     show_window(env, dlg, SW_HIDE, |_, _| Outcome::Return(1))
 }
@@ -503,7 +578,11 @@ fn get_dlg_item_text_a(env: &mut Env<'_>) -> Outcome {
 
 fn set_dlg_item_int(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, v, signed) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3) != 0);
-    let s = if signed { (v as i32).to_string() } else { v.to_string() };
+    let s = if signed {
+        (v as i32).to_string()
+    } else {
+        v.to_string()
+    };
     let p = guest_cstr(env, &s);
     let h = item(user(env), dlg, id);
     send(env, h, wm::SETTEXT, 0, p, move |env, r| {
@@ -515,8 +594,16 @@ fn set_dlg_item_int(env: &mut Env<'_>) -> Outcome {
 fn get_dlg_item_int(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, ok_out, signed) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3) != 0);
     let u = user(env);
-    let text = u.windows.get(&item(u, dlg, id)).map(|w| w.text.trim().to_owned()).unwrap_or_default();
-    let v = if signed { text.parse::<i32>().ok().map(|v| v as u32) } else { text.parse::<u32>().ok() };
+    let text = u
+        .windows
+        .get(&item(u, dlg, id))
+        .map(|w| w.text.trim().to_owned())
+        .unwrap_or_default();
+    let v = if signed {
+        text.parse::<i32>().ok().map(|v| v as u32)
+    } else {
+        text.parse::<u32>().ok()
+    };
     if ok_out != 0 {
         let _ = env.cpu.write_u32(ok_out, u32::from(v.is_some()));
     }
@@ -546,9 +633,18 @@ fn check_radio_button(env: &mut Env<'_>) -> Outcome {
 
 fn map_dialog_rect(env: &mut Env<'_>) -> Outcome {
     let (dlg, p) = (env.arg(0), env.arg(1));
-    let Some((bx, by)) = user(env).windows.get(&dlg).map(|w| w.control.base_units) else { return Outcome::Return(0) };
-    let Some(r) = Rect::read(env.cpu, p) else { return Outcome::Return(0) };
-    let r = Rect { left: r.left * bx / 4, top: r.top * by / 8, right: r.right * bx / 4, bottom: r.bottom * by / 8 };
+    let Some((bx, by)) = user(env).windows.get(&dlg).map(|w| w.control.base_units) else {
+        return Outcome::Return(0);
+    };
+    let Some(r) = Rect::read(env.cpu, p) else {
+        return Outcome::Return(0);
+    };
+    let r = Rect {
+        left: r.left * bx / 4,
+        top: r.top * by / 8,
+        right: r.right * bx / 4,
+        bottom: r.bottom * by / 8,
+    };
     Outcome::Return(u32::from(r.write(env.cpu, p)))
 }
 
@@ -568,7 +664,10 @@ fn is_dialog_message_a(env: &mut Env<'_>) -> Outcome {
         ..Default::default()
     };
     let u = user(env);
-    let for_dialog = m.hwnd == dlg || u.windows.get(&m.hwnd).is_some_and(|w| u.root(w.hwnd) == dlg);
+    let for_dialog = m.hwnd == dlg
+        || u.windows
+            .get(&m.hwnd)
+            .is_some_and(|w| u.root(w.hwnd) == dlg);
     if for_dialog && m.msg == wm::KEYDOWN && (m.wparam == 0x0d || m.wparam == 0x1b) {
         let id = if m.wparam == 0x0d { 1 } else { 2 };
         let ctl = item(u, dlg, id);
@@ -580,9 +679,19 @@ fn is_dialog_message_a(env: &mut Env<'_>) -> Outcome {
 pub fn register(reg: &mut Registry) {
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "CreateDialogParamA", 5, create_dialog_param_a);
-    s(reg, "CreateDialogIndirectParamA", 5, create_dialog_indirect_param_a);
+    s(
+        reg,
+        "CreateDialogIndirectParamA",
+        5,
+        create_dialog_indirect_param_a,
+    );
     s(reg, "DialogBoxParamA", 5, dialog_box_param_a);
-    s(reg, "DialogBoxIndirectParamA", 5, dialog_box_indirect_param_a);
+    s(
+        reg,
+        "DialogBoxIndirectParamA",
+        5,
+        dialog_box_indirect_param_a,
+    );
     s(reg, "EndDialog", 2, end_dialog);
     s(reg, "GetDlgItem", 2, get_dlg_item);
     s(reg, "GetDlgCtrlID", 1, get_dlg_ctrl_id);

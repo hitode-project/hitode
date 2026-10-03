@@ -34,11 +34,31 @@ pub struct LogFont {
 #[derive(Clone, Debug)]
 pub enum GdiObj {
     Font(LogFont),
-    Brush { color: u32 },
-    Pen { color: u32 },
-    Bitmap { width: i32, height: i32, bpp: u16, bits: u32, stride: u32, owned: bool },
-    Palette { entries: Vec<[u8; 4]> },
-    Dc { hwnd: u32, selected: [u32; 4], palette: u32, text_color: u32, bk_color: u32, bk_mode: u32 },
+    Brush {
+        color: u32,
+    },
+    Pen {
+        color: u32,
+    },
+    Bitmap {
+        width: i32,
+        height: i32,
+        bpp: u16,
+        bits: u32,
+        stride: u32,
+        owned: bool,
+    },
+    Palette {
+        entries: Vec<[u8; 4]>,
+    },
+    Dc {
+        hwnd: u32,
+        selected: [u32; 4],
+        palette: u32,
+        text_color: u32,
+        bk_color: u32,
+        bk_mode: u32,
+    },
     Region,
 }
 
@@ -69,10 +89,22 @@ impl Gdi {
         if let Some(object) = self.objects.get(&handle) {
             return matches!(object, GdiObj::Dc { .. });
         }
-        let selected = [stock_object(0), stock_object(7), stock_object(SYSTEM_FONT), 0];
+        let selected = [
+            stock_object(0),
+            stock_object(7),
+            stock_object(SYSTEM_FONT),
+            0,
+        ];
         self.objects.insert(
             handle,
-            GdiObj::Dc { hwnd, selected, palette: stock_object(15), text_color: 0, bk_color: 0xff_ffff, bk_mode: 2 },
+            GdiObj::Dc {
+                hwnd,
+                selected,
+                palette: stock_object(15),
+                text_color: 0,
+                bk_color: 0xff_ffff,
+                bk_mode: 2,
+            },
         );
         true
     }
@@ -104,7 +136,12 @@ fn gdi<'a>(env: &'a mut Env<'_>) -> &'a mut Gdi {
 
 /// A DC for a window (GetDC, BeginPaint).
 pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
-    let selected = [stock_object(0), stock_object(7), stock_object(SYSTEM_FONT), 0];
+    let selected = [
+        stock_object(0),
+        stock_object(7),
+        stock_object(SYSTEM_FONT),
+        0,
+    ];
     gdi(env).add(GdiObj::Dc {
         hwnd,
         selected,
@@ -127,7 +164,15 @@ pub fn create_font(env: &mut Env<'_>, height: i32, face: &str) -> u32 {
     let bytes = env.ext.get::<Win32>().codec.encode(face);
     let n = bytes.len().min(31);
     raw[28..28 + n].copy_from_slice(&bytes[..n]);
-    let f = LogFont { height, width: 0, weight: 400, italic: false, charset: 1, face: face.into(), raw };
+    let f = LogFont {
+        height,
+        width: 0,
+        weight: 400,
+        italic: false,
+        charset: 1,
+        face: face.into(),
+        raw,
+    };
     gdi(env).add(GdiObj::Font(f))
 }
 
@@ -147,7 +192,10 @@ fn create_font_indirect_a(env: &mut Env<'_>) -> Outcome {
 
 fn add_logfont(env: &mut Env<'_>, raw: Vec<u8>) -> u32 {
     let i32_at = |o: usize| i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
-    let face_end = raw[28..].iter().position(|&b| b == 0).map_or(60, |n| 28 + n);
+    let face_end = raw[28..]
+        .iter()
+        .position(|&b| b == 0)
+        .map_or(60, |n| 28 + n);
     let face = env.ext.get::<Win32>().codec.decode(&raw[28..face_end]);
     let f = LogFont {
         height: i32_at(0),
@@ -194,12 +242,17 @@ fn delete_object(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(1);
     }
     if matches!(gdi(env).get(h), Some(GdiObj::Palette { .. }))
-        && gdi(env).objects.values().any(|object| matches!(object, GdiObj::Dc { palette, .. } if *palette == h))
+        && gdi(env)
+            .objects
+            .values()
+            .any(|object| matches!(object, GdiObj::Dc { palette, .. } if *palette == h))
     {
         return Outcome::Return(0);
     }
     match gdi(env).objects.remove(&h) {
-        Some(GdiObj::Bitmap { bits, owned: true, .. }) => {
+        Some(GdiObj::Bitmap {
+            bits, owned: true, ..
+        }) => {
             let _ = env.sys.vm.free(env.cpu, bits);
             Outcome::Return(1)
         }
@@ -232,9 +285,13 @@ fn slot_of(g: &Gdi, h: u32) -> Option<usize> {
 fn select_object(env: &mut Env<'_>) -> Outcome {
     let (hdc, h) = (env.arg(0), env.arg(1));
     let g = gdi(env);
-    let Some(slot) = slot_of(g, h) else { return Outcome::Return(0) };
+    let Some(slot) = slot_of(g, h) else {
+        return Outcome::Return(0);
+    };
     match g.objects.get_mut(&hdc) {
-        Some(GdiObj::Dc { selected, .. }) => Outcome::Return(std::mem::replace(&mut selected[slot], h)),
+        Some(GdiObj::Dc { selected, .. }) => {
+            Outcome::Return(std::mem::replace(&mut selected[slot], h))
+        }
         _ => Outcome::Return(0),
     }
 }
@@ -249,11 +306,22 @@ fn get_object_a(env: &mut Env<'_>) -> Outcome {
         if size < 2 || !env.cpu.accessible(out, 2, Prot::WRITE) {
             return Outcome::Return(0);
         }
-        return Outcome::Return(if env.cpu.write(out, &count.to_le_bytes()).is_ok() { 2 } else { 0 });
+        return Outcome::Return(if env.cpu.write(out, &count.to_le_bytes()).is_ok() {
+            2
+        } else {
+            0
+        });
     }
     let bytes: Vec<u8> = match gdi(env).get(h) {
         Some(GdiObj::Font(f)) => f.raw.clone(),
-        Some(GdiObj::Bitmap { width, height, bpp, bits, stride, .. }) => {
+        Some(GdiObj::Bitmap {
+            width,
+            height,
+            bpp,
+            bits,
+            stride,
+            ..
+        }) => {
             // BITMAP: bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes, bmBitsPixel, bmBits.
             let mut b = Vec::with_capacity(24);
             for v in [0u32, *width as u32, height.unsigned_abs(), *stride] {
@@ -264,7 +332,10 @@ fn get_object_a(env: &mut Env<'_>) -> Outcome {
             b.extend_from_slice(&bits.to_le_bytes());
             b
         }
-        Some(GdiObj::Brush { color }) => [0u32, *color, 0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        Some(GdiObj::Brush { color }) => [0u32, *color, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
         _ => return Outcome::Return(0),
     };
     if out == 0 {
@@ -279,13 +350,27 @@ fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u
     let stride = (width.unsigned_abs() * u32::from(bpp)).div_ceil(32) * 4;
     let size = (stride * height.unsigned_abs()).max(4);
     let bits = env.sys.vm.alloc(env.cpu, size, Prot::RW).ok()?;
-    let h = gdi(env).add(GdiObj::Bitmap { width, height, bpp, bits, stride, owned: true });
+    let h = gdi(env).add(GdiObj::Bitmap {
+        width,
+        height,
+        bpp,
+        bits,
+        stride,
+        owned: true,
+    });
     Some((h, bits))
 }
 
 fn create_bitmap(env: &mut Env<'_>) -> Outcome {
-    let (w, h, bpp, init) = (env.arg(0) as i32, env.arg(1) as i32, env.arg(3) as u16, env.arg(4));
-    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp.max(1)) else { return Outcome::Return(0) };
+    let (w, h, bpp, init) = (
+        env.arg(0) as i32,
+        env.arg(1) as i32,
+        env.arg(3) as u16,
+        env.arg(4),
+    );
+    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp.max(1)) else {
+        return Outcome::Return(0);
+    };
     if init != 0 {
         // Source rows are WORD-aligned; ours DWORD-aligned.
         let src_stride = (w.unsigned_abs() * u32::from(bpp)).div_ceil(16) * 2;
@@ -310,7 +395,9 @@ fn create_dib_section(env: &mut Env<'_>) -> Outcome {
     let w = env.cpu.read_u32(bmi + 4).unwrap_or(0) as i32;
     let h = env.cpu.read_u32(bmi + 8).unwrap_or(0) as i32;
     let bpp = env.cpu.read_u16(bmi + 14).unwrap_or(32);
-    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp) else { return Outcome::Return(0) };
+    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp) else {
+        return Outcome::Return(0);
+    };
     out_u32(env.cpu, bits_out, bits);
     Outcome::Return(hbm)
 }
@@ -346,7 +433,12 @@ fn get_device_caps(env: &mut Env<'_>) -> Outcome {
 fn dc_field(env: &mut Env<'_>, f: impl FnOnce(&mut u32, &mut u32, &mut u32) -> u32) -> Outcome {
     let hdc = env.arg(0);
     match gdi(env).objects.get_mut(&hdc) {
-        Some(GdiObj::Dc { text_color, bk_color, bk_mode, .. }) => Outcome::Return(f(text_color, bk_color, bk_mode)),
+        Some(GdiObj::Dc {
+            text_color,
+            bk_color,
+            bk_mode,
+            ..
+        }) => Outcome::Return(f(text_color, bk_color, bk_mode)),
         _ => Outcome::Return(0),
     }
 }

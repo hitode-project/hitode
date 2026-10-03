@@ -25,7 +25,11 @@ struct Coverage {
 }
 impl Coverage {
     fn mark(&mut self, generation: u32, turn: u32, mask: u64) {
-        if let Some(epoch) = self.epochs.iter_mut().find(|epoch| epoch.generation == generation && epoch.turn == turn) {
+        if let Some(epoch) = self
+            .epochs
+            .iter_mut()
+            .find(|epoch| epoch.generation == generation && epoch.turn == turn)
+        {
             epoch.mask |= mask;
             return;
         }
@@ -38,12 +42,16 @@ impl Coverage {
         } else {
             1
         };
-        self.epochs[at] = Written { generation, turn, mask };
+        self.epochs[at] = Written {
+            generation,
+            turn,
+            mask,
+        };
     }
     fn covers(&self, generation: u32, turn: u32, bit: u32) -> bool {
-        self.epochs
-            .iter()
-            .any(|epoch| epoch.generation == generation && epoch.turn >= turn && epoch.mask & (1 << bit) != 0)
+        self.epochs.iter().any(|epoch| {
+            epoch.generation == generation && epoch.turn >= turn && epoch.mask & (1 << bit) != 0
+        })
     }
 }
 pub struct RingVoice {
@@ -82,7 +90,10 @@ impl RingVoice {
             || config.bytes as usize > config.view.len()
             || config.bytes % align != 0
             || config.notifications.len() > 1024
-            || config.notifications.iter().any(|&(offset, _)| offset != u32::MAX && offset >= config.bytes)
+            || config
+                .notifications
+                .iter()
+                .any(|&(offset, _)| offset != u32::MAX && offset >= config.bytes)
         {
             return Err("invalid shared PCM voice".into());
         }
@@ -184,7 +195,11 @@ impl RingVoice {
             let frames = self.frames();
             self.initial_partial = self.written.iter().enumerate().any(|(index, cell)| {
                 let length = (frames - index as u64 * 64).min(64);
-                let full = if length == 64 { u64::MAX } else { (1 << length) - 1 };
+                let full = if length == 64 {
+                    u64::MAX
+                } else {
+                    (1 << length) - 1
+                };
                 cell.pending != full
             });
             for cell in &mut self.written {
@@ -214,7 +229,8 @@ impl RingVoice {
         if len == 0 {
             return;
         }
-        if self.playing && self.initial_partial && self.notifications.len() >= 2 && len < self.bytes {
+        if self.playing && self.initial_partial && self.notifications.len() >= 2 && len < self.bytes
+        {
             self.streaming = true;
         }
         let mut frame = u64::from(offset / self.align());
@@ -229,7 +245,11 @@ impl RingVoice {
             if self.playing && frame < current % total {
                 run = run.min(current % total - frame);
             }
-            let mask = if run == 64 { u64::MAX } else { ((1 << run) - 1) << bit };
+            let mask = if run == 64 {
+                u64::MAX
+            } else {
+                ((1 << run) - 1) << bit
+            };
             let cell = &mut self.written[frame as usize / 64];
             if self.playing {
                 cell.mark(self.generation as u32, turn as u32, mask);
@@ -259,7 +279,13 @@ impl RingVoice {
         }
         let position = frame % frames;
         let cell = written[position as usize / 64];
-        if streaming && !cell.covers(generation as u32, (frame / frames) as u32, (position % 64) as u32) {
+        if streaming
+            && !cell.covers(
+                generation as u32,
+                (frame / frames) as u32,
+                (position % 64) as u32,
+            )
+        {
             return [0.0; 2];
         }
         let at = position as usize * align as usize;
@@ -298,7 +324,11 @@ impl RingVoice {
             let cell = self.written[position as usize / 64];
             let absent = self.playing
                 && self.streaming
-                && !cell.covers(self.generation as u32, (frame / self.frames()) as u32, (position % 64) as u32);
+                && !cell.covers(
+                    self.generation as u32,
+                    (frame / self.frames()) as u32,
+                    (position % 64) as u32,
+                );
             self.missing_frames += u64::from(absent);
             if absent {
                 missing[index / 64] |= 1 << (index % 64);
@@ -345,7 +375,11 @@ impl RingVoice {
             }
             let offset = u64::from(offset / self.align());
             let occurrence = first / total * total + offset;
-            let occurrence = if occurrence < first { occurrence + total } else { occurrence };
+            let occurrence = if occurrence < first {
+                occurrence + total
+            } else {
+                occurrence
+            };
             if occurrence < last {
                 self.pending_notices[i / 64] |= 1 << (i % 64);
             }

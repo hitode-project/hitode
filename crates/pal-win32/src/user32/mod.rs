@@ -50,7 +50,15 @@ fn wsprintf_a(env: &mut Env<'_>) -> Outcome {
     let f = cstr(env.cpu, fmt);
     let esp = env.cpu.reg(pal_cpu::Reg::Esp);
     let codec = env.ext.get::<Win32>().codec;
-    let out = format(env.cpu, &codec, &f, &mut StackArgs { cpu: env.cpu, addr: esp + 12 });
+    let out = format(
+        env.cpu,
+        &codec,
+        &f,
+        &mut StackArgs {
+            cpu: env.cpu,
+            addr: esp + 12,
+        },
+    );
     Outcome::Return(put_cstr(env.cpu, buf, WSPRINTF_MAX, &out).unwrap_or(WSPRINTF_MAX - 1))
 }
 
@@ -58,15 +66,29 @@ fn wvsprintf_a(env: &mut Env<'_>) -> Outcome {
     let (buf, fmt, va) = (env.arg(0), env.arg(1), env.arg(2));
     let f = cstr(env.cpu, fmt);
     let codec = env.ext.get::<Win32>().codec;
-    let out = format(env.cpu, &codec, &f, &mut StackArgs { cpu: env.cpu, addr: va });
+    let out = format(
+        env.cpu,
+        &codec,
+        &f,
+        &mut StackArgs {
+            cpu: env.cpu,
+            addr: va,
+        },
+    );
     Outcome::Return(put_cstr(env.cpu, buf, WSPRINTF_MAX, &out).unwrap_or(WSPRINTF_MAX - 1))
 }
 
 fn message_box_a(env: &mut Env<'_>) -> Outcome {
     let (text, caption, ty) = (env.arg(1), env.arg(2), env.arg(3));
     let c = env.ext.get::<Win32>().codec;
-    let (t, cap) = (c.decode(&cstr(env.cpu, text)), c.decode(&cstr(env.cpu, caption)));
-    log::warn!("MessageBoxA [{cap}] {t} (type {ty:#x}) from {:#010x}", env.caller());
+    let (t, cap) = (
+        c.decode(&cstr(env.cpu, text)),
+        c.decode(&cstr(env.cpu, caption)),
+    );
+    log::warn!(
+        "MessageBoxA [{cap}] {t} (type {ty:#x}) from {:#010x}",
+        env.caller()
+    );
     // IDOK for OK-style boxes, IDYES for yes/no.
     Outcome::Return(match ty & 0xf {
         3 | 4 => 6,
@@ -79,22 +101,22 @@ fn get_system_metrics(env: &mut Env<'_>) -> Outcome {
     let (w, h) = user(env).screen;
     let (w, h) = (w as u32, h as u32);
     Outcome::Return(match env.arg(0) {
-        0 | 16 | 78 => w,                        // SM_CXSCREEN, SM_CXFULLSCREEN, SM_CXVIRTUALSCREEN
-        1 | 79 => h,                             // SM_CYSCREEN, SM_CYVIRTUALSCREEN
-        17 => h - 40 - 23,                       // SM_CYFULLSCREEN (minus taskbar and caption)
-        4 => 23,                                 // SM_CYCAPTION
-        5 | 6 => 1,                              // SM_CXBORDER, SM_CYBORDER
-        7 | 8 => 3,                              // SM_CXFIXEDFRAME, SM_CYFIXEDFRAME
-        11 | 12 => 32,                           // SM_CXICON, SM_CYICON
-        13 | 14 => 32,                           // SM_CXCURSOR, SM_CYCURSOR
-        15 => 20,                                // SM_CYMENU
+        0 | 16 | 78 => w,  // SM_CXSCREEN, SM_CXFULLSCREEN, SM_CXVIRTUALSCREEN
+        1 | 79 => h,       // SM_CYSCREEN, SM_CYVIRTUALSCREEN
+        17 => h - 40 - 23, // SM_CYFULLSCREEN (minus taskbar and caption)
+        4 => 23,           // SM_CYCAPTION
+        5 | 6 => 1,        // SM_CXBORDER, SM_CYBORDER
+        7 | 8 => 3,        // SM_CXFIXEDFRAME, SM_CYFIXEDFRAME
+        11 | 12 => 32,     // SM_CXICON, SM_CYICON
+        13 | 14 => 32,     // SM_CXCURSOR, SM_CYCURSOR
+        15 => 20,          // SM_CYMENU
         23 => u32::from(user(env).swap_buttons), // SM_SWAPBUTTON
-        32 | 33 => 8,                            // SM_CXFRAME, SM_CYFRAME
-        34 => 136,                               // SM_CXMINTRACK
-        35 => 39,                                // SM_CYMINTRACK
-        49 | 50 => 16,                           // SM_CXSMICON, SM_CYSMICON
-        61 | 62 => w,                            // SM_CXMAXIMIZED... close enough: SM_CXMAXTRACK
-        80 => 1,                                 // SM_CMONITORS
+        32 | 33 => 8,      // SM_CXFRAME, SM_CYFRAME
+        34 => 136,         // SM_CXMINTRACK
+        35 => 39,          // SM_CYMINTRACK
+        49 | 50 => 16,     // SM_CXSMICON, SM_CYSMICON
+        61 | 62 => w,      // SM_CXMAXIMIZED... close enough: SM_CXMAXTRACK
+        80 => 1,           // SM_CMONITORS
         n => {
             log::debug!("GetSystemMetrics({n}) = 0");
             0
@@ -130,7 +152,11 @@ fn load_user_object(env: &mut Env<'_>, kind: &str, inst: u32, name: u32) -> Outc
     if let Some((&h, _)) = user(env).objects.iter().find(|(_, v)| **v == key) {
         return Outcome::Return(h);
     }
-    let ty = if kind == "cursor" { RT_GROUP_CURSOR } else { RT_GROUP_ICON };
+    let ty = if kind == "cursor" {
+        RT_GROUP_CURSOR
+    } else {
+        RT_GROUP_ICON
+    };
     if crate::kernel32::find_resource_data(env, inst, &ResId::Id(ty), &id).is_none() {
         log::debug!("Load {kind} {id:?}: not found");
         return Outcome::Return(0);
@@ -165,7 +191,9 @@ fn create_icon_indirect(env: &mut Env<'_>) -> Outcome {
     let r = |i: u32| env.cpu.read_u32(p + 4 * i).unwrap_or(0);
     let (is_icon, mask, color) = (r(0), r(3), r(4));
     let kind = if is_icon != 0 { "icon" } else { "cursor" };
-    Outcome::Return(user_mut(env).add_object(format!("{kind} indirect mask {mask:#x} color {color:#x}")))
+    Outcome::Return(
+        user_mut(env).add_object(format!("{kind} indirect mask {mask:#x} color {color:#x}")),
+    )
 }
 
 fn destroy_user_object(env: &mut Env<'_>) -> Outcome {
@@ -177,7 +205,9 @@ fn destroy_user_object(env: &mut Env<'_>) -> Outcome {
 fn load_string_a(env: &mut Env<'_>) -> Outcome {
     let (inst, id, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let block = ResId::Id(((id >> 4) + 1) as u16);
-    let Some((addr, _)) = crate::kernel32::find_resource_data(env, inst, &ResId::Id(RT_STRING), &block) else {
+    let Some((addr, _)) =
+        crate::kernel32::find_resource_data(env, inst, &ResId::Id(RT_STRING), &block)
+    else {
         return put_empty(env, buf, cap);
     };
     // A block holds 16 length-prefixed UTF-16 strings.
@@ -190,7 +220,9 @@ fn load_string_a(env: &mut Env<'_>) -> Outcome {
     if len == 0 {
         return put_empty(env, buf, cap);
     }
-    let units: Vec<u16> = (0..u32::from(len)).map(|i| env.cpu.read_u16(p + 2 + 2 * i).unwrap_or(0)).collect();
+    let units: Vec<u16> = (0..u32::from(len))
+        .map(|i| env.cpu.read_u16(p + 2 + 2 * i).unwrap_or(0))
+        .collect();
     let (bytes, _) = env.ext.get::<Win32>().codec.from_utf16(0, &units);
     Outcome::Return(put_cstr(env.cpu, buf, cap, &bytes).unwrap_or(cap.saturating_sub(1)))
 }
@@ -237,7 +269,9 @@ fn get_async_key_state(env: &mut Env<'_>) -> Outcome {
         || {
             user.input_tracking
                 .as_ref()
-                .map_or(u64::from(user.keys[vk]), |tracking| tracking.key_observation(vk, user.keys[vk]))
+                .map_or(u64::from(user.keys[vk]), |tracking| {
+                    tracking.key_observation(vk, user.keys[vk])
+                })
         },
         |keys| keys.observation(vk as u32),
     );
@@ -251,14 +285,20 @@ fn get_async_key_state(env: &mut Env<'_>) -> Outcome {
 fn get_key_state(env: &mut Env<'_>) -> Outcome {
     let vk = env.arg(0) as usize & 0xff;
     let user = user(env);
-    let k = user.host_keys.as_ref().map_or(user.keys[vk], |keys| keys.get(vk as u32));
+    let k = user
+        .host_keys
+        .as_ref()
+        .map_or(user.keys[vk], |keys| keys.get(vk as u32));
     Outcome::Return(u32::from(k & 1) | if k & 0x80 != 0 { 0xffff_8000 } else { 0 })
 }
 
 fn get_keyboard_state(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     let user = user(env);
-    let keys = user.host_keys.as_ref().map_or(user.keys, |keys| keys.snapshot());
+    let keys = user
+        .host_keys
+        .as_ref()
+        .map_or(user.keys, |keys| keys.snapshot());
     Outcome::Return(u32::from(env.cpu.write(p, &keys).is_ok()))
 }
 
@@ -290,10 +330,14 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
     let (w, h) = user(env).screen;
     let rect = window::temp_alloc(env, 16);
     window::Rect::new(0, 0, w, h).write(env.cpu, rect);
-    Outcome::call(proc, [window::HMONITOR_PRIMARY, hdc, rect, data], move |env, _| {
-        window::temp_free(env, rect);
-        Outcome::Return(1)
-    })
+    Outcome::call(
+        proc,
+        [window::HMONITOR_PRIMARY, hdc, rect, data],
+        move |env, _| {
+            window::temp_free(env, rect);
+            Outcome::Return(1)
+        },
+    )
 }
 
 fn get_dc(env: &mut Env<'_>) -> Outcome {

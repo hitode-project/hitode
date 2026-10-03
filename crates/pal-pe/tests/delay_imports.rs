@@ -12,7 +12,13 @@ fn check(pe: &Pe, base: u32) {
     assert_eq!(module.module_handle_rva, HMOD + 0x300);
     assert_eq!(module.imports.len(), 2);
     assert_eq!(module.imports[0].iat_rva, IAT + 0x300);
-    assert_eq!(module.imports[0].name, ImportName::Name { hint: 42, name: "FixtureCall".into() });
+    assert_eq!(
+        module.imports[0].name,
+        ImportName::Name {
+            hint: 42,
+            name: "FixtureCall".into()
+        }
+    );
     assert_eq!(module.imports[1].iat_rva, IAT + 0x304);
     assert_eq!(module.imports[1].name, ImportName::Ordinal(7));
 }
@@ -24,7 +30,10 @@ fn old_va_and_current_rva_delay_imports_decode_the_same_names_and_ordinals() {
         check(&pe, BASE);
         assert_eq!(
             pe.delay_imports().unwrap()[0].imports[0].name,
-            ImportName::Name { hint: 42, name: "FixtureCall".into() }
+            ImportName::Name {
+                hint: 42,
+                name: "FixtureCall".into()
+            }
         );
     }
 }
@@ -35,7 +44,10 @@ fn rebased_old_va_names_use_the_loaded_base_and_preserve_ordinal_bits() {
     let base = 0x1040_0000;
     assert_eq!(pe.relocate(base - BASE).unwrap(), 5);
     check(&pe, base);
-    assert!(pe.delay_imports().is_err(), "unrelocated base must not accept rebased VAs");
+    assert!(
+        pe.delay_imports().is_err(),
+        "unrelocated base must not accept rebased VAs"
+    );
     let current = Pe::parse(&image(true)).unwrap();
     check(&current, base);
 }

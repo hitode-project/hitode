@@ -45,10 +45,18 @@ pub fn image(rva_based: bool) -> Vec<u8> {
         word(&mut bytes, 0x98 + 96 + 5 * 8, 0x800);
         word(&mut bytes, 0x98 + 100 + 5 * 8, 20);
         word(&mut bytes, 0x804, 20);
-        for (i, offset) in
-            [descriptor + 4, descriptor + 8, descriptor + 12, descriptor + 16, INT + 0x300].into_iter().enumerate()
+        for (i, offset) in [
+            descriptor + 4,
+            descriptor + 8,
+            descriptor + 12,
+            descriptor + 16,
+            INT + 0x300,
+        ]
+        .into_iter()
+        .enumerate()
         {
-            bytes[0x808 + i * 2..0x80a + i * 2].copy_from_slice(&(0x3000u16 | offset as u16).to_le_bytes());
+            bytes[0x808 + i * 2..0x80a + i * 2]
+                .copy_from_slice(&(0x3000u16 | offset as u16).to_le_bytes());
         }
     }
     bytes

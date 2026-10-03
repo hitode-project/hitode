@@ -21,17 +21,28 @@ impl Test {
     fn new() -> Self {
         let mut registry = Registry::default();
         pal_win32::register(&mut registry);
-        let mut machine =
-            Machine::new(UnicornCpu::new(pal_machine::layout::PARK_ADDR).unwrap(), registry, Clock::virtual_time())
-                .unwrap();
+        let mut machine = Machine::new(
+            UnicornCpu::new(pal_machine::layout::PARK_ADDR).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
         Win32::install(
             &mut machine,
-            Win32Config::new(".", "process-environment-fixture.exe", "target/process-environment-fixture"),
+            Win32Config::new(
+                ".",
+                "process-environment-fixture.exe",
+                "target/process-environment-fixture",
+            ),
         )
         .unwrap();
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
-        Self { machine, code: Asm::new(CODE), next: LOG }
+        Self {
+            machine,
+            code: Asm::new(CODE),
+            next: LOG,
+        }
     }
     fn call(&mut self, name: &str, args: &[Arg]) -> u32 {
         for arg in args.iter().rev() {
@@ -54,7 +65,10 @@ impl Test {
         self.call("ExitProcess", &[V(0)]);
         self.machine.cpu.write(CODE, &self.code.bytes).unwrap();
         self.machine.spawn("main", CODE, &[], 0x10000).unwrap();
-        assert!(matches!(self.machine.run_virtual(1_000_000), RunResult::Exited(0)));
+        assert!(matches!(
+            self.machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
     }
     fn value(&self, address: u32) -> u32 {
         self.machine.cpu.read_u32(address).unwrap()
@@ -69,7 +83,10 @@ impl Test {
 #[test]
 fn environment_state_is_process_local_and_failed_updates_are_atomic() {
     let mut t = Test::new();
-    t.machine.cpu.write(DATA, b"ADV_PRIVATE_ENV\0first\0bad=name\0").unwrap();
+    t.machine
+        .cpu
+        .write(DATA, b"ADV_PRIVATE_ENV\0first\0bad=name\0")
+        .unwrap();
     let created = t.call("SetEnvironmentVariableA", &[V(DATA), V(DATA + 16)]);
     let invalid = t.call("SetEnvironmentVariableA", &[V(DATA + 22), V(DATA + 16)]);
     let invalid_error = t.call("GetLastError", &[]);
@@ -98,7 +115,10 @@ fn invalid_version_sizes_and_readonly_environment_outputs_preserve_memory() {
     let mut t = Test::new();
     let readonly = DATA + 4096;
     t.machine.cpu.map(readonly, 4096, Prot::READ).unwrap();
-    t.machine.cpu.write(DATA, b"ADV_PRIVATE_ENV\0first\0").unwrap();
+    t.machine
+        .cpu
+        .write(DATA, b"ADV_PRIVATE_ENV\0first\0")
+        .unwrap();
     t.machine.cpu.write_u32(DATA + 100, 0xfffffff0).unwrap();
     t.machine.cpu.write_u32(DATA + 104, 0x12345678).unwrap();
     t.call("SetEnvironmentVariableA", &[V(DATA), V(DATA + 16)]);
@@ -125,13 +145,25 @@ fn utf8_ansi_input_limit_counts_decoded_units_not_dbcs_bytes() {
     t.machine.cpu.write(DATA, b"ADV_PRIVATE_ENV\0").unwrap();
     t.machine
         .cpu
-        .write(DATA + 100, &"ADV_PRIVATE_ENV\0".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
+        .write(
+            DATA + 100,
+            &"ADV_PRIVATE_ENV\0"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
         .unwrap();
     let set = t.call("SetEnvironmentVariableA", &[V(DATA), V(input)]);
     let size = t.call("GetEnvironmentVariableW", &[V(DATA + 100), V(0), V(0)]);
-    let got = t.call("GetEnvironmentVariableW", &[V(DATA + 100), V(output), V(24_001)]);
+    let got = t.call(
+        "GetEnvironmentVariableW",
+        &[V(DATA + 100), V(output), V(24_001)],
+    );
     t.run();
-    assert_eq!((t.value(set), t.value(size), t.value(got)), (1, 24_001, 24_000));
+    assert_eq!(
+        (t.value(set), t.value(size), t.value(got)),
+        (1, 24_001, 24_000)
+    );
     assert_eq!(t.machine.cpu.read_u16(output).unwrap(), 0x4e2d);
     assert_eq!(t.machine.cpu.read_u16(output + 47_998).unwrap(), 0x4e2d);
     assert_eq!(t.machine.cpu.read_u16(output + 48_000).unwrap(), 0);

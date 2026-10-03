@@ -21,7 +21,12 @@ struct Atoms {
 
 impl Default for Atoms {
     fn default() -> Self {
-        Self { names: BTreeMap::new(), entries: BTreeMap::new(), free: BTreeSet::new(), next: 0xc000 }
+        Self {
+            names: BTreeMap::new(),
+            entries: BTreeMap::new(),
+            free: BTreeSet::new(),
+            next: 0xc000,
+        }
     }
 }
 
@@ -33,7 +38,11 @@ enum Name {
 fn name(env: &Env<'_>, wide: bool) -> Result<Name, u32> {
     let pointer = env.arg(0);
     if pointer < 0x10000 {
-        return if (1..0xc000).contains(&pointer) { Ok(Name::Integer(pointer as u16)) } else { Err(87) };
+        return if (1..0xc000).contains(&pointer) {
+            Ok(Name::Integer(pointer as u16))
+        } else {
+            Err(87)
+        };
     }
     let units = if wide {
         let mut units = Vec::new();
@@ -56,12 +65,21 @@ fn name(env: &Env<'_>, wide: bool) -> Result<Name, u32> {
     if units.len() > 255 {
         return Err(87);
     }
-    if units[0] == b'#' as u16 && units.len() > 1 && units[1..].iter().all(|c| (0x30..=0x39).contains(c)) {
+    if units[0] == b'#' as u16
+        && units.len() > 1
+        && units[1..].iter().all(|c| (0x30..=0x39).contains(c))
+    {
         let value = units[1..]
             .iter()
-            .try_fold(0u32, |v, &c| v.checked_mul(10)?.checked_add(u32::from(c - 0x30)))
+            .try_fold(0u32, |v, &c| {
+                v.checked_mul(10)?.checked_add(u32::from(c - 0x30))
+            })
             .ok_or(87u32)?;
-        return if (1..0xc000).contains(&value) { Ok(Name::Integer(value as u16)) } else { Err(87) };
+        return if (1..0xc000).contains(&value) {
+            Ok(Name::Integer(value as u16))
+        } else {
+            Err(87)
+        };
     }
     Ok(Name::String(units))
 }
@@ -77,7 +95,10 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
         Ok(Name::String(units)) => units,
         Err(error) => return fail(env, error),
     };
-    let key: Vec<_> = spelling.iter().map(|&u| crate::user32::strings::unit_case(u, true)).collect();
+    let key: Vec<_> = spelling
+        .iter()
+        .map(|&u| crate::user32::strings::unit_case(u, true))
+        .collect();
     if env.ext.try_get_mut::<Atoms>().is_none() {
         env.ext.insert(Atoms::default());
     }
@@ -85,7 +106,9 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
     if let Some(&id) = table.names.get(&key) {
         if add {
             let entry = table.entries.get_mut(&id).unwrap();
-            let Some(references) = entry.references.checked_add(1) else { return fail(env, 8) };
+            let Some(references) = entry.references.checked_add(1) else {
+                return fail(env, 8);
+            };
             entry.references = references;
         }
         return Outcome::Return(u32::from(id));
@@ -103,7 +126,14 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
         return fail(env, 8);
     };
     table.names.insert(key.clone(), id);
-    table.entries.insert(id, Entry { spelling, key, references: 1 });
+    table.entries.insert(
+        id,
+        Entry {
+            spelling,
+            key,
+            references: 1,
+        },
+    );
     Outcome::Return(u32::from(id))
 }
 
@@ -112,8 +142,12 @@ fn delete(env: &mut Env<'_>) -> Outcome {
     if atom < 0xc000 {
         return Outcome::Return(0);
     }
-    let Some(table) = env.ext.try_get_mut::<Atoms>() else { return fail(env, 6) };
-    let Some(entry) = table.entries.get_mut(&atom) else { return fail(env, 6) };
+    let Some(table) = env.ext.try_get_mut::<Atoms>() else {
+        return fail(env, 6);
+    };
+    let Some(entry) = table.entries.get_mut(&atom) else {
+        return fail(env, 6);
+    };
     entry.references -= 1;
     if entry.references == 0 {
         let entry = table.entries.remove(&atom).unwrap();
@@ -158,15 +192,31 @@ fn get_name(env: &mut Env<'_>, wide: bool) -> Outcome {
     if let Err(error) = env.cpu.write(out, &bytes) {
         return Outcome::Fail(error.to_string());
     }
-    if !wide && n < length { fail(env, 234) } else { Outcome::Return(n as u32) }
+    if !wide && n < length {
+        fail(env, 234)
+    } else {
+        Outcome::Return(n as u32)
+    }
 }
 
 pub(super) fn register(reg: &mut Registry) {
-    stdcall(reg, super::K32, "GlobalAddAtomA", 1, |e| lookup(e, false, true));
-    stdcall(reg, super::K32, "GlobalAddAtomW", 1, |e| lookup(e, true, true));
-    stdcall(reg, super::K32, "GlobalFindAtomA", 1, |e| lookup(e, false, false));
-    stdcall(reg, super::K32, "GlobalFindAtomW", 1, |e| lookup(e, true, false));
+    stdcall(reg, super::K32, "GlobalAddAtomA", 1, |e| {
+        lookup(e, false, true)
+    });
+    stdcall(reg, super::K32, "GlobalAddAtomW", 1, |e| {
+        lookup(e, true, true)
+    });
+    stdcall(reg, super::K32, "GlobalFindAtomA", 1, |e| {
+        lookup(e, false, false)
+    });
+    stdcall(reg, super::K32, "GlobalFindAtomW", 1, |e| {
+        lookup(e, true, false)
+    });
     stdcall(reg, super::K32, "GlobalDeleteAtom", 1, delete);
-    stdcall(reg, super::K32, "GlobalGetAtomNameA", 3, |e| get_name(e, false));
-    stdcall(reg, super::K32, "GlobalGetAtomNameW", 3, |e| get_name(e, true));
+    stdcall(reg, super::K32, "GlobalGetAtomNameA", 3, |e| {
+        get_name(e, false)
+    });
+    stdcall(reg, super::K32, "GlobalGetAtomNameW", 3, |e| {
+        get_name(e, true)
+    });
 }

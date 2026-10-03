@@ -56,7 +56,10 @@ pub struct ResourceLeaf {
 
 impl ResourceDir {
     pub fn get(&self, id: &ResId) -> Option<&ResourceNode> {
-        self.entries.iter().find(|e| e.id.matches(id)).map(|e| &e.node)
+        self.entries
+            .iter()
+            .find(|e| e.id.matches(id))
+            .map(|e| &e.node)
     }
 
     fn subdir(&self, id: &ResId) -> Option<&ResourceDir> {
@@ -74,20 +77,37 @@ impl ResourceDir {
             (ResId::Id(l), ResourceNode::Data(d)) => Some((*l, *d)),
             _ => None,
         };
-        let pick = |want: u16| langs.entries.iter().find(|e| e.id == ResId::Id(want)).and_then(data);
-        lang.and_then(pick).or_else(|| pick(0)).or_else(|| langs.entries.iter().find_map(data))
+        let pick = |want: u16| {
+            langs
+                .entries
+                .iter()
+                .find(|e| e.id == ResId::Id(want))
+                .and_then(data)
+        };
+        lang.and_then(pick)
+            .or_else(|| pick(0))
+            .or_else(|| langs.entries.iter().find_map(data))
     }
 
     /// All type/name/language leaves, in directory order.
     pub fn leaves(&self) -> Vec<ResourceLeaf> {
         let mut out = Vec::new();
         for t in &self.entries {
-            let ResourceNode::Dir(names) = &t.node else { continue };
+            let ResourceNode::Dir(names) = &t.node else {
+                continue;
+            };
             for n in &names.entries {
-                let ResourceNode::Dir(langs) = &n.node else { continue };
+                let ResourceNode::Dir(langs) = &n.node else {
+                    continue;
+                };
                 for l in &langs.entries {
                     if let (ResId::Id(lang), ResourceNode::Data(d)) = (&l.id, &l.node) {
-                        out.push(ResourceLeaf { ty: t.id.clone(), name: n.id.clone(), lang: *lang, data: *d });
+                        out.push(ResourceLeaf {
+                            ty: t.id.clone(),
+                            name: n.id.clone(),
+                            lang: *lang,
+                            data: *d,
+                        });
                     }
                 }
             }
@@ -113,8 +133,11 @@ fn parse_dir(pe: &Pe, root: u32, off: u32, depth: u32) -> Result<ResourceDir> {
         let id = if name & 0x8000_0000 != 0 {
             let s = root + (name & 0x7fff_ffff);
             let len = u32::from(pe.u16_at(s)?);
-            let units: Vec<u16> =
-                pe.slice(s + 2, len * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let units: Vec<u16> = pe
+                .slice(s + 2, len * 2)?
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
             ResId::Name(String::from_utf16_lossy(&units))
         } else {
             ResId::Id(name as u16)

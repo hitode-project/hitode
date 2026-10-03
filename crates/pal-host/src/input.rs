@@ -7,7 +7,9 @@ pub struct KeyState {
 }
 impl Default for KeyState {
     fn default() -> Self {
-        Self { keys: std::array::from_fn(|_| AtomicU64::new(0)) }
+        Self {
+            keys: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
     }
 }
 impl KeyState {
@@ -16,7 +18,11 @@ impl KeyState {
             return;
         };
         let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-            let toggle = if pressed && old & 0x80 == 0 && matches!(key, 0x14 | 0x90 | 0x91) { old ^ 1 } else { old };
+            let toggle = if pressed && old & 0x80 == 0 && matches!(key, 0x14 | 0x90 | 0x91) {
+                old ^ 1
+            } else {
+                old
+            };
             let generation = (old & !0xff).wrapping_add(0x100);
             Some(generation | (toggle & 1) | if pressed { 0x80 } else { 0 })
         });
@@ -26,7 +32,9 @@ impl KeyState {
     }
     /// Opaque generation together with the key value in the low byte.
     pub fn observation(&self, key: u32) -> u64 {
-        self.keys.get(key as usize).map_or(0, |key| key.load(Ordering::Relaxed))
+        self.keys
+            .get(key as usize)
+            .map_or(0, |key| key.load(Ordering::Relaxed))
     }
     pub fn release_all(&self) {
         for key in &self.keys {

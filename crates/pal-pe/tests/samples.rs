@@ -39,7 +39,12 @@ fn check(rel: &str, f: &Value, pe: &Pe) {
     assert_eq!(pe.size_of_image, n("size_of_image"), "{rel}");
     assert_eq!(pe.timestamp, n("timestamp"), "{rel}");
     let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
-    let want: Vec<&str> = f["sections"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    let want: Vec<&str> = f["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
     assert_eq!(names, want, "{rel}");
 
     let relocs = pe.relocations().unwrap();
@@ -48,22 +53,38 @@ fn check(rel: &str, f: &Value, pe: &Pe) {
     assert_fnv(rel, "relocs", &r.join(","), &s("relocs_fnv"));
 
     let imports = pe.imports().unwrap();
-    assert_eq!(imports.iter().map(|m| m.imports.len()).sum::<usize>() as u32, n("imports"), "{rel}");
+    assert_eq!(
+        imports.iter().map(|m| m.imports.len()).sum::<usize>() as u32,
+        n("imports"),
+        "{rel}"
+    );
     let canon: Vec<String> = imports
         .iter()
         .map(|m| {
-            let v: Vec<String> = m.imports.iter().map(|i| format!("{}@{:x}", i.name, i.iat_rva)).collect();
+            let v: Vec<String> = m
+                .imports
+                .iter()
+                .map(|i| format!("{}@{:x}", i.name, i.iat_rva))
+                .collect();
             format!("{}|{}", m.dll, v.join(","))
         })
         .collect();
     assert_fnv(rel, "imports", &canon.join(";"), &s("imports_fnv"));
 
     let delay = pe.delay_imports().unwrap();
-    assert_eq!(delay.iter().map(|m| m.imports.len()).sum::<usize>() as u32, n("delay_imports"), "{rel}");
+    assert_eq!(
+        delay.iter().map(|m| m.imports.len()).sum::<usize>() as u32,
+        n("delay_imports"),
+        "{rel}"
+    );
     let canon: Vec<String> = delay
         .iter()
         .map(|m| {
-            let v: Vec<String> = m.imports.iter().map(|i| format!("{}@{:x}", i.name, i.iat_rva)).collect();
+            let v: Vec<String> = m
+                .imports
+                .iter()
+                .map(|i| format!("{}@{:x}", i.name, i.iat_rva))
+                .collect();
             format!("{}|{:x}|{}", m.dll, m.module_handle_rva, v.join(","))
         })
         .collect();
@@ -84,11 +105,24 @@ fn check(rel: &str, f: &Value, pe: &Pe) {
         .collect();
     assert_fnv(rel, "exports", &canon.join(";"), &s("exports_fnv"));
 
-    let leaves = pe.resources().unwrap().map(|r| r.leaves()).unwrap_or_default();
+    let leaves = pe
+        .resources()
+        .unwrap()
+        .map(|r| r.leaves())
+        .unwrap_or_default();
     assert_eq!(leaves.len() as u32, n("resources"), "{rel}");
     let canon: Vec<String> = leaves
         .iter()
-        .map(|l| format!("{}/{}/{}:{:x}+{:x}", resid(&l.ty), resid(&l.name), l.lang, l.data.rva, l.data.size))
+        .map(|l| {
+            format!(
+                "{}/{}/{}:{:x}+{:x}",
+                resid(&l.ty),
+                resid(&l.name),
+                l.lang,
+                l.data.rva,
+                l.data.size
+            )
+        })
         .collect();
     assert_fnv(rel, "resources", &canon.join(";"), &s("resources_fnv"));
 
@@ -96,7 +130,17 @@ fn check(rel: &str, f: &Value, pe: &Pe) {
         (None, None) => {}
         (Some(t), Some(w)) => {
             let w: Vec<u32> = w.iter().map(|v| v.as_u64().unwrap() as u32).collect();
-            assert_eq!([t.raw_start_va, t.raw_end_va, t.index_va, t.callbacks_va, t.zero_fill], w[..], "{rel}");
+            assert_eq!(
+                [
+                    t.raw_start_va,
+                    t.raw_end_va,
+                    t.index_va,
+                    t.callbacks_va,
+                    t.zero_fill
+                ],
+                w[..],
+                "{rel}"
+            );
         }
         _ => panic!("{rel}: TLS presence differs"),
     }
@@ -104,12 +148,19 @@ fn check(rel: &str, f: &Value, pe: &Pe) {
 
 #[test]
 fn matches_pefile_on_samples() {
-    let fixtures: Value = serde_json::from_str(include_str!("../../../data/pe-fixtures.json")).unwrap();
+    let fixtures: Value =
+        serde_json::from_str(include_str!("../../../data/pe-fixtures.json")).unwrap();
     let mut checked = 0;
     for (rel, f) in fixtures.as_object().unwrap() {
         let (build, name) = rel.split_once('/').unwrap();
-        let name = if name == "$exe" { pal_samples::exe(build) } else { Some(name.to_owned()) };
-        let Some(bytes) = name.and_then(|name| std::fs::read(pal_samples::file(build, &name)?).ok()) else {
+        let name = if name == "$exe" {
+            pal_samples::exe(build)
+        } else {
+            Some(name.to_owned())
+        };
+        let Some(bytes) =
+            name.and_then(|name| std::fs::read(pal_samples::file(build, &name)?).ok())
+        else {
             continue;
         };
         let pe = Pe::parse(&bytes).unwrap_or_else(|e| panic!("{rel}: {e}"));

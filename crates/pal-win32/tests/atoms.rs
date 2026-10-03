@@ -21,13 +21,24 @@ impl Test {
     fn new() -> Self {
         let mut registry = Registry::default();
         pal_win32::register(&mut registry);
-        let mut machine =
-            Machine::new(UnicornCpu::new(pal_machine::layout::PARK_ADDR).unwrap(), registry, Clock::virtual_time())
-                .unwrap();
-        Win32::install(&mut machine, Win32Config::new(".", "atom-fixture.exe", "target/atom-fixture")).unwrap();
+        let mut machine = Machine::new(
+            UnicornCpu::new(pal_machine::layout::PARK_ADDR).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        Win32::install(
+            &mut machine,
+            Win32Config::new(".", "atom-fixture.exe", "target/atom-fixture"),
+        )
+        .unwrap();
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
-        Self { machine, code: Asm::new(CODE), next: LOG }
+        Self {
+            machine,
+            code: Asm::new(CODE),
+            next: LOG,
+        }
     }
     fn call(&mut self, name: &str, args: &[Arg]) -> u32 {
         for arg in args.iter().rev() {
@@ -50,7 +61,10 @@ impl Test {
         self.call("ExitProcess", &[V(0)]);
         self.machine.cpu.write(CODE, &self.code.bytes).unwrap();
         self.machine.spawn("main", CODE, &[], 0x10000).unwrap();
-        assert!(matches!(self.machine.run_virtual(1_000_000), RunResult::Exited(0)));
+        assert!(matches!(
+            self.machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
     }
     fn value(&self, address: u32) -> u32 {
         self.machine.cpu.read_u32(address).unwrap()
@@ -92,7 +106,12 @@ fn global_atoms_preserve_first_spelling_and_release_last_reference() {
     assert_eq!((t.value(integer), t.value(integer_name)), (12, 3));
     assert_eq!(
         t.bytes(DATA + 120, 8),
-        b"#\0".iter().chain(b"1\0".iter()).chain(b"2\0\0\0".iter()).copied().collect::<Vec<_>>()
+        b"#\0"
+            .iter()
+            .chain(b"1\0".iter())
+            .chain(b"2\0\0\0".iter())
+            .copied()
+            .collect::<Vec<_>>()
     );
     assert_eq!((t.value(bad_integer), t.value(bad_error)), (0, 87));
     assert_eq!((t.value(empty), t.value(empty_error)), (0, 123));
