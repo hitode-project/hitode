@@ -1,7 +1,7 @@
 //! Loaded-module table: guest images (exe, guest DLLs, resource-only DLLs) and host modules
 //! (kernel32, ...) with real, guest-readable synthetic PE images.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use adv_pe::{ExportTarget, ResourceDir};
 
@@ -34,6 +34,38 @@ pub struct Module {
     pub load_count: u32,
     /// Stable x86 LDR_DATA_TABLE_ENTRY in guest memory, zero until published.
     pub ldr_entry: u32,
+    pub ldr_size: u32,
+    /// Loader lifetime is separate from the numeric image base, which may be reused.
+    pub lifetime: Lifetime,
+}
+
+#[derive(Debug)]
+pub struct Lifetime {
+    pub mapped: bool,
+    pub pinned: bool,
+    pub external_refs: u32,
+    pub dependencies: BTreeSet<ModuleId>,
+    pub callbacks: Vec<u32>,
+    pub tls_index: Option<u32>,
+    pub attach_started: bool,
+    pub unloading: bool,
+    pub thread_calls: bool,
+}
+
+impl Default for Lifetime {
+    fn default() -> Self {
+        Self {
+            mapped: false,
+            pinned: false,
+            external_refs: 1,
+            dependencies: BTreeSet::new(),
+            callbacks: Vec::new(),
+            tls_index: None,
+            attach_started: false,
+            unloading: false,
+            thread_calls: true,
+        }
+    }
 }
 
 impl Module {
@@ -57,10 +89,12 @@ pub fn module_key(path: &str) -> String {
 
 #[derive(Default)]
 pub struct Modules {
-    list: Vec<Module>,
+    list: BTreeMap<ModuleId, Module>,
+    next_id: ModuleId,
     by_name: HashMap<String, ModuleId>,
     ldr: u32,
     ldr_used: u32,
+    ldr_free: Vec<(u32, u32)>,
 }
 
 impl Modules {
@@ -70,6 +104,15 @@ impl Modules {
         size: u32,
     ) -> Result<u32, adv_cpu::backend::MemFault> {
         use adv_machine::layout::{LDR_BASE, LDR_SIZE};
+        if let Some(index) = self.ldr_free.iter().position(|(_, free)| *free >= size) {
+            let (address, free) = self.ldr_free[index];
+            cpu.map(address, size, adv_cpu::backend::Prot::RW)?;
+            self.ldr_free.swap_remove(index);
+            if free > size {
+                self.ldr_free.push((address + size, free - size));
+            }
+            return Ok(address);
+        }
         let address = LDR_BASE + self.ldr_used;
         if size > LDR_SIZE.saturating_sub(self.ldr_used) {
             return Err(adv_cpu::backend::MemFault {
@@ -82,18 +125,19 @@ impl Modules {
         Ok(address)
     }
     pub fn add(&mut self, m: Module) -> ModuleId {
-        let id = self.list.len();
+        let id = self.next_id;
+        self.next_id += 1;
         self.by_name.entry(m.name.clone()).or_insert(id);
-        self.list.push(m);
+        self.list.insert(id, m);
         id
     }
 
     pub fn get(&self, id: ModuleId) -> &Module {
-        &self.list[id]
+        &self.list[&id]
     }
 
     pub fn get_mut(&mut self, id: ModuleId) -> &mut Module {
-        &mut self.list[id]
+        self.list.get_mut(&id).expect("live module id")
     }
 
     pub fn by_name(&self, path: &str) -> Option<ModuleId> {
@@ -103,38 +147,178 @@ impl Modules {
         if path.contains(['\\', '/']) {
             let path = path.replace('/', "\\");
             return self
-                .list
                 .iter()
-                .position(|m| m.path.eq_ignore_ascii_case(&path));
+                .find(|(_, m)| m.path.eq_ignore_ascii_case(&path))
+                .map(|(id, _)| id);
         }
         self.by_name.get(&module_key(path)).copied()
     }
 
     pub fn system(&self, name: &str) -> Option<ModuleId> {
         let key = module_key(name);
-        self.list
-            .iter()
-            .position(|m| m.kind == ModuleKind::Host && m.name == key)
+        self.iter()
+            .find(|(_, m)| m.kind == ModuleKind::Host && m.name == key)
+            .map(|(id, _)| id)
     }
 
     /// Module whose HMODULE is `handle`.
     pub fn by_handle(&self, handle: u32) -> Option<ModuleId> {
-        self.list.iter().position(|m| m.base == handle)
+        self.iter()
+            .find(|(_, m)| m.base == handle)
+            .map(|(id, _)| id)
     }
 
     /// Image module containing guest address `addr`.
     pub fn containing(&self, addr: u32) -> Option<ModuleId> {
-        self.list.iter().position(|m| m.contains(addr))
+        self.iter()
+            .find(|(_, m)| m.contains(addr))
+            .map(|(id, _)| id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (ModuleId, &Module)> {
-        self.list.iter().enumerate()
+        self.list.iter().map(|(&id, module)| (id, module))
+    }
+
+    pub fn retain(
+        &mut self,
+        cpu: &mut dyn adv_cpu::backend::Guest,
+        id: ModuleId,
+    ) -> Result<(), adv_cpu::backend::MemFault> {
+        self.get_mut(id).lifetime.external_refs =
+            self.get(id).lifetime.external_refs.saturating_add(1);
+        self.sync_counts(cpu)
+    }
+
+    /// Imports own one graph edge, irrespective of the number of exported symbols
+    /// resolved through that dependency. Reachability also handles import cycles.
+    pub(crate) fn dependency(
+        &mut self,
+        cpu: &mut dyn adv_cpu::backend::Guest,
+        owner: ModuleId,
+        dependency: ModuleId,
+    ) -> Result<(), adv_cpu::backend::MemFault> {
+        self.get_mut(owner).lifetime.dependencies.insert(dependency);
+        self.sync_counts(cpu)
+    }
+
+    pub fn release(
+        &mut self,
+        cpu: &mut dyn adv_cpu::backend::Guest,
+        id: ModuleId,
+    ) -> Result<Vec<ModuleId>, adv_cpu::backend::MemFault> {
+        let life = &mut self.get_mut(id).lifetime;
+        life.external_refs = life.external_refs.saturating_sub(1);
+        self.sync_counts(cpu)?;
+        Ok(self.unreachable())
+    }
+
+    pub fn unreachable(&self) -> Vec<ModuleId> {
+        let mut reachable = BTreeSet::new();
+        let mut pending: Vec<_> = self
+            .iter()
+            .filter(|(_, m)| m.lifetime.pinned || m.lifetime.external_refs > 0)
+            .map(|(id, _)| id)
+            .collect();
+        while let Some(id) = pending.pop() {
+            if reachable.insert(id) {
+                pending.extend(self.get(id).lifetime.dependencies.iter().copied());
+            }
+        }
+        // A dependent is initialized after its dependencies. Postorder reversed
+        // releases it first, including modules which were already loaded earlier.
+        let dead: BTreeSet<_> = self
+            .iter()
+            .filter(|(id, m)| !m.lifetime.unloading && !reachable.contains(id))
+            .map(|(id, _)| id)
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut result = Vec::new();
+        for &id in &dead {
+            let mut pending = vec![(id, false)];
+            while let Some((id, visited)) = pending.pop() {
+                if visited {
+                    result.push(id);
+                } else if dead.contains(&id) && seen.insert(id) {
+                    pending.push((id, true));
+                    pending.extend(
+                        self.get(id)
+                            .lifetime
+                            .dependencies
+                            .iter()
+                            .rev()
+                            .map(|&dependency| (dependency, false)),
+                    );
+                }
+            }
+        }
+        result.reverse();
+        result
+    }
+
+    fn sync_counts(
+        &mut self,
+        cpu: &mut dyn adv_cpu::backend::Guest,
+    ) -> Result<(), adv_cpu::backend::MemFault> {
+        let mut counts: BTreeMap<_, _> = self
+            .iter()
+            .map(|(id, m)| (id, m.lifetime.external_refs))
+            .collect();
+        for (_, module) in self.iter() {
+            for &id in &module.lifetime.dependencies {
+                if let Some(count) = counts.get_mut(&id) {
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        for (&id, module) in &mut self.list {
+            let count = counts[&id];
+            module.load_count = count;
+            if module.ldr_entry != 0 {
+                let count = count.min(u16::MAX as u32) as u16;
+                cpu.write(module.ldr_entry + 0x38, &count.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire loader links before unmapping the image. Host ids are not reused;
+    /// storage is released and guest LDR addresses may be reused after unlinking.
+    pub fn retire(
+        &mut self,
+        cpu: &mut dyn adv_cpu::backend::Guest,
+        id: ModuleId,
+    ) -> Result<(), adv_cpu::backend::MemFault> {
+        use adv_cpu::backend::GuestExt;
+        let (entry, size) = (self.get(id).ldr_entry, self.get(id).ldr_size);
+        if entry != 0 {
+            for offset in [0, 8, 16] {
+                let node = entry + offset;
+                let next = cpu.read_u32(node)?;
+                let previous = cpu.read_u32(node + 4)?;
+                if next != 0 && previous != 0 {
+                    cpu.write_u32(previous, next)?;
+                    cpu.write_u32(next + 4, previous)?;
+                    cpu.write_u32(node, 0)?;
+                    cpu.write_u32(node + 4, 0)?;
+                }
+            }
+        }
+        if entry != 0 {
+            cpu.unmap(entry, size)?;
+            self.ldr_free.push((entry, size));
+        }
+        let name = self.list.remove(&id).expect("live module id").name;
+        self.by_name.remove(&name);
+        let replacement = self.iter().find(|(_, m)| m.name == name).map(|(id, _)| id);
+        if let Some(replacement) = replacement {
+            self.by_name.insert(name, replacement);
+        }
+        self.sync_counts(cpu)
     }
 
     pub fn host_count(&self) -> u32 {
-        self.list
-            .iter()
-            .filter(|m| m.kind == ModuleKind::Host)
+        self.iter()
+            .filter(|(_, m)| m.kind == ModuleKind::Host)
             .count() as u32
     }
 
@@ -159,10 +343,10 @@ impl Modules {
             cpu.write_u32(PEB_ADDR + 0x0c, address)?;
             self.ldr = address;
         }
-        if self.list[id].ldr_entry != 0 {
+        if self.get(id).ldr_entry != 0 {
             return Ok(());
         }
-        let m = &self.list[id];
+        let m = self.get(id);
         let full: Vec<u16> = full_path.encode_utf16().collect();
         let name: Vec<u16> = m.name.encode_utf16().collect();
         // UNICODE_STRING lengths are WORDs. Invalid overlong paths never enter
@@ -171,7 +355,9 @@ impl Modules {
         let name_bytes = name.len().min(32766) * 2;
         let size = adv_machine::vm::align_up((0x80 + full_bytes + name_bytes + 4) as u32, PAGE);
         let entry = self.alloc_ldr(cpu, size)?;
-        let m = &self.list[id];
+        self.get_mut(id).ldr_entry = entry;
+        self.get_mut(id).ldr_size = size;
+        let m = self.get(id);
         cpu.write_u32(entry + 0x18, m.base)?;
         cpu.write_u32(entry + 0x1c, m.entry)?;
         cpu.write_u32(entry + 0x20, m.size)?;
@@ -202,7 +388,6 @@ impl Modules {
             cpu.write_u32(tail, node)?;
             cpu.write_u32(head + 4, node)?;
         }
-        self.list[id].ldr_entry = entry;
         Ok(())
     }
 
@@ -212,7 +397,7 @@ impl Modules {
         id: ModuleId,
     ) -> Result<(), adv_cpu::backend::MemFault> {
         use adv_cpu::backend::GuestExt;
-        let module = &self.list[id];
+        let module = self.get(id);
         if !module.is_dll {
             return Ok(());
         }
@@ -232,7 +417,56 @@ impl Modules {
 
 #[cfg(test)]
 mod tests {
-    use super::module_key;
+    use super::*;
+
+    fn image(name: &str, base: u32) -> Module {
+        Module {
+            name: name.into(),
+            path: name.into(),
+            kind: ModuleKind::Image,
+            base,
+            size: 4096,
+            is_dll: true,
+            entry: base,
+            stack_reserve: 0,
+            exports_by_name: HashMap::new(),
+            exports_by_ordinal: HashMap::new(),
+            resources: None,
+            load_count: 1,
+            ldr_entry: 0,
+            ldr_size: 0,
+            lifetime: Lifetime::default(),
+        }
+    }
+
+    #[test]
+    fn dependency_cycles_release_as_a_group_and_explicit_references_keep_them_alive() {
+        let mut cpu = adv_cpu::backend::jit::JitCpu::new(0x1000, false).unwrap();
+        let mut modules = Modules::default();
+        let a = modules.add(image("a.dll", 0x10000));
+        let b = modules.add(image("b.dll", 0x20000));
+        let c = modules.add(image("c.dll", 0x30000));
+        modules.dependency(&mut cpu, a, b).unwrap();
+        modules.dependency(&mut cpu, b, a).unwrap();
+        modules.dependency(&mut cpu, a, c).unwrap();
+        modules.dependency(&mut cpu, a, c).unwrap();
+        assert_eq!(
+            modules.get(c).load_count,
+            2,
+            "repeated export resolution must not retain twice"
+        );
+        assert!(modules.release(&mut cpu, a).unwrap().is_empty());
+        assert_eq!(modules.release(&mut cpu, b).unwrap(), vec![a, b]);
+        modules.retire(&mut cpu, a).unwrap();
+        modules.retire(&mut cpu, b).unwrap();
+        assert_eq!(modules.get(c).load_count, 1);
+        assert_eq!(modules.release(&mut cpu, c).unwrap(), vec![c]);
+        modules.retire(&mut cpu, c).unwrap();
+        assert_eq!(modules.iter().count(), 0);
+        let later = modules.add(image("a.dll", 0x10000));
+        assert!(later > c, "host identities must not alias retired modules");
+        assert_eq!(modules.by_name("A.DLL"), Some(later));
+    }
 
     #[test]
     fn keys() {

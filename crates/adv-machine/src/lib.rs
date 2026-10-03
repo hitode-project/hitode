@@ -49,6 +49,22 @@ pub use thunk::{Conv, Handler, HostFn, Resolver, ThunkTable};
 pub use trace::{Trace, TraceRecord};
 pub use vm::Vm;
 
+fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Result<u32, MemFault> {
+    let size = u32::try_from(image.template.len())
+        .ok()
+        .and_then(|n| n.checked_add(image.zero_fill))
+        .ok_or(MemFault {
+            addr: 0,
+            len: u32::MAX,
+        })?;
+    let block = vm.alloc(cpu, size.max(1), Prot::RW)?;
+    if let Err(error) = cpu.write(block, &image.template) {
+        let _ = vm.free(cpu, block);
+        return Err(error);
+    }
+    Ok(block)
+}
+
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
@@ -210,23 +226,90 @@ impl Sys {
     /// Allocate this thread's static TLS blocks and point TEB.ThreadLocalStoragePointer at
     /// the per-image block array.
     fn setup_static_tls(&mut self, cpu: &mut dyn Guest, teb: u32) -> Result<(), MemFault> {
-        if self.tls_images.is_empty() {
-            return Ok(());
+        // The directory stays fixed across later image loads; individual blocks
+        // likewise keep their addresses while other modules arrive or retire.
+        let directory = self.vm.alloc(cpu, PAGE, Prot::RW)?;
+        let mut allocated = vec![directory];
+        let result = (|| {
+            for image in self.tls_images.iter().filter(|image| image.active) {
+                let block = allocate_tls_block(&mut self.vm, cpu, image)?;
+                allocated.push(block);
+                cpu.write_u32(directory + 4 * image.index, block)?;
+            }
+            cpu.write_u32(teb + teb::TLS_POINTER, directory)
+        })();
+        if result.is_err() {
+            for block in allocated {
+                let _ = self.vm.free(cpu, block);
+            }
         }
-        let n = self.tls_images.len() as u32;
-        let mut offsets = Vec::with_capacity(n as usize);
-        let mut size = n * 4;
-        for t in &self.tls_images {
-            size = vm::align_up(size, 16);
-            offsets.push(size);
-            size += t.template.len() as u32 + t.zero_fill;
+        result
+    }
+
+    /// Publish a static TLS template to all existing contexts transactionally.
+    /// This is process storage, not an OS callback or a second scheduler.
+    pub fn add_static_tls(
+        &mut self,
+        cpu: &mut dyn Guest,
+        mut image: TlsImage,
+    ) -> Result<u32, MemFault> {
+        let index = self
+            .tls_images
+            .iter()
+            .position(|image| !image.active)
+            .unwrap_or(self.tls_images.len()) as u32;
+        if index >= PAGE / 4 {
+            return Err(MemFault { addr: 0, len: PAGE });
         }
-        let block = self.vm.alloc(cpu, size, Prot::RW)?;
-        for (t, off) in self.tls_images.iter().zip(&offsets) {
-            cpu.write_u32(block + 4 * t.index, block + off)?;
-            cpu.write(block + off, &t.template)?;
+        image.index = index;
+        let mut allocated = Vec::new();
+        let result = (|| {
+            for context in &self.contexts {
+                let directory = cpu.read_u32(context.teb + teb::TLS_POINTER)?;
+                if directory == 0 {
+                    return Err(MemFault {
+                        addr: context.teb,
+                        len: 4,
+                    });
+                }
+                let block = allocate_tls_block(&mut self.vm, cpu, &image)?;
+                allocated.push((directory + 4 * index, block));
+            }
+            for &(slot, block) in &allocated {
+                cpu.write_u32(slot, block)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for (slot, block) in allocated {
+                let _ = cpu.write_u32(slot, 0);
+                let _ = self.vm.free(cpu, block);
+            }
+            return Err(error);
         }
-        cpu.write_u32(teb + teb::TLS_POINTER, block)
+        if index as usize == self.tls_images.len() {
+            self.tls_images.push(image);
+        } else {
+            self.tls_images[index as usize] = image;
+        }
+        Ok(index)
+    }
+
+    pub fn remove_static_tls(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), MemFault> {
+        for context in &self.contexts {
+            let directory = cpu.read_u32(context.teb + teb::TLS_POINTER)?;
+            let slot = directory + index * 4;
+            let block = cpu.read_u32(slot)?;
+            cpu.write_u32(slot, 0)?;
+            if block != 0 {
+                self.vm.free(cpu, block)?;
+            }
+        }
+        if let Some(image) = self.tls_images.get_mut(index as usize) {
+            image.active = false;
+            image.template.clear();
+        }
+        Ok(())
     }
 
     /// Human-readable list of the most recent host calls.
@@ -494,11 +577,13 @@ fn process_start(env: &mut Env<'_>) -> Outcome {
             None => Outcome::Return(last),
             Some(c) => {
                 log::debug!("process init: {} at {:#010x}", c.what, c.target);
-                let what = c.what;
+                let failure_exit = c.failure_exit;
                 Outcome::call(c.target, c.args, move |env, r| {
                     let v = r.value();
-                    if what.starts_with("DllMain") && v == 0 {
-                        log::warn!("{what} returned FALSE");
+                    if v == 0
+                        && let Some(status) = failure_exit
+                    {
+                        return Outcome::ExitProcess(status);
                     }
                     next(env, v)
                 })
@@ -1052,12 +1137,13 @@ impl<B: Backend> Machine<B> {
             target: entry,
             args: vec![],
             what: format!("entry of {name}"),
+            failure_exit: None,
         });
         let start = self
             .sys
             .thunks
             .resolve(&mut self.cpu, INTERNAL_MODULE, "process_start")?;
-        self.spawn("M", start, &[], stack.max(DEFAULT_STACK))
+        self.spawn("main", start, &[], stack.max(DEFAULT_STACK))
     }
 
     /// Resolve `module!name` to a thunk address (for the loader).

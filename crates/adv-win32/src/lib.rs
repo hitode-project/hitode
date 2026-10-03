@@ -82,6 +82,8 @@ pub struct Win32 {
     pub gdi: gdi32::Gdi,
     /// Lazily created guest strings (command line, environment).
     pub statics: HashMap<&'static str, u32>,
+    /// Common waitable mutex; guest initializer continuations retain ownership.
+    pub(crate) loader_lock: Option<u32>,
 }
 
 /// Standard handles (the values old Windows consoles used).
@@ -107,6 +109,7 @@ impl Win32 {
             next_hrsrc: 0x7e80_0000,
             unhandled_filter: 0,
             statics: HashMap::new(),
+            loader_lock: None,
             user: user32::User::new(&mut m.sys.objects, cfg.screen, cfg.auto_dialog_ms)
                 .ok_or(MemFault { addr: 0, len: 0 })?,
             gdi: gdi32::Gdi::default(),

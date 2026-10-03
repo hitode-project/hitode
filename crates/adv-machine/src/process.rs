@@ -9,6 +9,9 @@ pub struct InitCall {
     pub args: Vec<u32>,
     /// For logs: "tls callback of X" / "DllMain of X" / "entry of X".
     pub what: String,
+    /// Optional process status if this initializer returns zero. The image/OS
+    /// frontend chooses the policy; the machine never interprets API names.
+    pub failure_exit: Option<u32>,
 }
 
 /// Static TLS of one image (`__declspec(thread)` data).
@@ -17,6 +20,7 @@ pub struct TlsImage {
     pub index: u32,
     pub template: Vec<u8>,
     pub zero_fill: u32,
+    pub active: bool,
 }
 
 /// A mapped guest image, as backtraces and profiles name addresses.
@@ -42,6 +46,10 @@ pub struct Images {
 impl Images {
     pub fn add(&mut self, image: Image) {
         self.list.push(image);
+    }
+
+    pub fn remove(&mut self, base: u32) {
+        self.list.retain(|image| image.base != base);
     }
 
     pub fn containing(&self, addr: u32) -> Option<&Image> {

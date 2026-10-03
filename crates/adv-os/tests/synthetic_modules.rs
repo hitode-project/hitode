@@ -29,6 +29,32 @@ fn machine(jit: bool) -> Machine<JitCpu> {
     )
     .unwrap()
 }
+
+#[test]
+fn initializer_failure_policy_is_owned_by_the_frontend_and_stops_process_entry() {
+    for jit in [false, true] {
+        let mut machine = machine(jit);
+        machine.cpu.map(0x400000, 4096, Prot::RWX).unwrap();
+        machine.cpu.write(0x400000, &[0x31, 0xc0, 0xc3]).unwrap(); // xor eax,eax; ret
+        machine
+            .cpu
+            .write(0x400010, &[0xb8, 7, 0, 0, 0, 0xc3])
+            .unwrap();
+        machine.sys.process_init.push_back(adv_machine::InitCall {
+            target: 0x400000,
+            args: vec![],
+            what: "frontend initializer with no API-specific name".into(),
+            failure_exit: Some(0xc0000142),
+        });
+        machine
+            .start_main(0x400000, 0x400010, 0x10000, "authored")
+            .unwrap();
+        assert!(matches!(
+            machine.run_virtual(100000),
+            RunResult::Exited(0xc0000142)
+        ));
+    }
+}
 fn resolve(machine: &mut Machine<JitCpu>, id: usize, symbol: ImportName) -> u32 {
     Loader::new(
         &mut machine.cpu,

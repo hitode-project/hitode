@@ -19,7 +19,7 @@ use adv_machine::layout::{GRANULE, HOST_MODULE_BASE, HOST_MODULE_CAP, PAGE};
 use adv_machine::vm::align_up;
 use adv_machine::{Image, InitCall, Sys, TlsImage};
 
-use crate::module::{Module, ModuleId, ModuleKind, Modules, module_key};
+use crate::module::{Lifetime, Module, ModuleId, ModuleKind, Modules, module_key};
 
 /// System modules available from the synthetic System32 view. A game-side proxy
 /// takes precedence for a bare module name; an absolute System32 path bypasses it.
@@ -170,6 +170,25 @@ impl<'a> Loader<'a> {
 
     /// Load `path` (or bump the load count if it is already loaded).
     pub fn load(&mut self, path: &str) -> Result<ModuleId, LoadError> {
+        let before: std::collections::BTreeSet<_> = self.modules.iter().map(|(id, _)| id).collect();
+        let initializers = self.inits.len();
+        let result = self.load_inner(path, true);
+        if result.is_err() {
+            self.inits.truncate(initializers);
+            let created: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|(id, m)| !before.contains(id) && m.kind == ModuleKind::Image)
+                .map(|(id, _)| id)
+                .collect();
+            for id in created.into_iter().rev() {
+                self.retire(id)?;
+            }
+        }
+        result
+    }
+
+    fn load_inner(&mut self, path: &str, retain: bool) -> Result<ModuleId, LoadError> {
         let key = module_key(path);
         let system = is_system_path(path);
         let loaded = if system {
@@ -178,25 +197,20 @@ impl<'a> Loader<'a> {
             self.modules.by_name(path)
         };
         if let Some(id) = loaded {
-            let module = self.modules.get_mut(id);
-            module.load_count = module.load_count.saturating_add(1);
-            if module.ldr_entry != 0 {
-                self.cpu.write(
-                    module.ldr_entry + 0x38,
-                    &(module.load_count.min(u16::MAX as u32) as u16).to_le_bytes(),
-                )?;
+            if retain {
+                self.modules.retain(self.cpu, id)?;
             }
             return Ok(id);
         }
         if system {
             return if is_host_module(self.sys, &key) {
-                self.load_host(key, path)
+                self.load_host(key, path, retain)
             } else {
                 Err(LoadError::NotFound(path.to_owned()))
             };
         }
         if self.sys.thunks.resolver().replaces_module(&key) {
-            return self.load_host(key, path);
+            return self.load_host(key, path, retain);
         }
         if let Some((resolved, bytes)) =
             module_file(self.files, path, self.importers.last().map(String::as_str))
@@ -204,15 +218,15 @@ impl<'a> Loader<'a> {
             if resolved != path {
                 log::info!("{path}: found as {resolved}");
             }
-            return self.load_image(key, &resolved, bytes);
+            return self.load_image(key, &resolved, bytes, retain);
         }
         // Anything the game doesn't ship is a system DLL: the host provides it, and calls
         // into unimplemented functions fail by name.
         log::info!("{path}: not in the game files, treating as a system module");
-        self.load_host(key, path)
+        self.load_host(key, path, retain)
     }
 
-    fn load_host(&mut self, key: String, _path: &str) -> Result<ModuleId, LoadError> {
+    fn load_host(&mut self, key: String, _path: &str, retain: bool) -> Result<ModuleId, LoadError> {
         let n = self.modules.host_count();
         if n >= HOST_MODULE_CAP {
             return Err(LoadError::TooManyHostModules);
@@ -272,6 +286,13 @@ impl<'a> Loader<'a> {
             resources: None,
             load_count: 1,
             ldr_entry: 0,
+            ldr_size: 0,
+            lifetime: Lifetime {
+                mapped: true,
+                pinned: true,
+                external_refs: u32::from(retain),
+                ..Lifetime::default()
+            },
         });
         self.modules.publish_ldr(self.cpu, id, &path)?;
         self.modules.complete_ldr(self.cpu, id)?;
@@ -283,12 +304,13 @@ impl<'a> Loader<'a> {
         key: String,
         path: &str,
         bytes: Vec<u8>,
+        retain: bool,
     ) -> Result<ModuleId, LoadError> {
         let pe_err = |err| LoadError::Pe {
             path: path.to_owned(),
             err,
         };
-        let mut pe = Pe::parse(&bytes).map_err(pe_err)?;
+        let pe = Pe::parse(&bytes).map_err(pe_err)?;
         drop(bytes);
 
         let size = align_up(pe.size_of_image, PAGE);
@@ -305,6 +327,26 @@ impl<'a> Loader<'a> {
                 .vm
                 .reserve(size)
                 .ok_or_else(|| LoadError::NoSpace(path.to_owned(), size))?
+        };
+        let result = self.populate_image(key, path, pe, base, size, retain);
+        if result.is_err() && self.modules.by_handle(base).is_none() {
+            self.sys.vm.free(self.cpu, base)?;
+        }
+        result
+    }
+
+    fn populate_image(
+        &mut self,
+        key: String,
+        path: &str,
+        mut pe: Pe,
+        base: u32,
+        size: u32,
+        retain: bool,
+    ) -> Result<ModuleId, LoadError> {
+        let pe_err = |err| LoadError::Pe {
+            path: path.to_owned(),
+            err,
         };
         if base != pe.image_base {
             let n = pe
@@ -344,6 +386,12 @@ impl<'a> Loader<'a> {
             resources: pe.resources().map_err(pe_err)?,
             load_count: 1,
             ldr_entry: 0,
+            ldr_size: 0,
+            lifetime: Lifetime {
+                pinned: !pe.is_dll(),
+                external_refs: u32::from(retain),
+                ..Lifetime::default()
+            },
         });
         self.modules
             .publish_ldr(self.cpu, id, &self.files.absolute_path(path))?;
@@ -356,26 +404,25 @@ impl<'a> Loader<'a> {
         let mut tls_callbacks = Vec::new();
         if let Some(tls) = pe.tls().map_err(pe_err)? {
             // The directory's VAs were fixed up with the rest of the image.
-            let index = self.sys.tls_images.len() as u32;
             let len = tls.raw_end_va.saturating_sub(tls.raw_start_va);
             let template = pe
                 .slice(tls.raw_start_va.wrapping_sub(base), len)
                 .map_err(pe_err)?
                 .to_vec();
+            let index = self.sys.add_static_tls(
+                self.cpu,
+                TlsImage {
+                    index: 0,
+                    template,
+                    zero_fill: tls.zero_fill,
+                    active: true,
+                },
+            )?;
+            self.modules.get_mut(id).lifetime.tls_index = Some(index);
             if tls.index_va != 0 {
                 pe.set_u32(tls.index_va.wrapping_sub(base), index)
                     .map_err(pe_err)?;
             }
-            if !self.sys.contexts.is_empty() {
-                log::warn!(
-                    "{key}: static TLS in a DLL loaded after threads started; existing threads lack it"
-                );
-            }
-            self.sys.tls_images.push(TlsImage {
-                index,
-                template,
-                zero_fill: tls.zero_fill,
-            });
             tls_callbacks = pe.tls_callbacks(&tls, base).map_err(pe_err)?;
         }
 
@@ -386,7 +433,7 @@ impl<'a> Loader<'a> {
             .rfind(['\\', '/'])
             .map_or(String::new(), |i| path[..i].to_owned());
         self.importers.push(dir);
-        let bound = self.bind(&mut pe, path, base);
+        let bound = self.bind(&mut pe, path, base, id);
         self.importers.pop();
         bound?;
 
@@ -405,12 +452,18 @@ impl<'a> Loader<'a> {
             }
         }
         log::info!("loaded {key} at {base:#010x} (+{size:#x})");
+        self.modules.get_mut(id).lifetime.mapped = true;
 
+        self.modules.get_mut(id).lifetime.callbacks = tls_callbacks.clone();
+        // Startup's generic initializer chain runs before any application call;
+        // the dynamic frontend separately clears/marks pending attach entries.
+        self.modules.get_mut(id).lifetime.attach_started = true;
         for cb in tls_callbacks {
             self.inits.push(InitCall {
                 target: cb,
                 args: vec![base, DLL_PROCESS_ATTACH, 0],
                 what: format!("TLS callback of {key}"),
+                failure_exit: None,
             });
         }
         let m = self.modules.get(id);
@@ -419,6 +472,7 @@ impl<'a> Loader<'a> {
                 target: m.entry,
                 args: vec![base, DLL_PROCESS_ATTACH, 0],
                 what: format!("DllMain of {key}"),
+                failure_exit: Some(0xc0000142),
             });
         }
         self.modules.complete_ldr(self.cpu, id)?;
@@ -426,13 +480,20 @@ impl<'a> Loader<'a> {
     }
 
     /// Fill the IAT and delay-load IAT (and the delay descriptor's HMODULE slot).
-    fn bind(&mut self, pe: &mut Pe, path: &str, base: u32) -> Result<(), LoadError> {
+    fn bind(
+        &mut self,
+        pe: &mut Pe,
+        path: &str,
+        base: u32,
+        owner: ModuleId,
+    ) -> Result<(), LoadError> {
         let pe_err = |err| LoadError::Pe {
             path: path.to_owned(),
             err,
         };
         for m in pe.imports().map_err(pe_err)? {
-            let dep = self.load(&m.dll)?;
+            let dep = self.load_inner(&m.dll, false)?;
+            self.modules.dependency(self.cpu, owner, dep)?;
             for imp in &m.imports {
                 let addr = self.resolve(dep, &imp.name)?;
                 pe.set_u32(imp.iat_rva, addr).map_err(pe_err)?;
@@ -446,7 +507,8 @@ impl<'a> Loader<'a> {
             Vec::new()
         });
         for m in delay {
-            let dep = self.load(&m.dll)?;
+            let dep = self.load_inner(&m.dll, false)?;
+            self.modules.dependency(self.cpu, owner, dep)?;
             if m.module_handle_rva != 0 {
                 pe.set_u32(m.module_handle_rva, self.modules.get(dep).base)
                     .map_err(pe_err)?;
@@ -495,12 +557,23 @@ impl<'a> Loader<'a> {
             }
         }
         // GetProcAddress observes the live guest EAT, including patch edits.
-        let target = mapped_export(self.cpu, module.base, module.size, sym);
+        let target = if module.lifetime.mapped {
+            mapped_export(self.cpu, module.base, module.size, sym)
+        } else {
+            // Circular imports can resolve exports before the importing image's
+            // IAT is bound. Once mapped, the live EAT always takes precedence.
+            match sym {
+                ImportName::Name { name, .. } => module.exports_by_name.get(name),
+                ImportName::Ordinal(ordinal) => module.exports_by_ordinal.get(ordinal),
+            }
+            .cloned()
+        };
         match target {
             Some(ExportTarget::Rva(rva)) => Ok(module.base + rva),
             Some(ExportTarget::Forwarder(f)) => {
                 let (dll, func) = f.rsplit_once('.').unwrap_or((&f, ""));
-                let dep = self.load(dll)?;
+                let dep = self.load_inner(dll, false)?;
+                self.modules.dependency(self.cpu, m, dep)?;
                 let sym = match func.strip_prefix('#').and_then(|o| o.parse().ok()) {
                     Some(o) => ImportName::Ordinal(o),
                     None => ImportName::Name {
@@ -515,6 +588,19 @@ impl<'a> Loader<'a> {
                 name,
             }),
         }
+    }
+
+    /// Frontends run guest detach callbacks first, then retire process storage.
+    pub fn retire(&mut self, id: ModuleId) -> Result<(), LoadError> {
+        let module = self.modules.get(id);
+        let (base, tls) = (module.base, module.lifetime.tls_index);
+        if let Some(index) = tls {
+            self.sys.remove_static_tls(self.cpu, index)?;
+        }
+        self.modules.retire(self.cpu, id)?;
+        self.sys.images.remove(base);
+        self.sys.vm.free(self.cpu, base)?;
+        Ok(())
     }
 }
 
