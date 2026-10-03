@@ -4,7 +4,7 @@
 use adv_device::surface::{
     BlitOptions, BlitRect, PixelFormat, Presenter, Rect, Sampling, SurfaceMemory, Surfaces, size,
 };
-use adv_os::gdi::{DeviceContexts, STOCK_BITMAP, WINDOW_DC};
+use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
 pub mod api {
     pub const GET_DC: u32 = 100;
@@ -100,7 +100,25 @@ impl Raster {
                 };
                 let bitmap =
                     surfaces.create(w as u32, height.unsigned_abs(), height > 0, format, m)?;
-                m.put_u32(a[3], surfaces.get(bitmap).unwrap().pixels)?;
+                let surface = surfaces.get(bitmap).unwrap();
+                let bits = surface.pixels;
+                let metadata = GdiObj::Bitmap {
+                    width: w,
+                    height,
+                    bpp: (format.bytes() * 8) as u16,
+                    bits,
+                    stride: surface.pitch,
+                    owned: false,
+                };
+                if !dcs.register_bitmap(objects, bitmap, metadata) {
+                    surfaces.delete(bitmap);
+                    return Ok(self.fail(8));
+                }
+                if let Err(error) = m.put_u32(a[3], bits) {
+                    dcs.remove_bitmap(objects, bitmap);
+                    surfaces.delete(bitmap);
+                    return Err(error);
+                }
                 bitmap
             }
             api::SELECT => {
@@ -130,6 +148,7 @@ impl Raster {
                     return Ok(self.fail(170));
                 }
                 if surfaces.delete(a[0]) {
+                    dcs.remove_bitmap(objects, a[0]);
                     1
                 } else {
                     self.fail(6)

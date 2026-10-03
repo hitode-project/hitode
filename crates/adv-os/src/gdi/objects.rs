@@ -85,6 +85,10 @@ impl Gdi {
             .and_then(|ns| objects.insert_host_in(ns, o))
             .unwrap_or(0)
     }
+    pub fn add_at(&mut self, objects: &mut Objects, handle: u32, object: GdiObj) -> bool {
+        self.namespace(objects)
+            .is_some_and(|ns| objects.insert_host_at(ns, handle, object))
+    }
     pub fn get<'a>(&self, objects: &'a Objects, h: u32) -> Option<&'a GdiObj> {
         objects.owned(objects.lookup_alias(self.namespace.get()?, h)?)
     }

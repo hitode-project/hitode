@@ -68,6 +68,26 @@ impl DeviceContexts {
         self.get(objects, dc).is_some()
     }
 
+    /// Publish the GDI handle for pixels owned by the common device surface store.
+    pub fn register_bitmap(
+        &mut self,
+        objects: &mut Objects,
+        bitmap: u32,
+        metadata: GdiObj,
+    ) -> bool {
+        matches!(metadata, GdiObj::Bitmap { owned: false, .. })
+            && self.gdi.add_at(objects, bitmap, metadata)
+    }
+
+    pub fn remove_bitmap(&mut self, objects: &mut Objects, bitmap: u32) {
+        if matches!(
+            self.gdi.get(objects, bitmap),
+            Some(GdiObj::Bitmap { owned: false, .. })
+        ) {
+            self.gdi.remove(objects, bitmap);
+        }
+    }
+
     pub fn stretch_mode(&self, objects: &Objects, dc: u32) -> u32 {
         match self.gdi.get(objects, dc) {
             Some(GdiObj::Dc { modes, .. }) => modes.stretch,

@@ -114,12 +114,23 @@ mod tests {
         for _ in 0..8 {
             assert_eq!(invoke(&mut machine, data, "CreateCompatibleDC", &[0]), 0);
         }
+        let mut header = [0; 40];
+        for (offset, value) in [(0, 40u32), (4, 4), (8, 2), (12, 0x200001)] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        machine.cpu.write(data + 64, &header).unwrap();
+        for _ in 0..64 {
+            machine.cpu.write_u32(data + 128, 0xcccccccc).unwrap();
+            assert_eq!(invoke(&mut machine, data, "CreateDIBSection", &[0, data + 64, 0, data + 128, 0, 0]), 0);
+            assert_eq!(machine.cpu.read_u32(data + 128).unwrap(), 0);
+        }
         assert_eq!(machine.sys.objects.object_count(), 1);
         let graphics = machine
             .ext
             .get::<crate::graphics::Graphics<crate::graphics::Snapshot>>();
         for dc in 2..128 {
             assert!(!graphics.owns_dc(&machine.sys.objects, dc));
+            assert!(!graphics.contains(dc));
         }
     }
 
@@ -169,6 +180,11 @@ mod tests {
             &[dc, data + 64, 0, data + 128, 0, 0],
         );
         assert_ne!(bitmap, 0);
+        let bits = machine.cpu.read_u32(data + 128).unwrap();
+        assert_eq!(invoke(&mut machine, data, "GetObjectA", &[bitmap, 24, data + 256]), 24);
+        for (offset, value) in [(4, 4), (8, 2), (12, 16), (16, 0x200001), (20, bits)] {
+            assert_eq!(machine.cpu.read_u32(data + 256 + offset).unwrap(), value);
+        }
         assert_eq!(
             invoke(&mut machine, data, "SelectObject", &[dc, bitmap]),
             adv_os::gdi::STOCK_BITMAP
@@ -202,6 +218,7 @@ mod tests {
             bitmap
         );
         assert_eq!(invoke(&mut machine, data, "DeleteObject", &[bitmap]), 1);
+        assert!(machine.ext.get::<Win32>().gdi.get(&machine.sys.objects, bitmap).is_none());
         assert_eq!(invoke(&mut machine, data, "DeleteDC", &[dc]), 1);
         assert!(
             machine
