@@ -24,6 +24,7 @@ windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Fou
 [dev-dependencies]
 unicorn-engine.workspace = true
 adv-unicorn = { path = "../adv-unicorn" }
+adv-samples = { path = "../adv-samples" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 png = "0.17"
 

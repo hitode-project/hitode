@@ -86,6 +86,7 @@ dependencies = [
  "adv-device",
  "adv-machine",
  "adv-pe",
+ "adv-samples",
  "adv-sync",
  "adv-unicorn",
  "adv-win32",

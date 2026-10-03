@@ -2,7 +2,7 @@
 //! and the repository's interpreter/JIT CPUs.
 //! Inputs and reference PCM are short sine tones generated with FFmpeg/libvorbis.
 #![cfg(windows)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,15 @@ use adv_runtime::boot::Runtime;
 use adv_runtime::vorbis::Policy;
 #[path = "support/cpu.rs"]
 mod cpu;
+
+const NANA: &str = "七色★星露";
+
+/// `directory` under `$ADV_SAMPLES`, when the tester has that game installed.
+fn sample(directory: &str) -> Option<PathBuf> {
+    adv_samples::root()
+        .map(|root| root.join(directory))
+        .filter(|path| path.is_dir())
+}
 
 fn samples(bytes: &[u8]) -> Vec<f64> {
     bytes
@@ -33,7 +42,8 @@ fn snr(reference: &[u8], actual: &[u8]) -> f64 {
 #[test]
 #[ignore = "read-only preflight against a locally installed authorized game"]
 fn real_codec_capability_preflight_reports_actual_provider() {
-    let files = adv_machine::loader::HostDir::new("<games>/七色★星露", "C:\\Game");
+    let Some(game) = sample(NANA) else { return };
+    let files = adv_machine::loader::HostDir::new(game, "C:\\Game");
     let selected =
         adv_runtime::vorbis::select_policy_with_reason(&files, "nana_chs.exe", Policy::Native)
             .unwrap();
@@ -44,6 +54,9 @@ fn real_codec_capability_preflight_reports_actual_provider() {
 #[test]
 #[ignore = "read-only preflight against locally installed authorized cross-engine games"]
 fn cross_engine_preflight_is_observable_without_rejecting_guest_startup() {
+    let Some(games) = adv_samples::root() else {
+        return;
+    };
     for (directory, exe) in [
         ("AQUA", "AQUA.exe"),
         ("KIMIKISHI", "kimikishi.exe"),
@@ -53,7 +66,7 @@ fn cross_engine_preflight_is_observable_without_rejecting_guest_startup() {
         ),
     ] {
         let files = adv_win32::Vfs::new(&adv_win32::Win32Config::new(
-            Path::new("<games>").join(directory),
+            games.join(directory),
             exe,
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/cross-engine/preflight-only"),
         ));
@@ -79,11 +92,13 @@ fn standard_vorbis_callbacks_seek_lifetime_and_pcm_match_reference() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let originals = Path::new("<games>/七色★星露");
-    let native_available = ["vorbisfile.dll", "vorbis.dll", "ogg.dll"]
-        .iter()
-        .all(|name| originals.join(name).exists());
-    if native_available {
+    let originals = sample(NANA);
+    let native_available = originals.as_ref().is_some_and(|originals| {
+        ["vorbisfile.dll", "vorbis.dll", "ogg.dll"]
+            .iter()
+            .all(|name| originals.join(name).exists())
+    });
+    if let Some(originals) = originals.filter(|_| native_available) {
         for name in ["vorbisfile.dll", "vorbis.dll", "ogg.dll"] {
             std::fs::copy(originals.join(name), output.join(name)).unwrap();
         }
@@ -230,12 +245,9 @@ fn real_vorbis_pages_and_packet_boundaries_match_reference() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
+    let originals = sample(NANA).expect("the original codec DLLs under $ADV_SAMPLES");
     for name in ["vorbisfile.dll", "vorbis.dll", "ogg.dll"] {
-        std::fs::copy(
-            Path::new("<games>/七色★星露").join(name),
-            output.join(name),
-        )
-        .unwrap();
+        std::fs::copy(originals.join(name), output.join(name)).unwrap();
     }
     let sources = root.join("target/manual-regressions/audio-reference-src");
     let mut report = String::new();

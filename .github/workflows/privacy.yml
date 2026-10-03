@@ -1,0 +1,27 @@
+name: Privacy scan
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Test the scanner
+        run: python3 -m unittest discover -s tools/privacy -v
+      - name: Scan files for host paths and email addresses
+        run: python3 tools/privacy/scan.py
+      - name: Check that new commits use noreply addresses
+        if: github.event_name == 'pull_request'
+        run: >-
+          python3 tools/privacy/scan.py
+          --commits "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"

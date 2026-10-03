@@ -6,3 +6,5 @@ __pycache__/
 *.trace
 *.png
 *.bmp
+# local privacy-scan terms (tools/privacy/scan.py)
+/.privacy-terms
