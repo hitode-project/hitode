@@ -1,9 +1,12 @@
 //! Explicit diagnostic control. The reader never touches guest or window state.
 use crate::window::WakeEvent;
-use std::collections::VecDeque;
+use adv_sync::spsc;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,9 +93,94 @@ pub fn acknowledge(result: Result<String, String>) {
     let _ = std::io::stdout().flush();
 }
 
+const CONTROL_CAPACITY: usize = 128;
+struct Packet {
+    sequence: u64,
+    command: Command,
+}
+struct Sender {
+    input: spsc::Producer<Packet>,
+    diagnostics: spsc::Producer<Packet>,
+    sequence: u64,
+}
+struct Inbox {
+    input: spsc::Consumer<Packet>,
+    diagnostics: spsc::Consumer<Packet>,
+    input_head: Option<Packet>,
+    diagnostic_head: Option<Packet>,
+}
+fn channel() -> (Sender, Inbox) {
+    let (input, input_rx) = spsc::channel(CONTROL_CAPACITY);
+    let (diagnostics, diagnostics_rx) = spsc::channel(CONTROL_CAPACITY);
+    (
+        Sender {
+            input,
+            diagnostics,
+            sequence: 0,
+        },
+        Inbox {
+            input: input_rx,
+            diagnostics: diagnostics_rx,
+            input_head: None,
+            diagnostic_head: None,
+        },
+    )
+}
+impl Sender {
+    fn send(&mut self, command: Command) -> Result<(), Command> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .expect("control sequence exhausted");
+        let queue = if command.interrupts_guest() {
+            &mut self.input
+        } else {
+            &mut self.diagnostics
+        };
+        queue
+            .push(Packet {
+                sequence: self.sequence,
+                command,
+            })
+            .map_err(|packet| packet.command)
+    }
+}
+impl Inbox {
+    fn fill(&mut self) {
+        if self.input_head.is_none() {
+            self.input_head = self.input.pop();
+        }
+        if self.diagnostic_head.is_none() {
+            self.diagnostic_head = self.diagnostics.pop();
+        }
+    }
+    fn pop_input(&mut self) -> Option<Command> {
+        self.input_head.take().map(|packet| packet.command)
+    }
+    fn pop_first(&mut self) -> Option<Command> {
+        let input_first = self.input_head.as_ref().is_some_and(|input| {
+            self.diagnostic_head
+                .as_ref()
+                .is_none_or(|diagnostic| input.sequence < diagnostic.sequence)
+        });
+        if input_first {
+            self.pop_input()
+        } else {
+            self.diagnostic_head.take().map(|packet| packet.command)
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.input_head.is_none()
+            && self.diagnostic_head.is_none()
+            && self.input.is_empty()
+            && self.diagnostics.is_empty()
+    }
+}
+
 pub struct Control {
-    receiver: Receiver<Command>,
-    pending: VecDeque<Command>,
+    receiver: Inbox,
+    reader: Option<std::thread::Thread>,
+    alive: Arc<AtomicBool>,
     awaiting_guest_boundary: bool,
     input_receipt: u64,
     awaiting_until: Option<Instant>,
@@ -102,9 +190,11 @@ impl Control {
         wake: WakeEvent,
         keys: std::sync::Arc<adv_sync::input::KeyState>,
     ) -> Result<Self, String> {
-        let (sender, receiver) = mpsc::channel();
+        let (mut sender, receiver) = channel();
         let reader_wake = wake.clone();
-        std::thread::Builder::new()
+        let alive = Arc::new(AtomicBool::new(true));
+        let reader_alive = alive.clone();
+        let reader = std::thread::Builder::new()
             .name("adv-control-stdin".into())
             .spawn(move || {
                 for line in std::io::stdin().lock().lines() {
@@ -121,8 +211,26 @@ impl Control {
                         _ => {}
                     }
                     let interrupt = command.interrupts_guest();
-                    if sender.send(command).is_err() {
-                        break;
+                    let mut pending = command;
+                    loop {
+                        if !reader_alive.load(Ordering::Acquire) {
+                            return;
+                        }
+                        match sender.send(pending) {
+                            Ok(()) => break,
+                            Err(command) if !interrupt => {
+                                acknowledge(Err(format!("diagnostic queue full: {command:?}")));
+                                break;
+                            }
+                            Err(command) => {
+                                pending = command;
+                                reader_wake.signal();
+                                // Only this producer parks for backpressure.
+                                // The guest worker never waits for the reader;
+                                // unpark retains a token across this race.
+                                std::thread::park();
+                            }
+                        }
                     }
                     if interrupt {
                         reader_wake.signal();
@@ -139,31 +247,23 @@ impl Control {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             receiver,
-            pending: VecDeque::new(),
+            reader: Some(reader.thread().clone()),
+            alive,
             awaiting_guest_boundary: false,
             input_receipt: 0,
             awaiting_until: None,
         })
     }
     pub fn drain(&mut self) -> Vec<Command> {
-        loop {
-            match self.receiver.try_recv() {
-                Ok(command) => self.pending.push_back(command),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
+        self.receiver.fill();
+        if let Some(reader) = &self.reader {
+            reader.unpark();
         }
         // An interrupt can produce a slice with no guest progress, or stop a
         // partial message dispatch. Keep diagnostics behind a normal guest
         // boundary after input, while new input and close remain responsive.
         let command = if self.awaiting_guest_boundary {
-            let input = self
-                .pending
-                .iter()
-                .position(Command::interrupts_guest)
-                .and_then(|index| self.pending.remove(index));
+            let input = self.receiver.pop_input();
             if input.is_some() {
                 input
             } else if self
@@ -174,7 +274,7 @@ impl Control {
                 // diagnostic wait with a visible error; actual close still wins.
                 self.awaiting_guest_boundary = false;
                 self.awaiting_until = None;
-                self.pending.pop_front().map(|command| {
+                self.receiver.pop_first().map(|command| {
                     Command::Error(format!(
                         "input observation fence timed out before {command:?}"
                     ))
@@ -183,7 +283,7 @@ impl Control {
                 None
             }
         } else {
-            self.pending.pop_front()
+            self.receiver.pop_first()
         };
         if command.as_ref().is_some_and(Command::interrupts_guest) {
             self.awaiting_guest_boundary = true;
@@ -210,13 +310,54 @@ impl Control {
         self.awaiting_guest_boundary.then_some(self.input_receipt)
     }
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.receiver.is_empty()
+    }
+}
+impl Drop for Control {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        if let Some(reader) = &self.reader {
+            reader.unpark();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saturated_diagnostics_cannot_consume_input_capacity_or_grow_pending_storage() {
+        let (mut sender, receiver) = channel();
+        for _ in 0..CONTROL_CAPACITY {
+            sender.send(Command::ResetMetrics).unwrap();
+        }
+        assert_eq!(
+            sender.send(Command::ResetMetrics),
+            Err(Command::ResetMetrics)
+        );
+        sender.send(Command::KeyUp(17)).unwrap();
+        sender.send(Command::Close).unwrap();
+        let mut control = Control {
+            receiver,
+            reader: None,
+            alive: Arc::new(AtomicBool::new(true)),
+            awaiting_guest_boundary: true,
+            input_receipt: 0,
+            awaiting_until: Some(Instant::now() + Duration::from_secs(1)),
+        };
+        assert_eq!(control.drain(), [Command::KeyUp(17)]);
+        assert_eq!(control.drain(), [Command::Close]);
+        control.after_guest_step(true);
+        for _ in 0..CONTROL_CAPACITY {
+            assert_eq!(control.drain(), [Command::ResetMetrics]);
+        }
+        assert!(!control.has_pending());
+        // Input saturation returns ownership to the reader for parked retry.
+        for _ in 0..CONTROL_CAPACITY {
+            sender.send(Command::KeyDown(65)).unwrap();
+        }
+        assert_eq!(sender.send(Command::KeyUp(65)), Err(Command::KeyUp(65)));
+    }
     #[test]
     fn commands_preserve_paths_and_reject_invalid_packets() {
         assert_eq!(
@@ -261,10 +402,11 @@ mod tests {
     }
     #[test]
     fn diagnostic_after_input_waits_for_an_ordinary_guest_boundary() {
-        let (sender, receiver) = mpsc::channel();
+        let (mut sender, receiver) = channel();
         let mut control = Control {
             receiver,
-            pending: VecDeque::new(),
+            reader: None,
+            alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
             input_receipt: 0,
             awaiting_until: None,
@@ -287,10 +429,11 @@ mod tests {
     }
     #[test]
     fn input_and_close_overtake_diagnostics_waiting_for_guest_dispatch() {
-        let (sender, receiver) = mpsc::channel();
+        let (mut sender, receiver) = channel();
         let mut control = Control {
             receiver,
-            pending: VecDeque::new(),
+            reader: None,
+            alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
             input_receipt: 0,
             awaiting_until: None,
@@ -312,10 +455,11 @@ mod tests {
     }
     #[test]
     fn a_fence_without_any_observation_reports_an_error_without_waiting_forever() {
-        let (sender, receiver) = mpsc::channel();
+        let (mut sender, receiver) = channel();
         let mut control = Control {
             receiver,
-            pending: VecDeque::new(),
+            reader: None,
+            alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
             input_receipt: 0,
             awaiting_until: None,
