@@ -25,6 +25,51 @@ struct Program {
     next: u32,
 }
 impl Program {
+    fn new(backend: &str, game: &Path, profile: &Path, portable: bool) -> Self {
+        let mut registry = Registry::default();
+        pal_win32::register(&mut registry);
+        let mut machine = Machine::new(
+            cpu::Cpu::new(backend).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let mut config = Win32Config::new(game, "authored.exe", profile);
+        config.write_game = portable;
+        Win32::install(&mut machine, config).unwrap();
+        machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
+        machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
+        machine.cpu.write(DATA, b"pack.bin\0").unwrap();
+        machine.set_execution_budget(Some(Duration::from_secs(5)));
+        Self {
+            machine,
+            code: CodeAssembler::new(32).unwrap(),
+            next: OUTPUT,
+        }
+    }
+
+    fn run(&mut self, native: bool) {
+        self.call("ExitProcess", &[V(0)]);
+        let code = self.code.assemble(u64::from(CODE)).unwrap();
+        self.machine.cpu.write(CODE, &code).unwrap();
+        if native {
+            let mut jit = self.machine.cpu.jit_mut().unwrap().machine_mut();
+            jit.set_async_compilation(false);
+            jit.add_region(adv_jit::Region::new(CODE, code.len()))
+                .unwrap();
+        }
+        self.machine
+            .spawn("mapping copy-up", CODE, &[], 0x10000)
+            .unwrap();
+        assert!(matches!(
+            self.machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
+        if native {
+            assert!(self.machine.cpu.stats().native_entries > 0);
+        }
+    }
+
     fn call(&mut self, name: &str, arguments: &[Arg]) -> u32 {
         for argument in arguments.iter().rev() {
             match argument {
@@ -69,26 +114,7 @@ fn writable_mapping_copies_up_and_retargets_existing_handles_without_touching_as
             let profile = root.join("profile");
             std::fs::create_dir_all(&game).unwrap();
             std::fs::write(game.join("pack.bin"), &original).unwrap();
-            let mut registry = Registry::default();
-            pal_win32::register(&mut registry);
-            let mut machine = Machine::new(
-                cpu::Cpu::new(backend).unwrap(),
-                registry,
-                Clock::virtual_time(),
-            )
-            .unwrap();
-            let mut config = Win32Config::new(&game, "authored.exe", &profile);
-            config.write_game = portable;
-            Win32::install(&mut machine, config).unwrap();
-            machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
-            machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
-            machine.cpu.write(DATA, b"pack.bin\0").unwrap();
-            machine.set_execution_budget(Some(Duration::from_secs(5)));
-            let mut p = Program {
-                machine,
-                code: CodeAssembler::new(32).unwrap(),
-                next: OUTPUT,
-            };
+            let mut p = Program::new(backend, &game, &profile, portable);
             // Opening the writable FD first also tests the ordinary isolated
             // VFS copy-up. In portable mode the mapping itself must copy up.
             let writable = p.call(
@@ -127,16 +153,7 @@ fn writable_mapping_copies_up_and_retargets_existing_handles_without_touching_as
                 .map(|handle| p.call("CloseHandle", &[S(handle)]));
             let retained = p.view_word(ro_view);
             let unmap = [ro_view, rw_view].map(|view| p.call("UnmapViewOfFile", &[S(view)]));
-            p.call("ExitProcess", &[V(0)]);
-            let code = p.code.assemble(u64::from(CODE)).unwrap();
-            p.machine.cpu.write(CODE, &code).unwrap();
-            p.machine
-                .spawn("mapping copy-up", CODE, &[], 0x10000)
-                .unwrap();
-            assert!(
-                matches!(p.machine.run_virtual(1_000_000), RunResult::Exited(0)),
-                "{backend}/{portable}"
-            );
+            p.run(backend == "jit");
             assert_eq!(
                 p.value(before),
                 u32::from_le_bytes(original[..4].try_into().unwrap())
@@ -159,6 +176,52 @@ fn writable_mapping_copies_up_and_retargets_existing_handles_without_touching_as
             assert_eq!(
                 std::fs::read(profile.join("overlay/pack.bin")).unwrap(),
                 expected
+            );
+        }
+    }
+}
+
+#[test]
+fn process_teardown_persists_dirty_shared_views_without_explicit_flush_or_unmap() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/file-mapping-overlay")
+        .join(format!("exit-{}-{stamp}", std::process::id()));
+    let original = vec![0x5a; 8192];
+    for backend in ["interpreter", "jit", "unicorn"] {
+        for portable in [false, true] {
+            let root = directory.join(format!("{backend}-{portable}"));
+            let game = root.join("game");
+            let profile = root.join("profile");
+            std::fs::create_dir_all(&game).unwrap();
+            std::fs::write(game.join("pack.bin"), &original).unwrap();
+            let mut p = Program::new(backend, &game, &profile, portable);
+            let file = p.call(
+                "CreateFileA",
+                &[V(DATA), V(0xc0000000), V(3), V(0), V(3), V(0), V(0)],
+            );
+            let section = p.call(
+                "CreateFileMappingA",
+                &[S(file), V(0), V(4), V(0), V(0), V(0)],
+            );
+            let view = p.call("MapViewOfFile", &[S(section), V(2), V(0), V(0), V(8192)]);
+            p.call("CloseHandle", &[S(file)]);
+            p.call("CloseHandle", &[S(section)]);
+            p.code.mov(eax, dword_ptr(view)).unwrap();
+            p.code.mov(dword_ptr(eax + 4096), 0x2468ace0u32).unwrap();
+            p.run(backend == "jit");
+            // Process-owned resources are released by the owner after exit.
+            drop(p);
+            assert_eq!(std::fs::read(game.join("pack.bin")).unwrap(), original);
+            let mut expected = original.clone();
+            expected[4096..4100].copy_from_slice(&0x2468ace0u32.to_le_bytes());
+            assert_eq!(
+                std::fs::read(profile.join("overlay/pack.bin")).unwrap(),
+                expected,
+                "{backend}/{portable}"
             );
         }
     }
