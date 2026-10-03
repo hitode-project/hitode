@@ -1,10 +1,10 @@
 #![cfg(feature = "pal")]
 
 use adv_jit::pal::JitCpu;
+use adv_machine::layout::PARK_ADDR;
+use adv_machine::{Clock, Conv, Env, Machine, Object, Outcome, Registry, RunResult, Wait};
 use pal_cpu::asm::Asm;
 use pal_cpu::{Guest, GuestExt, Prot};
-use pal_machine::layout::PARK_ADDR;
-use pal_machine::{Clock, Conv, Env, Machine, Object, Outcome, Registry, RunResult, Wait};
 
 const CODE: u32 = 0x0040_0000;
 const CALLBACK: u32 = CODE + 0x100;
@@ -106,12 +106,12 @@ fn callback_event_wait_thread_join_and_fs_survive_real_scheduler_switches() {
             let mut code = adv_jit::Region::new(CODE, 0x300);
             code.entries.extend([CALLBACK, WORKER]);
             let mut thunks = adv_jit::Region::new(
-                pal_machine::layout::THUNK_BASE,
-                (m.sys.thunks.len() * pal_machine::layout::THUNK_STRIDE) as usize,
+                adv_machine::layout::THUNK_BASE,
+                (m.sys.thunks.len() * adv_machine::layout::THUNK_STRIDE) as usize,
             );
             thunks
                 .entries
-                .extend((0..m.sys.thunks.len()).map(pal_machine::layout::thunk_addr));
+                .extend((0..m.sys.thunks.len()).map(adv_machine::layout::thunk_addr));
             m.cpu.machine_mut().add_region(code).unwrap();
             m.cpu.machine_mut().add_region(thunks).unwrap();
         }

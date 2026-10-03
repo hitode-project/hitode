@@ -7,8 +7,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use adv_machine::{Clock, Conv, Outcome, RunResult, SliceResult, WakePriority};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, Conv, Outcome, RunResult, SliceResult, WakePriority};
 #[path = "support/cpu.rs"]
 mod cpu;
 

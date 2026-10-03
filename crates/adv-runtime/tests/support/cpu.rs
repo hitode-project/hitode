@@ -16,7 +16,7 @@ pub enum Context {
 
 impl Cpu {
     pub fn new(name: &str) -> Result<Self, String> {
-        let park = pal_machine::layout::PARK_ADDR;
+        let park = adv_machine::layout::PARK_ADDR;
         match name {
             "jit" => Ok(Self::Jit(Box::new(JitCpu::new(park, true)?))),
             "interpreter" => Ok(Self::Jit(Box::new(JitCpu::new(park, false)?))),

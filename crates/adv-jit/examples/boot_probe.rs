@@ -1,9 +1,9 @@
 //! Minimal loader probe; graphics and interactive frontend live in adv-run.
 use adv_jit::pal::JitCpu;
-use pal_machine::layout::PARK_ADDR;
-use pal_machine::loader::HostDir;
-use pal_machine::{Clock, Machine, Registry};
-use pal_win32::{Win32, Win32Config};
+use adv_machine::layout::PARK_ADDR;
+use adv_machine::loader::HostDir;
+use adv_machine::{Clock, Machine, Registry};
+use adv_win32::{Win32, Win32Config};
 use std::path::PathBuf;
 fn main() -> Result<(), String> {
     let path = PathBuf::from(std::env::args().nth(1).ok_or("expected exe path")?);
@@ -15,7 +15,7 @@ fn main() -> Result<(), String> {
     let parent = path.parent().ok_or("no parent")?;
     let name = path.file_name().ok_or("no exe name")?.to_string_lossy();
     let mut registry = Registry::default();
-    pal_win32::register(&mut registry);
+    adv_win32::register(&mut registry);
     let mut m = Machine::new(
         JitCpu::new(PARK_ADDR, jit)?,
         registry,

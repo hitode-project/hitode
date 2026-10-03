@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/adv-device",
     "crates/adv-jit",
+    "crates/adv-machine",
+    "crates/adv-pe",
     "crates/adv-runtime",
-    "crates/pal-audio",
+    "crates/adv-samples",
+    "crates/adv-sync",
+    "crates/adv-win32",
     "crates/pal-cpu",
-    "crates/pal-host",
-    "crates/pal-machine",
-    "crates/pal-pe",
-    "crates/pal-samples",
-    "crates/pal-win32",
     "apps/adv-run",
 ]
 exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]
@@ -21,9 +21,9 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
-pal-pe = { path = "crates/pal-pe" }
-pal-machine = { path = "crates/pal-machine" }
-pal-samples = { path = "crates/pal-samples" }
+adv-pe = { path = "crates/adv-pe" }
+adv-machine = { path = "crates/adv-machine" }
+adv-samples = { path = "crates/adv-samples" }
 
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
 thiserror = "2"

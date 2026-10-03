@@ -11,7 +11,7 @@ fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces(
         let (producer, mut consumer) = adv_runtime::frame_mailbox();
         if mailbox {
             f.graphics
-                .set_frame_mailbox(producer, pal_host::WakeEvent::new().unwrap());
+                .set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
         } else {
             f.graphics.set_deferred_presentation(true).unwrap();
         }

@@ -3,9 +3,9 @@
 use pal_cpu::asm::Asm;
 use std::time::{Duration, Instant};
 
+use adv_machine::layout::PARK_ADDR;
+use adv_machine::{Clock, Conv, Machine, Outcome, Registry, RunResult, SliceResult, Wait};
 use pal_cpu::{Guest, GuestExt, Prot, Reg};
-use pal_machine::layout::PARK_ADDR;
-use pal_machine::{Clock, Conv, Machine, Outcome, Registry, RunResult, SliceResult, Wait};
 
 type Cpu = adv_jit::pal::JitCpu;
 fn new_cpu() -> Cpu {
@@ -665,7 +665,7 @@ fn frame_inside_nested_callbacks_survives_a_peer_context_switch() {
 
 #[test]
 fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
-    use pal_machine::{Object, Resume, WakeReason};
+    use adv_machine::{Object, Resume, WakeReason};
     let mut r = Registry::default();
     r.add("test", "wait", Conv::Stdcall { argc: 1 }, |e| {
         let handle = e.arg(0);

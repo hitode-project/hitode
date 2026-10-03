@@ -2,8 +2,8 @@ use adv_jit::{
     ApiCall, ApiMemory, ApiOutcome, EXEC, HostServices, Machine, READ, Region, RunOutcome,
     TSC_FREQ, WRITE,
 };
+use adv_machine::Clock;
 use iced_x86::code_asm::*;
-use pal_machine::Clock;
 
 const CODE: u32 = 0x10000;
 const DATA: u32 = 0x16000;
@@ -141,7 +141,7 @@ fn virtual_clock_progress_jump_and_qpc_ratio_use_the_execution_owner() {
         assert_eq!(clock.0.now_us(), before + 3);
         assert_eq!(
             ticks(&machine, 2),
-            clock.0.qpc() * (TSC_FREQ / pal_machine::clock::QPC_FREQ)
+            clock.0.qpc() * (TSC_FREQ / adv_machine::clock::QPC_FREQ)
         );
         let deadline = clock.0.now_us() + 10_000;
         clock.0.advance_to(deadline);
@@ -167,12 +167,12 @@ fn paused_real_owner_excludes_host_pause_duration() {
             [paused * 1000, paused * 1000 + 1, paused * 1000 + 2]
         );
         clock.0.resume();
-        let resumed = clock.0.qpc() * (TSC_FREQ / pal_machine::clock::QPC_FREQ);
+        let resumed = clock.0.qpc() * (TSC_FREQ / adv_machine::clock::QPC_FREQ);
         machine.restore_context(&saved).unwrap();
         machine.run_with_services(STOP, 100, &mut clock).unwrap();
         assert!(ticks(&machine, 0) >= resumed);
         assert!(
-            ticks(&machine, 2) <= clock.0.qpc() * (TSC_FREQ / pal_machine::clock::QPC_FREQ) + 999
+            ticks(&machine, 2) <= clock.0.qpc() * (TSC_FREQ / adv_machine::clock::QPC_FREQ) + 999
         );
     }
 }
@@ -215,12 +215,12 @@ fn standalone_default_clock_reads_progress_without_host_cpu_frequency() {
 #[test]
 fn pal_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
     use adv_jit::pal::JitCpu;
+    use adv_machine::{Machine as PalMachine, Registry, RunResult};
     use pal_cpu::{Guest, Prot};
-    use pal_machine::{Machine as PalMachine, Registry, RunResult};
     for native in [false, true] {
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
-        let cpu = JitCpu::new(pal_machine::layout::PARK_ADDR, native).unwrap();
+        adv_win32::register(&mut registry);
+        let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, native).unwrap();
         let mut machine = PalMachine::new(cpu, registry, Clock::virtual_time()).unwrap();
         let qpc = machine
             .resolve_import("kernel32.dll", "QueryPerformanceCounter")

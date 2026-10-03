@@ -1,8 +1,8 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
-use pal_audio::{AudioControl, AudioEvent, RingState, ring::RingConfig};
+use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
+use adv_machine::{Conv, Env, Machine, Outcome, Registry};
+use adv_win32::Win32;
 use pal_cpu::{Backend, Guest, GuestExt, Prot};
-use pal_machine::{Conv, Env, Machine, Outcome, Registry};
-use pal_win32::Win32;
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};
 use std::sync::Arc;
@@ -147,7 +147,7 @@ struct ChunkDump {
 struct Buffer {
     audio_id: u64,
     voice: Option<Arc<RingState>>,
-    playback_clock: Arc<pal_audio::clock::PlaybackClock>,
+    playback_clock: Arc<adv_device::clock::PlaybackClock>,
     generation: u64,
     storage: u32,
     len: u32,
@@ -254,7 +254,7 @@ pub(crate) struct Sound {
     trace: Option<std::io::BufWriter<std::fs::File>>,
     trace_pcm_dir: Option<std::path::PathBuf>,
     trace_pcm_chunks: bool,
-    playback_clock: Arc<pal_audio::clock::PlaybackClock>,
+    playback_clock: Arc<adv_device::clock::PlaybackClock>,
 }
 impl Sound {
     pub(crate) fn source_status(&self, guest_now: u64) -> AudioSourceStatus {
@@ -575,7 +575,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 let (storage, region) = if primary {
                     (0, None)
                 } else {
-                    let mapped_len = pal_machine::vm::align_up(len, 4096);
+                    let mapped_len = adv_machine::vm::align_up(len, 4096);
                     let base = e
                         .sys
                         .vm
@@ -691,7 +691,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if (offset != u32::MAX && offset >= len)
                 || !matches!(
                     e.sys.objects.get(handle),
-                    Some(pal_machine::Object::Event { .. })
+                    Some(adv_machine::Object::Event { .. })
                 )
             {
                 return Ok(INVALID);
@@ -930,7 +930,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             for &(offset, handle) in &buf.notifications {
                 if offset == u32::MAX {
                     e.sys
-                        .set_event_with_priority(handle, pal_machine::WakePriority::Audio);
+                        .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
                 }
             }
             0
@@ -1098,7 +1098,7 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
                 };
                 if signal {
                     m.sys
-                        .set_event_with_priority(event, pal_machine::WakePriority::Audio);
+                        .set_event_with_priority(event, adv_machine::WakePriority::Audio);
                     next = Some(guest_now);
                 }
             }
@@ -1116,7 +1116,7 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
             }
             if due <= now {
                 m.sys
-                    .set_event_with_priority(event, pal_machine::WakePriority::Audio);
+                    .set_event_with_priority(event, adv_machine::WakePriority::Audio);
                 if let Some(trace) = s.trace.as_mut() {
                     let _ = writeln!(
                         trace,
@@ -1175,24 +1175,24 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
 mod tests {
     use super::*;
     use adv_jit::pal::JitCpu;
+    use adv_machine::{Clock, Object as WaitObject};
     use pal_cpu::Reg;
-    use pal_machine::{Clock, Object as WaitObject};
     const DATA: u32 = 0x500000;
     const STACK: u32 = 0x600000;
 
     fn machine() -> Machine<JitCpu> {
         let mut reg = Registry::default();
-        pal_win32::register(&mut reg);
+        adv_win32::register(&mut reg);
         register(&mut reg);
         let mut m = Machine::new(
-            JitCpu::new(pal_machine::layout::PARK_ADDR, true).unwrap(),
+            JitCpu::new(adv_machine::layout::PARK_ADDR, true).unwrap(),
             reg,
             Clock::virtual_time(),
         )
         .unwrap();
         Win32::install(
             &mut m,
-            pal_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
+            adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
         )
         .unwrap();
         install(&mut m).unwrap();
@@ -1435,7 +1435,7 @@ mod tests {
                 pump(&mut m).unwrap().is_none(),
                 "a static loop needs no execution-side polling"
             );
-            let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
+            let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
             let mut out = [0.0; 40];
             stream.read_stereo(&mut out, 1000);
             for frame in out.as_chunks::<2>().0 {
@@ -1472,7 +1472,7 @@ mod tests {
         m.cpu.write(ptr, &[192; 100]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut first = [0.0; 20];
         stream.read_stereo(&mut first, 1000);
         assert_eq!(first, [0.5; 20]);
@@ -1535,7 +1535,7 @@ mod tests {
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[music, 0, 0, 1]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out, [0.75; 20]);
@@ -1588,7 +1588,7 @@ mod tests {
         m.cpu.write(storage, &[64; 30]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 80];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out[..60], [-0.5; 60]);
@@ -1611,7 +1611,7 @@ mod tests {
         m.cpu.write(storage + 500, &[64; 500]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out, [0.5; 20]);
@@ -1652,7 +1652,7 @@ mod tests {
         m.cpu.write(next_storage, &[64; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[next_voice, 0, 0, 0]);
         pump(&mut m).unwrap();
-        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
         assert_eq!(out, [-0.25; 20]);
@@ -1813,7 +1813,7 @@ mod tests {
             .write(code, &a.assemble(u64::from(code)).unwrap())
             .unwrap();
         m.spawn("audio-com", code, &[], 65536).unwrap();
-        assert!(matches!(m.run(), pal_machine::RunResult::Exited(0)));
+        assert!(matches!(m.run(), adv_machine::RunResult::Exited(0)));
         assert_eq!(m.cpu.read_u32(DATA + 512).unwrap(), 0);
         assert!(m.ext.get::<Sound>().buffers[&b].playing);
     }

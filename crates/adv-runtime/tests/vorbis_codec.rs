@@ -6,9 +6,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use adv_machine::{Clock, RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
 use adv_runtime::vorbis::Policy;
-use pal_machine::{Clock, RunResult, SliceResult};
 #[path = "support/cpu.rs"]
 mod cpu;
 
@@ -33,7 +33,7 @@ fn snr(reference: &[u8], actual: &[u8]) -> f64 {
 #[test]
 #[ignore = "read-only preflight against a locally installed authorized game"]
 fn real_codec_capability_preflight_reports_actual_provider() {
-    let files = pal_machine::loader::HostDir::new("<games>/七色★星露", "C:\\Game");
+    let files = adv_machine::loader::HostDir::new("<games>/七色★星露", "C:\\Game");
     let selected =
         adv_runtime::vorbis::select_policy_with_reason(&files, "nana_chs.exe", Policy::Native)
             .unwrap();
@@ -52,7 +52,7 @@ fn cross_engine_preflight_is_observable_without_rejecting_guest_startup() {
             "DimensionToTsuLovers_cn.exe",
         ),
     ] {
-        let files = pal_win32::Vfs::new(&pal_win32::Win32Config::new(
+        let files = adv_win32::Vfs::new(&adv_win32::Win32Config::new(
             Path::new("<games>").join(directory),
             exe,
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/cross-engine/preflight-only"),

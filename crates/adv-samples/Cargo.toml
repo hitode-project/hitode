@@ -1,0 +1,14 @@
+[package]
+name = "adv-samples"
+description = "Test support: locate the tester's own game copies under ADV_SAMPLES"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+publish.workspace = true
+
+[dependencies]
+adv-pe.workspace = true
+
+[lints]
+workspace = true

@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn completion_is_receivable_when_the_retained_os_wake_arrives() {
         for panic in [false, true] {
-            let wake = pal_host::WakeEvent::new().unwrap();
+            let wake = adv_sync::WakeEvent::new().unwrap();
             let signal = wake.clone();
             let mut worker = Worker::with_compiler(move |_| {
                 assert!(!panic, "contained compiler panic");

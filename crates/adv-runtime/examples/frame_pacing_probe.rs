@@ -2,8 +2,8 @@
 //! Usage: frame_pacing_probe EXE OVERLAY [QUANTUM_US=1000|0] [SECONDS=30]
 //!                          [CODEPAGE=932] [--audio]
 //! OVERLAY must be a dedicated local diagnostic directory. No report is uploaded.
+use adv_machine::{RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{RunResult, SliceResult};
 use std::time::{Duration, Instant};
 
 fn run() -> Result<(), String> {

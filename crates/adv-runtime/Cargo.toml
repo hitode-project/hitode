@@ -6,13 +6,13 @@ publish.workspace = true
 description = "Guest GDI/DirectDraw software surfaces and a common presentation boundary"
 
 [dependencies]
-pal-host = { path = "../pal-host" }
+adv-sync = { path = "../adv-sync" }
 adv-jit = { path = "../adv-jit", features = ["pal"] }
 pal-cpu = { path = "../pal-cpu", default-features = false }
-pal-machine = { path = "../pal-machine" }
-pal-win32 = { path = "../pal-win32" }
-pal-audio = { path = "../pal-audio" }
-pal-pe = { path = "../pal-pe" }
+adv-machine = { path = "../adv-machine" }
+adv-win32 = { path = "../adv-win32" }
+adv-device = { path = "../adv-device" }
+adv-pe = { path = "../adv-pe" }
 ogg = "0.9.2"
 symphonia = { version = "0.5.5", default-features = false, features = ["vorbis", "wav", "pcm", "adpcm"] }
 

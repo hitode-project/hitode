@@ -1,7 +1,7 @@
 //! Native x86 data-section lifecycle, coherence, COPY and namespace oracle.
 #![cfg(windows)]
+use adv_machine::{Clock, RunResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult};
 use std::os::windows::process::CommandExt;
 use std::{path::Path, process::Command, time::Duration};
 #[path = "support/cpu.rs"]

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 pub struct AudioOutput {
     #[cfg(windows)]
-    output: Option<pal_audio::Output>,
+    output: Option<adv_device::Output>,
 }
 
 impl AudioOutput {
@@ -19,7 +19,7 @@ impl AudioOutput {
                 } else {
                     log::set_max_level(log::LevelFilter::Warn);
                 }
-                Some(pal_audio::Output::new(runtime.audio_stream()))
+                Some(adv_device::Output::new(runtime.audio_stream()))
             } else {
                 None
             };
@@ -50,7 +50,7 @@ impl AudioOutput {
 
     pub fn wait_duration(&self, delay: Option<Duration>) -> Option<Duration> {
         #[cfg(windows)]
-        let wake = self.output.as_ref().and_then(pal_audio::Output::next_wake);
+        let wake = self.output.as_ref().and_then(adv_device::Output::next_wake);
         #[cfg(not(windows))]
         let wake = None;
         cap_delay(delay, wake, Instant::now())
@@ -119,7 +119,7 @@ static AUDIO_LOGGER: AudioLogger = AudioLogger {
 #[cfg(windows)]
 impl log::Log for AudioLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn && metadata.target().starts_with("pal_audio")
+        metadata.level() <= log::Level::Warn && metadata.target().starts_with("adv_device")
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {

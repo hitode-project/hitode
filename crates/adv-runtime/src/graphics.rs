@@ -467,10 +467,10 @@ impl PendingFrame {
     }
 }
 
-pub type FrameProducer = pal_host::mailbox::Producer<PendingFrame>;
-pub type FrameConsumer = pal_host::mailbox::Consumer<PendingFrame>;
+pub type FrameProducer = adv_sync::mailbox::Producer<PendingFrame>;
+pub type FrameConsumer = adv_sync::mailbox::Consumer<PendingFrame>;
 pub fn frame_mailbox() -> (FrameProducer, FrameConsumer) {
-    pal_host::mailbox::channel(std::array::from_fn(|_| PendingFrame::default()))
+    adv_sync::mailbox::channel(std::array::from_fn(|_| PendingFrame::default()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,7 +635,7 @@ pub struct Graphics<P: Presenter> {
     pending_frame: Option<PendingFrame>,
     captured_serial: u64,
     conversion: Vec<u8>,
-    frame_mailbox: Option<(FrameProducer, pal_host::WakeEvent)>,
+    frame_mailbox: Option<(FrameProducer, adv_sync::WakeEvent)>,
 }
 
 impl<P: Presenter> Graphics<P> {
@@ -752,7 +752,7 @@ impl<P: Presenter> Graphics<P> {
     pub fn live_surfaces(&self) -> usize {
         self.surfaces.len()
     }
-    pub fn set_frame_mailbox(&mut self, mailbox: FrameProducer, wake: pal_host::WakeEvent) {
+    pub fn set_frame_mailbox(&mut self, mailbox: FrameProducer, wake: adv_sync::WakeEvent) {
         self.frame_mailbox = Some((mailbox, wake));
         self.deferred_presentation = true;
     }

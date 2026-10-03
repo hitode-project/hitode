@@ -1,0 +1,22 @@
+[package]
+name = "adv-win32"
+description = "Personality layer: Win32 API behaviour (kernel32, user32, gdi32, advapi32, winmm, ...)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+publish.workspace = true
+
+[dependencies]
+adv-sync = { path = "../adv-sync" }
+pal-cpu = { path = "../pal-cpu", default-features = false }
+adv-machine.workspace = true
+adv-pe.workspace = true
+log.workspace = true
+encoding_rs.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pal-cpu = { path = "../pal-cpu", features = ["unicorn"] }

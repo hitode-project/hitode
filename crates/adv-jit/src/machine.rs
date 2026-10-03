@@ -1149,7 +1149,7 @@ mod asynchronous_tests {
     #[test]
     fn lazy_worker_inherits_wake_and_pending_jobs_reject_replacement() {
         let mut m = fixture();
-        let wake = pal_host::WakeEvent::new().unwrap();
+        let wake = adv_sync::WakeEvent::new().unwrap();
         let signal = wake.clone();
         m.set_completion_waker(Arc::new(move || signal.signal()))
             .unwrap();

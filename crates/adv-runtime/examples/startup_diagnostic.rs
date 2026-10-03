@@ -1,8 +1,8 @@
 //! Local, headless failure evidence with guest code/state snapshots. No game mutation.
 //! startup_diagnostic <exe> <output-directory> [seconds=10] [codepage=932] [hex-pages...]
+use adv_machine::{RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
 use pal_cpu::{Guest, GuestExt, Reg};
-use pal_machine::{RunResult, SliceResult};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     runtime.set_codepage(codepage);
     runtime.set_auto_dialog_ms(Some(50));
-    runtime.machine.sys.trace = pal_machine::Trace::to_writer(Box::new(std::io::BufWriter::new(
+    runtime.machine.sys.trace = adv_machine::Trace::to_writer(Box::new(std::io::BufWriter::new(
         std::fs::File::create(folder.join("api.log"))?,
     )));
     runtime.machine.sys.trace.all = true;

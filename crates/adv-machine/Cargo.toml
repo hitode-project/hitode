@@ -1,0 +1,22 @@
+[package]
+name = "adv-machine"
+description = "Machine layer: guest contexts, scheduler and virtual clock, waits, SEH dispatch, trap dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+publish.workspace = true
+
+[dependencies]
+pal-cpu = { path = "../pal-cpu", default-features = false }
+adv-pe.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+pal-cpu = { path = "../pal-cpu", features = ["unicorn"] }
+adv-samples.workspace = true
+adv-pe.workspace = true

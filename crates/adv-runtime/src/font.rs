@@ -1,7 +1,7 @@
 //! Guest font selection and Windows GDI glyph extraction for software DCs.
 use crate::{Graphics, Snapshot};
-use pal_machine::{Conv, Env, Handler, Outcome, Registry};
-use pal_win32::{
+use adv_machine::{Conv, Env, Handler, Outcome, Registry};
+use adv_win32::{
     Win32,
     gdi32::{GdiObj, LogFont},
     util::set_last_error,
@@ -97,9 +97,9 @@ pub(crate) fn register(registry: &mut Registry) {
     );
 }
 
-pub(crate) fn install<B: pal_cpu::Backend>(machine: &mut pal_machine::Machine<B>) {
+pub(crate) fn install<B: pal_cpu::Backend>(machine: &mut adv_machine::Machine<B>) {
     let mut original = Registry::default();
-    pal_win32::register(&mut original);
+    adv_win32::register(&mut original);
     machine.ext.insert(Fonts {
         dcs: BTreeMap::new(),
         select: original.get("gdi32.dll", "SelectObject").unwrap().handler,
@@ -545,19 +545,19 @@ impl Drop for NativeFont {
 mod tests {
     use super::*;
     use adv_jit::pal::JitCpu;
+    use adv_machine::{Clock, Machine};
     use pal_cpu::{Guest, GuestExt, Prot, Reg};
-    use pal_machine::{Clock, Machine};
 
     fn fixture() -> (Machine<JitCpu>, u32, u32) {
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
+        adv_win32::register(&mut registry);
         crate::boot::register_graphics(&mut registry);
         register(&mut registry);
-        let cpu = JitCpu::new(pal_machine::layout::PARK_ADDR, false).unwrap();
+        let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
         let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
-        pal_win32::Win32::install(
+        adv_win32::Win32::install(
             &mut machine,
-            pal_win32::Win32Config::new(".", "font-test.exe", "target/font-test-overlay"),
+            adv_win32::Win32Config::new(".", "font-test.exe", "target/font-test-overlay"),
         )
         .unwrap();
         crate::boot::install_graphics(&mut machine, 4, 2).unwrap();
@@ -568,7 +568,7 @@ mod tests {
             .alloc(&mut machine.cpu, 4096, Prot::RW)
             .unwrap();
         machine
-            .spawn("font test", pal_machine::layout::PARK_ADDR, &[], 65536)
+            .spawn("font test", adv_machine::layout::PARK_ADDR, &[], 65536)
             .unwrap();
         let dc = invoke(&mut machine, data, "CreateCompatibleDC", &[0]);
         let mut raw = [0u8; 60];
@@ -586,7 +586,7 @@ mod tests {
     }
     fn invoke(machine: &mut Machine<JitCpu>, data: u32, name: &str, args: &[u32]) -> u32 {
         let address = machine.resolve_import("gdi32.dll", name).unwrap();
-        let index = (address - pal_machine::layout::THUNK_BASE) / pal_machine::layout::THUNK_STRIDE;
+        let index = (address - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
         let handler = machine.sys.thunks.get(index).f.handler;
         machine.cpu.set_reg(Reg::Esp, data + 2048);
         for (i, &arg) in args.iter().enumerate() {
@@ -785,7 +785,7 @@ mod tests {
         let win32 = machine.ext.get_mut::<Win32>();
         // The selected GB2312 font overrides a different process ACP.
         win32.cfg.codepage = 932;
-        win32.codec = pal_win32::Codec::new(932);
+        win32.codec = adv_win32::Codec::new(932);
         let mut raw = [0u8; 60];
         raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
         raw[16..20].copy_from_slice(&400i32.to_le_bytes());
@@ -803,7 +803,7 @@ mod tests {
         identity[14..16].copy_from_slice(&1i16.to_le_bytes());
         machine.cpu.write(matrix, &identity).unwrap();
         for character in ['中', '文'] {
-            let codec = pal_win32::Codec::new(936);
+            let codec = adv_win32::Codec::new(936);
             let (encoded, lossy) = codec.from_utf16(0, &[character as u16]);
             assert!(!lossy);
             assert_eq!(encoded.len(), 2);
@@ -850,7 +850,7 @@ mod tests {
         let (mut machine, data, dc) = fixture();
         let win32 = machine.ext.get_mut::<Win32>();
         win32.cfg.codepage = 936;
-        win32.codec = pal_win32::Codec::new(936);
+        win32.codec = adv_win32::Codec::new(936);
         let mut raw = [0u8; 60];
         raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
         raw[16..20].copy_from_slice(&400i32.to_le_bytes());

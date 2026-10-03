@@ -170,7 +170,7 @@ fn pal_budget_stop_disable_and_fault_priorities_preserve_original_outcomes() {
     use adv_jit::pal::JitCpu;
     use pal_cpu::{Backend, Exit, Fault, FaultKind, Guest, Prot, Reg, TrapAction, TrapHandler};
     struct Signal {
-        wake: pal_host::WakeEvent,
+        wake: adv_sync::WakeEvent,
         park: bool,
     }
     impl TrapHandler for Signal {
@@ -185,7 +185,7 @@ fn pal_budget_stop_disable_and_fault_priorities_preserve_original_outcomes() {
         }
     }
     for native in [false, true] {
-        let wake = pal_host::WakeEvent::new().unwrap();
+        let wake = adv_sync::WakeEvent::new().unwrap();
         let mut cpu = JitCpu::new(STOP, native).unwrap();
         cpu.map(CODE, 4096, Prot::RX).unwrap();
         cpu.map(STOP, 4096, Prot::RX).unwrap();

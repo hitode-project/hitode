@@ -1,5 +1,5 @@
 use adv_runtime::Snapshot;
-pub use pal_host::WakeEvent;
+pub use adv_sync::WakeEvent;
 use std::time::Duration;
 
 #[cfg_attr(not(windows), allow(dead_code))]

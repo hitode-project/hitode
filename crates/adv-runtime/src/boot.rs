@@ -4,9 +4,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use adv_jit::pal::JitCpu;
+use adv_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult};
+use adv_win32::{Win32, Win32Config};
 use pal_cpu::{Backend, GuestExt, Prot};
-use pal_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult};
-use pal_win32::{Win32, Win32Config};
 
 use crate::graphics::{API_SPECS, DEVICE_METHODS, GuestMemory, SURFACE_METHODS};
 use crate::{Graphics, Snapshot, api};
@@ -37,7 +37,7 @@ impl Runtime<JitCpu> {
         Self::with_cpu_and_codec(
             exe,
             data,
-            JitCpu::new(pal_machine::layout::PARK_ADDR, jit)?,
+            JitCpu::new(adv_machine::layout::PARK_ADDR, jit)?,
             width,
             height,
             codec,
@@ -53,7 +53,7 @@ impl Runtime<JitCpu> {
         Self::with_cpu(
             exe_path,
             data_dir,
-            JitCpu::new(pal_machine::layout::PARK_ADDR, jit)?,
+            JitCpu::new(adv_machine::layout::PARK_ADDR, jit)?,
             width,
             height,
         )
@@ -105,11 +105,11 @@ impl<B: Backend> Runtime<B> {
             932
         };
         cfg.write_game = false;
-        let files = pal_win32::Vfs::new(&cfg);
+        let files = adv_win32::Vfs::new(&cfg);
         let selection = crate::vorbis::select_policy_with_reason(&files, exe_name, codec)?;
         let codec = selection.policy;
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
+        adv_win32::register(&mut registry);
         crate::crt::register(&mut registry);
         crate::compat::register(&mut registry);
         register_graphics(&mut registry);
@@ -167,7 +167,7 @@ impl<B: Backend> Runtime<B> {
                 other => other,
             },
             Ok(None) => outcome,
-            Err(message) => SliceResult::Complete(RunResult::Failed(pal_machine::MachineError {
+            Err(message) => SliceResult::Complete(RunResult::Failed(adv_machine::MachineError {
                 ctx: self.machine.sys.current,
                 pc: self.machine.cpu.reg(pal_cpu::Reg::Eip),
                 message,
@@ -181,12 +181,12 @@ impl<B: Backend> Runtime<B> {
         self.machine.ext.get_mut::<crate::sound::Sound>().enabled = enabled;
     }
 
-    pub fn audio_stream(&self) -> pal_audio::AudioStream {
+    pub fn audio_stream(&self) -> adv_device::AudioStream {
         self.machine.ext.get::<crate::sound::Sound>().audio.stream()
     }
 
     /// Queue and missing-PCM observations, independent of audible sample values.
-    pub fn audio_pcm_metrics(&self) -> pal_audio::PcmMetrics {
+    pub fn audio_pcm_metrics(&self) -> adv_device::PcmMetrics {
         self.audio_stream().metrics()
     }
     pub fn audio_source_status(&self) -> crate::AudioSourceStatus {
@@ -232,14 +232,14 @@ impl<B: Backend> Runtime<B> {
     pub fn set_frame_mailbox(
         &mut self,
         mailbox: crate::graphics::FrameProducer,
-        wake: pal_host::WakeEvent,
+        wake: adv_sync::WakeEvent,
     ) {
         self.machine
             .ext
             .get_mut::<Graphics<Snapshot>>()
             .set_frame_mailbox(mailbox, wake);
     }
-    pub fn set_host_keys(&mut self, keys: std::sync::Arc<pal_host::input::KeyState>) {
+    pub fn set_host_keys(&mut self, keys: std::sync::Arc<adv_sync::input::KeyState>) {
         self.machine.ext.get_mut::<Win32>().user.host_keys = Some(keys);
     }
 
@@ -334,7 +334,7 @@ impl<B: Backend> Runtime<B> {
     pub fn set_codepage(&mut self, codepage: u32) {
         let win32 = self.machine.ext.get_mut::<Win32>();
         win32.cfg.codepage = codepage;
-        win32.codec = pal_win32::Codec::new(codepage);
+        win32.codec = adv_win32::Codec::new(codepage);
     }
 
     /// Post input to the foremost visible window's thread. Keyboard messages use
@@ -361,10 +361,10 @@ impl<B: Backend> Runtime<B> {
             let (ox, oy) = user.client_origin(top);
             user.cursor_pos = (x + ox, y + oy);
             if message == 0x20a || message == 0x20e {
-                lparam = pal_win32::user32::window::make_long(x + ox, y + oy);
+                lparam = adv_win32::user32::window::make_long(x + ox, y + oy);
             } else if hwnd != top {
                 let (tx, ty) = user.client_origin(hwnd);
-                lparam = pal_win32::user32::window::make_long(x + ox - tx, y + oy - ty);
+                lparam = adv_win32::user32::window::make_long(x + ox - tx, y + oy - ty);
             }
             for (down, up, vk) in [(0x201, 0x202, 1), (0x204, 0x205, 2), (0x207, 0x208, 4)] {
                 if message == down {
@@ -381,7 +381,7 @@ impl<B: Backend> Runtime<B> {
             ext: &mut self.machine.ext,
             thunk: 0,
         };
-        pal_win32::user32::message::post_input(&mut env, hwnd, message, wparam, lparam)
+        adv_win32::user32::message::post_input(&mut env, hwnd, message, wparam, lparam)
     }
 
     /// Release keys/buttons when the native host loses focus. Preserve toggle
@@ -395,7 +395,7 @@ impl<B: Backend> Runtime<B> {
             }
             let position = input_target(user, 0x200).map_or(0, |(top, _)| {
                 let (ox, oy) = user.client_origin(top);
-                pal_win32::user32::window::make_long(user.cursor_pos.0 - ox, user.cursor_pos.1 - oy)
+                adv_win32::user32::window::make_long(user.cursor_pos.0 - ox, user.cursor_pos.1 - oy)
             });
             (pressed, position)
         };
@@ -439,7 +439,7 @@ impl<B: Backend> Runtime<B> {
                     || (called.contains(index)
                         && std::ptr::fn_addr_eq(
                             t.f.handler,
-                            unsupported_graphics as pal_machine::Handler,
+                            unsupported_graphics as adv_machine::Handler,
                         ))
             })
             .map(|(_, t)| format!("{}!{}", t.module, t.name))
@@ -519,10 +519,10 @@ impl<B: Backend> Runtime<B> {
             if let Some(wait) = context.waiting_on() {
                 report.push_str(&format!(" {wait:?}"));
                 let deadline = match wait {
-                    pal_machine::Wait::Until(deadline) => Some(*deadline),
-                    pal_machine::Wait::Object { deadline, .. }
-                    | pal_machine::Wait::Objects { deadline, .. } => *deadline,
-                    pal_machine::Wait::Yield => None,
+                    adv_machine::Wait::Until(deadline) => Some(*deadline),
+                    adv_machine::Wait::Object { deadline, .. }
+                    | adv_machine::Wait::Objects { deadline, .. } => *deadline,
+                    adv_machine::Wait::Yield => None,
                 };
                 if let Some(deadline) = deadline {
                     report.push_str(&format!(
@@ -530,7 +530,7 @@ impl<B: Backend> Runtime<B> {
                         deadline.saturating_sub(now) as f64 / 1000.0
                     ));
                 }
-                if let pal_machine::Wait::Object { handle, .. } = wait {
+                if let adv_machine::Wait::Object { handle, .. } = wait {
                     report.push_str(&format!(
                         " object {:?}",
                         self.machine.sys.objects.get(*handle)
@@ -639,7 +639,7 @@ impl<B: Backend> Runtime<B> {
     }
 }
 
-fn input_target(user: &pal_win32::user32::User, message: u32) -> Option<(u32, u32)> {
+fn input_target(user: &adv_win32::user32::User, message: u32) -> Option<(u32, u32)> {
     let top = user.top.iter().copied().find(|h| {
         user.windows
             .get(h)
@@ -661,9 +661,9 @@ fn input_target(user: &pal_win32::user32::User, message: u32) -> Option<(u32, u3
 }
 
 fn valid_input_window(
-    user: &pal_win32::user32::User,
+    user: &adv_win32::user32::User,
     hwnd: u32,
-    thread: pal_machine::CtxId,
+    thread: adv_machine::CtxId,
 ) -> bool {
     if !user.windows.get(&hwnd).is_some_and(|w| w.thread == thread) {
         return false;
@@ -905,7 +905,7 @@ fn begin_paint(env: &mut Env<'_>) -> Outcome {
     if let Err(error) = env.cpu.write(paint, &bytes) {
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
-    pal_win32::user32::message::validate(env, hwnd);
+    adv_win32::user32::message::validate(env, hwnd);
     Outcome::Return(dc)
 }
 
@@ -918,7 +918,7 @@ mod tests {
     fn machine() -> Machine<JitCpu> {
         let mut registry = Registry::default();
         register_graphics(&mut registry);
-        let cpu = JitCpu::new(pal_machine::layout::PARK_ADDR, false).unwrap();
+        let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
         let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
         install_graphics(&mut machine, 4, 2).unwrap();
         machine
@@ -983,7 +983,7 @@ mod tests {
         let runtime = Runtime::with_cpu(
             &exe,
             directory.join("overlay"),
-            JitCpu::new(pal_machine::layout::PARK_ADDR, false).unwrap(),
+            JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap(),
             4,
             2,
         )
@@ -1043,7 +1043,7 @@ mod tests {
     }
 
     fn input_runtime() -> Runtime {
-        use pal_win32::user32::window::{
+        use adv_win32::user32::window::{
             ControlState, Rect, WS_CHILD, WS_POPUP, WS_VISIBLE, Window,
         };
         let mut machine = machine();
@@ -1100,7 +1100,7 @@ mod tests {
         let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
         assert_eq!(user.queue(0).posted.pop_front().unwrap().hwnd, 0x10024);
         assert_eq!(user.keys[0x41] & 0x80, 0x80);
-        user.windows.get_mut(&0x10024).unwrap().style &= !pal_win32::user32::window::WS_VISIBLE;
+        user.windows.get_mut(&0x10024).unwrap().style &= !adv_win32::user32::window::WS_VISIBLE;
         assert!(runtime.post_input(0x101, 0x41, 0xc0000001));
         let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
         assert_eq!(user.queue(0).posted.pop_front().unwrap().hwnd, 0x10020);
@@ -1125,12 +1125,12 @@ mod tests {
     #[test]
     fn mouse_capture_receives_child_coordinates_and_missing_capture_falls_back() {
         let mut runtime = input_runtime();
-        let top_position = pal_win32::user32::window::make_long(60, 80);
+        let top_position = adv_win32::user32::window::make_long(60, 80);
         assert!(runtime.post_input(0x200, 0, top_position));
         let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
         let message = user.queue(0).posted.pop_front().unwrap();
         assert_eq!(message.hwnd, 0x10028);
-        assert_eq!(message.lparam, pal_win32::user32::window::make_long(20, 30));
+        assert_eq!(message.lparam, adv_win32::user32::window::make_long(20, 30));
         assert_eq!(user.cursor_pos, (160, 130));
         assert!(runtime.post_input(0x20a, 120 << 16, top_position));
         assert_eq!(
@@ -1144,7 +1144,7 @@ mod tests {
                 .pop_front()
                 .unwrap()
                 .lparam,
-            pal_win32::user32::window::make_long(160, 130)
+            adv_win32::user32::window::make_long(160, 130)
         );
         runtime.machine.ext.get_mut::<Win32>().user.queue(0).capture = 0xdeadbeef;
         assert!(runtime.post_input(0x200, 0, top_position));
@@ -1165,12 +1165,12 @@ mod tests {
         let mut runtime = input_runtime();
         assert!(runtime.post_input(0x100, 0x41, 1));
         assert!(runtime.post_input(0x104, 0x12, 1));
-        assert!(runtime.post_input(0x201, 1, pal_win32::user32::window::make_long(60, 80)));
+        assert!(runtime.post_input(0x201, 1, adv_win32::user32::window::make_long(60, 80)));
         let event = runtime
             .machine
             .sys
             .objects
-            .insert(pal_machine::Object::Event {
+            .insert(adv_machine::Object::Event {
                 manual_reset: false,
                 signaled: false,
             });
@@ -1201,7 +1201,7 @@ mod tests {
         );
         assert!(matches!(
             runtime.machine.sys.objects.get(event),
-            Some(pal_machine::Object::Event { signaled: true, .. })
+            Some(adv_machine::Object::Event { signaled: true, .. })
         ));
         assert_eq!(runtime.release_input(), 0);
         assert_eq!(

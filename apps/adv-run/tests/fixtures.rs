@@ -683,7 +683,7 @@ fn sliced_jit_and_interpreter_compute_exactly_the_unsliced_guest_results() {
         // volatile increments and computed the same final register-derived result.
         assert!(matches!(
             reference.step(),
-            pal_machine::RunResult::Exited(0)
+            adv_machine::RunResult::Exited(0)
         ));
         let report_path = directory.join(format!("slice-{backend}.json"));
         let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))

@@ -1,7 +1,7 @@
 //! Native and guest x86 CRT callbacks, including suspension and error propagation.
 #![cfg(windows)]
+use adv_machine::{Clock, RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult, SliceResult};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;

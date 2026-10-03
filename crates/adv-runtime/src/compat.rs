@@ -1,7 +1,7 @@
 //! Small non-rendering compatibility services needed by the first generic ADV sample.
+use adv_machine::{Conv, Env, Outcome, Registry};
+use adv_win32::{Win32, util::set_last_error};
 use pal_cpu::GuestExt;
-use pal_machine::{Conv, Env, Outcome, Registry};
-use pal_win32::{Win32, util::set_last_error};
 
 pub fn register(r: &mut Registry) {
     crate::mmio::register(r);
@@ -43,20 +43,20 @@ pub fn register(r: &mut Registry) {
 }
 
 fn diagnostic_wsprintf(e: &mut Env<'_>) -> Outcome {
-    static ORIGINAL: std::sync::LazyLock<pal_machine::Handler> = std::sync::LazyLock::new(|| {
+    static ORIGINAL: std::sync::LazyLock<adv_machine::Handler> = std::sync::LazyLock::new(|| {
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
+        adv_win32::register(&mut registry);
         registry.get("user32.dll", "wsprintfA").unwrap().handler
     });
     let diagnostic = std::env::var_os("ADV_PRINTF_DIAG_PATH").map(|path| {
         use pal_cpu::Reg;
-        let mut args = pal_win32::printf::StackArgs { cpu: e.cpu, addr: e.cpu.reg(Reg::Esp) + 12 };
-        let format = pal_win32::util::cstr(e.cpu, e.arg(1));
-        let out = pal_win32::printf::format(e.cpu, &e.ext.get::<Win32>().codec, &format, &mut args);
+        let mut args = adv_win32::printf::StackArgs { cpu: e.cpu, addr: e.cpu.reg(Reg::Esp) + 12 };
+        let format = adv_win32::util::cstr(e.cpu, e.arg(1));
+        let out = adv_win32::printf::format(e.cpu, &e.ext.get::<Win32>().codec, &format, &mut args);
         let mut strings = Vec::new();
         for i in 2..5 {
             let pointer = e.arg(i);
-            let bytes = e.cpu.read_cstr(pointer, pal_win32::util::MAX_STR).unwrap_or_default();
+            let bytes = e.cpu.read_cstr(pointer, adv_win32::util::MAX_STR).unwrap_or_default();
             strings.push((pointer, bytes.len(), bytes.into_iter().take(64).collect::<Vec<_>>()));
         }
         let words: Vec<_> = std::env::var("ADV_PRINTF_DIAG_WORDS").unwrap_or_default().split(',').filter_map(|value| {
@@ -83,9 +83,9 @@ fn diagnostic_wsprintf(e: &mut Env<'_>) -> Outcome {
     result
 }
 fn diagnostic_peek(e: &mut Env<'_>) -> Outcome {
-    static ORIGINAL: std::sync::LazyLock<pal_machine::Handler> = std::sync::LazyLock::new(|| {
+    static ORIGINAL: std::sync::LazyLock<adv_machine::Handler> = std::sync::LazyLock::new(|| {
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
+        adv_win32::register(&mut registry);
         registry.get("user32.dll", "PeekMessageA").unwrap().handler
     });
     let pointer = e.arg(0);
@@ -182,7 +182,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
         }
         "PtInRect" => {
-            let Some(r) = pal_win32::user32::window::Rect::read(e.cpu, a) else {
+            let Some(r) = adv_win32::user32::window::Rect::read(e.cpu, a) else {
                 return Outcome::Return(0);
             };
             let (x, y) = (e.arg(1) as i32, e.arg(2) as i32);
@@ -234,7 +234,7 @@ fn message_wait(
     deadline: Option<u64>,
     mask: u32,
 ) -> Outcome {
-    use pal_machine::{Object, Resume, Wait, WakeReason};
+    use adv_machine::{Object, Resume, Wait, WakeReason};
     let now = e.sys.clock.now_us();
     let ctx = e.sys.current;
     for &h in &handles {
@@ -251,7 +251,7 @@ fn message_wait(
             return Outcome::Return(u32::MAX);
         }
     }
-    let (input, notification) = pal_win32::user32::message::message_wait_events(e, mask);
+    let (input, notification) = adv_win32::user32::message::message_wait_events(e, mask);
     // The native fixture establishes input priority over ready handles for
     // MsgWait; ordinary WaitForMultipleObjects preserves handle-array order.
     let wait_handles: Vec<_> = std::iter::once(input)
@@ -316,22 +316,22 @@ fn message_wait(
 mod tests {
     use super::*;
     use adv_jit::pal::JitCpu;
+    use adv_machine::{Clock, Machine, Object, RunResult};
     use pal_cpu::{Guest, Prot, asm::Asm};
-    use pal_machine::{Clock, Machine, Object, RunResult};
 
     fn waiter(jit: bool, timeout: u32, event: bool) -> (Machine<JitCpu>, Option<u32>) {
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
+        adv_win32::register(&mut registry);
         register(&mut registry);
         let mut m = Machine::new(
-            JitCpu::new(pal_machine::layout::PARK_ADDR, jit).unwrap(),
+            JitCpu::new(adv_machine::layout::PARK_ADDR, jit).unwrap(),
             registry,
             Clock::virtual_time(),
         )
         .unwrap();
         Win32::install(
             &mut m,
-            pal_win32::Win32Config::new(".", "wait-test.exe", "target/wait-test"),
+            adv_win32::Win32Config::new(".", "wait-test.exe", "target/wait-test"),
         )
         .unwrap();
         let code = 0x400000;
@@ -391,7 +391,7 @@ mod tests {
                 ext: &mut m.ext,
                 thunk: 0,
             };
-            assert!(pal_win32::user32::message::post_input(
+            assert!(adv_win32::user32::message::post_input(
                 &mut env, 0, 0x200, 0, 0
             ));
             assert!(
@@ -409,7 +409,7 @@ mod tests {
                 ext: &mut m.ext,
                 thunk: 0,
             };
-            assert!(pal_win32::user32::message::post_input(
+            assert!(adv_win32::user32::message::post_input(
                 &mut env, 0, 0x100, 65, 0
             ));
             assert!(matches!(m.run(), RunResult::Exited(0)));

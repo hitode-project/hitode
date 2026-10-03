@@ -1,6 +1,6 @@
 //! AVIFile library lifetime. File/stream decoding is registered only as its
 //! persona is implemented; initialization does not claim those capabilities.
-use pal_machine::{Conv, Env, Outcome, Registry};
+use adv_machine::{Conv, Env, Outcome, Registry};
 
 #[derive(Default)]
 struct Library {

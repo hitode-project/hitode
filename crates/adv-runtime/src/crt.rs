@@ -1,7 +1,7 @@
 //! Small C-runtime services used by guest library DLLs. Library algorithms remain guest code.
+use adv_machine::{Conv, Env, Outcome, Registry};
+use adv_win32::Win32;
 use pal_cpu::{GuestExt, Reg};
-use pal_machine::{Conv, Env, Outcome, Registry};
-use pal_win32::Win32;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -11,7 +11,7 @@ struct CrtState {
     globals: HashMap<(String, String), u32>,
 }
 
-pub fn install<B: pal_cpu::Backend>(machine: &mut pal_machine::Machine<B>) -> Result<(), String> {
+pub fn install<B: pal_cpu::Backend>(machine: &mut adv_machine::Machine<B>) -> Result<(), String> {
     let data = machine
         .resolve_import("msvcrt.dll", "_adjust_fdiv")
         .map_err(|e| e.to_string())?;
@@ -286,7 +286,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let module = e.sys.thunks.get(e.thunk).module.clone();
             let state = e.ext.get_mut::<CrtState>();
             let handle = *state.locks.entry((module, a)).or_insert_with(|| {
-                e.sys.objects.insert(pal_machine::Object::Mutex {
+                e.sys.objects.insert(adv_machine::Object::Mutex {
                     owner: None,
                     recursion: 0,
                 })
@@ -296,7 +296,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     return Outcome::Return(0);
                 }
                 return Outcome::block(
-                    pal_machine::Wait::Object {
+                    adv_machine::Wait::Object {
                         handle,
                         deadline: None,
                     },
@@ -304,7 +304,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 );
             }
             match e.sys.objects.get_mut(handle) {
-                Some(pal_machine::Object::Mutex { owner, recursion })
+                Some(adv_machine::Object::Mutex { owner, recursion })
                     if *owner == Some(e.sys.current) =>
                 {
                     *recursion -= 1;
@@ -512,22 +512,22 @@ fn call(e: &mut Env<'_>) -> Outcome {
 mod tests {
     use super::*;
     use adv_jit::pal::JitCpu;
+    use adv_machine::{Clock, Machine, RunResult};
     use iced_x86::code_asm::*;
     use pal_cpu::{Guest, Prot};
-    use pal_machine::{Clock, Machine, RunResult};
     fn machine(jit: bool) -> Machine<JitCpu> {
         let mut reg = Registry::default();
-        pal_win32::register(&mut reg);
+        adv_win32::register(&mut reg);
         register(&mut reg);
         let mut m = Machine::new(
-            JitCpu::new(pal_machine::layout::PARK_ADDR, jit).unwrap(),
+            JitCpu::new(adv_machine::layout::PARK_ADDR, jit).unwrap(),
             reg,
             Clock::virtual_time(),
         )
         .unwrap();
         Win32::install(
             &mut m,
-            pal_win32::Win32Config::new(".", "crt-test.exe", "target/crt-test"),
+            adv_win32::Win32Config::new(".", "crt-test.exe", "target/crt-test"),
         )
         .unwrap();
         install(&mut m).unwrap();

@@ -2,7 +2,7 @@
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
 use adv_runtime::{FrameConsumer, FrameProducer, Snapshot};
-use pal_host::{WakeEvent, input::KeyState, spsc};
+use adv_sync::{WakeEvent, input::KeyState, spsc};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},

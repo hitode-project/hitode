@@ -4,9 +4,9 @@
 //! from a host Read implementation. PCM decoding is deferred until ov_read.
 use std::collections::{BTreeMap, BTreeSet};
 
+use adv_machine::{Conv, Env, FileSource, Machine, Outcome, Registry};
 use ogg::reading::{BasePacketReader, PageParser};
 use pal_cpu::{Backend, GuestExt, Prot};
-use pal_machine::{Conv, Env, FileSource, Machine, Outcome, Registry};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_VORBIS, CodecParameters, Decoder, DecoderOptions};
 use symphonia::core::formats::Packet;
@@ -86,7 +86,7 @@ pub fn select_policy_with_reason(
     }
     let lower_symbols = lower_symbols(files);
     let mut verified_ordinal_layout = false;
-    if let Some((path, bytes)) = pal_machine::loader::module_file(files, "vorbisfile.dll", None) {
+    if let Some((path, bytes)) = adv_machine::loader::module_file(files, "vorbisfile.dll", None) {
         if let Some(reason) = ordinal_layout_error(&bytes) {
             return Ok(Selection::guest(format!("{path}: {reason}")));
         }
@@ -113,7 +113,7 @@ pub fn select_policy_with_reason(
         // process loader. Packed or otherwise uninspectable dependencies cannot
         // prove the Native ABI safe. Leave them and all codec state to Guest;
         // the loader still reports errors in required image/import data itself.
-        let pe = match pal_pe::Pe::parse(&bytes) {
+        let pe = match adv_pe::Pe::parse(&bytes) {
             Ok(pe) => pe,
             Err(e) => {
                 return Ok(Selection::guest(format!(
@@ -154,7 +154,7 @@ pub fn select_policy_with_reason(
                 if !verified_ordinal_layout {
                     let dir = path.rfind(['/', '\\']).map(|i| &path[..i]);
                     if let Some((codec_path, bytes)) =
-                        pal_machine::loader::module_file(files, &dll, dir)
+                        adv_machine::loader::module_file(files, &dll, dir)
                     {
                         if let Some(reason) = ordinal_layout_error(&bytes) {
                             return Ok(Selection::guest(format!("{codec_path}: {reason}")));
@@ -165,10 +165,10 @@ pub fn select_policy_with_reason(
                 for import in symbols {
                     let description = import.name.to_string();
                     let supported = match import.name {
-                        pal_pe::ImportName::Name { name, .. } => {
+                        adv_pe::ImportName::Name { name, .. } => {
                             EXPORTS.iter().any(|&(n, _, _)| n == name)
                         }
-                        pal_pe::ImportName::Ordinal(ordinal) => {
+                        adv_pe::ImportName::Ordinal(ordinal) => {
                             verified_ordinal_layout && EXPORTS.iter().any(|&(_, _, o)| o == ordinal)
                         }
                     };
@@ -181,7 +181,7 @@ pub fn select_policy_with_reason(
             } else {
                 let dir = path.rfind(['/', '\\']).map(|i| &path[..i]);
                 if let Some((dependency_path, _)) =
-                    pal_machine::loader::module_file(files, &dll, dir)
+                    adv_machine::loader::module_file(files, &dll, dir)
                 {
                     pending.push(dependency_path);
                 }
@@ -195,7 +195,7 @@ pub fn select_policy_with_reason(
 }
 
 fn ordinal_layout_error(bytes: &[u8]) -> Option<String> {
-    let pe = match pal_pe::Pe::parse(bytes) {
+    let pe = match adv_pe::Pe::parse(bytes) {
         Ok(pe) => pe,
         Err(e) => return Some(format!("invalid codec PE: {e}")),
     };
@@ -207,7 +207,7 @@ fn ordinal_layout_error(bytes: &[u8]) -> Option<String> {
         let actual = exports.iter().find(|export| export.ordinal == ordinal);
         if actual.is_none_or(|export| {
             export.name.as_deref() != Some(name)
-                || !matches!(export.target, pal_pe::ExportTarget::Rva(_))
+                || !matches!(export.target, adv_pe::ExportTarget::Rva(_))
         }) {
             return Some(format!(
                 "ordinal #{ordinal} expected {name}, actual {}",
@@ -268,8 +268,8 @@ fn lower_symbols(files: &dyn FileSource) -> BTreeSet<String> {
         }
     }
     for dll in ["vorbis.dll", "ogg.dll"] {
-        if let Some((_, bytes)) = pal_machine::loader::module_file(files, dll, None)
-            && let Ok(pe) = pal_pe::Pe::parse(&bytes)
+        if let Some((_, bytes)) = adv_machine::loader::module_file(files, dll, None)
+            && let Ok(pe) = adv_pe::Pe::parse(&bytes)
             && let Ok(exports) = pe.exports()
         {
             names.extend(exports.into_iter().filter_map(|e| e.name));
@@ -355,7 +355,7 @@ fn callback(
     kind: Callback,
     target: u32,
     args: impl Into<Vec<u32>>,
-    then: impl FnOnce(&mut Env<'_>, pal_machine::Resume) -> Outcome + 'static,
+    then: impl FnOnce(&mut Env<'_>, adv_machine::Resume) -> Outcome + 'static,
 ) -> Outcome {
     let stats = &mut e.ext.get_mut::<Provider>().stats;
     stats.guest_callbacks += 1;

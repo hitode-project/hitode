@@ -1,8 +1,8 @@
 //! Writable views must preserve source assets even in portable-save mode.
+use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_win32::{Win32, Win32Config};
 use iced_x86::code_asm::*;
 use pal_cpu::{Guest, GuestExt, Prot};
-use pal_machine::{Clock, Machine, Registry, RunResult};
-use pal_win32::{Win32, Win32Config};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,7 @@ struct Program {
 impl Program {
     fn new(backend: &str, game: &Path, profile: &Path, portable: bool) -> Self {
         let mut registry = Registry::default();
-        pal_win32::register(&mut registry);
+        adv_win32::register(&mut registry);
         let mut machine = Machine::new(
             cpu::Cpu::new(backend).unwrap(),
             registry,

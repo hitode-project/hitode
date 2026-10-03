@@ -5,8 +5,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use adv_machine::{Clock, RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult, SliceResult};
 
 #[test]
 fn native_and_guest_thread_message_observation_and_nine_object_priority_match() {

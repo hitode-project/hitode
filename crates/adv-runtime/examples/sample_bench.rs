@@ -3,8 +3,8 @@
 #[path = "../tests/support/cpu.rs"]
 mod backend;
 use adv_jit::CompileStrategy;
+use adv_machine::{Clock, RunResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]

@@ -1,8 +1,8 @@
 //! Native x86 window creation timing and editable system-menu state.
 //! Built-in label contents are tested separately under the virtual en-US locale.
 #![cfg(windows)]
+use adv_machine::{Clock, RunResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;

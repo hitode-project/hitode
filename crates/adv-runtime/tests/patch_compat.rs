@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use adv_machine::RunResult;
 use adv_runtime::boot::Runtime;
-use pal_machine::RunResult;
 #[path = "support/cpu.rs"]
 mod backend;
 
@@ -52,10 +52,10 @@ fn fixtures() -> PathBuf {
 
 #[test]
 fn relocated_api_thunks_preserve_stack_registers_callbacks_and_float_returns() {
+    use adv_machine::layout::THUNK_STRIDE;
+    use adv_machine::{Clock, Conv, Machine, Outcome, Registry, Wait};
     use pal_cpu::asm::Asm;
     use pal_cpu::{Guest, GuestExt, Prot};
-    use pal_machine::layout::THUNK_STRIDE;
-    use pal_machine::{Clock, Conv, Machine, Outcome, Registry, Wait};
     const CODE: u32 = 0x0040_0000;
     const RELOCATED: u32 = CODE + 0x400;
     const CALLBACK: u32 = CODE + 0x500;
@@ -68,7 +68,7 @@ fn relocated_api_thunks_preserve_stack_registers_callbacks_and_float_returns() {
         });
         registry.add("probe.dll", "callback", Conv::Stdcall { argc: 2 }, |e| {
             Outcome::call(CALLBACK, vec![e.arg(0), e.arg(1)], |_, value| {
-                let pal_machine::Resume::Returned(value) = value else {
+                let adv_machine::Resume::Returned(value) = value else {
                     unreachable!()
                 };
                 Outcome::Return(value + 1)

@@ -5,8 +5,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use adv_machine::{Clock, RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult, SliceResult};
 #[path = "support/cpu.rs"]
 mod cpu;
 

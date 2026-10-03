@@ -8,7 +8,7 @@ description = "Experimental x86-32 hot-region JIT with a shared-state interprete
 [dependencies]
 libc = "0.2"
 pal-cpu = { path = "../pal-cpu", default-features = false, optional = true }
-pal-host = { path = "../pal-host", optional = true }
+adv-sync = { path = "../adv-sync", optional = true }
 cranelift-codegen = "0.125"
 cranelift-frontend = "0.125"
 cranelift-jit = "0.125"
@@ -16,7 +16,7 @@ cranelift-module = "0.125"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 [features]
-pal = ["dep:pal-cpu", "dep:pal-host"]
+pal = ["dep:pal-cpu", "dep:adv-sync"]
 
 [build-dependencies]
 cc = "1"
@@ -24,8 +24,8 @@ cc = "1"
 [dev-dependencies]
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
 pal-cpu = { path = "../pal-cpu", default-features = false, features = ["unicorn"] }
-pal-machine = { path = "../pal-machine" }
-pal-win32 = { path = "../pal-win32" }
+adv-machine = { path = "../adv-machine" }
+adv-win32 = { path = "../adv-win32" }
 
 [[example]]
 name = "boot_probe"

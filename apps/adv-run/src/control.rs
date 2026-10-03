@@ -100,7 +100,7 @@ pub struct Control {
 impl Control {
     pub fn start(
         wake: WakeEvent,
-        keys: std::sync::Arc<pal_host::input::KeyState>,
+        keys: std::sync::Arc<adv_sync::input::KeyState>,
     ) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
         let reader_wake = wake.clone();

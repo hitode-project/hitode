@@ -45,7 +45,7 @@ impl JitCpu {
     }
     /// Install the execution owner's retained event before the first guest run.
     /// Compiler completion and native/interpreted safepoints use the same wake.
-    pub fn set_waker(&mut self, wake: pal_host::WakeEvent) -> Result<(), String> {
+    pub fn set_waker(&mut self, wake: adv_sync::WakeEvent) -> Result<(), String> {
         let m = self.inner.get_mut();
         let flag = wake.interrupt_flag();
         m.set_completion_waker(std::sync::Arc::new(move || wake.signal()))?;

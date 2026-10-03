@@ -7,9 +7,9 @@
 //! accepted source chunks before conversion, gain and resampling.
 #[path = "../tests/support/cpu.rs"]
 mod backend;
+use adv_machine::{RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
 use pal_cpu::{Guest, GuestExt, Reg};
-use pal_machine::{RunResult, SliceResult};
 use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
@@ -18,7 +18,7 @@ use std::{
 };
 
 struct MixerCapture {
-    audio: pal_audio::AudioStream,
+    audio: adv_device::AudioStream,
     output: std::io::BufWriter<std::fs::File>,
     timeline: std::io::BufWriter<std::fs::File>,
     origin: Option<u64>,
@@ -26,7 +26,7 @@ struct MixerCapture {
 }
 
 impl MixerCapture {
-    fn open(audio: pal_audio::AudioStream) -> Result<Option<Self>, String> {
+    fn open(audio: adv_device::AudioStream) -> Result<Option<Self>, String> {
         let Some(path) = std::env::var_os("ADV_AUDIO_CAPTURE") else {
             return Ok(None);
         };
@@ -188,7 +188,7 @@ fn run() -> Result<(), String> {
         let files: BTreeMap<_, _> = r
             .machine
             .ext
-            .get::<pal_win32::Win32>()
+            .get::<adv_win32::Win32>()
             .files
             .iter()
             .map(|(&id, file)| {
@@ -241,11 +241,11 @@ fn run() -> Result<(), String> {
                 "trace" => {
                     r.machine.sys.trace.flush();
                     r.machine.sys.trace = if rest == "off" {
-                        pal_machine::Trace::default()
+                        adv_machine::Trace::default()
                     } else {
                         let file = std::fs::File::create(rest).map_err(|e| e.to_string())?;
                         let mut trace =
-                            pal_machine::Trace::to_writer(Box::new(std::io::BufWriter::new(file)));
+                            adv_machine::Trace::to_writer(Box::new(std::io::BufWriter::new(file)));
                         trace.all = true;
                         trace
                     };

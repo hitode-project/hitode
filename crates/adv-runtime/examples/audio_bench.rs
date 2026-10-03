@@ -4,7 +4,7 @@
 use adv_runtime::boot::Runtime;
 #[path = "../tests/support/cpu.rs"]
 mod backend;
-use pal_machine::{Clock, RunResult, SliceResult};
+use adv_machine::{Clock, RunResult, SliceResult};
 use std::time::{Duration, Instant};
 
 fn run() -> Result<(), String> {

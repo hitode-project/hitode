@@ -5,8 +5,8 @@ mod frontend;
 mod performance;
 mod window;
 
+use adv_machine::{RunResult, SliceResult};
 use adv_runtime::{CompileStrategy, Snapshot, boot::Runtime};
-use pal_machine::{RunResult, SliceResult};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -389,7 +389,7 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
 fn run(options: Options) -> Result<u8, String> {
     window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
-    let keys = std::sync::Arc::new(pal_host::input::KeyState::default());
+    let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
     if options.headless {
         return run_execution(options, None, wake, keys);
     }
@@ -408,7 +408,7 @@ fn run(options: Options) -> Result<u8, String> {
     )?;
     let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
     let completion_wake = ui.wake();
-    let (mut tx, mut rx) = pal_host::spsc::channel(1);
+    let (mut tx, mut rx) = adv_sync::spsc::channel(1);
     let execution = std::thread::Builder::new()
         .name("adv-execution".into())
         .spawn(move || {
@@ -432,7 +432,7 @@ fn run_execution(
     options: Options,
     mut window: Option<frontend::Worker>,
     wake: window::WakeEvent,
-    keys: std::sync::Arc<pal_host::input::KeyState>,
+    keys: std::sync::Arc<adv_sync::input::KeyState>,
 ) -> Result<u8, String> {
     let started = Instant::now();
     let mut runtime = Runtime::with_codec(
@@ -471,7 +471,7 @@ fn run_execution(
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        runtime.machine.sys.trace = pal_machine::Trace::to_writer(Box::new(
+        runtime.machine.sys.trace = adv_machine::Trace::to_writer(Box::new(
             std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?),
         ));
         runtime.machine.sys.trace.all = true;

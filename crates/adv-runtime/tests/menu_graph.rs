@@ -1,7 +1,7 @@
 //! Authored menu graph/resources with invisible native windows, no game/device.
 #![cfg(windows)]
+use adv_machine::{Clock, RunResult};
 use adv_runtime::boot::Runtime;
-use pal_machine::{Clock, RunResult};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
