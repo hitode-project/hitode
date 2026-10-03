@@ -2,7 +2,7 @@
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome};
-use adv_win32::Win32;
+use adv_os::Heaps;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -167,9 +167,9 @@ fn allocate(e: &mut Env<'_>, size: u32, zero: bool) -> u32 {
     if size > 0x40000000 {
         return 0;
     }
-    let w = e.ext.get_mut::<Win32>();
-    let h = w.heaps.process_heap;
-    w.heaps
+    let heaps = e.ext.get_mut::<Heaps>();
+    let h = heaps.process_heap;
+    heaps
         .alloc(e.cpu, &mut e.sys.vm, h, size, zero)
         .unwrap_or(0)
 }
@@ -253,12 +253,12 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let pointer = if begin == 0 {
                 allocate(e, needed, false)
             } else {
-                let w = e.ext.get_mut::<Win32>();
-                w.heaps
+                let heaps = e.ext.get_mut::<Heaps>();
+                heaps
                     .realloc(
                         e.cpu,
                         &mut e.sys.vm,
-                        w.heaps.process_heap,
+                        heaps.process_heap,
                         begin,
                         needed,
                         false,
@@ -340,8 +340,8 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "calloc" => a.checked_mul(b).map_or(0, |n| allocate(e, n, true)),
         "free" => {
             if a != 0 {
-                let w = e.ext.get_mut::<Win32>();
-                w.heaps.free(e.cpu, &mut e.sys.vm, w.heaps.process_heap, a);
+                let heaps = e.ext.get_mut::<Heaps>();
+                heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
             }
             0
         }
@@ -349,21 +349,13 @@ fn call(e: &mut Env<'_>) -> Outcome {
             if a == 0 {
                 allocate(e, b, false)
             } else if b == 0 {
-                let w = e.ext.get_mut::<Win32>();
-                w.heaps.free(e.cpu, &mut e.sys.vm, w.heaps.process_heap, a);
+                let heaps = e.ext.get_mut::<Heaps>();
+                heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
                 0
             } else {
-                let w = e.ext.get_mut::<Win32>();
-                w.heaps
-                    .realloc(
-                        e.cpu,
-                        &mut e.sys.vm,
-                        w.heaps.process_heap,
-                        a,
-                        b,
-                        false,
-                        false,
-                    )
+                let heaps = e.ext.get_mut::<Heaps>();
+                heaps
+                    .realloc(e.cpu, &mut e.sys.vm, heaps.process_heap, a, b, false, false)
                     .unwrap_or(0)
             }
         }
@@ -528,7 +520,7 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
-        Win32::install(
+        adv_win32::Win32::install(
             &mut m,
             adv_win32::Win32Config::new(".", "crt-test.exe", "target/crt-test"),
         )

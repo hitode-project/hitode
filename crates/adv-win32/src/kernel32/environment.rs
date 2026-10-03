@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
+use adv_os::Heaps;
 
 use crate::{Win32, stdcall, util::set_last_error};
 
@@ -217,15 +218,12 @@ fn strings(env: &mut Env<'_>, wide: bool) -> Outcome {
         units.push(0);
     }
     let bytes = encoded(env, &units, wide);
-    let state = env.ext.get_mut::<Win32>();
-    let Some(pointer) = state
-        .heaps
-        .alloc(env.cpu, &mut env.sys.vm, 0, bytes.len() as u32, false)
-    else {
+    let heaps = env.ext.get_mut::<Heaps>();
+    let Some(pointer) = heaps.alloc(env.cpu, &mut env.sys.vm, 0, bytes.len() as u32, false) else {
         return error(env, 8);
     };
     if env.cpu.write(pointer, &bytes).is_err() {
-        state.heaps.free(env.cpu, &mut env.sys.vm, 0, pointer);
+        heaps.free(env.cpu, &mut env.sys.vm, 0, pointer);
         return error(env, 998);
     }
     env.ext.get_mut::<Environment>().snapshots.insert(pointer);
@@ -237,13 +235,8 @@ fn free_strings(env: &mut Env<'_>) -> Outcome {
     if !env.ext.get_mut::<Environment>().snapshots.remove(&pointer) {
         return error(env, 87);
     }
-    let state = env.ext.get_mut::<Win32>();
-    Outcome::Return(u32::from(state.heaps.free(
-        env.cpu,
-        &mut env.sys.vm,
-        0,
-        pointer,
-    )))
+    let heaps = env.ext.get_mut::<Heaps>();
+    Outcome::Return(u32::from(heaps.free(env.cpu, &mut env.sys.vm, 0, pointer)))
 }
 
 pub(super) fn register(registry: &mut Registry) {

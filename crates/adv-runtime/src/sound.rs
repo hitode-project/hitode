@@ -3,7 +3,7 @@ use adv_abi::Registry;
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
 use adv_machine::{Conv, Env, Machine, Outcome};
-use adv_win32::Win32;
+use adv_os::Heaps;
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};
 use std::sync::Arc;
@@ -357,15 +357,14 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     Ok(())
 }
 fn alloc(e: &mut Env<'_>, len: u32) -> Result<u32, String> {
-    let w = e.ext.get_mut::<Win32>();
-    w.heaps
-        .alloc(e.cpu, &mut e.sys.vm, w.heaps.process_heap, len, true)
+    let heaps = e.ext.get_mut::<Heaps>();
+    heaps
+        .alloc(e.cpu, &mut e.sys.vm, heaps.process_heap, len, true)
         .ok_or("audio heap exhausted".into())
 }
 fn free(e: &mut Env<'_>, ptr: u32) {
-    let w = e.ext.get_mut::<Win32>();
-    w.heaps
-        .free(e.cpu, &mut e.sys.vm, w.heaps.process_heap, ptr);
+    let heaps = e.ext.get_mut::<Heaps>();
+    heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, ptr);
 }
 fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     let s = e.ext.get_mut::<Sound>();
@@ -425,7 +424,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         let files: Vec<_> = if matches!(name, "Play" | "Stop" | "SetCurrentPosition" | "Release") {
             e.sys
                 .objects
-                .hosts::<adv_win32::FileObj>()
+                .hosts::<adv_os::vfs::FileObj>()
                 .map(|(handle, file)| {
                     let mut native = &file.file;
                     (
@@ -1190,7 +1189,7 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
-        Win32::install(
+        adv_win32::Win32::install(
             &mut m,
             adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
         )

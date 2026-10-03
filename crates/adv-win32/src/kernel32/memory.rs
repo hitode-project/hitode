@@ -6,8 +6,9 @@ use adv_machine::layout::{GRANULE, PAGE};
 use adv_machine::{Env, Outcome};
 
 use super::K32;
+use crate::stdcall;
 use crate::util::{err, set_last_error};
-use crate::{Win32, stdcall};
+use adv_os::Heaps;
 
 const HEAP_ZERO_MEMORY: u32 = 0x8;
 const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
@@ -26,8 +27,8 @@ fn page_span(addr: u32, size: u32) -> Option<(u32, u32)> {
 }
 
 fn heap_create(env: &mut Env<'_>) -> Outcome {
-    let w = env.ext.get_mut::<Win32>();
-    match w.heaps.create(env.cpu, &mut env.sys.vm) {
+    let heaps = env.ext.get_mut::<Heaps>();
+    match heaps.create(env.cpu, &mut env.sys.vm) {
         Ok(h) => Outcome::Return(h),
         Err(_) => Outcome::Return(0),
     }
@@ -35,14 +36,13 @@ fn heap_create(env: &mut Env<'_>) -> Outcome {
 
 fn heap_destroy(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
-    let w = env.ext.get_mut::<Win32>();
-    Outcome::Return(u32::from(w.heaps.destroy(env.cpu, &mut env.sys.vm, h)))
+    let heaps = env.ext.get_mut::<Heaps>();
+    Outcome::Return(u32::from(heaps.destroy(env.cpu, &mut env.sys.vm, h)))
 }
 
 fn alloc(env: &mut Env<'_>, heap: u32, size: u32, zero: bool) -> u32 {
-    let w = env.ext.get_mut::<Win32>();
-    let p = w
-        .heaps
+    let heaps = env.ext.get_mut::<Heaps>();
+    let p = heaps
         .alloc(env.cpu, &mut env.sys.vm, heap, size, zero)
         .unwrap_or(0);
     if p == 0 {
@@ -55,13 +55,13 @@ fn free(env: &mut Env<'_>, heap: u32, p: u32) -> bool {
     if p == 0 {
         return true;
     }
-    let w = env.ext.get_mut::<Win32>();
+    let heaps = env.ext.get_mut::<Heaps>();
     let heap = if heap == 0 {
-        w.heaps.owner(p).unwrap_or(0)
+        heaps.owner(p).unwrap_or(0)
     } else {
         heap
     };
-    let ok = w.heaps.free(env.cpu, &mut env.sys.vm, heap, p);
+    let ok = heaps.free(env.cpu, &mut env.sys.vm, heap, p);
     if !ok {
         log::warn!(
             "free of unknown block {p:#x} (heap {heap:#x}) from {:#010x}",
@@ -83,11 +83,10 @@ fn heap_free(env: &mut Env<'_>) -> Outcome {
 
 fn heap_realloc(env: &mut Env<'_>) -> Outcome {
     let (h, flags, p, size) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let w = env.ext.get_mut::<Win32>();
+    let heaps = env.ext.get_mut::<Heaps>();
     let zero = flags & HEAP_ZERO_MEMORY != 0;
     let in_place = flags & HEAP_REALLOC_IN_PLACE_ONLY != 0;
-    let r = w
-        .heaps
+    let r = heaps
         .realloc(env.cpu, &mut env.sys.vm, h, p, size, zero, in_place)
         .unwrap_or(0);
     if r == 0 {
@@ -98,13 +97,7 @@ fn heap_realloc(env: &mut Env<'_>) -> Outcome {
 
 fn heap_size(env: &mut Env<'_>) -> Outcome {
     let (h, p) = (env.arg(0), env.arg(2));
-    Outcome::Return(
-        env.ext
-            .get_mut::<Win32>()
-            .heaps
-            .size(h, p)
-            .unwrap_or(u32::MAX),
-    )
+    Outcome::Return(env.ext.get_mut::<Heaps>().size(h, p).unwrap_or(u32::MAX))
 }
 
 fn local_alloc(env: &mut Env<'_>) -> Outcome {
@@ -120,10 +113,10 @@ fn local_free(env: &mut Env<'_>) -> Outcome {
 
 fn local_realloc(env: &mut Env<'_>) -> Outcome {
     let (p, size, flags) = (env.arg(0), env.arg(1), env.arg(2));
-    let w = env.ext.get_mut::<Win32>();
-    let heap = w.heaps.owner(p).unwrap_or(0);
+    let heaps = env.ext.get_mut::<Heaps>();
+    let heap = heaps.owner(p).unwrap_or(0);
     Outcome::Return(
-        w.heaps
+        heaps
             .realloc(
                 env.cpu,
                 &mut env.sys.vm,
@@ -139,9 +132,9 @@ fn local_realloc(env: &mut Env<'_>) -> Outcome {
 
 fn local_size(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
-    let w = env.ext.get_mut::<Win32>();
-    let heap = w.heaps.owner(p).unwrap_or(0);
-    Outcome::Return(w.heaps.size(heap, p).unwrap_or(0))
+    let heaps = env.ext.get_mut::<Heaps>();
+    let heap = heaps.owner(p).unwrap_or(0);
+    Outcome::Return(heaps.size(heap, p).unwrap_or(0))
 }
 
 /// VirtualAlloc: regions are reserved and committed in one go (the host maps them fully).
@@ -367,7 +360,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "HeapValidate", 3, |_| Outcome::Return(1));
     stdcall(reg, K32, "HeapCompact", 2, |_| Outcome::Return(0x10_0000));
     stdcall(reg, K32, "GetProcessHeap", 0, |e| {
-        Outcome::Return(e.ext.get::<Win32>().heaps.process_heap)
+        Outcome::Return(e.ext.get::<Heaps>().process_heap)
     });
     for p in ["Local", "Global"] {
         stdcall(reg, K32, &format!("{p}Alloc"), 2, local_alloc);

@@ -23,6 +23,14 @@ pub struct DirEntry {
     pub modified: Option<SystemTime>,
 }
 
+/// An open guest file: a host object in the machine's handle table. Every personality
+/// that opens or traces files shares this one type.
+pub struct FileObj {
+    pub file: std::fs::File,
+    pub guest_path: String,
+    pub access: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Loc {
     /// Under the game root: relative components.

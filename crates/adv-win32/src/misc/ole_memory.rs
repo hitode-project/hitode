@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
+use adv_os::Heaps;
 
-use crate::{Win32, stdcall};
+use crate::stdcall;
 
 const MAX_BSTR_BYTES: u32 = 16 * 1024 * 1024;
 #[derive(Default)]
@@ -24,15 +25,13 @@ fn allocate(env: &mut Env<'_>, size: u32) -> u32 {
         return 0;
     }
     env.ext
-        .get_mut::<Win32>()
-        .heaps
+        .get_mut::<Heaps>()
         .alloc(env.cpu, &mut env.sys.vm, 0, size, false)
         .unwrap_or(0)
 }
 fn free(env: &mut Env<'_>, pointer: u32) {
     env.ext
-        .get_mut::<Win32>()
-        .heaps
+        .get_mut::<Heaps>()
         .free(env.cpu, &mut env.sys.vm, 0, pointer);
 }
 fn task_alloc(env: &mut Env<'_>) -> Outcome {
@@ -78,8 +77,7 @@ fn task_realloc(env: &mut Env<'_>) -> Outcome {
     }
     let pointer = env
         .ext
-        .get_mut::<Win32>()
-        .heaps
+        .get_mut::<Heaps>()
         .realloc(env.cpu, &mut env.sys.vm, 0, old, size, false, false)
         .unwrap_or(0);
     if pointer != 0 {

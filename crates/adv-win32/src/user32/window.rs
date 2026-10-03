@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{CtxId, Env, Handle, Outcome};
+use adv_os::Heaps;
 
 use super::message::{send, send_all};
 use super::{USER32, user, user_mut};
@@ -916,17 +917,17 @@ pub fn make_long(lo: i32, hi: i32) -> u32 {
 
 /// Scratch guest memory from the process heap (CREATESTRUCT, WINDOWPOS, ...).
 pub fn temp_alloc(env: &mut Env<'_>, size: u32) -> u32 {
-    let w = env.ext.get_mut::<Win32>();
-    let h = w.heaps.process_heap;
-    w.heaps
+    let heaps = env.ext.get_mut::<Heaps>();
+    let h = heaps.process_heap;
+    heaps
         .alloc(env.cpu, &mut env.sys.vm, h, size, true)
         .unwrap_or(0)
 }
 
 pub fn temp_free(env: &mut Env<'_>, p: u32) {
-    let w = env.ext.get_mut::<Win32>();
-    let h = w.heaps.process_heap;
-    w.heaps.free(env.cpu, &mut env.sys.vm, h, p);
+    let heaps = env.ext.get_mut::<Heaps>();
+    let h = heaps.process_heap;
+    heaps.free(env.cpu, &mut env.sys.vm, h, p);
 }
 
 fn destroy_window_api(env: &mut Env<'_>) -> Outcome {

@@ -6,6 +6,7 @@ use std::io::{Read, Seek, SeekFrom};
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Conv, Env, Outcome};
+use adv_os::Heaps;
 use adv_win32::{
     Win32,
     util::{cstr, wstr},
@@ -198,8 +199,7 @@ fn open(e: &mut Env<'_>) -> Outcome {
         let address = if owned {
             let Some(address) =
                 e.ext
-                    .get_mut::<Win32>()
-                    .heaps
+                    .get_mut::<Heaps>()
                     .alloc(e.cpu, &mut e.sys.vm, 0, capacity, true)
             else {
                 return open_error(e, info, 258);
@@ -211,8 +211,7 @@ fn open(e: &mut Env<'_>) -> Outcome {
         if address.checked_add(capacity).is_none() {
             if owned {
                 e.ext
-                    .get_mut::<Win32>()
-                    .heaps
+                    .get_mut::<Heaps>()
                     .free(e.cpu, &mut e.sys.vm, 0, address);
             }
             return open_error(e, info, 272);
@@ -326,8 +325,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         } = file.source
         {
             e.ext
-                .get_mut::<Win32>()
-                .heaps
+                .get_mut::<Heaps>()
                 .free(e.cpu, &mut e.sys.vm, 0, address);
         }
         return Outcome::Return(0);

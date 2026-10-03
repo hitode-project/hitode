@@ -3,6 +3,7 @@
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Env, Outcome};
+use adv_os::Heaps;
 
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
@@ -23,22 +24,22 @@ fn terminate_process(env: &mut Env<'_>) -> Outcome {
 }
 
 fn command_line_a(env: &mut Env<'_>) -> Outcome {
-    let w = env.ext.get_mut::<Win32>();
+    let (w, heaps) = env.ext.get2_mut::<Win32, Heaps>();
     let line = format!("\"{}\"", w.exe_path());
     let mut bytes = w.codec.encode(&line);
     bytes.push(0);
-    Outcome::Return(w.static_bytes("cmdline_a", env.cpu, env.sys, &bytes))
+    Outcome::Return(w.static_bytes("cmdline_a", env.cpu, env.sys, heaps, &bytes))
 }
 
 fn command_line_w(env: &mut Env<'_>) -> Outcome {
-    let w = env.ext.get_mut::<Win32>();
+    let (w, heaps) = env.ext.get2_mut::<Win32, Heaps>();
     let line = format!("\"{}\"", w.exe_path());
     let bytes: Vec<u8> = line
         .encode_utf16()
         .chain([0])
         .flat_map(u16::to_le_bytes)
         .collect();
-    Outcome::Return(w.static_bytes("cmdline_w", env.cpu, env.sys, &bytes))
+    Outcome::Return(w.static_bytes("cmdline_w", env.cpu, env.sys, heaps, &bytes))
 }
 
 pub(super) fn environment(w: &Win32) -> Vec<String> {
@@ -153,8 +154,8 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
             "RtlUnwind to {ip:#010x} from {ret:#010x}: only the return address is supported"
         ));
     }
-    let w = env.ext.get_mut::<Win32>();
-    let Some(scratch) = w.heaps.alloc(env.cpu, &mut env.sys.vm, 0, SCRATCH, true) else {
+    let heaps = env.ext.get_mut::<Heaps>();
+    let Some(scratch) = heaps.alloc(env.cpu, &mut env.sys.vm, 0, SCRATCH, true) else {
         return Outcome::Fail("RtlUnwind: out of memory".into());
     };
     let flags = EXCEPTION_UNWINDING
@@ -210,8 +211,8 @@ fn unwind_step(env: &mut Env<'_>, u: Unwind) -> Outcome {
         for (r, v) in SAVED.into_iter().zip(u.saved) {
             env.cpu.set_reg(r, v);
         }
-        let w = env.ext.get_mut::<Win32>();
-        w.heaps.free(env.cpu, &mut env.sys.vm, 0, u.scratch);
+        let heaps = env.ext.get_mut::<Heaps>();
+        heaps.free(env.cpu, &mut env.sys.vm, 0, u.scratch);
         return Outcome::Return(u.value);
     }
     if u.target != 0 && frame > u.target {

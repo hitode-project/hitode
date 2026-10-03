@@ -7,6 +7,8 @@
 //! * [`vfs`] maps guest paths onto the game directory and the data overlay, [`heap`] is
 //!   the guest heap allocator, [`nls`] holds code pages and case mapping and
 //!   [`registry`] is the private virtual registry; every personality layer shares them.
+//!   The process's [`Heaps`] are their own `Ext` entry, and an open file is a
+//!   [`vfs::FileObj`] in the machine's handle table, so any personality can reach both.
 
 pub mod heap;
 pub mod loader;

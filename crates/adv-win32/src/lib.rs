@@ -54,14 +54,10 @@ impl Win32Config {
     }
 }
 
-/// Open file; a host object in the machine's handle table, like the others below.
-pub struct FileObj {
-    pub file: std::fs::File,
-    pub guest_path: String,
-    pub access: u32,
-}
+pub use adv_os::vfs::FileObj;
 
-/// FindFirstFile enumeration.
+/// FindFirstFile enumeration; a host object in the machine's handle table, like the others
+/// below.
 pub struct FindObj {
     pub entries: Vec<vfs::DirEntry>,
     pub next: usize,
@@ -77,7 +73,6 @@ pub struct Win32 {
     pub cfg: Win32Config,
     pub codec: Codec,
     pub vfs: Vfs,
-    pub heaps: Heaps,
     pub tls_used: [bool; 64],
     /// HRSRC -> (data address, size).
     pub resources: HashMap<u32, (u32, u32)>,
@@ -95,7 +90,8 @@ pub const STD_OUTPUT: u32 = 7;
 pub const STD_ERROR: u32 = 11;
 
 impl Win32 {
-    /// Create the Win32 state (process heap included) and install it into the machine.
+    /// Create the Win32 state and the process heap and install them into the machine. The
+    /// heaps are their own `Ext` entry: other personalities allocate from them too.
     pub fn install<B: Backend>(m: &mut Machine<B>, cfg: Win32Config) -> Result<(), MemFault> {
         let mut heaps = Heaps::default();
         let process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm)?;
@@ -106,7 +102,6 @@ impl Win32 {
         let w = Win32 {
             codec: Codec::new(cfg.os.codepage),
             vfs,
-            heaps,
             tls_used: [false; 64],
             resources: HashMap::new(),
             next_hrsrc: 0x7e80_0000,
@@ -117,6 +112,7 @@ impl Win32 {
             cfg,
         };
         m.ext.insert(w);
+        m.ext.insert(heaps);
         user32::install(m)?;
         Ok(())
     }
@@ -132,14 +128,14 @@ impl Win32 {
         key: &'static str,
         cpu: &mut dyn Guest,
         sys: &mut Sys,
+        heaps: &mut Heaps,
         bytes: &[u8],
     ) -> u32 {
         if let Some(&p) = self.statics.get(key) {
             return p;
         }
-        let h = self.heaps.process_heap;
-        let p = self
-            .heaps
+        let h = heaps.process_heap;
+        let p = heaps
             .alloc(cpu, &mut sys.vm, h, bytes.len() as u32, false)
             .unwrap_or(0);
         if p != 0 {
