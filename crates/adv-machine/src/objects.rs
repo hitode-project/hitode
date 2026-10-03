@@ -1,0 +1,592 @@
+//! Process-owned payloads and opaque alias namespaces.
+//!
+//! This table knows ownership, identity and aliasing, not API handle semantics.
+//! The default namespace preserves the scheduler's existing handle interface.
+//! Other namespaces can use the same numeric aliases without making them kernel
+//! handles. An identity is a borrowed token: copying or looking it up does not
+//! acquire a reference. Anonymous references and alias references are counted
+//! separately, so releasing a borrowed token cannot destroy an open alias.
+
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::sched::{Handle, Object};
+
+static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
+
+/// An opaque alias namespace, valid only in the table which created it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Namespace {
+    table: u64,
+    id: u32,
+}
+
+impl Namespace {
+    /// The existing kernel-handle namespace. Its token is valid in every table.
+    pub const DEFAULT: Self = Self { table: 0, id: 0 };
+}
+
+/// A type-checked, non-owning identity. Stale identities are never reused.
+pub struct Identity<T: Any> {
+    table: u64,
+    id: u64,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: Any> Copy for Identity<T> {}
+impl<T: Any> Clone for Identity<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: Any> PartialEq for Identity<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.table == other.table && self.id == other.id
+    }
+}
+impl<T: Any> Eq for Identity<T> {}
+impl<T: Any> std::hash::Hash for Identity<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.table.hash(state);
+        self.id.hash(state);
+    }
+}
+impl<T: Any> std::fmt::Debug for Identity<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("table", &self.table)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+/// Bounded process resources. Reference limits include both owners and aliases.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectLimits {
+    pub objects: usize,
+    pub aliases: usize,
+    /// Includes the default namespace.
+    pub namespaces: usize,
+    pub references: u32,
+}
+
+impl Default for ObjectLimits {
+    fn default() -> Self {
+        Self {
+            objects: 65_536,
+            aliases: 262_144,
+            namespaces: 1_024,
+            references: u32::MAX,
+        }
+    }
+}
+
+struct NamespaceState {
+    next: u32,
+    aliases: usize,
+}
+
+impl Default for NamespaceState {
+    fn default() -> Self {
+        Self {
+            next: 0x100,
+            aliases: 0,
+        }
+    }
+}
+
+struct Entry {
+    value: Object,
+    owners: u32,
+    aliases: u32,
+    /// Counts aliases per namespace, so iteration yields each payload once.
+    namespaces: BTreeMap<u32, usize>,
+    /// Stable identity for the legacy default-namespace interface.
+    kernel_identity: Option<Handle>,
+}
+
+impl Entry {
+    fn references(&self) -> u32 {
+        // All mutations preflight the total, including its arithmetic overflow.
+        self.owners + self.aliases
+    }
+}
+
+/// One payload table for the process, with independent numeric alias namespaces.
+pub struct Objects {
+    table: u64,
+    entries: HashMap<u64, Entry>,
+    targets: HashMap<(u32, u32), u64>,
+    kernel_identities: HashMap<Handle, u64>,
+    namespaces: HashMap<u32, NamespaceState>,
+    next_object: u64,
+    next_namespace: u32,
+    limits: ObjectLimits,
+}
+
+impl Default for Objects {
+    fn default() -> Self {
+        Self::with_limits(ObjectLimits::default())
+    }
+}
+
+impl Objects {
+    pub fn with_limits(limits: ObjectLimits) -> Self {
+        let table = NEXT_TABLE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("object table identity space exhausted");
+        Self {
+            table,
+            entries: HashMap::new(),
+            targets: HashMap::new(),
+            kernel_identities: HashMap::new(),
+            namespaces: HashMap::from([(0, NamespaceState::default())]),
+            next_object: 0,
+            next_namespace: 0,
+            limits,
+        }
+    }
+
+    fn namespace_id(&self, ns: Namespace) -> Option<u32> {
+        if ns == Namespace::DEFAULT {
+            return Some(0);
+        }
+        (ns.table == self.table && self.namespaces.contains_key(&ns.id)).then_some(ns.id)
+    }
+
+    fn token<T: Any>(&self, id: u64) -> Identity<T> {
+        Identity {
+            table: self.table,
+            id,
+            marker: PhantomData,
+        }
+    }
+
+    fn entry<T: Any>(&self, id: Identity<T>) -> Option<&Entry> {
+        if id.table != self.table {
+            return None;
+        }
+        let entry = self.entries.get(&id.id)?;
+        match &entry.value {
+            Object::Host(value) if value.is::<T>() => Some(entry),
+            _ => None,
+        }
+    }
+
+    fn can_reference(&self, entry: &Entry) -> bool {
+        entry
+            .references()
+            .checked_add(1)
+            .is_some_and(|count| count <= self.limits.references)
+    }
+
+    fn vacant_alias(&self, ns: u32, alias: u32) -> bool {
+        // A closed original kernel handle remains an identity while its payload
+        // survives. Reusing that number would make alias_identity ambiguous.
+        !self.targets.contains_key(&(ns, alias))
+            && (ns != 0 || (alias != 0 && !self.kernel_identities.contains_key(&alias)))
+    }
+
+    fn next_alias(&self, ns: u32) -> Option<u32> {
+        if self.targets.len() >= self.limits.aliases {
+            return None;
+        }
+        let mut next = self.namespaces.get(&ns)?.next;
+        loop {
+            next = next.checked_add(4)?;
+            if self.vacant_alias(ns, next) {
+                return Some(next);
+            }
+        }
+    }
+
+    fn insert_aliased(&mut self, ns: u32, value: Object) -> Option<u32> {
+        if self.entries.len() >= self.limits.objects || self.limits.references == 0 {
+            return None;
+        }
+        let alias = self.next_alias(ns)?;
+        let id = self.next_object.checked_add(1)?;
+        self.next_object = id;
+        let kernel_identity = (ns == 0).then_some(alias);
+        self.entries.insert(
+            id,
+            Entry {
+                value,
+                owners: 0,
+                aliases: 1,
+                namespaces: BTreeMap::from([(ns, 1)]),
+                kernel_identity,
+            },
+        );
+        self.targets.insert((ns, alias), id);
+        let state = self.namespaces.get_mut(&ns).unwrap();
+        state.next = alias;
+        state.aliases += 1;
+        if let Some(kernel_identity) = kernel_identity {
+            self.kernel_identities.insert(kernel_identity, id);
+        }
+        Some(alias)
+    }
+
+    fn add_alias(&mut self, ns: u32, alias: u32, id: u64) -> bool {
+        if self.targets.len() >= self.limits.aliases || !self.vacant_alias(ns, alias) {
+            return false;
+        }
+        let Some(entry) = self.entries.get(&id) else {
+            return false;
+        };
+        if !self.can_reference(entry) {
+            return false;
+        }
+        let entry = self.entries.get_mut(&id).unwrap();
+        entry.aliases += 1;
+        *entry.namespaces.entry(ns).or_default() += 1;
+        if ns == 0 && entry.kernel_identity.is_none() {
+            entry.kernel_identity = Some(alias);
+            self.kernel_identities.insert(alias, id);
+        }
+        self.targets.insert((ns, alias), id);
+        self.namespaces.get_mut(&ns).unwrap().aliases += 1;
+        true
+    }
+
+    fn take_unreferenced(&mut self, id: u64) -> Option<Object> {
+        if self.entries.get(&id)?.references() != 0 {
+            return None;
+        }
+        let entry = self.entries.remove(&id).unwrap();
+        if let Some(kernel_identity) = entry.kernel_identity {
+            self.kernel_identities.remove(&kernel_identity);
+        }
+        Some(entry.value)
+    }
+
+    pub fn new_namespace(&mut self) -> Option<Namespace> {
+        if self.namespaces.len() >= self.limits.namespaces {
+            return None;
+        }
+        let id = self.next_namespace.checked_add(1)?;
+        self.namespaces.insert(id, NamespaceState::default());
+        self.next_namespace = id;
+        Some(Namespace {
+            table: self.table,
+            id,
+        })
+    }
+
+    /// Live aliases in one namespace; O(1). Invalid tokens report zero.
+    pub fn alias_count(&self, ns: Namespace) -> usize {
+        self.namespace_id(ns)
+            .and_then(|id| self.namespaces.get(&id))
+            .map_or(0, |state| state.aliases)
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Total anonymous and alias references, for ownership diagnostics.
+    pub fn strong_count<T: Any>(&self, id: Identity<T>) -> Option<u32> {
+        Some(self.entry(id)?.references())
+    }
+
+    /// Insert with one anonymous owner, to be explicitly retained or released.
+    /// Binding an alias adds a separate reference; it does not consume this one.
+    pub fn insert_owned<T: Any>(&mut self, value: T) -> Option<Identity<T>> {
+        if self.entries.len() >= self.limits.objects || self.limits.references == 0 {
+            return None;
+        }
+        let id = self.next_object.checked_add(1)?;
+        self.next_object = id;
+        self.entries.insert(
+            id,
+            Entry {
+                value: Object::Host(Box::new(value)),
+                owners: 1,
+                aliases: 0,
+                namespaces: BTreeMap::new(),
+                kernel_identity: None,
+            },
+        );
+        Some(self.token(id))
+    }
+
+    /// Retain an anonymous strong reference, after checking table, type and limits.
+    pub fn retain<T: Any>(&mut self, id: Identity<T>) -> bool {
+        let Some(entry) = self.entry(id) else {
+            return false;
+        };
+        if !self.can_reference(entry) {
+            return false;
+        }
+        self.entries.get_mut(&id.id).unwrap().owners += 1;
+        true
+    }
+
+    /// Release one anonymous owner. A borrowed alias identity without an owner
+    /// cannot be released. The last reference returns the payload for cleanup.
+    pub fn release<T: Any>(&mut self, id: Identity<T>) -> Option<Option<T>> {
+        if self.entry(id)?.owners == 0 {
+            return None;
+        }
+        self.entries.get_mut(&id.id)?.owners -= 1;
+        Some(self.take_unreferenced(id.id).map(|object| match object {
+            Object::Host(value) => *value.downcast::<T>().ok().unwrap(),
+            _ => unreachable!("typed identity must name a host payload"),
+        }))
+    }
+
+    pub fn owned<T: Any>(&self, id: Identity<T>) -> Option<&T> {
+        match &self.entry(id)?.value {
+            Object::Host(value) => value.downcast_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn owned_mut<T: Any>(&mut self, id: Identity<T>) -> Option<&mut T> {
+        self.entry(id)?;
+        match &mut self.entries.get_mut(&id.id)?.value {
+            Object::Host(value) => value.downcast_mut(),
+            _ => None,
+        }
+    }
+
+    /// Bind a specified alias, retaining the payload. Existing aliases are never
+    /// overwritten. A guest pointer may be an alias in a nondefault namespace.
+    pub fn bind_alias<T: Any>(&mut self, ns: Namespace, alias: u32, id: Identity<T>) -> bool {
+        let Some(ns) = self.namespace_id(ns) else {
+            return false;
+        };
+        if self.entry(id).is_none() {
+            return false;
+        }
+        self.add_alias(ns, alias, id.id)
+    }
+
+    /// Borrow an identity without retaining it; refuses stale, foreign or wrong types.
+    pub fn lookup_alias<T: Any>(&self, ns: Namespace, alias: u32) -> Option<Identity<T>> {
+        let ns = self.namespace_id(ns)?;
+        let token = self.token(*self.targets.get(&(ns, alias))?);
+        self.entry(token)?;
+        Some(token)
+    }
+
+    /// Release one alias reference in precisely this namespace.
+    pub fn close_alias(&mut self, ns: Namespace, alias: u32) -> Option<Option<Object>> {
+        let ns = self.namespace_id(ns)?;
+        let id = self.targets.remove(&(ns, alias))?;
+        self.namespaces.get_mut(&ns).unwrap().aliases -= 1;
+        let entry = self.entries.get_mut(&id).unwrap();
+        entry.aliases -= 1;
+        let count = entry.namespaces.get_mut(&ns).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            entry.namespaces.remove(&ns);
+        }
+        Some(self.take_unreferenced(id))
+    }
+
+    /// Insert a payload with an automatically allocated alias and exactly one
+    /// reference. No anonymous owner is left behind; failures do not mutate the table.
+    pub fn insert_host_in<T: Any>(&mut self, ns: Namespace, value: T) -> Option<u32> {
+        let ns = self.namespace_id(ns)?;
+        self.insert_aliased(ns, Object::Host(Box::new(value)))
+    }
+
+    /// Every typed payload with a live alias in `ns`, once regardless of alias count.
+    pub fn hosts_in<T: Any>(&self, ns: Namespace) -> impl Iterator<Item = (Identity<T>, &T)> {
+        let ns = self.namespace_id(ns);
+        self.entries.iter().filter_map(move |(&id, entry)| {
+            if !entry.namespaces.contains_key(&ns?) {
+                return None;
+            }
+            match &entry.value {
+                Object::Host(value) => Some((self.token(id), value.downcast_ref()?)),
+                _ => None,
+            }
+        })
+    }
+
+    pub fn hosts_in_mut<T: Any>(
+        &mut self,
+        ns: Namespace,
+    ) -> impl Iterator<Item = (Identity<T>, &mut T)> {
+        let ns = self.namespace_id(ns);
+        let table = self.table;
+        self.entries.iter_mut().filter_map(move |(&id, entry)| {
+            if !entry.namespaces.contains_key(&ns?) {
+                return None;
+            }
+            match &mut entry.value {
+                Object::Host(value) => Some((
+                    Identity {
+                        table,
+                        id,
+                        marker: PhantomData,
+                    },
+                    value.downcast_mut()?,
+                )),
+                _ => None,
+            }
+        })
+    }
+
+    /// All typed payloads, including anonymous owners and every namespace, once each.
+    pub fn all_hosts<T: Any>(&self) -> impl Iterator<Item = (Identity<T>, &T)> {
+        self.entries
+            .iter()
+            .filter_map(|(&id, entry)| match &entry.value {
+                Object::Host(value) => Some((self.token(id), value.downcast_ref()?)),
+                _ => None,
+            })
+    }
+
+    pub fn all_hosts_mut<T: Any>(&mut self) -> impl Iterator<Item = (Identity<T>, &mut T)> {
+        let table = self.table;
+        self.entries
+            .iter_mut()
+            .filter_map(move |(&id, entry)| match &mut entry.value {
+                Object::Host(value) => Some((
+                    Identity {
+                        table,
+                        id,
+                        marker: PhantomData,
+                    },
+                    value.downcast_mut()?,
+                )),
+                _ => None,
+            })
+    }
+
+    /// Existing default-namespace insertion; zero denotes resource exhaustion.
+    pub fn insert(&mut self, object: Object) -> Handle {
+        self.insert_aliased(0, object).unwrap_or(0)
+    }
+
+    pub fn insert_host<T: Any>(&mut self, value: T) -> Handle {
+        self.insert(Object::Host(Box::new(value)))
+    }
+
+    pub fn get(&self, handle: Handle) -> Option<&Object> {
+        Some(&self.entries.get(self.targets.get(&(0, handle))?)?.value)
+    }
+
+    pub fn get_mut(&mut self, handle: Handle) -> Option<&mut Object> {
+        let id = self.targets.get(&(0, handle))?;
+        Some(&mut self.entries.get_mut(id)?.value)
+    }
+
+    pub fn host<T: Any>(&self, handle: Handle) -> Option<&T> {
+        match self.get(handle)? {
+            Object::Host(value) => value.downcast_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn host_mut<T: Any>(&mut self, handle: Handle) -> Option<&mut T> {
+        match self.get_mut(handle)? {
+            Object::Host(value) => value.downcast_mut(),
+            _ => None,
+        }
+    }
+
+    /// Legacy iteration by original default-namespace identity, once each.
+    /// Use `all_hosts` to include payloads created only in other namespaces.
+    pub fn hosts<T: Any>(&self) -> impl Iterator<Item = (Handle, &T)> {
+        self.entries
+            .values()
+            .filter_map(|entry| match &entry.value {
+                Object::Host(value) => Some((entry.kernel_identity?, value.downcast_ref()?)),
+                _ => None,
+            })
+    }
+
+    pub fn hosts_mut<T: Any>(&mut self) -> impl Iterator<Item = (Handle, &mut T)> {
+        self.entries
+            .values_mut()
+            .filter_map(|entry| match &mut entry.value {
+                Object::Host(value) => Some((entry.kernel_identity?, value.downcast_mut()?)),
+                _ => None,
+            })
+    }
+
+    pub fn close(&mut self, handle: Handle) -> Option<Option<Object>> {
+        self.close_alias(Namespace::DEFAULT, handle)
+    }
+
+    pub fn duplicate(&mut self, handle: Handle) -> Option<Handle> {
+        self.alias_identity(self.identity(handle)?)
+    }
+
+    pub fn identity(&self, handle: Handle) -> Option<Handle> {
+        self.entries
+            .get(self.targets.get(&(0, handle))?)?
+            .kernel_identity
+    }
+
+    pub fn has_identity(&self, identity: Handle) -> bool {
+        self.kernel_identities.contains_key(&identity)
+    }
+
+    pub fn same_object(&self, first: Handle, second: Handle) -> bool {
+        self.identity(first)
+            .is_some_and(|object| self.identity(second) == Some(object))
+    }
+
+    pub fn alias_identity(&mut self, identity: Handle) -> Option<Handle> {
+        let id = *self.kernel_identities.get(&identity)?;
+        let alias = self.next_alias(0)?;
+        if !self.add_alias(0, alias, id) {
+            return None;
+        }
+        self.namespaces.get_mut(&0).unwrap().next = alias;
+        Some(alias)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_and_reference_overflow_refuse_without_mutation() {
+        let mut objects = Objects::default();
+        let id = objects.insert_owned(7_u32).unwrap();
+        objects.entries.get_mut(&id.id).unwrap().owners = u32::MAX;
+        assert!(!objects.retain(id));
+        assert!(!objects.bind_alias(Namespace::DEFAULT, 0x104, id));
+        assert_eq!(objects.strong_count(id), Some(u32::MAX));
+        assert_eq!(objects.alias_count(Namespace::DEFAULT), 0);
+
+        let mut objects = Objects::default();
+        objects.next_object = u64::MAX;
+        assert!(objects.insert_owned(1_u32).is_none());
+        assert_eq!(objects.insert_host(2_u32), 0);
+        assert_eq!(objects.object_count(), 0);
+        objects.next_namespace = u32::MAX;
+        assert!(objects.new_namespace().is_none());
+        objects.namespaces.get_mut(&0).unwrap().next = u32::MAX - 3;
+        objects.next_object = 0;
+        assert_eq!(objects.insert_host(3_u32), 0);
+        assert_eq!(objects.object_count(), 0);
+    }
+
+    #[test]
+    fn wrong_type_identity_is_rejected_by_every_typed_mutation() {
+        let mut objects = Objects::default();
+        let id = objects.insert_owned(7_u32).unwrap();
+        let wrong: Identity<String> = Identity {
+            table: id.table,
+            id: id.id,
+            marker: PhantomData,
+        };
+        assert!(objects.owned(wrong).is_none());
+        assert!(objects.owned_mut(wrong).is_none());
+        assert!(!objects.retain(wrong));
+        assert!(objects.release(wrong).is_none());
+        assert!(!objects.bind_alias(Namespace::DEFAULT, 0x104, wrong));
+        assert_eq!(objects.strong_count(id), Some(1));
+    }
+}

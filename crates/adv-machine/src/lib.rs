@@ -13,6 +13,7 @@
 pub mod clock;
 pub mod ext;
 pub mod layout;
+pub mod objects;
 pub mod outcome;
 pub mod patch;
 pub mod process;
@@ -37,6 +38,7 @@ use adv_cpu::backend::{
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
 pub use ext::Ext;
 use layout::*;
+pub use objects::{Identity, Namespace, ObjectLimits};
 pub use outcome::{Continuation, Outcome, Resume, WakeReason};
 pub use patch::Detour;
 pub use process::{Image, Images, InitCall, TlsImage};

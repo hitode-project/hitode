@@ -6,7 +6,7 @@
 //! lane remains round-robin, with a bounded preference for genuinely satisfied waits.
 
 use std::any::Any;
-use std::collections::HashMap;
+pub use crate::objects::Objects;
 
 use crate::outcome::{Continuation, DeferredContinuation, WakeReason};
 
@@ -219,104 +219,6 @@ impl std::fmt::Debug for Object {
                 .finish(),
             Self::Host(_) => f.write_str("Host(..)"),
         }
-    }
-}
-
-/// The process handle table. Several handles may name one object (duplicates, opens of a
-/// named object); the object goes away with its last handle. An object's identity is the
-/// handle it was created with.
-#[derive(Default)]
-pub struct Objects {
-    map: HashMap<Handle, Object>,
-    targets: HashMap<Handle, Handle>,
-    references: HashMap<Handle, u32>,
-    next: Handle,
-}
-
-impl Objects {
-    pub fn insert(&mut self, o: Object) -> Handle {
-        // Handles are multiples of 4, like NT's, starting well above small integers.
-        self.next = self.next.max(0x100) + 4;
-        self.map.insert(self.next, o);
-        self.targets.insert(self.next, self.next);
-        self.references.insert(self.next, 1);
-        self.next
-    }
-    /// A handle to a new [`Object::Host`] holding `value`.
-    pub fn insert_host<T: Any>(&mut self, value: T) -> Handle {
-        self.insert(Object::Host(Box::new(value)))
-    }
-    pub fn get(&self, h: Handle) -> Option<&Object> {
-        self.map.get(self.targets.get(&h)?)
-    }
-    pub fn get_mut(&mut self, h: Handle) -> Option<&mut Object> {
-        self.map.get_mut(self.targets.get(&h)?)
-    }
-    /// The payload of `h` if it is a host object of type `T`.
-    pub fn host<T: Any>(&self, h: Handle) -> Option<&T> {
-        match self.get(h)? {
-            Object::Host(value) => value.downcast_ref(),
-            _ => None,
-        }
-    }
-    pub fn host_mut<T: Any>(&mut self, h: Handle) -> Option<&mut T> {
-        match self.get_mut(h)? {
-            Object::Host(value) => value.downcast_mut(),
-            _ => None,
-        }
-    }
-    /// Every live host object of type `T`, once each, by identity.
-    pub fn hosts<T: Any>(&self) -> impl Iterator<Item = (Handle, &T)> {
-        self.map.iter().filter_map(|(&id, object)| match object {
-            Object::Host(value) => Some((id, value.downcast_ref()?)),
-            _ => None,
-        })
-    }
-    pub fn hosts_mut<T: Any>(&mut self) -> impl Iterator<Item = (Handle, &mut T)> {
-        self.map
-            .iter_mut()
-            .filter_map(|(&id, object)| match object {
-                Object::Host(value) => Some((id, value.downcast_mut()?)),
-                _ => None,
-            })
-    }
-    /// Close one handle. `None` if `h` is not open; otherwise the object if this was its
-    /// last handle (for the caller to inspect or drop), or `Some(None)` if others remain.
-    pub fn close(&mut self, h: Handle) -> Option<Option<Object>> {
-        let object = self.targets.remove(&h)?;
-        let references = self.references.get_mut(&object).unwrap();
-        *references -= 1;
-        if *references == 0 {
-            self.references.remove(&object);
-            Some(self.map.remove(&object))
-        } else {
-            Some(None)
-        }
-    }
-    /// A new handle to the object `h` names (DuplicateHandle).
-    pub fn duplicate(&mut self, h: Handle) -> Option<Handle> {
-        let object = self.identity(h)?;
-        self.alias_identity(object)
-    }
-    pub fn identity(&self, h: Handle) -> Option<Handle> {
-        self.targets.get(&h).copied()
-    }
-    pub fn has_identity(&self, object: Handle) -> bool {
-        self.references.contains_key(&object)
-    }
-    pub fn same_object(&self, first: Handle, second: Handle) -> bool {
-        self.identity(first)
-            .is_some_and(|object| self.identity(second) == Some(object))
-    }
-    /// Another live handle to the same retained object, including shared state.
-    pub fn alias_identity(&mut self, object: Handle) -> Option<Handle> {
-        let references = self.references.get_mut(&object)?;
-        let count = references.checked_add(1)?;
-        let next = self.next.checked_add(4)?;
-        *references = count;
-        self.next = next;
-        self.targets.insert(next, object);
-        Some(next)
     }
 }
 
