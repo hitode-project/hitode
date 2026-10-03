@@ -7,7 +7,7 @@ use adv_machine::{Clock, Machine};
 use windows_sys::Win32::Graphics::Gdi as gdi;
 
 fn selected_font(machine: &Machine<JitCpu>, dc: u32) -> u32 {
-    match machine.ext.get::<Win32>().gdi.get(dc) {
+    match machine.ext.get::<Win32>().gdi.get(&machine.sys.objects, dc) {
         Some(GdiObj::Dc { selected, .. }) => selected[2],
         _ => panic!("font fixture DC missing"),
     }
@@ -25,7 +25,7 @@ fn native_font(machine: &Machine<JitCpu>, dc: u32) -> NativeOracle {
         .ext
         .get::<Win32>()
         .gdi
-        .get(selected_font(machine, dc))
+        .get(&machine.sys.objects, selected_font(machine, dc))
     else {
         panic!("font")
     };
@@ -415,7 +415,14 @@ fn software_dc_preserves_font_and_mapping_state() {
         font
     );
     assert_eq!(invoke(&mut machine, data, "DeleteObject", &[font]), 1);
-    assert!(machine.ext.get::<Win32>().gdi.get(font).is_none());
+    assert!(
+        machine
+            .ext
+            .get::<Win32>()
+            .gdi
+            .get(&machine.sys.objects, font)
+            .is_none()
+    );
     assert_eq!(invoke(&mut machine, data, "DeleteDC", &[dc]), 1);
     assert_eq!(invoke(&mut machine, data, "GetMapMode", &[dc]), 0);
 }

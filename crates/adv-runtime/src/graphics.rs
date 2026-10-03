@@ -165,7 +165,9 @@ pub fn register_graphics(registry: &mut Registry) {
             registry.add(
                 "ddraw.dll",
                 &format!("{interface}::{method}"),
-                signature.conv.expect("DirectDraw method has a supported x86 convention"),
+                signature
+                    .conv
+                    .expect("DirectDraw method has a supported x86 convention"),
                 unsupported_graphics,
             );
         }
@@ -320,14 +322,20 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
         if (added.is_some() || removed.is_some() || selection.is_some())
             && let Some(win32) = env.ext.try_get_mut::<Win32>()
         {
-            if let Some((dc, hwnd)) = added {
-                win32.gdi.register_external_dc(dc, hwnd);
+            if let Some((dc, hwnd)) = added
+                && !win32
+                    .gdi
+                    .register_external_dc(&mut env.sys.objects, dc, hwnd)
+            {
+                return rollback_dc(env, id, args, dc);
             }
             if let Some(dc) = removed {
-                win32.gdi.remove_external_dc(dc);
+                win32.gdi.remove_external_dc(&mut env.sys.objects, dc);
             }
             if let Some((dc, bitmap)) = selection {
-                win32.gdi.set_external_bitmap(dc, bitmap);
+                win32
+                    .gdi
+                    .set_external_bitmap(&mut env.sys.objects, dc, bitmap);
             }
         }
         if let Some(dc) = removed {
@@ -358,6 +366,28 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
     }
 }
 
+fn rollback_dc(env: &mut Env<'_>, id: u32, args: &[u32], dc: u32) -> Outcome {
+    let (release, words) = match id {
+        api::SURFACE_DC => (api::SURFACE_RELEASE_DC, [args[0], dc]),
+        api::CREATE_DC => (api::DELETE_DC, [dc, 0]),
+        _ => (api::RELEASE_DC, [args[0], dc]),
+    };
+    if let Err(error) =
+        env.ext
+            .get_mut::<Graphics<Snapshot>>()
+            .handle(release, &words, &mut GuestMemory(env.cpu))
+    {
+        return Outcome::Fail(format!("GDI context allocation rollback: {error}"));
+    }
+    if id == api::SURFACE_DC {
+        let _ = env.cpu.write_u32(args[1], 0);
+        Outcome::Return(0x8007000e) // E_OUTOFMEMORY
+    } else {
+        adv_win32::util::set_last_error(env, 8);
+        Outcome::Return(0)
+    }
+}
+
 pub(crate) fn unsupported_graphics(env: &mut Env<'_>) -> Outcome {
     let thunk = env.sys.thunks.get(env.thunk);
     Outcome::Fail(format!("unimplemented: {}!{}", thunk.module, thunk.name))
@@ -381,10 +411,14 @@ fn begin_paint(env: &mut Env<'_>) -> Outcome {
         Ok(dc) => dc,
         Err(error) => return Outcome::Fail(format!("BeginPaint: {error}")),
     };
-    env.ext
+    if !env
+        .ext
         .get_mut::<Win32>()
         .gdi
-        .register_external_dc(dc, hwnd);
+        .register_external_dc(&mut env.sys.objects, dc, hwnd)
+    {
+        return rollback_dc(env, api::GET_DC, &[hwnd], dc);
+    }
     let mut bytes = [0u8; 64];
     bytes[..4].copy_from_slice(&dc.to_le_bytes());
     bytes[16..20].copy_from_slice(&width.to_le_bytes());

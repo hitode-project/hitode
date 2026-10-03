@@ -93,18 +93,29 @@ fn drawing_dc(env: &Env<'_>, dc: u32) -> bool {
     drawing(env).is_some_and(|p| (p.contains_dc)(env, dc))
 }
 fn valid_dc(env: &Env<'_>, dc: u32) -> bool {
-    drawing_dc(env, dc) || matches!(env.ext.get::<Win32>().gdi.get(dc), Some(GdiObj::Dc { .. }))
+    drawing_dc(env, dc)
+        || matches!(
+            env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc),
+            Some(GdiObj::Dc { .. })
+        )
 }
 
 #[win32(gdi32, name = "SelectObject", level = implement)]
 fn select_object(env: &mut Env<'_>, dc: Handle, object: Handle) -> Outcome {
     let is_font = matches!(
-        env.ext.get::<Win32>().gdi.get(object.0),
+        env.ext.get::<Win32>().gdi.get(&env.sys.objects, object.0),
         Some(GdiObj::Font(_))
     ) || matches!(object.0, 0x0190_001a..=0x0190_001e | 0x0190_0020..=0x0190_0021);
     if is_font && valid_dc(env, dc.0) {
-        if drawing_dc(env, dc.0) {
-            env.ext.get_mut::<Win32>().gdi.register_external_dc(dc.0, 0);
+        if drawing_dc(env, dc.0)
+            && !env
+                .ext
+                .get_mut::<Win32>()
+                .gdi
+                .register_external_dc(&mut env.sys.objects, dc.0, 0)
+        {
+            set_last_error(env, 8);
+            return Outcome::Return(0);
         }
         return super::select_object(env);
     }
@@ -119,7 +130,12 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
     if drawing(env).is_some_and(|p| (p.contains_bitmap)(env, object.0)) {
         return (drawing(env).unwrap().call)(env);
     }
-    if env.ext.get::<Win32>().gdi.font_selected(object.0) {
+    if env
+        .ext
+        .get::<Win32>()
+        .gdi
+        .font_selected(&env.sys.objects, object.0)
+    {
         set_last_error(env, 170);
         return Outcome::Return(0);
     }
@@ -211,11 +227,11 @@ fn get_poly_fill(env: &mut Env<'_>, dc: Handle) -> i32 {
 }
 fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
     let gdi = &env.ext.get::<Win32>().gdi;
-    let font = match gdi.get(dc) {
+    let font = match gdi.get(&env.sys.objects, dc) {
         Some(GdiObj::Dc { selected, .. }) => selected[2],
         _ => STOCK_FONT,
     };
-    if let Some(GdiObj::Font(font)) = gdi.get(font) {
+    if let Some(GdiObj::Font(font)) = gdi.get(&env.sys.objects, font) {
         from_font(font)
     } else {
         FontRequest {

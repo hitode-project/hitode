@@ -81,6 +81,49 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_external_dc_ownership_rolls_back_the_raster_context() {
+        let mut registry = Registry::default();
+        adv_win32::register(&mut registry);
+        crate::graphics::register_graphics(&mut registry);
+        register(&mut registry);
+        let mut machine = Machine::new(
+            JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        Win32::install(
+            &mut machine,
+            Win32Config::new(".", "dc-limit.exe", "target/dc-limit-test"),
+        )
+        .unwrap();
+        crate::graphics::install_graphics(&mut machine, 4, 2).unwrap();
+        install(&mut machine);
+        machine.sys.objects = adv_machine::Objects::with_limits(adv_machine::ObjectLimits {
+            objects: 1,
+            ..Default::default()
+        });
+        machine
+            .spawn("dc limit", adv_machine::layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        let data = machine
+            .sys
+            .vm
+            .alloc(&mut machine.cpu, 4096, Prot::RW)
+            .unwrap();
+        for _ in 0..8 {
+            assert_eq!(invoke(&mut machine, data, "CreateCompatibleDC", &[0]), 0);
+        }
+        assert_eq!(machine.sys.objects.object_count(), 1);
+        let graphics = machine
+            .ext
+            .get::<crate::graphics::Graphics<crate::graphics::Snapshot>>();
+        for dc in 2..128 {
+            assert!(!graphics.owns_dc(dc));
+        }
+    }
+
+    #[test]
     fn font_and_bitmap_selection_share_the_raster_dc_lifetime() {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
@@ -160,7 +203,14 @@ mod tests {
         );
         assert_eq!(invoke(&mut machine, data, "DeleteObject", &[bitmap]), 1);
         assert_eq!(invoke(&mut machine, data, "DeleteDC", &[dc]), 1);
-        assert!(machine.ext.get::<Win32>().gdi.get(dc).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Win32>()
+                .gdi
+                .get(&machine.sys.objects, dc)
+                .is_none()
+        );
         assert_eq!(invoke(&mut machine, data, "GetPolyFillMode", &[dc]), 0);
     }
 }

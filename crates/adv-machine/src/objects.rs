@@ -206,10 +206,19 @@ impl Objects {
     }
 
     fn insert_aliased(&mut self, ns: u32, value: Object) -> Option<u32> {
+        let alias = self.next_alias(ns)?;
+        self.insert_at(ns, alias, value)?;
+        self.namespaces.get_mut(&ns).unwrap().next = alias;
+        Some(alias)
+    }
+
+    fn insert_at(&mut self, ns: u32, alias: u32, value: Object) -> Option<()> {
         if self.entries.len() >= self.limits.objects || self.limits.references == 0 {
             return None;
         }
-        let alias = self.next_alias(ns)?;
+        if self.targets.len() >= self.limits.aliases || !self.vacant_alias(ns, alias) {
+            return None;
+        }
         let id = self.next_object.checked_add(1)?;
         self.next_object = id;
         let kernel_identity = (ns == 0).then_some(alias);
@@ -225,12 +234,11 @@ impl Objects {
         );
         self.targets.insert((ns, alias), id);
         let state = self.namespaces.get_mut(&ns).unwrap();
-        state.next = alias;
         state.aliases += 1;
         if let Some(kernel_identity) = kernel_identity {
             self.kernel_identities.insert(kernel_identity, id);
         }
-        Some(alias)
+        Some(())
     }
 
     fn add_alias(&mut self, ns: u32, alias: u32, id: u64) -> bool {
@@ -422,6 +430,15 @@ impl Objects {
     pub fn insert_host_in<T: Any>(&mut self, ns: Namespace, value: T) -> Option<u32> {
         let ns = self.namespace_id(ns)?;
         self.insert_aliased(ns, Object::Host(Box::new(value)))
+    }
+
+    /// Insert a new payload directly at a specified alias with one reference.
+    /// Refuses collisions without replacing or leaking the previous payload.
+    pub fn insert_host_at<T: Any>(&mut self, ns: Namespace, alias: u32, value: T) -> bool {
+        self.namespace_id(ns).is_some_and(|ns| {
+            self.insert_at(ns, alias, Object::Host(Box::new(value)))
+                .is_some()
+        })
     }
 
     /// Every typed payload with a live alias in `ns`, once regardless of alias count.

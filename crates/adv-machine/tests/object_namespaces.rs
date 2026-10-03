@@ -22,6 +22,25 @@ fn payload(value: u32, drops: &Rc<Cell<u32>>) -> Payload {
 }
 
 #[test]
+fn explicit_initial_alias_uses_one_reference_and_refuses_collisions() {
+    let mut objects = Objects::with_limits(ObjectLimits {
+        references: 1,
+        ..ObjectLimits::default()
+    });
+    let ns = objects.new_namespace().unwrap();
+    assert!(objects.insert_host_at(ns, 0x104, 7_u32));
+    assert!(!objects.insert_host_at(ns, 0x104, 8_u32));
+    let id = objects.lookup_alias::<u32>(ns, 0x104).unwrap();
+    assert_eq!(objects.strong_count(id), Some(1));
+    assert_eq!(objects.owned(id), Some(&7));
+    // The allocator skips explicit aliases without overwriting them.
+    assert_eq!(objects.insert_host_in(ns, 9_u32), Some(0x108));
+    assert_eq!(objects.object_count(), 2);
+    objects.close_alias(ns, 0x104).unwrap();
+    assert!(objects.owned(id).is_none());
+}
+
+#[test]
 fn numeric_aliases_are_isolated_from_kernel_handles() {
     let mut objects = Objects::default();
     let first = objects.new_namespace().unwrap();

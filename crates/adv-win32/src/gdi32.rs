@@ -1,19 +1,63 @@
-//! gdi32: the GDI object table (fonts, brushes, bitmaps, DCs) with enough behavior for
-//! Game.exe's setup code. Actual drawing belongs to PAL's renderer, not GDI, so drawing
-//! calls only keep state.
-
-use std::collections::HashMap;
+//! GDI object semantics over the process object table. Raster and text commands
+//! translate into the shared device implementation.
 
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Outcome};
+use adv_machine::{Env, Namespace, Object, Objects, Outcome};
 
 use crate::util::{cstr, out_u32};
 use crate::{Win32, stdcall};
 
-mod palette;
 pub mod font;
+mod palette;
 pub mod raster;
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+    use adv_machine::ObjectLimits;
+
+    #[test]
+    fn common_ownership_keeps_external_dc_selection_and_kernel_handles_separate() {
+        let mut objects = Objects::with_limits(ObjectLimits {
+            references: 1,
+            ..ObjectLimits::default()
+        });
+        let mut gdi = Gdi::default();
+        let kernel = objects.insert_host(42_u32);
+        assert!(gdi.register_external_dc(&mut objects, kernel, 7));
+        gdi.set_external_bitmap(&mut objects, kernel, 123);
+        assert!(gdi.register_external_dc(&mut objects, kernel, 8));
+        assert!(
+            matches!(gdi.get(&objects, kernel), Some(GdiObj::Dc { hwnd: 7, selected, .. }) if selected[3] == 123)
+        );
+        let brush = gdi.add(&mut objects, GdiObj::Brush { color: 0xff });
+        assert_eq!(brush, 0x04000004);
+        assert!(objects.close(brush).is_none());
+        assert!(!gdi.register_external_dc(&mut objects, brush, 9));
+        assert!(gdi.remove_external_dc(&mut objects, kernel));
+        assert_eq!(objects.host::<u32>(kernel), Some(&42));
+        assert_eq!(objects.all_hosts::<GdiObj>().count(), 1);
+        assert!(matches!(
+            gdi.remove(&mut objects, brush),
+            Some(GdiObj::Brush { color: 0xff })
+        ));
+        assert!(!gdi.remove_external_dc(&mut objects, kernel));
+        assert_eq!(objects.object_count(), 1);
+    }
+
+    #[test]
+    fn exhausted_gdi_ownership_does_not_publish_a_handle() {
+        let mut objects = Objects::with_limits(ObjectLimits {
+            objects: 0,
+            ..ObjectLimits::default()
+        });
+        let mut gdi = Gdi::default();
+        assert_eq!(gdi.add(&mut objects, GdiObj::Region), 0);
+        assert!(!gdi.register_external_dc(&mut objects, 1, 7));
+        assert_eq!(objects.object_count(), 0);
+    }
+}
 
 const GDI32: &str = "gdi32.dll";
 
@@ -67,33 +111,49 @@ pub enum GdiObj {
 
 #[derive(Default)]
 pub struct Gdi {
-    objects: HashMap<u32, GdiObj>,
-    next: u32,
+    namespace: Option<Namespace>,
 }
 
 impl Gdi {
-    pub fn add(&mut self, o: GdiObj) -> u32 {
-        // Handles carry a type tag in bits 16..23 on real GDI; keep them distinct from
-        // stock handles and USER handles.
-        self.next = self.next.max(0x0400_0000) + 4;
-        self.objects.insert(self.next, o);
-        self.next
+    fn namespace(&mut self, objects: &mut Objects) -> Option<Namespace> {
+        if self.namespace.is_none() {
+            self.namespace = objects.new_namespace_in(0x0400_0004, 0x04ff_fffc);
+        }
+        self.namespace
     }
-    pub fn get(&self, h: u32) -> Option<&GdiObj> {
-        self.objects.get(&h)
+    pub fn add(&mut self, objects: &mut Objects, o: GdiObj) -> u32 {
+        self.namespace(objects)
+            .and_then(|ns| objects.insert_host_in(ns, o))
+            .unwrap_or(0)
     }
-
-    pub(crate) fn font_selected(&self, font: u32) -> bool {
-        self.objects.values().any(|object| matches!(object, GdiObj::Dc { selected, .. } if selected[2] == font))
+    pub fn get<'a>(&self, objects: &'a Objects, h: u32) -> Option<&'a GdiObj> {
+        objects.owned(objects.lookup_alias(self.namespace?, h)?)
+    }
+    fn get_mut<'a>(&self, objects: &'a mut Objects, h: u32) -> Option<&'a mut GdiObj> {
+        objects.owned_mut(objects.lookup_alias(self.namespace?, h)?)
+    }
+    fn remove(&self, objects: &mut Objects, h: u32) -> Option<GdiObj> {
+        objects.lookup_alias::<GdiObj>(self.namespace?, h)?;
+        match objects.close_alias(self.namespace?, h)?? {
+            Object::Host(value) => value.downcast::<GdiObj>().ok().map(|value| *value),
+            _ => unreachable!("GDI namespace contains typed host objects"),
+        }
+    }
+    pub(crate) fn font_selected(&self, objects: &Objects, font: u32) -> bool {
+        self.namespace.is_some_and(|ns| {
+            objects.hosts_in::<GdiObj>(ns).any(
+                |(_, object)| matches!(object, GdiObj::Dc { selected, .. } if selected[2] == font),
+            )
+        })
     }
 
     /// Attach GDI metadata to a DC owned by another drawing provider. Repeated
     /// GetDC calls preserve its logical selections instead of resetting them.
-    pub fn register_external_dc(&mut self, handle: u32, hwnd: u32) -> bool {
+    pub fn register_external_dc(&mut self, objects: &mut Objects, handle: u32, hwnd: u32) -> bool {
         if handle == 0 {
             return false;
         }
-        if let Some(object) = self.objects.get(&handle) {
+        if let Some(object) = self.get(objects, handle) {
             return matches!(object, GdiObj::Dc { .. });
         }
         let selected = [
@@ -102,7 +162,11 @@ impl Gdi {
             stock_object(SYSTEM_FONT),
             0,
         ];
-        self.objects.insert(
+        let Some(ns) = self.namespace(objects) else {
+            return false;
+        };
+        objects.insert_host_at(
+            ns,
             handle,
             GdiObj::Dc {
                 hwnd,
@@ -112,22 +176,21 @@ impl Gdi {
                 bk_color: 0xff_ffff,
                 bk_mode: 2,
             },
-        );
-        true
+        )
     }
 
     /// Retire the logical selections when the drawing provider destroys a DC.
-    pub fn remove_external_dc(&mut self, handle: u32) -> bool {
-        if !matches!(self.get(handle), Some(GdiObj::Dc { .. })) {
+    pub fn remove_external_dc(&mut self, objects: &mut Objects, handle: u32) -> bool {
+        if !matches!(self.get(objects, handle), Some(GdiObj::Dc { .. })) {
             return false;
         }
-        self.objects.remove(&handle);
+        self.remove(objects, handle);
         true
     }
 
     /// Keep a drawing provider's externally stored selection visible to GDI queries.
-    pub fn set_external_bitmap(&mut self, handle: u32, bitmap: u32) {
-        if let Some(GdiObj::Dc { selected, .. }) = self.objects.get_mut(&handle) {
+    pub fn set_external_bitmap(&mut self, objects: &mut Objects, handle: u32, bitmap: u32) {
+        if let Some(GdiObj::Dc { selected, .. }) = self.get_mut(objects, handle) {
             selected[3] = bitmap;
         }
     }
@@ -137,8 +200,20 @@ pub fn stock_object(i: u32) -> u32 {
     STOCK_BASE + i
 }
 
-fn gdi<'a>(env: &'a mut Env<'_>) -> &'a mut Gdi {
-    &mut env.ext.get_mut::<Win32>().gdi
+fn add(env: &mut Env<'_>, object: GdiObj) -> u32 {
+    env.ext
+        .get_mut::<Win32>()
+        .gdi
+        .add(&mut env.sys.objects, object)
+}
+fn get<'a>(env: &'a Env<'_>, handle: u32) -> Option<&'a GdiObj> {
+    env.ext.get::<Win32>().gdi.get(&env.sys.objects, handle)
+}
+fn get_mut<'a>(env: &'a mut Env<'_>, handle: u32) -> Option<&'a mut GdiObj> {
+    env.ext
+        .get::<Win32>()
+        .gdi
+        .get_mut(&mut env.sys.objects, handle)
 }
 
 /// A DC for a window (GetDC, BeginPaint).
@@ -149,19 +224,28 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
         stock_object(SYSTEM_FONT),
         0,
     ];
-    gdi(env).add(GdiObj::Dc {
-        hwnd,
-        selected,
-        palette: stock_object(15),
-        text_color: 0,
-        bk_color: 0xff_ffff,
-        bk_mode: 2,
-    })
+    add(
+        env,
+        GdiObj::Dc {
+            hwnd,
+            selected,
+            palette: stock_object(15),
+            text_color: 0,
+            bk_color: 0xff_ffff,
+            bk_mode: 2,
+        },
+    )
 }
 
 pub fn release_dc(env: &mut Env<'_>, hdc: u32) -> bool {
-    let released = gdi(env).remove_external_dc(hdc);
-    if released { font::retire_dc(env, hdc); }
+    let released = env
+        .ext
+        .get_mut::<Win32>()
+        .gdi
+        .remove_external_dc(&mut env.sys.objects, hdc);
+    if released {
+        font::retire_dc(env, hdc);
+    }
     released
 }
 
@@ -182,7 +266,7 @@ pub fn create_font(env: &mut Env<'_>, height: i32, face: &str) -> u32 {
         face: face.into(),
         raw,
     };
-    gdi(env).add(GdiObj::Font(f))
+    add(env, GdiObj::Font(f))
 }
 
 fn get_stock_object(env: &mut Env<'_>) -> Outcome {
@@ -216,7 +300,7 @@ fn add_logfont(env: &mut Env<'_>, raw: Vec<u8>) -> u32 {
         raw,
     };
     log::debug!("CreateFont({} h{} w{})", f.face, f.height, f.weight);
-    gdi(env).add(GdiObj::Font(f))
+    add(env, GdiObj::Font(f))
 }
 
 fn create_font_a(env: &mut Env<'_>) -> Outcome {
@@ -237,12 +321,12 @@ fn create_font_a(env: &mut Env<'_>) -> Outcome {
 
 fn create_solid_brush(env: &mut Env<'_>) -> Outcome {
     let color = env.arg(0);
-    Outcome::Return(gdi(env).add(GdiObj::Brush { color }))
+    Outcome::Return(add(env, GdiObj::Brush { color }))
 }
 
 fn create_pen(env: &mut Env<'_>) -> Outcome {
     let color = env.arg(2);
-    Outcome::Return(gdi(env).add(GdiObj::Pen { color }))
+    Outcome::Return(add(env, GdiObj::Pen { color }))
 }
 
 fn delete_object(env: &mut Env<'_>) -> Outcome {
@@ -250,15 +334,12 @@ fn delete_object(env: &mut Env<'_>) -> Outcome {
     if (STOCK_BASE..STOCK_BASE + STOCK_COUNT).contains(&h) {
         return Outcome::Return(1);
     }
-    if matches!(gdi(env).get(h), Some(GdiObj::Palette { .. }))
-        && gdi(env)
-            .objects
-            .values()
-            .any(|object| matches!(object, GdiObj::Dc { palette, .. } if *palette == h))
+    if env.sys.objects.all_hosts::<GdiObj>()
+        .any(|(_, object)| matches!(object, GdiObj::Dc { selected, palette, .. } if selected.contains(&h) || *palette == h))
     {
         return Outcome::Return(0);
     }
-    match gdi(env).objects.remove(&h) {
+    match env.ext.get::<Win32>().gdi.remove(&mut env.sys.objects, h) {
         Some(GdiObj::Bitmap {
             bits, owned: true, ..
         }) => {
@@ -271,7 +352,7 @@ fn delete_object(env: &mut Env<'_>) -> Outcome {
 }
 
 /// Slot in a DC's selection for an object: brush, pen, font, bitmap.
-fn slot_of(g: &Gdi, h: u32) -> Option<usize> {
+fn slot_of(env: &Env<'_>, h: u32) -> Option<usize> {
     if (STOCK_BASE..STOCK_BASE + STOCK_COUNT).contains(&h) {
         if h == stock_object(15) {
             return None;
@@ -282,7 +363,7 @@ fn slot_of(g: &Gdi, h: u32) -> Option<usize> {
             _ => 2,
         });
     }
-    match g.get(h)? {
+    match get(env, h)? {
         GdiObj::Brush { .. } => Some(0),
         GdiObj::Pen { .. } => Some(1),
         GdiObj::Font(_) => Some(2),
@@ -293,11 +374,10 @@ fn slot_of(g: &Gdi, h: u32) -> Option<usize> {
 
 fn select_object(env: &mut Env<'_>) -> Outcome {
     let (hdc, h) = (env.arg(0), env.arg(1));
-    let g = gdi(env);
-    let Some(slot) = slot_of(g, h) else {
+    let Some(slot) = slot_of(env, h) else {
         return Outcome::Return(0);
     };
-    match g.objects.get_mut(&hdc) {
+    match get_mut(env, hdc) {
         Some(GdiObj::Dc { selected, .. }) => {
             Outcome::Return(std::mem::replace(&mut selected[slot], h))
         }
@@ -307,7 +387,7 @@ fn select_object(env: &mut Env<'_>) -> Outcome {
 
 fn get_object_a(env: &mut Env<'_>) -> Outcome {
     let (h, size, out) = (env.arg(0), env.arg(1), env.arg(2));
-    if let Some(entries) = palette::entries(gdi(env), h) {
+    if let Some(entries) = palette::entries(env, h) {
         let count = entries.len() as u16;
         if out == 0 {
             return Outcome::Return(2);
@@ -321,7 +401,7 @@ fn get_object_a(env: &mut Env<'_>) -> Outcome {
             0
         });
     }
-    let bytes: Vec<u8> = match gdi(env).get(h) {
+    let bytes: Vec<u8> = match get(env, h) {
         Some(GdiObj::Font(f)) => f.raw.clone(),
         Some(GdiObj::Bitmap {
             width,
@@ -359,14 +439,21 @@ fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u
     let stride = (width.unsigned_abs() * u32::from(bpp)).div_ceil(32) * 4;
     let size = (stride * height.unsigned_abs()).max(4);
     let bits = env.sys.vm.alloc(env.cpu, size, Prot::RW).ok()?;
-    let h = gdi(env).add(GdiObj::Bitmap {
-        width,
-        height,
-        bpp,
-        bits,
-        stride,
-        owned: true,
-    });
+    let h = add(
+        env,
+        GdiObj::Bitmap {
+            width,
+            height,
+            bpp,
+            bits,
+            stride,
+            owned: true,
+        },
+    );
+    if h == 0 {
+        let _ = env.sys.vm.free(env.cpu, bits);
+        return None;
+    }
     Some((h, bits))
 }
 
@@ -441,7 +528,7 @@ fn get_device_caps(env: &mut Env<'_>) -> Outcome {
 
 fn dc_field(env: &mut Env<'_>, f: impl FnOnce(&mut u32, &mut u32, &mut u32) -> u32) -> Outcome {
     let hdc = env.arg(0);
-    match gdi(env).objects.get_mut(&hdc) {
+    match get_mut(env, hdc) {
         Some(GdiObj::Dc {
             text_color,
             bk_color,
@@ -469,12 +556,11 @@ fn set_bk_mode(env: &mut Env<'_>) -> Outcome {
 
 /// Font height of the font selected into `hdc` (for text metrics).
 fn dc_font_height(env: &mut Env<'_>, hdc: u32) -> i32 {
-    let g = gdi(env);
-    let font = match g.get(hdc) {
+    let font = match get(env, hdc) {
         Some(GdiObj::Dc { selected, .. }) => selected[2],
         _ => 0,
     };
-    match g.get(font) {
+    match get(env, font) {
         Some(GdiObj::Font(f)) if f.height != 0 => f.height.abs(),
         _ => 16,
     }

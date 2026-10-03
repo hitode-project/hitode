@@ -4,7 +4,7 @@ use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
-use super::{GDI32, Gdi, GdiObj, gdi, stock_object};
+use super::{GDI32, GdiObj, add, get, get_mut, stock_object};
 use crate::stdcall;
 
 // Windows' immutable 20-entry DEFAULT_PALETTE, confirmed by native GDI.
@@ -30,11 +30,11 @@ const DEFAULT: [[u8; 4]; 20] = [
     [0, 255, 255, 0],
     [255, 255, 255, 0],
 ];
-pub(super) fn entries(gdi: &Gdi, palette: u32) -> Option<&[[u8; 4]]> {
+pub(super) fn entries<'a>(env: &'a Env<'_>, palette: u32) -> Option<&'a [[u8; 4]]> {
     if palette == stock_object(15) {
         return Some(&DEFAULT);
     }
-    match gdi.get(palette)? {
+    match get(env, palette)? {
         GdiObj::Palette { entries } => Some(entries),
         _ => None,
     }
@@ -65,7 +65,7 @@ fn create(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     let entries = raw.as_chunks::<4>().0.to_vec();
-    Outcome::Return(gdi(env).add(GdiObj::Palette { entries }))
+    Outcome::Return(add(env, GdiObj::Palette { entries }))
 }
 fn get_entries(env: &mut Env<'_>) -> Outcome {
     let (palette, start, count, out) = (
@@ -74,7 +74,7 @@ fn get_entries(env: &mut Env<'_>) -> Outcome {
         env.arg(2) as usize,
         env.arg(3),
     );
-    let Some(palette) = entries(gdi(env), palette) else {
+    let Some(palette) = entries(env, palette) else {
         return Outcome::Return(0);
     };
     if out == 0 {
@@ -102,7 +102,7 @@ fn set_entries(env: &mut Env<'_>) -> Outcome {
         env.arg(2) as usize,
         env.arg(3),
     );
-    let Some(GdiObj::Palette { entries }) = gdi(env).get(handle) else {
+    let Some(GdiObj::Palette { entries }) = get(env, handle) else {
         return Outcome::Return(0);
     };
     let n = count.min(entries.len().saturating_sub(start));
@@ -113,7 +113,7 @@ fn set_entries(env: &mut Env<'_>) -> Outcome {
     if env.cpu.read(ptr, &mut raw).is_err() {
         return Outcome::Return(0);
     }
-    let Some(GdiObj::Palette { entries }) = gdi(env).objects.get_mut(&handle) else {
+    let Some(GdiObj::Palette { entries }) = get_mut(env, handle) else {
         return Outcome::Return(0);
     };
     for (entry, bytes) in entries[start..start + n]
@@ -126,10 +126,10 @@ fn set_entries(env: &mut Env<'_>) -> Outcome {
 }
 fn select(env: &mut Env<'_>) -> Outcome {
     let (dc, palette) = (env.arg(0), env.arg(1));
-    if entries(gdi(env), palette).is_none() {
+    if entries(env, palette).is_none() {
         return Outcome::Return(0);
     }
-    match gdi(env).objects.get_mut(&dc) {
+    match get_mut(env, dc) {
         Some(GdiObj::Dc {
             palette: selected, ..
         }) => Outcome::Return(std::mem::replace(selected, palette)),
@@ -140,7 +140,7 @@ fn realize(env: &mut Env<'_>) -> Outcome {
     let dc = env.arg(0);
     // The device advertises no RC_PALETTE/SIZEPALETTE: no physical system
     // palette entries change on this true-colour display.
-    Outcome::Return(if matches!(gdi(env).get(dc), Some(GdiObj::Dc { .. })) {
+    Outcome::Return(if matches!(get(env, dc), Some(GdiObj::Dc { .. })) {
         0
     } else {
         u32::MAX
@@ -151,7 +151,7 @@ fn resize(env: &mut Env<'_>) -> Outcome {
     if count == 0 || count > 1024 {
         return Outcome::Return(0);
     }
-    match gdi(env).objects.get_mut(&palette) {
+    match get_mut(env, palette) {
         Some(GdiObj::Palette { entries }) => {
             entries.resize(count, [0; 4]);
             Outcome::Return(1)
@@ -161,7 +161,7 @@ fn resize(env: &mut Env<'_>) -> Outcome {
 }
 fn nearest(env: &mut Env<'_>) -> Outcome {
     let (palette, color) = (env.arg(0), env.arg(1));
-    let Some(palette) = entries(gdi(env), palette) else {
+    let Some(palette) = entries(env, palette) else {
         return Outcome::Return(u32::MAX);
     };
     if color >> 24 == 1 {
@@ -192,7 +192,7 @@ fn current_object(env: &mut Env<'_>) -> Outcome {
     let (dc, kind) = (env.arg(0), env.arg(1));
     let Some(GdiObj::Dc {
         palette, selected, ..
-    }) = gdi(env).get(dc)
+    }) = get(env, dc)
     else {
         return Outcome::Return(0);
     };
