@@ -169,3 +169,4 @@ pub mod imm32;
 pub mod msacm32;
 pub mod msvcrt;
 pub mod ole32;
+pub mod vorbisfile;

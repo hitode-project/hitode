@@ -52,6 +52,7 @@ dependencies = [
  "adv-sync",
  "cpal",
  "log",
+ "ogg",
  "rubato",
  "symphonia",
 ]
@@ -131,9 +132,7 @@ dependencies = [
  "adv-unicorn",
  "adv-win32",
  "iced-x86",
- "ogg",
  "png",
- "symphonia",
  "unicorn-engine",
  "windows-sys 0.60.2",
 ]

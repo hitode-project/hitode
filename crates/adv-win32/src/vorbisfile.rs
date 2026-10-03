@@ -6,12 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
+use adv_device::vorbis::{ByteOrder, DecodeError, Next, Packet, PcmFormat, Stream as CodecStream};
 use adv_machine::{Conv, Env, Machine, Outcome};
 use adv_os::FileSource;
-use ogg::reading::{BasePacketReader, PageParser};
-use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::{CODEC_TYPE_VORBIS, CodecParameters, Decoder, DecoderOptions};
-use symphonia::core::formats::Packet;
 
 const READ_SIZE: u32 = 65_536;
 const ARENA_SIZE: u32 = 131_072;
@@ -375,24 +372,8 @@ struct Stream {
     seekable: bool,
     partial: bool,
     busy: bool,
-    raw: Vec<u8>,
-    raw_at: usize,
-    source_pos: u64,
-    data_offset: u64,
-    eof: bool,
-    reader: BasePacketReader,
-    headers: Vec<Vec<u8>>,
-    serial: u32,
-    channels: usize,
-    rate: u32,
+    codec: CodecStream,
     comment_memory: Vec<u8>,
-    decoder: Option<Box<dyn Decoder>>,
-    pcm: Vec<f32>,
-    pcm_at: usize,
-    decoded_frames: u64,
-    pcm_offset: u64,
-    total: Option<u64>,
-    end: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -480,7 +461,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 if !seconds.is_finite() || seconds < 0.0 {
                     return error(OV_EINVAL);
                 }
-                (seconds * f64::from(s.rate)).floor() as u64
+                (seconds * f64::from(s.codec.format().sample_rate)).floor() as u64
             } else {
                 bits
             };
@@ -533,14 +514,14 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 } else {
                     s.arena + READ_SIZE + 32
                 }),
-                "ov_pcm_tell" => Outcome::Return64(s.pcm_offset),
-                "ov_raw_tell" => {
-                    Outcome::Return64(s.source_pos.saturating_sub((s.raw.len() - s.raw_at) as u64))
-                }
-                "ov_time_tell" => Outcome::ReturnF64(s.pcm_offset as f64 / f64::from(s.rate)),
+                "ov_pcm_tell" => Outcome::Return64(s.codec.pcm_position()),
+                "ov_raw_tell" => Outcome::Return64(s.codec.raw_position()),
+                "ov_time_tell" => Outcome::ReturnF64(
+                    s.codec.pcm_position() as f64 / f64::from(s.codec.format().sample_rate),
+                ),
                 "ov_seekable" => Outcome::Return(u32::from(s.seekable)),
                 "ov_streams" => Outcome::Return(1),
-                "ov_serialnumber" => Outcome::Return(s.serial),
+                "ov_serialnumber" => Outcome::Return(s.codec.format().serial),
                 _ => error(OV_EINVAL),
             }
         }
@@ -584,24 +565,8 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
             seekable: false,
             partial,
             busy: true,
-            raw,
-            raw_at: 0,
-            source_pos: u64::from(initial_len),
-            data_offset: 0,
-            eof: false,
-            reader: BasePacketReader::new(),
-            headers: Vec::new(),
-            serial: 0,
-            channels: 0,
-            rate: 0,
+            codec: CodecStream::new(raw),
             comment_memory: Vec::new(),
-            decoder: None,
-            pcm: Vec::new(),
-            pcm_at: 0,
-            decoded_frames: 0,
-            pcm_offset: 0,
-            total: None,
-            end: None,
         },
     );
     if callbacks[1] == 0 || callbacks[3] == 0 {
@@ -627,7 +592,7 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
                         && r.value() as i32 >= 0
                     {
                         s.seekable = true;
-                        s.source_pos = u64::from(r.value());
+                        s.codec.set_source_position(u64::from(r.value()));
                     }
                     advance(e, vf, Operation::Open)
                 },
@@ -669,131 +634,28 @@ fn abandon(e: &mut Env<'_>, vf: u32, code: i32, opening: bool) -> Outcome {
     error(code)
 }
 
-enum Next {
-    Packet(ogg::Packet),
-    More,
-    Eof,
-    Error(i32),
-}
-
-fn next_packet(s: &mut Stream) -> Next {
-    loop {
-        if let Some(packet) = s.reader.read_packet() {
-            return Next::Packet(packet);
-        }
-        let bytes = &s.raw[s.raw_at..];
-        if bytes.len() < 27 {
-            return if s.eof && bytes.is_empty() {
-                Next::Eof
-            } else if s.eof {
-                Next::Error(OV_EBADLINK)
-            } else {
-                Next::More
-            };
-        }
-        let Ok((mut parser, segments)) = PageParser::new(bytes[..27].try_into().unwrap()) else {
-            return Next::Error(if s.headers.is_empty() {
-                OV_ENOTVORBIS
-            } else {
-                OV_EBADLINK
-            });
-        };
-        if bytes.len() < 27 + segments {
-            return if s.eof {
-                Next::Error(OV_EBADLINK)
-            } else {
-                Next::More
-            };
-        }
-        let body = parser.parse_segments(bytes[27..27 + segments].to_vec());
-        let page_length = 27 + segments + body;
-        if bytes.len() < page_length {
-            return if s.eof {
-                Next::Error(OV_EBADLINK)
-            } else {
-                Next::More
-            };
-        }
-        let Ok(page) = parser.parse_packet_data(bytes[27 + segments..page_length].to_vec()) else {
-            return Next::Error(OV_EBADLINK);
-        };
-        if s.reader.push_page(page).is_err() {
-            return Next::Error(OV_EBADLINK);
-        }
-        s.raw_at += page_length;
+fn codec_error(error: DecodeError) -> i32 {
+    match error {
+        DecodeError::NotVorbis => OV_ENOTVORBIS,
+        DecodeError::BadHeader => OV_EBADHEADER,
+        DecodeError::BadLink => OV_EBADLINK,
+        DecodeError::UnexpectedSampleFormat => OV_EFAULT,
     }
 }
-
-fn header(s: &mut Stream, p: ogg::Packet) -> Result<(), i32> {
-    let expected = [1, 3, 5][s.headers.len()];
-    if p.data.len() < 7 || p.data[0] != expected || &p.data[1..7] != b"vorbis" {
-        return Err(OV_EBADHEADER);
+fn header(s: &mut Stream, packet: Packet) -> Result<(), i32> {
+    // Keep guest layout bounds validation before committing the comment header.
+    if s.codec.header_count() == 1 {
+        s.codec.validate_header(&packet).map_err(codec_error)?;
+        s.comment_memory = parse_comments(&packet.data, s.arena + READ_SIZE + 32)?;
     }
-    if s.headers.is_empty() {
-        if p.data.len() != 30 || p.data[7..11] != [0; 4] {
-            return Err(OV_EBADHEADER);
-        }
-        s.serial = p.stream_serial();
-        s.channels = usize::from(p.data[11]);
-        s.rate = u32::from_le_bytes(p.data[12..16].try_into().unwrap());
-        if s.channels == 0 || s.channels > 8 || s.rate == 0 {
-            return Err(OV_EBADHEADER);
-        }
-    } else if p.stream_serial() != s.serial {
-        return Err(OV_EBADHEADER);
-    }
-    if expected == 3 {
-        s.comment_memory = parse_comments(&p.data, s.arena + READ_SIZE + 32)?;
-    }
-    s.headers.push(p.data);
-    if s.headers.len() == 3 {
-        s.data_offset = s.source_pos.saturating_sub((s.raw.len() - s.raw_at) as u64);
-        let mut params = CodecParameters::new();
-        params.for_codec(CODEC_TYPE_VORBIS).with_extra_data(
-            [s.headers[0].as_slice(), s.headers[2].as_slice()]
-                .concat()
-                .into_boxed_slice(),
-        );
-        // Validate codec setup at open, but do not decode any audio packets.
-        s.decoder = Some(
-            symphonia::default::get_codecs()
-                .make(&params, &DecoderOptions::default())
-                .map_err(|_| OV_EBADHEADER)?,
-        );
-    }
-    Ok(())
+    s.codec.accept_header(packet).map_err(codec_error)
 }
 
 fn parse_comments(data: &[u8], base: u32) -> Result<Vec<u8>, i32> {
-    let mut at = 7usize;
-    let read_length = |at: &mut usize| -> Result<usize, i32> {
-        let end = at.checked_add(4).ok_or(OV_EBADHEADER)?;
-        let value = u32::from_le_bytes(data.get(*at..end).ok_or(OV_EBADHEADER)?.try_into().unwrap())
-            as usize;
-        *at = end;
-        Ok(value)
-    };
-    let vendor_len = read_length(&mut at)?;
-    let vendor = data
-        .get(at..at.checked_add(vendor_len).ok_or(OV_EBADHEADER)?)
-        .ok_or(OV_EBADHEADER)?;
-    at += vendor_len;
-    let count = read_length(&mut at)?;
-    if count > data.len() / 4 {
-        return Err(OV_EBADHEADER);
-    }
-    let mut comments = Vec::with_capacity(count);
-    for _ in 0..count {
-        let len = read_length(&mut at)?;
-        comments.push(
-            data.get(at..at.checked_add(len).ok_or(OV_EBADHEADER)?)
-                .ok_or(OV_EBADHEADER)?,
-        );
-        at += len;
-    }
-    if data.get(at).is_none_or(|b| b & 1 == 0) {
-        return Err(OV_EBADHEADER);
-    }
+    let parsed = adv_device::vorbis::parse_comments(data).map_err(codec_error)?;
+    let vendor = parsed.vendor;
+    let comments = parsed.values;
+    let count = comments.len();
     let pointer_offset = 112usize; // Reserve fixed vi/offset/length public arrays.
     let length_offset = pointer_offset + (count + 1) * 4;
     let strings_offset = length_offset + count * 4;
@@ -807,7 +669,7 @@ fn parse_comments(data: &[u8], base: u32) -> Result<Vec<u8>, i32> {
     memory[4..8].copy_from_slice(&(base + length_offset as u32).to_le_bytes());
     memory[8..12].copy_from_slice(&(count as u32).to_le_bytes());
     memory[12..16].copy_from_slice(&(base + strings_offset as u32).to_le_bytes());
-    memory[strings_offset..strings_offset + vendor.len()].copy_from_slice(vendor);
+    memory[strings_offset..strings_offset + vendor.len()].copy_from_slice(&vendor);
     let mut cursor = strings_offset + vendor.len() + 1;
     for (i, comment) in comments.iter().enumerate() {
         memory[pointer_offset + i * 4..pointer_offset + (i + 1) * 4]
@@ -820,84 +682,28 @@ fn parse_comments(data: &[u8], base: u32) -> Result<Vec<u8>, i32> {
     Ok(memory)
 }
 
-fn decode(s: &mut Stream, p: ogg::Packet) -> Result<(), i32> {
-    if p.stream_serial() != s.serial {
-        return Err(OV_EBADLINK);
-    }
-    if s.decoder.is_none() {
-        let mut params = CodecParameters::new();
-        params.for_codec(CODEC_TYPE_VORBIS).with_extra_data(
-            [s.headers[0].as_slice(), s.headers[2].as_slice()]
-                .concat()
-                .into_boxed_slice(),
-        );
-        s.decoder = Some(
-            symphonia::default::get_codecs()
-                .make(&params, &DecoderOptions::default())
-                .map_err(|_| OV_EBADHEADER)?,
-        );
-    }
-    let eos = p.last_in_stream();
-    let granule = p.absgp_page();
-    let packet = Packet::new_from_boxed_slice(0, s.decoded_frames, 0, p.data.into_boxed_slice());
-    let decoded = s
-        .decoder
-        .as_mut()
-        .unwrap()
-        .decode(&packet)
-        .map_err(|_| OV_EBADLINK)?;
-    let AudioBufferRef::F32(decoded) = decoded else {
-        return Err(OV_EFAULT);
-    };
-    let frames = if eos && granule != u64::MAX {
-        decoded
-            .frames()
-            .min(granule.saturating_sub(s.decoded_frames) as usize)
-    } else {
-        decoded.frames()
-    };
-    s.pcm.clear();
-    s.pcm_at = 0;
-    for frame in 0..frames {
-        for channel in 0..s.channels {
-            let mapped = match s.channels {
-                3 => [0, 2, 1][channel],
-                5 => [0, 2, 1, 3, 4][channel],
-                6 => [0, 2, 1, 4, 5, 3][channel],
-                7 => [0, 2, 1, 5, 6, 4, 3][channel],
-                8 => [0, 2, 1, 6, 7, 4, 5, 3][channel],
-                _ => channel,
-            };
-            s.pcm.push(decoded.chan(mapped)[frame]);
-        }
-    }
-    s.decoded_frames += frames as u64;
-    if eos && granule != u64::MAX {
-        s.total = Some(granule);
-    }
-    Ok(())
-}
-
 fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
     let Some(mut s) = e.ext.get_mut::<Provider>().streams.remove(&vf) else {
         return error(OV_EINVAL);
     };
     let opening = matches!(op, Operation::Open);
     s.busy = true;
-    if !opening && (s.partial || (s.headers.len() != 3 && !matches!(op, Operation::Seek { .. }))) {
+    if !opening
+        && (s.partial || (s.codec.header_count() != 3 && !matches!(op, Operation::Seek { .. })))
+    {
         s.busy = false;
         e.ext.get_mut::<Provider>().streams.insert(vf, s);
         return error(OV_EINVAL);
     }
     if let Operation::Read { length, word, .. } = &op
-        && (*length as usize) < s.channels * (*word as usize)
+        && (*length as usize) < s.codec.format().channels * (*word as usize)
     {
         s.busy = false;
         e.ext.get_mut::<Provider>().streams.insert(vf, s);
         return error(OV_EINVAL);
     }
     loop {
-        if opening && s.headers.len() == 3 {
+        if opening && s.codec.header_count() == 3 {
             s.busy = false;
             e.ext.get_mut::<Provider>().streams.insert(vf, s);
             publish(e, vf);
@@ -911,31 +717,25 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                 word,
                 signed,
                 section,
-            } if s.pcm_at < s.pcm.len() || *length == 0 => {
-                let sample_count = (*length as usize / *word as usize / s.channels * s.channels)
-                    .min(s.pcm.len() - s.pcm_at);
-                let mut bytes = Vec::with_capacity(sample_count * *word as usize);
-                for &sample in &s.pcm[s.pcm_at..s.pcm_at + sample_count] {
-                    let signed_sample = (sample * 32768.0).round().clamp(-32768.0, 32767.0) as i32;
-                    if *word == 1 {
-                        let value = (sample * 128.0).round().clamp(-128.0, 127.0) as i32;
-                        bytes.push((value + if *signed { 0 } else { 128 }) as u8);
-                    } else {
-                        let value = (signed_sample + if *signed { 0 } else { 32768 }) as u16;
-                        bytes.extend_from_slice(&if *endian {
-                            value.to_be_bytes()
+            } if s.codec.has_pcm() || *length == 0 => {
+                let bytes = s.codec.peek_pcm(
+                    *length as usize,
+                    PcmFormat {
+                        bytes_per_sample: *word as u8,
+                        byte_order: if *endian {
+                            ByteOrder::Big
                         } else {
-                            value.to_le_bytes()
-                        });
-                    }
-                }
+                            ByteOrder::Little
+                        },
+                        signed: *signed,
+                    },
+                );
                 let result = if e.cpu.write(*output, &bytes).is_err()
                     || (*section != 0 && e.cpu.write_u32(*section, 0).is_err())
                 {
                     error(OV_EFAULT)
                 } else {
-                    s.pcm_at += sample_count;
-                    s.pcm_offset += (sample_count / s.channels) as u64;
+                    s.codec.consume_samples(bytes.len() / *word as usize);
                     Outcome::Return(bytes.len() as u32)
                 };
                 s.busy = false;
@@ -943,19 +743,15 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                 publish(e, vf);
                 return result;
             }
-            Operation::Seek { target } if s.pcm_at < s.pcm.len() => {
-                let frames = ((s.pcm.len() - s.pcm_at) / s.channels) as u64;
-                let skip = target.saturating_sub(s.pcm_offset).min(frames);
-                s.pcm_at += skip as usize * s.channels;
-                s.pcm_offset += skip;
-                if s.pcm_offset == *target {
+            Operation::Seek { target } if s.codec.has_pcm() => {
+                if s.codec.skip_to(*target) {
                     s.busy = false;
                     e.ext.get_mut::<Provider>().streams.insert(vf, s);
                     publish(e, vf);
                     return Outcome::Return(0);
                 }
             }
-            Operation::Seek { target: 0 } if s.headers.len() == 3 => {
+            Operation::Seek { target: 0 } if s.codec.header_count() == 3 => {
                 s.busy = false;
                 e.ext.get_mut::<Provider>().streams.insert(vf, s);
                 publish(e, vf);
@@ -963,16 +759,16 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
             }
             _ => {}
         }
-        match next_packet(&mut s) {
+        match s.codec.next_packet() {
             Next::Packet(p) => {
-                let result = if s.headers.len() < 3 {
+                let result = if s.codec.header_count() < 3 {
                     header(&mut s, p)
                 } else {
-                    let before = s.decoded_frames;
-                    let result = decode(&mut s, p);
+                    let before = s.codec.decoded_frames();
+                    let result = s.codec.decode_packet(p).map_err(codec_error);
                     let stats = &mut e.ext.get_mut::<Provider>().stats;
                     stats.decoded_packets += 1;
-                    stats.decoded_frames += s.decoded_frames - before;
+                    stats.decoded_frames += s.codec.decoded_frames() - before;
                     result
                 };
                 if let Err(code) = result {
@@ -981,10 +777,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                 }
             }
             Next::More => {
-                if s.raw_at != 0 {
-                    s.raw.drain(..s.raw_at);
-                    s.raw_at = 0;
-                }
+                s.codec.compact_input();
                 let (read, datasource, scratch, generation) =
                     (s.callbacks[0], s.datasource, s.arena, s.generation);
                 e.ext.get_mut::<Provider>().streams.insert(vf, s);
@@ -1012,9 +805,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                         else {
                             return error(OV_EINVAL);
                         };
-                        s.eof = length == 0;
-                        s.source_pos += u64::from(length);
-                        s.raw.extend(bytes);
+                        s.codec.feed(bytes);
                         advance(e, vf, op)
                     },
                 );
@@ -1036,7 +827,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
             }
             Next::Error(code) => {
                 e.ext.get_mut::<Provider>().streams.insert(vf, s);
-                return abandon(e, vf, code, opening);
+                return abandon(e, vf, codec_error(code), opening);
             }
         }
     }
@@ -1059,26 +850,34 @@ fn publish(e: &mut Env<'_>, vf: u32) {
     word(0x48, info);
     word(0x4c, info + 32);
     word(0x58, if s.partial { 1 } else { 2 });
-    word(0x5c, s.serial);
-    let raw_offset = s.source_pos.saturating_sub((s.raw.len() - s.raw_at) as u64);
+    word(0x5c, s.codec.format().serial);
+    let raw_offset = s.codec.raw_position();
     prefix[8..16].copy_from_slice(&raw_offset.to_le_bytes());
-    prefix[16..24].copy_from_slice(&s.end.unwrap_or(0).to_le_bytes());
-    prefix[0x50..0x58].copy_from_slice(&s.pcm_offset.to_le_bytes());
+    prefix[16..24].copy_from_slice(&s.codec.source_length().unwrap_or(0).to_le_bytes());
+    prefix[0x50..0x58].copy_from_slice(&s.codec.pcm_position().to_le_bytes());
     let mut vi = [0u8; 32];
-    if let Some(header) = s.headers.first() {
-        vi[4..8].copy_from_slice(&(s.channels as u32).to_le_bytes());
-        vi[8..12].copy_from_slice(&s.rate.to_le_bytes());
+    if let Some(header) = s.codec.identification_header() {
+        vi[4..8].copy_from_slice(&(s.codec.format().channels as u32).to_le_bytes());
+        vi[8..12].copy_from_slice(&s.codec.format().sample_rate.to_le_bytes());
         vi[12..24].copy_from_slice(&header[16..28]);
     }
     let _ = e.cpu.write(vf, &prefix);
     let _ = e.cpu.write(info, &vi);
     let _ = e.cpu.write(info + 32, &s.comment_memory);
     let _ = e.cpu.write(info + 64, &0u64.to_le_bytes());
-    let _ = e.cpu.write(info + 72, &s.end.unwrap_or(0).to_le_bytes());
-    let _ = e.cpu.write(info + 80, &s.data_offset.to_le_bytes());
-    let _ = e.cpu.write_u32(info + 88, s.serial);
+    let _ = e.cpu.write(
+        info + 72,
+        &s.codec.source_length().unwrap_or(0).to_le_bytes(),
+    );
+    let _ = e
+        .cpu
+        .write(info + 80, &s.codec.data_position().to_le_bytes());
+    let _ = e.cpu.write_u32(info + 88, s.codec.format().serial);
     let _ = e.cpu.write(info + 96, &0u64.to_le_bytes());
-    let _ = e.cpu.write(info + 104, &s.total.unwrap_or(0).to_le_bytes());
+    let _ = e.cpu.write(
+        info + 104,
+        &s.codec.total_frames().unwrap_or(0).to_le_bytes(),
+    );
 }
 
 fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
@@ -1088,7 +887,7 @@ fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
     if !s.seekable {
         return error(OV_ENOSEEK);
     }
-    if target > i64::MAX as u64 || s.total.is_some_and(|total| target > total) {
+    if target > i64::MAX as u64 || s.codec.total_frames().is_some_and(|total| target > total) {
         return error(OV_EINVAL);
     }
     let (seek_callback, datasource, generation) = (s.callbacks[1], s.datasource, s.generation);
@@ -1117,18 +916,8 @@ fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
                 s.busy = false;
                 return error(OV_EREAD);
             }
-            s.raw.clear();
-            s.raw_at = 0;
-            s.source_pos = 0;
-            s.eof = false;
-            s.reader = BasePacketReader::new();
-            s.decoder = None;
-            s.pcm.clear();
-            s.pcm_at = 0;
-            s.decoded_frames = 0;
-            s.pcm_offset = 0;
             // Re-read the three headers from the datasource; no eager PCM decode.
-            s.headers.clear();
+            s.codec.reset();
             advance(e, vf, Operation::Seek { target })
         },
     )
@@ -1146,14 +935,15 @@ fn totals(e: &mut Env<'_>, vf: u32, link: i32, name: String) -> Outcome {
         };
     }
     if let Some(total) = s
-        .total
-        .filter(|_| name != "ov_raw_total" || s.end.is_some())
+        .codec
+        .total_frames()
+        .filter(|_| name != "ov_raw_total" || s.codec.source_length().is_some())
     {
         return if name == "ov_time_total" {
-            Outcome::ReturnF64(total as f64 / f64::from(s.rate))
+            Outcome::ReturnF64(total as f64 / f64::from(s.codec.format().sample_rate))
         } else if name == "ov_pcm_total" {
             Outcome::Return64(total)
-        } else if let Some(end) = s.end {
+        } else if let Some(end) = s.codec.source_length() {
             Outcome::Return64(end)
         } else {
             error(OV_EINVAL)
@@ -1274,36 +1064,8 @@ fn scan_read(e: &mut Env<'_>, scan: Scan) -> Outcome {
         else {
             return total_error(&scan.name, OV_EINVAL);
         };
-        let serial = s.serial;
-        let mut at = 0usize;
-        let mut total = None;
-        while at + 27 <= scan.bytes.len() {
-            if &scan.bytes[at..at + 4] != b"OggS" {
-                at += 1;
-                continue;
-            }
-            let header: &[u8] = &scan.bytes[at..at + 27];
-            let Ok((mut parser, n)) = PageParser::new(header.try_into().unwrap()) else {
-                at += 1;
-                continue;
-            };
-            if at + 27 + n > scan.bytes.len() {
-                break;
-            }
-            let body = parser.parse_segments(scan.bytes[at + 27..at + 27 + n].to_vec());
-            if at + 27 + n + body > scan.bytes.len() {
-                break;
-            }
-            if parser
-                .parse_packet_data(scan.bytes[at + 27 + n..at + 27 + n + body].to_vec())
-                .is_ok()
-                && header[5] & 4 != 0
-                && u32::from_le_bytes(header[14..18].try_into().unwrap()) == serial
-            {
-                total = Some(u64::from_le_bytes(header[6..14].try_into().unwrap()));
-            }
-            at += 27 + n + body;
-        }
+        let serial = s.codec.format().serial;
+        let total = adv_device::vorbis::tail_total(&scan.bytes, serial);
         return restore_scan(e, scan, total.filter(|&n| n != u64::MAX).ok_or(OV_EBADLINK));
     }
     let request = remaining.min(u64::from(READ_SIZE)) as u32;
@@ -1358,10 +1120,9 @@ fn restore_scan(e: &mut Env<'_>, scan: Scan, result: Result<u64, i32>) -> Outcom
                 Ok(total) => total,
                 Err(code) => return total_error(&scan.name, code),
             };
-            s.total = Some(total);
-            s.end = Some(scan.end);
+            s.codec.set_totals(total, scan.end);
             let outcome = if scan.name == "ov_time_total" {
-                Outcome::ReturnF64(total as f64 / f64::from(s.rate))
+                Outcome::ReturnF64(total as f64 / f64::from(s.codec.format().sample_rate))
             } else if scan.name == "ov_pcm_total" {
                 Outcome::Return64(total)
             } else {

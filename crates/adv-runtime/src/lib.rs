@@ -8,7 +8,7 @@ mod font;
 mod graphics;
 pub use adv_win32::winmm::mmio;
 mod report;
-pub mod vorbis;
+pub use adv_win32::vorbisfile as vorbis;
 pub use adv_abi::RunMode;
 pub use adv_cpu::CompileStrategy;
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};

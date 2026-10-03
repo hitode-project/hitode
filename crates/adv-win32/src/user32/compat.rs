@@ -1,8 +1,7 @@
 //! The runtime's existing USER32 compatibility personality and diagnostic wrappers.
-//! This group remains opt-in so the default Win32 NLS personality is unchanged.
 use crate::{Win32, util::set_last_error};
 use adv_abi::{
-    AnsiStr, Conv, GuestPtr, Handle, Registry,
+    Conv, GuestPtr, Handle, Registry,
     types::{POINT, RECT},
     win32,
 };
@@ -25,8 +24,6 @@ pub fn register(registry: &mut Registry) {
         );
     }
     for api in [
-        char_upper_ABI,
-        char_lower_ABI,
         point_in_rect_ABI,
         open_icon_ABI,
         close_window_ABI,
@@ -63,50 +60,6 @@ fn wait_objects(
     }
     let deadline = (timeout != u32::MAX).then(|| e.sys.clock.now_us() + u64::from(timeout) * 1000);
     message_wait(e, values, all != 0, deadline, mask)
-}
-
-#[win32(user32, name = "CharUpperA", level = implement)]
-fn char_upper(e: &mut Env<'_>, text: AnsiStr) -> Outcome {
-    change_case(e, text, true)
-}
-#[win32(user32, name = "CharLowerA", level = implement)]
-fn char_lower(e: &mut Env<'_>, text: AnsiStr) -> Outcome {
-    change_case(e, text, false)
-}
-fn change_case(e: &mut Env<'_>, text: AnsiStr, upper: bool) -> Outcome {
-    let address = text.0.addr();
-    if address >> 16 == 0 {
-        if address > 255 {
-            return Outcome::Return(address);
-        }
-        let byte = address as u8;
-        return Outcome::Return(u32::from(if upper {
-            byte.to_ascii_uppercase()
-        } else {
-            byte.to_ascii_lowercase()
-        }));
-    }
-    let Ok(mut bytes) = e.cpu.read_cstr(address, 16 * 1024 * 1024) else {
-        return Outcome::Fail("CharUpper/Lower: invalid string".into());
-    };
-    let codec = &e.ext.get::<Win32>().codec;
-    let mut i = 0;
-    while i < bytes.len() {
-        if codec.is_lead_byte(0, bytes[i]) && i + 1 < bytes.len() {
-            i += 2;
-        } else {
-            bytes[i] = if upper {
-                bytes[i].to_ascii_uppercase()
-            } else {
-                bytes[i].to_ascii_lowercase()
-            };
-            i += 1;
-        }
-    }
-    if let Err(error) = e.cpu.write(address, &bytes) {
-        return Outcome::Fail(error.to_string());
-    }
-    Outcome::Return(address)
 }
 
 #[win32(user32, name = "PtInRect", level = implement)]

@@ -12,6 +12,7 @@ mod owned;
 mod resample;
 pub mod ring;
 pub mod surface;
+pub mod vorbis;
 pub use actor::{AudioControl, AudioEvent, RingState};
 #[cfg(feature = "device")]
 pub use device::{Metrics, Output};

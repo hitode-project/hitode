@@ -7,11 +7,26 @@ use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
 
 fn convert(name: &str, cp: u32, input: &[u8], count: u32, writable: bool) -> (u32, Vec<u8>) {
+    call_case(name, cp, input, Some(count), None, writable, false)
+}
+
+fn call_case(
+    name: &str,
+    cp: u32,
+    input: &[u8],
+    count: Option<u32>,
+    packed: Option<u16>,
+    writable: bool,
+    compat: bool,
+) -> (u32, Vec<u8>) {
     const CODE: u32 = 0x400000;
     const DATA: u32 = 0x410000;
     const RESULT: u32 = 0x420000;
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
+    if compat {
+        adv_win32::user32::compat::register(&mut registry);
+    }
     let mut m = Machine::new(
         UnicornCpu::new(adv_machine::layout::PARK_ADDR).unwrap(),
         registry,
@@ -30,8 +45,10 @@ fn convert(name: &str, cp: u32, input: &[u8], count: u32, writable: bool) -> (u3
     let proc = m.resolve_import("user32.dll", name).unwrap();
     let exit = m.resolve_import("kernel32.dll", "ExitProcess").unwrap();
     let mut code = Asm::new(CODE);
-    code.push_imm(count)
-        .push_imm(DATA)
+    if let Some(count) = count {
+        code.push_imm(count);
+    }
+    code.push_imm(packed.map_or(DATA, u32::from))
         .call(proc)
         .mov_mem_eax(RESULT)
         .push_imm(0)
@@ -42,6 +59,67 @@ fn convert(name: &str, cp: u32, input: &[u8], count: u32, writable: bool) -> (u3
     let mut output = vec![0; input.len()];
     m.cpu.read(DATA, &mut output).unwrap();
     (m.cpu.read_u32(RESULT).unwrap(), output)
+}
+
+#[cfg(windows)]
+#[test]
+fn ansi_pointer_and_packed_forms_match_native_without_compat_override() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn CharUpperA(text: *mut u8) -> *mut u8;
+        fn CharLowerA(text: *mut u8) -> *mut u8;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetACP() -> u32;
+    }
+    // SAFETY: GetACP has no memory access preconditions.
+    let cp = unsafe { GetACP() };
+    assert!(
+        adv_os::nls::is_valid_codepage(cp),
+        "unsupported native ACP {cp}"
+    );
+    let codec = adv_os::Codec::new(cp);
+    for (name, upper) in [("CharUpperA", true), ("CharLowerA", false)] {
+        let mut input = codec.encode("aZéÖßıİΣσςЯяＡｚａｂαя漢字");
+        input.extend_from_slice(b"\0suffix untouched\0");
+        let mut expected = input.clone();
+        let pointer = expected.as_mut_ptr();
+        // SAFETY: expected contains a terminating NUL in a writable buffer.
+        assert_eq!(
+            unsafe {
+                if upper {
+                    CharUpperA(pointer)
+                } else {
+                    CharLowerA(pointer)
+                }
+            },
+            pointer
+        );
+        for compat in [false, true] {
+            assert_eq!(
+                call_case(name, cp, &input, None, None, true, compat),
+                (0x410000, expected.clone()),
+                "{name} ACP={cp} compat={compat}"
+            );
+            for character in [0u16, 0x61, 0x5a, 0x141, 0x161, 0x6162, 0xe1a3, 0xa3e1] {
+                let packed = usize::from(character) as *mut u8;
+                // SAFETY: a zero high word selects a packed byte character.
+                let reference = unsafe {
+                    if upper {
+                        CharUpperA(packed)
+                    } else {
+                        CharLowerA(packed)
+                    }
+                } as usize as u32;
+                assert_eq!(
+                    call_case(name, cp, &[], None, Some(character), true, compat),
+                    (reference, Vec::new()),
+                    "{name} packed={character:#06x} compat={compat}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
