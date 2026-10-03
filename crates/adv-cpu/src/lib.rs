@@ -9,8 +9,8 @@ mod discovery;
 mod executor;
 mod file_memory;
 mod floating;
-// Hardware fault primitives are dormant until validated Cranelift side tables
-// are connected. Other hosts retain the current checked execution lane.
+// The opt-in fault lane accepts only verified scalar recovery sites. Other
+// accesses and hosts retain the current checked execution lane.
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 #[allow(dead_code)]
 mod host_fault;

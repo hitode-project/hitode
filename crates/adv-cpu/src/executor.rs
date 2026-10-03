@@ -281,6 +281,24 @@ impl Executor {
         &self.memory
     }
 
+    /// Opt into synchronized host protections before compiling native regions.
+    #[cfg(windows)]
+    pub fn enable_native_protection(&mut self) -> Result<(), String> {
+        self.memory.enable_native_protection()
+    }
+
+    /// OS committed/reserved bytes for finalized code and its xdata pages.
+    /// Module/Rust heap data and unrelated guest storage are not included.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    pub fn native_code_storage_bytes(&self) -> Result<(usize, usize), String> {
+        self.compiled
+            .values()
+            .try_fold((0, 0), |(committed, reserved), code| {
+                let (code_committed, code_reserved) = code.storage_bytes()?;
+                Ok((committed + code_committed, reserved + code_reserved))
+            })
+    }
+
     /// Loader/debugger writes bypass guest permissions and invalidate code.
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         self.memory.write(addr, bytes)

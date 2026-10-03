@@ -6,6 +6,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
+pub(crate) mod recipe;
 mod unwind;
 
 // The VEH copies a frozen architectural checkpoint without allocation or drop.
@@ -105,13 +106,15 @@ pub(crate) struct CodeRegion<'a> {
     start: usize,
     end: usize,
     sites: &'a [FaultSite],
+    recipes: Option<&'a [recipe::Recipe]>,
     _owner: &'a dyn Any,
 }
 impl<'a> CodeRegion<'a> {
     /// # Safety
     /// `owner` must own this finalized executable allocation. Every recovery PC
     /// must begin a cold epilogue using the faulting instruction's exact native
-    /// stack layout, and every site must have the complete frozen checkpoint.
+    /// stack layout, and the session must supply each site's complete frozen
+    /// checkpoint or a verified scalar recovery recipe.
     pub(crate) unsafe fn new(
         owner: &'a dyn Any,
         start: usize,
@@ -136,8 +139,28 @@ impl<'a> CodeRegion<'a> {
             start,
             end,
             sites,
+            recipes: None,
             _owner: owner,
         })
+    }
+    /// # Safety
+    /// Every recipe describes the exact first scalar load of a fresh native
+    /// entry. Its machine PC and same-frame epilogue have been verified against
+    /// finalized code, and that code's owner remains borrowed for this session.
+    pub(crate) unsafe fn with_recipes(
+        owner: &'a dyn Any,
+        start: usize,
+        len: usize,
+        sites: &'a [FaultSite],
+        recipes: &'a [recipe::Recipe],
+    ) -> Result<Self, String> {
+        if sites.len() != recipes.len() || recipes.iter().any(|recipe| !recipe.valid())
+            || sites.iter().any(|site| site.access != Access::Read || !matches!(site.width, 1 | 2 | 4)) {
+            return Err("incomplete native recovery recipes".into());
+        }
+        let mut region = unsafe { Self::new(owner, start, len, sites) }?;
+        region.recipes = Some(recipes);
+        Ok(region)
     }
     fn site(&self, pc: usize) -> Option<&FaultSite> {
         (self.start..self.end).contains(&pc).then_some(())?;
@@ -171,9 +194,9 @@ impl Checkpoint {
 
 struct Session<'a> {
     state: *mut CpuState,
-    checkpoint: &'a Checkpoint,
+    checkpoint: Option<&'a Checkpoint>,
     regions: &'a [CodeRegion<'a>],
-    window: &'a Reservation,
+    window: (usize, usize),
     guest_base: u32,
     recovered: Cell<u64>,
     _exclusive: PhantomData<&'a mut CpuState>,
@@ -215,6 +238,38 @@ pub(crate) fn with_session<R>(
     guest_base: u32,
     run: impl FnOnce(*mut CpuState) -> R,
 ) -> Result<(R, u64), String> {
+    session(
+        state,
+        Some(checkpoint),
+        regions,
+        (window.ptr.as_ptr() as usize, window.len),
+        guest_base,
+        run,
+    )
+}
+
+/// # Safety
+/// The execution owner pins this reservation for the entire closure. Store
+/// only its address bounds: Rust helpers may borrow the enclosing Memory
+/// mutably, so no overlapping `&Reservation` is held across a native call.
+pub(crate) unsafe fn with_native_session<R>(
+    state: &mut CpuState,
+    regions: &[CodeRegion<'_>],
+    window: (usize, usize),
+    guest_base: u32,
+    run: impl FnOnce(*mut CpuState) -> R,
+) -> Result<(R, u64), String> {
+    session(state, None, regions, window, guest_base, run)
+}
+
+fn session<R>(
+    state: &mut CpuState,
+    checkpoint: Option<&Checkpoint>,
+    regions: &[CodeRegion<'_>],
+    window: (usize, usize),
+    guest_base: u32,
+    run: impl FnOnce(*mut CpuState) -> R,
+) -> Result<(R, u64), String> {
     install()?;
     let mut session = Session {
         state,
@@ -237,7 +292,7 @@ unsafe extern "C" fn dispatch(
     pc: usize,
     address: usize,
     access: usize,
-    _context: *mut c_void,
+    context: *mut c_void,
 ) -> usize {
     if code != ACCESS_VIOLATION || access > 1 {
         return 0;
@@ -251,54 +306,88 @@ unsafe extern "C" fn dispatch(
             // SAFETY: with_session publishes this stable stack address on this
             // thread only; the VEH interrupts that same exclusively owned run.
             let session = unsafe { &*session };
-            let Some(site) = session.regions.iter().find_map(|r| r.site(pc)) else {
+            let Some((region, site)) = session
+                .regions
+                .iter()
+                .find_map(|region| region.site(pc).map(|site| (region, site)))
+            else {
                 return 0;
             };
             if (site.access == Access::Write) != (access == 1) {
                 return 0;
             }
-            let checkpoint = session.checkpoint.state.get();
-            if unsafe { (*checkpoint).eip } != site.guest_pc {
-                return 0;
-            }
-            let Some(offset) = session
-                .checkpoint
-                .address
-                .get()
-                .checked_sub(session.guest_base)
-            else {
+            let recovered = if let Some(recipes) = region.recipes {
+                let index = region
+                    .sites
+                    .binary_search_by_key(&pc, |site| site.host_pc)
+                    .unwrap();
+                let Some(recovered) =
+                    (unsafe { recipes[index].evaluate(&*session.state, context) })
+                else {
+                    return 0;
+                };
+                Some(recovered)
+            } else {
+                None
+            };
+            let operand = if let Some(recovered) = &recovered {
+                recovered.address
+            } else if let Some(checkpoint) = session.checkpoint {
+                if unsafe { (*checkpoint.state.get()).eip } != site.guest_pc {
+                    return 0;
+                }
+                checkpoint.address.get()
+            } else {
                 return 0;
             };
-            let Some(start) = (session.window.ptr.as_ptr() as usize).checked_add(offset as usize)
-            else {
+            let Some(offset) = operand.checked_sub(session.guest_base) else {
+                return 0;
+            };
+            let Some(start) = session.window.0.checked_add(offset as usize) else {
                 return 0;
             };
             let Some(end) = start.checked_add(site.width) else {
                 return 0;
             };
-            let Some(window_end) =
-                (session.window.ptr.as_ptr() as usize).checked_add(session.window.len)
-            else {
+            let Some(window_end) = session.window.0.checked_add(session.window.1) else {
                 return 0;
             };
-            if start < session.window.ptr.as_ptr() as usize
-                || end > window_end
-                || !(start..end).contains(&address)
-            {
+            if start < session.window.0 || end > window_end || !(start..end).contains(&address) {
                 return 0;
             }
-            // SAFETY: complete checkpoint and live exclusive CpuState are distinct
-            // allocations with no owning fields, and no Rust references are live
-            // inside the interrupted generated frame. No allocation/unwind occurs.
+            // SAFETY: all recipe inputs have been staged before these writes;
+            // legacy checkpoints are distinct allocations. CpuState has no
+            // owning fields and no Rust references escape the stopped worker.
             unsafe {
-                std::ptr::copy_nonoverlapping(checkpoint, session.state, 1);
+                if let Some(recovered) = recovered {
+                    (*session.state).regs = recovered.regs;
+                    (*session.state).eflags = recovered.flags;
+                    (*session.state).fuel = recovered.fuel;
+                    #[cfg(test)]
+                    RECIPE_RECOVERIES.with(|count| count.set(count.get() + 1));
+                } else {
+                    std::ptr::copy_nonoverlapping(
+                        session.checkpoint.unwrap().state.get(),
+                        session.state,
+                        1,
+                    );
+                }
                 (*session.state).eip = site.guest_pc;
-                (*session.state).fault_addr = session.checkpoint.address.get();
+                (*session.state).fault_addr = operand;
             }
             session.recovered.set(session.recovered.get() + 1);
             site.recovery_pc
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECIPE_RECOVERIES: Cell<u64> = const { Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn recipe_recoveries() -> u64 {
+    RECIPE_RECOVERIES.with(Cell::get)
 }
 
 /// Read an OS-saved host register for future verified Reg/CFA recovery recipes.

@@ -67,6 +67,38 @@ pub(crate) unsafe fn unwind_storage(code: usize, size: usize) -> Result<(*mut u8
     Ok((storage as *mut u8, PAGE))
 }
 
+/// # Safety
+/// The two finalized function owners remain alive for the entire query.
+pub(crate) unsafe fn code_storage_bytes(functions: [usize; 2]) -> Result<(usize, usize), String> {
+    let mut previous = 0;
+    let mut committed = 0;
+    let mut reserved = 0;
+    for function in functions {
+        let allocation = query(function as *const u8)
+            .map_err(|error| error.to_string())?
+            .allocation;
+        if allocation == previous {
+            continue;
+        }
+        previous = allocation;
+        let mut address = allocation;
+        loop {
+            let region = query(address as *const u8).map_err(|error| error.to_string())?;
+            if region.allocation != allocation || region.state == 0x10000 {
+                break;
+            }
+            reserved += region.region;
+            if region.state == 0x1000 {
+                committed += region.region;
+            }
+            address = address
+                .checked_add(region.region)
+                .ok_or("code allocation range overflow")?;
+        }
+    }
+    Ok((committed, reserved))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Code,

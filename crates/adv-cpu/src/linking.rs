@@ -83,5 +83,9 @@ pub(crate) struct NativeContext {
     pub mask: u32,
     pub remaining: u32,
     pub stop: u32,
+    /// Only the initial borrowed owner has a hardware-fault session. Tail
+    /// transfers clear this flag before entering another checked region.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    pub fault_reads: u8,
     pub linked_entries: u64,
 }

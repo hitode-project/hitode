@@ -13,6 +13,8 @@ use iced_x86::{
 
 use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+mod fault;
 mod mmx;
 mod scalar;
 mod simd;
@@ -31,6 +33,12 @@ pub(crate) struct Compiled {
     module: Option<JITModule>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     unwind: Vec<crate::host_fault::UnwindRegistration>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_sites: Vec<crate::host_fault::FaultSite>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_recipes: Vec<crate::host_fault::recipe::Recipe>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    body_len: usize,
     entry: Entry,
     pub tail_entry: usize,
     pub pages: Vec<(usize, u64)>,
@@ -56,6 +64,10 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    pub(crate) fn storage_bytes(&self) -> Result<(usize, usize), String> {
+        unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
+    }
     pub fn valid(&self, memory: &Memory) -> bool {
         memory.base == self.window_base
             && memory.len == self.window_len
@@ -96,12 +108,68 @@ impl Compiled {
             mask,
             remaining: crate::linking::CHAIN_LIMIT,
             stop: controls.stop,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_reads: 0,
             linked_entries: 0,
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
-        // stable. Every guest access is range/permission checked by generated code.
+        // stable. Checked accesses retain their guards; verified ordinary reads
+        // may use the synchronized OS protection and the owner's fault table.
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        if !self.fault_sites.is_empty()
+            && state.eip == self.fault_recipes[0].entry_pc
+            && memory.native_fault_reads_available()
+            && let Some(window) = memory.native_fault_window()
+            && let Some(result) = self.run_fault_owner(
+                state,
+                &mut context,
+                window,
+                memory.base,
+                memory.ptr.as_ptr(),
+            )
+        {
+            return (result, context.linked_entries);
+        }
         let result = unsafe { (self.entry)(&mut context, memory.ptr.as_ptr()) };
         (result, context.linked_entries)
+    }
+
+    // Keep TLS/metadata validation and its large stack frame out of the normal
+    // checked entry. This opt-in proof lane is not used for default memory.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    #[inline(never)]
+    fn run_fault_owner(
+        &self,
+        state: &mut CpuState,
+        context: &mut NativeContext,
+        window: (usize, usize),
+        guest_base: u32,
+        pointer: *mut u8,
+    ) -> Option<u32> {
+        let region = unsafe {
+            crate::host_fault::CodeRegion::with_recipes(
+                self,
+                self.tail_entry,
+                self.body_len,
+                &self.fault_sites,
+                &self.fault_recipes,
+            )
+        }
+        .ok()?;
+        let result = unsafe {
+            crate::host_fault::with_native_session(state, &[region], window, guest_base, |state| {
+                context.state = state;
+                context.fault_reads = 1;
+                (self.entry)(context, pointer)
+            })
+        };
+        match result {
+            Ok((result, _)) => Some(result),
+            Err(_) => {
+                context.fault_reads = 0;
+                None
+            }
+        }
     }
 }
 
@@ -117,6 +185,8 @@ pub(crate) struct Snapshot {
     // Published reachable regions compare only their decoded instruction bytes.
     // A pending snapshot still stamps the full bounded window conservatively.
     covered: Option<Vec<(usize, usize)>>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    native_fault_reads: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +239,8 @@ impl Snapshot {
             len: memory.len,
             bytes,
             covered: None,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            native_fault_reads: memory.native_fault_reads_available(),
             pages: pages
                 .into_iter()
                 .map(|page| PageStamp {
@@ -401,6 +473,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         None
     };
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let fault_pc = snapshot
+        .native_fault_reads
+        .then(|| fault::candidate(region.start, &instructions))
+        .flatten();
 
     let opt_level = match region.compile_strategy {
         CompileStrategy::Speed => "speed",
@@ -530,6 +607,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_read_timestamp", Linkage::Import, &timestamp_signature)
         .map_err(|e| e.to_string())?;
     let timestamp_ref = module.declare_func_in_func(timestamp_id, &mut ctx.func);
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let mut fault_draft = None;
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    if fault_pc.is_some() {
+        ctx.func.collect_debug_info();
+    }
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
         let prologue = b.create_block();
@@ -562,6 +645,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             offset_of!(NativeContext, interrupt) as i32,
         );
         let tail_ref = b.import_signature(tail_signature);
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        let fault_mode = fault_pc.map(|_| {
+            let variable = b.declare_var(types::I8);
+            let enabled = b.ins().load(
+                types::I8,
+                MemFlags::trusted(),
+                params[0],
+                offset_of!(NativeContext, fault_reads) as i32,
+            );
+            b.def_var(variable, enabled);
+            variable
+        });
         let regs: [Variable; 8] = std::array::from_fn(|_| b.declare_var(types::I32));
         let mut xmm = [None; 8];
         for instruction in instructions.values().filter(|i| supported(i)) {
@@ -699,12 +794,44 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_pc,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_mode,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_entry: region.start,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_seeds: Vec::new(),
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_draft: None,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            fault_return: None,
         };
         for (&start, &block) in &e.blocks.clone() {
             e.b.switch_to_block(block);
             e.pc = start;
             e.begin_mmx_block();
             let budget = e.b.use_var(e.fuel);
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            if start == region.start && fault_pc.is_some() {
+                use crate::host_fault::recipe::Input;
+                for (index, variable) in e.regs.iter().enumerate() {
+                    e.fault_seeds
+                        .push((e.b.use_var(*variable), Input::Register(index as u8)));
+                }
+                e.fault_seeds.push((e.b.use_var(e.flags), Input::Flags));
+                e.fault_seeds.push((budget, Input::Fuel));
+                for (index, variable) in e.lazy.iter().enumerate() {
+                    e.fault_seeds.push((
+                        e.b.use_var(*variable),
+                        if index == 4 {
+                            Input::Carry
+                        } else {
+                            Input::Zero
+                        },
+                    ));
+                }
+            }
             let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
             e.guard(zero, Exit::Budget, None);
             let remaining = e.b.ins().iadd_imm(budget, -1);
@@ -758,9 +885,20 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let pc = e.b.block_params(shared_exit)[1];
         e.save_state(pc);
         e.chain_or_return(reason, pc);
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        if let Some(block) = e.fault_return {
+            e.b.switch_to_block(block);
+            e.b.set_srcloc(ir::SourceLoc::new(fault::RETURN_SOURCE));
+            let reason = e.constant(Exit::ReadFault as u32);
+            e.b.ins().return_(&[reason]);
+            e.b.set_srcloc(ir::SourceLoc::default());
+            fault_draft = e.fault_draft.take();
+        }
         e.b.seal_all_blocks();
         e.b.finalize();
     }
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
     module
         .define_function(id, &mut ctx)
         .map_err(|e| format!("{e:?}"))?;
@@ -874,10 +1012,27 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // a one-unit scheduler slice from repeatedly entering native code without progress.
     entries.retain(|pc| supported(&instructions[pc]));
     let input = snapshot.with_coverage(&instructions, &pages);
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let (fault_sites, fault_recipes) = if unwind.len() == 2 {
+        fault_draft
+            .and_then(|draft| draft.finish(ctx.compiled_code().unwrap(), tail_entry))
+            .map_or_else(
+                || (Vec::new(), Vec::new()),
+                |(site, recipe)| (vec![site], vec![recipe]),
+            )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     Ok(Compiled {
         module: Some(module),
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         unwind,
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        fault_sites,
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        fault_recipes,
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        body_len: ctx.compiled_code().unwrap().code_buffer().len(),
         entry,
         tail_entry,
         pages: pages
@@ -964,6 +1119,42 @@ mod snapshot_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    #[test]
+    fn first_scalar_load_has_a_verified_machine_fault_site_without_hot_checkpoints() {
+        let mut memory = Memory::reserve(0, 1usize << 32).unwrap();
+        memory.map(0x10000, 4096, READ | EXEC).unwrap();
+        memory.write(0x10000, &[0x8b, 0x06, 0xc3]).unwrap();
+        memory.enable_native_protection().unwrap();
+        let compiled = compile(&Region::new(0x10000, 3), &memory).unwrap();
+        assert_eq!(compiled.fault_sites.len(), 1, "{}", compiled.disasm);
+        assert_eq!(compiled.fault_recipes.len(), 1);
+        assert!(compiled.fault_recipes[0].valid());
+        assert_eq!(compiled.fault_sites[0].guest_pc, 0x10000);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    #[test]
+    fn incomplete_merge_recipes_and_default_memory_keep_checked_scalar_loads() {
+        for policy in [false, true] {
+            let mut memory = Memory::reserve(0, 1usize << 32).unwrap();
+            memory.map(0x10000, 4096, READ | EXEC).unwrap();
+            memory
+                .write(0x10000, &[0x83, 0xc3, 1, 0x8b, 0x06, 0xc3])
+                .unwrap();
+            if policy {
+                memory.enable_native_protection().unwrap();
+            }
+            let mut region = Region::new(0x10000, 6);
+            if policy {
+                region.entries.push(0x10003);
+            }
+            let compiled = compile(&region, &memory).unwrap();
+            assert!(compiled.fault_sites.is_empty());
+            assert!(compiled.fault_recipes.is_empty());
+        }
+    }
 
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     #[test]
@@ -1183,6 +1374,18 @@ struct Emitter<'a> {
     file_prepare_ref: ir::FuncRef,
     file_prepared_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_pc: Option<u32>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_mode: Option<Variable>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_entry: u32,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_seeds: Vec<(Value, crate::host_fault::recipe::Input)>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_draft: Option<fault::Pending>,
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fault_return: Option<ir::Block>,
 }
 
 impl Emitter<'_> {
@@ -1326,6 +1529,16 @@ impl Emitter<'_> {
             self.context,
             offset_of!(NativeContext, linked_entries) as i32,
         );
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        if self.fault_mode.is_some() {
+            let disabled = self.b.ins().iconst(types::I8, 0);
+            self.b.ins().store(
+                MemFlags::trusted(),
+                disabled,
+                self.context,
+                offset_of!(NativeContext, fault_reads) as i32,
+            );
+        }
         self.b
             .ins()
             .return_call_indirect(self.tail_ref, entry, &[self.context, self.mem]);
@@ -1706,6 +1919,15 @@ impl Emitter<'_> {
     fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        let hardware = if !write
+            && self.fault_pc == Some(self.pc)
+            && matches!(ty, types::I8 | types::I16 | types::I32)
+        {
+            self.capture_hardware_read(addr, size)
+        } else {
+            None
+        };
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
         let bad =
             self.b
@@ -1725,6 +1947,37 @@ impl Emitter<'_> {
         let done = self.b.create_block();
         if !write {
             self.b.append_block_param(done, ty);
+        }
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        if let Some((enabled, _)) = hardware {
+            let classify = self.b.create_block();
+            let checked = self.b.create_block();
+            let raw = self.b.create_block();
+            self.b.ins().brif(enabled, classify, &[], checked, &[]);
+            self.b.switch_to_block(classify);
+            let permissions = [offset, end].map(|position| {
+                let page = self.b.ins().ushr_imm(position, 12);
+                let page = self.b.ins().uextend(self.ptr_ty, page);
+                let at = self.b.ins().iadd(self.perms, page);
+                self.b.ins().load(types::I8, MemFlags::trusted(), at, 0)
+            });
+            let combined = self.b.ins().bor(permissions[0], permissions[1]);
+            let shared = self
+                .b
+                .ins()
+                .band_imm(combined, i64::from(crate::memory::SHARED));
+            self.b.ins().brif(shared, checked, &[], raw, &[]);
+            self.b.switch_to_block(raw);
+            self.b.set_srcloc(ir::SourceLoc::new(fault::LOAD_SOURCE));
+            let result = self.b.ins().load(
+                ty,
+                MemFlags::new().with_trap_code(Some(ir::TrapCode::user(1).unwrap())),
+                address,
+                0,
+            );
+            self.b.set_srcloc(ir::SourceLoc::default());
+            self.b.ins().jump(done, &[result.into()]);
+            self.b.switch_to_block(checked);
         }
         let permission = if write { WRITE } else { READ };
         let mut combined = None;
@@ -1774,6 +2027,13 @@ impl Emitter<'_> {
             let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
             let access = self.b.ins().band_imm(p, i64::from(permission));
             let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            if let Some((_, recovery)) = hardware {
+                self.checked_read_guard(missing, addr, recovery);
+            } else {
+                self.guard(missing, reason, Some(addr));
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
             self.guard(missing, reason, Some(addr));
             self.b.set_cold_block(self.b.current_block().unwrap());
             combined = Some(if let Some(old) = combined {
@@ -1847,6 +2107,56 @@ impl Emitter<'_> {
     }
     fn direct_load(&mut self, addr: Value, ty: ir::Type) -> Value {
         self.direct_memory(addr, ty, None).unwrap()
+    }
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fn capture_hardware_read(
+        &mut self,
+        address: Value,
+        width: usize,
+    ) -> Option<(Value, ir::Block)> {
+        let variable = self.fault_mode?;
+        let outputs = std::array::from_fn(|index| match index {
+            0..=7 => self.b.use_var(self.regs[index]),
+            8 => self.b.use_var(self.flags),
+            9..=15 => self.b.use_var(self.lazy[index - 9]),
+            16 => self.b.use_var(self.fuel),
+            _ => address,
+        });
+        let draft = fault::Draft::capture(
+            &mut self.b,
+            &self.fault_seeds,
+            self.state,
+            outputs,
+            self.fault_entry,
+            self.pc,
+            width,
+        )?;
+        let enabled = self.b.use_var(variable);
+        let disabled = self.b.ins().iconst(types::I8, 0);
+        self.b.def_var(variable, disabled);
+        let recovery = self.b.create_block();
+        self.b.set_cold_block(recovery);
+        self.fault_return = Some(recovery);
+        self.fault_draft = Some(draft);
+        Some((enabled, recovery))
+    }
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fn checked_read_guard(&mut self, bad: Value, address: Value, recovery: ir::Block) {
+        let failed = self.b.create_block();
+        self.b.set_cold_block(failed);
+        let continued = self.b.create_block();
+        self.b.ins().brif(bad, failed, &[], continued, &[]);
+        self.b.switch_to_block(failed);
+        self.b.ins().store(
+            MemFlags::trusted(),
+            address,
+            self.state,
+            offset_of!(CpuState, fault_addr) as i32,
+        );
+        let pc = self.constant(self.pc);
+        self.save_state(pc);
+        self.b.ins().jump(recovery, &[]);
+        self.b.switch_to_block(continued);
     }
     fn direct_store(&mut self, addr: Value, value: Value) {
         let ty = self.b.func.dfg.value_type(value);
