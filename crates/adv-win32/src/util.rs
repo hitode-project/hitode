@@ -1,8 +1,8 @@
 //! Guest memory helpers shared by the Win32 handlers.
 
+use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::Env;
 use adv_machine::layout::teb;
-use pal_cpu::{Guest, GuestExt};
 
 pub const MAX_STR: usize = 0x1_0000;
 

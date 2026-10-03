@@ -7,8 +7,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::rc::{Rc, Weak};
 
+use adv_cpu::backend::{FilePage, GuestExt, Prot};
 use adv_machine::{Env, Object, Outcome, Registry};
-use pal_cpu::{FilePage, GuestExt, Prot};
 
 use super::K32;
 use crate::{Win32, stdcall, util::set_last_error};

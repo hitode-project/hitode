@@ -1,6 +1,6 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
-use adv_jit::RunOutcome;
+use adv_cpu::RunOutcome;
 use pipeline::*;
 use std::time::Instant;
 

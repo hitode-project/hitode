@@ -9,23 +9,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "adv-device"
+name = "adv-cpu"
 version = "0.1.0"
 dependencies = [
  "adv-sync",
- "cpal",
- "log",
- "pal-cpu",
- "rubato",
-]
-
-[[package]]
-name = "adv-jit"
-version = "0.1.0"
-dependencies = [
- "adv-machine",
- "adv-sync",
- "adv-win32",
+ "adv-unicorn",
  "cc",
  "cranelift-codegen",
  "cranelift-frontend",
@@ -33,18 +21,30 @@ dependencies = [
  "cranelift-module",
  "iced-x86",
  "libc",
- "pal-cpu",
+ "thiserror 2.0.21",
  "unicorn-engine",
+]
+
+[[package]]
+name = "adv-device"
+version = "0.1.0"
+dependencies = [
+ "adv-cpu",
+ "adv-sync",
+ "cpal",
+ "log",
+ "rubato",
 ]
 
 [[package]]
 name = "adv-machine"
 version = "0.1.0"
 dependencies = [
+ "adv-cpu",
  "adv-pe",
  "adv-samples",
+ "adv-unicorn",
  "log",
- "pal-cpu",
  "thiserror 2.0.21",
 ]
 
@@ -74,15 +74,15 @@ dependencies = [
 name = "adv-runtime"
 version = "0.1.0"
 dependencies = [
+ "adv-cpu",
  "adv-device",
- "adv-jit",
  "adv-machine",
  "adv-pe",
  "adv-sync",
+ "adv-unicorn",
  "adv-win32",
  "iced-x86",
  "ogg",
- "pal-cpu",
  "png",
  "symphonia",
  "unicorn-engine",
@@ -104,15 +104,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-unicorn"
+version = "0.1.0"
+dependencies = [
+ "adv-cpu",
+ "unicorn-engine",
+]
+
+[[package]]
 name = "adv-win32"
 version = "0.1.0"
 dependencies = [
+ "adv-cpu",
  "adv-machine",
  "adv-pe",
  "adv-sync",
+ "adv-unicorn",
  "encoding_rs",
  "log",
- "pal-cpu",
 ]
 
 [[package]]
@@ -995,14 +1004,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "pal-cpu"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.21",
- "unicorn-engine",
-]
 
 [[package]]
 name = "pin-project-lite"

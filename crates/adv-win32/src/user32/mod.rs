@@ -9,9 +9,9 @@ pub mod message;
 pub(crate) mod strings;
 pub mod window;
 
+use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::{Env, Machine, Outcome, Registry};
 use adv_pe::ResId;
-use pal_cpu::{Backend, GuestExt, MemFault};
 
 pub use window::User;
 
@@ -48,7 +48,7 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
 fn wsprintf_a(env: &mut Env<'_>) -> Outcome {
     let (buf, fmt) = (env.arg(0), env.arg(1));
     let f = cstr(env.cpu, fmt);
-    let esp = env.cpu.reg(pal_cpu::Reg::Esp);
+    let esp = env.cpu.reg(adv_cpu::backend::Reg::Esp);
     let codec = env.ext.get::<Win32>().codec;
     let out = format(
         env.cpu,

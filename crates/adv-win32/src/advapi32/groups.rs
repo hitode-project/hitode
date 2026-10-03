@@ -1,7 +1,7 @@
 //! Enumeration is stable in canonical UTF-16 order. Names retain their original
 //! spelling; deleted handles remain closable but cannot observe a recreated key.
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::{GuestExt, Prot};
 
 use super::{
     ACCESS_DENIED, INVALID_DATA, INVALID_PARAMETER, Key, KeyMetadata, MORE_DATA, NOACCESS,

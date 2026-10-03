@@ -1,10 +1,10 @@
 //! Authored programs call the real registered guest ABI. No native registry
 //! access, host keys, installed configuration or game-specific values are used.
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_unicorn::UnicornCpu;
 use adv_win32::{Codec, Win32, Win32Config};
-use pal_cpu::asm::Asm;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Guest, GuestExt, Prot};
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;

@@ -1,7 +1,7 @@
 //! Small non-rendering compatibility services needed by the first generic ADV sample.
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Conv, Env, Outcome, Registry};
 use adv_win32::{Win32, util::set_last_error};
-use pal_cpu::GuestExt;
 
 pub fn register(r: &mut Registry) {
     crate::mmio::register(r);
@@ -49,7 +49,7 @@ fn diagnostic_wsprintf(e: &mut Env<'_>) -> Outcome {
         registry.get("user32.dll", "wsprintfA").unwrap().handler
     });
     let diagnostic = std::env::var_os("ADV_PRINTF_DIAG_PATH").map(|path| {
-        use pal_cpu::Reg;
+        use adv_cpu::backend::Reg;
         let mut args = adv_win32::printf::StackArgs { cpu: e.cpu, addr: e.cpu.reg(Reg::Esp) + 12 };
         let format = adv_win32::util::cstr(e.cpu, e.arg(1));
         let out = adv_win32::printf::format(e.cpu, &e.ext.get::<Win32>().codec, &format, &mut args);
@@ -315,9 +315,9 @@ fn message_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adv_jit::pal::JitCpu;
+    use adv_cpu::JitCpu;
+    use adv_cpu::backend::{Guest, Prot, asm::Asm};
     use adv_machine::{Clock, Machine, Object, RunResult};
-    use pal_cpu::{Guest, Prot, asm::Asm};
 
     fn waiter(jit: bool, timeout: u32, event: bool) -> (Machine<JitCpu>, Option<u32>) {
         let mut registry = Registry::default();

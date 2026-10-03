@@ -1,7 +1,7 @@
 //! Multimedia timers on one cooperative guest worker. No host thread, polling,
 //! or system timer-resolution request is used by this persona.
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{CtxId, Env, Object, Outcome, Registry, Wait};
-use pal_cpu::{GuestExt, Prot};
 use std::collections::BTreeMap;
 
 const MIN_MS: u32 = 1;

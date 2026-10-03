@@ -2,8 +2,8 @@
 //! Built-in labels use a fixed virtual en-US locale, independent of the host UI.
 use super::{user, user_mut};
 use crate::{stdcall, util::set_last_error};
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::{GuestExt, Prot};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Default)]
@@ -576,7 +576,7 @@ fn legacy_insert(env: &mut Env<'_>, wide: bool, append: bool) -> Outcome {
 // leave partial handle trees. Indirect templates have no supplied byte length;
 // enforce the same 1-MiB, 64-level and 16384-item limits using checked reads.
 struct Template<'a> {
-    cpu: &'a dyn pal_cpu::Guest,
+    cpu: &'a dyn adv_cpu::backend::Guest,
     base: u32,
     len: u32,
     at: u32,
@@ -695,7 +695,7 @@ fn build_menu(env: &mut Env<'_>, parsed: ParsedMenu, extended: bool) -> u32 {
     menu
 }
 fn parse_template(
-    cpu: &dyn pal_cpu::Guest,
+    cpu: &dyn adv_cpu::backend::Guest,
     base: u32,
     len: u32,
 ) -> Result<(ParsedMenu, bool, usize), u32> {
@@ -846,7 +846,7 @@ pub(super) fn register(reg: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pal_cpu::{Guest, MemFault, Reg};
+    use adv_cpu::backend::{Guest, MemFault, Reg};
     const BASE: u32 = 0x10000;
     struct TemplateGuest(Vec<u8>);
     impl Guest for TemplateGuest {

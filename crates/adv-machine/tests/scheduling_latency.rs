@@ -1,9 +1,9 @@
 //! Synthetic scheduling contracts. No game code, assets or wall-clock speed claims.
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
 use adv_machine::{Clock, Conv, Machine, Outcome, Registry, RunResult, SliceResult, Wait};
-use pal_cpu::asm::Asm;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Guest, GuestExt, Prot};
+use adv_unicorn::UnicornCpu;
 use std::time::{Duration, Instant};
 
 const CODE: u32 = 0x0040_0000;

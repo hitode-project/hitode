@@ -2,7 +2,7 @@
 //! sample_bench <EXE> <jit|interpreter|unicorn> [frames=120] [codepage=932] [PNG] [--profile] [--compile fast|speed] [--sync-compilation]
 #[path = "../tests/support/cpu.rs"]
 mod backend;
-use adv_jit::CompileStrategy;
+use adv_cpu::CompileStrategy;
 use adv_machine::{Clock, RunResult};
 use adv_runtime::boot::Runtime;
 use std::time::{Duration, Instant};

@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 adv-sync = { path = "../adv-sync" }
-pal-cpu = { path = "../pal-cpu", default-features = false }
+adv-cpu = { path = "../adv-cpu" }
 adv-machine.workspace = true
 adv-pe.workspace = true
 log.workspace = true
@@ -19,4 +19,4 @@ encoding_rs.workspace = true
 workspace = true
 
 [dev-dependencies]
-pal-cpu = { path = "../pal-cpu", features = ["unicorn"] }
+adv-unicorn = { path = "../adv-unicorn" }

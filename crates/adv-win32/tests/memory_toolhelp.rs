@@ -1,10 +1,10 @@
 //! Real guest thunk calls validate protected output buffers before host writes.
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::{PAGE, PARK_ADDR};
 use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
-use pal_cpu::asm::Asm;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Guest, GuestExt, Prot};
 
 const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;

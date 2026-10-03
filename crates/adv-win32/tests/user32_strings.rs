@@ -1,9 +1,9 @@
 //! Real guest API calls: explicit counts, ACP, DBCS boundaries and protected ranges.
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, Registry, RunResult};
+use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
-use pal_cpu::asm::Asm;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Guest, GuestExt, Prot};
 
 fn convert(name: &str, cp: u32, input: &[u8], count: u32, writable: bool) -> (u32, Vec<u8>) {
     const CODE: u32 = 0x400000;

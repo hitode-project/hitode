@@ -1,7 +1,7 @@
 //! Small C-runtime services used by guest library DLLs. Library algorithms remain guest code.
+use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome, Registry};
 use adv_win32::Win32;
-use pal_cpu::{GuestExt, Reg};
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -11,7 +11,9 @@ struct CrtState {
     globals: HashMap<(String, String), u32>,
 }
 
-pub fn install<B: pal_cpu::Backend>(machine: &mut adv_machine::Machine<B>) -> Result<(), String> {
+pub fn install<B: adv_cpu::backend::Backend>(
+    machine: &mut adv_machine::Machine<B>,
+) -> Result<(), String> {
     let data = machine
         .resolve_import("msvcrt.dll", "_adjust_fdiv")
         .map_err(|e| e.to_string())?;
@@ -232,8 +234,8 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
         }
         "__dllonexit" => {
-            if !e.cpu.accessible(b, 4, pal_cpu::Prot::RW)
-                || !e.cpu.accessible(c, 4, pal_cpu::Prot::RW)
+            if !e.cpu.accessible(b, 4, adv_cpu::backend::Prot::RW)
+                || !e.cpu.accessible(c, 4, adv_cpu::backend::Prot::RW)
             {
                 return Outcome::Fail("CRT exit table pointer is inaccessible".into());
             }
@@ -511,10 +513,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adv_jit::pal::JitCpu;
+    use adv_cpu::JitCpu;
+    use adv_cpu::backend::{Guest, Prot};
     use adv_machine::{Clock, Machine, RunResult};
     use iced_x86::code_asm::*;
-    use pal_cpu::{Guest, Prot};
     fn machine(jit: bool) -> Machine<JitCpu> {
         let mut reg = Registry::default();
         adv_win32::register(&mut reg);

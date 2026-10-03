@@ -7,9 +7,9 @@
 //! accepted source chunks before conversion, gain and resampling.
 #[path = "../tests/support/cpu.rs"]
 mod backend;
+use adv_cpu::backend::{Guest, GuestExt, Reg};
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_cpu::{Guest, GuestExt, Reg};
 use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,

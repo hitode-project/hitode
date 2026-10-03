@@ -6,13 +6,13 @@ use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
 use adv_machine::{
     Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult, Trace, Wait,
 };
-use pal_cpu::asm::Asm;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Backend, Guest, GuestExt, Prot};
+use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x0040_0000;
 const PROC: u32 = CODE + 0x100;
@@ -21,7 +21,7 @@ const FLAG: u32 = 0x0041_0000;
 
 #[test]
 fn cdecl_float_return_pushes_x87_without_destroying_existing_stack() {
-    use pal_cpu::GuestExt;
+    use adv_cpu::backend::GuestExt;
     let mut r = Registry::default();
     r.add("test", "float", Conv::Cdecl { argc: 0 }, |_| {
         Outcome::ReturnF32(1.25)

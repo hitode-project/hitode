@@ -3,9 +3,9 @@
 
 use std::collections::VecDeque;
 
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, InitCall, Loader, ModuleId, ModuleKind, Outcome, Registry};
 use adv_pe::{ImportName, ResId};
-use pal_cpu::GuestExt;
 
 use super::K32;
 use crate::util::{IntOrStr, cstr, err, put_cstr, put_wstr, set_last_error, wstr};

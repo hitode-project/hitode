@@ -8,7 +8,7 @@ license = "GPL-2.0-or-later"
 publish.workspace = true
 
 [dependencies]
-pal-cpu = { path = "../pal-cpu", default-features = false }
+adv-cpu = { path = "../adv-cpu" }
 adv-pe.workspace = true
 thiserror.workspace = true
 log.workspace = true
@@ -17,6 +17,6 @@ log.workspace = true
 workspace = true
 
 [dev-dependencies]
-pal-cpu = { path = "../pal-cpu", features = ["unicorn"] }
+adv-unicorn = { path = "../adv-unicorn" }
 adv-samples.workspace = true
 adv-pe.workspace = true

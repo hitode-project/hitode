@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use pal_cpu::{Guest, MemFault, Prot};
+use adv_cpu::backend::{Guest, MemFault, Prot};
 
 use crate::layout::{DYN_END, DYN_START, GRANULE, PAGE};
 
@@ -144,7 +144,7 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pal_cpu::Reg;
+    use adv_cpu::backend::Reg;
 
     #[derive(Default)]
     struct MappingGuest {

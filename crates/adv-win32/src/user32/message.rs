@@ -14,8 +14,8 @@
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Object, Outcome, Registry, Wait};
-use pal_cpu::GuestExt;
 
 use super::window::{self, Rect, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
@@ -199,7 +199,7 @@ impl Msg {
             self.pt.1 as u32,
         ]
     }
-    fn write(&self, cpu: &mut dyn pal_cpu::Guest, p: u32) -> bool {
+    fn write(&self, cpu: &mut dyn adv_cpu::backend::Guest, p: u32) -> bool {
         let f = self.guest_fields();
         let mut valid = true;
         for (i, v) in f.into_iter().enumerate() {
@@ -208,7 +208,7 @@ impl Msg {
         valid
     }
 
-    fn read(cpu: &dyn pal_cpu::Guest, p: u32) -> Self {
+    fn read(cpu: &dyn adv_cpu::backend::Guest, p: u32) -> Self {
         let r = |i: u32| cpu.read_u32(p + 4 * i).unwrap_or(0);
         Msg {
             hwnd: r(0),

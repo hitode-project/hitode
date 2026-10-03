@@ -1,4 +1,4 @@
-use adv_jit::{ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices, Machine};
+use adv_cpu::{ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices, Machine};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -33,7 +33,7 @@ impl SurfaceMemory for ApiMemory<'_> {
     }
 }
 
-pub(crate) struct GuestMemory<'a>(pub &'a mut dyn pal_cpu::Guest);
+pub(crate) struct GuestMemory<'a>(pub &'a mut dyn adv_cpu::backend::Guest);
 impl SurfaceMemory for GuestMemory<'_> {
     fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
         if let Some(bytes) = self.0.shared_bytes(addr, len) {
@@ -47,7 +47,10 @@ impl SurfaceMemory for GuestMemory<'_> {
         self.0.write(addr, data).map_err(|e| e.to_string())
     }
     fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
-        if self.0.accessible(addr, len as u32, pal_cpu::Prot::WRITE) {
+        if self
+            .0
+            .accessible(addr, len as u32, adv_cpu::backend::Prot::WRITE)
+        {
             Ok(())
         } else {
             Err(format!(

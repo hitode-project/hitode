@@ -11,8 +11,8 @@
 //! * Initializers (TLS callbacks, DllMain) are returned as [`InitCall`]s, which the process
 //!   start thunk runs as a chain of guest calls on the main context.
 
+use adv_cpu::backend::{Guest, MemFault, Prot};
 use adv_pe::{ExportTarget, ImportName, Pe, PeError, file_flags, scn};
-use pal_cpu::{Guest, MemFault, Prot};
 use thiserror::Error;
 
 use crate::Sys;

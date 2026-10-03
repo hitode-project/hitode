@@ -17,7 +17,7 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $MsysBin 'sh.exe'))) { throw 'Unicorn test tools require MSYS sh on Windows' }
         $env:CMAKE_TOOLCHAIN_FILE = (Join-Path $PSScriptRoot 'arm64-v8a.toolchain.cmake')
         $env:PATH = $MsysBin + ';' + $env:PATH
-        cargo ndk -t arm64-v8a --platform 29 build --release -p adv-jit -p adv-runtime --examples
+        cargo ndk -t arm64-v8a --platform 29 build --release -p adv-cpu -p adv-runtime --examples
         if ($LASTEXITCODE -ne 0) { throw "Android oracle examples failed: $LASTEXITCODE" }
     }
 } finally {

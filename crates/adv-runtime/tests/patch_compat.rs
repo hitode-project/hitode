@@ -11,8 +11,8 @@ use adv_runtime::boot::Runtime;
 #[path = "support/cpu.rs"]
 mod backend;
 
-fn named_export(cpu: &dyn pal_cpu::Guest, base: u32, name: &[u8]) -> u32 {
-    use pal_cpu::GuestExt;
+fn named_export(cpu: &dyn adv_cpu::backend::Guest, base: u32, name: &[u8]) -> u32 {
+    use adv_cpu::backend::GuestExt;
     let pe = base + cpu.read_u32(base + 0x3c).unwrap();
     let directory = base + cpu.read_u32(pe + 24 + 96).unwrap();
     let count = cpu.read_u32(directory + 24).unwrap();
@@ -52,10 +52,10 @@ fn fixtures() -> PathBuf {
 
 #[test]
 fn relocated_api_thunks_preserve_stack_registers_callbacks_and_float_returns() {
+    use adv_cpu::backend::asm::Asm;
+    use adv_cpu::backend::{Guest, GuestExt, Prot};
     use adv_machine::layout::THUNK_STRIDE;
     use adv_machine::{Clock, Conv, Machine, Outcome, Registry, Wait};
-    use pal_cpu::asm::Asm;
-    use pal_cpu::{Guest, GuestExt, Prot};
     const CODE: u32 = 0x0040_0000;
     const RELOCATED: u32 = CODE + 0x400;
     const CALLBACK: u32 = CODE + 0x500;
@@ -226,7 +226,7 @@ fn real_minhook_iat_com_and_dllmain_match_native_windows() {
                 .jit_mut()
                 .unwrap()
                 .machine_mut()
-                .add_region(adv_jit::Region::new(target, 6))
+                .add_region(adv_cpu::Region::new(target, 6))
                 .unwrap();
         }
         runtime

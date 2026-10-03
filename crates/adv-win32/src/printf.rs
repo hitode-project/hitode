@@ -4,7 +4,7 @@
 //! converted with the codec. Floating point (`%f %e %g`) reads a double (two stack slots),
 //! which wsprintf itself never does but C printf does.
 
-use pal_cpu::Guest;
+use adv_cpu::backend::Guest;
 
 use crate::Codec;
 use crate::util::{cstr, wstr};
@@ -243,23 +243,33 @@ mod tests {
         fn push_f32(&mut self, _: f32) {
             unreachable!()
         }
-        fn reg(&self, _: pal_cpu::Reg) -> u32 {
+        fn reg(&self, _: adv_cpu::backend::Reg) -> u32 {
             0
         }
-        fn set_reg(&mut self, _: pal_cpu::Reg, _: u32) {}
-        fn read(&self, addr: u32, _: &mut [u8]) -> Result<(), pal_cpu::MemFault> {
-            Err(pal_cpu::MemFault { addr, len: 0 })
+        fn set_reg(&mut self, _: adv_cpu::backend::Reg, _: u32) {}
+        fn read(&self, addr: u32, _: &mut [u8]) -> Result<(), adv_cpu::backend::MemFault> {
+            Err(adv_cpu::backend::MemFault { addr, len: 0 })
         }
-        fn write(&mut self, addr: u32, _: &[u8]) -> Result<(), pal_cpu::MemFault> {
-            Err(pal_cpu::MemFault { addr, len: 0 })
+        fn write(&mut self, addr: u32, _: &[u8]) -> Result<(), adv_cpu::backend::MemFault> {
+            Err(adv_cpu::backend::MemFault { addr, len: 0 })
         }
-        fn map(&mut self, _: u32, _: u32, _: pal_cpu::Prot) -> Result<(), pal_cpu::MemFault> {
+        fn map(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: adv_cpu::backend::Prot,
+        ) -> Result<(), adv_cpu::backend::MemFault> {
             Ok(())
         }
-        fn protect(&mut self, _: u32, _: u32, _: pal_cpu::Prot) -> Result<(), pal_cpu::MemFault> {
+        fn protect(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: adv_cpu::backend::Prot,
+        ) -> Result<(), adv_cpu::backend::MemFault> {
             Ok(())
         }
-        fn unmap(&mut self, _: u32, _: u32) -> Result<(), pal_cpu::MemFault> {
+        fn unmap(&mut self, _: u32, _: u32) -> Result<(), adv_cpu::backend::MemFault> {
             Ok(())
         }
     }

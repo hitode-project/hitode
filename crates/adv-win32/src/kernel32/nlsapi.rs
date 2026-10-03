@@ -1,7 +1,7 @@
 //! Code page and locale functions.
 
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::GuestExt;
 
 use super::K32;
 use crate::nls::{ctype1, is_valid_codepage, lead_byte_ranges};

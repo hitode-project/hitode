@@ -1,8 +1,8 @@
 //! Local, headless failure evidence with guest code/state snapshots. No game mutation.
 //! startup_diagnostic <exe> <output-directory> [seconds=10] [codepage=932] [hex-pages...]
+use adv_cpu::backend::{Guest, GuestExt, Reg};
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_cpu::{Guest, GuestExt, Reg};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

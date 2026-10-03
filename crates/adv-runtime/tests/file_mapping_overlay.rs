@@ -1,8 +1,8 @@
 //! Writable views must preserve source assets even in portable-save mode.
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, Registry, RunResult};
 use adv_win32::{Win32, Win32Config};
 use iced_x86::code_asm::*;
-use pal_cpu::{Guest, GuestExt, Prot};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -55,7 +55,7 @@ impl Program {
         if native {
             let mut jit = self.machine.cpu.jit_mut().unwrap().machine_mut();
             jit.set_async_compilation(false);
-            jit.add_region(adv_jit::Region::new(CODE, code.len()))
+            jit.add_region(adv_cpu::Region::new(CODE, code.len()))
                 .unwrap();
         }
         self.machine

@@ -1,12 +1,12 @@
 //! Wait-set acquisition happens when the set becomes ready, before its
 //! continuation runs. These checks cover reset/reacquisition races and WaitAll.
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
 use adv_machine::{
     Clock, Conv, Machine, Object, Outcome, Registry, Resume, RunResult, Wait, WakeReason,
 };
-use pal_cpu::asm::Asm;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Guest, GuestExt, Prot};
+use adv_unicorn::UnicornCpu;
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x500000;

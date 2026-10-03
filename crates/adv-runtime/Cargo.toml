@@ -7,8 +7,7 @@ description = "Guest GDI/DirectDraw software surfaces and a common presentation 
 
 [dependencies]
 adv-sync = { path = "../adv-sync" }
-adv-jit = { path = "../adv-jit", features = ["pal"] }
-pal-cpu = { path = "../pal-cpu", default-features = false }
+adv-cpu = { path = "../adv-cpu" }
 adv-machine = { path = "../adv-machine" }
 adv-win32 = { path = "../adv-win32" }
 adv-device = { path = "../adv-device" }
@@ -20,8 +19,8 @@ symphonia = { version = "0.5.5", default-features = false, features = ["vorbis",
 windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Foundation"] }
 
 [dev-dependencies]
-unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
-pal-cpu = { path = "../pal-cpu", default-features = false, features = ["unicorn"] }
+unicorn-engine.workspace = true
+adv-unicorn = { path = "../adv-unicorn" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 png = "0.17"
 

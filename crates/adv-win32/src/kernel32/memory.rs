@@ -1,8 +1,8 @@
 //! Heap, Local/Global, and Virtual memory functions.
 
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::layout::{GRANULE, PAGE};
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::{GuestExt, Prot};
 
 use super::K32;
 use crate::util::{err, set_last_error};

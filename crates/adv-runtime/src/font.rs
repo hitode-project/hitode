@@ -97,7 +97,7 @@ pub(crate) fn register(registry: &mut Registry) {
     );
 }
 
-pub(crate) fn install<B: pal_cpu::Backend>(machine: &mut adv_machine::Machine<B>) {
+pub(crate) fn install<B: adv_cpu::backend::Backend>(machine: &mut adv_machine::Machine<B>) {
     let mut original = Registry::default();
     adv_win32::register(&mut original);
     machine.ext.insert(Fonts {
@@ -544,9 +544,9 @@ impl Drop for NativeFont {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adv_jit::pal::JitCpu;
+    use adv_cpu::JitCpu;
+    use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
     use adv_machine::{Clock, Machine};
-    use pal_cpu::{Guest, GuestExt, Prot, Reg};
 
     fn fixture() -> (Machine<JitCpu>, u32, u32) {
         let mut registry = Registry::default();

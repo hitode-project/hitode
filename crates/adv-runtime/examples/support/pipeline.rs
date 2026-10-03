@@ -1,7 +1,7 @@
 #![allow(dead_code)]
-#[path = "../../../adv-jit/tests/support/mod.rs"]
+#[path = "../../../adv-cpu/tests/support/mod.rs"]
 mod oracle_support;
-use adv_jit::{CpuState, EXEC, READ, Region, WRITE};
+use adv_cpu::{CpuState, EXEC, READ, Region, WRITE};
 use adv_runtime::{Graphics, IID_DDRAW7, Snapshot, api, install};
 use iced_x86::code_asm::*;
 use oracle_support::Machine;
@@ -219,7 +219,7 @@ pub fn invoke(f: &mut Fixture, id: u32, args: &[u32]) -> u32 {
         f.machine
             .run_with_services(STOP, 10000, &mut f.graphics)
             .unwrap(),
-        adv_jit::RunOutcome::ReachedStop
+        adv_cpu::RunOutcome::ReachedStop
     );
     assert_eq!(f.machine.state.regs[4], STACK + 4);
     f.machine.state.regs[0]

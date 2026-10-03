@@ -4,12 +4,12 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
+use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Conv, Env, Object, Outcome, Registry};
 use adv_win32::{
     Win32,
     util::{cstr, wstr},
 };
-use pal_cpu::{Guest, GuestExt};
 
 const MEM: u32 = u32::from_le_bytes(*b"MEM ");
 const DOS: u32 = u32::from_le_bytes(*b"DOS ");

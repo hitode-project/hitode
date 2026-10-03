@@ -1,8 +1,8 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
 use adv_machine::{Conv, Env, Machine, Outcome, Registry};
 use adv_win32::Win32;
-use pal_cpu::{Backend, Guest, GuestExt, Prot};
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};
 use std::sync::Arc;
@@ -1174,9 +1174,9 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adv_jit::pal::JitCpu;
+    use adv_cpu::JitCpu;
+    use adv_cpu::backend::Reg;
     use adv_machine::{Clock, Object as WaitObject};
-    use pal_cpu::Reg;
     const DATA: u32 = 0x500000;
     const STACK: u32 = 0x600000;
 

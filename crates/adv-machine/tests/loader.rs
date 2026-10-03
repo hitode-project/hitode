@@ -1,12 +1,12 @@
 //! Loader tests on the local sample corpus (`adv-samples`).
 //! Each test is skipped when its sample is missing.
 
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::layout::{HOST_MODULE_BASE, PARK_ADDR, THUNK_BASE, THUNK_SIZE, THUNK_STRIDE};
 use adv_machine::loader::HostDir;
 use adv_machine::{Clock, FileSource, Machine, ModuleKind, Registry, RunResult};
 use adv_pe::Pe;
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Guest, GuestExt, Prot};
+use adv_unicorn::UnicornCpu;
 
 fn game(build: &str) -> Option<HostDir> {
     adv_samples::dir(build).map(|root| HostDir::new(root, "C:\\Game"))
@@ -208,7 +208,10 @@ fn leyline_runs_crt_init_until_first_unimplemented_call() {
     eprintln!("stopped: {e}\n  recent: {:?}", e.recent);
     assert!(e.message.starts_with("unimplemented: "), "{e}");
     // The failing call came from guest code inside the exe, i.e. the CRT actually ran.
-    let caller = m.cpu.read_u32(m.cpu.reg(pal_cpu::Reg::Esp)).unwrap();
+    let caller = m
+        .cpu
+        .read_u32(m.cpu.reg(adv_cpu::backend::Reg::Esp))
+        .unwrap();
     assert_eq!(
         m.sys.modules.containing(caller),
         Some(exe),

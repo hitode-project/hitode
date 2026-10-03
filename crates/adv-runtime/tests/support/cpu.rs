@@ -1,8 +1,8 @@
 //! Dev-only runtime backend selection. `unicorn` always owns a real UnicornCpu.
 #![allow(dead_code)]
-use adv_jit::{CompileStrategy, Stats, pal::JitCpu};
-use pal_cpu::unicorn::UnicornCpu;
-use pal_cpu::{Backend, Exit, Guest, MemFault, Prot, Reg, SegmentSetup, TrapHandler};
+use adv_cpu::backend::{Backend, Exit, Guest, MemFault, Prot, Reg, SegmentSetup, TrapHandler};
+use adv_cpu::{CompileStrategy, JitCpu, Stats};
+use adv_unicorn::UnicornCpu;
 use std::time::Duration;
 
 pub enum Cpu {
@@ -38,7 +38,7 @@ impl Cpu {
             _ => Stats::default(),
         }
     }
-    pub fn profile(&self) -> std::collections::BTreeMap<u32, adv_jit::ProfileSample> {
+    pub fn profile(&self) -> std::collections::BTreeMap<u32, adv_cpu::ProfileSample> {
         match self {
             Self::Jit(cpu) => cpu.profile(),
             Self::Unicorn(_) => std::collections::BTreeMap::new(),
@@ -85,7 +85,7 @@ impl Guest for Cpu {
     fn map_file_pages(
         &mut self,
         addr: u32,
-        pages: &[std::rc::Rc<pal_cpu::FilePage>],
+        pages: &[std::rc::Rc<adv_cpu::backend::FilePage>],
         prot: Prot,
         copy_on_write: bool,
     ) -> Result<(), MemFault> {

@@ -1,6 +1,6 @@
 //! Audio-owned DMA voice state. The only shared data is a byte-atomic read view.
 use crate::resample::Converter;
-use pal_cpu::SharedReadView;
+use adv_cpu::backend::SharedReadView;
 use std::sync::Arc;
 
 pub struct RingConfig {

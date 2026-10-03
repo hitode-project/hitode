@@ -1,7 +1,7 @@
 //! Logical palettes on the provider's 32-bit true-colour display. Entries are
 //! real shared GDI objects; selecting a palette does not copy its contents.
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::{GuestExt, Prot};
 
 use super::{GDI32, Gdi, GdiObj, gdi, stock_object};
 use crate::stdcall;

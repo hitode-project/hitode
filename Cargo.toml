@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/adv-cpu",
     "crates/adv-device",
-    "crates/adv-jit",
     "crates/adv-machine",
     "crates/adv-pe",
     "crates/adv-runtime",
     "crates/adv-samples",
     "crates/adv-sync",
+    "crates/adv-unicorn",
     "crates/adv-win32",
-    "crates/pal-cpu",
     "apps/adv-run",
 ]
 exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]

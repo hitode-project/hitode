@@ -1,7 +1,7 @@
 //! End-to-end guest GDI/DDraw calls, native pixel drawing, and PNG presentation.
 #[path = "support/pipeline.rs"]
 mod pipeline;
-use adv_jit::RunOutcome;
+use adv_cpu::RunOutcome;
 use pipeline::*;
 
 fn main() {

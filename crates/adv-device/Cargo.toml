@@ -15,7 +15,7 @@ device = ["dep:cpal"]
 cpal = { version = "0.16", optional = true }
 log.workspace = true
 adv-sync = { path = "../adv-sync" }
-pal-cpu = { path = "../pal-cpu", default-features = false }
+adv-cpu = { path = "../adv-cpu" }
 rubato = { version = "0.16", default-features = false }
 
 [lints]

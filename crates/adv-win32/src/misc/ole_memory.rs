@@ -1,8 +1,8 @@
 //! Guest-owned COM task memory and Automation strings. No host COM pointers.
 use std::collections::BTreeSet;
 
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::{GuestExt, Prot};
 
 use crate::{Win32, stdcall};
 

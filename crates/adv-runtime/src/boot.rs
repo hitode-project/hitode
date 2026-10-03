@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use adv_jit::pal::JitCpu;
+use adv_cpu::JitCpu;
+use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult};
 use adv_win32::{Win32, Win32Config};
-use pal_cpu::{Backend, GuestExt, Prot};
 
 use crate::graphics::{API_SPECS, DEVICE_METHODS, GuestMemory, SURFACE_METHODS};
 use crate::{Graphics, Snapshot, api};
@@ -169,7 +169,7 @@ impl<B: Backend> Runtime<B> {
             Ok(None) => outcome,
             Err(message) => SliceResult::Complete(RunResult::Failed(adv_machine::MachineError {
                 ctx: self.machine.sys.current,
-                pc: self.machine.cpu.reg(pal_cpu::Reg::Eip),
+                pc: self.machine.cpu.reg(adv_cpu::backend::Reg::Eip),
                 message,
                 recent: self.machine.sys.recent_calls(),
             })),
@@ -463,28 +463,28 @@ impl<B: Backend> Runtime<B> {
             self.machine.sys.current
         ));
         for register in [
-            pal_cpu::Reg::Eip,
-            pal_cpu::Reg::Esp,
-            pal_cpu::Reg::Ebp,
-            pal_cpu::Reg::Eax,
-            pal_cpu::Reg::Ebx,
-            pal_cpu::Reg::Ecx,
-            pal_cpu::Reg::Edx,
-            pal_cpu::Reg::Esi,
-            pal_cpu::Reg::Edi,
+            adv_cpu::backend::Reg::Eip,
+            adv_cpu::backend::Reg::Esp,
+            adv_cpu::backend::Reg::Ebp,
+            adv_cpu::backend::Reg::Eax,
+            adv_cpu::backend::Reg::Ebx,
+            adv_cpu::backend::Reg::Ecx,
+            adv_cpu::backend::Reg::Edx,
+            adv_cpu::backend::Reg::Esi,
+            adv_cpu::backend::Reg::Edi,
         ] {
             report.push_str(&format!(
                 " {register:?}={:#010x}",
                 self.machine.cpu.reg(register)
             ));
         }
-        let stack = self.machine.cpu.reg(pal_cpu::Reg::Esp);
+        let stack = self.machine.cpu.reg(adv_cpu::backend::Reg::Esp);
         report.push_str("\nActive stack words:");
         for index in 0..64u32 {
             let Some(address) = stack.checked_add(index * 4) else {
                 break;
             };
-            match pal_cpu::GuestExt::read_u32(&self.machine.cpu, address) {
+            match adv_cpu::backend::GuestExt::read_u32(&self.machine.cpu, address) {
                 Ok(value) => report.push_str(&format!(" {value:08x}")),
                 Err(_) => {
                     report.push_str(" <unmapped>");
@@ -541,10 +541,9 @@ impl<B: Backend> Runtime<B> {
                 let call = self.machine.sys.thunks.get(thunk);
                 report.push_str(&format!(" in {}!{}", call.module, call.name));
             }
-            if let Some(caller) = context
-                .blocked_stack()
-                .and_then(|stack| pal_cpu::GuestExt::read_u32(&self.machine.cpu, stack).ok())
-            {
+            if let Some(caller) = context.blocked_stack().and_then(|stack| {
+                adv_cpu::backend::GuestExt::read_u32(&self.machine.cpu, stack).ok()
+            }) {
                 let place = self
                     .machine
                     .sys
@@ -608,7 +607,7 @@ impl<B: Backend> Runtime<B> {
         report
     }
 
-    pub fn report_with_profile(&self, samples: &BTreeMap<u32, adv_jit::ProfileSample>) -> String {
+    pub fn report_with_profile(&self, samples: &BTreeMap<u32, adv_cpu::ProfileSample>) -> String {
         let mut report = self.report();
         let mut samples: Vec<_> = samples.iter().collect();
         samples.sort_by_key(|(_, s)| std::cmp::Reverse(s.native_ns + s.interpreter_ns));
@@ -912,8 +911,8 @@ fn begin_paint(env: &mut Env<'_>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adv_cpu::backend::{Guest, GuestExt};
     use iced_x86::code_asm::*;
-    use pal_cpu::{Guest, GuestExt};
 
     fn machine() -> Machine<JitCpu> {
         let mut registry = Registry::default();

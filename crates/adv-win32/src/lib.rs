@@ -26,9 +26,9 @@ mod winsock;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use adv_cpu::backend::{Backend, Guest, GuestExt, MemFault};
 use adv_machine::layout::{PEB_ADDR, peb};
 use adv_machine::{Conv, Handle, Handler, Machine, Registry, Sys};
-use pal_cpu::{Backend, Guest, GuestExt, MemFault};
 
 pub use heap::Heaps;
 pub use nls::Codec;

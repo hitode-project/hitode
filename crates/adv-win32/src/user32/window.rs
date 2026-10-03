@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{CtxId, Env, Handle, Outcome, Registry};
-use pal_cpu::{Guest, GuestExt};
 
 use super::message::{send, send_all};
 use super::{USER32, user, user_mut};

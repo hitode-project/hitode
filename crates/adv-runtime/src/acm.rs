@@ -2,8 +2,8 @@
 //! Windows ACM is used solely by the repository's native differential fixture.
 use std::collections::BTreeMap;
 
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Conv, Env, Outcome, Registry};
-use pal_cpu::{Guest, GuestExt, Prot};
 use symphonia::core::audio::{Channels, SampleBuffer};
 use symphonia::core::codecs::{
     CODEC_TYPE_ADPCM_IMA_WAV, CODEC_TYPE_ADPCM_MS, CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_U8,

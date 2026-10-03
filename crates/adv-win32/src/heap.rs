@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use adv_cpu::backend::{Guest, MemFault, Prot};
 use adv_machine::Vm;
-use pal_cpu::{Guest, MemFault, Prot};
 
 const ALIGN: u32 = 8;
 const ARENA: u32 = 0x10_0000;
@@ -245,7 +245,7 @@ impl Heaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pal_cpu::Reg;
+    use adv_cpu::backend::Reg;
     use std::cell::Cell;
 
     #[derive(Default)]

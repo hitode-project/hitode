@@ -1,7 +1,7 @@
 //! Time: all readings come from the machine clock (virtual or real).
 
+use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Env, Outcome, Registry, Wait};
-use pal_cpu::{Guest, GuestExt};
 
 use super::K32;
 use crate::{Win32, stdcall, util::write_units};

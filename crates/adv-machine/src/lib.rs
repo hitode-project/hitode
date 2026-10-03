@@ -27,8 +27,8 @@ pub use wake_queue::WakePriority;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use pal_cpu::asm::Asm;
-use pal_cpu::{
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{
     Backend, Exit, Fault, Guest, GuestExt, MemFault, Prot, Reg, SegmentSetup, TrapAction,
     TrapHandler,
 };
@@ -739,7 +739,7 @@ impl TrapHandler for Dispatch<'_> {
     fn on_trap(&mut self, cpu: &mut dyn Guest, vector: u8) -> TrapAction {
         let frame_before = self.sys.completed_frames;
         let eip = cpu.reg(Reg::Eip);
-        let res = if vector != pal_cpu::asm::TRAP_VECTOR {
+        let res = if vector != adv_cpu::backend::asm::TRAP_VECTOR {
             Err(Parked::Exception(vector))
         } else if eip == thunk_addr(thunk::RETURN_PAD) + 2 {
             self.guest_return(cpu)
@@ -751,7 +751,7 @@ impl TrapHandler for Dispatch<'_> {
             let index = cpu.read_u32(esp).ok();
             let valid = cpu.read(eip.wrapping_sub(7), &mut instruction).is_ok()
                 && instruction[0] == 0x68
-                && instruction[5..] == [0xcd, pal_cpu::asm::TRAP_VECTOR]
+                && instruction[5..] == [0xcd, adv_cpu::backend::asm::TRAP_VECTOR]
                 && index.is_some_and(|i| {
                     i != thunk::RETURN_PAD
                         && i < self.sys.thunks.len()

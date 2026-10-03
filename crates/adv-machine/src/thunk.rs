@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
-use pal_cpu::asm::Asm;
-use pal_cpu::{Guest, MemFault};
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, MemFault};
 
 use crate::layout::{THUNK_CAP, thunk_addr};
 use crate::{Env, Outcome};

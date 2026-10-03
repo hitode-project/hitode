@@ -4,9 +4,9 @@
 //! from a host Read implementation. PCM decoding is deferred until ov_read.
 use std::collections::{BTreeMap, BTreeSet};
 
+use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_machine::{Conv, Env, FileSource, Machine, Outcome, Registry};
 use ogg::reading::{BasePacketReader, PageParser};
-use pal_cpu::{Backend, GuestExt, Prot};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{CODEC_TYPE_VORBIS, CodecParameters, Decoder, DecoderOptions};
 use symphonia::core::formats::Packet;

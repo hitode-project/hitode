@@ -6,8 +6,8 @@
 //! the function, so the handler can still run the original code with
 //! [`Outcome::call`](crate::Outcome::call) when it cannot (or must not) handle a call itself.
 
-use pal_cpu::asm::Asm;
-use pal_cpu::{Backend, MemFault, Prot};
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Backend, MemFault, Prot};
 
 use crate::Machine;
 use crate::layout::{PAGE, THUNK_BASE, THUNK_STRIDE};

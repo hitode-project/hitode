@@ -2,8 +2,8 @@
 //! owned snapshots whose lifetime is independent of later environment changes.
 use std::collections::{BTreeMap, BTreeSet};
 
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome, Registry};
-use pal_cpu::{GuestExt, Prot};
 
 use crate::{Win32, stdcall, util::set_last_error};
 

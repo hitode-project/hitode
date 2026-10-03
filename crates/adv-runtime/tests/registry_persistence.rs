@@ -4,10 +4,10 @@
 use std::path::Path;
 use std::time::Duration;
 
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Clock, RunResult, SliceResult};
 use adv_runtime::boot::Runtime;
-use pal_cpu::asm::Asm;
-use pal_cpu::{Guest, GuestExt, Prot};
 #[path = "support/cpu.rs"]
 mod cpu;
 
