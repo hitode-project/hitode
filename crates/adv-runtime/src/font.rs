@@ -7,7 +7,7 @@ pub(crate) fn install<B: adv_cpu::backend::Backend>(machine: &mut Machine<B>) {
     fn contains_dc(env: &Env<'_>, dc: u32) -> bool {
         env.ext
             .get::<crate::Graphics<crate::Snapshot>>()
-            .owns_dc(dc)
+            .owns_dc(&env.sys.objects, dc)
     }
     fn contains_bitmap(env: &Env<'_>, bitmap: u32) -> bool {
         env.ext
@@ -119,7 +119,7 @@ mod tests {
             .ext
             .get::<crate::graphics::Graphics<crate::graphics::Snapshot>>();
         for dc in 2..128 {
-            assert!(!graphics.owns_dc(dc));
+            assert!(!graphics.owns_dc(&machine.sys.objects, dc));
         }
     }
 

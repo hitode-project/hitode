@@ -57,6 +57,7 @@ impl Raster {
         a: &[u32],
         surfaces: &mut Surfaces<P>,
         dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, String> {
         Ok(match id {
@@ -69,7 +70,9 @@ impl Raster {
             api::FLUSH => 1,
             api::CREATE_DC => {
                 let id = surfaces.new_id();
-                dcs.insert(id, STOCK_BITMAP);
+                if !dcs.create(objects, id, STOCK_BITMAP) {
+                    return Ok(self.fail(8));
+                }
                 id
             }
             api::CREATE_DIB => {
@@ -103,20 +106,22 @@ impl Raster {
                 bitmap
             }
             api::SELECT => {
-                if !dcs.contains(a[0]) || (a[1] != STOCK_BITMAP && !surfaces.contains(a[1])) {
+                if !dcs.contains(objects, a[0])
+                    || (a[1] != STOCK_BITMAP && !surfaces.contains(a[1]))
+                {
                     return Ok(self.fail(6));
                 }
-                if a[1] != STOCK_BITMAP && dcs.selects(a[1], Some(a[0])) {
+                if a[1] != STOCK_BITMAP && dcs.selects(objects, a[1], Some(a[0])) {
                     return Ok(self.fail(87));
                 }
-                dcs.insert(a[0], a[1]).unwrap()
+                dcs.select(objects, a[0], a[1]).unwrap()
             }
             api::DELETE_DC => {
                 self.stretch_modes.remove(&a[0]);
-                u32::from(dcs.remove(a[0]).is_some())
+                u32::from(dcs.remove(objects, a[0]).is_some())
             }
             api::SET_STRETCH_MODE => {
-                if a[0] != WINDOW_DC && !dcs.contains(a[0]) {
+                if a[0] != WINDOW_DC && !dcs.contains(objects, a[0]) {
                     return Ok(self.fail(6));
                 }
                 let mode = match a[1] {
@@ -136,7 +141,7 @@ impl Raster {
                 }
             }
             api::DELETE_OBJECT => {
-                if dcs.selects(a[0], None) || surfaces.primary_id() == Some(a[0]) {
+                if dcs.selects(objects, a[0], None) || surfaces.primary_id() == Some(a[0]) {
                     return Ok(self.fail(170));
                 }
                 if surfaces.delete(a[0]) {
@@ -149,13 +154,13 @@ impl Raster {
                 if a[8] != 0x00cc0020 {
                     return Ok(self.fail(87));
                 }
-                let Some(src) = dcs.get(a[5]) else {
+                let Some(src) = dcs.get(objects, a[5]) else {
                     return Ok(self.fail(6));
                 };
                 let dst = if a[0] == WINDOW_DC {
                     surfaces.primary(m)?
                 } else {
-                    dcs.get(a[0]).unwrap_or(0)
+                    dcs.get(objects, a[0]).unwrap_or(0)
                 };
                 let (Some(s), Some(d)) = (surfaces.get(src), surfaces.get(dst)) else {
                     return Ok(self.fail(6));
@@ -212,12 +217,12 @@ impl Raster {
                 let src = if a[5] == WINDOW_DC {
                     surfaces.primary(m)?
                 } else {
-                    dcs.get(a[5]).unwrap_or(0)
+                    dcs.get(objects, a[5]).unwrap_or(0)
                 };
                 let dst = if a[0] == WINDOW_DC {
                     surfaces.primary(m)?
                 } else {
-                    dcs.get(a[0]).unwrap_or(0)
+                    dcs.get(objects, a[0]).unwrap_or(0)
                 };
                 let (Some(s), Some(_d)) = (surfaces.get(src), surfaces.get(dst)) else {
                     return Ok(self.fail(6));

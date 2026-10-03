@@ -1,0 +1,151 @@
+//! Windows-visible logical GDI payloads owned by the shared process object table.
+use adv_machine::{Namespace, Object, Objects};
+use std::{cell::Cell, rc::Rc};
+const STOCK_BASE: u32 = 0x0190_0010;
+const SYSTEM_FONT: u32 = 13;
+
+#[derive(Clone, Debug)]
+pub struct LogFont {
+    pub height: i32,
+    pub width: i32,
+    pub weight: i32,
+    pub italic: bool,
+    pub charset: u8,
+    pub face: String,
+    /// The raw LOGFONTA for GetObject.
+    pub raw: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub enum GdiObj {
+    Font(LogFont),
+    Brush {
+        color: u32,
+    },
+    Pen {
+        color: u32,
+    },
+    Bitmap {
+        width: i32,
+        height: i32,
+        bpp: u16,
+        bits: u32,
+        stride: u32,
+        owned: bool,
+    },
+    Palette {
+        entries: Vec<[u8; 4]>,
+    },
+    Dc {
+        /// The DC selects a surface from the common raster store.
+        raster: bool,
+        hwnd: u32,
+        selected: [u32; 4],
+        palette: u32,
+        text_color: u32,
+        bk_color: u32,
+        bk_mode: u32,
+    },
+    Region,
+}
+
+#[derive(Clone, Default)]
+pub struct Gdi {
+    // Copies share only the namespace token; payloads live exclusively in Objects.
+    namespace: Rc<Cell<Option<Namespace>>>,
+}
+
+impl Gdi {
+    fn namespace(&mut self, objects: &mut Objects) -> Option<Namespace> {
+        if self.namespace.get().is_none() {
+            self.namespace
+                .set(objects.new_namespace_in(0x0400_0004, 0x04ff_fffc));
+        }
+        self.namespace.get()
+    }
+    pub fn add(&mut self, objects: &mut Objects, o: GdiObj) -> u32 {
+        self.namespace(objects)
+            .and_then(|ns| objects.insert_host_in(ns, o))
+            .unwrap_or(0)
+    }
+    pub fn get<'a>(&self, objects: &'a Objects, h: u32) -> Option<&'a GdiObj> {
+        objects.owned(objects.lookup_alias(self.namespace.get()?, h)?)
+    }
+    pub fn get_mut<'a>(&self, objects: &'a mut Objects, h: u32) -> Option<&'a mut GdiObj> {
+        objects.owned_mut(objects.lookup_alias(self.namespace.get()?, h)?)
+    }
+    pub fn remove(&self, objects: &mut Objects, h: u32) -> Option<GdiObj> {
+        objects.lookup_alias::<GdiObj>(self.namespace.get()?, h)?;
+        match objects.close_alias(self.namespace.get()?, h)?? {
+            Object::Host(value) => value.downcast::<GdiObj>().ok().map(|value| *value),
+            _ => unreachable!("GDI namespace contains typed host objects"),
+        }
+    }
+    pub fn font_selected(&self, objects: &Objects, font: u32) -> bool {
+        self.namespace.get().is_some_and(|ns| {
+            objects.hosts_in::<GdiObj>(ns).any(
+                |(_, object)| matches!(object, GdiObj::Dc { selected, .. } if selected[2] == font),
+            )
+        })
+    }
+
+    /// Attach GDI metadata to a DC owned by another drawing provider. Repeated
+    /// GetDC calls preserve its logical selections instead of resetting them.
+    pub fn register_external_dc(&mut self, objects: &mut Objects, handle: u32, hwnd: u32) -> bool {
+        if handle == 0 {
+            return false;
+        }
+        if let Some(object) = self.get(objects, handle) {
+            return matches!(object, GdiObj::Dc { .. });
+        }
+        let selected = [
+            stock_object(0),
+            stock_object(7),
+            stock_object(SYSTEM_FONT),
+            0,
+        ];
+        let Some(ns) = self.namespace(objects) else {
+            return false;
+        };
+        objects.insert_host_at(
+            ns,
+            handle,
+            GdiObj::Dc {
+                raster: false,
+                hwnd,
+                selected,
+                palette: stock_object(15),
+                text_color: 0,
+                bk_color: 0xff_ffff,
+                bk_mode: 2,
+            },
+        )
+    }
+
+    pub fn values<'a>(&self, objects: &'a Objects) -> impl Iterator<Item = &'a GdiObj> {
+        self.namespace
+            .get()
+            .into_iter()
+            .flat_map(move |ns| objects.hosts_in::<GdiObj>(ns).map(|(_, value)| value))
+    }
+
+    /// Retire the logical selections when the drawing provider destroys a DC.
+    pub fn remove_external_dc(&mut self, objects: &mut Objects, handle: u32) -> bool {
+        if !matches!(self.get(objects, handle), Some(GdiObj::Dc { .. })) {
+            return false;
+        }
+        self.remove(objects, handle);
+        true
+    }
+
+    /// Keep a drawing provider's externally stored selection visible to GDI queries.
+    pub fn set_external_bitmap(&mut self, objects: &mut Objects, handle: u32, bitmap: u32) {
+        if let Some(GdiObj::Dc { selected, .. }) = self.get_mut(objects, handle) {
+            selected[3] = bitmap;
+        }
+    }
+}
+
+pub fn stock_object(i: u32) -> u32 {
+    STOCK_BASE + i
+}

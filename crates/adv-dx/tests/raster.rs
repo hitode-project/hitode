@@ -29,6 +29,7 @@ impl SurfaceMemory for Memory {
     }
 }
 struct Fixture {
+    objects: adv_machine::Objects,
     memory: Memory,
     surfaces: Surfaces<Snapshot>,
     contexts: DeviceContexts,
@@ -39,6 +40,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let mut f = Self {
+            objects: adv_machine::Objects::default(),
             memory: Memory(vec![0; 65536]),
             surfaces: Surfaces::new(5, 4, 4096, 61440, Snapshot::default()).unwrap(),
             contexts: DeviceContexts::default(),
@@ -63,6 +65,7 @@ impl Fixture {
                 args,
                 &mut self.surfaces,
                 &mut self.contexts,
+                &mut self.objects,
                 &mut self.memory,
             )
             .unwrap()
@@ -74,6 +77,7 @@ impl Fixture {
                 args,
                 &mut self.surfaces,
                 &mut self.contexts,
+                &mut self.objects,
                 &mut self.memory,
             )
             .unwrap()

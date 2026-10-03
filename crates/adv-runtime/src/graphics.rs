@@ -105,26 +105,27 @@ impl<P: Presenter> Graphics<P> {
         &mut self,
         id: u32,
         args: &[u32],
+        objects: &mut adv_machine::Objects,
         memory: &mut dyn SurfaceMemory,
     ) -> Result<u32, String> {
         if id < 200 {
             self.raster
-                .call(id, args, &mut self.surfaces, &mut self.dcs, memory)
+                .call(id, args, &mut self.surfaces, &mut self.dcs, objects, memory)
         } else {
             self.ddraw
-                .call(id, args, &mut self.surfaces, &mut self.dcs, memory)
+                .call(id, args, &mut self.surfaces, &mut self.dcs, objects, memory)
         }
     }
 
-    pub(crate) fn owns_dc(&self, dc: u32) -> bool {
-        dc == WINDOW_DC || self.dcs.contains(dc)
+    pub(crate) fn owns_dc(&self, objects: &adv_machine::Objects, dc: u32) -> bool {
+        dc == WINDOW_DC || self.dcs.contains(objects, dc)
     }
 
-    pub(crate) fn dc_bitmap(&self, dc: u32) -> Option<u32> {
+    pub(crate) fn dc_bitmap(&self, objects: &adv_machine::Objects, dc: u32) -> Option<u32> {
         if dc == WINDOW_DC {
             self.surfaces.primary_id()
         } else {
-            self.dcs.get(dc)
+            self.dcs.get(objects, dc)
         }
     }
 
@@ -236,14 +237,11 @@ pub fn install_graphics<B: Backend>(
         bgra: vec![0; width as usize * height as usize * 4],
         frames: 0,
     };
-    machine.ext.insert(Graphics::new(
-        width,
-        height,
-        arena,
-        arena_len,
-        entries.clone(),
-        snapshot,
-    )?);
+    let mut graphics = Graphics::new(width, height, arena, arena_len, entries.clone(), snapshot)?;
+    if let Some(win32) = machine.ext.try_get::<Win32>() {
+        graphics.dcs = DeviceContexts::new(win32.gdi.clone());
+    }
+    machine.ext.insert(graphics);
     Ok(entries)
 }
 
@@ -292,7 +290,7 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
         }
     }
     let before = graphics.stats.presentations;
-    let out = graphics.handle(id, args, &mut GuestMemory(env.cpu));
+    let out = graphics.handle(id, args, &mut env.sys.objects, &mut GuestMemory(env.cpu));
     let presented = graphics.stats.presentations;
     if let Ok(value) = &out {
         // Raster storage stays in Graphics; USER32/GDI object metadata must
@@ -318,7 +316,11 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
                     None
                 }
             })
-            .and_then(|dc| graphics.dc_bitmap(dc).map(|bitmap| (dc, bitmap)));
+            .and_then(|dc| {
+                graphics
+                    .dc_bitmap(&env.sys.objects, dc)
+                    .map(|bitmap| (dc, bitmap))
+            });
         if (added.is_some() || removed.is_some() || selection.is_some())
             && let Some(win32) = env.ext.try_get_mut::<Win32>()
         {
@@ -372,11 +374,12 @@ fn rollback_dc(env: &mut Env<'_>, id: u32, args: &[u32], dc: u32) -> Outcome {
         api::CREATE_DC => (api::DELETE_DC, [dc, 0]),
         _ => (api::RELEASE_DC, [args[0], dc]),
     };
-    if let Err(error) =
-        env.ext
-            .get_mut::<Graphics<Snapshot>>()
-            .handle(release, &words, &mut GuestMemory(env.cpu))
-    {
+    if let Err(error) = env.ext.get_mut::<Graphics<Snapshot>>().handle(
+        release,
+        &words,
+        &mut env.sys.objects,
+        &mut GuestMemory(env.cpu),
+    ) {
         return Outcome::Fail(format!("GDI context allocation rollback: {error}"));
     }
     if id == api::SURFACE_DC {
@@ -407,7 +410,12 @@ fn begin_paint(env: &mut Env<'_>) -> Outcome {
     {
         return Outcome::Fail(format!("BeginPaint resize: {error}"));
     }
-    let dc = match graphics.handle(api::GET_DC, &[hwnd], &mut GuestMemory(env.cpu)) {
+    let dc = match graphics.handle(
+        api::GET_DC,
+        &[hwnd],
+        &mut env.sys.objects,
+        &mut GuestMemory(env.cpu),
+    ) {
         Ok(dc) => dc,
         Err(error) => return Outcome::Fail(format!("BeginPaint: {error}")),
     };
@@ -452,7 +460,12 @@ mod tests {
         machine
             .ext
             .get_mut::<Graphics<Snapshot>>()
-            .handle(id, args, &mut GuestMemory(&mut machine.cpu))
+            .handle(
+                id,
+                args,
+                &mut machine.sys.objects,
+                &mut GuestMemory(&mut machine.cpu),
+            )
             .unwrap()
     }
 
@@ -613,7 +626,9 @@ mod tests {
         let dc = m.cpu.read_u32(data).unwrap();
         assert_ne!(graphics(&mut m, api::SURFACE_RELEASE_DC, &[source, dc]), 0);
         assert!(
-            m.ext.get::<Graphics<Snapshot>>().owns_dc(dc),
+            m.ext
+                .get::<Graphics<Snapshot>>()
+                .owns_dc(&m.sys.objects, dc),
             "a rejected ReleaseDC must retain the original surface DC"
         );
         assert_eq!(graphics(&mut m, api::SURFACE_RELEASE_DC, &[primary, dc]), 0);

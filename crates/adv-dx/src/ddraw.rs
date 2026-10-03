@@ -531,6 +531,7 @@ impl DirectDraw {
         a: &[u32],
         surfaces: &mut Surfaces<P>,
         dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, String> {
         if id == api::UNIMPLEMENTED_COM {
@@ -917,7 +918,9 @@ impl DirectDraw {
                     return Ok(BUSY);
                 }
                 let dc = surfaces.new_id();
-                dcs.insert(dc, sid);
+                if !dcs.create(objects, dc, sid) {
+                    return Ok(0x8007000e);
+                }
                 m.put_u32(a[1], dc)?;
                 0
             }
@@ -925,10 +928,10 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(a[0]) else {
                     return Ok(INVALID);
                 };
-                if dcs.get(a[1]) != Some(sid) {
+                if dcs.get(objects, a[1]) != Some(sid) {
                     return Ok(INVALID);
                 }
-                dcs.remove(a[1]);
+                dcs.remove(objects, a[1]);
                 if surfaces.primary_id() == Some(sid) {
                     surfaces.present(sid, m)?;
                 }
