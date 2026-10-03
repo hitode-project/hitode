@@ -81,6 +81,9 @@ pub struct Executor {
     tier_attempted: BTreeSet<u32>,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
+    background_sender: Option<adv_sync::background::LocalSender>,
+    background_service: Option<adv_sync::background::Service>,
+    background_wake: Option<adv_sync::WakeEvent>,
     completion_wake: Option<crate::compiler::CompletionWake>,
     interrupt: Arc<AtomicBool>,
     inactive_interrupt: AtomicBool,
@@ -209,6 +212,9 @@ impl Executor {
             tier_attempted: BTreeSet::new(),
             async_compilation: false,
             compiler: None,
+            background_sender: None,
+            background_service: None,
+            background_wake: None,
             completion_wake: None,
             interrupt: Arc::new(AtomicBool::new(false)),
             inactive_interrupt: AtomicBool::new(false),
@@ -474,8 +480,8 @@ impl Executor {
         }
         let snapshot = compile::Snapshot::capture(&region, &self.memory)?;
         if self.compiler.is_none() {
-            let mut worker = crate::compiler::Worker::new()
-                .map_err(|e| format!("start compiler worker: {e}"))?;
+            let sender = self.background_sender()?;
+            let mut worker = crate::compiler::Worker::with_sender(sender);
             if let Some(wake) = &self.completion_wake {
                 worker.set_waker(wake.clone());
             }
@@ -633,6 +639,72 @@ impl Executor {
             self.stats.pending_compilations = 0;
             self.compiler = None;
         }
+    }
+
+    /// Inject a startup-registered owner endpoint before the lazy background
+    /// service is first used. UI/GPU and CPU jobs then share exactly one worker.
+    pub fn set_background_sender(
+        &mut self,
+        sender: adv_sync::background::LocalSender,
+    ) -> Result<(), String> {
+        if self.background_sender.is_some()
+            || self
+                .compiler
+                .as_ref()
+                .is_some_and(|worker| worker.has_outstanding())
+        {
+            return Err("background sender must be installed before first use".into());
+        }
+        let wake = sender.borrow().execution_wake();
+        if self
+            .background_wake
+            .as_ref()
+            .is_some_and(|old| !Arc::ptr_eq(&old.interrupt_flag(), &wake.interrupt_flag()))
+        {
+            return Err("background service must use the execution owner's wake event".into());
+        }
+        self.set_wake_event(wake)?;
+        self.background_sender = Some(sender);
+        Ok(())
+    }
+
+    /// Return the same local producer for other execution-owned components.
+    /// A standalone executor lazily creates one service; shells requiring a UI
+    /// endpoint must register/inject both ports before the first guest run.
+    pub fn background_sender(&mut self) -> Result<adv_sync::background::LocalSender, String> {
+        if let Some(sender) = &self.background_sender {
+            return Ok(sender.clone());
+        }
+        let wake = self
+            .background_wake
+            .clone()
+            .map_or_else(adv_sync::WakeEvent::new, Ok)
+            .map_err(|error| error.to_string())?;
+        let mut builder =
+            adv_sync::background::Builder::new(wake).map_err(|error| error.to_string())?;
+        let sender = builder
+            .sender(crate::compiler::CAPACITY, crate::compiler::CAPACITY)
+            .map_err(|error| error.to_string())?
+            .into_local();
+        self.background_service = Some(builder.start().map_err(|error| error.to_string())?);
+        self.background_sender = Some(sender.clone());
+        Ok(sender)
+    }
+
+    pub(crate) fn set_wake_event(&mut self, wake: adv_sync::WakeEvent) -> Result<(), String> {
+        if self.background_sender.as_ref().is_some_and(|sender| {
+            !Arc::ptr_eq(
+                &sender.borrow().execution_wake().interrupt_flag(),
+                &wake.interrupt_flag(),
+            )
+        }) {
+            return Err("wake event cannot change after background service registration".into());
+        }
+        let signal = wake.clone();
+        self.set_completion_waker(Arc::new(move || signal.signal()))?;
+        self.interrupt = wake.interrupt_flag();
+        self.background_wake = Some(wake);
+        Ok(())
     }
 
     /// Register before running guest code. Replacing a notifier while owned
@@ -1157,6 +1229,63 @@ mod asynchronous_tests {
         assert_eq!(m.state.regs[0], 100);
         assert_eq!(m.stats.compilations, 1);
         assert!(m.stats.native_entries > 0);
+    }
+
+    #[test]
+    fn lazy_background_handle_retains_the_installed_execution_wake_without_jit() {
+        let mut m = fixture();
+        m.enable_auto_jit(false);
+        let wake = adv_sync::WakeEvent::new().unwrap();
+        m.set_wake_event(wake.clone()).unwrap();
+        let sender = m.background_sender().unwrap();
+        assert!(Arc::ptr_eq(
+            &wake.interrupt_flag(),
+            &sender.borrow().execution_wake().interrupt_flag()
+        ));
+        assert!(m.compiler.is_none());
+        sender
+            .borrow_mut()
+            .try_submit(
+                adv_sync::background::Priority::Urgent,
+                adv_sync::background::Task::new(|| {}),
+            )
+            .unwrap();
+        assert!(wake.wait(Some(Duration::from_secs(5))).unwrap());
+        assert!(wake.take_interrupt());
+        assert!(
+            m.set_wake_event(adv_sync::WakeEvent::new().unwrap())
+                .unwrap_err()
+                .contains("cannot change")
+        );
+    }
+
+    #[test]
+    fn startup_background_injection_rejects_a_different_execution_event() {
+        let mut m = fixture();
+        let wake = adv_sync::WakeEvent::new().unwrap();
+        m.set_wake_event(wake.clone()).unwrap();
+        let mut wrong =
+            adv_sync::background::Builder::new(adv_sync::WakeEvent::new().unwrap()).unwrap();
+        let sender = wrong.sender(2, 8).unwrap().into_local();
+        let _wrong_service = wrong.start().unwrap();
+        assert!(
+            m.set_background_sender(sender)
+                .unwrap_err()
+                .contains("owner's wake")
+        );
+        let mut right = adv_sync::background::Builder::new(wake).unwrap();
+        let sender = right.sender(2, 8).unwrap().into_local();
+        let _service = right.start().unwrap();
+        m.set_background_sender(sender.clone()).unwrap();
+        assert!(
+            m.set_background_sender(sender)
+                .unwrap_err()
+                .contains("before first use")
+        );
+        assert!(
+            m.background_service.is_none(),
+            "injection must not spawn a second worker"
+        );
     }
 }
 

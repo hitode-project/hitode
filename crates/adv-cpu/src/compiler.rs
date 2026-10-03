@@ -1,13 +1,16 @@
-//! One bounded compile worker. Requests own small immutable code snapshots;
-//! neither this module nor its thread receives or borrows guest memory.
+//! CPU compilation client of the one neutral background task service.
+//! Snapshots and typed completions retain their bounded SPSC ownership contract.
+#[cfg(test)]
+use adv_sync::{WakeEvent, background::Builder};
 use adv_sync::{
-    WakeEvent,
+    background::{Affinity, LocalSender, Priority, Service, Task, Ticket},
     spsc::{self, Consumer, Producer},
 };
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{TryRecvError, TrySendError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::Region;
@@ -15,6 +18,7 @@ use crate::compile::{self, Compiled, Snapshot};
 
 pub(crate) const CAPACITY: usize = 8;
 pub(crate) type CompletionWake = Arc<dyn Fn() + Send + Sync>;
+type Compiler = dyn Fn(&Snapshot) -> Result<Compiled, String> + Send + Sync;
 
 pub(crate) struct Completion {
     pub ticket: u64,
@@ -24,168 +28,189 @@ pub(crate) struct Completion {
     pub duration: Duration,
 }
 
-struct Job {
-    ticket: u64,
-    input: Snapshot,
-    wake: Option<CompletionWake>,
+// The only writers are sealed compilation tasks bound to one immutable service
+// Affinity. Task execution is private to that service's sole worker. No producer
+// reference escapes this module or reaches the execution owner. An injected
+// LocalSender can be replaced by safe caller code, but affinity checks then
+// reject those jobs rather than access this producer from a second worker.
+struct Delivery(UnsafeCell<Producer<Completion>>);
+unsafe impl Sync for Delivery {}
+impl Delivery {
+    fn publish(&self, completion: Completion) -> bool {
+        // SAFETY: the private caller is a service-affine task; no other thread
+        // can call it or execute a second producer operation concurrently.
+        unsafe { (&mut *self.0.get()).push(completion).is_ok() }
+    }
 }
 
 pub(crate) struct Worker {
-    requests: Option<Producer<Job>>,
+    sender: LocalSender,
+    affinity: Affinity,
+    delivery: Arc<Delivery>,
+    compiler: Arc<Compiler>,
     results: Option<Consumer<Completion>>,
-    // Only the execution owner submits and drains work, so this permit count
-    // needs neither atomic operations nor another shared mutable object.
     outstanding: usize,
     closed: Arc<AtomicBool>,
-    request_wake: WakeEvent,
     next_ticket: u64,
-    thread: Option<JoinHandle<()>>,
+    jobs: Vec<Ticket>,
+    // Only standalone CPU tests own a service here. Executor keeps its lazy
+    // service alive across disabling JIT, so canceling a client never joins a
+    // running compile on the guest execution path.
+    service: Option<Service>,
     wake: Option<CompletionWake>,
 }
 
-struct WorkerExit(Arc<AtomicBool>);
-impl Drop for WorkerExit {
+struct ClientPanic(Arc<AtomicBool>);
+impl Drop for ClientPanic {
     fn drop(&mut self) {
-        // Also publish disconnection if a notifier unexpectedly panics.
-        self.0.store(true, Ordering::Release);
+        if thread::panicking() {
+            self.0.store(true, Ordering::Release);
+        }
     }
 }
 
 impl Worker {
+    #[cfg(test)]
     pub fn new() -> std::io::Result<Self> {
         Self::with_compiler(compile::compile_snapshot)
     }
 
+    pub fn with_sender(sender: LocalSender) -> Self {
+        Self::with_sender_compiler(sender, compile::compile_snapshot)
+    }
+
+    #[cfg(test)]
     fn with_compiler<F>(compiler: F) -> std::io::Result<Self>
     where
-        F: Fn(&Snapshot) -> Result<Compiled, String> + Send + 'static,
+        F: Fn(&Snapshot) -> Result<Compiled, String> + Send + Sync + 'static,
     {
-        fn send<T: Send>() {}
-        send::<Snapshot>();
-        send::<Compiled>();
-        let (requests, mut jobs) = spsc::channel::<Job>(CAPACITY);
-        let (mut completed, results) = spsc::channel::<Completion>(CAPACITY);
-        let closed = Arc::new(AtomicBool::new(false));
-        let worker_closed = Arc::clone(&closed);
-        let request_wake = WakeEvent::new()?;
-        let worker_wake = request_wake.clone();
-        let thread = thread::Builder::new()
-            .name("adv-compiler".into())
-            .spawn(move || {
-                let _exit = WorkerExit(worker_closed.clone());
-                loop {
-                    if worker_closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let Some(job) = jobs.pop() else {
-                        // The producer publishes before notifying this retained
-                        // event. A notification between the empty check and wait
-                        // stays pending, so no polling timeout is necessary.
-                        if worker_closed.load(Ordering::Acquire) || worker_wake.wait(None).is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    };
-                    let started = Instant::now();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        compiler(&job.input)
-                    }))
-                    .unwrap_or_else(|_| Err("background compiler panicked".into()));
-                    let completion = Completion {
-                        ticket: job.ticket,
-                        region: (*job.input.region).clone(),
-                        input: job.input,
-                        result,
-                        duration: started.elapsed(),
-                    };
-                    if worker_closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    // Queued + active + completed is capped at CAPACITY. With
-                    // this active job there are at most CAPACITY-1 completions;
-                    // publishing its result cannot block on a consumer.
-                    if completed.push(completion).is_err() {
-                        debug_assert!(false, "compile completion permit invariant");
-                        break;
-                    }
-                    // The execution owner retains its existing unique wake.
-                    // The compiler's request event is never an execution wait.
-                    if let Some(wake) = job.wake {
-                        wake();
-                    }
-                }
-            })?;
-        Ok(Self {
-            requests: Some(requests),
+        let mut builder = Builder::new(WakeEvent::new()?)?;
+        let sender = builder.sender(CAPACITY, CAPACITY)?.into_local();
+        let service = builder.start()?;
+        let mut worker = Self::with_sender_compiler(sender, compiler);
+        worker.service = Some(service);
+        Ok(worker)
+    }
+
+    fn with_sender_compiler<F>(sender: LocalSender, compiler: F) -> Self
+    where
+        F: Fn(&Snapshot) -> Result<Compiled, String> + Send + Sync + 'static,
+    {
+        let affinity = sender.borrow().affinity();
+        let (completed, results) = spsc::channel(CAPACITY);
+        Self {
+            sender,
+            affinity,
+            delivery: Arc::new(Delivery(UnsafeCell::new(completed))),
+            compiler: Arc::new(compiler),
             results: Some(results),
             outstanding: 0,
-            closed,
-            request_wake,
+            closed: Arc::new(AtomicBool::new(false)),
             next_ticket: 1,
-            thread: Some(thread),
+            jobs: Vec::with_capacity(CAPACITY),
+            service: None,
             wake: None,
-        })
+        }
     }
 
     pub fn set_waker(&mut self, wake: CompletionWake) {
         debug_assert_eq!(self.outstanding, 0);
         self.wake = Some(wake);
     }
+    pub fn has_outstanding(&self) -> bool {
+        self.outstanding != 0
+    }
 
-    pub fn try_submit(&mut self, input: Snapshot) -> Result<u64, TrySendError<Snapshot>> {
+    pub fn try_submit(&mut self, input: Snapshot) -> Result<u64, TrySendError<Task>> {
+        let ticket = self.next_ticket;
+        let compiler = self.compiler.clone();
+        let delivery = self.delivery.clone();
+        let closed = self.closed.clone();
+        let wake = self.wake.clone();
+        let notify_here = wake.is_some();
+        let mut task = Task::new(move || {
+            if closed.load(Ordering::Acquire) {
+                return;
+            }
+            let _panic = ClientPanic(closed.clone());
+            let started = Instant::now();
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler(&input)))
+                    .unwrap_or_else(|_| Err("background compiler panicked".into()));
+            let completion = Completion {
+                ticket,
+                region: (*input.region).clone(),
+                input,
+                result,
+                duration: started.elapsed(),
+            };
+            if closed.load(Ordering::Acquire) {
+                return;
+            }
+            // Owner-only permits include queued, active AND unconsumed results.
+            // This active job leaves at most CAPACITY-1 completed results.
+            if !delivery.publish(completion) {
+                closed.store(true, Ordering::Release);
+                debug_assert!(false, "compile completion permit invariant");
+                return;
+            }
+            if let Some(wake) = wake {
+                wake();
+            }
+        })
+        .affine_to(self.affinity);
+        if notify_here {
+            task = task.without_wake();
+        }
         if self.closed.load(Ordering::Acquire) {
-            return Err(TrySendError::Disconnected(input));
+            return Err(TrySendError::Disconnected(task));
         }
         if self.outstanding >= CAPACITY {
-            return Err(TrySendError::Full(input));
+            return Err(TrySendError::Full(task));
         }
-        let Some(requests) = self.requests.as_mut() else {
-            return Err(TrySendError::Disconnected(input));
-        };
-        let ticket = self.next_ticket;
+        let job = self
+            .sender
+            .borrow_mut()
+            .try_submit(Priority::Background, task)?;
         self.next_ticket = self.next_ticket.wrapping_add(1);
-        let job = Job {
-            ticket,
-            input,
-            wake: self.wake.clone(),
-        };
-        if let Err(job) = requests.push(job) {
-            return Err(TrySendError::Full(job.input));
-        }
         self.outstanding += 1;
-        self.request_wake.notify();
+        self.jobs.push(job);
         Ok(ticket)
     }
 
     pub fn try_recv(&mut self) -> Result<Completion, TryRecvError> {
-        // Warm dispatch pays no queue poll when no queued, active or completed
-        // permit remains. The single owner decrements only after taking a value.
         if self.outstanding == 0 {
             return Err(TryRecvError::Empty);
         }
         let results = self.results.as_mut().ok_or(TryRecvError::Disconnected)?;
         if let Some(completion) = results.pop() {
             self.outstanding -= 1;
+            self.jobs.retain(|job| {
+                matches!(
+                    job.status(),
+                    adv_sync::background::Status::Queued | adv_sync::background::Status::Running
+                )
+            });
             return Ok(completion);
         }
-        Err(if self.closed.load(Ordering::Acquire) {
-            TryRecvError::Disconnected
-        } else {
-            TryRecvError::Empty
-        })
+        Err(
+            if self.closed.load(Ordering::Acquire) || self.sender.borrow().is_stopped() {
+                TryRecvError::Disconnected
+            } else {
+                TryRecvError::Empty
+            },
+        )
     }
 }
-
 impl Drop for Worker {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
-        // An idle worker must leave its retained wait even with no queued job.
-        self.request_wake.notify();
+        for job in &self.jobs {
+            job.cancel();
+        }
         self.results.take();
-        self.requests.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(mut service) = self.service.take() {
+            service.shutdown();
         }
     }
 }
@@ -195,6 +220,7 @@ mod tests {
     use super::*;
     use crate::{EXEC, Memory, READ, WRITE};
     use std::sync::Barrier;
+    use std::sync::OnceLock;
     use std::sync::atomic::AtomicUsize;
 
     fn snapshot() -> Snapshot {
@@ -257,18 +283,16 @@ mod tests {
             worker.try_submit(input.clone()).unwrap();
         }
         let closed = Arc::clone(&worker.closed);
-        let finished = Arc::new(AtomicBool::new(false));
-        let mark_finished = Arc::clone(&finished);
-        let dropping = thread::spawn(move || {
-            drop(worker);
-            mark_finished.store(true, Ordering::Release);
+        // The producer endpoint stays on its owner. This helper releases the
+        // active job once teardown marks the client closed; it never owns Worker.
+        let releasing = thread::spawn(move || {
+            while !closed.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            released.wait();
         });
-        while !closed.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-        released.wait();
-        dropping.join().unwrap();
-        assert!(finished.load(Ordering::Acquire));
+        drop(worker);
+        releasing.join().unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
@@ -384,5 +408,161 @@ mod tests {
             worker.try_submit(snapshot()),
             Err(TrySendError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn injected_cpu_and_device_jobs_run_on_the_same_background_thread() {
+        let mut builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
+        let sender = builder.sender(2, CAPACITY).unwrap().into_local();
+        let _service = builder.start().unwrap();
+        let cpu = Arc::new(OnceLock::new());
+        let seen = cpu.clone();
+        let mut worker = Worker::with_sender_compiler(sender.clone(), move |_| {
+            seen.set(thread::current().id()).unwrap();
+            Err("same worker".into())
+        });
+        let device = Arc::new(OnceLock::new());
+        let seen = device.clone();
+        let job = sender
+            .borrow_mut()
+            .try_submit(
+                Priority::Urgent,
+                Task::new(move || {
+                    seen.set(thread::current().id()).unwrap();
+                }),
+            )
+            .unwrap();
+        worker.try_submit(snapshot()).unwrap();
+        receive(&mut worker);
+        assert_eq!(job.status(), adv_sync::background::Status::Completed);
+        assert_eq!(cpu.get(), device.get());
+        assert_ne!(cpu.get(), Some(&thread::current().id()));
+    }
+
+    #[test]
+    fn dropping_injected_client_does_not_join_the_active_shared_worker() {
+        let mut builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
+        let sender = builder.sender(2, CAPACITY).unwrap().into_local();
+        let _service = builder.start().unwrap();
+        let started = WakeEvent::new().unwrap();
+        let signal = started.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let release = released.clone();
+        let blocked = Arc::new(AtomicBool::new(false));
+        let failed = blocked.clone();
+        let mut worker = Worker::with_sender_compiler(sender.clone(), move |_| {
+            signal.notify();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !release.load(Ordering::Acquire) {
+                if Instant::now() > until {
+                    failed.store(true, Ordering::Release);
+                    break;
+                }
+                thread::yield_now();
+            }
+            Err("client cancelled".into())
+        });
+        worker.try_submit(snapshot()).unwrap();
+        assert!(started.wait(Some(Duration::from_secs(5))).unwrap());
+        drop(worker);
+        assert!(
+            !blocked.load(Ordering::Acquire),
+            "client teardown joined an active shared job"
+        );
+        let device = sender
+            .borrow_mut()
+            .try_submit(Priority::Urgent, Task::new(|| {}))
+            .unwrap();
+        released.store(true, Ordering::Release);
+        let until = Instant::now() + Duration::from_secs(5);
+        while device.status() != adv_sync::background::Status::Completed {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn replacing_a_local_endpoint_cannot_move_its_completion_writer_to_another_service() {
+        let mut first_builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
+        let sender = first_builder.sender(2, CAPACITY).unwrap().into_local();
+        let _first_service = first_builder.start().unwrap();
+        let mut worker =
+            Worker::with_sender_compiler(sender.clone(), |_| Err("still affine".into()));
+        let mut second_builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
+        let second = second_builder.sender(2, CAPACITY).unwrap();
+        let _second_service = second_builder.start().unwrap();
+        let original = std::mem::replace(&mut *sender.borrow_mut(), second);
+        assert!(matches!(
+            worker.try_submit(snapshot()),
+            Err(TrySendError::Disconnected(_))
+        ));
+        *sender.borrow_mut() = original;
+        worker.try_submit(snapshot()).unwrap();
+        assert!(receive(&mut worker).result.is_err());
+    }
+
+    #[test]
+    #[ignore = "diagnostic nonpreemptible compilation latency, not a shared-runner gate"]
+    fn report_nonpreemptible_compile_latency() {
+        let execution = WakeEvent::new().unwrap();
+        let ui_wake = WakeEvent::new().unwrap();
+        let mut builder = Builder::new(execution).unwrap();
+        let sender = builder.sender(2, CAPACITY).unwrap().into_local();
+        let mut ui = builder.sender(2, 1).unwrap();
+        let service = builder.start().unwrap();
+        for strategy in [crate::CompileStrategy::Fast, crate::CompileStrategy::Speed] {
+            let mut bytes = Vec::new();
+            for _ in 0..63 {
+                bytes.extend_from_slice(&[0x8b, 0x05, 0, 0, 2, 0]); // mov eax,[data]
+                bytes.extend_from_slice(&[0x03, 0x1d, 4, 0, 2, 0]); // add ebx,[data+4]
+                bytes.extend_from_slice(&[0x89, 0x0d, 8, 0, 2, 0]); // mov [data+8],ecx
+                bytes.extend_from_slice(&[0x33, 0xd0]); // xor edx,eax
+            }
+            bytes.push(0xc3);
+            let mut memory = Memory::new(0x10000, 0x20000).unwrap();
+            memory
+                .protect(0x10000, 0x20000, READ | WRITE | EXEC)
+                .unwrap();
+            memory.write(0x10000, &bytes).unwrap();
+            let mut region = Region::new(0x10000, bytes.len());
+            region.compile_strategy = strategy;
+            let input = Snapshot::capture(&region, &memory).unwrap();
+            let begun = WakeEvent::new().unwrap();
+            let signal = begun.clone();
+            let released = WakeEvent::new().unwrap();
+            let go = released.clone();
+            let mut worker = Worker::with_sender_compiler(sender.clone(), move |input| {
+                signal.notify();
+                go.wait(None).unwrap();
+                compile::compile_snapshot(input)
+            });
+            let mut compile_ms = Vec::new();
+            let mut urgent_ms = Vec::new();
+            for _ in 0..7 {
+                worker.try_submit(input.clone()).unwrap();
+                assert!(begun.wait(Some(Duration::from_secs(5))).unwrap());
+                let queued = Instant::now();
+                let ticket = ui
+                    .try_submit(
+                        Priority::Urgent,
+                        Task::new(|| {}).with_wake(ui_wake.clone()),
+                    )
+                    .unwrap();
+                released.notify();
+                assert!(ui_wake.wait(Some(Duration::from_secs(30))).unwrap());
+                urgent_ms.push(queued.elapsed().as_secs_f64() * 1000.0);
+                let completion = receive(&mut worker);
+                compile_ms.push(completion.duration.as_secs_f64() * 1000.0);
+                assert!(completion.result.is_ok());
+                assert_eq!(ticket.status(), adv_sync::background::Status::Completed);
+            }
+            compile_ms.sort_by(f64::total_cmp);
+            urgent_ms.sort_by(f64::total_cmp);
+            println!(
+                "strategy={strategy:?} instructions=253 samples=7 compile_p50_ms={:.3} compile_max_ms={:.3} urgent_p50_ms={:.3} urgent_max_ms={:.3}",
+                compile_ms[3], compile_ms[6], urgent_ms[3], urgent_ms[6]
+            );
+        }
+        println!("service={:?}", service.stats(Priority::Urgent));
     }
 }

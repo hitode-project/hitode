@@ -42,14 +42,21 @@ impl JitCpu {
     pub fn set_async_compilation(&mut self, enabled: bool) {
         self.inner.set_async_compilation(enabled);
     }
+    pub fn set_background_sender(
+        &mut self,
+        sender: adv_sync::background::LocalSender,
+    ) -> Result<(), String> {
+        let wake = sender.borrow().execution_wake();
+        self.inner.set_background_sender(sender)?;
+        self.set_waker(wake)
+    }
+    pub fn background_sender(&mut self) -> Result<adv_sync::background::LocalSender, String> {
+        self.inner.background_sender()
+    }
     /// Install the execution owner's retained event before the first guest run.
     /// Compiler completion and native/interpreted safepoints use the same wake.
     pub fn set_waker(&mut self, wake: adv_sync::WakeEvent) -> Result<(), String> {
-        let m = &mut self.inner;
-        let flag = wake.interrupt_flag();
-        m.set_completion_waker(std::sync::Arc::new(move || wake.signal()))?;
-        m.set_host_interrupt_flag(flag);
-        Ok(())
+        self.inner.set_wake_event(wake)
     }
     pub fn profile(&self) -> std::collections::BTreeMap<u32, crate::ProfileSample> {
         self.inner.profile.clone()
