@@ -31,6 +31,11 @@ pub struct FrameView<'a> {
 }
 pub trait Presenter {
     fn present(&mut self, frame: FrameView<'_>) -> Result<(), String>;
+    /// Native GPU composition is a separate capability; no implicit CPU readback.
+    #[cfg(feature = "gpu")]
+    fn present_native(&mut self, _frame: &crate::gpu::NativeFrame) -> Result<(), String> {
+        Err("presenter does not support native GPU frames".into())
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +78,8 @@ pub struct PendingFrame {
     format: PixelFormat,
     serial: u64,
     pixels: Vec<u8>,
+    #[cfg(feature = "gpu")]
+    native: Option<crate::gpu::NativeFrame>,
 }
 impl Default for PendingFrame {
     fn default() -> Self {
@@ -83,11 +90,17 @@ impl Default for PendingFrame {
             format: PixelFormat::Bgra32,
             serial: 0,
             pixels: Vec::new(),
+            #[cfg(feature = "gpu")]
+            native: None,
         }
     }
 }
 impl PendingFrame {
     fn store(&mut self, surface: &Surface, pixels: &[u8], serial: u64) {
+        #[cfg(feature = "gpu")]
+        {
+            self.native = None;
+        }
         self.width = surface.width;
         self.height = surface.height;
         self.pitch = surface.pitch;
@@ -108,6 +121,10 @@ impl PendingFrame {
     }
     /// Conversion is performed only by the display consumer, or an explicit capture.
     pub fn snapshot(&self, out: &mut Snapshot) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        if self.native.is_some() {
+            return Err("native GPU snapshot requires an explicit asynchronous readback".into());
+        }
         if self.width == 0 {
             return Ok(());
         }
@@ -128,6 +145,21 @@ impl PendingFrame {
             }
         }
         Ok(())
+    }
+    #[cfg(feature = "gpu")]
+    pub fn native(&self) -> Option<&crate::gpu::NativeFrame> {
+        self.native.as_ref()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn store_native(&mut self, frame: crate::gpu::NativeFrame) {
+        self.width = frame.image.width();
+        self.height = frame.image.height();
+        self.pitch = self.width * 4;
+        self.format = PixelFormat::Bgra32;
+        self.serial = frame.serial;
+        self.pixels.clear();
+        self.native = Some(frame);
     }
 }
 
@@ -331,6 +363,8 @@ pub struct Surfaces<P: Presenter> {
     /// Next id; surfaces and device contexts share the numbering.
     next: u32,
     surfaces: BTreeMap<u32, Surface>,
+    #[cfg(feature = "gpu")]
+    native_surfaces: BTreeMap<u32, crate::gpu::Target>,
     primary: Option<u32>,
     deferred_presentation: bool,
     pending_frame: Option<PendingFrame>,
@@ -361,6 +395,8 @@ impl<P: Presenter> Surfaces<P> {
             arena: Arena::new(arena, len)?,
             next: 16,
             surfaces: BTreeMap::new(),
+            #[cfg(feature = "gpu")]
+            native_surfaces: BTreeMap::new(),
             primary: None,
             deferred_presentation: false,
             pending_frame: None,
@@ -402,6 +438,10 @@ impl<P: Presenter> Surfaces<P> {
         let Some(s) = self.surfaces.remove(&id) else {
             return false;
         };
+        #[cfg(feature = "gpu")]
+        if self.native_surfaces.remove(&id).is_some() {
+            return true;
+        }
         self.arena.release(s.pixels, s.pitch * s.height);
         true
     }
@@ -445,6 +485,13 @@ impl<P: Presenter> Surfaces<P> {
         else {
             return Ok(false);
         };
+        #[cfg(feature = "gpu")]
+        if let Some(native) = &frame.native {
+            self.presenter.present_native(native)?;
+            self.captured_serial = frame.serial;
+            self.stats.host_captures += 1;
+            return Ok(true);
+        }
         let (pixels, pitch) = if frame.format == PixelFormat::Bgra32 {
             (frame.pixels.as_slice(), frame.pitch)
         } else {
@@ -560,6 +607,10 @@ impl<P: Presenter> Surfaces<P> {
     }
     /// Hand surface `id` to the frame mailbox, the pending frame or the presenter.
     pub fn present(&mut self, id: u32, m: &dyn SurfaceMemory) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        if self.native_surfaces.contains_key(&id) {
+            return Err("native surface requires GPU presentation".into());
+        }
         let s = &self.surfaces[&id];
         self.stats.presentations += 1;
         let pixels = m.read(s.pixels, (s.pitch * s.height) as usize)?;
@@ -609,6 +660,81 @@ impl<P: Presenter> Surfaces<P> {
             serial: self.stats.presentations,
         })
     }
+
+    /// A GPU-backed entry in the same surface-id space. Its pixels are not mapped
+    /// in guest memory until the API frontend explicitly requests a lock/readback.
+    #[cfg(feature = "gpu")]
+    pub fn create_native(
+        &mut self,
+        gpu: &crate::gpu::Gpu,
+        width: u32,
+        height: u32,
+        depth: bool,
+    ) -> Result<u32, String> {
+        size(width, height)?;
+        let target = gpu
+            .target(width, height, depth)
+            .map_err(|error| error.to_string())?;
+        let id = self.new_id();
+        self.surfaces.insert(
+            id,
+            Surface {
+                pixels: 0,
+                width,
+                height,
+                pitch: width * 4,
+                bottom_up: false,
+                locked: None,
+                version: 0,
+                format: PixelFormat::Bgra32,
+            },
+        );
+        self.native_surfaces.insert(id, target);
+        Ok(id)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn native_target(&self, id: u32) -> Option<&crate::gpu::Target> {
+        self.native_surfaces.get(&id)
+    }
+
+    /// Reuse the common presentation serial, coalescing and ownership mailbox.
+    #[cfg(feature = "gpu")]
+    pub fn present_native(&mut self, id: u32, gpu: &mut crate::gpu::Gpu) -> Result<(), String> {
+        let image = &self
+            .native_surfaces
+            .get(&id)
+            .ok_or("unknown native surface")?
+            .image;
+        let serial = self.stats.presentations + 1;
+        let frame = gpu
+            .present(image, serial)
+            .map_err(|error| error.to_string())?;
+        self.stats.presentations = serial;
+        if let Some((mailbox, wake)) = &mut self.frame_mailbox {
+            let overwritten = mailbox.publish(|slot| slot.store_native(frame));
+            self.stats.coalesced_frames += u64::from(overwritten);
+            if !overwritten {
+                wake.signal();
+            }
+        } else if self.deferred_presentation {
+            if self
+                .pending_frame
+                .as_ref()
+                .is_some_and(|old| old.serial != self.captured_serial)
+            {
+                self.stats.coalesced_frames += 1;
+            }
+            self.pending_frame
+                .get_or_insert_with(PendingFrame::default)
+                .store_native(frame);
+        } else {
+            self.presenter.present_native(&frame)?;
+            self.captured_serial = serial;
+            self.stats.host_captures += 1;
+        }
+        Ok(())
+    }
     /// Fill a rectangle with a packed pixel in the destination's own format.
     pub fn fill_raw(
         &mut self,
@@ -617,6 +743,10 @@ impl<P: Presenter> Surfaces<P> {
         value: u32,
         m: &mut dyn SurfaceMemory,
     ) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        if self.native_surfaces.contains_key(&dst) {
+            return Err("native fill requires a GPU drawing command".into());
+        }
         let d = self
             .surfaces
             .get(&dst)
@@ -678,6 +808,10 @@ impl<P: Presenter> Surfaces<P> {
         options: BlitOptions,
         m: &mut dyn SurfaceMemory,
     ) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        if self.native_surfaces.contains_key(&src) || self.native_surfaces.contains_key(&dst) {
+            return Err("native blit requires GPU copy or explicit asynchronous readback".into());
+        }
         let s = self
             .surfaces
             .get(&src)

@@ -1,0 +1,461 @@
+//! Actual host-adapter rendering. Readback is explicit validation, never Present.
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use adv_device::gpu::*;
+use adv_device::surface::Rect;
+
+fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
+    let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+    let mut readback = gpu.readback(image, Some(wake.clone())).unwrap();
+    // This blocking poll belongs only to a host test, not the guest execution path.
+    gpu.context()
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .unwrap();
+    gpu.check().unwrap();
+    assert!(
+        wake.wait(Some(Duration::ZERO)).unwrap(),
+        "callback signals the retained wake event"
+    );
+    let pixels = readback.poll().expect("map callback completed").unwrap();
+    assert!(
+        readback.poll().is_none(),
+        "completion transfers ownership once"
+    );
+    pixels
+}
+
+fn pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let at = ((y * width + x) * 4) as usize;
+    bytes[at..at + 4].try_into().unwrap()
+}
+
+fn quad(color: [f32; 4], depth: f32, uv_scale: f32) -> [Vertex; 6] {
+    let vertex = |x, y, u, v| Vertex {
+        position: [x, y, depth, 1.0],
+        color,
+        uv: [u, v],
+    };
+    [
+        vertex(-1.0, 1.0, 0.0, 0.0),
+        vertex(-1.0, -1.0, 0.0, uv_scale),
+        vertex(1.0, 1.0, uv_scale, 0.0),
+        vertex(1.0, 1.0, uv_scale, 0.0),
+        vertex(-1.0, -1.0, 0.0, uv_scale),
+        vertex(1.0, -1.0, uv_scale, uv_scale),
+    ]
+}
+
+fn near(got: [u8; 4], expected: [u8; 4], tolerance: u8) {
+    assert!(
+        got.iter()
+            .zip(expected)
+            .all(|(a, b)| a.abs_diff(b) <= tolerance),
+        "BGRA {got:?} differs from {expected:?}"
+    );
+}
+
+#[test]
+fn actual_gpu_color_texture_blend_clip_depth_and_native_frame_readback() {
+    color_texture_blend_clip_depth_and_native_frame_readback(false);
+}
+
+fn color_texture_blend_clip_depth_and_native_frame_readback(fallback: bool) {
+    let started = Instant::now();
+    let mut gpu = pollster::block_on(Gpu::request(fallback)).expect("actual host GPU adapter");
+    eprintln!("adapter: {:?}", gpu.context().adapter.get_info());
+    let target = gpu.target(63, 31, true).unwrap();
+    gpu.clear(&target, Some([0.0, 0.0, 0.0, 1.0]), Some(1.0))
+        .unwrap();
+    let mut state = DrawState::new(63, 31);
+    gpu.draw(&target, &quad([1.0, 0.0, 0.0, 1.0], 0.5, 1.0), None, state)
+        .unwrap();
+    let pixels = read(&mut gpu, &target.image);
+    assert_eq!(pixels.len(), 63 * 31 * 4, "alignment padding is stripped");
+    assert_eq!(pixel(&pixels, 63, 31, 15), [0, 0, 255, 255]);
+
+    let image = gpu.image(2, 2).unwrap();
+    gpu.upload(
+        &image,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        },
+        12,
+        &[
+            0, 0, 255, 255, 0, 255, 0, 255, 19, 19, 19, 19, 255, 0, 0, 255, 255, 255, 255, 255,
+        ],
+    )
+    .unwrap();
+    state.texture_op = TextureOp::Texture;
+    state.alpha_texture_op = TextureOp::Texture;
+    gpu.draw(&target, &quad([1.0; 4], 0.5, 1.0), Some(&image), state)
+        .unwrap();
+    let pixels = read(&mut gpu, &target.image);
+    assert_eq!(pixel(&pixels, 63, 8, 4), [0, 0, 255, 255]);
+    assert_eq!(pixel(&pixels, 63, 54, 4), [0, 255, 0, 255]);
+    assert_eq!(pixel(&pixels, 63, 8, 26), [255, 0, 0, 255]);
+    assert_eq!(pixel(&pixels, 63, 54, 26), [255, 255, 255, 255]);
+
+    state.sampler.min = Filter::Linear;
+    state.sampler.mag = Filter::Linear;
+    gpu.draw(&target, &quad([1.0; 4], 0.5, 1.0), Some(&image), state)
+        .unwrap();
+    // D3D's 8-bit subtexel addressing permits fixed-point filter rounding;
+    // Vulkan RTX returns 128/128/128, DX12 WARP returns 128/126/128 here.
+    // Limit that tolerance to the filtered sample, keeping solid/nearest exact.
+    // https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#7.18.16.1%20Texture%20Addressing%20and%20LOD%20Precision
+    near(
+        pixel(&read(&mut gpu, &target.image), 63, 31, 15),
+        [128, 128, 128, 255],
+        2,
+    );
+
+    state = DrawState::new(63, 31);
+    gpu.clear(&target, Some([0.0, 0.0, 1.0, 1.0]), Some(1.0))
+        .unwrap();
+    state.blend = Some(Blend {
+        source: Factor::SourceAlpha,
+        destination: Factor::OneMinusSourceAlpha,
+        operation: BlendOp::Add,
+    });
+    state.alpha_blend = Some(Blend {
+        source: Factor::One,
+        destination: Factor::Zero,
+        operation: BlendOp::Add,
+    });
+    state.scissor = Some(Rect {
+        x: 10,
+        y: 5,
+        w: 40,
+        h: 20,
+    });
+    gpu.draw(&target, &quad([1.0, 0.0, 0.0, 0.5], 0.5, 1.0), None, state)
+        .unwrap();
+    let pixels = read(&mut gpu, &target.image);
+    near(pixel(&pixels, 63, 31, 15), [128, 0, 128, 128], 1);
+    assert_eq!(pixel(&pixels, 63, 2, 2), [255, 0, 0, 255]);
+
+    state = DrawState::new(63, 31);
+    state.depth = Some(Compare::Less);
+    state.depth_write = true;
+    gpu.clear(&target, Some([0.0, 0.0, 0.0, 1.0]), Some(1.0))
+        .unwrap();
+    gpu.draw(&target, &quad([0.0, 1.0, 0.0, 1.0], 0.2, 1.0), None, state)
+        .unwrap();
+    gpu.draw(&target, &quad([1.0, 0.0, 0.0, 1.0], 0.8, 1.0), None, state)
+        .unwrap();
+    assert_eq!(
+        pixel(&read(&mut gpu, &target.image), 63, 31, 15),
+        [0, 255, 0, 255]
+    );
+    state.depth = None;
+    state.alpha_test = Compare::Greater;
+    state.alpha_reference = 0.7;
+    gpu.draw(&target, &quad([1.0, 0.0, 0.0, 0.5], 0.1, 1.0), None, state)
+        .unwrap();
+    assert_eq!(
+        pixel(&read(&mut gpu, &target.image), 63, 31, 15),
+        [0, 255, 0, 255]
+    );
+
+    let readbacks = gpu.stats().readbacks;
+    let frame = gpu.present(&target.image, 7).unwrap();
+    assert_eq!(
+        gpu.stats().readbacks,
+        readbacks,
+        "native Present never performs CPU readback"
+    );
+    assert_eq!(frame.serial, 7);
+    gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None)
+        .unwrap();
+    assert_eq!(
+        pixel(&read(&mut gpu, &frame.image), 63, 31, 15),
+        [0, 255, 0, 255],
+        "retained native frame is not mutated by the next frame"
+    );
+    assert_eq!(gpu.stats().native_frames, 1);
+    gpu.poll().unwrap();
+    eprintln!("GPU slice {:?}, {:?}", gpu.stats(), started.elapsed());
+}
+
+#[test]
+fn invalid_commands_are_rejected_before_gpu_submission_and_context_can_be_rebuilt() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    assert!(gpu.target(0, 16, false).is_err());
+    let target = gpu.target(16, 16, false).unwrap();
+    let mut state = DrawState::new(16, 16);
+    let vertices = quad([1.0; 4], 0.5, 1.0);
+    let before = gpu.stats().submissions;
+    assert!(gpu.draw(&target, &vertices[..2], None, state).is_err());
+    assert!(
+        gpu.draw(&target, &vertices, Some(&target.image), state)
+            .is_err()
+    );
+    state.depth = Some(Compare::Less);
+    assert!(gpu.draw(&target, &vertices, None, state).is_err());
+    state = DrawState::new(16, 16);
+    state.scissor = Some(Rect {
+        x: u32::MAX,
+        y: 0,
+        w: 1,
+        h: 1,
+    });
+    assert!(gpu.draw(&target, &vertices, None, state).is_err());
+    assert!(
+        gpu.upload(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16
+            },
+            64,
+            &[0; 4]
+        )
+        .is_err()
+    );
+    assert_eq!(gpu.stats().submissions, before);
+    gpu.check().unwrap();
+
+    let mut rebuilt = pollster::block_on(Gpu::request(false)).unwrap();
+    let new_target = rebuilt.target(16, 16, false).unwrap();
+    assert!(
+        rebuilt
+            .copy(
+                &target.image,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1,
+                    h: 1
+                },
+                &new_target.image,
+                0,
+                0
+            )
+            .is_err()
+    );
+    drop(gpu);
+    rebuilt
+        .clear(&new_target, Some([0.0, 0.0, 1.0, 1.0]), None)
+        .unwrap();
+    assert_eq!(
+        pixel(&read(&mut rebuilt, &new_target.image), 16, 8, 8),
+        [255, 0, 0, 255]
+    );
+}
+
+#[test]
+fn actual_software_adapter_clear_and_draw() {
+    color_texture_blend_clip_depth_and_native_frame_readback(true);
+}
+
+#[test]
+fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
+    use adv_device::surface::{PixelFormat, Snapshot, SurfaceMemory, Surfaces, frame_mailbox};
+    use std::borrow::Cow;
+    struct Memory(Vec<u8>);
+    impl SurfaceMemory for Memory {
+        fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+            Ok(Cow::Borrowed(&self.0[addr as usize..addr as usize + len]))
+        }
+        fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+            self.0[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn writable(&self, _addr: u32, _len: usize) -> Result<(), String> {
+            Ok(())
+        }
+        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+            self.0
+                .copy_within(src as usize..src as usize + len, dst as usize);
+            Ok(())
+        }
+    }
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let mut surfaces = Surfaces::new(16, 16, 0x1000, 0x10000, Snapshot::default()).unwrap();
+    let mut memory = Memory(vec![0; 0x11000]);
+    let software = surfaces
+        .create(16, 16, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    let native = surfaces.create_native(&gpu, 16, 16, false).unwrap();
+    assert_ne!(native, software);
+    assert!(surfaces.contains(native));
+    assert_eq!(surfaces.live_surfaces(), 2);
+    let image = surfaces.native_target(native).unwrap().clone();
+    gpu.clear(&image, Some([0.0, 1.0, 0.0, 1.0]), None).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    surfaces.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    assert!(
+        surfaces
+            .fill_raw(
+                native,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 16
+                },
+                0,
+                &mut memory
+            )
+            .is_err()
+    );
+    assert!(
+        surfaces.present(native, &memory).is_err(),
+        "never treat native pixels as guest address zero"
+    );
+    for serial in 1..=100 {
+        surfaces.present_native(native, &mut gpu).unwrap();
+        if serial % 2 == 0 {
+            assert!(consumer.update());
+        }
+    }
+    assert_eq!(gpu.stats().readbacks, 0);
+    assert!(
+        gpu.stats().native_frame_allocations <= 4,
+        "triple mailbox uses bounded reusable GPU frames"
+    );
+    let native_frame = consumer.current().native().unwrap().clone();
+    assert_eq!(native_frame.serial, 100);
+    assert!(
+        consumer
+            .current()
+            .snapshot(&mut Snapshot::default())
+            .is_err(),
+        "CPU snapshot is explicit"
+    );
+    surfaces.present(software, &memory).unwrap();
+    assert!(consumer.update());
+    assert!(
+        consumer.current().native().is_none(),
+        "software publish clears a recycled native slot"
+    );
+    let mut snapshot = Snapshot::default();
+    consumer.current().snapshot(&mut snapshot).unwrap();
+    assert_eq!(snapshot.frames, 101);
+    assert_eq!(
+        pixel(&read(&mut gpu, &native_frame.image), 16, 8, 8),
+        [0, 255, 0, 255]
+    );
+    assert!(surfaces.delete(native));
+    assert!(!surfaces.contains(native));
+    assert!(surfaces.native_target(native).is_none());
+    assert_eq!(surfaces.live_surfaces(), 1);
+    eprintln!("mailbox GPU stats: {:?}", gpu.stats());
+}
+
+#[test]
+fn native_frame_saturation_reports_busy_and_release_reuses_storage() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None)
+        .unwrap();
+    let mut held = Vec::new();
+    for serial in 1..=8 {
+        held.push(gpu.present(&target.image, serial).unwrap());
+    }
+    let before = gpu.stats().submissions;
+    assert!(matches!(gpu.present(&target.image, 9), Err(Error::Busy)));
+    assert_eq!(gpu.stats().submissions, before);
+    held.pop();
+    assert_eq!(gpu.present(&target.image, 9).unwrap().serial, 9);
+    assert_eq!(gpu.stats().native_frame_allocations, 8);
+    assert_eq!(
+        pixel(&read(&mut gpu, &held[0].image), 8, 4, 4),
+        [0, 0, 255, 255]
+    );
+}
+
+#[test]
+fn readback_reservations_survive_ticket_cancellation_until_callback_completion() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    gpu.set_readback_limit(1).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    gpu.clear(&target, Some([0.0, 1.0, 0.0, 1.0]), None)
+        .unwrap();
+    let cancelled = gpu.readback(&target.image, None).unwrap();
+    drop(cancelled);
+    let before = gpu.stats().submissions;
+    assert!(matches!(
+        gpu.readback(&target.image, None),
+        Err(Error::Busy)
+    ));
+    assert_eq!(gpu.stats().submissions, before);
+    gpu.context()
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .unwrap();
+    assert_eq!(
+        pixel(&read(&mut gpu, &target.image), 8, 4, 4),
+        [0, 255, 0, 255]
+    );
+}
+
+#[test]
+fn repeated_drawing_reuses_upload_buffer_and_preserves_queue_order() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(64, 64, false).unwrap();
+    let state = DrawState::new(64, 64);
+    gpu.clear(&target, Some([0.0, 0.0, 0.0, 1.0]), None)
+        .unwrap();
+    gpu.draw(&target, &quad([1.0; 4], 0.5, 1.0), None, state)
+        .unwrap();
+    gpu.context()
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..256 {
+        let color = if i % 2 == 0 {
+            [0.0, 1.0, 0.0, 1.0]
+        } else {
+            [1.0, 0.0, 0.0, 1.0]
+        };
+        gpu.draw(&target, &quad(color, 0.5, 1.0), None, state)
+            .unwrap();
+    }
+    let encoding = start.elapsed();
+    assert_eq!(gpu.stats().vertex_buffer_allocations, 1);
+    assert_eq!(gpu.stats().draws, 257);
+    assert_eq!(
+        pixel(&read(&mut gpu, &target.image), 64, 32, 32),
+        [0, 0, 255, 255]
+    );
+    eprintln!(
+        "256 reused-buffer draws: encode {encoding:?}, finish {:?}; {:?}",
+        start.elapsed(),
+        gpu.stats()
+    );
+}
+
+#[test]
+fn destroyed_device_is_reported_and_commands_never_return_success_after_loss() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    gpu.context().device.destroy();
+    let _ = gpu.poll();
+    assert!(matches!(gpu.check(), Err(Error::Device(_))));
+    let before = gpu.stats().submissions;
+    assert!(
+        gpu.clear(&target, Some([0.0, 0.0, 0.0, 1.0]), None)
+            .is_err()
+    );
+    assert!(gpu.present(&target.image, 1).is_err());
+    assert!(gpu.readback(&target.image, None).is_err());
+    assert_eq!(gpu.stats().submissions, before);
+}
