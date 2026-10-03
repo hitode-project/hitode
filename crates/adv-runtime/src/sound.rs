@@ -4,7 +4,7 @@ use pal_cpu::{Backend, Guest, GuestExt, Prot};
 use pal_machine::{Conv, Env, Machine, Outcome, Registry};
 use pal_win32::Win32;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::sync::{Arc, Mutex};
 
 const INVALID: u32 = 0x80070057;
@@ -156,6 +156,7 @@ struct Buffer {
     notifications: Vec<(u32, u32)>,
     lock: Option<Lock>,
     trace_pcm: Option<Vec<u8>>,
+    trace_generation: u64,
 }
 impl Buffer {
     fn stereo_gain(&self) -> [f32; 2] {
@@ -222,6 +223,7 @@ pub(crate) struct Sound {
     pub capture_digests: bool,
     pub digests: Vec<PcmDigest>,
     trace: Option<std::io::BufWriter<std::fs::File>>,
+    trace_pcm_dir: Option<std::path::PathBuf>,
 }
 pub(crate) fn register(reg: &mut Registry) {
     for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
@@ -243,6 +245,24 @@ pub(crate) fn register(reg: &mut Registry) {
     }
 }
 pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
+    let trace = std::env::var_os("ADV_AUDIO_TRACE")
+        .map(|path| {
+            std::fs::File::create(&path)
+                .map(std::io::BufWriter::new)
+                .map_err(|error| format!("cannot create ADV_AUDIO_TRACE {path:?}: {error}"))
+        })
+        .transpose()?;
+    let trace_pcm_dir = if trace.is_some() {
+        std::env::var_os("ADV_AUDIO_DUMP_DIR")
+            .map(|path| {
+                std::fs::create_dir_all(&path)
+                    .map(|()| std::path::PathBuf::from(&path))
+                    .map_err(|error| format!("cannot create ADV_AUDIO_DUMP_DIR {path:?}: {error}"))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let mut tables = [0; 3];
     for (i, (prefix, methods)) in [
         ("IDirectSound8", DEVICE),
@@ -277,9 +297,8 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         nonzero_samples: 0,
         capture_digests: false,
         digests: Vec::new(),
-        trace: std::env::var_os("ADV_AUDIO_TRACE")
-            .and_then(|path| std::fs::File::create(path).ok())
-            .map(std::io::BufWriter::new),
+        trace,
+        trace_pcm_dir,
     });
     Ok(())
 }
@@ -343,13 +362,45 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
     let c = e.arg(2);
     let now = e.sys.clock.now_us();
     if e.ext.get::<Sound>().trace.is_some() {
-        let args: [u32;8] = std::array::from_fn(|i|e.arg(i as u32));
-        let ctx=e.sys.current;
-        let s=e.ext.get_mut::<Sound>();
-        let snapshot=s.buffers.get(&a).map(|buf|(buf.storage,buf.len,buf.playing,buf.base,buf.queued_frames));
-        if let Some(trace)=s.trace.as_mut() {
-            let _=writeln!(trace,"api us={now} ctx={ctx} method={name} args={args:08x?} buffer={snapshot:?}");
-            if matches!(name,"Play"|"Stop"|"Release") {let _=trace.flush();}
+        let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
+        let ctx = e.sys.current;
+        let caller = e.caller();
+        let files: Vec<_> = if matches!(name, "Play" | "Stop" | "SetCurrentPosition" | "Release") {
+            e.ext
+                .get::<Win32>()
+                .files
+                .iter()
+                .map(|(&handle, file)| {
+                    let mut native = &file.file;
+                    (
+                        handle,
+                        file.guest_path.clone(),
+                        native.stream_position().ok(),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let s = e.ext.get_mut::<Sound>();
+        let snapshot = s.buffers.get(&a).map(|buf| {
+            (
+                buf.storage,
+                buf.len,
+                buf.playing,
+                buf.base,
+                buf.queued_frames,
+            )
+        });
+        let cursor = s.buffers.get(&a).map(|buf| buf.cursor(now));
+        if let Some(trace) = s.trace.as_mut() {
+            let _ = writeln!(
+                trace,
+                "api us={now} ctx={ctx} caller={caller:08x} method={name} args={args:08x?} buffer={snapshot:?} cursor={cursor:?} files={files:?}"
+            );
+            if matches!(name, "Play" | "Stop" | "Release") {
+                let _ = trace.flush();
+            }
         }
     }
     if matches!(name, "#1" | "DirectSoundCreate" | "DirectSoundCreate8") {
@@ -490,6 +541,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         notifications: Vec::new(),
                         lock: None,
                         trace_pcm: None,
+                        trace_generation: 0,
                     },
                 );
                 e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
@@ -552,6 +604,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             .get_mut(&parent)
             .unwrap()
             .notifications = entries;
+        let s = e.ext.get_mut::<Sound>();
+        if let Some(trace) = s.trace.as_mut() {
+            let _ = writeln!(
+                trace,
+                "notifications us={now} id={parent:08x} entries={:?}",
+                s.buffers[&parent].notifications
+            );
+        }
         return Ok(0);
     }
     let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
@@ -685,12 +745,43 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 // buffer can retain unconsumed PCM in the device latency window;
                 // it must not survive reuse of the same DirectSound object.
                 s.mixer.lock().unwrap().flush_pcm(u64::from(a));
-                if let Some(trace)=s.trace.as_mut() {
-                    let mut bytes=vec![0;buf.len as usize];
-                    if buf.len != 0 {e.cpu.read(buf.storage,&mut bytes).map_err(|error|error.to_string())?;}
-                    let hash=bytes.iter().fold(0xcbf29ce484222325u64,|hash,byte|(hash^u64::from(*byte)).wrapping_mul(0x100000001b3));
-                    let _=writeln!(trace,"start us={now} id={a:08x} bytes={} hash={hash:016x}",buf.len);
-                    buf.trace_pcm=Some(bytes);
+                if let Some(trace) = s.trace.as_mut() {
+                    let mut bytes = vec![0; buf.len as usize];
+                    if buf.len != 0 {
+                        e.cpu
+                            .read(buf.storage, &mut bytes)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                    });
+                    buf.trace_generation += 1;
+                    let generation = buf.trace_generation;
+                    let _ = writeln!(
+                        trace,
+                        "start us={now} id={a:08x} generation={generation} storage={:08x} bytes={} hash={hash:016x} base={} loop={} rate={} channels={} bits={}",
+                        buf.storage,
+                        buf.len,
+                        buf.base,
+                        args[3] & 1,
+                        buf.frequency,
+                        buf.format.channels,
+                        buf.format.bits
+                    );
+                    if buf.len != 0
+                        && let Some(dir) = s.trace_pcm_dir.as_ref()
+                    {
+                        let path = dir.join(format!("{now}-{a:08x}-{generation}-{hash:016x}.pcm"));
+                        std::fs::write(&path, &bytes).map_err(|error| {
+                            format!("cannot write audio diagnostic {path:?}: {error}")
+                        })?;
+                        let _ = writeln!(
+                            trace,
+                            "dump us={now} id={a:08x} generation={generation} path={path:?}"
+                        );
+                    }
+                    buf.trace_pcm = Some(bytes);
+                    let _ = trace.flush();
                 }
                 if s.capture_digests && s.digests.len() < 4 && buf.len != 0 {
                     let mut bytes = vec![0; buf.len as usize];
@@ -831,6 +922,13 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
             let first = (old / total) * total + u64::from(offset);
             let first = if first < old { first + total } else { first };
             if first < progress {
+                if let Some(trace) = s.trace.as_mut() {
+                    let _ = writeln!(
+                        trace,
+                        "notice us={now} id={id:08x} generation={} old={old} progress={progress} offset={offset} event={event:08x}",
+                        buf.trace_generation
+                    );
+                }
                 events.push(event);
             }
         }
@@ -839,6 +937,13 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
             buf.playing = false;
             buf.base = 0;
             s.mixer.lock().unwrap().end_pcm(u64::from(id));
+            if let Some(trace) = s.trace.as_mut() {
+                let _ = writeln!(
+                    trace,
+                    "end us={now} id={id:08x} generation={} progress={progress} frames={}",
+                    buf.trace_generation, buf.queued_frames
+                );
+            }
             events.extend(
                 buf.notifications
                     .iter()
@@ -852,6 +957,13 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
         // playback. Verified with the native Windows audio_unlock_probe fixture.
         let elapsed_frames = now.saturating_sub(buf.anchor) * u64::from(buf.frequency) / 1_000_000;
         if buf.queued_frames + u64::from(buf.frequency) / 20 < elapsed_frames {
+            if let Some(trace) = s.trace.as_mut() {
+                let _ = writeln!(
+                    trace,
+                    "late us={now} id={id:08x} generation={} frames={} elapsed={elapsed_frames}",
+                    buf.trace_generation, buf.queued_frames
+                );
+            }
             buf.queued_frames = elapsed_frames;
             s.mixer.lock().unwrap().flush_pcm(u64::from(id));
         }
@@ -900,10 +1012,22 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
             samples.extend([l, r]);
         }
         let nonzero = samples.iter().filter(|v| v.abs() > 0.00001).count();
-        if let Some(trace)=s.trace.as_mut() {
-            let hash=bytes.iter().fold(0xcbf29ce484222325u64,|hash,byte|(hash^u64::from(*byte)).wrapping_mul(0x100000001b3));
-            let changed=buf.trace_pcm.as_ref().map_or(0,|snapshot|bytes.iter().enumerate().filter(|(n,byte)|**byte!=snapshot[(start as usize+n)%snapshot.len()]).count());
-            let _=writeln!(trace,"pcm us={now} id={id:08x} storage={:08x} offset={start} frames={} count={count} hash={hash:016x} nonzero={nonzero} changed={changed}",buf.storage,buf.queued_frames);
+        if let Some(trace) = s.trace.as_mut() {
+            let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+            let changed = buf.trace_pcm.as_ref().map_or(0, |snapshot| {
+                bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(n, byte)| **byte != snapshot[(start as usize + n) % snapshot.len()])
+                    .count()
+            });
+            let _ = writeln!(
+                trace,
+                "pcm us={now} id={id:08x} generation={} storage={:08x} offset={start} frames={} count={count} hash={hash:016x} nonzero={nonzero} changed={changed}",
+                buf.trace_generation, buf.storage, buf.queued_frames
+            );
         }
         let len = samples.len();
         let block = PcmBlock {
@@ -914,11 +1038,20 @@ pub(crate) fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String
             samples,
         };
         let mut mixer = s.mixer.lock().unwrap();
-        if mixer.push_pcm(block).is_ok() {
+        let accepted = mixer.push_pcm(block).is_ok();
+        if accepted {
             mixer.set_stereo_gain(u64::from(id), buf.stereo_gain());
             buf.queued_frames += count as u64;
             s.queued_samples += len as u64;
             s.nonzero_samples += nonzero as u64;
+        }
+        drop(mixer);
+        if let Some(trace) = s.trace.as_mut() {
+            let _ = writeln!(
+                trace,
+                "queue us={now} id={id:08x} generation={} accepted={accepted} frames={}",
+                buf.trace_generation, buf.queued_frames
+            );
         }
     }
     if !events.is_empty() {
@@ -1260,38 +1393,142 @@ mod tests {
     }
     #[test]
     fn stop_seek_and_buffer_reuse_cannot_emit_an_older_voice_generation() {
-        let mut m=machine();
-        let format=Format {rate:1000,channels:1,bits:8};
-        let voice=buffer(&mut m,format,1000);let music=buffer(&mut m,format,1000);
-        let voice_storage=m.ext.get::<Sound>().buffers[&voice].storage;
-        let music_storage=m.ext.get::<Sound>().buffers[&music].storage;
-        m.cpu.write(voice_storage,&[192;1000]).unwrap();m.cpu.write(music_storage,&[160;1000]).unwrap();
-        invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);
-        invoke(&mut m,"IDirectSoundBuffer8::Play",&[music,0,0,1]);pump(&mut m).unwrap();
-        let stream:pal_audio::AudioStream=m.ext.get::<Sound>().mixer.clone().into();
-        let mut out=[0.0;20];stream.read_stereo(&mut out,1000);assert_eq!(out,[0.75;20]);
-        advance(&mut m,10_000);invoke(&mut m,"IDirectSoundBuffer8::Stop",&[voice]);
-        invoke(&mut m,"IDirectSoundBuffer8::Lock",&[voice,0,1000,DATA+128,DATA+132,0,0,2]);
-        let pointer=m.cpu.read_u32(DATA+128).unwrap();m.cpu.write(pointer,&[64;1000]).unwrap();
-        assert_eq!(invoke(&mut m,"IDirectSoundBuffer8::Unlock",&[voice,pointer,1000,0,0]),0);
-        invoke(&mut m,"IDirectSoundBuffer8::SetCurrentPosition",&[voice,0]);
-        invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);pump(&mut m).unwrap();
-        stream.read_stereo(&mut out,1000);assert_eq!(out,[-0.25;20]);
-        invoke(&mut m,"IDirectSoundBuffer8::Stop",&[voice]);
-        stream.read_stereo(&mut out,1000);assert_eq!(out,[0.25;20]);
+        let mut m = machine();
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+        let voice = buffer(&mut m, format, 1000);
+        let music = buffer(&mut m, format, 1000);
+        let voice_storage = m.ext.get::<Sound>().buffers[&voice].storage;
+        let music_storage = m.ext.get::<Sound>().buffers[&music].storage;
+        m.cpu.write(voice_storage, &[192; 1000]).unwrap();
+        m.cpu.write(music_storage, &[160; 1000]).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[music, 0, 0, 1]);
+        pump(&mut m).unwrap();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let mut out = [0.0; 20];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [0.75; 20]);
+        advance(&mut m, 10_000);
+        invoke(&mut m, "IDirectSoundBuffer8::Stop", &[voice]);
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::Lock",
+            &[voice, 0, 1000, DATA + 128, DATA + 132, 0, 0, 2],
+        );
+        let pointer = m.cpu.read_u32(DATA + 128).unwrap();
+        m.cpu.write(pointer, &[64; 1000]).unwrap();
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Unlock",
+                &[voice, pointer, 1000, 0, 0]
+            ),
+            0
+        );
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::SetCurrentPosition",
+            &[voice, 0],
+        );
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
+        pump(&mut m).unwrap();
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [-0.25; 20]);
+        invoke(&mut m, "IDirectSoundBuffer8::Stop", &[voice]);
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [0.25; 20]);
     }
     #[test]
     fn restarting_a_naturally_ended_buffer_discards_its_unconsumed_old_tail() {
-        let mut m=machine();let format=Format {rate:1000,channels:1,bits:8};
-        let voice=buffer(&mut m,format,30);let storage=m.ext.get::<Sound>().buffers[&voice].storage;
-        m.cpu.write(storage,&[192;30]).unwrap();invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);
-        pump(&mut m).unwrap();advance(&mut m,30_000);
+        let mut m = machine();
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+        let voice = buffer(&mut m, format, 30);
+        let storage = m.ext.get::<Sound>().buffers[&voice].storage;
+        m.cpu.write(storage, &[192; 30]).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
+        pump(&mut m).unwrap();
+        advance(&mut m, 30_000);
         // No callback has consumed the first generation and no pump has normalized
         // natural completion yet. The new Play must not inherit its queued PCM.
-        m.cpu.write(storage,&[64;30]).unwrap();invoke(&mut m,"IDirectSoundBuffer8::Play",&[voice,0,0,0]);
-        pump(&mut m).unwrap();let stream:pal_audio::AudioStream=m.ext.get::<Sound>().mixer.clone().into();
-        let mut out=[0.0;80];stream.read_stereo(&mut out,1000);
-        assert_eq!(out[..60],[0.0;60]);assert_eq!(out[60..],[-0.5;20]);
+        m.cpu.write(storage, &[64; 30]).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
+        pump(&mut m).unwrap();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let mut out = [0.0; 80];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out[..60], [0.0; 60]);
+        assert_eq!(out[60..], [-0.5; 20]);
+    }
+    #[test]
+    fn seeking_a_playing_voice_discards_prefetch_from_the_previous_cursor() {
+        let mut m = machine();
+        let voice = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            1000,
+        );
+        let storage = m.ext.get::<Sound>().buffers[&voice].storage;
+        m.cpu.write(storage, &[192; 500]).unwrap();
+        m.cpu.write(storage + 500, &[64; 500]).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
+        pump(&mut m).unwrap();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let mut out = [0.0; 20];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [0.5; 20]);
+        advance(&mut m, 10_000);
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::SetCurrentPosition",
+                &[voice, 500]
+            ),
+            0
+        );
+        pump(&mut m).unwrap();
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [-0.5; 20]);
+        assert_eq!(position(&mut m, voice), 500);
+    }
+    #[test]
+    fn releasing_a_voice_cannot_leak_its_queue_into_the_next_buffer() {
+        let mut m = machine();
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+        let voice = buffer(&mut m, format, 1000);
+        let music = buffer(&mut m, format, 1000);
+        let voice_storage = m.ext.get::<Sound>().buffers[&voice].storage;
+        let music_storage = m.ext.get::<Sound>().buffers[&music].storage;
+        m.cpu.write(voice_storage, &[192; 1000]).unwrap();
+        m.cpu.write(music_storage, &[160; 1000]).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[music, 0, 0, 1]);
+        pump(&mut m).unwrap();
+        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[voice]), 0);
+        let next_voice = buffer(&mut m, format, 1000);
+        let next_storage = m.ext.get::<Sound>().buffers[&next_voice].storage;
+        m.cpu.write(next_storage, &[64; 1000]).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[next_voice, 0, 0, 0]);
+        pump(&mut m).unwrap();
+        let stream: pal_audio::AudioStream = m.ext.get::<Sound>().mixer.clone().into();
+        let mut out = [0.0; 20];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [-0.25; 20]);
     }
     #[test]
     fn notifications_wrap_and_natural_stop_signal_real_events() {
