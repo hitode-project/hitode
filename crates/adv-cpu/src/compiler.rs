@@ -1,7 +1,10 @@
 //! CPU compilation client of the one neutral background task service.
 //! Snapshots and typed completions retain their bounded SPSC ownership contract.
 #[cfg(test)]
-use adv_sync::{WakeEvent, background::Builder};
+use adv_sync::{
+    WakeEvent,
+    background::{Builder, WorkPolicy},
+};
 use adv_sync::{
     background::{Affinity, LocalSender, Priority, Service, Task, Ticket},
     spsc::{self, Consumer, Producer},
@@ -18,6 +21,12 @@ use crate::compile::{self, Compiled, Snapshot};
 
 pub(crate) const CAPACITY: usize = 8;
 pub(crate) type CompletionWake = Arc<dyn Fn() + Send + Sync>;
+#[derive(Debug)]
+pub(crate) enum SubmitError {
+    Full,
+    Closed,
+    WorkLimit { work: usize, limit: usize },
+}
 type Compiler = dyn Fn(&Snapshot) -> Result<Compiled, String> + Send + Sync;
 
 pub(crate) struct Completion {
@@ -52,6 +61,7 @@ pub(crate) struct Worker {
     outstanding: usize,
     closed: Arc<AtomicBool>,
     next_ticket: u64,
+    last_work: usize,
     jobs: Vec<Ticket>,
     // Only standalone CPU tests own a service here. Executor keeps its lazy
     // service alive across disabling JIT, so canceling a client never joins a
@@ -107,6 +117,7 @@ impl Worker {
             outstanding: 0,
             closed: Arc::new(AtomicBool::new(false)),
             next_ticket: 1,
+            last_work: 0,
             jobs: Vec::with_capacity(CAPACITY),
             service: None,
             wake: None,
@@ -120,8 +131,22 @@ impl Worker {
     pub fn has_outstanding(&self) -> bool {
         self.outstanding != 0
     }
+    pub fn last_work(&self) -> usize {
+        self.last_work
+    }
 
-    pub fn try_submit(&mut self, input: Snapshot) -> Result<u64, TrySendError<Task>> {
+    pub fn try_submit(&mut self, input: Snapshot) -> Result<u64, SubmitError> {
+        // Acquiring the started flag before reading policy also covers a client
+        // created before Builder finishes configuring its registered endpoints.
+        if self.sender.borrow().is_closed() {
+            return Err(SubmitError::Closed);
+        }
+        let work = crate::compile_budget::work(&input);
+        if let Some(limit) = self.sender.borrow().work_policy().background_limit()
+            && work > limit
+        {
+            return Err(SubmitError::WorkLimit { work, limit });
+        }
         let ticket = self.next_ticket;
         let compiler = self.compiler.clone();
         let delivery = self.delivery.clone();
@@ -163,16 +188,21 @@ impl Worker {
             task = task.without_wake();
         }
         if self.closed.load(Ordering::Acquire) {
-            return Err(TrySendError::Disconnected(task));
+            return Err(SubmitError::Closed);
         }
         if self.outstanding >= CAPACITY {
-            return Err(TrySendError::Full(task));
+            return Err(SubmitError::Full);
         }
         let job = self
             .sender
             .borrow_mut()
-            .try_submit(Priority::Background, task)?;
+            .try_submit(Priority::Background, task)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SubmitError::Full,
+                TrySendError::Disconnected(_) => SubmitError::Closed,
+            })?;
         self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.last_work = work;
         self.outstanding += 1;
         self.jobs.push(job);
         Ok(ticket)
@@ -250,7 +280,7 @@ mod tests {
             .collect();
         assert!(matches!(
             worker.try_submit(input.clone()),
-            Err(TrySendError::Full(_))
+            Err(SubmitError::Full)
         ));
         for expected in tickets {
             let completion = receive(&mut worker);
@@ -358,7 +388,7 @@ mod tests {
                 .collect();
             assert!(matches!(
                 worker.try_submit(input.clone()),
-                Err(TrySendError::Full(_))
+                Err(SubmitError::Full)
             ));
             for ticket in tickets {
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -406,7 +436,7 @@ mod tests {
         }
         assert!(matches!(
             worker.try_submit(snapshot()),
-            Err(TrySendError::Disconnected(_))
+            Err(SubmitError::Closed)
         ));
     }
 
@@ -494,11 +524,51 @@ mod tests {
         let original = std::mem::replace(&mut *sender.borrow_mut(), second);
         assert!(matches!(
             worker.try_submit(snapshot()),
-            Err(TrySendError::Disconnected(_))
+            Err(SubmitError::Closed)
         ));
         *sender.borrow_mut() = original;
         worker.try_submit(snapshot()).unwrap();
         assert!(receive(&mut worker).result.is_err());
+    }
+
+    #[test]
+    fn every_submission_rechecks_the_service_work_limit_before_enqueue() {
+        let mut builder = Builder::new(WakeEvent::new().unwrap())
+            .unwrap()
+            .with_work_policy(WorkPolicy::responsive(8));
+        let sender = builder.sender(2, CAPACITY).unwrap().into_local();
+        let service = builder.start().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let mut worker = Worker::with_sender_compiler(sender, move |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Err("small admitted input".into())
+        });
+        assert!(matches!(
+            worker.try_submit(snapshot()),
+            Err(SubmitError::WorkLimit { work: 36, limit: 8 })
+        ));
+        assert_eq!(service.stats(Priority::Background).submitted, 0);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        let mut memory = Memory::new(0x10000, 16384).unwrap();
+        memory.protect(0x10000, 16384, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &[0x90; 16384]).unwrap();
+        let mut authored = Region::new(0x10000, 16384);
+        authored.compile_strategy = crate::CompileStrategy::Fast;
+        assert!(matches!(
+            worker.try_submit(Snapshot::capture(&authored, &memory).unwrap()),
+            Err(SubmitError::WorkLimit {
+                work: 16384,
+                limit: 8
+            })
+        ));
+        assert_eq!(service.stats(Priority::Background).submitted, 0);
+        let mut admitted = snapshot();
+        admitted.region.compile_strategy = crate::CompileStrategy::Fast;
+        admitted.region.len = 1;
+        worker.try_submit(admitted).unwrap();
+        receive(&mut worker);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -564,5 +634,112 @@ mod tests {
             );
         }
         println!("service={:?}", service.stats(Priority::Urgent));
+    }
+
+    #[test]
+    #[ignore = "diagnostic weighted compilation latency, not a shared-runner timing gate"]
+    fn report_responsive_compile_latency() {
+        #[cfg(windows)]
+        unsafe {
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn SetProcessAffinityMask(process: *mut std::ffi::c_void, mask: usize) -> i32;
+            }
+            assert_ne!(SetProcessAffinityMask(GetCurrentProcess(), 1), 0);
+        }
+        let ui_wake = WakeEvent::new().unwrap();
+        let mut builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
+        let sender = builder.sender(2, CAPACITY).unwrap().into_local();
+        let mut ui = builder.sender(2, 1).unwrap();
+        let _service = builder.start().unwrap();
+        println!(
+            "case,strategy,limit,work,admitted,compile_p50_ms,compile_p95_ms,compile_max_ms,urgent_p95_ms,code_bytes"
+        );
+        for (name, op, repeats, limit) in [
+            ("scalar16", &[0x8b, 0x05, 0, 0, 2, 0][..], 16, 128),
+            ("rmw8", &[0x83, 0x05, 0, 0, 2, 0, 1][..], 8, 128),
+            ("simd4", &[0xf3, 0x0f, 0x6f, 0x05, 0, 0, 2, 0][..], 4, 128),
+            ("scalar3", &[0x8b, 0x05, 0, 0, 2, 0][..], 3, 128),
+            ("scalar32", &[0x8b, 0x05, 0, 0, 2, 0][..], 32, 256),
+            ("rmw16", &[0x83, 0x05, 0, 0, 2, 0, 1][..], 16, 256),
+            ("simd8", &[0xf3, 0x0f, 0x6f, 0x05, 0, 0, 2, 0][..], 8, 256),
+            ("scalar7", &[0x8b, 0x05, 0, 0, 2, 0][..], 7, 256),
+            ("scalar64", &[0x8b, 0x05, 0, 0, 2, 0][..], 64, 512),
+            ("rmw32", &[0x83, 0x05, 0, 0, 2, 0, 1][..], 32, 512),
+            ("simd16", &[0xf3, 0x0f, 0x6f, 0x05, 0, 0, 2, 0][..], 16, 512),
+            ("scalar15", &[0x8b, 0x05, 0, 0, 2, 0][..], 15, 512),
+        ] {
+            for strategy in [crate::CompileStrategy::Fast, crate::CompileStrategy::Speed] {
+                let mut bytes = op.repeat(repeats);
+                bytes.push(0xc3);
+                let mut memory = Memory::new(0x10000, 0x20000).unwrap();
+                memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+                memory.write(0x10000, &bytes).unwrap();
+                let mut region = Region::new(0x10000, bytes.len());
+                region.compile_strategy = strategy;
+                let mut input = Snapshot::capture(&region, &memory).unwrap();
+                if strategy == crate::CompileStrategy::Fast {
+                    input = crate::compile_budget::plan(input, limit).unwrap().remove(0);
+                }
+                let begun = WakeEvent::new().unwrap();
+                let signal = begun.clone();
+                let released = WakeEvent::new().unwrap();
+                let go = released.clone();
+                let mut worker = Worker::with_sender_compiler(sender.clone(), move |input| {
+                    signal.notify();
+                    go.wait(None).unwrap();
+                    compile::compile_snapshot(input)
+                });
+                let mut compilation = Vec::new();
+                let mut urgent = Vec::new();
+                let mut size = 0;
+                for _ in 0..21 {
+                    worker.try_submit(input.clone()).unwrap();
+                    assert!(begun.wait(Some(Duration::from_secs(5))).unwrap());
+                    let queued = Instant::now();
+                    let _ticket = ui
+                        .try_submit(
+                            Priority::Urgent,
+                            Task::new(|| {}).with_wake(ui_wake.clone()),
+                        )
+                        .unwrap();
+                    released.notify();
+                    assert!(ui_wake.wait(Some(Duration::from_secs(30))).unwrap());
+                    urgent.push(queued.elapsed().as_secs_f64() * 1000.0);
+                    let completion = receive(&mut worker);
+                    compilation.push(completion.duration.as_secs_f64() * 1000.0);
+                    size = completion.result.unwrap().code_size;
+                }
+                compilation.sort_by(f64::total_cmp);
+                urgent.sort_by(f64::total_cmp);
+                println!(
+                    "{name},{strategy:?},{limit},{},{},{:.3},{:.3},{:.3},{:.3},{size}",
+                    crate::compile_budget::work(&input),
+                    crate::compile_budget::work(&input) <= limit,
+                    compilation[10],
+                    compilation[19],
+                    compilation[20],
+                    urgent[19]
+                );
+            }
+        }
+        let mut memory = Memory::new(0x10000, 16384).unwrap();
+        memory.protect(0x10000, 16384, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &[0x90; 16384]).unwrap();
+        let mut authored = Region::new(0x10000, 16384);
+        authored.compile_strategy = crate::CompileStrategy::Fast;
+        let input = Snapshot::capture(&authored, &memory).unwrap();
+        let mut planning = Vec::new();
+        for _ in 0..21 {
+            let began = Instant::now();
+            let fragments = crate::compile_budget::plan(input.clone(), 128).unwrap();
+            planning.push(began.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(fragments.len(), 128);
+        }
+        planning.sort_by(f64::total_cmp);
+        println!(
+            "owner_plan_16384_nops_p50_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+            planning[10], planning[19], planning[20]
+        );
     }
 }

@@ -1,0 +1,368 @@
+//! Estimated code-generation work, bounded before any background submission.
+//! Units are empirical complexity weights, never a wall-clock deadline.
+use std::collections::{BTreeMap, BTreeSet};
+
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
+
+use crate::{CompileStrategy, Region, compile::Snapshot};
+
+/// Suggested starting limit for interactive owners; empirical, not real time.
+pub const RESPONSIVE_WORK: usize = 128;
+
+fn successors(instruction: &Instruction) -> Vec<u32> {
+    let mut next = Vec::with_capacity(2);
+    if instruction.op0_kind() == OpKind::NearBranch32 {
+        next.push(instruction.near_branch32());
+    }
+    if !instruction.is_invalid()
+        && !matches!(
+            instruction.flow_control(),
+            FlowControl::UnconditionalBranch
+                | FlowControl::IndirectBranch
+                | FlowControl::Return
+                | FlowControl::Exception
+        )
+    {
+        next.push(instruction.next_ip32());
+    }
+    next
+}
+
+// Match the compiler's linear scan plus independently decoded entry/target graph.
+// This includes authored regions and overlapping x86 instruction boundaries.
+fn decoded(input: &Snapshot) -> BTreeMap<u32, Instruction> {
+    let region = &input.region;
+    let bytes = input.bytes();
+    let mut instructions = BTreeMap::new();
+    if !region.reachable {
+        let mut decoder =
+            Decoder::with_ip(32, bytes, u64::from(region.start), DecoderOptions::NONE);
+        while decoder.can_decode() && decoder.ip() < u64::from(region.start) + region.len as u64 {
+            let instruction = decoder.decode();
+            instructions.insert(instruction.ip32(), instruction);
+        }
+    }
+    let mut pending = region.entries.clone();
+    if region.reachable && pending.is_empty() {
+        pending.push(region.start);
+    }
+    if !region.reachable {
+        pending.extend(
+            instructions
+                .values()
+                .filter(|i| i.op0_kind() == OpKind::NearBranch32)
+                .map(Instruction::near_branch32),
+        );
+    }
+    while let Some(target) = pending.pop() {
+        if instructions.contains_key(&target) || region.frontier.contains(&target) {
+            continue;
+        }
+        let Some(offset) = target
+            .checked_sub(region.start)
+            .map(|n| n as usize)
+            .filter(|&n| n < region.len)
+        else {
+            continue;
+        };
+        let mut decoder = Decoder::with_ip(
+            32,
+            &bytes[offset..],
+            u64::from(target),
+            DecoderOptions::NONE,
+        );
+        while decoder.can_decode()
+            && decoder.ip() < u64::from(region.start) + region.len as u64
+            && !instructions.contains_key(&(decoder.ip() as u32))
+            && !region.frontier.contains(&(decoder.ip() as u32))
+        {
+            let i = decoder.decode();
+            if i.op0_kind() == OpKind::NearBranch32 {
+                pending.push(i.near_branch32());
+            }
+            instructions.insert(i.ip32(), i);
+            if region.reachable
+                && (i.is_invalid()
+                    || matches!(
+                        i.flow_control(),
+                        FlowControl::UnconditionalBranch
+                            | FlowControl::IndirectBranch
+                            | FlowControl::Return
+                            | FlowControl::Exception
+                    ))
+            {
+                break;
+            }
+        }
+    }
+    instructions
+}
+
+fn weight(i: &Instruction) -> usize {
+    let memory = i.op_kinds().any(|kind| {
+        matches!(
+            kind,
+            OpKind::Memory
+                | OpKind::MemorySegSI
+                | OpKind::MemorySegESI
+                | OpKind::MemorySegRSI
+                | OpKind::MemorySegDI
+                | OpKind::MemorySegEDI
+                | OpKind::MemorySegRDI
+                | OpKind::MemoryESDI
+                | OpKind::MemoryESEDI
+                | OpKind::MemoryESRDI
+        )
+    });
+    let vector = (0..i.op_count()).any(|op| {
+        let register = i.op_register(op);
+        register.is_vector_register() || register.is_mm()
+    });
+    if crate::strings::operation(i).is_some() {
+        return 32;
+    }
+    if vector {
+        return if memory { 32 } else { 8 };
+    }
+    if matches!(i.mnemonic(), Mnemonic::Div | Mnemonic::Idiv) {
+        return 32;
+    }
+    if memory {
+        return if i.op0_kind() == OpKind::Memory
+            && matches!(
+                i.mnemonic(),
+                Mnemonic::Add
+                    | Mnemonic::Adc
+                    | Mnemonic::Sub
+                    | Mnemonic::Sbb
+                    | Mnemonic::And
+                    | Mnemonic::Or
+                    | Mnemonic::Xor
+                    | Mnemonic::Inc
+                    | Mnemonic::Dec
+                    | Mnemonic::Neg
+                    | Mnemonic::Not
+                    | Mnemonic::Shl
+                    | Mnemonic::Shr
+                    | Mnemonic::Sar
+                    | Mnemonic::Rol
+                    | Mnemonic::Ror
+                    | Mnemonic::Rcl
+                    | Mnemonic::Rcr
+                    | Mnemonic::Xchg
+                    | Mnemonic::Xadd
+                    | Mnemonic::Cmpxchg
+                    | Mnemonic::Bts
+                    | Mnemonic::Btr
+                    | Mnemonic::Btc
+                    | Mnemonic::Shld
+                    | Mnemonic::Shrd
+            ) {
+            16
+        } else {
+            8
+        };
+    }
+    if i.flow_control() != FlowControl::Next {
+        return 8;
+    }
+    1
+}
+
+fn total(instructions: &BTreeMap<u32, Instruction>, strategy: CompileStrategy) -> usize {
+    let multiplier = if strategy == CompileStrategy::Speed {
+        4
+    } else {
+        1
+    };
+    instructions
+        .values()
+        .map(weight)
+        .sum::<usize>()
+        .saturating_mul(multiplier)
+}
+
+pub(crate) fn work(input: &Snapshot) -> usize {
+    total(&decoded(input), input.region.compile_strategy)
+}
+
+/// Partition Fast work while retaining exact guest instruction/edge semantics.
+/// Speed is deliberately never partially substituted for a live larger Fast unit.
+pub(crate) fn plan(input: Snapshot, limit: usize) -> Result<Vec<Snapshot>, String> {
+    let instructions = decoded(&input);
+    if let Some(entry) = input
+        .region
+        .entries
+        .iter()
+        .find(|pc| !instructions.contains_key(pc))
+    {
+        return Err(format!("entry {entry:#x} is not an instruction boundary"));
+    }
+    let amount = total(&instructions, input.region.compile_strategy);
+    if amount <= limit {
+        return Ok(vec![input]);
+    }
+    if input.region.compile_strategy == CompileStrategy::Speed {
+        return Err(format!(
+            "Speed work {amount} exceeds background budget {limit}"
+        ));
+    }
+    let mut groups: Vec<BTreeSet<u32>> = Vec::new();
+    let mut current = BTreeSet::new();
+    let mut used = 0;
+    for (&pc, instruction) in &instructions {
+        let cost = weight(instruction);
+        if cost > limit {
+            return Err(format!(
+                "instruction work {cost} exceeds background budget {limit}"
+            ));
+        }
+        if used + cost > limit {
+            groups.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.insert(pc);
+        used += cost;
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    let owner: BTreeMap<_, _> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.iter().map(move |&pc| (pc, index)))
+        .collect();
+    let mut roots: Vec<_> = groups
+        .iter()
+        .map(|group| BTreeSet::from([*group.first().unwrap()]))
+        .collect();
+    let mut frontiers: Vec<BTreeSet<u32>> = groups
+        .iter()
+        .map(|_| input.region.frontier.iter().copied().collect())
+        .collect();
+    for pc in &input.region.entries {
+        if let Some(&index) = owner.get(pc) {
+            roots[index].insert(*pc);
+        }
+    }
+    // Assign each edge once. In particular, a 16-KiB authored NOP region must
+    // not scan all instructions again for each of its 128 small fragments.
+    for (&pc, instruction) in &instructions {
+        let from = owner[&pc];
+        for next in successors(instruction) {
+            let to = owner.get(&next).copied();
+            if to != Some(from) {
+                frontiers[from].insert(next);
+                if let Some(to) = to {
+                    roots[to].insert(next);
+                }
+            }
+        }
+        if !input.region.reachable
+            && instruction.flow_control() != FlowControl::Next
+            && let Some(&to) = owner.get(&instruction.next_ip32())
+        {
+            roots[to].insert(instruction.next_ip32());
+        }
+    }
+    let mut fragments = Vec::with_capacity(groups.len());
+    for ((selected, roots), mut frontier) in groups.into_iter().zip(roots).zip(frontiers) {
+        let start = *selected.first().unwrap();
+        let end = selected
+            .iter()
+            .map(|pc| u64::from(*pc) + instructions[pc].len() as u64)
+            .max()
+            .unwrap();
+        let mut region = Region::new(start, (end - u64::from(start)) as usize);
+        region.reachable = true;
+        region.complete_tail = input.region.complete_tail;
+        region.compile_strategy = input.region.compile_strategy;
+        // Overlapping instruction starts can fall inside an adjacent fragment's
+        // byte interval. A frontier suppresses the other independent decode.
+        frontier.extend(
+            instructions
+                .range(start..)
+                .take_while(|(pc, _)| u64::from(**pc) < end)
+                .filter_map(|(&pc, _)| (!selected.contains(&pc)).then_some(pc)),
+        );
+        frontier.retain(|pc| !selected.contains(pc));
+        region.entries = roots.into_iter().collect();
+        region.frontier = frontier.into_iter().collect();
+        // Actual graph cost is checked by Worker on every enqueue. Do not decode
+        // every piece twice on the owner while preparing a large authored input.
+        fragments.push(input.fragment(region)?);
+    }
+    Ok(fragments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EXEC, Memory, READ, WRITE};
+    fn input(bytes: &[u8]) -> Snapshot {
+        let mut memory = Memory::new(0x10000, 0x10000).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, bytes).unwrap();
+        let mut region = Region::new(0x10000, bytes.len());
+        region.compile_strategy = CompileStrategy::Fast;
+        Snapshot::capture(&region, &memory).unwrap()
+    }
+    #[test]
+    fn memory_and_vector_costs_differ_and_speed_never_bypasses_the_limit() {
+        assert_eq!(work(&input(&[0x90])), 1);
+        assert_eq!(work(&input(&[0x8b, 0x00])), 8);
+        assert_eq!(work(&input(&[0x0f, 0x10, 0x00])), 32);
+        let mut original = input(&[0x8b, 0x00, 0x8b, 0x00]);
+        original.region.compile_strategy = CompileStrategy::Speed;
+        assert!(plan(original, 32).is_err());
+    }
+    #[test]
+    fn authored_large_regions_are_sliced_on_full_instruction_boundaries() {
+        let mut bytes = [0x8b, 0x05, 0, 0, 2, 0].repeat(32);
+        bytes.push(0xc3);
+        let fragments = plan(input(&bytes), RESPONSIVE_WORK).unwrap();
+        assert_eq!(fragments.len(), 3);
+        assert!(fragments.iter().all(|input| work(input) <= RESPONSIVE_WORK));
+        assert_eq!(fragments[0].region.len, 96);
+        assert!(fragments[0].region.frontier.contains(&(0x10000 + 96)));
+    }
+
+    #[test]
+    fn crossing_branches_and_overlapping_decode_roots_keep_the_original_graph() {
+        // Jump into the immediate of a linear MOV; then branch back across a
+        // partition boundary. These are legitimate independent x86 decodes.
+        let bytes = [
+            0xb8, 0x90, 0x90, 0x90, 0x90, 0x8b, 0x00, 0x75, 0xf8, 0x8b, 0x00, 0xeb, 0xf8, 0xc3,
+        ];
+        let original = input(&bytes);
+        let expected = decoded(&original);
+        let fragments = plan(original, 16).unwrap();
+        let mut actual = BTreeMap::new();
+        for fragment in fragments {
+            assert!(work(&fragment) <= 16);
+            actual.extend(decoded(&fragment));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn a_split_truncated_fetch_retains_the_inaccessible_tail_page_dependency() {
+        let mut memory = Memory::new(0x10000, 8192).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        let mut bytes = [0x90; 16];
+        bytes[15] = 0x0f;
+        memory.write(0x10ff0, &bytes).unwrap();
+        let mut region = Region::new(0x10ff0, 16);
+        region.compile_strategy = CompileStrategy::Fast;
+        region.complete_tail = true;
+        let snapshot = Snapshot::capture(&region, &memory).unwrap();
+        let fragments = plan(snapshot, 8).unwrap();
+        let last = fragments.last().unwrap();
+        let compiled = crate::compile::compile_snapshot(last).unwrap();
+        assert!(compiled.pages.iter().any(|&(page, _)| page == 1));
+        memory.protect(0x11000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x11000, &[0xa2]).unwrap();
+        assert!(!last.valid(&memory));
+        assert!(!compiled.valid(&memory));
+    }
+}

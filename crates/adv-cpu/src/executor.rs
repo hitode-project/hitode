@@ -17,6 +17,11 @@ pub struct Stats {
     pub stale_compilations: u64,
     pub pending_compilations: usize,
     pub peak_pending_compilations: usize,
+    pub deferred_compilations: usize,
+    pub peak_deferred_compilations: usize,
+    pub compile_slices: u64,
+    pub compile_work_rejections: u64,
+    pub max_compile_work: usize,
     pub compile_time: Duration,
     pub native_code_bytes: usize,
     pub native_regions: usize,
@@ -89,6 +94,7 @@ pub struct Executor {
     inactive_interrupt: AtomicBool,
     host_interrupts: bool,
     pending_regions: BTreeMap<u32, u64>,
+    deferred_compilations: BTreeMap<u32, compile::Snapshot>,
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
     attempted: BTreeSet<u32>,
@@ -220,6 +226,7 @@ impl Executor {
             inactive_interrupt: AtomicBool::new(false),
             host_interrupts: true,
             pending_regions: BTreeMap::new(),
+            deferred_compilations: BTreeMap::new(),
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
             attempted: BTreeSet::new(),
@@ -320,6 +327,8 @@ impl Executor {
         self.region_pages.clear();
         self.entry_owner.clear();
         self.pending_regions.clear();
+        self.deferred_compilations.clear();
+        self.stats.deferred_compilations = 0;
         self.automatic_regions.clear();
         self.native_heat.clear();
         self.tier_attempted.clear();
@@ -336,6 +345,8 @@ impl Executor {
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
         self.pending_regions.remove(&region.start);
+        self.deferred_compilations.remove(&region.start);
+        self.stats.deferred_compilations = self.deferred_compilations.len();
         self.stats.pending_compilations = self.pending_regions.len();
         self.automatic_regions.remove(&region.start);
         self.publish(region, compiled);
@@ -420,6 +431,8 @@ impl Executor {
         self.attempted.remove(&start);
         self.hits.remove(&start);
         self.pending_regions.remove(&start);
+        self.deferred_compilations.remove(&start);
+        self.stats.deferred_compilations = self.deferred_compilations.len();
         self.stats.pending_compilations = self.pending_regions.len();
         self.automatic_regions.remove(&start);
         self.native_heat.remove(&start);
@@ -492,11 +505,60 @@ impl Executor {
 
     fn queue_region(&mut self, region: Region) -> Result<bool, String> {
         if self.pending_regions.contains_key(&region.start)
-            || self.pending_regions.len() >= crate::compiler::CAPACITY
+            || self.deferred_compilations.contains_key(&region.start)
+        {
+            return Ok(false);
+        }
+        let policy = self.background_sender()?.borrow().work_policy();
+        if policy.background_limit().is_none()
+            && self.pending_regions.len() >= crate::compiler::CAPACITY
         {
             return Ok(false);
         }
         let snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        let fragments = if let Some(limit) = policy.background_limit() {
+            match crate::compile_budget::plan(snapshot, limit) {
+                Ok(fragments) => fragments,
+                Err(error) => {
+                    self.stats.compile_work_rejections += 1;
+                    self.compile_errors.insert(region.start, error);
+                    while self.compile_errors.len() > 64 {
+                        self.compile_errors.pop_first();
+                    }
+                    self.attempted.extend(region.entries.iter().copied());
+                    self.attempted.insert(region.start);
+                    self.tier_attempted.insert(region.start);
+                    return Ok(false);
+                }
+            }
+        } else {
+            vec![snapshot]
+        };
+        // The owner may hold bounded immutable fragments waiting for a permit;
+        // no submission waits and no single job contains the original giant unit.
+        if self.deferred_compilations.len() + fragments.len() > 4096 {
+            return Ok(false);
+        }
+        self.stats.compile_slices += fragments.len().saturating_sub(1) as u64;
+        for fragment in fragments {
+            if !self.pending_regions.contains_key(&fragment.region.start) {
+                self.deferred_compilations
+                    .insert(fragment.region.start, fragment);
+            }
+        }
+        self.stats.deferred_compilations = self.deferred_compilations.len();
+        self.stats.peak_deferred_compilations = self
+            .stats
+            .peak_deferred_compilations
+            .max(self.deferred_compilations.len());
+        self.submit_deferred_compilations()?;
+        Ok(true)
+    }
+
+    fn submit_deferred_compilations(&mut self) -> Result<(), String> {
+        if self.deferred_compilations.is_empty() {
+            return Ok(());
+        }
         if self.compiler.is_none() {
             let sender = self.background_sender()?;
             let mut worker = crate::compiler::Worker::with_sender(sender);
@@ -505,29 +567,59 @@ impl Executor {
             }
             self.compiler = Some(worker);
         }
-        match self.compiler.as_mut().unwrap().try_submit(snapshot) {
-            Ok(ticket) => {
-                self.stats.compile_requests += 1;
-                self.pending_regions.insert(region.start, ticket);
-                self.stats.pending_compilations = self.pending_regions.len();
-                self.stats.peak_pending_compilations = self
-                    .stats
-                    .peak_pending_compilations
-                    .max(self.pending_regions.len());
-                self.automatic_regions.insert(region.start);
-                self.index_region(region);
-                Ok(true)
+        while self.pending_regions.len() < crate::compiler::CAPACITY {
+            let Some((&start, snapshot)) = self.deferred_compilations.first_key_value() else {
+                break;
+            };
+            if !snapshot.valid(&self.memory) {
+                let snapshot = self.deferred_compilations.remove(&start).unwrap();
+                self.stats.stale_compilations += 1;
+                self.attempted.remove(&start);
+                for pc in &snapshot.region.entries {
+                    self.attempted.remove(pc);
+                }
+                continue;
             }
-            Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                Err("compiler worker disconnected".into())
+            let region = (*snapshot.region).clone();
+            match self.compiler.as_mut().unwrap().try_submit(snapshot.clone()) {
+                Ok(ticket) => {
+                    self.deferred_compilations.remove(&start);
+                    self.stats.compile_requests += 1;
+                    self.stats.max_compile_work = self
+                        .stats
+                        .max_compile_work
+                        .max(self.compiler.as_ref().unwrap().last_work());
+                    self.pending_regions.insert(region.start, ticket);
+                    self.stats.pending_compilations = self.pending_regions.len();
+                    self.stats.peak_pending_compilations = self
+                        .stats
+                        .peak_pending_compilations
+                        .max(self.pending_regions.len());
+                    self.automatic_regions.insert(region.start);
+                    self.index_region(region);
+                }
+                Err(crate::compiler::SubmitError::Full) => break,
+                Err(crate::compiler::SubmitError::Closed) => {
+                    return Err("compiler worker disconnected".into());
+                }
+                Err(crate::compiler::SubmitError::WorkLimit { work, limit }) => {
+                    self.deferred_compilations.remove(&start);
+                    self.stats.compile_work_rejections += 1;
+                    self.compile_errors.insert(
+                        start,
+                        format!("compile work {work} exceeds background budget {limit}"),
+                    );
+                }
             }
         }
+        self.stats.deferred_compilations = self.deferred_compilations.len();
+        Ok(())
     }
 
     /// Publish only on the execution owner, outside generated code, after both
     /// request identity and every captured code-page version have been checked.
     fn collect_compilations(&mut self) -> Result<(), String> {
+        self.submit_deferred_compilations()?;
         loop {
             let Some(worker) = self.compiler.as_mut() else {
                 return Ok(());
@@ -577,6 +669,7 @@ impl Executor {
                     }
                 }
             }
+            self.submit_deferred_compilations()?;
         }
     }
 
@@ -654,6 +747,8 @@ impl Executor {
         if !enabled {
             self.tier_attempted.clear();
             self.pending_regions.clear();
+            self.deferred_compilations.clear();
+            self.stats.deferred_compilations = 0;
             self.stats.pending_compilations = 0;
             self.compiler = None;
         }
@@ -858,6 +953,14 @@ impl Executor {
                             .chain(std::iter::once(region.start))
                     }),
             )
+            .chain(self.deferred_compilations.values().flat_map(|input| {
+                input
+                    .region
+                    .entries
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(input.region.start))
+            }))
             .collect();
         let Some(region) = crate::discovery::discover(
             &self.memory,
@@ -1130,6 +1233,268 @@ impl Executor {
                         return Err(error);
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod responsive_compile_tests {
+    use super::*;
+    use crate::{EXEC, READ, WRITE};
+    use adv_sync::{
+        WakeEvent,
+        background::{Builder, Service, WorkPolicy},
+    };
+    use iced_x86::code_asm::*;
+
+    const CODE: u32 = 0x10000;
+    const DATA: u32 = 0x20000;
+    const STACK: u32 = 0x2f000;
+    const STOP: u32 = 0x2e000;
+
+    fn fixture(limit: usize) -> (Executor, Service) {
+        let mut m = Executor::new(CODE, 0x20000).unwrap();
+        m.protect(CODE, 0x20000, READ | WRITE).unwrap();
+        let wake = WakeEvent::new().unwrap();
+        let mut builder = Builder::new(wake).unwrap().with_work_policy(if limit == 0 {
+            WorkPolicy::default()
+        } else {
+            WorkPolicy::responsive(limit)
+        });
+        let sender = builder.sender(4, 8).unwrap().into_local();
+        let service = builder.start().unwrap();
+        m.set_background_sender(sender).unwrap();
+        m.set_async_compilation(true);
+        m.set_host_interrupts(false);
+        (m, service)
+    }
+    fn assemble(f: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
+        let mut a = CodeAssembler::new(32).unwrap();
+        f(&mut a);
+        a.assemble(u64::from(CODE)).unwrap()
+    }
+    fn region(m: &mut Executor, bytes: &[u8]) -> Region {
+        m.write(CODE, bytes).unwrap();
+        m.protect(CODE, 4096, READ | EXEC).unwrap();
+        let mut region = Region::new(CODE, bytes.len());
+        region.compile_strategy = CompileStrategy::Fast;
+        region
+    }
+    fn drain(m: &mut Executor) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !m.pending_regions.is_empty() || !m.deferred_compilations.is_empty() {
+            assert!(Instant::now() < until, "fragment publication stalled");
+            m.collect_compilations().unwrap();
+            std::thread::yield_now();
+        }
+    }
+    fn seed(m: &mut Executor, iterations: u32) {
+        m.write(STACK, &STOP.to_le_bytes()).unwrap();
+        m.state = CpuState::default();
+        m.state.eip = CODE;
+        m.state.regs[1] = iterations;
+        m.state.regs[4] = STACK;
+    }
+
+    #[test]
+    fn large_authored_units_are_bounded_and_linked_without_losing_budget_or_smc() {
+        let (mut m, _service) = fixture(crate::RESPONSIVE_COMPILE_WORK);
+        let bytes = assemble(|a| {
+            let mut begin = a.create_label();
+            a.set_label(&mut begin).unwrap();
+            for _ in 0..40 {
+                a.add(dword_ptr(DATA), 1).unwrap();
+            }
+            a.dec(ecx).unwrap();
+            a.jnz(begin).unwrap();
+            a.ret().unwrap();
+        });
+        let region = region(&mut m, &bytes);
+        assert!(m.queue_region(region.clone()).unwrap());
+        drain(&mut m);
+        assert!(m.compiled.len() > 1);
+        assert!(m.stats.max_compile_work <= crate::RESPONSIVE_COMPILE_WORK);
+        seed(&mut m, 2);
+        loop {
+            match m.run(STOP, 2).unwrap() {
+                RunOutcome::Budget => {}
+                RunOutcome::ReachedStop => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(
+            m.memory.read_data(DATA, 4).unwrap().as_ref(),
+            &80u32.to_le_bytes()
+        );
+        assert_eq!(m.state.regs[1], 0);
+        assert_eq!(m.state.regs[4], STACK + 4);
+        assert!(m.stats.linked_entries > 0);
+        // Patch an instruction in the last fragment; no old piece may execute.
+        let mut patched = bytes.clone();
+        let position = patched
+            .windows(7)
+            .rposition(|w| w == [0x83, 0x05, 0, 0, 2, 0, 1])
+            .unwrap();
+        patched[position + 6] = 2;
+        m.write(CODE, &patched).unwrap();
+        seed(&mut m, 1);
+        assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(
+            m.memory.read_data(DATA, 4).unwrap().as_ref(),
+            &121u32.to_le_bytes()
+        );
+        drain(&mut m);
+        assert!(m.stats.invalidations > 0);
+    }
+
+    #[test]
+    fn deferred_inputs_keep_versions_and_speed_rejection_preserves_live_fast_code() {
+        let (mut m, _service) = fixture(16);
+        let bytes = assemble(|a| {
+            for _ in 0..32 {
+                a.mov(eax, dword_ptr(DATA)).unwrap();
+            }
+            a.ret().unwrap();
+        });
+        let mut original = region(&mut m, &bytes);
+        assert!(m.queue_region(original.clone()).unwrap());
+        assert!(!m.deferred_compilations.is_empty());
+        m.write(CODE, &[0xb8, 42, 0, 0, 0, 0x90]).unwrap();
+        drain(&mut m);
+        assert!(
+            m.compiled.is_empty(),
+            "old deferred/active inputs must never publish"
+        );
+        assert!(m.stats.stale_compilations > 0);
+        assert!(m.queue_region(original.clone()).unwrap());
+        drain(&mut m);
+        let old = m.compiled[&CODE].tail_entry;
+        original.compile_strategy = CompileStrategy::Speed;
+        assert!(!m.queue_region(original).unwrap());
+        assert_eq!(m.compiled[&CODE].tail_entry, old);
+        assert!(m.tier_attempted.contains(&CODE));
+        assert_eq!(m.stats.compile_work_rejections, 1);
+    }
+
+    #[test]
+    fn faults_in_later_fragments_preserve_completed_prefix_and_retry_precisely() {
+        let (mut m, _service) = fixture(16);
+        let bytes = assemble(|a| {
+            a.mov(dword_ptr(DATA), 123).unwrap();
+            a.add(eax, 7).unwrap();
+            a.mov(ebx, dword_ptr(DATA + 4096)).unwrap();
+            a.mov(dword_ptr(DATA + 4), ebx).unwrap();
+            a.ret().unwrap();
+        });
+        let original = region(&mut m, &bytes);
+        m.queue_region(original).unwrap();
+        drain(&mut m);
+        m.protect(DATA + 4096, 4096, 0).unwrap();
+        seed(&mut m, 0);
+        let RunOutcome::ReadFault { pc, address } = m.run(STOP, 100).unwrap() else {
+            panic!("missing precise fault");
+        };
+        assert_eq!(address, DATA + 4096);
+        assert_eq!(m.state.regs[0], 7);
+        assert_eq!(
+            m.memory.read_data(DATA, 4).unwrap().as_ref(),
+            &123u32.to_le_bytes()
+        );
+        assert_eq!(m.state.eip, pc);
+        m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+        m.write(DATA + 4096, &77u32.to_le_bytes()).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 7, "completed prefix was replayed");
+        assert_eq!(
+            m.memory.read_data(DATA + 4, 4).unwrap().as_ref(),
+            &77u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic responsive compilation cost/throughput, not a timing gate"]
+    fn report_responsive_compile_tradeoffs() {
+        #[cfg(windows)]
+        unsafe {
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn SetProcessAffinityMask(process: *mut std::ffi::c_void, mask: usize) -> i32;
+            }
+            assert_ne!(SetProcessAffinityMask(GetCurrentProcess(), 1), 0);
+        }
+        println!(
+            "case,work_limit,cold_p50_ms,total_compile_p50_ms,hot_p50_ns_per_loop,regions,code_bytes,linked_per_loop"
+        );
+        for case in ["scalar", "simd"] {
+            let bytes = assemble(|a| {
+                let mut begin = a.create_label();
+                a.set_label(&mut begin).unwrap();
+                if case == "scalar" {
+                    for _ in 0..63 {
+                        a.mov(eax, dword_ptr(DATA)).unwrap();
+                        a.add(ebx, dword_ptr(DATA + 4)).unwrap();
+                        a.mov(dword_ptr(DATA + 8), ebx).unwrap();
+                        a.xor(edx, eax).unwrap();
+                    }
+                } else {
+                    for _ in 0..16 {
+                        a.movdqu(xmm0, xmmword_ptr(DATA)).unwrap();
+                        a.movdqu(xmmword_ptr(DATA + 16), xmm0).unwrap();
+                    }
+                }
+                a.dec(ecx).unwrap();
+                a.jnz(begin).unwrap();
+                a.ret().unwrap();
+            });
+            // A/B/A uses one executable and identical compiler/memory features.
+            for limit in [0, 128, 0, 64, 256, 512, 0] {
+                let mut cold = Vec::new();
+                let mut compilation = Vec::new();
+                let mut hot = Vec::new();
+                let mut sizes = (0, 0);
+                let mut linked = 0.0;
+                for _ in 0..5 {
+                    let (mut m, _service) = fixture(limit);
+                    m.write(DATA, &[7, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4])
+                        .unwrap();
+                    let original = region(&mut m, &bytes);
+                    let begun = Instant::now();
+                    m.queue_region(original).unwrap();
+                    drain(&mut m);
+                    cold.push(begun.elapsed().as_secs_f64() * 1000.0);
+                    compilation.push(m.stats.compile_time.as_secs_f64() * 1000.0);
+                    sizes = (m.compiled.len(), m.stats.native_code_bytes);
+                    let before_linked = m.stats.linked_entries;
+                    for _ in 0..7 {
+                        seed(&mut m, 20_000);
+                        let begun = Instant::now();
+                        assert_eq!(m.run(STOP, 20_000_000).unwrap(), RunOutcome::ReachedStop);
+                        hot.push(begun.elapsed().as_secs_f64() * 1e9 / 20_000.0);
+                        assert_eq!(m.state.regs[1], 0);
+                        assert_eq!(m.state.regs[4], STACK + 4);
+                        if case == "scalar" {
+                            assert_eq!(m.state.regs[3], 20_000 * 63 * 3);
+                        } else {
+                            assert_eq!(
+                                m.memory.read_data(DATA + 16, 16).unwrap(),
+                                m.memory.read_data(DATA, 16).unwrap()
+                            );
+                        }
+                    }
+                    linked = (m.stats.linked_entries - before_linked) as f64 / 140_000.0;
+                    assert!(m.stats.interpreter_instructions == 0);
+                    if limit != 0 {
+                        assert!(m.stats.max_compile_work <= limit);
+                    }
+                }
+                cold.sort_by(f64::total_cmp);
+                compilation.sort_by(f64::total_cmp);
+                hot.sort_by(f64::total_cmp);
+                println!(
+                    "{case},{limit},{:.3},{:.3},{:.3},{},{},{linked:.3}",
+                    cold[2], compilation[2], hot[17], sizes.0, sizes.1
+                );
             }
         }
     }

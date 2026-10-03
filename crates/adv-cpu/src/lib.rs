@@ -3,6 +3,7 @@
 mod atomic_memory;
 pub mod backend;
 mod compile;
+mod compile_budget;
 mod compiler;
 mod cpu_profile;
 mod discovery;
@@ -27,6 +28,7 @@ mod trap;
 mod virtual_memory;
 
 pub use backend::jit::JitCpu;
+pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::SegmentState;
 pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};

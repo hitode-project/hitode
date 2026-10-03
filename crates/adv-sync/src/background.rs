@@ -21,6 +21,24 @@ const CLOSED: usize = 1usize << (usize::BITS - 1);
 #[derive(Clone, Copy)]
 pub struct Affinity(u64);
 
+/// Client-defined estimates, not time or a preemption guarantee. Immutable once
+/// the service starts; neutral clients interpret one work unit themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkPolicy {
+    background_limit: Option<usize>,
+}
+impl WorkPolicy {
+    pub fn background_limit(self) -> Option<usize> {
+        self.background_limit
+    }
+    pub fn responsive(background_limit: usize) -> Self {
+        assert!(background_limit > 0);
+        Self {
+            background_limit: Some(background_limit),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Priority {
     Urgent,
@@ -189,6 +207,7 @@ struct Shared {
     request: WakeEvent,
     completion: WakeEvent,
     counts: [Counts; 2],
+    work_limit: AtomicUsize,
 }
 struct Packet {
     task: Task,
@@ -223,6 +242,14 @@ impl Sender {
     }
     pub fn affinity(&self) -> Affinity {
         Affinity(self.shared.id)
+    }
+    pub fn work_policy(&self) -> WorkPolicy {
+        WorkPolicy {
+            background_limit: std::num::NonZeroUsize::new(
+                self.shared.work_limit.load(Ordering::Relaxed),
+            )
+            .map(std::num::NonZeroUsize::get),
+        }
     }
     pub fn is_closed(&self) -> bool {
         self.shared.gate.load(Ordering::Acquire) & CLOSED != 0
@@ -314,12 +341,21 @@ impl Builder {
                 request: WakeEvent::new()?,
                 completion: execution_wake,
                 counts: [Counts::default(), Counts::default()],
+                work_limit: AtomicUsize::new(0),
             }),
             ports: Vec::new(),
             started: false,
             #[cfg(test)]
             after_empty: None,
         })
+    }
+    /// Configure before start, including endpoints already registered with this
+    /// builder. CPU/background clients enforce their own estimated work costs.
+    pub fn with_work_policy(self, policy: WorkPolicy) -> Self {
+        self.shared
+            .work_limit
+            .store(policy.background_limit.unwrap_or(0), Ordering::Relaxed);
+        self
     }
     pub fn sender(&mut self, urgent: usize, background: usize) -> std::io::Result<Sender> {
         self.register_sender(urgent, background, None)
@@ -586,6 +622,15 @@ mod tests {
         let ticket = first.try_submit(Priority::Urgent, task).unwrap();
         wait(&ticket);
         assert_eq!(ticket.status(), Status::Completed);
+    }
+
+    #[test]
+    fn startup_policy_is_visible_to_already_registered_unique_endpoints() {
+        let mut builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
+        let sender = builder.sender(1, 1).unwrap();
+        assert_eq!(sender.work_policy(), WorkPolicy::default());
+        let _service = builder.with_work_policy(WorkPolicy::responsive(128)).start().unwrap();
+        assert_eq!(sender.work_policy().background_limit(), Some(128));
     }
 
     #[test]

@@ -198,6 +198,41 @@ struct PageStamp {
 }
 
 impl Snapshot {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Slice an immutable input without consulting active guest memory. Keep
+    /// tail/negative-page stamps and the optional hardware-read proof capability.
+    pub(crate) fn fragment(&self, region: Region) -> Result<Self, String> {
+        let offset = region
+            .start
+            .checked_sub(self.region.start)
+            .ok_or("fragment starts before its snapshot")? as usize;
+        if region.len == 0 || offset + region.len > self.bytes.len() {
+            return Err("fragment extends beyond its snapshot".into());
+        }
+        let end =
+            (offset + region.len + if region.complete_tail { 14 } else { 0 }).min(self.bytes.len());
+        let first = (region.start - self.base) as usize / 4096;
+        let last = ((self.region.start - self.base) as usize + end) / 4096;
+        Ok(Self {
+            region: Box::new(region),
+            base: self.base,
+            len: self.len,
+            bytes: self.bytes[offset..end].to_vec(),
+            pages: self
+                .pages
+                .iter()
+                .filter(|stamp| (first..=last).contains(&stamp.page))
+                .cloned()
+                .collect(),
+            covered: None,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            native_fault_reads: self.native_fault_reads,
+        })
+    }
+
     pub fn capture(region: &Region, memory: &Memory) -> Result<Self, String> {
         if region.len == 0 || region.len > 16 * 1024 || !memory.executable(region.start, region.len)
         {
