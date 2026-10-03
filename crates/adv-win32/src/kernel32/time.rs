@@ -1,6 +1,6 @@
 //! Time: all readings come from the machine clock (virtual or real).
 
-use adv_abi::Registry;
+use adv_abi::{GuestPtr, Registry, types::FILETIME, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Env, Outcome, Wait};
 
@@ -100,11 +100,19 @@ fn read_st(cpu: &dyn Guest, p: u32) -> [u16; 8] {
     st
 }
 
-fn get_system_time_as_file_time(env: &mut Env<'_>) -> Outcome {
+#[win32(kernel32, name = "GetSystemTimeAsFileTime", level = implement)]
+fn get_system_time_as_file_time(
+    env: &mut Env<'_>,
+    out: GuestPtr<FILETIME>,
+) -> Result<(), adv_cpu::backend::MemFault> {
     let ft = filetime_now(env);
-    let out = env.arg(0);
-    write_ft(env.cpu, out, ft);
-    Outcome::Return(0)
+    out.write(
+        env.cpu,
+        FILETIME {
+            dwLowDateTime: ft as u32,
+            dwHighDateTime: (ft >> 32) as u32,
+        },
+    )
 }
 
 fn get_system_time(env: &mut Env<'_>) -> Outcome {
@@ -261,26 +269,33 @@ fn local_systemtime(env: &mut Env<'_>) -> [u16; 8] {
     filetime_to_systemtime(ft as u64)
 }
 
-fn get_tick_count(env: &mut Env<'_>) -> Outcome {
-    Outcome::Return((env.sys.clock.guest_now_us() / 1000) as u32)
+#[win32(kernel32, name = "GetTickCount", level = implement)]
+fn get_tick_count(env: &mut Env<'_>) -> u32 {
+    (env.sys.clock.guest_now_us() / 1000) as u32
 }
 
-fn query_performance_counter(env: &mut Env<'_>) -> Outcome {
+#[win32(kernel32, name = "QueryPerformanceCounter", level = implement)]
+fn query_performance_counter(
+    env: &mut Env<'_>,
+    out: GuestPtr<i64>,
+) -> Result<i32, adv_cpu::backend::MemFault> {
     let t = env.sys.clock.guest_now_us() * (adv_machine::clock::QPC_FREQ / 1_000_000);
-    let out = env.arg(0);
-    write_ft(env.cpu, out, t);
-    Outcome::Return(1)
+    out.write(env.cpu, t as i64)?;
+    Ok(1)
 }
 
-fn query_performance_frequency(env: &mut Env<'_>) -> Outcome {
-    let out = env.arg(0);
-    write_ft(env.cpu, out, adv_machine::clock::QPC_FREQ);
-    Outcome::Return(1)
+#[win32(kernel32, name = "QueryPerformanceFrequency", level = implement)]
+fn query_performance_frequency(
+    env: &mut Env<'_>,
+    out: GuestPtr<i64>,
+) -> Result<i32, adv_cpu::backend::MemFault> {
+    out.write(env.cpu, adv_machine::clock::QPC_FREQ as i64)?;
+    Ok(1)
 }
 
 /// Sleep(ms): 0 yields, anything else blocks the context until the deadline.
-pub(crate) fn sleep(env: &mut Env<'_>) -> Outcome {
-    let ms = env.arg(0);
+#[win32(kernel32, name = "Sleep", level = implement)]
+pub(crate) fn sleep(env: &mut Env<'_>, ms: u32) -> Outcome {
     if ms == 0 {
         return Outcome::block_then_return(Wait::Yield, 0);
     }
@@ -334,37 +349,19 @@ fn get_time_zone_information(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
-    stdcall(
-        reg,
-        K32,
-        "GetSystemTimeAsFileTime",
-        1,
-        get_system_time_as_file_time,
-    );
+    reg.register(get_system_time_as_file_time_ABI);
     stdcall(reg, K32, "GetSystemTime", 1, get_system_time);
     stdcall(reg, K32, "GetLocalTime", 1, get_local_time);
-    stdcall(reg, K32, "GetTickCount", 0, get_tick_count);
+    reg.register(get_tick_count_ABI);
     stdcall(reg, K32, "GetDateFormatW", 6, |e| {
         get_date_time_format_w(e, false)
     });
     stdcall(reg, K32, "GetTimeFormatW", 6, |e| {
         get_date_time_format_w(e, true)
     });
-    stdcall(
-        reg,
-        K32,
-        "QueryPerformanceCounter",
-        1,
-        query_performance_counter,
-    );
-    stdcall(
-        reg,
-        K32,
-        "QueryPerformanceFrequency",
-        1,
-        query_performance_frequency,
-    );
-    stdcall(reg, K32, "Sleep", 1, sleep);
+    reg.register(query_performance_counter_ABI);
+    reg.register(query_performance_frequency_ABI);
+    reg.register(sleep_ABI);
     stdcall(
         reg,
         K32,

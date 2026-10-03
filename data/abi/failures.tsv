@@ -1,0 +1,7 @@
+# Reviewed discovery failure contracts: dll<TAB>export<TAB>hex value<TAB>official source
+# HRESULT defaults to E_NOTIMPL (80004001), see https://learn.microsoft.com/en-us/windows/win32/seccrypto/common-hresult-values
+gdiplus.dll	GdiplusStartup	00000006	https://learn.microsoft.com/en-us/windows/win32/api/gdiplustypes/ne-gdiplustypes-status
+kernel32.dll	CreateFileA	ffffffff	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+kernel32.dll	CreateFileW	ffffffff	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+kernel32.dll	GetFileAttributesA	ffffffff	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesa
+kernel32.dll	GetFileAttributesW	ffffffff	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw

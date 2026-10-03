@@ -1,8 +1,8 @@
-//! Opt-in host-side cost accounting (`--stats` in pal-run and pal-desktop).
+//! Opt-in host-side cost accounting for the runtime and its frontend.
 //!
 //! Counters are always kept (plain integer adds); wall-clock timing only runs when
 //! [`Stats::enabled`] is set, so a normal run pays one branch per host call. Per-frame rows
-//! are closed whenever the PAL layer advances [`crate::Sys::frame`].
+//! are closed whenever the graphics front advances [`crate::Sys::frame`].
 //!
 //! Terms, all host wall time:
 //! * `run`: inside `Backend::run` (guest x86 execution plus in-hook host calls).
@@ -162,7 +162,7 @@ impl Stats {
         }
     }
 
-    /// Close the current row if the PAL frame moved on.
+    /// Close the current row if the presentation sequence moved on.
     pub(crate) fn note_frame(&mut self, frame: u32, guest_us: u64, blocks: Option<(u64, u64)>) {
         if let Some((b, bytes)) = blocks {
             self.total.blocks = b;

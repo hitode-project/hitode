@@ -1,7 +1,7 @@
 //! Host-boundary call trace.
 //!
-//! One record per completed host call, in the same shape the M2 oracle (a PAL.dll proxy
-//! running under real Windows) will emit, so the two traces can be diffed line by line:
+//! One record per completed host call, with a stable textual format suitable for
+//! comparing runtime execution with native Windows oracle traces:
 //!
 //! `<ctx>\t<frame>\t<module>!<name>\t<arg0,arg1,...>\t<ret>` (numbers in hex)
 

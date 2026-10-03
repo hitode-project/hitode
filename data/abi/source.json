@@ -1,0 +1,12 @@
+{
+  "project": "https://github.com/microsoft/win32metadata",
+  "package": "Microsoft.Windows.SDK.Win32Metadata",
+  "version": "71.0.26-preview",
+  "package_url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.win32metadata/71.0.26-preview/microsoft.windows.sdk.win32metadata.71.0.26-preview.nupkg",
+  "package_sha256": "758efe32666596b8596c58a8c46631da23757a914713b4e88403bbfa5110cb38",
+  "winmd_sha256": "0c0e5f11543fd654f9fad44c1952494bf407d6b067d93c2e5eef4fcf5d42edde",
+  "metadata_license": "MIT",
+  "generator": "tools/abi/Metadata.cs using Microsoft System.Reflection.Metadata",
+  "target": "x86 (SupportedArchitecture mask 1), little endian, 32-bit native pointers",
+  "scope": "data/abi/modules.txt"
+}

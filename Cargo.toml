@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/adv-abi",
+    "crates/adv-abi-macros",
     "crates/adv-cpu",
     "crates/adv-device",
     "crates/adv-dx",

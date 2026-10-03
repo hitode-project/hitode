@@ -1,0 +1,329 @@
+use adv_abi::{
+    ApiDiagnostics, Conv, Env, GuestPtr, ImplementationLevel, Outcome, Registry, RunMode,
+    signature, win32,
+};
+use adv_cpu::backend::asm::Asm;
+use adv_cpu::backend::{Guest, GuestExt, Prot};
+use adv_machine::{
+    Clock, Machine, RunResult,
+    layout::{PAGE, PARK_ADDR, teb},
+};
+use adv_unicorn::UnicornCpu;
+
+const CODE: u32 = 0x0040_0000;
+const DATA: u32 = 0x0041_0000;
+
+// These test adapters test ABI transport only; they are never runtime implementations.
+#[win32(kernel32, name = "QueryPerformanceCounter", level = state)]
+fn typed_output(
+    _env: &mut Env<'_>,
+    output: GuestPtr<i64>,
+) -> Result<i32, adv_cpu::backend::MemFault> {
+    output.write(_env.cpu, 0x1122_3344_5566_7788)?;
+    Ok(1)
+}
+
+#[win32(kernel32, name = "SetFilePointerEx", level = state)]
+fn typed_wide(
+    _env: &mut Env<'_>,
+    file: adv_abi::Handle,
+    distance: i64,
+    output: GuestPtr<i64>,
+    method: u32,
+) -> Result<i32, adv_cpu::backend::MemFault> {
+    assert_eq!(file.0, 0x1234);
+    assert_eq!(distance, -0x1020_3040_5060_708);
+    assert_eq!(method, 2);
+    output.write(_env.cpu, distance)?;
+    Ok(1)
+}
+
+#[win32(user32, name = "WindowFromPoint", level = state)]
+fn typed_point(_env: &mut Env<'_>, point: adv_abi::types::POINT) -> adv_abi::Handle {
+    assert_eq!(point.x, -123);
+    assert_eq!(point.y, 456);
+    adv_abi::Handle(0x5678)
+}
+
+fn machine(mut registry: Registry) -> Machine<UnicornCpu> {
+    registry.add("fixture.dll", "done", Conv::Cdecl { argc: 0 }, |_| {
+        Outcome::ExitProcess(0)
+    });
+    let mut machine = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    machine.cpu.map(CODE, PAGE, Prot::RWX).unwrap();
+    machine.cpu.map(DATA, PAGE, Prot::RW).unwrap();
+    machine
+}
+
+fn execute(machine: &mut Machine<UnicornCpu>, mut code: Asm) -> RunResult {
+    let done = machine.resolve_import("fixture.dll", "done").unwrap();
+    code.call(done);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.spawn("fixture", CODE, &[], 0x1_0000).unwrap();
+    machine.run_virtual(1_000_000)
+}
+
+#[test]
+fn typed_adapter_preserves_output_and_stdcall_stack() {
+    let mut registry = Registry::default();
+    registry.register(typed_output_ABI);
+    assert_eq!(
+        registry.level("KERNEL32.dll", "QueryPerformanceCounter"),
+        Some(ImplementationLevel::State)
+    );
+    let mut machine = machine(registry);
+    let thunk = machine
+        .resolve_import("kernel32.dll", "QueryPerformanceCounter")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]); // mov eax,esp
+    code.mov_mem_eax(DATA + 16)
+        .push_imm(DATA)
+        .call(thunk)
+        .mov_mem_eax(DATA + 8);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 20);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(
+        GuestPtr::<i64>::new(DATA).read(&machine.cpu).unwrap(),
+        0x1122_3344_5566_7788
+    );
+    assert_eq!(machine.cpu.read_u32(DATA + 8).unwrap(), 1);
+    assert_eq!(
+        machine.cpu.read_u32(DATA + 16).unwrap(),
+        machine.cpu.read_u32(DATA + 20).unwrap()
+    );
+}
+
+#[test]
+fn metadata_uses_stack_words_for_64_bit_parameters() {
+    let signature = signature::lookup("kernel32.dll", "SetFilePointerEx").unwrap();
+    assert_eq!(signature.parameters.len(), 4);
+    assert_eq!(signature.stack_words(), 5);
+    assert_eq!(typed_wide_ABI.conv, Conv::Stdcall { argc: 5 });
+    let mut registry = Registry::default();
+    registry.register(typed_wide_ABI);
+    let mut machine = machine(registry);
+    let thunk = machine
+        .resolve_import("kernel32.dll", "SetFilePointerEx")
+        .unwrap();
+    let distance = -0x1020_3040_5060_708i64;
+    let mut code = Asm::new(CODE);
+    code.push_imm(2)
+        .push_imm(DATA)
+        .push_imm((distance >> 32) as u32)
+        .push_imm(distance as u32)
+        .push_imm(0x1234)
+        .call(thunk);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(
+        GuestPtr::<i64>::new(DATA).read(&machine.cpu).unwrap(),
+        distance
+    );
+}
+
+#[test]
+fn guest_pointers_reject_null_overflow_and_protected_writes() {
+    let mut machine = machine(Registry::default());
+    assert!(GuestPtr::<u32>::new(0).read(&machine.cpu).is_err());
+    assert!(
+        GuestPtr::<u32>::new(u32::MAX - 1)
+            .read(&machine.cpu)
+            .is_err()
+    );
+    assert!(GuestPtr::<u64>::new(u32::MAX - 3).offset(1).is_err());
+    machine.cpu.write_u32(DATA, 0xaabb_ccdd).unwrap();
+    machine.cpu.protect(DATA, PAGE, Prot::READ).unwrap();
+    assert_eq!(
+        GuestPtr::<u32>::new(DATA).read(&machine.cpu).unwrap(),
+        0xaabb_ccdd
+    );
+    assert!(
+        GuestPtr::<u32>::new(DATA)
+            .write(&mut machine.cpu, 0)
+            .is_err()
+    );
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0xaabb_ccdd);
+}
+
+#[test]
+fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
+    let mut machine = machine(Registry::default());
+    let thunk = machine
+        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(DATA)
+        .push_imm(DATA + 32)
+        .push_imm(0)
+        .call(thunk);
+    let caller = CODE + code.bytes.len() as u32;
+    let RunResult::Failed(failure) = execute(&mut machine, code) else {
+        panic!("strict stub returned");
+    };
+    assert!(failure.message.contains("strict ABI stub"));
+    let diagnostics = machine.ext.get::<ApiDiagnostics>();
+    assert_eq!(diagnostics.stub_calls, 1);
+    assert_eq!(diagnostics.recent_stubs[0].caller, caller);
+    assert_eq!(diagnostics.recent_stubs[0].name, "DWriteCreateFactory");
+    assert!(!diagnostics.acceptance_eligible(RunMode::Strict));
+    assert!(
+        machine
+            .sys
+            .thunks
+            .iter()
+            .any(|(_, t)| t.name == "DWriteCreateFactory" && !t.implemented)
+    );
+}
+
+#[test]
+fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
+    let mut registry = Registry::default();
+    registry.set_mode(RunMode::Discovery);
+    let mut machine = machine(registry);
+    let thunk = machine
+        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .unwrap();
+    machine.cpu.write_u32(DATA, 0xdead_beef).unwrap();
+    let mut code = Asm::new(CODE);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 16)
+        .push_imm(DATA)
+        .push_imm(DATA + 32)
+        .push_imm(0)
+        .call(thunk)
+        .mov_mem_eax(DATA + 4);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 20);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 0x8000_4001);
+    assert_eq!(
+        machine.cpu.read_u32(DATA).unwrap(),
+        0xdead_beef,
+        "stub must not manufacture a COM object"
+    );
+    assert_eq!(
+        machine.cpu.read_u32(DATA + 16).unwrap(),
+        machine.cpu.read_u32(DATA + 20).unwrap()
+    );
+    let context = &machine.sys.contexts[machine.sys.current as usize];
+    assert_eq!(
+        machine.cpu.read_u32(context.teb + teb::LAST_ERROR).unwrap(),
+        120
+    );
+    assert_eq!(
+        machine.ext.get::<ApiDiagnostics>().gaps["dwrite.dll!DWriteCreateFactory"],
+        1
+    );
+}
+
+#[test]
+fn discovery_refuses_unknown_failure_contract_instead_of_guessing_zero() {
+    let mut registry = Registry::default();
+    registry.set_mode(RunMode::Discovery);
+    let mut machine = machine(registry);
+    let thunk = machine
+        .resolve_import("kernel32.dll", "GetTickCount")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    code.call(thunk);
+    let RunResult::Failed(failure) = execute(&mut machine, code) else {
+        panic!("unknown failure was guessed");
+    };
+    assert!(failure.message.contains("no reviewed failure contract"));
+}
+
+#[test]
+fn generated_com_slots_and_legacy_conflicts_are_visible() {
+    let present = signature::lookup_com("IDirect3DDevice9", "Present").unwrap();
+    assert_eq!(present.com_slot, Some(17));
+    assert_eq!(present.stack_words(), 5);
+    assert_eq!(
+        signature::lookup_com("IDirectDraw7", "QueryInterface")
+            .unwrap()
+            .com_slot,
+        Some(0)
+    );
+    let mut registry = Registry::default();
+    registry.add(
+        "kernel32.dll",
+        "SetFilePointerEx",
+        Conv::Stdcall { argc: 4 },
+        |_| Outcome::Return(0),
+    );
+    assert_eq!(registry.signature_conflicts().len(), 1);
+    assert_eq!(
+        registry.signature_conflicts()[0].metadata,
+        Some(Conv::Stdcall { argc: 5 })
+    );
+    assert!(registry.get("d3d11.dll", "D3D11CreateDevice").is_some());
+    assert!(
+        registry
+            .exports("dwrite.dll")
+            .iter()
+            .any(|s| s == "DWriteCreateFactory")
+    );
+    assert_eq!(registry.coverage().legacy, 1);
+}
+
+#[test]
+fn metadata_by_value_struct_is_a_stack_copy() {
+    let mut registry = Registry::default();
+    registry.register(typed_point_ABI);
+    assert_eq!(typed_point_ABI.conv, Conv::Stdcall { argc: 2 });
+    let mut machine = machine(registry);
+    let thunk = machine
+        .resolve_import("user32.dll", "WindowFromPoint")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(456)
+        .push_imm(-123i32 as u32)
+        .call(thunk)
+        .mov_mem_eax(DATA);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0x5678);
+}
+
+#[test]
+fn generated_flags_are_formatted_without_hiding_unknown_bits() {
+    let type_name = "Windows.Win32.System.Memory.VIRTUAL_ALLOCATION_TYPE";
+    assert_eq!(
+        adv_abi::constants::named(type_name, "MEM_COMMIT"),
+        Some(0x1000)
+    );
+    let text = adv_abi::constants::format(type_name, 0x1000 | 0x2000 | 1).unwrap();
+    assert!(text.contains("MEM_COMMIT"));
+    assert!(text.contains("MEM_RESERVE"));
+    assert!(text.contains("0x1"));
+    let signature = signature::lookup("kernel32.dll", "VirtualAlloc").unwrap();
+    let mut machine = machine(Registry::default());
+    machine.cpu.set_reg(adv_cpu::backend::Reg::Esp, DATA);
+    for (i, value) in [0x1234, 0, PAGE, 0x3000, 4].into_iter().enumerate() {
+        machine.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
+    }
+    let arguments = adv_abi::trace::format_arguments(&machine.cpu, signature);
+    assert!(arguments[2].contains("MEM_COMMIT"));
+    assert!(arguments[2].contains("MEM_RESERVE"));
+}
+
+#[test]
+fn gdiplus_status_failure_is_nonzero_and_generated_tables_have_no_duplicates() {
+    let signature = signature::lookup("gdiplus.dll", "GdiplusStartup").unwrap();
+    assert_eq!(adv_abi::stub::failure_value(signature), Some(6));
+    assert_eq!(signature.conv, Some(Conv::Stdcall { argc: 3 }));
+    for signatures in signature::signatures().windows(2) {
+        assert!(
+            (signatures[0].module, signatures[0].name) < (signatures[1].module, signatures[1].name)
+        );
+    }
+    for signature in signature::signatures() {
+        if let Some(conv) = signature.conv {
+            assert_eq!(u16::from(conv.argc()), signature.stack_words());
+        }
+    }
+}

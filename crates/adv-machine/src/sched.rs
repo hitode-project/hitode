@@ -1,8 +1,7 @@
 //! Guest contexts ("threads") and the cooperative scheduler.
 //!
-//! PAL runs three OS threads: main/UI, game, and work. Their only interaction is
-//! flag polling with `Sleep(1)`, events, and critical sections. We run them as guest contexts
-//! on one host thread. Blocking switches contexts; real-time slices can also preempt
+//! Any number of guest threads (up to the resource limit) run as contexts on one
+//! host execution thread. Blocking switches contexts; real-time slices can preempt
 //! guest computation or return a completed frame to the host. The normal scheduling
 //! lane remains round-robin, with a bounded preference for genuinely satisfied waits.
 

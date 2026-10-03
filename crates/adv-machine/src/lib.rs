@@ -6,8 +6,9 @@
 //! * A thunk trap runs the handler inside the CPU hook. `Return` and `Call` complete in-hook
 //!   (no emulation restart), except an optional real-time frame-boundary host yield.
 //!   Blocking, exit and failure also park the guest. [`Machine::run`] owns re-entry.
-//! * Each guest context (M = main/UI, G = game, W = work, plus any CreateThread) has its own
-//!   stack, TEB (FS base), registers, and continuation stack.
+//! * Each guest context has its own stack, TEB (FS base), registers, and continuation
+//!   stack. Names are diagnostic labels; scheduling depends only on readiness and
+//!   the urgency of the event that woke it, never an engine-specific thread role.
 
 pub mod clock;
 pub mod ext;
@@ -58,10 +59,10 @@ pub struct Sys {
     pub contexts: Vec<Context>,
     /// The context currently running (or last run).
     pub current: CtxId,
-    /// Guest frame number for traces; advanced by the PAL layer.
+    /// Presentation sequence for diagnostics, advanced by the graphics front.
     pub frame: u32,
-    /// Complete presentations available to the frontend. Independent of the trace
-    /// frame number, which PAL advances before running tasks and draw callbacks.
+    /// Complete presentations available to the frontend. This counts committed
+    /// device output, not a guest thread role or an engine-specific frame loop.
     pub completed_frames: u32,
     pub pid: u32,
     next_tid: u32,
@@ -852,6 +853,7 @@ impl<B: Backend> Machine<B> {
             HostFn {
                 conv: Conv::Cdecl { argc: 0 },
                 handler: process_start,
+                data: 0,
                 trace: false,
             },
         );
@@ -1452,7 +1454,7 @@ impl<B: Backend> Machine<B> {
         }
     }
 
-    /// Close the stats row when the PAL frame moved on.
+    /// Close the stats row when the presentation sequence moves on.
     fn note_frame(&mut self) {
         let blocks = self.cpu.executed_blocks();
         self.sys

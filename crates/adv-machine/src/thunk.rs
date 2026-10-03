@@ -41,6 +41,9 @@ impl Conv {
 pub struct HostFn {
     pub conv: Conv,
     pub handler: Handler,
+    /// Opaque binding data interpreted by the registered handler, never the CPU.
+    /// Bound once when resolving an import, avoiding runtime name lookups.
+    pub data: u64,
     /// Record calls in the trace.
     pub trace: bool,
 }
@@ -52,6 +55,10 @@ pub trait Resolver: Any {
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn>;
     /// Whether the host implements anything in `module` (lowercase file name).
     fn provides(&self, module: &str) -> bool;
+    /// Whether this binding has an implementation rather than a generated stub.
+    fn implemented(&self, module: &str, name: &str) -> bool {
+        self.host_fn(module, name).is_some()
+    }
 }
 
 pub struct Thunk {
@@ -89,6 +96,7 @@ impl ThunkTable {
             f: HostFn {
                 conv: Conv::Cdecl { argc: 0 },
                 handler: return_pad,
+                data: 0,
                 trace: false,
             },
             implemented: true,
@@ -152,12 +160,16 @@ impl ThunkTable {
             .copied()
             .or_else(|| self.resolver.host_fn(&key.0, name));
         let (f, implemented) = match found {
-            Some(f) => (f, true),
+            Some(f) => (
+                f,
+                self.internal.contains_key(&key) || self.resolver.implemented(&key.0, name),
+            ),
             // Unknown convention: it fails before returning, so `ret` is never reached.
             None => (
                 HostFn {
                     conv: Conv::Cdecl { argc: 0 },
                     handler: unimplemented,
+                    data: 0,
                     trace: false,
                 },
                 false,
