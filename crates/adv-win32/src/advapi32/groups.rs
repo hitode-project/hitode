@@ -53,13 +53,15 @@ fn text(env: &Env<'_>, units: &[u16], wide: bool) -> (Vec<u8>, usize) {
 }
 fn value_data(env: &Env<'_>, value: Value, wide: bool) -> Result<Vec<u8>, u32> {
     if !wide && string_type(value.kind) {
-        if value.bytes.len() % 2 != 0 {
+        if !value.bytes.len().is_multiple_of(2) {
             return Err(INVALID_DATA);
         }
         let units: Vec<_> = value
             .bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| u16::from_le_bytes(p))
             .collect();
         Ok(env.ext.get::<Win32>().codec.from_utf16(0, &units).0)
     } else {

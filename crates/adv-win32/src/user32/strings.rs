@@ -24,7 +24,9 @@ pub(crate) fn unit_case(unit: u16, upper: bool) -> u16 {
     };
     let i = table.partition_point(|&(_, last, _, _)| last < unit);
     match table.get(i) {
-        Some(&(first, _, stride, delta)) if unit >= first && (unit - first) % stride == 0 => {
+        Some(&(first, _, stride, delta))
+            if unit >= first && (unit - first).is_multiple_of(stride) =>
+        {
             (i32::from(unit) + delta) as u16
         }
         _ => unit,
@@ -83,9 +85,8 @@ fn convert(env: &mut Env<'_>, wide: bool, upper: bool) -> Outcome {
             return Outcome::Fail(error.to_string());
         }
         if wide {
-            for pair in scratch[..n].chunks_exact_mut(2) {
-                let mapped = unit_case(u16::from_le_bytes([pair[0], pair[1]]), upper);
-                pair.copy_from_slice(&mapped.to_le_bytes());
+            for pair in scratch[..n].as_chunks_mut::<2>().0 {
+                *pair = unit_case(u16::from_le_bytes(*pair), upper).to_le_bytes();
             }
         } else {
             // Count character boundaries before splitting; a DBCS trail byte can

@@ -157,12 +157,11 @@ fn virtual_alloc(env: &mut Env<'_>) -> Outcome {
     if addr != 0 {
         // Committing inside a region we handed out earlier.
         let base = addr & !(GRANULE - 1);
-        if let Some((start, len)) = find_region(env, addr) {
-            if u64::from(addr) + u64::from(size) <= u64::from(start) + u64::from(len)
-                && env.cpu.protect(page, span, prot).is_ok()
-            {
-                return Outcome::Return(addr);
-            }
+        if let Some((start, len)) = find_region(env, addr)
+            && u64::from(addr) + u64::from(size) <= u64::from(start) + u64::from(len)
+            && env.cpu.protect(page, span, prot).is_ok()
+        {
+            return Outcome::Return(addr);
         }
         let end = (u64::from(addr) + u64::from(size)).next_multiple_of(u64::from(GRANULE));
         if let Ok(len) = u32::try_from(end - u64::from(base))

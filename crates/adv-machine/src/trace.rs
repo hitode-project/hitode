@@ -78,16 +78,15 @@ impl Trace {
 
     /// A comment preserves the five-column oracle format and makes truncation explicit.
     pub fn note_variadic(&mut self, module: &str, name: &str, fixed: u8) {
-        if let Some(w) = &mut self.sink {
-            if self
+        if let Some(w) = &mut self.sink
+            && self
                 .variadic_noted
                 .insert((module.to_owned(), name.to_owned()))
-            {
-                let _ = writeln!(
-                    w,
-                    "# signature\t{module}!{name}\tfixed_prefix={fixed}\tvariadic=true"
-                );
-            }
+        {
+            let _ = writeln!(
+                w,
+                "# signature\t{module}!{name}\tfixed_prefix={fixed}\tvariadic=true"
+            );
         }
     }
 

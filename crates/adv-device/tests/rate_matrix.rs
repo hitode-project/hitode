@@ -303,7 +303,9 @@ fn unsigned_eight_bit_pcm_has_no_dc_offset_at_different_dac_rates() {
         let mut reader = control.stream().device_reader(rate, 2).unwrap();
         let output = render(&mut reader, rate as usize, 2);
         let stable: Vec<_> = output
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .skip(rate as usize / 25)
             .map(|frame| {
                 assert_eq!(frame[0], frame[1]);

@@ -192,7 +192,7 @@ mod reference {
             if block.sample_rate == 0
                 || block.channels == 0
                 || block.channels > 8
-                || block.samples.len() % block.channels as usize != 0
+                || !block.samples.len().is_multiple_of(block.channels as usize)
                 || block.samples.is_empty()
                 || block.duration() > 2_000_000
                 || (!self.streams.contains_key(&block.stream_id) && self.streams.len() >= 256)
@@ -736,7 +736,7 @@ mod reference {
                 let rate = if callback < 60_000 { 48_000 } else { 44_100 };
                 let mut out = vec![0.0; rate as usize / 100 * 2];
                 m.mix(&mut out, rate, 2);
-                for frame in out.chunks_exact(2) {
+                for frame in out.as_chunks::<2>().0 {
                     missing += usize::from(!(0.249..=0.501).contains(&frame[0]));
                     assert_eq!(frame[0], frame[1]);
                     max_step = max_step.max((frame[0] - previous).abs());

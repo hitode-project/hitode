@@ -627,14 +627,13 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
     let Some(view) = state(env).views.get(&address) else {
         return fail(env, 487);
     };
-    if !view.copy {
-        if let Err(e) = view
+    if !view.copy
+        && let Err(e) = view
             .section
             .backing
             .flush(view.offset, view.offset + u64::from(view.len))
-        {
-            return fail(env, io_error(&e));
-        }
+    {
+        return fail(env, io_error(&e));
     }
     if env.sys.vm.free(env.cpu, address).is_err() {
         return fail(env, 487);

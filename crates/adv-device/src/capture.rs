@@ -72,9 +72,9 @@ impl Capture {
         while let Some(packet) = receiver.pop() {
             for (&sample, bytes) in packet.data[..packet.samples]
                 .iter()
-                .zip(self.byte_buffer.chunks_exact_mut(4))
+                .zip(self.byte_buffer.as_chunks_mut::<4>().0)
             {
-                bytes.copy_from_slice(&sample.to_le_bytes());
+                *bytes = sample.to_le_bytes();
             }
             self.output
                 .write_all(&self.byte_buffer[..packet.samples * 4])

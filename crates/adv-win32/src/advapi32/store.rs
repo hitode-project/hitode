@@ -117,8 +117,10 @@ impl<'a> Cursor<'a> {
         }
         let bytes = self.take(len * 2)?;
         let units: Vec<_> = bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| u16::from_le_bytes(p))
             .collect();
         if units.contains(&0) {
             return Err(INVALID_DATA);
@@ -174,13 +176,13 @@ fn decode(bytes: &[u8]) -> Result<VirtualRegistry, u32> {
         if !seen.insert(key.clone()) || super::fold(&key.path) != key.path {
             return Err(INVALID_DATA);
         }
-        if let Some(at) = key.path.iter().rposition(|&unit| unit == 92) {
-            if !registry.keys.contains_key(&Key {
+        if let Some(at) = key.path.iter().rposition(|&unit| unit == 92)
+            && !registry.keys.contains_key(&Key {
                 root,
                 path: key.path[..at].to_vec(),
-            }) {
-                return Err(INVALID_DATA);
-            }
+            })
+        {
+            return Err(INVALID_DATA);
         }
         let canonical_name = key
             .path
@@ -355,10 +357,10 @@ pub(super) fn flush(registry: &mut VirtualRegistry) -> Result<(), u32> {
 }
 impl Drop for VirtualRegistry {
     fn drop(&mut self) {
-        if self.dirty {
-            if let Err(error) = flush(self) {
-                log::warn!("virtual registry: final flush failed with {error}");
-            }
+        if self.dirty
+            && let Err(error) = flush(self)
+        {
+            log::warn!("virtual registry: final flush failed with {error}");
         }
     }
 }

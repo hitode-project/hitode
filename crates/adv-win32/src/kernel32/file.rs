@@ -90,11 +90,10 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
                 if !truncate
                     && w.vfs.is_base_only(&guest)
                     && let Some(src) = &existing
+                    && let Err(e) = std::fs::copy(src, &dst)
                 {
-                    if let Err(e) = std::fs::copy(src, &dst) {
-                        io_error(env, &e);
-                        return INVALID_HANDLE_VALUE;
-                    }
+                    io_error(env, &e);
+                    return INVALID_HANDLE_VALUE;
                 }
                 std::fs::OpenOptions::new()
                     .read(true)

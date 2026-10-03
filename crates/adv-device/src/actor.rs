@@ -464,7 +464,10 @@ impl AudioControl {
             || block.channels == 0
             || block.channels > 8
             || block.samples.is_empty()
-            || block.samples.len() % usize::from(block.channels) != 0
+            || !block
+                .samples
+                .len()
+                .is_multiple_of(usize::from(block.channels))
         {
             return Err(block);
         }
@@ -1031,7 +1034,7 @@ impl crate::DeviceReader {
     }
     pub fn read(&mut self, out: &mut [f32], delay_us: u64) -> crate::DeviceRead {
         let first = self.engine.cursor_us as u64;
-        if out.len() % usize::from(self.channels) != 0 {
+        if !out.len().is_multiple_of(usize::from(self.channels)) {
             out.fill(0.0);
             return crate::DeviceRead {
                 first_pts_us: first,

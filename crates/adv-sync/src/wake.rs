@@ -123,12 +123,11 @@ mod os {
             }
         }
         pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
-            if let Some(duration) = timeout.filter(|duration| !duration.is_zero()) {
-                if let Ok(Some(result)) = DEADLINE_TIMER
+            if let Some(duration) = timeout.filter(|duration| !duration.is_zero())
+                && let Ok(Some(result)) = DEADLINE_TIMER
                     .try_with(|timer| timer.as_ref().map(|timer| timer.wait(self.0, duration)))
-                {
-                    return result;
-                }
+            {
+                return result;
             }
             // Unbounded waits and zero-duration polls need no timer. Older
             // Windows versions without high-resolution timers retain the event

@@ -441,7 +441,7 @@ impl Guest for Engine<'_> {
                 len: u32::MAX,
             })?;
         let fault = MemFault { addr, len: size };
-        if addr % 4096 != 0
+        if !addr.is_multiple_of(4096)
             || size == 0
             || prot.0 & !3 != 0
             || u64::from(addr) + u64::from(size) > 1u64 << 32
@@ -523,9 +523,9 @@ impl Guest for Engine<'_> {
     }
     fn protect(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
         let fault = MemFault { addr, len: size };
-        if addr % 4096 != 0
+        if !addr.is_multiple_of(4096)
             || size == 0
-            || size % 4096 != 0
+            || !size.is_multiple_of(4096)
             || !self.accessible(addr, size, Prot::default())
         {
             return Err(fault);
@@ -561,9 +561,9 @@ impl Guest for Engine<'_> {
     }
     fn unmap(&mut self, addr: u32, size: u32) -> Result<(), MemFault> {
         let fault = MemFault { addr, len: size };
-        if addr % 4096 != 0
+        if !addr.is_multiple_of(4096)
             || size == 0
-            || size % 4096 != 0
+            || !size.is_multiple_of(4096)
             || !self.accessible(addr, size, Prot::default())
         {
             return Err(fault);

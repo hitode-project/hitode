@@ -135,7 +135,9 @@ fn parse_dir(pe: &Pe, root: u32, off: u32, depth: u32) -> Result<ResourceDir> {
             let len = u32::from(pe.u16_at(s)?);
             let units: Vec<u16> = pe
                 .slice(s + 2, len * 2)?
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             ResId::Name(String::from_utf16_lossy(&units))

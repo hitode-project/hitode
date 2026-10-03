@@ -48,8 +48,10 @@ pub fn units_or_wstr(cpu: &dyn Guest, p: u32, len: i32) -> Vec<u16> {
     }
     let mut v = vec![0u8; len as usize * 2];
     let _ = cpu.read(p, &mut v);
-    v.chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    v.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_le_bytes(c))
         .collect()
 }
 

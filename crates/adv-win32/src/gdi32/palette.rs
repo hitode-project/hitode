@@ -63,10 +63,7 @@ fn create(env: &mut Env<'_>) -> Outcome {
     if env.cpu.read(data, &mut raw).is_err() {
         return Outcome::Return(0);
     }
-    let entries = raw
-        .chunks_exact(4)
-        .map(|entry| entry.try_into().unwrap())
-        .collect();
+    let entries = raw.as_chunks::<4>().0.to_vec();
     Outcome::Return(gdi(env).add(GdiObj::Palette { entries }))
 }
 fn get_entries(env: &mut Env<'_>) -> Outcome {
@@ -120,9 +117,9 @@ fn set_entries(env: &mut Env<'_>) -> Outcome {
     };
     for (entry, bytes) in entries[start..start + n]
         .iter_mut()
-        .zip(raw.chunks_exact(4))
+        .zip(raw.as_chunks::<4>().0)
     {
-        entry.copy_from_slice(bytes);
+        *entry = *bytes;
     }
     Outcome::Return(n as u32)
 }

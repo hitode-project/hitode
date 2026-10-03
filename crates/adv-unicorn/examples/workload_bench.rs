@@ -63,8 +63,8 @@ fn next(s: &mut u32) -> u32 {
 fn hash(cpu: &UnicornCpu, n: u32) -> u32 {
     let mut data = vec![0; n as usize * 4];
     cpu.read(OUTPUT, &mut data).unwrap();
-    data.chunks_exact(4).fold(2166136261u32, |h, v| {
-        (h ^ u32::from_le_bytes(v.try_into().unwrap())).wrapping_mul(16777619)
+    data.as_chunks::<4>().0.iter().fold(2166136261u32, |h, &v| {
+        (h ^ u32::from_le_bytes(v)).wrapping_mul(16777619)
     })
 }
 fn call(cpu: &mut UnicornCpu, entry: u32, n: u32, rounds: u32) {

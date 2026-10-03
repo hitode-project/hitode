@@ -129,7 +129,9 @@ fn first_192khz_callback_and_loop_boundaries_preserve_waveform_without_allocatin
         reader.read(&mut output, 22000);
     });
     let mono: Vec<f32> = output
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|frame| {
             assert_eq!(frame[0], frame[1]);
             frame[0]
@@ -307,7 +309,7 @@ fn stream_reuse_silences_old_generation_but_full_preloaded_static_loops_keep_the
     no_alloc(|| {
         reader.read(&mut output, 0);
     });
-    for turn in output.chunks_exact(1800) {
+    for turn in output.as_chunks::<1800>().0 {
         assert_eq!(turn[..600], [-0.5; 600]);
         assert_eq!(turn[600..], [0.5; 1200]);
     }
@@ -489,8 +491,8 @@ fn one_hundred_twenty_nine_short_packets_get_backpressure_before_any_pcm_is_lost
     no_alloc(|| {
         reader.read(&mut output, 0);
     });
-    for (frame, values) in output.chunks_exact(2).enumerate() {
-        assert_eq!(values, [frame as f32 / 256.0; 2]);
+    for (frame, values) in output.as_chunks::<2>().0.iter().enumerate() {
+        assert_eq!(*values, [frame as f32 / 256.0; 2]);
     }
     assert_eq!(control.stream().metrics().missing_output_frames, 0);
 }

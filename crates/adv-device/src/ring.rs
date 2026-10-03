@@ -88,7 +88,7 @@ impl RingVoice {
             || !matches!(config.bits, 8 | 16)
             || config.bytes == 0
             || config.bytes as usize > config.view.len()
-            || config.bytes % align != 0
+            || !config.bytes.is_multiple_of(align)
             || config.notifications.len() > 1024
             || config
                 .notifications
