@@ -55,6 +55,7 @@ dependencies = [
  "ogg",
  "rubato",
  "symphonia",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -134,7 +135,6 @@ dependencies = [
  "iced-x86",
  "png",
  "unicorn-engine",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -188,6 +188,7 @@ dependencies = [
  "encoding_rs",
  "iced-x86",
  "log",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

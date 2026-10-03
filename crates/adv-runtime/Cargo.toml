@@ -18,9 +18,6 @@ adv-device = { path = "../adv-device" }
 adv-dx = { path = "../adv-dx" }
 adv-pe = { path = "../adv-pe" }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Foundation"] }
-
 [dev-dependencies]
 unicorn-engine.workspace = true
 adv-unicorn = { path = "../adv-unicorn" }

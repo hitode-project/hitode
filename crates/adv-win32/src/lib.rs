@@ -113,6 +113,7 @@ impl Win32 {
         };
         m.ext.insert(w);
         m.ext.insert(heaps);
+        gdi32::font::install(m);
         user32::install(m)?;
         Ok(())
     }

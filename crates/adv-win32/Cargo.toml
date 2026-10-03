@@ -24,3 +24,6 @@ workspace = true
 [dev-dependencies]
 adv-unicorn = { path = "../adv-unicorn" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Foundation"] }

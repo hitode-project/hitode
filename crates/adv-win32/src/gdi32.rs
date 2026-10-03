@@ -8,10 +8,11 @@ use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
-use crate::util::{cstr, out_u32, zero};
+use crate::util::{cstr, out_u32};
 use crate::{Win32, stdcall};
 
 mod palette;
+pub mod font;
 pub mod raster;
 
 const GDI32: &str = "gdi32.dll";
@@ -80,6 +81,10 @@ impl Gdi {
     }
     pub fn get(&self, h: u32) -> Option<&GdiObj> {
         self.objects.get(&h)
+    }
+
+    pub(crate) fn font_selected(&self, font: u32) -> bool {
+        self.objects.values().any(|object| matches!(object, GdiObj::Dc { selected, .. } if selected[2] == font))
     }
 
     /// Attach GDI metadata to a DC owned by another drawing provider. Repeated
@@ -155,7 +160,9 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
 }
 
 pub fn release_dc(env: &mut Env<'_>, hdc: u32) -> bool {
-    gdi(env).remove_external_dc(hdc)
+    let released = gdi(env).remove_external_dc(hdc);
+    if released { font::retire_dc(env, hdc); }
+    released
 }
 
 /// A font object with the given height and face (for dialog fonts).
@@ -485,20 +492,6 @@ fn get_text_extent_point32_a(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn get_text_metrics_a(env: &mut Env<'_>) -> Outcome {
-    let (hdc, out) = (env.arg(0), env.arg(1));
-    let h = dc_font_height(env, hdc);
-    // TEXTMETRICA: height, ascent, descent, internal leading, external leading,
-    // ave char width, max char width, weight, ...
-    zero(env.cpu, out, 56);
-    let fields = [h, h * 7 / 8, h / 8, 0, 0, h / 2, h, 400];
-    for (i, v) in fields.into_iter().enumerate() {
-        out_u32(env.cpu, out + 4 * i as u32, v as u32);
-    }
-    let _ = env.cpu.write(out + 52, &[128]); // tmCharSet = SHIFTJIS_CHARSET
-    Outcome::Return(1)
-}
-
 pub fn register(reg: &mut Registry) {
     palette::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, GDI32, name, argc, h);
@@ -521,5 +514,5 @@ pub fn register(reg: &mut Registry) {
     s(reg, "SetBkMode", 2, set_bk_mode);
     s(reg, "TextOutA", 5, |_| Outcome::Return(1));
     s(reg, "GetTextExtentPoint32A", 4, get_text_extent_point32_a);
-    s(reg, "GetTextMetricsA", 2, get_text_metrics_a);
+    font::register(reg);
 }

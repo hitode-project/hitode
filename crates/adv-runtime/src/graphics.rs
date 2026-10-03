@@ -331,7 +331,7 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
             }
         }
         if let Some(dc) = removed {
-            crate::font::retire_dc(env, dc);
+            adv_win32::gdi32::font::retire_dc(env, dc);
         }
     }
     if presented != before {
