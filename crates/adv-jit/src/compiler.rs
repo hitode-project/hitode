@@ -10,6 +10,7 @@ use crate::Region;
 use crate::compile::{self, Compiled, Snapshot};
 
 pub(crate) const CAPACITY: usize = 8;
+pub(crate) type CompletionWake = Arc<dyn Fn() + Send + Sync>;
 
 pub(crate) struct Completion {
     pub ticket: u64,
@@ -22,6 +23,7 @@ pub(crate) struct Completion {
 struct Job {
     ticket: u64,
     input: Snapshot,
+    wake: Option<CompletionWake>,
 }
 
 pub(crate) struct Worker {
@@ -31,6 +33,7 @@ pub(crate) struct Worker {
     closed: Arc<AtomicBool>,
     next_ticket: AtomicU64,
     thread: Option<JoinHandle<()>>,
+    wake: Option<CompletionWake>,
 }
 
 impl Worker {
@@ -77,6 +80,11 @@ impl Worker {
                     if completed.send(completion).is_err() {
                         break;
                     }
+                    // Publish before waking: the execution owner can receive
+                    // this completion immediately after its retained OS wake.
+                    if let Some(wake) = job.wake {
+                        wake();
+                    }
                 }
             })?;
         Ok(Self {
@@ -86,7 +94,13 @@ impl Worker {
             closed,
             next_ticket: AtomicU64::new(1),
             thread: Some(thread),
+            wake: None,
         })
+    }
+
+    pub fn set_waker(&mut self, wake: CompletionWake) {
+        debug_assert_eq!(self.outstanding.load(Ordering::Acquire), 0);
+        self.wake = Some(wake);
     }
 
     pub fn try_submit(&self, input: Snapshot) -> Result<u64, TrySendError<Snapshot>> {
@@ -109,7 +123,11 @@ impl Worker {
             }
         }
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
-        let job = Job { ticket, input };
+        let job = Job {
+            ticket,
+            input,
+            wake: self.wake.clone(),
+        };
         let result = match self.requests.as_ref() {
             Some(requests) => requests.try_send(job),
             None => Err(TrySendError::Disconnected(job)),
@@ -263,5 +281,26 @@ mod tests {
         assert_eq!(completion.ticket, ticket);
         assert_eq!(completion.region.start, 0x10000);
         assert!(completion.result.unwrap().entries.contains(&0x10000));
+    }
+
+    #[cfg(feature = "pal")]
+    #[test]
+    fn completion_is_receivable_when_the_retained_os_wake_arrives() {
+        for panic in [false, true] {
+            let wake = pal_host::WakeEvent::new().unwrap();
+            let signal = wake.clone();
+            let mut worker = Worker::with_compiler(move |_| {
+                assert!(!panic, "contained compiler panic");
+                Err("contained compile failure".into())
+            })
+            .unwrap();
+            worker.set_waker(Arc::new(move || signal.signal()));
+            let ticket = worker.try_submit(snapshot()).unwrap();
+            assert!(wake.wait(Some(Duration::from_secs(5))).unwrap());
+            assert!(wake.take_interrupt());
+            let completion = worker.try_recv().expect("publication precedes wake");
+            assert_eq!(completion.ticket, ticket);
+            assert!(completion.result.is_err());
+        }
     }
 }

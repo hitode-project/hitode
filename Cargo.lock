@@ -20,6 +20,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "pal-cpu",
+ "pal-host",
  "pal-machine",
  "pal-win32",
  "unicorn-engine",
@@ -904,6 +905,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pal-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "pal-machine"
 version = "0.1.0"
 dependencies = [
@@ -927,6 +935,7 @@ dependencies = [
  "encoding_rs",
  "log",
  "pal-cpu",
+ "pal-host",
  "pal-machine",
  "pal-pe",
 ]

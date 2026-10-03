@@ -38,7 +38,7 @@ fn read(
     let mut bytes = [0; 16];
     if i.op_kind(n) == OpKind::Memory {
         let address = tx.address(i)?;
-        bytes[..width].copy_from_slice(tx.read(memory, address, width)?);
+        bytes[..width].copy_from_slice(&tx.read(memory, address, width)?);
     } else if let Some(slot) = xmm(i.op_register(n)) {
         bytes = tx.state.xmm[slot];
     } else if let Some(slot) = mmx(i.op_register(n)) {
@@ -296,7 +296,8 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
     if matches!(m, M::Ldmxcsr | M::Stmxcsr) {
         let address = tx.address(i)?;
         if m == M::Ldmxcsr {
-            let value = u32::from_le_bytes(tx.read(memory, address, 4)?.try_into().unwrap());
+            let value =
+                u32::from_le_bytes(tx.read(memory, address, 4)?.as_ref().try_into().unwrap());
             if value & !0xffff != 0 {
                 return Err(Step::Trap {
                     pc: tx.pc,

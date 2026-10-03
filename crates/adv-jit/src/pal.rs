@@ -43,6 +43,15 @@ impl JitCpu {
     pub fn set_async_compilation(&mut self, enabled: bool) {
         self.inner.get_mut().set_async_compilation(enabled);
     }
+    /// Install the execution owner's retained event before the first guest run.
+    /// Compiler completion and native/interpreted safepoints use the same wake.
+    pub fn set_waker(&mut self, wake: pal_host::WakeEvent) -> Result<(), String> {
+        let m = self.inner.get_mut();
+        let flag = wake.interrupt_flag();
+        m.set_completion_waker(std::sync::Arc::new(move || wake.signal()))?;
+        m.set_host_interrupt_flag(flag);
+        Ok(())
+    }
     pub fn profile(&self) -> std::collections::BTreeMap<u32, crate::ProfileSample> {
         self.inner.borrow().profile.clone()
     }
@@ -91,6 +100,17 @@ impl Guest for View<'_> {
     fn shared_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
         self.memory.read(addr, len).ok()
     }
+    fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<pal_cpu::SharedRegion, MemFault> {
+        let read_alias = self
+            .memory
+            .map_shared_audio(addr, len as usize)
+            .map_err(|_| fault(addr, len as usize))?;
+        Ok(pal_cpu::SharedRegion {
+            guest_base: addr,
+            len,
+            read_alias,
+        })
+    }
     fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
         crate::ApiMemory { inner: self.memory }
             .copy(src, dst, len)
@@ -115,12 +135,9 @@ impl Guest for View<'_> {
         set(self.state, r, v)
     }
     fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), MemFault> {
-        buf.copy_from_slice(
-            self.memory
-                .read(addr, buf.len())
-                .map_err(|_| fault(addr, buf.len()))?,
-        );
-        Ok(())
+        self.memory
+            .read_into(addr, buf)
+            .map_err(|_| fault(addr, buf.len()))
     }
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), MemFault> {
         self.memory
@@ -154,6 +171,9 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<pal_cpu::SharedRegion, MemFault> {
+        self.view(|g| g.map_shared_audio(addr, len))
+    }
     fn cpuid_features(&self) -> u32 {
         crate::cpu_profile::cpuid(1, 0)[3]
     }
@@ -170,14 +190,11 @@ impl Guest for JitCpu {
         set(&mut self.inner.get_mut().state, r, v)
     }
     fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), MemFault> {
-        buf.copy_from_slice(
-            self.inner
-                .borrow()
-                .memory
-                .read(addr, buf.len())
-                .map_err(|_| fault(addr, buf.len()))?,
-        );
-        Ok(())
+        self.inner
+            .borrow()
+            .memory
+            .read_into(addr, buf)
+            .map_err(|_| fault(addr, buf.len()))
     }
     fn write(&mut self, addr: u32, b: &[u8]) -> Result<(), MemFault> {
         self.view(|g| g.write(addr, b))
@@ -261,11 +278,17 @@ impl Backend for JitCpu {
     fn execution_budget(&self) -> Option<Duration> {
         self.budget
     }
+    fn set_host_interrupts(&mut self, enabled: bool) {
+        self.inner.get_mut().set_host_interrupts(enabled);
+    }
     fn run(&mut self, handler: &mut dyn TrapHandler) -> Exit {
         let start = Instant::now();
         self.inner.get_mut().deadline = self.budget.and_then(|b| start.checked_add(b));
         loop {
             let m = self.inner.get_mut();
+            if m.state.eip == self.park {
+                return Exit::Parked;
+            }
             if let Some(budget) = self.budget
                 && start.elapsed() >= budget
             {
@@ -282,6 +305,17 @@ impl Backend for JitCpu {
                     return Exit::Parked;
                 }
                 Ok(RunOutcome::Budget) => continue,
+                Ok(RunOutcome::Interrupted) => {
+                    if let Some(budget) = self.budget
+                        && start.elapsed() >= budget
+                    {
+                        return Exit::BudgetExceeded {
+                            pc: m.state.eip,
+                            budget,
+                        };
+                    }
+                    return Exit::Interrupted { pc: m.state.eip };
+                }
                 other => {
                     let kind = match other {
                         Ok(RunOutcome::ReadFault { address, .. }) => FaultKind::Read(address),

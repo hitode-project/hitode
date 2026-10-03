@@ -8,6 +8,7 @@ pub mod interpreter;
 mod linking;
 mod machine;
 mod memory;
+mod shared_memory;
 #[cfg(feature = "pal")]
 pub mod pal;
 mod state;
@@ -78,6 +79,7 @@ pub(crate) enum Exit {
     ReadFault = 3,
     WriteFault = 4,
     Host = 5,
+    Interrupted = 6,
 }
 
 /// Optimization policy for a native guest region.

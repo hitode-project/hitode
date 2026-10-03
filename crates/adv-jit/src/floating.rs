@@ -1,51 +1,81 @@
 //! Transactional x87, SSE and packed-integer execution on canonical CPU state.
 use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, interpreter::Step};
-use iced_x86::{Instruction, Register as R};
+use iced_x86::{Instruction, Mnemonic as M, Register as R};
+#[cfg(all(test, target_arch = "x86_64"))]
+mod native_x87;
 mod simd;
 mod softfloat;
 mod transcendental;
 mod x87;
 
-pub(crate) fn execute(i: &Instruction, state: &mut CpuState, memory: &mut Memory) -> Option<Step> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operation {
+    X87,
+    Simd,
+}
+
+pub(crate) fn operation(i: &Instruction) -> Option<Operation> {
     if i.has_lock_prefix() || i.segment_prefix() == R::GS {
         return None;
     }
-    if !x87::supported(i) && !simd::supported(i) {
-        return None;
+    if x87::supported(i) {
+        Some(Operation::X87)
+    } else if simd::supported(i) {
+        Some(Operation::Simd)
+    } else {
+        None
     }
+}
+
+pub(crate) fn execute(
+    i: &Instruction,
+    operation: Operation,
+    opcode: Option<u16>,
+    state: &mut CpuState,
+    memory: &mut Memory,
+    sync_mmx: bool,
+) -> Step {
+    let x87 = operation == Operation::X87;
     let pc = state.eip;
+    let snapshot = Snapshot::capture(state, x87 && i.mnemonic() != M::Fxrstor);
     let mut tx = Transaction {
-        state: state.clone(),
+        state,
         pc,
+        opcode,
         write: None,
         x87_exception: false,
         sse_exception: false,
     };
     tx.state.commit_mmx();
-    let result = if x87::supported(i) {
+    let result = if x87 {
         x87::execute(i, &mut tx, memory)
     } else {
         simd::execute(i, &mut tx, memory)
     };
     if let Err(result) = result {
-        return Some(result);
+        snapshot.restore(tx.state);
+        return result;
     }
     if tx.sse_exception {
-        state.mxcsr = tx.state.mxcsr;
-        return Some(Step::Trap { pc, vector: 19 });
+        let mxcsr = tx.state.mxcsr;
+        snapshot.restore(tx.state);
+        tx.state.mxcsr = mxcsr;
+        return Step::Trap { pc, vector: 19 };
     }
     if tx.x87_exception {
         // x87 arithmetic records an unmasked exception and suppresses the
         // result/pop/store. The next waiting instruction delivers #MF.
-        state.commit_mmx();
-        state.x87.status = (state.x87.status & !0x82ff) | (tx.state.x87.status & 0x82ff);
-        state.x87.ip = tx.state.x87.ip;
-        state.x87.dp = tx.state.x87.dp;
-        state.x87.cs = tx.state.x87.cs;
-        state.x87.ds = tx.state.x87.ds;
-        state.x87.opcode = tx.state.x87.opcode;
-        state.eip = i.next_ip32();
-        return Some(Step::Executed);
+        let pending = tx.state.x87.clone();
+        snapshot.restore(tx.state);
+        tx.state.commit_mmx();
+        tx.state.x87.status = (tx.state.x87.status & !0x82ff) | (pending.status & 0x82ff);
+        tx.state.x87.ip = pending.ip;
+        tx.state.x87.dp = pending.dp;
+        tx.state.x87.cs = pending.cs;
+        tx.state.x87.ds = pending.ds;
+        tx.state.x87.opcode = pending.opcode;
+        tx.state.eip = i.next_ip32();
+        return Step::Executed;
     }
     if let Some(write) = tx.write {
         let bytes = if let Some(bytes) = write.large.as_deref() {
@@ -62,24 +92,73 @@ pub(crate) fn execute(i: &Instruction, state: &mut CpuState, memory: &mut Memory
                         .write(write.address + offset as u32, &[*byte])
                         .is_err()
                     {
-                        return Some(Step::WriteFault {
+                        snapshot.restore(tx.state);
+                        return Step::WriteFault {
                             pc,
                             address: write.address + offset as u32,
-                        });
+                        };
                     }
                 }
             }
         } else if memory.write(write.address, bytes).is_err() {
-            return Some(Step::WriteFault {
+            snapshot.restore(tx.state);
+            return Step::WriteFault {
                 pc,
                 address: write.address,
-            });
+            };
         }
     }
     tx.state.eip = i.next_ip32();
-    tx.state.refresh_mmx();
-    *state = tx.state;
-    Some(Step::Executed)
+    if sync_mmx {
+        tx.state.refresh_mmx();
+    }
+    Step::Executed
+}
+
+/// Ordinary x87 instructions only edit their own state, AX and EFLAGS. Keep
+/// those fields restartable without copying XMM, MMX, segment or REP state for
+/// every decoder operation. FXRSTOR and SIMD retain a complete rollback image.
+#[allow(clippy::large_enum_variant)] // Inline rollback avoids allocations in both executor paths.
+enum Snapshot {
+    X87 {
+        floating: crate::X87State,
+        eax: u32,
+        flags: u32,
+        mmx_mode: u32,
+    },
+    Full(CpuState),
+}
+
+impl Snapshot {
+    fn capture(state: &CpuState, x87: bool) -> Self {
+        if x87 {
+            Self::X87 {
+                floating: state.x87.clone(),
+                eax: state.regs[0],
+                flags: state.eflags,
+                mmx_mode: state.mmx_mode,
+            }
+        } else {
+            Self::Full(state.clone())
+        }
+    }
+
+    fn restore(self, state: &mut CpuState) {
+        match self {
+            Self::X87 {
+                floating,
+                eax,
+                flags,
+                mmx_mode,
+            } => {
+                state.x87 = floating;
+                state.regs[0] = eax;
+                state.eflags = flags;
+                state.mmx_mode = mmx_mode;
+            }
+            Self::Full(original) => *state = original,
+        }
+    }
 }
 
 struct PendingWrite {
@@ -89,15 +168,16 @@ struct PendingWrite {
     large: Option<Vec<u8>>,
     mask: Option<u16>,
 }
-struct Transaction {
-    state: CpuState,
+struct Transaction<'a> {
+    state: &'a mut CpuState,
     pc: u32,
+    opcode: Option<u16>,
     write: Option<PendingWrite>,
     x87_exception: bool,
     sse_exception: bool,
 }
 
-impl Transaction {
+impl Transaction<'_> {
     fn address(&self, i: &Instruction) -> Result<u32, Step> {
         let register = |r| {
             reg_index(r)
@@ -156,9 +236,14 @@ impl Transaction {
         }
         Ok(())
     }
-    fn read<'a>(&self, memory: &'a Memory, address: u32, len: usize) -> Result<&'a [u8], Step> {
+    fn read<'a>(
+        &self,
+        memory: &'a Memory,
+        address: u32,
+        len: usize,
+    ) -> Result<std::borrow::Cow<'a, [u8]>, Step> {
         self.check(memory, address, len, false)?;
-        memory.read(address, len).map_err(|_| Step::ReadFault {
+        memory.read_data(address, len).map_err(|_| Step::ReadFault {
             pc: self.pc,
             address,
         })

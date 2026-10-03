@@ -119,16 +119,18 @@ impl<'a> ApiMemory<'a> {
         }
         Ok(())
     }
-    pub fn read(&self, addr: u32, len: usize) -> Result<&[u8], String> {
+    pub fn read(&self, addr: u32, len: usize) -> Result<std::borrow::Cow<'_, [u8]>, String> {
         self.check(addr, len, READ)?;
-        self.inner.read(addr, len)
+        self.inner.read_data(addr, len)
     }
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         self.check(addr, bytes.len(), WRITE)?;
         self.inner.write(addr, bytes)
     }
     pub fn u32(&self, addr: u32) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.read(addr, 4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(
+            self.read(addr, 4)?.as_ref().try_into().unwrap(),
+        ))
     }
     pub fn put_u32(&mut self, addr: u32, value: u32) -> Result<(), String> {
         self.write(addr, &value.to_le_bytes())
@@ -139,24 +141,7 @@ impl<'a> ApiMemory<'a> {
     pub fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
         self.check(src, len, READ)?;
         self.check(dst, len, WRITE)?;
-        let source = self.inner.range(src, len)?;
-        let dest = self.inner.range(dst, len)?;
-        if !dest.is_empty()
-            && self.inner.perms[dest.start / 4096..=(dest.end - 1) / 4096]
-                .iter()
-                .any(|p| p & crate::EXEC != 0)
-        {
-            self.inner.touch(dst, len);
-        }
-        // SAFETY: both ranges checked; ptr::copy supports overlapping surfaces.
-        unsafe {
-            std::ptr::copy(
-                self.inner.ptr.as_ptr().add(source.start),
-                self.inner.ptr.as_ptr().add(dest.start),
-                len,
-            )
-        };
-        Ok(())
+        self.inner.copy(src, dst, len)
     }
 }
 

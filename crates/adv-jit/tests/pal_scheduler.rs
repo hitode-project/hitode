@@ -173,3 +173,44 @@ fn pal_float_return_preserves_guest_stack_below_st0() {
         assert_eq!(f32::from_bits(m.cpu.read_u32(DATA).unwrap()), 2.25);
     }
 }
+
+#[test]
+fn pal_double_return_retains_f64_precision_x87_stack_and_integer_registers() {
+    let precise = f64::from_bits(1.0f64.to_bits() + 1);
+    for jit in [false, true] {
+        let mut registry = Registry::default();
+        registry.add("test", "double", Conv::Cdecl { argc: 0 }, |_| {
+            Outcome::ReturnF64(f64::from_bits(1.0f64.to_bits() + 1))
+        });
+        registry.add("test", "done", Conv::Cdecl { argc: 0 }, |_| Outcome::ExitProcess(0));
+        let mut m = Machine::new(JitCpu::new(PARK_ADDR, jit).unwrap(), registry, Clock::virtual_time()).unwrap();
+        m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+        m.cpu.map(DATA, 4096, Prot::RW).unwrap();
+        let double = m.resolve_import("test", "double").unwrap();
+        let done = m.resolve_import("test", "done").unwrap();
+        let mut a = Asm::new(CODE);
+        a.bytes.extend_from_slice(&[0xd9, 0xe8]); // fld1
+        a.bytes.push(0xb8); // mov eax, immediate
+        a.bytes.extend_from_slice(&0x12345678u32.to_le_bytes());
+        a.bytes.push(0xba); // mov edx, immediate
+        a.bytes.extend_from_slice(&0x76543210u32.to_le_bytes());
+        a.call(double).mov_mem_eax(DATA + 16);
+        a.bytes.extend_from_slice(&[0x89, 0x15]); // mov [DATA+20], edx
+        a.bytes.extend_from_slice(&(DATA + 20).to_le_bytes());
+        for destination in [DATA, DATA + 8] {
+            a.bytes.extend_from_slice(&[0xdd, 0x1d]); // fstp qword
+            a.bytes.extend_from_slice(&destination.to_le_bytes());
+        }
+        a.call(done);
+        m.cpu.write(CODE, &a.bytes).unwrap();
+        m.spawn("M", CODE, &[], 0x1_0000).unwrap();
+        assert!(matches!(m.run_virtual(1_000_000), RunResult::Exited(0)));
+        let mut bytes = [0; 8];
+        m.cpu.read(DATA, &mut bytes).unwrap();
+        assert_eq!(f64::from_le_bytes(bytes), precise);
+        m.cpu.read(DATA + 8, &mut bytes).unwrap();
+        assert_eq!(f64::from_le_bytes(bytes), 1.0);
+        assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0x12345678);
+        assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 0x76543210);
+    }
+}

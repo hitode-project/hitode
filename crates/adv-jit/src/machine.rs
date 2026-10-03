@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::compile::{self, Compiled};
@@ -47,6 +48,7 @@ pub struct ProfileSample {
 pub enum RunOutcome {
     ReachedStop,
     Budget,
+    Interrupted,
     ReadFault { pc: u32, address: u32 },
     WriteFault { pc: u32, address: u32 },
     FetchFault { pc: u32, address: u32 },
@@ -93,6 +95,10 @@ pub struct Machine {
     tier_attempted: BTreeSet<u32>,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
+    completion_wake: Option<crate::compiler::CompletionWake>,
+    interrupt: Arc<AtomicBool>,
+    inactive_interrupt: AtomicBool,
+    host_interrupts: bool,
     pending_regions: BTreeMap<u32, u64>,
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
@@ -209,6 +215,10 @@ impl Machine {
             tier_attempted: BTreeSet::new(),
             async_compilation: false,
             compiler: None,
+            completion_wake: None,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            inactive_interrupt: AtomicBool::new(false),
+            host_interrupts: true,
             pending_regions: BTreeMap::new(),
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
@@ -394,10 +404,12 @@ impl Machine {
         }
         let snapshot = compile::Snapshot::capture(&region, &self.memory)?;
         if self.compiler.is_none() {
-            self.compiler = Some(
-                crate::compiler::Worker::new()
-                    .map_err(|e| format!("start compiler worker: {e}"))?,
-            );
+            let mut worker = crate::compiler::Worker::new()
+                .map_err(|e| format!("start compiler worker: {e}"))?;
+            if let Some(wake) = &self.completion_wake {
+                worker.set_waker(wake.clone());
+            }
+            self.compiler = Some(worker);
         }
         match self.compiler.as_ref().unwrap().try_submit(snapshot) {
             Ok(ticket) => {
@@ -550,6 +562,31 @@ impl Machine {
             self.stats.pending_compilations = 0;
             self.compiler = None;
         }
+    }
+
+    /// Register before running guest code. Replacing a notifier while owned
+    /// compile jobs are pending would leave their completions on the old wake.
+    pub fn set_completion_waker(
+        &mut self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        if !self.pending_regions.is_empty() {
+            return Err("cannot replace compiler wake while compile jobs are pending".into());
+        }
+        if let Some(worker) = &mut self.compiler {
+            worker.set_waker(wake.clone());
+        }
+        self.completion_wake = Some(wake);
+        Ok(())
+    }
+
+    /// The owner clears this flag before draining host channels, never here.
+    pub fn set_host_interrupt_flag(&mut self, interrupt: Arc<AtomicBool>) {
+        self.interrupt = interrupt;
+    }
+
+    pub fn set_host_interrupts(&mut self, enabled: bool) {
+        self.host_interrupts = enabled;
     }
 
     fn record_native_work(&mut self, entry: u32, blocks: u64) {
@@ -799,6 +836,9 @@ impl Machine {
             if bridge.parked {
                 return Ok(RunOutcome::Parked);
             }
+            if self.state.eip == stop {
+                return Ok(RunOutcome::ReachedStop);
+            }
             if self.deadline.is_some_and(|t| Instant::now() >= t) {
                 return Ok(RunOutcome::Budget);
             }
@@ -840,6 +880,9 @@ impl Machine {
             }
             if self.state.fuel == 0 {
                 return Ok(RunOutcome::Budget);
+            }
+            if self.host_interrupts && self.interrupt.load(Ordering::Acquire) {
+                return Ok(RunOutcome::Interrupted);
             }
             if self
                 .state
@@ -888,9 +931,16 @@ impl Machine {
                     &mut self.state,
                     &mut self.memory,
                     bridge,
-                    (self.region_linking && !self.profiling).then_some(&self.links),
-                    stop,
-                    self.return_pad,
+                    compile::NativeRun {
+                        links: (self.region_linking && !self.profiling).then_some(&self.links),
+                        stop,
+                        return_pad: self.return_pad,
+                        interrupt: if self.host_interrupts {
+                            self.interrupt.as_ref()
+                        } else {
+                            &self.inactive_interrupt
+                        },
+                    },
                 );
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
@@ -915,6 +965,12 @@ impl Machine {
                         continue;
                     }
                     n if n == Exit::Dispatch as u32 => continue,
+                    n if n == Exit::Interrupted as u32 => {
+                        if self.deadline.is_some_and(|t| Instant::now() >= t) {
+                            return Ok(RunOutcome::Budget);
+                        }
+                        return Ok(RunOutcome::Interrupted);
+                    }
                     n if n == Exit::Budget as u32 => {
                         if reserved != 0 {
                             // Only the internal safepoint allowance ran out.
@@ -1070,6 +1126,27 @@ mod asynchronous_tests {
         m.state.regs[4] = 0x4f00;
         m.set_async_compilation(true);
         m
+    }
+    #[cfg(feature = "pal")]
+    #[test]
+    fn lazy_worker_inherits_wake_and_pending_jobs_reject_replacement() {
+        let mut m = fixture();
+        let wake = pal_host::WakeEvent::new().unwrap();
+        let signal = wake.clone();
+        m.set_completion_waker(Arc::new(move || signal.signal()))
+            .unwrap();
+        assert!(m.compiler.is_none());
+        assert!(m.queue_region(Region::new(0x1000, 6)).unwrap());
+        assert!(
+            m.set_completion_waker(Arc::new(|| {}))
+                .unwrap_err()
+                .contains("pending")
+        );
+        assert!(wake.wait(Some(Duration::from_secs(5))).unwrap());
+        m.collect_compilations().unwrap();
+        assert_eq!(m.stats.compilations, 1);
+        assert_eq!(m.stats.pending_compilations, 0);
+        m.set_completion_waker(Arc::new(|| {})).unwrap();
     }
     fn collect_one(m: &mut Machine) {
         let before = m.stats.compilations;

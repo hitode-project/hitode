@@ -48,6 +48,56 @@ fn arbitrary_fuel_slices_match_single_instruction_reference() {
 }
 
 #[test]
+fn mixed_x87_mmx_and_sse_aliases_match_public_steps_at_every_fuel_boundary() {
+    use iced_x86::code_asm::*;
+    let data = CODE + 0x2000;
+    let mut a = CodeAssembler::new(32).unwrap();
+    a.fld1().unwrap();
+    a.fldz().unwrap();
+    a.fstp(tbyte_ptr(data as i32)).unwrap();
+    a.fld1().unwrap();
+    a.fstp(qword_ptr(data as i32 + 16)).unwrap();
+    // MM6 aliases a physical x87 register written by the completed prefix.
+    a.movq(mm0, mm6).unwrap();
+    a.emms().unwrap();
+    a.fld1().unwrap();
+    a.pxor(xmm0, xmm0).unwrap();
+    a.fnstsw(ax).unwrap();
+    a.fstp(qword_ptr(data as i32 + 24)).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    for slice in 1..=16 {
+        let mut m = machine(&code);
+        m.state.xmm = [[0xa5; 16]; 8];
+        let mut memory = Memory::new(CODE, 0x5000).unwrap();
+        memory.protect(CODE, 0x5000, READ | WRITE).unwrap();
+        memory.write(CODE, &code).unwrap();
+        memory.write(STACK, &STOP.to_le_bytes()).unwrap();
+        memory.protect(CODE, 4096, READ | EXEC).unwrap();
+        let mut state = m.state.clone();
+        let mut reference = Interpreter::new();
+        loop {
+            let outcome = m.run(STOP, slice).unwrap();
+            state.fuel = slice;
+            while state.fuel != 0 && state.eip != STOP {
+                let execution = reference.run_chunk(&mut state, &mut memory, 1);
+                assert_eq!(execution.step, Step::Executed);
+                state.fuel -= u64::from(execution.units);
+            }
+            assert_eq!(m.state, state, "slice={slice}");
+            assert_eq!(
+                m.memory().read(data, 32).unwrap(),
+                memory.read(data, 32).unwrap()
+            );
+            if outcome == RunOutcome::ReachedStop {
+                break;
+            }
+            assert_eq!(outcome, RunOutcome::Budget);
+        }
+    }
+}
+
+#[test]
 fn stop_inside_a_cached_block_is_not_skipped() {
     let mut m = machine(&[0x40, 0x40, 0x40, 0x40, 0xc3]);
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);

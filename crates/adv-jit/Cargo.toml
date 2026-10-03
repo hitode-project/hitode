@@ -8,6 +8,7 @@ description = "Experimental x86-32 hot-region JIT with a shared-state interprete
 [dependencies]
 libc = "0.2"
 pal-cpu = { path = "../../../pal-hle/crates/pal-cpu", default-features = false, optional = true }
+pal-host = { path = "../../../pal-hle/crates/pal-host", optional = true }
 cranelift-codegen = "0.125"
 cranelift-frontend = "0.125"
 cranelift-jit = "0.125"
@@ -15,7 +16,7 @@ cranelift-module = "0.125"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 [features]
-pal = ["dep:pal-cpu"]
+pal = ["dep:pal-cpu", "dep:pal-host"]
 
 [build-dependencies]
 cc = "1"

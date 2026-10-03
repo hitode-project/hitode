@@ -182,7 +182,7 @@ impl Interpreter {
             }
             decoded
         };
-        execute_decoded(decoded, state, memory, max_units)
+        execute_decoded(decoded, state, memory, max_units, None)
     }
 
     /// Execute one bounded predecoded basic block. This is internal to Machine:
@@ -232,6 +232,7 @@ fn execute_decoded(
     state: &mut CpuState,
     memory: &mut Memory,
     max_units: u32,
+    deferred_mmx: Option<&mut bool>,
 ) -> Execution {
     let pc = state.eip;
     if state.rep.as_ref().is_some_and(|r| r.pc != pc) {
@@ -246,10 +247,26 @@ fn execute_decoded(
                 units: 0,
             };
         }
-        Decoded::Extended(i) => {
-            let step = crate::floating::execute(&i, state, memory)
-                .unwrap_or(Step::Unsupported { pc, code: i.code() });
+        Decoded::Extended(i, operation, opcode) => {
+            let x87 = operation == crate::floating::Operation::X87;
+            let defer = x87 && deferred_mmx.is_some();
+            if let Some(dirty) = deferred_mmx.as_deref()
+                && *dirty
+                && !x87
+            {
+                // A following SIMD/MMX instruction can read the physical x87
+                // aliases. Materialize the completed x87 prefix before it runs.
+                state.refresh_mmx();
+            }
+            let step = crate::floating::execute(&i, operation, opcode, state, memory, !defer);
             let completed = step == Step::Executed;
+            if let Some(dirty) = deferred_mmx {
+                if x87 {
+                    *dirty |= completed;
+                } else {
+                    *dirty = false;
+                }
+            }
             return Execution {
                 step: if completed && debug {
                     Step::Trap { pc, vector: 1 }
@@ -324,7 +341,7 @@ fn execute_decoded(
 #[derive(Clone, Copy)]
 enum Decoded {
     Ready(Predecoded),
-    Extended(Instruction),
+    Extended(Instruction, crate::floating::Operation, Option<u16>),
     Stop(Step),
 }
 
@@ -372,7 +389,7 @@ impl Cached {
         self.pages.iter().flatten().all(|p| p.matches(memory))
             // Also makes reuse with another Memory instance safe, and catches
             // shared executor writes before its dirty-page synchronization.
-            && memory.read(self.pc, self.len as usize).is_ok_and(|bytes| bytes == &self.bytes[..self.len as usize])
+            && memory.read_data(self.pc, self.len as usize).is_ok_and(|bytes| bytes == &self.bytes[..self.len as usize])
     }
 }
 
@@ -400,7 +417,7 @@ fn fetch(memory: &Memory, pc: u32) -> Cached {
             denied = Some(address);
             break;
         }
-        match memory.read(address, 1) {
+        match memory.read_data(address, 1) {
             Ok(byte) => {
                 entry.bytes[offset as usize] = byte[0];
                 entry.len += 1;
@@ -431,8 +448,19 @@ fn fetch(memory: &Memory, pc: u32) -> Cached {
             action,
             next: instruction.next_ip32(),
         })
+    } else if let Some(operation) = crate::floating::operation(&instruction) {
+        // Preserve the original prefix/opcode scan in the decoded entry. Its
+        // code bytes share the same validation as the instruction itself.
+        let opcode = entry.bytes[..instruction.len()]
+            .windows(2)
+            .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
+            .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16);
+        Decoded::Extended(instruction, operation, opcode)
     } else {
-        Decoded::Extended(instruction)
+        Decoded::Stop(Step::Unsupported {
+            pc,
+            code: instruction.code(),
+        })
     };
     entry
 }
@@ -455,7 +483,7 @@ impl DecodedBlock {
     fn valid(&self, memory: &Memory) -> bool {
         self.pages.iter().all(|page| page.matches(memory))
             && memory
-                .read(self.pc, self.bytes.len())
+                .read_data(self.pc, self.bytes.len())
                 .is_ok_and(|bytes| bytes == self.bytes)
     }
 
@@ -499,7 +527,7 @@ impl DecodedBlock {
                             | Action::PopFlags(..)
                     ),
                 ),
-                Decoded::Extended(instruction) => (
+                Decoded::Extended(instruction, _, _) => (
                     instruction.next_ip32(),
                     instruction.flow_control() != iced_x86::FlowControl::Next,
                 ),
@@ -542,12 +570,19 @@ impl DecodedBlock {
             units: 0,
         };
         let mut last_units = 0;
+        let mut deferred_mmx = false;
         for &(pc, decoded) in &self.instructions {
             if result.units == max_units || state.eip != pc || pc == stop || return_pad == Some(pc)
             {
                 break;
             }
-            let execution = execute_decoded(decoded, state, memory, max_units - result.units);
+            let execution = execute_decoded(
+                decoded,
+                state,
+                memory,
+                max_units - result.units,
+                Some(&mut deferred_mmx),
+            );
             result.units += execution.units;
             result.step = execution.step;
             last_units = execution.units;
@@ -559,6 +594,11 @@ impl DecodedBlock {
             {
                 break;
             }
+        }
+        if deferred_mmx {
+            // Every public/context/native boundary still exposes a coherent
+            // MMX cache; only consecutive x87 instructions skip redundant work.
+            state.refresh_mmx();
         }
         (result, last_units)
     }
@@ -1329,7 +1369,7 @@ impl Transaction {
             });
         }
         let mut bytes = [0; 4];
-        bytes[..width as usize].copy_from_slice(memory.read(address, width as usize).map_err(
+        bytes[..width as usize].copy_from_slice(&memory.read_data(address, width as usize).map_err(
             |_| Step::ReadFault {
                 pc: self.pc,
                 address,

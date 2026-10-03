@@ -203,26 +203,27 @@ fn source(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<Ext,
         let width = i.memory_size().size();
         let bytes = tx.read(memory, address, width)?;
         let value = match width {
-            10 if !is_integer(i.mnemonic()) => Ext(bytes.try_into().unwrap()),
+            10 if !is_integer(i.mnemonic()) => Ext(bytes.as_ref().try_into().unwrap()),
             2 if is_integer(i.mnemonic()) => sf::from(
-                i16::from_le_bytes(bytes.try_into().unwrap()) as i32 as u32 as u64,
+                i16::from_le_bytes(bytes.as_ref().try_into().unwrap()) as i32 as u32 as u64,
                 2,
             ),
-            4 if is_integer(i.mnemonic()) => {
-                sf::from(u32::from_le_bytes(bytes.try_into().unwrap()) as u64, 2)
-            }
+            4 if is_integer(i.mnemonic()) => sf::from(
+                u32::from_le_bytes(bytes.as_ref().try_into().unwrap()) as u64,
+                2,
+            ),
             8 if is_integer(i.mnemonic()) => {
-                sf::from(u64::from_le_bytes(bytes.try_into().unwrap()), 3)
+                sf::from(u64::from_le_bytes(bytes.as_ref().try_into().unwrap()), 3)
             }
             4 => {
-                let bits = u32::from_le_bytes(bytes.try_into().unwrap());
+                let bits = u32::from_le_bytes(bytes.as_ref().try_into().unwrap());
                 if bits & 0x7f80_0000 == 0 && bits & 0x007f_ffff != 0 {
                     exceptions(tx, DE);
                 }
                 sf::from(bits as u64, 0)
             }
             8 => {
-                let bits = u64::from_le_bytes(bytes.try_into().unwrap());
+                let bits = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
                 if bits & 0x7ff0_0000_0000_0000 == 0 && bits & 0x000f_ffff_ffff_ffff != 0 {
                     exceptions(tx, DE);
                 }
@@ -251,16 +252,10 @@ fn reset(tx: &mut Transaction) {
         ..X87State::default()
     };
 }
-fn metadata(i: &Instruction, tx: &mut Transaction, memory: &Memory) {
+fn metadata(tx: &mut Transaction) {
     tx.state.x87.ip = tx.pc;
-    for offset in 0..i.len().saturating_sub(1) {
-        let Ok(bytes) = memory.read(tx.pc + offset as u32, 2) else {
-            break;
-        };
-        if (0xd8..=0xdf).contains(&bytes[0]) {
-            tx.state.x87.opcode = ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16;
-            break;
-        }
+    if let Some(opcode) = tx.opcode {
+        tx.state.x87.opcode = opcode;
     }
 }
 pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
@@ -289,7 +284,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         M::Fnclex | M::Fclex => tx.state.x87.status &= !0x80ff,
         M::Fldcw => {
             let addr = tx.address(i)?;
-            let cw = u16::from_le_bytes(tx.read(memory, addr, 2)?.try_into().unwrap());
+            let cw = u16::from_le_bytes(tx.read(memory, addr, 2)?.as_ref().try_into().unwrap());
             tx.state.x87.control = cw;
             if tx.state.x87.status & !cw & 0x3f != 0 {
                 tx.state.x87.status |= 0x8080;
@@ -315,12 +310,12 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         }
         M::Fxsave | M::Fxrstor => fx_environment(i, tx, memory)?,
         M::Fld | M::Fild => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let value = source(i, tx, memory)?;
             push(tx, value);
         }
         M::Fld1 | M::Fldz | M::Fldpi | M::Fldl2e | M::Fldl2t | M::Fldlg2 | M::Fldln2 => {
-            metadata(i, tx, memory);
+            metadata(tx);
             // Intel's constant ROM is rounded according to RC, independently of PC.
             let (mut sig, exp, below) = match m {
                 M::Fld1 => (0x8000_0000_0000_0000, 0x3fff, false),
@@ -343,7 +338,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             push(tx, Ext::from_parts(sig, exp));
         }
         M::Fst | M::Fstp | M::Fist | M::Fistp | M::Fisttp => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let address = if i.op0_kind() == OpKind::Memory {
                 let addr = tx.address(i)?;
                 tx.check(memory, addr, i.memory_size().size(), true)?;
@@ -413,7 +408,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         | M::Fdivrp
         | M::Fidiv
         | M::Fidivr => {
-            metadata(i, tx, memory);
+            metadata(tx);
             tx.state.x87.status &= !C1;
             let dest = if i.op_count() == 2 {
                 st_index(i.op0_register()).unwrap_or(0)
@@ -456,7 +451,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             }
         }
         M::Fsqrt | M::Frndint => {
-            metadata(i, tx, memory);
+            metadata(tx);
             tx.state.x87.status &= !C1;
             let a = operand(tx, 0);
             let result = sf::unary(a, u8::from(m == M::Frndint));
@@ -464,7 +459,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             set(tx, 0, result);
         }
         M::Fscale => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let a = operand(tx, 0);
             let b = operand(tx, 1);
             let (result, flags) = super::transcendental::scale(a, b, tx.state.x87.control);
@@ -473,7 +468,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             set(tx, 0, result);
         }
         M::Fprem | M::Fprem1 => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let a = operand(tx, 0);
             let b = operand(tx, 1);
             let (result, flags, quotient) = remainder(a, b, m == M::Fprem1, tx.state.x87.control);
@@ -489,7 +484,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             set(tx, 0, result);
         }
         M::Fyl2x | M::Fyl2xp1 | M::Fpatan => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let x = operand(tx, 0);
             let y = operand(tx, 1);
             let (result, flags) = if m == M::Fpatan {
@@ -503,7 +498,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             pop(tx);
         }
         M::F2xm1 => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let x = operand(tx, 0);
             let Some((result, flags)) =
                 super::transcendental::exp2_minus_one(x, tx.state.x87.control)
@@ -515,7 +510,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             set(tx, 0, result);
         }
         M::Fsin | M::Fcos | M::Fsincos | M::Fptan => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let x = operand(tx, 0);
             if let Some(((sine, cosine), flags)) =
                 super::transcendental::sin_cos(x, tx.state.x87.control)
@@ -540,7 +535,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             }
         }
         M::Fxtract => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let a = operand(tx, 0);
             let exponent = a.sign_exponent() & 0x7fff;
             let mut significand = a;
@@ -573,7 +568,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             push(tx, significand);
         }
         M::Fabs | M::Fchs => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let value = operand(tx, 0);
             let exp = if m == M::Fabs {
                 value.sign_exponent() & 0x7fff
@@ -584,7 +579,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             tx.state.x87.status &= !C1;
         }
         M::Fxch => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let n = st_index(i.op1_register()).unwrap_or(1);
             let a = operand(tx, 0);
             let b = operand(tx, n);
@@ -619,7 +614,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         | M::Fcmovne
         | M::Fcmovnu
         | M::Fcmovu => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let flags = tx.state.eflags;
             let taken = match m {
                 M::Fcmovb => flags & 1 != 0,
@@ -665,7 +660,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
                 };
         }
         _ => {
-            metadata(i, tx, memory);
+            metadata(tx);
             let a = operand(tx, 0);
             let b = if m == M::Ftst {
                 Ext::default()
@@ -711,7 +706,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
 
 fn bcd(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
     let address = tx.address(i)?;
-    metadata(i, tx, memory);
+    metadata(tx);
     if i.mnemonic() == M::Fbld {
         let bytes = tx.read(memory, address, 10)?;
         let mut value = 0u64;

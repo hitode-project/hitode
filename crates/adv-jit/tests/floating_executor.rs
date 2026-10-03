@@ -107,6 +107,96 @@ fn extended_store_fault_does_not_pop_or_modify_any_memory() {
 }
 
 #[test]
+fn x87_fault_rolls_back_pending_mmx_and_preserves_the_complete_cpu() {
+    for store in [false, true] {
+        let bytes = code(|a| {
+            if store {
+                a.fstp(dword_ptr(DATA as i32 + 4094)).unwrap();
+            } else {
+                a.fld(dword_ptr(DATA as i32 + 4094)).unwrap();
+            }
+        });
+        let mut s = CpuState {
+            regs: [0x1234_5678; 8],
+            eip: CODE,
+            eflags: 0x8d7,
+            fs_base: 0x12000,
+            fault_addr: 0x7654_3210,
+            fuel: 91,
+            xmm: [[0xa5; 16]; 8],
+            mmx: [0x8123_4567_89ab_cdef; 8],
+            mmx_mode: 1,
+            mxcsr: 0x3f80,
+            ..CpuState::default()
+        };
+        s.segments.gdt_base = 0x23400;
+        let before = s.clone();
+        let mut m = memory();
+        m.protect(DATA + 4096, 4096, if store { READ } else { WRITE })
+            .unwrap();
+        let outcome = run(&bytes, &mut s, &mut m);
+        assert_eq!(
+            outcome,
+            if store {
+                Step::WriteFault {
+                    pc: CODE,
+                    address: DATA + 4096,
+                }
+            } else {
+                Step::ReadFault {
+                    pc: CODE,
+                    address: DATA + 4096,
+                }
+            }
+        );
+        assert_eq!(s, before, "store={store}");
+        assert_eq!(m.read(DATA + 4094, 4).unwrap(), [0; 4]);
+    }
+}
+
+#[test]
+fn unmasked_comparison_suppresses_pop_and_integer_flags_without_losing_metadata() {
+    let bytes = code(|a| a.fcomip(st0, st1).unwrap());
+    let mut s = CpuState {
+        eip: CODE,
+        eflags: 0x8d7,
+        xmm: [[0x69; 16]; 8],
+        mxcsr: 0x5f80,
+        ..CpuState::default()
+    };
+    s.x87.control &= !1;
+    s.x87.push(X87Register::from_parts(1 << 63, 0x3fff));
+    s.x87
+        .push(X87Register::from_parts(0xc000_0000_0000_1234, 0x7fff));
+    s.refresh_mmx();
+    let mut expected = s.clone();
+    expected.eip = CODE + bytes.len() as u32;
+    expected.x87.status |= 0x8081;
+    expected.x87.ip = CODE;
+    expected.x87.opcode = ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16;
+    let mut m = memory();
+    assert_eq!(run(&bytes, &mut s, &mut m), Step::Executed);
+    assert_eq!(s, expected);
+}
+
+#[test]
+fn cached_prefixed_x87_metadata_is_redecoded_after_code_changes() {
+    let mut m = memory();
+    let mut interpreter = Interpreter::new();
+    for (bytes, opcode) in [([0x66, 0xd9, 0xe8], 0x1e8), ([0x66, 0xd9, 0xee], 0x1ee)] {
+        m.write(CODE, &bytes).unwrap();
+        let mut s = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        assert_eq!(interpreter.step(&mut s, &mut m), Step::Executed);
+        assert_eq!(s.x87.ip, CODE);
+        assert_eq!(s.x87.opcode, opcode);
+    }
+    assert_eq!(interpreter.decode_count(), 2);
+}
+
+#[test]
 fn scalar_sse_rounding_daz_ftz_and_unmasked_exceptions_commit_correctly() {
     let conversion = code(|a| {
         a.cvtss2si(eax, xmm0).unwrap();

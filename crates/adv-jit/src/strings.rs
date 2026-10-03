@@ -140,33 +140,53 @@ fn execute(bridge: &mut crate::host::Bridge<'_>, state: &mut CpuState, operation
         return BUDGET;
     }
     let bytes = len.min(CHUNK_BYTES);
-    // SAFETY: all pages, permissions, bounds, non-overlap and address arithmetic
-    // were validated for the complete remaining instruction before any mutation.
-    unsafe {
-        let destination = memory.ptr.as_ptr().add(dst_offset);
-        if copy {
-            std::ptr::copy_nonoverlapping(
-                memory.ptr.as_ptr().add(src_offset),
-                destination,
-                bytes as usize,
-            );
-        } else if width == 1 {
-            std::ptr::write_bytes(destination, state.regs[0] as u8, bytes as usize);
-        } else if width == 4 && (destination as usize).is_multiple_of(4) {
-            std::slice::from_raw_parts_mut(destination.cast::<u32>(), (bytes / 4) as usize)
-                .fill(state.regs[0].to_le());
-        } else if width == 2 && (destination as usize).is_multiple_of(2) {
-            std::slice::from_raw_parts_mut(destination.cast::<u16>(), (bytes / 2) as usize)
-                .fill((state.regs[0] as u16).to_le());
+    if memory.shared_range(dst, bytes as usize)
+        || (copy && memory.shared_range(src, bytes as usize))
+    {
+        // Dedicated device storage must never reach the raw-pointer bulk paths.
+        // Preserve full-range permission validation and bounded REP progress;
+        // the memory helpers use matching byte atomics throughout the overlay.
+        let result = if copy {
+            memory.copy(src, dst, bytes as usize)
         } else {
-            // Unaligned fills use non-overlapping byte copies of a repeated pattern.
-            let pattern = state.regs[0].to_le_bytes();
-            std::ptr::copy_nonoverlapping(pattern.as_ptr(), destination, width as usize);
-            let mut filled = width as usize;
-            while filled < bytes as usize {
-                let n = filled.min(bytes as usize - filled);
-                std::ptr::copy_nonoverlapping(destination, destination.add(filled), n);
-                filled += n;
+            memory.fill(
+                dst,
+                &state.regs[0].to_le_bytes()[..width as usize],
+                bytes as usize,
+            )
+        };
+        if result.is_err() {
+            return FALLBACK;
+        }
+    } else {
+        // SAFETY: all pages, permissions, bounds, non-overlap and address arithmetic
+        // were validated for the complete remaining instruction before any mutation.
+        unsafe {
+            let destination = memory.ptr.as_ptr().add(dst_offset);
+            if copy {
+                std::ptr::copy_nonoverlapping(
+                    memory.ptr.as_ptr().add(src_offset),
+                    destination,
+                    bytes as usize,
+                );
+            } else if width == 1 {
+                std::ptr::write_bytes(destination, state.regs[0] as u8, bytes as usize);
+            } else if width == 4 && (destination as usize).is_multiple_of(4) {
+                std::slice::from_raw_parts_mut(destination.cast::<u32>(), (bytes / 4) as usize)
+                    .fill(state.regs[0].to_le());
+            } else if width == 2 && (destination as usize).is_multiple_of(2) {
+                std::slice::from_raw_parts_mut(destination.cast::<u16>(), (bytes / 2) as usize)
+                    .fill((state.regs[0] as u16).to_le());
+            } else {
+                // Unaligned fills use non-overlapping byte copies of a repeated pattern.
+                let pattern = state.regs[0].to_le_bytes();
+                std::ptr::copy_nonoverlapping(pattern.as_ptr(), destination, width as usize);
+                let mut filled = width as usize;
+                while filled < bytes as usize {
+                    let n = filled.min(bytes as usize - filled);
+                    std::ptr::copy_nonoverlapping(destination, destination.add(filled), n);
+                    filled += n;
+                }
             }
         }
     }
@@ -207,7 +227,11 @@ fn readable_elements(memory: &Memory, address: u32, width: u32, backwards: bool)
     let range = memory.range(address, width as usize).ok()?;
     let first = range.start / 4096;
     let last = (range.end - 1) / 4096;
-    if (first..=last).any(|page| !memory.mapped[page] || memory.perms[page] & READ == 0) {
+    if (first..=last).any(|page| {
+        !memory.mapped[page]
+            || memory.perms[page] & READ == 0
+            || memory.perms[page] & crate::memory::SHARED != 0
+    }) {
         return None;
     }
     let within_page = (range.start % 4096) as u32;

@@ -19,6 +19,14 @@ mod simd;
 
 type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
+/// Borrowed controls for one bounded native entry and its linked regions.
+pub(crate) struct NativeRun<'a> {
+    pub links: Option<&'a Table>,
+    pub stop: u32,
+    pub return_pad: Option<u32>,
+    pub interrupt: &'a std::sync::atomic::AtomicBool,
+}
+
 pub(crate) struct Compiled {
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
@@ -70,21 +78,20 @@ impl Compiled {
         state: &mut CpuState,
         memory: &mut Memory,
         bridge: &mut crate::host::Bridge<'_>,
-        links: Option<&Table>,
-        stop: u32,
-        return_pad: Option<u32>,
+        controls: NativeRun<'_>,
     ) -> (u32, u64) {
         bridge.memory = memory;
-        let (slots, mask) = links.map_or((std::ptr::null(), 0), Table::parts);
+        let (slots, mask) = controls.links.map_or((std::ptr::null(), 0), Table::parts);
         let mut context = NativeContext {
             state,
             perms: memory.perms.as_ptr(),
             bridge: (bridge as *mut crate::host::Bridge<'_>).cast(),
+            interrupt: controls.interrupt,
             slots,
             mask,
             remaining: crate::linking::CHAIN_LIMIT,
-            stop,
-            return_pad: return_pad.map_or(u64::MAX, u64::from),
+            stop: controls.stop,
+            return_pad: controls.return_pad.map_or(u64::MAX, u64::from),
             linked_entries: 0,
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
@@ -119,7 +126,7 @@ impl Snapshot {
         {
             return Err("region must contain 1..16384 executable bytes".into());
         }
-        let mut bytes = memory.read(region.start, region.len)?.to_vec();
+        let mut bytes = memory.read_data(region.start, region.len)?.to_vec();
         let first = (region.start - memory.base) as usize / 4096;
         let last = ((region.start - memory.base) as usize + region.len - 1) / 4096;
         let mut pages: BTreeSet<usize> = (first..=last).collect();
@@ -139,7 +146,7 @@ impl Snapshot {
                 if !memory.executable(address, 1) {
                     break;
                 }
-                bytes.push(memory.read(address, 1)?[0]);
+                bytes.push(memory.read_data(address, 1)?[0]);
             }
             if let Some(address) = u64::from(region.start)
                 .checked_add(bytes.len() as u64)
@@ -184,7 +191,7 @@ impl Snapshot {
                     && memory.mapped.get(stamp.page) == Some(&stamp.mapped)
             })
             && memory
-                .read(self.region.start, self.bytes.len())
+                .read_data(self.region.start, self.bytes.len())
                 .is_ok_and(|bytes| bytes == self.bytes)
     }
 
@@ -412,6 +419,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             params[0],
             offset_of!(NativeContext, bridge) as i32,
         );
+        let interrupt = b.ins().load(
+            ptr_ty,
+            MemFlags::trusted(),
+            params[0],
+            offset_of!(NativeContext, interrupt) as i32,
+        );
         let tail_ref = b.import_signature(tail_signature);
         let regs: [Variable; 8] = std::array::from_fn(|_| b.declare_var(types::I32));
         let mut xmm = [None; 8];
@@ -529,6 +542,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             state,
             mem: params[1],
             perms,
+            interrupt,
             context: params[0],
             tail_ref,
             ptr_ty,
@@ -578,6 +592,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         e.mmx_effects = None;
         e.b.switch_to_block(dispatch);
         let target = e.b.block_params(dispatch)[0];
+        // Atomic rather than readonly/trusted ordinary data: this flag can
+        // change while a generated loop is running and must not be hoisted.
+        e.interrupt_at(target, true);
         let outside = e.b.create_block();
         e.b.set_cold_block(outside);
         let mut switch = Switch::new();
@@ -929,6 +946,7 @@ struct Emitter<'a> {
     state: Value,
     mem: Value,
     perms: Value,
+    interrupt: Value,
     context: Value,
     tail_ref: ir::SigRef,
     ptr_ty: ir::Type,
@@ -992,6 +1010,23 @@ impl Emitter<'_> {
         let prepare = self.b.create_block();
         self.b.ins().brif(bad, returned, &[], prepare, &[]);
         self.b.switch_to_block(prepare);
+        // State was saved before reaching the chain candidate. Return directly
+        // so an interrupt never charges the next region or grows the Rust stack.
+        let pending = self
+            .b
+            .ins()
+            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
+        let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+        let interrupted = self.b.create_block();
+        self.b.set_cold_block(interrupted);
+        let search_ready = self.b.create_block();
+        self.b
+            .ins()
+            .brif(pending, interrupted, &[], search_ready, &[]);
+        self.b.switch_to_block(interrupted);
+        let interrupted_reason = self.constant(Exit::Interrupted as u32);
+        self.b.ins().return_(&[interrupted_reason]);
+        self.b.switch_to_block(search_ready);
         let mask = self.b.ins().load(
             types::I32,
             MemFlags::trusted(),
@@ -1272,6 +1307,10 @@ impl Emitter<'_> {
     }
     fn direct(&mut self, pc: u32) {
         if let Some(&block) = self.blocks.get(&pc) {
+            if pc <= self.pc {
+                let target = self.constant(pc);
+                self.interrupt_at(target, false);
+            }
             self.flush_mmx_effects();
             self.b.ins().jump(block, &[]);
         } else {
@@ -1281,6 +1320,42 @@ impl Emitter<'_> {
     fn indirect(&mut self, target: Value) {
         self.flush_mmx_effects();
         self.b.ins().jump(self.dispatch, &[target.into()]);
+    }
+    fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
+        let pending = self
+            .b
+            .ins()
+            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
+        let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+        let fuel = self.b.use_var(self.fuel);
+        let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
+        let mut pending = self.b.ins().band(pending, work);
+        if respect_stops {
+            let stop = self.b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                self.context,
+                offset_of!(NativeContext, stop) as i32,
+            );
+            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc, stop);
+            pending = self.b.ins().band(pending, ordinary);
+            let pad = self.b.ins().load(
+                types::I64,
+                MemFlags::trusted(),
+                self.context,
+                offset_of!(NativeContext, return_pad) as i32,
+            );
+            let pc64 = self.b.ins().uextend(types::I64, pc);
+            let ordinary = self.b.ins().icmp(IntCC::NotEqual, pc64, pad);
+            pending = self.b.ins().band(pending, ordinary);
+        }
+        let interrupted = self.b.create_block();
+        self.b.set_cold_block(interrupted);
+        let continued = self.b.create_block();
+        self.b.ins().brif(pending, interrupted, &[], continued, &[]);
+        self.b.switch_to_block(interrupted);
+        self.exit(Exit::Interrupted, pc);
+        self.b.switch_to_block(continued);
     }
     fn address(&mut self, i: &Instruction) -> Value {
         let mut addr = self.constant(i.memory_displacement32());
@@ -1326,12 +1401,47 @@ impl Emitter<'_> {
             let page = self.b.ins().uextend(self.ptr_ty, page);
             let at = self.b.ins().iadd(self.perms, page);
             let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
+            let permission = if write { WRITE } else { READ };
             let mask = self
                 .b
                 .ins()
-                .band_imm(p, i64::from(if write { WRITE } else { READ }));
-            let bad = self.b.ins().icmp_imm(IntCC::Equal, mask, 0);
-            self.guard(bad, reason, Some(addr));
+                .band_imm(p, i64::from(permission | crate::memory::SHARED));
+            let bad = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, mask, i64::from(permission));
+            // Keep the ordinary-page hot path's original guard count. Only the
+            // cold failure block distinguishes atomic-overlay fallback from a
+            // permission fault; neither path accesses the linear raw pointer.
+            let ok = self.b.create_block();
+            let fail = self.b.create_block();
+            self.b.set_cold_block(fail);
+            self.b.ins().brif(bad, fail, &[], ok, &[]);
+            self.b.switch_to_block(fail);
+            let shared = self.b.ins().band_imm(p, i64::from(crate::memory::SHARED));
+            let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let fallback = self.constant(Exit::Fallback as u32);
+            let fault = self.constant(reason as u32);
+            let reason_value = self.b.ins().select(shared, fallback, fault);
+            let previous = self.b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                self.state,
+                offset_of!(CpuState, fault_addr) as i32,
+            );
+            let fault_address = self.b.ins().select(shared, previous, addr);
+            self.b.ins().store(
+                MemFlags::trusted(),
+                fault_address,
+                self.state,
+                offset_of!(CpuState, fault_addr) as i32,
+            );
+            self.flush_mmx_effects();
+            let pc = self.constant(self.pc);
+            self.b
+                .ins()
+                .jump(self.shared_exit, &[reason_value.into(), pc.into()]);
+            self.b.switch_to_block(ok);
             combined = Some(if let Some(old) = combined {
                 self.b.ins().bor(old, p)
             } else {
