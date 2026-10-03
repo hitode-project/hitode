@@ -26,6 +26,23 @@ pub struct Consumer<T> {
     slot: usize,
     _single: PhantomData<Cell<()>>,
 }
+/// Read-only scheduling view. It never clears the dirty bit or accesses a slot,
+/// so a consumer can move to an owned background job while UI observes updates.
+pub struct Observer<T> {
+    shared: Arc<Shared<T>>,
+}
+impl<T> Clone for Observer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+impl<T> Observer<T> {
+    pub fn has_update(&self) -> bool {
+        self.shared.middle.load(Ordering::Acquire) & DIRTY != 0
+    }
+}
 pub fn channel<T>(slots: [T; 3]) -> (Producer<T>, Consumer<T>) {
     let shared = Arc::new(Shared {
         slots: slots.map(UnsafeCell::new),
@@ -65,6 +82,11 @@ impl<T: Sync> Producer<T> {
     }
 }
 impl<T> Consumer<T> {
+    pub fn observer(&self) -> Observer<T> {
+        Observer {
+            shared: self.shared.clone(),
+        }
+    }
     pub fn has_update(&self) -> bool {
         self.shared.middle.load(Ordering::Acquire) & DIRTY != 0
     }
@@ -103,5 +125,45 @@ mod tests {
         }
         producer.join().unwrap();
         assert!(!rx.update());
+    }
+
+    #[test]
+    fn observer_does_not_consume_updates_and_covers_publication_during_a_job() {
+        let (mut producer, mut consumer) = channel([0_u32; 3]);
+        let observer = consumer.observer();
+        let second = observer.clone();
+        assert!(!observer.has_update());
+        producer.publish(|slot| *slot = 1);
+        for _ in 0..10 {
+            assert!(observer.has_update());
+        }
+        // A failed enqueue/retry observes dirty without clearing the frame.
+        producer.publish(|slot| *slot = 2);
+        assert!(second.has_update());
+        assert!(consumer.update());
+        assert_eq!(*consumer.current(), 2);
+        assert!(!observer.has_update());
+        // Publication while the worker renders is still pending after its job
+        // completes; UI's observer can schedule the next ownership transfer.
+        producer.publish(|slot| *slot = 3);
+        assert!(observer.has_update());
+        assert_eq!(*consumer.current(), 2);
+        assert!(consumer.update());
+        assert_eq!(*consumer.current(), 3);
+        assert!(!second.has_update());
+    }
+
+    #[test]
+    fn observer_is_send_sync_without_requiring_clone_or_sync_payloads() {
+        struct NotClone(std::cell::Cell<u32>);
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Observer<NotClone>>();
+        let (mut producer, consumer) =
+            channel(std::array::from_fn(|_| NotClone(std::cell::Cell::new(0))));
+        let observer = consumer.observer();
+        let duplicate = observer.clone();
+        producer.publish(|slot| slot.0.set(5));
+        assert!(observer.has_update() && duplicate.has_update());
+        assert!(consumer.has_update());
     }
 }
