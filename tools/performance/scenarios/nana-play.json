@@ -1,0 +1,19 @@
+[
+  {"at": 17.906, "command": "key-down 17"},
+  {"at": 39.578, "command": "key-up 17"},
+  {"at": 39.578, "checkpoint": "title"},
+  {"at": 40.5, "command": "click 650 410"},
+  {"at": 55, "checkpoint": "story-start", "reset_metrics": true},
+  {"at": 70, "checkpoint": "normal-before-skip", "reset_metrics": true},
+  {"at": 70, "command": "key-down 17"},
+  {"at": 90, "checkpoint": "skip-one"},
+  {"at": 90, "command": "key-up 17"},
+  {"at": 90, "command": "reset-metrics"},
+  {"at": 110, "checkpoint": "resume-one", "reset_metrics": true},
+  {"at": 112, "command": "key-down 17"},
+  {"at": 142, "checkpoint": "skip-two"},
+  {"at": 142, "command": "key-up 17"},
+  {"at": 142, "command": "reset-metrics"},
+  {"at": 162, "checkpoint": "resume-two"},
+  {"at": 165, "command": "close"}
+]
