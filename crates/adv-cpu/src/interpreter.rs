@@ -76,6 +76,10 @@ pub struct RepContinuation {
 }
 
 impl RepContinuation {
+    pub(crate) fn fault_native_compare(state: &mut CpuState, native: u32) {
+        Self::commit_native_compare(state, native, true);
+        state.eflags = state.rep.take().unwrap().flags;
+    }
     /// Called immediately before a native comparison chunk commits its flags.
     /// A later native/interpreted chunk belongs to the same guest instruction.
     pub(crate) fn commit_native_compare(state: &mut CpuState, native: u32, more: bool) {

@@ -15,6 +15,8 @@ const SHARED_CHUNK_BYTES: u32 = 4096;
 pub(crate) const FALLBACK: u32 = 1;
 pub(crate) const MORE: u32 = 2;
 pub(crate) const BUDGET: u32 = 3;
+pub(crate) const READ_FAULT: u32 = 4;
+pub(crate) const WRITE_FAULT: u32 = 5;
 
 pub(crate) fn operation(i: &Instruction) -> Option<u32> {
     if !(i.has_rep_prefix() || i.has_repne_prefix())
@@ -148,6 +150,13 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         || (copy && memory.shared_range(src, bytes as usize));
     if shared {
         bytes = bytes.min(SHARED_CHUNK_BYTES);
+        // A file first-touch failure must belong to the next guest element,
+        // rather than a later page we happened to prefetch. Each prepared chunk
+        // stays within the pages touched by its first element.
+        bytes = bytes.min(((4096 - dst % 4096) / width).max(1) * width);
+        if copy {
+            bytes = bytes.min(((4096 - src % 4096) / width).max(1) * width);
+        }
     }
     if copy && memory.rep_alias_hazard(src, dst, bytes as usize) {
         return FALLBACK;
@@ -156,6 +165,21 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         // Dedicated device storage must never reach the raw-pointer bulk paths.
         // Preserve full-range permission validation and bounded REP progress;
         // Audio helpers use byte atomics; worker-owned file views use page copies.
+        if copy
+            && memory
+                .prepare_native_access(src, bytes as usize, false)
+                .is_err()
+        {
+            state.fault_addr = src;
+            return READ_FAULT;
+        }
+        if memory
+            .prepare_native_access(dst, bytes as usize, true)
+            .is_err()
+        {
+            state.fault_addr = dst;
+            return WRITE_FAULT;
+        }
         let result = if copy {
             memory.copy(src, dst, bytes as usize)
         } else {
@@ -165,8 +189,10 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
                 bytes as usize,
             )
         };
+        // Successful preparation is retained under this exclusive borrow.
+        // copy/fill cannot encounter a new lazy IO/COW failure after mutation.
         if result.is_err() {
-            return FALLBACK;
+            std::process::abort();
         }
     } else {
         // SAFETY: all pages, permissions, bounds, non-overlap and address arithmetic
@@ -238,20 +264,24 @@ fn readable_elements(
     address: u32,
     width: u32,
     backwards: bool,
-) -> Option<(u32, bool)> {
+) -> Option<(u32, u8)> {
     let range = memory.range(address, width as usize).ok()?;
     let first = range.start / 4096;
     let last = (range.end - 1) / 4096;
-    if (first..=last).any(|page| {
-        !memory.mapped[page]
-            || memory.perms[page] & READ == 0
-            || (memory.perms[page] & crate::memory::SHARED != 0
-                && memory.perms[page] & crate::memory::AUDIO == 0)
-    }) {
+    if (first..=last).any(|page| !memory.mapped[page] || memory.perms[page] & READ == 0) {
         return None;
     }
     let within_page = (range.start % 4096) as u32;
-    let audio = (first..=last).any(|page| memory.perms[page] & crate::memory::AUDIO != 0);
+    let file = (first..=last).any(|page| {
+        memory.perms[page] & (crate::memory::SHARED | crate::memory::AUDIO) == crate::memory::SHARED
+    });
+    let kind = if file {
+        2
+    } else if (first..=last).any(|page| memory.perms[page] & crate::memory::AUDIO != 0) {
+        1
+    } else {
+        0
+    };
     let span = if backwards {
         within_page / width + 1
     } else {
@@ -259,16 +289,25 @@ fn readable_elements(
         // checked, but process just that one element before choosing a new span.
         ((4096 - within_page) / width).max(1)
     };
-    Some((span, audio))
+    Some((span, kind))
 }
 
 /// The complete element and its pages were checked by readable_elements. A wide
 /// guest element on PCM is composed only from matching byte atomic accesses;
 /// concurrent readers may observe a mixture of bytes, as the PCM protocol allows.
 #[inline(always)]
-unsafe fn read_element<const AUDIO: bool>(memory: &Memory, address: u32, width: u32) -> u32 {
-    let pointer = unsafe { memory.ptr.as_ptr().add((address - memory.base) as usize) };
-    if AUDIO {
+unsafe fn read_element<const KIND: u8>(
+    memory: &Memory,
+    address: u32,
+    width: u32,
+    file: FileSpan<'_>,
+) -> u32 {
+    let pointer = if KIND == 2 {
+        unsafe { file.bytes.as_ptr().add((address - file.start) as usize) }
+    } else {
+        unsafe { memory.ptr.as_ptr().add((address - memory.base) as usize) }
+    };
+    if KIND == 1 {
         let mut value = 0;
         for byte in 0..width {
             let atom = unsafe { &*pointer.add(byte as usize).cast::<AtomicU8>() };
@@ -312,12 +351,18 @@ struct ScanProgress {
     right: u32,
 }
 
+#[derive(Clone, Copy)]
+struct FileSpan<'a> {
+    start: u32,
+    bytes: &'a [u8],
+}
+
 // Keep the byte-atomic alternatives out of the ordinary loop's optimization
 // unit. Width and access modes are fixed for a checked span; dispatch costs one
 // call per page, while no classification or width test runs for each element.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn scan_span<const WIDTH: u32, const SOURCE_AUDIO: bool, const DESTINATION_AUDIO: bool>(
+fn scan_span<const WIDTH: u32, const SOURCE_KIND: u8, const DESTINATION_KIND: u8>(
     memory: &Memory,
     accumulator: u32,
     cmps: bool,
@@ -326,6 +371,8 @@ fn scan_span<const WIDTH: u32, const SOURCE_AUDIO: bool, const DESTINATION_AUDIO
     count: u32,
     span: u32,
     progress: &mut ScanProgress,
+    source_file: FileSpan<'_>,
+    destination_file: FileSpan<'_>,
 ) -> bool {
     let mut source = progress.source;
     let mut destination = progress.destination;
@@ -342,11 +389,11 @@ fn scan_span<const WIDTH: u32, const SOURCE_AUDIO: bool, const DESTINATION_AUDIO
         // SAFETY: readable_elements checked all complete elements in this span.
         unsafe {
             left = if cmps {
-                read_element::<SOURCE_AUDIO>(memory, source, WIDTH)
+                read_element::<SOURCE_KIND>(memory, source, WIDTH, source_file)
             } else {
                 accumulator
             };
-            right = read_element::<DESTINATION_AUDIO>(memory, destination, WIDTH);
+            right = read_element::<DESTINATION_KIND>(memory, destination, WIDTH, destination_file);
         }
         completed += 1;
         destination = destination.wrapping_add(delta);
@@ -366,6 +413,144 @@ fn scan_span<const WIDTH: u32, const SOURCE_AUDIO: bool, const DESTINATION_AUDIO
         right,
     };
     stopped
+}
+
+#[derive(Clone, Copy)]
+struct ScanConfig {
+    width: u32,
+    accumulator: u32,
+    cmps: bool,
+    equal_repeat: bool,
+    delta: u32,
+    count: u32,
+    span: u32,
+    source_kind: u8,
+    destination_kind: u8,
+}
+
+#[inline(always)]
+fn dispatch_span(
+    memory: &Memory,
+    config: ScanConfig,
+    progress: &mut ScanProgress,
+    source_file: FileSpan<'_>,
+    destination_file: FileSpan<'_>,
+) -> bool {
+    macro_rules! scan {
+        ($src:literal, $dst:literal) => {
+            match config.width {
+                1 => scan_span::<1, $src, $dst>(
+                    memory,
+                    config.accumulator,
+                    config.cmps,
+                    config.equal_repeat,
+                    config.delta,
+                    config.count,
+                    config.span,
+                    progress,
+                    source_file,
+                    destination_file,
+                ),
+                2 => scan_span::<2, $src, $dst>(
+                    memory,
+                    config.accumulator,
+                    config.cmps,
+                    config.equal_repeat,
+                    config.delta,
+                    config.count,
+                    config.span,
+                    progress,
+                    source_file,
+                    destination_file,
+                ),
+                _ => scan_span::<4, $src, $dst>(
+                    memory,
+                    config.accumulator,
+                    config.cmps,
+                    config.equal_repeat,
+                    config.delta,
+                    config.count,
+                    config.span,
+                    progress,
+                    source_file,
+                    destination_file,
+                ),
+            }
+        };
+    }
+    match (config.source_kind, config.destination_kind) {
+        (0, 0) => scan!(0, 0),
+        (0, 1) => scan!(0, 1),
+        (1, 0) => scan!(1, 0),
+        (1, 1) => scan!(1, 1),
+        (0, 2) => scan!(0, 2),
+        (1, 2) => scan!(1, 2),
+        (2, 0) => scan!(2, 0),
+        (2, 1) => scan!(2, 1),
+        (2, 2) => scan!(2, 2),
+        _ => unreachable!(),
+    }
+}
+
+// Only file scans allocate these private stack buffers. A span stays in the
+// pages touched by its first element, so lazy IO does not touch later pages.
+#[inline(never)]
+fn scan_files(
+    memory: &mut Memory,
+    config: ScanConfig,
+    progress: &mut ScanProgress,
+) -> Result<bool, u32> {
+    let mut source_bytes = [0; 4096];
+    let mut destination_bytes = [0; 4096];
+    let mut source_file = FileSpan {
+        start: 0,
+        bytes: &[],
+    };
+    let mut destination_file = FileSpan {
+        start: 0,
+        bytes: &[],
+    };
+    let bytes = (config.span * config.width) as usize;
+    let start = |address: u32| {
+        if (config.delta as i32) < 0 {
+            address - (config.span - 1) * config.width
+        } else {
+            address
+        }
+    };
+    if config.source_kind == 2 && config.cmps {
+        let address = start(progress.source);
+        memory
+            .prepare_native_access(address, bytes, false)
+            .map_err(|_| progress.source)?;
+        memory
+            .read_into(address, &mut source_bytes[..bytes])
+            .map_err(|_| progress.source)?;
+        source_file = FileSpan {
+            start: address,
+            bytes: &source_bytes[..bytes],
+        };
+    }
+    if config.destination_kind == 2 {
+        let address = start(progress.destination);
+        memory
+            .prepare_native_access(address, bytes, false)
+            .map_err(|_| progress.destination)?;
+        memory
+            .read_into(address, &mut destination_bytes[..bytes])
+            .map_err(|_| progress.destination)?;
+        destination_file = FileSpan {
+            start: address,
+            bytes: &destination_bytes[..bytes],
+        };
+    }
+    Ok(dispatch_span(
+        memory,
+        config,
+        progress,
+        source_file,
+        destination_file,
+    ))
 }
 
 fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
@@ -389,7 +574,7 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     };
     // SAFETY: the native executor is suspended and the bridge exclusively borrows
     // the Executor's live memory. Comparisons do not write or dirty guest pages.
-    let memory = unsafe { &*bridge.memory };
+    let memory = unsafe { &mut *bridge.memory };
     let validated = compare_range(
         memory,
         state.regs[7],
@@ -428,22 +613,22 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
             }
             break BUDGET;
         }
-        let Some((mut span, destination_audio)) =
+        let Some((mut span, destination_kind)) =
             readable_elements(memory, destination, width, backwards)
         else {
             // A non-validated scan has not changed any architectural state.
             return FALLBACK;
         };
-        let mut source_audio = false;
+        let mut source_kind = 0;
         if cmps {
-            let Some((source_span, audio)) = readable_elements(memory, source, width, backwards)
+            let Some((source_span, kind)) = readable_elements(memory, source, width, backwards)
             else {
                 return FALLBACK;
             };
             span = span.min(source_span);
-            source_audio = audio;
+            source_kind = kind;
         }
-        if source_audio || destination_audio {
+        if source_kind != 0 || destination_kind != 0 {
             limit = limit.min(completed + SHARED_CHUNK_BYTES / width);
         }
         span = span.min(limit - completed);
@@ -454,47 +639,41 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
             left,
             right,
         };
-        macro_rules! scan {
-            ($src:literal, $dst:literal) => {
-                match width {
-                    1 => scan_span::<1, $src, $dst>(
-                        memory,
-                        state.regs[0],
-                        cmps,
-                        equal_repeat,
-                        delta,
-                        count,
-                        span,
-                        &mut progress,
-                    ),
-                    2 => scan_span::<2, $src, $dst>(
-                        memory,
-                        state.regs[0],
-                        cmps,
-                        equal_repeat,
-                        delta,
-                        count,
-                        span,
-                        &mut progress,
-                    ),
-                    _ => scan_span::<4, $src, $dst>(
-                        memory,
-                        state.regs[0],
-                        cmps,
-                        equal_repeat,
-                        delta,
-                        count,
-                        span,
-                        &mut progress,
-                    ),
+        let config = ScanConfig {
+            width,
+            accumulator: state.regs[0],
+            cmps,
+            equal_repeat,
+            delta,
+            count,
+            span,
+            source_kind,
+            destination_kind,
+        };
+        let stopped = if source_kind == 2 || destination_kind == 2 {
+            match scan_files(memory, config, &mut progress) {
+                Ok(stopped) => stopped,
+                Err(address) => {
+                    state.regs[1] -= completed;
+                    state.regs[7] = destination;
+                    if cmps {
+                        state.regs[6] = source;
+                    }
+                    state.fault_addr = address;
+                    crate::interpreter::RepContinuation::fault_native_compare(state, operation);
+                    if completed != 0 {
+                        bridge.bulk_calls += 1;
+                        bridge.bulk_bytes += u64::from(completed * width);
+                    }
+                    return READ_FAULT;
                 }
+            }
+        } else {
+            let empty = FileSpan {
+                start: 0,
+                bytes: &[],
             };
-        }
-        let stopped = match (source_audio, destination_audio) {
-            (false, false) => scan!(false, false),
-            (false, true) => scan!(false, true),
-            (true, false) => scan!(true, false),
-            (true, true) => scan!(true, true),
+            dispatch_span(memory, config, &mut progress, empty, empty)
         };
         ScanProgress {
             source,

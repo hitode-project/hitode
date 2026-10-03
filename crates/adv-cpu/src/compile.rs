@@ -362,6 +362,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
+    builder.symbol("adv_file_read", crate::file_memory::read as *const u8);
+    builder.symbol("adv_file_write", crate::file_memory::write as *const u8);
+    builder.symbol("adv_file_prepare", crate::file_memory::prepare as *const u8);
+    builder.symbol(
+        "adv_file_write_prepared",
+        crate::file_memory::write_prepared as *const u8,
+    );
     builder.symbol(
         "adv_atomic_load_vector",
         crate::atomic_memory::load_vector as *const u8,
@@ -427,6 +434,38 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         )
         .map_err(|e| e.to_string())?;
     let atomic_load_ref = module.declare_func_in_func(atomic_load_id, &mut ctx.func);
+    let mut file_signature = module.make_signature();
+    file_signature.params.extend([
+        AbiParam::new(ptr_ty),
+        AbiParam::new(types::I32),
+        AbiParam::new(ptr_ty),
+        AbiParam::new(types::I32),
+    ]);
+    file_signature.returns.push(AbiParam::new(types::I32));
+    let file_read_id = module
+        .declare_function("adv_file_read", Linkage::Import, &file_signature)
+        .map_err(|e| e.to_string())?;
+    let file_read_ref = module.declare_func_in_func(file_read_id, &mut ctx.func);
+    let file_write_id = module
+        .declare_function("adv_file_write", Linkage::Import, &file_signature)
+        .map_err(|e| e.to_string())?;
+    let file_write_ref = module.declare_func_in_func(file_write_id, &mut ctx.func);
+    file_signature.returns.clear();
+    let file_prepared_id = module
+        .declare_function("adv_file_write_prepared", Linkage::Import, &file_signature)
+        .map_err(|e| e.to_string())?;
+    let file_prepared_ref = module.declare_func_in_func(file_prepared_id, &mut ctx.func);
+    let mut prepare_signature = module.make_signature();
+    prepare_signature.params.extend([
+        AbiParam::new(ptr_ty),
+        AbiParam::new(types::I32),
+        AbiParam::new(types::I32),
+    ]);
+    prepare_signature.returns.push(AbiParam::new(types::I32));
+    let prepare_id = module
+        .declare_function("adv_file_prepare", Linkage::Import, &prepare_signature)
+        .map_err(|e| e.to_string())?;
+    let file_prepare_ref = module.declare_func_in_func(prepare_id, &mut ctx.func);
     let mut timestamp_signature = module.make_signature();
     timestamp_signature.params.push(AbiParam::new(ptr_ty));
     timestamp_signature.returns.push(AbiParam::new(types::I64));
@@ -598,6 +637,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             repeat_ref,
             atomic_store_ref,
             atomic_load_ref,
+            file_read_ref,
+            file_write_ref,
+            file_prepare_ref,
+            file_prepared_ref,
             timestamp_ref,
         };
         for (&start, &block) in &e.blocks.clone() {
@@ -978,7 +1021,9 @@ fn supported(i: &Instruction) -> bool {
 #[derive(Clone, Copy)]
 struct GuestPointer {
     address: Value,
-    audio: Value,
+    guest: Value,
+    shared: Value,
+    file: Value,
 }
 
 struct Emitter<'a> {
@@ -1012,6 +1057,10 @@ struct Emitter<'a> {
     repeat_ref: ir::FuncRef,
     atomic_store_ref: ir::FuncRef,
     atomic_load_ref: ir::FuncRef,
+    file_read_ref: ir::FuncRef,
+    file_write_ref: ir::FuncRef,
+    file_prepare_ref: ir::FuncRef,
+    file_prepared_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
 }
 
@@ -1437,98 +1486,97 @@ impl Emitter<'_> {
         }
         addr
     }
-    fn pointer(&mut self, addr: Value, write: bool, size: usize) -> GuestPointer {
+    fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
         let bad =
             self.b
                 .ins()
                 .icmp_imm(IntCC::UnsignedGreaterThan, offset, (self.len - size) as i64);
-        let reason = if write {
-            Exit::WriteFault
-        } else {
-            Exit::ReadFault
-        };
-        self.guard(bad, reason, Some(addr));
+        self.guard(bad, Exit::WriteFault, Some(addr));
         let end = self.b.ins().iadd_imm(offset, size as i64 - 1);
-        let mut combined = None;
-        for position in [offset, end] {
+        // Both metadata addresses are safe after the range guard. Loading them
+        // together lets either original SHARED guard enter one cold path, where
+        // all permissions are checked before file preparation or SSA mutation.
+        let permissions = [offset, end].map(|position| {
             let page = self.b.ins().ushr_imm(position, 12);
             let page = self.b.ins().uextend(self.ptr_ty, page);
             let at = self.b.ins().iadd(self.perms, page);
-            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
-            let permission = if write { WRITE } else { READ };
+            self.b.ins().load(types::I8, MemFlags::trusted(), at, 0)
+        });
+        let combined = self.b.ins().bor(permissions[0], permissions[1]);
+        let shared = self
+            .b
+            .ins()
+            .band_imm(combined, i64::from(crate::memory::SHARED));
+        let executable = self.b.ins().band_imm(combined, i64::from(EXEC));
+        let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
+        let no_file = self.b.ins().iconst(types::I8, 0);
+        let cold = self.b.create_block();
+        self.b.set_cold_block(cold);
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I8);
+        for p in permissions {
             let mask = self
                 .b
                 .ins()
-                .band_imm(p, i64::from(permission | crate::memory::SHARED));
+                .band_imm(p, i64::from(WRITE | crate::memory::SHARED));
             let bad = self
                 .b
                 .ins()
-                .icmp_imm(IntCC::NotEqual, mask, i64::from(permission));
-            // Retain the ordinary page guard. Only its cold path distinguishes
-            // linear AUDIO from a worker-owned file overlay.
+                .icmp_imm(IntCC::NotEqual, mask, i64::from(WRITE));
             let ok = self.b.create_block();
-            let fail = self.b.create_block();
-            self.b.set_cold_block(fail);
-            self.b.ins().brif(bad, fail, &[], ok, &[]);
-            self.b.switch_to_block(fail);
-            let audio = self.b.ins().band_imm(p, i64::from(crate::memory::AUDIO));
-            let audio = self.b.ins().icmp_imm(IntCC::NotEqual, audio, 0);
-            let access = self.b.ins().band_imm(p, i64::from(permission));
-            let access = self.b.ins().icmp_imm(IntCC::NotEqual, access, 0);
-            let allowed = self.b.ins().band(audio, access);
-            let rejected = self.b.create_block();
-            self.b.set_cold_block(rejected);
-            self.b.ins().brif(allowed, ok, &[], rejected, &[]);
-            self.b.switch_to_block(rejected);
-            let shared = self.b.ins().band_imm(p, i64::from(crate::memory::SHARED));
-            let shared = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
-            let file = self.b.ins().icmp_imm(IntCC::Equal, audio, 0);
-            let shared = self.b.ins().band(shared, file);
-            let fallback = self.constant(Exit::Fallback as u32);
-            let fault = self.constant(reason as u32);
-            let reason_value = self.b.ins().select(shared, fallback, fault);
-            let previous = self.b.ins().load(
-                types::I32,
-                MemFlags::trusted(),
-                self.state,
-                offset_of!(CpuState, fault_addr) as i32,
-            );
-            let fault_address = self.b.ins().select(shared, previous, addr);
-            self.b.ins().store(
-                MemFlags::trusted(),
-                fault_address,
-                self.state,
-                offset_of!(CpuState, fault_addr) as i32,
-            );
-            self.flush_mmx_effects();
-            let pc = self.constant(self.pc);
+            self.b.ins().brif(bad, cold, &[], ok, &[]);
+            self.b.switch_to_block(ok);
+        }
+        self.guard(executable, Exit::Fallback, None);
+        self.b.ins().jump(done, &[no_file.into()]);
+        self.b.switch_to_block(cold);
+        for p in permissions {
+            let access = self.b.ins().band_imm(p, i64::from(WRITE));
+            let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
+            self.guard(missing, Exit::WriteFault, Some(addr));
+            self.b.set_cold_block(self.b.current_block().unwrap());
+        }
+        self.guard(executable, Exit::Fallback, None);
+        self.b.set_cold_block(self.b.current_block().unwrap());
+        let file = permissions.map(|p| {
+            let kind = self
+                .b
+                .ins()
+                .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
             self.b
                 .ins()
-                .jump(self.shared_exit, &[reason_value.into(), pc.into()]);
-            self.b.switch_to_block(ok);
-            combined = Some(if let Some(old) = combined {
-                self.b.ins().bor(old, p)
-            } else {
-                p
-            });
-        }
-        if write {
-            let code = self.b.ins().band_imm(combined.unwrap(), i64::from(EXEC));
-            let code = self.b.ins().icmp_imm(IntCC::NotEqual, code, 0);
-            // Stop before the write. the interpreter executes it and the runtime invalidates
-            // native regions before they can be entered again.
-            self.guard(code, Exit::Fallback, None);
-        }
-        // File overlays have already exited above, so a shared bit here denotes
-        // byte-atomic AUDIO, including a mixed ordinary/AUDIO boundary element.
-        let audio = self
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
+        });
+        let file = self.b.ins().bor(file[0], file[1]);
+        let prepare = self.b.create_block();
+        self.b.set_cold_block(prepare);
+        let pcm = self.b.create_block();
+        self.b.set_cold_block(pcm);
+        self.b.ins().brif(file, prepare, &[], pcm, &[]);
+        self.b.switch_to_block(pcm);
+        self.b.ins().jump(done, &[no_file.into()]);
+        self.b.switch_to_block(prepare);
+        let width = self.constant(size as u32);
+        let call = self
             .b
             .ins()
-            .band_imm(combined.unwrap(), i64::from(crate::memory::SHARED));
-        let offset = self.b.ins().uextend(self.ptr_ty, offset);
-        let address = self.b.ins().iadd(self.mem, offset);
-        GuestPointer { address, audio }
+            .call(self.file_prepare_ref, &[self.bridge, addr, width]);
+        let failed = self.b.inst_results(call)[0];
+        self.guard(failed, Exit::WriteFault, Some(addr));
+        self.b.set_cold_block(self.b.current_block().unwrap());
+        let is_file = self.b.ins().iconst(types::I8, 1);
+        self.b.ins().jump(done, &[is_file.into()]);
+        self.b.switch_to_block(done);
+        let file = self.b.block_params(done)[0];
+        let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
+        let address = self.b.ins().iadd(self.mem, host_offset);
+        GuestPointer {
+            address,
+            guest: addr,
+            shared,
+            file,
+        }
     }
     /// Loads and plain stores can finish their shared access inside the original
     /// page-guard cold path. No classification branch runs after an ordinary
@@ -1595,23 +1643,14 @@ impl Emitter<'_> {
         }
         self.b.switch_to_block(atomic);
         // Either boundary guard can enter here. Revalidate *both* pages before
-        // any byte is read/written; this also rejects mixed file/AUDIO elements.
+        // any byte is read/written. Mixed file/AUDIO elements use checked Memory
+        // helpers, which keep PCM subranges byte atomic.
         let mut combined = None;
         for position in [offset, end] {
             let page = self.b.ins().ushr_imm(position, 12);
             let page = self.b.ins().uextend(self.ptr_ty, page);
             let at = self.b.ins().iadd(self.perms, page);
             let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
-            let kind = self
-                .b
-                .ins()
-                .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
-            let file = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED));
-            self.guard(file, Exit::Fallback, None);
-            self.b.set_cold_block(self.b.current_block().unwrap());
             let access = self.b.ins().band_imm(p, i64::from(permission));
             let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
             self.guard(missing, reason, Some(addr));
@@ -1628,11 +1667,58 @@ impl Emitter<'_> {
             self.guard(executable, Exit::Fallback, None);
             self.b.set_cold_block(self.b.current_block().unwrap());
         }
+        let file = [offset, end].map(|position| {
+            let page = self.b.ins().ushr_imm(position, 12);
+            let page = self.b.ins().uextend(self.ptr_ty, page);
+            let at = self.b.ins().iadd(self.perms, page);
+            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
+            let kind = self
+                .b
+                .ins()
+                .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
+            self.b
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
+        });
+        let file = self.b.ins().bor(file[0], file[1]);
+        let overlay = self.b.create_block();
+        self.b.set_cold_block(overlay);
+        let pcm = self.b.create_block();
+        self.b.set_cold_block(pcm);
+        self.b.ins().brif(file, overlay, &[], pcm, &[]);
+        self.b.switch_to_block(pcm);
         if let Some(value) = value {
             self.store_atomic(address, value);
             self.b.ins().jump(done, &[]);
         } else {
             let result = self.load_atomic(address, ty);
+            self.b.ins().jump(done, &[result.into()]);
+        }
+        self.b.switch_to_block(overlay);
+        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+        let width = self.constant(size as u32);
+        let function = if let Some(value) = value {
+            self.b.ins().stack_store(value, slot, 0);
+            self.file_write_ref
+        } else {
+            self.file_read_ref
+        };
+        let call = self
+            .b
+            .ins()
+            .call(function, &[self.bridge, addr, buffer, width]);
+        let failed = self.b.inst_results(call)[0];
+        self.guard(failed, reason, Some(addr));
+        self.b.set_cold_block(self.b.current_block().unwrap());
+        if write {
+            self.b.ins().jump(done, &[]);
+        } else {
+            let result = self.b.ins().stack_load(ty, slot, 0);
             self.b.ins().jump(done, &[result.into()]);
         }
         self.b.switch_to_block(done);
@@ -1644,22 +1730,6 @@ impl Emitter<'_> {
     fn direct_store(&mut self, addr: Value, value: Value) {
         let ty = self.b.func.dfg.value_type(value);
         self.direct_memory(addr, ty, Some(value));
-    }
-    fn load_memory(&mut self, pointer: GuestPointer, ty: ir::Type) -> Value {
-        let ordinary = self.b.create_block();
-        let atomic = self.b.create_block();
-        self.b.set_cold_block(atomic);
-        let done = self.b.create_block();
-        self.b.append_block_param(done, ty);
-        self.b.ins().brif(pointer.audio, atomic, &[], ordinary, &[]);
-        self.b.switch_to_block(ordinary);
-        let value = self.b.ins().load(ty, MemFlags::new(), pointer.address, 0);
-        self.b.ins().jump(done, &[value.into()]);
-        self.b.switch_to_block(atomic);
-        let value = self.load_atomic(pointer.address, ty);
-        self.b.ins().jump(done, &[value.into()]);
-        self.b.switch_to_block(done);
-        self.b.block_params(done)[0]
     }
     fn load_atomic(&mut self, pointer: Value, ty: ir::Type) -> Value {
         if ty.is_vector() {
@@ -1702,14 +1772,36 @@ impl Emitter<'_> {
         let atomic = self.b.create_block();
         self.b.set_cold_block(atomic);
         let done = self.b.create_block();
-        self.b.ins().brif(pointer.audio, atomic, &[], ordinary, &[]);
+        self.b
+            .ins()
+            .brif(pointer.shared, atomic, &[], ordinary, &[]);
         self.b.switch_to_block(ordinary);
         self.b
             .ins()
             .store(MemFlags::new(), value, pointer.address, 0);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(atomic);
+        let overlay = self.b.create_block();
+        self.b.set_cold_block(overlay);
+        let pcm = self.b.create_block();
+        self.b.set_cold_block(pcm);
+        self.b.ins().brif(pointer.file, overlay, &[], pcm, &[]);
+        self.b.switch_to_block(pcm);
         self.store_atomic(pointer.address, value);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(overlay);
+        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        self.b.ins().stack_store(value, slot, 0);
+        let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
+        let width = self.constant(self.b.func.dfg.value_type(value).bytes());
+        self.b.ins().call(
+            self.file_prepared_ref,
+            &[self.bridge, pointer.guest, buffer, width],
+        );
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
     }
@@ -1780,7 +1872,7 @@ impl Emitter<'_> {
     fn destination(&mut self, i: &Instruction) -> Option<GuestPointer> {
         if i.op0_kind() == OpKind::Memory {
             let addr = self.address(i);
-            Some(self.pointer(addr, true, i.memory_size().size()))
+            Some(self.pointer(addr, i.memory_size().size()))
         } else {
             None
         }
@@ -1968,10 +2060,16 @@ impl Emitter<'_> {
             let retry = self.b.create_block();
             let fallback = self.b.create_block();
             let budget = self.b.create_block();
+            let read_fault = self.b.create_block();
+            let write_fault = self.b.create_block();
+            self.b.set_cold_block(read_fault);
+            self.b.set_cold_block(write_fault);
             let mut switch = Switch::new();
             switch.set_entry(0, done);
             switch.set_entry(u128::from(crate::strings::MORE), retry);
             switch.set_entry(u128::from(crate::strings::BUDGET), budget);
+            switch.set_entry(u128::from(crate::strings::READ_FAULT), read_fault);
+            switch.set_entry(u128::from(crate::strings::WRITE_FAULT), write_fault);
             switch.emit(&mut self.b, result, fallback);
             self.b.switch_to_block(done);
             self.direct(i.next_ip32());
@@ -1981,6 +2079,10 @@ impl Emitter<'_> {
             self.exit_const(Exit::Fallback, i.ip32());
             self.b.switch_to_block(budget);
             self.exit_const(Exit::Budget, i.ip32());
+            self.b.switch_to_block(read_fault);
+            self.exit_const(Exit::ReadFault, i.ip32());
+            self.b.switch_to_block(write_fault);
+            self.exit_const(Exit::WriteFault, i.ip32());
             return true;
         }
         if matches!(i.mnemonic(), M::Cmp | M::Test) {
@@ -2103,7 +2205,7 @@ impl Emitter<'_> {
                 let v = self.read(i, 0);
                 let sp = self.b.use_var(self.regs[4]);
                 let sp = self.b.ins().iadd_imm(sp, -4);
-                let ptr = self.pointer(sp, true, 4);
+                let ptr = self.pointer(sp, 4);
                 let pushed = if i.mnemonic() == M::Call {
                     self.constant(i.next_ip32())
                 } else {
@@ -2123,8 +2225,7 @@ impl Emitter<'_> {
             }
             M::Pop | M::Ret => {
                 let sp = self.b.use_var(self.regs[4]);
-                let ptr = self.pointer(sp, false, 4);
-                let value = self.load_memory(ptr, types::I32);
+                let value = self.direct_load(sp, types::I32);
                 let adjustment = if i.mnemonic() == M::Ret && i.op_count() != 0 {
                     i64::from(i.immediate16())
                 } else {
