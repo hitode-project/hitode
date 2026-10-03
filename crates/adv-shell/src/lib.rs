@@ -2,6 +2,8 @@
 mod audio;
 mod control;
 mod frontend;
+#[cfg(all(windows, feature = "gpu"))]
+mod native_gpu;
 mod performance;
 pub mod window;
 
@@ -479,8 +481,16 @@ fn run(options: Options) -> Result<u8, String> {
     window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
     let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
+    let mut background =
+        adv_sync::background::Builder::new(wake.clone()).map_err(|error| error.to_string())?;
+    let execution_sender = background
+        .sender_with_capacity_wake(8, 8, wake.clone())
+        .map_err(|error| error.to_string())?;
     if options.headless {
-        return run_execution(options, None, wake, keys);
+        let mut service = background.start().map_err(|error| error.to_string())?;
+        let result = run_execution(options, None, wake, keys, execution_sender);
+        service.shutdown();
+        return result;
     }
     let mut window = window::Window::new(
         &format!(
@@ -496,13 +506,30 @@ fn run(options: Options) -> Result<u8, String> {
         options.hidden,
     )?;
     let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
+    #[cfg(all(windows, feature = "gpu"))]
+    {
+        // Startup is the only UI-side GPU initialization. Guest submission has
+        // not begun, so configuring the initially empty queue cannot race it.
+        let (gpu, presenter) = window.create_native()?;
+        let context = gpu.context().clone();
+        context
+            .set_execution_wake(wake.clone())
+            .map_err(|_| "GPU execution wake was already registered")?;
+        let ui_sender = background
+            .sender_with_capacity_wake(1, 1, ui.wake())
+            .map_err(|error| error.to_string())?;
+        ui.native(presenter, ui_sender);
+    }
+    // All startup ports are registered before this one common worker starts.
+    // Interpretation uses it as well, even when compilation is disabled.
+    let mut service = background.start().map_err(|error| error.to_string())?;
     let completion_wake = ui.wake();
     let (mut tx, mut rx) = adv_sync::spsc::channel(1);
     let execution = std::thread::Builder::new()
         .name("adv-execution".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_execution(options, Some(worker), wake, keys)
+                run_execution(options, Some(worker), wake, keys, execution_sender)
             }))
             .unwrap_or_else(|_| Err("execution worker panicked".into()));
             let _ = tx.push(result);
@@ -514,6 +541,9 @@ fn run(options: Options) -> Result<u8, String> {
     execution
         .join()
         .map_err(|_| "execution worker panicked".to_owned())?;
+    // Accepted presenter and fence jobs return/drop their owned resources while
+    // HWND is still alive. The window is destroyed only after this join.
+    service.shutdown();
     result?
 }
 
@@ -522,6 +552,7 @@ fn run_execution(
     mut window: Option<frontend::Worker>,
     wake: window::WakeEvent,
     keys: std::sync::Arc<adv_sync::input::KeyState>,
+    background: adv_sync::background::Sender,
 ) -> Result<u8, String> {
     let started = Instant::now();
     let mut runtime = Runtime::with_codec(
@@ -535,6 +566,10 @@ fn run_execution(
     runtime.set_codepage(options.codepage);
     runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
+    runtime
+        .machine
+        .cpu
+        .set_background_sender(background.into_local())?;
     if options.time_skip {
         let skip_keys = keys.clone();
         let pending_input = wake.interrupt_flag();

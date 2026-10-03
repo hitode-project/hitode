@@ -11,6 +11,38 @@ struct Samples {
     max_ms: f64,
 }
 const SAMPLE_CAPACITY: usize = 4096;
+/// Cumulative native compositor observations, independent of metric resets.
+/// Queue delay is reported separately from nonpreemptible acquire/configure.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativePresentation {
+    pub consumed: u64,
+    pub uploads: u64,
+    pub presented: u64,
+    pub configurations: u64,
+    pub max_queue_ns: u64,
+    pub max_job_ns: u64,
+    pub max_acquire_ns: u64,
+    pub max_configure_ns: u64,
+}
+impl NativePresentation {
+    fn json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"cumulative\": true, \"consumed_frames\": {}, \"software_uploads\": {}, ",
+                "\"presentations\": {}, \"configurations\": {}, \"max_queue_ns\": {}, ",
+                "\"max_job_ns\": {}, \"max_acquire_ns\": {}, \"max_configure_ns\": {}}}"
+            ),
+            self.consumed,
+            self.uploads,
+            self.presented,
+            self.configurations,
+            self.max_queue_ns,
+            self.max_job_ns,
+            self.max_acquire_ns,
+            self.max_configure_ns
+        )
+    }
+}
 impl Samples {
     fn add(&mut self, elapsed: Duration) {
         let milliseconds = elapsed.as_secs_f64() * 1000.0;
@@ -56,6 +88,7 @@ pub struct Performance {
     pump_total: Duration,
     pump_max: Duration,
     ui_metrics_dropped_total: u64,
+    native: Option<NativePresentation>,
     observed_serial: u64,
     observations: u64,
     serial_skipped: u64,
@@ -91,6 +124,7 @@ impl Performance {
             // This channel-health counter is cumulative for the process,
             // independent of when delayed metrics reach the measurement window.
             ui_metrics_dropped_total: self.ui_metrics_dropped_total,
+            native: self.native,
             ..Self::default()
         };
     }
@@ -109,6 +143,10 @@ impl Performance {
     }
     pub fn set_ui_metrics_dropped(&mut self, total: u64) {
         self.ui_metrics_dropped_total = total;
+    }
+    #[cfg(all(windows, feature = "gpu"))]
+    pub(crate) fn native(&mut self, stats: NativePresentation) {
+        self.native = Some(stats);
     }
     pub fn step(&mut self, elapsed: Duration, serial: u64) {
         self.steps += 1;
@@ -178,6 +216,7 @@ impl Performance {
                 "    \"runtime_steps\": {}, \"runtime_soft_yields\": {}, \"runtime_step_seconds\": {:.6}, \"runtime_step_max_seconds\": {:.6},\n",
                 "    \"cold_step_seconds_before_first_observation\": {:.6}, \"event_pump_seconds\": {:.6}, \"event_pump_max_seconds\": {:.6},\n",
                 "    \"ui_metrics_dropped_total\": {},\n",
+                "    \"native_presentation\": {},\n",
                 "    \"frame_observations\": {}, \"guest_serial_skipped_between_observations\": {}, \"guest_serial_delta_max\": {},\n",
                 "    \"warm_steps_producing_available_frames\": {},\n",
                 "    \"warm_active_runtime_between_frame_observations\": {},\n",
@@ -199,6 +238,8 @@ impl Performance {
             self.pump_total.as_secs_f64(),
             self.pump_max.as_secs_f64(),
             self.ui_metrics_dropped_total,
+            self.native
+                .map_or_else(|| "null".into(), |stats| stats.json()),
             self.observations,
             self.serial_skipped,
             self.serial_delta_max,

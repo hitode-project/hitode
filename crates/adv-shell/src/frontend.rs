@@ -17,6 +17,8 @@ enum Delivery {
     Input(window::Event),
     Present(u64, Duration, Instant),
     Pump(Duration, Instant),
+    #[cfg(all(windows, feature = "gpu"))]
+    Native(performance::NativePresentation),
 }
 const INPUT_CAPACITY: usize = 4096;
 const METRIC_LIMIT: usize = 128;
@@ -32,7 +34,9 @@ pub struct Worker {
 pub struct Ui {
     events: spsc::Producer<Delivery>,
     requests: spsc::Consumer<Request>,
-    frames: FrameConsumer,
+    frames: Option<FrameConsumer>,
+    #[cfg(all(windows, feature = "gpu"))]
+    native: Option<crate::native_gpu::UiPresenter>,
     keys: Arc<KeyState>,
     execution_wake: WakeEvent,
     wake: WakeEvent,
@@ -58,7 +62,9 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
         Ui {
             events,
             requests: requests_rx,
-            frames: frames_rx,
+            frames: Some(frames_rx),
+            #[cfg(all(windows, feature = "gpu"))]
+            native: None,
             keys,
             execution_wake: wake,
             wake: ui_wake,
@@ -78,6 +84,8 @@ impl Worker {
                 Delivery::Input(event) => events.push(event),
                 Delivery::Present(serial, elapsed, at) => performance.present(serial, elapsed, at),
                 Delivery::Pump(elapsed, at) => performance.pump(elapsed, at),
+                #[cfg(all(windows, feature = "gpu"))]
+                Delivery::Native(stats) => performance.native(stats),
             }
         }
         performance.set_ui_metrics_dropped(self.metrics_dropped.load(Ordering::Relaxed));
@@ -99,6 +107,21 @@ impl Worker {
     }
 }
 impl Ui {
+    #[cfg(all(windows, feature = "gpu"))]
+    pub(crate) fn native(
+        &mut self,
+        presenter: crate::native_gpu::WindowPresenter,
+        sender: adv_sync::background::Sender,
+    ) {
+        self.native = Some(crate::native_gpu::UiPresenter::new(
+            presenter,
+            self.frames
+                .take()
+                .expect("native compositor installed once"),
+            sender,
+            self.wake.clone(),
+        ));
+    }
     fn deliver(&mut self, event: Delivery) -> Result<(), String> {
         self.events
             .push(event)
@@ -166,10 +189,46 @@ impl Ui {
             let started = Instant::now();
             let events = window.pump();
             repaint |= self.pump_events(events, started)?;
-            if Instant::now() >= next && (self.frames.has_update() || repaint) {
+            #[cfg(all(windows, feature = "gpu"))]
+            if let Some(native) = &mut self.native {
+                let completed = native.poll()?;
+                if let Some(completed) = completed {
+                    self.metric(Delivery::Native(completed.stats));
+                    repaint |= window.native_canvas(completed.rendered.canvas)?;
+                    if matches!(
+                        completed.rendered.result,
+                        crate::native_gpu::DrawResult::Presented
+                    ) {
+                        self.metric(Delivery::Present(
+                            completed.rendered.serial,
+                            completed.elapsed,
+                            completed.at,
+                        ));
+                    }
+                }
+                let native = self.native.as_mut().unwrap();
+                let dimensions = window.native_client_size()?;
+                if Instant::now() >= next
+                    && (native.has_update() || repaint)
+                    && native.schedule(dimensions, repaint)?
+                {
+                    repaint = false;
+                    next = window.next_refresh();
+                }
+                let delay = (!native.in_flight()
+                    && (native.has_update() || repaint)
+                    && dimensions.0 != 0
+                    && dimensions.1 != 0)
+                    .then(|| next.saturating_duration_since(Instant::now()));
+                window.wait_with_wake(delay, Some(&self.wake))?;
+                continue;
+            }
+            let frames = self.frames.as_mut().expect("software UI owns its consumer");
+            if Instant::now() >= next && (frames.has_update() || repaint) {
                 let present_started = Instant::now();
-                let changed = if self.frames.update() {
-                    self.frames.current().snapshot(&mut candidate)?;
+                let updated = frames.update();
+                let changed = if updated {
+                    frames.current().snapshot(&mut candidate)?;
                     let changed = snapshot.width != candidate.width
                         || snapshot.height != candidate.height
                         || snapshot.bgra != candidate.bgra;
@@ -190,7 +249,7 @@ impl Ui {
                 repaint = false;
                 next = window.next_refresh();
             }
-            let delay = (self.frames.has_update() || repaint)
+            let delay = (self.frames.as_ref().unwrap().has_update() || repaint)
                 .then(|| next.saturating_duration_since(Instant::now()));
             window.wait_with_wake(delay, Some(&self.wake))?;
         }
@@ -238,10 +297,22 @@ mod tests {
             Duration::from_millis(1),
             Instant::now(),
         ));
+        #[cfg(all(windows, feature = "gpu"))]
+        ui.metric(Delivery::Native(performance::NativePresentation {
+            consumed: 2,
+            uploads: 1,
+            presented: 1,
+            ..Default::default()
+        }));
         assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
         assert!(!wake.interrupt_flag().load(Ordering::Acquire));
         let mut performance = performance::Performance::default();
         assert!(worker.pump(&mut performance).is_empty());
+        #[cfg(all(windows, feature = "gpu"))]
+        {
+            performance.reset(1);
+            assert!(performance.json().contains("\"software_uploads\": 1"));
+        }
         ui.pump_events(
             vec![window::Event::Input {
                 message: 0x100,

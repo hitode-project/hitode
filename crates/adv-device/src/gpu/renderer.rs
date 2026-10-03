@@ -27,9 +27,65 @@ pub struct NativeContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    queue: wgpu::Queue,
     id: u64,
     failure: Arc<OnceLock<String>>,
+    gate: Arc<submission::Gate>,
+}
+
+impl NativeContext {
+    pub fn check(&self) -> Result<(), Error> {
+        match self.failure.get() {
+            Some(error) => Err(Error::Device(error.clone())),
+            None => Ok(()),
+        }
+    }
+    pub fn submission(&self) -> Result<Submission<'_>, Error> {
+        self.check()?;
+        Ok(Submission {
+            context: self,
+            _lease: self.gate.enter()?,
+        })
+    }
+    pub fn pause_submissions(&self) -> Result<SubmissionPause, Error> {
+        self.gate.pause()
+    }
+    /// Install the existing execution wait object once during assembly.
+    pub fn set_execution_wake(&self, wake: adv_sync::WakeEvent) -> Result<(), adv_sync::WakeEvent> {
+        self.gate.set_wake(wake)
+    }
+}
+
+/// A short nonblocking submission lease. The raw queue is never exposed, so
+/// native consumers cannot accidentally bypass configuration exclusion.
+pub struct Submission<'a> {
+    context: &'a NativeContext,
+    _lease: submission::Lease,
+}
+impl Submission<'_> {
+    pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.context.queue.write_buffer(buffer, offset, data);
+    }
+    pub fn write_texture(
+        &self,
+        texture: wgpu::TexelCopyTextureInfo<'_>,
+        data: &[u8],
+        layout: wgpu::TexelCopyBufferLayout,
+        size: wgpu::Extent3d,
+    ) {
+        self.context
+            .queue
+            .write_texture(texture, data, layout, size);
+    }
+    pub fn submit(
+        &self,
+        commands: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> wgpu::SubmissionIndex {
+        self.context.queue.submit(commands)
+    }
+    pub fn present(&self, texture: wgpu::SurfaceTexture) {
+        self.context.queue.present(texture);
+    }
 }
 
 /// An owned color image, usable both as a texture and as a render target.
@@ -84,10 +140,47 @@ pub struct Readback {
     completion: adv_sync::spsc::Consumer<Result<Vec<u8>, Error>>,
     pub width: u32,
     pub height: u32,
+    context: NativeContext,
+    submission: wgpu::SubmissionIndex,
+    job_taken: bool,
 }
 impl Readback {
     pub fn poll(&mut self) -> Option<Result<Vec<u8>, Error>> {
         self.completion.pop()
+    }
+
+    /// Submit this once to the shared backend service. It never runs guest code
+    /// and must never execute on UI or the machine's execution thread. The fence
+    /// is this transfer's submission, not a continually moving latest frame.
+    pub fn take_completion_job(&mut self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        if std::mem::replace(&mut self.job_taken, true) {
+            return None;
+        }
+        let context = self.context.clone();
+        let submission = self.submission.clone();
+        Some(Box::new(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                context.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })
+            }));
+            let failure = match result {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("GPU transfer completion panicked".into()),
+            };
+            if let Some(error) = failure {
+                // A stalled/lost device is a failure, never a successful empty
+                // readback. Destruction fails outstanding maps and invokes the
+                // existing one-shot completion producer with its wake event.
+                let _ = context
+                    .failure
+                    .set(format!("GPU transfer fence failed: {error}"));
+                context.device.destroy();
+                let _ = context.device.poll(wgpu::PollType::Poll);
+            }
+        }))
     }
 }
 
@@ -127,11 +220,30 @@ impl Gpu {
     /// unavailable adapter is an error, never a no-op renderer.
     pub async fn request(fallback: bool) -> Result<Self, Error> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        Self::request_from(instance, None, fallback).await
+    }
+
+    /// The platform shell creates its native surface first. This request chooses
+    /// an adapter capable of presenting to that surface, using the same device
+    /// and Queue for rendering and composition. No platform types enter here.
+    pub async fn request_presenting(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        fallback: bool,
+    ) -> Result<Self, Error> {
+        Self::request_from(instance, Some(surface), fallback).await
+    }
+
+    async fn request_from(
+        instance: wgpu::Instance,
+        surface: Option<&wgpu::Surface<'_>>,
+        fallback: bool,
+    ) -> Result<Self, Error> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: fallback,
-                compatible_surface: None,
+                compatible_surface: surface,
                 ..Default::default()
             })
             .await
@@ -160,6 +272,7 @@ impl Gpu {
             queue,
             id: NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed),
             failure,
+            gate: submission::Gate::new().map_err(|error| Error::Unavailable(error.to_string()))?,
         };
         let error_scope = context
             .device
@@ -223,7 +336,7 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let white = Self::make_image(&context, 1, 1);
-        context.queue.write_texture(
+        context.submission()?.write_texture(
             white.texture.as_image_copy(),
             &[255; 4],
             wgpu::TexelCopyBufferLayout {
@@ -277,10 +390,7 @@ impl Gpu {
     }
 
     pub fn check(&self) -> Result<(), Error> {
-        match self.context.failure.get() {
-            Some(error) => Err(Error::Device(error.clone())),
-            None => Ok(()),
-        }
+        self.context.check()
     }
 
     /// Nonblocking completion maintenance, for the shell/machine driver.
@@ -377,6 +487,7 @@ impl Gpu {
         pitch: u32,
         bgra: &[u8],
     ) -> Result<(), Error> {
+        let submission = self.context.submission()?;
         self.own(image)?;
         rectangle_in(image, rectangle)?;
         let row = rectangle
@@ -388,7 +499,7 @@ impl Gpu {
         if pitch < row || pitch & 3 != 0 || bgra.len() < size {
             return Err(invalid("upload pitch or storage is too small"));
         }
-        self.context.queue.write_texture(
+        submission.write_texture(
             wgpu::TexelCopyTextureInfo {
                 origin: wgpu::Origin3d {
                     x: rectangle.x,
@@ -414,6 +525,8 @@ impl Gpu {
         color: Option<[f64; 4]>,
         depth: Option<f32>,
     ) -> Result<(), Error> {
+        let context = self.context.clone();
+        let submission = context.submission()?;
         self.own(&target.image)?;
         if color.is_some_and(|c| c.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)))
             || depth.is_some_and(|d| !d.is_finite() || !(0.0..=1.0).contains(&d))
@@ -460,7 +573,7 @@ impl Gpu {
                 ..Default::default()
             });
         }
-        self.submit(encoder);
+        self.submit(encoder, &submission);
         self.check()
     }
 
@@ -530,6 +643,8 @@ impl Gpu {
         image: Option<&Image>,
         state: DrawState,
     ) -> Result<(), Error> {
+        let context = self.context.clone();
+        let submission = context.submission()?;
         self.own(&target.image)?;
         if let Some(image) = image {
             self.own(image)?;
@@ -564,18 +679,14 @@ impl Gpu {
         };
         let pipeline = self.pipeline(key)?;
         let sampler = self.sampler(state.sampler);
-        self.context
-            .queue
-            .write_buffer(&self.upload, 0, bytemuck::cast_slice(vertices));
+        submission.write_buffer(&self.upload, 0, bytemuck::cast_slice(vertices));
         let parameters = [
             texture_op(state.texture_op),
             texture_op(state.alpha_texture_op),
             compare_index(state.alpha_test),
             state.alpha_reference.to_bits(),
         ];
-        self.context
-            .queue
-            .write_buffer(&self.uniform, 0, bytemuck::cast_slice(&parameters));
+        submission.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&parameters));
         let binding = self
             .context
             .device
@@ -644,15 +755,20 @@ impl Gpu {
             pass.set_vertex_buffer(0, self.upload.slice(0..size));
             pass.draw(0..vertices.len() as u32, 0..1);
         }
-        self.submit(encoder);
+        self.submit(encoder, &submission);
         self.stats.draws += 1;
         self.stats.vertices += vertices.len() as u64;
         self.check()
     }
 
-    fn submit(&mut self, encoder: wgpu::CommandEncoder) {
-        self.context.queue.submit([encoder.finish()]);
+    fn submit(
+        &mut self,
+        encoder: wgpu::CommandEncoder,
+        guard: &Submission<'_>,
+    ) -> wgpu::SubmissionIndex {
+        let submission = guard.submit([encoder.finish()]);
         self.stats.submissions += 1;
+        submission
     }
 
     pub fn copy(
@@ -662,6 +778,20 @@ impl Gpu {
         destination: &Image,
         x: u32,
         y: u32,
+    ) -> Result<(), Error> {
+        let context = self.context.clone();
+        let submission = context.submission()?;
+        self.copy_under(source, rectangle, destination, x, y, &submission)
+    }
+
+    fn copy_under(
+        &mut self,
+        source: &Image,
+        rectangle: Rect,
+        destination: &Image,
+        x: u32,
+        y: u32,
+        submission: &Submission<'_>,
     ) -> Result<(), Error> {
         self.own(source)?;
         self.own(destination)?;
@@ -697,12 +827,14 @@ impl Gpu {
             },
             extent(rectangle.w, rectangle.h),
         );
-        self.submit(encoder);
+        self.submit(encoder, submission);
         self.check()
     }
 
     /// Present through a GPU snapshot. No readback, CPU conversion or upload.
     pub fn present(&mut self, image: &Image, serial: u64) -> Result<NativeFrame, Error> {
+        let context = self.context.clone();
+        let submission = context.submission()?;
         self.own(image)?;
         let reusable = self
             .frames
@@ -724,7 +856,7 @@ impl Gpu {
             self.frames.len() - 1
         };
         let snapshot = self.frames[index].clone();
-        self.copy(
+        self.copy_under(
             image,
             Rect {
                 x: 0,
@@ -735,6 +867,7 @@ impl Gpu {
             &snapshot,
             0,
             0,
+            &submission,
         )?;
         self.stats.native_frames += 1;
         Ok(NativeFrame {
@@ -749,6 +882,8 @@ impl Gpu {
         image: &Image,
         wake: Option<Arc<adv_sync::WakeEvent>>,
     ) -> Result<Readback, Error> {
+        let context = self.context.clone();
+        let submission_guard = context.submission()?;
         self.own(image)?;
         self.readbacks
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -782,7 +917,7 @@ impl Gpu {
             },
             extent(image.width, image.height),
         );
-        self.submit(encoder);
+        let submission = self.submit(encoder, &submission_guard);
         let (mut producer, consumer) = adv_sync::spsc::channel(1);
         let completion_buffer = buffer.clone();
         let (width, height) = (image.width, image.height);
@@ -815,6 +950,9 @@ impl Gpu {
             completion: consumer,
             width,
             height,
+            context: self.context.clone(),
+            submission,
+            job_taken: false,
         })
     }
 }

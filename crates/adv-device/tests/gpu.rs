@@ -459,3 +459,133 @@ fn destroyed_device_is_reported_and_commands_never_return_success_after_loss() {
     assert!(gpu.readback(&target.image, None).is_err());
     assert_eq!(gpu.stats().submissions, before);
 }
+
+#[test]
+fn explicit_completion_job_drives_one_readback_and_wakes_without_a_poll_loop() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+    gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None)
+        .unwrap();
+    let mut readback = gpu.readback(&target.image, Some(wake.clone())).unwrap();
+    let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();
+    let mut sender = builder.sender(1, 1).unwrap();
+    let mut service = builder.start().unwrap();
+    let completion = readback.take_completion_job().unwrap();
+    assert!(readback.take_completion_job().is_none());
+    let ticket = sender
+        .try_submit(
+            adv_sync::background::Priority::Urgent,
+            adv_sync::background::Task::new(completion)
+                .finish_on_shutdown()
+                .without_wake(),
+        )
+        .unwrap();
+    assert!(wake.wait(Some(Duration::from_secs(10))).unwrap());
+    assert_eq!(
+        pixel(&readback.poll().unwrap().unwrap(), 8, 4, 4),
+        [0, 0, 255, 255]
+    );
+    assert!(readback.poll().is_none());
+    service.shutdown();
+    assert_eq!(ticket.status(), adv_sync::background::Status::Completed);
+}
+
+#[test]
+fn accepted_transfer_after_device_loss_finishes_with_a_typed_error_and_wake() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+    gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None)
+        .unwrap();
+    let mut readback = gpu.readback(&target.image, Some(wake.clone())).unwrap();
+    let completion = readback.take_completion_job().unwrap();
+    gpu.context().device.destroy();
+    let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();
+    let mut sender = builder.sender(1, 1).unwrap();
+    let mut service = builder.start().unwrap();
+    let ticket = sender
+        .try_submit(
+            adv_sync::background::Priority::Urgent,
+            adv_sync::background::Task::new(completion)
+                .finish_on_shutdown()
+                .without_wake(),
+        )
+        .unwrap();
+    service.shutdown();
+    assert_eq!(ticket.status(), adv_sync::background::Status::Completed);
+    assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+    assert!(matches!(readback.poll().unwrap(), Err(Error::Device(_))));
+    assert!(readback.poll().is_none());
+    assert!(gpu.check().is_err());
+}
+
+#[test]
+fn configuration_pause_rejects_all_queue_operations_before_observable_mutation() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    let destination = gpu.image(8, 8).unwrap();
+    gpu.clear(&target, Some([0.0, 1.0, 0.0, 1.0]), None)
+        .unwrap();
+    let context = gpu.context().clone();
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    assert!(context.set_execution_wake(wake.clone()).is_ok());
+    let pause = context.pause_submissions().unwrap();
+    pause.wait_drained().unwrap();
+    let before = gpu.stats();
+    assert!(matches!(
+        gpu.upload(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8
+            },
+            32,
+            &[255; 256]
+        ),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        gpu.draw(
+            &target,
+            &quad([1.0; 4], 0.5, 1.0),
+            None,
+            DrawState::new(8, 8)
+        ),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        gpu.copy(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8
+            },
+            &destination,
+            0,
+            0
+        ),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(gpu.present(&target.image, 1), Err(Error::Busy)));
+    assert!(matches!(
+        gpu.readback(&target.image, None),
+        Err(Error::Busy)
+    ));
+    assert_eq!(gpu.stats(), before);
+    assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
+    drop(pause);
+    assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+    assert_eq!(
+        pixel(&read(&mut gpu, &target.image), 8, 4, 4),
+        [0, 255, 0, 255]
+    );
+}

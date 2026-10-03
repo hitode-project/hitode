@@ -2,7 +2,10 @@
 //! no guest addresses, Windows handles, COM layouts or D3D state identifiers.
 use crate::surface::Rect;
 mod renderer;
+mod submission;
+pub use renderer::Submission;
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Target};
+pub use submission::SubmissionPause;
 
 /// Clip-space position, RGBA diffuse color and normalized texture coordinates.
 #[repr(C)]
@@ -151,7 +154,7 @@ impl DrawState {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub submissions: u64,
     pub draws: u64,

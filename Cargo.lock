@@ -159,6 +159,8 @@ dependencies = [
  "adv-sync",
  "log",
  "png",
+ "pollster",
+ "wgpu",
  "windows-sys 0.60.2",
 ]
 

@@ -1,5 +1,7 @@
 use adv_runtime::Snapshot;
 pub use adv_sync::WakeEvent;
+#[cfg(all(windows, feature = "gpu"))]
+pub(crate) use native::native_viewport;
 use std::time::Duration;
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -49,6 +51,8 @@ mod native {
         closed: bool,
         retained: RetainedFrame,
         paint_error: Option<String>,
+        #[cfg(feature = "gpu")]
+        gpu_mode: bool,
     }
     pub struct Window {
         hwnd: HWND,
@@ -130,6 +134,31 @@ mod native {
                     .div_euclid(i64::from(self.height.max(1))) as i32,
             )
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn native_viewport(
+        width: u32,
+        height: u32,
+        canvas_width: u32,
+        canvas_height: u32,
+    ) -> [f32; 4] {
+        let viewport = Viewport::fit(
+            &RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            },
+            canvas_width,
+            canvas_height,
+        );
+        [
+            viewport.x as f32,
+            viewport.y as f32,
+            viewport.width as f32,
+            viewport.height as f32,
+        ]
     }
 
     fn outer_rect(width: i32, height: i32, dpi: u32) -> Result<RECT, String> {
@@ -397,6 +426,14 @@ mod native {
                     let mut paint = std::mem::zeroed();
                     let dc = BeginPaint(hwnd, &mut paint);
                     let mut rect = std::mem::zeroed();
+                    #[cfg(feature = "gpu")]
+                    if (*pointer).gpu_mode {
+                        // DWM retains the previous opaque swapchain image. UI
+                        // records a new draw at its next refresh opportunity.
+                        EndPaint(hwnd, &paint);
+                        (*pointer).events.push_back(Event::Repaint);
+                        return 0;
+                    }
                     let result = if dc.is_null() || GetClientRect(hwnd, &mut rect) == 0 {
                         Err("BeginPaint/GetClientRect failed".into())
                     } else {
@@ -560,6 +597,8 @@ mod native {
                 closed: false,
                 retained: RetainedFrame::default(),
                 paint_error: None,
+                #[cfg(feature = "gpu")]
+                gpu_mode: false,
             });
             // SAFETY: null-terminated strings and the boxed state outlive window creation.
             let hwnd = unsafe {
@@ -659,6 +698,10 @@ mod native {
         }
 
         pub fn present(&mut self, frame: &Snapshot) -> Result<(), String> {
+            #[cfg(feature = "gpu")]
+            if self.state.gpu_mode {
+                return Err("GPU window frames must use the owned compositor".into());
+            }
             self.state.retained.update(frame)?;
             self.state.width = frame.width;
             self.state.height = frame.height;
@@ -684,6 +727,65 @@ mod native {
                 result?;
             }
             Ok(())
+        }
+
+        /// Startup preparation, before an execution worker can submit to this
+        /// device. Normal paint/present never configures or waits for queue idle.
+        #[cfg(feature = "gpu")]
+        pub(crate) fn create_native(
+            &mut self,
+        ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
+            let width = self.state.client_width.max(1) as u32;
+            let height = self.state.client_height.max(1) as u32;
+            // SAFETY: the assembly joins backend tasks before destroying HWND.
+            let (gpu, mut presenter) = pollster::block_on(unsafe {
+                crate::native_gpu::WindowPresenter::request(self.hwnd, width, height)
+            })?;
+            presenter.configure_exclusive(width, height)?;
+            self.state.gpu_mode = true;
+            Ok((gpu, presenter))
+        }
+
+        #[cfg(all(test, feature = "gpu"))]
+        pub(crate) fn prepare_native(
+            &mut self,
+            context: adv_device::gpu::NativeContext,
+        ) -> Result<crate::native_gpu::WindowPresenter, String> {
+            let width = self.state.client_width.max(1) as u32;
+            let height = self.state.client_height.max(1) as u32;
+            // SAFETY: the assembly joins required backend tasks and drops the
+            // returned presenter before destroying this HWND.
+            let mut presenter = unsafe {
+                crate::native_gpu::WindowPresenter::new(self.hwnd, context, width, height)?
+            };
+            presenter.configure_exclusive(width, height)?;
+            self.state.gpu_mode = true;
+            Ok(presenter)
+        }
+
+        /// UI-only geometry and input mapping. No GPU call takes place here.
+        #[cfg(feature = "gpu")]
+        pub fn native_client_size(&self) -> Result<(u32, u32), String> {
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetClientRect(self.hwnd, &mut rect) } == 0 {
+                return Err("GetClientRect for GPU window failed".into());
+            }
+            Ok((rect.right.max(0) as u32, rect.bottom.max(0) as u32))
+        }
+
+        #[cfg(feature = "gpu")]
+        pub fn native_canvas(&mut self, canvas: (u32, u32)) -> Result<bool, String> {
+            if canvas.0 == 0 || canvas.1 == 0 {
+                return Ok(false);
+            }
+            self.state.width = canvas.0;
+            self.state.height = canvas.1;
+            let changed = self.frame_size != Some(canvas);
+            if changed {
+                set_client_size(self.hwnd, canvas.0, canvas.1)?;
+                self.frame_size = Some(canvas);
+            }
+            Ok(changed)
         }
 
         #[allow(dead_code)] // Also used by the standalone wait_probe example.
