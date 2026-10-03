@@ -121,7 +121,7 @@ fn native_guard_with_one_unit_yields_then_delivers_the_precise_fault() {
 }
 
 #[test]
-fn feature_queries_are_virtual_and_do_not_advertise_host_avx_or_tsc() {
+fn feature_queries_expose_reference_tsc_without_host_avx_or_rdtscp() {
     for leaf in [0, 1, 7, 0x8000_0000, 0x8000_0001] {
         let mut m = machine(&[0x0f, 0xa2, 0xc3]);
         m.state.regs[0] = leaf;
@@ -139,7 +139,7 @@ fn feature_queries_are_virtual_and_do_not_advertise_host_avx_or_tsc() {
             }
             1 => {
                 assert_eq!(m.state.regs[1], 0);
-                assert_eq!(m.state.regs[2] & (1 << 4), 0);
+                assert_ne!(m.state.regs[2] & (1 << 4), 0);
                 assert_ne!(m.state.regs[2] & (1 << 26), 0);
             }
             0x8000_0000 => assert_eq!(m.state.regs[0], leaf),

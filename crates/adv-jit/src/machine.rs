@@ -117,6 +117,7 @@ pub struct Machine {
     callbacks: Vec<CallbackFrame>,
     suspended: Option<Suspended>,
     wake: Option<Resume>,
+    timestamp: crate::timestamp::Counter,
     pub state: CpuState,
     pub stats: Stats,
 }
@@ -172,6 +173,7 @@ impl Machine {
     ) -> Result<RunOutcome, String> {
         let apis = BTreeMap::new();
         let mut bridge = Bridge {
+            timestamp: std::mem::take(&mut self.timestamp),
             apis: &apis,
             services: &mut RejectServices,
             memory: &mut self.memory,
@@ -187,6 +189,7 @@ impl Machine {
         self.stats.host_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
+        self.timestamp = bridge.timestamp;
         result
     }
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
@@ -235,6 +238,7 @@ impl Machine {
             callbacks: Vec::new(),
             suspended: None,
             wake: None,
+            timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
         })
@@ -740,6 +744,7 @@ impl Machine {
         // the complete API table and all module/name strings on every entry.
         let apis = Arc::clone(&self.apis);
         let mut bridge = Bridge {
+            timestamp: std::mem::take(&mut self.timestamp),
             apis: &apis,
             services,
             memory: &mut self.memory,
@@ -755,6 +760,7 @@ impl Machine {
         self.stats.host_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
+        self.timestamp = bridge.timestamp;
         result
     }
 
@@ -1039,6 +1045,17 @@ impl Machine {
             }
             self.deferred_fallback = None;
             let step = match execution.step {
+                Step::ReadTimestamp { pc, next } => {
+                    let ticks = bridge.read_timestamp();
+                    self.state.regs[0] = ticks as u32;
+                    self.state.regs[2] = (ticks >> 32) as u32;
+                    self.state.eip = next;
+                    if single_step {
+                        Step::Trap { pc, vector: 1 }
+                    } else {
+                        Step::Executed
+                    }
+                }
                 Step::InvalidInstruction { pc } if bridge.raw.is_some() => {
                     Step::Trap { pc, vector: 6 }
                 }
@@ -1046,6 +1063,7 @@ impl Machine {
             };
             match step {
                 Step::Executed => {}
+                Step::ReadTimestamp { .. } => unreachable!("completed by the execution owner"),
                 Step::ReadFault { pc, address } => {
                     self.state.fault_addr = address;
                     return Ok(RunOutcome::ReadFault { pc, address });

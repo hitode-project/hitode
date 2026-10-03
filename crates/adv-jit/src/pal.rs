@@ -224,6 +224,9 @@ struct Raw<'a> {
     handler: &'a mut dyn TrapHandler,
 }
 impl crate::host::RawTrap for Raw<'_> {
+    fn guest_time_us(&mut self) -> Option<u64> {
+        self.handler.guest_time_us()
+    }
     fn call(
         &mut self,
         state: &mut CpuState,

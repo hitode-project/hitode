@@ -363,6 +363,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     .map_err(|e| e.to_string())?;
     builder.symbol("adv_host_call", crate::host::host_call as *const u8);
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
+    builder.symbol(
+        "adv_read_timestamp",
+        crate::host::read_timestamp as *const u8,
+    );
     let mut module = JITModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
@@ -394,6 +398,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_repeat", Linkage::Import, &repeat_signature)
         .map_err(|e| e.to_string())?;
     let repeat_ref = module.declare_func_in_func(repeat_id, &mut ctx.func);
+    let mut timestamp_signature = module.make_signature();
+    timestamp_signature.params.push(AbiParam::new(ptr_ty));
+    timestamp_signature.returns.push(AbiParam::new(types::I64));
+    let timestamp_id = module
+        .declare_function("adv_read_timestamp", Linkage::Import, &timestamp_signature)
+        .map_err(|e| e.to_string())?;
+    let timestamp_ref = module.declare_func_in_func(timestamp_id, &mut ctx.func);
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
         let prologue = b.create_block();
@@ -556,6 +567,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             bridge,
             host_ref,
             repeat_ref,
+            timestamp_ref,
         };
         for (&start, &block) in &e.blocks.clone() {
             e.b.switch_to_block(block);
@@ -859,6 +871,7 @@ fn supported(i: &Instruction) -> bool {
             | M::Push
             | M::Pop
             | M::Nop
+            | M::Rdtsc
             | M::Jmp
             | M::Call
             | M::Ret
@@ -960,6 +973,7 @@ struct Emitter<'a> {
     bridge: Value,
     host_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
+    timestamp_ref: ir::FuncRef,
 }
 
 impl Emitter<'_> {
@@ -1736,6 +1750,15 @@ impl Emitter<'_> {
                 return true;
             }
             M::Nop => {}
+            M::Rdtsc => {
+                let call = self.b.ins().call(self.timestamp_ref, &[self.bridge]);
+                let ticks = self.b.inst_results(call)[0];
+                let low = self.b.ins().ireduce(types::I32, ticks);
+                let shifted = self.b.ins().ushr_imm(ticks, 32);
+                let high = self.b.ins().ireduce(types::I32, shifted);
+                self.b.def_var(self.regs[0], low);
+                self.b.def_var(self.regs[2], high);
+            }
             M::Mov | M::Lea | M::Movzx | M::Movsx => {
                 let mut v = if i.mnemonic() == M::Lea {
                     self.address(i)

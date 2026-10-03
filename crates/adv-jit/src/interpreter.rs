@@ -25,6 +25,12 @@ const OF: u32 = 1 << 11;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Executed,
+    /// The owner completes a clock read into EDX:EAX and advances to `next`.
+    /// One instruction unit is charged; all architectural state is still intact.
+    ReadTimestamp {
+        pc: u32,
+        next: u32,
+    },
     Unsupported {
         pc: u32,
         code: Code,
@@ -288,6 +294,15 @@ fn execute_decoded(
         );
     }
     state.rep = None;
+    if let Action::Rdtsc = instruction.action {
+        return Execution {
+            step: Step::ReadTimestamp {
+                pc,
+                next: instruction.next,
+            },
+            units: 1,
+        };
+    }
     let mut tx = Transaction {
         regs: state.regs,
         flags: state.eflags,
@@ -525,6 +540,7 @@ impl DecodedBlock {
                             | Action::Ud2
                             | Action::String(..)
                             | Action::PopFlags(..)
+                            | Action::Rdtsc
                     ),
                 ),
                 Decoded::Extended(instruction, _, _) => (
@@ -742,6 +758,7 @@ impl Operand {
 enum Action {
     Nop,
     Cpuid,
+    Rdtsc,
     ReadSegment(Operand, usize),
     StoreGdt(Address),
     String(StringOp),
@@ -1056,6 +1073,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
     Some(match i.mnemonic() {
         M::Nop | M::Pause => Action::Nop,
         M::Cpuid => Action::Cpuid,
+        M::Rdtsc => Action::Rdtsc,
         M::Sgdt if i.op0_kind() == OpKind::Memory => Action::StoreGdt(Address::decode(i, false)?),
         M::Mov
             if matches!(
@@ -1468,6 +1486,7 @@ impl Transaction {
     }
     fn execute(&mut self, action: Action, memory: &Memory) -> Result<Option<u8>, Step> {
         match action {
+            Action::Rdtsc => unreachable!("clock reads complete at the owner boundary"),
             Action::String(_) => unreachable!("REP progress commits per element"),
             Action::Nop => {}
             Action::Cpuid => {

@@ -13,6 +13,7 @@ pub mod pal;
 mod shared_memory;
 mod state;
 mod strings;
+mod timestamp;
 mod virtual_memory;
 
 pub use cpu_profile::SegmentState;
@@ -20,6 +21,7 @@ pub use host::{ApiCall, ApiMemory, ApiOutcome, ApiSpec, Convention, HostServices
 pub use machine::{ExecutionContext, Machine, ProfileSample, RunOutcome, Stats};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use state::{X87Register, X87State};
+pub use timestamp::TSC_FREQ;
 
 /// Register order follows the x86 encoding: eax, ecx, edx, ebx, esp, ebp, esi, edi.
 #[repr(C)]

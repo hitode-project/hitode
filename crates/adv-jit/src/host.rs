@@ -87,6 +87,11 @@ pub enum ApiOutcome {
 }
 
 pub trait HostServices {
+    /// Execution-owner guest time for RDTSC. Implementations must not block,
+    /// allocate, perform IO, lock, or panic. None selects the standalone owner's Instant.
+    fn guest_time_us(&mut self) -> Option<u64> {
+        None
+    }
     fn call(&mut self, call: ApiCall<'_>, memory: &mut ApiMemory<'_>)
     -> Result<ApiOutcome, String>;
     fn resume(
@@ -156,6 +161,7 @@ impl HostServices for RejectServices {
 }
 
 pub(crate) struct Bridge<'a> {
+    pub timestamp: crate::timestamp::Counter,
     pub apis: &'a BTreeMap<u32, ApiSpec>,
     pub services: &'a mut dyn HostServices,
     pub memory: *mut Memory,
@@ -170,12 +176,31 @@ pub(crate) struct Bridge<'a> {
 
 /// Runtime integration hook. It runs with the CPU paused; true requests a scheduler park.
 pub(crate) trait RawTrap {
+    fn guest_time_us(&mut self) -> Option<u64> {
+        None
+    }
     fn call(
         &mut self,
         state: &mut CpuState,
         memory: &mut Memory,
         vector: u32,
     ) -> Result<bool, String>;
+}
+
+impl Bridge<'_> {
+    pub fn read_timestamp(&mut self) -> u64 {
+        let now = match &mut self.raw {
+            Some(raw) => raw.guest_time_us(),
+            None => self.services.guest_time_us(),
+        };
+        self.timestamp.read(now)
+    }
+}
+
+/// SAFETY: generated code passes its live, exclusively borrowed Bridge. This
+/// reads only the owner's clock/counter, never guest memory or architectural flags.
+pub(crate) unsafe extern "C" fn read_timestamp(bridge: *mut u8) -> u64 {
+    unsafe { &mut *bridge.cast::<Bridge<'_>>() }.read_timestamp()
 }
 
 pub(crate) fn call_raw(bridge: &mut Bridge<'_>, state: &mut CpuState, vector: u32) -> u32 {
