@@ -10,6 +10,8 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
+# Full DAC rate matrices; `cargo test-full` enables it.
+slow-tests = []
 
 [dependencies]
 cpal = { version = "0.16", optional = true }

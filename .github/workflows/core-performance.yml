@@ -68,7 +68,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Test the whole workspace
-        run: cargo test --workspace --release --locked
+        run: cargo test-full --release --locked
       - name: Lint
         run: |
           cargo fmt --all -- --check

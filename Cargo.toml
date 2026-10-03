@@ -43,6 +43,11 @@ unsafe_op_in_unsafe_fn = "deny"
 opt-level = 3
 debug = false
 
+# Third-party crates are built once and cached. Unoptimized, the resampler's FFT
+# makes the DAC tests take minutes. Workspace crates keep the plain debug profile.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 

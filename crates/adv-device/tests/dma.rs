@@ -6,6 +6,14 @@ use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
 };
+/// Output rates of the cross-product test: all common DAC rates in `cargo test-full`
+/// (`slow-tests`); otherwise downsampling, the source rate and the highest rate.
+#[cfg(feature = "slow-tests")]
+const MATRIX_OUTPUT_RATES: &[u32] = &[
+    32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+];
+#[cfg(not(feature = "slow-tests"))]
+const MATRIX_OUTPUT_RATES: &[u32] = &[32000, 44100, 384000];
 thread_local! {static COUNT:Cell<Option<(u64,u64)>>=const {Cell::new(None)};}
 struct Allocator;
 unsafe impl GlobalAlloc for Allocator {
@@ -730,9 +738,7 @@ fn owned_pcm_rounded_packets_match_one_block_at_all_output_rates() {
                     })
                 })
                 .collect();
-            for rate in [
-                32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
-            ] {
+            for &rate in MATRIX_OUTPUT_RATES {
                 for channels in [1, 2, 6] {
                     let expected = owned_output(
                         rate,

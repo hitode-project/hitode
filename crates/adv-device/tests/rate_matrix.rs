@@ -10,6 +10,12 @@ use std::sync::{
 const OUTPUT_RATES: [u32; 9] = [
     32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
 ];
+/// Output rates of the cross-product test: all of them in `cargo test-full`
+/// (`slow-tests`); otherwise downsampling, the source rate and the highest rate.
+#[cfg(feature = "slow-tests")]
+const MATRIX_OUTPUT_RATES: &[u32] = &OUTPUT_RATES;
+#[cfg(not(feature = "slow-tests"))]
+const MATRIX_OUTPUT_RATES: &[u32] = &[32_000, 44_100, 384_000];
 const SOURCE_RATES: [u32; 3] = [22_050, 44_100, 48_000];
 const AMPLITUDE: f64 = 10_000.0 / 32_768.0;
 
@@ -150,7 +156,7 @@ fn check_waveform(
 #[test]
 fn common_dac_rates_preserve_pitch_channels_cursor_and_notifications() {
     for source_rate in SOURCE_RATES {
-        for output_rate in OUTPUT_RATES {
+        for &output_rate in MATRIX_OUTPUT_RATES {
             for source_channels in [1, 2] {
                 for output_channels in [1, 2, 6] {
                     let label = format!(
