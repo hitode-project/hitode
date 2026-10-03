@@ -79,7 +79,10 @@ impl<B: Backend> Runtime<B> {
         crate::font::register(&mut registry);
         crate::sound::register(&mut registry);
         let mut machine = Machine::new(cpu, registry, Clock::real()).map_err(|e| e.to_string())?;
-        machine.set_execution_budget(Some(Duration::from_secs(30)));
+        // An interactive process can make progress while remaining Ready across
+        // indefinitely many slices. A cumulative hard run budget must be explicit;
+        // step_for still bounds guest execution by its soft slice and quantum.
+        machine.set_execution_budget(None);
         Win32::install(&mut machine, cfg).map_err(|e| e.to_string())?;
         // Load images before allocating the graphics arena, preserving their preferred bases.
         let exe = machine.load(&files, exe_name).map_err(|e| e.to_string())?;
@@ -666,6 +669,9 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
     let presented = graphics.stats.presentations;
     if presented != before {
         env.sys.frame = presented as u32;
+        if out.is_ok() {
+            env.sys.complete_frame();
+        }
         let control = env.ext.get_mut::<RunControl>();
         let now = Instant::now();
         control.first_frame.get_or_insert(now);
@@ -732,6 +738,116 @@ mod tests {
         let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
         install_graphics(&mut machine, 4, 2).unwrap();
         machine
+    }
+
+    fn looping_executable_runtime() -> Runtime<JitCpu> {
+        // A standalone authored PE exercises with_cpu, loader and startup policy
+        // without sample files, imported services or an external compiler.
+        let mut pe = vec![0u8; 1024];
+        let put16 = |pe: &mut [u8], offset: usize, value: u16| {
+            pe[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        let put32 = |pe: &mut [u8], offset: usize, value: u32| {
+            pe[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put16(&mut pe, 0, 0x5a4d);
+        put32(&mut pe, 0x3c, 0x80);
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        for (offset, value) in [
+            (0x84, 0x14c),
+            (0x86, 1),
+            (0x94, 224),
+            (0x96, 0x102),
+            (0x98, 0x10b),
+        ] {
+            put16(&mut pe, offset, value);
+        }
+        for (offset, value) in [
+            (0x9c, 0x200),
+            (0xa8, 0x1000),
+            (0xac, 0x1000),
+            (0xb4, 0x0040_0000),
+            (0xb8, 4096),
+            (0xbc, 512),
+            (0xd0, 0x2000),
+            (0xd4, 0x200),
+            (0xe0, 0x100000),
+            (0xe4, 4096),
+            (0xe8, 0x100000),
+            (0xec, 4096),
+            (0xf4, 16),
+            (0x180, 2),
+            (0x184, 0x1000),
+            (0x188, 0x200),
+            (0x18c, 0x200),
+            (0x19c, 0x60000020),
+        ] {
+            put32(&mut pe, offset, value);
+        }
+        put16(&mut pe, 0xc0, 4);
+        put16(&mut pe, 0xc8, 4);
+        put16(&mut pe, 0xdc, 3);
+        pe[0x178..0x17d].copy_from_slice(b".text");
+        pe[0x200..0x202].copy_from_slice(&[0xeb, 0xfe]); // jmp $
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("adv-runtime-budget-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let exe = directory.join("loop.exe");
+        std::fs::write(&exe, pe).unwrap();
+        let runtime = Runtime::with_cpu(
+            &exe,
+            directory.join("overlay"),
+            JitCpu::new(pal_machine::layout::PARK_ADDR, false).unwrap(),
+            4,
+            2,
+        )
+        .unwrap();
+        std::fs::remove_file(exe).unwrap();
+        // Loader owns the mapped image now; remove only the known empty directories.
+        let _ = std::fs::remove_dir(directory.join("overlay"));
+        let _ = std::fs::remove_dir(directory);
+        runtime
+    }
+
+    #[test]
+    fn runtime_default_has_no_cumulative_budget_and_returns_bounded_slices() {
+        let mut runtime = looping_executable_runtime();
+        assert_eq!(runtime.machine.cpu.execution_budget(), None);
+        for _ in 0..4 {
+            assert!(matches!(
+                runtime.step_for(Duration::from_millis(2)),
+                SliceResult::Yielded
+            ));
+        }
+        assert_eq!(runtime.machine.sys.context(0).state_name(), "Ready");
+    }
+
+    #[test]
+    fn runtime_explicit_budget_still_fails_across_soft_slices() {
+        let mut runtime = looping_executable_runtime();
+        runtime
+            .machine
+            .set_execution_budget(Some(Duration::from_millis(12)));
+        let started = Instant::now();
+        let mut yielded = false;
+        loop {
+            assert!(started.elapsed() < Duration::from_secs(3));
+            match runtime.step_for(Duration::from_millis(2)) {
+                SliceResult::Yielded => yielded = true,
+                SliceResult::Complete(RunResult::Failed(error)) => {
+                    assert!(error.message.contains("execution budget exhausted"));
+                    assert_eq!(error.ctx, 0);
+                    assert!(
+                        yielded,
+                        "soft slicing did not retain the explicit allowance"
+                    );
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     fn graphics(machine: &mut Machine<JitCpu>, id: u32, args: &[u32]) -> u32 {
@@ -968,6 +1084,10 @@ mod tests {
         let graphics = m.ext.get::<Graphics<Snapshot>>();
         assert_eq!(graphics.presenter.bgra, expected);
         assert_eq!(graphics.presenter.frames, 1);
+        assert_eq!(
+            m.sys.completed_frames, 1,
+            "the real graphics trap did not publish its completed frame"
+        );
     }
 
     #[test]
