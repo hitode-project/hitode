@@ -1,12 +1,12 @@
 //! Where tests find real games: the tester's own copies, one directory per PAL build under
-//! `$PAL_SAMPLES`:
+//! `$ADV_SAMPLES` (the older `$PAL_SAMPLES` is still accepted):
 //!
 //! ```text
-//! $PAL_SAMPLES/FH2009/  LL1/  LL2/  KS2013/  LL3/  KK2015/  RC2022/  TL2026/
+//! $ADV_SAMPLES/FH2009/  LL1/  LL2/  KS2013/  LL3/  KK2015/  RC2022/  TL2026/
 //! ```
 //!
 //! Each directory is an installed game (the exe, `dll/PAL.dll`, the `.pac` archives). Tests
-//! that need a sample skip it when `PAL_SAMPLES` is unset or the directory is missing, so the
+//! that need a sample skip it when neither variable is set or the directory is missing, so the
 //! default test run needs no game files. Nothing is read from or written to a sample.
 
 use std::path::{Path, PathBuf};
@@ -27,11 +27,13 @@ const EXE: &[(&str, &str)] = &[
     ("RC2022", "red_cherish.exe"),
 ];
 
-/// `$PAL_SAMPLES`, or `None` (with a note on stderr) when it is not set.
+/// `$ADV_SAMPLES` (or `$PAL_SAMPLES`), or `None` (with a note on stderr) when neither is set.
 pub fn root() -> Option<PathBuf> {
-    let root = std::env::var_os("PAL_SAMPLES").map(PathBuf::from);
+    let root = std::env::var_os("ADV_SAMPLES")
+        .or_else(|| std::env::var_os("PAL_SAMPLES"))
+        .map(PathBuf::from);
     if root.is_none() {
-        eprintln!("PAL_SAMPLES is not set; tests on local games are not run");
+        eprintln!("ADV_SAMPLES is not set; tests on local games are not run");
     }
     root
 }
