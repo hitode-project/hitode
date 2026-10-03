@@ -47,6 +47,8 @@ mod native {
         client_width: i32,
         client_height: i32,
         closed: bool,
+        retained: RetainedFrame,
+        paint_error: Option<String>,
     }
     pub struct Window {
         hwnd: HWND,
@@ -170,47 +172,205 @@ mod native {
         Ok(())
     }
 
-    fn paint_frame(dc: HDC, client: &RECT, frame: &Snapshot) -> Result<(), String> {
-        let viewport = Viewport::fit(client, frame.width, frame.height);
-        if viewport.width == 0 || viewport.height == 0 {
-            return Ok(());
-        }
-        // SAFETY: caller owns the DC, and Snapshot owns packed BGRA pixels.
-        unsafe {
-            PatBlt(dc, 0, 0, client.right, client.bottom, BLACKNESS);
-            SetStretchBltMode(dc, COLORONCOLOR);
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: frame.width as i32,
-                    biHeight: -(frame.height as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
+    /// UI-owned storage. GDI handles and the DIB pointer never leave this thread.
+    struct Dib {
+        dc: HDC,
+        bitmap: HBITMAP,
+        original: HGDIOBJ,
+        bits: *mut u8,
+        width: i32,
+        height: i32,
+    }
+    impl Dib {
+        fn new(width: i32, height: i32) -> Result<Self, String> {
+            if width <= 0 || height <= 0 {
+                return Err("invalid presentation buffer dimensions".into());
+            }
+            // SAFETY: this memory DC and selected top-down DIB are owned together.
+            unsafe {
+                let dc = CreateCompatibleDC(null_mut());
+                if dc.is_null() {
+                    return Err("CreateCompatibleDC failed".into());
+                }
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB,
+                        ..std::mem::zeroed()
+                    },
                     ..std::mem::zeroed()
-                },
-                ..std::mem::zeroed()
-            };
-            let result = StretchDIBits(
-                dc,
-                viewport.x,
-                viewport.y,
-                viewport.width,
-                viewport.height,
-                0,
-                0,
-                frame.width as i32,
-                frame.height as i32,
-                frame.bgra.as_ptr().cast(),
-                &info,
-                DIB_RGB_COLORS,
-                SRCCOPY,
-            );
-            if result == 0 || result == -1 {
-                return Err("StretchDIBits failed".into());
+                };
+                let mut bits = null_mut();
+                let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+                if bitmap.is_null() || bits.is_null() {
+                    if !bitmap.is_null() {
+                        DeleteObject(bitmap);
+                    }
+                    DeleteDC(dc);
+                    return Err("CreateDIBSection failed".into());
+                }
+                let original = SelectObject(dc, bitmap);
+                if original.is_null() || original as isize == -1 {
+                    DeleteObject(bitmap);
+                    DeleteDC(dc);
+                    return Err("SelectObject failed for presentation buffer".into());
+                }
+                Ok(Self {
+                    dc,
+                    bitmap,
+                    original,
+                    bits: bits.cast(),
+                    width,
+                    height,
+                })
             }
         }
-        Ok(())
+    }
+    impl Drop for Dib {
+        fn drop(&mut self) {
+            // SAFETY: finish queued reads before releasing storage and restore
+            // the stock bitmap before deleting the owned bitmap/DC.
+            unsafe {
+                GdiFlush();
+                SelectObject(self.dc, self.original);
+                DeleteObject(self.bitmap);
+                DeleteDC(self.dc);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RetainedFrame {
+        source: Option<Dib>,
+        composition: Option<Dib>,
+    }
+    impl RetainedFrame {
+        fn update(&mut self, frame: &Snapshot) -> Result<(), String> {
+            let length = (frame.width as usize)
+                .checked_mul(frame.height as usize)
+                .and_then(|n| n.checked_mul(4));
+            if frame.width == 0
+                || frame.height == 0
+                || frame.width > i32::MAX as u32
+                || frame.height > i32::MAX as u32
+                || length != Some(frame.bgra.len())
+            {
+                return Err("invalid guest frame dimensions or pixels".into());
+            }
+            let (width, height) = (frame.width as i32, frame.height as i32);
+            // A prior BitBlt may still read the DIB. Flush before replacing or
+            // writing it; no window pixels are touched during this upload.
+            if unsafe { GdiFlush() } == 0 {
+                return Err("GdiFlush failed before frame upload".into());
+            }
+            if self
+                .source
+                .as_ref()
+                .is_none_or(|s| (s.width, s.height) != (width, height))
+            {
+                self.source = Some(Dib::new(width, height)?);
+            }
+            let source = self.source.as_ref().unwrap();
+            // SAFETY: checked packed BGRA length matches the owned DIB. No GDI
+            // reads remain in flight, and callbacks run on this same UI thread.
+            unsafe {
+                std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), source.bits, frame.bgra.len())
+            };
+            Ok(())
+        }
+
+        fn prepare(&mut self, client: &RECT) -> Result<Option<&Dib>, String> {
+            let (width, height) = (client.right - client.left, client.bottom - client.top);
+            if width <= 0 || height <= 0 {
+                return Ok(None);
+            }
+            let Some(source) = &self.source else {
+                return Ok(None);
+            };
+            // Native-size output only needs the final blit; no clear or scale.
+            if (source.width, source.height) == (width, height) {
+                return Ok(Some(source));
+            }
+            if self
+                .composition
+                .as_ref()
+                .is_none_or(|s| (s.width, s.height) != (width, height))
+            {
+                self.composition = Some(Dib::new(width, height)?);
+            }
+            let canvas = self.composition.as_ref().unwrap();
+            let viewport = Viewport::fit(client, source.width as u32, source.height as u32);
+            // All clear/scale operations are PRIVATE. A GDI batch flush between
+            // them cannot expose a black intermediate frame to the compositor.
+            unsafe {
+                if PatBlt(canvas.dc, 0, 0, width, height, BLACKNESS) == 0
+                    || SetStretchBltMode(canvas.dc, COLORONCOLOR) == 0
+                    || StretchBlt(
+                        canvas.dc,
+                        viewport.x,
+                        viewport.y,
+                        viewport.width,
+                        viewport.height,
+                        source.dc,
+                        0,
+                        0,
+                        source.width,
+                        source.height,
+                        SRCCOPY,
+                    ) == 0
+                {
+                    return Err("offscreen frame composition failed".into());
+                }
+            }
+            Ok(Some(canvas))
+        }
+
+        fn draw(&mut self, dc: HDC, client: &RECT) -> Result<(), String> {
+            let Some(complete) = self.prepare(client)? else {
+                // Only before the first guest frame, or for an empty client.
+                // Once a frame exists, idle paints always use retained pixels.
+                if self.source.is_none()
+                    && client.right > 0
+                    && client.bottom > 0
+                    && unsafe { PatBlt(dc, 0, 0, client.right, client.bottom, BLACKNESS) } == 0
+                {
+                    return Err("initial background paint failed".into());
+                }
+                return Ok(());
+            };
+            // The ONLY write to a populated window is a complete opaque frame.
+            if unsafe {
+                BitBlt(
+                    dc,
+                    0,
+                    0,
+                    complete.width,
+                    complete.height,
+                    complete.dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                )
+            } == 0
+            {
+                return Err("BitBlt frame commit failed".into());
+            }
+            if unsafe { GdiFlush() } == 0 {
+                return Err("GdiFlush failed after frame commit".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn paint_frame(dc: HDC, client: &RECT, frame: &Snapshot) -> Result<(), String> {
+        let mut retained = RetainedFrame::default();
+        retained.update(frame)?;
+        retained.draw(dc, client)
     }
 
     unsafe extern "system" fn procedure(
@@ -228,6 +388,28 @@ mod native {
             }
             let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
             if !pointer.is_null() {
+                // BeginPaint may synchronously send WM_ERASEBKGND. Do not hold
+                // a mutable State borrow across it or recreate one for erase.
+                if message == WM_ERASEBKGND {
+                    return 1;
+                }
+                if message == WM_PAINT {
+                    let mut paint = std::mem::zeroed();
+                    let dc = BeginPaint(hwnd, &mut paint);
+                    let mut rect = std::mem::zeroed();
+                    let result = if dc.is_null() || GetClientRect(hwnd, &mut rect) == 0 {
+                        Err("BeginPaint/GetClientRect failed".into())
+                    } else {
+                        // Restore while the paint DC is valid, even when the
+                        // guest is idle or no newer frame has reached UI.
+                        (*pointer).retained.draw(dc, &rect)
+                    };
+                    EndPaint(hwnd, &paint);
+                    if let Err(error) = result {
+                        (*pointer).paint_error = Some(error);
+                    }
+                    return 0;
+                }
                 if message == WM_DPICHANGED {
                     let suggested = *(lparam as *const RECT);
                     // Preserve the chosen physical client size across monitors;
@@ -270,14 +452,6 @@ mod native {
                             state.closed = true;
                         }
                         ShowWindow(hwnd, SW_HIDE);
-                        return 0;
-                    }
-                    WM_ERASEBKGND => return 1,
-                    WM_PAINT => {
-                        let mut paint = std::mem::zeroed();
-                        BeginPaint(hwnd, &mut paint);
-                        EndPaint(hwnd, &paint);
-                        state.events.push_back(Event::Repaint);
                         return 0;
                     }
                     WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
@@ -384,6 +558,8 @@ mod native {
                 client_width: width as i32,
                 client_height: height as i32,
                 closed: false,
+                retained: RetainedFrame::default(),
+                paint_error: None,
             });
             // SAFETY: null-terminated strings and the boxed state outlive window creation.
             let hwnd = unsafe {
@@ -483,12 +659,7 @@ mod native {
         }
 
         pub fn present(&mut self, frame: &Snapshot) -> Result<(), String> {
-            if frame.width == 0
-                || frame.height == 0
-                || frame.bgra.len() != frame.width as usize * frame.height as usize * 4
-            {
-                return Err("invalid guest frame dimensions or pixels".into());
-            }
+            self.state.retained.update(frame)?;
             self.state.width = frame.width;
             self.state.height = frame.height;
             if self.frame_size != Some((frame.width, frame.height)) {
@@ -502,10 +673,13 @@ mod native {
                     return Err("GetDC failed".into());
                 }
                 let mut rect: RECT = std::mem::zeroed();
-                GetClientRect(self.hwnd, &mut rect);
+                if GetClientRect(self.hwnd, &mut rect) == 0 {
+                    ReleaseDC(self.hwnd, dc);
+                    return Err("GetClientRect failed".into());
+                }
                 // Aspect-preserving fit with explicit nearest pixel sampling.
                 // Letterboxing never changes the guest canvas or input space.
-                let result = paint_frame(dc, &rect, frame);
+                let result = self.state.retained.draw(dc, &rect);
                 ReleaseDC(self.hwnd, dc);
                 result?;
             }
@@ -528,6 +702,9 @@ mod native {
             duration: Option<Duration>,
             wake: Option<&WakeEvent>,
         ) -> Result<WaitOutcome, String> {
+            if let Some(error) = self.state.paint_error.take() {
+                return Err(error);
+            }
             let timed = duration.is_some_and(|d| !d.is_zero());
             if let Some(duration) = duration.filter(|d| !d.is_zero()) {
                 let ticks = duration.as_nanos().saturating_add(99) / 100;
@@ -597,8 +774,90 @@ mod native {
     }
 
     #[cfg(test)]
+    mod desktop_tests {
+        include!("window_desktop_tests.rs");
+    }
+
+    #[cfg(test)]
     mod presentation_tests {
         use super::*;
+
+        #[test]
+        fn composing_a_frame_keeps_the_previous_output_until_commit() {
+            let target = Dib::new(16, 16).unwrap();
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 16,
+            };
+            let mut frame = Snapshot {
+                width: 8,
+                height: 6,
+                bgra: [32, 64, 192, 255].repeat(8 * 6),
+                frames: 1,
+            };
+            let mut retained = RetainedFrame::default();
+            retained.update(&frame).unwrap();
+            retained.draw(target.dc, &rect).unwrap();
+            let previous = unsafe { GetPixel(target.dc, 8, 8) };
+            assert_eq!(previous, 0x2040c0);
+
+            // Upload and every offscreen GDI operation may be preempted/flushed.
+            // None may expose the clear used for composing the next frame.
+            frame.bgra = [224, 128, 16, 255].repeat(8 * 6);
+            retained.update(&frame).unwrap();
+            retained.prepare(&rect).unwrap();
+            assert_ne!(unsafe { GdiFlush() }, 0);
+            assert_eq!(unsafe { GetPixel(target.dc, 8, 8) }, previous);
+            retained.draw(target.dc, &rect).unwrap();
+            assert_eq!(unsafe { GetPixel(target.dc, 8, 8) }, 0xe08010);
+            assert_eq!(unsafe { GetPixel(target.dc, 8, 0) }, 0);
+        }
+
+        #[test]
+        fn retained_pixels_survive_caller_reuse_and_invalid_frames_but_allow_black() {
+            let target = Dib::new(8, 6).unwrap();
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 6,
+            };
+            let mut frame = Snapshot {
+                width: 8,
+                height: 6,
+                bgra: [32, 64, 192, 255].repeat(8 * 6),
+                frames: 1,
+            };
+            let mut retained = RetainedFrame::default();
+            retained.update(&frame).unwrap();
+            // Mailbox storage is reusable immediately after upload.
+            frame.bgra.fill(0);
+            retained.draw(target.dc, &rect).unwrap();
+            assert_eq!(unsafe { GetPixel(target.dc, 4, 3) }, 0x2040c0);
+            let invalid = Snapshot {
+                width: 0,
+                height: 6,
+                bgra: Vec::new(),
+                frames: 2,
+            };
+            assert!(retained.update(&invalid).is_err());
+            let short = Snapshot {
+                width: 8,
+                height: 6,
+                bgra: vec![0; 8],
+                frames: 2,
+            };
+            assert!(retained.update(&short).is_err());
+            retained.draw(target.dc, &rect).unwrap();
+            assert_eq!(unsafe { GetPixel(target.dc, 4, 3) }, 0x2040c0);
+
+            // Real guest fades/black frames must remain visible, never filtered.
+            retained.update(&frame).unwrap();
+            retained.draw(target.dc, &rect).unwrap();
+            assert_eq!(unsafe { GetPixel(target.dc, 4, 3) }, 0);
+        }
 
         fn client(window: &Window) -> (i32, i32) {
             let mut rect: RECT = unsafe { std::mem::zeroed() };
