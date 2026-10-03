@@ -202,7 +202,11 @@ mod tests {
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn VirtualQuery(address: *const u8, info: *mut MemoryInfo, len: usize) -> usize;
+        fn VirtualQuery(
+            address: *const std::ffi::c_void,
+            info: *mut std::ffi::c_void,
+            len: usize,
+        ) -> usize;
     }
     #[test]
     fn callback_alias_is_os_read_only_and_reads_the_same_physical_bytes() {
@@ -213,16 +217,16 @@ mod tests {
         unsafe {
             assert_ne!(
                 VirtualQuery(
-                    storage.mapping.read.as_ptr(),
-                    &mut read,
+                    storage.mapping.read.as_ptr().cast(),
+                    (&mut read as *mut MemoryInfo).cast(),
                     std::mem::size_of::<MemoryInfo>()
                 ),
                 0
             );
             assert_ne!(
                 VirtualQuery(
-                    storage.mapping.write.as_ptr(),
-                    &mut write,
+                    storage.mapping.write.as_ptr().cast(),
+                    (&mut write as *mut MemoryInfo).cast(),
                     std::mem::size_of::<MemoryInfo>()
                 ),
                 0

@@ -7,6 +7,16 @@ use std::{cell::RefCell, collections::BTreeMap};
 #[cfg(windows)]
 mod os {
     use std::ffi::c_void;
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+    const MEM_DECOMMIT: u32 = 0x4000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
+    const MEM_PRESERVE_PLACEHOLDER: u32 = 2;
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    const PAGE_NOACCESS: u32 = 1;
+    const PAGE_READWRITE: u32 = 4;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn VirtualAlloc(
@@ -16,6 +26,22 @@ mod os {
             protection: u32,
         ) -> *mut c_void;
         fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
+        fn VirtualProtect(address: *mut c_void, size: usize, protection: u32, old: *mut u32)
+        -> i32;
+        fn VirtualQuery(address: *const c_void, info: *mut c_void, size: usize) -> usize;
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryInfo {
+        base: usize,
+        allocation: usize,
+        allocation_protection: u32,
+        #[cfg(target_pointer_width = "64")]
+        partition: u16,
+        region: usize,
+        state: u32,
+        protection: u32,
+        kind: u32,
     }
     #[link(name = "onecore")]
     unsafe extern "system" {
@@ -47,8 +73,8 @@ mod os {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 size,
-                0x2000 | 0x40000,
-                1,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
                 std::ptr::null(),
                 0,
             )
@@ -56,21 +82,21 @@ mod os {
         }
     }
     pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
-        unsafe { !VirtualAlloc(p.cast(), size, 0x1000, 4).is_null() }
+        unsafe { !VirtualAlloc(p.cast(), size, MEM_COMMIT, PAGE_READWRITE).is_null() }
     }
     pub unsafe fn decommit(p: *mut u8, size: usize) -> bool {
-        unsafe { VirtualFree(p.cast(), size, 0x4000) != 0 }
+        unsafe { VirtualFree(p.cast(), size, MEM_DECOMMIT) != 0 }
     }
     pub unsafe fn release(p: *mut u8, _: usize) {
         unsafe {
-            VirtualFree(p.cast(), 0, 0x8000);
+            VirtualFree(p.cast(), 0, MEM_RELEASE);
         }
     }
     pub unsafe fn split(p: *mut u8, size: usize) -> bool {
-        unsafe { VirtualFree(p.cast(), size, 0x8000 | 2) != 0 }
+        unsafe { VirtualFree(p.cast(), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0 }
     }
     pub unsafe fn coalesce(p: *mut u8, size: usize) -> bool {
-        unsafe { VirtualFree(p.cast(), size, 0x8000 | 1) != 0 }
+        unsafe { VirtualFree(p.cast(), size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0 }
     }
     pub unsafe fn private(p: *mut u8, size: usize, commit: bool) -> bool {
         unsafe {
@@ -78,8 +104,8 @@ mod os {
                 std::ptr::null_mut(),
                 p.cast(),
                 size,
-                0x2000 | 0x4000 | if commit { 0x1000 } else { 0 },
-                4,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | if commit { MEM_COMMIT } else { 0 },
+                PAGE_READWRITE,
                 std::ptr::null(),
                 0,
             ) == p.cast()
@@ -93,15 +119,43 @@ mod os {
                 p.cast(),
                 offset as u64,
                 size,
-                0x4000,
-                4,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
                 std::ptr::null(),
                 0,
             ) == p.cast()
         }
     }
     pub unsafe fn unmap_section(p: *mut u8) -> bool {
-        unsafe { UnmapViewOfFile2((-1isize) as *mut c_void, p.cast(), 2) != 0 }
+        unsafe {
+            UnmapViewOfFile2((-1isize) as *mut c_void, p.cast(), MEM_PRESERVE_PLACEHOLDER) != 0
+        }
+    }
+    #[allow(dead_code)] // Dormant until verified production fault sites are connected.
+    pub unsafe fn protect(p: *mut u8, size: usize, protection: u32) -> bool {
+        let mut old = 0;
+        unsafe { VirtualProtect(p.cast(), size, protection, &mut old) != 0 }
+    }
+    #[allow(dead_code)]
+    pub unsafe fn protection(p: *const u8) -> Option<(usize, u32)> {
+        let mut info = MemoryInfo::default();
+        if unsafe {
+            VirtualQuery(
+                p.cast(),
+                (&mut info as *mut MemoryInfo).cast(),
+                std::mem::size_of::<MemoryInfo>(),
+            )
+        } == 0
+            || info.state != MEM_COMMIT
+        {
+            return None;
+        }
+        Some((
+            info.base
+                .checked_add(info.region)?
+                .checked_sub(p as usize)?,
+            info.protection,
+        ))
     }
 }
 #[cfg(unix)]
@@ -154,6 +208,36 @@ enum Kind {
     Placeholder,
     Private(Vec<bool>),
     Section,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+#[repr(u32)]
+#[allow(dead_code)]
+pub(crate) enum HostProtection {
+    NoAccess = 1,
+    Read = 2,
+    ReadWrite = 4,
+}
+
+/// Restore each original OS protection separately, including mixed protection
+/// spans in the same private allocation. The reservation remains exclusively
+/// owned by the caller while a scope exists; addresses may not be remapped.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) struct ProtectionScope<'a> {
+    reservation: &'a Reservation,
+    original: Vec<(usize, usize, u32)>,
+}
+#[cfg(windows)]
+impl Drop for ProtectionScope<'_> {
+    fn drop(&mut self) {
+        for &(offset, len, protection) in self.original.iter().rev() {
+            let ok =
+                unsafe { os::protect(self.reservation.ptr.as_ptr().add(offset), len, protection) };
+            assert!(ok, "cannot restore scoped guest host protection");
+        }
+    }
 }
 impl Reservation {
     pub fn new(len: usize) -> Result<Self, String> {
@@ -223,6 +307,62 @@ impl Reservation {
             .checked_add(len)
             .filter(|&end| end <= self.len)
             .ok_or_else(|| "outside reservation".into())
+    }
+
+    /// Temporarily grant/restrict host access without altering guest permission
+    /// metadata. No production memory policy is changed by adding this primitive.
+    ///
+    /// # Safety
+    /// Do not map/unmap/retire any affected pages until the returned scope drops.
+    /// An override that relaxes guest protection may only run host initialization
+    /// or capture operations; native guest code must remain stopped then.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn temporary_protection(
+        &self,
+        offset: usize,
+        len: usize,
+        protection: HostProtection,
+    ) -> Result<ProtectionScope<'_>, String> {
+        let end = self.bounds(offset, len)?;
+        let regions = self.regions.borrow();
+        let spans = Self::spans(&regions, offset, end);
+        for &(base, start, stop) in &spans {
+            match &regions[&base].kind {
+                Kind::Private(pages)
+                    if pages[(start - base) / 4096..(stop - base) / 4096]
+                        .iter()
+                        .all(|p| *p) => {}
+                Kind::Section => {}
+                _ => return Err("protection requires committed host pages".into()),
+            }
+        }
+        let mut scope = ProtectionScope {
+            reservation: self,
+            original: Vec::new(),
+        };
+        for (_, start, stop) in spans {
+            let mut at = start;
+            while at < stop {
+                let ptr = unsafe { self.ptr.as_ptr().add(at) };
+                let (count, old) =
+                    unsafe { os::protection(ptr) }.ok_or("cannot query guest host protection")?;
+                let count = count.min(stop - at);
+                if count == 0 {
+                    return Err("empty host protection region".into());
+                }
+                if old != protection as u32 {
+                    if !unsafe { os::protect(ptr, count, protection as u32) } {
+                        return Err(format!(
+                            "protect guest host pages: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    scope.original.push((at, count, old));
+                }
+                at += count;
+            }
+        }
+        Ok(scope)
     }
 
     fn split_at(&self, regions: &mut BTreeMap<usize, Region>, at: usize) -> Result<(), String> {

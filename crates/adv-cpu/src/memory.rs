@@ -690,7 +690,11 @@ mod linear_audio_tests {
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn VirtualQuery(address: *const u8, info: *mut MemoryInfo, len: usize) -> usize;
+        fn VirtualQuery(
+            address: *const std::ffi::c_void,
+            info: *mut std::ffi::c_void,
+            len: usize,
+        ) -> usize;
     }
     fn query(memory: &Memory, address: u32) -> MemoryInfo {
         let mut info = MemoryInfo::default();
@@ -699,8 +703,8 @@ mod linear_audio_tests {
         assert_ne!(
             unsafe {
                 VirtualQuery(
-                    memory.ptr.as_ptr().add(offset),
-                    &mut info,
+                    memory.ptr.as_ptr().add(offset).cast(),
+                    (&mut info as *mut MemoryInfo).cast(),
                     std::mem::size_of::<MemoryInfo>(),
                 )
             },

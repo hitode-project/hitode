@@ -7,6 +7,11 @@ mod compiler;
 mod cpu_profile;
 mod executor;
 mod floating;
+// Hardware fault primitives are dormant until validated Cranelift side tables
+// are connected. Other hosts retain the current checked execution lane.
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+#[allow(dead_code)]
+mod host_fault;
 pub mod interpreter;
 mod linking;
 mod memory;
