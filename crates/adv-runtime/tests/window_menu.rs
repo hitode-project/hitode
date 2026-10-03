@@ -1,4 +1,5 @@
 //! Native x86 window creation timing and editable system-menu state.
+//! Built-in label contents are tested separately under the virtual en-US locale.
 #![cfg(windows)]
 use adv_runtime::boot::Runtime;
 use pal_machine::{Clock, RunResult};
@@ -37,9 +38,12 @@ fn window_geometry_and_system_menu_match_native_windows() {
             .success()
     );
     let reference = std::fs::read(native.join("window-menu.bin")).unwrap();
+    assert_eq!(reference.len() % 4, 0);
     let words: Vec<_> = reference
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     assert_eq!(
         &words[..16],
@@ -61,11 +65,33 @@ fn window_geometry_and_system_menu_match_native_windows() {
         let actual = std::fs::read(profile.join("overlay/window-menu.bin")).unwrap();
         assert_eq!(actual.len(), reference.len());
         for (i, (a, b)) in actual
-            .chunks_exact(4)
-            .zip(reference.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(reference.as_chunks::<4>().0.iter())
             .enumerate()
         {
             assert_eq!(a, b, "{backend}, result word {i}");
+        }
+        let labels = std::fs::read(profile.join("overlay/window-menu-labels.bin")).unwrap();
+        let expected = [
+            "&Restore",
+            "&Move",
+            "&Size",
+            "Mi&nimize",
+            "Ma&ximize",
+            "&Close\tAlt+F4",
+        ];
+        assert_eq!(labels.len(), expected.len() * 64);
+        for (bytes, expected) in labels.as_chunks::<64>().0.iter().zip(expected) {
+            let units: Vec<_> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .take_while(|&unit| unit != 0)
+                .collect();
+            assert_eq!(String::from_utf16(&units).unwrap(), expected, "{backend}");
         }
     }
 }
