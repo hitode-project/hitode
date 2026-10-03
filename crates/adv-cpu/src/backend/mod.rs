@@ -33,9 +33,8 @@ pub mod asm;
 pub mod file_page;
 pub mod jit;
 pub use file_page::FilePage;
-pub mod shared;
 pub mod x87;
-pub use shared::{SharedReadView, SharedRegion};
+pub use adv_sync::shared::{SharedReadView, SharedRegion};
 
 /// Guest general-purpose registers plus EIP/EFLAGS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

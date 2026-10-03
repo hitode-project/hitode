@@ -1,5 +1,5 @@
-use adv_cpu::backend::SharedReadView;
 use adv_device::{AudioControl, ring::RingConfig};
+use adv_sync::shared::SharedReadView;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::{

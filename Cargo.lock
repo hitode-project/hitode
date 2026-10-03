@@ -29,7 +29,6 @@ dependencies = [
 name = "adv-device"
 version = "0.1.0"
 dependencies = [
- "adv-cpu",
  "adv-sync",
  "cpal",
  "log",

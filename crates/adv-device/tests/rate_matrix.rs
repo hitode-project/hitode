@@ -1,7 +1,7 @@
 //! Device-independent DAC acceptance. These tests exercise the production DMA
 //! consumer; they do not imply physical-device testing at every output rate.
-use adv_cpu::backend::SharedReadView;
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
+use adv_sync::shared::SharedReadView;
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
