@@ -86,9 +86,9 @@ pub fn select_policy_with_reason(
     }
     let lower_symbols = lower_symbols(files);
     let mut verified_ordinal_layout = false;
-    if let Some(bytes) = files.read("vorbisfile.dll") {
+    if let Some((path, bytes)) = pal_machine::loader::module_file(files, "vorbisfile.dll", None) {
         if let Some(reason) = ordinal_layout_error(&bytes) {
-            return Ok(Selection::guest(format!("vorbisfile.dll: {reason}")));
+            return Ok(Selection::guest(format!("{path}: {reason}")));
         }
         verified_ordinal_layout = true;
     }
@@ -109,19 +109,36 @@ pub fn select_policy_with_reason(
                 "{path}: unsupported dynamic codec symbol literal {symbol}"
             )));
         }
-        let pe = pal_pe::Pe::parse(&bytes).map_err(|e| format!("codec preflight {path}: {e}"))?;
-        let mut imports: Vec<_> = pe
-            .imports()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|m| (m.dll, m.imports))
-            .collect();
-        imports.extend(
-            pe.delay_imports()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|m| (m.dll, m.imports)),
-        );
+        // This is a capability proof for replacing the complete codec, not the
+        // process loader. Packed or otherwise uninspectable dependencies cannot
+        // prove the Native ABI safe. Leave them and all codec state to Guest;
+        // the loader still reports errors in required image/import data itself.
+        let pe = match pal_pe::Pe::parse(&bytes) {
+            Ok(pe) => pe,
+            Err(e) => {
+                return Ok(Selection::guest(format!(
+                    "codec preflight {path}: PE headers/image unavailable: {e}"
+                )));
+            }
+        };
+        let normal = match pe.imports() {
+            Ok(imports) => imports,
+            Err(e) => {
+                return Ok(Selection::guest(format!(
+                    "codec preflight {path}: imports unavailable: {e}"
+                )));
+            }
+        };
+        let delay = match pe.delay_imports() {
+            Ok(imports) => imports,
+            Err(e) => {
+                return Ok(Selection::guest(format!(
+                    "codec preflight {path}: delay imports unavailable: {e}"
+                )));
+            }
+        };
+        let mut imports: Vec<_> = normal.into_iter().map(|m| (m.dll, m.imports)).collect();
+        imports.extend(delay.into_iter().map(|m| (m.dll, m.imports)));
         for (dll, symbols) in imports {
             let key = dll
                 .rsplit(['/', '\\'])
@@ -135,15 +152,12 @@ pub fn select_policy_with_reason(
             }
             if key == "vorbisfile.dll" {
                 if !verified_ordinal_layout {
-                    let near = path
-                        .rfind(['/', '\\'])
-                        .map(|i| format!("{}\\{}", &path[..i], dll));
-                    if let Some(bytes) = files
-                        .read(&dll)
-                        .or_else(|| near.as_deref().and_then(|p| files.read(p)))
+                    let dir = path.rfind(['/', '\\']).map(|i| &path[..i]);
+                    if let Some((codec_path, bytes)) =
+                        pal_machine::loader::module_file(files, &dll, dir)
                     {
                         if let Some(reason) = ordinal_layout_error(&bytes) {
-                            return Ok(Selection::guest(format!("{dll}: {reason}")));
+                            return Ok(Selection::guest(format!("{codec_path}: {reason}")));
                         }
                         verified_ordinal_layout = true;
                     }
@@ -165,14 +179,12 @@ pub fn select_policy_with_reason(
                     }
                 }
             } else {
-                let near = path
-                    .rfind(['/', '\\'])
-                    .map(|i| format!("{}\\{}", &path[..i], dll));
-                pending.push(if files.read(&dll).is_some() {
-                    dll
-                } else {
-                    near.unwrap_or(dll)
-                });
+                let dir = path.rfind(['/', '\\']).map(|i| &path[..i]);
+                if let Some((dependency_path, _)) =
+                    pal_machine::loader::module_file(files, &dll, dir)
+                {
+                    pending.push(dependency_path);
+                }
             }
         }
     }
@@ -256,7 +268,7 @@ fn lower_symbols(files: &dyn FileSource) -> BTreeSet<String> {
         }
     }
     for dll in ["vorbis.dll", "ogg.dll"] {
-        if let Some(bytes) = files.read(dll)
+        if let Some((_, bytes)) = pal_machine::loader::module_file(files, dll, None)
             && let Ok(pe) = pal_pe::Pe::parse(&bytes)
             && let Ok(exports) = pe.exports()
         {
@@ -1437,6 +1449,49 @@ mod tests {
             select_policy(&Files(bytes), "app.exe", Policy::Native).unwrap(),
             Policy::Guest
         );
+    }
+
+    #[test]
+    fn uninspectable_pe_or_imports_choose_whole_guest_codec_with_path_and_stage() {
+        struct Files(Vec<u8>);
+        impl FileSource for Files {
+            fn read(&self, path: &str) -> Option<Vec<u8>> {
+                (path == "packed.exe").then(|| self.0.clone())
+            }
+        }
+        let put = |bytes: &mut [u8], at: usize, value: u32| {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        for stage in ["PE headers/image", "imports", "delay imports"] {
+            let mut bytes = export_fixture();
+            match stage {
+                "PE headers/image" => bytes[..2].copy_from_slice(b"xx"),
+                "imports" => {
+                    put(&mut bytes, 0x98 + 96 + 8, 0x800);
+                    put(&mut bytes, 0x98 + 100 + 8, 40);
+                    put(&mut bytes, 0x800, 0xffff_fffc);
+                    put(&mut bytes, 0x80c, 0x950);
+                    put(&mut bytes, 0x810, 0x920);
+                    bytes[0x950..0x95d].copy_from_slice(b"kernel32.dll\0");
+                }
+                _ => {
+                    put(&mut bytes, 0x98 + 96 + 13 * 8, 0x800);
+                    put(&mut bytes, 0x98 + 100 + 13 * 8, 64);
+                    put(&mut bytes, 0x800, 1);
+                    put(&mut bytes, 0x804, 0x950);
+                    put(&mut bytes, 0x810, 0xffff_fffc);
+                    bytes[0x950..0x95d].copy_from_slice(b"kernel32.dll\0");
+                }
+            }
+            let selected =
+                select_policy_with_reason(&Files(bytes), "packed.exe", Policy::Native).unwrap();
+            assert_eq!(selected.policy, Policy::Guest);
+            let reason = selected.reason.unwrap();
+            assert!(
+                reason.contains("packed.exe") && reason.contains(stage),
+                "{reason}"
+            );
+        }
     }
 
     #[test]

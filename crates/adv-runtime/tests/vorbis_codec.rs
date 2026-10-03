@@ -42,6 +42,28 @@ fn real_codec_capability_preflight_reports_actual_provider() {
 }
 
 #[test]
+#[ignore = "read-only preflight against locally installed authorized cross-engine games"]
+fn cross_engine_preflight_is_observable_without_rejecting_guest_startup() {
+    for (directory, exe) in [
+        ("AQUA", "AQUA.exe"),
+        ("KIMIKISHI", "kimikishi.exe"),
+        (
+            "ディメンション凸ラバース！！",
+            "DimensionToTsuLovers_cn.exe",
+        ),
+    ] {
+        let files = pal_win32::Vfs::new(&pal_win32::Win32Config::new(
+            Path::new("<games>").join(directory),
+            exe,
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/cross-engine/preflight-only"),
+        ));
+        let selected =
+            adv_runtime::vorbis::select_policy_with_reason(&files, exe, Policy::Native).unwrap();
+        eprintln!("{directory}/{exe}: {selected:?}");
+    }
+}
+
+#[test]
 fn standard_vorbis_callbacks_seek_lifetime_and_pcm_match_reference() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = root.join("target/vorbis-codec-tests");
