@@ -1,0 +1,118 @@
+{
+  "process_architecture": "x86",
+  "wsadata_bytes": 400,
+  "never_creates_socket": true,
+  "undefined_field_policy": "Startup failure thread error is not part of the API result; null/version-failure error is omitted.",
+  "cases": [
+    {
+      "requested": "0.0",
+      "result": 10092,
+      "version": "0x0202",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "1.0",
+      "result": 0,
+      "version": "0x0001",
+      "highest": "0x0202",
+      "sockets": 32767,
+      "udp": 65467,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "0.1",
+      "result": 10092,
+      "version": "0x0202",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "1.1",
+      "result": 0,
+      "version": "0x0101",
+      "highest": "0x0202",
+      "sockets": 32767,
+      "udp": 65467,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "2.0",
+      "result": 0,
+      "version": "0x0002",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "2.1",
+      "result": 0,
+      "version": "0x0102",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "2.2",
+      "result": 0,
+      "version": "0x0202",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "1.2",
+      "result": 0,
+      "version": "0x0101",
+      "highest": "0x0202",
+      "sockets": 32767,
+      "udp": 65467,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "3.0",
+      "result": 0,
+      "version": "0x0202",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    },
+    {
+      "requested": "255.255",
+      "result": 0,
+      "version": "0x0202",
+      "highest": "0x0202",
+      "sockets": 0,
+      "udp": 0,
+      "description": "WinSock 2.0",
+      "status": "Running",
+      "vendor_and_padding_unchanged": true
+    }
+  ]
+}
