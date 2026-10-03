@@ -1,10 +1,34 @@
 [workspace]
 resolver = "3"
-members = ["crates/adv-jit", "crates/adv-runtime", "apps/adv-run"]
+members = [
+    "crates/adv-jit",
+    "crates/adv-runtime",
+    "crates/pal-audio",
+    "crates/pal-cpu",
+    "crates/pal-host",
+    "crates/pal-machine",
+    "crates/pal-pe",
+    "crates/pal-samples",
+    "crates/pal-win32",
+    "apps/adv-run",
+]
+exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 publish = false
+
+[workspace.dependencies]
+pal-pe = { path = "crates/pal-pe" }
+pal-machine = { path = "crates/pal-machine" }
+pal-samples = { path = "crates/pal-samples" }
+
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
+thiserror = "2"
+log = "0.4"
+encoding_rs = "0.8"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -17,5 +41,5 @@ debug = false
 debug = "line-tables-only"
 
 [patch.crates-io]
-cpal = { path = "../pal-hle/vendor/cpal" }
-symphonia-codec-adpcm = { path = "../pal-hle/vendor/symphonia-codec-adpcm" }
+cpal = { path = "vendor/cpal" }
+symphonia-codec-adpcm = { path = "vendor/symphonia-codec-adpcm" }

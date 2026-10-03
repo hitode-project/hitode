@@ -7,8 +7,8 @@ description = "Experimental x86-32 hot-region JIT with a shared-state interprete
 
 [dependencies]
 libc = "0.2"
-pal-cpu = { path = "../../../pal-hle/crates/pal-cpu", default-features = false, optional = true }
-pal-host = { path = "../../../pal-hle/crates/pal-host", optional = true }
+pal-cpu = { path = "../pal-cpu", default-features = false, optional = true }
+pal-host = { path = "../pal-host", optional = true }
 cranelift-codegen = "0.125"
 cranelift-frontend = "0.125"
 cranelift-jit = "0.125"
@@ -23,9 +23,9 @@ cc = "1"
 
 [dev-dependencies]
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
-pal-cpu = { path = "../../../pal-hle/crates/pal-cpu", default-features = false, features = ["unicorn"] }
-pal-machine = { path = "../../../pal-hle/crates/pal-machine" }
-pal-win32 = { path = "../../../pal-hle/crates/pal-win32" }
+pal-cpu = { path = "../pal-cpu", default-features = false, features = ["unicorn"] }
+pal-machine = { path = "../pal-machine" }
+pal-win32 = { path = "../pal-win32" }
 
 [[example]]
 name = "boot_probe"

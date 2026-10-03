@@ -1,0 +1,22 @@
+[package]
+name = "pal-audio"
+description = "On-demand native PCM output for PAL frontends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+publish.workspace = true
+
+[features]
+default = []
+device = ["dep:cpal"]
+
+[dependencies]
+cpal = { version = "0.16", optional = true }
+log.workspace = true
+pal-host = { path = "../pal-host" }
+pal-cpu = { path = "../pal-cpu", default-features = false }
+rubato = { version = "0.16", default-features = false }
+
+[lints]
+workspace = true

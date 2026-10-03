@@ -1,0 +1,14 @@
+[package]
+name = "pal-host"
+description = "Bounded host-thread channels and a single execution wake event"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+publish.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

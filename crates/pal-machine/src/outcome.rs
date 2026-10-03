@@ -1,0 +1,96 @@
+//! What a host handler asks the machine to do next.
+//!
+//! Handlers never call guest code and never block the host thread. They return an
+//! [`Outcome`]; calls into the guest and waits are expressed as continuations stored per
+//! guest context. So a guest context that sleeps inside a callback leaves nothing on the host
+//! stack, and any other context can run meanwhile.
+
+use crate::Env;
+use crate::sched::Wait;
+
+/// Continuation run when a guest call returns or a wait ends.
+pub type Continuation = Box<dyn FnOnce(&mut Env<'_>, Resume) -> Outcome>;
+
+/// Host work to resume after a completed presentation is handed to the frontend.
+/// This continuation does not represent a guest wait or advance guest time.
+pub type DeferredContinuation = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resume {
+    /// A guest call made with [`Outcome::Call`] returned this EAX.
+    Returned(u32),
+    /// A wait ended.
+    Woke(WakeReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeReason {
+    /// The deadline passed (or the wait was a plain sleep/yield).
+    Timeout,
+    /// The awaited object was signaled.
+    Signaled,
+    /// A multiple-object wait acquired its selected object(s).
+    Objects { index: u32, abandoned: bool },
+    /// Wait criteria changed; the continuation must recompute them.
+    Notified,
+}
+
+impl Resume {
+    /// EAX of a returned guest call.
+    pub fn value(self) -> u32 {
+        match self {
+            Resume::Returned(v) => v,
+            Resume::Woke(_) => panic!("expected a guest return, got {self:?}"),
+        }
+    }
+}
+
+pub enum Outcome {
+    /// Finish the host call: EAX = value; the thunk's `ret[ n]` pops the caller's frame.
+    Return(u32),
+    /// Finish the host call with EDX:EAX.
+    Return64(u64),
+    /// Finish a cdecl floating return in x87 ST(0); trace stores the f32 bit pattern.
+    ReturnF32(f32),
+    /// Finish a cdecl double return in x87 ST(0), retaining the full f64 precision.
+    ReturnF64(f64),
+    /// Call guest `target(args...)` on the current context. `then` receives its EAX.
+    /// The stack is reset afterwards, so the guest callee's convention doesn't matter.
+    Call { target: u32, args: Vec<u32>, then: Continuation },
+    /// Suspend the current context until `wait` is satisfied, then run `then`.
+    Block { wait: Wait, then: Continuation },
+    /// Continue host work after handing a completed frame to the frontend. Real-time
+    /// sliced execution may defer `then`; other modes run it inline.
+    Defer { then: DeferredContinuation },
+    /// The current context's thread ends (ExitThread).
+    ExitThread(u32),
+    /// The process ends (ExitProcess).
+    ExitProcess(u32),
+    /// Stop the machine with an error (unimplemented API, bad arguments, ...).
+    Fail(String),
+}
+
+impl Outcome {
+    pub fn call(
+        target: u32,
+        args: impl Into<Vec<u32>>,
+        then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static,
+    ) -> Self {
+        Outcome::Call { target, args: args.into(), then: Box::new(then) }
+    }
+
+    pub fn block(wait: Wait, then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static) -> Self {
+        Outcome::Block { wait, then: Box::new(then) }
+    }
+
+    /// Block, then return `value` from the host call.
+    pub fn block_then_return(wait: Wait, value: u32) -> Self {
+        Self::block(wait, move |_, _| Outcome::Return(value))
+    }
+
+    /// Use after `Sys::complete_frame` to defer the following host work, preserving
+    /// the current guest call without fabricating a guest wait.
+    pub fn defer(then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Self {
+        Self::Defer { then: Box::new(then) }
+    }
+}
