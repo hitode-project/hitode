@@ -3,7 +3,11 @@ name: Core execution validation
 on:
   pull_request:
     paths:
-      - 'crates/adv-jit/**'
+      - 'crates/**'
+      - 'apps/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/layering/**'
       - 'tools/performance/**'
       - '.github/workflows/core-performance.yml'
   workflow_dispatch:
@@ -32,35 +36,18 @@ jobs:
           cat "$RUNNER_TEMP/core-environment.txt"
       - name: Test runtime comparison gates
         run: python3 -m unittest discover -s tools/performance -v
-      - name: Prepare isolated core crate
-        shell: python
+      - name: Check crate layering
         run: |
-          import os, pathlib, re, shutil
-          source = pathlib.Path('crates/adv-jit')
-          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'adv-jit-core'
-          shutil.copytree(source, target)
-          manifest = (source / 'Cargo.toml').read_text()
-          manifest = manifest.replace('edition.workspace = true', 'edition = "2024"')
-          manifest = manifest.replace('publish.workspace = true', 'publish = false')
-          manifest = manifest.replace('pal = ["dep:pal-cpu"]', 'pal = []')
-          manifest = re.sub(r'^pal-(?:cpu|machine|win32)\s*=.*\n', '', manifest, flags=re.M)
-          manifest = manifest.replace('[lints]\nworkspace = true', '[workspace]')
-          (target / 'Cargo.toml').write_text(manifest)
-          shutil.copy('Cargo.lock', target / 'Cargo.lock')
-          # This gate is NOT full workspace/runtime validation. Keep every
-          # independent test and expose every excluded adapter test in the log.
-          for test in (target / 'tests').glob('*.rs'):
-              if re.search(r'\bpal_(?:cpu|machine|win32)\b|adv_jit::pal\b', test.read_text()):
-                  print('SKIP sibling-dependent test:', test.name)
-                  test.rename(test.with_suffix('.rs.disabled'))
-      - name: Test core library and independent integration tests
+          python3 -m unittest discover -s tools/layering -v
+          python3 tools/layering/check_layers.py
+      - name: Test execution layer
         run: |
           set -o pipefail
-          cargo test --release --manifest-path "$RUNNER_TEMP/adv-jit-core/Cargo.toml" --lib --tests 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
+          cargo test --release -p adv-cpu --lib --tests 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
       - name: Record diagnostic synthetic benchmark
         run: |
           set -o pipefail
-          cargo build --release --manifest-path "$RUNNER_TEMP/adv-jit-core/Cargo.toml" --example execution_bench
+          cargo build --release -p adv-cpu --example execution_bench
           "$CARGO_TARGET_DIR/release/examples/execution_bench" 7 | tee "$RUNNER_TEMP/core-bench.csv"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
@@ -70,6 +57,19 @@ jobs:
             ${{ runner.temp }}/core-environment.txt
             ${{ runner.temp }}/core-tests.txt
             ${{ runner.temp }}/core-bench.csv
-            ${{ runner.temp }}/adv-jit-core/Cargo.lock
           if-no-files-found: ignore
           retention-days: 14
+
+  workspace:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Test the whole workspace
+        run: cargo test --workspace --release --locked
+      - name: Lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --release --locked -- -D warnings
