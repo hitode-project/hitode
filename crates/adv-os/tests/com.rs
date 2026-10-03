@@ -10,6 +10,81 @@ const A: [u8; 16] = [1; 16];
 const B: [u8; 16] = [2; 16];
 const C: [u8; 16] = [3; 16];
 
+#[test]
+fn bindings_keep_zero_public_reference_identity_and_getters_can_retain_it_again() {
+    let mut objects = Objects::default();
+    let com = Com::new(&mut objects).unwrap();
+    let id = com.create(&mut objects, 0x1000, A, 7_u32).unwrap();
+    assert!(com.retain_internal(&mut objects, id));
+    assert_eq!(com.references(&objects, id), Some(1));
+    assert_eq!(objects.strong_count(id), Some(3));
+    let release = com.release_identity(&mut objects, id).unwrap();
+    assert_eq!(release.references, 0);
+    assert!(release.destroyed.is_none());
+    assert_eq!(com.get::<u32>(&objects, 0x1000), Some(&7));
+    assert!(com.release_identity(&mut objects, id).is_none());
+    assert_eq!(com.query::<u32>(&mut objects, 0x1000, A), Ok(0x1000));
+    assert_eq!(com.references(&objects, id), Some(1));
+    assert!(com.release_internal(&mut objects, id).unwrap().is_none());
+    assert!(com.release_internal(&mut objects, id).is_none());
+    assert_eq!(com.references(&objects, id), Some(1));
+    assert!(
+        com.release_identity(&mut objects, id)
+            .unwrap()
+            .destroyed
+            .is_some()
+    );
+    assert_eq!(objects.object_count(), 0);
+}
+
+#[test]
+fn last_binding_releases_zero_public_reference_payload_and_all_aliases_once() {
+    let drops = Rc::new(Cell::new(0));
+    let mut objects = Objects::default();
+    let com = Com::new(&mut objects).unwrap();
+    let id = com
+        .create(&mut objects, 0x1000, A, Payload(drops.clone()))
+        .unwrap();
+    assert!(com.register_interface(&mut objects, id, B, 0x2000));
+    assert!(com.retain_internal(&mut objects, id));
+    assert!(com.retain_internal(&mut objects, id));
+    assert_eq!(
+        com.release_identity(&mut objects, id).unwrap().references,
+        0
+    );
+    assert!(com.release_internal(&mut objects, id).unwrap().is_none());
+    let destroyed = com.release_internal(&mut objects, id).unwrap().unwrap();
+    assert_eq!(destroyed.interfaces, vec![0x1000, 0x2000]);
+    assert_eq!(objects.object_count(), 0);
+    assert_eq!(objects.alias_count(com.namespace()), 0);
+    assert_eq!(drops.get(), 0);
+    drop(destroyed);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn internal_ownership_refuses_limits_and_foreign_identities_transactionally() {
+    let mut objects = Objects::with_limits(ObjectLimits {
+        references: 2,
+        ..ObjectLimits::default()
+    });
+    let com = Com::new(&mut objects).unwrap();
+    let id = com.create(&mut objects, 0x1000, A, 7_u32).unwrap();
+    assert!(!com.retain_internal(&mut objects, id));
+    assert_eq!(com.references(&objects, id), Some(1));
+    assert_eq!(objects.strong_count(id), Some(2));
+    assert!(com.release_internal(&mut objects, id).is_none());
+    let other = Com::new(&mut objects).unwrap();
+    assert!(!other.retain_internal(&mut objects, id));
+    assert!(other.release_internal(&mut objects, id).is_none());
+    assert!(
+        com.release_identity(&mut objects, id)
+            .unwrap()
+            .destroyed
+            .is_some()
+    );
+}
+
 struct Payload(Rc<Cell<u32>>);
 impl Drop for Payload {
     fn drop(&mut self) {

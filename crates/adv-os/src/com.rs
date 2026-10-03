@@ -23,6 +23,8 @@ pub struct ComObject<T: Any> {
     canonical: u32,
     interfaces: BTreeMap<Iid, u32>,
     aliases: BTreeSet<u32>,
+    /// Device bindings retain storage without changing observable COM counts.
+    internal: u32,
     /// Once queried, the observable interface set must remain static.
     sealed: bool,
 }
@@ -83,6 +85,7 @@ impl Com {
             canonical: pointer,
             interfaces: BTreeMap::from([(IUNKNOWN, pointer), (iid, pointer)]),
             aliases: BTreeSet::from([pointer]),
+            internal: 0,
             sealed: false,
         })?;
         if !objects.bind_alias(self.namespace, pointer, id) {
@@ -175,7 +178,42 @@ impl Com {
         }
         objects
             .strong_count(id)?
-            .checked_sub(object.aliases.len().try_into().ok()?)
+            .checked_sub(object.aliases.len().try_into().ok()?)?
+            .checked_sub(object.internal)
+    }
+
+    /// A device/state binding owns the payload, but is not an AddRef visible to
+    /// the guest. A zero-public-reference object can remain bound and later be
+    /// returned by a getter. Frontends manage parent ownership on that 0/1 edge.
+    pub fn retain_internal<T: Any>(&self, objects: &mut Objects, id: ComIdentity<T>) -> bool {
+        let Some(internal) = self
+            .object(objects, id)
+            .and_then(|o| o.internal.checked_add(1))
+        else {
+            return false;
+        };
+        if !objects.retain(id) {
+            return false;
+        }
+        objects.owned_mut(id).unwrap().internal = internal;
+        true
+    }
+
+    /// Release a binding. `None` is invalid ownership; `Some(None)` keeps a
+    /// live payload, and `Some(Some(..))` transfers final cleanup to the caller.
+    pub fn release_internal<T: Any>(
+        &self,
+        objects: &mut Objects,
+        id: ComIdentity<T>,
+    ) -> Option<Option<Destroyed<T>>> {
+        let internal = self.object(objects, id)?.internal.checked_sub(1)?;
+        let references = self.references(objects, id)?;
+        if internal == 0 && references == 0 {
+            return Some(Some(self.destroy(objects, id)?));
+        }
+        objects.owned_mut(id)?.internal = internal;
+        objects.release(id)?;
+        Some(None)
     }
 
     /// QueryInterface succeeds only for declared IIDs and retains exactly once.
@@ -228,13 +266,20 @@ impl Com {
         id: ComIdentity<T>,
     ) -> Option<Released<T>> {
         let references = self.references(objects, id)?.checked_sub(1)?;
-        if references != 0 {
+        if references != 0 || self.object(objects, id)?.internal != 0 {
             objects.release(id)?;
             return Some(Released {
                 references,
                 destroyed: None,
             });
         }
+        Some(Released {
+            references: 0,
+            destroyed: Some(self.destroy(objects, id)?),
+        })
+    }
+
+    fn destroy<T: Any>(&self, objects: &mut Objects, id: ComIdentity<T>) -> Option<Destroyed<T>> {
         // Preflight before removing any alias, including metadata corruption
         // caused by another layer closing the COM namespace directly.
         let pointers: Vec<_> = self.object(objects, id)?.aliases.iter().copied().collect();
@@ -248,12 +293,9 @@ impl Com {
             objects.close_alias(self.namespace, pointer)?;
         }
         let object = objects.release(id)??;
-        Some(Released {
-            references: 0,
-            destroyed: Some(Destroyed {
-                value: object.value,
-                interfaces: pointers,
-            }),
+        Some(Destroyed {
+            value: object.value,
+            interfaces: pointers,
         })
     }
 }
