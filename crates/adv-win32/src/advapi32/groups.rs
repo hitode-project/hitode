@@ -6,7 +6,7 @@ use adv_machine::{Env, Outcome};
 
 use super::{
     ACCESS_DENIED, INVALID_DATA, INVALID_PARAMETER, Key, KeyMetadata, MORE_DATA, NOACCESS,
-    NOT_FOUND, QUERY, SET, Value, VirtualRegistry, child_key, fold, name, output, state,
+    NOT_FOUND, QUERY, SET, Value, VirtualRegistry, child_key, fold, name, opened, output, state,
     string_type,
 };
 use crate::{Win32, stdcall};
@@ -126,7 +126,7 @@ fn enum_key(env: &mut Env<'_>, wide: bool) -> Outcome {
             env.arg(6),
             env.arg(7),
         );
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & ENUMERATE == 0 {
             return Err(ACCESS_DENIED);
         }
@@ -177,7 +177,7 @@ fn enum_value(env: &mut Env<'_>, wide: bool) -> Outcome {
             env.arg(6),
             env.arg(7),
         );
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
         }
@@ -244,7 +244,7 @@ fn query_info(env: &mut Env<'_>, wide: bool) -> Outcome {
         }
         let (hkey, class_out, class_size, time_out) =
             (env.arg(0), env.arg(1), env.arg(2), env.arg(11));
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
         }
@@ -345,7 +345,7 @@ fn delete_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         let hkey = env.arg(0);
         let value_name = fold(&name(env, env.arg(1), wide, true)?);
         let modified = crate::kernel32::filetime_now(env);
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & SET == 0 {
             return Err(ACCESS_DENIED);
         }
@@ -375,7 +375,7 @@ fn delete_key(env: &mut Env<'_>, wide: bool) -> Outcome {
         let hkey = env.arg(0);
         let subkey = name(env, env.arg(1), wide, false)?;
         let modified = crate::kernel32::filetime_now(env);
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         let (key, _) = child_key(&opened.key, &subkey)?;
         if key.path.is_empty() {
             return Err(ACCESS_DENIED);
@@ -398,11 +398,6 @@ fn delete_key(env: &mut Env<'_>, wide: bool) -> Outcome {
         if !registry.volatile_keys.remove(&key) {
             registry.dirty = true;
         }
-        for opened in registry.handles.values_mut() {
-            if opened.key == key {
-                opened.deleted = true;
-            }
-        }
         let parent = key.parent();
         if let Some(metadata) = registry.metadata.get_mut(&parent) {
             metadata.modified = modified;
@@ -410,6 +405,9 @@ fn delete_key(env: &mut Env<'_>, wide: bool) -> Outcome {
         if !registry.volatile_keys.contains(&parent) {
             registry.dirty = true;
         }
+        env.ext
+            .get::<VirtualRegistry>()
+            .mark_deleted(&mut env.sys.objects, &key);
         Ok(0)
     })();
     Outcome::Return(result.unwrap_or_else(|error| error))

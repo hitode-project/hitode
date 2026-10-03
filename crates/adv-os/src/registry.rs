@@ -1,6 +1,7 @@
 //! The private virtual registry: keys, values and open-key handles, persisted as a bounded
 //! versioned file inside the runtime data folder. Never opens the host registry. Error
 //! values are Win32 error codes.
+use adv_machine::{Namespace, Objects};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -71,8 +72,7 @@ impl KeyMetadata {
 pub struct VirtualRegistry {
     pub keys: BTreeMap<Key, BTreeMap<Vec<u16>, Value>>,
     pub metadata: BTreeMap<Key, KeyMetadata>,
-    pub handles: BTreeMap<u32, OpenKey>,
-    pub next_handle: u32,
+    namespace: Option<Namespace>,
     pub total_bytes: usize,
     pub total_values: usize,
     pub metadata_bytes: usize,
@@ -110,8 +110,7 @@ impl Default for VirtualRegistry {
         Self {
             keys,
             metadata,
-            handles: BTreeMap::new(),
-            next_handle: 0x6b00_0000,
+            namespace: None,
             total_bytes: 0,
             total_values: 0,
             metadata_bytes: 5 * 28,
@@ -124,7 +123,7 @@ impl Default for VirtualRegistry {
     }
 }
 impl VirtualRegistry {
-    pub fn key(&self, handle: u32) -> Result<OpenKey, u32> {
+    pub fn key(&self, objects: &Objects, handle: u32) -> Result<OpenKey, u32> {
         if let Some(error) = self.load_error {
             return Err(error);
         }
@@ -139,7 +138,10 @@ impl VirtualRegistry {
                 deleted: false,
             });
         }
-        let open = self.handles.get(&handle).ok_or(INVALID_HANDLE)?;
+        let id = objects
+            .lookup_alias::<OpenKey>(self.namespace.ok_or(INVALID_HANDLE)?, handle)
+            .ok_or(INVALID_HANDLE)?;
+        let open = objects.owned(id).ok_or(INVALID_HANDLE)?;
         if open.deleted {
             return Err(1018);
         }
@@ -149,24 +151,59 @@ impl VirtualRegistry {
             deleted: false,
         })
     }
-    pub fn allocate(&mut self, key: Key, access: u32) -> Result<u32, u32> {
-        if self.handles.len() >= MAX_HANDLES {
+    pub fn handle_count(&self, objects: &Objects) -> usize {
+        self.namespace.map_or(0, |ns| objects.alias_count(ns))
+    }
+    pub fn allocate(&mut self, objects: &mut Objects, key: Key, access: u32) -> Result<u32, u32> {
+        if self.handle_count(objects) >= MAX_HANDLES {
             return Err(NO_MEMORY);
         }
-        let handle = self.next_handle;
-        self.next_handle = handle
-            .checked_add(4)
-            .filter(|next| *next < 0x7000_0000)
-            .ok_or(NO_MEMORY)?;
-        self.handles.insert(
-            handle,
-            OpenKey {
-                key,
-                access,
-                deleted: false,
-            },
-        );
-        Ok(handle)
+        let namespace = match self.namespace {
+            Some(ns) => ns,
+            None => {
+                // Keep registry handles outside the usual kernel-handle range;
+                // misusing CloseHandle must not accidentally close a thread.
+                let ns = objects
+                    .new_namespace_in(0x6b00_0000, 0x6fff_fffc)
+                    .ok_or(NO_MEMORY)?;
+                self.namespace = Some(ns);
+                ns
+            }
+        };
+        objects
+            .insert_host_in(
+                namespace,
+                OpenKey {
+                    key,
+                    access,
+                    deleted: false,
+                },
+            )
+            .ok_or(NO_MEMORY)
+    }
+    pub fn close(&self, objects: &mut Objects, handle: u32) -> Result<(), u32> {
+        if self.keys.contains_key(&Key {
+            root: handle,
+            path: Vec::new(),
+        }) {
+            return Ok(());
+        }
+        let ns = self.namespace.ok_or(INVALID_HANDLE)?;
+        objects
+            .lookup_alias::<OpenKey>(ns, handle)
+            .ok_or(INVALID_HANDLE)?;
+        objects.close_alias(ns, handle).ok_or(INVALID_HANDLE)?;
+        Ok(())
+    }
+    /// Deletion tombstones existing opens even if the same path is recreated.
+    pub fn mark_deleted(&self, objects: &mut Objects, key: &Key) {
+        if let Some(ns) = self.namespace {
+            for (_, open) in objects.hosts_in_mut::<OpenKey>(ns) {
+                if &open.key == key {
+                    open.deleted = true;
+                }
+            }
+        }
     }
 }
 /// Canonical (case-folded) spelling of a key or value name.

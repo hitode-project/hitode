@@ -56,6 +56,28 @@ fn numeric_aliases_are_isolated_from_kernel_handles() {
 }
 
 #[test]
+fn automatic_alias_ranges_are_checked_bounded_and_do_not_reuse_stale_numbers() {
+    let mut objects = Objects::with_limits(ObjectLimits {
+        namespaces: 2,
+        ..ObjectLimits::default()
+    });
+    for (first, last) in [(0, 4), (9, 16), (8, 15), (16, 8)] {
+        assert!(objects.new_namespace_in(first, last).is_none());
+    }
+    // Rejected range definitions do not consume the namespace limit.
+    let ns = objects.new_namespace_in(0xfffffff8, 0xfffffffc).unwrap();
+    assert_eq!(objects.insert_host_in(ns, 1_u32), Some(0xfffffff8));
+    assert_eq!(objects.insert_host_in(ns, 2_u32), Some(0xfffffffc));
+    assert!(objects.insert_host_in(ns, 3_u32).is_none());
+    assert_eq!(objects.alias_count(ns), 2);
+    objects.close_alias(ns, 0xfffffff8).unwrap();
+    assert!(objects.insert_host_in(ns, 4_u32).is_none());
+    assert_eq!(objects.object_count(), 1);
+    // Kernel allocation is unaffected by another namespace's exhaustion.
+    assert_eq!(objects.insert_host(5_u32), 0x104);
+}
+
+#[test]
 fn automatic_alias_transfers_owner_without_leaking() {
     let drops = Rc::new(Cell::new(0));
     let mut objects = Objects::default();

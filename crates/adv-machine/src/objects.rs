@@ -85,6 +85,7 @@ impl Default for ObjectLimits {
 
 struct NamespaceState {
     next: u32,
+    last: u32,
     aliases: usize,
 }
 
@@ -92,6 +93,7 @@ impl Default for NamespaceState {
     fn default() -> Self {
         Self {
             next: 0x100,
+            last: u32::MAX & !3,
             aliases: 0,
         }
     }
@@ -193,9 +195,10 @@ impl Objects {
         if self.targets.len() >= self.limits.aliases {
             return None;
         }
-        let mut next = self.namespaces.get(&ns)?.next;
+        let state = self.namespaces.get(&ns)?;
+        let mut next = state.next;
         loop {
-            next = next.checked_add(4)?;
+            next = next.checked_add(4).filter(|next| *next <= state.last)?;
             if self.vacant_alias(ns, next) {
                 return Some(next);
             }
@@ -264,11 +267,28 @@ impl Objects {
     }
 
     pub fn new_namespace(&mut self) -> Option<Namespace> {
+        self.new_namespace_in(0x104, u32::MAX & !3)
+    }
+
+    /// Select a bounded, inclusive range for automatic aliases. Explicit
+    /// bind_alias calls still accept any numeric alias (such as guest pointers).
+    /// The OS personality chooses its ranges; this table only enforces them.
+    pub fn new_namespace_in(&mut self, first: u32, last: u32) -> Option<Namespace> {
+        if first == 0 || first > last || first & 3 != 0 || last & 3 != 0 {
+            return None;
+        }
         if self.namespaces.len() >= self.limits.namespaces {
             return None;
         }
         let id = self.next_namespace.checked_add(1)?;
-        self.namespaces.insert(id, NamespaceState::default());
+        self.namespaces.insert(
+            id,
+            NamespaceState {
+                next: first - 4,
+                last,
+                aliases: 0,
+            },
+        );
         self.next_namespace = id;
         Some(Namespace {
             table: self.table,

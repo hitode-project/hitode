@@ -3,7 +3,7 @@
 use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
-use adv_machine::{Clock, Machine, RunResult};
+use adv_machine::{Clock, Machine, ObjectLimits, Objects, RunResult};
 use adv_os::Codec;
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
@@ -84,7 +84,10 @@ impl Fixture {
         self.blob(&bytes)
     }
     fn call(&mut self, name: &str, args: &[Arg]) -> u32 {
-        let target = self.machine.resolve_import("advapi32.dll", name).unwrap();
+        self.call_in("advapi32.dll", name, args)
+    }
+    fn call_in(&mut self, dll: &str, name: &str, args: &[Arg]) -> u32 {
+        let target = self.machine.resolve_import(dll, name).unwrap();
         for &arg in args.iter().rev() {
             match arg {
                 I(v) => {
@@ -209,6 +212,52 @@ fn nested_case_insensitive_keys_distinct_handles_close_and_machine_isolation() {
     let rc = isolated.call("RegOpenKeyExA", &[I(HKCU), I(path), I(0), I(1), I(out)]);
     isolated.run();
     assert_eq!(isolated.get(rc), 2);
+}
+
+#[test]
+fn object_exhaustion_does_not_create_a_key_or_write_output_handles() {
+    let mut f = Fixture::new(932);
+    // The only available object will be the executing guest thread.
+    f.machine.sys.objects = Objects::with_limits(ObjectLimits {
+        objects: 1,
+        ..ObjectLimits::default()
+    });
+    let path = f.a("Software\\MustNotExist", 932);
+    let (created, key, disposition) = f.create(path, false, 3);
+    f.machine.cpu.write_u32(key, 0xcccccccc).unwrap();
+    f.machine.cpu.write_u32(disposition, 0xdddddddd).unwrap();
+    let out = f.word(0);
+    let opened = f.call("RegOpenKeyExA", &[I(HKCU), I(path), I(0), I(1), I(out)]);
+    f.run();
+    assert_eq!(f.get(created), 8);
+    assert_eq!(f.get(opened), 2);
+    assert_eq!((f.get(key), f.get(disposition)), (0xcccccccc, 0xdddddddd));
+    assert_eq!(f.machine.sys.objects.object_count(), 1);
+}
+
+#[test]
+fn registry_handles_share_ownership_without_entering_the_kernel_namespace() {
+    let mut f = Fixture::new(932);
+    let path = f.a("Software\\Namespace Fixture", 932);
+    let (created, key, _) = f.create(path, false, 3);
+    let wrong_close = f.call_in("kernel32.dll", "CloseHandle", &[L(key)]);
+    let closed = f.call("RegCloseKey", &[L(key)]);
+    let twice = f.call("RegCloseKey", &[L(key)]);
+    f.run();
+    assert_eq!(f.get(created), 0);
+    assert_eq!(f.get(key), 0x6b000000);
+    assert_eq!(f.get(wrong_close), 0);
+    assert_eq!((f.get(closed), f.get(twice)), (0, 6));
+    assert_eq!(
+        f.machine
+            .sys
+            .objects
+            .all_hosts::<adv_os::registry::OpenKey>()
+            .count(),
+        0
+    );
+    // Closing a key did not release the executing thread.
+    assert_eq!(f.machine.sys.objects.object_count(), 1);
 }
 
 #[test]

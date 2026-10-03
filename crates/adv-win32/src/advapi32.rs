@@ -23,6 +23,12 @@ fn state<'a>(env: &'a mut Env<'_>) -> &'a mut VirtualRegistry {
     }
     env.ext.get_mut::<VirtualRegistry>()
 }
+fn opened(env: &mut Env<'_>, handle: u32) -> Result<OpenKey, u32> {
+    state(env);
+    env.ext
+        .get::<VirtualRegistry>()
+        .key(&env.sys.objects, handle)
+}
 fn name(env: &Env<'_>, ptr: u32, wide: bool, nullable: bool) -> Result<Vec<u16>, u32> {
     if ptr == 0 {
         return if nullable {
@@ -146,16 +152,18 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
             Vec::new()
         };
         let modified = crate::kernel32::filetime_now(env);
-        let parent = state(env).key(hkey)?;
+        let parent = opened(env, hkey)?;
         let (key, parents) = child_key(&parent.key, &subkey)?;
-        let registry = state(env);
+        let registry = env.ext.get_mut::<VirtualRegistry>();
         let existed = registry.keys.contains_key(&key);
         if !create && !existed {
             return Err(NOT_FOUND);
         }
-        if registry.handles.len() >= MAX_HANDLES {
+        if registry.handle_count(&env.sys.objects) >= MAX_HANDLES {
             return Err(NO_MEMORY);
         }
+        let mut additions = BTreeMap::new();
+        let mut metadata = 0;
         if create && !existed {
             let missing_keys: Vec<_> = parents
                 .iter()
@@ -166,7 +174,7 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
                 .split(|&unit| unit == 92)
                 .filter(|part| !part.is_empty())
                 .collect();
-            let additions: BTreeMap<_, _> = parents
+            additions = parents
                 .iter()
                 .zip(parts)
                 .map(|(candidate, part)| {
@@ -185,7 +193,7 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
                     )
                 })
                 .collect();
-            let metadata: usize = missing_keys
+            metadata = missing_keys
                 .iter()
                 .map(|key| 12 + key.path.len() * 2 + additions[*key].size())
                 .sum();
@@ -201,6 +209,15 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
             if registry.keys.len() + missing > MAX_KEYS {
                 return Err(NO_MEMORY);
             }
+        }
+        // Reserve ownership after every semantic check, before mutating the
+        // persistent key tree. Table exhaustion must not leave a created key.
+        let handle = if !create && subkey.is_empty() && (hkey & 0x8000_0000 != 0) {
+            hkey
+        } else {
+            registry.allocate(&mut env.sys.objects, key.clone(), access)?
+        };
+        if create && !existed {
             // This virtual namespace uses a default writable ACL. Like Win32,
             // creating a child checks that ACL, not the parent's handle mask.
             for parent in parents {
@@ -225,11 +242,6 @@ fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcom
             }
             registry.metadata_bytes += metadata;
         }
-        let handle = if !create && subkey.is_empty() && (hkey & 0x8000_0000 != 0) {
-            hkey
-        } else {
-            state(env).allocate(key, access)?
-        };
         env.cpu.write_u32(out, handle).map_err(|_| NOACCESS)?;
         if disposition != 0 {
             env.cpu
@@ -252,7 +264,7 @@ fn set_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         let name = fold(&display_name);
         let modified = crate::kernel32::filetime_now(env);
         let hkey = env.arg(0);
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & SET == 0 {
             return Err(ACCESS_DENIED);
         }
@@ -331,7 +343,7 @@ fn query_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         }
         let name = fold(&name(env, env.arg(1), wide, true)?);
         let hkey = env.arg(0);
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
         }
@@ -390,23 +402,19 @@ fn query_value(env: &mut Env<'_>, wide: bool) -> Outcome {
 }
 fn close_key(env: &mut Env<'_>) -> Outcome {
     let key = env.arg(0);
-    let registry = state(env);
-    let code = if registry.keys.contains_key(&Key {
-        root: key,
-        path: Vec::new(),
-    }) || registry.handles.remove(&key).is_some()
-    {
-        0
-    } else {
-        INVALID_HANDLE
-    };
+    state(env);
+    let code = env
+        .ext
+        .get::<VirtualRegistry>()
+        .close(&mut env.sys.objects, key)
+        .map_or_else(|error| error, |()| 0);
     Outcome::Return(code)
 }
 
 fn flush_key(env: &mut Env<'_>) -> Outcome {
     let hkey = env.arg(0);
     let result = (|| {
-        let opened = state(env).key(hkey)?;
+        let opened = opened(env, hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
         }
