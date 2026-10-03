@@ -313,7 +313,7 @@ fn native_surfaces_share_ids_mailbox_and_reusable_bounded_frame_ownership() {
         surfaces.present(native, &memory).is_err(),
         "never treat native pixels as guest address zero"
     );
-    for serial in 1..=100 {
+    for serial in 1..=100_u32 {
         surfaces.present_native(native, &mut gpu).unwrap();
         if serial % 2 == 0 {
             assert!(consumer.update());
@@ -489,6 +489,229 @@ fn explicit_completion_job_drives_one_readback_and_wakes_without_a_poll_loop() {
     assert!(readback.poll().is_none());
     service.shutdown();
     assert_eq!(ticket.status(), adv_sync::background::Status::Completed);
+}
+
+#[test]
+fn concurrent_unpinned_image_clone_releases_notify_capacity_after_their_refcounts_drop() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let image = gpu.image(8, 8).unwrap();
+    let context = gpu.context().clone();
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    assert!(context.set_execution_wake(wake.clone()).is_ok());
+    let frames: Vec<_> = (0..8)
+        .map(|serial| gpu.present(&image, serial).unwrap())
+        .collect();
+    let mut saved: Vec<_> = frames.iter().map(|frame| frame.image.clone()).collect();
+    drop(frames); // Saved Images keep each slot unavailable without FramePins.
+    assert!(matches!(gpu.present(&image, 9), Err(Error::Busy)));
+    let first = saved.pop().unwrap();
+    let second = first.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier.clone();
+    let a = std::thread::spawn(move || {
+        first_barrier.wait();
+        drop(first);
+    });
+    let b = std::thread::spawn(move || {
+        second_barrier.wait();
+        drop(second);
+    });
+    barrier.wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match gpu.present(&image, 9) {
+            Ok(_) => break,
+            Err(Error::Busy) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "last Image release lost its capacity wake"
+                );
+                assert!(wake.wait(Some(remaining)).unwrap());
+            }
+            Err(error) => panic!("unexpected retry failure: {error}"),
+        }
+    }
+    a.join().unwrap();
+    b.join().unwrap();
+}
+
+#[test]
+fn ownership_frames_freeze_all_writes_without_a_copy_and_unfreeze_after_the_last_clone() {
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let target = gpu.target(8, 8, false).unwrap();
+    let source = gpu.image(8, 8).unwrap();
+    gpu.clear(&target, Some([0.0, 1.0, 0.0, 1.0]), None)
+        .unwrap();
+    let before = gpu.stats();
+    let frame = gpu.completed_frame(target.image.clone(), 1).unwrap();
+    assert_eq!(gpu.stats().submissions, before.submissions);
+    assert_eq!(gpu.stats().native_frame_allocations, 0);
+    let retained = frame.clone();
+    drop(frame);
+    let before = gpu.stats();
+    assert!(matches!(
+        gpu.upload(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8
+            },
+            32,
+            &[255; 256]
+        ),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        gpu.draw(
+            &target,
+            &quad([1.0; 4], 0.5, 1.0),
+            None,
+            DrawState::new(8, 8)
+        ),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        gpu.copy(
+            &source,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8
+            },
+            &target.image,
+            0,
+            0
+        ),
+        Err(Error::Busy)
+    ));
+    assert_eq!(gpu.stats(), before);
+    assert_eq!(
+        pixel(&read(&mut gpu, &retained.image), 8, 4, 4),
+        [0, 255, 0, 255]
+    );
+    drop(retained);
+    gpu.clear(&target, Some([1.0, 0.0, 0.0, 1.0]), None)
+        .unwrap();
+    assert_eq!(
+        pixel(&read(&mut gpu, &target.image), 8, 4, 4),
+        [0, 0, 255, 255]
+    );
+}
+
+#[test]
+fn rotating_surface_uses_one_logical_id_no_present_submits_and_a_bounded_immutable_pool() {
+    use adv_device::surface::{Snapshot, Surfaces, frame_mailbox};
+    let mut gpu = pollster::block_on(Gpu::request(false)).unwrap();
+    let mut surfaces = Surfaces::new(8, 8, 0x1000, 0x10000, Snapshot::default()).unwrap();
+    let context = gpu.context().clone();
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    assert!(context.set_execution_wake(wake.clone()).is_ok());
+    let id = surfaces.create_native(&gpu, 8, 8, false).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    surfaces.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    let mut first = None;
+    for serial in 1..=100_u32 {
+        gpu.clear(
+            surfaces.native_target(id).unwrap(),
+            Some([f64::from(serial) / 255.0, 0.0, 0.0, 1.0]),
+            None,
+        )
+        .unwrap();
+        let before = gpu.stats().submissions;
+        assert_eq!(
+            surfaces.present_native_rotating(id, &mut gpu).unwrap(),
+            u64::from(serial)
+        );
+        assert_eq!(
+            gpu.stats().submissions,
+            before,
+            "Present ownership performs zero Queue submissions"
+        );
+        if serial == 1 || serial % 2 == 0 {
+            assert!(consumer.update());
+            if serial == 1 {
+                first = Some(consumer.current().native().unwrap().clone());
+            }
+        }
+    }
+    assert_eq!(surfaces.live_surfaces(), 1);
+    assert!(surfaces.native_pool_size(id).unwrap() <= 6);
+    assert_eq!(gpu.stats().native_frame_allocations, 0);
+    assert_eq!(gpu.stats().readbacks, 0);
+    let last = consumer.current().native().unwrap().clone();
+    assert_eq!(
+        pixel(&read(&mut gpu, &first.as_ref().unwrap().image), 8, 4, 4),
+        [0, 0, 1, 255]
+    );
+    assert_eq!(
+        pixel(&read(&mut gpu, &last.image), 8, 4, 4),
+        [0, 0, 100, 255]
+    );
+    drop(first);
+    drop(last);
+    assert!(
+        !wake.wait(Some(Duration::ZERO)).unwrap(),
+        "ordinary presentation release never wakes execution"
+    );
+    let mut held = Vec::new();
+    while surfaces.native_pool_size(id).unwrap() < 8 {
+        surfaces.present_native_rotating(id, &mut gpu).unwrap();
+        consumer.update();
+        held.push(consumer.current().native().unwrap().clone());
+    }
+    // Fill the last reusable slots too, retaining each completed frame.
+    loop {
+        let serial = surfaces.stats.presentations;
+        match surfaces.present_native_rotating(id, &mut gpu) {
+            Ok(_) => {
+                consumer.update();
+                held.push(consumer.current().native().unwrap().clone());
+            }
+            Err(Error::Busy) => {
+                assert_eq!(surfaces.stats.presentations, serial);
+                break;
+            }
+            Err(error) => panic!("unexpected rotation failure: {error}"),
+        }
+    }
+    assert_eq!(surfaces.native_pool_size(id), Some(8));
+    held.clear();
+    assert!(
+        wake.wait(Some(Duration::ZERO)).unwrap(),
+        "real frame-capacity release resumes the pending producer"
+    );
+    assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
+    surfaces.present_native_rotating(id, &mut gpu).unwrap();
+    let before = surfaces.stats.presentations;
+    let pause = context.pause_submissions().unwrap();
+    assert!(matches!(
+        surfaces.present_native_rotating(id, &mut gpu),
+        Err(Error::Busy)
+    ));
+    assert_eq!(surfaces.stats.presentations, before);
+    drop(pause);
+    let replacement = gpu.target(16, 12, false).unwrap();
+    surfaces.replace_native(id, replacement).unwrap();
+    assert_eq!(surfaces.native_pool_size(id), Some(1));
+    assert_eq!(
+        (
+            surfaces.get(id).unwrap().width,
+            surfaces.get(id).unwrap().height
+        ),
+        (16, 12)
+    );
+    assert!(surfaces.delete(id));
+    assert_eq!(surfaces.live_surfaces(), 0);
+    assert_eq!(surfaces.native_pool_size(id), None);
 }
 
 #[test]

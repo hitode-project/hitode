@@ -364,7 +364,7 @@ pub struct Surfaces<P: Presenter> {
     next: u32,
     surfaces: BTreeMap<u32, Surface>,
     #[cfg(feature = "gpu")]
-    native_surfaces: BTreeMap<u32, crate::gpu::Target>,
+    native_surfaces: BTreeMap<u32, NativeSurface>,
     primary: Option<u32>,
     deferred_presentation: bool,
     pending_frame: Option<PendingFrame>,
@@ -375,6 +375,14 @@ pub struct Surfaces<P: Presenter> {
     blit_source: Vec<u8>,
     frame_mailbox: Option<(FrameProducer, adv_sync::WakeEvent)>,
 }
+
+#[cfg(feature = "gpu")]
+struct NativeSurface {
+    target: crate::gpu::Target,
+    spares: Vec<crate::gpu::Target>,
+}
+#[cfg(feature = "gpu")]
+const MAX_ROTATION_TARGETS: usize = 8;
 
 impl<P: Presenter> Surfaces<P> {
     /// A store whose pixels and front objects live in the guest range `arena..arena + len`.
@@ -675,6 +683,15 @@ impl<P: Presenter> Surfaces<P> {
         let target = gpu
             .target(width, height, depth)
             .map_err(|error| error.to_string())?;
+        self.insert_native(target)
+    }
+
+    /// Adopt an already created device target into the one shared id space.
+    #[cfg(feature = "gpu")]
+    pub fn insert_native(&mut self, target: crate::gpu::Target) -> Result<u32, String> {
+        let width = target.image.width();
+        let height = target.image.height();
+        size(width, height)?;
         let id = self.new_id();
         self.surfaces.insert(
             id,
@@ -689,13 +706,50 @@ impl<P: Presenter> Surfaces<P> {
                 format: PixelFormat::Bgra32,
             },
         );
-        self.native_surfaces.insert(id, target);
+        self.native_surfaces.insert(
+            id,
+            NativeSurface {
+                target,
+                spares: Vec::new(),
+            },
+        );
         Ok(id)
     }
 
     #[cfg(feature = "gpu")]
     pub fn native_target(&self, id: u32) -> Option<&crate::gpu::Target> {
-        self.native_surfaces.get(&id)
+        self.native_surfaces.get(&id).map(|surface| &surface.target)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn native_pool_size(&self, id: u32) -> Option<usize> {
+        self.native_surfaces
+            .get(&id)
+            .map(|surface| surface.spares.len() + 1)
+    }
+
+    /// Reset/replace storage while preserving the logical surface id. All old
+    /// frames retain their own images; their pixels cannot observe the new target.
+    #[cfg(feature = "gpu")]
+    pub fn replace_native(
+        &mut self,
+        id: u32,
+        target: crate::gpu::Target,
+    ) -> Result<crate::gpu::Target, String> {
+        let native = self
+            .native_surfaces
+            .get_mut(&id)
+            .ok_or("unknown native surface")?;
+        let surface = self.surfaces.get_mut(&id).unwrap();
+        if surface.locked.is_some() {
+            return Err("native surface is locked during replacement".into());
+        }
+        surface.width = target.image.width();
+        surface.height = target.image.height();
+        surface.pitch = surface.width * 4;
+        surface.version = surface.version.wrapping_add(1);
+        native.spares.clear();
+        Ok(std::mem::replace(&mut native.target, target))
     }
 
     /// Reuse the common presentation serial, coalescing and ownership mailbox.
@@ -705,11 +759,111 @@ impl<P: Presenter> Surfaces<P> {
             .native_surfaces
             .get(&id)
             .ok_or("unknown native surface")?
+            .target
             .image;
         let serial = self.stats.presentations + 1;
         let frame = gpu
             .present(image, serial)
             .map_err(|error| error.to_string())?;
+        self.publish_native_frame(id, frame)?;
+        Ok(())
+    }
+
+    /// A discard boundary transfers the old target into the immutable frame and
+    /// rotates one available target. No texture copy or Queue submit is needed.
+    /// The pool is bounded; retaining all frames returns Busy before publication.
+    #[cfg(feature = "gpu")]
+    pub fn present_native_rotating(
+        &mut self,
+        id: u32,
+        gpu: &mut crate::gpu::Gpu,
+    ) -> Result<u64, crate::gpu::Error> {
+        use crate::gpu::Error;
+        let context = gpu.context().clone();
+        let submission = context.submission()?;
+        let native = self
+            .native_surfaces
+            .get_mut(&id)
+            .ok_or_else(|| Error::Invalid("unknown native surface".into()))?;
+        let mut reusable = native
+            .spares
+            .iter()
+            .position(|target| target.image.reusable());
+        if reusable.is_none() && native.spares.len() + 1 >= MAX_ROTATION_TARGETS {
+            // Register before the second capacity check, covering release
+            // between the first observation and a future Machine wait.
+            gpu.wait_for_frame_release();
+            reusable = native
+                .spares
+                .iter()
+                .position(|target| target.image.reusable());
+            if reusable.is_none() {
+                return Err(Error::Busy);
+            }
+        }
+        // Prepare every fallible operation before changing the active target.
+        let replacement = if reusable.is_none() {
+            Some(gpu.target(
+                native.target.image.width(),
+                native.target.image.height(),
+                native.target.has_depth(),
+            )?)
+        } else {
+            None
+        };
+        let serial = self
+            .stats
+            .presentations
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("presentation serial exhausted".into()))?;
+        let frame = gpu.completed_frame_under(native.target.image.clone(), serial, &submission)?;
+        let replacement =
+            replacement.unwrap_or_else(|| native.spares.swap_remove(reusable.unwrap()));
+        if let Err(error) = self.publish_native_frame(id, frame) {
+            if reusable.is_some() {
+                self.native_surfaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .spares
+                    .push(replacement);
+            }
+            return Err(Error::Invalid(error));
+        }
+        let native = self.native_surfaces.get_mut(&id).unwrap();
+        let old = std::mem::replace(&mut native.target, replacement);
+        native.spares.push(old);
+        Ok(serial)
+    }
+
+    /// Commit a frame prepared by a device command producer through the same
+    /// serial, ownership mailbox and capture path used by GDI/DirectDraw.
+    #[cfg(feature = "gpu")]
+    pub fn publish_native_frame(
+        &mut self,
+        id: u32,
+        mut frame: crate::gpu::NativeFrame,
+    ) -> Result<u64, String> {
+        let native = self
+            .native_surfaces
+            .get(&id)
+            .ok_or("unknown native surface")?;
+        if !native.target.image.same_context(&frame.image)
+            || (native.target.image.width(), native.target.image.height())
+                != (frame.image.width(), frame.image.height())
+        {
+            return Err("prepared frame does not match its native surface".into());
+        }
+        let serial = self
+            .stats
+            .presentations
+            .checked_add(1)
+            .ok_or("presentation serial exhausted")?;
+        frame.serial = serial;
+        if self.frame_mailbox.is_none() && !self.deferred_presentation {
+            self.presenter.present_native(&frame)?;
+            self.captured_serial = serial;
+            self.stats.host_captures += 1;
+        }
         self.stats.presentations = serial;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|slot| slot.store_native(frame));
@@ -728,12 +882,8 @@ impl<P: Presenter> Surfaces<P> {
             self.pending_frame
                 .get_or_insert_with(PendingFrame::default)
                 .store_native(frame);
-        } else {
-            self.presenter.present_native(&frame)?;
-            self.captured_serial = serial;
-            self.stats.host_captures += 1;
         }
-        Ok(())
+        Ok(serial)
     }
     /// Fill a rectangle with a packed pixel in the destination's own format.
     pub fn fill_raw(

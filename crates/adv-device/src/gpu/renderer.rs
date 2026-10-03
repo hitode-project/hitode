@@ -97,7 +97,9 @@ pub struct Image {
     height: u32,
     context: u64,
     id: u64,
-    lease: Arc<()>,
+    lease: Option<Arc<()>>,
+    frame_pins: Arc<AtomicUsize>,
+    gate: Arc<submission::Gate>,
 }
 impl Image {
     pub fn width(&self) -> u32 {
@@ -106,11 +108,32 @@ impl Image {
     pub fn height(&self) -> u32 {
         self.height
     }
-    pub fn texture(&self) -> &wgpu::Texture {
-        &self.texture
-    }
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
+    }
+    pub(crate) fn reusable(&self) -> bool {
+        Arc::strong_count(self.lease.as_ref().unwrap()) == 1
+            && self.frame_pins.load(Ordering::Acquire) == 0
+    }
+    fn writable(&self) -> Result<(), Error> {
+        if self.frame_pins.load(Ordering::Acquire) != 0 {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    pub(crate) fn same_context(&self, other: &Image) -> bool {
+        self.context == other.context
+    }
+}
+impl Drop for Image {
+    fn drop(&mut self) {
+        // Linearize the actual release before notification. Testing strong_count
+        // before automatic field drop can miss two concurrent clone releases;
+        // notifying before decrement can wake a retry while capacity is still full.
+        drop(self.lease.take());
+        if self.frame_pins.load(Ordering::Acquire) == 0 {
+            self.gate.frame_available();
+        }
     }
 }
 
@@ -118,6 +141,37 @@ impl Image {
 pub struct Target {
     pub image: Image,
     depth: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+impl Target {
+    pub(crate) fn has_depth(&self) -> bool {
+        self.depth.is_some()
+    }
+}
+
+struct FramePin {
+    pins: Arc<AtomicUsize>,
+    gate: Arc<submission::Gate>,
+}
+impl FramePin {
+    fn new(image: &Image) -> Result<Arc<Self>, Error> {
+        image
+            .frame_pins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+                pins.checked_add(1)
+            })
+            .map_err(|_| Error::Busy)?;
+        Ok(Arc::new(Self {
+            pins: image.frame_pins.clone(),
+            gate: image.gate.clone(),
+        }))
+    }
+}
+impl Drop for FramePin {
+    fn drop(&mut self) {
+        if self.pins.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.gate.frame_available();
+        }
+    }
 }
 
 /// Immutable GPU snapshot of one presentation. Copies are texture-to-texture;
@@ -127,6 +181,7 @@ pub struct NativeFrame {
     pub image: Image,
     pub serial: u64,
     context: NativeContext,
+    _pin: Arc<FramePin>,
 }
 impl NativeFrame {
     pub fn context(&self) -> &NativeContext {
@@ -251,7 +306,8 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("adv neutral graphics"),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits()),
                 ..Default::default()
             })
             .await
@@ -445,7 +501,9 @@ impl Gpu {
             height,
             context: context.id,
             id: NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed),
-            lease: Arc::new(()),
+            lease: Some(Arc::new(())),
+            frame_pins: Arc::new(AtomicUsize::new(0)),
+            gate: context.gate.clone(),
         }
     }
 
@@ -489,6 +547,7 @@ impl Gpu {
     ) -> Result<(), Error> {
         let submission = self.context.submission()?;
         self.own(image)?;
+        image.writable()?;
         rectangle_in(image, rectangle)?;
         let row = rectangle
             .w
@@ -528,6 +587,7 @@ impl Gpu {
         let context = self.context.clone();
         let submission = context.submission()?;
         self.own(&target.image)?;
+        target.image.writable()?;
         if color.is_some_and(|c| c.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)))
             || depth.is_some_and(|d| !d.is_finite() || !(0.0..=1.0).contains(&d))
             || (depth.is_some() && target.depth.is_none())
@@ -646,6 +706,7 @@ impl Gpu {
         let context = self.context.clone();
         let submission = context.submission()?;
         self.own(&target.image)?;
+        target.image.writable()?;
         if let Some(image) = image {
             self.own(image)?;
             if image.id == target.image.id {
@@ -795,6 +856,7 @@ impl Gpu {
     ) -> Result<(), Error> {
         self.own(source)?;
         self.own(destination)?;
+        destination.writable()?;
         rectangle_in(source, rectangle)?;
         rectangle_in(
             destination,
@@ -836,10 +898,14 @@ impl Gpu {
         let context = self.context.clone();
         let submission = context.submission()?;
         self.own(image)?;
-        let reusable = self
-            .frames
-            .iter()
-            .position(|frame| Arc::strong_count(&frame.lease) == 1);
+        let mut reusable = self.frames.iter().position(Image::reusable);
+        if reusable.is_none() && self.frames.len() >= MAX_NATIVE_FRAMES {
+            self.wait_for_frame_release();
+            reusable = self.frames.iter().position(Image::reusable);
+            if reusable.is_none() {
+                return Err(Error::Busy);
+            }
+        }
         let index = if let Some(index) = reusable {
             if self.frames[index].width != image.width || self.frames[index].height != image.height
             {
@@ -870,10 +936,45 @@ impl Gpu {
             &submission,
         )?;
         self.stats.native_frames += 1;
+        let pin = FramePin::new(&snapshot)?;
         Ok(NativeFrame {
             image: snapshot,
             serial,
             context: self.context.clone(),
+            _pin: pin,
+        })
+    }
+
+    pub(crate) fn wait_for_frame_release(&self) {
+        self.context.gate.wait_for_frame();
+    }
+
+    /// Freeze the completed image by ownership, without copying or submitting.
+    /// The caller must rotate its writable target before another draw. A live
+    /// frame rejects all ordinary GPU writes to this image, including clones.
+    pub fn completed_frame(&mut self, image: Image, serial: u64) -> Result<NativeFrame, Error> {
+        let context = self.context.clone();
+        let submission = context.submission()?;
+        self.completed_frame_under(image, serial, &submission)
+    }
+
+    pub(crate) fn completed_frame_under(
+        &mut self,
+        image: Image,
+        serial: u64,
+        submission: &Submission<'_>,
+    ) -> Result<NativeFrame, Error> {
+        if submission.context.id != self.context.id {
+            return Err(invalid("submission lease belongs to another GPU context"));
+        }
+        self.own(&image)?;
+        let pin = FramePin::new(&image)?;
+        self.stats.native_frames += 1;
+        Ok(NativeFrame {
+            image,
+            serial,
+            context: self.context.clone(),
+            _pin: pin,
         })
     }
 

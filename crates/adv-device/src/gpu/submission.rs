@@ -1,7 +1,7 @@
 //! Nonblocking submission exclusion for native swapchain configuration.
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ pub(super) struct Gate {
     state: AtomicU32,
     drained: WakeEvent,
     execution: OnceLock<WakeEvent>,
+    frame_waiter: AtomicBool,
 }
 impl Gate {
     pub(super) fn new() -> std::io::Result<Arc<Self>> {
@@ -22,6 +23,7 @@ impl Gate {
             state: AtomicU32::new(0),
             drained: WakeEvent::new()?,
             execution: OnceLock::new(),
+            frame_waiter: AtomicBool::new(false),
         }))
     }
     pub(super) fn enter(self: &Arc<Self>) -> Result<Lease, Error> {
@@ -42,6 +44,16 @@ impl Gate {
     }
     pub(super) fn set_wake(&self, wake: WakeEvent) -> Result<(), WakeEvent> {
         self.execution.set(wake)
+    }
+    pub(super) fn wait_for_frame(&self) {
+        self.frame_waiter.store(true, Ordering::Release);
+    }
+    pub(super) fn frame_available(&self) {
+        if self.frame_waiter.swap(false, Ordering::AcqRel)
+            && let Some(wake) = self.execution.get()
+        {
+            wake.signal();
+        }
     }
 }
 
