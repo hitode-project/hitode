@@ -8,7 +8,9 @@ use adv_machine::{Env, Outcome};
 mod ole_memory;
 
 use crate::util::{cstr, put_cstr, set_last_error};
-use crate::{Codec, Win32, stdcall};
+use adv_os::Codec;
+
+use crate::{Win32, stdcall};
 
 const SHLWAPI: &str = "shlwapi.dll";
 const SHELL32: &str = "shell32.dll";
@@ -217,7 +219,7 @@ fn path_is_directory_a(env: &mut Env<'_>) -> Outcome {
 
 /// Guest path of a CSIDL folder, or `None` if unsupported.
 fn special_folder(w: &Win32, csidl: u32) -> Option<String> {
-    let user = format!("C:\\Users\\{}", w.cfg.user_name);
+    let user = format!("C:\\Users\\{}", w.cfg.os.user_name);
     Some(match csidl & 0xff {
         0x00 | 0x10 => format!("{user}\\Desktop"),
         0x05 => format!("{user}\\Documents"),

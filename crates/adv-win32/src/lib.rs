@@ -11,15 +11,12 @@
 
 mod advapi32;
 pub mod gdi32;
-pub mod heap;
 pub mod kernel32;
 mod misc;
-pub mod nls;
 pub mod printf;
 pub mod user32;
 pub mod util;
 mod version;
-pub mod vfs;
 mod winmm;
 mod winsock;
 
@@ -31,28 +28,12 @@ use adv_cpu::backend::{Backend, Guest, GuestExt, MemFault};
 use adv_machine::layout::{PEB_ADDR, peb};
 use adv_machine::{Conv, Handle, Handler, Machine, Sys};
 
-pub use heap::Heaps;
-pub use nls::Codec;
-pub use vfs::Vfs;
+use adv_os::{Codec, Heaps, OsConfig, Vfs, vfs};
 
+/// The OS layer's configuration plus what only the Win32 personality uses.
 #[derive(Clone, Debug)]
 pub struct Win32Config {
-    /// ANSI code page of the guest (932 for Japanese builds, 936 for GBK fan builds).
-    pub codepage: u32,
-    /// Host directory with the game files (writable only when write_game is true).
-    pub game_dir: PathBuf,
-    /// Write ordinary game files in place; explicit data overlays keep this false.
-    pub write_game: bool,
-    /// Optional read-only replacement files, with paths relative to the game root.
-    /// Guest writes in data_dir take precedence over this layer.
-    pub resource_dir: Option<PathBuf>,
-    /// Guest path of the game directory.
-    pub guest_root: String,
-    /// Exe file name as it will appear in the guest (for the command line).
-    pub exe_name: String,
-    /// Host directory for everything the guest writes (overlay, user profile).
-    pub data_dir: PathBuf,
-    pub user_name: String,
+    pub os: OsConfig,
     /// Minutes east of UTC for local time (JST = 540).
     pub utc_offset_min: i32,
     /// Desktop size in pixels.
@@ -65,14 +46,7 @@ pub struct Win32Config {
 impl Win32Config {
     pub fn new(game_dir: impl Into<PathBuf>, exe_name: &str, data_dir: impl Into<PathBuf>) -> Self {
         Self {
-            codepage: 932,
-            game_dir: game_dir.into(),
-            write_game: false,
-            resource_dir: None,
-            guest_root: "C:\\Game".into(),
-            exe_name: exe_name.into(),
-            data_dir: data_dir.into(),
-            user_name: "Player".into(),
+            os: OsConfig::new(game_dir, exe_name, data_dir),
             utc_offset_min: 9 * 60,
             screen: (1920, 1080),
             auto_dialog_ms: None,
@@ -126,9 +100,9 @@ impl Win32 {
         heaps.process_heap = process_heap;
         m.cpu
             .write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
-        let vfs = Vfs::new(&cfg);
+        let vfs = Vfs::new(&cfg.os);
         let w = Win32 {
-            codec: Codec::new(cfg.codepage),
+            codec: Codec::new(cfg.os.codepage),
             vfs,
             heaps,
             files: HashMap::new(),
@@ -150,7 +124,7 @@ impl Win32 {
 
     /// Guest path of the exe.
     pub fn exe_path(&self) -> String {
-        format!("{}\\{}", self.cfg.guest_root, self.cfg.exe_name)
+        self.cfg.os.exe_path()
     }
 
     /// A guest copy of `bytes` from the process heap, created once per `key`.

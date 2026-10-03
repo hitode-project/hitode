@@ -98,7 +98,7 @@ fn lookup(env: &mut Env<'_>, wide: bool, add: bool) -> Outcome {
     };
     let key: Vec<_> = spelling
         .iter()
-        .map(|&u| crate::user32::strings::unit_case(u, true))
+        .map(|&u| adv_os::nls::unit_case(u, true))
         .collect();
     if env.ext.try_get_mut::<Atoms>().is_none() {
         env.ext.insert(Atoms::default());

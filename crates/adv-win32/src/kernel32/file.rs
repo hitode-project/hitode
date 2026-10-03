@@ -1,4 +1,4 @@
-//! Files, directories, and .ini profiles, all through the [`crate::vfs::Vfs`].
+//! Files, directories, and .ini profiles, all through the [`adv_os::Vfs`].
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::SystemTime;
@@ -11,8 +11,8 @@ use super::K32;
 use crate::util::{
     INVALID_HANDLE_VALUE, cstr, err, out_u32, put_cstr, put_wstr, set_last_error, wstr, zero,
 };
-use crate::vfs::{DirEntry, wildcard};
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
+use adv_os::vfs::{DirEntry, wildcard};
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const CREATE_NEW: u32 = 1;
@@ -932,7 +932,7 @@ pub(super) fn register(reg: &mut Registry) {
         let (cap, buf) = (e.arg(0), e.arg(1));
         let p = format!(
             "C:\\Users\\{}\\AppData\\Local\\Temp\\",
-            e.ext.get::<Win32>().cfg.user_name
+            e.ext.get::<Win32>().cfg.os.user_name
         );
         match put_cstr(e.cpu, buf, cap, p.as_bytes()) {
             Some(n) => Outcome::Return(n),

@@ -785,8 +785,8 @@ mod tests {
         let (mut machine, data, dc) = fixture();
         let win32 = machine.ext.get_mut::<Win32>();
         // The selected GB2312 font overrides a different process ACP.
-        win32.cfg.codepage = 932;
-        win32.codec = adv_win32::Codec::new(932);
+        win32.cfg.os.codepage = 932;
+        win32.codec = adv_os::Codec::new(932);
         let mut raw = [0u8; 60];
         raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
         raw[16..20].copy_from_slice(&400i32.to_le_bytes());
@@ -804,7 +804,7 @@ mod tests {
         identity[14..16].copy_from_slice(&1i16.to_le_bytes());
         machine.cpu.write(matrix, &identity).unwrap();
         for character in ['中', '文'] {
-            let codec = adv_win32::Codec::new(936);
+            let codec = adv_os::Codec::new(936);
             let (encoded, lossy) = codec.from_utf16(0, &[character as u16]);
             assert!(!lossy);
             assert_eq!(encoded.len(), 2);
@@ -850,8 +850,8 @@ mod tests {
     fn selected_charset_and_metrics_match_native_gdi_across_process_acp() {
         let (mut machine, data, dc) = fixture();
         let win32 = machine.ext.get_mut::<Win32>();
-        win32.cfg.codepage = 936;
-        win32.codec = adv_win32::Codec::new(936);
+        win32.cfg.os.codepage = 936;
+        win32.codec = adv_os::Codec::new(936);
         let mut raw = [0u8; 60];
         raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
         raw[16..20].copy_from_slice(&400i32.to_le_bytes());

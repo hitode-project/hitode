@@ -1,194 +1,27 @@
-//! Private virtual registry. Never opens the host registry. Nonvolatile data
-//! lives in a bounded versioned file inside the configured runtime data folder.
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+//! Registry API over the private virtual registry in [`adv_os::registry`].
+use std::collections::BTreeMap;
 
 mod groups;
-mod store;
 
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
+use adv_os::registry::{self as store, *};
 
 use crate::{Win32, stdcall};
 
-const NOT_FOUND: u32 = 2;
-const ACCESS_DENIED: u32 = 5;
-const INVALID_HANDLE: u32 = 6;
-const NO_MEMORY: u32 = 8;
-const INVALID_DATA: u32 = 13;
-const NOT_SUPPORTED: u32 = 50;
-const INVALID_PARAMETER: u32 = 87;
-const MORE_DATA: u32 = 234;
-const NOACCESS: u32 = 998;
-const QUERY: u32 = 1;
-const SET: u32 = 2;
-const ALL_ACCESS: u32 = 0xf003f;
-const MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
-const MAX_KEYS: usize = 16_384;
-const MAX_HANDLES: usize = 16_384;
-const MAX_VALUES: usize = 16_384;
-const MAX_METADATA_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Key {
-    root: u32,
-    path: Vec<u16>,
-}
-impl Key {
-    fn parent(&self) -> Self {
-        let path = self
-            .path
-            .iter()
-            .rposition(|&unit| unit == 92)
-            .map_or(Vec::new(), |at| self.path[..at].to_vec());
-        Self {
-            root: self.root,
-            path,
-        }
-    }
-}
-struct OpenKey {
-    key: Key,
-    access: u32,
-    deleted: bool,
-}
-struct Value {
-    kind: u32,
-    display_name: Vec<u16>,
-    // String types are stored as UTF-16 bytes, including exactly the supplied
-    // terminators. Other types retain their byte representation and length.
-    bytes: Vec<u8>,
-}
-#[derive(Clone, Default)]
-struct KeyMetadata {
-    display_name: Vec<u16>,
-    class: Vec<u16>,
-    modified: u64,
-}
-impl KeyMetadata {
-    fn size(&self) -> usize {
-        16 + (self.display_name.len() + self.class.len()) * 2
-    }
-}
-struct VirtualRegistry {
-    keys: BTreeMap<Key, BTreeMap<Vec<u16>, Value>>,
-    metadata: BTreeMap<Key, KeyMetadata>,
-    handles: BTreeMap<u32, OpenKey>,
-    next_handle: u32,
-    total_bytes: usize,
-    total_values: usize,
-    metadata_bytes: usize,
-    volatile_keys: BTreeSet<Key>,
-    storage: Option<PathBuf>,
-    dirty: bool,
-    load_error: Option<u32>,
-    storage_lock: Option<std::fs::File>,
-}
-impl Default for VirtualRegistry {
-    fn default() -> Self {
-        let keys: BTreeMap<_, _> = [
-            0x8000_0000,
-            0x8000_0001,
-            0x8000_0002,
-            0x8000_0003,
-            0x8000_0005,
-        ]
-        .into_iter()
-        .map(|root| {
-            (
-                Key {
-                    root,
-                    path: Vec::new(),
-                },
-                BTreeMap::new(),
-            )
-        })
-        .collect();
-        let metadata = keys
-            .keys()
-            .cloned()
-            .map(|key| (key, KeyMetadata::default()))
-            .collect();
-        Self {
-            keys,
-            metadata,
-            handles: BTreeMap::new(),
-            next_handle: 0x6b00_0000,
-            total_bytes: 0,
-            total_values: 0,
-            metadata_bytes: 5 * 28,
-            volatile_keys: BTreeSet::new(),
-            storage: None,
-            dirty: false,
-            load_error: None,
-            storage_lock: None,
-        }
-    }
-}
-impl VirtualRegistry {
-    fn key(&self, handle: u32) -> Result<OpenKey, u32> {
-        if let Some(error) = self.load_error {
-            return Err(error);
-        }
-        let predefined = Key {
-            root: handle,
-            path: Vec::new(),
-        };
-        if self.keys.contains_key(&predefined) {
-            return Ok(OpenKey {
-                key: predefined,
-                access: ALL_ACCESS,
-                deleted: false,
-            });
-        }
-        let open = self.handles.get(&handle).ok_or(INVALID_HANDLE)?;
-        if open.deleted {
-            return Err(1018);
-        }
-        Ok(OpenKey {
-            key: open.key.clone(),
-            access: open.access,
-            deleted: false,
-        })
-    }
-    fn allocate(&mut self, key: Key, access: u32) -> Result<u32, u32> {
-        if self.handles.len() >= MAX_HANDLES {
-            return Err(NO_MEMORY);
-        }
-        let handle = self.next_handle;
-        self.next_handle = handle
-            .checked_add(4)
-            .filter(|next| *next < 0x7000_0000)
-            .ok_or(NO_MEMORY)?;
-        self.handles.insert(
-            handle,
-            OpenKey {
-                key,
-                access,
-                deleted: false,
-            },
-        );
-        Ok(handle)
-    }
-}
 fn state<'a>(env: &'a mut Env<'_>) -> &'a mut VirtualRegistry {
     if env.ext.try_get::<VirtualRegistry>().is_none() {
         let path = env
             .ext
             .get::<Win32>()
             .cfg
+            .os
             .data_dir
             .join("registry/registry-v1.bin");
         env.ext.insert(store::load(path));
     }
     env.ext.get_mut::<VirtualRegistry>()
-}
-fn fold(name: &[u16]) -> Vec<u16> {
-    name.iter()
-        .map(|&unit| crate::user32::strings::unit_case(unit, true))
-        .collect()
 }
 fn name(env: &Env<'_>, ptr: u32, wide: bool, nullable: bool) -> Result<Vec<u16>, u32> {
     if ptr == 0 {
@@ -274,34 +107,6 @@ fn desired_access(mut access: u32) -> Result<u32, u32> {
         return Err(ACCESS_DENIED);
     }
     Ok(access)
-}
-fn child_key(parent: &Key, subkey: &[u16]) -> Result<(Key, Vec<Key>), u32> {
-    if subkey.first() == Some(&92) {
-        return Err(INVALID_PARAMETER);
-    }
-    let mut key = parent.clone();
-    let mut parents = Vec::new();
-    let parts: Vec<_> = subkey
-        .split(|&unit| unit == 92)
-        .filter(|p| !p.is_empty())
-        .collect();
-    if parts.len() > 32 {
-        return Err(INVALID_PARAMETER);
-    }
-    for part in parts {
-        if part.len() > 255 {
-            return Err(INVALID_PARAMETER);
-        }
-        if !key.path.is_empty() {
-            key.path.push(92)
-        }
-        key.path.extend(fold(part));
-        parents.push(key.clone());
-    }
-    if key.path.len() > 32_767 || key.path.iter().filter(|&&u| u == 92).count() >= 512 {
-        return Err(INVALID_PARAMETER);
-    }
-    Ok((key, parents))
 }
 fn open_key(env: &mut Env<'_>, wide: bool, create: bool, legacy: bool) -> Outcome {
     let result = (|| -> Result<u32, u32> {

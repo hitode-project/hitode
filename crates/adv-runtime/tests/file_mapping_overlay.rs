@@ -36,7 +36,7 @@ impl Program {
         )
         .unwrap();
         let mut config = Win32Config::new(game, "authored.exe", profile);
-        config.write_game = portable;
+        config.os.write_game = portable;
         Win32::install(&mut machine, config).unwrap();
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.map(DATA, 4096, Prot::RW).unwrap();

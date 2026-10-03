@@ -1,6 +1,6 @@
 [package]
 name = "adv-os"
-description = "OS layer: PE loading, the module table and guest file sources"
+description = "OS layer: PE loading, the module table, the guest file system, heaps and code pages"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ adv-machine.workspace = true
 adv-pe.workspace = true
 thiserror.workspace = true
 log.workspace = true
+encoding_rs.workspace = true
 
 [lints]
 workspace = true

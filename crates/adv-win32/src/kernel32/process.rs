@@ -45,20 +45,29 @@ pub(super) fn environment(w: &Win32) -> Vec<String> {
     vec![
         "=C:=C:\\Game".into(),
         "ALLUSERSPROFILE=C:\\ProgramData".into(),
-        format!("APPDATA=C:\\Users\\{}\\AppData\\Roaming", w.cfg.user_name),
+        format!(
+            "APPDATA=C:\\Users\\{}\\AppData\\Roaming",
+            w.cfg.os.user_name
+        ),
         "COMPUTERNAME=PAL-HLE".into(),
         format!(
             "LOCALAPPDATA=C:\\Users\\{}\\AppData\\Local",
-            w.cfg.user_name
+            w.cfg.os.user_name
         ),
         "OS=Windows_NT".into(),
         "PATH=C:\\Windows\\system32;C:\\Windows".into(),
         "SystemDrive=C:".into(),
         "SystemRoot=C:\\Windows".into(),
-        format!("TEMP=C:\\Users\\{}\\AppData\\Local\\Temp", w.cfg.user_name),
-        format!("TMP=C:\\Users\\{}\\AppData\\Local\\Temp", w.cfg.user_name),
-        format!("USERNAME={}", w.cfg.user_name),
-        format!("USERPROFILE=C:\\Users\\{}", w.cfg.user_name),
+        format!(
+            "TEMP=C:\\Users\\{}\\AppData\\Local\\Temp",
+            w.cfg.os.user_name
+        ),
+        format!(
+            "TMP=C:\\Users\\{}\\AppData\\Local\\Temp",
+            w.cfg.os.user_name
+        ),
+        format!("USERNAME={}", w.cfg.os.user_name),
+        format!("USERPROFILE=C:\\Users\\{}", w.cfg.os.user_name),
         "windir=C:\\Windows".into(),
     ]
 }

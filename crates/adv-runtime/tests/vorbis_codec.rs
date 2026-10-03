@@ -65,7 +65,7 @@ fn cross_engine_preflight_is_observable_without_rejecting_guest_startup() {
             "DimensionToTsuLovers_cn.exe",
         ),
     ] {
-        let files = adv_win32::Vfs::new(&adv_win32::Win32Config::new(
+        let files = adv_os::Vfs::new(&adv_os::OsConfig::new(
             games.join(directory),
             exe,
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/cross-engine/preflight-only"),

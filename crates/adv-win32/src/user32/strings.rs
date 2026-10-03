@@ -2,37 +2,10 @@
 use adv_abi::Registry;
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
+use adv_os::Codec;
+use adv_os::nls::unit_case;
 
-use crate::{Codec, Win32, stdcall};
-
-#[path = "case_table.rs"]
-mod case_table;
-
-pub(crate) fn unit_case(unit: u16, upper: bool) -> u16 {
-    if unit < 0x80 {
-        return if upper {
-            (unit as u8).to_ascii_uppercase()
-        } else {
-            (unit as u8).to_ascii_lowercase()
-        } as u16;
-    }
-    // Pin USER32's legacy invariant mapping instead of inheriting Rust's full
-    // Unicode expansion rules or changing behavior with the Rust toolchain.
-    let table = if upper {
-        case_table::UPPER
-    } else {
-        case_table::LOWER
-    };
-    let i = table.partition_point(|&(_, last, _, _)| last < unit);
-    match table.get(i) {
-        Some(&(first, _, stride, delta))
-            if unit >= first && (unit - first).is_multiple_of(stride) =>
-        {
-            (i32::from(unit) + delta) as u16
-        }
-        _ => unit,
-    }
-}
+use crate::{Win32, stdcall};
 
 fn ansi_case(bytes: &mut [u8], codec: Codec, upper: bool) {
     let mut i = 0;

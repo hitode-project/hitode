@@ -1,7 +1,7 @@
 //! Flatten profile-based save folders in portable mode, retaining original backups.
 
 use super::{ci_find, ci_path};
-use crate::Win32Config;
+use crate::OsConfig;
 use std::io;
 use std::path::Path;
 
@@ -31,7 +31,7 @@ pub(super) fn relative<'a>(parts: &'a [String], user: &str) -> Option<&'a [Strin
     Some(&parts[start + offset..])
 }
 
-pub(super) fn migrate(cfg: &Win32Config) -> io::Result<()> {
+pub(super) fn migrate(cfg: &OsConfig) -> io::Result<()> {
     let marker = cfg.data_dir.join(MARKER);
     if marker.is_file() {
         return Ok(());

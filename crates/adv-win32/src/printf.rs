@@ -6,8 +6,8 @@
 
 use adv_cpu::backend::Guest;
 
-use crate::Codec;
 use crate::util::{cstr, wstr};
+use adv_os::Codec;
 
 /// Supplies successive 32-bit argument slots.
 pub trait Args {

@@ -136,7 +136,7 @@ fn invalid_version_sizes_and_readonly_environment_outputs_preserve_memory() {
 #[test]
 fn utf8_ansi_input_limit_counts_decoded_units_not_dbcs_bytes() {
     let mut t = Test::new();
-    t.machine.ext.get_mut::<Win32>().codec = adv_win32::Codec::new(65001);
+    t.machine.ext.get_mut::<Win32>().codec = adv_os::Codec::new(65001);
     let input = 0x500000;
     let output = 0x530000;
     t.machine.cpu.map(input, 0x20000, Prot::RW).unwrap();

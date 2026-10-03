@@ -24,7 +24,7 @@ struct Environment {
 
 fn fold(name: &[u16]) -> Vec<u16> {
     name.iter()
-        .map(|&unit| crate::user32::strings::unit_case(unit, true))
+        .map(|&unit| adv_os::nls::unit_case(unit, true))
         .collect()
 }
 fn initialize(env: &mut Env<'_>) {

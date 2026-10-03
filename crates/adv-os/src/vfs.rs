@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::Win32Config;
+use crate::OsConfig;
 
 mod portable_saves;
 
@@ -73,7 +73,7 @@ fn ci_path(base: &Path, comps: &[String]) -> PathBuf {
 }
 
 impl Vfs {
-    pub fn new(cfg: &Win32Config) -> Self {
+    pub fn new(cfg: &OsConfig) -> Self {
         let root = normalize_abs(&cfg.guest_root);
         let portable_saves = cfg.write_game
             && match portable_saves::migrate(cfg) {
@@ -182,7 +182,7 @@ impl Vfs {
 
     /// File mappings always persist game changes in the isolated overlay,
     /// including when ordinary portable saves use the game directory.
-    pub(crate) fn mapping_write_path(&self, guest: &str) -> Option<PathBuf> {
+    pub fn mapping_write_path(&self, guest: &str) -> Option<PathBuf> {
         let path = match self.locate(guest)? {
             Loc::Game(rel) => ci_path(&self.overlay, &rel),
             Loc::Other(rel) => ci_path(&self.other, &rel),
@@ -287,7 +287,7 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-impl adv_os::FileSource for Vfs {
+impl crate::FileSource for Vfs {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         let p = self.lookup(path)?;
         p.is_file().then(|| std::fs::read(p).ok()).flatten()
@@ -299,7 +299,7 @@ mod tests {
     use super::*;
 
     fn vfs(dir: &Path) -> Vfs {
-        let cfg = Win32Config::new(dir.join("game"), "x.exe", dir.join("data"));
+        let cfg = OsConfig::new(dir.join("game"), "x.exe", dir.join("data"));
         Vfs::new(&cfg)
     }
 
@@ -369,7 +369,7 @@ mod tests {
         std::fs::create_dir_all(tmp.join("resources")).unwrap();
         std::fs::write(tmp.join("game/Config.ini"), b"old").unwrap();
         std::fs::write(tmp.join("resources/Story.dat"), b"replacement").unwrap();
-        let mut cfg = Win32Config::new(tmp.join("game"), "x.exe", tmp.join("data"));
+        let mut cfg = OsConfig::new(tmp.join("game"), "x.exe", tmp.join("data"));
         cfg.write_game = true;
         cfg.resource_dir = Some(tmp.join("resources"));
         let v = Vfs::new(&cfg);
@@ -423,7 +423,7 @@ mod tests {
         std::fs::write(old.join("system.dat"), b"legacy system").unwrap();
         std::fs::write(old.join("screenshots/01.bmp"), b"thumbnail").unwrap();
         std::fs::write(game.join("Save/System.dat"), b"current system").unwrap();
-        let mut cfg = Win32Config::new(&game, "game.exe", &data);
+        let mut cfg = OsConfig::new(&game, "game.exe", &data);
         cfg.write_game = true;
         let v = Vfs::new(&cfg);
         let guest = "c:/users/player/documents/Studio/Title/SAVE";
@@ -485,7 +485,7 @@ mod tests {
         std::fs::write(old.join("slot.dat"), b"legacy").unwrap();
         // A file in place of the destination directory must not lose access to saves.
         std::fs::write(game.join("save"), b"unrelated file").unwrap();
-        let mut cfg = Win32Config::new(&game, "game.exe", &data);
+        let mut cfg = OsConfig::new(&game, "game.exe", &data);
         cfg.write_game = true;
         let v = Vfs::new(&cfg);
         let guest = "C:/Users/Player/Documents/Title/save/slot.dat";
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn portable_save_aliases_are_limited_to_profile_save_subtrees() {
-        let mut cfg = Win32Config::new("/nonexistent/game", "game.exe", "/nonexistent/data");
+        let mut cfg = OsConfig::new("/nonexistent/game", "game.exe", "/nonexistent/data");
         cfg.write_game = true;
         let v = Vfs::new(&cfg);
         for path in [
@@ -541,7 +541,7 @@ mod tests {
         std::fs::write(tmp.join("game/Only.dat"), b"base only").unwrap();
         std::fs::write(tmp.join("resources/STORY.DAT"), b"replacement").unwrap();
         std::fs::write(tmp.join("resources/Sub/New.dat"), b"new").unwrap();
-        let mut cfg = Win32Config::new(tmp.join("game"), "x.exe", tmp.join("data"));
+        let mut cfg = OsConfig::new(tmp.join("game"), "x.exe", tmp.join("data"));
         cfg.resource_dir = Some(tmp.join("resources"));
         let v = Vfs::new(&cfg);
         assert_eq!(

@@ -5,12 +5,12 @@ use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 use super::K32;
-use crate::nls::{ctype1, is_valid_codepage, lead_byte_ranges};
 use crate::util::{
     bytes_or_cstr, err, out_u32, put_cstr, put_wstr, set_last_error, units_or_wstr, write_units,
     zero,
 };
 use crate::{Win32, stdcall};
+use adv_os::nls::{ctype1, is_valid_codepage, lead_byte_ranges};
 
 /// Japanese (0x411) or Chinese PRC (0x804), following the code page.
 fn lcid(env: &Env<'_>) -> u32 {

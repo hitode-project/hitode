@@ -33,7 +33,7 @@ impl Test {
         .unwrap();
         let directory = std::env::temp_dir().join("pal-memory-toolhelp-tests");
         let mut cfg = Win32Config::new(&directory, "fixture.exe", &directory);
-        cfg.write_game = false;
+        cfg.os.write_game = false;
         Win32::install(&mut m, cfg).unwrap();
         m.cpu.map(CODE, PAGE, Prot::RX).unwrap();
         m.cpu.map(DATA, PAGE, Prot::RW).unwrap();

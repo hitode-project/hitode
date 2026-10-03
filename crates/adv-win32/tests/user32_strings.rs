@@ -19,7 +19,7 @@ fn convert(name: &str, cp: u32, input: &[u8], count: u32, writable: bool) -> (u3
     )
     .unwrap();
     let mut cfg = Win32Config::new(".", "case-fixture.exe", "target/case-fixture");
-    cfg.codepage = cp;
+    cfg.os.codepage = cp;
     Win32::install(&mut m, cfg).unwrap();
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
     m.cpu
@@ -71,7 +71,7 @@ fn dbcs_trails_and_chunk_boundaries_are_not_ascii_letters() {
             convert("CharUpperBuffA", cp, &input, input.len() as u32, true),
             (input.len() as u32, expected)
         );
-        let codec = adv_win32::Codec::new(cp);
+        let codec = adv_os::Codec::new(cp);
         let input = codec.encode("ａｂαя漢字");
         let expected = codec.encode("ＡＢΑЯ漢字");
         assert_eq!(

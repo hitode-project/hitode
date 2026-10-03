@@ -56,7 +56,9 @@ fn lock(path: &Path) -> Result<File, u32> {
     Ok(file)
 }
 
-pub(super) fn load(path: PathBuf) -> VirtualRegistry {
+/// Open the registry stored at `path`, locking it against other processes. A file that
+/// fails to load is left intact and every access reports the load error.
+pub fn load(path: PathBuf) -> VirtualRegistry {
     let mut storage_lock = None;
     let result = (|| -> Result<VirtualRegistry, u32> {
         storage_lock = Some(lock(&path)?);
@@ -321,7 +323,8 @@ fn replace(from: &Path, to: &Path) -> Result<(), u32> {
     }
     Ok(())
 }
-pub(super) fn flush(registry: &mut VirtualRegistry) -> Result<(), u32> {
+/// Write nonvolatile keys back, atomically replacing the file.
+pub fn flush(registry: &mut VirtualRegistry) -> Result<(), u32> {
     if let Some(error) = registry.load_error {
         return Err(error);
     }

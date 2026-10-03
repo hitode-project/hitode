@@ -63,6 +63,7 @@ dependencies = [
  "adv-pe",
  "adv-samples",
  "adv-unicorn",
+ "encoding_rs",
  "log",
  "thiserror 2.0.21",
 ]

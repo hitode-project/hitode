@@ -101,13 +101,13 @@ impl<B: Backend> Runtime<B> {
             .ok_or("invalid executable filename")?;
         let mut cfg = Win32Config::new(game_dir, exe_name, data_dir.as_ref());
         cfg.screen = (width as i32, height as i32);
-        cfg.codepage = if exe_name.to_ascii_lowercase().contains("chs") {
+        cfg.os.codepage = if exe_name.to_ascii_lowercase().contains("chs") {
             936
         } else {
             932
         };
-        cfg.write_game = false;
-        let files = adv_win32::Vfs::new(&cfg);
+        cfg.os.write_game = false;
+        let files = adv_os::Vfs::new(&cfg.os);
         let selection = crate::vorbis::select_policy_with_reason(&files, exe_name, codec)?;
         let codec = selection.policy;
         let mut registry = Registry::default();
@@ -335,8 +335,8 @@ impl<B: Backend> Runtime<B> {
     /// ANSI decoding for paths, text and font names; configure before the first step.
     pub fn set_codepage(&mut self, codepage: u32) {
         let win32 = self.machine.ext.get_mut::<Win32>();
-        win32.cfg.codepage = codepage;
-        win32.codec = adv_win32::Codec::new(codepage);
+        win32.cfg.os.codepage = codepage;
+        win32.codec = adv_os::Codec::new(codepage);
     }
 
     /// Post input to the foremost visible window's thread. Keyboard messages use

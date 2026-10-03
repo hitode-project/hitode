@@ -2,6 +2,8 @@
 
 use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8, WINDOWS_1252};
 
+mod case_table;
+
 pub const CP_ACP: u32 = 0;
 pub const CP_OEMCP: u32 = 1;
 pub const CP_THREAD_ACP: u32 = 3;
@@ -142,6 +144,34 @@ pub fn ctype1(c: u16) -> u16 {
         t |= PUNCT;
     }
     t
+}
+
+/// USER32's invariant case mapping of one UTF-16 unit (CharUpperW, CompareString
+/// with NORM_IGNORECASE, registry and atom names).
+pub fn unit_case(unit: u16, upper: bool) -> u16 {
+    if unit < 0x80 {
+        return if upper {
+            (unit as u8).to_ascii_uppercase()
+        } else {
+            (unit as u8).to_ascii_lowercase()
+        } as u16;
+    }
+    // Pin USER32's legacy invariant mapping instead of inheriting Rust's full
+    // Unicode expansion rules or changing behavior with the Rust toolchain.
+    let table = if upper {
+        case_table::UPPER
+    } else {
+        case_table::LOWER
+    };
+    let i = table.partition_point(|&(_, last, _, _)| last < unit);
+    match table.get(i) {
+        Some(&(first, _, stride, delta))
+            if unit >= first && (unit - first).is_multiple_of(stride) =>
+        {
+            (i32::from(unit) + delta) as u16
+        }
+        _ => unit,
+    }
 }
 
 #[cfg(test)]

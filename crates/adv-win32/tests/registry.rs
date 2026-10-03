@@ -4,8 +4,9 @@ use adv_abi::Registry;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, RunResult};
+use adv_os::Codec;
 use adv_unicorn::UnicornCpu;
-use adv_win32::{Codec, Win32, Win32Config};
+use adv_win32::{Win32, Win32Config};
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
@@ -48,7 +49,7 @@ impl Fixture {
         )
         .unwrap();
         let mut cfg = Win32Config::new("/nonexistent/registry-fixture", "registry.exe", data);
-        cfg.codepage = cp;
+        cfg.os.codepage = cp;
         Win32::install(&mut machine, cfg).unwrap();
         machine.cpu.map(CODE, 0x10000, Prot::RX).unwrap();
         machine.cpu.map(DATA, 0x10000, Prot::RW).unwrap();

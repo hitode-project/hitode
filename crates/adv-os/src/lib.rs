@@ -4,17 +4,69 @@
 //!   initializers; [`module`] is the module table (`HMODULE`s, exports, resources), kept
 //!   in the machine's [`Ext`] so subsystems such as kernel32 can reach it.
 //! * [`Process`] adds `load` and `start_process` to a [`Machine`].
+//! * [`vfs`] maps guest paths onto the game directory and the data overlay, [`heap`] is
+//!   the guest heap allocator, [`nls`] holds code pages and case mapping and
+//!   [`registry`] is the private virtual registry; every personality layer shares them.
 
+pub mod heap;
 pub mod loader;
 pub mod module;
+pub mod nls;
+pub mod registry;
+pub mod vfs;
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use adv_cpu::backend::{Backend, MemFault};
 use adv_machine::{CtxId, Ext, Machine};
 
+pub use heap::Heaps;
 pub use loader::{FileSource, HOST_MODULES, HostDir, LoadError, Loader, module_file};
 pub use module::{Module, ModuleId, ModuleKind, Modules, module_key};
+pub use nls::Codec;
+pub use vfs::Vfs;
+
+/// What the OS layer needs to know about the game and the host.
+#[derive(Clone, Debug)]
+pub struct OsConfig {
+    /// ANSI code page of the guest (932 for Japanese builds, 936 for GBK fan builds).
+    pub codepage: u32,
+    /// Host directory with the game files (writable only when write_game is true).
+    pub game_dir: PathBuf,
+    /// Write ordinary game files in place; explicit data overlays keep this false.
+    pub write_game: bool,
+    /// Optional read-only replacement files, with paths relative to the game root.
+    /// Guest writes in data_dir take precedence over this layer.
+    pub resource_dir: Option<PathBuf>,
+    /// Guest path of the game directory.
+    pub guest_root: String,
+    /// Exe file name as it will appear in the guest (for the command line).
+    pub exe_name: String,
+    /// Host directory for everything the guest writes (overlay, user profile, registry).
+    pub data_dir: PathBuf,
+    pub user_name: String,
+}
+
+impl OsConfig {
+    pub fn new(game_dir: impl Into<PathBuf>, exe_name: &str, data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            codepage: 932,
+            game_dir: game_dir.into(),
+            write_game: false,
+            resource_dir: None,
+            guest_root: "C:\\Game".into(),
+            exe_name: exe_name.into(),
+            data_dir: data_dir.into(),
+            user_name: "Player".into(),
+        }
+    }
+
+    /// Guest path of the exe.
+    pub fn exe_path(&self) -> String {
+        format!("{}\\{}", self.guest_root, self.exe_name)
+    }
+}
 
 /// The module table of `ext`'s process (empty before anything is loaded).
 pub fn modules(ext: &Ext) -> &Modules {
