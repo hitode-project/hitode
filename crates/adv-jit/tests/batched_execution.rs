@@ -220,3 +220,186 @@ fn data_writes_on_the_code_page_do_not_force_single_step_redecoding() {
     assert_eq!(state.regs[3], 1);
     assert_eq!(interpreter.decode_count(), 2);
 }
+
+#[test]
+fn native_fallback_batches_consecutive_x87_before_returning_to_native_code() {
+    // INC EBX; FLD1; FADD ST0,ST0; FSTP dword [DATA]; MOV EAX,91; RET.
+    let data = CODE + 0x2000;
+    let mut code = vec![0x43, 0xd9, 0xe8, 0xd8, 0xc0, 0xd9, 0x1d];
+    code.extend_from_slice(&data.to_le_bytes());
+    code.extend_from_slice(&[0xb8, 91, 0, 0, 0, 0xc3]);
+    let mut m = machine(&code);
+    let mut region = adv_jit::Region::new(CODE, code.len());
+    region.entries.push(CODE + 11);
+    m.add_region(region).unwrap();
+    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(m.state.regs[0], 91);
+    assert_eq!(m.state.regs[3], 1);
+    assert_eq!(m.memory().read(data, 4).unwrap(), 2.0f32.to_le_bytes());
+    assert_eq!(m.stats.interpreter_entries, 1);
+    assert_eq!(m.stats.interpreter_instructions, 3);
+    assert_eq!(m.stats.native_entries, 2);
+}
+
+#[test]
+fn cached_floating_fallthrough_yields_to_new_integer_and_simd_native_entries() {
+    for simd in [false, true] {
+        // Cache FLD1; FADD ST0,ST0 before publishing its native fallthrough.
+        let data = CODE + 0x2000;
+        let mut code = vec![0xd9, 0xe8, 0xd8, 0xc0];
+        if simd {
+            // PXOR XMM0,XMM0; MOVDQU [DATA],XMM0; RET.
+            code.extend_from_slice(&[0x66, 0x0f, 0xef, 0xc0, 0xf3, 0x0f, 0x7f, 0x05]);
+            code.extend_from_slice(&data.to_le_bytes());
+        } else {
+            code.extend_from_slice(&[0xb8, 91, 0, 0, 0]);
+        }
+        code.push(0xc3);
+        let mut m = machine(&code);
+        assert_eq!(m.run(CODE + 4, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.stats.interpreter_entries, 1);
+        assert_eq!(m.stats.interpreter_instructions, 2);
+        m.add_region(adv_jit::Region::new(CODE + 4, code.len() - 4))
+            .unwrap();
+        m.state.eip = CODE;
+        m.state.xmm[0] = [0x5a; 16];
+        m.write(data, &[0xa5; 16]).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.stats.interpreter_entries, 2, "simd={simd}");
+        assert_eq!(m.stats.interpreter_instructions, 4, "simd={simd}");
+        assert_eq!(m.stats.native_entries, 1, "simd={simd}");
+        if simd {
+            assert_eq!(m.memory().read(data, 16).unwrap(), [0; 16]);
+        } else {
+            assert_eq!(m.state.regs[0], 91);
+        }
+    }
+}
+
+#[test]
+fn cached_floating_prefix_keeps_unmasked_sse_fault_precise() {
+    // INC EBX; FLD1; DIVSD XMM0,XMM1; INC EBX; RET.
+    let mut m = machine(&[0x43, 0xd9, 0xe8, 0xf2, 0x0f, 0x5e, 0xc1, 0x43, 0xc3]);
+    m.state.mxcsr &= !(1 << 9);
+    m.state.xmm[0][..8].copy_from_slice(&1.0f64.to_le_bytes());
+    let before = m.state.xmm;
+    assert_eq!(
+        m.run(STOP, 100).unwrap(),
+        RunOutcome::Trap {
+            pc: CODE + 3,
+            vector: 19
+        }
+    );
+    assert_eq!(m.state.eip, CODE + 3);
+    assert_eq!(m.state.regs[3], 1);
+    assert_eq!(m.state.xmm, before);
+    assert_eq!(m.state.mxcsr & 4, 4);
+    assert_eq!(m.state.fuel, 98);
+    assert_eq!(m.stats.interpreter_entries, 1);
+    assert_eq!(m.stats.interpreter_instructions, 2);
+    m.state.xmm[1][..8].copy_from_slice(&2.0f64.to_le_bytes());
+    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(m.state.regs[3], 2);
+    assert_eq!(&m.state.xmm[0][..8], &0.5f64.to_le_bytes());
+}
+
+#[test]
+fn authored_pcm_mixing_matches_integer_expectations_across_fuel_slices() {
+    use iced_x86::code_asm::*;
+    let source = CODE + 0x2000;
+    let output = source + 0x100;
+    let gain = source + 0x200;
+    let samples = [-32768i32, -321, -3, -2, -1, 0, 1, 2, 3, 321, 32767];
+    let expected: Vec<_> = samples
+        .iter()
+        .flat_map(|&s| ((s / 2) as i16).to_le_bytes())
+        .collect();
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.mov(esi, source).unwrap();
+    a.mov(edi, output).unwrap();
+    a.mov(ecx, samples.len() as u32).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.fild(dword_ptr(esi)).unwrap();
+    a.fmul(qword_ptr(gain as i32)).unwrap();
+    a.fistp(word_ptr(edi)).unwrap();
+    a.add(esi, 4).unwrap();
+    a.add(edi, 2).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.ret().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    for native in [false, true] {
+        for fuel in [1, 2, 3, 7, 64, 256] {
+            let mut m = machine(&code);
+            m.write(
+                source,
+                &samples
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            m.write(gain, &0.5f64.to_le_bytes()).unwrap();
+            // Truncate toward zero; the independent integer expectation is s / 2.
+            m.state.x87.control = (m.state.x87.control & !0x0c00) | 0x0c00;
+            if native {
+                let mut region = adv_jit::Region::new(CODE, code.len());
+                // Resume the integer loop tail after the three x87 instructions.
+                region.entries.push(CODE + 25);
+                m.add_region(region).unwrap();
+            }
+            let mut complete = false;
+            for _ in 0..256 {
+                match m.run(STOP, fuel).unwrap() {
+                    RunOutcome::ReachedStop => {
+                        complete = true;
+                        break;
+                    }
+                    RunOutcome::Budget => {}
+                    other => panic!("native={native} fuel={fuel}: {other:?}"),
+                }
+            }
+            assert!(complete, "native={native} fuel={fuel}");
+            assert_eq!(
+                m.memory().read(output, expected.len()).unwrap(),
+                expected,
+                "native={native} fuel={fuel}"
+            );
+            assert_eq!(m.state.regs[1], 0);
+            assert_eq!(m.state.regs[6], source + 4 * samples.len() as u32);
+            assert_eq!(m.state.regs[7], output + 2 * samples.len() as u32);
+            assert_eq!(m.state.x87.tag, 0xffff);
+        }
+    }
+}
+
+#[test]
+fn an_exception_raised_inside_cached_x87_cannot_enter_native_mmx() {
+    // FLDZ; FLD1; FDIV ST0,ST1; PXOR MM0,MM0; RET.
+    let code = [0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1, 0x0f, 0xef, 0xc0, 0xc3];
+    let mut m = machine(&code);
+    assert_eq!(m.run(CODE + 6, 100).unwrap(), RunOutcome::ReachedStop);
+    m.add_region(adv_jit::Region::new(CODE + 6, code.len() - 6))
+        .unwrap();
+    m.state.eip = CODE;
+    m.state.x87 = adv_jit::X87State::default();
+    m.state.x87.control &= !(1 << 2);
+    m.state.refresh_mmx();
+    let mut reference = machine(&code);
+    reference.state.x87.control &= !(1 << 2);
+    assert_eq!(
+        reference.run(CODE + 6, 100).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    assert_eq!(
+        m.run(STOP, 100).unwrap(),
+        RunOutcome::Trap {
+            pc: CODE + 6,
+            vector: 16
+        }
+    );
+    assert_eq!(m.state, reference.state);
+    assert_eq!(m.state.x87.status & 0x84, 0x84);
+    assert_eq!(m.stats.native_entries, 0);
+}

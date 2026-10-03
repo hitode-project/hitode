@@ -194,66 +194,36 @@ impl Interpreter {
         max_units: u32,
         stop: u32,
         return_pad: Option<u32>,
-        native_entries: Option<&BTreeMap<u32, u32>>,
+        native: Option<(&BTreeMap<u32, u32>, u64)>,
     ) -> (Execution, u32) {
-        if max_units == 0 || self.capacity == 0 {
-            let execution = self.run_chunk(state, memory, max_units);
-            return (execution, execution.units);
+        if max_units == 0 || state.eip == stop || return_pad == Some(state.eip) {
+            return (
+                Execution {
+                    step: Step::Executed,
+                    units: 0,
+                },
+                0,
+            );
         }
         let pc = state.eip;
+        let revision = native.map(|(_, revision)| revision);
         if !self
             .blocks
             .get(&pc)
-            .is_some_and(|block| block.valid(memory))
+            .is_some_and(|block| block.revision == revision && block.valid(memory))
         {
-            let block = DecodedBlock::fetch(memory, pc, &mut self.decodes);
-            // A block holds at most 32 instructions. Bound this independent cache
-            // in blocks, without clearing the public single-step decode cache.
-            if self.blocks.len() >= self.capacity.div_ceil(32) {
+            let block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
+            if self.capacity == 0 {
+                return block.execute(state, memory, max_units, stop, return_pad);
+            }
+            // Bound each independent cache in entries. A larger block working set
+            // avoids flushing hot floating fallback sequences during discovery.
+            if self.blocks.len() >= self.capacity {
                 self.blocks.clear();
             }
             self.blocks.insert(pc, block);
         }
-        let block = &self.blocks[&pc];
-        let epoch = memory.epoch;
-        let mut units = 0;
-        let mut last_units = 0;
-        for &decoded in &block.instructions {
-            if units == max_units || state.eip == stop || return_pad == Some(state.eip) {
-                break;
-            }
-            // A native entry may lie in the middle of this cached fallthrough
-            // (notably the next REP after an x87 fallback). Do not interpret it.
-            if units != 0 && native_entries.is_some_and(|entries| entries.contains_key(&state.eip))
-            {
-                break;
-            }
-            let execution = execute_decoded(decoded, state, memory, max_units - units);
-            units += execution.units;
-            last_units = execution.units;
-            if execution.step != Step::Executed {
-                return (
-                    Execution {
-                        step: execution.step,
-                        units,
-                    },
-                    last_units,
-                );
-            }
-            // A guest store can patch the NEXT instruction in this very block.
-            // Never execute another cached instruction after executable memory
-            // changes, even when the block's original bytes validated on entry.
-            if memory.epoch != epoch {
-                break;
-            }
-        }
-        (
-            Execution {
-                step: Step::Executed,
-                units,
-            },
-            last_units,
-        )
+        self.blocks[&pc].execute(state, memory, max_units, stop, return_pad)
     }
 }
 
@@ -467,71 +437,130 @@ fn fetch(memory: &Memory, pc: u32) -> Cached {
     entry
 }
 
+const BLOCK_INSTRUCTIONS: usize = 64;
+const BLOCK_BYTES: usize = 512;
+
 /// A contiguous basic block, including its terminating instruction. Validation
 /// retains byte comparison (cross-Memory/external-executor safety) and negative
 /// page dependencies. Only the frequency of validation changes, not its contract.
 struct DecodedBlock {
     pc: u32,
-    instructions: Vec<Decoded>,
+    instructions: Vec<(u32, Decoded)>,
     bytes: Vec<u8>,
-    pages: [Option<Page>; 2],
+    pages: Vec<Page>,
+    revision: Option<u64>,
 }
 
 impl DecodedBlock {
     fn valid(&self, memory: &Memory) -> bool {
-        self.pages.iter().flatten().all(|page| page.matches(memory))
+        self.pages.iter().all(|page| page.matches(memory))
             && memory
                 .read(self.pc, self.bytes.len())
                 .is_ok_and(|bytes| bytes == self.bytes)
     }
 
-    fn fetch(memory: &Memory, start: u32, decodes: &mut u64) -> Self {
+    fn fetch(
+        memory: &Memory,
+        start: u32,
+        native: Option<(&BTreeMap<u32, u32>, u64)>,
+        decodes: &mut u64,
+    ) -> Self {
         let mut block = Self {
             pc: start,
             instructions: Vec::new(),
             bytes: Vec::new(),
-            pages: [None; 2],
+            pages: Vec::new(),
+            revision: native.map(|(_, revision)| revision),
         };
         let mut pc = start;
-        let mut end = u64::from(start);
-        for _ in 0..32 {
-            *decodes += 1;
-            let entry = fetch(memory, pc);
-            for page in entry.pages.into_iter().flatten() {
-                if block.pages[0].is_none() {
-                    block.pages[0] = Some(page);
-                } else if block.pages[0].unwrap().address != page.address {
-                    block.pages[1] = Some(page);
-                }
-            }
-            end = end.max(u64::from(pc) + u64::from(entry.len));
-            block.instructions.push(entry.decoded);
-            let Decoded::Ready(instruction) = entry.decoded else {
-                break;
-            };
-            // Do not speculate across transfers, a restartable REP, or a flags
-            // change that can enable single stepping for the following instruction.
-            if matches!(
-                instruction.action,
-                Action::Branch(..)
-                    | Action::Loop(..)
-                    | Action::Call(..)
-                    | Action::Ret(..)
-                    | Action::Int(..)
-                    | Action::Ud2
-                    | Action::String(..)
-                    | Action::PopFlags(..)
-            ) || instruction.next <= pc
+        while block.instructions.len() < BLOCK_INSTRUCTIONS && block.bytes.len() < BLOCK_BYTES {
+            // Published entries already exclude forms unsupported by native code.
+            // Check all forms, including SSE/MMX, only while building the block.
+            // x87 fallbacks remain contiguous because they have no native entry.
+            if !block.instructions.is_empty()
+                && native.is_some_and(|(entries, _)| entries.contains_key(&pc))
             {
                 break;
             }
-            pc = instruction.next;
+            *decodes += 1;
+            let entry = fetch(memory, pc);
+            let (next, terminates) = match entry.decoded {
+                Decoded::Ready(instruction) => (
+                    instruction.next,
+                    matches!(
+                        instruction.action,
+                        Action::Branch(..)
+                            | Action::Loop(..)
+                            | Action::Call(..)
+                            | Action::Ret(..)
+                            | Action::Int(..)
+                            | Action::Ud2
+                            | Action::String(..)
+                            | Action::PopFlags(..)
+                    ),
+                ),
+                Decoded::Extended(instruction) => (
+                    instruction.next_ip32(),
+                    instruction.flow_control() != iced_x86::FlowControl::Next,
+                ),
+                Decoded::Stop(_) => (pc, true),
+            };
+            let len = if next > pc {
+                (next - pc) as usize
+            } else {
+                entry.len as usize
+            };
+            if !block.instructions.is_empty() && block.bytes.len() + len > BLOCK_BYTES {
+                break;
+            }
+            block.bytes.extend_from_slice(&entry.bytes[..len]);
+            for page in entry.pages.into_iter().flatten() {
+                if !block.pages.iter().any(|old| old.address == page.address) {
+                    block.pages.push(page);
+                }
+            }
+            block.instructions.push((pc, entry.decoded));
+            if terminates || next <= pc {
+                break;
+            }
+            pc = next;
         }
-        block.bytes = memory
-            .read(start, (end - u64::from(start)) as usize)
-            .unwrap_or(&[])
-            .to_vec();
         block
+    }
+
+    fn execute(
+        &self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        max_units: u32,
+        stop: u32,
+        return_pad: Option<u32>,
+    ) -> (Execution, u32) {
+        let epoch = memory.epoch;
+        let mut result = Execution {
+            step: Step::Executed,
+            units: 0,
+        };
+        let mut last_units = 0;
+        for &(pc, decoded) in &self.instructions {
+            if result.units == max_units || state.eip != pc || pc == stop || return_pad == Some(pc)
+            {
+                break;
+            }
+            let execution = execute_decoded(decoded, state, memory, max_units - result.units);
+            result.units += execution.units;
+            result.step = execution.step;
+            last_units = execution.units;
+            // Stores can patch this block's next instruction. A flags change can
+            // enable single stepping, and floating exceptions remain restartable.
+            if execution.step != Step::Executed
+                || memory.epoch != epoch
+                || state.eflags & 0x100 != 0
+            {
+                break;
+            }
+        }
+        (result, last_units)
     }
 }
 
@@ -2079,6 +2108,78 @@ fn condition_true(condition: ConditionCode, flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_native_revision_reuses_blocks_and_publication_rebuilds_the_boundary() {
+        let code = 0x10000;
+        let mut memory = Memory::new(code, PAGE_SIZE).unwrap();
+        memory.protect(code, PAGE_SIZE, READ | EXEC).unwrap();
+        // FLD1; FADD ST0,ST0; PXOR XMM0,XMM0; INT 2E.
+        memory
+            .write(
+                code,
+                &[0xd9, 0xe8, 0xd8, 0xc0, 0x66, 0x0f, 0xef, 0xc0, 0xcd, 0x2e],
+            )
+            .unwrap();
+        let mut native = BTreeMap::new();
+        let mut interpreter = Interpreter::new();
+        let make = || CpuState {
+            eip: code,
+            xmm: [[0x5a; 16]; 8],
+            ..CpuState::default()
+        };
+        let mut state = make();
+        let (result, _) = interpreter.run_block(
+            &mut state,
+            &mut memory,
+            256,
+            code + 4,
+            None,
+            Some((&native, 0)),
+        );
+        assert_eq!(result.units, 2);
+        let decodes = interpreter.decode_count();
+        state = make();
+        let (result, _) = interpreter.run_block(
+            &mut state,
+            &mut memory,
+            256,
+            code + 4,
+            None,
+            Some((&native, 0)),
+        );
+        assert_eq!(result.units, 2);
+        assert_eq!(interpreter.decode_count(), decodes);
+        native.insert(code + 4, code + 4);
+        state = make();
+        let (result, last_units) = interpreter.run_block(
+            &mut state,
+            &mut memory,
+            256,
+            code + 32,
+            None,
+            Some((&native, 1)),
+        );
+        assert_eq!(result.step, Step::Executed);
+        assert_eq!(result.units, 2);
+        assert_eq!(last_units, 1);
+        assert_eq!(state.eip, code + 4);
+        assert_eq!(state.xmm[0], [0x5a; 16]);
+        let decodes = interpreter.decode_count();
+        for _ in 0..100 {
+            state = make();
+            let (result, _) = interpreter.run_block(
+                &mut state,
+                &mut memory,
+                256,
+                code + 32,
+                None,
+                Some((&native, 1)),
+            );
+            assert_eq!(result.units, 2);
+        }
+        assert_eq!(interpreter.decode_count(), decodes);
+    }
 
     #[test]
     fn unmap_remap_and_missing_tail_page_invalidate_cached_code_and_faults() {

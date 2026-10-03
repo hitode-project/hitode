@@ -949,29 +949,29 @@ impl Machine {
             use crate::interpreter::Step;
             let pc = self.state.eip;
             let timer = self.profiling.then(Instant::now);
-            // String instructions make bounded progress with their restart state
-            // in CpuState; deadlines and cache publication are checked between chunks.
+            // Contiguous integer and floating fallback instructions share a bounded
+            // decoded block. Transfers, exceptions, SMC and REP return here; native
+            // publications change the revision used to build fallthrough boundaries.
             let units = self.state.fuel.min(256) as u32;
-            let (execution, last_units) =
-                if self.profiling || single_step || self.deferred_fallback.is_some() {
-                    let execution =
-                        self.interpreter
-                            .run_chunk(&mut self.state, &mut self.memory, units);
-                    (execution, execution.units)
-                } else {
-                    self.interpreter.run_block(
-                        &mut self.state,
-                        &mut self.memory,
-                        units,
-                        stop,
-                        self.return_pad,
-                        (!interpreter_only
-                            && !single_step
-                            && !pending_fpu
-                            && !self.entry_owner.is_empty())
-                        .then_some(&self.entry_owner),
-                    )
-                };
+            let (execution, last_units) = if self.profiling || single_step {
+                let execution =
+                    self.interpreter
+                        .run_chunk(&mut self.state, &mut self.memory, units);
+                (execution, execution.units)
+            } else {
+                self.interpreter.run_block(
+                    &mut self.state,
+                    &mut self.memory,
+                    units,
+                    stop,
+                    self.return_pad,
+                    (!interpreter_only
+                        && !single_step
+                        && !pending_fpu
+                        && !self.entry_owner.is_empty())
+                    .then_some((&self.entry_owner, self.cache_revision)),
+                )
+            };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
             self.state.fuel -= u64::from(execution.units);
@@ -1193,6 +1193,67 @@ mod floating_boundary_tests {
         assert_eq!(m.state.x87.regs, registers);
         assert_eq!(m.stats.native_entries, 1);
     }
+
+    #[test]
+    fn batched_fault_prefix_charges_the_same_fuel_as_single_instruction_execution() {
+        struct Repair(usize);
+        impl crate::host::RawTrap for Repair {
+            fn call(
+                &mut self,
+                state: &mut CpuState,
+                _: &mut Memory,
+                vector: u32,
+            ) -> Result<bool, String> {
+                assert_eq!(vector, 0);
+                assert_eq!(state.eip, 0x1001);
+                assert_eq!(state.regs[3], 1);
+                state.regs[1] = 3;
+                self.0 += 1;
+                Ok(false)
+            }
+        }
+        let make = |profile| {
+            let mut m = Machine::new(0x1000, 0x4000).unwrap();
+            m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
+            // INC EBX; IDIV ECX; RET. The handler repairs ECX without moving EIP.
+            m.write(0x1000, &[0x43, 0xf7, 0xf9, 0xc3]).unwrap();
+            m.protect(0x1000, 4096, READ | EXEC).unwrap();
+            m.write(0x4f00, &0x3000u32.to_le_bytes()).unwrap();
+            m.state.eip = 0x1000;
+            m.state.regs[0] = 9;
+            m.state.regs[4] = 0x4f00;
+            m.set_profiling(profile);
+            m
+        };
+        let mut batched = make(false);
+        let mut single = make(true);
+        let mut a = Repair(0);
+        let mut b = Repair(0);
+        for m in [&mut batched, &mut single] {
+            let handler = if m.profiling { &mut b } else { &mut a };
+            assert_eq!(
+                m.run_traps(0x3000, 2, handler, true).unwrap(),
+                RunOutcome::Budget
+            );
+            assert_eq!(m.state.eip, 0x1001);
+            assert_eq!(m.state.fuel, 0);
+        }
+        assert_eq!(a.0, 1);
+        assert_eq!(b.0, 1);
+        assert_eq!(batched.state, single.state);
+        for m in [&mut batched, &mut single] {
+            let handler = if m.profiling { &mut b } else { &mut a };
+            assert_eq!(
+                m.run_traps(0x3000, 2, handler, true).unwrap(),
+                RunOutcome::ReachedStop
+            );
+            assert_eq!(m.state.regs[0], 3);
+            assert_eq!(m.state.regs[3], 1);
+        }
+        assert_eq!(batched.state, single.state);
+        assert_eq!(a.0, 1);
+        assert_eq!(b.0, 1);
+    }
 }
 
 #[cfg(test)]
@@ -1269,7 +1330,7 @@ mod tiering_tests {
 #[cfg(test)]
 mod native_deadline_tests {
     use super::*;
-    use crate::{READ, WRITE, EXEC};
+    use crate::{EXEC, READ, WRITE};
 
     fn machine(code: &[u8]) -> Machine {
         let mut m = Machine::new(0x1000, 0x5000).unwrap();
@@ -1297,7 +1358,9 @@ mod native_deadline_tests {
             assert_eq!(timed.state, plain.state, "fuel {budget}");
             assert_eq!(timed.stats.native_blocks, plain.stats.native_blocks);
             assert_eq!(timed.stats.native_blocks, budget);
-            if budget > 256 { assert!(timed.stats.native_entries > 1); }
+            if budget > 256 {
+                assert!(timed.stats.native_entries > 1);
+            }
         }
     }
 
@@ -1313,7 +1376,13 @@ mod native_deadline_tests {
         let a = plain.run(0x4000, 1000).unwrap();
         let b = timed.run(0x4000, 1000).unwrap();
         assert_eq!(a, b);
-        assert!(matches!(b, RunOutcome::ReadFault { pc: 0x1003, address: 0x90000 }));
+        assert!(matches!(
+            b,
+            RunOutcome::ReadFault {
+                pc: 0x1003,
+                address: 0x90000
+            }
+        ));
         assert_eq!(timed.state, plain.state);
     }
 
@@ -1346,7 +1415,11 @@ mod native_deadline_tests {
             let started = Instant::now();
             m.deadline = Some(started + Duration::from_micros(100));
             assert_eq!(m.run(0x4000, 32768).unwrap(), RunOutcome::Budget);
-            println!("NATIVE_DEADLINE sample={sample} requested_us=100 elapsed_us={} blocks={}", started.elapsed().as_micros(), m.stats.native_blocks - before);
+            println!(
+                "NATIVE_DEADLINE sample={sample} requested_us=100 elapsed_us={} blocks={}",
+                started.elapsed().as_micros(),
+                m.stats.native_blocks - before
+            );
         }
     }
 }
