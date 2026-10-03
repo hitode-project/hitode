@@ -7,6 +7,7 @@ pub mod crt;
 mod font;
 mod graphics;
 pub mod mmio;
+mod report;
 pub mod vorbis;
 pub use adv_cpu::CompileStrategy;
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};

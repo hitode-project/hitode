@@ -4,6 +4,7 @@
 
 pub mod controls;
 pub mod dialog;
+pub mod host_input;
 mod menu;
 pub mod message;
 pub(crate) mod strings;

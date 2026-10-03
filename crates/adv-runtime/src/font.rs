@@ -145,7 +145,7 @@ fn select_object(env: &mut Env<'_>) -> Outcome {
         return result;
     }
     if env.ext.get::<Graphics<Snapshot>>().owns_dc(dc) {
-        crate::boot::graphics_call(env)
+        crate::graphics::graphics_call(env)
     } else {
         let handler = env.ext.get::<Fonts>().select;
         handler(env)
@@ -154,7 +154,7 @@ fn select_object(env: &mut Env<'_>) -> Outcome {
 fn delete_object(env: &mut Env<'_>) -> Outcome {
     let object = env.arg(0);
     if env.ext.get::<Graphics<Snapshot>>().owns_bitmap(object) {
-        return crate::boot::graphics_call(env);
+        return crate::graphics::graphics_call(env);
     }
     if env
         .ext
@@ -172,7 +172,7 @@ fn delete_object(env: &mut Env<'_>) -> Outcome {
 fn delete_dc(env: &mut Env<'_>) -> Outcome {
     let dc = env.arg(0);
     let result = if env.ext.get::<Graphics<Snapshot>>().owns_dc(dc) {
-        crate::boot::graphics_call(env)
+        crate::graphics::graphics_call(env)
     } else {
         let handler = env.ext.get::<Fonts>().delete_dc;
         handler(env)
@@ -552,7 +552,7 @@ mod tests {
     fn fixture() -> (Machine<JitCpu>, u32, u32) {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
-        crate::boot::register_graphics(&mut registry);
+        crate::graphics::register_graphics(&mut registry);
         register(&mut registry);
         let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
         let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
@@ -561,7 +561,7 @@ mod tests {
             adv_win32::Win32Config::new(".", "font-test.exe", "target/font-test-overlay"),
         )
         .unwrap();
-        crate::boot::install_graphics(&mut machine, 4, 2).unwrap();
+        crate::graphics::install_graphics(&mut machine, 4, 2).unwrap();
         install(&mut machine);
         let data = machine
             .sys
