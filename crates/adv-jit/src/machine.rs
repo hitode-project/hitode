@@ -871,6 +871,16 @@ impl Machine {
                         && self.deferred_fallback != Some(self.state.eip)
                 });
             if let Some(native) = native {
+                // Internal region loops do not use the inter-region chain limit.
+                // Reserve unused caller fuel and periodically return through Rust
+                // while a wall deadline is active, without charging extra work.
+                let reserved = if self.deadline.is_some() {
+                    let reserved = self.state.fuel.saturating_sub(256);
+                    self.state.fuel -= reserved;
+                    reserved
+                } else {
+                    0
+                };
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
@@ -889,8 +899,10 @@ impl Machine {
                 }
                 self.stats.native_entries += 1 + linked;
                 self.stats.linked_entries += linked;
-                self.stats.native_blocks += before - self.state.fuel;
-                self.record_native_work(pc, before - self.state.fuel);
+                let completed = before - self.state.fuel;
+                self.state.fuel += reserved;
+                self.stats.native_blocks += completed;
+                self.record_native_work(pc, completed);
                 match result {
                     n if n == Exit::Host as u32 => {
                         if let Some(outcome) = bridge.pending.take() {
@@ -903,7 +915,14 @@ impl Machine {
                         continue;
                     }
                     n if n == Exit::Dispatch as u32 => continue,
-                    n if n == Exit::Budget as u32 => return Ok(RunOutcome::Budget),
+                    n if n == Exit::Budget as u32 => {
+                        if reserved != 0 {
+                            // Only the internal safepoint allowance ran out.
+                            // Recheck the actual deadline and retain caller fuel.
+                            continue;
+                        }
+                        return Ok(RunOutcome::Budget);
+                    }
                     n if n == Exit::ReadFault as u32 => {
                         return Ok(RunOutcome::ReadFault {
                             pc: self.state.eip,
@@ -1244,5 +1263,90 @@ mod tiering_tests {
         m.automatic_regions.clear();
         m.record_native_work(0x1000, 100_000);
         assert_eq!(m.stats.tier_up_requests, 0);
+    }
+}
+
+#[cfg(test)]
+mod native_deadline_tests {
+    use super::*;
+    use crate::{READ, WRITE, EXEC};
+
+    fn machine(code: &[u8]) -> Machine {
+        let mut m = Machine::new(0x1000, 0x5000).unwrap();
+        m.protect(0x1000, 0x5000, READ | WRITE).unwrap();
+        m.write(0x1000, code).unwrap();
+        m.protect(0x1000, 0x1000, READ | EXEC).unwrap();
+        m.add_region(Region::new(0x1000, code.len())).unwrap();
+        m.state.eip = 0x1000;
+        m.state.regs[0] = 7;
+        m.state.regs[4] = 0x5f00;
+        m.write(0x5f00, &0x4000u32.to_le_bytes()).unwrap();
+        m
+    }
+
+    #[test]
+    fn safepoints_preserve_exact_caller_fuel_and_cpu_state() {
+        // inc eax; add ebx,3; jmp back -- one native basic block.
+        let code = [0x40, 0x83, 0xc3, 3, 0xeb, 0xfa];
+        for budget in [1, 255, 256, 257, 511, 512, 10001] {
+            let mut plain = machine(&code);
+            let mut timed = machine(&code);
+            timed.deadline = Some(Instant::now() + Duration::from_secs(60));
+            assert_eq!(plain.run(0x4000, budget).unwrap(), RunOutcome::Budget);
+            assert_eq!(timed.run(0x4000, budget).unwrap(), RunOutcome::Budget);
+            assert_eq!(timed.state, plain.state, "fuel {budget}");
+            assert_eq!(timed.stats.native_blocks, plain.stats.native_blocks);
+            assert_eq!(timed.stats.native_blocks, budget);
+            if budget > 256 { assert!(timed.stats.native_entries > 1); }
+        }
+    }
+
+    #[test]
+    fn safepoint_prefix_before_a_precise_memory_fault_is_not_replayed() {
+        // dec ecx; jnz back; mov eax,[unmapped/outside window].
+        let code = [0x49, 0x75, 0xfd, 0xa1, 0, 0, 9, 0];
+        let mut plain = machine(&code);
+        let mut timed = machine(&code);
+        plain.state.regs[1] = 600;
+        timed.state.regs[1] = 600;
+        timed.deadline = Some(Instant::now() + Duration::from_secs(60));
+        let a = plain.run(0x4000, 1000).unwrap();
+        let b = timed.run(0x4000, 1000).unwrap();
+        assert_eq!(a, b);
+        assert!(matches!(b, RunOutcome::ReadFault { pc: 0x1003, address: 0x90000 }));
+        assert_eq!(timed.state, plain.state);
+    }
+
+    #[test]
+    fn completed_native_region_keeps_unspent_outer_fuel() {
+        let mut m = machine(&[0x40, 0xc3]);
+        m.deadline = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(m.run(0x4000, 10000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 8);
+        assert_eq!(m.state.fuel, 9999);
+    }
+
+    // This source is copied unchanged into baseline and candidate for the probe.
+    #[test]
+    #[ignore = "diagnostic deadline latency, not a shared-runner timing gate"]
+    fn report_long_region_deadline_latency() {
+        let mut code = Vec::new();
+        for _ in 0..200 {
+            // imul eax,eax,1664525 -- a dependent chain that must execute.
+            code.extend_from_slice(&[0x69, 0xc0, 0x0d, 0x66, 0x19, 0]);
+            code.extend_from_slice(&[0x35, 0x79, 0x37, 0x9e, 0x55]); // xor prevents algebraic folding
+        }
+        code.push(0xe9);
+        let displacement = -((code.len() + 4) as i32);
+        code.extend_from_slice(&displacement.to_le_bytes());
+        let mut m = machine(&code);
+        m.run(0x4000, 100).unwrap(); // warm executable pages, not timed
+        for sample in 0..9 {
+            let before = m.stats.native_blocks;
+            let started = Instant::now();
+            m.deadline = Some(started + Duration::from_micros(100));
+            assert_eq!(m.run(0x4000, 32768).unwrap(), RunOutcome::Budget);
+            println!("NATIVE_DEADLINE sample={sample} requested_us=100 elapsed_us={} blocks={}", started.elapsed().as_micros(), m.stats.native_blocks - before);
+        }
     }
 }
