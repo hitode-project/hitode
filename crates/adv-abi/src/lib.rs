@@ -20,6 +20,7 @@ pub use adv_machine::{Conv, Env, Handler, HostFn, Outcome};
 
 pub mod constants;
 pub mod guest;
+pub mod ordinals;
 pub mod signature;
 pub mod stub;
 pub mod trace;
@@ -133,6 +134,8 @@ impl Registry {
     }
 
     pub fn get(&self, module: &str, name: &str) -> Option<HostFn> {
+        let canonical = self.canonical_name(module, name);
+        let name = canonical.unwrap_or(name);
         if let Some(entry) = self
             .fns
             .get(&(module.to_ascii_lowercase(), name.to_owned()))
@@ -152,12 +155,23 @@ impl Registry {
         })
     }
 
+    /// An explicit legacy ordinal implementation wins over an SDK alias.
+    pub fn canonical_name(&self, module: &str, name: &str) -> Option<&'static str> {
+        let module = module.to_ascii_lowercase();
+        if self.fns.contains_key(&(module.clone(), name.to_owned())) {
+            return None;
+        }
+        ordinals::lookup(&module, name)
+    }
+
     pub fn level(&self, module: &str, name: &str) -> Option<ImplementationLevel> {
+        let name = self.canonical_name(module, name).unwrap_or(name);
         self.fns
             .get(&(module.to_ascii_lowercase(), name.to_owned()))
             .and_then(|e| e.level)
     }
     pub fn is_implemented(&self, module: &str, name: &str) -> bool {
+        let name = self.canonical_name(module, name).unwrap_or(name);
         self.fns
             .contains_key(&(module.to_ascii_lowercase(), name.to_owned()))
     }
@@ -262,6 +276,9 @@ pub struct Coverage {
 }
 
 impl adv_machine::Resolver for Registry {
+    fn canonical_name(&self, module: &str, name: &str) -> Option<String> {
+        Registry::canonical_name(self, module, name).map(str::to_owned)
+    }
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn> {
         self.get(module, name)
     }

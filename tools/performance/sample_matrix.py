@@ -31,10 +31,39 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def milestones(report: dict, evidence: dict | None = None, report_hash: str | None = None) -> dict:
+    """Only an inspected title/audio/chapter can certify S2-S4, not a frame counter.
+
+    External evidence must name the exact report digest, its reviewer and a note.
+    Discovery runs keep observations but never acquire an accepted stage.
+    """
+    api = report.get("api") or {}
+    strict = api.get("mode") == "strict"
+    eligible = (strict and api.get("acceptance_eligible") is True
+                and api.get("stub_calls") == 0 and not api.get("signature_conflicts")
+                and not report.get("failure") and not report.get("screenshot_error"))
+    startup = report.get("startup") or {}
+    reached = "S1" if startup.get("loaded") and startup.get("guest_windows", 0) > 0 else None
+    proof = None
+    if evidence:
+        if (not report_hash or evidence.get("report_sha256") != report_hash
+                or not evidence.get("reviewer") or not evidence.get("note")
+                or evidence.get("stage") not in ("S1", "S2", "S3", "S4")):
+            raise ValueError("milestone evidence requires matching report_sha256, stage, reviewer and note")
+        reached = evidence["stage"]
+        proof = evidence
+    return {"stage_reached": reached, "accepted_stage": reached if eligible else None,
+            "acceptance_eligible": eligible, "review": proof,
+            "observations": {"frames": report.get("frames", 0),
+                             "first_frame_seconds": report.get("first_frame_seconds"),
+                             "note": "Frames alone do not establish a title screen, correct sound or chapter completion."}}
+
+
 def run(args: argparse.Namespace) -> None:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
     samples = manifest["samples"] if isinstance(manifest, dict) else manifest
     selected = set(args.only or [])
+    evidence = json.loads(args.evidence.read_text(encoding="utf-8-sig")) if args.evidence else {}
     ids = set()
     for sample in samples:
         name = sample["id"]
@@ -58,7 +87,7 @@ def run(args: argparse.Namespace) -> None:
     environment["ADV_AUDIO_MUTE_DEVICE"] = "1"
     metadata = {"binary": str(binary), "binary_sha256": digest(binary),
                 "manifest": str(args.manifest.resolve()), "seconds_per_sample": args.seconds,
-                "mode": args.mode, "codec": args.codec, "hardware_muted": True,
+                "mode": args.mode, "api_mode": args.api_mode, "codec": args.codec, "hardware_muted": True,
                 "auto_dialog_ms": 50, "qualification": "startup probe, not playability or peak throughput",
                 "samples": []}
     write_json(output / "results.json", metadata)
@@ -69,7 +98,7 @@ def run(args: argparse.Namespace) -> None:
         folder.mkdir()
         game = Path(sample["exe"]).resolve(strict=True)
         command = [str(binary), str(game), "--" + args.mode, "--audio",
-                   "--codec", args.codec, "--seconds", str(args.seconds),
+                   "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(args.seconds),
                    "--codepage", str(sample.get("codepage", 932)),
                    "--auto-dialog-ms", "50", "--data-dir", str(folder / "overlay"),
                    "--report", str(folder / "report.json"),
@@ -77,6 +106,7 @@ def run(args: argparse.Namespace) -> None:
         if args.trace:
             command += ["--trace", str(folder / "api.log")]
         result = dict(sample, command=command, guest_exe_sha256=digest(game))
+        result["milestones"] = milestones({})
         started = time.monotonic()
         print(f"START {sample['id']}", flush=True)
         try:
@@ -100,8 +130,10 @@ def run(args: argparse.Namespace) -> None:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
                 for key in ("stop_reason", "guest_exit_code", "frames", "first_frame_seconds",
                             "width", "height", "frame_fnv1a64", "missing_apis", "failure",
-                            "screenshot_error", "audio", "pcm", "codec", "performance"):
+                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup"):
                     result[key] = report.get(key)
+                result["report_sha256"] = digest(report_path)
+                result["milestones"] = milestones(report, evidence.get(sample["id"]), result["report_sha256"])
             except (ValueError, OSError) as error:
                 result["report_error"] = str(error)
         stderr = (folder / "stderr.log").read_text(encoding="utf-8", errors="replace")
@@ -128,11 +160,13 @@ def run(args: argparse.Namespace) -> None:
               f"wall={result['wall_seconds']:.2f}s", flush=True)
     rows = ["# Startup probes", "", "Sequential, bounded, hardware-muted runs. Frame production does not certify playability.",
             "Unresolved imports and actual runtime failures must be evaluated separately.", "",
-            "| Sample | Engine evidence | Result | Frames | First frame (s) | Called API blocker |", "|---|---|---|---:|---:|---|"]
+            "| Sample | Engine evidence | Result | Reached | Accepted | Frames | First frame (s) | Called API blocker |", "|---|---|---|---|---|---:|---:|---|"]
     for result in metadata["samples"]:
         clean = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
         rows.append("| " + " | ".join(map(clean, [result["id"], result.get("engine", "unknown"),
-                    result["status"], result.get("frames", 0), result.get("first_frame_seconds"), result.get("blocker_api") or "see failure evidence"])) + " |")
+                    result["status"], result["milestones"]["stage_reached"] or "unverified",
+                    result["milestones"]["accepted_stage"] or "none", result.get("frames", 0),
+                    result.get("first_frame_seconds"), result.get("blocker_api") or "see failure evidence"])) + " |")
     (output / "summary.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
@@ -146,6 +180,8 @@ if __name__ == "__main__":
     parser.add_argument("--timeout-grace", type=float, default=15)
     parser.add_argument("--mode", choices=("hidden", "headless"), default="hidden")
     parser.add_argument("--codec", choices=("native", "guest"), default="native")
+    parser.add_argument("--api-mode", choices=("strict", "discovery"), default="strict")
+    parser.add_argument("--evidence", type=Path, help="reviewed S1-S4 evidence keyed by sample id, tied to report SHA-256")
     parser.add_argument("--trace", action="store_true", help="diagnostic API trace, not a performance measurement")
     options = parser.parse_args()
     if not math.isfinite(options.seconds) or not 0 < options.seconds <= 3600:

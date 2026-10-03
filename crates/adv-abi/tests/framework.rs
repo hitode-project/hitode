@@ -13,6 +13,31 @@ use adv_unicorn::UnicornCpu;
 const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
+#[test]
+fn sdk_ordinals_and_names_resolve_to_the_same_patchable_entry() {
+    let mut m = machine(Registry::default());
+    let by_ordinal = m.resolve_import("d2d1.dll", "#1").unwrap();
+    let by_name = m.resolve_import("d2d1.dll", "D2D1CreateFactory").unwrap();
+    assert_eq!(by_ordinal, by_name);
+    assert_eq!(
+        m.sys
+            .thunks
+            .resolver()
+            .host_fn("d2d1.dll", "#1")
+            .unwrap()
+            .conv,
+        Conv::Stdcall { argc: 4 }
+    );
+    m.cpu.write(by_name, &[0xc3]).unwrap();
+    assert_eq!(m.cpu.read_u8(by_ordinal).unwrap(), 0xc3);
+    let mut explicit = Registry::default();
+    explicit.add("d2d1.dll", "#1", Conv::Stdcall { argc: 4 }, |_| {
+        Outcome::Return(19)
+    });
+    assert_eq!(explicit.canonical_name("d2d1.dll", "#1"), None);
+    assert_eq!(explicit.canonical_name("d2d1.dll", "#65535"), None);
+}
+
 // These test adapters test ABI transport only; they are never runtime implementations.
 #[win32(kernel32, name = "QueryPerformanceCounter", level = state)]
 fn typed_output(

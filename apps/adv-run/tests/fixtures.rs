@@ -42,6 +42,54 @@ fn number(report: &str, key: &str) -> f64 {
         .unwrap()
 }
 
+#[test]
+fn generated_stubs_stop_strict_and_report_the_discovery_chain() {
+    let directory = fixtures();
+    for backend in ["jit", "interpreter"] {
+        for mode in ["strict", "discovery"] {
+            let report_path = directory.join(format!("api-stubs-{backend}-{mode}.json"));
+            let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
+                .arg(directory.join("fixture_api_stubs.exe"))
+                .args([
+                    "--headless",
+                    "--backend",
+                    backend,
+                    "--api-mode",
+                    mode,
+                    "--seconds",
+                    "5",
+                    "--report",
+                ])
+                .arg(&report_path)
+                .env("ADV_AUDIO_MUTE_DEVICE", "1")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                mode == "discovery",
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report = std::fs::read_to_string(report_path).unwrap();
+            assert!(report.contains(&format!("\"mode\": \"{mode}\"")));
+            assert!(report.contains("\"acceptance_eligible\": false"));
+            assert!(report.contains("\"signature_conflicts\": []"));
+            assert!(report.contains("\"dwrite.dll!DWriteCreateFactory\": 1"));
+            assert_eq!(
+                number(&report, "stub_calls"),
+                if mode == "strict" { 1.0 } else { 2.0 }
+            );
+            if mode == "discovery" {
+                assert!(report.contains("\"d2d1.dll!D2D1CreateFactory\": 1"));
+                assert_eq!(number(&report, "guest_exit_code"), 0.0);
+            } else {
+                assert!(report.contains("strict ABI stub"));
+                assert!(!report.contains("\"d2d1.dll!D2D1CreateFactory\": 1"));
+            }
+        }
+    }
+}
+
 fn execute(name: &str, backend: &str, hidden: bool) -> (String, Vec<u8>) {
     let directory = fixtures();
     let report_path = directory.join(format!("{name}.json"));

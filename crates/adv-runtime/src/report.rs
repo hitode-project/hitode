@@ -9,6 +9,62 @@ use crate::graphics::{RunControl, unsupported_graphics};
 use crate::{Graphics, Snapshot};
 
 impl<B: Backend> Runtime<B> {
+    pub fn last_indirect_branch(&self) -> Option<adv_cpu::IndirectBranch> {
+        self.machine.cpu.last_indirect_branch()
+    }
+    fn api_registry(&self) -> &adv_abi::Registry {
+        (self.machine.sys.thunks.resolver() as &dyn std::any::Any)
+            .downcast_ref()
+            .expect("runtime ABI registry")
+    }
+
+    /// Select before the first step. Discovery results are never compatibility passes.
+    pub fn set_api_mode(&mut self, mode: adv_abi::RunMode) {
+        self.machine
+            .sys
+            .thunks
+            .resolver_mut::<adv_abi::Registry>()
+            .expect("runtime ABI registry")
+            .set_mode(mode);
+    }
+
+    pub fn api_mode(&self) -> adv_abi::RunMode {
+        self.api_registry().mode()
+    }
+
+    pub fn api_diagnostics(&self) -> Option<&adv_abi::ApiDiagnostics> {
+        self.machine.ext.try_get()
+    }
+
+    pub fn api_signature_conflicts(&self) -> Vec<adv_abi::SignatureConflict> {
+        self.api_registry().signature_conflicts()
+    }
+
+    pub fn api_coverage(&self) -> adv_abi::Coverage {
+        self.api_registry().coverage()
+    }
+
+    /// Necessary ABI conditions only; this does not certify graphics, audio or playability.
+    pub fn api_acceptance_eligible(&self) -> bool {
+        self.api_mode() == adv_abi::RunMode::Strict
+            && self.api_diagnostics().is_none_or(|d| d.stub_calls == 0)
+            && self.api_signature_conflicts().is_empty()
+            && self
+                .machine
+                .sys
+                .recent
+                .iter()
+                .all(|(_, thunk, _)| self.machine.sys.thunks.get(*thunk).implemented)
+    }
+
+    pub fn guest_window_count(&self) -> usize {
+        let user = &self.machine.ext.get::<Win32>().user;
+        user.windows
+            .values()
+            .filter(|window| window.hwnd != user.desktop)
+            .count()
+    }
+
     /// Imports with no handler; resolved probes are included even if never called.
     pub fn missing_apis(&self) -> Vec<String> {
         let called: std::collections::BTreeSet<_> = self
@@ -47,9 +103,37 @@ impl<B: Backend> Runtime<B> {
         );
         let user = &self.machine.ext.get::<Win32>().user;
         report.push_str(&format!(
+            "\nAPI mode: {:?}; ABI acceptance eligible: {}; signature conflicts: {:?}",
+            self.api_mode(),
+            self.api_acceptance_eligible(),
+            self.api_signature_conflicts()
+        ));
+        if let Some(diagnostics) = self.api_diagnostics() {
+            report.push_str(&format!(
+                "\nCalled API gaps: {:?}; stub calls: {}",
+                diagnostics.gaps, diagnostics.stub_calls
+            ));
+            for call in &diagnostics.recent_stubs {
+                report.push_str(&format!(
+                    "\n  stub {}!{} from {:#010x}, context {}: {}",
+                    call.module,
+                    call.name,
+                    call.caller,
+                    call.context,
+                    call.arguments.join(", ")
+                ));
+            }
+        }
+        report.push_str(&format!(
             "\nActive CPU context {}:",
             self.machine.sys.current
         ));
+        if let Some(branch) = self.last_indirect_branch() {
+            report.push_str(&format!(
+                " last indirect {:?} {:#010x} -> {:#010x};",
+                branch.kind, branch.source, branch.target
+            ));
+        }
         for register in [
             adv_cpu::backend::Reg::Eip,
             adv_cpu::backend::Reg::Esp,

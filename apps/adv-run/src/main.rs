@@ -35,11 +35,13 @@ struct Options {
     control_stdin: bool,
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
+    api_mode: adv_runtime::RunMode,
 }
 
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
+  --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-region-linking     return to the dispatcher between native regions\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
@@ -89,6 +91,7 @@ impl Options {
             control_stdin: false,
             audio: false,
             codec: adv_runtime::vorbis::Policy::Native,
+            api_mode: adv_runtime::RunMode::Strict,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -100,6 +103,13 @@ impl Options {
                 }
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--api-mode" => {
+                    options.api_mode = match value()?.as_str() {
+                        "strict" => adv_runtime::RunMode::Strict,
+                        "discovery" => adv_runtime::RunMode::Discovery,
+                        _ => return Err("--api-mode must be strict or discovery".into()),
+                    };
+                }
                 "--backend" => {
                     options.jit = match value()?.as_str() {
                         "jit" => true,
@@ -232,6 +242,70 @@ fn checksum(bytes: &[u8]) -> u64 {
     })
 }
 
+fn api_report(runtime: &Runtime) -> String {
+    let mode = match runtime.api_mode() {
+        adv_runtime::RunMode::Strict => "strict",
+        adv_runtime::RunMode::Discovery => "discovery",
+    };
+    let diagnostics = runtime.api_diagnostics();
+    let gaps = diagnostics.map_or_else(String::new, |d| {
+        d.gaps
+            .iter()
+            .map(|(name, count)| format!("{}: {count}", json(name)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    let recent = diagnostics.map_or_else(String::new, |d| d.recent_stubs.iter().map(|call| {
+        let args = call.arguments.iter().map(|arg| json(arg)).collect::<Vec<_>>().join(", ");
+        format!("{{\"module\": {}, \"name\": {}, \"caller\": {}, \"context\": {}, \"arguments\": [{args}]}}",
+            json(&call.module), json(&call.name), call.caller, call.context)
+    }).collect::<Vec<_>>().join(", "));
+    let conflicts = runtime
+        .api_signature_conflicts()
+        .iter()
+        .map(|conflict| {
+            format!(
+                "{{\"api\": {}, \"registered\": {}, \"metadata\": {}}}",
+                json(&format!("{}!{}", conflict.module, conflict.name)),
+                json(&format!("{:?}", conflict.registered)),
+                json(&format!("{:?}", conflict.metadata))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let branch = runtime.last_indirect_branch().map_or_else(
+        || "null".into(),
+        |branch| {
+            format!(
+                "{{\"source\": {}, \"target\": {}, \"kind\": {}}}",
+                branch.source,
+                branch.target,
+                json(&format!("{:?}", branch.kind))
+            )
+        },
+    );
+    let coverage = runtime.api_coverage();
+    format!(
+        concat!(
+            "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, ",
+            "\"called_gaps\": {{{}}}, \"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
+            "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}}}"
+        ),
+        json(mode),
+        runtime.api_acceptance_eligible(),
+        diagnostics.map_or(0, |d| d.stub_calls),
+        gaps,
+        recent,
+        conflicts,
+        branch,
+        coverage.generated_exports,
+        coverage.implement,
+        coverage.state,
+        coverage.safe_fail,
+        coverage.legacy
+    )
+}
+
 struct ReportContext<'a> {
     options: &'a Options,
     runtime: &'a Runtime,
@@ -325,6 +399,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
+            "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
@@ -364,6 +439,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         runtime.machine.sys.contexts.len(),
         runtime.machine.sys.tls_images.len(),
         modules,
+        api_report(runtime),
+        runtime.guest_window_count(),
         missing
             .iter()
             .map(|s| json(s))
@@ -444,6 +521,7 @@ fn run_execution(
         options.codec,
     )?;
     runtime.set_codepage(options.codepage);
+    runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
     runtime
         .audio_stream()

@@ -51,6 +51,10 @@ pub struct HostFn {
 /// Where host implementations come from. The machine only binds what it is given; naming,
 /// signatures and stubs belong to the ABI layer (`adv_abi::Registry`).
 pub trait Resolver: Any {
+    /// Optional symbol alias. The machine keeps aliases on the same hookable thunk.
+    fn canonical_name(&self, _module: &str, _name: &str) -> Option<String> {
+        None
+    }
     /// Host implementation of `module!name` (`module` is a lowercase file name), if any.
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn>;
     /// Whether the host implements anything in `module` (lowercase file name).
@@ -148,7 +152,13 @@ impl ThunkTable {
         module: &str,
         name: &str,
     ) -> Result<u32, MemFault> {
-        let key = (module.to_ascii_lowercase(), name.to_owned());
+        let mut key = (module.to_ascii_lowercase(), name.to_owned());
+        if !self.internal.contains_key(&key)
+            && let Some(canonical) = self.resolver.canonical_name(&key.0, name)
+        {
+            key.1 = canonical;
+        }
+        let name = key.1.as_str();
         if let Some(&i) = self.by_name.get(&key) {
             return Ok(thunk_addr(i));
         }
