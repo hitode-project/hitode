@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+adv-abi.workspace = true
 adv-cpu = { path = "../adv-cpu" }
 adv-machine.workspace = true
 adv-pe.workspace = true

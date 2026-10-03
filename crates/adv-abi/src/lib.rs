@@ -66,6 +66,7 @@ pub struct SignatureConflict {
 pub struct Registry {
     fns: HashMap<(String, String), Entry>,
     mode: RunMode,
+    replacements: std::collections::BTreeSet<String>,
 }
 
 impl Default for Registry {
@@ -73,11 +74,16 @@ impl Default for Registry {
         Self {
             fns: HashMap::new(),
             mode: RunMode::Strict,
+            replacements: Default::default(),
         }
     }
 }
 
 impl Registry {
+    /// Opt in only after validating a complete native provider's ABI.
+    pub fn replace_module(&mut self, module: &str) {
+        self.replacements.insert(module.to_ascii_lowercase());
+    }
     pub fn add(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
         self.add_with_data(module, name, conv, handler, 0);
     }
@@ -106,11 +112,33 @@ impl Registry {
     }
 
     pub fn register(&mut self, api: Api) {
-        self.add(api.module, api.name, api.conv, api.handler);
+        self.register_with_data(api, 0);
+    }
+
+    /// Preserve immutable binding data when composing typed API decorators.
+    pub fn register_with_data(&mut self, api: Api, data: u64) {
+        self.add_with_data(api.module, api.name, api.conv, api.handler, data);
         self.fns
             .get_mut(&(api.module.to_ascii_lowercase(), api.name.to_owned()))
             .expect("just inserted")
             .level = Some(api.level);
+    }
+
+    /// Visible DLL function names, including diagnostic exports. COM method
+    /// descriptors are not DLL exports. Ordinal-only registrations retain #N.
+    pub fn export_names(&self, module: &str) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for signature in signature::signatures() {
+            if signature.module.eq_ignore_ascii_case(module) {
+                names.insert(signature.name.to_owned());
+            }
+        }
+        for (dll, name) in self.fns.keys() {
+            if dll.eq_ignore_ascii_case(module) && !name.contains("::") {
+                names.insert(name.clone());
+            }
+        }
+        names.into_iter().collect()
     }
 
     pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
@@ -276,6 +304,9 @@ pub struct Coverage {
 }
 
 impl adv_machine::Resolver for Registry {
+    fn replaces_module(&self, module: &str) -> bool {
+        self.replacements.contains(&module.to_ascii_lowercase())
+    }
     fn canonical_name(&self, module: &str, name: &str) -> Option<String> {
         Registry::canonical_name(self, module, name).map(str::to_owned)
     }

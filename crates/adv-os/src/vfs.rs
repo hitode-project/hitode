@@ -296,6 +296,9 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
 }
 
 impl crate::FileSource for Vfs {
+    fn absolute_path(&self, path: &str) -> String {
+        self.normalize(path)
+    }
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         let p = self.lookup(path)?;
         p.is_file().then(|| std::fs::read(p).ok()).flatten()

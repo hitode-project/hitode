@@ -3,15 +3,15 @@
 //! * Images load at their preferred base when it is free (TL2026's exe has no relocations).
 //!   Otherwise they are rebased with their fixups; images without a relocation directory
 //!   and without code (RESOURCE.dll / FX.dll share base 0x10000000) are moved as-is.
-//! * Imports and delay imports are bound eagerly. A module the host implements (kernel32,
-//!   or a registered codec/engine module) resolves to thunks; any other module is loaded from the game files as a
-//!   guest DLL. Delay-load slots and the delay descriptor's HMODULE slot are prefilled, so
+//! * Imports and delay imports are bound eagerly. Shipped DLLs win over synthetic
+//!   system images; an explicit whole-module provider requires a capability check.
+//!   Delay-load slots and the delay descriptor's HMODULE slot are prefilled, so
 //!   the guest's `__delayLoadHelper2` never runs.
 //! * Static TLS templates are recorded; each guest context gets its blocks at spawn.
 //! * Initializers (TLS callbacks, DllMain) are returned as [`InitCall`]s, which the process
 //!   start thunk runs as a chain of guest calls on the main context.
 
-use adv_cpu::backend::{Guest, MemFault, Prot};
+use adv_cpu::backend::{Guest, GuestExt, MemFault, Prot};
 use adv_pe::{ExportTarget, ImportName, Pe, PeError, file_flags, scn};
 use thiserror::Error;
 
@@ -21,8 +21,8 @@ use adv_machine::{Image, InitCall, Sys, TlsImage};
 
 use crate::module::{Module, ModuleId, ModuleKind, Modules, module_key};
 
-/// System modules always implemented by the host, even if a file with that name exists
-/// in the game directory. Engine modules are selected by the host registry instead.
+/// System modules available from the synthetic System32 view. A game-side proxy
+/// takes precedence for a bare module name; an absolute System32 path bypasses it.
 pub const HOST_MODULES: &[&str] = &[
     "kernel32.dll",
     "user32.dll",
@@ -56,6 +56,13 @@ const DLL_PROCESS_ATTACH: u32 = 1;
 /// (an import descriptor name, possibly relative, or a LoadLibrary argument).
 pub trait FileSource {
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+    fn absolute_path(&self, path: &str) -> String {
+        if path.contains(':') {
+            path.replace('/', "\\")
+        } else {
+            format!("C:\\Game\\{path}")
+        }
+    }
 }
 
 /// Resolve only module files. Ordinary guest file operations retain their exact
@@ -108,6 +115,17 @@ pub fn is_host_module(sys: &Sys, key: &str) -> bool {
         || sys.thunks.resolver().provides(key)
 }
 
+pub fn is_system_path(path: &str) -> bool {
+    let path = path.replace('/', "\\");
+    ["C:\\Windows\\system32\\", "C:\\Windows\\syswow64\\"]
+        .iter()
+        .any(|prefix| {
+            path.get(..prefix.len())
+                .is_some_and(|part| part.eq_ignore_ascii_case(prefix))
+                && !path[prefix.len()..].contains('\\')
+        })
+}
+
 pub struct Loader<'a> {
     pub cpu: &'a mut dyn Guest,
     pub sys: &'a mut Sys,
@@ -153,11 +171,24 @@ impl<'a> Loader<'a> {
     /// Load `path` (or bump the load count if it is already loaded).
     pub fn load(&mut self, path: &str) -> Result<ModuleId, LoadError> {
         let key = module_key(path);
-        if let Some(id) = self.modules.by_name(&key) {
-            self.modules.get_mut(id).load_count += 1;
+        let system = is_system_path(path);
+        let loaded = if system {
+            self.modules.system(&key)
+        } else {
+            self.modules.by_name(path)
+        };
+        if let Some(id) = loaded {
+            let module = self.modules.get_mut(id);
+            module.load_count = module.load_count.saturating_add(1);
+            if module.ldr_entry != 0 {
+                self.cpu.write(
+                    module.ldr_entry + 0x38,
+                    &(module.load_count.min(u16::MAX as u32) as u16).to_le_bytes(),
+                )?;
+            }
             return Ok(id);
         }
-        if is_host_module(self.sys, &key) {
+        if system || self.sys.thunks.resolver().replaces_module(&key) {
             return self.load_host(key, path);
         }
         if let Some((resolved, bytes)) =
@@ -174,25 +205,97 @@ impl<'a> Loader<'a> {
         self.load_host(key, path)
     }
 
-    fn load_host(&mut self, key: String, path: &str) -> Result<ModuleId, LoadError> {
+    fn load_host(&mut self, key: String, _path: &str) -> Result<ModuleId, LoadError> {
         let n = self.modules.host_count();
         if n >= HOST_MODULE_CAP {
             return Err(LoadError::TooManyHostModules);
         }
-        Ok(self.modules.add(Module {
+        let base = self
+            .modules
+            .iter()
+            .filter(|(_, m)| m.kind == ModuleKind::Host)
+            .map(|(_, m)| align_up(m.base + m.size, GRANULE))
+            .max()
+            .unwrap_or(HOST_MODULE_BASE);
+        let registry =
+            (self.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<adv_abi::Registry>();
+        let names = registry.map(|r| r.export_names(&key)).unwrap_or_default();
+        let mut known_ordinals: std::collections::BTreeMap<String, u16> =
+            adv_abi::ordinals::exports(&key)
+                .map(|(ordinal, name)| (name.to_owned(), ordinal))
+                .collect();
+        let explicit_ordinals: std::collections::BTreeSet<u16> = names
+            .iter()
+            .filter_map(|name| name.strip_prefix('#')?.parse().ok())
+            .collect();
+        known_ordinals.retain(|_, ordinal| !explicit_ordinals.contains(ordinal));
+        let mut exports = Vec::with_capacity(names.len());
+        for name in names {
+            let thunk = self.sys.thunks.publish(self.cpu, &key, &name)?;
+            let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
+            self.cpu.read(thunk, &mut bytes)?;
+            let ordinal = name.strip_prefix('#').and_then(|n| n.parse().ok());
+            exports.push(crate::synthetic::Export {
+                ordinal: ordinal.or_else(|| known_ordinals.get(&name).copied()),
+                name: ordinal.is_none().then_some(name),
+                target: crate::synthetic::Target::Code(bytes),
+            });
+        }
+        let image = crate::synthetic::build(base, &key, &exports).map_err(|err| LoadError::Pe {
+            path: key.clone(),
+            err,
+        })?;
+        let size = image.bytes.len() as u32;
+        if base
+            .checked_add(size)
+            .is_none_or(|end| end > HOST_MODULE_BASE + HOST_MODULE_CAP * GRANULE)
+        {
+            return Err(LoadError::NoSpace(key, size));
+        }
+        let pe = Pe::parse(&image.bytes).map_err(|err| LoadError::Pe {
+            path: key.clone(),
+            err,
+        })?;
+        let mut exports_by_name = std::collections::HashMap::new();
+        let mut exports_by_ordinal = std::collections::HashMap::new();
+        for export in pe.exports().map_err(|err| LoadError::Pe {
+            path: key.clone(),
+            err,
+        })? {
+            if let Some(name) = export.name {
+                exports_by_name.insert(name, export.target.clone());
+            }
+            exports_by_ordinal.insert(export.ordinal, export.target);
+        }
+        self.cpu.map(base, size, Prot::RW)?;
+        self.cpu.write(base, &image.bytes)?;
+        self.cpu.protect(base, size, Prot::READ)?;
+        self.cpu
+            .protect(base + image.text_rva, image.text_size, Prot::RX)?;
+        self.sys.images.add(Image {
+            name: key.clone(),
+            base,
+            size,
+        });
+        let path = format!("C:\\Windows\\system32\\{key}");
+        let id = self.modules.add(Module {
+            path: path.clone(),
             name: key,
-            path: path.to_owned(),
             kind: ModuleKind::Host,
-            base: HOST_MODULE_BASE + n * GRANULE,
-            size: 0,
+            base,
+            size,
             is_dll: true,
             entry: 0,
             stack_reserve: 0,
-            exports_by_name: Default::default(),
-            exports_by_ordinal: Default::default(),
+            exports_by_name,
+            exports_by_ordinal,
             resources: None,
             load_count: 1,
-        }))
+            ldr_entry: 0,
+        });
+        self.modules.publish_ldr(self.cpu, id, &path)?;
+        self.modules.complete_ldr(self.cpu, id)?;
+        Ok(id)
     }
 
     fn load_image(
@@ -260,7 +363,10 @@ impl<'a> Loader<'a> {
             exports_by_ordinal,
             resources: pe.resources().map_err(pe_err)?,
             load_count: 1,
+            ldr_entry: 0,
         });
+        self.modules
+            .publish_ldr(self.cpu, id, &self.files.absolute_path(path))?;
         self.sys.images.add(Image {
             name: key.clone(),
             base,
@@ -293,27 +399,8 @@ impl<'a> Loader<'a> {
             tls_callbacks = pe.tls_callbacks(&tls, base).map_err(pe_err)?;
         }
 
-        // Detours' setdll prepends DLLs to the import table so Windows loads them first
-        // (never part of the game as shipped) and keeps the original table in its header. Bind the original: the game runs as it shipped, and the added DLLs never load.
-        if let Some(orig) = pe.detours_original_imports().map_err(pe_err)? {
-            let now: Vec<String> = pe
-                .imports()
-                .map_err(pe_err)?
-                .into_iter()
-                .map(|m| m.dll)
-                .collect();
-            pe.dirs[adv_pe::dir::IMPORT] = orig;
-            let kept: Vec<String> = pe
-                .imports()
-                .map_err(pe_err)?
-                .into_iter()
-                .map(|m| m.dll)
-                .collect();
-            let added: Vec<&String> = now.iter().filter(|d| !kept.contains(d)).collect();
-            log::info!(
-                "{key}: rewritten by Detours setdll; binding the original imports, not loading {added:?}"
-            );
-        }
+        // Bind the current import directory, including Detours-added DLLs.
+        // Historical imports in .detour are rollback metadata, not loader policy.
 
         let dir = path
             .rfind(['\\', '/'])
@@ -354,6 +441,7 @@ impl<'a> Loader<'a> {
                 what: format!("DllMain of {key}"),
             });
         }
+        self.modules.complete_ldr(self.cpu, id)?;
         Ok(id)
     }
 
@@ -393,20 +481,45 @@ impl<'a> Loader<'a> {
 
     /// Address of `sym` in module `m` (a thunk for host modules). Follows forwarders.
     pub fn resolve(&mut self, m: ModuleId, sym: &ImportName) -> Result<u32, LoadError> {
+        self.resolve_inner(m, sym, 0)
+    }
+
+    fn resolve_inner(
+        &mut self,
+        m: ModuleId,
+        sym: &ImportName,
+        depth: u8,
+    ) -> Result<u32, LoadError> {
         let module = self.modules.get(m);
         let name = sym.to_string();
+        if depth >= 32 {
+            return Err(LoadError::Pe {
+                path: module.path.clone(),
+                err: PeError::Malformed("export forwarder cycle or excessive depth".into()),
+            });
+        }
         if module.kind == ModuleKind::Host {
             let key = module.name.clone();
-            return Ok(self.sys.thunks.resolve(self.cpu, &key, &name)?);
+            let published = match sym {
+                ImportName::Name { name, .. } => module.exports_by_name.contains_key(name),
+                ImportName::Ordinal(ordinal) => {
+                    let known = self.sys.thunks.resolver().host_fn(&key, &name).is_some();
+                    known && module.exports_by_ordinal.contains_key(ordinal)
+                }
+            };
+            let thunk = self.sys.thunks.resolve(self.cpu, &key, &name)?;
+            if !published {
+                // Unknown static imports retain fail-before-return diagnostics;
+                // they do not fabricate a PE export or a calling convention.
+                return Ok(thunk);
+            }
         }
-        let target = match sym {
-            ImportName::Name { name, .. } => module.exports_by_name.get(name),
-            ImportName::Ordinal(o) => module.exports_by_ordinal.get(o),
-        };
-        match target.cloned() {
+        // GetProcAddress observes the live guest EAT, including patch edits.
+        let target = mapped_export(self.cpu, module.base, module.size, sym);
+        match target {
             Some(ExportTarget::Rva(rva)) => Ok(module.base + rva),
             Some(ExportTarget::Forwarder(f)) => {
-                let (dll, func) = f.split_once('.').unwrap_or((&f, ""));
+                let (dll, func) = f.rsplit_once('.').unwrap_or((&f, ""));
                 let dep = self.load(dll)?;
                 let sym = match func.strip_prefix('#').and_then(|o| o.parse().ok()) {
                     Some(o) => ImportName::Ordinal(o),
@@ -415,13 +528,90 @@ impl<'a> Loader<'a> {
                         name: func.to_owned(),
                     },
                 };
-                self.resolve(dep, &sym)
+                self.resolve_inner(dep, &sym, depth + 1)
             }
             None => Err(LoadError::MissingExport {
                 module: module.name.clone(),
                 name,
             }),
         }
+    }
+}
+
+/// Bounded reads from a loaded PE, without copying/reparsing an entire image on
+/// every symbol lookup. Forwarder strings are bounded by the export directory.
+fn mapped_export(
+    cpu: &dyn Guest,
+    base: u32,
+    size: u32,
+    symbol: &ImportName,
+) -> Option<ExportTarget> {
+    let range =
+        |rva: u32, len: u32| (rva.checked_add(len)? <= size).then_some(base.checked_add(rva)?);
+    let word = |rva| cpu.read_u32(range(rva, 4)?).ok();
+    let short = |rva| cpu.read_u16(range(rva, 2)?).ok();
+    let string = |rva: u32, limit: u32| {
+        let len = size.checked_sub(rva)?.min(limit).min(65536);
+        let bytes = cpu.read_cstr(range(rva, 1)?, len as usize).ok()?;
+        if bytes.len() == len as usize {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    };
+    if short(0)? != 0x5a4d {
+        return None;
+    }
+    let pe = word(0x3c)?;
+    if word(pe)? != 0x4550 || short(pe.checked_add(24)?)? != 0x10b {
+        return None;
+    }
+    let dir = word(pe.checked_add(120)?)?;
+    let dir_size = word(pe.checked_add(124)?)?;
+    if dir == 0 || dir_size < 40 {
+        return None;
+    }
+    range(dir, dir_size)?;
+    let ordinal_base = word(dir.checked_add(16)?)?;
+    let count = word(dir.checked_add(20)?)?;
+    let named = word(dir.checked_add(24)?)?;
+    let functions = word(dir.checked_add(28)?)?;
+    let names = word(dir.checked_add(32)?)?;
+    let ordinals = word(dir.checked_add(36)?)?;
+    range(functions, count.checked_mul(4)?)?;
+    range(names, named.checked_mul(4)?)?;
+    range(ordinals, named.checked_mul(2)?)?;
+    let index = match symbol {
+        ImportName::Ordinal(ordinal) => u32::from(*ordinal).checked_sub(ordinal_base)?,
+        ImportName::Name { name, .. } => {
+            let (mut low, mut high) = (0, named);
+            let mut found = None;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let candidate = string(word(names + middle * 4)?, 65536)?;
+                match name.cmp(&candidate) {
+                    std::cmp::Ordering::Less => high = middle,
+                    std::cmp::Ordering::Greater => low = middle + 1,
+                    std::cmp::Ordering::Equal => {
+                        found = Some(u32::from(short(ordinals + middle * 2)?));
+                        break;
+                    }
+                }
+            }
+            found?
+        }
+    };
+    if index >= count {
+        return None;
+    }
+    let rva = word(functions + index * 4)?;
+    if rva == 0 {
+        return None;
+    }
+    range(rva, 1)?;
+    if rva >= dir && rva < dir + dir_size {
+        Some(ExportTarget::Forwarder(string(rva, dir + dir_size - rva)?))
+    } else {
+        Some(ExportTarget::Rva(rva))
     }
 }
 
@@ -472,6 +662,13 @@ impl HostDir {
 }
 
 impl FileSource for HostDir {
+    fn absolute_path(&self, path: &str) -> String {
+        if path.contains(':') {
+            path.replace('/', "\\")
+        } else {
+            format!("{}\\{path}", self.guest_root)
+        }
+    }
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         let p = self.host_path(path)?;
         p.is_file().then(|| std::fs::read(p).ok()).flatten()

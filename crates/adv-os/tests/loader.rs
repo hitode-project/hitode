@@ -44,7 +44,7 @@ fn machine() -> Machine<UnicornCpu> {
 mod delay_fixture;
 
 #[test]
-fn engine_dll_from_bundled_directory_is_guest_unless_registered() {
+fn shipped_dll_wins_over_api_registration_unless_provider_is_explicit() {
     struct Files(Vec<u8>);
     impl FileSource for Files {
         fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -85,6 +85,14 @@ fn engine_dll_from_bundled_directory_is_guest_unless_registered() {
         adv_pe::ExportTarget::Rva(0x900)
     );
     let mut host = machine();
+    let id = host.load(&files, "PAL.dll").unwrap();
+    assert_eq!(adv_os::modules(&host.ext).get(id).kind, ModuleKind::Image);
+    let mut host = machine();
+    host.sys
+        .thunks
+        .resolver_mut::<Registry>()
+        .unwrap()
+        .replace_module("pal.dll");
     let id = host.load(&files, "PAL.dll").unwrap();
     assert_eq!(adv_os::modules(&host.ext).get(id).kind, ModuleKind::Host);
     // An explicit path must not accidentally select a dll/dll/ fallback.
@@ -159,6 +167,8 @@ fn old_va_delay_imports_bind_after_loader_relocation() {
 
 fn is_thunk(addr: u32) -> bool {
     (THUNK_BASE..THUNK_BASE + THUNK_SIZE).contains(&addr)
+        || (HOST_MODULE_BASE..HOST_MODULE_BASE + adv_machine::layout::HOST_MODULE_CAP * 65536)
+            .contains(&addr)
 }
 
 #[test]
@@ -248,31 +258,23 @@ fn resource_dlls_share_a_preferred_base() {
 }
 
 #[test]
-fn tl2026_static_tls_and_detours_added_imports_skipped() {
+fn tl2026_static_tls_and_current_detours_imports_preserved() {
     let Some((files, name)) = game("TL2026").zip(adv_samples::exe("TL2026")) else {
         return;
     };
     let mut m = machine();
     let exe = m.load(&files, &name).unwrap();
-    // If Detours' setdll added DLLs to the import table, the loader binds the original table
-    // from the .detour header: the added DLLs never load, and only the exe has TLS.
+    // Added imports are part of the executable's current process contract.
     let mut pe = Pe::parse(&std::fs::read(files.host_path(&name).unwrap()).unwrap()).unwrap();
     let now = import_names(&pe);
     if let Some(original) = pe.detours_original_imports().unwrap() {
         pe.dirs[adv_pe::dir::IMPORT] = original;
         let kept = import_names(&pe);
         for dll in now.iter().filter(|d| !kept.contains(d)) {
-            assert!(adv_os::modules(&m.ext).by_name(dll).is_none(), "{dll}");
-            assert!(
-                m.sys
-                    .process_init
-                    .iter()
-                    .all(|c| !c.what.contains(dll.as_str())),
-                "{dll}"
-            );
+            assert!(adv_os::modules(&m.ext).by_name(dll).is_some(), "{dll}");
         }
     }
-    assert_eq!(m.sys.tls_images.len(), 1);
+    assert!(!m.sys.tls_images.is_empty());
     assert_eq!(m.sys.tls_images[0].template.len(), 8);
 
     // The main context gets a TLS block holding a copy of the template.

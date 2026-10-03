@@ -79,7 +79,7 @@ impl<B: Backend> Runtime<B> {
             .thunks
             .iter()
             .filter(|(index, t)| {
-                !t.implemented
+                (!t.implemented && (t.requested || called.contains(index)))
                     || (called.contains(index)
                         && std::ptr::fn_addr_eq(
                             t.f.handler,

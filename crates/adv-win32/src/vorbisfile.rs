@@ -290,6 +290,7 @@ pub fn register(registry: &mut Registry, policy: Policy) {
     if policy == Policy::Guest {
         return;
     }
+    registry.replace_module("vorbisfile.dll");
     for &(name, argc, ordinal) in EXPORTS {
         registry.add("vorbisfile.dll", name, Conv::Cdecl { argc }, call);
         registry.add(

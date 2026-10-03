@@ -59,6 +59,11 @@ pub trait Resolver: Any {
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn>;
     /// Whether the host implements anything in `module` (lowercase file name).
     fn provides(&self, module: &str) -> bool;
+    /// Explicit whole-module provider selected by assembly after a capability
+    /// check. Ordinary API registrations never override a shipped guest module.
+    fn replaces_module(&self, _module: &str) -> bool {
+        false
+    }
     /// Whether this binding has an implementation rather than a generated stub.
     fn implemented(&self, module: &str, name: &str) -> bool {
         self.host_fn(module, name).is_some()
@@ -70,6 +75,9 @@ pub struct Thunk {
     pub name: String,
     pub f: HostFn,
     pub implemented: bool,
+    /// An import or dynamic lookup requested this binding. Merely publishing a
+    /// module's export table must not count every diagnostic export as imported.
+    pub requested: bool,
 }
 
 /// Index 0 is reserved: the pad guest callees return to after an [`Outcome::Call`].
@@ -104,6 +112,7 @@ impl ThunkTable {
                 trace: false,
             },
             implemented: true,
+            requested: false,
         };
         Self {
             resolver,
@@ -152,6 +161,26 @@ impl ThunkTable {
         module: &str,
         name: &str,
     ) -> Result<u32, MemFault> {
+        self.bind(cpu, module, name, true)
+    }
+
+    /// Publish a relocatable entry without recording an import or feature probe.
+    pub fn publish(
+        &mut self,
+        cpu: &mut dyn Guest,
+        module: &str,
+        name: &str,
+    ) -> Result<u32, MemFault> {
+        self.bind(cpu, module, name, false)
+    }
+
+    fn bind(
+        &mut self,
+        cpu: &mut dyn Guest,
+        module: &str,
+        name: &str,
+        requested: bool,
+    ) -> Result<u32, MemFault> {
         let mut key = (module.to_ascii_lowercase(), name.to_owned());
         if !self.internal.contains_key(&key)
             && let Some(canonical) = self.resolver.canonical_name(&key.0, name)
@@ -160,6 +189,7 @@ impl ThunkTable {
         }
         let name = key.1.as_str();
         if let Some(&i) = self.by_name.get(&key) {
+            self.thunks[i as usize].requested |= requested;
             return Ok(thunk_addr(i));
         }
         let index = self.thunks.len() as u32;
@@ -191,6 +221,7 @@ impl ThunkTable {
             name: name.to_owned(),
             f,
             implemented,
+            requested,
         });
         self.by_name.insert(key, index);
         Ok(thunk_addr(index))
