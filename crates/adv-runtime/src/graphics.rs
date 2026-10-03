@@ -759,6 +759,13 @@ impl<P: Presenter> Graphics<P> {
     pub(crate) fn owns_dc(&self, dc: u32) -> bool {
         dc == WINDOW_DC || self.dcs.contains_key(&dc)
     }
+    pub(crate) fn dc_bitmap(&self, dc: u32) -> Option<u32> {
+        if dc == WINDOW_DC {
+            self.primary
+        } else {
+            self.dcs.get(&dc).copied()
+        }
+    }
     pub(crate) fn owns_bitmap(&self, object: u32) -> bool {
         self.surfaces.contains_key(&object)
     }
@@ -1713,9 +1720,10 @@ impl<P: Presenter> Graphics<P> {
                 let Some(sid) = self.surface_id(a[0]) else {
                     return Ok(INVALID);
                 };
-                if self.dcs.remove(&a[1]) != Some(sid) {
+                if self.dcs.get(&a[1]) != Some(&sid) {
                     return Ok(INVALID);
                 }
+                self.dcs.remove(&a[1]);
                 if self.primary == Some(sid) {
                     self.present(sid, m)?;
                 }

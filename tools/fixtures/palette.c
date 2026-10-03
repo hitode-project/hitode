@@ -60,6 +60,20 @@ void mainCRTStartup(void) {
     record(RealizePalette(dc));
     record(SelectObject(dc, palette) == NULL);
     record(SelectObject(dc, stock) == NULL);
+    /* The drawing provider and logical GDI metadata share font/bitmap selections. */
+    {
+        HGDIOBJ oldfont = GetCurrentObject(dc, OBJ_FONT), font = GetStockObject(ANSI_FIXED_FONT);
+        BITMAPINFO info = {0}; void *pixels;
+        HBITMAP bitmap; HGDIOBJ oldbitmap = GetCurrentObject(dc, OBJ_BITMAP);
+        record(oldfont != NULL); record(SelectObject(dc, font) == oldfont);
+        record(GetCurrentObject(dc, OBJ_FONT) == font); record(SelectObject(dc, oldfont) == font);
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = 4;
+        info.bmiHeader.biHeight = -4; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+        bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, NULL, 0);
+        record(bitmap != NULL); record(oldbitmap != NULL);
+        record(SelectObject(dc, bitmap) == oldbitmap); record(GetCurrentObject(dc, OBJ_BITMAP) == bitmap);
+        record(SelectObject(dc, oldbitmap) == bitmap); record(DeleteObject(bitmap));
+    }
     record(DeleteObject(palette));
     record(SelectPalette(dc, stock, TRUE) == palette);
     record(DeleteObject(palette));

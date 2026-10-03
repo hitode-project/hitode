@@ -120,20 +120,28 @@ fn valid_dc(env: &Env<'_>, dc: u32) -> bool {
     env.ext.get::<Graphics<Snapshot>>().owns_dc(dc)
         || matches!(env.ext.get::<Win32>().gdi.get(dc), Some(GdiObj::Dc { .. }))
 }
+
+pub(crate) fn retire_dc(env: &mut Env<'_>, dc: u32) {
+    if let Some(fonts) = env.ext.try_get_mut::<Fonts>() {
+        fonts.dcs.remove(&dc);
+    }
+}
 fn select_object(env: &mut Env<'_>) -> Outcome {
     let (dc, object) = (env.arg(0), env.arg(1));
     let is_font = matches!(
         env.ext.get::<Win32>().gdi.get(object),
         Some(GdiObj::Font(_))
-    ) || (0x0190_001a..=0x0190_0021).contains(&object);
+    ) || matches!(object, 0x0190_001a..=0x0190_001e | 0x0190_0020..=0x0190_0021);
     if is_font && valid_dc(env, dc) {
         if env.ext.get::<Graphics<Snapshot>>().owns_dc(dc) {
-            let state = env.ext.get_mut::<Fonts>().dcs.entry(dc).or_default();
-            return Outcome::Return(std::mem::replace(&mut state.font, object));
+            env.ext.get_mut::<Win32>().gdi.register_external_dc(dc, 0);
         }
-        env.ext.get_mut::<Fonts>().dcs.entry(dc).or_default().font = object;
         let handler = env.ext.get::<Fonts>().select;
-        return handler(env);
+        let result = handler(env);
+        if matches!(result, Outcome::Return(old) if old != 0) {
+            env.ext.get_mut::<Fonts>().dcs.entry(dc).or_default().font = object;
+        }
+        return result;
     }
     if env.ext.get::<Graphics<Snapshot>>().owns_dc(dc) {
         crate::boot::graphics_call(env)
@@ -169,7 +177,7 @@ fn delete_dc(env: &mut Env<'_>) -> Outcome {
         handler(env)
     };
     if matches!(result, Outcome::Return(1)) {
-        env.ext.get_mut::<Fonts>().dcs.remove(&dc);
+        retire_dc(env, dc);
     }
     result
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use adv_jit::pal::JitCpu;
-use pal_cpu::{Backend, Prot};
+use pal_cpu::{Backend, GuestExt, Prot};
 use pal_machine::{Clock, Conv, Env, Machine, Outcome, Registry, RunResult, SliceResult};
 use pal_win32::{Win32, Win32Config};
 
@@ -805,6 +805,42 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
     let before = graphics.stats.presentations;
     let out = graphics.handle(id, &args, &mut GuestMemory(env.cpu));
     let presented = graphics.stats.presentations;
+    if let Ok(value) = &out {
+        // Raster storage stays in Graphics; USER32/GDI object metadata must
+        // refer to the same HDC so fonts and palettes share its real lifetime.
+        let added = match id {
+            api::GET_DC if *value != 0 => Some((*value, args[0])),
+            api::CREATE_DC if *value != 0 => Some((*value, 0)),
+            api::SURFACE_DC if *value == 0 => env.cpu.read_u32(args[1]).ok().map(|dc| (dc, 0)),
+            _ => None,
+        };
+        let removed = match id {
+            api::DELETE_DC if *value != 0 => Some(args[0]),
+            api::RELEASE_DC if *value != 0 => Some(args[1]),
+            api::SURFACE_RELEASE_DC if *value == 0 => Some(args[1]),
+            _ => None,
+        };
+        let selection = added
+            .map(|(dc, _)| dc)
+            .or_else(|| if id == api::SELECT && *value != 0 { Some(args[0]) } else { None })
+            .and_then(|dc| graphics.dc_bitmap(dc).map(|bitmap| (dc, bitmap)));
+        if (added.is_some() || removed.is_some() || selection.is_some())
+            && let Some(win32) = env.ext.try_get_mut::<Win32>()
+        {
+            if let Some((dc, hwnd)) = added {
+                win32.gdi.register_external_dc(dc, hwnd);
+            }
+            if let Some(dc) = removed {
+                win32.gdi.remove_external_dc(dc);
+            }
+            if let Some((dc, bitmap)) = selection {
+                win32.gdi.set_external_bitmap(dc, bitmap);
+            }
+        }
+        if let Some(dc) = removed {
+            crate::font::retire_dc(env, dc);
+        }
+    }
     if presented != before {
         env.sys.frame = presented as u32;
         if out.is_ok() {
@@ -852,6 +888,10 @@ fn begin_paint(env: &mut Env<'_>) -> Outcome {
         Ok(dc) => dc,
         Err(error) => return Outcome::Fail(format!("BeginPaint: {error}")),
     };
+    env.ext
+        .get_mut::<Win32>()
+        .gdi
+        .register_external_dc(dc, hwnd);
     let mut bytes = [0u8; 64];
     bytes[..4].copy_from_slice(&dc.to_le_bytes());
     bytes[16..20].copy_from_slice(&width.to_le_bytes());
@@ -1326,6 +1366,11 @@ mod tests {
         assert_eq!(m.cpu.read_u32(data + 24).unwrap(), 3);
         assert_eq!(graphics(&mut m, api::SURFACE_DC, &[primary, data]), 0);
         let dc = m.cpu.read_u32(data).unwrap();
+        assert_ne!(graphics(&mut m, api::SURFACE_RELEASE_DC, &[source, dc]), 0);
+        assert!(
+            m.ext.get::<Graphics<Snapshot>>().owns_dc(dc),
+            "a rejected ReleaseDC must retain the original surface DC"
+        );
         assert_eq!(graphics(&mut m, api::SURFACE_RELEASE_DC, &[primary, dc]), 0);
         let frame = &m.ext.get::<Graphics<Snapshot>>().presenter;
         assert_eq!((frame.width, frame.height), (6, 3));
