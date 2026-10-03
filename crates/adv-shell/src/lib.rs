@@ -36,12 +36,14 @@ struct Options {
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
     api_mode: adv_runtime::RunMode,
+    time_skip: bool,
 }
 
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
+  --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-region-linking     return to the dispatcher between native regions\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
@@ -92,6 +94,7 @@ impl Options {
             audio: false,
             codec: adv_runtime::vorbis::Policy::Native,
             api_mode: adv_runtime::RunMode::Strict,
+            time_skip: true,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -103,6 +106,7 @@ impl Options {
                 }
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--no-time-skip" => options.time_skip = false,
                 "--api-mode" => {
                     options.api_mode = match value()?.as_str() {
                         "strict" => adv_runtime::RunMode::Strict,
@@ -400,6 +404,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
+            "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
@@ -441,6 +446,9 @@ fn build_report(context: ReportContext<'_>) -> String {
         modules,
         api_report(runtime),
         runtime.guest_window_count(),
+        options.time_skip,
+        runtime.machine.sys.scheduling.active_time_skips,
+        runtime.machine.sys.scheduling.active_time_skip_us,
         missing
             .iter()
             .map(|s| json(s))
@@ -523,6 +531,19 @@ fn run_execution(
     runtime.set_codepage(options.codepage);
     runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
+    if options.time_skip {
+        let skip_keys = keys.clone();
+        let pending_input = wake.interrupt_flag();
+        runtime
+            .machine
+            .set_time_skip_source(Some(std::sync::Arc::new(move || {
+                // Pending input/audio notifications must be drained before jumping.
+                !pending_input.load(std::sync::atomic::Ordering::Acquire)
+                    && [0x11, 0xa2, 0xa3]
+                        .iter()
+                        .any(|key| skip_keys.get(*key) & 0x80 != 0)
+            })));
+    }
     runtime
         .audio_stream()
         .set_waker(wake.clone())

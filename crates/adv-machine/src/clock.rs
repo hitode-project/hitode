@@ -19,6 +19,7 @@ pub struct Clock {
     mode: ClockMode,
     /// Added to every reading so tick counts don't start at zero (some code treats 0 as unset).
     pub epoch_us: u64,
+    active_skip_us: u64,
 }
 
 /// QueryPerformanceFrequency. 10 MHz, as on current Windows.
@@ -33,6 +34,7 @@ impl Clock {
                 paused_for_us: 0,
             },
             epoch_us: 1_000_000,
+            active_skip_us: 0,
         }
     }
 
@@ -40,6 +42,7 @@ impl Clock {
         Self {
             mode: ClockMode::Virtual(0),
             epoch_us: 1_000_000,
+            active_skip_us: 0,
         }
     }
 
@@ -49,6 +52,7 @@ impl Clock {
 
     pub fn now_us(&self) -> u64 {
         self.epoch_us
+            + self.active_skip_us
             + match &self.mode {
                 ClockMode::Real {
                     started,
@@ -87,6 +91,29 @@ impl Clock {
         if let ClockMode::Virtual(t) = &mut self.mode {
             *t = (*t).max(us.saturating_sub(self.epoch_us));
         }
+    }
+
+    /// Explicit user-requested time skipping. The scheduler must first prove
+    /// there are no runnable contexts and select an eligible timed deadline.
+    /// This never changes a device clock or compensates a passive host stall.
+    pub(crate) fn skip_to(&mut self, deadline: u64) -> u64 {
+        if matches!(
+            self.mode,
+            ClockMode::Real {
+                paused_at: Some(_),
+                ..
+            }
+        ) {
+            return 0;
+        }
+        let delta = deadline.saturating_sub(self.now_us());
+        match &mut self.mode {
+            ClockMode::Virtual(time) => *time = time.saturating_add(delta),
+            ClockMode::Real { .. } => {
+                self.active_skip_us = self.active_skip_us.saturating_add(delta)
+            }
+        }
+        delta
     }
 
     /// Freeze guest-visible real time while the frontend is backgrounded.

@@ -62,7 +62,11 @@ pub enum Outcome {
         then: Continuation,
     },
     /// Suspend the current context until `wait` is satisfied, then run `then`.
-    Block { wait: Wait, then: Continuation },
+    Block {
+        wait: Wait,
+        then: Continuation,
+        allow_time_skip: bool,
+    },
     /// Continue host work after handing a completed frame to the frontend. Real-time
     /// sliced execution may defer `then`; other modes run it inline.
     Defer { then: DeferredContinuation },
@@ -89,8 +93,22 @@ impl Outcome {
 
     pub fn block(wait: Wait, then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static) -> Self {
         Outcome::Block {
+            allow_time_skip: matches!(wait, Wait::Until(_)),
             wait,
             then: Box::new(then),
+        }
+    }
+
+    /// A time-based wait which can also be interrupted by input/objects. Ordinary
+    /// synchronization waits must use block: an external producer may need real time.
+    pub fn block_timed(
+        wait: Wait,
+        then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static,
+    ) -> Self {
+        Outcome::Block {
+            wait,
+            then: Box::new(then),
+            allow_time_skip: true,
         }
     }
 

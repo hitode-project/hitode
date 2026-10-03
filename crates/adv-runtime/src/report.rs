@@ -257,6 +257,11 @@ impl<B: Backend> Runtime<B> {
             }
         }
         report.push_str("\nVisible windows:");
+        report.push_str(&format!(
+            "\nActive time skips: {}; skipped guest microseconds: {}",
+            self.machine.sys.scheduling.active_time_skips,
+            self.machine.sys.scheduling.active_time_skip_us
+        ));
         for window in user
             .windows
             .values()

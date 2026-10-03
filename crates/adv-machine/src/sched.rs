@@ -83,6 +83,7 @@ pub(crate) enum State {
         wait: Wait,
         then: Continuation,
         origin: Origin,
+        allow_time_skip: bool,
     },
     Done {
         exit_code: u32,

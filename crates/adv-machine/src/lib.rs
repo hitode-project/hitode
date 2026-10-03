@@ -398,8 +398,9 @@ impl Sys {
     }
 
     fn release_waiter(&mut self, i: usize, reason: WakeReason, now: u64) {
-        let State::Blocked { wait, then, origin } =
-            std::mem::replace(&mut self.contexts[i].state, State::Ready { resume: None })
+        let State::Blocked {
+            wait, then, origin, ..
+        } = std::mem::replace(&mut self.contexts[i].state, State::Ready { resume: None })
         else {
             unreachable!("only blocked contexts have a pending wait")
         };
@@ -514,6 +515,7 @@ enum Parked {
         wait: Wait,
         then: Continuation,
         origin: Origin,
+        allow_time_skip: bool,
     },
     ExitThread(u32),
     ExitProcess(u32),
@@ -591,7 +593,16 @@ fn apply(
                 .push(Frame { then, origin });
             Ok(())
         }
-        Outcome::Block { wait, then } => Err(Parked::Block { wait, then, origin }),
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Err(Parked::Block {
+            wait,
+            then,
+            origin,
+            allow_time_skip,
+        }),
         Outcome::Defer { .. } => unreachable!("deferred outcomes were resolved above"),
         Outcome::ExitThread(c) => Err(Parked::ExitThread(c)),
         Outcome::ExitProcess(c) => Err(Parked::ExitProcess(c)),
@@ -840,6 +851,9 @@ pub struct Machine<B: Backend> {
     scheduling_quantum: Option<Duration>,
     /// One-shot wake preference, demand-driven quantum and frame-boundary host returns.
     latency_scheduling: bool,
+    /// Non-blocking live user intent, owned by the host input path. Never inferred
+    /// from context names, frame rates or guest engine behavior.
+    time_skip_source: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl<B: Backend> Machine<B> {
@@ -912,6 +926,7 @@ impl<B: Backend> Machine<B> {
             slice_elapsed: Duration::ZERO,
             scheduling_quantum: Some(scheduling::DEFAULT_QUANTUM),
             latency_scheduling: true,
+            time_skip_source: None,
         })
     }
 
@@ -923,6 +938,59 @@ impl<B: Backend> Machine<B> {
         stack_size: u32,
     ) -> Result<CtxId, MemFault> {
         self.sys.spawn(&mut self.cpu, name, entry, args, stack_size)
+    }
+
+    /// Install a non-blocking, live input observation (normally atomic key state).
+    pub fn set_time_skip_source(
+        &mut self,
+        source: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) {
+        self.time_skip_source = source;
+    }
+
+    fn skip_idle_time(&mut self) -> bool {
+        let Some(source) = &self.time_skip_source else {
+            return false;
+        };
+        if !source() || self.sys.contexts.iter().any(|context| context.is_ready()) {
+            return false;
+        }
+        let Some(deadline) = self.sys.next_deadline() else {
+            return false;
+        };
+        let eligible = self.sys.contexts.iter().any(|context| {
+            let State::Blocked {
+                wait,
+                allow_time_skip: true,
+                ..
+            } = &context.state
+            else {
+                return false;
+            };
+            match wait {
+                Wait::Until(at) => *at == deadline,
+                Wait::Object { deadline: at, .. } | Wait::Objects { deadline: at, .. } => {
+                    *at == Some(deadline)
+                }
+                Wait::Yield => false,
+            }
+        });
+        // Re-read live intent at the commit point; an up event never has to drain
+        // a guest message queue before stopping time skipping.
+        if !eligible || !source() {
+            return false;
+        }
+        let advanced = self.sys.clock.skip_to(deadline);
+        if advanced == 0 {
+            return false;
+        }
+        self.sys.scheduling.active_time_skips += 1;
+        self.sys.scheduling.active_time_skip_us = self
+            .sys
+            .scheduling
+            .active_time_skip_us
+            .saturating_add(advanced);
+        true
     }
 
     /// Limit one `run` invocation using host wall time, independently of `Clock`.
@@ -1050,6 +1118,7 @@ impl<B: Backend> Machine<B> {
                 wait: Wait::Yield,
                 then,
                 origin,
+                ..
             } => {
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Woke {
@@ -1060,8 +1129,18 @@ impl<B: Backend> Machine<B> {
                 };
                 ctx.yielded = true;
             }
-            Parked::Block { wait, then, origin } => {
-                ctx.state = State::Blocked { wait, then, origin };
+            Parked::Block {
+                wait,
+                then,
+                origin,
+                allow_time_skip,
+            } => {
+                ctx.state = State::Blocked {
+                    wait,
+                    then,
+                    origin,
+                    allow_time_skip,
+                };
                 ctx.yielded = false;
             }
             Parked::ExitThread(code) => {
@@ -1182,6 +1261,9 @@ impl<B: Backend> Machine<B> {
                 latency_mode,
             );
             let Some(selection) = selection else {
+                if self.skip_idle_time() {
+                    continue;
+                }
                 self.sys.trace.flush();
                 return SliceResult::Complete(RunResult::Idle {
                     next_deadline: self.sys.next_deadline(),

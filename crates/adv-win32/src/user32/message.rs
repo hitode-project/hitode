@@ -747,7 +747,7 @@ fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
     }
     let event = queue_event(env);
     let deadline = next_deadline(env, f);
-    Outcome::block(
+    Outcome::block_timed(
         Wait::Object {
             handle: event,
             deadline,
@@ -770,7 +770,7 @@ pub fn wait_for_message(
             max: 0,
         },
     );
-    Outcome::block(
+    Outcome::block_timed(
         Wait::Object {
             handle: event,
             deadline,

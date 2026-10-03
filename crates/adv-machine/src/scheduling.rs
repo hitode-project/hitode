@@ -59,6 +59,8 @@ pub struct SchedulingStats {
     pub timed_dispatch_lateness_us_total: u64,
     pub timed_dispatch_lateness_us_max: u64,
     pub frame_host_yields: u64,
+    pub active_time_skips: u64,
+    pub active_time_skip_us: u64,
 }
 
 /// Only runnable peers (or waits whose signal can change inside guest execution)

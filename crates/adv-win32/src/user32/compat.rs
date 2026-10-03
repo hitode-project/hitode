@@ -233,7 +233,7 @@ fn message_wait(
         notification: Some(notification),
     };
     let count = handles.len() as u32;
-    Outcome::block(wait, move |e, wake| {
+    Outcome::block_timed(wait, move |e, wake| {
         match wake {
             // The object was already acquired when the wait became ready.
             // A later ResetEvent or waiter must not revoke/steal that grant.
@@ -371,6 +371,27 @@ mod tests {
                     ..
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn active_time_skip_advances_message_timeout_but_not_an_input_only_wait() {
+        for jit in [false, true] {
+            let (mut m, _) = waiter(jit, 7, false);
+            m.set_time_skip_source(Some(std::sync::Arc::new(|| true)));
+            let before = m.sys.clock.now_us();
+            assert!(matches!(m.run(), RunResult::Exited(0x102)));
+            assert_eq!(m.sys.clock.now_us() - before, 7000);
+            assert_eq!(m.sys.scheduling.active_time_skips, 1);
+            let (mut waiting, _) = waiter(jit, u32::MAX, false);
+            waiting.set_time_skip_source(Some(std::sync::Arc::new(|| true)));
+            assert!(matches!(
+                waiting.run(),
+                RunResult::Idle {
+                    next_deadline: None
+                }
+            ));
+            assert_eq!(waiting.sys.scheduling.active_time_skips, 0);
         }
     }
 }
