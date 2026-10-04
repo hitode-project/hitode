@@ -149,7 +149,7 @@ impl Drop for Image {
 #[derive(Clone)]
 pub struct Target {
     pub image: Image,
-    depth: Option<(wgpu::Texture, wgpu::TextureView)>,
+    depth: Option<Depth>,
 }
 impl Target {
     /// Declare the interpretation of an image before publishing its front-end view.
@@ -159,6 +159,24 @@ impl Target {
     }
     pub(crate) fn has_depth(&self) -> bool {
         self.depth.is_some()
+    }
+    pub fn depth(&self) -> Option<&Depth> {
+        self.depth.as_ref()
+    }
+    /// Attachment views must have equal dimensions on the common GPU backend.
+    /// Reject mismatches before encoding; never hide a resize or per-draw copy.
+    pub fn with_depth(mut self, depth: Option<Depth>) -> Result<Self, Error> {
+        if depth.as_ref().is_some_and(|d| {
+            d.context != self.image.context
+                || d.width != self.image.width
+                || d.height != self.image.height
+        }) {
+            return Err(invalid(
+                "depth attachment context or dimensions do not match",
+            ));
+        }
+        self.depth = depth;
+        Ok(self)
     }
 }
 
@@ -268,7 +286,8 @@ struct PipelineKey {
     alpha_blend: Option<Blend>,
     depth: Option<Compare>,
     depth_write: bool,
-    has_depth: bool,
+    depth_format: Option<DepthFormat>,
+    stencil: Option<Stencil>,
     color_write: u8,
 }
 
@@ -538,25 +557,37 @@ impl Gpu {
 
     pub fn target(&self, width: u32, height: u32, depth: bool) -> Result<Target, Error> {
         let image = self.image(width, height)?;
-        let depth = depth.then(|| {
-            let texture = self
-                .context
-                .device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("adv depth image"),
-                    size: extent(width, height),
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                });
-            let view = texture.create_view(&Default::default());
-            (texture, view)
-        });
-        self.check()?;
+        let depth = depth
+            .then(|| self.depth(width, height, DepthFormat::Float32))
+            .transpose()?;
         Ok(Target { image, depth })
+    }
+
+    pub fn depth(&self, width: u32, height: u32, format: DepthFormat) -> Result<Depth, Error> {
+        self.dimensions(width, height)?;
+        let texture = self
+            .context
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("adv depth/stencil image"),
+                size: extent(width, height),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: format.format(),
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&Default::default());
+        self.check()?;
+        Ok(Depth {
+            _texture: texture,
+            view,
+            context: self.context.id,
+            width,
+            height,
+            format,
+        })
     }
 
     /// Upload a checked BGRA rectangle. Row padding stays outside the GPU image.
@@ -606,6 +637,16 @@ impl Gpu {
         color: Option<[f64; 4]>,
         depth: Option<f32>,
     ) -> Result<(), Error> {
+        self.clear_with_stencil(target, color, depth, None)
+    }
+
+    pub fn clear_with_stencil(
+        &mut self,
+        target: &Target,
+        color: Option<[f64; 4]>,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    ) -> Result<(), Error> {
         let context = self.context.clone();
         let submission = context.submission()?;
         self.own(&target.image)?;
@@ -613,10 +654,15 @@ impl Gpu {
         if color.is_some_and(|c| c.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)))
             || depth.is_some_and(|d| !d.is_finite() || !(0.0..=1.0).contains(&d))
             || (depth.is_some() && target.depth.is_none())
+            || (stencil.is_some()
+                && target
+                    .depth
+                    .as_ref()
+                    .is_none_or(|d| !d.format.has_stencil()))
         {
             return Err(invalid("clear value or depth attachment is invalid"));
         }
-        if color.is_none() && depth.is_none() {
+        if color.is_none() && depth.is_none() && stencil.is_none() {
             return Err(invalid("clear has no attachment"));
         }
         let mut encoder = self
@@ -646,14 +692,18 @@ impl Gpu {
             })];
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &colors,
-                depth_stencil_attachment: target.depth.as_ref().map(|(_, view)| {
+                depth_stencil_attachment: target.depth.as_ref().map(|attachment| {
                     wgpu::RenderPassDepthStencilAttachment {
-                        view,
+                        view: &attachment.view,
                         depth_ops: Some(wgpu::Operations {
                             load: depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: None,
+                        stencil_ops: attachment.format.has_stencil().then_some(wgpu::Operations {
+                            load: stencil
+                                .map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(v & 255)),
+                            store: wgpu::StoreOp::Store,
+                        }),
                     }
                 }),
                 ..Default::default()
@@ -685,10 +735,10 @@ impl Gpu {
                     Cull::CounterClockwise => Some(wgpu::Face::Front) },
                 ..Default::default()
             },
-            depth_stencil: key.has_depth.then_some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(key.depth_write && key.depth.is_some()),
+            depth_stencil: key.depth_format.map(|format| wgpu::DepthStencilState {
+                format: format.format(), depth_write_enabled: Some(key.depth_write && key.depth.is_some()),
                 depth_compare: Some(key.depth.map_or(wgpu::CompareFunction::Always, compare)),
-                stencil: Default::default(), bias: Default::default(),
+                stencil: key.stencil.map(stencil_state).unwrap_or_default(), bias: Default::default(),
             }),
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState { module: &self.shader, entry_point: Some("fragment_main"),
@@ -740,6 +790,14 @@ impl Gpu {
             }
         }
         validate(target, vertices, &state)?;
+        if state.stencil.is_some()
+            && target
+                .depth
+                .as_ref()
+                .is_none_or(|d| !d.format.has_stencil())
+        {
+            return Err(invalid("stencil state requires a stencil attachment"));
+        }
         if target.image.alpha == AlphaMode::Opaque {
             // RGBX has destination alpha one irrespective of unused storage bits.
             // Preserve source alpha for color blending and alpha testing.
@@ -774,7 +832,8 @@ impl Gpu {
             alpha_blend: state.alpha_blend,
             depth: state.depth,
             depth_write: state.depth_write,
-            has_depth: target.depth.is_some(),
+            depth_format: target.depth.as_ref().map(|d| d.format),
+            stencil: state.stencil,
             color_write: state.color_write,
         };
         let pipeline = self.pipeline(key)?;
@@ -831,19 +890,25 @@ impl Gpu {
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &colors,
-                depth_stencil_attachment: target.depth.as_ref().map(|(_, view)| {
+                depth_stencil_attachment: target.depth.as_ref().map(|attachment| {
                     wgpu::RenderPassDepthStencilAttachment {
-                        view,
+                        view: &attachment.view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: None,
+                        stencil_ops: attachment.format.has_stencil().then_some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
                     }
                 }),
                 ..Default::default()
             });
             pass.set_pipeline(&pipeline);
+            if state.stencil.is_some() {
+                pass.set_stencil_reference(state.stencil_reference & 255);
+            }
             pass.set_bind_group(0, &binding, &[]);
             let viewport = state.viewport;
             pass.set_viewport(
@@ -1210,6 +1275,30 @@ fn compare(c: Compare) -> wgpu::CompareFunction {
         Compare::NotEqual => wgpu::CompareFunction::NotEqual,
         Compare::GreaterEqual => wgpu::CompareFunction::GreaterEqual,
         Compare::Always => wgpu::CompareFunction::Always,
+    }
+}
+fn stencil_state(s: Stencil) -> wgpu::StencilState {
+    let operation = |op| match op {
+        StencilOp::Keep => wgpu::StencilOperation::Keep,
+        StencilOp::Zero => wgpu::StencilOperation::Zero,
+        StencilOp::Replace => wgpu::StencilOperation::Replace,
+        StencilOp::IncrementClamp => wgpu::StencilOperation::IncrementClamp,
+        StencilOp::DecrementClamp => wgpu::StencilOperation::DecrementClamp,
+        StencilOp::Invert => wgpu::StencilOperation::Invert,
+        StencilOp::IncrementWrap => wgpu::StencilOperation::IncrementWrap,
+        StencilOp::DecrementWrap => wgpu::StencilOperation::DecrementWrap,
+    };
+    let face = |f: StencilFace| wgpu::StencilFaceState {
+        compare: compare(f.compare),
+        fail_op: operation(f.fail),
+        depth_fail_op: operation(f.depth_fail),
+        pass_op: operation(f.pass),
+    };
+    wgpu::StencilState {
+        front: face(s.front),
+        back: face(s.back),
+        read_mask: s.read_mask & 255,
+        write_mask: s.write_mask & 255,
     }
 }
 fn factor(f: Factor) -> wgpu::BlendFactor {

@@ -1,8 +1,10 @@
 //! Neutral GPU drawing and ownership of submitted resources. This module has
 //! no guest addresses, Windows handles, COM layouts or D3D state identifiers.
 use crate::surface::Rect;
+mod depth;
 mod renderer;
 mod submission;
+pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
 pub use renderer::Submission;
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Target};
 pub use submission::SubmissionPause;
@@ -120,6 +122,8 @@ pub struct DrawState {
     pub alpha_blend: Option<Blend>,
     pub depth: Option<Compare>,
     pub depth_write: bool,
+    pub stencil: Option<Stencil>,
+    pub stencil_reference: u32,
     pub viewport: Viewport,
     pub scissor: Option<Rect>,
     pub sampler: Sampler,
@@ -139,6 +143,8 @@ impl DrawState {
             alpha_blend: None,
             depth: None,
             depth_write: false,
+            stencil: None,
+            stencil_reference: 0,
             viewport: Viewport {
                 x: 0.0,
                 y: 0.0,

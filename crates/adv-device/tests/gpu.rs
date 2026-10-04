@@ -79,6 +79,183 @@ fn near(got: [u8; 4], expected: [u8; 4], tolerance: u8) {
 }
 
 #[test]
+fn independent_depth_survives_color_target_switches_in_all_supported_formats() {
+    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    for format in [
+        DepthFormat::Float32,
+        DepthFormat::Unorm16,
+        DepthFormat::Depth24Stencil8,
+    ] {
+        let depth = gpu.depth(4, 4, format).unwrap();
+        let first = gpu
+            .target(4, 4, false)
+            .unwrap()
+            .with_depth(Some(depth.clone()))
+            .unwrap();
+        let second = gpu
+            .target(4, 4, false)
+            .unwrap()
+            .with_depth(Some(depth))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = Some(Compare::Less);
+        state.depth_write = true;
+        gpu.clear(&first, Some([1., 0., 0., 1.]), Some(1.)).unwrap();
+        gpu.draw(&first, &quad([0., 1., 0., 1.], 0.25, 1.), None, state)
+            .unwrap();
+        gpu.clear(&second, Some([0., 0., 0., 1.]), None).unwrap();
+        gpu.draw(&second, &quad([1., 0., 0., 1.], 0.5, 1.), None, state)
+            .unwrap();
+        assert_eq!(read(&mut gpu, &second.image), [0, 0, 0, 255].repeat(16));
+        gpu.draw(&second, &quad([0., 0., 1., 1.], 0.125, 1.), None, state)
+            .unwrap();
+        assert_eq!(read(&mut gpu, &second.image), [255, 0, 0, 255].repeat(16));
+        assert_eq!(read(&mut gpu, &first.image), [0, 255, 0, 255].repeat(16));
+    }
+    let depth = gpu.depth(8, 8, DepthFormat::Float32).unwrap();
+    assert!(matches!(
+        gpu.target(4, 4, false).unwrap().with_depth(Some(depth)),
+        Err(Error::Invalid(_))
+    ));
+    let foreign = pollster::block_on(Gpu::request(true))
+        .unwrap()
+        .depth(4, 4, DepthFormat::Float32)
+        .unwrap();
+    assert!(matches!(
+        gpu.target(4, 4, false).unwrap().with_depth(Some(foreign)),
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        gpu.check().is_ok(),
+        "invalid attachment pairing must not poison the device"
+    );
+}
+
+#[test]
+fn stencil_operations_masks_and_failure_paths_write_the_shared_attachment() {
+    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let target = gpu
+        .target(4, 4, false)
+        .unwrap()
+        .with_depth(Some(gpu.depth(4, 4, DepthFormat::Depth24Stencil8).unwrap()))
+        .unwrap();
+    let face = |compare, fail, depth_fail, pass| StencilFace {
+        compare,
+        fail,
+        depth_fail,
+        pass,
+    };
+    let both = |face, read_mask, write_mask| Stencil {
+        front: face,
+        back: face,
+        read_mask,
+        write_mask,
+    };
+    for (initial, op, reference, mask, expected) in [
+        (5, StencilOp::Keep, 37, 255, 5),
+        (5, StencilOp::Zero, 37, 255, 0),
+        (5, StencilOp::Replace, 37, 255, 37),
+        (255, StencilOp::IncrementClamp, 37, 255, 255),
+        (0, StencilOp::DecrementClamp, 37, 255, 0),
+        (0x55, StencilOp::Invert, 37, 255, 0xaa),
+        (255, StencilOp::IncrementWrap, 37, 255, 0),
+        (0, StencilOp::DecrementWrap, 37, 255, 255),
+        (0xa0, StencilOp::Replace, 0x15, 15, 0xa5),
+    ] {
+        gpu.clear_with_stencil(&target, Some([0., 0., 0., 1.]), Some(1.), Some(initial))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.color_write = 0;
+        state.stencil = Some(both(
+            face(Compare::Always, StencilOp::Keep, StencilOp::Keep, op),
+            255,
+            mask,
+        ));
+        state.stencil_reference = reference;
+        gpu.draw(&target, &quad([1.; 4], 0.5, 1.), None, state)
+            .unwrap();
+        state.color_write = 15;
+        state.stencil = Some(both(
+            face(
+                Compare::Equal,
+                StencilOp::Keep,
+                StencilOp::Keep,
+                StencilOp::Keep,
+            ),
+            255,
+            0,
+        ));
+        state.stencil_reference = expected;
+        gpu.draw(&target, &quad([0., 0., 1., 1.], 0.5, 1.), None, state)
+            .unwrap();
+        assert_eq!(
+            read(&mut gpu, &target.image),
+            [255, 0, 0, 255].repeat(16),
+            "{op:?}"
+        );
+    }
+    for depth_failure in [false, true] {
+        gpu.clear_with_stencil(&target, Some([0., 0., 0., 1.]), Some(0.25), Some(0))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = Some(Compare::Less);
+        state.stencil_reference = 0xa5;
+        state.stencil = Some(both(
+            face(
+                if depth_failure {
+                    Compare::Always
+                } else {
+                    Compare::Never
+                },
+                StencilOp::Replace,
+                StencilOp::Replace,
+                StencilOp::Keep,
+            ),
+            255,
+            255,
+        ));
+        gpu.draw(&target, &quad([1., 0., 0., 1.], 0.75, 1.), None, state)
+            .unwrap();
+        state.depth = None;
+        state.stencil_reference = 5;
+        state.stencil = Some(both(
+            face(
+                Compare::Equal,
+                StencilOp::Keep,
+                StencilOp::Keep,
+                StencilOp::Keep,
+            ),
+            15,
+            0,
+        ));
+        gpu.draw(&target, &quad([0., 0., 1., 1.], 0.75, 1.), None, state)
+            .unwrap();
+        assert_eq!(read(&mut gpu, &target.image), [255, 0, 0, 255].repeat(16));
+    }
+    let ordinary = gpu.target(4, 4, true).unwrap();
+    assert!(matches!(
+        gpu.clear_with_stencil(&ordinary, None, None, Some(1)),
+        Err(Error::Invalid(_))
+    ));
+    let mut state = DrawState::new(4, 4);
+    state.stencil = Some(both(
+        face(
+            Compare::Always,
+            StencilOp::Keep,
+            StencilOp::Keep,
+            StencilOp::Keep,
+        ),
+        255,
+        255,
+    ));
+    assert!(matches!(
+        gpu.draw(&ordinary, &quad([1.; 4], 0.5, 1.), None, state),
+        Err(Error::Invalid(_))
+    ));
+    assert!(gpu.check().is_ok());
+}
+
+#[test]
 fn opaque_images_sample_one_and_preserve_semantics_across_frame_rotation() {
     use adv_device::surface::{Snapshot, Surfaces, frame_mailbox};
     let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
