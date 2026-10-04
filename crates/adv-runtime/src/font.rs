@@ -1,29 +1,8 @@
-//! Assembly of the Win32 font front and the raster/DirectDraw DC provider.
+//! Compatibility path for the Win32 font personality.
+#[cfg(test)]
 use adv_machine::{Env, Machine};
-pub(crate) use adv_win32::gdi32::font::register;
-use adv_win32::gdi32::font::{DrawingProvider, set_drawing_provider};
-
-pub(crate) fn install<B: adv_cpu::backend::Backend>(machine: &mut Machine<B>) {
-    fn contains_dc(env: &Env<'_>, dc: u32) -> bool {
-        env.ext
-            .get::<crate::Graphics<crate::Snapshot>>()
-            .owns_dc(&env.sys.objects, dc)
-    }
-    fn contains_bitmap(env: &Env<'_>, bitmap: u32) -> bool {
-        env.ext
-            .get::<crate::Graphics<crate::Snapshot>>()
-            .owns_bitmap(bitmap)
-    }
-    set_drawing_provider(
-        machine,
-        DrawingProvider {
-            contains_dc,
-            contains_bitmap,
-            call: crate::graphics::graphics_call,
-        },
-    );
-}
-
+#[cfg(test)]
+use adv_win32::gdi32::font::{install, register};
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,7 +13,7 @@ mod tests {
     use adv_win32::{Win32, Win32Config};
 
     #[test]
-    fn font_decorators_preserve_the_raster_descriptor_and_trace() {
+    fn font_registration_leaves_typed_object_handlers_and_trace_intact() {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
         crate::graphics::register_graphics(&mut registry);
@@ -46,10 +25,11 @@ mod tests {
         register(&mut registry);
         for (name, original) in names.into_iter().zip(before) {
             let decorated = registry.get("gdi32.dll", name).unwrap();
-            assert_ne!(
+            assert_eq!(
                 original.data, 0,
-                "the raster front must have a bound operation"
+                "typed GDI must not decode descriptor data"
             );
+            assert!(std::ptr::fn_addr_eq(decorated.handler, original.handler));
             assert_eq!(decorated.conv, original.conv);
             assert_eq!(decorated.data, original.data);
             assert_eq!(decorated.trace, original.trace);
@@ -121,7 +101,15 @@ mod tests {
         machine.cpu.write(data + 64, &header).unwrap();
         for _ in 0..64 {
             machine.cpu.write_u32(data + 128, 0xcccccccc).unwrap();
-            assert_eq!(invoke(&mut machine, data, "CreateDIBSection", &[0, data + 64, 0, data + 128, 0, 0]), 0);
+            assert_eq!(
+                invoke(
+                    &mut machine,
+                    data,
+                    "CreateDIBSection",
+                    &[0, data + 64, 0, data + 128, 0, 0]
+                ),
+                0
+            );
             assert_eq!(machine.cpu.read_u32(data + 128).unwrap(), 0);
         }
         assert_eq!(machine.sys.objects.object_count(), 1);
@@ -129,7 +117,10 @@ mod tests {
             .ext
             .get::<crate::graphics::Graphics<crate::graphics::Snapshot>>();
         for dc in 2..128 {
-            assert!(!graphics.owns_dc(&machine.sys.objects, dc));
+            assert!(!matches!(
+                machine.ext.get::<Win32>().gdi.get(&machine.sys.objects, dc),
+                Some(adv_os::gdi::GdiObj::Dc { .. })
+            ));
             assert!(!graphics.contains(dc));
         }
     }
@@ -181,7 +172,10 @@ mod tests {
         );
         assert_ne!(bitmap, 0);
         let bits = machine.cpu.read_u32(data + 128).unwrap();
-        assert_eq!(invoke(&mut machine, data, "GetObjectA", &[bitmap, 24, data + 256]), 24);
+        assert_eq!(
+            invoke(&mut machine, data, "GetObjectA", &[bitmap, 24, data + 256]),
+            24
+        );
         for (offset, value) in [(4, 4), (8, 2), (12, 16), (16, 0x200001), (20, bits)] {
             assert_eq!(machine.cpu.read_u32(data + 256 + offset).unwrap(), value);
         }
@@ -218,7 +212,14 @@ mod tests {
             bitmap
         );
         assert_eq!(invoke(&mut machine, data, "DeleteObject", &[bitmap]), 1);
-        assert!(machine.ext.get::<Win32>().gdi.get(&machine.sys.objects, bitmap).is_none());
+        assert!(
+            machine
+                .ext
+                .get::<Win32>()
+                .gdi
+                .get(&machine.sys.objects, bitmap)
+                .is_none()
+        );
         assert_eq!(invoke(&mut machine, data, "DeleteDC", &[dc]), 1);
         assert!(
             machine

@@ -381,16 +381,6 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
     )
 }
 
-fn get_dc(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
-    Outcome::Return(crate::gdi32::window_dc(env, hwnd))
-}
-
-fn release_dc(env: &mut Env<'_>) -> Outcome {
-    let hdc = env.arg(1);
-    Outcome::Return(u32::from(crate::gdi32::release_dc(env, hdc)))
-}
-
 pub fn register(reg: &mut Registry) {
     window::register(reg);
     message::register(reg);
@@ -445,7 +435,4 @@ pub fn register(reg: &mut Registry) {
     s(reg, "MonitorFromRect", 2, monitor_from);
     s(reg, "GetMonitorInfoA", 2, get_monitor_info_a);
     s(reg, "EnumDisplayMonitors", 4, enum_display_monitors);
-    s(reg, "GetDC", 1, get_dc);
-    s(reg, "GetWindowDC", 1, get_dc);
-    s(reg, "ReleaseDC", 2, release_dc);
 }

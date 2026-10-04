@@ -13,16 +13,6 @@ fn omission_reason(name: &str) -> &'static str {
             && matches!(export, "startup_enter" | "startup_leave" | "thread_start")
     {
         "personality-internal guest entry"
-    } else if module == "ddraw.dll"
-        && [
-            "QueryInterface",
-            "AddRef",
-            "Release",
-            "UnsupportedCOMMethod",
-        ]
-        .contains(&export)
-    {
-        "internal common COM dispatch"
     } else if module == "kernel32.dll" && export == "GetEnvironmentStringsA" {
         "SDK/export name alias"
     } else if module == "kernel32.dll"

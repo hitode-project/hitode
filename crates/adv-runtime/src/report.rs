@@ -5,7 +5,7 @@ use adv_cpu::backend::Backend;
 use adv_win32::Win32;
 
 use crate::boot::Runtime;
-use crate::graphics::{RunControl, unsupported_graphics};
+use crate::graphics::RunControl;
 use crate::{Graphics, Snapshot};
 
 impl<B: Backend> Runtime<B> {
@@ -78,14 +78,7 @@ impl<B: Backend> Runtime<B> {
             .sys
             .thunks
             .iter()
-            .filter(|(index, t)| {
-                (!t.implemented && (t.requested || called.contains(index)))
-                    || (called.contains(index)
-                        && std::ptr::fn_addr_eq(
-                            t.f.handler,
-                            unsupported_graphics as adv_machine::Handler,
-                        ))
-            })
+            .filter(|(index, t)| !t.implemented && (t.requested || called.contains(index)))
             .map(|(_, t)| format!("{}!{}", t.module, t.name))
             .collect()
     }

@@ -6,6 +6,9 @@ use adv_device::surface::{
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
+pub mod front;
+pub use front::{DrawingProvider, install, register, set_provider};
+
 pub mod api {
     pub const GET_DC: u32 = 100;
     pub const CREATE_DC: u32 = 101;
@@ -21,266 +24,332 @@ pub mod api {
     pub const SET_STRETCH_MODE: u32 = 111;
 }
 
-/// (id, module, name, argc) of every raster call.
-pub const API_SPECS: &[(u32, &str, &str, u8)] = &[
-    (api::GET_DC, "user32.dll", "GetDC", 1),
-    (api::CREATE_DC, "gdi32.dll", "CreateCompatibleDC", 1),
-    (api::CREATE_DIB, "gdi32.dll", "CreateDIBSection", 6),
-    (api::SELECT, "gdi32.dll", "SelectObject", 2),
-    (api::BITBLT, "gdi32.dll", "BitBlt", 9),
-    (api::DELETE_OBJECT, "gdi32.dll", "DeleteObject", 1),
-    (api::DELETE_DC, "gdi32.dll", "DeleteDC", 1),
-    (api::FLUSH, "gdi32.dll", "GdiFlush", 0),
-    (api::LAST_ERROR, "kernel32.dll", "GetLastError", 0),
-    (api::RELEASE_DC, "user32.dll", "ReleaseDC", 2),
-    (api::STRETCHBLT, "gdi32.dll", "StretchBlt", 11),
-    (api::SET_STRETCH_MODE, "gdi32.dll", "SetStretchBltMode", 2),
-];
-
 #[derive(Default)]
 pub struct Raster {
     last_error: u32,
 }
 
 impl Raster {
+    /// Last failing raster operation, for diagnostics; ABI handlers update the TEB.
+    pub fn last_error(&self) -> u32 {
+        self.last_error
+    }
     fn fail(&mut self, code: u32) -> u32 {
         self.last_error = code;
         0
     }
+}
 
-    /// Run raster call `id` with arguments `a`.
-    pub fn call<P: Presenter>(
+// Named raster operations; typed fronts never reconstruct an argument array.
+#[allow(clippy::too_many_arguments)]
+impl Raster {
+    pub fn create_dc<P: Presenter>(
         &mut self,
-        id: u32,
-        a: &[u32],
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        _m: &mut dyn SurfaceMemory,
+        _source: u32,
+    ) -> Result<u32, String> {
+        Ok({
+            let id = surfaces.new_id();
+            if !dcs.create(objects, id, STOCK_BITMAP) {
+                return Ok(self.fail(8));
+            }
+            id
+        })
+    }
+    pub fn create_dib<P: Presenter>(
+        &mut self,
         surfaces: &mut Surfaces<P>,
         dcs: &mut DeviceContexts,
         objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
+        _dc: u32,
+        info: u32,
+        usage: u32,
+        bits_out: u32,
+        section: u32,
+        _offset: u32,
     ) -> Result<u32, String> {
-        Ok(match id {
-            api::GET_DC => {
-                surfaces.primary(m)?;
-                WINDOW_DC
+        Ok({
+            m.put_u32(bits_out, 0)?;
+            let h = m.read(info, 40)?;
+            let w = i32::from_le_bytes(h[4..8].try_into().unwrap());
+            let height = i32::from_le_bytes(h[8..12].try_into().unwrap());
+            if u32::from_le_bytes(h[..4].try_into().unwrap()) != 40
+                || w <= 0
+                || height == 0
+                || height == i32::MIN
+                || h[12..14] != 1u16.to_le_bytes()
+                || !matches!(u16::from_le_bytes(h[14..16].try_into().unwrap()), 16 | 32)
+                || h[16..20] != [0; 4]
+                || usage != 0
+                || section != 0
+            {
+                return Ok(self.fail(87));
             }
-            api::RELEASE_DC => u32::from(a[1] == WINDOW_DC),
-            api::LAST_ERROR => self.last_error,
-            api::FLUSH => 1,
-            api::CREATE_DC => {
-                let id = surfaces.new_id();
-                if !dcs.create(objects, id, STOCK_BITMAP) {
-                    return Ok(self.fail(8));
-                }
-                id
+            if size(w as u32, height.unsigned_abs()).is_err() {
+                return Ok(self.fail(87));
             }
-            api::CREATE_DIB => {
-                m.put_u32(a[3], 0)?;
-                let h = m.read(a[1], 40)?;
-                let w = i32::from_le_bytes(h[4..8].try_into().unwrap());
-                let height = i32::from_le_bytes(h[8..12].try_into().unwrap());
-                if u32::from_le_bytes(h[..4].try_into().unwrap()) != 40
-                    || w <= 0
-                    || height == 0
-                    || height == i32::MIN
-                    || h[12..14] != 1u16.to_le_bytes()
-                    || !matches!(u16::from_le_bytes(h[14..16].try_into().unwrap()), 16 | 32)
-                    || h[16..20] != [0; 4]
-                    || a[2] != 0
-                    || a[4] != 0
-                {
-                    return Ok(self.fail(87));
-                }
-                if size(w as u32, height.unsigned_abs()).is_err() {
-                    return Ok(self.fail(87));
-                }
-                let format = if h[14..16] == 16u16.to_le_bytes() {
-                    PixelFormat::Rgb555
-                } else {
-                    PixelFormat::Bgra32
-                };
-                let bitmap =
-                    surfaces.create(w as u32, height.unsigned_abs(), height > 0, format, m)?;
-                let surface = surfaces.get(bitmap).unwrap();
-                let bits = surface.pixels;
-                let metadata = GdiObj::Bitmap {
-                    width: w,
-                    height,
-                    bpp: (format.bytes() * 8) as u16,
-                    bits,
-                    stride: surface.pitch,
-                    owned: false,
-                };
-                if !dcs.register_bitmap(objects, bitmap, metadata) {
-                    surfaces.delete(bitmap);
-                    return Ok(self.fail(8));
-                }
-                if let Err(error) = m.put_u32(a[3], bits) {
-                    dcs.remove_bitmap(objects, bitmap);
-                    surfaces.delete(bitmap);
-                    return Err(error);
-                }
-                bitmap
+            let format = if h[14..16] == 16u16.to_le_bytes() {
+                PixelFormat::Rgb555
+            } else {
+                PixelFormat::Bgra32
+            };
+            let bitmap = surfaces.create(w as u32, height.unsigned_abs(), height > 0, format, m)?;
+            let surface = surfaces.get(bitmap).unwrap();
+            let bits = surface.pixels;
+            let metadata = GdiObj::Bitmap {
+                width: w,
+                height,
+                bpp: (format.bytes() * 8) as u16,
+                bits,
+                stride: surface.pitch,
+                owned: false,
+            };
+            if !dcs.register_bitmap(objects, bitmap, metadata) {
+                surfaces.delete(bitmap);
+                return Ok(self.fail(8));
             }
-            api::SELECT => {
-                if !dcs.contains(objects, a[0])
-                    || (a[1] != STOCK_BITMAP && !surfaces.contains(a[1]))
-                {
-                    return Ok(self.fail(6));
-                }
-                if a[1] != STOCK_BITMAP && dcs.selects(objects, a[1], Some(a[0])) {
-                    return Ok(self.fail(87));
-                }
-                dcs.select(objects, a[0], a[1]).unwrap()
+            if let Err(error) = m.put_u32(bits_out, bits) {
+                dcs.remove_bitmap(objects, bitmap);
+                surfaces.delete(bitmap);
+                return Err(error);
             }
-            api::DELETE_DC => u32::from(dcs.remove(objects, a[0]).is_some()),
-            api::SET_STRETCH_MODE => {
-                if a[0] != WINDOW_DC && !dcs.contains(objects, a[0]) {
-                    return Ok(self.fail(6));
-                }
-                if !(1..=3).contains(&a[1]) {
-                    return Ok(self.fail(87));
-                }
-                dcs.set_stretch_mode(objects, a[0], a[1])
-                    .unwrap_or_else(|| self.fail(8))
+            bitmap
+        })
+    }
+    pub fn select_bitmap<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        _m: &mut dyn SurfaceMemory,
+        dc: u32,
+        bitmap: u32,
+    ) -> Result<u32, String> {
+        Ok({
+            if !dcs.contains(objects, dc) || (bitmap != STOCK_BITMAP && !surfaces.contains(bitmap))
+            {
+                return Ok(self.fail(6));
             }
-            api::DELETE_OBJECT => {
-                if dcs.selects(objects, a[0], None) || surfaces.primary_id() == Some(a[0]) {
-                    return Ok(self.fail(170));
-                }
-                if surfaces.delete(a[0]) {
-                    dcs.remove_bitmap(objects, a[0]);
-                    1
-                } else {
-                    self.fail(6)
-                }
+            if bitmap != STOCK_BITMAP && dcs.selects(objects, bitmap, Some(dc)) {
+                return Ok(self.fail(87));
             }
-            api::BITBLT => {
-                if a[8] != 0x00cc0020 {
-                    return Ok(self.fail(87));
-                }
-                let Some(src) = dcs.get(objects, a[5]) else {
-                    return Ok(self.fail(6));
-                };
-                let dst = if a[0] == WINDOW_DC {
-                    surfaces.primary(m)?
-                } else {
-                    dcs.get(objects, a[0]).unwrap_or(0)
-                };
-                let (Some(s), Some(d)) = (surfaces.get(src), surfaces.get(dst)) else {
-                    return Ok(self.fail(6));
-                };
-                let (x, y, w, h, sx, sy) = (
-                    a[1] as i32 as i64,
-                    a[2] as i32 as i64,
-                    a[3] as i32 as i64,
-                    a[4] as i32 as i64,
-                    a[6] as i32 as i64,
-                    a[7] as i32 as i64,
-                );
-                if w < 0 || h < 0 {
-                    return Ok(self.fail(87));
-                }
-                let (left, top, right, bottom) = (
-                    x.max(0),
-                    y.max(0),
-                    (x + w).min(i64::from(d.width)),
-                    (y + h).min(i64::from(d.height)),
-                );
-                if right <= left || bottom <= top {
-                    return Ok(1);
-                }
-                let (sx, sy) = (sx + left - x, sy + top - y);
-                if sx < 0
-                    || sy < 0
-                    || sx + right - left > i64::from(s.width)
-                    || sy + bottom - top > i64::from(s.height)
-                {
-                    return Ok(self.fail(87));
-                }
-                let sr = Rect {
-                    x: sx as u32,
-                    y: sy as u32,
-                    w: (right - left) as u32,
-                    h: (bottom - top) as u32,
-                };
-                let dr = Rect {
-                    x: left as u32,
-                    y: top as u32,
-                    ..sr
-                };
-                surfaces.copy(src, sr, dst, dr, m)?;
-                if a[0] == WINDOW_DC {
-                    surfaces.present(dst, m)?;
-                }
+            dcs.select(objects, dc, bitmap).unwrap()
+        })
+    }
+    pub fn delete_dc<P: Presenter>(
+        &mut self,
+        _surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        _m: &mut dyn SurfaceMemory,
+        dc: u32,
+    ) -> Result<u32, String> {
+        Ok(u32::from(dcs.remove(objects, dc).is_some()))
+    }
+    pub fn set_stretch_mode<P: Presenter>(
+        &mut self,
+        _surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        _m: &mut dyn SurfaceMemory,
+        dc: u32,
+        mode: u32,
+    ) -> Result<u32, String> {
+        Ok({
+            if dc != WINDOW_DC && !dcs.contains(objects, dc) {
+                return Ok(self.fail(6));
+            }
+            if !(1..=3).contains(&mode) {
+                return Ok(self.fail(87));
+            }
+            dcs.set_stretch_mode(objects, dc, mode)
+                .unwrap_or_else(|| self.fail(8))
+        })
+    }
+    pub fn delete_bitmap<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        _m: &mut dyn SurfaceMemory,
+        bitmap: u32,
+    ) -> Result<u32, String> {
+        Ok({
+            if dcs.selects(objects, bitmap, None) || surfaces.primary_id() == Some(bitmap) {
+                return Ok(self.fail(170));
+            }
+            if surfaces.delete(bitmap) {
+                dcs.remove_bitmap(objects, bitmap);
                 1
+            } else {
+                self.fail(6)
             }
-            api::STRETCHBLT => {
-                if a[10] != 0x00cc0020 {
-                    return Ok(self.fail(87));
-                }
-                let src = if a[5] == WINDOW_DC {
-                    surfaces.primary(m)?
-                } else {
-                    dcs.get(objects, a[5]).unwrap_or(0)
-                };
-                let dst = if a[0] == WINDOW_DC {
-                    surfaces.primary(m)?
-                } else {
-                    dcs.get(objects, a[0]).unwrap_or(0)
-                };
-                let (Some(s), Some(_d)) = (surfaces.get(src), surfaces.get(dst)) else {
-                    return Ok(self.fail(6));
-                };
-                let (x, y, w, h, sx, sy, sw, sh) = (
-                    i64::from(a[1] as i32),
-                    i64::from(a[2] as i32),
-                    a[3] as i32,
-                    a[4] as i32,
-                    i64::from(a[6] as i32),
-                    i64::from(a[7] as i32),
-                    a[8] as i32,
-                    a[9] as i32,
-                );
-                if w == 0 || h == 0 || sw == 0 || sh == 0 {
-                    return Ok(1);
-                }
-                let left = sx + i64::from(sw.min(0));
-                let top = sy + i64::from(sh.min(0));
-                if left < 0
-                    || top < 0
-                    || left + i64::from(sw.unsigned_abs()) > i64::from(s.width)
-                    || top + i64::from(sh.unsigned_abs()) > i64::from(s.height)
-                {
-                    return Ok(self.fail(87));
-                }
-                let sr = Rect {
-                    x: left as u32,
-                    y: top as u32,
-                    w: sw.unsigned_abs(),
-                    h: sh.unsigned_abs(),
-                };
-                let dr = BlitRect {
-                    x: x + i64::from(w.min(0)),
-                    y: y + i64::from(h.min(0)),
-                    w: w.unsigned_abs(),
-                    h: h.unsigned_abs(),
-                };
-                let options = BlitOptions {
-                    mirror_x: (w < 0) != (sw < 0),
-                    mirror_y: (h < 0) != (sh < 0),
-                    sampling: match dcs.stretch_mode(objects, a[0]) {
-                        2 => Sampling::Or,
-                        3 => Sampling::Nearest,
-                        _ => Sampling::And,
-                    },
-                };
-                surfaces.blit(src, sr, dst, dr, options, m)?;
-                if a[0] == WINDOW_DC {
-                    surfaces.present(dst, m)?;
-                }
-                1
+        })
+    }
+    pub fn bit_blt<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        m: &mut dyn SurfaceMemory,
+        destination_dc: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        source_dc: u32,
+        source_x: u32,
+        source_y: u32,
+        rop: u32,
+    ) -> Result<u32, String> {
+        Ok({
+            if rop != 0x00cc0020 {
+                return Ok(self.fail(87));
             }
-            _ => return Err(format!("unknown GDI API {id}")),
+            let Some(src) = dcs.get(objects, source_dc) else {
+                return Ok(self.fail(6));
+            };
+            let dst = if destination_dc == WINDOW_DC {
+                surfaces.primary(m)?
+            } else {
+                dcs.get(objects, destination_dc).unwrap_or(0)
+            };
+            let (Some(s), Some(d)) = (surfaces.get(src), surfaces.get(dst)) else {
+                return Ok(self.fail(6));
+            };
+            let (x, y, w, h, sx, sy) = (
+                x as i32 as i64,
+                y as i32 as i64,
+                width as i32 as i64,
+                height as i32 as i64,
+                source_x as i32 as i64,
+                source_y as i32 as i64,
+            );
+            if w < 0 || h < 0 {
+                return Ok(self.fail(87));
+            }
+            let (left, top, right, bottom) = (
+                x.max(0),
+                y.max(0),
+                (x + w).min(i64::from(d.width)),
+                (y + h).min(i64::from(d.height)),
+            );
+            if right <= left || bottom <= top {
+                return Ok(1);
+            }
+            let (sx, sy) = (sx + left - x, sy + top - y);
+            if sx < 0
+                || sy < 0
+                || sx + right - left > i64::from(s.width)
+                || sy + bottom - top > i64::from(s.height)
+            {
+                return Ok(self.fail(87));
+            }
+            let sr = Rect {
+                x: sx as u32,
+                y: sy as u32,
+                w: (right - left) as u32,
+                h: (bottom - top) as u32,
+            };
+            let dr = Rect {
+                x: left as u32,
+                y: top as u32,
+                ..sr
+            };
+            surfaces.copy(src, sr, dst, dr, m)?;
+            if destination_dc == WINDOW_DC {
+                surfaces.present(dst, m)?;
+            }
+            1
+        })
+    }
+    pub fn stretch_blt<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        m: &mut dyn SurfaceMemory,
+        destination_dc: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        source_dc: u32,
+        source_x: u32,
+        source_y: u32,
+        source_width: u32,
+        source_height: u32,
+        rop: u32,
+    ) -> Result<u32, String> {
+        Ok({
+            if rop != 0x00cc0020 {
+                return Ok(self.fail(87));
+            }
+            let src = if source_dc == WINDOW_DC {
+                surfaces.primary(m)?
+            } else {
+                dcs.get(objects, source_dc).unwrap_or(0)
+            };
+            let dst = if destination_dc == WINDOW_DC {
+                surfaces.primary(m)?
+            } else {
+                dcs.get(objects, destination_dc).unwrap_or(0)
+            };
+            let (Some(s), Some(_d)) = (surfaces.get(src), surfaces.get(dst)) else {
+                return Ok(self.fail(6));
+            };
+            let (x, y, w, h, sx, sy, sw, sh) = (
+                i64::from(x as i32),
+                i64::from(y as i32),
+                width as i32,
+                height as i32,
+                i64::from(source_x as i32),
+                i64::from(source_y as i32),
+                source_width as i32,
+                source_height as i32,
+            );
+            if w == 0 || h == 0 || sw == 0 || sh == 0 {
+                return Ok(1);
+            }
+            let left = sx + i64::from(sw.min(0));
+            let top = sy + i64::from(sh.min(0));
+            if left < 0
+                || top < 0
+                || left + i64::from(sw.unsigned_abs()) > i64::from(s.width)
+                || top + i64::from(sh.unsigned_abs()) > i64::from(s.height)
+            {
+                return Ok(self.fail(87));
+            }
+            let sr = Rect {
+                x: left as u32,
+                y: top as u32,
+                w: sw.unsigned_abs(),
+                h: sh.unsigned_abs(),
+            };
+            let dr = BlitRect {
+                x: x + i64::from(w.min(0)),
+                y: y + i64::from(h.min(0)),
+                w: w.unsigned_abs(),
+                h: h.unsigned_abs(),
+            };
+            let options = BlitOptions {
+                mirror_x: (w < 0) != (sw < 0),
+                mirror_y: (h < 0) != (sh < 0),
+                sampling: match dcs.stretch_mode(objects, destination_dc) {
+                    2 => Sampling::Or,
+                    3 => Sampling::Nearest,
+                    _ => Sampling::And,
+                },
+            };
+            surfaces.blit(src, sr, dst, dr, options, m)?;
+            if destination_dc == WINDOW_DC {
+                surfaces.present(dst, m)?;
+            }
+            1
         })
     }
 }

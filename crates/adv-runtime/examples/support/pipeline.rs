@@ -114,6 +114,7 @@ pub fn fixture(ddraw: bool, w: u32, h: u32, bottom_up: bool) -> Fixture {
 pub fn fixture_backend(ddraw: bool, w: u32, h: u32, bottom_up: bool, backend: &str) -> Fixture {
     assert!((w * h).is_multiple_of(4));
     let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
     register_graphics(&mut registry);
     registry.add(
         "fixture.dll",
@@ -129,6 +130,10 @@ pub fn fixture_backend(ddraw: bool, w: u32, h: u32, bottom_up: bool, backend: &s
     .unwrap();
     m.set_execution_budget(Some(Duration::from_secs(5)));
     m.cpu.map(CODE, 0x4000000, Prot::RW).unwrap();
+    let mut config =
+        adv_win32::Win32Config::new(".", "pipeline-fixture.exe", "target/pipeline-fixture");
+    config.screen = (w as i32, h as i32);
+    adv_win32::Win32::install(&mut m, config).unwrap();
     let entries = install_graphics(&mut m, w, h).unwrap();
     let done = m.resolve_import("fixture.dll", "Completed").unwrap();
     let gate = m.sys.objects.insert(Object::Event {

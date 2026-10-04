@@ -2,7 +2,7 @@
 //! translate into the shared device implementation.
 
 use adv_abi::Registry;
-use adv_cpu::backend::{GuestExt, Prot};
+use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 
 use crate::util::{cstr, out_u32};
@@ -108,7 +108,10 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
 }
 
 pub fn release_dc(env: &mut Env<'_>, hdc: u32) -> bool {
-    env.ext.get_mut::<Win32>().gdi.remove_external_dc(&mut env.sys.objects, hdc)
+    env.ext
+        .get_mut::<Win32>()
+        .gdi
+        .remove_external_dc(&mut env.sys.objects, hdc)
 }
 
 /// A font object with the given height and face (for dialog fonts).
@@ -191,8 +194,7 @@ fn create_pen(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(add(env, GdiObj::Pen { color }))
 }
 
-fn delete_object(env: &mut Env<'_>) -> Outcome {
-    let h = env.arg(0);
+pub(super) fn delete_object_value(env: &mut Env<'_>, h: u32) -> Outcome {
     if (STOCK_BASE..STOCK_BASE + STOCK_COUNT).contains(&h) {
         return Outcome::Return(1);
     }
@@ -234,8 +236,7 @@ fn slot_of(env: &Env<'_>, h: u32) -> Option<usize> {
     }
 }
 
-fn select_object(env: &mut Env<'_>) -> Outcome {
-    let (hdc, h) = (env.arg(0), env.arg(1));
+pub(super) fn select_object_value(env: &mut Env<'_>, hdc: u32, h: u32) -> Outcome {
     let Some(slot) = slot_of(env, h) else {
         return Outcome::Return(0);
     };
@@ -348,27 +349,6 @@ fn create_compatible_bitmap(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(new_bitmap(env, w, h, 32).map_or(0, |(h, _)| h))
 }
 
-fn create_dib_section(env: &mut Env<'_>) -> Outcome {
-    let (bmi, bits_out) = (env.arg(1), env.arg(3));
-    let w = env.cpu.read_u32(bmi + 4).unwrap_or(0) as i32;
-    let h = env.cpu.read_u32(bmi + 8).unwrap_or(0) as i32;
-    let bpp = env.cpu.read_u16(bmi + 14).unwrap_or(32);
-    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp) else {
-        return Outcome::Return(0);
-    };
-    out_u32(env.cpu, bits_out, bits);
-    Outcome::Return(hbm)
-}
-
-fn create_compatible_dc(env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(window_dc(env, 0))
-}
-
-fn delete_dc(env: &mut Env<'_>) -> Outcome {
-    let hdc = env.arg(0);
-    Outcome::Return(u32::from(release_dc(env, hdc)))
-}
-
 fn get_device_caps(env: &mut Env<'_>) -> Outcome {
     let (w, h) = env.ext.get::<Win32>().user.screen;
     Outcome::Return(match env.arg(1) {
@@ -448,14 +428,9 @@ pub fn register(reg: &mut Registry) {
     s(reg, "CreateFontA", 14, create_font_a);
     s(reg, "CreateSolidBrush", 1, create_solid_brush);
     s(reg, "CreatePen", 3, create_pen);
-    s(reg, "DeleteObject", 1, delete_object);
-    s(reg, "SelectObject", 2, select_object);
     s(reg, "GetObjectA", 3, get_object_a);
     s(reg, "CreateBitmap", 5, create_bitmap);
     s(reg, "CreateCompatibleBitmap", 3, create_compatible_bitmap);
-    s(reg, "CreateDIBSection", 6, create_dib_section);
-    s(reg, "CreateCompatibleDC", 1, create_compatible_dc);
-    s(reg, "DeleteDC", 1, delete_dc);
     s(reg, "GetDeviceCaps", 2, get_device_caps);
     s(reg, "SetTextColor", 2, set_text_color);
     s(reg, "SetBkColor", 2, set_bk_color);
@@ -463,4 +438,5 @@ pub fn register(reg: &mut Registry) {
     s(reg, "TextOutA", 5, |_| Outcome::Return(1));
     s(reg, "GetTextExtentPoint32A", 4, get_text_extent_point32_a);
     font::register(reg);
+    raster::register(reg);
 }

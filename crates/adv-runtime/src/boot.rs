@@ -25,7 +25,6 @@ pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
     crate::crt::register(&mut registry);
     crate::compat::register(&mut registry);
     register_graphics(&mut registry);
-    crate::font::register(&mut registry);
     adv_dx::dsound::register(&mut registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(&mut registry);
@@ -131,7 +130,6 @@ impl<B: Backend> Runtime<B> {
         install_graphics(&mut machine, width, height)?;
         #[cfg(feature = "gpu")]
         adv_dx::d3d9::install(&mut machine, crate::graphics::d3d9_provider())?;
-        crate::font::install(&mut machine);
         adv_dx::dsound::install(&mut machine)?;
         machine.start_process(exe).map_err(|e| e.to_string())?;
         Ok(Self { machine })
@@ -281,6 +279,9 @@ impl<B: Backend> Runtime<B> {
             .ext
             .get_mut::<Graphics<Snapshot>>()
             .set_frame_mailbox(mailbox, wake);
+        // The UI consumes published frames independently; returning after every
+        // intermediate guest frame would only repeat the outer service loop.
+        self.machine.set_frame_handoff(false);
     }
     pub fn set_host_keys(&mut self, keys: std::sync::Arc<adv_sync::input::KeyState>) {
         self.machine.ext.get_mut::<Win32>().user.host_keys = Some(keys);

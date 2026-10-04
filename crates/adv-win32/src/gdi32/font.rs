@@ -1,8 +1,8 @@
 //! GDI font semantics and guest layouts. Matching, rasterization and immutable
-//! glyph caching are owned by adv-device; drawing providers only lend DCs.
+//! glyph caching are owned by adv-device; DCs have one OS object payload.
 use super::{GdiObj, LogFont};
 use crate::{Win32, util::set_last_error};
-use adv_abi::{Env, GuestPtr, Handle, Handler, Outcome, Registry, win32};
+use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
 use adv_device::text::{
     self, Character, ClipPrecision, Clipping, Curve, Encoding, Family, FontRequest, GlyphData,
     GlyphFormat, GlyphRequest, Pitch, Precision, Quality, Text, TextError, Transform,
@@ -17,17 +17,8 @@ mod tests;
 const STOCK_FONT: u32 = 0x0190_0010 + 13;
 const GDI_ERROR: u32 = u32::MAX;
 
-/// The assembly supplies access to its drawing front. Font semantics remain
-/// here; the callbacks only query ownership or dispatch a bound raster call.
-#[derive(Clone, Copy)]
-pub struct DrawingProvider {
-    pub contains_dc: fn(&Env<'_>, u32) -> bool,
-    pub contains_bitmap: fn(&Env<'_>, u32) -> bool,
-    pub call: Handler,
-}
 #[derive(Default)]
 struct Fonts {
-    drawing: Option<DrawingProvider>,
     text: Text,
 }
 
@@ -43,115 +34,25 @@ pub fn register(registry: &mut Registry) {
     ] {
         registry.register(api);
     }
-    for api in [select_object_ABI, delete_object_ABI, delete_dc_ABI] {
-        let original = registry
-            .get(api.module, api.name)
-            .expect("GDI registered before fonts");
-        assert_eq!(
-            original.conv, api.conv,
-            "font decorator must preserve the original convention"
-        );
-        registry.register_with_data(api, original.data);
-        registry.set_trace(api.module, api.name, original.trace);
-    }
 }
+
 pub fn install<B: adv_cpu::backend::Backend>(machine: &mut Machine<B>) {
     machine.ext.insert(Fonts::default());
-}
-pub fn set_drawing_provider<B: adv_cpu::backend::Backend>(
-    machine: &mut Machine<B>,
-    provider: DrawingProvider,
-) {
-    machine.ext.get_mut::<Fonts>().drawing = Some(provider);
 }
 pub fn cache_stats<B: adv_cpu::backend::Backend>(machine: &Machine<B>) -> text::CacheStats {
     machine.ext.get::<Fonts>().text.stats()
 }
 
-fn drawing(env: &Env<'_>) -> Option<DrawingProvider> {
-    env.ext.get::<Fonts>().drawing
-}
-fn drawing_dc(env: &Env<'_>, dc: u32) -> bool {
-    drawing(env).is_some_and(|p| (p.contains_dc)(env, dc))
-}
-fn valid_dc(env: &Env<'_>, dc: u32) -> bool {
-    drawing_dc(env, dc)
-        || matches!(
-            env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc),
-            Some(GdiObj::Dc { .. })
-        )
-}
-
-#[win32(gdi32, name = "SelectObject", level = implement)]
-fn select_object(env: &mut Env<'_>, dc: Handle, object: Handle) -> Outcome {
-    let is_font = matches!(
-        env.ext.get::<Win32>().gdi.get(&env.sys.objects, object.0),
-        Some(GdiObj::Font(_))
-    ) || matches!(object.0, 0x0190_001a..=0x0190_001e | 0x0190_0020..=0x0190_0021);
-    if is_font && valid_dc(env, dc.0) {
-        if drawing_dc(env, dc.0)
-            && !env
-                .ext
-                .get_mut::<Win32>()
-                .gdi
-                .register_external_dc(&mut env.sys.objects, dc.0, 0)
-        {
-            set_last_error(env, 8);
-            return Outcome::Return(0);
-        }
-        return super::select_object(env);
-    }
-    if drawing_dc(env, dc.0) {
-        (drawing(env).unwrap().call)(env)
-    } else {
-        super::select_object(env)
-    }
-}
-#[win32(gdi32, name = "DeleteObject", level = implement)]
-fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
-    if drawing(env).is_some_and(|p| (p.contains_bitmap)(env, object.0)) {
-        return (drawing(env).unwrap().call)(env);
-    }
-    if env
-        .ext
-        .get::<Win32>()
-        .gdi
-        .font_selected(&env.sys.objects, object.0)
-    {
-        set_last_error(env, 170);
-        return Outcome::Return(0);
-    }
-    super::delete_object(env)
-}
-#[win32(gdi32, name = "DeleteDC", level = implement)]
-fn delete_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
-    if drawing_dc(env, dc.0) {
-        (drawing(env).unwrap().call)(env)
-    } else {
-        super::delete_dc(env)
-    }
-}
 fn reject_dc(env: &mut Env<'_>, dc: u32) -> bool {
     if matches!(
         env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc),
         Some(GdiObj::Dc { .. })
     ) {
-        return false;
-    }
-    if !drawing_dc(env, dc) {
+        false
+    } else {
         set_last_error(env, 6);
-        return true;
+        true
     }
-    if !env
-        .ext
-        .get_mut::<Win32>()
-        .gdi
-        .register_external_dc(&mut env.sys.objects, dc, 0)
-    {
-        set_last_error(env, 8);
-        return true;
-    }
-    false
 }
 fn modes<'a>(env: &'a mut Env<'_>, dc: u32) -> &'a mut adv_os::gdi::DcModes {
     let Some(GdiObj::Dc { modes, .. }) =

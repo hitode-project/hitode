@@ -11,6 +11,9 @@ use adv_machine::Objects;
 use adv_os::com::{Com as CommonCom, ComIdentity, QueryError};
 use adv_os::gdi::DeviceContexts;
 
+pub mod front;
+pub use front::{Provider, WindowGeometry, install, register};
+
 pub mod api {
     pub const DD_CREATE: u32 = 200;
     pub const QUERY: u32 = 201;
@@ -163,131 +166,6 @@ const UNSUPPORTED: u32 = 0x80004001;
 const BUSY: u32 = 0x887601ae;
 const NOT_LOCKED: u32 = 0x88760248;
 
-/// (id, module, name, argc) of every DirectDraw call; COM methods are named
-/// `Interface::Method`.
-pub const API_SPECS: &[(u32, &str, &str, u8)] = &[
-    (
-        api::CREATE_CLIPPER,
-        "ddraw.dll",
-        "IDirectDraw7::CreateClipper",
-        4,
-    ),
-    (
-        api::CLIPPER_SET_HWND,
-        "ddraw.dll",
-        "IDirectDrawClipper::SetHWnd",
-        3,
-    ),
-    (
-        api::CLIPPER_GET_HWND,
-        "ddraw.dll",
-        "IDirectDrawClipper::GetHWnd",
-        2,
-    ),
-    (
-        api::SET_CLIPPER,
-        "ddraw.dll",
-        "IDirectDrawSurface7::SetClipper",
-        2,
-    ),
-    (
-        api::CLIPPER_INITIALIZE,
-        "ddraw.dll",
-        "IDirectDrawClipper::Initialize",
-        3,
-    ),
-    (
-        api::UNIMPLEMENTED_COM,
-        "ddraw.dll",
-        "UnsupportedCOMMethod",
-        0,
-    ),
-    (api::DD_CREATE, "ddraw.dll", "DirectDrawCreateEx", 4),
-    (api::QUERY, "ddraw.dll", "QueryInterface", 3),
-    (api::ADDREF, "ddraw.dll", "AddRef", 1),
-    (api::RELEASE, "ddraw.dll", "Release", 1),
-    (
-        api::CREATE_SURFACE,
-        "ddraw.dll",
-        "IDirectDraw7::CreateSurface",
-        4,
-    ),
-    (
-        api::COOPERATIVE,
-        "ddraw.dll",
-        "IDirectDraw7::SetCooperativeLevel",
-        3,
-    ),
-    (api::LOCK, "ddraw.dll", "IDirectDrawSurface7::Lock", 5),
-    (api::UNLOCK, "ddraw.dll", "IDirectDrawSurface7::Unlock", 2),
-    (api::BLT, "ddraw.dll", "IDirectDrawSurface7::Blt", 6),
-    (
-        api::GET_DESC,
-        "ddraw.dll",
-        "IDirectDrawSurface7::GetSurfaceDesc",
-        2,
-    ),
-    (api::IS_LOST, "ddraw.dll", "IDirectDrawSurface7::IsLost", 1),
-    (api::DD_CREATE_OLD, "ddraw.dll", "DirectDrawCreate", 3),
-    (
-        api::DISPLAY_MODE,
-        "ddraw.dll",
-        "IDirectDraw7::SetDisplayMode",
-        6,
-    ),
-    (
-        api::DISPLAY_MODE_OLD,
-        "ddraw.dll",
-        "IDirectDraw::SetDisplayMode",
-        4,
-    ),
-    (
-        api::RESTORE_MODE,
-        "ddraw.dll",
-        "IDirectDraw7::RestoreDisplayMode",
-        1,
-    ),
-    (
-        api::GET_DISPLAY_MODE,
-        "ddraw.dll",
-        "IDirectDraw7::GetDisplayMode",
-        2,
-    ),
-    (api::GET_CAPS, "ddraw.dll", "IDirectDraw7::GetCaps", 3),
-    (
-        api::BLT_FAST,
-        "ddraw.dll",
-        "IDirectDrawSurface7::BltFast",
-        6,
-    ),
-    (api::FLIP, "ddraw.dll", "IDirectDrawSurface7::Flip", 3),
-    (
-        api::GET_ATTACHED,
-        "ddraw.dll",
-        "IDirectDrawSurface7::GetAttachedSurface",
-        3,
-    ),
-    (
-        api::SURFACE_DC,
-        "ddraw.dll",
-        "IDirectDrawSurface7::GetDC",
-        2,
-    ),
-    (
-        api::SURFACE_RELEASE_DC,
-        "ddraw.dll",
-        "IDirectDrawSurface7::ReleaseDC",
-        2,
-    ),
-    (api::RESTORE, "ddraw.dll", "IDirectDrawSurface7::Restore", 1),
-    (
-        api::GET_PIXEL_FORMAT,
-        "ddraw.dll",
-        "IDirectDrawSurface7::GetPixelFormat",
-        2,
-    ),
-];
-
 pub struct DirectDraw {
     com: Option<CommonCom>,
     /// Non-owning index; all payload and reference ownership lives in Objects.
@@ -372,7 +250,16 @@ impl DirectDraw {
                 .ok_or("missing COM diagnostic thunk")?;
             m.put_u32(p + slot * 4, *thunk)?;
         }
-        let mut methods = vec![(0, api::QUERY), (1, api::ADDREF), (2, api::RELEASE)];
+        // Production tables have a generated, correctly named thunk per slot.
+        // Standalone domain fixtures can still supply the common entries.
+        let mut methods = if self
+            .entries
+            .contains_key(&(if surface { 500 } else { 400 }))
+        {
+            Vec::new()
+        } else {
+            vec![(0, api::QUERY), (1, api::ADDREF), (2, api::RELEASE)]
+        };
         if surface {
             methods.extend([
                 (5, api::BLT),
@@ -449,7 +336,12 @@ impl DirectDraw {
             } else {
                 let table = surfaces.alloc(9 * 4, m)?;
                 for slot in 0..9 {
-                    m.put_u32(table + slot * 4, self.entries[&api::UNIMPLEMENTED_COM])?;
+                    let entry = self
+                        .entries
+                        .get(&(600 + slot))
+                        .or_else(|| self.entries.get(&api::UNIMPLEMENTED_COM))
+                        .ok_or("missing generated clipper thunk")?;
+                    m.put_u32(table + slot * 4, *entry)?;
                 }
                 for (slot, id) in [
                     (0, api::QUERY),
@@ -459,7 +351,9 @@ impl DirectDraw {
                     (5, api::CLIPPER_INITIALIZE),
                     (8, api::CLIPPER_SET_HWND),
                 ] {
-                    m.put_u32(table + slot * 4, self.entries[&id])?;
+                    if slot >= 3 || !self.entries.contains_key(&600) {
+                        m.put_u32(table + slot * 4, self.entries[&id])?;
+                    }
                 }
                 self.clipper_vtable = Some(table);
                 table
@@ -1021,11 +915,15 @@ impl DirectDraw {
                 if surfaces[sid].locked.is_some() {
                     return Ok(BUSY);
                 }
+                m.writable(a[1], 4)?;
                 let dc = surfaces.new_id();
                 if !dcs.create(objects, dc, sid) {
                     return Ok(0x8007000e);
                 }
-                m.put_u32(a[1], dc)?;
+                if let Err(error) = m.put_u32(a[1], dc) {
+                    dcs.remove(objects, dc);
+                    return Err(error);
+                }
                 0
             }
             api::SURFACE_RELEASE_DC => {

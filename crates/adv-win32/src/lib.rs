@@ -115,6 +115,7 @@ impl Win32 {
             cfg,
         };
         m.ext.insert(w);
+        gdi32::raster::install(m);
         kernel32::install_startup(m)?;
         m.ext.insert(heaps);
         gdi32::font::install(m);

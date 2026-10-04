@@ -1,143 +1,133 @@
-//! Assembly of the graphics fronts: GDI raster calls (adv-win32) and DirectDraw (adv-dx)
-//! over one surface store (adv-device) and one device-context table (adv-os).
+//! Thin assembly of personality fronts over one neutral device SurfaceStore.
+use adv_abi::Registry;
+use adv_cpu::backend::{Backend, Guest, Prot};
+use adv_device::surface::{MemoryOperations, MemoryView, SurfaceStore};
+use adv_machine::{Env, Ext, Machine, Objects, Outcome};
+use adv_win32::Win32;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ops::{Deref, DerefMut};
-
 use std::time::{Duration, Instant};
-
-use adv_abi::Registry;
-use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_dx::ddraw::DirectDraw;
-use adv_machine::{Conv, Env, Machine, Outcome};
-use adv_os::gdi::{DeviceContexts, WINDOW_DC};
-use adv_win32::Win32;
-use adv_win32::gdi32::raster::Raster;
 
 pub use adv_device::surface::{
     FrameConsumer, FrameProducer, FrameView, GraphicsStats, PendingFrame, Presenter, Snapshot,
     SurfaceMemory, Surfaces, frame_mailbox,
 };
-pub use adv_dx::ddraw::{DEVICE_METHODS, IID_DDRAW7, IID_SURFACE7, SURFACE_METHODS};
-
-/// Call ids of both fronts: raster calls below 200, DirectDraw from 200.
+pub use adv_dx::ddraw::{IID_DDRAW7, IID_SURFACE7};
+/// Compatibility name; ownership is the device store, with no API frontend payload.
+pub type Graphics<P = Snapshot> = Surfaces<P>;
 pub mod api {
     pub use adv_dx::ddraw::api::*;
     pub use adv_win32::gdi32::raster::api::*;
 }
-
-/// (id, module, name, argc) of every graphics call.
-pub fn api_specs() -> impl Iterator<Item = &'static (u32, &'static str, &'static str, u8)> {
-    adv_dx::ddraw::API_SPECS
-        .iter()
-        .chain(adv_win32::gdi32::raster::API_SPECS)
+/// One byte-access adapter, borrowed on the stack by both personality fronts.
+fn guest_memory<'a>(cpu: &'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a> {
+    MemoryView::new(
+        cpu,
+        MemoryOperations {
+            read: |cpu, addr, len| {
+                if let Some(bytes) = cpu.shared_bytes(addr, len) {
+                    return Ok(Cow::Borrowed(bytes));
+                }
+                let mut bytes = vec![0; len];
+                cpu.read(addr, &mut bytes).map_err(|e| e.to_string())?;
+                Ok(Cow::Owned(bytes))
+            },
+            write: |cpu, addr, bytes| cpu.write(addr, bytes).map_err(|e| e.to_string()),
+            writable: |cpu, addr, len| {
+                let len32 =
+                    u32::try_from(len).map_err(|_| "surface memory length overflow".to_owned())?;
+                if cpu.accessible(addr, len32, Prot::WRITE) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "surface memory is not writable at {addr:#x} (+{len})"
+                    ))
+                }
+            },
+            copy: |cpu, src, dst, len| cpu.copy_memory(src, dst, len).map_err(|e| e.to_string()),
+        },
+    )
 }
-
-pub(crate) struct GuestMemory<'a>(pub &'a mut dyn adv_cpu::backend::Guest);
-impl SurfaceMemory for GuestMemory<'_> {
-    fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-        if let Some(bytes) = self.0.shared_bytes(addr, len) {
-            return Ok(Cow::Borrowed(bytes));
-        }
-        let mut bytes = vec![0; len];
-        self.0.read(addr, &mut bytes).map_err(|e| e.to_string())?;
-        Ok(Cow::Owned(bytes))
-    }
-    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
-        self.0.write(addr, data).map_err(|e| e.to_string())
-    }
-    fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
-        if self
-            .0
-            .accessible(addr, len as u32, adv_cpu::backend::Prot::WRITE)
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "surface memory is not writable at {addr:#x} (+{len})"
-            ))
-        }
-    }
-    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-        self.0.copy_memory(src, dst, len).map_err(|e| e.to_string())
-    }
+fn window_geometry(
+    ext: &Ext,
+    objects: &Objects,
+    hwnd: u32,
+) -> Option<adv_dx::ddraw::WindowGeometry> {
+    let win32 = ext.get::<Win32>();
+    let window = win32.user.windows.get(objects, &hwnd)?;
+    let (width, height) = window.client_size();
+    (width > 0 && height > 0).then(|| adv_dx::ddraw::WindowGeometry {
+        width: width as u32,
+        height: height as u32,
+        origin: win32.user.client_origin(objects, hwnd),
+    })
 }
-
-/// The surface store with both fronts. Dereferences to the store for presentation.
-pub struct Graphics<P: Presenter> {
-    surfaces: Surfaces<P>,
-    dcs: DeviceContexts,
-    raster: Raster,
-    ddraw: DirectDraw,
+pub fn register_graphics(registry: &mut Registry) {
+    adv_win32::gdi32::raster::register(registry);
+    adv_dx::ddraw::register(registry);
 }
-
-impl<P: Presenter> Deref for Graphics<P> {
-    type Target = Surfaces<P>;
-    fn deref(&self) -> &Surfaces<P> {
-        &self.surfaces
+pub fn install_graphics<B: Backend>(
+    machine: &mut Machine<B>,
+    width: u32,
+    height: u32,
+) -> Result<BTreeMap<u32, u32>, String> {
+    adv_device::surface::size(width, height)?;
+    if machine.ext.try_get::<SurfaceStore>().is_some() {
+        return Err("the process surface store is already installed".into());
     }
+    if machine.ext.try_get::<Win32>().is_none()
+        || machine
+            .ext
+            .try_get::<adv_win32::gdi32::raster::front::State>()
+            .is_none()
+    {
+        return Err("Win32 and its GDI frontend must be installed before graphics".into());
+    }
+    let arena_len = 64 * 1024 * 1024;
+    let arena = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, arena_len, Prot::RW)
+        .map_err(|e| e.to_string())?;
+    let snapshot = Snapshot {
+        width,
+        height,
+        bgra: vec![0; width as usize * height as usize * 4],
+        frames: 0,
+    };
+    machine.ext.insert(SurfaceStore::new(
+        width, height, arena, arena_len, snapshot,
+    )?);
+    machine.ext.insert(RunControl::default());
+    adv_win32::gdi32::raster::set_provider(
+        &mut machine.ext,
+        adv_win32::gdi32::raster::DrawingProvider {
+            memory: guest_memory,
+            completed: frame_completed,
+        },
+    );
+    let gdi = machine.ext.get::<Win32>().gdi.clone();
+    let mut entries = adv_dx::ddraw::install(
+        machine,
+        gdi,
+        adv_dx::ddraw::Provider {
+            memory: guest_memory,
+            window: window_geometry,
+            completed: frame_completed,
+        },
+    )?;
+    for &(id, api) in adv_win32::gdi32::raster::front::BINDINGS {
+        entries.insert(
+            id,
+            machine
+                .sys
+                .thunks
+                .publish(&mut machine.cpu, api.module, api.name)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(entries)
 }
-
-impl<P: Presenter> DerefMut for Graphics<P> {
-    fn deref_mut(&mut self) -> &mut Surfaces<P> {
-        &mut self.surfaces
-    }
-}
-
-impl<P: Presenter> Graphics<P> {
-    pub fn new(
-        width: u32,
-        height: u32,
-        arena: u32,
-        len: u32,
-        entries: BTreeMap<u32, u32>,
-        presenter: P,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            surfaces: Surfaces::new(width, height, arena, len, presenter)?,
-            dcs: DeviceContexts::default(),
-            raster: Raster::default(),
-            ddraw: DirectDraw::new(entries),
-        })
-    }
-
-    pub(crate) fn handle(
-        &mut self,
-        id: u32,
-        args: &[u32],
-        objects: &mut adv_machine::Objects,
-        memory: &mut dyn SurfaceMemory,
-    ) -> Result<u32, String> {
-        if id < 200 {
-            self.raster
-                .call(id, args, &mut self.surfaces, &mut self.dcs, objects, memory)
-        } else {
-            self.ddraw
-                .call(id, args, &mut self.surfaces, &mut self.dcs, objects, memory)
-        }
-    }
-
-    pub(crate) fn owns_dc(&self, objects: &adv_machine::Objects, dc: u32) -> bool {
-        dc == WINDOW_DC || self.dcs.contains(objects, dc)
-    }
-
-    pub(crate) fn dc_bitmap(&self, objects: &adv_machine::Objects, dc: u32) -> Option<u32> {
-        if dc == WINDOW_DC {
-            self.surfaces.primary_id()
-        } else {
-            self.dcs.get(objects, dc)
-        }
-    }
-
-    pub(crate) fn owns_bitmap(&self, object: u32) -> bool {
-        self.surfaces.contains(object)
-    }
-
-    pub(crate) fn configure_clipper(&mut self, clipper: u32, origin: (i32, i32)) {
-        self.ddraw.configure_clipper(clipper, origin);
-    }
-}
-
 #[derive(Default)]
 /// Frame accounting of a run, updated by every presentation.
 pub(crate) struct RunControl {
@@ -148,6 +138,23 @@ pub(crate) struct RunControl {
     pub(crate) frame_intervals: Vec<Duration>,
 }
 
+fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
+    env.sys.frame = serial as u32;
+    env.sys.complete_frame();
+    let control = env.ext.get_mut::<RunControl>();
+    let now = Instant::now();
+    control.first_frame.get_or_insert(now);
+    if control.frame_timing
+        && let Some(last) = control.last_frame
+    {
+        control.frame_intervals.push(now.duration_since(last));
+    }
+    control.last_frame = Some(now);
+    control
+        .frame_limit
+        .filter(|&limit| serial >= limit)
+        .map(|_| Outcome::ExitProcess(0))
+}
 #[cfg(feature = "gpu")]
 pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
@@ -195,329 +202,21 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                     != 0
             })
         },
-        completed: |env, serial| {
-            env.sys.frame = serial as u32;
-            env.sys.complete_frame();
-            let control = env.ext.get_mut::<RunControl>();
-            let now = Instant::now();
-            control.first_frame.get_or_insert(now);
-            if control.frame_timing
-                && let Some(last) = control.last_frame
-            {
-                control.frame_intervals.push(now.duration_since(last));
-            }
-            control.last_frame = Some(now);
-            control
-                .frame_limit
-                .filter(|&limit| serial >= limit)
-                .map(|_| Outcome::ExitProcess(0))
-        },
+        completed: frame_completed,
     }
-}
-
-/// Graphics registrations replace the Win32 state-only drawing handlers.
-pub fn register_graphics(registry: &mut Registry) {
-    registry.add(
-        "user32.dll",
-        "BeginPaint",
-        Conv::Stdcall { argc: 2 },
-        begin_paint,
-    );
-    for (interface, methods) in [
-        ("IDirectDraw7", DEVICE_METHODS),
-        ("IDirectDrawSurface7", SURFACE_METHODS),
-    ] {
-        for method in methods {
-            let signature = adv_abi::signature::lookup_com(interface, method)
-                .expect("DirectDraw vtable slot is in generated Win32Metadata");
-            registry.add(
-                "ddraw.dll",
-                &format!("{interface}::{method}"),
-                signature
-                    .conv
-                    .expect("DirectDraw method has a supported x86 convention"),
-                unsupported_graphics,
-            );
-        }
-    }
-    for &(id, module, name, argc) in api_specs() {
-        // GetLastError follows each context's TEB, including file and heap calls.
-        if id != api::LAST_ERROR {
-            assert!(
-                usize::from(argc) <= MAX_GRAPHICS_ARGS,
-                "graphics ABI exceeds argument buffer"
-            );
-            registry.add_with_data(
-                module,
-                name,
-                Conv::Stdcall { argc },
-                graphics_call,
-                u64::from(id) | (u64::from(argc) << 32),
-            );
-        }
-    }
-}
-
-/// Allocate shared surfaces and bind their vtables to the registry's actual thunks.
-pub fn install_graphics<B: Backend>(
-    machine: &mut Machine<B>,
-    width: u32,
-    height: u32,
-) -> Result<BTreeMap<u32, u32>, String> {
-    machine.ext.insert(RunControl::default());
-    if width == 0 || height == 0 || width > 16384 || height > 16384 {
-        return Err("invalid surface dimensions".into());
-    }
-    let arena_len = 64 * 1024 * 1024;
-    let arena = machine
-        .sys
-        .vm
-        .alloc(&mut machine.cpu, arena_len, Prot::RW)
-        .map_err(|e| e.to_string())?;
-    let mut entries = BTreeMap::new();
-    for (base, interface, methods) in [
-        (400, "IDirectDraw7", DEVICE_METHODS),
-        (500, "IDirectDrawSurface7", SURFACE_METHODS),
-    ] {
-        for (slot, method) in methods.iter().enumerate() {
-            entries.insert(
-                base + slot as u32,
-                machine
-                    .resolve_import("ddraw.dll", &format!("{interface}::{method}"))
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-    }
-    for &(id, module, name, _) in api_specs() {
-        if id != api::LAST_ERROR {
-            entries.insert(
-                id,
-                machine
-                    .resolve_import(module, name)
-                    .map_err(|e| e.to_string())?,
-            );
-        }
-    }
-    let snapshot = Snapshot {
-        width,
-        height,
-        bgra: vec![0; width as usize * height as usize * 4],
-        frames: 0,
-    };
-    let mut graphics = Graphics::new(width, height, arena, arena_len, entries.clone(), snapshot)?;
-    if let Some(win32) = machine.ext.try_get::<Win32>() {
-        graphics.dcs = DeviceContexts::new(win32.gdi.clone());
-    }
-    machine.ext.insert(graphics);
-    Ok(entries)
-}
-
-const MAX_GRAPHICS_ARGS: usize = 16;
-
-pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
-    let binding = env.sys.thunks.get(env.thunk).f.data;
-    let id = binding as u32;
-    let argc = (binding >> 32) as usize;
-    if argc > MAX_GRAPHICS_ARGS {
-        return Outcome::Fail("invalid graphics ABI binding".into());
-    }
-    let mut words = [0; MAX_GRAPHICS_ARGS];
-    for (index, word) in words[..argc].iter_mut().enumerate() {
-        *word = match env.cpu.arg(index as u32) {
-            Ok(value) => value,
-            Err(error) => return Outcome::Fail(format!("graphics argument {index}: {error}")),
-        };
-    }
-    let args = &words[..argc];
-    let hwnd = match id {
-        api::GET_DC => Some(args[0]),
-        api::COOPERATIVE if args[2] == 8 => Some(args[1]),
-        api::CLIPPER_SET_HWND => Some(args[2]),
-        _ => None,
-    };
-    let geometry = hwnd
-        .and_then(|hwnd| {
-            env.ext.try_get_mut::<Win32>().and_then(|win32| {
-                win32
-                    .user
-                    .windows
-                    .get(&env.sys.objects, &hwnd)
-                    .map(|window| {
-                        let (w, h) = window.client_size();
-                        (w, h, win32.user.client_origin(&env.sys.objects, hwnd))
-                    })
-            })
-        })
-        .filter(|&(w, h, _)| w > 0 && h > 0);
-    let graphics = env.ext.get_mut::<Graphics<Snapshot>>();
-    if let Some((width, height, origin)) = geometry {
-        if let Err(error) =
-            graphics.configure_window(width as u32, height as u32, &mut GuestMemory(env.cpu))
-        {
-            return Outcome::Fail(format!("window graphics: {error}"));
-        }
-        if id == api::CLIPPER_SET_HWND {
-            graphics.configure_clipper(args[0], origin);
-        }
-    }
-    let before = graphics.stats.presentations;
-    let out = graphics.handle(id, args, &mut env.sys.objects, &mut GuestMemory(env.cpu));
-    let presented = graphics.stats.presentations;
-    if let Ok(value) = &out {
-        // Raster storage stays in Graphics; USER32/GDI object metadata must
-        // refer to the same HDC so fonts and palettes share its real lifetime.
-        let added = match id {
-            api::GET_DC if *value != 0 => Some((*value, args[0])),
-            api::CREATE_DC if *value != 0 => Some((*value, 0)),
-            api::SURFACE_DC if *value == 0 => env.cpu.read_u32(args[1]).ok().map(|dc| (dc, 0)),
-            _ => None,
-        };
-        let removed = match id {
-            api::DELETE_DC if *value != 0 => Some(args[0]),
-            api::RELEASE_DC if *value != 0 => Some(args[1]),
-            api::SURFACE_RELEASE_DC if *value == 0 => Some(args[1]),
-            _ => None,
-        };
-        let selection = added
-            .map(|(dc, _)| dc)
-            .or_else(|| {
-                if id == api::SELECT && *value != 0 {
-                    Some(args[0])
-                } else {
-                    None
-                }
-            })
-            .and_then(|dc| {
-                graphics
-                    .dc_bitmap(&env.sys.objects, dc)
-                    .map(|bitmap| (dc, bitmap))
-            });
-        if (added.is_some() || removed.is_some() || selection.is_some())
-            && let Some(win32) = env.ext.try_get_mut::<Win32>()
-        {
-            if let Some((dc, hwnd)) = added
-                && !win32
-                    .gdi
-                    .register_external_dc(&mut env.sys.objects, dc, hwnd)
-            {
-                return rollback_dc(env, id, args, dc);
-            }
-            if let Some(dc) = removed {
-                win32.gdi.remove_external_dc(&mut env.sys.objects, dc);
-            }
-            if let Some((dc, bitmap)) = selection {
-                win32
-                    .gdi
-                    .set_external_bitmap(&mut env.sys.objects, dc, bitmap);
-            }
-        }
-    }
-    if presented != before {
-        env.sys.frame = presented as u32;
-        if out.is_ok() {
-            env.sys.complete_frame();
-        }
-        let control = env.ext.get_mut::<RunControl>();
-        let now = Instant::now();
-        control.first_frame.get_or_insert(now);
-        if control.frame_timing
-            && let Some(last) = control.last_frame
-        {
-            control.frame_intervals.push(now.duration_since(last));
-        }
-        control.last_frame = Some(now);
-        if out.is_ok() && control.frame_limit.is_some_and(|limit| presented >= limit) {
-            return Outcome::ExitProcess(0);
-        }
-    }
-    match out {
-        Ok(value) => Outcome::Return(value),
-        Err(error) => Outcome::Fail(format!("graphics: {error}")),
-    }
-}
-
-fn rollback_dc(env: &mut Env<'_>, id: u32, args: &[u32], dc: u32) -> Outcome {
-    let (release, words) = match id {
-        api::SURFACE_DC => (api::SURFACE_RELEASE_DC, [args[0], dc]),
-        api::CREATE_DC => (api::DELETE_DC, [dc, 0]),
-        _ => (api::RELEASE_DC, [args[0], dc]),
-    };
-    if let Err(error) = env.ext.get_mut::<Graphics<Snapshot>>().handle(
-        release,
-        &words,
-        &mut env.sys.objects,
-        &mut GuestMemory(env.cpu),
-    ) {
-        return Outcome::Fail(format!("GDI context allocation rollback: {error}"));
-    }
-    if id == api::SURFACE_DC {
-        let _ = env.cpu.write_u32(args[1], 0);
-        Outcome::Return(0x8007000e) // E_OUTOFMEMORY
-    } else {
-        adv_win32::util::set_last_error(env, 8);
-        Outcome::Return(0)
-    }
-}
-
-pub(crate) fn unsupported_graphics(env: &mut Env<'_>) -> Outcome {
-    let thunk = env.sys.thunks.get(env.thunk);
-    Outcome::Fail(format!("unimplemented: {}!{}", thunk.module, thunk.name))
-}
-
-fn begin_paint(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, paint) = (env.arg(0), env.arg(1));
-    let Some(window) = env
-        .ext
-        .get::<Win32>()
-        .user
-        .windows
-        .get(&env.sys.objects, &hwnd)
-    else {
-        return Outcome::Return(0);
-    };
-    let (width, height) = window.client_size();
-    let graphics = env.ext.get_mut::<Graphics<Snapshot>>();
-    if width > 0
-        && height > 0
-        && let Err(error) =
-            graphics.configure_window(width as u32, height as u32, &mut GuestMemory(env.cpu))
-    {
-        return Outcome::Fail(format!("BeginPaint resize: {error}"));
-    }
-    let dc = match graphics.handle(
-        api::GET_DC,
-        &[hwnd],
-        &mut env.sys.objects,
-        &mut GuestMemory(env.cpu),
-    ) {
-        Ok(dc) => dc,
-        Err(error) => return Outcome::Fail(format!("BeginPaint: {error}")),
-    };
-    if !env
-        .ext
-        .get_mut::<Win32>()
-        .gdi
-        .register_external_dc(&mut env.sys.objects, dc, hwnd)
-    {
-        return rollback_dc(env, api::GET_DC, &[hwnd], dc);
-    }
-    let mut bytes = [0u8; 64];
-    bytes[..4].copy_from_slice(&dc.to_le_bytes());
-    bytes[16..20].copy_from_slice(&width.to_le_bytes());
-    bytes[20..24].copy_from_slice(&height.to_le_bytes());
-    if let Err(error) = env.cpu.write(paint, &bytes) {
-        return Outcome::Fail(format!("BeginPaint: {error}"));
-    }
-    adv_win32::user32::message::validate(env, hwnd);
-    Outcome::Return(dc)
 }
 
 #[cfg(test)]
 pub(crate) fn test_machine() -> Machine<adv_cpu::JitCpu> {
     let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
     register_graphics(&mut registry);
     let cpu = adv_cpu::JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
     let mut machine = Machine::new(cpu, registry, adv_machine::Clock::virtual_time()).unwrap();
+    let mut config =
+        adv_win32::Win32Config::new(".", "graphics-fixture.exe", "target/graphics-fixture");
+    config.screen = (4, 2);
+    Win32::install(&mut machine, config).unwrap();
     install_graphics(&mut machine, 4, 2).unwrap();
     machine
 }
@@ -526,7 +225,7 @@ pub(crate) fn test_machine() -> Machine<adv_cpu::JitCpu> {
 mod tests {
     use super::*;
     use adv_cpu::JitCpu;
-    use adv_cpu::backend::Guest;
+    use adv_cpu::backend::{Guest, GuestExt};
     use adv_machine::RunResult;
     use iced_x86::code_asm::*;
 
@@ -534,11 +233,6 @@ mod tests {
     #[test]
     fn d3d9_present_boost_observes_live_physical_control_and_release() {
         let mut machine = test_machine();
-        Win32::install(
-            &mut machine,
-            adv_win32::Win32Config::new(".", "pacing.exe", "."),
-        )
-        .unwrap();
         let provider = d3d9_provider();
         assert!(!(provider.fast_forward)(&machine.ext));
         machine.ext.get_mut::<Win32>().user.keys[0x11] = 0x80;
@@ -561,16 +255,199 @@ mod tests {
     }
 
     fn graphics(machine: &mut Machine<JitCpu>, id: u32, args: &[u32]) -> u32 {
-        machine
-            .ext
-            .get_mut::<Graphics<Snapshot>>()
-            .handle(
-                id,
-                args,
-                &mut machine.sys.objects,
-                &mut GuestMemory(&mut machine.cpu),
-            )
+        let api = adv_win32::gdi32::raster::front::BINDINGS
+            .iter()
+            .chain(adv_dx::ddraw::front::BINDINGS)
+            .find(|(candidate, _)| *candidate == id)
             .unwrap()
+            .1;
+        invoke(machine, api.module, api.name, args)
+    }
+    fn invoke(machine: &mut Machine<JitCpu>, module: &str, name: &str, args: &[u32]) -> u32 {
+        use adv_cpu::backend::Reg;
+        if machine.sys.contexts.is_empty() {
+            // Host-only ABI calls still need a TEB for LastError. Finish this
+            // owner before any later fixture thread is run by the scheduler.
+            let code = machine
+                .sys
+                .vm
+                .alloc(&mut machine.cpu, 4096, Prot::RX)
+                .unwrap();
+            machine.cpu.write(code, &[0x31, 0xc0, 0xc3]).unwrap();
+            machine.spawn("ABI test owner", code, &[], 65536).unwrap();
+            assert!(matches!(machine.run(), RunResult::Exited(0)));
+        }
+        let address = machine.resolve_import(module, name).unwrap();
+        let index = (address - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        let handler = machine.sys.thunks.get(index).f.handler;
+        let stack = machine
+            .sys
+            .vm
+            .alloc(&mut machine.cpu, 128, Prot::RW)
+            .unwrap();
+        machine.cpu.set_reg(Reg::Esp, stack);
+        for (index, arg) in args.iter().enumerate() {
+            machine
+                .cpu
+                .write_u32(stack + 4 + index as u32 * 4, *arg)
+                .unwrap();
+        }
+        let result = handler(&mut Env {
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: index,
+        });
+        machine.sys.vm.free(&mut machine.cpu, stack).unwrap();
+        let Outcome::Return(value) = result else {
+            panic!("graphics must return; {module}!{name}")
+        };
+        value
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gdi_directdraw_and_d3d9_share_surface_identity_and_dc_ownership() {
+        // Initialization only: device futures wake this owner without polling
+        // intervals. Guest execution and presentation never run this executor.
+        fn initialize<T>(future: impl std::future::Future<Output = T>) -> T {
+            use std::task::{Context, Poll, Wake, Waker};
+            struct Owner(std::thread::Thread);
+            impl Wake for Owner {
+                fn wake(self: std::sync::Arc<Self>) {
+                    self.0.unpark();
+                }
+                fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                    self.0.unpark();
+                }
+            }
+            let waker = Waker::from(std::sync::Arc::new(Owner(std::thread::current())));
+            let mut context = Context::from_waker(&waker);
+            let mut future = std::pin::pin!(future);
+            loop {
+                match future.as_mut().poll(&mut context) {
+                    Poll::Ready(result) => return result,
+                    Poll::Pending => std::thread::park(),
+                }
+            }
+        }
+        let mut m = test_machine();
+        let data = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+        let mut header = [0; 40];
+        for (offset, value) in [(0, 40u32), (4, 4), (8, 2), (12, 0x200001)] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        m.cpu.write(data + 64, &header).unwrap();
+        let bitmap = graphics(&mut m, api::CREATE_DIB, &[0, data + 64, 0, data, 0, 0]);
+        assert_ne!(bitmap, 0);
+        let memory_dc = graphics(&mut m, api::CREATE_DC, &[0]);
+        assert_eq!(
+            graphics(&mut m, api::SELECT, &[memory_dc, bitmap]),
+            adv_os::gdi::STOCK_BITMAP
+        );
+
+        assert_eq!(graphics(&mut m, api::DD_CREATE_OLD, &[0, data, 0]), 0);
+        let device = m.cpu.read_u32(data).unwrap();
+        let mut description = [0u8; 108];
+        for (offset, value) in [(0, 108u32), (4, 7), (8, 2), (12, 4), (104, 0x40)] {
+            description[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        m.cpu.write(data + 64, &description).unwrap();
+        assert_eq!(
+            graphics(&mut m, api::CREATE_SURFACE, &[device, data + 64, data, 0]),
+            0
+        );
+        let surface = m.cpu.read_u32(data).unwrap();
+        assert_eq!(graphics(&mut m, api::SURFACE_DC, &[surface, data]), 0);
+        let surface_dc = m.cpu.read_u32(data).unwrap();
+        let gdi = &m.ext.get::<Win32>().gdi;
+        let Some(adv_os::gdi::GdiObj::Dc { selected, .. }) = gdi.get(&m.sys.objects, surface_dc)
+        else {
+            panic!("DirectDraw must lend the same public GDI payload")
+        };
+        let dd_surface = selected[3];
+        assert_ne!(bitmap, dd_surface);
+        assert_eq!(
+            invoke(&mut m, "gdi32.dll", "SetPolyFillMode", &[surface_dc, 2]),
+            1
+        );
+        assert_eq!(
+            invoke(&mut m, "gdi32.dll", "GetPolyFillMode", &[surface_dc]),
+            2
+        );
+        assert_eq!(
+            graphics(&mut m, api::SELECT, &[surface_dc, 0x0190_0021]),
+            0x0190_001d
+        );
+
+        let gpu = initialize(adv_device::gpu::Gpu::request(false)).unwrap();
+        let target = gpu.target(4, 2, false).unwrap();
+        let provider = d3d9_provider();
+        let native = (provider.insert)(&mut m.ext, target).unwrap();
+        assert_ne!(native, bitmap);
+        assert_ne!(native, dd_surface);
+        let store = m.ext.get::<SurfaceStore>();
+        assert_eq!(store.live_surfaces(), 3);
+        for id in [bitmap, dd_surface, native] {
+            assert!(store.contains(id));
+        }
+        assert!((provider.target)(&m.ext, native).is_some());
+        assert_eq!(store.get(native).unwrap().pixels, 0);
+        assert!(
+            m.ext
+                .get_mut::<SurfaceStore>()
+                .fill_raw(
+                    native,
+                    adv_device::surface::Rect {
+                        x: 0,
+                        y: 0,
+                        w: 4,
+                        h: 2
+                    },
+                    0,
+                    &mut guest_memory(&mut m.cpu)
+                )
+                .is_err(),
+            "native pixels require the GPU command path"
+        );
+        assert_eq!(
+            gpu.stats().readbacks,
+            0,
+            "sharing identities must not read native pixels"
+        );
+        assert!(
+            m.sys.objects.close(surface_dc).is_none(),
+            "kernel close cannot retire a GDI alias"
+        );
+        assert_ne!(
+            graphics(&mut m, api::SURFACE_RELEASE_DC, &[surface, memory_dc]),
+            0
+        );
+        assert!(matches!(
+            m.ext.get::<Win32>().gdi.get(&m.sys.objects, surface_dc),
+            Some(adv_os::gdi::GdiObj::Dc { .. })
+        ));
+        assert_eq!(
+            graphics(&mut m, api::SURFACE_RELEASE_DC, &[surface, surface_dc]),
+            0
+        );
+        assert!(
+            m.ext
+                .get::<Win32>()
+                .gdi
+                .get(&m.sys.objects, surface_dc)
+                .is_none()
+        );
+        assert_eq!(
+            invoke(&mut m, "gdi32.dll", "GetPolyFillMode", &[surface_dc]),
+            0
+        );
+        assert_eq!(graphics(&mut m, api::DELETE_DC, &[memory_dc]), 1);
+        assert_eq!(graphics(&mut m, api::DELETE_OBJECT, &[bitmap]), 1);
+        assert_eq!(graphics(&mut m, api::RELEASE, &[surface]), 0);
+        assert_eq!(graphics(&mut m, api::RELEASE, &[device]), 0);
+        (provider.remove)(&mut m.ext, &mut m.cpu, native).unwrap();
+        assert_eq!(m.ext.get::<SurfaceStore>().live_surfaces(), 0);
     }
 
     #[test]
@@ -699,7 +576,7 @@ mod tests {
         let clipper = m.cpu.read_u32(data).unwrap();
         assert_eq!(graphics(&mut m, api::SET_CLIPPER, &[primary, clipper]), 0);
         m.ext
-            .get_mut::<Graphics<Snapshot>>()
+            .get_mut::<adv_dx::ddraw::front::State>()
             .configure_clipper(clipper, (100, 50));
         m.cpu
             .write(
@@ -720,7 +597,7 @@ mod tests {
         assert_eq!(&frame.bgra[12..16], &[0; 4]);
         m.ext
             .get_mut::<Graphics<Snapshot>>()
-            .configure_window(6, 3, &mut GuestMemory(&mut m.cpu))
+            .configure_window(6, 3, &mut guest_memory(&mut m.cpu))
             .unwrap();
         m.cpu.write_u32(data + 16, 108).unwrap();
         assert_eq!(graphics(&mut m, api::GET_DESC, &[primary, data + 16]), 0);
@@ -730,9 +607,10 @@ mod tests {
         let dc = m.cpu.read_u32(data).unwrap();
         assert_ne!(graphics(&mut m, api::SURFACE_RELEASE_DC, &[source, dc]), 0);
         assert!(
-            m.ext
-                .get::<Graphics<Snapshot>>()
-                .owns_dc(&m.sys.objects, dc),
+            matches!(
+                m.ext.get::<Win32>().gdi.get(&m.sys.objects, dc),
+                Some(adv_os::gdi::GdiObj::Dc { .. })
+            ),
             "a rejected ReleaseDC must retain the original surface DC"
         );
         assert_eq!(graphics(&mut m, api::SURFACE_RELEASE_DC, &[primary, dc]), 0);

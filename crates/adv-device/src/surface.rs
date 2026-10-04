@@ -45,6 +45,50 @@ pub struct Snapshot {
     pub bgra: Vec<u8>,
     pub frames: u64,
 }
+
+/// One process-local pixel/target store. Snapshot is neutral device data, so
+/// all personality fronts can borrow this type without depending on a host shell.
+pub type SurfaceStore = Surfaces<Snapshot>;
+
+/// Assembly-supplied byte access. The store does not know the guest CPU type.
+pub type MemoryRead<T> = for<'a> fn(&'a T, u32, usize) -> Result<Cow<'a, [u8]>, String>;
+pub struct MemoryOperations<T: ?Sized> {
+    pub read: MemoryRead<T>,
+    pub write: fn(&mut T, u32, &[u8]) -> Result<(), String>,
+    pub writable: fn(&T, u32, usize) -> Result<(), String>,
+    pub copy: fn(&mut T, u32, u32, usize) -> Result<(), String>,
+}
+impl<T: ?Sized> Copy for MemoryOperations<T> {}
+impl<T: ?Sized> Clone for MemoryOperations<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Stack-only borrowed view: no state allocation or ownership transfer.
+pub struct MemoryView<'a, T: ?Sized> {
+    value: &'a mut T,
+    operations: MemoryOperations<T>,
+}
+impl<'a, T: ?Sized> MemoryView<'a, T> {
+    pub fn new(value: &'a mut T, operations: MemoryOperations<T>) -> Self {
+        Self { value, operations }
+    }
+}
+impl<T: ?Sized> SurfaceMemory for MemoryView<'_, T> {
+    fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+        (self.operations.read)(self.value, addr, len)
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), String> {
+        (self.operations.write)(self.value, addr, data)
+    }
+    fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
+        (self.operations.writable)(self.value, addr, len)
+    }
+    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+        (self.operations.copy)(self.value, src, dst, len)
+    }
+}
 impl Presenter for Snapshot {
     fn present(&mut self, f: FrameView<'_>) -> Result<(), String> {
         self.width = f.width;

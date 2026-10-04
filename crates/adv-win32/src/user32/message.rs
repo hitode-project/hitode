@@ -18,7 +18,7 @@ use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Object, Outcome, Wait};
 
-use super::window::{self, Rect, destroy_window, make_long, wm};
+use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr};
 use crate::{Win32, stdcall};
@@ -1246,21 +1246,6 @@ fn validate_rect(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn begin_paint(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, ps) = (env.arg(0), env.arg(1));
-    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
-        return Outcome::Return(0);
-    };
-    let (cw, ch) = w.client_size();
-    validate(env, hwnd);
-    let hdc = crate::gdi32::window_dc(env, hwnd);
-    // PAINTSTRUCT: hdc, fErase, rcPaint, fRestore, fIncUpdate, rgbReserved[32].
-    crate::util::zero(env.cpu, ps, 64);
-    let _ = env.cpu.write_u32(ps, hdc);
-    Rect::new(0, 0, cw, ch).write(env.cpu, ps + 8);
-    Outcome::Return(hdc)
-}
-
 fn end_paint(env: &mut Env<'_>) -> Outcome {
     let ps = env.arg(1);
     let hdc = env.cpu.read_u32(ps).unwrap_or(0);
@@ -1303,7 +1288,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "CallWindowProcA", 5, call_window_proc_a);
     s(reg, "InvalidateRect", 3, invalidate_rect);
     s(reg, "ValidateRect", 2, validate_rect);
-    s(reg, "BeginPaint", 2, begin_paint);
     s(reg, "EndPaint", 2, end_paint);
     s(reg, "RedrawWindow", 4, redraw_window);
 }
