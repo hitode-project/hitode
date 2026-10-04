@@ -1,13 +1,14 @@
 //! UI owns the native window. The execution worker owns the entire guest machine.
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
-use adv_runtime::{FrameConsumer, FrameProducer, Snapshot};
+use adv_runtime::{FrameConsumer, FrameProducer, MenuBar, MenuKey, Snapshot};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
+use std::{cell::RefCell, rc::Rc};
 
 enum Request {
     Hide,
@@ -29,14 +30,17 @@ pub struct Worker {
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
     frames: Option<FrameProducer>,
+    menus: adv_sync::mailbox::Producer<MenuBar>,
+    menu_key: Option<MenuKey>,
     pub ui_wake: WakeEvent,
     stopped: Arc<AtomicBool>,
     metrics_dropped: Arc<AtomicU64>,
 }
 pub struct Ui {
-    events: spsc::Producer<Delivery>,
+    events: Rc<RefCell<spsc::Producer<Delivery>>>,
     requests: spsc::Consumer<Request>,
     frames: Option<FrameConsumer>,
+    menus: adv_sync::mailbox::Consumer<MenuBar>,
     #[cfg(all(windows, feature = "gpu"))]
     native: Option<crate::native_gpu::UiPresenter>,
     keys: Arc<KeyState>,
@@ -50,6 +54,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     let (events, incoming) = spsc::channel(INPUT_CAPACITY);
     let (requests_tx, requests_rx) = spsc::channel(32);
     let (frames_tx, frames_rx) = adv_runtime::frame_mailbox();
+    let (menus_tx, menus_rx) =
+        adv_sync::mailbox::channel(std::array::from_fn(|_| MenuBar::default()));
     let stopped = Arc::new(AtomicBool::new(false));
     let metrics_dropped = Arc::new(AtomicU64::new(0));
     Ok((
@@ -59,14 +65,17 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             incoming,
             requests: requests_tx,
             frames: Some(frames_tx),
+            menus: menus_tx,
+            menu_key: None,
             ui_wake: ui_wake.clone(),
             stopped: stopped.clone(),
             metrics_dropped: metrics_dropped.clone(),
         },
         Ui {
-            events,
+            events: Rc::new(RefCell::new(events)),
             requests: requests_rx,
             frames: Some(frames_rx),
+            menus: menus_rx,
             #[cfg(all(windows, feature = "gpu"))]
             native: None,
             keys,
@@ -78,6 +87,14 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     ))
 }
 impl Worker {
+    pub fn needs_menu(&self, key: MenuKey) -> bool {
+        self.menu_key != Some(key)
+    }
+    pub fn publish_menu(&mut self, menu: MenuBar) {
+        self.menu_key = Some(menu.key);
+        self.menus.publish(move |slot| *slot = menu);
+        self.ui_wake.signal();
+    }
     pub fn take_frames(&mut self) -> FrameProducer {
         self.frames.take().expect("frame producer installed once")
     }
@@ -128,6 +145,7 @@ impl Ui {
     }
     fn deliver(&mut self, event: Delivery) -> Result<(), String> {
         self.events
+            .borrow_mut()
             .push(event)
             .map_err(|_| "UI input channel capacity exceeded")?;
         self.execution_wake.signal();
@@ -137,7 +155,8 @@ impl Ui {
     /// Saturation is counted; key releases and close/focus events keep the reserve.
     fn metric(&mut self, event: Delivery) {
         debug_assert!(!matches!(event, Delivery::Input(_)));
-        if self.events.available() <= RESERVED_INPUT || self.events.push(event).is_err() {
+        let mut events = self.events.borrow_mut();
+        if events.available() <= RESERVED_INPUT || events.push(event).is_err() {
             self.metrics_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -158,6 +177,7 @@ impl Ui {
                     repaint = true;
                     continue;
                 }
+                window::Event::Menu(_) => {}
             }
             had_input = true;
             self.deliver(Delivery::Input(event))?;
@@ -176,6 +196,18 @@ impl Ui {
         window: &mut window::Window,
         done: &mut spsc::Consumer<T>,
     ) -> Result<T, String> {
+        // Menu modal dispatch still runs on this UI thread. Its callbacks can
+        // enqueue events immediately without waiting for the outer paint loop.
+        let events = self.events.clone();
+        let execution_wake = self.execution_wake.clone();
+        window.set_menu_event_sink(Box::new(move |event| {
+            events
+                .borrow_mut()
+                .push(Delivery::Input(window::Event::Menu(event)))
+                .map_err(|_| "UI menu input channel capacity exceeded".to_owned())?;
+            execution_wake.signal();
+            Ok(())
+        }));
         let mut next = window.next_refresh();
         let mut snapshot = Snapshot::default();
         let mut candidate = Snapshot::default();
@@ -189,6 +221,9 @@ impl Ui {
                     Request::Hide => window.hide(),
                     Request::Input(m, w, l) => window.post_input(m, w, l)?,
                 }
+            }
+            if self.menus.update() {
+                window.set_menu_bar(self.menus.current())?;
             }
             let started = Instant::now();
             let events = window.pump();
@@ -286,6 +321,49 @@ pub fn update_keys(keys: &KeyState, message: u32, key: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn menu_mailbox_coalesces_and_commands_use_the_existing_waking_input_channel() {
+        let wake = WakeEvent::new().unwrap();
+        let keys = Arc::new(KeyState::default());
+        let (mut worker, mut ui) = channel(wake.clone(), keys.clone()).unwrap();
+        for revision in 1..=10 {
+            worker.publish_menu(MenuBar {
+                key: MenuKey {
+                    window: 1,
+                    menu: 2,
+                    revision,
+                    enabled: true,
+                },
+                items: Vec::new(),
+            });
+        }
+        assert!(ui.menus.update());
+        assert_eq!(ui.menus.current().key.revision, 10);
+        assert!(!ui.menus.update());
+        assert!(!worker.needs_menu(ui.menus.current().key));
+        assert!(
+            !wake.wait(Some(Duration::ZERO)).unwrap(),
+            "menu output does not wake the guest"
+        );
+        let command = adv_runtime::MenuCommand {
+            window: 1,
+            root: 2,
+            menu: 2,
+            position: 0,
+            id: 77,
+        };
+        ui.pump_events(
+            vec![window::Event::Menu(adv_runtime::MenuEvent::Command(
+                command,
+            ))],
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+        let mut performance = performance::Performance::default();
+        assert!(worker.pump(&mut performance).into_iter().any(|event|matches!(event,window::Event::Menu(adv_runtime::MenuEvent::Command(actual)) if actual==command)));
+        assert_eq!(keys.get(0x11), 0, "menu clicks do not change physical Ctrl");
+    }
 
     #[test]
     fn repaint_and_telemetry_do_not_wake_execution_but_real_input_does() {
@@ -353,7 +431,7 @@ mod tests {
                 Instant::now(),
             ));
         }
-        assert_eq!(ui.events.available(), RESERVED_INPUT);
+        assert_eq!(ui.events.borrow().available(), RESERVED_INPUT);
         for _ in 0..1024 {
             ui.metric(Delivery::Pump(Duration::ZERO, Instant::now()));
         }
@@ -367,7 +445,7 @@ mod tests {
             }))
             .unwrap();
         }
-        assert!(ui.events.is_full());
+        assert!(ui.events.borrow().is_full());
         ui.metric(Delivery::Present(9999, Duration::ZERO, Instant::now()));
         assert!(!worker.stopped());
         let mut performance = performance::Performance::default();
@@ -381,8 +459,8 @@ mod tests {
                 .json()
                 .contains("\"ui_metrics_dropped_total\": 1025")
         );
-        assert_eq!(ui.events.available(), INPUT_CAPACITY);
+        assert_eq!(ui.events.borrow().available(), INPUT_CAPACITY);
         ui.metric(Delivery::Present(10000, Duration::ZERO, Instant::now()));
-        assert_eq!(ui.events.available(), INPUT_CAPACITY - 1);
+        assert_eq!(ui.events.borrow().available(), INPUT_CAPACITY - 1);
     }
 }

@@ -425,6 +425,23 @@ impl<B: Backend> Runtime<B> {
         adv_win32::user32::host_input::post(&mut self.env(), message, wparam, lparam)
     }
 
+    /// Immutable native-menu projection; this is called only by execution.
+    pub fn menu_key(&self) -> crate::MenuKey {
+        adv_win32::user32::menu::presentation_key(
+            &self.machine.ext.get::<Win32>().user,
+            &self.machine.sys.objects,
+        )
+    }
+    pub fn menu_bar(&self) -> Result<crate::MenuBar, String> {
+        adv_win32::user32::menu::presentation(
+            &self.machine.ext.get::<Win32>().user,
+            &self.machine.sys.objects,
+        )
+    }
+    pub fn post_menu_event(&mut self, event: crate::MenuEvent) -> bool {
+        adv_win32::user32::menu::post_host_event(&mut self.env(), event)
+    }
+
     /// Release held keys and buttons when the host loses focus.
     pub fn release_input(&mut self) -> usize {
         adv_win32::user32::host_input::release(&mut self.env())

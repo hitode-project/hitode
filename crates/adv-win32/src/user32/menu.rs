@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct Menus {
+    revision: u64,
     namespace: Option<Namespace>,
     /// Window associations do not own a second copy of the menu payload.
     owners: BTreeMap<u32, u32>,
@@ -33,6 +34,182 @@ struct Item {
     submenu: u32,
 }
 
+/// Immutable presentation data. No guest payload or native platform handle is shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MenuKey {
+    pub window: u32,
+    pub menu: u32,
+    pub revision: u64,
+    pub enabled: bool,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuBar {
+    pub key: MenuKey,
+    pub items: Vec<MenuItem>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuItem {
+    pub text: Vec<u16>,
+    pub flags: u32,
+    pub supported: bool,
+    pub command: MenuCommand,
+    pub submenu: u32,
+    pub children: Vec<MenuItem>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MenuCommand {
+    pub window: u32,
+    pub root: u32,
+    pub menu: u32,
+    pub position: u32,
+    pub id: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuEvent {
+    Command(MenuCommand),
+    Initialize {
+        window: u32,
+        root: u32,
+        menu: u32,
+        position: Option<u16>,
+    },
+}
+
+/// The same foremost visible window used by the host input frontend.
+pub fn presentation_key(user: &super::User, objects: &Objects) -> MenuKey {
+    let window = user
+        .top
+        .iter()
+        .copied()
+        .find(|hwnd| {
+            user.windows
+                .get(objects, hwnd)
+                .is_some_and(|window| window.visible() && !window.destroying)
+        })
+        .unwrap_or(0);
+    MenuKey {
+        window,
+        menu: user.menus.attached.get(&window).copied().unwrap_or(0),
+        revision: user.menus.revision,
+        enabled: user
+            .windows
+            .get(objects, &window)
+            .is_some_and(super::window::Window::enabled),
+    }
+}
+pub fn presentation(user: &super::User, objects: &Objects) -> Result<MenuBar, String> {
+    let key = presentation_key(user, objects);
+    let mut remaining = 16384;
+    fn items(
+        menus: &Menus,
+        objects: &Objects,
+        key: MenuKey,
+        menu: u32,
+        depth: u32,
+        remaining: &mut usize,
+    ) -> Result<Vec<MenuItem>, String> {
+        if depth >= 64 {
+            return Err("host menu exceeds 64 levels".into());
+        }
+        let Some(source) = menus.get(objects, menu) else {
+            return Ok(Vec::new());
+        };
+        let mut output = Vec::with_capacity(source.len().min(*remaining));
+        for (position, item) in source.iter().enumerate() {
+            if *remaining == 0 {
+                return Err("host menu exceeds 16384 items".into());
+            }
+            *remaining -= 1;
+            let supported = item.flags & (0x4 | 0x100) == 0 && item.bitmap == 0;
+            output.push(MenuItem {
+                text: item.text.clone(),
+                flags: item.flags,
+                supported,
+                command: MenuCommand {
+                    window: key.window,
+                    root: key.menu,
+                    menu,
+                    position: position as u32,
+                    id: item.id,
+                },
+                submenu: item.submenu,
+                children: if item.submenu == 0 {
+                    Vec::new()
+                } else {
+                    items(menus, objects, key, item.submenu, depth + 1, remaining)?
+                },
+            });
+        }
+        Ok(output)
+    }
+    Ok(MenuBar {
+        key,
+        items: items(&user.menus, objects, key, key.menu, 0, &mut remaining)?,
+    })
+}
+
+/// Validate immutable UI routing data against the live, sole guest owner.
+pub fn post_host_event(env: &mut Env<'_>, event: MenuEvent) -> bool {
+    let (hwnd, root) = match event {
+        MenuEvent::Command(command) => (command.window, command.root),
+        MenuEvent::Initialize { window, root, .. } => (window, root),
+    };
+    let u = user(env);
+    if root == 0
+        || u.menus.attached.get(&hwnd) != Some(&root)
+        || !u
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .is_some_and(|window| window.visible() && window.enabled() && !window.destroying)
+    {
+        return false;
+    }
+    let (message, wparam, lparam) = match event {
+        MenuEvent::Command(command) => {
+            let mut pending = vec![root];
+            let mut seen = BTreeSet::new();
+            let mut selectable = false;
+            while let Some(menu) = pending.pop() {
+                if !seen.insert(menu) {
+                    continue;
+                }
+                if let Some(items) = u.menus.get(&env.sys.objects, menu) {
+                    for (position, item) in items.iter().enumerate() {
+                        if item.flags & (3 | 0x800 | 0x4 | 0x100) != 0 || item.bitmap != 0 {
+                            continue;
+                        }
+                        if menu == command.menu
+                            && position as u32 == command.position
+                            && item.id == command.id
+                            && item.submenu == 0
+                        {
+                            selectable = true;
+                        }
+                        if item.submenu != 0 {
+                            pending.push(item.submenu);
+                        }
+                    }
+                }
+            }
+            if !selectable {
+                return false;
+            }
+            (0x111, command.id & 0xffff, 0)
+        }
+        MenuEvent::Initialize { menu, position, .. } => {
+            if !u.menus.reaches(&env.sys.objects, root, menu) {
+                return false;
+            }
+            match position {
+                Some(index) => (0x117, menu, u32::from(index)),
+                None if menu == root => (0x116, menu, 0),
+                None => return false,
+            }
+        }
+    };
+    super::message::post(env, hwnd, message, wparam, lparam)
+}
+
 impl Menus {
     fn new_menu(&mut self, objects: &mut Objects) -> Option<u32> {
         if self.namespace.is_none() {
@@ -42,7 +219,9 @@ impl Menus {
         if objects.alias_count(namespace) >= 16384 {
             return None;
         }
-        objects.insert_host_in(namespace, Menu::default())
+        let menu = objects.insert_host_in(namespace, Menu::default())?;
+        self.revision = self.revision.wrapping_add(1);
+        Some(menu)
     }
     fn count(&self, objects: &Objects) -> usize {
         self.namespace
@@ -52,8 +231,9 @@ impl Menus {
         let id = objects.lookup_alias::<Menu>(self.namespace?, menu)?;
         Some(&objects.owned(id)?.items)
     }
-    fn get_mut<'a>(&self, objects: &'a mut Objects, menu: u32) -> Option<&'a mut Vec<Item>> {
+    fn get_mut<'a>(&mut self, objects: &'a mut Objects, menu: u32) -> Option<&'a mut Vec<Item>> {
         let id = objects.lookup_alias::<Menu>(self.namespace?, menu)?;
+        self.revision = self.revision.wrapping_add(1);
         Some(&mut objects.owned_mut(id)?.items)
     }
     pub(super) fn remove_window(&mut self, hwnd: u32, objects: &mut Objects) {
@@ -72,6 +252,7 @@ impl Menus {
         if self.get(objects, menu).is_none() {
             return false;
         }
+        self.revision = self.revision.wrapping_add(1);
         let mut pending = vec![menu];
         while let Some(menu) = pending.pop() {
             if let Some(Some(adv_machine::Object::Host(payload))) =
@@ -149,7 +330,7 @@ fn get<'a>(env: &'a Env<'_>, menu: u32) -> Option<&'a Vec<Item>> {
 }
 fn get_mut<'a>(env: &'a mut Env<'_>, menu: u32) -> Option<&'a mut Vec<Item>> {
     env.ext
-        .get::<crate::Win32>()
+        .get_mut::<crate::Win32>()
         .user
         .menus
         .get_mut(&mut env.sys.objects, menu)
@@ -549,8 +730,9 @@ fn draw_menu_bar(env: &mut Env<'_>, window: Handle) -> i32 {
         set_last_error(env, 1400); // ERROR_INVALID_WINDOW_HANDLE
         return 0;
     }
-    // Menus are process state; the shell presents the client surface only.
-    // Edits are already visible to menu queries, without invalidating guest pixels.
+    // Notify the immutable host projection, without invalidating guest pixels.
+    let menus = &mut user_mut(env).menus;
+    menus.revision = menus.revision.wrapping_add(1);
     1
 }
 fn get_submenu(env: &mut Env<'_>) -> Outcome {
@@ -932,6 +1114,147 @@ pub(super) fn register(reg: &mut Registry) {
 mod tests {
     use super::*;
     use adv_cpu::backend::{Guest, MemFault, Reg};
+
+    #[test]
+    fn immutable_menu_projection_routes_commands_and_rejects_live_disabled_or_detached_items() {
+        use adv_cpu::{JitCpu, backend::Prot};
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        crate::Win32::install(
+            &mut machine,
+            crate::Win32Config::new(
+                "/nonexistent/menu-projection",
+                "fixture.exe",
+                "/nonexistent/menu-projection-data",
+            ),
+        )
+        .unwrap();
+        machine.cpu.map(0x400000, 4096, Prot::RX).unwrap();
+        machine.cpu.write(0x400000, &[0xc3]).unwrap();
+        machine.spawn("menu owner", 0x400000, &[], 65536).unwrap();
+        let u = &mut machine.ext.get_mut::<crate::Win32>().user;
+        let hwnd = u.desktop;
+        u.top.push(hwnd);
+        let root = u.menus.new_menu(&mut machine.sys.objects).unwrap();
+        let popup = u.menus.new_menu(&mut machine.sys.objects).unwrap();
+        *u.menus.get_mut(&mut machine.sys.objects, root).unwrap() = vec![Item {
+            text: "&設定".encode_utf16().collect(),
+            submenu: popup,
+            ..Item::default()
+        }];
+        *u.menus.get_mut(&mut machine.sys.objects, popup).unwrap() = vec![
+            Item {
+                id: 0x1234_0404,
+                flags: 8,
+                text: "Text\tF6".encode_utf16().collect(),
+                ..Item::default()
+            },
+            Item {
+                id: 77,
+                flags: 3,
+                text: "Disabled".encode_utf16().collect(),
+                ..Item::default()
+            },
+            Item {
+                flags: 0x800,
+                ..Item::default()
+            },
+            Item {
+                id: 88,
+                flags: 4,
+                bitmap: 1,
+                ..Item::default()
+            },
+        ];
+        u.menus.attached.insert(hwnd, root);
+        let objects = machine.sys.objects.object_count();
+        let snapshot = presentation(u, &machine.sys.objects).unwrap();
+        assert_eq!(
+            machine.sys.objects.object_count(),
+            objects,
+            "snapshot does not own guest payloads"
+        );
+        assert_eq!(snapshot.key.window, hwnd);
+        assert_eq!(
+            snapshot.items[0].text,
+            "&設定".encode_utf16().collect::<Vec<_>>()
+        );
+        let items = &snapshot.items[0].children;
+        assert_eq!(items[0].flags & 8, 8);
+        assert_eq!(items[1].flags & 3, 3);
+        assert_eq!(items[2].flags & 0x800, 0x800);
+        assert!(!items[3].supported);
+        let command = items[0].command;
+        let disabled = items[1].command;
+        let mut env = Env {
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        assert!(post_host_event(
+            &mut env,
+            MenuEvent::Initialize {
+                window: hwnd,
+                root,
+                menu: root,
+                position: None
+            }
+        ));
+        assert!(post_host_event(
+            &mut env,
+            MenuEvent::Initialize {
+                window: hwnd,
+                root,
+                menu: popup,
+                position: Some(0)
+            }
+        ));
+        assert!(post_host_event(&mut env, MenuEvent::Command(command)));
+        assert!(!post_host_event(&mut env, MenuEvent::Command(disabled)));
+        let queue = &env.ext.get::<crate::Win32>().user.queues[&0];
+        let actual: Vec<_> = queue
+            .posted
+            .iter()
+            .map(|message| (message.hwnd, message.msg, message.wparam, message.lparam))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (hwnd, 0x116, root, 0),
+                (hwnd, 0x117, popup, 0),
+                (hwnd, 0x111, 0x404, 0)
+            ]
+        );
+        assert!(
+            queue.posted.iter().all(|message| !message.input),
+            "menus do not synthesize physical input"
+        );
+        let u = &mut env.ext.get_mut::<crate::Win32>().user;
+        u.menus.get_mut(&mut env.sys.objects, popup).unwrap()[0].flags |= 3;
+        assert_ne!(presentation_key(u, &env.sys.objects), snapshot.key);
+        assert!(
+            !post_host_event(&mut env, MenuEvent::Command(command)),
+            "disabled live item rejects an old UI command"
+        );
+        env.ext
+            .get_mut::<crate::Win32>()
+            .user
+            .menus
+            .attached
+            .remove(&hwnd);
+        assert!(
+            !post_host_event(&mut env, MenuEvent::Command(command)),
+            "detached menu rejects an old UI command"
+        );
+    }
     const BASE: u32 = 0x10000;
     struct TemplateGuest(Vec<u8>);
     impl Guest for TemplateGuest {

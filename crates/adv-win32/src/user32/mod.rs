@@ -8,7 +8,7 @@ pub mod controls;
 pub mod dialog;
 pub mod host_input;
 mod input;
-mod menu;
+pub mod menu;
 pub mod message;
 mod resources;
 mod system_parameters;

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum Event {
+    Menu(adv_runtime::MenuEvent),
     Input {
         message: u32,
         wparam: u32,
@@ -15,6 +16,7 @@ pub enum Event {
     FocusLost,
     Repaint,
 }
+pub type MenuSink = Box<dyn FnMut(adv_runtime::MenuEvent) -> Result<(), String>>;
 
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -28,6 +30,7 @@ mod native {
     use super::*;
     use std::collections::VecDeque;
     use std::ptr::{null, null_mut};
+    mod menu;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0,
         WAIT_TIMEOUT, WPARAM,
@@ -43,6 +46,8 @@ mod native {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     struct State {
+        menu: Option<menu::HostMenu>,
+        menu_sink: Option<MenuSink>,
         events: VecDeque<Event>,
         width: u32,
         height: u32,
@@ -161,15 +166,18 @@ mod native {
         ]
     }
 
-    fn outer_rect(width: i32, height: i32, dpi: u32) -> Result<RECT, String> {
+    fn outer_rect(width: i32, height: i32, dpi: u32, menu: bool) -> Result<RECT, String> {
         let mut rect = RECT {
             left: 0,
             top: 0,
             right: width,
             bottom: height,
         };
-        // SAFETY: valid rectangle; the fixed window style has no menu.
-        if unsafe { AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0, dpi) } == 0 {
+        // SAFETY: valid rectangle and the owned window's actual menu state.
+        if unsafe {
+            AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, i32::from(menu), 0, dpi)
+        } == 0
+        {
             return Err(format!("AdjustWindowRectExForDpi failed: {}", unsafe {
                 GetLastError()
             }));
@@ -178,9 +186,12 @@ mod native {
     }
 
     fn set_client_size(hwnd: HWND, width: u32, height: u32) -> Result<(), String> {
-        let rect = outer_rect(width as i32, height as i32, unsafe {
-            GetDpiForWindow(hwnd)
-        })?;
+        let rect = outer_rect(
+            width as i32,
+            height as i32,
+            unsafe { GetDpiForWindow(hwnd) },
+            !unsafe { GetMenu(hwnd) }.is_null(),
+        )?;
         // SAFETY: the live, owned window stays at its chosen position/z-order.
         if unsafe {
             SetWindowPos(
@@ -455,6 +466,7 @@ mod native {
                         (*pointer).client_width,
                         (*pointer).client_height,
                         (wparam as u32 & 0xffff).max(96),
+                        !GetMenu(hwnd).is_null(),
                     ) {
                         SetWindowPos(
                             hwnd,
@@ -470,6 +482,20 @@ mod native {
                     return 0;
                 }
                 let state = &mut *pointer;
+                if let Some(event) = state
+                    .menu
+                    .as_ref()
+                    .and_then(|menu| menu.event(message, wparam, lparam))
+                {
+                    if let Some(sink) = state.menu_sink.as_mut() {
+                        if let Err(error) = sink(event) {
+                            state.paint_error = Some(error);
+                        }
+                    } else {
+                        state.events.push_back(Event::Menu(event));
+                    }
+                    return 0;
+                }
                 match message {
                     WM_SIZE => {
                         if wparam as u32 != SIZE_MINIMIZED {
@@ -492,6 +518,9 @@ mod native {
                         return 0;
                     }
                     WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                        if state.menu.is_some() && matches!(message, WM_SYSKEYDOWN | WM_SYSKEYUP) {
+                            return DefWindowProcW(hwnd, message, wparam, lparam);
+                        }
                         state.events.push_back(Event::Input {
                             message,
                             wparam: wparam as u32,
@@ -501,6 +530,9 @@ mod native {
                     }
                     // The ANSI guest's TranslateMessage generates its characters.
                     // Host UTF-16 character messages must not enter that queue.
+                    WM_SYSCHAR if state.menu.is_some() => {
+                        return DefWindowProcW(hwnd, message, wparam, lparam);
+                    }
                     WM_CHAR | WM_SYSCHAR => return 0,
                     WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
                     | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL => {
@@ -596,6 +628,8 @@ mod native {
             let class: Vec<u16> = "AdvGuestHost\0".encode_utf16().collect();
             let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
             let mut state = Box::new(State {
+                menu: None,
+                menu_sink: None,
                 events: VecDeque::new(),
                 width,
                 height,
@@ -622,7 +656,7 @@ mod native {
                     return Err(format!("RegisterClassW failed: {}", GetLastError()));
                 }
                 let style = WS_OVERLAPPEDWINDOW;
-                let rect = outer_rect(width as i32, height as i32, GetDpiForSystem())?;
+                let rect = outer_rect(width as i32, height as i32, GetDpiForSystem(), false)?;
                 let hwnd = CreateWindowExW(
                     0,
                     class.as_ptr(),
@@ -684,6 +718,7 @@ mod native {
                     if message.message == WM_QUIT {
                         self.state.events.push_back(Event::Close);
                     } else {
+                        TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
                 }
@@ -876,6 +911,10 @@ mod native {
         fn drop(&mut self) {
             // SAFETY: state remains live until synchronous destruction and callbacks finish.
             unsafe {
+                if self.state.menu.is_some() {
+                    SetMenu(self.hwnd, null_mut());
+                    drop(self.state.menu.take());
+                }
                 CancelWaitableTimer(self.timer);
                 CloseHandle(self.timer);
                 DestroyWindow(self.hwnd);
@@ -1005,7 +1044,7 @@ mod native {
             );
             let dpi = unsafe { GetDpiForWindow(window.hwnd) };
             println!("PMv2 window DPI={dpi}; initial guest/client=800x600 physical pixels");
-            let rect = outer_rect(800, 800, dpi).unwrap();
+            let rect = outer_rect(800, 800, dpi, false).unwrap();
             assert_ne!(
                 unsafe {
                     SetWindowPos(
@@ -1159,6 +1198,10 @@ pub fn initialize_dpi() -> Result<(), String> {
 pub struct Window;
 #[cfg(not(windows))]
 impl Window {
+    pub fn set_menu_bar(&mut self, _: &adv_runtime::MenuBar) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn set_menu_event_sink(&mut self, _: MenuSink) {}
     pub fn next_refresh(&self) -> std::time::Instant {
         std::time::Instant::now() + Duration::from_nanos(16_666_667)
     }

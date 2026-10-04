@@ -365,6 +365,11 @@ fn build_report(context: ReportContext<'_>) -> String {
         audio,
     } = context;
     let frame = runtime.frame();
+    let arena = runtime.machine.ext.get::<adv_runtime::Graphics>().arena_usage();
+    let graphics_memory = format!(
+        "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}}}",
+        arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
+    );
     let stats = runtime.machine.cpu.stats();
     #[cfg(feature = "gpu")]
     let gpu_diagnostics = {
@@ -442,7 +447,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"gpu\": {},\n  \"runtime\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -501,6 +506,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         pcm_metrics,
         codec,
         gpu_diagnostics,
+        graphics_memory,
         json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
     )
 }
@@ -781,6 +787,7 @@ fn run_execution(
                     }
                     window::Event::Repaint => {}
                     window::Event::FocusLost => inputs += runtime.release_input() as u64,
+                    window::Event::Menu(event) => inputs += u64::from(runtime.post_menu_event(event)),
                 }
             }
         }
@@ -905,6 +912,13 @@ fn run_execution(
         let interrupts_before = runtime.machine.sys.scheduling.external_interrupts;
         let frame_yields_before = runtime.machine.sys.scheduling.frame_host_yields;
         let outcome = runtime.step_for(SOFT_SLICE);
+        // Publish before an Idle wait: an engine may finish constructing its
+        // menu and then wait indefinitely for the very first UI command.
+        if let Some(worker) = window.as_mut()
+            && worker.needs_menu(runtime.menu_key())
+        {
+            worker.publish_menu(runtime.menu_bar()?);
+        }
         if let Some(controller) = control.as_mut() {
             let ordinary = runtime.machine.sys.scheduling.external_interrupts == interrupts_before;
             let full_or_idle = runtime.machine.sys.scheduling.frame_host_yields
