@@ -442,7 +442,7 @@ unknown!(
 
 #[win32(d3d9, name = "Direct3DCreate9", level = implement)]
 fn create(env: &mut Env<'_>, version: u32) -> GuestPtr<()> {
-    if version != 32 {
+    if !matches!(version, 31 | 32) {
         return GuestPtr::new(0);
     }
     GuestPtr::new(object(env, "IDirect3D9", IID_FACTORY, Payload::Factory).map_or(0, |v| v.0))

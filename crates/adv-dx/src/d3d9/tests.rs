@@ -108,6 +108,42 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     (device, device_id, resource, id)
 }
 #[test]
+fn native_sdk_31_and_32_create_real_factories_with_one_initial_reference() {
+    let mut machine = machine();
+    let mut env = Env {
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    for (version, supported) in [
+        (0, false),
+        (30, false),
+        (31, true),
+        (32, true),
+        (33, false),
+        (0x8000001f, false),
+        (0x80000020, false),
+        (u32::MAX, false),
+    ] {
+        let count = env.sys.objects.object_count();
+        let pointer = create(&mut env, version).addr();
+        assert_eq!(pointer != 0, supported, "SDK {version:#x}");
+        if supported {
+            assert!(matches!(
+                com(&env).get::<Payload>(&env.sys.objects, pointer),
+                Some(Payload::Factory)
+            ));
+            assert_eq!(env.sys.objects.object_count(), count + 1);
+            assert_eq!(add_ref(&mut env, pointer), Some(2));
+            assert_eq!(release(&mut env, pointer), 1);
+            assert_eq!(release(&mut env, pointer), 0);
+        }
+        assert_eq!(env.sys.objects.object_count(), count);
+    }
+}
+
+#[test]
 fn query_of_bound_zero_reference_resource_retains_parent_once_and_failed_query_rolls_back() {
     let mut m = machine();
     let mut env = Env {
