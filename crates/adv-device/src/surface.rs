@@ -113,6 +113,8 @@ pub struct GraphicsStats {
     pub bytes_blitted: u64,
     pub locks: u64,
     pub unlocks: u64,
+    /// Growth of the bounded text patch, rather than one allocation per string.
+    pub text_scratch_growths: u64,
 }
 
 pub struct PendingFrame {
@@ -184,7 +186,9 @@ impl PendingFrame {
                 dst.copy_from_slice(&src[..dst.len()]);
             } else {
                 for (x, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                    pixel.copy_from_slice(&self.format.decode(&src[x * 2..]));
+                    pixel.copy_from_slice(
+                        &self.format.decode(&src[x * self.format.bytes() as usize..]),
+                    );
                 }
             }
         }
@@ -238,16 +242,21 @@ pub struct Surface {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     Bgra32,
+    Bgr24,
     Rgb565,
     Rgb555,
 }
 impl PixelFormat {
     pub fn bytes(self) -> u32 {
-        if self == Self::Bgra32 { 4 } else { 2 }
+        match self {
+            Self::Bgra32 => 4,
+            Self::Bgr24 => 3,
+            _ => 2,
+        }
     }
     pub fn masks(self) -> (u32, u32, u32) {
         match self {
-            Self::Bgra32 => (0xff0000, 0xff00, 0xff),
+            Self::Bgra32 | Self::Bgr24 => (0xff0000, 0xff00, 0xff),
             Self::Rgb565 => (0xf800, 0x7e0, 0x1f),
             Self::Rgb555 => (0x7c00, 0x3e0, 0x1f),
         }
@@ -256,11 +265,14 @@ impl PixelFormat {
         if self == Self::Bgra32 {
             return p[..4].try_into().unwrap();
         }
+        if self == Self::Bgr24 {
+            return [p[0], p[1], p[2], 0];
+        }
         let v = u32::from(u16::from_le_bytes(p[..2].try_into().unwrap()));
         let (r, g) = match self {
             Self::Rgb565 => ((v >> 11) & 31, ((v >> 5) & 63) * 255 / 63),
             Self::Rgb555 => ((v >> 10) & 31, ((v >> 5) & 31) * 255 / 31),
-            Self::Bgra32 => unreachable!(),
+            Self::Bgra32 | Self::Bgr24 => unreachable!(),
         };
         [
             ((v & 31) * 255 / 31) as u8,
@@ -271,7 +283,7 @@ impl PixelFormat {
     }
     /// Packed pixel, padded to four bytes. Only the first `bytes()` bytes are stored.
     pub fn encode(self, p: [u8; 4]) -> [u8; 4] {
-        if self == Self::Bgra32 {
+        if matches!(self, Self::Bgra32 | Self::Bgr24) {
             return p;
         }
         let r = u16::from(p[2]) * 31 / 255;
@@ -279,7 +291,7 @@ impl PixelFormat {
         let value = match self {
             Self::Rgb565 => r << 11 | (u16::from(p[1]) * 63 / 255) << 5 | b,
             Self::Rgb555 => r << 10 | (u16::from(p[1]) * 31 / 255) << 5 | b,
-            Self::Bgra32 => unreachable!(),
+            Self::Bgra32 | Self::Bgr24 => unreachable!(),
         };
         let [lo, hi] = value.to_le_bytes();
         [lo, hi, 0, 0]
@@ -324,7 +336,10 @@ fn convert_bgra(s: &Surface, input: &[u8], output: &mut Vec<u8>) {
         if s.format == PixelFormat::Bgra32 {
             dst.copy_from_slice(&src[..stride]);
         } else {
-            for (pixel, raw) in dst.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+            for (pixel, raw) in dst
+                .chunks_exact_mut(4)
+                .zip(src.chunks_exact(s.format.bytes() as usize))
+            {
                 pixel.copy_from_slice(&s.format.decode(raw));
             }
         }
@@ -417,6 +432,7 @@ pub struct Surfaces<P: Presenter> {
     blit_row: Vec<u8>,
     blit_sample: Vec<u8>,
     blit_source: Vec<u8>,
+    text_patch: Vec<u8>,
     frame_mailbox: Option<(FrameProducer, adv_sync::WakeEvent)>,
 }
 
@@ -457,6 +473,7 @@ impl<P: Presenter> Surfaces<P> {
             blit_row: Vec::new(),
             blit_sample: Vec::new(),
             blit_source: Vec::new(),
+            text_patch: Vec::new(),
             frame_mailbox: None,
         })
     }
@@ -969,6 +986,129 @@ impl<P: Presenter> Surfaces<P> {
                 .store_native(frame);
         }
         Ok(serial)
+    }
+    /// Draw a counted text run through the cached backend. Scratch storage is
+    /// bounded and reused; no surface payload or guest object is created.
+    pub fn draw_text(
+        &mut self,
+        id: u32,
+        memory: &mut dyn SurfaceMemory,
+        text: &mut crate::text::Text,
+        font: &crate::text::FontRequest,
+        paint: crate::text::Paint<'_>,
+    ) -> Result<bool, String> {
+        use crate::text::{Horizontal, Pixels, Vertical};
+        #[cfg(feature = "gpu")]
+        if self.native_surfaces.contains_key(&id) {
+            return Err("native text target requires an explicit GPU text command".into());
+        }
+        let surface = self
+            .surfaces
+            .get(&id)
+            .ok_or("unknown text surface")?
+            .clone();
+        if surface.locked.is_some() {
+            return Err("text surface is locked".into());
+        }
+        if font.baseline_angle != 0 || font.glyph_angle != 0 || font.face.starts_with('@') {
+            return Err("rotated or vertical text is not supported".into());
+        }
+        let size = text.extent(font, paint.input).map_err(|e| e.to_string())?;
+        let metrics = text.metrics(font).map_err(|e| e.to_string())?;
+        let x = i64::from(paint.origin.x)
+            - match paint.horizontal {
+                Horizontal::Left => 0,
+                Horizontal::Center => i64::from(size.width) / 2,
+                Horizontal::Right => i64::from(size.width),
+            };
+        let y = i64::from(paint.origin.y)
+            - match paint.vertical {
+                Vertical::Top => 0,
+                Vertical::Baseline => i64::from(metrics.ascent),
+                Vertical::Bottom => i64::from(metrics.height),
+            };
+        // Conservative ink bounds include italics, underline and fallback glyphs.
+        let mx = i64::from(metrics.maximum_width).abs().max(1) * 2;
+        let my = i64::from(metrics.height).abs().max(1) * 2;
+        let (mut left, mut top, mut right, mut bottom) = (
+            x - mx,
+            y - my,
+            x + i64::from(size.width) + mx,
+            y + i64::from(size.height) + my,
+        );
+        if let Some(rect) = paint.fill {
+            left = left.min(i64::from(rect.left));
+            top = top.min(i64::from(rect.top));
+            right = right.max(i64::from(rect.right));
+            bottom = bottom.max(i64::from(rect.bottom));
+        }
+        if let Some(rect) = paint.clip {
+            left = left.max(i64::from(rect.left));
+            top = top.max(i64::from(rect.top));
+            right = right.min(i64::from(rect.right));
+            bottom = bottom.min(i64::from(rect.bottom));
+        }
+        left = left.max(0);
+        top = top.max(0);
+        right = right.min(i64::from(surface.width));
+        bottom = bottom.min(i64::from(surface.height));
+        if left >= right || top >= bottom {
+            return Ok(false);
+        }
+        let bounds = Rect {
+            x: left as u32,
+            y: top as u32,
+            w: (right - left) as u32,
+            h: (bottom - top) as u32,
+        };
+        let row = usize::try_from(bounds.w).unwrap() * surface.format.bytes() as usize;
+        let pitch = (row + 3) & !3;
+        let len = pitch
+            .checked_mul(bounds.h as usize)
+            .filter(|&n| n <= 32 * 1024 * 1024)
+            .ok_or("text patch exceeds allocation limit")?;
+        if len > self.text_patch.capacity() {
+            self.text_patch.reserve_exact(len - self.text_patch.len());
+            self.stats.text_scratch_growths += 1;
+        }
+        if len > self.text_patch.len() {
+            self.text_patch.resize(len, 0);
+        }
+        let bytes = &mut self.text_patch[..len];
+        for y in 0..bounds.h {
+            let addr = surface.row(bounds.x, bounds.y + y);
+            memory.writable(addr, row)?;
+            bytes[y as usize * pitch..y as usize * pitch + row]
+                .copy_from_slice(memory.read(addr, row)?.as_ref());
+        }
+        text.paint(
+            font,
+            paint,
+            Pixels {
+                bounds,
+                pitch: pitch as u32,
+                format: surface.format,
+                bytes,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let changed = (0..bounds.h).try_fold(false, |changed, y| {
+            let original = memory.read(surface.row(bounds.x, bounds.y + y), row)?;
+            Ok::<bool, String>(
+                changed
+                    || original.as_ref() != &bytes[y as usize * pitch..y as usize * pitch + row],
+            )
+        })?;
+        if changed {
+            for y in 0..bounds.h {
+                memory.write(
+                    surface.row(bounds.x, bounds.y + y),
+                    &bytes[y as usize * pitch..y as usize * pitch + row],
+                )?;
+            }
+            self.surfaces.get_mut(&id).unwrap().version += 1;
+        }
+        Ok(changed)
     }
     /// Fill a rectangle with a packed pixel in the destination's own format.
     pub fn fill_raw(

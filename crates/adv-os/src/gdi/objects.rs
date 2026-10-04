@@ -9,6 +9,7 @@ pub struct DcModes {
     pub map: i32,
     pub poly_fill: i32,
     pub stretch: u32,
+    pub text_align: u32,
 }
 impl Default for DcModes {
     fn default() -> Self {
@@ -16,6 +17,7 @@ impl Default for DcModes {
             map: 1,
             poly_fill: 1,
             stretch: 1,
+            text_align: 0,
         }
     }
 }

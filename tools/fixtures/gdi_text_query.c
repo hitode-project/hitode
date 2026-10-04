@@ -26,8 +26,8 @@ void mainCRTStartup(void) {
     int face, charset, count, i;
     if (!dc) ExitProcess(1);
 #ifdef PROBE_TEXTOUT
-    /* A strict run must stop at this known missing capability. A discovery run
-       may return only documented BOOL failure, with no pixels fabricated. */
+    /* The typed implementation explicitly rejects this unbacked default
+       monochrome bitmap target, without reporting pixels or an ABI stub. */
     record(TextOutA(dc, 2, 3, "AV", 2));
 #else
     for (face = 0; face < 3; ++face) for (charset = 0; charset < 3; ++charset) {

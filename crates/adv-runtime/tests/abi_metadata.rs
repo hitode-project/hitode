@@ -102,7 +102,7 @@ fn diagnostic_override_has_the_same_variadic_contract() {
     );
 }
 #[test]
-fn gdi_object_and_extent_bindings_are_generated_but_missing_textout_remains_a_gap() {
+fn gdi_object_extent_and_text_output_bindings_are_generated_without_dispatch_data() {
     let registry = adv_runtime::boot::api_registry(adv_runtime::vorbis::Policy::Guest);
     for name in [
         "GetStockObject",
@@ -127,7 +127,17 @@ fn gdi_object_and_extent_bindings_are_generated_but_missing_textout_remains_a_ga
         assert!(registry.is_implemented("gdi32.dll", name));
         assert_eq!(registry.get("gdi32.dll", name).unwrap().data, 0);
     }
-    assert!(!registry.is_implemented("gdi32.dll", "TextOutA"));
+    for name in [
+        "TextOutA",
+        "TextOutW",
+        "ExtTextOutA",
+        "ExtTextOutW",
+        "SetTextAlign",
+        "GetTextAlign",
+    ] {
+        assert!(registry.is_implemented("gdi32.dll", name));
+        assert_eq!(registry.get("gdi32.dll", name).unwrap().data, 0);
+    }
     assert_eq!(
         registry.get("gdi32.dll", "TextOutA").unwrap().conv,
         adv_abi::Conv::Stdcall { argc: 5 }

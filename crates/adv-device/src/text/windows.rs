@@ -7,6 +7,7 @@ pub(super) struct Font {
     dc: HDC,
     font: HFONT,
     old: HGDIOBJ,
+    owned: bool,
 }
 
 fn encoding(value: Encoding) -> u8 {
@@ -124,6 +125,122 @@ fn decode_family(value: u8) -> Family {
     }
 }
 impl Font {
+    pub(super) fn paint(
+        &self,
+        canvas: &mut Canvas,
+        paint: Paint<'_>,
+        pixels: Pixels<'_>,
+    ) -> Result<(), TextError> {
+        canvas.ensure(pixels.bounds.w, pixels.bounds.h, pixels.format)?;
+        let row = pixels.bounds.w as usize * pixels.format.bytes() as usize;
+        // SAFETY: ensure owns a DIB of at least these dimensions; its storage is
+        // unselected between calls, and GdiFlush completes each render before read.
+        unsafe {
+            for y in 0..pixels.bounds.h as usize {
+                std::ptr::copy_nonoverlapping(
+                    pixels.bytes.as_ptr().add(y * pixels.pitch as usize),
+                    canvas.bits.add(y * canvas.pitch),
+                    row,
+                );
+            }
+            let saved = gdi::SaveDC(self.dc);
+            if saved == 0 {
+                return Err(TextError::Font("SaveDC failed".into()));
+            }
+            let previous = gdi::GetCurrentObject(self.dc, gdi::OBJ_BITMAP as u32);
+            let result = (|| {
+                let old = gdi::SelectObject(self.dc, canvas.bitmap);
+                if old.is_null() || old as usize == usize::MAX {
+                    return Err(TextError::Font("text bitmap selection failed".into()));
+                }
+                gdi::SetViewportOrgEx(
+                    self.dc,
+                    -(pixels.bounds.x as i32),
+                    -(pixels.bounds.y as i32),
+                    std::ptr::null_mut(),
+                );
+                gdi::IntersectClipRect(
+                    self.dc,
+                    pixels.bounds.x as i32,
+                    pixels.bounds.y as i32,
+                    (pixels.bounds.x + pixels.bounds.w) as i32,
+                    (pixels.bounds.y + pixels.bounds.h) as i32,
+                );
+                if let Some(r) = paint.clip {
+                    gdi::IntersectClipRect(self.dc, r.left, r.top, r.right, r.bottom);
+                }
+                let color = |rgb: [u8; 3]| {
+                    u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16)
+                };
+                gdi::SetTextColor(self.dc, color(paint.foreground));
+                gdi::SetBkColor(self.dc, color(paint.background));
+                gdi::SetBkMode(self.dc, if paint.opaque_background { 2 } else { 1 });
+                let align = match paint.horizontal {
+                    Horizontal::Left => 0,
+                    Horizontal::Center => 6,
+                    Horizontal::Right => 2,
+                } | match paint.vertical {
+                    Vertical::Top => 0,
+                    Vertical::Baseline => 24,
+                    Vertical::Bottom => 8,
+                };
+                gdi::SetTextAlign(self.dc, align);
+                let rect = paint.fill.map(|r| windows_sys::Win32::Foundation::RECT {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                });
+                let rectptr = rect.as_ref().map_or(std::ptr::null(), |r| r as *const _);
+                let options = if rect.is_some() { 2 } else { 0 };
+                let ok = match paint.input {
+                    TextInput::Encoded(bytes) => gdi::ExtTextOutA(
+                        self.dc,
+                        paint.origin.x,
+                        paint.origin.y,
+                        options,
+                        rectptr,
+                        bytes.as_ptr(),
+                        bytes.len() as u32,
+                        std::ptr::null(),
+                    ),
+                    TextInput::Unicode(units) => gdi::ExtTextOutW(
+                        self.dc,
+                        paint.origin.x,
+                        paint.origin.y,
+                        options,
+                        rectptr,
+                        units.as_ptr(),
+                        units.len() as u32,
+                        std::ptr::null(),
+                    ),
+                };
+                if ok == 0 {
+                    return Err(TextError::Font("native text paint failed".into()));
+                }
+                if gdi::GdiFlush() == 0 {
+                    return Err(TextError::Font("native text flush failed".into()));
+                }
+                Ok(())
+            })();
+            // Restore before any error return; no cached DC retains the bitmap.
+            if gdi::RestoreDC(self.dc, saved) == 0 {
+                // Even a failed state restoration must not retain a scratch
+                // selection when its owner is later replaced or dropped.
+                gdi::SelectObject(self.dc, previous);
+                return Err(TextError::Font("RestoreDC failed".into()));
+            }
+            result?;
+            for y in 0..pixels.bounds.h as usize {
+                std::ptr::copy_nonoverlapping(
+                    canvas.bits.add(y * canvas.pitch),
+                    pixels.bytes.as_mut_ptr().add(y * pixels.pitch as usize),
+                    row,
+                );
+            }
+        }
+        Ok(())
+    }
     pub(super) fn new(request: &FontRequest) -> Result<Self, TextError> {
         if request.height.unsigned_abs() > 16384 || request.width.unsigned_abs() > 16384 {
             return Err(TextError::Font("invalid font dimensions".into()));
@@ -164,18 +281,38 @@ impl Font {
             if dc.is_null() {
                 return Err(TextError::Font("CreateCompatibleDC failed".into()));
             }
-            let font = gdi::CreateFontIndirectW(&logical);
+            let owned = request.default.is_none();
+            let font = if let Some(kind) = request.default {
+                gdi::GetStockObject(match kind {
+                    DefaultFont::Console => 10,
+                    DefaultFont::Fixed => 11,
+                    DefaultFont::Variable => 12,
+                    DefaultFont::System => 13,
+                    DefaultFont::Device => 14,
+                    DefaultFont::SystemFixed => 16,
+                    DefaultFont::Interface => 17,
+                })
+            } else {
+                gdi::CreateFontIndirectW(&logical)
+            };
             if font.is_null() {
                 gdi::DeleteDC(dc);
                 return Err(TextError::Font("CreateFontIndirectW failed".into()));
             }
             let old = gdi::SelectObject(dc, font);
             if old.is_null() || old as usize == usize::MAX {
-                gdi::DeleteObject(font);
+                if owned {
+                    gdi::DeleteObject(font);
+                }
                 gdi::DeleteDC(dc);
                 return Err(TextError::Font("SelectObject failed".into()));
             }
-            Ok(Self { dc, font, old })
+            Ok(Self {
+                dc,
+                font,
+                old,
+                owned,
+            })
         }
     }
     pub(super) fn metrics(&self) -> Result<TextMetrics, TextError> {
@@ -328,6 +465,120 @@ impl Font {
         })
     }
 }
+
+/// One bounded scratch bitmap shared by the font cache, never by guest handles.
+pub(super) struct Canvas {
+    bitmap: gdi::HBITMAP,
+    bits: *mut u8,
+    width: u32,
+    height: u32,
+    pitch: usize,
+    format: crate::surface::PixelFormat,
+}
+impl Default for Canvas {
+    fn default() -> Self {
+        Self {
+            bitmap: std::ptr::null_mut(),
+            bits: std::ptr::null_mut(),
+            width: 0,
+            height: 0,
+            pitch: 0,
+            format: crate::surface::PixelFormat::Bgra32,
+        }
+    }
+}
+impl Canvas {
+    fn ensure(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: crate::surface::PixelFormat,
+    ) -> Result<(), TextError> {
+        if !self.bitmap.is_null()
+            && self.width >= width
+            && self.height >= height
+            && self.format == format
+        {
+            return Ok(());
+        }
+        let width = width
+            .checked_next_power_of_two()
+            .ok_or_else(|| TextError::Font("text canvas width overflow".into()))?;
+        let height = height
+            .checked_next_power_of_two()
+            .ok_or_else(|| TextError::Font("text canvas height overflow".into()))?;
+        let pitch = (width as usize * format.bytes() as usize + 3) & !3;
+        if pitch
+            .checked_mul(height as usize)
+            .is_none_or(|n| n > 32 * 1024 * 1024)
+        {
+            return Err(TextError::Font(
+                "text canvas exceeds allocation limit".into(),
+            ));
+        }
+        #[repr(C)]
+        struct Info {
+            header: gdi::BITMAPINFOHEADER,
+            masks: [u32; 3],
+        }
+        let masks = format.masks();
+        let info = Info {
+            header: gdi::BITMAPINFOHEADER {
+                biSize: 40,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: (format.bytes() * 8) as u16,
+                biCompression: if format.bytes() == 2 { 3 } else { 0 },
+                ..Default::default()
+            },
+            masks: [masks.0, masks.1, masks.2],
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: info has the header and three bitfield masks when needed;
+        // acquired bitmap is not selected, and replacement is transactional.
+        let bitmap = unsafe {
+            gdi::CreateDIBSection(
+                std::ptr::null_mut(),
+                &info as *const Info as *const gdi::BITMAPINFO,
+                0,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if bitmap.is_null() || bits.is_null() {
+            if !bitmap.is_null() {
+                unsafe {
+                    gdi::DeleteObject(bitmap);
+                }
+            }
+            return Err(TextError::Font("text canvas allocation failed".into()));
+        }
+        let old = std::mem::replace(
+            self,
+            Self {
+                bitmap,
+                bits: bits.cast(),
+                width,
+                height,
+                pitch,
+                format,
+            },
+        );
+        drop(old);
+        Ok(())
+    }
+}
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        if !self.bitmap.is_null() {
+            unsafe {
+                gdi::DeleteObject(self.bitmap);
+            }
+        }
+    }
+}
 fn contours(bytes: &[u8]) -> Result<Vec<Contour>, TextError> {
     let invalid = || TextError::Glyph("invalid native outline result".into());
     let u32_at = |at: usize| -> Result<u32, TextError> {
@@ -399,7 +650,9 @@ impl Drop for Font {
         // SAFETY: restore the owned DC's previous selection before releasing its font.
         unsafe {
             gdi::SelectObject(self.dc, self.old);
-            gdi::DeleteObject(self.font);
+            if self.owned {
+                gdi::DeleteObject(self.font);
+            }
             gdi::DeleteDC(self.dc);
         }
     }

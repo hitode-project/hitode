@@ -724,7 +724,9 @@ fn glyph_cache_separates_transform_encoding_and_selected_font() {
     machine.cpu.write(matrix, &transform).unwrap();
     assert!(query(&mut machine, "GetGlyphOutlineW") > original);
     assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 3);
-    invoke(&mut machine, data, "SelectObject", &[dc, STOCK_FONT]);
+    // Use a stock outline font. SYSTEM_FONT is a bitmap font and native
+    // GetGlyphOutline correctly fails for it.
+    invoke(&mut machine, data, "SelectObject", &[dc, 0x0190_0010 + 17]);
     assert_ne!(query(&mut machine, "GetGlyphOutlineW"), GDI_ERROR);
     assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 4);
     assert_eq!(machine.ext.get::<Fonts>().text.stats().hits, 1);

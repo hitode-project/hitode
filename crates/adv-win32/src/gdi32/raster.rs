@@ -82,8 +82,12 @@ impl Raster {
                 || height == 0
                 || height == i32::MIN
                 || h[12..14] != 1u16.to_le_bytes()
-                || !matches!(u16::from_le_bytes(h[14..16].try_into().unwrap()), 16 | 32)
-                || h[16..20] != [0; 4]
+                || !matches!(
+                    u16::from_le_bytes(h[14..16].try_into().unwrap()),
+                    16 | 24 | 32
+                )
+                || !(h[16..20] == [0; 4]
+                    || (h[16..20] == 3u32.to_le_bytes() && h[14..16] == 16u16.to_le_bytes()))
                 || usage != 0
                 || section != 0
             {
@@ -93,7 +97,22 @@ impl Raster {
                 return Ok(self.fail(87));
             }
             let format = if h[14..16] == 16u16.to_le_bytes() {
-                PixelFormat::Rgb555
+                if h[16..20] == [0; 4] {
+                    PixelFormat::Rgb555
+                } else {
+                    let Some(address) = info.checked_add(40) else {
+                        return Ok(self.fail(87));
+                    };
+                    let masks = m.read(address, 12)?;
+                    let mask = |at| u32::from_le_bytes(masks[at..at + 4].try_into().unwrap());
+                    match (mask(0), mask(4), mask(8)) {
+                        (0x7c00, 0x3e0, 0x1f) => PixelFormat::Rgb555,
+                        (0xf800, 0x7e0, 0x1f) => PixelFormat::Rgb565,
+                        _ => return Ok(self.fail(87)),
+                    }
+                }
+            } else if h[14..16] == 24u16.to_le_bytes() {
+                PixelFormat::Bgr24
             } else {
                 PixelFormat::Bgra32
             };

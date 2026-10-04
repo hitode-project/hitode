@@ -93,6 +93,8 @@ pub struct Clipping {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FontRequest {
+    /// A platform default is selected directly, rather than guessed by face name.
+    pub default: Option<DefaultFont>,
     pub face: String,
     pub height: i32,
     pub width: i32,
@@ -109,6 +111,56 @@ pub struct FontRequest {
     pub quality: Quality,
     pub pitch: Pitch,
     pub family: Family,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DefaultFont {
+    Console,
+    Fixed,
+    Variable,
+    System,
+    Device,
+    SystemFixed,
+    Interface,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum Horizontal {
+    Left,
+    Center,
+    Right,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum Vertical {
+    Top,
+    Baseline,
+    Bottom,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct TextBox {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+#[derive(Clone, Copy)]
+pub struct Paint<'a> {
+    pub input: TextInput<'a>,
+    pub origin: Point,
+    pub horizontal: Horizontal,
+    pub vertical: Vertical,
+    /// RGB colors resolved by the personality layer.
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub opaque_background: bool,
+    pub clip: Option<TextBox>,
+    pub fill: Option<TextBox>,
+}
+pub const MAX_PAINT_UNITS: usize = 8192;
+/// A bounded patch in logical top-down order; the original pixel format is kept.
+pub struct Pixels<'a> {
+    pub bounds: crate::surface::Rect,
+    pub pitch: u32,
+    pub format: crate::surface::PixelFormat,
+    pub bytes: &'a mut [u8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -285,6 +337,8 @@ impl std::fmt::Display for TextError {
 pub struct Text {
     #[cfg(windows)]
     fonts: BTreeMap<FontRequest, windows::Font>,
+    #[cfg(windows)]
+    canvas: Option<windows::Canvas>,
     glyphs: BTreeMap<(FontRequest, GlyphRequest), Arc<Glyph>>,
     bytes: usize,
     hits: u64,
@@ -293,6 +347,53 @@ pub struct Text {
 /// results are immutable and remain valid after the native owner is evicted.
 pub const FONT_CACHE_CAPACITY: usize = 128;
 impl Text {
+    /// Rasterize a complete counted run with the same selected font as queries.
+    pub fn paint(
+        &mut self,
+        request: &FontRequest,
+        paint: Paint<'_>,
+        pixels: Pixels<'_>,
+    ) -> Result<(), TextError> {
+        let units = match paint.input {
+            TextInput::Encoded(bytes) => bytes.len(),
+            TextInput::Unicode(units) => units.len(),
+        };
+        if units > MAX_PAINT_UNITS {
+            return Err(TextError::Font("text run exceeds paint limit".into()));
+        }
+        let row = pixels.bounds.w.checked_mul(pixels.format.bytes());
+        let length = pixels.pitch.checked_mul(pixels.bounds.h);
+        if row.is_none_or(|row| row > pixels.pitch)
+            || length.is_none_or(|length| {
+                length as usize > pixels.bytes.len() || length > 32 * 1024 * 1024
+            })
+            || pixels
+                .bounds
+                .x
+                .checked_add(pixels.bounds.w)
+                .is_none_or(|n| n > i32::MAX as u32)
+            || pixels
+                .bounds
+                .y
+                .checked_add(pixels.bounds.h)
+                .is_none_or(|n| n > i32::MAX as u32)
+            || pixels.bounds.w == 0
+            || pixels.bounds.h == 0
+        {
+            return Err(TextError::Font("invalid text pixel storage".into()));
+        }
+        #[cfg(windows)]
+        {
+            self.font(request)?;
+            let canvas = self.canvas.get_or_insert_with(windows::Canvas::default);
+            self.fonts[request].paint(canvas, paint, pixels)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (request, paint, pixels);
+            Err(TextError::Unavailable)
+        }
+    }
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             fonts: self.font_count(),

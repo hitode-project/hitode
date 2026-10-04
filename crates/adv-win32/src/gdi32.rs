@@ -498,8 +498,6 @@ pub fn register(reg: &mut Registry) {
     ] {
         reg.register(api);
     }
-    // TextOut remains a generated, observed failure until the real raster path
-    // is installed. Registering a success-only handler would hide missing pixels.
     font::register(reg);
     raster::register(reg);
 }

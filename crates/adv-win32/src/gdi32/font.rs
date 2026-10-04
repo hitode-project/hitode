@@ -10,6 +10,7 @@ use adv_device::text::{
 use adv_machine::Machine;
 use std::borrow::Cow;
 
+mod paint;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -23,6 +24,7 @@ struct Fonts {
 }
 
 pub fn register(registry: &mut Registry) {
+    paint::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,
@@ -111,16 +113,25 @@ fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
         from_font(font)
     } else {
         FontRequest {
-            face: "Segoe UI".into(),
-            height: 16,
+            default: Some(match font.wrapping_sub(0x0190_0010) {
+                10 => text::DefaultFont::Console,
+                11 => text::DefaultFont::Fixed,
+                12 => text::DefaultFont::Variable,
+                14 => text::DefaultFont::Device,
+                16 => text::DefaultFont::SystemFixed,
+                17 => text::DefaultFont::Interface,
+                _ => text::DefaultFont::System,
+            }),
+            face: String::new(),
+            height: 0,
             width: 0,
             baseline_angle: 0,
             glyph_angle: 0,
-            weight: 400,
+            weight: 0,
             italic: false,
             underline: false,
             strikeout: false,
-            encoding: Encoding::Latin,
+            encoding: Encoding::Automatic,
             precision: Precision::Default,
             clipping: Clipping {
                 precision: ClipPrecision::Default,
@@ -474,6 +485,7 @@ fn from_font(font: &LogFont) -> FontRequest {
     let raw = &font.raw;
     let integer = |at| i32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
     FontRequest {
+        default: None,
         face: font.face.clone(),
         height: integer(0),
         width: integer(4),

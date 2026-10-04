@@ -1,4 +1,4 @@
-//! Owned x86 fixtures: native whole-string measurements and strict missing drawing.
+//! Owned x86 fixtures: native measurements and an unsupported mono drawing target.
 #![cfg(windows)]
 use adv_machine::{Clock, RunResult, SliceResult};
 use adv_runtime::{RunMode, boot::Runtime};
@@ -57,6 +57,7 @@ fn runtime(directory: &Path, executable: &str, backend: &str, suffix: &str) -> R
         32,
     )
     .unwrap();
+    runtime.set_api_mode(RunMode::Strict);
     runtime.machine.sys.clock = Clock::virtual_time();
     runtime
         .machine
@@ -127,43 +128,23 @@ fn selected_fonts_and_counted_ansi_utf16_extents_match_native_and_three_cpus() {
     }
 }
 #[test]
-fn missing_textout_stops_strict_and_discovery_returns_only_bool_failure() {
+fn unsupported_mono_target_returns_failure_without_a_stub_or_false_success() {
     let directory = fixtures();
     for backend in ["interpreter", "jit"] {
-        for mode in [RunMode::Strict, RunMode::Discovery] {
-            let suffix = format!("stub-{backend}-{mode:?}");
-            let actual_path = directory.join(&suffix).join("overlay/gdi-text-query.bin");
-            if actual_path.exists() {
-                std::fs::remove_file(&actual_path).unwrap();
-            }
-            let mut runtime = runtime(directory, "fixture_gdi_textout-stub.exe", backend, &suffix);
-            runtime.set_api_mode(mode);
-            let result = run(&mut runtime);
-            match (&result, mode) {
-                (RunResult::Failed(error), RunMode::Strict) => assert!(
-                    error
-                        .message
-                        .contains("gdi32.dll!TextOutA (strict ABI stub)")
-                ),
-                (RunResult::Exited(0), RunMode::Discovery) => assert_eq!(
-                    std::fs::read(actual_path).unwrap(),
-                    [0u32, 1]
-                        .into_iter()
-                        .flat_map(u32::to_le_bytes)
-                        .collect::<Vec<_>>()
-                ),
-                _ => panic!("{backend}/{mode:?}: {result:?}"),
-            }
-            let diagnostics = runtime.api_diagnostics().unwrap();
-            assert_eq!(diagnostics.stub_calls, 1);
-            assert_eq!(diagnostics.gaps["gdi32.dll!TextOutA"], 1);
-            assert!(!runtime.api_acceptance_eligible());
-            assert!(
-                runtime
-                    .missing_apis()
-                    .iter()
-                    .any(|name| name == "gdi32.dll!TextOutA")
-            );
+        let suffix = format!("unsupported-target-{backend}");
+        let actual_path = directory.join(&suffix).join("overlay/gdi-text-query.bin");
+        if actual_path.exists() {
+            std::fs::remove_file(&actual_path).unwrap();
         }
+        let mut runtime = runtime(directory, "fixture_gdi_textout-stub.exe", backend, &suffix);
+        assert!(matches!(run(&mut runtime), RunResult::Exited(0)));
+        assert_eq!(
+            std::fs::read(actual_path).unwrap(),
+            [0u32, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(runtime.api_diagnostics().map_or(0, |d| d.stub_calls), 0);
     }
 }

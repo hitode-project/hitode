@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 // Authored graphics fixtures use the production machine/ABI path for every backend.
 #[path = "../../tests/support/cpu.rs"]
-mod cpu;
+pub mod cpu;
 use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_cpu::{Region, RunOutcome};

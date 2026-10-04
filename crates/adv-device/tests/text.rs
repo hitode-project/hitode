@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 fn font() -> FontRequest {
     FontRequest {
+        default: None,
         face: "Arial".into(),
         height: -24,
         width: 0,

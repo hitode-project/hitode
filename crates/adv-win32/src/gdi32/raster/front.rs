@@ -28,6 +28,9 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) {
 pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
     ext.get_mut::<State>().provider = Some(provider);
 }
+pub(crate) fn provider(ext: &Ext) -> Option<DrawingProvider> {
+    ext.try_get::<State>().and_then(|state| state.provider)
+}
 /// Stable diagnostic ids, independent of runtime ABI decoding.
 pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::GET_DC, get_dc_ABI),
@@ -221,6 +224,20 @@ fn create_dib(
 ) -> Outcome {
     if !available(env) {
         return fail(env, 50); // A raster store is required; no placeholder bitmap.
+    }
+    if adv_abi::guest::check_range(env.cpu, bits.addr(), 4, Prot::WRITE).is_err()
+        || adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err()
+    {
+        return fail(env, 87);
+    }
+    let mut header = [0; 40];
+    if env.cpu.read(info.addr(), &mut header).is_err() {
+        return fail(env, 87);
+    }
+    if header[16..20] == 3u32.to_le_bytes()
+        && adv_abi::guest::check_range(env.cpu, info.addr(), 52, Prot::READ).is_err()
+    {
+        return fail(env, 87);
     }
     raster_call(env, |r, s, d, o, m| {
         r.create_dib(
