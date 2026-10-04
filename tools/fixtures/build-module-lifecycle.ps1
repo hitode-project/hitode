@@ -44,4 +44,8 @@ Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module
 Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_self_exit.exe", "$OutputDirectory/module_self_exit.obj", 'kernel32.lib'))
 Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module_forwarder.c'), "/Fo$OutputDirectory/module_forwarder.obj"))
 Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_forwarder.exe", "$OutputDirectory/module_forwarder.obj", 'kernel32.lib'))
+Invoke-LifecycleChecked (Join-Path $LlvmBin 'llvm-rc.exe') @('/nologo', "/fo$OutputDirectory/resource_handles.res", (Join-Path $PSScriptRoot 'resource_handles.rc'))
+Invoke-LifecycleChecked $linker ($link + @('/dll', '/noentry', '/base:0x18000000', "/out:$OutputDirectory/lifecycle_resources.dll", "$OutputDirectory/resource_handles.res"))
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'resource_handles.c'), "/Fo$OutputDirectory/resource_handles.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_resource_handles.exe", "$OutputDirectory/resource_handles.obj", 'kernel32.lib'))
 Write-Output "Built x86 module lifecycle fixtures in $OutputDirectory"

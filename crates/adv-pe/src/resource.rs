@@ -22,6 +22,8 @@ impl ResId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceData {
+    /// RVA of IMAGE_RESOURCE_DATA_ENTRY, used as the image-owned HRSRC.
+    pub entry_rva: u32,
     /// RVA of the data in the mapped image (LoadResource returns `base + rva`).
     pub rva: u32,
     pub size: u32,
@@ -149,6 +151,7 @@ fn parse_dir(pe: &Pe, root: u32, off: u32, depth: u32) -> Result<ResourceDir> {
         } else {
             let de = root + target;
             ResourceNode::Data(ResourceData {
+                entry_rva: de,
                 rva: pe.u32_at(de)?,
                 size: pe.u32_at(de + 4)?,
                 codepage: pe.u32_at(de + 8)?,

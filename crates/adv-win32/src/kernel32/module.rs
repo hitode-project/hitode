@@ -94,12 +94,6 @@ fn locked(env: &mut Env<'_>, operation: impl FnOnce(&mut Env<'_>) -> Outcome + '
 }
 
 fn retire(env: &mut Env<'_>, id: ModuleId) -> Result<(), String> {
-    let module = adv_os::modules(env.ext).get(id);
-    let (base, size) = (module.base, module.size);
-    env.ext
-        .get_mut::<Win32>()
-        .resources
-        .retain(|_, (address, _)| address.wrapping_sub(base) >= size);
     let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
     Loader::new(env.cpu, env.sys, modules, &win32.vfs)
         .retire(id)
@@ -474,7 +468,7 @@ pub(crate) fn find_resource_data(
 ) -> Option<(u32, u32)> {
     let m = adv_os::modules(env.ext).get(module_of(env, h)?);
     let (_, data) = m.resources.as_ref()?.find(ty, name, None)?;
-    Some((m.base + data.rva, data.size))
+    resource_data(env, h, m.base + data.entry_rva)
 }
 
 fn find_resource(
@@ -500,34 +494,34 @@ fn find_resource(
         set_last_error(env, err::RESOURCE_NAME_NOT_FOUND);
         return Outcome::Return(0);
     };
-    let addr = m.base + data.rva;
-    let w = env.ext.get_mut::<Win32>();
-    let h = w.next_hrsrc;
-    w.next_hrsrc += 0x10;
-    w.resources.insert(h, (addr, data.size));
-    Outcome::Return(h)
+    // HRSRC is an address in the owning image, not a separately allocated
+    // handle. Repeated queries are stable and unload retires it with the image.
+    Outcome::Return(m.base + data.entry_rva)
 }
 
-fn load_resource(env: &mut Env<'_>) -> Outcome {
-    let r = env.arg(1);
-    Outcome::Return(
-        env.ext
-            .get::<Win32>()
-            .resources
-            .get(&r)
-            .map_or(0, |&(a, _)| a),
-    )
+fn resource_data(env: &Env<'_>, module: u32, resource: u32) -> Option<(u32, u32)> {
+    let image = adv_os::modules(env.ext).get(module_of(env, module)?);
+    let entry = resource.checked_sub(image.base)?;
+    if entry.checked_add(16)? > image.size {
+        return None;
+    }
+    // Observe the live data entry, including intentional resource patches.
+    let rva = env.cpu.read_u32(resource).ok()?;
+    let size = env.cpu.read_u32(resource + 4).ok()?;
+    if rva.checked_add(size)? > image.size {
+        return None;
+    }
+    Some((image.base.checked_add(rva)?, size))
 }
 
-fn sizeof_resource(env: &mut Env<'_>) -> Outcome {
-    let r = env.arg(1);
-    Outcome::Return(
-        env.ext
-            .get::<Win32>()
-            .resources
-            .get(&r)
-            .map_or(0, |&(_, s)| s),
-    )
+#[win32(kernel32, name = "LoadResource", level = implement)]
+fn load_resource(env: &mut Env<'_>, module: Handle, resource: Handle) -> Handle {
+    Handle(resource_data(env, module.0, resource.0).map_or(0, |(address, _)| address))
+}
+
+#[win32(kernel32, name = "SizeofResource", level = implement)]
+fn sizeof_resource(env: &mut Env<'_>, module: Handle, resource: Handle) -> u32 {
+    resource_data(env, module.0, resource.0).map_or(0, |(_, size)| size)
 }
 
 pub(super) fn register(reg: &mut Registry) {
@@ -621,8 +615,8 @@ pub(super) fn register(reg: &mut Registry) {
         let (h, t, n, l) = (e.arg(0), e.arg(1), e.arg(2), e.arg(3));
         find_resource(e, h, n, t, Some(l as u16), false)
     });
-    stdcall(reg, K32, "LoadResource", 2, load_resource);
+    reg.register(load_resource_ABI);
     stdcall(reg, K32, "LockResource", 1, |e| Outcome::Return(e.arg(0)));
-    stdcall(reg, K32, "SizeofResource", 2, sizeof_resource);
+    reg.register(sizeof_resource_ABI);
     stdcall(reg, K32, "FreeResource", 1, |_| Outcome::Return(0));
 }

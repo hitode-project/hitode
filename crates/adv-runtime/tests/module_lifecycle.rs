@@ -12,6 +12,64 @@ use adv_runtime::boot::Runtime;
 mod backend;
 
 #[test]
+fn resource_handles_are_stable_image_entries_and_observe_live_metadata() {
+    let directory = fixtures();
+    let exe = directory.join("fixture_resource_handles.exe");
+    let _ = std::fs::remove_file(directory.join("resource-handles.bin"));
+    let mut child = Command::new(&exe)
+        .current_dir(&directory)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "native resource handles: {status:?}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("native resource handles timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let golden = std::fs::read(directory.join("resource-handles.bin")).unwrap();
+    assert_eq!(
+        golden,
+        [
+            8u32, 0x12345678, 0x9abcdef0, 1, 1, 1, 1, 1, 1, 4, 0x9abcdef0, 0, 1, 0
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>()
+    );
+    for name in ["jit", "interpreter", "unicorn"] {
+        let data = directory.join("resources").join(name);
+        let _ = std::fs::remove_file(data.join("overlay/resource-handles.bin"));
+        let mut runtime =
+            Runtime::with_cpu(&exe, &data, backend::Cpu::new(name).unwrap(), 64, 32).unwrap();
+        runtime.machine.sys.clock = adv_machine::Clock::virtual_time();
+        runtime.machine.cpu.set_async_compilation(false);
+        let result = runtime.machine.run_virtual(10_000_000);
+        assert!(
+            matches!(result, RunResult::Exited(0)),
+            "{name}: {result:?}; {:?}",
+            runtime.machine.sys.recent_calls()
+        );
+        assert_eq!(
+            std::fs::read(data.join("overlay/resource-handles.bin")).unwrap(),
+            golden,
+            "{name}: image-owned resource identity or metadata differs from Windows"
+        );
+        assert!(
+            adv_os::modules(&runtime.machine.ext)
+                .by_name("lifecycle_resources.dll")
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn dynamic_forwarders_initialize_or_roll_back_before_returning() {
     let directory = fixtures();
     let exe = directory.join("fixture_module_forwarder.exe");

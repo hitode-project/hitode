@@ -74,9 +74,6 @@ pub struct Win32 {
     pub codec: Codec,
     pub vfs: Vfs,
     pub tls_used: [bool; 64],
-    /// HRSRC -> (data address, size).
-    pub resources: HashMap<u32, (u32, u32)>,
-    pub next_hrsrc: u32,
     pub unhandled_filter: u32,
     pub user: user32::User,
     pub gdi: gdi32::Gdi,
@@ -107,8 +104,6 @@ impl Win32 {
             codec: Codec::new(cfg.os.codepage),
             vfs,
             tls_used: [false; 64],
-            resources: HashMap::new(),
-            next_hrsrc: 0x7e80_0000,
             unhandled_filter: 0,
             statics: HashMap::new(),
             loader_lock: None,
