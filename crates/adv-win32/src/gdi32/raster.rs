@@ -7,6 +7,7 @@ use adv_device::surface::{
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
 pub mod front;
+mod fill;
 pub use front::{DrawingProvider, install, register, set_provider};
 
 pub mod api {

@@ -11,6 +11,7 @@ mod input;
 mod menu;
 pub mod message;
 mod resources;
+mod system_parameters;
 pub(crate) mod strings;
 pub mod window;
 
@@ -393,6 +394,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    system_parameters::register(reg);
     window::register(reg);
     message::register(reg);
     controls::register(reg);

@@ -391,6 +391,7 @@ pub struct User {
     pub swap_buttons: bool,
     /// The guest's installed input profile, shared by all its current threads.
     pub keyboard_layout: u32,
+    pub icon_title_font: super::system_parameters::IconFont,
     pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
     pub cursor_count: i32,
@@ -426,6 +427,7 @@ impl User {
             input_tracking: None,
             swap_buttons: false,
             keyboard_layout: 0x0411_0411,
+            icon_title_font: super::system_parameters::IconFont::default(),
             clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
             cursor_count: 0,

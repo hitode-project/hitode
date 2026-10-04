@@ -46,6 +46,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::FLUSH, flush_ABI),
 ];
 pub fn register(registry: &mut Registry) {
+    super::fill::register(registry);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
