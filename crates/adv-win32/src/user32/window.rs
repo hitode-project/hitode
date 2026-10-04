@@ -380,6 +380,9 @@ pub struct User {
     pub input_tracking: Option<Box<super::message::InputTracking>>,
     /// SM_SWAPBUTTON, shared by GetSystemMetrics and PAL input sampling.
     pub swap_buttons: bool,
+    /// The guest's installed input profile, shared by all its current threads.
+    pub keyboard_layout: u32,
+    pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
     pub cursor_count: i32,
 }
@@ -413,6 +416,8 @@ impl User {
             host_keys: None,
             input_tracking: None,
             swap_buttons: false,
+            keyboard_layout: 0x0411_0411,
+            clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
             cursor_count: 0,
         };
@@ -575,6 +580,7 @@ impl User {
     }
 
     fn remove_window(&mut self, hwnd: u32, objects: &mut adv_machine::Objects) {
+        self.clipboard.remove_window(hwnd);
         self.menus.remove_window(hwnd, objects);
         let Some(w) = self.windows.remove(objects, &hwnd) else {
             return;
@@ -1067,11 +1073,14 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
             .map(|&h| [h, wm::NCDESTROY, 0, 0])
             .collect();
         send_all(env, msgs, move |env| {
-            let u = &mut env.ext.get_mut::<crate::Win32>().user;
-            for h in all.iter().rev() {
-                u.remove_window(*h, &mut env.sys.objects);
-            }
-            then(env, true)
+            let removed = all.clone();
+            super::clipboard::remove_windows(env, &removed, move |env| {
+                let u = &mut env.ext.get_mut::<crate::Win32>().user;
+                for h in all.iter().rev() {
+                    u.remove_window(*h, &mut env.sys.objects);
+                }
+                then(env, true)
+            })
         })
     });
     let destroy: Then = Box::new(move |env| {

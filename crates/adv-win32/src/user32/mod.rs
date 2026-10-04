@@ -3,9 +3,11 @@
 //! formatting/message-box helpers Game.exe uses.
 
 pub mod compat;
+pub(crate) mod clipboard;
 pub mod controls;
 pub mod dialog;
 pub mod host_input;
+mod input;
 mod menu;
 pub mod message;
 mod resources;
@@ -45,7 +47,9 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
         static_: proc(controls::STATIC_PROC)?,
         edit: proc(controls::EDIT_PROC)?,
     };
-    m.ext.get_mut::<Win32>().user.add_system_classes(procs);
+    let win32 = m.ext.get_mut::<Win32>();
+    win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);
+    win32.user.add_system_classes(procs);
     Ok(())
 }
 
@@ -388,6 +392,8 @@ pub fn register(reg: &mut Registry) {
     dialog::register(reg);
     strings::register(reg);
     menu::register(reg);
+    input::register(reg);
+    clipboard::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     // WINAPIV is cdecl with a two-argument mandatory prefix, not a fixed signature.
     reg.add(

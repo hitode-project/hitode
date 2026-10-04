@@ -10,6 +10,7 @@ pub use adv_win32::winmm::mmio;
 mod report;
 pub use adv_win32::vorbisfile as vorbis;
 pub use adv_abi::RunMode;
+pub use adv_win32::user32::host_input::mouse_mapping;
 pub use adv_cpu::CompileStrategy;
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
 pub use graphics::{

@@ -218,19 +218,21 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
             env,
             calls,
             Box::new(move |env| {
-                if let Err(error) = crate::msvcrt::detach_thread(env) {
-                    return Outcome::Fail(error);
-                }
-                if env
-                    .sys
-                    .contexts
-                    .iter()
-                    .all(|context| context.id == env.sys.current || context.is_done())
-                {
-                    exit_process(env, code)
-                } else {
-                    Outcome::ExitThread(code)
-                }
+                crate::user32::clipboard::exit_thread(env, move |env| {
+                    if let Err(error) = crate::msvcrt::detach_thread(env) {
+                        return Outcome::Fail(error);
+                    }
+                    if env
+                        .sys
+                        .contexts
+                        .iter()
+                        .all(|context| context.id == env.sys.current || context.is_done())
+                    {
+                        exit_process(env, code)
+                    } else {
+                        Outcome::ExitThread(code)
+                    }
+                })
             }),
         )
     })

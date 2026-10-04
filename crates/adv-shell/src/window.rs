@@ -524,9 +524,16 @@ mod native {
                             return 0;
                         }
                         let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
-                        state.events.push_back(Event::Input {
+                        // Windows messages are already logical. Normalize to
+                        // physical buttons before publishing live key state.
+                        let (physical_message, physical_buttons) = adv_runtime::mouse_mapping(
                             message,
-                            wparam: wparam as u32,
+                            wparam as u32,
+                            GetSystemMetrics(SM_SWAPBUTTON) != 0,
+                        );
+                        state.events.push_back(Event::Input {
+                            message: physical_message,
+                            wparam: physical_buttons,
                             lparam: position,
                         });
                         if matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {

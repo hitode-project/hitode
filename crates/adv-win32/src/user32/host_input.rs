@@ -6,6 +6,24 @@ use super::User;
 use super::window::make_long;
 use crate::Win32;
 
+/// Involutive mapping between physical L/R and logical primary/secondary.
+/// The platform adapter uses it once to undo host mapping; this frontend uses
+/// it once to apply the guest mapping. Keyboard/Ctrl and wheel high bits stay intact.
+pub fn mouse_mapping(message: u32, buttons: u32, swapped: bool) -> (u32, u32) {
+    if !swapped || !(0x200..=0x20e).contains(&message) {
+        return (message, buttons);
+    }
+    let message = match message {
+        0x201..=0x203 => message + 3,
+        0x204..=0x206 => message - 3,
+        _ => message,
+    };
+    (
+        message,
+        (buttons & !3) | ((buttons & 1) << 1) | ((buttons & 2) >> 1),
+    )
+}
+
 /// Post input to the foremost visible window's thread. Keyboard messages use
 /// its valid focus window; mouse messages use its valid capture window.
 pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
@@ -44,6 +62,7 @@ pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
             }
         }
     }
+    let (message, wparam) = mouse_mapping(message, wparam, user.swap_buttons);
     super::message::post_input(env, hwnd, message, wparam, lparam)
 }
 
