@@ -87,6 +87,7 @@ pub mod wm {
     pub const RBUTTONUP: u32 = 0x205;
     pub const MOUSEWHEEL: u32 = 0x20a;
     pub const PARENTNOTIFY: u32 = 0x210;
+    pub const DWMNCRENDERINGCHANGED: u32 = 0x31f;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -955,6 +956,16 @@ pub fn create_window(
             temp_free(env, cs);
             // Native USER32 sends NCDESTROY, but not DESTROY, when NCCREATE fails.
             return destroy_boxed(env, hwnd, false, Box::new(move |env, _| then(env, 0)));
+        }
+        // The virtual desktop is composited. Native USER queues this initial
+        // notification after NCCREATE succeeds, before CREATE, for decorated
+        // top-level windows. Bare popups, children and HWND_MESSAGE are excluded.
+        if p.parent != (-3i32) as u32
+            && let Some(win) = user(env).windows.get(&env.sys.objects, &hwnd)
+            && win.style & WS_CHILD == 0
+            && (win.style & WS_CAPTION == WS_CAPTION || win.style & WS_THICKFRAME != 0)
+        {
+            super::message::post_system(env, hwnd, wm::DWMNCRENDERINGCHANGED, 1);
         }
         send(env, hwnd, wm::CREATE, 0, cs, move |env, r| {
             temp_free(env, cs);

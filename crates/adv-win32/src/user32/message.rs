@@ -24,6 +24,8 @@ use crate::util::{cstr, put_cstr};
 use crate::{Win32, stdcall};
 
 #[cfg(test)]
+mod dwm_tests;
+#[cfg(test)]
 mod keyboard_tests;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,6 +44,9 @@ pub struct Msg {
     /// Queue-local key update captured from this input message, independent of
     /// the live physical state which may already include later releases.
     pub input_key: Option<KeyTransition>,
+    /// USER-generated post: QS_POSTMESSAGE without QS_ALLPOSTMESSAGE. This
+    /// origin is private queue metadata, never inferred from the message number.
+    pub(super) system: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -257,6 +262,7 @@ impl Msg {
             input: false,
             input_receipt: 0,
             input_key: None,
+            system: false,
         }
     }
 }
@@ -383,6 +389,7 @@ fn post_kind(
             input,
             input_receipt,
             input_key: input.then(|| key_transition(msg, wparam, lparam)).flatten(),
+            system: false,
         },
     );
     if posted && input {
@@ -396,6 +403,28 @@ fn post_to_thread(env: &mut Env<'_>, ctx: adv_machine::CtxId, m: Msg) -> bool {
     user_mut(env).queue(ctx).post(m);
     queue_changed(env, ctx);
     true
+}
+
+/// Lifecycle notifications use the existing owning thread's posted queue.
+/// They carry no physical-input receipt and do not manufacture keyboard state.
+pub(super) fn post_system(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32) {
+    let Some(ctx) = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map(|w| w.thread)
+    else {
+        return;
+    };
+    let message = Msg {
+        hwnd,
+        msg,
+        wparam,
+        time: env.sys.clock.now_ms(),
+        pt: user(env).cursor_pos,
+        system: true,
+        ..Default::default()
+    };
+    post_to_thread(env, ctx, message);
 }
 
 /// Notify both message retrieval and MsgWait. The latter needs a persistent,
@@ -470,7 +499,7 @@ const QS_ALLPOSTMESSAGE: u32 = 0x100;
 
 pub(super) fn posted_status(m: &Msg) -> u32 {
     if !m.input {
-        return QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+        return QS_POSTMESSAGE | if m.system { 0 } else { QS_ALLPOSTMESSAGE };
     }
     match m.msg {
         wm::KEYDOWN | wm::KEYUP | wm::SYSKEYDOWN | 0x105 => 1, // WM_SYSKEYUP
@@ -567,6 +596,13 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
     let now_ms = env.sys.clock.now_ms();
     let frame = env.sys.frame;
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    // Native retrieval discards lifecycle posts whose HWND was destroyed,
+    // including WM_CREATE failure. Before retrieval their category remains
+    // observable through GetQueueStatus; the post never owns the window.
+    if let Some(q) = u.queues.get_mut(&ctx) {
+        q.posted
+            .retain(|m| !m.system || u.windows.contains_key(&env.sys.objects, &m.hwnd));
+    }
     let mut found = None;
     {
         let posted = &u.queues.get(&ctx).map(|q| &q.posted);
@@ -618,6 +654,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
             input: false,
             input_receipt: 0,
             input_key: None,
+            system: false,
         });
     }
     if f.range(wm::PAINT) {
@@ -641,6 +678,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 input: false,
                 input_receipt: 0,
                 input_key: None,
+                system: false,
             });
         }
     }
@@ -664,6 +702,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 input: false,
                 input_receipt: 0,
                 input_key: None,
+                system: false,
             };
             if remove {
                 t.due_us = now + t.interval_us;
@@ -977,6 +1016,7 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
             input: false,
             input_receipt: 0,
             input_key: None,
+            system: false,
         },
     )))
 }
@@ -1357,6 +1397,7 @@ mod receipt_tests {
             input: receipt != 0,
             input_receipt: receipt,
             input_key: None,
+            system: false,
         }
     }
 
