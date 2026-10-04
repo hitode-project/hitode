@@ -22,23 +22,47 @@ impl DepthFormat {
 }
 
 #[derive(Clone)]
-pub struct Depth {
-    pub(super) _texture: wgpu::Texture,
-    pub(super) view: wgpu::TextureView,
-    pub(super) context: u64,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) format: DepthFormat,
+pub struct Depth(std::sync::Arc<DepthImage>);
+struct DepthImage {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    context: u64,
+    width: u32,
+    height: u32,
+    format: DepthFormat,
 }
 impl Depth {
+    pub(super) fn new(
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        context: u64,
+        width: u32,
+        height: u32,
+        format: DepthFormat,
+    ) -> Self {
+        Self(std::sync::Arc::new(DepthImage {
+            _texture: texture,
+            view,
+            context,
+            width,
+            height,
+            format,
+        }))
+    }
+    pub(super) fn context(&self) -> u64 {
+        self.0.context
+    }
+    pub(super) fn view(&self) -> &wgpu::TextureView {
+        &self.0.view
+    }
     pub fn width(&self) -> u32 {
-        self.width
+        self.0.width
     }
     pub fn height(&self) -> u32 {
-        self.height
+        self.0.height
     }
     pub fn format(&self) -> DepthFormat {
-        self.format
+        self.0.format
     }
 }
 

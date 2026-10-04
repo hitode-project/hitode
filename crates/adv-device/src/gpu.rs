@@ -93,6 +93,9 @@ pub enum Address {
 pub struct Sampler {
     pub min: Filter,
     pub mag: Filter,
+    /// None clamps sampling to the most detailed permitted level.
+    pub mip: Option<Filter>,
+    pub first_level: u32,
     pub u: Address,
     pub v: Address,
 }
@@ -155,6 +158,8 @@ impl DrawState {
             },
             scissor: None,
             sampler: Sampler {
+                mip: None,
+                first_level: 0,
                 min: Filter::Nearest,
                 mag: Filter::Nearest,
                 u: Address::Clamp,

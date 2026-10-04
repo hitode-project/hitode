@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -93,6 +93,9 @@ impl Submission<'_> {
 pub struct Image {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    render_view: wgpu::TextureView,
+    mip: u32,
+    levels: u32,
     width: u32,
     height: u32,
     alpha: AlphaMode,
@@ -114,6 +117,32 @@ impl Image {
     }
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
+    }
+    pub fn mip_levels(&self) -> u32 {
+        self.levels
+    }
+    /// A single-level view of the same allocation, sharing frame pins and lease.
+    pub fn mip_level(&self, level: u32) -> Result<Self, Error> {
+        if level >= self.levels {
+            return Err(invalid("mip level is outside the image view"));
+        }
+        let mip = self.mip + level;
+        let view = self.texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let mut image = self.clone();
+        image.render_view = view.clone();
+        image.view = view;
+        image.mip = mip;
+        image.levels = 1;
+        image.width = (self.width >> level).max(1);
+        image.height = (self.height >> level).max(1);
+        Ok(image)
+    }
+    pub fn shares_storage(&self, other: &Self) -> bool {
+        self.context == other.context && self.id == other.id
     }
     pub(crate) fn reusable(&self) -> bool {
         Arc::strong_count(self.lease.as_ref().unwrap()) == 1
@@ -152,6 +181,16 @@ pub struct Target {
     depth: Option<Depth>,
 }
 impl Target {
+    pub fn mip_level(&self, level: u32) -> Result<Self, Error> {
+        if level != 0 && self.depth.is_some() {
+            return Err(invalid("depth attachment has no color mip-level alias"));
+        }
+        let image = self.image.mip_level(level)?;
+        Ok(Self {
+            image,
+            depth: self.depth.clone(),
+        })
+    }
     /// Declare the interpretation of an image before publishing its front-end view.
     pub fn with_alpha_mode(mut self, alpha: AlphaMode) -> Self {
         self.image.alpha = alpha;
@@ -167,9 +206,9 @@ impl Target {
     /// Reject mismatches before encoding; never hide a resize or per-draw copy.
     pub fn with_depth(mut self, depth: Option<Depth>) -> Result<Self, Error> {
         if depth.as_ref().is_some_and(|d| {
-            d.context != self.image.context
-                || d.width != self.image.width
-                || d.height != self.image.height
+            d.context() != self.image.context
+                || d.width() != self.image.width
+                || d.height() != self.image.height
         }) {
             return Err(invalid(
                 "depth attachment context or dimensions do not match",
@@ -299,6 +338,8 @@ pub struct Gpu {
     layout: wgpu::PipelineLayout,
     bindings: wgpu::BindGroupLayout,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    pipeline_order: VecDeque<PipelineKey>,
+    pipeline_limit: usize,
     samplers: HashMap<Sampler, wgpu::Sampler>,
     white: Image,
     upload: wgpu::Buffer,
@@ -431,7 +472,7 @@ impl Gpu {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let white = Self::make_image(&context, 1, 1);
+        let white = Self::make_image(&context, 1, 1, 1);
         context.submission()?.write_texture(
             white.texture.as_image_copy(),
             &[255; 4],
@@ -451,6 +492,8 @@ impl Gpu {
             layout,
             bindings,
             pipelines: HashMap::new(),
+            pipeline_order: VecDeque::new(),
+            pipeline_limit: MAX_PIPELINES,
             samplers: HashMap::new(),
             white,
             upload,
@@ -519,11 +562,25 @@ impl Gpu {
         Ok(())
     }
 
-    fn make_image(context: &NativeContext, width: u32, height: u32) -> Image {
+    pub(super) fn own_target(&self, target: &Target) -> Result<(), Error> {
+        self.own(&target.image)?;
+        if target.depth.as_ref().is_some_and(|depth| {
+            depth.context() != target.image.context
+                || depth.width() != target.image.width
+                || depth.height() != target.image.height
+        }) {
+            return Err(invalid(
+                "depth attachment context or dimensions do not match",
+            ));
+        }
+        Ok(())
+    }
+
+    fn make_image(context: &NativeContext, width: u32, height: u32, levels: u32) -> Image {
         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("adv color image"),
             size: extent(width, height),
-            mip_level_count: 1,
+            mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: FORMAT,
@@ -534,9 +591,16 @@ impl Gpu {
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
+        let render_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
         Image {
             texture,
             view,
+            render_view,
+            mip: 0,
+            levels,
             width,
             height,
             alpha: AlphaMode::Stored,
@@ -549,8 +613,16 @@ impl Gpu {
     }
 
     pub fn image(&self, width: u32, height: u32) -> Result<Image, Error> {
+        self.image_levels(width, height, 1)
+    }
+
+    pub fn image_levels(&self, width: u32, height: u32, levels: u32) -> Result<Image, Error> {
         self.dimensions(width, height)?;
-        let image = Self::make_image(&self.context, width, height);
+        let maximum = 32 - width.max(height).leading_zeros();
+        if levels == 0 || levels > maximum {
+            return Err(invalid("image mip count exceeds its dimensions"));
+        }
+        let image = Self::make_image(&self.context, width, height, levels);
         self.check()?;
         Ok(image)
     }
@@ -561,6 +633,14 @@ impl Gpu {
             .then(|| self.depth(width, height, DepthFormat::Float32))
             .transpose()?;
         Ok(Target { image, depth })
+    }
+
+    /// A color mip chain, with no per-level allocation or automatic generation.
+    pub fn target_levels(&self, width: u32, height: u32, levels: u32) -> Result<Target, Error> {
+        Ok(Target {
+            image: self.image_levels(width, height, levels)?,
+            depth: None,
+        })
     }
 
     pub fn depth(&self, width: u32, height: u32, format: DepthFormat) -> Result<Depth, Error> {
@@ -580,14 +660,7 @@ impl Gpu {
             });
         let view = texture.create_view(&Default::default());
         self.check()?;
-        Ok(Depth {
-            _texture: texture,
-            view,
-            context: self.context.id,
-            width,
-            height,
-            format,
-        })
+        Ok(Depth::new(texture, view, self.context.id, width, height, format))
     }
 
     /// Upload a checked BGRA rectangle. Row padding stays outside the GPU image.
@@ -613,6 +686,7 @@ impl Gpu {
         }
         submission.write_texture(
             wgpu::TexelCopyTextureInfo {
+                mip_level: image.mip,
                 origin: wgpu::Origin3d {
                     x: rectangle.x,
                     y: rectangle.y,
@@ -649,7 +723,7 @@ impl Gpu {
     ) -> Result<(), Error> {
         let context = self.context.clone();
         let submission = context.submission()?;
-        self.own(&target.image)?;
+        self.own_target(target)?;
         target.image.writable()?;
         if color.is_some_and(|c| c.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)))
             || depth.is_some_and(|d| !d.is_finite() || !(0.0..=1.0).contains(&d))
@@ -658,7 +732,7 @@ impl Gpu {
                 && target
                     .depth
                     .as_ref()
-                    .is_none_or(|d| !d.format.has_stencil()))
+                    .is_none_or(|d| !d.format().has_stencil()))
         {
             return Err(invalid("clear value or depth attachment is invalid"));
         }
@@ -671,7 +745,7 @@ impl Gpu {
             .create_command_encoder(&Default::default());
         {
             let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &target.image.view,
+                view: &target.image.render_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -694,12 +768,12 @@ impl Gpu {
                 color_attachments: &colors,
                 depth_stencil_attachment: target.depth.as_ref().map(|attachment| {
                     wgpu::RenderPassDepthStencilAttachment {
-                        view: &attachment.view,
+                        view: attachment.view(),
                         depth_ops: Some(wgpu::Operations {
                             load: depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: attachment.format.has_stencil().then_some(wgpu::Operations {
+                        stencil_ops: attachment.format().has_stencil().then_some(wgpu::Operations {
                             load: stencil
                                 .map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(v & 255)),
                             store: wgpu::StoreOp::Store,
@@ -716,9 +790,6 @@ impl Gpu {
     fn pipeline(&mut self, key: PipelineKey) -> Result<wgpu::RenderPipeline, Error> {
         if let Some(pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline.clone());
-        }
-        if self.pipelines.len() >= MAX_PIPELINES {
-            return Err(Error::Busy);
         }
         let pipeline = self.context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("adv fixed pipeline"), layout: Some(&self.layout),
@@ -750,7 +821,18 @@ impl Gpu {
             multiview_mask: None, cache: None,
         });
         self.check()?;
+        // Submitted command buffers retain their own pipeline references. A
+        // full cache can retire an entry immediately instead of waiting for a
+        // capacity wake that could never occur. Hits leave FIFO order intact.
+        if self.pipelines.len() >= self.pipeline_limit {
+            let oldest = self
+                .pipeline_order
+                .pop_front()
+                .expect("nonempty pipeline cache");
+            self.pipelines.remove(&oldest);
+        }
         self.pipelines.insert(key, pipeline.clone());
+        self.pipeline_order.push_back(key);
         Ok(pipeline)
     }
 
@@ -766,6 +848,16 @@ impl Gpu {
                         address_mode_v: address(spec.v),
                         mag_filter: filter(spec.mag),
                         min_filter: filter(spec.min),
+                        mipmap_filter: match spec.mip {
+                            Some(Filter::Linear) => wgpu::MipmapFilterMode::Linear,
+                            _ => wgpu::MipmapFilterMode::Nearest,
+                        },
+                        lod_min_clamp: spec.first_level as f32,
+                        lod_max_clamp: if spec.mip.is_none() {
+                            spec.first_level as f32
+                        } else {
+                            32.0
+                        },
                         ..Default::default()
                     })
             })
@@ -781,7 +873,7 @@ impl Gpu {
     ) -> Result<(), Error> {
         let context = self.context.clone();
         let submission = context.submission()?;
-        self.own(&target.image)?;
+        self.own_target(target)?;
         target.image.writable()?;
         if let Some(image) = image {
             self.own(image)?;
@@ -794,9 +886,15 @@ impl Gpu {
             && target
                 .depth
                 .as_ref()
-                .is_none_or(|d| !d.format.has_stencil())
+                .is_none_or(|d| !d.format().has_stencil())
         {
             return Err(invalid("stencil state requires a stencil attachment"));
+        }
+        if let Some(stencil) = &mut state.stencil {
+            // Every supported stencil attachment has eight bits. Ignored
+            // high bits must not consume distinct pipeline cache entries.
+            stencil.read_mask &= 255;
+            stencil.write_mask &= 255;
         }
         if target.image.alpha == AlphaMode::Opaque {
             // RGBX has destination alpha one irrespective of unused storage bits.
@@ -832,12 +930,16 @@ impl Gpu {
             alpha_blend: state.alpha_blend,
             depth: state.depth,
             depth_write: state.depth_write,
-            depth_format: target.depth.as_ref().map(|d| d.format),
+            depth_format: target.depth.as_ref().map(|d| d.format()),
             stencil: state.stencil,
             color_write: state.color_write,
         };
         let pipeline = self.pipeline(key)?;
-        let sampler = self.sampler(state.sampler);
+        let image_levels = image.map_or(1, Image::mip_levels);
+        let sampler = self.sampler(Sampler {
+            first_level: state.sampler.first_level.min(image_levels - 1),
+            ..state.sampler
+        });
         submission.write_buffer(&self.upload, 0, bytemuck::cast_slice(vertices));
         let parameters = [
             texture_op(state.texture_op),
@@ -880,7 +982,7 @@ impl Gpu {
             .create_command_encoder(&Default::default());
         {
             let colors = [Some(wgpu::RenderPassColorAttachment {
-                view: &target.image.view,
+                view: &target.image.render_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -892,12 +994,12 @@ impl Gpu {
                 color_attachments: &colors,
                 depth_stencil_attachment: target.depth.as_ref().map(|attachment| {
                     wgpu::RenderPassDepthStencilAttachment {
-                        view: &attachment.view,
+                        view: attachment.view(),
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: attachment.format.has_stencil().then_some(wgpu::Operations {
+                        stencil_ops: attachment.format().has_stencil().then_some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
@@ -985,6 +1087,7 @@ impl Gpu {
             .create_command_encoder(&Default::default());
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
+                mip_level: source.mip,
                 origin: wgpu::Origin3d {
                     x: rectangle.x,
                     y: rectangle.y,
@@ -993,6 +1096,7 @@ impl Gpu {
                 ..source.texture.as_image_copy()
             },
             wgpu::TexelCopyTextureInfo {
+                mip_level: destination.mip,
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 ..destination.texture.as_image_copy()
             },
@@ -1117,7 +1221,10 @@ impl Gpu {
             .device
             .create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
-            image.texture.as_image_copy(),
+            wgpu::TexelCopyTextureInfo {
+                mip_level: image.mip,
+                ..image.texture.as_image_copy()
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -1348,5 +1455,104 @@ fn compare_index(c: Compare) -> u32 {
         Compare::NotEqual => 5,
         Compare::GreaterEqual => 6,
         Compare::Always => 7,
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn full_pipeline_cache_evicts_fifo_and_submitted_commands_remain_valid() {
+        let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+        assert_eq!(gpu.pipeline_limit, 512);
+        assert_eq!(gpu.pipeline_limit, MAX_PIPELINES);
+        gpu.pipeline_limit = 2;
+        let depth = gpu.depth(2, 2, DepthFormat::Depth24Stencil8).unwrap();
+        let target = gpu
+            .target(2, 2, false)
+            .unwrap()
+            .with_depth(Some(depth))
+            .unwrap();
+        let snapshot = gpu.image(2, 2).unwrap();
+        gpu.clear_with_stencil(&target, Some([0.; 4]), Some(1.), Some(0))
+            .unwrap();
+        let face = StencilFace {
+            compare: Compare::Always,
+            fail: StencilOp::Keep,
+            depth_fail: StencilOp::Keep,
+            pass: StencilOp::Keep,
+        };
+        let quad = |color| {
+            let vertex = |x, y| Vertex {
+                position: [x, y, 0., 1.],
+                color,
+                uv: [0.; 2],
+            };
+            [
+                vertex(-1., 1.),
+                vertex(-1., -1.),
+                vertex(1., 1.),
+                vertex(1., 1.),
+                vertex(-1., -1.),
+                vertex(1., -1.),
+            ]
+        };
+        let mut state = DrawState::new(2, 2);
+        state.stencil = Some(Stencil {
+            front: face,
+            back: face,
+            read_mask: 1,
+            write_mask: 1,
+        });
+        gpu.draw(&target, &quad([1., 0., 0., 1.]), None, state)
+            .unwrap();
+        gpu.copy(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            &snapshot,
+            0,
+            0,
+        )
+        .unwrap();
+        state.stencil.as_mut().unwrap().read_mask = 2;
+        gpu.draw(&target, &quad([0., 1., 0., 1.]), None, state)
+            .unwrap();
+        let insertion_order = gpu.pipeline_order.clone();
+        state.stencil.as_mut().unwrap().read_mask = 0xab00_0001;
+        state.stencil.as_mut().unwrap().write_mask = 0xcd00_0001;
+        gpu.draw(&target, &quad([0., 1., 0., 1.]), None, state)
+            .unwrap();
+        assert_eq!(
+            gpu.pipeline_order, insertion_order,
+            "ignored high bits reuse the original key; hits do not reorder FIFO"
+        );
+        for mask in 3..=6 {
+            state.stencil.as_mut().unwrap().read_mask = mask;
+            gpu.draw(&target, &quad([0., 1., 0., 1.]), None, state)
+                .unwrap();
+            assert_eq!(gpu.pipelines.len(), 2);
+            assert_eq!(gpu.pipeline_order.len(), 2);
+        }
+        assert!(!gpu.pipelines.contains_key(&insertion_order[0]));
+        // No fence wait preceded eviction. Both submitted copies/draws must
+        // retain their pipeline resources after the cache releases its handles.
+        let mut old = gpu.readback(&snapshot, None).unwrap();
+        let mut latest = gpu.readback(&target.image, None).unwrap();
+        gpu.context
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(5)),
+            })
+            .unwrap();
+        gpu.check().unwrap();
+        assert_eq!(old.poll().unwrap().unwrap(), [0, 0, 255, 255].repeat(4));
+        assert_eq!(latest.poll().unwrap().unwrap(), [0, 255, 0, 255].repeat(4));
     }
 }
