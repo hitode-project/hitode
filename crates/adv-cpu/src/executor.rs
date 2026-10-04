@@ -103,6 +103,11 @@ pub struct Executor {
     host_interrupts: bool,
     pending_regions: BTreeMap<u32, u64>,
     deferred_compilations: BTreeMap<u32, compile::Snapshot>,
+    /// Queue order of deferred work; later discoveries are what runs now.
+    deferred_order: HashMap<u32, u64>,
+    deferred_sequence: u64,
+    /// Interpreter starts at unowned pcs while compilation work is deferred.
+    demand: HashMap<u32, u64>,
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
     attempted: BTreeSet<u32>,
@@ -236,12 +241,15 @@ impl Executor {
             host_interrupts: true,
             pending_regions: BTreeMap::new(),
             deferred_compilations: BTreeMap::new(),
+            deferred_order: HashMap::new(),
+            deferred_sequence: 0,
+            demand: HashMap::new(),
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
             attempted: BTreeSet::new(),
             cache_revision: 1,
-            cache_region_limit: 4096,
-            cache_byte_limit: 32 * 1024 * 1024,
+            cache_region_limit: 16384,
+            cache_byte_limit: 128 * 1024 * 1024,
             cache_clock: 0,
             rejected_entries: BTreeMap::new(),
             observed_epoch: 0,
@@ -342,6 +350,8 @@ impl Executor {
         self.native_heat.clear();
         self.tier_attempted.clear();
         self.hits.clear();
+        self.demand.clear();
+        self.deferred_order.clear();
         self.attempted.clear();
         self.stats.pending_compilations = 0;
         self.cache_revision += 1;
@@ -390,6 +400,7 @@ impl Executor {
         compiled.cache_stamp = self.cache_clock;
         for &pc in &compiled.entries {
             self.entry_owner.insert(pc, region.start);
+            self.demand.remove(&pc);
         }
         self.stats.native_code_bytes += compiled.code_size;
         self.compiled.insert(region.start, compiled);
@@ -461,7 +472,8 @@ impl Executor {
     }
 
     /// Bound resident generated code by both region count and executable bytes.
-    /// Defaults are 4096 regions and 32 MiB. Zero disables native residency.
+    /// Defaults are 16384 regions and 128 MiB; a real sample filled 32 MiB within
+    /// a minute and then recompiled evicted code. Zero disables native residency.
     /// Eviction is owner-only, with recency sampled at Rust native entries;
     /// individual Tail-linked callees do not add hot-path instrumentation.
     pub fn set_code_cache_limits(&mut self, regions: usize, bytes: usize) {
@@ -552,6 +564,9 @@ impl Executor {
         self.stats.compile_slices += fragments.len().saturating_sub(1) as u64;
         for fragment in fragments {
             if !self.pending_regions.contains_key(&fragment.region.start) {
+                self.deferred_sequence += 1;
+                self.deferred_order
+                    .insert(fragment.region.start, self.deferred_sequence);
                 self.deferred_compilations
                     .insert(fragment.region.start, fragment);
             }
@@ -563,6 +578,26 @@ impl Executor {
             .max(self.deferred_compilations.len());
         self.submit_deferred_compilations()?;
         Ok(true)
+    }
+
+    /// Submit the work the interpreter is spending the most time in first;
+    /// otherwise the newest discovery, which is what the guest runs now.
+    fn next_deferred(&mut self) -> Option<u32> {
+        self.deferred_order
+            .retain(|start, _| self.deferred_compilations.contains_key(start));
+        self.deferred_compilations
+            .iter()
+            .max_by_key(|(start, snapshot)| {
+                let demand: u64 = snapshot
+                    .region
+                    .entries
+                    .iter()
+                    .chain(std::iter::once(*start))
+                    .map(|pc| self.demand.get(pc).copied().unwrap_or(0))
+                    .sum();
+                (demand, self.deferred_order.get(start).copied().unwrap_or(0))
+            })
+            .map(|(&start, _)| start)
     }
 
     fn submit_deferred_compilations(&mut self) -> Result<(), String> {
@@ -578,9 +613,10 @@ impl Executor {
             self.compiler = Some(worker);
         }
         while self.pending_regions.len() < crate::compiler::CAPACITY {
-            let Some((&start, snapshot)) = self.deferred_compilations.first_key_value() else {
+            let Some(start) = self.next_deferred() else {
                 break;
             };
+            let snapshot = &self.deferred_compilations[&start];
             if !snapshot.valid(&self.memory) {
                 let snapshot = self.deferred_compilations.remove(&start).unwrap();
                 self.stats.stale_compilations += 1;
@@ -1205,6 +1241,12 @@ impl Executor {
             };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
+            if !self.deferred_compilations.is_empty() && !self.entry_owner.contains_key(&pc) {
+                if self.demand.len() >= 65_536 {
+                    self.demand.clear();
+                }
+                *self.demand.entry(pc).or_default() += 1;
+            }
             self.state.fuel -= u64::from(execution.units);
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
@@ -2136,6 +2178,28 @@ mod tiering_tests {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
+    }
+    #[test]
+    fn deferred_work_is_ordered_by_interpreter_demand_then_recency() {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
+            .unwrap();
+        for start in [0x1000, 0x1100, 0x1200] {
+            m.write(start, &[0x40, 0xc3]).unwrap();
+        }
+        m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
+        for (sequence, start) in [0x1000u32, 0x1100, 0x1200].into_iter().enumerate() {
+            let region = Region::new(start, 2);
+            let snapshot = compile::Snapshot::capture(&region, &m.memory).unwrap();
+            m.deferred_compilations.insert(start, snapshot);
+            m.deferred_order.insert(start, sequence as u64);
+        }
+        assert_eq!(m.next_deferred(), Some(0x1200));
+        m.demand.insert(0x1000, 3);
+        assert_eq!(m.next_deferred(), Some(0x1000));
+        m.deferred_compilations.remove(&0x1000);
+        assert_eq!(m.next_deferred(), Some(0x1200));
+        assert!(!m.deferred_order.contains_key(&0x1000));
     }
     #[test]
     fn speed_compilation_keeps_fast_code_live_and_publishes_once() {
