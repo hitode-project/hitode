@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+pub use crate::{ArchitecturalState, StateError};
 use thiserror::Error;
 
 /// Tiny `bitflags`-style newtype, so we don't pull a dependency for one type.
@@ -140,6 +141,15 @@ impl FpuEnvironment {
 
 /// Registers and memory as seen from inside a trap handler.
 pub trait Guest {
+    /// Capture architecture at a paused boundary, materializing floating aliases.
+    /// This contains no scheduler, REP continuation, clock or host IRQ metadata.
+    fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
+        Err(StateError::Unsupported)
+    }
+    /// Validate all supported fields before committing any architectural change.
+    fn restore_architecture(&mut self, _state: &ArchitecturalState) -> Result<(), StateError> {
+        Err(StateError::Unsupported)
+    }
     /// Materialize deferred floating aliases and read canonical control state.
     fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
         Err(FpuEnvironmentError::Unsupported)

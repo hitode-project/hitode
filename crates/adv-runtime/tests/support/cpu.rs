@@ -1,7 +1,7 @@
 //! Dev-only runtime backend selection. `unicorn` always owns a real UnicornCpu.
 #![allow(dead_code)]
 use adv_cpu::backend::{Backend, Exit, Guest, MemFault, Prot, Reg, SegmentSetup, TrapHandler};
-use adv_cpu::{CompileStrategy, JitCpu, Stats};
+use adv_cpu::{ArchitecturalState, CompileStrategy, JitCpu, StateError, Stats};
 use adv_unicorn::UnicornCpu;
 use std::time::Duration;
 
@@ -79,6 +79,12 @@ impl Cpu {
     }
 }
 impl Guest for Cpu {
+    fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
+        self.guest_mut().capture_architecture()
+    }
+    fn restore_architecture(&mut self, state: &ArchitecturalState) -> Result<(), StateError> {
+        self.guest_mut().restore_architecture(state)
+    }
     fn last_indirect_branch(&self) -> Option<adv_cpu::IndirectBranch> {
         self.guest().last_indirect_branch()
     }

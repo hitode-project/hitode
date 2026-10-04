@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+mod architecture;
 mod guard;
 mod watchdog;
 pub use guard::Guarded;
@@ -16,8 +17,9 @@ use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot as UcPro
 use unicorn_engine::{RegisterX86, Unicorn};
 
 use adv_cpu::backend::{
-    Backend, Exit, Fault, FaultKind, FilePage, FpuEnvironment, FpuEnvironmentError, Guest,
-    MemFault, Prot, Reg, SegmentSetup, TrapAction, TrapHandler,
+    ArchitecturalState, Backend, Exit, Fault, FaultKind, FilePage, FpuEnvironment,
+    FpuEnvironmentError, Guest, MemFault, Prot, Reg, SegmentSetup, StateError, TrapAction,
+    TrapHandler,
 };
 
 struct FileBinding {
@@ -62,6 +64,8 @@ pub struct HookData {
     handler: Option<*mut (dyn TrapHandler + 'static)>,
     park: u32,
     last_mem_fault: Option<(MemType, u32)>,
+    /// Restart only at a completed host trap, keeping one Backend::run budget.
+    resume_after_trap: bool,
     /// Executed blocks and guest code bytes, while the block hook is installed.
     blocks: (u64, u64),
     /// Per block start: (executions, size), while profiling.
@@ -117,6 +121,7 @@ impl UnicornCpu {
             handler: None,
             park,
             last_mem_fault: None,
+            resume_after_trap: false,
             blocks: (0, 0),
             profile: None,
             count_blocks: false,
@@ -157,6 +162,15 @@ impl UnicornCpu {
                 // Writing PC from a hook restarts translation at `park`, which is the
                 // `until` address of emu_start, so emulation stops before executing it.
                 uc.set_pc(park.into()).expect("set pc");
+            } else {
+                // Writing EIP from this hook leaves Unicorn 2.1's
+                // skip_sync_pc_on_exit set until the next emu_start. A later
+                // write fault otherwise reports the block's start, after its
+                // prefix stores already committed. Re-enter at this precise
+                // trap boundary; no guest instruction is replayed.
+                uc.get_data_mut().resume_after_trap = true;
+                uc.emu_stop()
+                    .expect("restart reference at host trap boundary");
             }
         })?;
         let bad = HookType::MEM_READ_UNMAPPED
@@ -316,6 +330,12 @@ fn descriptor(base: u32, limit: u32, code: bool, dpl: u64) -> u64 {
 
 // Implemented on the raw engine so trap handlers can receive it directly as `&mut dyn Guest`.
 impl Guest for Engine<'_> {
+    fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
+        self.capture_state()
+    }
+    fn restore_architecture(&mut self, state: &ArchitecturalState) -> Result<(), StateError> {
+        self.restore_state(state)
+    }
     fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
         let error = |e: uc_error| FpuEnvironmentError::Backend(e.to_string());
         Ok(FpuEnvironment {
@@ -633,6 +653,12 @@ impl Guest for Engine<'_> {
 }
 
 impl Guest for UnicornCpu {
+    fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
+        self.uc.capture_state()
+    }
+    fn restore_architecture(&mut self, state: &ArchitecturalState) -> Result<(), StateError> {
+        self.uc.restore_state(state)
+    }
     fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
         self.uc.fpu_environment()
     }
@@ -789,7 +815,19 @@ impl Backend for UnicornCpu {
             watchdog.arm(budget);
             self.uc.get_data_mut().budget_active = true;
         }
-        let res = self.uc.emu_start(pc.into(), self.park.into(), 0, 0);
+        let res = loop {
+            self.uc.get_data_mut().resume_after_trap = false;
+            let pc = self.uc.reg(Reg::Eip);
+            let res = self.uc.emu_start(pc.into(), self.park.into(), 0, 0);
+            let d = self.uc.get_data();
+            if res.is_err()
+                || !d.resume_after_trap
+                || self.uc.reg(Reg::Eip) == self.park
+                || (d.budget_active && d.budget_expired.load(Ordering::Acquire))
+            {
+                break res;
+            }
+        };
         let expired = self.watchdog.as_ref().is_some_and(Watchdog::disarm);
         self.uc.get_data_mut().handler = None;
         self.uc.get_data_mut().budget_active = false;

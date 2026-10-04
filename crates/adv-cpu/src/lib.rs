@@ -1,5 +1,6 @@
 //! Execution layer: shared-state x86-32 interpreter, hot-region JIT, and the guest CPU
 //! interface ([`backend`]) the machine layer drives. See the README for scope.
+mod architecture;
 mod atomic_memory;
 pub mod backend;
 mod compile;
@@ -27,6 +28,7 @@ mod timestamp;
 mod trap;
 mod virtual_memory;
 
+pub use architecture::{ArchitecturalState, StateError};
 pub use backend::jit::JitCpu;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::SegmentState;

@@ -1,7 +1,7 @@
 //! CPU backend adapter for a caller-owned trap dispatcher.
 use crate::backend::{
-    Backend, Exit, Fault, FaultKind, FpuEnvironment, FpuEnvironmentError, Guest, MemFault, Prot,
-    Reg, SegmentSetup, TrapAction, TrapHandler,
+    ArchitecturalState, Backend, Exit, Fault, FaultKind, FpuEnvironment, FpuEnvironmentError,
+    Guest, MemFault, Prot, Reg, SegmentSetup, StateError, TrapAction, TrapHandler,
 };
 use crate::{
     CompileStrategy, CpuState, ExecutionContext, Executor, Memory, RunOutcome, Stats, X87Register,
@@ -103,6 +103,12 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
+        Ok(self.state.capture_architecture())
+    }
+    fn restore_architecture(&mut self, state: &ArchitecturalState) -> Result<(), StateError> {
+        self.state.restore_architecture(state)
+    }
     fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
         self.state.commit_mmx();
         Ok(FpuEnvironment {
@@ -224,6 +230,12 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
+        self.view(|g| g.capture_architecture())
+    }
+    fn restore_architecture(&mut self, state: &ArchitecturalState) -> Result<(), StateError> {
+        self.view(|g| g.restore_architecture(state))
+    }
     fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
         self.view(|g| g.fpu_environment())
     }
