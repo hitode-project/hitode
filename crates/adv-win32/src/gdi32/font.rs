@@ -10,6 +10,7 @@ use adv_device::text::{
 use adv_machine::Machine;
 use std::borrow::Cow;
 
+mod enumeration;
 mod paint;
 mod resource;
 #[cfg(test)]
@@ -28,6 +29,7 @@ struct Fonts {
 pub fn register(registry: &mut Registry) {
     paint::register(registry);
     resource::register(registry);
+    enumeration::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,
@@ -181,6 +183,29 @@ fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<
         _ => return None,
     };
     Some(codec.to_utf16(codepage, bytes))
+}
+
+fn ansi_character(env: &Env<'_>, font: &FontRequest, character: u32) -> Character {
+    if !matches!(
+        font.encoding,
+        Encoding::Automatic | Encoding::Latin | Encoding::Oem
+    ) {
+        return Character::Encoded(character);
+    }
+    // GGO packs a DBCS lead byte in the high byte, unlike a counted A string.
+    // Resolve the guest repertoire before entering a host font backend, whose
+    // default charset may have been selected under a different system locale.
+    let packed = character as u16;
+    let bytes = packed.to_be_bytes();
+    let bytes = if packed <= 0xff {
+        &bytes[1..]
+    } else {
+        &bytes[..]
+    };
+    match ansi_units(env, font, bytes).as_deref() {
+        Some([unit]) => Character::Unicode(u32::from(*unit)),
+        _ => Character::Encoded(character),
+    }
 }
 
 #[win32(gdi32, name = "GetTextMetricsA", level = implement)]
@@ -364,11 +389,12 @@ fn glyph(
         return fail(env);
     };
     let fixed = |at| i32::from_le_bytes(matrix[at..at + 4].try_into().unwrap());
+    let font = font_request(env, dc);
     let request = GlyphRequest {
         character: if format & 0x80 != 0 {
             Character::GlyphIndex(character)
         } else if ansi {
-            Character::Encoded(character)
+            ansi_character(env, &font, character)
         } else {
             Character::Unicode(character)
         },
@@ -389,7 +415,6 @@ fn glyph(
             yy: fixed(12),
         },
     };
-    let font = font_request(env, dc);
     match env.ext.get_mut::<Fonts>().text.glyph(&font, request) {
         Ok(glyph) => {
             let fetch = !buffer.is_null() && capacity != 0 && format & 0x7f != 0;

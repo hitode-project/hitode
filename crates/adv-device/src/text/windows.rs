@@ -3,6 +3,8 @@
 use super::*;
 use windows_sys::Win32::Graphics::Gdi::{self as gdi, HDC, HFONT, HGDIOBJ};
 
+pub(super) mod enumeration;
+
 pub(super) struct MemoryFont {
     handle: windows_sys::Win32::Foundation::HANDLE,
     pub faces: u32,

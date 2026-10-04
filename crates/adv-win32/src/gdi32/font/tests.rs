@@ -737,7 +737,7 @@ fn glyph_metrics_bitmap_gray8_and_index_use_real_font_pixels() {
 
 #[test]
 #[cfg(windows)]
-fn glyph_cache_separates_transform_encoding_and_selected_font() {
+fn glyph_cache_shares_decoded_characters_and_separates_transform_and_font() {
     let (mut machine, data, dc) = fixture();
     let matrix = data + 128;
     let mut transform = [0u8; 16];
@@ -757,17 +757,17 @@ fn glyph_cache_separates_transform_encoding_and_selected_font() {
     assert_eq!(query(&mut machine, "GetGlyphOutlineW"), original);
     assert_eq!(machine.ext.get::<Fonts>().text.stats().hits, 1);
     assert_eq!(query(&mut machine, "GetGlyphOutlineA"), original);
-    assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 2);
+    assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 1);
     transform[2..4].copy_from_slice(&2i16.to_le_bytes());
     machine.cpu.write(matrix, &transform).unwrap();
     assert!(query(&mut machine, "GetGlyphOutlineW") > original);
-    assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 3);
+    assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 2);
     // Use a stock outline font. SYSTEM_FONT is a bitmap font and native
     // GetGlyphOutline correctly fails for it.
     invoke(&mut machine, data, "SelectObject", &[dc, 0x0190_0010 + 17]);
     assert_ne!(query(&mut machine, "GetGlyphOutlineW"), GDI_ERROR);
-    assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 4);
-    assert_eq!(machine.ext.get::<Fonts>().text.stats().hits, 1);
+    assert_eq!(machine.ext.get::<Fonts>().text.stats().glyphs, 3);
+    assert_eq!(machine.ext.get::<Fonts>().text.stats().hits, 2);
 }
 
 #[test]
@@ -833,6 +833,66 @@ fn gbk_packed_characters_match_unicode_glyph_pixels() {
         assert_eq!(ansi, unicode);
         assert!(ansi.iter().any(|&alpha| alpha > 0));
         assert!(ansi.iter().all(|&alpha| alpha <= 64));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn default_charset_glyphs_use_guest_codepage_and_keep_wide_pixels() {
+    let (mut machine, data, dc) = fixture();
+    let matrix = data + 128;
+    let metrics = data + 160;
+    let buffer = data + 256;
+    let mut transform = [0u8; 16];
+    transform[2..4].copy_from_slice(&1i16.to_le_bytes());
+    transform[14..16].copy_from_slice(&1i16.to_le_bytes());
+    machine.cpu.write(matrix, &transform).unwrap();
+    for charset in [0, 1] {
+        let mut raw = [0u8; 60];
+        raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
+        raw[16..20].copy_from_slice(&400i32.to_le_bytes());
+        raw[23] = charset;
+        raw[28..38].copy_from_slice(b"MS Gothic\0");
+        machine.cpu.write(data, &raw).unwrap();
+        let font = invoke(&mut machine, data, "CreateFontIndirectA", &[data]);
+        invoke(&mut machine, data, "SelectObject", &[dc, font]);
+        for (codepage, text) in [(932, "あｭ"), (936, "中文")] {
+            machine.ext.get_mut::<Win32>().codec = adv_os::Codec::new(codepage);
+            for character in text.chars() {
+                let codec = adv_os::Codec::new(codepage);
+                let (bytes, lossy) = codec.from_utf16(0, &[character as u16]);
+                assert!(!lossy);
+                let packed = bytes.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b));
+                let mut outputs = Vec::new();
+                for (api, code) in [
+                    ("GetGlyphOutlineA", packed),
+                    ("GetGlyphOutlineW", character as u32),
+                ] {
+                    let size = invoke(
+                        &mut machine,
+                        data,
+                        api,
+                        &[dc, code, 6, metrics, 0, 0, matrix],
+                    );
+                    assert_ne!(size, GDI_ERROR);
+                    assert_eq!(
+                        invoke(
+                            &mut machine,
+                            data,
+                            api,
+                            &[dc, code, 6, metrics, size, buffer, matrix]
+                        ),
+                        size
+                    );
+                    let mut pixels = vec![0; size as usize];
+                    machine.cpu.read(buffer, &mut pixels).unwrap();
+                    let mut layout = [0; 20];
+                    machine.cpu.read(metrics, &mut layout).unwrap();
+                    outputs.push((layout, pixels));
+                }
+                assert_eq!(outputs[0], outputs[1], "cp={codepage} charset={charset}");
+            }
+        }
     }
 }
 

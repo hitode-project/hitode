@@ -112,6 +112,47 @@ pub struct FontRequest {
     pub pitch: Pitch,
     pub family: Family,
 }
+/// Installed face discovery. Families keeps the native provider's family/style
+/// grouping; Faces preserves its legacy face enumeration policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontEnumeration {
+    Families,
+    Faces,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontKind {
+    Raster,
+    Vector,
+    TrueType,
+}
+#[derive(Clone, Debug)]
+pub struct FontDesign {
+    pub italic: bool,
+    pub bold: bool,
+    pub regular: bool,
+    pub nonnegative_spacing: bool,
+    pub postscript_outline: bool,
+    pub truetype_outline: bool,
+    pub multiple_master: bool,
+    pub type1: bool,
+    pub digital_signature: bool,
+    pub em_units: u32,
+    pub cell_height: u32,
+    pub average_width: u32,
+}
+/// Owned, neutral font data. Text characters remain Unicode until the
+/// personality chooses the guest's encoding and packs its callback ABI.
+#[derive(Clone, Debug)]
+pub struct EnumeratedFont {
+    pub font: FontRequest,
+    pub metrics: TextMetrics,
+    pub characters: [u16; 4],
+    pub kind: FontKind,
+    pub device: bool,
+    pub full_name: String,
+    pub style: String,
+    pub design: Option<FontDesign>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DefaultFont {
     Console,
@@ -359,6 +400,23 @@ pub const MAX_FONT_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// results are immutable and remain valid after the native owner is evicted.
 pub const FONT_CACHE_CAPACITY: usize = 128;
 impl Text {
+    /// Enumerate current backend fonts without exposing a native DC or font
+    /// handle. Memory-font registrations retain the provider's visibility rules.
+    pub fn enumerate(
+        &self,
+        face: Option<&str>,
+        mode: FontEnumeration,
+    ) -> Result<Vec<EnumeratedFont>, TextError> {
+        #[cfg(windows)]
+        {
+            windows::enumeration::enumerate(face, mode)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (face, mode);
+            Err(TextError::Unavailable)
+        }
+    }
     /// Install owned backend font data. Successful resource changes invalidate
     /// matching and glyph caches; immutable glyph results held by callers live on.
     pub fn add_resource(&mut self, bytes: &[u8]) -> Result<(FontResourceId, u32), TextError> {
