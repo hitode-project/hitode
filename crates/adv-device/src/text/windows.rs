@@ -211,6 +211,31 @@ impl Font {
             encoding: decode_encoding(m.tmCharSet),
         })
     }
+    pub(super) fn extent(&self, input: TextInput<'_>) -> Result<TextExtent, TextError> {
+        let mut size = windows_sys::Win32::Foundation::SIZE::default();
+        let result = match input {
+            TextInput::Encoded(bytes) => {
+                let count = i32::try_from(bytes.len())
+                    .map_err(|_| TextError::Font("encoded run length overflow".into()))?;
+                // SAFETY: the counted input covers every byte GDI may consume;
+                // no terminator scan. The selected private font defines its repertoire.
+                unsafe { gdi::GetTextExtentPoint32A(self.dc, bytes.as_ptr(), count, &mut size) }
+            }
+            TextInput::Unicode(units) => {
+                let count = i32::try_from(units.len())
+                    .map_err(|_| TextError::Font("UTF-16 run length overflow".into()))?;
+                // SAFETY: same owned DC and explicit count of initialized UTF-16 units.
+                unsafe { gdi::GetTextExtentPoint32W(self.dc, units.as_ptr(), count, &mut size) }
+            }
+        };
+        if result == 0 {
+            return Err(TextError::Font("native text extent query failed".into()));
+        }
+        Ok(TextExtent {
+            width: size.cx,
+            height: size.cy,
+        })
+    }
     pub(super) fn glyph(&self, request: GlyphRequest) -> Result<Glyph, TextError> {
         let (code, ansi, index) = match request.character {
             Character::Unicode(code) => (code, false, false),

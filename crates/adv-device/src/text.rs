@@ -245,6 +245,18 @@ pub struct TextMetrics {
     pub family: Family,
     pub encoding: Encoding,
 }
+/// Explicitly counted units. Encoded bytes follow the selected font repertoire;
+/// UTF-16 keeps surrogate pairs and embedded zero units intact.
+#[derive(Clone, Copy)]
+pub enum TextInput<'a> {
+    Encoded(&'a [u8]),
+    Unicode(&'a [u16]),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextExtent {
+    pub width: i32,
+    pub height: i32,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub fonts: usize,
@@ -277,6 +289,9 @@ pub struct Text {
     bytes: usize,
     hits: u64,
 }
+/// Each cached native font owns a font and a private measurement DC. Glyph
+/// results are immutable and remain valid after the native owner is evicted.
+pub const FONT_CACHE_CAPACITY: usize = 128;
 impl Text {
     pub fn stats(&self) -> CacheStats {
         CacheStats {
@@ -299,8 +314,11 @@ impl Text {
     #[cfg(windows)]
     fn font(&mut self, request: &FontRequest) -> Result<&windows::Font, TextError> {
         if !self.fonts.contains_key(request) {
-            self.fonts
-                .insert(request.clone(), windows::Font::new(request)?);
+            let font = windows::Font::new(request)?;
+            if self.fonts.len() >= FONT_CACHE_CAPACITY {
+                self.fonts.clear();
+            }
+            self.fonts.insert(request.clone(), font);
         }
         Ok(&self.fonts[request])
     }
@@ -312,6 +330,23 @@ impl Text {
         #[cfg(not(windows))]
         {
             let _ = request;
+            Err(TextError::Unavailable)
+        }
+    }
+    /// Measure the entire run with the same owned font used for glyph requests.
+    /// Individual glyph advances are insufficient for a shaped or kerned run.
+    pub fn extent(
+        &mut self,
+        request: &FontRequest,
+        input: TextInput<'_>,
+    ) -> Result<TextExtent, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(request)?.extent(input)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (request, input);
             Err(TextError::Unavailable)
         }
     }

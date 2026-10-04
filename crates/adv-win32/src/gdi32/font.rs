@@ -2,7 +2,7 @@
 //! glyph caching are owned by adv-device; DCs have one OS object payload.
 use super::{GdiObj, LogFont};
 use crate::{Win32, util::set_last_error};
-use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
+use adv_abi::{AnsiStr, Env, GuestPtr, Handle, Outcome, Registry, WideStr, win32};
 use adv_device::text::{
     self, Character, ClipPrecision, Clipping, Curve, Encoding, Family, FontRequest, GlyphData,
     GlyphFormat, GlyphRequest, Pitch, Precision, Quality, Text, TextError, Transform,
@@ -31,6 +31,8 @@ pub fn register(registry: &mut Registry) {
         get_map_mode_ABI,
         set_poly_fill_ABI,
         get_poly_fill_ABI,
+        extent_a_ABI,
+        extent_w_ABI,
     ] {
         registry.register(api);
     }
@@ -156,6 +158,87 @@ fn metrics_a(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> Outcome {
         {
             Outcome::Return(1)
         }
+        Err(TextError::Unavailable) => Outcome::Fail(TextError::Unavailable.to_string()),
+        _ => {
+            set_last_error(env, 87);
+            Outcome::Return(0)
+        }
+    }
+}
+#[win32(gdi32, name = "GetTextExtentPoint32A", level = implement)]
+fn extent_a(
+    env: &mut Env<'_>,
+    dc: Handle,
+    input: AnsiStr,
+    count: i32,
+    output: GuestPtr<[i32; 2]>,
+) -> Outcome {
+    extent(env, dc.0, input.0.addr(), count, output, true)
+}
+#[win32(gdi32, name = "GetTextExtentPoint32W", level = implement)]
+fn extent_w(
+    env: &mut Env<'_>,
+    dc: Handle,
+    input: WideStr,
+    count: i32,
+    output: GuestPtr<[i32; 2]>,
+) -> Outcome {
+    extent(env, dc.0, input.0.addr(), count, output, false)
+}
+fn extent(
+    env: &mut Env<'_>,
+    dc: u32,
+    input: u32,
+    count: i32,
+    output: GuestPtr<[i32; 2]>,
+    ansi: bool,
+) -> Outcome {
+    if reject_dc(env, dc) {
+        return Outcome::Return(0);
+    }
+    // Counted strings may contain NUL. Bound work and check the whole output
+    // before touching it; a short output must never publish half a SIZE.
+    let length = usize::try_from(count)
+        .ok()
+        .and_then(|n| n.checked_mul(if ansi { 1 } else { 2 }));
+    let Some(length) = length.filter(|&n| n <= 1024 * 1024) else {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    };
+    if adv_abi::guest::check_range(env.cpu, output.addr(), 8, adv_cpu::backend::Prot::WRITE)
+        .is_err()
+        || (length != 0
+            && adv_abi::guest::check_range(
+                env.cpu,
+                input,
+                length as u32,
+                adv_cpu::backend::Prot::READ,
+            )
+            .is_err())
+    {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let mut bytes = vec![0; length];
+    if length != 0 && env.cpu.read(input, &mut bytes).is_err() {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let units;
+    let input = if ansi {
+        text::TextInput::Encoded(&bytes)
+    } else {
+        units = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes(*unit))
+            .collect::<Vec<_>>();
+        text::TextInput::Unicode(&units)
+    };
+    let request = font_request(env, dc);
+    match env.ext.get_mut::<Fonts>().text.extent(&request, input) {
+        Ok(size) if output.write(env.cpu, [size.width, size.height]).is_ok() => Outcome::Return(1),
         Err(TextError::Unavailable) => Outcome::Fail(TextError::Unavailable.to_string()),
         _ => {
             set_last_error(env, 87);

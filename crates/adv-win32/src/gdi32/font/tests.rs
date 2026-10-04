@@ -400,6 +400,163 @@ fn invoke(machine: &mut Machine<JitCpu>, data: u32, name: &str, args: &[u32]) ->
     value
 }
 #[test]
+fn text_extent_rejects_short_readonly_and_overflowing_ranges_without_partial_size() {
+    let (mut machine, data, dc) = fixture();
+    let output = data + 1024;
+    machine.cpu.write(data + 512, b"AV\0x").unwrap();
+    for (pointer, count) in [
+        (u32::MAX - 1, 4),
+        (data + 512, u32::MAX),
+        (data + 512, 2 * 1024 * 1024),
+    ] {
+        machine.cpu.write(output, &[0xcc; 8]).unwrap();
+        for name in ["GetTextExtentPoint32A", "GetTextExtentPoint32W"] {
+            assert_eq!(
+                invoke(&mut machine, data, name, &[dc, pointer, count, output]),
+                0
+            );
+            let mut actual = [0; 8];
+            machine.cpu.read(output, &mut actual).unwrap();
+            assert_eq!(actual, [0xcc; 8]);
+        }
+    }
+    let read_only = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 4096, Prot::RW)
+        .unwrap();
+    machine.cpu.write(read_only, &[0xcd; 8]).unwrap();
+    machine.cpu.protect(read_only, 4096, Prot::READ).unwrap();
+    for name in ["GetTextExtentPoint32A", "GetTextExtentPoint32W"] {
+        assert_eq!(
+            invoke(&mut machine, data, name, &[dc, data + 512, 2, read_only]),
+            0
+        );
+        let mut actual = [0; 8];
+        machine.cpu.read(read_only, &mut actual).unwrap();
+        assert_eq!(actual, [0xcd; 8]);
+    }
+    assert_eq!(
+        machine.ext.get::<Fonts>().text.stats().fonts,
+        0,
+        "invalid outputs fail before native font matching"
+    );
+}
+#[test]
+#[cfg(windows)]
+fn measurements_bound_native_font_owners_without_invalidating_cached_glyph_results() {
+    let (mut machine, _data, dc) = fixture();
+    let Some(GdiObj::Font(font)) = machine
+        .ext
+        .get::<Win32>()
+        .gdi
+        .get(&machine.sys.objects, selected_font(&machine, dc))
+    else {
+        panic!("font");
+    };
+    let original = from_font(font);
+    let request = GlyphRequest {
+        character: Character::Unicode(u32::from(b'W')),
+        format: GlyphFormat::Gray8,
+        hinted: true,
+        transform: Transform::IDENTITY,
+    };
+    let text = &mut machine.ext.get_mut::<Fonts>().text;
+    let retained = text.glyph(&original, request).unwrap();
+    let pixels = retained.data.clone();
+    for width in 1..=text::FONT_CACHE_CAPACITY + 8 {
+        let mut font = original.clone();
+        font.width = width as i32;
+        let extent = text
+            .extent(&font, text::TextInput::Unicode(&[u16::from(b'W')]))
+            .unwrap();
+        assert!(extent.width > 0);
+        assert!(text.stats().fonts <= text::FONT_CACHE_CAPACITY);
+    }
+    let hits = text.stats().hits;
+    let reused = text.glyph(&original, request).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&retained, &reused));
+    assert_eq!(reused.data, pixels);
+    assert_eq!(text.stats().hits, hits + 1);
+}
+#[test]
+fn bitmap_source_and_palette_outputs_obey_permissions_and_never_wrap_or_leak() {
+    let (mut machine, data, _dc) = fixture();
+    let source = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 4096, Prot::WRITE)
+        .unwrap();
+    machine.cpu.write(source, &[0x37; 16]).unwrap();
+    let objects_before = machine.sys.objects.object_count();
+    let first_free = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 4096, Prot::RW)
+        .unwrap();
+    machine.sys.vm.free(&mut machine.cpu, first_free).unwrap();
+    for pointer in [u32::MAX - 3, source] {
+        for _ in 0..8 {
+            assert_eq!(
+                invoke(&mut machine, data, "CreateBitmap", &[2, 2, 1, 32, pointer]),
+                0
+            );
+            assert_eq!(machine.sys.objects.object_count(), objects_before);
+        }
+    }
+    let after = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 4096, Prot::RW)
+        .unwrap();
+    assert_eq!(
+        after, first_free,
+        "rejected source validation must not leave a guest allocation"
+    );
+    machine.sys.vm.free(&mut machine.cpu, after).unwrap();
+    let zero = invoke(&mut machine, data, "CreateBitmap", &[0, 7, 1, 32, 0]);
+    assert_ne!(zero, 0);
+    assert!(matches!(
+        machine
+            .ext
+            .get::<Win32>()
+            .gdi
+            .get(&machine.sys.objects, zero),
+        Some(GdiObj::Bitmap {
+            width: 1,
+            height: 1,
+            bpp: 1,
+            ..
+        })
+    ));
+    assert_eq!(invoke(&mut machine, data, "DeleteObject", &[zero]), 1);
+    assert_eq!(machine.sys.objects.object_count(), objects_before);
+
+    // DEFAULT_PALETTE returns only its two-byte entry count. The entire count
+    // must be writable even if the backend's host write can bypass guest protection.
+    let output = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 4096, Prot::RW)
+        .unwrap();
+    machine.cpu.write(output, &[0xcd; 2]).unwrap();
+    machine.cpu.protect(output, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        invoke(&mut machine, data, "GetObjectA", &[0x0190_001f, 2, output]),
+        0
+    );
+    assert_eq!(machine.cpu.read_u16(output).unwrap(), 0xcdcd);
+    assert_eq!(
+        invoke(
+            &mut machine,
+            data,
+            "GetObjectA",
+            &[0x0190_001f, 2, u32::MAX]
+        ),
+        0
+    );
+}
+#[test]
 fn software_dc_preserves_font_and_mapping_state() {
     let (mut machine, data, dc) = fixture();
     assert_eq!(invoke(&mut machine, data, "SetMapMode", &[dc, 1]), 1);

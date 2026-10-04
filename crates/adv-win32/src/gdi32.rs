@@ -1,12 +1,11 @@
 //! GDI object semantics over the process object table. Raster and text commands
 //! translate into the shared device implementation.
 
-use adv_abi::Registry;
+use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 
-use crate::util::{cstr, out_u32};
-use crate::{Win32, stdcall};
+use crate::Win32;
 
 pub mod font;
 mod palette;
@@ -59,7 +58,7 @@ mod object_tests {
     }
 }
 
-const GDI32: &str = "gdi32.dll";
+const GDI32: &str = "gdi32.dll"; // Shared by the palette frontend.
 
 /// Stock objects (GetStockObject index i) have fixed handles.
 const STOCK_BASE: u32 = 0x0190_0010;
@@ -134,15 +133,18 @@ pub fn create_font(env: &mut Env<'_>, height: i32, face: &str) -> u32 {
     add(env, GdiObj::Font(f))
 }
 
-fn get_stock_object(env: &mut Env<'_>) -> Outcome {
-    let i = env.arg(0);
+#[win32(gdi32, name = "GetStockObject", level = state)]
+fn get_stock_object(_env: &mut Env<'_>, index: i32) -> Outcome {
+    let i = index as u32;
     Outcome::Return(if i < STOCK_COUNT { stock_object(i) } else { 0 })
 }
 
-fn create_font_indirect_a(env: &mut Env<'_>) -> Outcome {
-    let p = env.arg(0);
-    let mut raw = vec![0u8; 60];
-    if env.cpu.read(p, &mut raw).is_err() {
+#[win32(gdi32, name = "CreateFontIndirectA", level = implement)]
+fn create_font_indirect_a(env: &mut Env<'_>, pointer: GuestPtr<[u8; 60]>) -> Outcome {
+    let mut raw = vec![0; 60];
+    if adv_abi::guest::check_range(env.cpu, pointer.addr(), 60, Prot::READ).is_err()
+        || env.cpu.read(pointer.addr(), &mut raw).is_err()
+    {
         return Outcome::Return(0);
     }
     Outcome::Return(add_logfont(env, raw))
@@ -168,29 +170,55 @@ fn add_logfont(env: &mut Env<'_>, raw: Vec<u8>) -> u32 {
     add(env, GdiObj::Font(f))
 }
 
-fn create_font_a(env: &mut Env<'_>) -> Outcome {
-    // CreateFontA's 14 arguments are LOGFONTA's fields in order.
-    let mut raw = vec![0u8; 60];
-    for i in 0..5 {
-        let v = env.arg(i);
-        raw[4 * i as usize..4 * i as usize + 4].copy_from_slice(&v.to_le_bytes());
+#[win32(gdi32, name = "CreateFontA", level = implement)]
+#[expect(clippy::too_many_arguments, reason = "SDK CreateFontA fields")]
+fn create_font_a(
+    env: &mut Env<'_>,
+    height: i32,
+    width: i32,
+    escapement: i32,
+    orientation: i32,
+    weight: i32,
+    italic: u32,
+    underline: u32,
+    strikeout: u32,
+    charset: u32,
+    precision: u32,
+    clip: u32,
+    quality: u32,
+    pitch: u32,
+    face: AnsiStr,
+) -> Outcome {
+    let mut raw = vec![0; 60];
+    for (slot, value) in raw[..20].as_chunks_mut::<4>().0.iter_mut().zip([
+        height,
+        width,
+        escapement,
+        orientation,
+        weight,
+    ]) {
+        *slot = value.to_le_bytes();
     }
-    for i in 0..8 {
-        raw[20 + i] = env.arg(5 + i as u32) as u8;
+    for (slot, value) in raw[20..28].iter_mut().zip([
+        italic, underline, strikeout, charset, precision, clip, quality, pitch,
+    ]) {
+        *slot = value as u8;
     }
-    let face = cstr(env.cpu, env.arg(13));
-    let n = face.len().min(31);
-    raw[28..28 + n].copy_from_slice(&face[..n]);
+    if face.0.addr() != 0 {
+        let Ok(face) = face.read(env.cpu, 4096) else {
+            return Outcome::Return(0);
+        };
+        let length = face.len().min(31);
+        raw[28..28 + length].copy_from_slice(&face[..length]);
+    }
     Outcome::Return(add_logfont(env, raw))
 }
-
-fn create_solid_brush(env: &mut Env<'_>) -> Outcome {
-    let color = env.arg(0);
+#[win32(gdi32, name = "CreateSolidBrush", level = implement)]
+fn create_solid_brush(env: &mut Env<'_>, color: u32) -> Outcome {
     Outcome::Return(add(env, GdiObj::Brush { color }))
 }
-
-fn create_pen(env: &mut Env<'_>) -> Outcome {
-    let color = env.arg(2);
+#[win32(gdi32, name = "CreatePen", level = implement)]
+fn create_pen(env: &mut Env<'_>, _style: i32, _width: i32, color: u32) -> Outcome {
     Outcome::Return(add(env, GdiObj::Pen { color }))
 }
 
@@ -248,14 +276,15 @@ pub(super) fn select_object_value(env: &mut Env<'_>, hdc: u32, h: u32) -> Outcom
     }
 }
 
-fn get_object_a(env: &mut Env<'_>) -> Outcome {
-    let (h, size, out) = (env.arg(0), env.arg(1), env.arg(2));
+#[win32(gdi32, name = "GetObjectA", level = implement)]
+fn get_object_a(env: &mut Env<'_>, object: Handle, count: i32, output: GuestPtr<()>) -> Outcome {
+    let (h, size, out) = (object.0, count.max(0) as u32, output.addr());
     if let Some(entries) = palette::entries(env, h) {
         let count = entries.len() as u16;
         if out == 0 {
             return Outcome::Return(2);
         }
-        if size < 2 || !env.cpu.accessible(out, 2, Prot::WRITE) {
+        if size < 2 || adv_abi::guest::check_range(env.cpu, out, 2, Prot::WRITE).is_err() {
             return Outcome::Return(0);
         }
         return Outcome::Return(if env.cpu.write(out, &count.to_le_bytes()).is_ok() {
@@ -294,13 +323,31 @@ fn get_object_a(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(bytes.len() as u32);
     }
     let n = bytes.len().min(size as usize);
-    let _ = env.cpu.write(out, &bytes[..n]);
-    Outcome::Return(n as u32)
+    Outcome::Return(
+        if adv_abi::guest::check_range(env.cpu, out, n as u32, Prot::WRITE).is_ok()
+            && env.cpu.write(out, &bytes[..n]).is_ok()
+        {
+            n as u32
+        } else {
+            0
+        },
+    )
 }
 
 fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u32, u32)> {
-    let stride = (width.unsigned_abs() * u32::from(bpp)).div_ceil(32) * 4;
-    let size = (stride * height.unsigned_abs()).max(4);
+    if width < 0 || height < 0 {
+        return None;
+    }
+    let (width, height, bpp) = if width == 0 || height == 0 {
+        (1, 1, 1)
+    } else {
+        (width, height, bpp)
+    };
+    let stride = (width as u32)
+        .checked_mul(u32::from(bpp))?
+        .div_ceil(32)
+        .checked_mul(4)?;
+    let size = stride.checked_mul(height as u32)?;
     let bits = env.sys.vm.alloc(env.cpu, size, Prot::RW).ok()?;
     let h = add(
         env,
@@ -320,47 +367,81 @@ fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u
     Some((h, bits))
 }
 
-fn create_bitmap(env: &mut Env<'_>) -> Outcome {
-    let (w, h, bpp, init) = (
-        env.arg(0) as i32,
-        env.arg(1) as i32,
-        env.arg(3) as u16,
-        env.arg(4),
-    );
-    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp.max(1)) else {
+#[win32(gdi32, name = "CreateBitmap", level = implement)]
+fn create_bitmap(
+    env: &mut Env<'_>,
+    w: i32,
+    h: i32,
+    planes: u32,
+    depth: u32,
+    input: GuestPtr<()>,
+) -> Outcome {
+    if planes != 1 || !matches!(depth, 1 | 4 | 8 | 16 | 24 | 32) || w < 0 || h < 0 {
+        return Outcome::Return(0);
+    }
+    let (bpp, init) = (depth as u16, input.addr());
+    if w == 0 || h == 0 {
+        // Native returns a 1x1 monochrome bitmap. There are no counted source
+        // rows to inspect, even when the caller supplies a non-null pointer.
+        return Outcome::Return(new_bitmap(env, w, h, bpp).map_or(0, |(bitmap, _)| bitmap));
+    }
+    let Some(row_bits) = (w as u32).checked_mul(depth) else {
+        return Outcome::Return(0);
+    };
+    let Some(src_stride) = row_bits.div_ceil(16).checked_mul(2) else {
+        return Outcome::Return(0);
+    };
+    let Some(dst_stride) = row_bits.div_ceil(32).checked_mul(4) else {
+        return Outcome::Return(0);
+    };
+    let Some(source_length) = src_stride.checked_mul(h as u32) else {
+        return Outcome::Return(0);
+    };
+    // Guest::read may bypass page permissions on a host-backed CPU. Validate
+    // every source row as one region before allocating or publishing the bitmap.
+    if init != 0
+        && (init.checked_add(source_length).is_none()
+            || adv_abi::guest::check_range(env.cpu, init, source_length, Prot::READ).is_err())
+    {
+        return Outcome::Return(0);
+    }
+    let Some((hbm, bits)) = new_bitmap(env, w, h, bpp) else {
         return Outcome::Return(0);
     };
     if init != 0 {
         // Source rows are WORD-aligned; ours DWORD-aligned.
-        let src_stride = (w.unsigned_abs() * u32::from(bpp)).div_ceil(16) * 2;
-        let dst_stride = (w.unsigned_abs() * u32::from(bpp)).div_ceil(32) * 4;
-        let mut row = vec![0u8; src_stride as usize];
+        let mut row = vec![0; src_stride as usize];
         for y in 0..h.unsigned_abs() {
-            if env.cpu.read(init + y * src_stride, &mut row).is_ok() {
-                let _ = env.cpu.write(bits + y * dst_stride, &row);
+            let source = init
+                .checked_add(y * src_stride)
+                .expect("validated counted source");
+            if env.cpu.read(source, &mut row).is_err()
+                || env.cpu.write(bits + y * dst_stride, &row).is_err()
+            {
+                delete_object_value(env, hbm);
+                return Outcome::Return(0);
             }
         }
     }
     Outcome::Return(hbm)
 }
-
-fn create_compatible_bitmap(env: &mut Env<'_>) -> Outcome {
-    let (w, h) = (env.arg(1) as i32, env.arg(2) as i32);
+#[win32(gdi32, name = "CreateCompatibleBitmap", level = implement)]
+fn create_compatible_bitmap(env: &mut Env<'_>, _dc: Handle, w: i32, h: i32) -> Outcome {
     Outcome::Return(new_bitmap(env, w, h, 32).map_or(0, |(h, _)| h))
 }
-
-fn get_device_caps(env: &mut Env<'_>) -> Outcome {
+#[win32(gdi32, name = "GetDeviceCaps", level = state)]
+fn get_device_caps(env: &mut Env<'_>, _dc: Handle, index: i32) -> Outcome {
     let (w, h) = env.ext.get::<Win32>().user.screen;
-    Outcome::Return(match env.arg(1) {
-        8 => w as u32,   // HORZRES
-        10 => h as u32,  // VERTRES
-        12 => 32,        // BITSPIXEL
-        14 => 1,         // PLANES
-        24 => u32::MAX,  // NUMCOLORS (true color)
-        88 | 90 => 96,   // LOGPIXELSX/Y
-        116 => 60,       // VREFRESH
-        118 => w as u32, // DESKTOPHORZRES
-        117 => h as u32, // DESKTOPVERTRES
+    Outcome::Return(match index {
+        8 => w as u32,
+        10 => h as u32,
+        12 => 32,
+        14 => 1,
+        24 => u32::MAX,
+        88 | 90 => 96,
+        116 => 60,
+        118 => w as u32,
+        117 => h as u32,
         n => {
             log::debug!("GetDeviceCaps({n}) = 0");
             0
@@ -368,8 +449,11 @@ fn get_device_caps(env: &mut Env<'_>) -> Outcome {
     })
 }
 
-fn dc_field(env: &mut Env<'_>, f: impl FnOnce(&mut u32, &mut u32, &mut u32) -> u32) -> Outcome {
-    let hdc = env.arg(0);
+fn dc_field(
+    env: &mut Env<'_>,
+    hdc: u32,
+    f: impl FnOnce(&mut u32, &mut u32, &mut u32) -> u32,
+) -> Outcome {
     match get_mut(env, hdc) {
         Some(GdiObj::Dc {
             text_color,
@@ -381,62 +465,41 @@ fn dc_field(env: &mut Env<'_>, f: impl FnOnce(&mut u32, &mut u32, &mut u32) -> u
     }
 }
 
-fn set_text_color(env: &mut Env<'_>) -> Outcome {
-    let v = env.arg(1);
-    dc_field(env, |t, _, _| std::mem::replace(t, v))
+#[win32(gdi32, name = "SetTextColor", level = state)]
+fn set_text_color(env: &mut Env<'_>, dc: Handle, color: u32) -> Outcome {
+    dc_field(env, dc.0, |t, _, _| std::mem::replace(t, color))
 }
-
-fn set_bk_color(env: &mut Env<'_>) -> Outcome {
-    let v = env.arg(1);
-    dc_field(env, |_, b, _| std::mem::replace(b, v))
+#[win32(gdi32, name = "SetBkColor", level = state)]
+fn set_bk_color(env: &mut Env<'_>, dc: Handle, color: u32) -> Outcome {
+    dc_field(env, dc.0, |_, b, _| std::mem::replace(b, color))
 }
-
-fn set_bk_mode(env: &mut Env<'_>) -> Outcome {
-    let v = env.arg(1);
-    dc_field(env, |_, _, m| std::mem::replace(m, v))
-}
-
-/// Font height of the font selected into `hdc` (for text metrics).
-fn dc_font_height(env: &mut Env<'_>, hdc: u32) -> i32 {
-    let font = match get(env, hdc) {
-        Some(GdiObj::Dc { selected, .. }) => selected[2],
-        _ => 0,
-    };
-    match get(env, font) {
-        Some(GdiObj::Font(f)) if f.height != 0 => f.height.abs(),
-        _ => 16,
-    }
-}
-
-fn get_text_extent_point32_a(env: &mut Env<'_>) -> Outcome {
-    let (hdc, s, n, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let h = dc_font_height(env, hdc);
-    // Monospace approximation: single-byte characters are half the height wide.
-    let mut bytes = vec![0u8; n as usize];
-    let _ = env.cpu.read(s, &mut bytes);
-    let width: i32 = bytes.len() as i32 * h / 2;
-    out_u32(env.cpu, out, width as u32);
-    out_u32(env.cpu, out + 4, h as u32);
-    Outcome::Return(1)
+#[win32(gdi32, name = "SetBkMode", level = state)]
+fn set_bk_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
+    // Native GDI preserves even nonstandard integer modes. Drawing validates
+    // the supported behavior separately instead of changing this state contract.
+    dc_field(env, dc.0, |_, _, m| std::mem::replace(m, mode as u32))
 }
 
 pub fn register(reg: &mut Registry) {
     palette::register(reg);
-    let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, GDI32, name, argc, h);
-    s(reg, "GetStockObject", 1, get_stock_object);
-    s(reg, "CreateFontIndirectA", 1, create_font_indirect_a);
-    s(reg, "CreateFontA", 14, create_font_a);
-    s(reg, "CreateSolidBrush", 1, create_solid_brush);
-    s(reg, "CreatePen", 3, create_pen);
-    s(reg, "GetObjectA", 3, get_object_a);
-    s(reg, "CreateBitmap", 5, create_bitmap);
-    s(reg, "CreateCompatibleBitmap", 3, create_compatible_bitmap);
-    s(reg, "GetDeviceCaps", 2, get_device_caps);
-    s(reg, "SetTextColor", 2, set_text_color);
-    s(reg, "SetBkColor", 2, set_bk_color);
-    s(reg, "SetBkMode", 2, set_bk_mode);
-    s(reg, "TextOutA", 5, |_| Outcome::Return(1));
-    s(reg, "GetTextExtentPoint32A", 4, get_text_extent_point32_a);
+    for api in [
+        get_stock_object_ABI,
+        create_font_indirect_a_ABI,
+        create_font_a_ABI,
+        create_solid_brush_ABI,
+        create_pen_ABI,
+        get_object_a_ABI,
+        create_bitmap_ABI,
+        create_compatible_bitmap_ABI,
+        get_device_caps_ABI,
+        set_text_color_ABI,
+        set_bk_color_ABI,
+        set_bk_mode_ABI,
+    ] {
+        reg.register(api);
+    }
+    // TextOut remains a generated, observed failure until the real raster path
+    // is installed. Registering a success-only handler would hide missing pixels.
     font::register(reg);
     raster::register(reg);
 }

@@ -101,3 +101,35 @@ fn diagnostic_override_has_the_same_variadic_contract() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+#[test]
+fn gdi_object_and_extent_bindings_are_generated_but_missing_textout_remains_a_gap() {
+    let registry = adv_runtime::boot::api_registry(adv_runtime::vorbis::Policy::Guest);
+    for name in [
+        "GetStockObject",
+        "CreateFontIndirectA",
+        "CreateFontA",
+        "CreateSolidBrush",
+        "CreatePen",
+        "GetObjectA",
+        "CreateBitmap",
+        "CreateCompatibleBitmap",
+        "GetDeviceCaps",
+        "SetTextColor",
+        "SetBkColor",
+        "SetBkMode",
+        "GetTextExtentPoint32A",
+        "GetTextExtentPoint32W",
+    ] {
+        assert!(
+            registry.level("gdi32.dll", name).is_some(),
+            "{name} must be a generated descriptor"
+        );
+        assert!(registry.is_implemented("gdi32.dll", name));
+        assert_eq!(registry.get("gdi32.dll", name).unwrap().data, 0);
+    }
+    assert!(!registry.is_implemented("gdi32.dll", "TextOutA"));
+    assert_eq!(
+        registry.get("gdi32.dll", "TextOutA").unwrap().conv,
+        adv_abi::Conv::Stdcall { argc: 5 }
+    );
+}
