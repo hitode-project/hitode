@@ -65,6 +65,7 @@ pub struct SignatureConflict {
 /// Legacy registrations coexist with generated adapters and are audited separately.
 pub struct Registry {
     fns: HashMap<(String, String), Entry>,
+    data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
     replacements: std::collections::BTreeSet<String>,
 }
@@ -73,6 +74,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             fns: HashMap::new(),
+            data: HashMap::new(),
             mode: RunMode::Strict,
             replacements: Default::default(),
         }
@@ -97,6 +99,15 @@ impl Registry {
         handler: Handler,
         data: u64,
     ) {
+        assert!(
+            signature::lookup(module, name).is_none_or(|s| s.data_size.is_none()),
+            "a data export cannot be registered as a function: {module}!{name}"
+        );
+        assert!(
+            !self
+                .data
+                .contains_key(&(module.to_ascii_lowercase(), name.to_owned()))
+        );
         self.fns.insert(
             (module.to_ascii_lowercase(), name.to_owned()),
             Entry {
@@ -109,6 +120,42 @@ impl Registry {
                 level: None,
             },
         );
+    }
+
+    /// Register a data cell against the same generated export declarations.
+    pub fn register_data(&mut self, module: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let key = (module.to_ascii_lowercase(), name.to_owned());
+        let size = signature::lookup(module, name)
+            .and_then(|s| s.data_size)
+            .ok_or_else(|| format!("no generated data declaration: {module}!{name}"))?;
+        if bytes.len() != size as usize
+            || self.fns.contains_key(&key)
+            || self.data.contains_key(&key)
+        {
+            return Err(format!("conflicting data registration: {module}!{name}"));
+        }
+        self.data.insert(key, bytes.to_vec());
+        Ok(())
+    }
+
+    /// Assembly initializes descriptor bytes before synthetic images are built.
+    pub fn set_data(&mut self, module: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let value = self
+            .data
+            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
+            .ok_or_else(|| format!("data export not registered: {module}!{name}"))?;
+        if value.len() != bytes.len() {
+            return Err(format!("data size mismatch: {module}!{name}"));
+        }
+        value.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    pub fn data(&self, module: &str, name: &str) -> Option<&[u8]> {
+        let name = self.canonical_name(module, name).unwrap_or(name);
+        self.data
+            .get(&(module.to_ascii_lowercase(), name.to_owned()))
+            .map(Vec::as_slice)
     }
 
     pub fn register(&mut self, api: Api) {
@@ -147,6 +194,9 @@ impl Registry {
     pub fn get(&self, module: &str, name: &str) -> Option<HostFn> {
         let canonical = self.canonical_name(module, name);
         let name = canonical.unwrap_or(name);
+        if signature::lookup(module, name).is_some_and(|s| s.data_size.is_some()) {
+            return None;
+        }
         if let Some(entry) = self
             .fns
             .get(&(module.to_ascii_lowercase(), name.to_owned()))
@@ -169,13 +219,18 @@ impl Registry {
     /// An explicit legacy ordinal implementation wins over an SDK alias.
     pub fn canonical_name(&self, module: &str, name: &str) -> Option<&'static str> {
         let module = module.to_ascii_lowercase();
-        if self.fns.contains_key(&(module.clone(), name.to_owned())) {
+        if self.fns.contains_key(&(module.clone(), name.to_owned()))
+            || self.data.contains_key(&(module.clone(), name.to_owned()))
+        {
             return None;
         }
         ordinals::lookup(&module, name)
     }
 
     pub fn level(&self, module: &str, name: &str) -> Option<ImplementationLevel> {
+        if self.data(module, name).is_some() {
+            return Some(ImplementationLevel::State);
+        }
         let name = self.canonical_name(module, name).unwrap_or(name);
         self.fns
             .get(&(module.to_ascii_lowercase(), name.to_owned()))
@@ -185,6 +240,7 @@ impl Registry {
         let name = self.canonical_name(module, name).unwrap_or(name);
         self.fns
             .contains_key(&(module.to_ascii_lowercase(), name.to_owned()))
+            || self.data(module, name).is_some()
     }
 
     /// Dynamic capability probes expose registered behavior, including explicit
@@ -205,16 +261,17 @@ impl Registry {
                 })
     }
     pub fn len(&self) -> usize {
-        self.fns.len()
+        self.fns.len() + self.data.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.fns.is_empty()
+        self.fns.is_empty() && self.data.is_empty()
     }
 
     /// Include generated DLLs so static imports retain diagnostic stub bindings.
     pub fn has_module(&self, module: &str) -> bool {
         let module = module.to_ascii_lowercase();
         self.fns.keys().any(|(m, _)| *m == module)
+            || self.data.keys().any(|(m, _)| *m == module)
             || signature::signatures().iter().any(|s| s.module == module)
     }
 
@@ -231,6 +288,12 @@ impl Registry {
                 .keys()
                 .filter(|(m, name)| *m == module && !name.contains("::"))
                 .map(|(_, n)| n.clone()),
+        );
+        names.extend(
+            self.data
+                .keys()
+                .filter(|(m, _)| *m == module)
+                .map(|(_, name)| name.clone()),
         );
         names.sort();
         names.dedup();
@@ -291,6 +354,7 @@ impl Registry {
                 None => coverage.legacy += 1,
             }
         }
+        coverage.state += self.data.len();
         coverage
     }
 }
@@ -305,6 +369,13 @@ pub struct Coverage {
 }
 
 impl adv_machine::Resolver for Registry {
+    fn host_data(&self, module: &str, name: &str) -> Option<&[u8]> {
+        self.data(module, name)
+    }
+    fn data_size(&self, module: &str, name: &str) -> Option<u32> {
+        let name = self.canonical_name(module, name).unwrap_or(name);
+        signature::lookup(module, name).and_then(|s| s.data_size)
+    }
     fn replaces_module(&self, module: &str) -> bool {
         self.replacements.contains(&module.to_ascii_lowercase())
     }

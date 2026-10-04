@@ -26,21 +26,58 @@ fn terminate_process(env: &mut Env<'_>) -> Outcome {
 
 pub(crate) fn command_line(env: &mut Env<'_>, wide: bool) -> u32 {
     let (w, heaps) = env.ext.get2_mut::<Win32, Heaps>();
+    let key = if wide { "cmdline_w" } else { "cmdline_a" };
+    if let Some(&pointer) = w.statics.get(key) {
+        return pointer;
+    }
     let line = format!("\"{}\"", w.exe_path());
-    let (key, bytes) = if wide {
-        (
-            "cmdline_w",
-            line.encode_utf16()
-                .chain([0])
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        )
+    let bytes = if wide {
+        line.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
     } else {
         let mut bytes = w.codec.encode(&line);
         bytes.push(0);
-        ("cmdline_a", bytes)
+        // Reserve enough room for a later explicitly selected code page while
+        // retaining the address stored in each CRT data cell.
+        bytes.resize(line.encode_utf16().count() * 4 + 1, 0);
+        bytes
     };
     w.static_bytes(key, env.cpu, env.sys, heaps, &bytes)
+}
+
+pub(crate) fn configure_codepage(
+    env: &mut Env<'_>,
+    codepage: u32,
+) -> Result<(), adv_cpu::backend::MemFault> {
+    let w = env.ext.get::<Win32>();
+    if w.cfg.os.codepage == codepage {
+        return Ok(());
+    }
+    let codec = adv_os::Codec::new(codepage);
+    if let Some(&pointer) = w.statics.get("cmdline_a") {
+        let mut bytes = codec.encode(&format!("\"{}\"", w.exe_path()));
+        bytes.push(0);
+        let length = bytes.len() as u32;
+        if env
+            .ext
+            .get_mut::<Heaps>()
+            .size(0, pointer)
+            .is_none_or(|size| size < length)
+        {
+            return Err(adv_cpu::backend::MemFault {
+                addr: pointer,
+                len: length,
+            });
+        }
+        adv_abi::guest::check_range(env.cpu, pointer, length, adv_cpu::backend::Prot::WRITE)?;
+        env.cpu.write(pointer, &bytes)?;
+    }
+    let w = env.ext.get_mut::<Win32>();
+    w.cfg.os.codepage = codepage;
+    w.codec = codec;
+    Ok(())
 }
 
 fn command_line_a(env: &mut Env<'_>) -> Outcome {

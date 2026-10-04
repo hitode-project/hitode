@@ -84,7 +84,7 @@ fn machine<B: Backend>(cpu: B) -> Machine<B> {
         &mut machine,
         Win32Config::new(
             "/nonexistent/mainargs",
-            "表 fixture.exe",
+            "表 fixture with sufficient room for the authored command line.exe",
             "/nonexistent/mainargs-data",
         ),
     )
@@ -105,26 +105,24 @@ fn command<B: Backend>(machine: &mut Machine<B>, line: &str) {
         .flat_map(u16::to_le_bytes)
         .collect();
     // Seed the actual shared Win32 buffers; no second command-line state.
-    assert_ne!(
-        w.static_bytes(
-            "cmdline_a",
-            &mut machine.cpu,
-            &mut machine.sys,
-            heaps,
-            &ansi
-        ),
-        0
+    let a = w.static_bytes(
+        "cmdline_a",
+        &mut machine.cpu,
+        &mut machine.sys,
+        heaps,
+        &ansi,
     );
-    assert_ne!(
-        w.static_bytes(
-            "cmdline_w",
-            &mut machine.cpu,
-            &mut machine.sys,
-            heaps,
-            &wide
-        ),
-        0
+    let b = w.static_bytes(
+        "cmdline_w",
+        &mut machine.cpu,
+        &mut machine.sys,
+        heaps,
+        &wide,
     );
+    assert!(heaps.size(0, a).unwrap() >= ansi.len() as u32);
+    assert!(heaps.size(0, b).unwrap() >= wide.len() as u32);
+    machine.cpu.write(a, &ansi).unwrap();
+    machine.cpu.write(b, &wide).unwrap();
 }
 fn invoke(code: &mut Asm, target: u32, args: [u32; 5], result: u32) {
     for arg in args.into_iter().rev() {

@@ -77,3 +77,26 @@ msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|envir
 msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcrt.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr80.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
+msvcr80.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr90.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
+msvcr90.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcr80.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcr80.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcr90.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcr90.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcrt.dll	_acmdln	data	ptr	char*	
+msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
+msvcrt.dll	_adjust_fdiv	data	i32	int	
+msvcr80.dll	_acmdln	data	ptr	char*	
+msvcr80.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr90.dll	_acmdln	data	ptr	char*	
+msvcr90.dll	_wcmdln	data	ptr	wchar_t*	

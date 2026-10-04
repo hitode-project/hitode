@@ -26,7 +26,7 @@ fn run() -> Result<(), String> {
     let limit = Duration::from_secs(120);
     let overlay = format!("target/audio-bench-data/{}-{}", args[1], std::process::id());
     let mut runtime = Runtime::with_cpu(exe, overlay, cpu, 640, 480)?;
-    runtime.set_codepage(codepage);
+    runtime.set_codepage(codepage)?;
     runtime.set_auto_dialog_ms(Some(50));
     runtime.set_audio_enabled(true);
     runtime.enable_audio_pcm_digests();

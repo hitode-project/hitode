@@ -5,9 +5,13 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
 mod convert;
+mod cpp_alloc;
+mod data;
+pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
 mod onexit;
+mod secure_memory;
 mod startup;
 mod wide_string;
 
@@ -55,19 +59,18 @@ fn invalid_parameter(env: &mut Env<'_>, function: &str, error: i32) -> Outcome {
 pub fn install<B: adv_cpu::backend::Backend>(
     machine: &mut adv_machine::Machine<B>,
 ) -> Result<(), String> {
-    let data = machine
-        .resolve_import("msvcrt.dll", "_adjust_fdiv")
-        .map_err(|e| e.to_string())?;
-    machine.cpu.write_u32(data, 0).map_err(|e| e.to_string())?;
     machine.ext.insert(CrtState::default());
     Ok(())
 }
 
 pub fn register(r: &mut Registry) {
+    data::register(r);
     floating::register(r);
     onexit::register(r);
     startup::register(r);
     convert::register(r);
+    cpp_alloc::register(r);
+    secure_memory::register(r);
     heap::register(r);
     wide_string::register(r);
     for (name, argc) in [
@@ -89,7 +92,6 @@ pub fn register(r: &mut Registry) {
         ("__set_app_type", 1),
         ("__p__fmode", 0),
         ("__p__commode", 0),
-        ("_adjust_fdiv", 0),
         ("toupper", 1),
         ("qsort", 4),
         ("floor", 2),
@@ -502,7 +504,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             return initializers(e, a, b, name == "_initterm_e");
         }
-        "_adjust_fdiv" => 0,
         "toupper" => {
             if a <= 255 {
                 u32::from((a as u8).to_ascii_uppercase())

@@ -122,6 +122,7 @@ impl Win32 {
         m.ext.insert(heaps);
         gdi32::font::install(m);
         user32::install(m)?;
+        msvcrt::initialize_data(m)?;
         Ok(())
     }
 
@@ -152,6 +153,11 @@ impl Win32 {
         self.statics.insert(key, p);
         p
     }
+}
+
+/// Change the personality's ANSI code page and refresh its existing process string.
+pub fn set_codepage(env: &mut adv_machine::Env<'_>, codepage: u32) -> Result<(), MemFault> {
+    kernel32::configure_codepage(env, codepage)
 }
 
 /// Register every implemented Win32 function.

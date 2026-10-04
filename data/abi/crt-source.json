@@ -2,7 +2,7 @@
   "source": "Microsoft Windows SDK 10.0.26100.0",
   "header": "ucrt/float.h",
   "sha256": "0fbf87532c053b666940a65360f2488f5b6bb2e601632e32a0f1a8a078d8fdcd",
-  "target": "x86 __cdecl; unsigned int and pointer 32 bits",
+  "target": "x86 __cdecl functions and data cells; unsigned int and pointer 32 bits",
   "input": "data/abi/crt-input.tsv",
   "output": "data/abi/signatures.tsv via tools/abi/Metadata.cs",
   "documentation": [
@@ -17,7 +17,13 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/exit-exit-exit",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/cexit-c-exit",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/getmainargs-wgetmainargs",
-    "https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments"
+    "https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments",
+    "https://learn.microsoft.com/en-us/cpp/standard-library/new-operators",
+    "https://learn.microsoft.com/en-us/cpp/cpp/new-and-delete-operators",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memcpy-s-wmemcpy-s",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memmove-s-wmemmove-s",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -45,6 +51,21 @@
   },
   "legacy_startup": {
     "declarations": "Microsoft Learn __getmainargs/__wgetmainargs, x86 cdecl five parameters; these legacy exports are absent from modern UCRT SDK headers and are not advertised for ucrtbase/API-set DLLs"
+  },
+  "vcruntime_new.h": {
+    "source": "Microsoft Visual C++ Build Tools 14.44.35207",
+    "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_new.h",
+    "sha256": "8ee45e7db7f08475d1ddf33d493fd7cb5cd10b54b4756b39156c8548281b3e63",
+    "projection": "x86 __cdecl scalar operator new(size_t) and operator delete(void*), legacy MSVC decorated names"
+  },
+  "corecrt_memcpy_s.h": {
+    "header": "ucrt/corecrt_memcpy_s.h",
+    "sha256": "359f3ce9e84bc00c983f01d9c3375d0ca9e0ef6a42e797d16e119c62b2ef333b"
+  },
+  "legacy_data": {
+    "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
+    "adjust_fdiv": "Existing x86 MSVCRT compatibility data cell, int32 zero initial value. The installed Microsoft SysWOW64/msvcrt.dll PE exports _adjust_fdiv from its writable, non-executable .data virtual tail, not a code entry. No modern SDK header declaration is claimed.",
+    "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
   },
   "process.h": {
     "header": "ucrt/process.h",

@@ -17,7 +17,7 @@ mod nlsapi;
 mod osversion;
 mod process;
 pub(crate) use environment::entries as environment_entries;
-pub(crate) use process::command_line;
+pub(crate) use process::{command_line, configure_codepage};
 mod string;
 mod sync;
 mod time;

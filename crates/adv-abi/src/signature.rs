@@ -67,6 +67,8 @@ pub struct Signature {
     pub return_kind: AbiKind,
     pub parameters: Vec<Parameter>,
     pub conv: Option<Conv>,
+    /// Size of a data export's cell; data has no calling convention or parameters.
+    pub data_size: Option<u32>,
     /// A COM signature includes the guest `this` pointer as its first parameter.
     pub com_slot: Option<u16>,
 }
@@ -133,6 +135,11 @@ pub fn signatures() -> &'static [Signature] {
                     return_type: fields[4],
                     parameters,
                     conv,
+                    data_size: (fields[2] == "data").then(|| match fields[3] {
+                        "ptr" | "u32" | "i32" => 4,
+                        "u64" => 8,
+                        _ => panic!("invalid generated data kind"),
+                    }),
                     com_slot: None,
                 }
             })
@@ -168,6 +175,7 @@ pub fn com_signatures() -> &'static [Signature] {
                     parameters,
                     conv: u8::try_from(words).ok().map(|argc| Conv::Stdcall { argc }),
                     com_slot: Some(fields[1].parse().expect("COM slot")),
+                    data_size: None,
                 }
             })
             .collect()

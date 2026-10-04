@@ -14,6 +14,60 @@ const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
 #[test]
+fn data_declarations_have_width_and_cannot_be_function_bindings() {
+    use adv_machine::Resolver;
+    let mut registry = Registry::default();
+    let signature = signature::lookup("msvcr90.dll", "_acmdln").unwrap();
+    assert_eq!(signature.data_size, Some(4));
+    assert!(!signature.callable());
+    assert!(signature.conv.is_none());
+    assert!(signature.parameters.is_empty());
+    assert_eq!(registry.data_size("msvcr90.dll", "_acmdln"), Some(4));
+    assert!(registry.get("msvcr90.dll", "_acmdln").is_none());
+    assert!(!registry.dynamic_available("msvcr90.dll", "_acmdln"));
+    assert!(
+        registry
+            .register_data("msvcr90.dll", "_acmdln", &[0; 8])
+            .is_err()
+    );
+    assert!(
+        registry
+            .register_data("kernel32.dll", "GetTickCount", &[0; 4])
+            .is_err()
+    );
+    registry
+        .register_data("MSVCR90.DLL", "_acmdln", &[0; 4])
+        .unwrap();
+    assert!(registry.dynamic_available("msvcr90.dll", "_acmdln"));
+    assert_eq!(
+        registry.level("msvcr90.dll", "_acmdln"),
+        Some(ImplementationLevel::State)
+    );
+    assert_eq!(registry.coverage().state, 1);
+    assert!(
+        registry
+            .set_data("msvcr90.dll", "_acmdln", &[0; 8])
+            .is_err()
+    );
+    registry
+        .set_data("msvcr90.dll", "_acmdln", &17u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        registry.host_data("msvcr90.dll", "_acmdln"),
+        Some(17u32.to_le_bytes().as_slice())
+    );
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.add("msvcr90.dll", "_acmdln", Conv::Cdecl { argc: 0 }, |_| {
+                Outcome::Return(0)
+            });
+        }))
+        .is_err()
+    );
+    assert!(registry.signature_conflicts().is_empty());
+}
+
+#[test]
 fn dynamic_availability_requires_registered_behavior_or_an_explicit_proxy_contract() {
     let mut registry = Registry::default();
     for mode in [RunMode::Strict, RunMode::Discovery] {

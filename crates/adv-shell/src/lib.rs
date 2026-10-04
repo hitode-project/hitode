@@ -652,7 +652,7 @@ fn run_execution(
         options.height,
         options.codec,
     )?;
-    runtime.set_codepage(options.codepage);
+    runtime.set_codepage(options.codepage)?;
     runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
     runtime

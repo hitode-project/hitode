@@ -73,7 +73,7 @@ fn run() -> Result<(), String> {
         std::process::id()
     );
     let mut runtime = Runtime::with_cpu(exe, overlay, cpu, 640, 480)?;
-    runtime.set_codepage(codepage);
+    runtime.set_codepage(codepage)?;
     runtime.set_auto_dialog_ms(Some(50));
     runtime.set_frame_limit(Some(limit));
     runtime.enable_frame_timing();

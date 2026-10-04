@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
     let startup = Instant::now();
     let mut runtime = Runtime::new(&args[0], &args[1], true, 640, 480)?;
     let startup_ms = startup.elapsed().as_secs_f64() * 1000.0;
-    runtime.set_codepage(codepage as u32);
+    runtime.set_codepage(codepage as u32)?;
     runtime.set_audio_enabled(audio);
     runtime.enable_frame_timing();
     runtime

@@ -167,7 +167,7 @@ fn run() -> Result<(), String> {
     };
     let mut r = Runtime::with_cpu(&args[0], &args[3], backend::Cpu::new(cpu_name)?, 800, 600)?;
     r.machine.cpu.set_async_compilation(args[1] == "jit");
-    r.set_codepage(936);
+    r.set_codepage(936)?;
     r.set_audio_enabled(true);
     r.set_auto_dialog_ms(Some(50));
     r.enable_audio_pcm_digests();

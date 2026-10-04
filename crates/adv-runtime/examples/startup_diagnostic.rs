@@ -231,7 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         480,
         adv_runtime::vorbis::Policy::Native,
     )?;
-    runtime.set_codepage(codepage);
+    runtime.set_codepage(codepage)?;
     if std::env::var("ADV_STARTUP_GPU").as_deref() == Ok("1") {
         #[cfg(feature = "gpu")]
         runtime.install_gpu(

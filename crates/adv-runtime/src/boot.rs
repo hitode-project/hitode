@@ -415,10 +415,8 @@ impl<B: Backend> Runtime<B> {
         win32.user.auto_dialog_ms = delay;
     }
     /// ANSI decoding for paths, text and font names; configure before the first step.
-    pub fn set_codepage(&mut self, codepage: u32) {
-        let win32 = self.machine.ext.get_mut::<Win32>();
-        win32.cfg.os.codepage = codepage;
-        win32.codec = adv_os::Codec::new(codepage);
+    pub fn set_codepage(&mut self, codepage: u32) -> Result<(), String> {
+        adv_win32::set_codepage(&mut self.env(), codepage).map_err(|error| error.to_string())
     }
 
     /// Post host input to the window that would receive it (see

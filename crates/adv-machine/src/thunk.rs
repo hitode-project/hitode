@@ -57,6 +57,14 @@ pub trait Resolver: Any {
     }
     /// Host implementation of `module!name` (`module` is a lowercase file name), if any.
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn>;
+    /// Declarative guest data storage, never a callable host function.
+    fn host_data(&self, _module: &str, _name: &str) -> Option<&[u8]> {
+        None
+    }
+    /// A known data declaration may lack an initialized host implementation.
+    fn data_size(&self, module: &str, name: &str) -> Option<u32> {
+        self.host_data(module, name).map(|bytes| bytes.len() as u32)
+    }
     /// Whether the host implements anything in `module` (lowercase file name).
     fn provides(&self, module: &str) -> bool;
     /// Explicit whole-module provider selected by assembly after a capability
@@ -66,7 +74,7 @@ pub trait Resolver: Any {
     }
     /// Whether this binding has an implementation rather than a generated stub.
     fn implemented(&self, module: &str, name: &str) -> bool {
-        self.host_fn(module, name).is_some()
+        self.host_fn(module, name).is_some() || self.host_data(module, name).is_some()
     }
 }
 
@@ -210,6 +218,10 @@ impl ThunkTable {
             key.1 = canonical;
         }
         let name = key.1.as_str();
+        if let Some(size) = self.resolver.data_size(&key.0, name) {
+            // Data imports are resolved by the image loader to RW/NX storage.
+            return Err(MemFault { addr: 0, len: size });
+        }
         if let Some(&i) = self.by_name.get(&key) {
             self.thunks[i as usize].requested |= requested;
             return Ok(thunk_addr(i));

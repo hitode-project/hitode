@@ -379,6 +379,10 @@ impl<'a> Loader<'a> {
         self.cpu.protect(base, size, Prot::READ)?;
         self.cpu
             .protect(base + image.text_rva, image.text_size, Prot::RX)?;
+        if image.data_size != 0 {
+            self.cpu
+                .protect(base + image.data_rva, image.data_size, Prot::RW)?;
+        }
         self.sys.images.add(Image {
             name: key.clone(),
             base,
@@ -692,7 +696,9 @@ impl<'a> Loader<'a> {
             let published = match sym {
                 ImportName::Name { name, .. } => module.exports_by_name.contains_key(name),
                 ImportName::Ordinal(ordinal) => {
-                    let known = self.sys.thunks.resolver().host_fn(&key, &name).is_some();
+                    let resolver = self.sys.thunks.resolver();
+                    let known = resolver.host_fn(&key, &name).is_some()
+                        || resolver.data_size(&key, &name).is_some();
                     known && module.exports_by_ordinal.contains_key(ordinal)
                 }
             };
@@ -717,23 +723,45 @@ impl<'a> Loader<'a> {
         match target {
             Some(ExportTarget::Rva(rva)) => {
                 let address = module.base + rva;
+                let original = match sym {
+                    ImportName::Name { name, .. } => module.exports_by_name.get(name),
+                    ImportName::Ordinal(ordinal) => module.exports_by_ordinal.get(ordinal),
+                };
+                let binding = match sym {
+                    ImportName::Name { name, .. } => Some(name.clone()),
+                    ImportName::Ordinal(_) => module
+                        .exports_by_name
+                        .iter()
+                        .find(|(_, target)| Some(*target) == original)
+                        .map(|(name, _)| name.clone()),
+                }
+                .unwrap_or_else(|| name.clone());
+                let data_size = self.sys.thunks.resolver().data_size(&module.name, &binding);
+                if let Some(data_size) = data_size
+                    && module.kind == ModuleKind::Host
+                    && original == Some(&ExportTarget::Rva(rva))
+                    && !self
+                        .sys
+                        .thunks
+                        .resolver()
+                        .implemented(&module.name, &binding)
+                {
+                    // Undeclared behavior is a named static/dynamic failure,
+                    // never an executable stub masquerading as a pointer cell.
+                    let mut live = vec![0; data_size as usize];
+                    if self.cpu.read(address, &mut live).is_err()
+                        || live.iter().all(|&byte| byte == 0)
+                    {
+                        return Err(LoadError::MissingExport {
+                            module: module.name.clone(),
+                            name,
+                        });
+                    }
+                }
                 if dynamic && module.kind == ModuleKind::Host {
-                    let original = match sym {
-                        ImportName::Name { name, .. } => module.exports_by_name.get(name),
-                        ImportName::Ordinal(ordinal) => module.exports_by_ordinal.get(ordinal),
-                    };
                     // A changed live EAT is guest-owned behavior. Capability
                     // filtering applies only to the original diagnostic entry.
                     if original == Some(&ExportTarget::Rva(rva)) {
-                        let binding = match sym {
-                            ImportName::Name { name, .. } => Some(name.clone()),
-                            ImportName::Ordinal(_) => module
-                                .exports_by_name
-                                .iter()
-                                .find(|(_, target)| Some(*target) == original)
-                                .map(|(name, _)| name.clone()),
-                        }
-                        .unwrap_or_else(|| name.clone());
                         let key = module.name.clone();
                         let available = (self.sys.thunks.resolver() as &dyn std::any::Any)
                             .downcast_ref::<adv_abi::Registry>()
@@ -741,7 +769,7 @@ impl<'a> Loader<'a> {
                                 || self.sys.thunks.resolver().implemented(&key, &binding),
                                 |registry| registry.dynamic_available(&key, &binding),
                             );
-                        if !available {
+                        if !available && data_size.is_none() {
                             let thunk = self.sys.thunks.publish(self.cpu, &key, &binding)?;
                             let index = (thunk - adv_machine::layout::THUNK_BASE)
                                 / adv_machine::layout::THUNK_STRIDE;
@@ -755,7 +783,7 @@ impl<'a> Loader<'a> {
                         }
                     }
                 }
-                if module.kind == ModuleKind::Host {
+                if module.kind == ModuleKind::Host && data_size.is_none() {
                     self.sys.thunks.resolve(self.cpu, &module.name, &name)?;
                 }
                 Ok(address)
@@ -958,14 +986,38 @@ pub(crate) fn system_image(
     known_ordinals.retain(|_, ordinal| !explicit_ordinals.contains(ordinal));
     let mut exports = Vec::with_capacity(names.len());
     for name in names {
-        let thunk = sys.thunks.publish(cpu, key, &name)?;
-        let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
-        cpu.read(thunk, &mut bytes)?;
+        let target = if let Some(size) = sys.thunks.resolver().data_size(key, &name) {
+            let bytes = sys
+                .thunks
+                .resolver()
+                .host_data(key, &name)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_else(|| vec![0; size as usize]);
+            if bytes.len() != size as usize {
+                return Err(LoadError::Pe {
+                    path: key.to_owned(),
+                    err: PeError::Malformed("data descriptor size mismatch".into()),
+                });
+            }
+            crate::synthetic::Target::Data {
+                binding: sys
+                    .thunks
+                    .resolver()
+                    .canonical_name(key, &name)
+                    .unwrap_or_else(|| name.clone()),
+                bytes,
+            }
+        } else {
+            let thunk = sys.thunks.publish(cpu, key, &name)?;
+            let mut bytes = vec![0; adv_machine::layout::THUNK_STRIDE as usize];
+            cpu.read(thunk, &mut bytes)?;
+            crate::synthetic::Target::Code(bytes)
+        };
         let ordinal = name.strip_prefix('#').and_then(|n| n.parse().ok());
         exports.push(crate::synthetic::Export {
             ordinal: ordinal.or_else(|| known_ordinals.get(&name).copied()),
             name: ordinal.is_none().then_some(name),
-            target: crate::synthetic::Target::Code(bytes),
+            target,
         });
     }
     crate::synthetic::build(base, key, &exports).map_err(|err| LoadError::Pe {
