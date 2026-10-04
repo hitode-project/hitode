@@ -5,6 +5,7 @@ API HANDLE WINAPI CreatePopupMenu(void);
 API BOOL WINAPI DestroyMenu(HANDLE);
 API HANDLE WINAPI GetMenu(HWND);
 API BOOL WINAPI SetMenu(HWND,HANDLE);
+API BOOL WINAPI DrawMenuBar(HWND);
 API HANDLE WINAPI GetSubMenu(HANDLE,int);
 API HANDLE WINAPI LoadMenuA(HANDLE,const char *);
 API HANDLE WINAPI LoadMenuW(HANDLE,const WORD *);
@@ -66,6 +67,8 @@ void mainCRTStartup(void) {
     info(p,0x63);p[3]=8;p[4]=82;p[8]=0x1234;p[9]=(DWORD)L"changed";
     emit(SetMenuItemInfoW(root,81,0,p));info(p,0x23);emit(GetMenuItemInfoW(nested,82,0,p));emit(p[3]);emit(p[4]);emit(p[8]);
     w=window(atom,root,0,0);emit(w!=0);emit(GetMenu(w)==root);emit(seen_menu==root);emit(seen_cs_menu==root);
+    if(!DrawMenuBar(w)||GetMenu(w)!=root)ExitProcess(5);
+    if(DrawMenuBar(0)||GetLastError()!=1400)ExitProcess(6);
     child=window(atom,123,w,0x40000000);emit(child!=0);emit(GetMenu(child));
     SetLastError(0x4242);emit(SetMenu(child,root));emit(GetLastError());DestroyWindow(child);
     replacement=CreateMenu();emit(SetMenu(w,replacement));emit(GetMenu(w)==replacement);emit(IsMenu(root));

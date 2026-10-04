@@ -2,7 +2,7 @@
 //! Built-in labels use a fixed virtual en-US locale, independent of the host UI.
 use super::{user, user_mut};
 use crate::{stdcall, util::set_last_error};
-use adv_abi::Registry;
+use adv_abi::{Handle, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Namespace, Objects, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
@@ -542,6 +542,17 @@ fn set_menu(env: &mut Env<'_>) -> Outcome {
     }
     Outcome::Return(1)
 }
+
+#[win32(user32, name="DrawMenuBar", level=state)]
+fn draw_menu_bar(env: &mut Env<'_>, window: Handle) -> i32 {
+    if !user(env).is_window(&env.sys.objects, window.0) {
+        set_last_error(env, 1400); // ERROR_INVALID_WINDOW_HANDLE
+        return 0;
+    }
+    // Menus are process state; the shell presents the client surface only.
+    // Edits are already visible to menu queries, without invalidating guest pixels.
+    1
+}
 fn get_submenu(env: &mut Env<'_>) -> Outcome {
     let (menu, at) = (env.arg(0), env.arg(1));
     if get(env, menu).is_none() {
@@ -833,6 +844,7 @@ fn load_indirect(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(draw_menu_bar_ABI);
     stdcall(reg, super::USER32, "GetSystemMenu", 2, get_system_menu);
     stdcall(reg, super::USER32, "InsertMenuItemA", 4, |e| {
         item_info(e, false, false)
