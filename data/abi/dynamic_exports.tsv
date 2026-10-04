@@ -1,0 +1,9 @@
+# Reviewed proxy lookup exceptions from docs/architecture.md §5.
+# dll<TAB>export. Availability is distinct from implementation and failure return.
+# All other metadata-only exports remain in the synthetic EAT for static imports
+# and hooks, but pristine entries do not advertise dynamic capabilities.
+d2d1.dll	D2D1CreateFactory
+d3d11.dll	D3D11CreateDevice
+dwrite.dll	DWriteCreateFactory
+gdiplus.dll	GdiplusShutdown
+gdiplus.dll	GdiplusStartup

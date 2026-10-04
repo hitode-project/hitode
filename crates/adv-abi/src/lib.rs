@@ -186,6 +186,24 @@ impl Registry {
         self.fns
             .contains_key(&(module.to_ascii_lowercase(), name.to_owned()))
     }
+
+    /// Dynamic capability probes expose registered behavior, including explicit
+    /// safe failures. Signature metadata alone does not promise an API exists.
+    /// Reviewed proxy exports remain discoverable without becoming implemented.
+    pub fn dynamic_available(&self, module: &str, name: &str) -> bool {
+        let name = self.canonical_name(module, name).unwrap_or(name);
+        self.is_implemented(module, name)
+            || include_str!("../../../data/abi/dynamic_exports.tsv")
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .any(|line| {
+                    let mut fields = line.split('\t');
+                    fields
+                        .next()
+                        .is_some_and(|dll| dll.eq_ignore_ascii_case(module))
+                        && fields.next() == Some(name)
+                })
+    }
     pub fn len(&self) -> usize {
         self.fns.len()
     }
@@ -193,7 +211,7 @@ impl Registry {
         self.fns.is_empty()
     }
 
-    /// Include generated DLLs so static imports and GetProcAddress resolve stubs.
+    /// Include generated DLLs so static imports retain diagnostic stub bindings.
     pub fn has_module(&self, module: &str) -> bool {
         let module = module.to_ascii_lowercase();
         self.fns.keys().any(|(m, _)| *m == module)

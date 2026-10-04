@@ -73,6 +73,213 @@ fn named(name: &str) -> ImportName {
     }
 }
 
+fn dynamic(
+    machine: &mut Machine<JitCpu>,
+    id: usize,
+    symbol: ImportName,
+) -> Result<u32, adv_os::loader::LoadError> {
+    Loader::new(
+        &mut machine.cpu,
+        &mut machine.sys,
+        machine.ext.get_mut::<Modules>(),
+        &Empty,
+    )
+    .resolve_dynamic(id, &symbol)
+    .map(|(address, _)| address)
+}
+
+#[test]
+fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exports() {
+    let mut machine = machine(false);
+    let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
+    for name in ["FlsAlloc", "FlsFree", "FlsGetValue", "FlsSetValue"] {
+        let module = adv_os::modules(&machine.ext).get(kernel);
+        let target = module.exports_by_name[name].clone();
+        let ordinal = module
+            .exports_by_ordinal
+            .iter()
+            .find(|(_, rva)| **rva == target)
+            .unwrap()
+            .0;
+        let ordinal = *ordinal;
+        assert!(dynamic(&mut machine, kernel, named(name)).is_err());
+        assert!(dynamic(&mut machine, kernel, ImportName::Ordinal(ordinal)).is_err());
+        assert_ne!(
+            resolve(&mut machine, kernel, named(name)),
+            0,
+            "static diagnostics remain hookable"
+        );
+    }
+    for (dll, name) in [
+        ("dwrite.dll", "DWriteCreateFactory"),
+        ("d3d11.dll", "D3D11CreateDevice"),
+        ("gdiplus.dll", "GdiplusStartup"),
+        ("gdiplus.dll", "GdiplusShutdown"),
+        ("d2d1.dll", "D2D1CreateFactory"),
+    ] {
+        let id = machine.load(&Empty, dll).unwrap();
+        assert_eq!(
+            dynamic(&mut machine, id, named(name)).unwrap(),
+            resolve(&mut machine, id, named(name))
+        );
+        assert!(!machine.sys.thunks.resolver().implemented(dll, name));
+    }
+    let d2d = adv_os::modules(&machine.ext).by_name("d2d1.dll").unwrap();
+    assert_eq!(
+        dynamic(&mut machine, d2d, ImportName::Ordinal(1)).unwrap(),
+        resolve(&mut machine, d2d, named("D2D1CreateFactory"))
+    );
+    // A discoverable signature and HRESULT failure value are not capabilities.
+    let d3d11 = adv_os::modules(&machine.ext).by_name("d3d11.dll").unwrap();
+    assert!(adv_abi::signature::lookup("d3d11.dll", "D3D11CreateDeviceAndSwapChain").is_some());
+    assert!(dynamic(&mut machine, d3d11, named("D3D11CreateDeviceAndSwapChain")).is_err());
+}
+
+#[test]
+fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or_code() {
+    for jit in [false, true] {
+        let mut machine = machine(jit);
+        let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
+        let module = adv_os::modules(&machine.ext).get(kernel);
+        let (base, size) = (module.base, module.size);
+        let original = resolve(&mut machine, kernel, named("FlsAlloc"));
+        assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+        machine
+            .cpu
+            .protect(original & !4095, 4096, Prot::RWX)
+            .unwrap();
+        machine
+            .cpu
+            .write(original, &[0xb8, 99, 0, 0, 0, 0xc2, 4, 0])
+            .unwrap();
+        assert_eq!(
+            dynamic(&mut machine, kernel, named("FlsAlloc")).unwrap(),
+            original
+        );
+        machine.cpu.map(0x400000, 4096, Prot::RX).unwrap();
+        let mut code = adv_cpu::backend::asm::Asm::new(0x400000);
+        code.push_imm(0).call(original).ret();
+        machine.cpu.write(0x400000, &code.bytes).unwrap();
+        machine
+            .start_main(0x400000, 0x400000, 65536, "hooked-probe")
+            .unwrap();
+        assert!(matches!(machine.run_virtual(100000), RunResult::Exited(99)));
+        let directory = base + machine.cpu.read_u32(base + 0x80 + 120).unwrap();
+        let ExportTarget::Rva(original_rva) =
+            adv_os::modules(&machine.ext).get(kernel).exports_by_name["FlsAlloc"]
+        else {
+            panic!("code")
+        };
+        let count = machine.cpu.read_u32(directory + 20).unwrap();
+        let table = base + machine.cpu.read_u32(directory + 28).unwrap();
+        let slot = (0..count)
+            .map(|i| table + i * 4)
+            .find(|slot| machine.cpu.read_u32(*slot).unwrap() == original_rva)
+            .unwrap();
+        machine.cpu.write_u32(slot, original_rva + 1).unwrap();
+        assert_eq!(
+            dynamic(&mut machine, kernel, named("FlsAlloc")).unwrap(),
+            original + 1
+        );
+        for invalid in [0, size] {
+            machine.cpu.write_u32(slot, invalid).unwrap();
+            assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+        }
+    }
+}
+
+#[test]
+fn real_guest_exports_and_forwarders_are_not_filtered_by_host_capability_metadata() {
+    struct Files;
+    impl FileSource for Files {
+        fn read(&self, path: &str) -> Option<Vec<u8>> {
+            let (base, target) = match path {
+                "kernel32.dll" => (
+                    0x400000,
+                    adv_os::synthetic::Target::Code(vec![0xb8, 99, 0, 0, 0, 0xc2, 4, 0]),
+                ),
+                "proxy.dll" => (
+                    0x600000,
+                    adv_os::synthetic::Target::Forwarder("kernel32.FlsAlloc".into()),
+                ),
+                _ => return None,
+            };
+            Some(
+                adv_os::synthetic::build(
+                    base,
+                    path,
+                    &[adv_os::synthetic::Export {
+                        name: Some("FlsAlloc".into()),
+                        ordinal: Some(1),
+                        target,
+                    }],
+                )
+                .unwrap()
+                .bytes,
+            )
+        }
+    }
+    let mut machine = machine(false);
+    let guest = machine.load(&Files, "kernel32.dll").unwrap();
+    let proxy = machine.load(&Files, "proxy.dll").unwrap();
+    assert_eq!(
+        adv_os::modules(&machine.ext).get(guest).kind,
+        ModuleKind::Image
+    );
+    let mut loader = Loader::new(
+        &mut machine.cpu,
+        &mut machine.sys,
+        machine.ext.get_mut::<Modules>(),
+        &Files,
+    );
+    let entry = loader.resolve_dynamic(guest, &named("FlsAlloc")).unwrap().0;
+    assert_eq!(
+        loader.resolve_dynamic(proxy, &named("FlsAlloc")).unwrap().0,
+        entry
+    );
+    assert_eq!(
+        loader
+            .resolve_dynamic(proxy, &ImportName::Ordinal(1))
+            .unwrap()
+            .0,
+        entry
+    );
+    let host = loader.load("C:\\Windows\\system32\\kernel32.dll").unwrap();
+    let module = loader.modules.get(host);
+    let base = module.base;
+    let ExportTarget::Rva(original_rva) = module.exports_by_name["FlsAlloc"] else {
+        panic!("code")
+    };
+    let directory_rva = loader.cpu.read_u32(base + 0x80 + 120).unwrap();
+    let directory = base + directory_rva;
+    let count = loader.cpu.read_u32(directory + 20).unwrap();
+    let table = base + loader.cpu.read_u32(directory + 28).unwrap();
+    let slot = (0..count)
+        .map(|i| table + i * 4)
+        .find(|slot| loader.cpu.read_u32(*slot).unwrap() == original_rva)
+        .unwrap();
+    let old_size = loader.cpu.read_u32(base + 0x80 + 124).unwrap();
+    let text = b"kernel32.FlsAlloc\0";
+    // Extend the live export directory into its existing alignment padding.
+    loader
+        .cpu
+        .write(base + directory_rva + old_size, text)
+        .unwrap();
+    loader
+        .cpu
+        .write_u32(base + 0x80 + 124, old_size + text.len() as u32)
+        .unwrap();
+    loader
+        .cpu
+        .write_u32(slot, directory_rva + old_size)
+        .unwrap();
+    assert_eq!(
+        loader.resolve_dynamic(host, &named("FlsAlloc")).unwrap().0,
+        entry,
+        "a live host forwarder must reach the real guest DLL"
+    );
+}
+
 #[test]
 fn published_entries_are_real_pe_code_aliases_hookable_and_callable() {
     for jit in [false, true] {

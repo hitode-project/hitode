@@ -657,9 +657,6 @@ impl<'a> Loader<'a> {
         }
         if module.kind == ModuleKind::Host {
             let key = module.name.clone();
-            if dynamic && self.sys.thunks.resolver().host_fn(&key, &name).is_none() {
-                return Err(LoadError::MissingExport { module: key, name });
-            }
             let published = match sym {
                 ImportName::Name { name, .. } => module.exports_by_name.contains_key(name),
                 ImportName::Ordinal(ordinal) => {
@@ -667,11 +664,10 @@ impl<'a> Loader<'a> {
                     known && module.exports_by_ordinal.contains_key(ordinal)
                 }
             };
-            let thunk = self.sys.thunks.resolve(self.cpu, &key, &name)?;
-            if !published {
+            if !dynamic && !published {
                 // Unknown static imports retain fail-before-return diagnostics;
                 // they do not fabricate a PE export or a calling convention.
-                return Ok(thunk);
+                return Ok(self.sys.thunks.resolve(self.cpu, &key, &name)?);
             }
         }
         // GetProcAddress observes the live guest EAT, including patch edits.
@@ -687,7 +683,51 @@ impl<'a> Loader<'a> {
             .cloned()
         };
         match target {
-            Some(ExportTarget::Rva(rva)) => Ok(module.base + rva),
+            Some(ExportTarget::Rva(rva)) => {
+                let address = module.base + rva;
+                if dynamic && module.kind == ModuleKind::Host {
+                    let original = match sym {
+                        ImportName::Name { name, .. } => module.exports_by_name.get(name),
+                        ImportName::Ordinal(ordinal) => module.exports_by_ordinal.get(ordinal),
+                    };
+                    // A changed live EAT is guest-owned behavior. Capability
+                    // filtering applies only to the original diagnostic entry.
+                    if original == Some(&ExportTarget::Rva(rva)) {
+                        let binding = match sym {
+                            ImportName::Name { name, .. } => Some(name.clone()),
+                            ImportName::Ordinal(_) => module
+                                .exports_by_name
+                                .iter()
+                                .find(|(_, target)| Some(*target) == original)
+                                .map(|(name, _)| name.clone()),
+                        }
+                        .unwrap_or_else(|| name.clone());
+                        let key = module.name.clone();
+                        let available = (self.sys.thunks.resolver() as &dyn std::any::Any)
+                            .downcast_ref::<adv_abi::Registry>()
+                            .map_or_else(
+                                || self.sys.thunks.resolver().implemented(&key, &binding),
+                                |registry| registry.dynamic_available(&key, &binding),
+                            );
+                        if !available {
+                            let thunk = self.sys.thunks.publish(self.cpu, &key, &binding)?;
+                            let index = (thunk - adv_machine::layout::THUNK_BASE)
+                                / adv_machine::layout::THUNK_STRIDE;
+                            let expected = self.sys.thunks.pristine_entry(index);
+                            let mut live = vec![0; expected.len()];
+                            if self.cpu.read(address, &mut live).is_err() || live == expected {
+                                return Err(LoadError::MissingExport { module: key, name });
+                            }
+                            // Inline hooks, including a changed original thunk,
+                            // win over host metadata's capability declaration.
+                        }
+                    }
+                }
+                if module.kind == ModuleKind::Host {
+                    self.sys.thunks.resolve(self.cpu, &module.name, &name)?;
+                }
+                Ok(address)
+            }
             Some(ExportTarget::Forwarder(f)) => {
                 let (dll, func) = f.rsplit_once('.').unwrap_or((&f, ""));
                 let dep = self.load_inner(dll, false)?;

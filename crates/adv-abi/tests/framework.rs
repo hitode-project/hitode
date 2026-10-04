@@ -14,6 +14,37 @@ const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
 #[test]
+fn dynamic_availability_requires_registered_behavior_or_an_explicit_proxy_contract() {
+    let mut registry = Registry::default();
+    for mode in [RunMode::Strict, RunMode::Discovery] {
+        registry.set_mode(mode);
+        assert!(
+            registry.get("kernel32.dll", "FlsAlloc").is_some(),
+            "metadata retains a static diagnostic handler"
+        );
+        assert!(!registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+        assert!(registry.dynamic_available("DWRITE.DLL", "DWriteCreateFactory"));
+        assert!(registry.dynamic_available("d2d1.dll", "#1"));
+        assert!(
+            !registry.dynamic_available("kernel32.dll", "CreateFileW"),
+            "reviewed discovery return is not dynamic capability"
+        );
+    }
+    registry.register(adv_abi::Api {
+        module: "kernel32.dll",
+        name: "FlsAlloc",
+        conv: Conv::Stdcall { argc: 1 },
+        handler: |_| Outcome::Return(u32::MAX),
+        level: ImplementationLevel::SafeFail,
+    });
+    assert!(registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+    assert_eq!(
+        registry.level("kernel32.dll", "FlsAlloc"),
+        Some(ImplementationLevel::SafeFail)
+    );
+}
+
+#[test]
 fn packed_large_sdk_output_preserves_guid_bytes_and_four_byte_guest_alignment() {
     use adv_abi::types::D3DADAPTER_IDENTIFIER9;
     let mut machine = machine(Registry::default());

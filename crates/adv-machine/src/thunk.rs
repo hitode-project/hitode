@@ -142,6 +142,12 @@ impl ThunkTable {
         self.resolver.as_ref()
     }
 
+    /// Immutable encoding of an existing binding, independent of guest hook
+    /// writes to either its published entry or the original thunk page.
+    pub fn pristine_entry(&self, index: u32) -> Vec<u8> {
+        Self::emit(index, self.get(index).f.conv)
+    }
+
     /// The resolver as its concrete type, to add implementations after the machine exists.
     pub fn resolver_mut<T: Resolver>(&mut self) -> Option<&mut T> {
         (self.resolver.as_mut() as &mut dyn Any).downcast_mut()
