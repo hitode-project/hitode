@@ -22,7 +22,10 @@ $variants = @(
     @{Name='fail'; Id=4; Flags=@('/DFAIL_ATTACH'); Libs=@()},
     @{Name='tls'; Id=5; Flags=@('/DWITH_TLS'); Libs=@("$OutputDirectory/tls_array.obj")},
     @{Name='slow'; Id=6; Flags=@('/DSLOW_ATTACH'); Libs=@()},
-    @{Name='self'; Id=7; Flags=@('/DSELF_EXIT'); Libs=@('/export:SelfExit=_SelfExit@4')}
+    @{Name='self'; Id=7; Flags=@('/DSELF_EXIT'); Libs=@('/export:SelfExit=_SelfExit@4')},
+    @{Name='forward'; Id=8; Flags=@(); Libs=@('/export:Later=lifecycle_dep.Dependency', '/export:Failed=lifecycle_fail.Dependency', '/export:FailedTree=lifecycle_failtree.LinkedValue', '/export:Absent=kernel32.AdvFixtureUnimplemented', '/export:AbsentGuest=lifecycle_dep.DoesNotExist', '/export:Cycle=lifecycle_forward.Cycle')},
+    @{Name='failtree'; Id=10; Flags=@('/DWITH_TLS_DEPENDENCY', '/DFAIL_ATTACH'); Libs=@('lifecycle_tls.lib')},
+    @{Name='badforward'; Id=9; Flags=@('/DWITH_FORWARD_IMPORT'); Libs=@('lifecycle_forward.lib')}
 )
 foreach ($variant in $variants) {
     $name = 'lifecycle_' + $variant.Name
@@ -39,4 +42,6 @@ Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'thread
 Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_thread_exit.exe", "$OutputDirectory/thread_exit.obj", 'lifecycle_startup.lib', 'kernel32.lib'))
 Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module_self_exit.c'), "/Fo$OutputDirectory/module_self_exit.obj"))
 Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_self_exit.exe", "$OutputDirectory/module_self_exit.obj", 'kernel32.lib'))
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module_forwarder.c'), "/Fo$OutputDirectory/module_forwarder.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_forwarder.exe", "$OutputDirectory/module_forwarder.obj", 'kernel32.lib'))
 Write-Output "Built x86 module lifecycle fixtures in $OutputDirectory"

@@ -284,7 +284,7 @@ impl Modules {
         result
     }
 
-    fn sync_counts(
+    pub(crate) fn sync_counts(
         &mut self,
         cpu: &mut dyn adv_cpu::backend::Guest,
     ) -> Result<(), adv_cpu::backend::MemFault> {

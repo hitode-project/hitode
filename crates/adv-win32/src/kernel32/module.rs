@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use adv_abi::{Handle, Registry, win32};
 use adv_cpu::backend::GuestExt;
+use adv_machine::outcome::DeferredContinuation;
 use adv_machine::{Env, InitCall, Object, Outcome, Wait};
 use adv_os::{Loader, ModuleId, ModuleKind, Modules};
 use adv_pe::{ImportName, ResId};
@@ -194,11 +195,11 @@ fn free_library_and_exit_thread(env: &mut Env<'_>, handle: Handle, code: u32) ->
 fn run_inits(
     env: &mut Env<'_>,
     mut inits: VecDeque<InitCall>,
-    root: ModuleId,
-    ret: u32,
+    finished: DeferredContinuation,
+    failed: DeferredContinuation,
 ) -> Outcome {
     match inits.pop_front() {
-        None => Outcome::Return(ret),
+        None => finished(env),
         Some(c) => {
             log::debug!("LoadLibrary init: {}", c.what);
             let is_dllmain = c.failure_exit.is_some();
@@ -207,13 +208,9 @@ fn run_inits(
             }
             Outcome::call(c.target, c.args, move |env, resume| {
                 if is_dllmain && resume.value() == 0 {
-                    let ids = match adv_os::modules_mut(env.ext).release(env.cpu, root) {
-                        Ok(ids) => ids,
-                        Err(error) => return Outcome::Fail(error.to_string()),
-                    };
-                    unload(env, ids, 0, Some(1114))
+                    failed(env)
                 } else {
-                    run_inits(env, inits, root, ret)
+                    run_inits(env, inits, finished, failed)
                 }
             })
         }
@@ -238,7 +235,18 @@ fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
                         .attach_started = false;
                 }
             }
-            run_inits(env, inits, id, base)
+            run_inits(
+                env,
+                inits,
+                Box::new(move |_| Outcome::Return(base)),
+                Box::new(move |env| {
+                    let ids = match adv_os::modules_mut(env.ext).release(env.cpu, id) {
+                        Ok(ids) => ids,
+                        Err(error) => return Outcome::Fail(error.to_string()),
+                    };
+                    unload(env, ids, 0, Some(1114))
+                }),
+            )
         }
         Err(e) => {
             log::warn!("LoadLibrary({name}) failed: {e}");
@@ -382,6 +390,10 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
             name: String::from_utf8_lossy(&cstr(env.cpu, name_p)).into_owned(),
         }
     };
+    locked(env, move |env| resolve_proc(env, h, sym, caller))
+}
+
+fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outcome {
     let Some(id) = module_of(env, h) else {
         env.sys
             .trace
@@ -389,35 +401,42 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::MOD_NOT_FOUND);
         return Outcome::Return(0);
     };
-    let m = adv_os::modules(env.ext).get(id);
-    if m.kind == ModuleKind::Host
-        && env
-            .sys
-            .thunks
-            .resolver()
-            .host_fn(&m.name, &sym.to_string())
-            .is_none()
-    {
-        // Unimplemented host function: report "not found" so feature probes fall back.
-        log::info!("GetProcAddress({}, {sym}) = NULL (not implemented)", m.name);
-        env.sys.trace.resolution(caller, &m.name, &sym, 0);
-        set_last_error(env, err::PROC_NOT_FOUND);
-        return Outcome::Return(0);
-    }
+    let name = adv_os::modules(env.ext).get(id).name.clone();
     let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
     let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, modules, &w.vfs);
-    let r = l.resolve(id, &sym);
+    let r = l.resolve_dynamic(id, &sym);
+    let inits: VecDeque<_> = std::mem::take(&mut l.inits).into();
     drop(l);
-    env.sys.trace.resolution(
-        caller,
-        &adv_os::modules(env.ext).get(id).name,
-        &sym,
-        r.as_ref().copied().unwrap_or(0),
-    );
     match r {
-        Ok(a) => Outcome::Return(a),
+        Ok((address, changes)) => {
+            if inits.is_empty() {
+                env.sys.trace.resolution(caller, &name, &sym, address);
+                return Outcome::Return(address);
+            }
+            let success_name = name.clone();
+            let success_sym = sym.clone();
+            run_inits(
+                env,
+                inits,
+                Box::new(move |env| {
+                    env.sys
+                        .trace
+                        .resolution(caller, &success_name, &success_sym, address);
+                    Outcome::Return(address)
+                }),
+                Box::new(move |env| {
+                    env.sys.trace.resolution(caller, &name, &sym, 0);
+                    let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
+                    match Loader::new(env.cpu, env.sys, modules, &w.vfs).abort_resolution(changes) {
+                        Ok(ids) => unload(env, ids, 0, Some(err::PROC_NOT_FOUND)),
+                        Err(error) => Outcome::Fail(error.to_string()),
+                    }
+                }),
+            )
+        }
         Err(e) => {
             log::info!("GetProcAddress: {e}");
+            env.sys.trace.resolution(caller, &name, &sym, 0);
             set_last_error(env, err::PROC_NOT_FOUND);
             Outcome::Return(0)
         }

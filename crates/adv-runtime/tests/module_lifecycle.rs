@@ -12,6 +12,105 @@ use adv_runtime::boot::Runtime;
 mod backend;
 
 #[test]
+fn dynamic_forwarders_initialize_or_roll_back_before_returning() {
+    let directory = fixtures();
+    let exe = directory.join("fixture_module_forwarder.exe");
+    let _ = std::fs::remove_file(directory.join("module-forwarder.bin"));
+    let mut child = Command::new(&exe)
+        .current_dir(&directory)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "native forwarder: {status:?}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("native forwarder timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let golden = std::fs::read(directory.join("module-forwarder.bin")).unwrap();
+    let words: Vec<_> = golden
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
+        .collect();
+    assert!(
+        words
+            .windows(5)
+            .any(|part| part == [0x40201, 0x40200, 0, 127, 0])
+    );
+    assert!(
+        words
+            .windows(4)
+            .any(|part| part == [0xa0201, 0xa0200, 0x50100, 0x50200])
+    );
+    assert_eq!(&words[..6], &[0x80201, 0, 0x20201, 2, 1, 1]);
+    assert!(words.ends_with(&[0x80200, 0x20200, 0, 0]));
+    for name in ["jit", "interpreter", "unicorn"] {
+        let data = directory.join("forwarder").join(name);
+        let _ = std::fs::remove_file(data.join("overlay/module-forwarder.bin"));
+        let mut runtime =
+            Runtime::with_cpu(&exe, &data, backend::Cpu::new(name).unwrap(), 64, 32).unwrap();
+        runtime.machine.sys.clock = adv_machine::Clock::virtual_time();
+        runtime.machine.cpu.set_async_compilation(false);
+        let result = runtime.machine.run_virtual(10_000_000);
+        assert!(
+            matches!(result, RunResult::Exited(0)),
+            "{name}: {result:?}; {:?}",
+            runtime.machine.sys.recent_calls()
+        );
+        assert_eq!(
+            std::fs::read(data.join("overlay/module-forwarder.bin")).unwrap(),
+            golden,
+            "{name}: target initialization, feature probe or unload differs from Windows"
+        );
+        // Storage-only failures must undo new edges on an already loaded image.
+        // No callback runs here; native notification behavior is checked above.
+        let (win32, modules) = runtime
+            .machine
+            .ext
+            .get2_mut::<adv_win32::Win32, adv_os::Modules>();
+        let mut loader = adv_os::Loader::new(
+            &mut runtime.machine.cpu,
+            &mut runtime.machine.sys,
+            modules,
+            &win32.vfs,
+        );
+        let forwarder = loader.load("lifecycle_forward.dll").unwrap();
+        loader.inits.clear();
+        let edges = loader.modules.get(forwarder).lifetime.dependencies.clone();
+        let count = loader.modules.iter().count();
+        for _ in 0..32 {
+            assert!(matches!(
+                loader.load("lifecycle_badforward.dll"),
+                Err(adv_os::LoadError::MissingExport { .. })
+            ));
+            assert!(loader.inits.is_empty());
+            assert_eq!(loader.modules.iter().count(), count);
+            assert_eq!(loader.modules.get(forwarder).lifetime.dependencies, edges);
+            for export in ["Cycle", "AbsentGuest"] {
+                let symbol = adv_pe::ImportName::Name {
+                    hint: 0,
+                    name: export.into(),
+                };
+                assert!(loader.resolve_dynamic(forwarder, &symbol).is_err());
+                assert!(loader.inits.is_empty());
+                assert_eq!(loader.modules.iter().count(), count);
+                assert_eq!(loader.modules.get(forwarder).lifetime.dependencies, edges);
+                assert!(loader.modules.by_name("lifecycle_dep.dll").is_none());
+                assert!(loader.modules.unreachable().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
 fn freeing_the_executing_dll_and_exiting_its_thread_matches_windows() {
     let directory = fixtures();
     let exe = directory.join("fixture_module_self_exit.exe");

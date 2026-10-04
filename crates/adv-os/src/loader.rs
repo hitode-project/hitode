@@ -142,6 +142,16 @@ pub struct Loader<'a> {
     pub inits: Vec<InitCall>,
     /// Guest directories of the images whose imports are being bound (innermost last).
     importers: Vec<String>,
+    changes: ResolutionChanges,
+}
+
+/// Mutations made while following dynamic export forwarders. The frontend can
+/// undo only these edges if a newly loaded DLL rejects process initialization.
+/// Existing module references and mutations from reentrant guest calls survive.
+#[derive(Default)]
+pub struct ResolutionChanges {
+    created: Vec<ModuleId>,
+    dependencies: Vec<(ModuleId, ModuleId)>,
 }
 
 fn prot_of(characteristics: u32) -> Prot {
@@ -172,30 +182,94 @@ impl<'a> Loader<'a> {
             files,
             inits: Vec::new(),
             importers: Vec::new(),
+            changes: ResolutionChanges::default(),
         }
     }
 
     /// Load `path` (or bump the load count if it is already loaded).
     pub fn load(&mut self, path: &str) -> Result<ModuleId, LoadError> {
-        let before: std::collections::BTreeSet<_> = self.modules.iter().map(|(id, _)| id).collect();
         let initializers = self.inits.len();
         let result = self.load_inner(path, true);
+        let changes = std::mem::take(&mut self.changes);
         if result.is_err() {
             self.inits.truncate(initializers);
-            let created: Vec<_> = self
-                .modules
-                .iter()
-                .filter(|(id, m)| !before.contains(id) && m.kind == ModuleKind::Image)
-                .map(|(id, _)| id)
-                .collect();
-            for id in created.into_iter().rev() {
-                self.retire(id)?;
-            }
+            self.rollback_storage(changes)?;
         }
         result
     }
 
+    fn dependency(&mut self, owner: ModuleId, dependency: ModuleId) -> Result<(), LoadError> {
+        if !self
+            .modules
+            .get(owner)
+            .lifetime
+            .dependencies
+            .contains(&dependency)
+        {
+            self.changes.dependencies.push((owner, dependency));
+            self.modules.dependency(self.cpu, owner, dependency)?;
+        }
+        Ok(())
+    }
+
+    fn remove_edges(&mut self, changes: &ResolutionChanges) -> Result<(), LoadError> {
+        for &(owner, dependency) in changes.dependencies.iter().rev() {
+            if self.modules.try_get(owner).is_some() {
+                self.modules
+                    .get_mut(owner)
+                    .lifetime
+                    .dependencies
+                    .remove(&dependency);
+            }
+        }
+        self.modules.sync_counts(self.cpu)?;
+        Ok(())
+    }
+
+    fn rollback_storage(&mut self, changes: ResolutionChanges) -> Result<(), LoadError> {
+        // No guest initializer ran yet. First detach graph edges (including
+        // edges added to pre-existing forwarder modules), then retire new images.
+        self.remove_edges(&changes)?;
+        for id in changes.created.into_iter().rev() {
+            if self.modules.get(id).kind == ModuleKind::Image {
+                self.retire(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the detach plan after a dynamic forwarder's initializer fails.
+    /// New explicit references acquired by guest callbacks remain graph roots.
+    pub fn abort_resolution(
+        &mut self,
+        mut changes: ResolutionChanges,
+    ) -> Result<Vec<ModuleId>, LoadError> {
+        // Keep dependencies owned by new images until their detach callbacks
+        // finish. They determine reverse-initialization order, and a reentrant
+        // LoadLibrary may have retained one of those images independently.
+        let created: std::collections::BTreeSet<_> = changes.created.iter().copied().collect();
+        changes
+            .dependencies
+            .retain(|(owner, _)| !created.contains(owner));
+        self.remove_edges(&changes)?;
+        Ok(self.modules.unreachable())
+    }
+
     fn load_inner(&mut self, path: &str, retain: bool) -> Result<ModuleId, LoadError> {
+        // Both LoadLibrary and PE forwarders accept a module name without the
+        // extension. Normalize the file lookup as well as the module-table key.
+        let extended;
+        let path = if !path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(path)
+            .contains('.')
+        {
+            extended = format!("{path}.dll");
+            extended.as_str()
+        } else {
+            path
+        };
         let key = module_key(path);
         let system = is_system_path(path);
         let loaded = if system {
@@ -301,6 +375,7 @@ impl<'a> Loader<'a> {
                 ..Lifetime::default()
             },
         });
+        self.changes.created.push(id);
         self.modules.publish_ldr(self.cpu, id, &path)?;
         self.modules.complete_ldr(self.cpu, id)?;
         Ok(id)
@@ -400,6 +475,7 @@ impl<'a> Loader<'a> {
                 ..Lifetime::default()
             },
         });
+        self.changes.created.push(id);
         self.modules
             .publish_ldr(self.cpu, id, &self.files.absolute_path(path))?;
         self.sys.images.add(Image {
@@ -499,9 +575,9 @@ impl<'a> Loader<'a> {
         };
         for m in pe.imports().map_err(pe_err)? {
             let dep = self.load_inner(&m.dll, false)?;
-            self.modules.dependency(self.cpu, owner, dep)?;
+            self.dependency(owner, dep)?;
             for imp in &m.imports {
-                let addr = self.resolve(dep, &imp.name)?;
+                let addr = self.resolve_inner(dep, &imp.name, 0, false)?;
                 pe.set_u32(imp.iat_rva, addr).map_err(pe_err)?;
             }
         }
@@ -514,13 +590,13 @@ impl<'a> Loader<'a> {
         });
         for m in delay {
             let dep = self.load_inner(&m.dll, false)?;
-            self.modules.dependency(self.cpu, owner, dep)?;
+            self.dependency(owner, dep)?;
             if m.module_handle_rva != 0 {
                 pe.set_u32(m.module_handle_rva, self.modules.get(dep).base)
                     .map_err(pe_err)?;
             }
             for imp in &m.imports {
-                let addr = self.resolve(dep, &imp.name)?;
+                let addr = self.resolve_inner(dep, &imp.name, 0, false)?;
                 pe.set_u32(imp.iat_rva, addr).map_err(pe_err)?;
             }
         }
@@ -529,7 +605,37 @@ impl<'a> Loader<'a> {
 
     /// Address of `sym` in module `m` (a thunk for host modules). Follows forwarders.
     pub fn resolve(&mut self, m: ModuleId, sym: &ImportName) -> Result<u32, LoadError> {
-        self.resolve_inner(m, sym, 0)
+        self.resolve_transaction(m, sym, false)
+            .map(|(address, _)| address)
+    }
+
+    /// Dynamic probes never fabricate diagnostic imports for missing exports,
+    /// including when the missing function is reached through a forwarder.
+    pub fn resolve_dynamic(
+        &mut self,
+        m: ModuleId,
+        sym: &ImportName,
+    ) -> Result<(u32, ResolutionChanges), LoadError> {
+        self.resolve_transaction(m, sym, true)
+    }
+
+    fn resolve_transaction(
+        &mut self,
+        m: ModuleId,
+        sym: &ImportName,
+        dynamic: bool,
+    ) -> Result<(u32, ResolutionChanges), LoadError> {
+        let initializers = self.inits.len();
+        let result = self.resolve_inner(m, sym, 0, dynamic);
+        let changes = std::mem::take(&mut self.changes);
+        match result {
+            Ok(address) => Ok((address, changes)),
+            Err(error) => {
+                self.inits.truncate(initializers);
+                self.rollback_storage(changes)?;
+                Err(error)
+            }
+        }
     }
 
     fn resolve_inner(
@@ -537,6 +643,7 @@ impl<'a> Loader<'a> {
         m: ModuleId,
         sym: &ImportName,
         depth: u8,
+        dynamic: bool,
     ) -> Result<u32, LoadError> {
         let module = self.modules.get(m);
         let name = sym.to_string();
@@ -548,6 +655,9 @@ impl<'a> Loader<'a> {
         }
         if module.kind == ModuleKind::Host {
             let key = module.name.clone();
+            if dynamic && self.sys.thunks.resolver().host_fn(&key, &name).is_none() {
+                return Err(LoadError::MissingExport { module: key, name });
+            }
             let published = match sym {
                 ImportName::Name { name, .. } => module.exports_by_name.contains_key(name),
                 ImportName::Ordinal(ordinal) => {
@@ -579,7 +689,7 @@ impl<'a> Loader<'a> {
             Some(ExportTarget::Forwarder(f)) => {
                 let (dll, func) = f.rsplit_once('.').unwrap_or((&f, ""));
                 let dep = self.load_inner(dll, false)?;
-                self.modules.dependency(self.cpu, m, dep)?;
+                self.dependency(m, dep)?;
                 let sym = match func.strip_prefix('#').and_then(|o| o.parse().ok()) {
                     Some(o) => ImportName::Ordinal(o),
                     None => ImportName::Name {
@@ -587,7 +697,7 @@ impl<'a> Loader<'a> {
                         name: func.to_owned(),
                     },
                 };
-                self.resolve_inner(dep, &sym, depth + 1)
+                self.resolve_inner(dep, &sym, depth + 1, dynamic)
             }
             None => Err(LoadError::MissingExport {
                 module: module.name.clone(),

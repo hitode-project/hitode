@@ -3,6 +3,16 @@
 #define MODULE_ID 1
 #endif
 
+#ifdef WITH_FORWARD_IMPORT
+__declspec(dllimport) int __cdecl AbsentGuest(void);
+__declspec(dllexport) int __cdecl ForwardImport(void) { return AbsentGuest(); }
+#endif
+
+#ifdef WITH_TLS_DEPENDENCY
+__declspec(dllimport) int __cdecl TlsValue(void);
+__declspec(dllexport) int __cdecl LinkedValue(void) { return TlsValue(); }
+#endif
+
 #ifdef SELF_EXIT
 API __declspec(noreturn) void WINAPI FreeLibraryAndExitThread(HMODULE, DWORD);
 __declspec(dllexport) DWORD WINAPI SelfExit(void *argument) {

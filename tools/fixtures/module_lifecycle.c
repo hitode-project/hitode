@@ -31,7 +31,6 @@ static DWORD WINAPI load_worker(void *argument) {
     DWORD index = (DWORD)argument;
     SetEvent(load_ready[index]); WaitForSingleObject(load_go, INFINITE);
     load_modules[index] = LoadLibraryA("lifecycle_slow.dll");
-    Record(load_modules[index] != 0);
     SetEvent(load_done[index]); WaitForSingleObject(load_exit, INFINITE);
     return 0;
 }
@@ -103,6 +102,9 @@ void mainCRTStartup(void) {
     }
     SetEvent(load_go);
     for (written = 0; written < 2; ++written) WaitForSingleObject(load_done[written], INFINITE);
+    /* Keep the record buffer single-writer; concurrent worker Record calls can
+       lose an entry on native Windows even when both loads succeed. */
+    Record(load_modules[0] != 0); Record(load_modules[1] != 0);
     Record(load_modules[0] == load_modules[1]);
     Record(FreeLibrary(load_modules[0])); Record(FreeLibrary(load_modules[1]));
     loaded("lifecycle_slow.dll");
