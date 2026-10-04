@@ -33,6 +33,7 @@ struct Options {
     report: Option<PathBuf>,
     screenshot: Option<PathBuf>,
     trace: Option<PathBuf>,
+    host_profile: Option<PathBuf>,
     auto_dialog_ms: Option<u32>,
     self_test_input: bool,
     profile: bool,
@@ -65,6 +66,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
   --trace PATH            write every completed guest API call to a local trace\n\
+  --host-profile PATH     opt-in API service time CSV (also supports N=2)\n\
   --auto-dialog-ms N      explicitly auto-select dialog defaults after N guest ms\n\
   --self-test-input       post A key and left-click after the first idle\n\
   --profile               collect execution timings by guest address\n\
@@ -95,6 +97,7 @@ impl Options {
             report: None,
             screenshot: None,
             trace: None,
+            host_profile: None,
             auto_dialog_ms: None,
             self_test_input: false,
             profile: false,
@@ -177,6 +180,7 @@ impl Options {
                 "--report" => options.report = Some(value()?.into()),
                 "--screenshot" => options.screenshot = Some(value()?.into()),
                 "--trace" => options.trace = Some(value()?.into()),
+                "--host-profile" => options.host_profile = Some(value()?.into()),
                 "--auto-dialog-ms" => {
                     options.auto_dialog_ms =
                         Some(value()?.parse().map_err(|_| "invalid dialog delay")?)
@@ -767,6 +771,7 @@ fn run_execution(
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
     runtime.machine.cpu.set_profiling(options.profile);
+    runtime.machine.sys.stats.enabled = options.host_profile.is_some();
     if let Some(delay) = options.auto_dialog_ms {
         runtime.set_auto_dialog_ms(Some(delay));
     }
@@ -1230,6 +1235,20 @@ fn run_execution(
     });
     if let Some(path) = &options.report {
         write_report(path, &report)?;
+    }
+    if let Some(path) = &options.host_profile {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut file =
+            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+        runtime
+            .machine
+            .sys
+            .stats
+            .write_host_csv(&runtime.machine.sys.thunks, &mut file)
+            .map_err(|e| e.to_string())?;
+        std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
     }
     let stats = runtime.machine.cpu.stats();
     let parallel = runtime.machine.cpu.parallel_stats();

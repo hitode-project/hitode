@@ -1593,6 +1593,48 @@ impl<P: Presenter> Surfaces<P> {
                     clipped.w as usize * sb,
                 )?;
             }
+        } else if unscaled && !options.mirror_x && !aliases {
+            // Every sampling mode reduces to one source texel at equal size.
+            // Avoid the generic reduction/sampling buffers for common 24-bit
+            // DIB -> 32-bit display transfers. Y reversal is still row-only.
+            self.blit_row.resize(clipped.w as usize * db, 0);
+            for y in 0..clipped.h {
+                let sy = if options.mirror_y {
+                    sr.h - 1 - (oy + y)
+                } else {
+                    oy + y
+                };
+                let input = m.read(s.row(sr.x + ox, sr.y + sy), clipped.w as usize * sb)?;
+                match (s.format, d.format) {
+                    (PixelFormat::Bgr24, PixelFormat::Bgra32) => {
+                        for (src, dst) in input
+                            .chunks_exact(3)
+                            .zip(self.blit_row.as_chunks_mut::<4>().0)
+                        {
+                            *dst = [src[0], src[1], src[2], 0];
+                        }
+                    }
+                    (PixelFormat::Indexed8, PixelFormat::Bgra32) => {
+                        let palette = s.palette.as_deref().unwrap_or(&BLACK_PALETTE);
+                        for (&src, dst) in input.iter().zip(self.blit_row.as_chunks_mut::<4>().0) {
+                            *dst = palette[src as usize];
+                        }
+                    }
+                    _ => {
+                        for (src, dst) in input
+                            .chunks_exact(sb)
+                            .zip(self.blit_row.chunks_exact_mut(db))
+                        {
+                            if let Some(remap) = &remap {
+                                dst[0] = remap[src[0] as usize];
+                            } else {
+                                dst.copy_from_slice(&d.encode_pixel(s.decode_pixel(src))[..db]);
+                            }
+                        }
+                    }
+                }
+                m.write(d.row(clipped.x, clipped.y + y), &self.blit_row)?;
+            }
         } else {
             // A scaled/mirrored overlap can overwrite pixels needed by a later
             // sample in either direction. Preserve the complete original rectangle.

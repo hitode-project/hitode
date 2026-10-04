@@ -102,8 +102,8 @@ pub struct Stats {
     /// Totals when the current frame started.
     frame_start: FrameRow,
     pub frames: Vec<FrameRow>,
-    /// Per thunk index: (host wall ns, calls).
-    per_thunk: Vec<(u64, u64)>,
+    /// Per thunk index: (host wall ns, calls, longest handler/continuation ns).
+    per_thunk: Vec<(u64, u64, u64)>,
 }
 
 impl Stats {
@@ -135,10 +135,11 @@ impl Stats {
         }
         let i = thunk as usize;
         if self.per_thunk.len() <= i {
-            self.per_thunk.resize(i + 1, (0, 0));
+            self.per_thunk.resize(i + 1, (0, 0, 0));
         }
         self.per_thunk[i].0 += ns;
         self.per_thunk[i].1 += 1;
+        self.per_thunk[i].2 = self.per_thunk[i].2.max(ns);
     }
 
     /// Frontend work on the frame being accumulated.
@@ -253,18 +254,18 @@ impl Stats {
                 t.blocks as f64 / self.frames.len().max(1) as f64
             );
         }
-        let mut by_cost: Vec<(usize, (u64, u64))> = self
+        let mut by_cost: Vec<(usize, (u64, u64, u64))> = self
             .per_thunk
             .iter()
             .copied()
             .enumerate()
             .filter(|(_, c)| c.1 > 0)
             .collect();
-        by_cost.sort_by_key(|&(_, (ns, _))| std::cmp::Reverse(ns));
+        by_cost.sort_by_key(|&(_, (ns, _, _))| std::cmp::Reverse(ns));
         if !by_cost.is_empty() {
             s += "  host functions by time:\n";
         }
-        for (i, (ns, n)) in by_cost.into_iter().take(top) {
+        for (i, (ns, n, _)) in by_cost.into_iter().take(top) {
             let f = thunks.get(i as u32);
             s += &format!(
                 "    {:9.2} ms {:5.2}% {:8} calls {:7.2} us/call  {}!{}\n",
@@ -277,6 +278,25 @@ impl Stats {
             );
         }
         s
+    }
+
+    /// Host service time only: excludes guest callbacks/waits and native worker
+    /// execution. Opt-in timing perturbs the run; never report it as CPU usage.
+    pub fn write_host_csv(&self, thunks: &ThunkTable, writer: &mut dyn Write) -> io::Result<()> {
+        writeln!(writer, "module,function,calls,total_ns,max_ns")?;
+        for (i, &(ns, calls, max)) in self.per_thunk.iter().enumerate() {
+            if calls == 0 {
+                continue;
+            }
+            let thunk = thunks.get(i as u32);
+            writeln!(
+                writer,
+                "\"{}\",\"{}\",{calls},{ns},{max}",
+                thunk.module.replace('"', "\"\""),
+                thunk.name.replace('"', "\"\"")
+            )?;
+        }
+        Ok(())
     }
 }
 
