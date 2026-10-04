@@ -649,12 +649,12 @@ fn apply(
     ext: &mut Ext,
     mut out: Outcome,
     origin: Origin,
-    defer_frames: bool,
+    defer_work: bool,
 ) -> Result<(), Parked> {
     // A deferred boundary is a host continuation, never a Sleep or an object wake.
     // Keep unsliced and virtual execution inline, with no extra context switch.
     while let Outcome::Defer { then } = out {
-        if defer_frames {
+        if defer_work {
             return Err(Parked::Deferred { then, origin });
         }
         let thunk = origin.thunk;
@@ -765,6 +765,7 @@ struct Dispatch<'a> {
     ext: &'a mut Ext,
     parked: Option<Parked>,
     yield_on_frame: bool,
+    defer_work: bool,
 }
 
 /// Return addresses found by scanning the guest stack: values inside an image that follow
@@ -831,7 +832,7 @@ impl Dispatch<'_> {
             ext: &mut *self.ext,
             thunk: index,
         });
-        let r = apply(cpu, self.sys, self.ext, out, origin, self.yield_on_frame);
+        let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
         self.sys.stats.host(t0, index, true);
         r
     }
@@ -856,7 +857,7 @@ impl Dispatch<'_> {
             },
             Resume::Returned(eax),
         );
-        let r = apply(cpu, self.sys, self.ext, out, origin, self.yield_on_frame);
+        let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
         self.sys.stats.host(t0, thunk, true);
         r
     }
@@ -919,7 +920,7 @@ pub enum RunResult {
     Idle {
         next_deadline: Option<u64>,
     },
-    /// ExitProcess, or the main context returned.
+    /// Explicit process exit, or every guest context has ended.
     Exited(u32),
     Failed(MachineError),
 }
@@ -970,6 +971,9 @@ pub struct Machine<B: Backend> {
     scheduling_quantum: Option<Duration>,
     /// One-shot wake preference, demand-driven quantum and frame-boundary host returns.
     latency_scheduling: bool,
+    /// Legacy same-thread consumers require each completed output to return to
+    /// the host. An independent mailbox consumer does not need that handoff.
+    frame_handoff: bool,
     /// Non-blocking live user intent, owned by the host input path. Never inferred
     /// from context names, frame rates or guest engine behavior.
     time_skip_source: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -1047,6 +1051,7 @@ impl<B: Backend> Machine<B> {
             slice_elapsed: Duration::ZERO,
             scheduling_quantum: Some(scheduling::DEFAULT_QUANTUM),
             latency_scheduling: true,
+            frame_handoff: true,
             time_skip_source: None,
         })
     }
@@ -1148,6 +1153,14 @@ impl<B: Backend> Machine<B> {
     /// Neither this switch nor the policy changes guest Sleep durations or guest time.
     pub fn set_latency_scheduling(&mut self, enabled: bool) {
         self.latency_scheduling = enabled;
+    }
+
+    /// Select whether a completed frame requires the host driver to consume it.
+    /// Disable for an independent consumer, retaining wake priority, context
+    /// quantum, watchdog, interrupts and real waits. Per-frame Stats collection
+    /// still hands off so its rows retain the original measurement boundaries.
+    pub fn set_frame_handoff(&mut self, required: bool) {
+        self.frame_handoff = required;
     }
 
     /// Create the main context for the exe mapped at `base`: it runs the queued
@@ -1347,6 +1360,7 @@ impl<B: Backend> Machine<B> {
             && self.scheduling_quantum.is_some()
             && slice.is_some()
             && !self.sys.clock.is_virtual();
+        let frame_handoff = latency_mode && (self.frame_handoff || self.sys.stats.enabled);
         // Do not sleep the host after only one poller ran. Every currently ready
         // context must first get a turn in this scheduler invocation.
         let mut ran = vec![false; self.sys.contexts.len()];
@@ -1468,12 +1482,12 @@ impl<B: Backend> Machine<B> {
                     if let Some(r) = self.park(p) {
                         return SliceResult::Complete(r);
                     }
-                    if latency_mode && self.sys.completed_frames != frame_before {
+                    if frame_handoff && self.sys.completed_frames != frame_before {
                         return self.frame_boundary(last, started, hard_budget);
                     }
                     continue;
                 }
-                if latency_mode && self.sys.completed_frames != frame_before {
+                if frame_handoff && self.sys.completed_frames != frame_before {
                     return self.frame_boundary(last, started, hard_budget);
                 }
             }
@@ -1548,7 +1562,10 @@ impl<B: Backend> Machine<B> {
                 sys: &mut self.sys,
                 ext: &mut self.ext,
                 parked: None,
-                yield_on_frame: latency_mode,
+                yield_on_frame: frame_handoff,
+                // Explicit deferred work still returns to this scheduler to
+                // recheck deadlines/watchdog, without forcing a host handoff.
+                defer_work: latency_mode,
             };
             let exit = self.cpu.run(&mut d);
             let parked = d.parked.take();
@@ -1587,7 +1604,7 @@ impl<B: Backend> Machine<B> {
                         self.sys.trace.flush();
                         return SliceResult::Complete(r);
                     }
-                    if latency_mode && self.sys.completed_frames != frame_before {
+                    if frame_handoff && self.sys.completed_frames != frame_before {
                         return self.frame_boundary(last, started, hard_budget);
                     }
                 }
