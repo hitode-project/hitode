@@ -5,7 +5,7 @@ use adv_abi::types::D3DSURFACE_DESC;
 use adv_cpu::JitCpu;
 use adv_machine::{Clock, ObjectLimits};
 
-fn machine() -> Machine<JitCpu> {
+pub(super) fn machine() -> Machine<JitCpu> {
     let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
     let mut m = Machine::new(cpu, Registry::default(), Clock::virtual_time()).unwrap();
     m.sys.objects = Objects::with_limits(ObjectLimits {
@@ -24,6 +24,8 @@ fn machine() -> Machine<JitCpu> {
         present: |_, _, _| unreachable!(),
         window: |_, _, _| Some((16, 12)),
         visible: |_, _, _| Some(false),
+        fast_forward: |_| false,
+        display: |_| (16, 12, 60),
         completed: |_, _| None,
     };
     m.ext.insert(State {
@@ -57,6 +59,7 @@ fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             surface: 0,
             parameters: D3DPRESENT_PARAMETERS::default(),
             creator: 0,
+            preserve_fpu: true,
             scene: false,
             needs_reset: false,
             back_buffer: None,

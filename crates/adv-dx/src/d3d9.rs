@@ -13,7 +13,9 @@ use adv_os::{
     com::{Com, ComIdentity, Destroyed, Iid, QueryError},
 };
 use resources::Resource;
+mod capabilities;
 mod fixed;
+mod pacing;
 mod readback;
 #[cfg(test)]
 mod tests;
@@ -44,6 +46,9 @@ pub struct SurfaceProvider {
     pub present: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
     pub window: fn(&Ext, &Objects, u32) -> Option<(u32, u32)>,
     pub visible: fn(&Ext, &Objects, u32) -> Option<bool>,
+    /// Host input policy: bypass refresh pacing while physical Ctrl is held.
+    pub fast_forward: fn(&Ext) -> bool,
+    pub display: fn(&Ext) -> (u32, u32, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
 }
 
@@ -59,6 +64,7 @@ struct Device {
     surface: u32,
     parameters: D3DPRESENT_PARAMETERS,
     creator: u32,
+    preserve_fpu: bool,
     scene: bool,
     needs_reset: bool,
     back_buffer: Option<Id>,
@@ -102,6 +108,7 @@ enum Operation {
     Present {
         surface: u32,
         occluded: bool,
+        deadline: Option<u64>,
     },
     Upload {
         resource: Id,
@@ -121,7 +128,7 @@ struct Pending {
 }
 enum Completion {
     Command,
-    Presented(u64, bool),
+    Presented(u64, bool, Option<u64>),
 }
 
 pub fn register(registry: &mut Registry) {
@@ -147,6 +154,7 @@ pub fn register(registry: &mut Registry) {
     resources::register(registry);
     fixed::register(registry);
     readback::register(registry);
+    capabilities::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -412,7 +420,7 @@ fn normalize(
         || parameters.Flags != 0
         || parameters.EnableAutoDepthStencil != 0
         || parameters.FullScreen_RefreshRateInHz != 0
-        || parameters.PresentationInterval != 0x80000000
+        || !matches!(parameters.PresentationInterval, 0 | 1 | 0x80000000)
         || !matches!(parameters.BackBufferFormat, 0 | 21 | 22)
     {
         return Err(UNAVAILABLE);
@@ -463,10 +471,8 @@ fn create_device(
     {
         return Outcome::Return(INVALID);
     }
-    // FPU_PRESERVE is currently required; do not silently promise an unimplemented
-    // guest floating-point control-word change. Hardware/mixed vertex-processing
-    // policy and its state queries are not implemented by this first slice.
-    if flags & 2 == 0 || flags & 0x20 == 0 || flags & !(2 | 0x20 | 4) != 0 {
+    // Hardware/mixed vertex-processing policy is not implemented by this slice.
+    if flags & 0x20 == 0 || flags & !(2 | 0x20 | 4) != 0 {
         return Outcome::Return(UNAVAILABLE);
     }
     let Ok(input) = parameters.read(env.cpu) else {
@@ -475,6 +481,20 @@ fn create_device(
     let normalized = match normalize(env, input, focus.0) {
         Ok(p) => p,
         Err(e) => return Outcome::Return(e),
+    };
+    if adv_abi::guest::check_range(
+        env.cpu,
+        parameters.addr(),
+        std::mem::size_of::<D3DPRESENT_PARAMETERS>() as u32,
+        Prot::WRITE,
+    )
+    .is_err()
+    {
+        return Outcome::Return(INVALID);
+    }
+    let environment = match creation_environment(env.cpu, flags & 2 != 0) {
+        Ok(environment) => environment,
+        Err(_) => return Outcome::Return(UNAVAILABLE),
     };
     let target = match env.ext.get::<State>().gpu.as_ref() {
         Some(gpu) => gpu.target(
@@ -509,6 +529,7 @@ fn create_device(
         surface,
         parameters: normalized,
         creator: env.sys.current,
+        preserve_fpu: flags & 2 != 0,
         scene: false,
         needs_reset: false,
         back_buffer: None,
@@ -536,6 +557,12 @@ fn create_device(
     if let Some(Payload::Device(device)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         device.back_buffer = Some(back_buffer);
     }
+    if let Some(environment) = environment
+        && env.cpu.set_fpu_environment(environment).is_err()
+    {
+        release(env, pointer);
+        return Outcome::Return(UNAVAILABLE);
+    }
     if parameters.write(env.cpu, normalized).is_err() || output.write(env.cpu, pointer).is_err() {
         release(env, pointer);
         return Outcome::Return(INVALID);
@@ -547,6 +574,19 @@ fn device<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Device> {
         Payload::Device(d) => Some(d),
         _ => None,
     }
+}
+fn creation_environment(
+    cpu: &mut dyn adv_cpu::backend::Guest,
+    preserve: bool,
+) -> Result<Option<adv_cpu::backend::FpuEnvironment>, adv_cpu::backend::FpuEnvironmentError> {
+    if preserve {
+        return Ok(None);
+    }
+    let mut environment = cpu.fpu_environment()?;
+    // Native x86 CreateDevice/Reset: mask exceptions, PC=single, RC=nearest.
+    // Infinity/reserved controls and the complete MXCSR state remain intact.
+    environment.x87_control = (environment.x87_control & !0x0f3f) | 0x003f;
+    Ok(Some(environment))
 }
 #[win32(d3d9, name = "IDirect3DDevice9::TestCooperativeLevel", level = implement)]
 fn cooperative(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
@@ -578,6 +618,7 @@ fn reset(
         return Outcome::Return(INVALID);
     }
     let focus = d.parameters.hDeviceWindow;
+    let preserve_fpu = d.preserve_fpu;
     let surface = d.surface;
     let old_buffer = d.back_buffer;
     let old_texture = d.texture;
@@ -597,12 +638,23 @@ fn reset(
     let Ok(input) = parameters.read(env.cpu) else {
         return Outcome::Return(INVALID);
     };
-    if adv_abi::guest::check_range(env.cpu, parameters.addr(), 56, Prot::WRITE).is_err() {
+    if adv_abi::guest::check_range(
+        env.cpu,
+        parameters.addr(),
+        std::mem::size_of::<D3DPRESENT_PARAMETERS>() as u32,
+        Prot::WRITE,
+    )
+    .is_err()
+    {
         return Outcome::Return(INVALID);
     }
     let normalized = match normalize(env, input, focus) {
         Ok(p) => p,
         Err(e) => return Outcome::Return(e),
+    };
+    let environment = match creation_environment(env.cpu, preserve_fpu) {
+        Ok(environment) => environment,
+        Err(_) => return Outcome::Return(UNAVAILABLE),
     };
     let target = match env.ext.get::<State>().gpu.as_ref() {
         Some(g) => g.target(
@@ -621,6 +673,14 @@ fn reset(
         return Outcome::Return(OUT_OF_MEMORY);
     };
     let provider = env.ext.get::<State>().provider;
+    if let Some(environment) = environment
+        && env.cpu.set_fpu_environment(environment).is_err()
+    {
+        if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
+            destroy(env, dead);
+        }
+        return Outcome::Return(UNAVAILABLE);
+    }
     if (provider.replace)(env.ext, surface, target).is_err() {
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
             destroy(env, dead);
@@ -684,8 +744,12 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
         } => gpu
             .clear(target, *color, *depth)
             .map(|()| Completion::Command),
-        Operation::Present { surface, occluded } => (provider.present)(env.ext, *surface, &mut gpu)
-            .map(|serial| Completion::Presented(serial, *occluded)),
+        Operation::Present {
+            surface,
+            occluded,
+            deadline,
+        } => (provider.present)(env.ext, *surface, &mut gpu)
+            .map(|serial| Completion::Presented(serial, *occluded, *deadline)),
         Operation::Upload {
             resource,
             target,
@@ -715,12 +779,18 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
     result
 }
 fn completed(env: &mut Env<'_>, result: Completion) -> Outcome {
-    if let Completion::Presented(serial, occluded) = result {
+    if let Completion::Presented(serial, occluded, deadline) = result {
         let provider = env.ext.get::<State>().provider;
         if let Some(outcome) = (provider.completed)(env, serial) {
             return outcome;
         }
-        return Outcome::Return(if occluded { PRESENT_OCCLUDED } else { 0 });
+        let fast_forward = (provider.fast_forward)(env.ext);
+        return pacing::finish(
+            env,
+            deadline,
+            if occluded { PRESENT_OCCLUDED } else { 0 },
+            fast_forward,
+        );
     }
     Outcome::Return(0)
 }
@@ -914,8 +984,25 @@ fn present(
     let provider = env.ext.get::<State>().provider;
     let occluded = (provider.visible)(env.ext, &env.sys.objects, d.parameters.hDeviceWindow)
         .is_some_and(|visible| !visible);
+    let deadline = match pacing::deadline(
+        env.sys.clock.now_us(),
+        d.parameters.PresentationInterval,
+        (provider.display)(env.ext).2,
+        occluded,
+    ) {
+        Ok(deadline) => deadline,
+        Err(()) => return Outcome::Return(UNAVAILABLE),
+    };
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
-    dispatch(env, id, Operation::Present { surface, occluded })
+    dispatch(
+        env,
+        id,
+        Operation::Present {
+            surface,
+            occluded,
+            deadline,
+        },
+    )
 }

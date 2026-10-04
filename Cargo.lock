@@ -73,6 +73,7 @@ dependencies = [
  "adv-os",
  "adv-sync",
  "adv-win32",
+ "bytemuck",
  "iced-x86",
  "pollster",
 ]

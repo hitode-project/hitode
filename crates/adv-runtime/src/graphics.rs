@@ -151,6 +151,10 @@ pub(crate) struct RunControl {
 #[cfg(feature = "gpu")]
 pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
+        display: |ext| {
+            let (width, height) = ext.get::<Win32>().user.screen;
+            (width.max(1) as u32, height.max(1) as u32, 60)
+        },
         insert: |ext, target| ext.get_mut::<Graphics<Snapshot>>().insert_native(target),
         target: |ext, id| ext.get::<Graphics<Snapshot>>().native_target(id).cloned(),
         remove: |ext, _, id| {
@@ -180,6 +184,16 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .windows
                 .get(objects, &hwnd)
                 .map(|w| w.visible())
+        },
+        fast_forward: |ext| {
+            let user = &ext.get::<Win32>().user;
+            [0x11, 0xa2, 0xa3].into_iter().any(|key| {
+                user.host_keys
+                    .as_ref()
+                    .map_or(user.keys[key], |keys| keys.get(key as u32))
+                    & 0x80
+                    != 0
+            })
         },
         completed: |env, serial| {
             env.sys.frame = serial as u32;
@@ -515,6 +529,36 @@ mod tests {
     use adv_cpu::backend::Guest;
     use adv_machine::RunResult;
     use iced_x86::code_asm::*;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn d3d9_present_boost_observes_live_physical_control_and_release() {
+        let mut machine = test_machine();
+        Win32::install(
+            &mut machine,
+            adv_win32::Win32Config::new(".", "pacing.exe", "."),
+        )
+        .unwrap();
+        let provider = d3d9_provider();
+        assert!(!(provider.fast_forward)(&machine.ext));
+        machine.ext.get_mut::<Win32>().user.keys[0x11] = 0x80;
+        assert!(
+            (provider.fast_forward)(&machine.ext),
+            "fallback guest keys without a host observer"
+        );
+        let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
+        machine.ext.get_mut::<Win32>().user.host_keys = Some(keys.clone());
+        assert!(
+            !(provider.fast_forward)(&machine.ext),
+            "physical release overrides stale guest message state"
+        );
+        for key in [0x11, 0xa2, 0xa3] {
+            keys.set(key, true);
+            assert!((provider.fast_forward)(&machine.ext));
+            keys.set(key, false);
+            assert!(!(provider.fast_forward)(&machine.ext));
+        }
+    }
 
     fn graphics(machine: &mut Machine<JitCpu>, id: u32, args: &[u32]) -> u32 {
         machine

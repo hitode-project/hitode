@@ -18,6 +18,7 @@ adv-machine.workspace = true
 adv-os.workspace = true
 adv-device = { path = "../adv-device" }
 adv-sync = { path = "../adv-sync" }
+bytemuck = "1"
 
 [dev-dependencies]
 adv-win32 = { path = "../adv-win32" }
