@@ -3,7 +3,7 @@
 //! Any number of guest threads (up to the resource limit) run as contexts on one
 //! host execution thread. Blocking switches contexts; real-time slices can preempt
 //! guest computation or return a completed frame to the host. The normal scheduling
-//! lane remains round-robin, with bounded relative-priority and satisfied-wait preferences.
+//! lane remains round-robin, with a bounded preference for genuinely satisfied waits.
 
 pub use crate::objects::Objects;
 use std::any::Any;
@@ -16,7 +16,7 @@ pub type Handle = u32;
 /// What a blocked context waits for. Times are guest microseconds ([`crate::Clock`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// Give a ready peer the next ordinary turn (Sleep(0), SwitchToThread).
+    /// Let every other ready context run once, then continue (Sleep(0), SwitchToThread).
     Yield,
     /// Sleep until the given time.
     Until(u64),
@@ -99,8 +99,6 @@ pub(crate) enum State {
 pub struct Context {
     pub id: CtxId,
     pub name: String,
-    /// Personality-neutral relative scheduling preference. New contexts start at zero.
-    pub relative_priority: i8,
     pub tid: u32,
     pub teb: u32,
     pub stack_lo: u32,

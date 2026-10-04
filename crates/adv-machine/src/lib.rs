@@ -8,7 +8,7 @@
 //!   Blocking, exit and failure also park the guest. [`Machine::run`] owns re-entry.
 //! * Each guest context has its own stack, TEB (FS base), registers, and continuation
 //!   stack. Names are diagnostic labels; scheduling depends only on readiness and
-//!   relative priority and the urgency of the event that woke it, never a thread role.
+//!   the urgency of the event that woke it, never an engine-specific thread role.
 
 pub mod clock;
 pub mod exception;
@@ -219,7 +219,6 @@ impl Sys {
         self.contexts.push(Context {
             id,
             name: name.to_owned(),
-            relative_priority: 0,
             tid,
             teb,
             stack_lo: lo,
@@ -339,20 +338,6 @@ impl Sys {
 
     pub fn current_context(&self) -> &Context {
         &self.contexts[self.current as usize]
-    }
-
-    pub fn relative_priority(&self, id: CtxId) -> Option<i8> {
-        self.contexts.get(id as usize).map(|c| c.relative_priority)
-    }
-
-    /// Change selection preference only. A sleeping or exited context does not
-    /// become runnable, and a personality validates its own accepted values.
-    pub fn set_relative_priority(&mut self, id: CtxId, priority: i8) -> bool {
-        let Some(context) = self.contexts.get_mut(id as usize) else {
-            return false;
-        };
-        context.relative_priority = priority;
-        true
     }
 
     /// Stop peers before an OS frontend runs process termination callbacks.
@@ -1388,7 +1373,6 @@ impl<B: Backend> Machine<B> {
                     }),
                 };
                 ctx.yielded = true;
-                self.sys.wakes.note_yield(id);
             }
             Parked::Block {
                 wait,
@@ -1526,10 +1510,7 @@ impl<B: Backend> Machine<B> {
             let selection = self.sys.wakes.pick(
                 &mut last,
                 contexts.len(),
-                |id| {
-                    let context = &contexts[id as usize];
-                    context.is_ready().then_some(context.relative_priority)
-                },
+                |id| matches!(contexts[id as usize].state, State::Ready { .. }),
                 latency_mode,
             );
             let Some(selection) = selection else {
@@ -1554,7 +1535,6 @@ impl<B: Backend> Machine<B> {
                 selection.wake,
                 self.sys.clock.now_us(),
                 selection.promoted,
-                selection.relative_preferred,
             );
             let frame_before = self.sys.completed_frames;
             // A woken context first finishes the host call it blocked in.

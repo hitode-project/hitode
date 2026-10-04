@@ -52,8 +52,6 @@ pub struct SchedulingStats {
     pub cpu_budget_overrun_us_total: u64,
     pub cpu_budget_overrun_us_max: u64,
     pub wake_priority_dispatches: u64,
-    /// Base relative-priority choices, separate from event wake promotions.
-    pub relative_priority_dispatches: u64,
     pub wake_dispatches: u64,
     pub wake_ready_queue_us_total: u64,
     pub wake_ready_queue_us_max: u64,
@@ -84,10 +82,8 @@ impl SchedulingStats {
         stamp: Option<crate::wake_queue::WakeStamp>,
         now: u64,
         promoted: bool,
-        relative_preferred: bool,
     ) {
         self.wake_priority_dispatches += u64::from(promoted);
-        self.relative_priority_dispatches += u64::from(relative_preferred);
         if let Some(stamp) = stamp {
             let queued = now.saturating_sub(stamp.observed_us);
             self.wake_dispatches += 1;
@@ -148,7 +144,6 @@ mod tests {
             }),
             2500,
             true,
-            false,
         );
         assert_eq!(stats.wake_ready_queue_us_total, 1000);
         assert_eq!(stats.timed_dispatch_lateness_us_total, 1500);
@@ -160,21 +155,9 @@ mod tests {
             }),
             3000,
             false,
-            false,
         );
         assert_eq!(stats.wake_dispatches, 2);
         assert_eq!(stats.timed_dispatches, 1);
-        assert_eq!(stats.wake_priority_dispatches, 1);
-    }
-    #[test]
-    fn relative_priority_dispatch_is_not_counted_as_an_event_promotion() {
-        let mut stats = SchedulingStats::default();
-        stats.dispatch(None, 1000, false, true);
-        assert_eq!(stats.relative_priority_dispatches, 1);
-        assert_eq!(stats.wake_priority_dispatches, 0);
-        assert_eq!(stats.wake_dispatches, 0);
-        stats.dispatch(None, 2000, true, false);
-        assert_eq!(stats.relative_priority_dispatches, 1);
         assert_eq!(stats.wake_priority_dispatches, 1);
     }
     #[test]
