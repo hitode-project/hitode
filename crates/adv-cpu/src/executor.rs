@@ -31,6 +31,12 @@ pub struct Stats {
     pub native_entries: u64,
     /// Entries reached by a generated tail call without returning to run_inner.
     pub linked_entries: u64,
+    /// RET hints validated against the actual guest stack, including local hits.
+    pub shadow_matches: u64,
+    /// Validated hints that actually bypassed the hash search and tail-linked.
+    pub shadow_hits: u64,
+    pub shadow_misses: u64,
+    pub shadow_overflows: u64,
     pub interpreter_instructions: u64,
     pub interpreter_entries: u64,
     pub native_blocks: u64,
@@ -79,6 +85,7 @@ pub struct Executor {
     links: crate::linking::Table,
     links_revision: u64,
     region_linking: bool,
+    shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     interpreter: crate::interpreter::Interpreter,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
@@ -211,6 +218,7 @@ impl Executor {
             links: crate::linking::Table::default(),
             links_revision: 0,
             region_linking: true,
+            shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
@@ -342,7 +350,7 @@ impl Executor {
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
         let start = Instant::now();
-        let compiled = compile::compile(&region, &self.memory)?;
+        let compiled = compile::compile(&region, &self.memory, self.shadow_returns.is_some())?;
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
         self.pending_regions.remove(&region.start);
@@ -516,7 +524,8 @@ impl Executor {
         {
             return Ok(false);
         }
-        let snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        snapshot.shadow_returns = self.shadow_returns.is_some();
         let fragments = if let Some(limit) = policy.background_limit() {
             match crate::compile_budget::plan(snapshot, limit) {
                 Ok(fragments) => fragments,
@@ -737,6 +746,24 @@ impl Executor {
     }
     pub fn set_region_linking(&mut self, enabled: bool) {
         self.region_linking = enabled;
+    }
+
+    /// Experimental return prediction; choose codegen before compiling/submitting any region.
+    /// Hints are private to one bounded native chain and never enter a saved CPU
+    /// context. Default false preserves the existing checked CALL/RET path.
+    pub fn set_shadow_returns(&mut self, enabled: bool) -> Result<(), String> {
+        if self.shadow_returns.is_some() == enabled {
+            return Ok(());
+        }
+        if self.stats.compilations != 0
+            || self.stats.compile_requests != 0
+            || !self.pending_regions.is_empty()
+            || !self.deferred_compilations.is_empty()
+        {
+            return Err("shadow-return codegen must be configured before compilation".into());
+        }
+        self.shadow_returns = enabled.then(|| Box::new(crate::linking::shadow::Stack::new()));
+        Ok(())
     }
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
@@ -1083,6 +1110,7 @@ impl Executor {
                         } else {
                             &self.inactive_interrupt
                         },
+                        shadow: self.shadow_returns.as_deref_mut(),
                     },
                 );
                 if let Some(timer) = timer {
@@ -1092,6 +1120,12 @@ impl Executor {
                 }
                 self.stats.native_entries += 1 + linked;
                 self.stats.linked_entries += linked;
+                if let Some(shadow) = &self.shadow_returns {
+                    self.stats.shadow_matches = shadow.matches;
+                    self.stats.shadow_hits = shadow.hits;
+                    self.stats.shadow_misses = shadow.misses;
+                    self.stats.shadow_overflows = shadow.overflows;
+                }
                 let completed = before - self.state.fuel;
                 self.state.fuel += reserved;
                 self.stats.native_blocks += completed;

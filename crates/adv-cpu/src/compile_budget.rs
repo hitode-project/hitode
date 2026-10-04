@@ -169,7 +169,25 @@ fn weight(i: &Instruction) -> usize {
     1
 }
 
-fn total(instructions: &BTreeMap<u32, Instruction>, strategy: CompileStrategy) -> usize {
+fn weight_for(i: &Instruction, shadow_returns: bool) -> usize {
+    weight(i)
+        + if shadow_returns
+            && matches!(
+                i.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall | FlowControl::Return
+            )
+        {
+            16
+        } else {
+            0
+        }
+}
+
+fn total(
+    instructions: &BTreeMap<u32, Instruction>,
+    strategy: CompileStrategy,
+    shadow_returns: bool,
+) -> usize {
     let multiplier = if strategy == CompileStrategy::Speed {
         4
     } else {
@@ -177,13 +195,17 @@ fn total(instructions: &BTreeMap<u32, Instruction>, strategy: CompileStrategy) -
     };
     instructions
         .values()
-        .map(weight)
+        .map(|i| weight_for(i, shadow_returns))
         .sum::<usize>()
         .saturating_mul(multiplier)
 }
 
 pub(crate) fn work(input: &Snapshot) -> usize {
-    total(&decoded(input), input.region.compile_strategy)
+    total(
+        &decoded(input),
+        input.region.compile_strategy,
+        input.shadow_returns,
+    )
 }
 
 /// Partition Fast work while retaining exact guest instruction/edge semantics.
@@ -198,7 +220,11 @@ pub(crate) fn plan(input: Snapshot, limit: usize) -> Result<Vec<Snapshot>, Strin
     {
         return Err(format!("entry {entry:#x} is not an instruction boundary"));
     }
-    let amount = total(&instructions, input.region.compile_strategy);
+    let amount = total(
+        &instructions,
+        input.region.compile_strategy,
+        input.shadow_returns,
+    );
     if amount <= limit {
         return Ok(vec![input]);
     }
@@ -211,7 +237,7 @@ pub(crate) fn plan(input: Snapshot, limit: usize) -> Result<Vec<Snapshot>, Strin
     let mut current = BTreeSet::new();
     let mut used = 0;
     for (&pc, instruction) in &instructions {
-        let cost = weight(instruction);
+        let cost = weight_for(instruction, input.shadow_returns);
         if cost > limit {
             return Err(format!(
                 "instruction work {cost} exceeds background budget {limit}"
@@ -315,6 +341,23 @@ mod tests {
         let mut original = input(&[0x8b, 0x00, 0x8b, 0x00]);
         original.region.compile_strategy = CompileStrategy::Speed;
         assert!(plan(original, 32).is_err());
+    }
+    #[test]
+    fn shadow_metadata_is_budgeted_and_preserved_in_every_fragment() {
+        // External CALL followed by RET: ordinary work 16, metadata adds 32.
+        let mut original = input(&[0xe8, 0, 1, 0, 0, 0xc3]);
+        assert_eq!(work(&original), 16);
+        original.shadow_returns = true;
+        assert_eq!(work(&original), 48);
+        let fragments = plan(original.clone(), 24).unwrap();
+        assert_eq!(fragments.len(), 2);
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.shadow_returns && work(fragment) <= 24)
+        );
+        original.region.compile_strategy = CompileStrategy::Speed;
+        assert!(plan(original, 128).is_err());
     }
     #[test]
     fn authored_large_regions_are_sliced_on_full_instruction_boundaries() {

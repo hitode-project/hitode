@@ -17,6 +17,7 @@ use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 mod fault;
 mod mmx;
 mod scalar;
+mod shadow;
 mod simd;
 mod write_summary;
 
@@ -27,6 +28,7 @@ pub(crate) struct NativeRun<'a> {
     pub links: Option<&'a Table>,
     pub stop: u32,
     pub interrupt: &'a std::sync::atomic::AtomicBool,
+    pub shadow: Option<&'a mut crate::linking::shadow::Stack>,
 }
 
 pub(crate) struct Compiled {
@@ -96,9 +98,17 @@ impl Compiled {
         state: &mut CpuState,
         memory: &mut Memory,
         bridge: &mut crate::trap::Bridge<'_>,
-        controls: NativeRun<'_>,
+        mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
         bridge.memory = memory;
+        assert!(!self.input.shadow_returns || controls.shadow.is_some());
+        let shadow = controls
+            .shadow
+            .as_deref_mut()
+            .map_or(std::ptr::null_mut(), |stack| {
+                stack.clear();
+                stack as *mut _
+            });
         let (slots, mask) = controls.links.map_or((std::ptr::null(), 0), Table::parts);
         let mut context = NativeContext {
             state,
@@ -112,6 +122,7 @@ impl Compiled {
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
             linked_entries: 0,
+            shadow,
         };
         // SAFETY: generated function has this ABI; exclusive borrows keep its pointers
         // stable. Checked accesses retain their guards; verified ordinary reads
@@ -129,9 +140,15 @@ impl Compiled {
                 memory.ptr.as_ptr(),
             )
         {
+            if let Some(stack) = controls.shadow.as_deref_mut() {
+                stack.clear();
+            }
             return (result, context.linked_entries);
         }
         let result = unsafe { (self.entry)(&mut context, memory.ptr.as_ptr()) };
+        if let Some(stack) = controls.shadow {
+            stack.clear();
+        }
         (result, context.linked_entries)
     }
 
@@ -186,6 +203,7 @@ pub(crate) struct Snapshot {
     // Published reachable regions compare only their decoded instruction bytes.
     // A pending snapshot still stamps the full bounded window conservatively.
     covered: Option<Vec<(usize, usize)>>,
+    pub(crate) shadow_returns: bool,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     native_fault_reads: bool,
 }
@@ -229,6 +247,7 @@ impl Snapshot {
                 .cloned()
                 .collect(),
             covered: None,
+            shadow_returns: self.shadow_returns,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             native_fault_reads: self.native_fault_reads,
         })
@@ -275,6 +294,7 @@ impl Snapshot {
             len: memory.len,
             bytes,
             covered: None,
+            shadow_returns: false,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             native_fault_reads: memory.native_fault_reads_available(),
             pages: pages
@@ -386,8 +406,14 @@ fn record_tail_dependencies(
     }
 }
 
-pub(crate) fn compile(region: &Region, memory: &Memory) -> Result<Compiled, String> {
-    compile_snapshot(&Snapshot::capture(region, memory)?)
+pub(crate) fn compile(
+    region: &Region,
+    memory: &Memory,
+    shadow_returns: bool,
+) -> Result<Compiled, String> {
+    let mut input = Snapshot::capture(region, memory)?;
+    input.shadow_returns = shadow_returns;
+    compile_snapshot(&input)
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
@@ -564,6 +590,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
+    let shadow_ref = snapshot
+        .shadow_returns
+        .then(|| module.declare_func_in_func(id, &mut ctx.func));
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -791,17 +820,47 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let blocks: BTreeMap<_, _> = entries.iter().map(|&pc| (pc, b.create_block())).collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
+        if shadow_ref.is_some() {
+            b.append_block_param(dispatch, ptr_ty);
+        }
         let shared_exit = b.create_block();
         b.set_cold_block(shared_exit);
         b.append_block_param(shared_exit, types::I32); // Exit reason.
         b.append_block_param(shared_exit, types::I32); // Exact guest PC.
+        if shadow_ref.is_some() {
+            b.append_block_param(shared_exit, ptr_ty);
+        }
         let hot_dispatch = b.create_block();
         b.append_block_param(hot_dispatch, types::I32);
+        if shadow_ref.is_some() {
+            b.append_block_param(hot_dispatch, ptr_ty);
+        }
         let write_summary = write_summary::Summary::for_region(&instructions);
         let hot_exits = write_summary.is_some() && write_summary::crosses_regions(&instructions);
         if !hot_exits {
-            b.ins().jump(dispatch, &[pc.into()]);
+            if shadow_ref.is_some() {
+                let absent = b.ins().iconst(ptr_ty, 0);
+                b.ins().jump(dispatch, &[pc.into(), absent.into()]);
+            } else {
+                b.ins().jump(dispatch, &[pc.into()]);
+            }
         }
+        let local_return_hint = return_hint.filter(|&next| {
+            shadow_ref.is_some()
+                && instructions
+                    .values()
+                    .filter(|i| {
+                        matches!(
+                            i.flow_control(),
+                            FlowControl::Call | FlowControl::IndirectCall
+                        )
+                    })
+                    .all(|i| {
+                        i.op0_kind() == OpKind::NearBranch32
+                            && i.next_ip32() == next
+                            && blocks.contains_key(&i.near_branch32())
+                    })
+        });
         let mut e = Emitter {
             b,
             regs,
@@ -826,6 +885,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             shared_exit,
             pc: region.start,
             return_hint,
+            local_return_hint,
+            shadow_ref,
+            shadow_entries: if shadow_ref.is_some() {
+                entries
+                    .iter()
+                    .copied()
+                    .filter(|pc| supported(&instructions[pc]))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            },
             hot_dispatch,
             direct_footers: BTreeMap::new(),
             write_summary,
@@ -925,6 +995,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         e.mmx_effects = None;
         e.b.switch_to_block(dispatch);
         let target = e.b.block_params(dispatch)[0];
+        let prediction = shadow_ref.map(|_| e.b.block_params(dispatch)[1]);
         // Atomic rather than readonly/trusted ordinary data: this flag can
         // change while a generated loop is running and must not be hoisted.
         e.interrupt_at(target, true);
@@ -938,7 +1009,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
         switch.emit(&mut e.b, target, outside);
         e.b.switch_to_block(outside);
-        e.exit(Exit::Dispatch, target);
+        e.exit_predicted(Exit::Dispatch, target, prediction);
         // SSA variables merge each predecessor's state here. Keep one writeback
         // and one lazy-flags materialization instead of duplicating them at every
         // memory/budget guard. Fault addresses are still stored at the fault site.
@@ -952,7 +1023,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         if hot_exits {
             e.b.ins().return_(&[reason]);
         } else {
-            e.chain_or_return(pc, None, Some(reason));
+            let prediction = shadow_ref.map(|_| e.b.block_params(shared_exit)[2]);
+            e.chain_or_return(pc, None, Some(reason), prediction);
         }
         // Normal transfers do not merge with fault/budget prefixes. Bound the
         // number of constant-target footers, sharing all remaining destinations.
@@ -960,13 +1032,22 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let hot_chain = e.b.create_block();
         e.b.append_block_param(hot_chain, types::I32); // PC.
         e.b.append_block_param(hot_chain, types::I32); // Precomputed target hash.
+        if shadow_ref.is_some() {
+            e.b.append_block_param(hot_chain, ptr_ty);
+        }
         for (target, block) in direct_footers {
             e.b.switch_to_block(block);
             e.mmx_effects = None;
             let pc = e.constant(target);
             e.save_hot_state(pc);
             let hash = e.constant(crate::linking::hash(target));
-            e.b.ins().jump(hot_chain, &[pc.into(), hash.into()]);
+            if shadow_ref.is_some() {
+                let absent = e.b.ins().iconst(ptr_ty, 0);
+                e.b.ins()
+                    .jump(hot_chain, &[pc.into(), hash.into(), absent.into()]);
+            } else {
+                e.b.ins().jump(hot_chain, &[pc.into(), hash.into()]);
+            }
         }
         if hot_exits {
             e.b.switch_to_block(hot_dispatch);
@@ -978,11 +1059,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             let mixed = e.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
             let high = e.b.ins().ushr_imm(mixed, 16);
             let hash = e.b.ins().bxor(mixed, high);
-            e.b.ins().jump(hot_chain, &[pc.into(), hash.into()]);
+            if shadow_ref.is_some() {
+                let prediction = e.b.block_params(hot_dispatch)[1];
+                e.b.ins()
+                    .jump(hot_chain, &[pc.into(), hash.into(), prediction.into()]);
+            } else {
+                e.b.ins().jump(hot_chain, &[pc.into(), hash.into()]);
+            }
             e.b.switch_to_block(hot_chain);
             let pc = e.b.block_params(hot_chain)[0];
             let hash = e.b.block_params(hot_chain)[1];
-            e.chain_or_return(pc, Some(hash), None);
+            let prediction = shadow_ref.map(|_| e.b.block_params(hot_chain)[2]);
+            e.chain_or_return(pc, Some(hash), None, prediction);
         }
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if let Some(block) = e.fault_return {
@@ -1226,7 +1314,7 @@ mod tests {
         memory.map(0x10000, 4096, READ | EXEC).unwrap();
         memory.write(0x10000, &[0x8b, 0x06, 0xc3]).unwrap();
         memory.enable_native_protection().unwrap();
-        let compiled = compile(&Region::new(0x10000, 3), &memory).unwrap();
+        let compiled = compile(&Region::new(0x10000, 3), &memory, false).unwrap();
         assert_eq!(compiled.fault_sites.len(), 1, "{}", compiled.disasm);
         assert_eq!(compiled.fault_recipes.len(), 1);
         assert!(compiled.fault_recipes[0].valid());
@@ -1249,7 +1337,7 @@ mod tests {
             if policy {
                 region.entries.push(0x10003);
             }
-            let compiled = compile(&region, &memory).unwrap();
+            let compiled = compile(&region, &memory, false).unwrap();
             assert!(compiled.fault_sites.is_empty());
             assert!(compiled.fault_recipes.is_empty());
         }
@@ -1261,7 +1349,7 @@ mod tests {
         let mut memory = Memory::new(0x10000, 4096).unwrap();
         memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
         memory.write(0x10000, &[0x90, 0xc3]).unwrap();
-        let mut compiled = compile(&Region::new(0x10000, 2), &memory).unwrap();
+        let mut compiled = compile(&Region::new(0x10000, 2), &memory, false).unwrap();
         assert_eq!(compiled.unwind.len(), 2);
         assert!(crate::host_fault::registered(compiled.tail_entry));
         assert!(crate::host_fault::registered(compiled.entry as usize));
@@ -1287,7 +1375,8 @@ mod tests {
             let mut machine = crate::Executor::new(0x10000, 4096).unwrap();
             machine.write(0x10000, &bytes).unwrap();
             machine.protect(0x10000, 4096, READ | EXEC).unwrap();
-            let compiled = compile(&Region::new(0x10000, bytes.len()), machine.memory()).unwrap();
+            let compiled =
+                compile(&Region::new(0x10000, bytes.len()), machine.memory(), false).unwrap();
             let divides: Vec<_> = compiled
                 .disasm
                 .lines()
@@ -1463,6 +1552,9 @@ struct Emitter<'a> {
     shared_exit: ir::Block,
     pc: u32,
     return_hint: Option<u32>,
+    local_return_hint: Option<u32>,
+    shadow_ref: Option<ir::FuncRef>,
+    shadow_entries: BTreeSet<u32>,
     hot_dispatch: ir::Block,
     hot_exits: bool,
     direct_footers: BTreeMap<u32, ir::Block>,
@@ -1492,7 +1584,13 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    fn chain_or_return(&mut self, pc: Value, target_hash: Option<Value>, reason: Option<Value>) {
+    fn chain_or_return(
+        &mut self,
+        pc: Value,
+        target_hash: Option<Value>,
+        reason: Option<Value>,
+        prediction: Option<Value>,
+    ) {
         let returned = self.b.create_block();
         if let Some(reason) = reason {
             let candidate = self.b.create_block();
@@ -1549,6 +1647,18 @@ impl Emitter<'_> {
         let interrupted_reason = self.constant(Exit::Interrupted as u32);
         self.b.ins().return_(&[interrupted_reason]);
         self.b.switch_to_block(search_ready);
+        let hit = self.b.create_block();
+        self.b.append_block_param(hit, self.ptr_ty);
+        if let Some(prediction) = prediction {
+            let valid = self.b.ins().icmp_imm(IntCC::NotEqual, prediction, 0);
+            let predicted = self.b.create_block();
+            let search_only = self.b.create_block();
+            self.b.ins().brif(valid, predicted, &[], search_only, &[]);
+            self.b.switch_to_block(predicted);
+            self.shadow_hit();
+            self.b.ins().jump(hit, &[prediction.into()]);
+            self.b.switch_to_block(search_only);
+        }
         let mask = self.b.ins().load(
             types::I32,
             MemFlags::trusted(),
@@ -1598,9 +1708,8 @@ impl Emitter<'_> {
             offset_of!(Slot, pc) as i32,
         );
         let found = self.b.ins().icmp(IntCC::Equal, pc, key);
-        let hit = self.b.create_block();
         let advance = self.b.create_block();
-        self.b.ins().brif(found, hit, &[], advance, &[]);
+        self.b.ins().brif(found, hit, &[entry.into()], advance, &[]);
         self.b.switch_to_block(advance);
         let next = self.b.ins().iadd_imm(index, 1);
         let next = self.b.ins().band(next, mask);
@@ -1618,6 +1727,7 @@ impl Emitter<'_> {
             &[next.into(), probes.into()],
         );
         self.b.switch_to_block(hit);
+        let entry = self.b.block_params(hit)[0];
         let remaining = self.b.ins().iadd_imm(remaining, -1);
         self.b.ins().store(
             MemFlags::trusted(),
@@ -1674,7 +1784,7 @@ impl Emitter<'_> {
                 self.b.ins().jump(block, &[]);
             } else {
                 let target = self.constant(pc);
-                self.b.ins().jump(self.hot_dispatch, &[target.into()]);
+                self.exit_predicted(reason, target, None);
             }
             return;
         }
@@ -1682,15 +1792,33 @@ impl Emitter<'_> {
         self.exit(reason, pc);
     }
     fn exit(&mut self, reason: Exit, pc: Value) {
+        self.exit_predicted(reason, pc, None);
+    }
+    fn exit_predicted(&mut self, reason: Exit, pc: Value, prediction: Option<Value>) {
         self.flush_mmx_effects();
         if reason == Exit::Dispatch && self.hot_exits {
-            self.b.ins().jump(self.hot_dispatch, &[pc.into()]);
+            if self.shadow_ref.is_some() {
+                let prediction = prediction.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));
+                self.b
+                    .ins()
+                    .jump(self.hot_dispatch, &[pc.into(), prediction.into()]);
+            } else {
+                self.b.ins().jump(self.hot_dispatch, &[pc.into()]);
+            }
             return;
         }
         let reason = self.constant(reason as u32);
-        self.b
-            .ins()
-            .jump(self.shared_exit, &[reason.into(), pc.into()]);
+        if self.shadow_ref.is_some() {
+            let prediction = prediction.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));
+            self.b.ins().jump(
+                self.shared_exit,
+                &[reason.into(), pc.into(), prediction.into()],
+            );
+        } else {
+            self.b
+                .ins()
+                .jump(self.shared_exit, &[reason.into(), pc.into()]);
+        }
     }
     fn save_state(&mut self, pc: Value) {
         self.flush_mmx_effects();
@@ -1877,6 +2005,7 @@ impl Emitter<'_> {
     fn trap_call(&mut self, next: u32) {
         let pc = self.constant(next);
         self.save_state(pc);
+        self.shadow_clear();
         let pc = self.constant(self.pc);
         let call = self
             .b
@@ -1929,8 +2058,18 @@ impl Emitter<'_> {
         }
     }
     fn indirect(&mut self, target: Value) {
+        self.indirect_predicted(target, None);
+    }
+    fn indirect_predicted(&mut self, target: Value, prediction: Option<Value>) {
         self.flush_mmx_effects();
-        self.b.ins().jump(self.dispatch, &[target.into()]);
+        if self.shadow_ref.is_some() {
+            let prediction = prediction.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));
+            self.b
+                .ins()
+                .jump(self.dispatch, &[target.into(), prediction.into()]);
+        } else {
+            self.b.ins().jump(self.dispatch, &[target.into()]);
+        }
     }
     fn record_indirect(&mut self, target: Value, kind: crate::IndirectBranchKind) {
         // Only committed indirect transfers pay these plain state stores.
@@ -2825,6 +2964,7 @@ impl Emitter<'_> {
                 self.store_memory(ptr, pushed);
                 self.b.def_var(self.regs[4], sp);
                 if i.mnemonic() == M::Call {
+                    self.shadow_push(sp, i.next_ip32());
                     if i.op0_kind() == OpKind::NearBranch32 {
                         self.direct(i.near_branch32());
                     } else {
@@ -2836,6 +2976,7 @@ impl Emitter<'_> {
             }
             M::Pop | M::Ret => {
                 let sp = self.b.use_var(self.regs[4]);
+                let original_sp = sp;
                 let value = self.direct_load(sp, types::I32);
                 let adjustment = if i.mnemonic() == M::Ret && i.op_count() != 0 {
                     i64::from(i.immediate16())
@@ -2857,11 +2998,16 @@ impl Emitter<'_> {
                         let miss = self.b.create_block();
                         self.b.ins().brif(hit, yes, &[], miss, &[]);
                         self.b.switch_to_block(yes);
+                        if self.local_return_hint.is_none() {
+                            self.shadow_prediction(original_sp, value);
+                        }
                         self.direct(target);
                         self.b.switch_to_block(miss);
-                        self.indirect(value);
+                        let prediction = self.shadow_prediction(original_sp, value);
+                        self.indirect_predicted(value, prediction);
                     } else {
-                        self.indirect(value);
+                        let prediction = self.shadow_prediction(original_sp, value);
+                        self.indirect_predicted(value, prediction);
                     }
                     return true;
                 }

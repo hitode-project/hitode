@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::CpuState;
 
+pub(crate) mod shadow;
+
 pub(crate) const PROBES: usize = 8;
 pub(crate) const CHAIN_LIMIT: u32 = 1024;
 
@@ -88,4 +90,7 @@ pub(crate) struct NativeContext {
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub fault_reads: u8,
     pub linked_entries: u64,
+    /// Exclusive metadata borrowed for this chain. Cleared before/after native
+    /// execution, so it cannot retain a target across publication or retirement.
+    pub shadow: *mut shadow::Stack,
 }
