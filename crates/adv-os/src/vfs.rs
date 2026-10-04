@@ -14,7 +14,9 @@ use std::time::SystemTime;
 use crate::OsConfig;
 
 mod portable_saves;
+mod section;
 mod stream;
+pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
 pub use stream::FileStream;
 
 #[derive(Clone, Debug)]
@@ -42,6 +44,7 @@ enum Loc {
 }
 
 pub struct Vfs {
+    pub sections: SharedFiles,
     /// Current directory (normalized guest path).
     pub cwd: String,
     game_root: String,
@@ -94,6 +97,7 @@ impl Vfs {
                 }
             };
         Self {
+            sections: SharedFiles::default(),
             cwd: root.clone(),
             game_root: root,
             game_host: cfg.game_dir.clone(),

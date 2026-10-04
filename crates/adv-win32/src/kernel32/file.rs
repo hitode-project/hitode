@@ -109,6 +109,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     let write = access & GENERIC_WRITE != 0
         || matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING);
     let exists = existing.as_ref().is_some_and(|p| p.is_file());
+    let mut transfer = None;
 
     let result = if !write {
         match (&existing, disposition) {
@@ -144,10 +145,21 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
                 if !truncate
                     && w.vfs.is_base_only(&guest)
                     && let Some(src) = &existing
-                    && let Err(e) = std::fs::copy(src, &dst)
                 {
-                    io_error(env, &e);
-                    return INVALID_HANDLE_VALUE;
+                    let old = match std::fs::File::open(src)
+                        .and_then(|file| adv_os::vfs::file_identity(&file))
+                    {
+                        Ok(id) => id,
+                        Err(error) => {
+                            io_error(env, &error);
+                            return INVALID_HANDLE_VALUE;
+                        }
+                    };
+                    if let Err(error) = std::fs::copy(src, &dst) {
+                        io_error(env, &error);
+                        return INVALID_HANDLE_VALUE;
+                    }
+                    transfer = Some((old, dst.clone()));
                 }
                 std::fs::OpenOptions::new()
                     .read(true)
@@ -160,6 +172,38 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     };
     match result {
         Ok(file) => {
+            if let Some((old, destination)) = transfer {
+                let replacements = match super::file_mapping::prepare_retarget_handles(
+                    env,
+                    &guest,
+                    old,
+                    &destination,
+                ) {
+                    Ok(replacements) => replacements,
+                    Err(error) => {
+                        set_last_error(env, error);
+                        return INVALID_HANDLE_VALUE;
+                    }
+                };
+                let content = match file.try_clone().and_then(|owned| {
+                    let len = owned.metadata()?.len();
+                    env.ext
+                        .get::<Win32>()
+                        .vfs
+                        .sections
+                        .transfer(old, owned, len, true)
+                }) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        io_error(env, &error);
+                        return INVALID_HANDLE_VALUE;
+                    }
+                };
+                replacements.apply(&mut env.sys.objects);
+                // The weak registry must not extend content lifetime on its own.
+                // Existing views keep it live; with no view this temporary drops.
+                drop(content);
+            }
             let h = env.sys.objects.insert_host(FileObj {
                 file: file.into(),
                 guest_path: guest.clone(),
@@ -189,6 +233,23 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
+    let section = &env.ext.get::<Win32>().vfs.sections;
+    let content = if section.has_entries() {
+        f.file.cached_identity().and_then(|id| section.lookup(id))
+    } else {
+        None
+    };
+    let coherence = if let Some(content) = content {
+        match f.file.stream_position() {
+            Ok(offset) => Some((content, offset)),
+            Err(error) => {
+                io_error(env, &error);
+                return Outcome::Return(0);
+            }
+        }
+    } else {
+        None
+    };
     let mut data = vec![0u8; n as usize];
     let mut got = 0;
     while got < data.len() {
@@ -200,6 +261,12 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(0);
             }
         }
+    }
+    if let Some((content, offset)) = coherence
+        && let Err(error) = content.merge_read(offset, &mut data[..got])
+    {
+        io_error(env, &error);
+        return Outcome::Return(0);
     }
     if env.cpu.write(buf, &data[..got]).is_err() {
         set_last_error(env, 998); // ERROR_NOACCESS
@@ -223,13 +290,35 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
-    match f.file.write_all(&data) {
+    let section = &env.ext.get::<Win32>().vfs.sections;
+    let content = if section.has_entries() {
+        f.file.cached_identity().and_then(|id| section.lookup(id))
+    } else {
+        None
+    };
+    let content = if let Some(content) = content {
+        match f.file.stream_position() {
+            Ok(offset) => Some((content, offset)),
+            Err(error) => {
+                io_error(env, &error);
+                return Outcome::Return(0);
+            }
+        }
+    } else {
+        None
+    };
+    let result = if let Some((content, offset)) = content {
+        content.write_to(&mut f.file, offset, &data)
+    } else {
+        f.file.write_all(&data)
+    };
+    match result {
         Ok(()) => {
             out_u32(env.cpu, written, n);
             Outcome::Return(1)
         }
-        Err(e) => {
-            io_error(env, &e);
+        Err(error) => {
+            io_error(env, &error);
             Outcome::Return(0)
         }
     }

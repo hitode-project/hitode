@@ -1,15 +1,16 @@
 //! Worker-owned data mappings. Views retain their section after handles close.
 //! Executable/image/reserved/device mappings and cross-host-process sharing are
 //! explicitly outside this implementation; no native OS named object is created.
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::rc::{Rc, Weak};
 
 use adv_abi::Registry;
-use adv_cpu::backend::{FilePage, GuestExt, Prot};
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Object, Outcome};
+use adv_os::vfs::{FileIdentity, FileSection, file_identity as identity};
 
 use super::K32;
 use crate::{FileObj, Win32, stdcall, util::set_last_error};
@@ -22,12 +23,10 @@ const COPY: u32 = 1;
 const ALL: u32 = 0xf001f;
 const GENERIC_READ: u32 = 0x80000000;
 const GENERIC_WRITE: u32 = 0x40000000;
-type Identity = (u64, u64);
 
 #[derive(Default)]
 struct Mappings {
     names: HashMap<Vec<u16>, Named>,
-    files: HashMap<Identity, Weak<Backing>>,
     views: BTreeMap<u32, View>,
 }
 /// A section object in the handle table. Its section counts open section objects, so a
@@ -59,21 +58,13 @@ impl Mappings {
                 .is_some_and(|section| section.handles.get() != 0),
             Named::Sync { identity, .. } => objects.has_identity(*identity),
         });
-        self.files.retain(|_, backing| backing.strong_count() != 0);
     }
 }
 struct Section {
-    backing: Rc<Backing>,
+    backing: Rc<FileSection>,
     len: u64,
     protection: u32,
     handles: Cell<u32>,
-}
-struct Backing {
-    file: RefCell<Option<File>>,
-    virtual_data: Option<std::sync::Arc<[u8]>>,
-    file_len: Cell<u64>,
-    writable: Cell<bool>,
-    pages: RefCell<BTreeMap<u64, Rc<FilePage>>>,
 }
 struct View {
     section: Rc<Section>,
@@ -82,17 +73,6 @@ struct View {
     copy: bool,
     maximum: u32,
     protections: Vec<u32>,
-}
-
-impl Drop for Backing {
-    fn drop(&mut self) {
-        // Views can outlive every section/file handle. Process teardown must
-        // still persist dirty shared data when the guest omits Flush/Unmap.
-        // Rc confines this final owner to the guest worker, never an audio callback.
-        if let Err(error) = self.flush(0, self.file_len.get()) {
-            log::error!("file mapping teardown could not persist dirty data: {error}");
-        }
-    }
 }
 
 fn state<'a>(env: &'a mut Env<'_>) -> &'a mut Mappings {
@@ -161,151 +141,12 @@ fn raw_name(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Option<Vec<u16>>,
     Ok((!units.is_empty()).then_some(units))
 }
 
-#[cfg(windows)]
-fn identity(file: &File) -> std::io::Result<Identity> {
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[derive(Default)]
-    struct Info {
-        attributes: u32,
-        created: [u32; 2],
-        accessed: [u32; 2],
-        written: [u32; 2],
-        volume: u32,
-        high_size: u32,
-        low_size: u32,
-        links: u32,
-        high_index: u32,
-        low_index: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut Info) -> i32;
-    }
-    let mut info = Info::default();
-    // SAFETY: live owned file and correctly sized writable native metadata.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((
-        u64::from(info.volume),
-        (u64::from(info.high_index) << 32) | u64::from(info.low_index),
-    ))
-}
-#[cfg(unix)]
-fn identity(file: &File) -> std::io::Result<Identity> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata()?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-#[cfg(not(any(windows, unix)))]
-fn identity(_: &File) -> std::io::Result<Identity> {
-    Err(std::io::ErrorKind::Unsupported.into())
-}
-
-impl Backing {
-    fn page(self: &Rc<Self>, index: u64) -> Rc<FilePage> {
-        if let Some(page) = self.pages.borrow().get(&index) {
-            return page.clone();
-        }
-        let backing = Rc::downgrade(self);
-        let page = FilePage::lazy(move || {
-            backing
-                .upgrade()
-                .ok_or("file mapping backing was retired")?
-                .load_page(index)
-                .map_err(|e| e.to_string())
-        });
-        self.pages.borrow_mut().insert(index, page.clone());
-        page
-    }
-
-    fn load_page(&self, index: u64) -> std::io::Result<[u8; 4096]> {
-        let mut bytes = [0; 4096];
-        if let Some(data) = &self.virtual_data {
-            let start = usize::try_from(
-                index
-                    .checked_mul(PAGE)
-                    .ok_or(std::io::ErrorKind::InvalidInput)?,
-            )
-            .map_err(|_| std::io::ErrorKind::InvalidInput)?;
-            if let Some(source) = data.get(start..) {
-                let length = source.len().min(bytes.len());
-                bytes[..length].copy_from_slice(&source[..length]);
-            }
-            return Ok(bytes);
-        }
-        if let Some(file) = self.file.borrow().as_ref() {
-            // A cloned Windows FD shares its cursor. Restore it even after an
-            // I/O error; all guest operations use this same execution worker.
-            let mut file = file;
-            let saved = file.stream_position()?;
-            let result = (|| {
-                file.seek(SeekFrom::Start(index * PAGE))?;
-                let mut read = 0;
-                while read < bytes.len() {
-                    let n = file.read(&mut bytes[read..])?;
-                    if n == 0 {
-                        break;
-                    }
-                    read += n;
-                }
-                Ok::<_, std::io::Error>(())
-            })();
-            let restored = file.seek(SeekFrom::Start(saved));
-            result?;
-            restored?;
-        }
-        Ok(bytes)
-    }
-
-    fn flush(&self, start: u64, end: u64) -> std::io::Result<()> {
-        let file = self.file.borrow();
-        let Some(file) = file.as_ref() else {
-            return Ok(());
-        };
-        let mut file = file;
-        let saved = file.stream_position()?;
-        let mut flushed = Vec::new();
-        let result = (|| {
-            let mut wrote = false;
-            for (&index, page) in self.pages.borrow().range(start / PAGE..end.div_ceil(PAGE)) {
-                if !page.dirty() {
-                    continue;
-                }
-                if !self.writable.get() {
-                    return Err(std::io::ErrorKind::PermissionDenied.into());
-                }
-                let position = index * PAGE;
-                let count = self.file_len.get().saturating_sub(position).min(PAGE) as usize;
-                if count != 0 {
-                    file.seek(SeekFrom::Start(position))?;
-                    file.write_all(&page.snapshot().map_err(std::io::Error::other)?[..count])?;
-                }
-                flushed.push(page.clone());
-                wrote = true;
-            }
-            if wrote {
-                file.sync_data()?;
-            }
-            Ok::<_, std::io::Error>(())
-        })();
-        let restored = file.seek(SeekFrom::Start(saved));
-        result?;
-        restored?;
-        for page in flushed {
-            page.clear_dirty();
-        }
-        Ok(())
-    }
-}
-
 fn file_backing(
     env: &mut Env<'_>,
     handle: u32,
     writable: bool,
     maximum: u64,
-) -> Result<Rc<Backing>, u32> {
+) -> Result<Rc<FileSection>, u32> {
     let source = env.sys.objects.host::<FileObj>(handle).ok_or(6u32)?;
     if source.access & (GENERIC_READ | 0x10000000) == 0
         || (writable && source.access & (GENERIC_WRITE | 0x10000000) == 0)
@@ -316,19 +157,7 @@ fn file_backing(
         if writable || maximum > data.len() as u64 {
             return Err(5);
         }
-        let key = (u64::MAX, data.as_ptr() as usize as u64);
-        if let Some(backing) = state(env).files.get(&key).and_then(Weak::upgrade) {
-            return Ok(backing);
-        }
-        let backing = Rc::new(Backing {
-            file: RefCell::new(None),
-            file_len: Cell::new(data.len() as u64),
-            virtual_data: Some(data),
-            writable: Cell::new(false),
-            pages: RefCell::new(BTreeMap::new()),
-        });
-        state(env).files.insert(key, Rc::downgrade(&backing));
-        return Ok(backing);
+        return Ok(env.ext.get::<Win32>().vfs.sections.memory(data));
     }
     let old_id = identity(source.file.host().ok_or(6u32)?).map_err(|e| io_error(&e))?;
     let guest_path = source.guest_path.clone();
@@ -336,7 +165,7 @@ fn file_backing(
     if !writable && maximum > length {
         return Err(5);
     }
-    let backing = state(env).files.get(&old_id).and_then(Weak::upgrade);
+    let mut replacements = None;
     let file = if writable {
         let w = env.ext.get::<Win32>();
         let selected = w.vfs.lookup(&guest_path).ok_or(2u32)?;
@@ -357,32 +186,12 @@ fn file_backing(
         if maximum > length {
             target.set_len(maximum).map_err(|e| io_error(&e))?;
         }
-        let new_id = identity(&target).map_err(|e| io_error(&e))?;
-        // Reopen each matching file instance independently, preserving its own
-        // access metadata and position. A different file at the same name stays.
-        for (_, file) in env.sys.objects.hosts_mut::<FileObj>() {
-            if file.guest_path.eq_ignore_ascii_case(&guest_path)
-                && identity(file.file.host().ok_or(6u32)?).map_err(|e| io_error(&e))? == old_id
-            {
-                let position = file.file.stream_position().map_err(|e| io_error(&e))?;
-                let mut replacement = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(file.access & (GENERIC_WRITE | 0x10000000) != 0)
-                    .open(&destination)
-                    .map_err(|e| io_error(&e))?;
-                replacement
-                    .seek(SeekFrom::Start(position))
-                    .map_err(|e| io_error(&e))?;
-                file.file = replacement.into();
-            }
-        }
-        if let Some(backing) = &backing {
-            *backing.file.borrow_mut() = Some(target);
-            backing.writable.set(true);
-            backing.file_len.set(length.max(maximum));
-            state(env).files.insert(new_id, Rc::downgrade(backing));
-            return Ok(backing.clone());
-        }
+        replacements = Some(prepare_retarget_handles(
+            env,
+            &guest_path,
+            old_id,
+            &destination,
+        )?);
         target
     } else {
         env.sys
@@ -395,20 +204,58 @@ fn file_backing(
             .try_clone()
             .map_err(|e| io_error(&e))?
     };
-    if let Some(backing) = backing {
-        return Ok(backing);
+    let backing = env
+        .ext
+        .get::<Win32>()
+        .vfs
+        .sections
+        .transfer(old_id, file, length.max(maximum), writable)
+        .map_err(|e| io_error(&e))?;
+    if let Some(replacements) = replacements {
+        replacements.apply(&mut env.sys.objects);
     }
-    let id = identity(&file).map_err(|e| io_error(&e))?;
-    let backing = Rc::new(Backing {
-        file: RefCell::new(Some(file)),
-        virtual_data: None,
-        file_len: Cell::new(length.max(maximum)),
-        writable: Cell::new(writable),
-        pages: RefCell::new(BTreeMap::new()),
-    });
-    state(env).files.insert(old_id, Rc::downgrade(&backing));
-    state(env).files.insert(id, Rc::downgrade(&backing));
     Ok(backing)
+}
+
+pub(super) struct Retarget(Vec<(adv_machine::Identity<FileObj>, adv_os::vfs::FileStream)>);
+
+impl Retarget {
+    pub fn apply(self, objects: &mut adv_machine::Objects) {
+        for (identity, replacement) in self.0 {
+            objects.owned_mut(identity).unwrap().file = replacement;
+        }
+    }
+}
+
+/// Reopen matching guest file instances independently, preserving cursors. An
+/// overlay copy transfers identity; unrelated files at the same name stay old.
+pub(super) fn prepare_retarget_handles(
+    env: &Env<'_>,
+    guest_path: &str,
+    old_id: FileIdentity,
+    destination: &std::path::Path,
+) -> Result<Retarget, u32> {
+    let mut replacements = Vec::new();
+    for (token, file) in env.sys.objects.all_hosts::<FileObj>() {
+        if file.guest_path.eq_ignore_ascii_case(guest_path)
+            && file
+                .file
+                .host()
+                .is_some_and(|source| identity(source).ok() == Some(old_id))
+        {
+            let position = file.file.stream_position().map_err(|e| io_error(&e))?;
+            let mut replacement = std::fs::OpenOptions::new()
+                .read(true)
+                .write(file.access & (GENERIC_WRITE | 0x10000000) != 0)
+                .open(destination)
+                .map_err(|e| io_error(&e))?;
+            replacement
+                .seek(SeekFrom::Start(position))
+                .map_err(|e| io_error(&e))?;
+            replacements.push((token, replacement.into()));
+        }
+    }
+    Ok(Retarget(replacements))
 }
 
 fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
@@ -472,16 +319,7 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
         if maximum == 0 {
             return fail(env, 87);
         }
-        (
-            maximum,
-            Rc::new(Backing {
-                file: RefCell::new(None),
-                virtual_data: None,
-                file_len: Cell::new(0),
-                writable: Cell::new(false),
-                pages: RefCell::new(BTreeMap::new()),
-            }),
-        )
+        (maximum, FileSection::anonymous())
     } else {
         let Some(file_obj) = env.sys.objects.host::<FileObj>(file) else {
             return fail(env, 6);
@@ -694,13 +532,8 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
     state(env).views.remove(&address);
     if let Some(state) = env.ext.try_get_mut::<Mappings>() {
         state.prune(&env.sys.objects);
-        for backing in state.files.values().filter_map(Weak::upgrade) {
-            backing
-                .pages
-                .borrow_mut()
-                .retain(|_, page| page.dirty() || Rc::strong_count(page) > 1);
-        }
     }
+    env.ext.get::<Win32>().vfs.sections.prune_pages();
     Outcome::Return(1)
 }
 
@@ -868,79 +701,4 @@ pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, K32, "MapViewOfFileEx", 6, |env| map(env, true));
     stdcall(registry, K32, "FlushViewOfFile", 2, flush);
     stdcall(registry, K32, "UnmapViewOfFile", 1, unmap);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failed_flush_keeps_all_dirty_pages_and_cursor_for_retry() {
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/mapping-flush-tests");
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(format!("retry-{}.bin", std::process::id()));
-        std::fs::write(&path, [0u8; 8192]).unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let fail = Rc::new(Cell::new(true));
-        let injected = fail.clone();
-        let first = FilePage::new([0x11; 4096]);
-        first.mark_dirty();
-        let second = FilePage::lazy(move || {
-            if injected.get() {
-                Err("second page snapshot failure".into())
-            } else {
-                Ok([0x22; 4096])
-            }
-        });
-        second.mark_dirty();
-        let backing = Backing {
-            file: RefCell::new(Some(file)),
-            virtual_data: None,
-            file_len: Cell::new(8192),
-            writable: Cell::new(true),
-            pages: RefCell::new(BTreeMap::from([(0, first.clone()), (1, second.clone())])),
-        };
-        let retained = backing.file.borrow();
-        retained
-            .as_ref()
-            .unwrap()
-            .seek(SeekFrom::Start(17))
-            .unwrap();
-        drop(retained);
-        assert!(backing.flush(0, 8192).is_err());
-        assert!(first.dirty() && second.dirty());
-        assert_eq!(
-            backing
-                .file
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .stream_position()
-                .unwrap(),
-            17
-        );
-        fail.set(false);
-        backing.flush(0, 8192).unwrap();
-        assert!(!first.dirty() && !second.dirty());
-        assert_eq!(
-            backing
-                .file
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .stream_position()
-                .unwrap(),
-            17
-        );
-        let output = std::fs::read(&path).unwrap();
-        assert_eq!(&output[..4096], &[0x11; 4096]);
-        assert_eq!(&output[4096..], &[0x22; 4096]);
-        drop(backing);
-        std::fs::remove_file(path).unwrap();
-    }
 }
