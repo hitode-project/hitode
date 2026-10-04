@@ -1436,8 +1436,10 @@ impl<B: Backend> Machine<B> {
         }
         self.slice_elapsed = Duration::ZERO;
         // Without a Machine policy, preserve the original per-backend-run default.
-        let result = match self.run_scheduler(None, Instant::now(), self.execution_budget.flatten())
-        {
+        let hard_budget = self
+            .execution_budget
+            .unwrap_or_else(|| self.cpu.execution_budget());
+        let result = match self.run_scheduler(None, Instant::now(), hard_budget) {
             SliceResult::Complete(result) => result,
             SliceResult::Yielded => unreachable!("an unsliced run cannot soft-yield"),
         };
@@ -1600,6 +1602,12 @@ impl<B: Backend> Machine<B> {
                 self.sys.trace.flush();
                 return SliceResult::Yielded;
             }
+            if slice.is_some() && self.cpu.host_interrupt_pending() {
+                self.sys.rr_last = last;
+                self.sys.trace.flush();
+                self.sys.scheduling.external_interrupts += 1;
+                return SliceResult::Yielded;
+            }
             self.sys.wake();
             if !self.cpu.parallel_capacity_available() {
                 if let Err(error) = self.wait_parallel(started, slice, hard_budget) {
@@ -1638,6 +1646,12 @@ impl<B: Backend> Machine<B> {
                         return SliceResult::Complete(self.fail(error));
                     }
                     continue;
+                }
+                if slice.is_some() && self.cpu.host_interrupt_pending() {
+                    self.sys.rr_last = last;
+                    self.sys.trace.flush();
+                    self.sys.scheduling.external_interrupts += 1;
+                    return SliceResult::Yielded;
                 }
                 if self.skip_idle_time() {
                     continue;
@@ -1749,7 +1763,7 @@ impl<B: Backend> Machine<B> {
             let reschedule = self
                 .scheduling_quantum
                 .filter(|_| {
-                    slice.is_some()
+                    (slice.is_some() || self.cpu.guest_workers() > 1)
                         && !self.sys.clock.is_virtual()
                         && self.sys.contexts.iter().any(|c| c.id != id && !c.is_done())
                 })
@@ -1786,6 +1800,10 @@ impl<B: Backend> Machine<B> {
                 scheduling::Allowance::choose(hard_remaining, soft_remaining, reschedule);
             if let Some(allowance) = allowance {
                 self.cpu.set_execution_budget(Some(allowance.duration));
+            } else {
+                // A former peer may have exited. Do not inherit its expired
+                // quantum when the final context has no watchdog or deadline.
+                self.cpu.set_execution_budget(hard_budget);
             }
 
             let run_started = Instant::now();
@@ -1851,7 +1869,12 @@ impl<B: Backend> Machine<B> {
                     return SliceResult::Yielded;
                 }
                 Exit::Parked => {
-                    if let Some(r) = self.park(parked.expect("parked without a reason")) {
+                    let Some(reason) = parked else {
+                        return SliceResult::Complete(self.fail(
+                            "guest reached the park address without a host continuation".into(),
+                        ));
+                    };
+                    if let Some(r) = self.park(reason) {
                         self.sys.trace.flush();
                         return SliceResult::Complete(r);
                     }
@@ -1880,13 +1903,13 @@ impl<B: Backend> Machine<B> {
                     let hard_expired = hard_budget.is_some_and(|hard| {
                         self.slice_elapsed.saturating_add(started.elapsed()) >= hard
                     });
-                    if slice.is_some()
+                    if (slice.is_some() || self.cpu.guest_workers() > 1)
                         && !hard_expired
                         && allowance.is_some_and(|a| a.limit != scheduling::Limit::Hard)
                     {
                         self.sys.contexts[id as usize].yielded = false;
                         if allowance.is_some_and(|a| a.limit == scheduling::Limit::Reschedule)
-                            && slice.is_some_and(|limit| started.elapsed() < limit)
+                            && slice.is_none_or(|limit| started.elapsed() < limit)
                         {
                             self.sys.scheduling.internal_preemptions += 1;
                             // Preserve CPU, continuation and watchdog state. Wake and

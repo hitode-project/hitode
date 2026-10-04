@@ -240,3 +240,27 @@ fn process_exit_drains_late_completions_without_resurrecting_running_contexts() 
     std::thread::sleep(Duration::from_millis(2));
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), final_value);
 }
+
+#[test]
+fn unsliced_parallel_run_still_observes_a_timed_wake_during_guest_computation() {
+    let mut m = machine(2);
+    m.set_execution_budget(None);
+    let wait = m.resolve_import("test", "wait").unwrap();
+    let done = m.resolve_import("test", "finish").unwrap();
+    let mut a = Asm::new(CODE);
+    a.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(0).call(wait)
+        .mov_mem_imm(DATA, 1).call(done).hlt();
+    let mut b = Asm::new(CODE + 0x100);
+    b.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(0);
+    let spin = b.here();
+    b.cmp_mem_imm8(DATA, 0).jz(spin).mov_ecx_imm(3_000_000);
+    let finish_work = b.here();
+    b.dec_ecx().jnz(finish_work).call(done).hlt();
+    for (pc, code) in [(CODE, a), (CODE + 0x100, b)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu.executor_mut().add_region(Region::new(pc, code.bytes.len())).unwrap();
+        m.spawn("timed", pc, &[], 65536).unwrap();
+    }
+    assert!(matches!(m.run(), RunResult::Exited(_)));
+    assert_eq!(m.ext.get::<Vec<u32>>().len(), 2);
+}

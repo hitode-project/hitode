@@ -404,6 +404,10 @@ impl Backend for JitCpu {
     fn set_host_interrupts(&mut self, enabled: bool) {
         self.inner.set_host_interrupts(enabled);
     }
+
+    fn host_interrupt_pending(&self) -> bool {
+        self.inner.host_interrupt_pending()
+    }
     fn run(&mut self, handler: &mut dyn TrapHandler) -> Exit {
         let _activity = self.inner.inline_activity();
         let start = Instant::now();

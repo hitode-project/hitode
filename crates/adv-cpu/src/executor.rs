@@ -977,6 +977,10 @@ impl Executor {
         self.interrupt = interrupt;
     }
 
+    pub fn host_interrupt_pending(&self) -> bool {
+        self.host_interrupts && self.interrupt.load(Ordering::Acquire)
+    }
+
     pub fn set_host_interrupts(&mut self, enabled: bool) {
         self.host_interrupts = enabled;
     }

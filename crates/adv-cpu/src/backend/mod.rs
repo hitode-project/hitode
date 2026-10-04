@@ -361,6 +361,10 @@ pub trait Backend: Guest {
     /// do not support host interrupts keep their existing synchronous behavior.
     fn set_host_interrupts(&mut self, _enabled: bool) {}
 
+    fn host_interrupt_pending(&self) -> bool {
+        false
+    }
+
     /// Run from the current EIP until a handler parks, the budget expires, or the guest faults.
     fn run(&mut self, handler: &mut dyn TrapHandler) -> Exit;
 
