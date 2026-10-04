@@ -81,6 +81,91 @@ fn systemtime_to_filetime(st: [u16; 8]) -> u64 {
     ((secs * 10_000_000 + i64::from(st[7]) * 10_000) + UNIX_EPOCH_FT as i64) as u64
 }
 
+fn filetime_to_dos(ft: u64) -> Option<(u16, u16)> {
+    // Native rounds upward to the next two-second FAT tick before checking
+    // its representable year. This can carry the final second of 1979 into
+    // 1980, or reject the final second of 2107 after it carries into 2108.
+    let tick = 20_000_000;
+    let rounded = ft.checked_add(tick - 1)? / tick * tick;
+    let first = systemtime_to_filetime([1980, 1, 0, 1, 0, 0, 0, 0]);
+    let limit = systemtime_to_filetime([2108, 1, 0, 1, 0, 0, 0, 0]);
+    if !(first..limit).contains(&rounded) {
+        return None;
+    }
+    let [year, month, _, day, hour, minute, second, _] = filetime_to_systemtime(rounded);
+    Some((
+        ((year - 1980) << 9) | (month << 5) | day,
+        (hour << 11) | (minute << 5) | (second / 2),
+    ))
+}
+
+fn dos_to_filetime(date: u16, time: u16) -> Option<u64> {
+    let year = 1980 + (date >> 9);
+    let month = (date >> 5) & 15;
+    let day = date & 31;
+    let hour = time >> 11;
+    let minute = (time >> 5) & 63;
+    let second = (time & 31) * 2;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let days = days_from_civil(i64::from(year), u32::from(month), u32::from(day));
+    if civil_from_days(days) != (i64::from(year), u32::from(month), u32::from(day)) {
+        return None;
+    }
+    Some(systemtime_to_filetime([
+        year, month, 0, day, hour, minute, second, 0,
+    ]))
+}
+
+#[win32(kernel32, name = "FileTimeToDosDateTime", level = implement)]
+fn file_time_to_dos_date_time(
+    env: &mut Env<'_>,
+    input: GuestPtr<FILETIME>,
+    date: GuestPtr<u16>,
+    time: GuestPtr<u16>,
+) -> Result<i32, adv_cpu::backend::MemFault> {
+    let ft = input.read(env.cpu)?;
+    let value = u64::from(ft.dwLowDateTime) | u64::from(ft.dwHighDateTime) << 32;
+    let Some((date_value, time_value)) = filetime_to_dos(value) else {
+        crate::util::set_last_error(env, crate::util::err::INVALID_PARAMETER);
+        return Ok(0);
+    };
+    // Verify both outputs before publishing either one. Invalid input leaves
+    // both buffers intact and reports ERROR_INVALID_PARAMETER, as native does.
+    adv_abi::guest::check_range(env.cpu, date.addr(), 2, adv_cpu::backend::Prot::WRITE)?;
+    adv_abi::guest::check_range(env.cpu, time.addr(), 2, adv_cpu::backend::Prot::WRITE)?;
+    date.write(env.cpu, date_value)?;
+    time.write(env.cpu, time_value)?;
+    Ok(1)
+}
+
+#[win32(kernel32, name = "DosDateTimeToFileTime", level = implement)]
+fn dos_date_time_to_file_time(
+    env: &mut Env<'_>,
+    date: u32,
+    time: u32,
+    output: GuestPtr<FILETIME>,
+) -> Result<i32, adv_cpu::backend::MemFault> {
+    let Some(value) = dos_to_filetime(date as u16, time as u16) else {
+        crate::util::set_last_error(env, crate::util::err::INVALID_PARAMETER);
+        return Ok(0);
+    };
+    output.write(
+        env.cpu,
+        FILETIME {
+            dwLowDateTime: value as u32,
+            dwHighDateTime: (value >> 32) as u32,
+        },
+    )?;
+    Ok(1)
+}
+
 fn read_ft(cpu: &dyn Guest, p: u32) -> u64 {
     let lo = cpu.read_u32(p).unwrap_or(0);
     let hi = cpu.read_u32(p + 4).unwrap_or(0);
@@ -350,6 +435,8 @@ fn get_time_zone_information(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     reg.register(get_system_time_as_file_time_ABI);
+    reg.register(file_time_to_dos_date_time_ABI);
+    reg.register(dos_date_time_to_file_time_ABI);
     stdcall(reg, K32, "GetSystemTime", 1, get_system_time);
     stdcall(reg, K32, "GetLocalTime", 1, get_local_time);
     reg.register(get_tick_count_ABI);
@@ -413,6 +500,127 @@ mod tests {
         assert_eq!(
             filetime_to_systemtime(UNIX_EPOCH_FT),
             [1970, 1, 4, 1, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn dos_conversion_rounds_up_before_range_check_and_carries_calendar_boundaries() {
+        let first = systemtime_to_filetime([1980, 1, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(filetime_to_dos(first - 20_000_000), None);
+        assert_eq!(filetime_to_dos(first - 10_000_000), Some((0x21, 0)));
+        assert_eq!(filetime_to_dos(first), Some((0x21, 0)));
+        assert_eq!(filetime_to_dos(first + 1), Some((0x21, 1)));
+        assert_eq!(filetime_to_dos(first + 20_000_000), Some((0x21, 1)));
+        assert_eq!(filetime_to_dos(first + 20_000_001), Some((0x21, 2)));
+        let leap_end = systemtime_to_filetime([2000, 2, 0, 29, 23, 59, 59, 999]);
+        assert_eq!(
+            filetime_to_dos(leap_end),
+            Some((((2000 - 1980) << 9) | (3 << 5) | 1, 0))
+        );
+        let last = systemtime_to_filetime([2107, 12, 0, 31, 23, 59, 58, 0]);
+        assert_eq!(filetime_to_dos(last), Some((0xff9f, 0xbf7d)));
+        assert_eq!(filetime_to_dos(last + 1), None);
+        for invalid in [0, i64::MAX as u64, 1 << 63, u64::MAX] {
+            assert_eq!(filetime_to_dos(invalid), None);
+        }
+    }
+
+    #[test]
+    fn dos_calendar_rejects_invalid_leap_days_and_packed_time_fields() {
+        let date = |year: u16, month: u16, day: u16| ((year - 1980) << 9) | (month << 5) | day;
+        for year in [1980, 2000, 2004] {
+            let packed = date(year, 2, 29);
+            assert_eq!(
+                filetime_to_dos(dos_to_filetime(packed, 0).unwrap()),
+                Some((packed, 0))
+            );
+        }
+        for invalid in [
+            date(2001, 2, 29),
+            date(2100, 2, 29),
+            date(1980, 4, 31),
+            date(1980, 0, 1),
+            date(1980, 13, 1),
+            date(1980, 1, 0),
+            0xffff,
+        ] {
+            assert_eq!(dos_to_filetime(invalid, 0), None);
+        }
+        for invalid in [24 << 11, 60 << 5, 30, 31, 0xffff] {
+            assert_eq!(dos_to_filetime(0x21, invalid), None);
+        }
+    }
+
+    #[test]
+    fn dos_handlers_preserve_invalid_outputs_and_preflight_both_success_outputs() {
+        use adv_cpu::backend::Prot;
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        let mut machine = Machine::new(
+            adv_cpu::JitCpu::new(PARK_ADDR, false).unwrap(),
+            Registry::default(),
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.cpu.map(0x400000, 4096, Prot::RW).unwrap();
+        machine.cpu.map(0x401000, 4096, Prot::READ).unwrap();
+        let context = machine
+            .spawn("dos-conversion", PARK_ADDR, &[], 0x10000)
+            .unwrap();
+        machine.sys.current = context;
+        let mut env = Env {
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        let input = GuestPtr::new(0x400000);
+        let date = GuestPtr::new(0x400010);
+        let time = GuestPtr::new(0x400012);
+        let output = GuestPtr::new(0x400020);
+        input.write(env.cpu, FILETIME::default()).unwrap();
+        date.write(env.cpu, 0xcafe).unwrap();
+        time.write(env.cpu, 0xbeef).unwrap();
+        assert_eq!(
+            file_time_to_dos_date_time(&mut env, input, date, time),
+            Ok(0)
+        );
+        assert_eq!(
+            (date.read(env.cpu).unwrap(), time.read(env.cpu).unwrap()),
+            (0xcafe, 0xbeef)
+        );
+        assert_eq!(crate::util::last_error(&env), 87);
+        output
+            .write(
+                env.cpu,
+                FILETIME {
+                    dwLowDateTime: 0xdeadbeef,
+                    dwHighDateTime: 0xcafebabe,
+                },
+            )
+            .unwrap();
+        assert_eq!(dos_date_time_to_file_time(&mut env, 0x5e, 0, output), Ok(0));
+        let intact = output.read(env.cpu).unwrap();
+        assert_eq!(
+            (intact.dwLowDateTime, intact.dwHighDateTime),
+            (0xdeadbeef, 0xcafebabe)
+        );
+        let first = dos_to_filetime(0x21, 0).unwrap();
+        input
+            .write(
+                env.cpu,
+                FILETIME {
+                    dwLowDateTime: first as u32,
+                    dwHighDateTime: (first >> 32) as u32,
+                },
+            )
+            .unwrap();
+        let fault = file_time_to_dos_date_time(&mut env, input, date, GuestPtr::new(0x401000)).unwrap_err();
+        assert_eq!(fault.addr, 0x401000);
+        assert_eq!(date.read(env.cpu).unwrap(), 0xcafe);
+        assert_eq!(
+            dos_date_time_to_file_time(&mut env, 0xabcd0021, 0xffff0000, output),
+            Ok(1),
+            "WORD arguments ignore their unused upper ABI bits"
         );
     }
 }
