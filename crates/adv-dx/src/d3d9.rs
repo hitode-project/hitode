@@ -14,6 +14,7 @@ use adv_os::{
 };
 use resources::Resource;
 mod capabilities;
+mod creation;
 mod fixed;
 mod pacing;
 mod readback;
@@ -66,9 +67,11 @@ struct Device {
     parameters: D3DPRESENT_PARAMETERS,
     creator: u32,
     preserve_fpu: bool,
+    creation: creation::State,
     scene: bool,
     needs_reset: bool,
     back_buffer: Option<Id>,
+    depth_stencil: Option<Id>,
     texture: Option<Id>,
     /// Borrowed surface identity; its controlling resource has one internal ref.
     render_target: Option<Id>,
@@ -106,8 +109,10 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
 enum Operation {
     Clear {
         target: Target,
+        rectangle: adv_device::surface::Rect,
         color: Option<[f64; 4]>,
         depth: Option<f32>,
+        stencil: Option<u32>,
     },
     Present {
         surface: u32,
@@ -160,6 +165,8 @@ pub fn register(registry: &mut Registry) {
     capabilities::register(registry);
     targets::register(registry);
     buffers::register(registry);
+    creation::register(registry);
+    depth::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -276,6 +283,7 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
     if let Payload::Device(device) = destroyed.value {
         let provider = env.ext.get::<State>().provider;
         targets::release_binding(env, device.render_target);
+        depth::release_binding(env, device.depth_stencil);
         buffers::release_bindings(env, device.buffers);
         for binding in [device.texture, device.back_buffer].into_iter().flatten() {
             if let Some(Some(resource)) = com(env).release_internal(&mut env.sys.objects, binding) {
@@ -412,6 +420,7 @@ macro_rules! unknown {
     };
 }
 mod buffers;
+mod depth;
 mod resources;
 unknown!(
     factory_query,
@@ -454,8 +463,9 @@ fn normalize(
         || parameters.MultiSampleQuality != 0
         || parameters.SwapEffect != 1
         || parameters.BackBufferCount > 1
-        || parameters.Flags != 0
-        || parameters.EnableAutoDepthStencil != 0
+        || parameters.Flags & !2 != 0
+        || (parameters.EnableAutoDepthStencil != 0
+            && depth::format(parameters.AutoDepthStencilFormat).is_none())
         || parameters.FullScreen_RefreshRateInHz != 0
         || !matches!(parameters.PresentationInterval, 0 | 1 | 0x80000000)
         || !matches!(parameters.BackBufferFormat, 0 | 21 | 22)
@@ -508,10 +518,10 @@ fn create_device(
     {
         return Outcome::Return(INVALID);
     }
-    // Hardware/mixed vertex-processing policy is not implemented by this slice.
-    if flags & 0x20 == 0 || flags & !(2 | 0x20 | 4) != 0 {
-        return Outcome::Return(UNAVAILABLE);
-    }
+    let creation = match creation::State::new(adapter, kind, focus.0, flags) {
+        Ok(creation) => creation,
+        Err(error) => return Outcome::Return(error),
+    };
     let Ok(input) = parameters.read(env.cpu) else {
         return Outcome::Return(INVALID);
     };
@@ -563,6 +573,8 @@ fn create_device(
             return Outcome::Return(OUT_OF_MEMORY);
         }
     };
+    let mut fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
+    fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     let device = Device {
         pointer: 0,
         factory,
@@ -570,13 +582,15 @@ fn create_device(
         parameters: normalized,
         creator: env.sys.current,
         preserve_fpu: flags & 2 != 0,
+        creation,
         scene: false,
         needs_reset: false,
         back_buffer: None,
+        depth_stencil: None,
         texture: None,
         render_target: None,
         buffers: buffers::Bindings::default(),
-        fixed: fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight),
+        fixed,
     };
     let Some((pointer, id)) = object(
         env,
@@ -598,6 +612,16 @@ fn create_device(
     };
     if let Some(Payload::Device(device)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         device.back_buffer = Some(back_buffer);
+    }
+    let depth = match depth::implicit(env, id, normalized) {
+        Ok(value) => value,
+        Err(error) => {
+            release(env, pointer);
+            return Outcome::Return(error);
+        }
+    };
+    if let Some(Payload::Device(device)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
+        device.depth_stencil = depth;
     }
     if let Some(environment) = environment
         && env.cpu.set_fpu_environment(environment).is_err()
@@ -663,6 +687,7 @@ fn reset(
     let preserve_fpu = d.preserve_fpu;
     let surface = d.surface;
     let old_buffer = d.back_buffer;
+    let old_depth = d.depth_stencil;
     let old_texture = d.texture;
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
@@ -714,10 +739,20 @@ fn reset(
     else {
         return Outcome::Return(OUT_OF_MEMORY);
     };
+    let new_depth = match depth::implicit(env, device_id, normalized) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
+                destroy(env, dead);
+            }
+            return Outcome::Return(error);
+        }
+    };
     let provider = env.ext.get::<State>().provider;
     if let Some(environment) = environment
         && env.cpu.set_fpu_environment(environment).is_err()
     {
+        depth::release_binding(env, new_depth);
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
             destroy(env, dead);
         }
@@ -730,6 +765,7 @@ fn reset(
     )
     .is_err()
     {
+        depth::release_binding(env, new_depth);
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
             destroy(env, dead);
         }
@@ -738,10 +774,14 @@ fn reset(
     if let Some(Payload::Device(d)) = com.get_identity_mut(&mut env.sys.objects, device_id) {
         d.parameters = normalized;
         d.back_buffer = Some(new_buffer);
+        d.depth_stencil = new_depth;
         d.texture = None;
         d.needs_reset = false;
+        d.creation.reset();
         d.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
+        d.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     }
+    depth::release_binding(env, old_depth);
     buffers::reset_bindings(env, device_id);
     targets::reset_binding(env, device_id);
     for binding in [old_texture, old_buffer].into_iter().flatten() {
@@ -789,10 +829,12 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
     let result = match operation {
         Operation::Clear {
             target,
+            rectangle,
             color,
             depth,
+            stencil,
         } => gpu
-            .clear(target, *color, *depth)
+            .clear_region(target, *rectangle, *color, *depth, *stencil)
             .map(|()| Completion::Command),
         Operation::Present { surface, deadline } => (provider.present)(env.ext, *surface, &mut gpu)
             .map(|serial| Completion::Presented(serial, *deadline)),
@@ -968,18 +1010,31 @@ fn clear(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     count: u32,
-    _rectangles: GuestPtr<()>,
+    rectangles: GuestPtr<()>,
     flags: u32,
     color: u32,
     z: f32,
-    _stencil: u32,
+    stencil: u32,
 ) -> Outcome {
-    if count != 0 || flags == 0 || flags & !1 != 0 {
+    if count != 0 || !rectangles.is_null() || flags == 0 || flags & !7 != 0 {
         return Outcome::Return(INVALID);
     }
     let target = match targets::draw_target(env, this.addr()) {
         Ok(target) => target,
         Err(error) => return Outcome::Return(error),
+    };
+    let target = if flags & 6 != 0 {
+        if device(env, this.addr()).is_none_or(|d| d.depth_stencil.is_none())
+            || (flags & 4 != 0 && !depth::has_stencil(env, this.addr()))
+        {
+            return Outcome::Return(INVALID);
+        }
+        match depth::attach(env, this.addr(), target) {
+            Ok(target) => target,
+            Err(error) => return Outcome::Return(error),
+        }
+    } else {
+        target
     };
     let color = [
         ((color >> 16) & 255) as f64 / 255.,
@@ -995,8 +1050,10 @@ fn clear(
         id,
         Operation::Clear {
             target,
-            color: Some(color),
+            rectangle: device(env, this.addr()).unwrap().fixed.clear_rect(),
+            color: (flags & 1 != 0).then_some(color),
             depth: (flags & 2 != 0).then_some(z),
+            stencil: (flags & 4 != 0).then_some(stencil),
         },
     )
 }

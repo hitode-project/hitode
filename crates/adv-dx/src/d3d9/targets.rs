@@ -116,6 +116,7 @@ fn create(
                 Width: width,
                 Height: height,
             },
+            depth: None,
             surface: Some(surface),
             storage: 0,
             owns_surface: true,

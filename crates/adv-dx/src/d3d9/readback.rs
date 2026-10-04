@@ -75,6 +75,7 @@ fn create_offscreen(
                 Width: width,
                 Height: height,
             },
+            depth: None,
             surface: None,
             storage,
             owns_surface: false,

@@ -2,8 +2,8 @@
 use super::*;
 use adv_abi::types::D3DVIEWPORT9;
 use adv_device::gpu::{
-    Address, Blend, BlendOp, Compare, Cull, DrawState, Factor, Filter, Image, TextureOp, Topology,
-    Vertex, Viewport,
+    Address, Blend, BlendOp, Compare, Cull, DrawState, Factor, Filter, Image, Stencil, StencilFace,
+    StencilOp, TextureOp, Topology, Vertex, Viewport,
 };
 use adv_device::surface::Rect;
 
@@ -23,7 +23,48 @@ pub(super) struct Draw {
     pub state: DrawState,
 }
 impl Fixed {
+    pub(super) fn viewport_rect(&self) -> Rect {
+        Rect {
+            x: self.viewport.X,
+            y: self.viewport.Y,
+            w: self.viewport.Width,
+            h: self.viewport.Height,
+        }
+    }
+    pub(super) fn clear_rect(&self) -> Rect {
+        let viewport = self.viewport_rect();
+        if self.render[&174] == 0 {
+            return viewport;
+        }
+        let left = viewport.x.max(self.scissor.left as u32);
+        let top = viewport.y.max(self.scissor.top as u32);
+        let right = (viewport.x + viewport.w).min(self.scissor.right as u32);
+        let bottom = (viewport.y + viewport.h).min(self.scissor.bottom as u32);
+        if left >= right || top >= bottom {
+            return Rect {
+                x: viewport.x,
+                y: viewport.y,
+                w: 0,
+                h: 0,
+            };
+        }
+        Rect {
+            x: left,
+            y: top,
+            w: right - left,
+            h: bottom - top,
+        }
+    }
+    pub(super) fn auto_depth(&mut self, enabled: bool) {
+        self.render.insert(7, u32::from(enabled));
+    }
     pub(super) fn target_changed(&mut self, width: u32, height: u32) {
+        self.scissor = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
         self.viewport = D3DVIEWPORT9 {
             X: 0,
             Y: 0,
@@ -50,10 +91,23 @@ impl Fixed {
                 (24, 0),
                 (25, 8),
                 (27, 0),
+                (52, 0),
+                (53, 1),
+                (54, 1),
+                (55, 1),
+                (56, 8),
+                (57, 0),
+                (58, u32::MAX),
+                (59, u32::MAX),
                 (137, 1),
                 (168, 15),
                 (171, 1),
                 (174, 0),
+                (185, 0),
+                (186, 1),
+                (187, 1),
+                (188, 1),
+                (189, 8),
                 (206, 0),
                 (207, 2),
                 (208, 1),
@@ -174,17 +228,31 @@ fn compare(value: u32) -> Option<Compare> {
         _ => return None,
     })
 }
+fn stencil_op(value: u32) -> Option<StencilOp> {
+    Some(match value {
+        1 => StencilOp::Keep,
+        2 => StencilOp::Zero,
+        3 => StencilOp::Replace,
+        4 => StencilOp::IncrementClamp,
+        5 => StencilOp::DecrementClamp,
+        6 => StencilOp::Invert,
+        7 => StencilOp::IncrementWrap,
+        8 => StencilOp::DecrementWrap,
+        _ => return None,
+    })
+}
 #[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state)]
 fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
     let valid = match state {
-        7 | 14 | 15 | 27 | 137 | 174 | 206 => value <= 1,
+        7 | 14 | 15 | 27 | 52 | 137 | 174 | 185 | 206 => value <= 1,
         19 | 20 | 207 | 208 => factor(value).is_some(),
         22 => (1..=3).contains(&value),
-        23 | 25 => compare(value).is_some(),
-        24 => true,
+        23 | 25 | 56 | 189 => compare(value).is_some(),
+        53..=55 | 186..=188 => stencil_op(value).is_some(),
+        24 | 57..=59 => true,
         168 => value <= 15,
         171 | 209 => operation(value).is_some(),
         _ => return UNAVAILABLE,
@@ -583,6 +651,11 @@ pub(super) fn prepare(
     }
     let provider = env.ext.get::<State>().provider;
     let target = super::targets::draw_target(env, pointer)?;
+    let target = if f.render[&7] != 0 || f.render[&52] != 0 {
+        super::depth::attach(env, pointer, target)?
+    } else {
+        target
+    };
     let image = if let Some(id) = d.texture {
         let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
             return Err(INVALID);
@@ -605,9 +678,42 @@ pub(super) fn prepare(
         2 => Cull::Clockwise,
         _ => Cull::CounterClockwise,
     };
-    if f.render[&7] != 0 {
-        return Err(UNAVAILABLE);
-    } // Auto depth/stencil is not advertised yet.
+    if target.depth().is_some() {
+        if f.render[&7] != 0 {
+            state.depth = Some(compare(f.render[&23]).ok_or(INVALID)?);
+            state.depth_write = f.render[&14] != 0;
+        }
+        if f.render[&52] != 0 {
+            if !super::depth::has_stencil(env, pointer) {
+                return Err(INVALID);
+            }
+            let front = StencilFace {
+                compare: compare(f.render[&56]).ok_or(INVALID)?,
+                fail: stencil_op(f.render[&53]).ok_or(INVALID)?,
+                depth_fail: stencil_op(f.render[&54]).ok_or(INVALID)?,
+                pass: stencil_op(f.render[&55]).ok_or(INVALID)?,
+            };
+            let back = if f.render[&185] != 0 {
+                StencilFace {
+                    compare: compare(f.render[&189]).ok_or(INVALID)?,
+                    fail: stencil_op(f.render[&186]).ok_or(INVALID)?,
+                    depth_fail: stencil_op(f.render[&187]).ok_or(INVALID)?,
+                    pass: stencil_op(f.render[&188]).ok_or(INVALID)?,
+                }
+            } else {
+                front
+            };
+            // D3D's clockwise screen-space face maps to the GPU back face
+            // after our Y projection. CCW override therefore selects GPU front.
+            state.stencil = Some(Stencil {
+                front: back,
+                back: front,
+                read_mask: f.render[&58],
+                write_mask: f.render[&59],
+            });
+            state.stencil_reference = f.render[&57];
+        }
+    }
     if f.render[&27] != 0 {
         state.blend = Some(Blend {
             source: factor(f.render[&19]).ok_or(INVALID)?,

@@ -1,0 +1,149 @@
+use super::*;
+use adv_cpu::backend::Guest;
+
+#[test]
+fn creation_rejects_missing_combined_and_unimplemented_policies_before_publication() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (factory, id) = object(&mut env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+    let count = env.sys.objects.alias_count(com(&env).namespace());
+    for (flags, expected) in [
+        (2, INVALID),
+        (0x62, INVALID),
+        (0xa2, INVALID),
+        (0xc2, INVALID),
+        (0xe2, INVALID),
+        (0x32, INVALID),
+        (0x92, INVALID),
+        (0x52, UNAVAILABLE),
+        (0x10022, UNAVAILABLE),
+        (0x80000022, UNAVAILABLE),
+    ] {
+        output.write(env.cpu, 0xaabbccdd).unwrap();
+        assert!(matches!(
+            create_device(
+                &mut env,
+                GuestPtr::new(factory),
+                0,
+                1,
+                Handle(0),
+                flags,
+                GuestPtr::new(0),
+                output
+            ),
+            Outcome::Return(error) if error == expected
+        ));
+        assert_eq!(output.read(env.cpu).unwrap(), 0);
+        assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
+        assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), count);
+        assert!(env.ext.get::<super::super::State>().gpu.is_none());
+    }
+}
+
+#[test]
+fn fixed_modes_reject_changes_and_mixed_normalizes_bool_without_changing_creation_flags() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (pointer, id, _, _) = super::super::tests::setup(&mut env);
+    let output = GuestPtr::<D3DDEVICE_CREATION_PARAMETERS>::new(alloc(&mut env, 16).unwrap());
+    for flags in [0x22, 0x42, 0x82, 0x26, 0x46, 0x86] {
+        if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
+            d.creation = State::new(0, 1, 0, flags).unwrap();
+        }
+        let mut value = i32::from(flags & 0x20 != 0);
+        assert_eq!(get_software(&mut env, GuestPtr::new(pointer)), value);
+        for input in [0, 1, -1, 2, 0] {
+            let expected = if flags & 0x80 == 0 && i32::from(input != 0) != value {
+                INVALID
+            } else {
+                value = i32::from(input != 0);
+                0
+            };
+            assert_eq!(
+                set_software(&mut env, GuestPtr::new(pointer), input),
+                expected
+            );
+            assert_eq!(get_software(&mut env, GuestPtr::new(pointer)), value);
+            assert_eq!(parameters(&mut env, GuestPtr::new(pointer), output), 0);
+            assert_eq!(
+                output.read(env.cpu).unwrap(),
+                D3DDEVICE_CREATION_PARAMETERS {
+                    AdapterOrdinal: 0,
+                    DeviceType: 1,
+                    hFocusWindow: 0,
+                    BehaviorFlags: flags,
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn rejected_reset_keeps_mixed_mode_and_does_not_replace_creation_identity() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (pointer, id, _, _) = super::super::tests::setup(&mut env);
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
+        d.creation = State::new(0, 1, 0x778899, 0x86).unwrap();
+        d.scene = true;
+    }
+    assert_eq!(set_software(&mut env, GuestPtr::new(pointer), 1), 0);
+    assert!(matches!(
+        reset(&mut env, GuestPtr::new(pointer), GuestPtr::new(0)),
+        Outcome::Return(INVALID)
+    ));
+    assert_eq!(get_software(&mut env, GuestPtr::new(pointer)), 1);
+    let d = device(&env, pointer).unwrap();
+    assert_eq!(d.creation.parameters.hFocusWindow, 0x778899);
+    assert_eq!(d.creation.parameters.BehaviorFlags, 0x86);
+}
+
+#[test]
+fn output_faults_and_nonnull_shader_rejection_preserve_memory_and_ownership() {
+    let mut m = super::super::tests::machine();
+    m.cpu.map(0x550000, 8192, Prot::RW).unwrap();
+    m.cpu.write(0x550000, &[0xa5; 8192]).unwrap();
+    m.cpu.protect(0x551000, 4096, Prot::READ).unwrap();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (pointer, id, _, _) = super::super::tests::setup(&mut env);
+    let references = com(&env).references(&env.sys.objects, id);
+    let this = GuestPtr::new(pointer);
+    assert_eq!(parameters(&mut env, this, GuestPtr::new(0x550ff8)), INVALID);
+    let mut memory = [0; 16];
+    env.cpu.read(0x550ff8, &mut memory).unwrap();
+    assert_eq!(memory, [0xa5; 16]);
+    assert_eq!(parameters(&mut env, this, GuestPtr::new(0)), INVALID);
+    for setter in [set_vertex, set_pixel] {
+        assert_eq!(setter(&mut env, this, GuestPtr::new(0xdeadbeef)), INVALID);
+        assert_eq!(setter(&mut env, this, GuestPtr::new(0)), 0);
+    }
+    for getter in [get_vertex, get_pixel] {
+        assert_eq!(getter(&mut env, this, GuestPtr::new(0x551000)), INVALID);
+        assert_eq!(env.cpu.read_u32(0x551000).unwrap(), 0xa5a5a5a5);
+        assert_eq!(getter(&mut env, this, GuestPtr::new(0)), INVALID);
+        assert_eq!(getter(&mut env, this, GuestPtr::new(0x550000)), 0);
+        assert_eq!(env.cpu.read_u32(0x550000).unwrap(), 0);
+    }
+    assert_eq!(com(&env).references(&env.sys.objects, id), references);
+}

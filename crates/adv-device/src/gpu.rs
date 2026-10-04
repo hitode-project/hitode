@@ -1,6 +1,7 @@
 //! Neutral GPU drawing and ownership of submitted resources. This module has
 //! no guest addresses, Windows handles, COM layouts or D3D state identifiers.
 use crate::surface::Rect;
+mod clear;
 mod depth;
 mod renderer;
 mod submission;

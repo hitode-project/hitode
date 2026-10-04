@@ -163,13 +163,15 @@ fn check_format(
         return INVALID;
     }
     // Color surface/texture: sampled, dynamic or a single render-target mip.
-    // Depth, autogen, sRGB, cubes and volumes remain unadvertised.
-    let supported = match resource {
-        1 => usage == 0 || usage == 1,
-        3 => matches!(usage, 0 | 1 | 0x200),
-        _ => false,
-    };
-    if available(env) && format == 22 && matches!(check, 21 | 22) && supported {
+    // Autogen, sRGB, depth textures, cubes and volumes remain unadvertised.
+    let supported = (matches!(check, 21 | 22)
+        && match resource {
+            1 => usage == 0 || usage == 1,
+            3 => matches!(usage, 0 | 1 | 0x200),
+            _ => false,
+        })
+        || (resource == 1 && usage == 2 && depth::format(check).is_some());
+    if available(env) && format == 22 && supported {
         0
     } else {
         UNAVAILABLE
@@ -192,7 +194,11 @@ fn check_multisample(
     if kind != 1 {
         return 0x8876086b;
     } // D3DERR_INVALIDDEVICE
-    if !available(env) || !matches!(format, 21 | 22) || windowed == 0 || samples != 0 {
+    if !available(env)
+        || !(matches!(format, 21 | 22) || depth::format(format).is_some())
+        || windowed == 0
+        || samples != 0
+    {
         return UNAVAILABLE;
     }
     if quality.is_null() {
@@ -207,12 +213,18 @@ fn check_depth(
     this: GuestPtr<()>,
     adapter: u32,
     kind: i32,
-    _format: u32,
-    _target: u32,
-    _depth: u32,
+    format: u32,
+    target: u32,
+    depth: u32,
 ) -> u32 {
     if !factory(env, this.addr(), adapter) || kind != 1 {
         INVALID
+    } else if available(env)
+        && format == 22
+        && matches!(target, 21 | 22)
+        && depth::format(depth).is_some()
+    {
+        0
     } else {
         UNAVAILABLE
     }
@@ -253,7 +265,9 @@ fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         PresentationIntervals: 0x80000001, // IMMEDIATE and ONE (DEFAULT also paces).
         DevCaps: 0x40 | 0x200 | 0x400 | 0x800,
         PrimitiveMiscCaps: 0x10 | 0x20 | 0x40 | 0x80 | 0x800 | 0x20000,
-        RasterCaps: 0x01000000,
+        RasterCaps: 0x01000010,
+        ZCmpCaps: 0xff,
+        StencilCaps: 0x1ff,
         AlphaCmpCaps: 0xff,
         SrcBlendCaps: 0x7ff,
         DestBlendCaps: 0x7ff,
@@ -368,13 +382,11 @@ mod tests {
             (0, 0)
         );
         assert_eq!(
-            (
-                value.CubeTextureFilterCaps,
-                value.VolumeTextureFilterCaps,
-                value.StencilCaps
-            ),
-            (0, 0, 0)
+            (value.CubeTextureFilterCaps, value.VolumeTextureFilterCaps,),
+            (0, 0)
         );
+        assert_eq!(value.StencilCaps, 0x1ff);
+        assert_eq!(value.ZCmpCaps, 0xff);
         assert_eq!(value.TextureCaps & (0x4000 | 0x800 | 0x2000), 0);
         assert_eq!((value.MaxStreams, value.MaxVertexIndex), (16, 0x000f_ffff));
         assert_eq!(value.DevCaps2, 1, "only stream offsets are implemented");
@@ -383,14 +395,24 @@ mod tests {
                 <= 16 * 1024 * 1024
         );
         assert!(u64::from(value.MaxPrimitiveCount) * 3 * 40 <= 16 * 1024 * 1024);
-        for (usage, kind, format) in [(0, 3, 21), (0x200, 3, 22), (0, 1, 21), (1, 3, 21), (1, 1, 22)] {
+        for (usage, kind, format) in [
+            (0, 3, 21),
+            (0x200, 3, 22),
+            (0, 1, 21),
+            (1, 3, 21),
+            (1, 1, 22),
+            (2, 1, 75),
+            (2, 1, 77),
+            (2, 1, 80),
+        ] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),
                 0
             );
         }
         for (usage, kind, format) in [
-            (2, 1, 75),
+            (2, 3, 75),
+            (2, 1, 70),
             (0x400, 3, 21),
             (0, 4, 21),
             (0, 5, 21),
@@ -400,7 +422,7 @@ mod tests {
                 UNAVAILABLE
             );
         }
-        assert_eq!(check_depth(&mut env, this, 0, 1, 22, 21, 75), UNAVAILABLE);
+        assert_eq!(check_depth(&mut env, this, 0, 1, 22, 21, 75), 0);
         assert_eq!(check_type(&mut env, this, 0, 1, 22, 21, 0), UNAVAILABLE);
         assert_eq!(
             check_multisample(&mut env, this, 0, 1, 21, 1, 2, GuestPtr::new(0)),

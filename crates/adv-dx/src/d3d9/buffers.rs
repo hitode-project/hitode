@@ -142,6 +142,13 @@ fn create(
     if len == 0 || len > MAX_BUFFER || !matches!(pool, 0..=2) || usage & 0x200 != 0 && pool == 1 {
         return INVALID;
     }
+    if !super::device(env, this)
+        .unwrap()
+        .creation
+        .allows_buffer_usage(usage)
+    {
+        return INVALID;
+    }
     if !shared.is_null() || usage & !(8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200) != 0 {
         return UNAVAILABLE;
     }

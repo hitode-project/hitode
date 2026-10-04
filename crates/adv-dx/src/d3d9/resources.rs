@@ -24,6 +24,7 @@ pub(super) struct Resource {
     pub device: Id,
     pub kind: Kind,
     pub desc: D3DSURFACE_DESC,
+    pub depth: Option<adv_device::gpu::Depth>,
     pub surface: Option<u32>,
     pub storage: u32,
     pub owns_surface: bool,
@@ -32,6 +33,27 @@ pub(super) struct Resource {
     pub container: Option<Id>,
     /// The texture owns this interface metadata through an internal Objects ref.
     pub level_surface: Option<Id>,
+}
+impl Resource {
+    pub(super) fn new_depth(
+        device: Id,
+        desc: D3DSURFACE_DESC,
+        depth: adv_device::gpu::Depth,
+    ) -> Self {
+        Self {
+            pointer: 0,
+            device,
+            kind: Kind::Surface,
+            desc,
+            depth: Some(depth),
+            surface: None,
+            storage: 0,
+            owns_surface: false,
+            lock: None,
+            container: None,
+            level_surface: None,
+        }
+    }
 }
 #[derive(Clone, Copy)]
 pub(super) struct Lock {
@@ -129,6 +151,7 @@ fn texture_surface(
             device: r.device,
             kind: Kind::Surface,
             desc: r.desc,
+            depth: None,
             surface: r.surface,
             storage: 0,
             owns_surface: false,
@@ -199,7 +222,7 @@ fn surface_container(
     };
     let parent = if let Some(container) = r.container {
         container
-    } else if r.owns_surface || r.desc.Pool >= 2 {
+    } else if r.owns_surface || r.depth.is_some() || r.desc.Pool >= 2 {
         r.device
     } else {
         // Back buffers have a swap-chain container, not a device container.
@@ -338,6 +361,7 @@ pub(super) fn implicit_back_buffer(
                 Width: p.BackBufferWidth,
                 Height: p.BackBufferHeight,
             },
+            depth: None,
             surface: Some(surface),
             storage: 0,
             owns_surface: false,
@@ -464,6 +488,7 @@ fn create_texture(
                 Width: width,
                 Height: height,
             },
+            depth: None,
             surface: Some(surface),
             storage,
             owns_surface: true,
@@ -753,6 +778,7 @@ mod tests {
                     Format: 21,
                     ..D3DSURFACE_DESC::default()
                 },
+                depth: None,
                 surface: None,
                 storage: 0,
                 owns_surface: false,

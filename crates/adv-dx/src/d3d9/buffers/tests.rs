@@ -12,6 +12,52 @@ fn setup(env: &mut Env<'_>) -> (u32, Id) {
 }
 
 #[test]
+fn hardware_mode_rejects_software_buffer_usage_before_publishing_or_retaining_parent() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (device, id) = setup(&mut env);
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
+        d.creation = super::super::creation::State::new(0, 1, 0, 0x42).unwrap();
+    }
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+    let count = env.sys.objects.alias_count(com(&env).namespace());
+    assert_eq!(
+        create_vertex(
+            &mut env,
+            GuestPtr::new(device),
+            128,
+            0x10,
+            0x42,
+            1,
+            output,
+            GuestPtr::new(0)
+        ),
+        INVALID
+    );
+    assert_eq!(
+        create_index(
+            &mut env,
+            GuestPtr::new(device),
+            12,
+            0x10,
+            101,
+            1,
+            output,
+            GuestPtr::new(0)
+        ),
+        INVALID
+    );
+    assert_eq!(output.read(env.cpu).unwrap(), 0);
+    assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
+    assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), count);
+}
+
+#[test]
 fn zero_public_binding_resurrects_parent_once_and_unbinding_reclaims_storage() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
