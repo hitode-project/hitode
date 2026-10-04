@@ -48,6 +48,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
 ];
 pub fn register(registry: &mut Registry) {
     super::fill::register(registry);
+    super::color_table::register(registry);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }

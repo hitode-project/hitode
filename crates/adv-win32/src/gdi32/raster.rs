@@ -6,6 +6,7 @@ use adv_device::surface::{
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
+mod color_table;
 mod dib;
 mod fill;
 pub mod front;
@@ -106,6 +107,7 @@ impl Raster {
                 bits,
                 stride: surface.pitch,
                 owned: false,
+                dib_colors: dib.palette_count,
             };
             if !dcs.register_bitmap(objects, bitmap, metadata) {
                 surfaces.delete(bitmap);

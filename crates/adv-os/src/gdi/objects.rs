@@ -50,6 +50,9 @@ pub enum GdiObj {
         bits: u32,
         stride: u32,
         owned: bool,
+        /// Number of RGB entries in a DIB's table; zero for DDB/truecolor.
+        /// The colors themselves belong to the common device surface.
+        dib_colors: u16,
     },
     Palette {
         entries: Vec<[u8; 4]>,

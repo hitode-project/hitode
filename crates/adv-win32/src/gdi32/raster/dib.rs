@@ -9,6 +9,7 @@ pub(super) struct Dib {
     pub format: PixelFormat,
     pub pitch: u32,
     pub palette: Option<Arc<[[u8; 4]; 256]>>,
+    pub palette_count: u16,
 }
 
 pub(super) struct Transfer {
@@ -136,5 +137,6 @@ pub(super) fn read(
         format,
         pitch,
         palette,
+        palette_count: if bpp == 8 { 256 } else { 0 },
     }))
 }
