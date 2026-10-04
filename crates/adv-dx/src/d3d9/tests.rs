@@ -1,0 +1,162 @@
+//! Observable ownership edges measured by the native D3D9 fixture. This slice
+//! isolates QueryInterface/limits without a renderer, window or guest execution.
+use super::*;
+use adv_abi::types::D3DSURFACE_DESC;
+use adv_cpu::JitCpu;
+use adv_machine::{Clock, ObjectLimits};
+
+fn machine() -> Machine<JitCpu> {
+    let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+    let mut m = Machine::new(cpu, Registry::default(), Clock::virtual_time()).unwrap();
+    m.sys.objects = Objects::with_limits(ObjectLimits {
+        references: 3,
+        ..ObjectLimits::default()
+    });
+    let mut heaps = Heaps::default();
+    heaps.process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm).unwrap();
+    m.ext.insert(heaps);
+    let com = Com::new(&mut m.sys.objects).unwrap();
+    let provider = SurfaceProvider {
+        insert: |_, _| unreachable!("ownership-only fixture"),
+        target: |_, _| None,
+        remove: |_, _, _| Ok(()),
+        replace: |_, _, _| unreachable!(),
+        present: |_, _, _| unreachable!(),
+        window: |_, _, _| Some((16, 12)),
+        visible: |_, _, _| Some(false),
+        completed: |_, _| None,
+    };
+    m.ext.insert(State {
+        com,
+        tables: BTreeMap::from([
+            ("IDirect3D9", 0),
+            ("IDirect3DDevice9", 0),
+            ("IDirect3DSurface9", 0),
+        ]),
+        gpu: None,
+        provider,
+        pending: Vec::new(),
+        transfers: Vec::new(),
+        sender: None,
+        wake: None,
+    });
+    m
+}
+fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
+    let (_, factory) = object(env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
+    com(env)
+        .add_ref_identity(&mut env.sys.objects, factory)
+        .unwrap();
+    let (device, device_id) = object(
+        env,
+        "IDirect3DDevice9",
+        IID_DEVICE,
+        Payload::Device(Box::new(Device {
+            pointer: 0,
+            factory,
+            surface: 0,
+            parameters: D3DPRESENT_PARAMETERS::default(),
+            creator: 0,
+            scene: false,
+            needs_reset: false,
+            back_buffer: None,
+            texture: None,
+            fixed: fixed::Fixed::new(16, 12),
+        })),
+    )
+    .unwrap();
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
+        d.pointer = device;
+    }
+    let (resource, id) = resources::make(
+        env,
+        Resource {
+            pointer: 0,
+            device: device_id,
+            kind: resources::Kind::Surface,
+            desc: D3DSURFACE_DESC {
+                Pool: 2,
+                Type: 1,
+                Width: 1,
+                Height: 1,
+                ..D3DSURFACE_DESC::default()
+            },
+            surface: None,
+            storage: 0,
+            owns_surface: false,
+            lock: None,
+        },
+    )
+    .unwrap();
+    assert!(com(env).retain_internal(&mut env.sys.objects, id));
+    assert_eq!(release(env, resource), 0);
+    assert_eq!(com(env).references(&env.sys.objects, device_id), Some(1));
+    (device, device_id, resource, id)
+}
+#[test]
+fn query_of_bound_zero_reference_resource_retains_parent_once_and_failed_query_rolls_back() {
+    let mut m = machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (device, device_id, resource, id) = setup(&mut env);
+    let guid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+    guid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    assert!(matches!(
+        query(&mut env, GuestPtr::new(resource), guid, output),
+        Outcome::Return(0)
+    ));
+    assert_eq!(output.read(env.cpu).unwrap(), resource);
+    assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(2));
+    assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
+    assert_eq!(release(&mut env, resource), 0);
+    guid.write(env.cpu, [0xf1; 16]).unwrap();
+    assert!(matches!(
+        query(&mut env, GuestPtr::new(resource), guid, output),
+        Outcome::Return(NO_INTERFACE)
+    ));
+    assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(1));
+    assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
+    let dead = com(&env)
+        .release_internal(&mut env.sys.objects, id)
+        .unwrap()
+        .unwrap();
+    destroy(&mut env, dead);
+    assert_eq!(release(&mut env, device), 0);
+    assert_eq!(
+        env.sys.objects.alias_count(com(&env).namespace()),
+        1,
+        "only original factory owner remains"
+    );
+}
+#[test]
+fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts() {
+    let mut m = machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (_device, device_id, resource, id) = setup(&mut env);
+    assert_eq!(
+        com(&env).add_ref_identity(&mut env.sys.objects, device_id),
+        Some(2)
+    );
+    let guid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+    guid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    assert!(matches!(
+        query(&mut env, GuestPtr::new(resource), guid, output),
+        Outcome::Return(OUT_OF_MEMORY)
+    ));
+    assert_eq!(output.read(env.cpu).unwrap(), 0);
+    assert_eq!(com(&env).references(&env.sys.objects, device_id), Some(2));
+    assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
+    assert!(add_ref(&mut env, resource).is_none());
+    assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
+}

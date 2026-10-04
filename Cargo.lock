@@ -71,8 +71,10 @@ dependencies = [
  "adv-device",
  "adv-machine",
  "adv-os",
+ "adv-sync",
  "adv-win32",
  "iced-x86",
+ "pollster",
 ]
 
 [[package]]

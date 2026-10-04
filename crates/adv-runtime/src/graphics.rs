@@ -148,6 +148,59 @@ pub(crate) struct RunControl {
     pub(crate) frame_intervals: Vec<Duration>,
 }
 
+#[cfg(feature = "gpu")]
+pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
+    adv_dx::d3d9::SurfaceProvider {
+        insert: |ext, target| ext.get_mut::<Graphics<Snapshot>>().insert_native(target),
+        target: |ext, id| ext.get::<Graphics<Snapshot>>().native_target(id).cloned(),
+        remove: |ext, _, id| {
+            if ext.get_mut::<Graphics<Snapshot>>().delete(id) {
+                Ok(())
+            } else {
+                Err("D3D9 surface identity no longer exists".into())
+            }
+        },
+        replace: |ext, id, target| {
+            ext.get_mut::<Graphics<Snapshot>>()
+                .replace_native(id, target)
+                .map(|_| ())
+        },
+        present: |ext, id, gpu| {
+            ext.get_mut::<Graphics<Snapshot>>()
+                .present_native_rotating(id, gpu)
+        },
+        window: |ext, objects, hwnd| {
+            let window = ext.get::<Win32>().user.windows.get(objects, &hwnd)?;
+            let (width, height) = window.client_size();
+            (width > 0 && height > 0).then_some((width as u32, height as u32))
+        },
+        visible: |ext, objects, hwnd| {
+            ext.get::<Win32>()
+                .user
+                .windows
+                .get(objects, &hwnd)
+                .map(|w| w.visible())
+        },
+        completed: |env, serial| {
+            env.sys.frame = serial as u32;
+            env.sys.complete_frame();
+            let control = env.ext.get_mut::<RunControl>();
+            let now = Instant::now();
+            control.first_frame.get_or_insert(now);
+            if control.frame_timing
+                && let Some(last) = control.last_frame
+            {
+                control.frame_intervals.push(now.duration_since(last));
+            }
+            control.last_frame = Some(now);
+            control
+                .frame_limit
+                .filter(|&limit| serial >= limit)
+                .map(|_| Outcome::ExitProcess(0))
+        },
+    }
+}
+
 /// Graphics registrations replace the Win32 state-only drawing handlers.
 pub fn register_graphics(registry: &mut Registry) {
     registry.add(
@@ -271,10 +324,14 @@ pub(crate) fn graphics_call(env: &mut Env<'_>) -> Outcome {
     let geometry = hwnd
         .and_then(|hwnd| {
             env.ext.try_get_mut::<Win32>().and_then(|win32| {
-                win32.user.windows.get(&env.sys.objects, &hwnd).map(|window| {
-                    let (w, h) = window.client_size();
-                    (w, h, win32.user.client_origin(&env.sys.objects, hwnd))
-                })
+                win32
+                    .user
+                    .windows
+                    .get(&env.sys.objects, &hwnd)
+                    .map(|window| {
+                        let (w, h) = window.client_size();
+                        (w, h, win32.user.client_origin(&env.sys.objects, hwnd))
+                    })
             })
         })
         .filter(|&(w, h, _)| w > 0 && h > 0);
@@ -395,7 +452,12 @@ pub(crate) fn unsupported_graphics(env: &mut Env<'_>) -> Outcome {
 
 fn begin_paint(env: &mut Env<'_>) -> Outcome {
     let (hwnd, paint) = (env.arg(0), env.arg(1));
-    let Some(window) = env.ext.get::<Win32>().user.windows.get(&env.sys.objects, &hwnd)
+    let Some(window) = env
+        .ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get(&env.sys.objects, &hwnd)
     else {
         return Outcome::Return(0);
     };

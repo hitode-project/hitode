@@ -117,7 +117,12 @@ impl Image {
     }
     fn writable(&self) -> Result<(), Error> {
         if self.frame_pins.load(Ordering::Acquire) != 0 {
-            return Err(Error::Busy);
+            self.gate.wait_for_frame();
+            // Release may precede waiter publication. Recheck after publishing
+            // rather than sleeping with the final release already behind us.
+            if self.frame_pins.load(Ordering::Acquire) != 0 {
+                return Err(Error::Busy);
+            }
         }
         Ok(())
     }
@@ -192,6 +197,7 @@ impl NativeFrame {
 /// Explicit readback ownership. Normal rendering/presentation never maps buffers.
 /// Completion is delivered once through the common SPSC primitive and wake event.
 pub struct Readback {
+    buffer: wgpu::Buffer,
     completion: adv_sync::spsc::Consumer<Result<Vec<u8>, Error>>,
     pub width: u32,
     pub height: u32,
@@ -200,6 +206,12 @@ pub struct Readback {
     job_taken: bool,
 }
 impl Readback {
+    /// Cancel an unconsumed transfer during owner teardown. Unmapping cancels
+    /// its pending map; Poll only delivers ready callbacks and never waits.
+    pub fn cancel(&self) {
+        self.buffer.unmap();
+        let _ = self.context.device.poll(wgpu::PollType::Poll);
+    }
     pub fn poll(&mut self) -> Option<Result<Vec<u8>, Error>> {
         self.completion.pop()
     }
@@ -1048,6 +1060,7 @@ impl Gpu {
         self.stats.readbacks += 1;
         self.check()?;
         Ok(Readback {
+            buffer,
             completion: consumer,
             width,
             height,

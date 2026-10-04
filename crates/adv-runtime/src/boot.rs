@@ -27,6 +27,8 @@ pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
     register_graphics(&mut registry);
     crate::font::register(&mut registry);
     adv_dx::dsound::register(&mut registry);
+    #[cfg(feature = "gpu")]
+    adv_dx::d3d9::register(&mut registry);
     crate::vorbis::register(&mut registry, codec);
     registry
 }
@@ -127,6 +129,8 @@ impl<B: Backend> Runtime<B> {
         let exe = machine.load(&files, exe_name).map_err(|e| e.to_string())?;
         crate::crt::install(&mut machine)?;
         install_graphics(&mut machine, width, height)?;
+        #[cfg(feature = "gpu")]
+        adv_dx::d3d9::install(&mut machine, crate::graphics::d3d9_provider())?;
         crate::font::install(&mut machine);
         adv_dx::dsound::install(&mut machine)?;
         machine.start_process(exe).map_err(|e| e.to_string())?;
@@ -135,10 +139,12 @@ impl<B: Backend> Runtime<B> {
 
     /// Run until every context waits, the process exits, or a named failure occurs.
     pub fn step(&mut self) -> RunResult {
-        let outcome = self.machine.run();
-        match self.finish_step(SliceResult::Complete(outcome)) {
-            SliceResult::Complete(outcome) => outcome,
-            SliceResult::Yielded => unreachable!("an unsliced step cannot soft-yield"),
+        loop {
+            let outcome = self.machine.run();
+            match self.finish_step(SliceResult::Complete(outcome)) {
+                SliceResult::Complete(outcome) => return outcome,
+                SliceResult::Yielded => {}
+            }
         }
     }
 
@@ -154,7 +160,24 @@ impl<B: Backend> Runtime<B> {
             outcome,
             SliceResult::Complete(RunResult::Exited(_) | RunResult::Failed(_))
         ) {
+            #[cfg(feature = "gpu")]
+            adv_dx::d3d9::cancel_pending(&mut self.machine);
             return outcome;
+        }
+        #[cfg(feature = "gpu")]
+        match adv_dx::d3d9::pump(&mut self.machine) {
+            Ok(true) if matches!(outcome, SliceResult::Complete(RunResult::Idle { .. })) => {
+                return SliceResult::Yielded;
+            }
+            Ok(_) => {}
+            Err(message) => {
+                return SliceResult::Complete(RunResult::Failed(adv_machine::MachineError {
+                    ctx: self.machine.sys.current,
+                    pc: self.machine.cpu.reg(adv_cpu::backend::Reg::Eip),
+                    message,
+                    recent: self.machine.sys.recent_calls(),
+                }));
+            }
         }
         match adv_dx::dsound::pump(&mut self.machine) {
             Ok(Some(at)) => match outcome {
@@ -178,6 +201,23 @@ impl<B: Backend> Runtime<B> {
     /// Optional PCM device emulation; native device output is owned by the frontend.
     pub fn set_audio_enabled(&mut self, enabled: bool) {
         self.machine.ext.get_mut::<adv_dx::dsound::Sound>().enabled = enabled;
+    }
+    /// Attach the shell's surface-compatible GPU before executing guest code.
+    #[cfg(feature = "gpu")]
+    pub fn install_gpu(&mut self, gpu: adv_device::gpu::Gpu) -> Result<(), String> {
+        adv_dx::d3d9::set_gpu(&mut self.machine.ext, gpu)
+    }
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu_background(
+        &mut self,
+        sender: adv_sync::background::LocalSender,
+        wake: adv_sync::WakeEvent,
+    ) {
+        adv_dx::d3d9::set_background(&mut self.machine.ext, sender, wake);
+    }
+    #[cfg(feature = "gpu")]
+    pub fn gpu_diagnostics(&self) -> adv_dx::d3d9::Diagnostics {
+        adv_dx::d3d9::diagnostics(&self.machine.ext, &self.machine.sys.objects)
     }
 
     pub fn audio_stream(&self) -> adv_device::AudioStream {
@@ -306,6 +346,45 @@ impl<B: Backend> Runtime<B> {
             .ext
             .get_mut::<Graphics<Snapshot>>()
             .capture_latest()
+    }
+    #[cfg(feature = "gpu")]
+    pub fn has_native_frame(&self) -> bool {
+        self.machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .latest_native_frame()
+            .is_some()
+    }
+    /// Explicit export/diagnostic capture. Callers enqueue its fence job on the
+    /// existing background service and consume the typed completion separately.
+    #[cfg(feature = "gpu")]
+    pub fn begin_native_capture(
+        &mut self,
+    ) -> Result<Option<(u64, adv_device::gpu::Readback)>, adv_device::gpu::Error> {
+        let Some(frame) = self
+            .machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .latest_native_frame()
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        adv_dx::d3d9::readback_image(&mut self.machine.ext, &frame.image)
+            .map(|ticket| Some((frame.serial, ticket)))
+    }
+    #[cfg(feature = "gpu")]
+    pub fn finish_native_capture(
+        &mut self,
+        serial: u64,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<bool, String> {
+        self.machine
+            .ext
+            .get_mut::<Graphics<Snapshot>>()
+            .capture_native_pixels(serial, width, height, bgra)
     }
 
     /// End a bounded diagnostic run immediately after this presentation count.

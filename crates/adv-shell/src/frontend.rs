@@ -24,6 +24,8 @@ const INPUT_CAPACITY: usize = 4096;
 const METRIC_LIMIT: usize = 128;
 const RESERVED_INPUT: usize = INPUT_CAPACITY - METRIC_LIMIT;
 pub struct Worker {
+    #[cfg(all(windows, feature = "gpu"))]
+    pub(crate) gpu: Option<adv_device::gpu::Gpu>,
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
     frames: Option<FrameProducer>,
@@ -52,6 +54,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     let metrics_dropped = Arc::new(AtomicU64::new(0));
     Ok((
         Worker {
+            #[cfg(all(windows, feature = "gpu"))]
+            gpu: None,
             incoming,
             requests: requests_tx,
             frames: Some(frames_tx),

@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 description = "Guest GDI/DirectDraw software surfaces and a common presentation boundary"
 
+[features]
+default = []
+gpu = ["adv-dx/gpu", "adv-device/gpu"]
+
 [dependencies]
 adv-abi = { path = "../adv-abi" }
 adv-sync = { path = "../adv-sync" }

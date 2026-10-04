@@ -61,17 +61,20 @@ impl WindowPresenter {
         hwnd: windows_sys::Win32::Foundation::HWND,
         width: u32,
         height: u32,
+        fallback: bool,
     ) -> Result<(adv_device::gpu::Gpu, Self), String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = unsafe { Self::surface(hwnd, &instance)? };
-        let gpu = match adv_device::gpu::Gpu::request_presenting(instance.clone(), &surface, false)
-            .await
-        {
-            Ok(gpu) => gpu,
-            Err(_) => adv_device::gpu::Gpu::request_presenting(instance, &surface, true)
+        let gpu =
+            match adv_device::gpu::Gpu::request_presenting(instance.clone(), &surface, fallback)
                 .await
-                .map_err(|error| error.to_string())?,
-        };
+            {
+                Ok(gpu) => gpu,
+                Err(error) if fallback => return Err(error.to_string()),
+                Err(_) => adv_device::gpu::Gpu::request_presenting(instance, &surface, true)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            };
         let presenter = Self::with_surface(surface, gpu.context().clone(), width, height)?;
         Ok((gpu, presenter))
     }
@@ -951,7 +954,7 @@ mod tests {
     fn startup_selects_a_surface_compatible_adapter_and_rejects_a_destroyed_device() {
         let mut window =
             crate::window::Window::new("GPU startup regression", 32, 24, true).unwrap();
-        let (gpu, mut presenter) = window.create_native().unwrap();
+        let (gpu, mut presenter) = window.create_native(false).unwrap();
         assert!(
             gpu.context()
                 .adapter

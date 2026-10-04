@@ -24,6 +24,7 @@ struct Options {
     codepage: u32,
     headless: bool,
     hidden: bool,
+    gpu_software: bool,
     width: u32,
     height: u32,
     frames: Option<u64>,
@@ -54,6 +55,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --codec guest|native    whole-module Vorbis provider (default: native)\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
+  --gpu-software          select a software GPU adapter for diagnostics\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
   --frames N              stop after N presented guest frames\n\
   --seconds N             stop after N seconds of host wall time\n\
@@ -82,6 +84,7 @@ impl Options {
             codepage: 932,
             headless: false,
             hidden: false,
+            gpu_software: false,
             width: 640,
             height: 480,
             frames: None,
@@ -141,6 +144,7 @@ impl Options {
                 "--sync-compilation" => options.async_compilation = false,
                 "--headless" => options.headless = true,
                 "--hidden" => options.hidden = true,
+                "--gpu-software" => options.gpu_software = true,
                 "--self-test-input" => options.self_test_input = true,
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
@@ -346,6 +350,20 @@ fn build_report(context: ReportContext<'_>) -> String {
     } = context;
     let frame = runtime.frame();
     let stats = runtime.machine.cpu.stats();
+    #[cfg(feature = "gpu")]
+    let gpu_diagnostics = {
+        let diagnostics = runtime.gpu_diagnostics();
+        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations));
+        format!(
+            "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{}}}",
+            diagnostics.live_interfaces,
+            diagnostics.pending_waits,
+            diagnostics.pending_readbacks,
+            commands
+        )
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_diagnostics = "null";
     let mut codec = adv_runtime::vorbis::stats(&runtime.machine).map_or_else(
         || "{\"provider\": \"guest\"}".into(),
         |s| format!(concat!("{{\"provider\": \"native\", \"opens\": {}, \"failed_opens\": {}, ",
@@ -408,7 +426,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"runtime\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"gpu\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -466,6 +484,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         audio.json(),
         pcm_metrics,
         codec,
+        gpu_diagnostics,
         json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
     )
 }
@@ -477,7 +496,70 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
     std::fs::write(path, report).map_err(|e| e.to_string())
 }
 
+#[cfg(all(windows, feature = "gpu"))]
+fn capture_native_after_stop(
+    runtime: &mut Runtime,
+    wake: &window::WakeEvent,
+) -> Result<(), String> {
+    use adv_sync::background::{Priority, Task};
+    use std::sync::mpsc::TrySendError;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (serial, mut ticket) = loop {
+        match runtime.begin_native_capture() {
+            Ok(Some(capture)) => break capture,
+            Ok(None) => return Ok(()),
+            Err(adv_device::gpu::Error::Busy) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("native capture resource wait timed out".into());
+                }
+                wake.wait(Some(remaining)).map_err(|e| e.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let sender = runtime.machine.cpu.background_sender()?;
+    let mut task = Task::new(ticket.take_completion_job().unwrap())
+        .finish_on_shutdown()
+        .without_wake();
+    loop {
+        match sender.borrow_mut().try_submit(Priority::Urgent, task) {
+            Ok(_) => break,
+            Err(TrySendError::Full(returned)) => task = returned,
+            Err(TrySendError::Disconnected(_)) => {
+                ticket.cancel();
+                return Err("native capture background service closed".into());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            ticket.cancel();
+            return Err("native capture queue wait timed out".into());
+        }
+        wake.wait(Some(remaining)).map_err(|e| e.to_string())?;
+    }
+    loop {
+        if let Some(result) = ticket.poll() {
+            let pixels = result.map_err(|e| e.to_string())?;
+            if !runtime.finish_native_capture(serial, ticket.width, ticket.height, &pixels)? {
+                return Err("native capture was superseded".into());
+            }
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            ticket.cancel();
+            return Err("native capture fence wait timed out".into());
+        }
+        wake.wait(Some(remaining)).map_err(|e| e.to_string())?;
+    }
+}
+
 fn run(options: Options) -> Result<u8, String> {
+    #[cfg(not(feature = "gpu"))]
+    if options.gpu_software {
+        return Err("software GPU diagnostics require a GPU-enabled build".into());
+    }
     window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
     let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
@@ -511,10 +593,12 @@ fn run(options: Options) -> Result<u8, String> {
     )?;
     let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
     #[cfg(all(windows, feature = "gpu"))]
+    let mut worker = worker;
+    #[cfg(all(windows, feature = "gpu"))]
     {
         // Startup is the only UI-side GPU initialization. Guest submission has
         // not begun, so configuring the initially empty queue cannot race it.
-        let (gpu, presenter) = window.create_native()?;
+        let (gpu, presenter) = window.create_native(options.gpu_software)?;
         let context = gpu.context().clone();
         context
             .set_execution_wake(wake.clone())
@@ -523,6 +607,7 @@ fn run(options: Options) -> Result<u8, String> {
             .sender_with_capacity_wake(1, 1, ui.wake())
             .map_err(|error| error.to_string())?;
         ui.native(presenter, ui_sender);
+        worker.gpu = Some(gpu);
     }
     // All startup ports are registered before this one common worker starts.
     // Interpretation uses it as well, even when compilation is disabled.
@@ -622,6 +707,24 @@ fn run_execution(
     if let Some(worker) = window.as_mut() {
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
+    }
+    #[cfg(all(windows, feature = "gpu"))]
+    {
+        let gpu = match window.as_mut().and_then(|worker| worker.gpu.take()) {
+            Some(gpu) => gpu,
+            None => {
+                let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
+                    .map_err(|e| e.to_string())?;
+                gpu.context()
+                    .set_execution_wake(wake.clone())
+                    .map_err(|_| "GPU wake already installed")?;
+                runtime.set_deferred_presentation(true)?;
+                gpu
+            }
+        };
+        runtime.install_gpu(gpu)?;
+        let gpu_background = runtime.machine.cpu.background_sender()?;
+        runtime.set_gpu_background(gpu_background, wake.clone());
     }
     let mut audio = audio::AudioOutput::new(options.audio, options.headless, &runtime);
     let mut control = options
@@ -901,7 +1004,18 @@ fn run_execution(
         }
     }
     runtime.machine.sys.trace.flush();
-    runtime.capture_latest_frame()?;
+    #[cfg(all(windows, feature = "gpu"))]
+    let native_frame = runtime.has_native_frame();
+    #[cfg(not(all(windows, feature = "gpu")))]
+    let native_frame = false;
+    if native_frame {
+        #[cfg(all(windows, feature = "gpu"))]
+        if options.screenshot.is_some() || options.report.is_some() {
+            capture_native_after_stop(&mut runtime, &wake)?;
+        }
+    } else {
+        runtime.capture_latest_frame()?;
+    }
     let frame = runtime.frame();
     let screenshot_error = options
         .screenshot
@@ -929,7 +1043,7 @@ fn run_execution(
     println!(
         "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
         exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
-        frame.frames,
+        runtime.presented_frames(),
         started.elapsed().as_secs_f64(),
         runtime.machine.sys.host_calls,
         stats.native_entries,

@@ -9,7 +9,7 @@ description = "Host platform shell: window, input, audio device, execution drive
 
 [features]
 default = []
-gpu = ["adv-device/gpu", "dep:wgpu", "dep:pollster"]
+gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:wgpu", "dep:pollster"]
 
 [dependencies]
 adv-runtime = { path = "../adv-runtime" }

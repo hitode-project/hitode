@@ -734,12 +734,13 @@ mod native {
         #[cfg(feature = "gpu")]
         pub(crate) fn create_native(
             &mut self,
+            fallback: bool,
         ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
             let width = self.state.client_width.max(1) as u32;
             let height = self.state.client_height.max(1) as u32;
             // SAFETY: the assembly joins backend tasks before destroying HWND.
             let (gpu, mut presenter) = pollster::block_on(unsafe {
-                crate::native_gpu::WindowPresenter::request(self.hwnd, width, height)
+                crate::native_gpu::WindowPresenter::request(self.hwnd, width, height, fallback)
             })?;
             presenter.configure_exclusive(width, height)?;
             self.state.gpu_mode = true;

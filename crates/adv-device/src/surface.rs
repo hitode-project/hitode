@@ -479,6 +479,47 @@ impl<P: Presenter> Surfaces<P> {
             .as_ref()
             .is_some_and(|f| f.serial != self.captured_serial)
     }
+    #[cfg(feature = "gpu")]
+    pub fn latest_native_frame(&self) -> Option<&crate::gpu::NativeFrame> {
+        self.frame_mailbox
+            .as_ref()
+            .and_then(|(mailbox, _)| mailbox.latest())
+            .or(self.pending_frame.as_ref())
+            .and_then(|frame| frame.native.as_ref())
+    }
+    /// Commit an explicit diagnostic readback, never used by normal native
+    /// presentation. A newer frame invalidates this capture instead of mixing it.
+    #[cfg(feature = "gpu")]
+    pub fn capture_native_pixels(
+        &mut self,
+        serial: u64,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<bool, String> {
+        let Some(frame) = self.latest_native_frame() else {
+            return Ok(false);
+        };
+        if frame.serial != serial {
+            return Ok(false);
+        }
+        if frame.image.width() != width
+            || frame.image.height() != height
+            || bgra.len() != width as usize * height as usize * 4
+        {
+            return Err("native capture dimensions or byte length mismatch".into());
+        }
+        self.presenter.present(FrameView {
+            width,
+            height,
+            pitch: width * 4,
+            bgra,
+            serial,
+        })?;
+        self.captured_serial = serial;
+        self.stats.host_captures += 1;
+        Ok(true)
+    }
 
     /// Materialize the newest complete frame once, including after the guest stops
     /// producing frames. Raw pixels are owned, so later guest writes or surface

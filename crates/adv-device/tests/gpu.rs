@@ -29,6 +29,25 @@ fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
     pixels
 }
 
+#[test]
+fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_losing_the_device() {
+    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    gpu.set_readback_limit(1).unwrap();
+    let target = gpu.target(2, 2, false).unwrap();
+    gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+    let wake = std::sync::Arc::new(adv_sync::WakeEvent::new().unwrap());
+    let mut ticket = gpu.readback(&target.image, Some(wake.clone())).unwrap();
+    assert!(matches!(
+        gpu.readback(&target.image, None),
+        Err(Error::Busy)
+    ));
+    ticket.cancel();
+    assert!(matches!(ticket.poll(), Some(Err(Error::Device(_)))));
+    assert!(wake.wait(Some(std::time::Duration::from_secs(1))).unwrap());
+    assert!(gpu.check().is_ok());
+    assert_eq!(read(&mut gpu, &target.image), [0, 0, 255, 255].repeat(4));
+}
+
 fn pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let at = ((y * width + x) * 4) as usize;
     bytes[at..at + 4].try_into().unwrap()
