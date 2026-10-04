@@ -2,10 +2,11 @@
 //! `BitBlt`. Pixels live in [`Surfaces`]; DCs in [`DeviceContexts`], which DirectDraw
 //! surfaces also lend DCs from.
 use adv_device::surface::{
-    BlitOptions, BlitRect, PixelFormat, Presenter, Rect, Sampling, SurfaceMemory, Surfaces, size,
+    BlitOptions, BlitRect, Presenter, Rect, Sampling, Surface, SurfaceMemory, Surfaces,
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
+mod dib;
 mod fill;
 pub mod front;
 pub use front::{DrawingProvider, install, register, set_provider};
@@ -23,6 +24,7 @@ pub mod api {
     pub const RELEASE_DC: u32 = 109;
     pub const STRETCHBLT: u32 = 110;
     pub const SET_STRETCH_MODE: u32 = 111;
+    pub const STRETCH_DIB: u32 = 112;
 }
 
 #[derive(Default)]
@@ -75,73 +77,25 @@ impl Raster {
     ) -> Result<u32, String> {
         Ok({
             m.put_u32(bits_out, 0)?;
-            let h = m.read(info, 40)?;
-            let w = i32::from_le_bytes(h[4..8].try_into().unwrap());
-            let height = i32::from_le_bytes(h[8..12].try_into().unwrap());
-            if u32::from_le_bytes(h[..4].try_into().unwrap()) != 40
-                || w <= 0
-                || height == 0
-                || height == i32::MIN
-                || h[12..14] != 1u16.to_le_bytes()
-                || !matches!(
-                    u16::from_le_bytes(h[14..16].try_into().unwrap()),
-                    8 | 16 | 24 | 32
-                )
-                || !(h[16..20] == [0; 4]
-                    || (h[16..20] == 3u32.to_le_bytes() && h[14..16] == 16u16.to_le_bytes()))
-                || usage != 0
-                || section != 0
-            {
+            if section != 0 {
                 return Ok(self.fail(87));
             }
-            if size(w as u32, height.unsigned_abs()).is_err() {
+            let Some(dib) = dib::read(m, info, usage)? else {
                 return Ok(self.fail(87));
-            }
-            let indexed = h[14..16] == 8u16.to_le_bytes();
-            let palette = if indexed {
-                let used = u32::from_le_bytes(h[32..36].try_into().unwrap());
-                let count = if used == 0 { 256 } else { used };
-                if count > 256 {
-                    return Ok(self.fail(87));
-                }
-                let Some(address) = info.checked_add(40) else {
-                    return Ok(self.fail(87));
-                };
-                let colors = m.read(address, count as usize * 4)?;
-                let mut palette = [[0; 4]; 256];
-                for (entry, color) in palette.iter_mut().zip(colors.as_chunks::<4>().0) {
-                    // RGBQUAD's final byte is reserved, not DIB alpha.
-                    *entry = [color[0], color[1], color[2], 0];
-                }
-                Some(palette)
-            } else {
-                None
             };
-            let format = if indexed {
-                PixelFormat::Indexed8
-            } else if h[14..16] == 16u16.to_le_bytes() {
-                if h[16..20] == [0; 4] {
-                    PixelFormat::Rgb555
+            let (w, height, format) = (
+                dib.width as i32,
+                if dib.bottom_up {
+                    dib.height as i32
                 } else {
-                    let Some(address) = info.checked_add(40) else {
-                        return Ok(self.fail(87));
-                    };
-                    let masks = m.read(address, 12)?;
-                    let mask = |at| u32::from_le_bytes(masks[at..at + 4].try_into().unwrap());
-                    match (mask(0), mask(4), mask(8)) {
-                        (0x7c00, 0x3e0, 0x1f) => PixelFormat::Rgb555,
-                        (0xf800, 0x7e0, 0x1f) => PixelFormat::Rgb565,
-                        _ => return Ok(self.fail(87)),
-                    }
-                }
-            } else if h[14..16] == 24u16.to_le_bytes() {
-                PixelFormat::Bgr24
-            } else {
-                PixelFormat::Bgra32
-            };
+                    -(dib.height as i32)
+                },
+                dib.format,
+            );
+            let palette = dib.palette;
             let bitmap = surfaces.create(w as u32, height.unsigned_abs(), height > 0, format, m)?;
             if let Some(palette) = palette {
-                surfaces.set_palette(bitmap, 0, &palette)?;
+                surfaces.set_palette(bitmap, 0, palette.as_ref())?;
             }
             let surface = surfaces.get(bitmap).unwrap();
             let bits = surface.pixels;
@@ -312,6 +266,95 @@ impl Raster {
             1
         })
     }
+    pub fn stretch_dib<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        m: &mut dyn SurfaceMemory,
+        destination_dc: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        source_x: i32,
+        source_y: i32,
+        source_width: i32,
+        source_height: i32,
+        bits: u32,
+        info: u32,
+        usage: u32,
+        rop: u32,
+    ) -> Result<u32, String> {
+        if rop != 0x00cc0020 || bits == 0 {
+            return Ok(self.fail(87));
+        }
+        let Some(dib) = dib::read(m, info, usage)? else {
+            return Ok(self.fail(87));
+        };
+        let dst = if destination_dc == WINDOW_DC {
+            surfaces.primary(m)?
+        } else {
+            dcs.get(objects, destination_dc).unwrap_or(0)
+        };
+        if !surfaces.contains(dst) {
+            return Ok(self.fail(6));
+        }
+        if source_width == 0 || source_height == 0 {
+            return Ok(0);
+        }
+        if width == 0 || height == 0 {
+            // Native reports the input DIB scan count for a zero destination;
+            // no pixels are accessed and no completed frame is produced.
+            return Ok(dib.height);
+        }
+        let Some(transfer) = dib::transfer(
+            &dib,
+            x,
+            y,
+            width,
+            height,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+        ) else {
+            return Ok(self.fail(87));
+        };
+        let source = Surface {
+            pixels: bits,
+            width: dib.width,
+            height: dib.height,
+            pitch: dib.pitch,
+            bottom_up: dib.bottom_up,
+            locked: None,
+            version: 0,
+            format: dib.format,
+            palette: dib.palette,
+        };
+        let options = BlitOptions {
+            mirror_x: transfer.mirror_x,
+            mirror_y: transfer.mirror_y,
+            sampling: match dcs.stretch_mode(objects, destination_dc) {
+                2 => Sampling::OrColour,
+                3 => Sampling::PixelCentre,
+                _ => Sampling::AndColour,
+            },
+        };
+        surfaces.blit_from(
+            &source,
+            transfer.source,
+            dst,
+            transfer.destination,
+            options,
+            m,
+        )?;
+        if destination_dc == WINDOW_DC {
+            surfaces.present(dst, m)?;
+        }
+        Ok(transfer.scan_lines)
+    }
+
     pub fn stretch_blt<P: Presenter>(
         &mut self,
         surfaces: &mut Surfaces<P>,

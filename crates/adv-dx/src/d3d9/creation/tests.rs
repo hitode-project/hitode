@@ -2,6 +2,69 @@ use super::*;
 use adv_cpu::backend::Guest;
 
 #[test]
+fn windowed_dialog_box_mode_is_inert_outside_scene_even_with_locked_argb_backbuffer() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (pointer, owner, back_pointer, back) = super::super::tests::setup(&mut env);
+    let this = GuestPtr::new(pointer);
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.parameters.Windowed = 1;
+        d.parameters.BackBufferFormat = 21;
+        d.parameters.Flags = 1;
+        d.parameters.SwapEffect = 1;
+        d.back_buffer = Some(back);
+    }
+    if let Some(Payload::Resource(r)) = com(&env).get_identity_mut(&mut env.sys.objects, back) {
+        r.lock = Some(resources::Lock {
+            rectangle: adv_device::surface::Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            flags: 0x10,
+            ready: true,
+        });
+    }
+    let aliases = env.sys.objects.alias_count(com(&env).namespace());
+    let refs = env.sys.objects.strong_count(owner);
+    for enabled in [0, 1] {
+        assert_eq!(set_dialogs(&mut env, this, enabled), 0);
+    }
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.scene = true;
+    }
+    for enabled in [0, 1] {
+        assert_eq!(set_dialogs(&mut env, this, enabled), INVALID);
+    }
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.scene = false;
+        d.parameters.Windowed = 0;
+    }
+    assert_eq!(set_dialogs(&mut env, this, 1), UNAVAILABLE);
+    assert_eq!(
+        set_dialogs(&mut env, GuestPtr::new(back_pointer), 1),
+        INVALID
+    );
+    assert_eq!(set_dialogs(&mut env, GuestPtr::new(0), 0), INVALID);
+    assert!(
+        resources::resource(&env, back_pointer)
+            .unwrap()
+            .lock
+            .is_some()
+    );
+    assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), aliases);
+    assert_eq!(env.sys.objects.strong_count(owner), refs);
+    assert!(env.ext.get::<super::super::State>().pending.is_empty());
+    assert!(env.ext.get::<super::super::State>().transfers.is_empty());
+}
+
+#[test]
 fn creation_rejects_missing_combined_and_unimplemented_policies_before_publication() {
     let mut m = super::super::tests::machine();
     let mut env = Env {

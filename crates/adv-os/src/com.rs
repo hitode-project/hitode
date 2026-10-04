@@ -100,6 +100,11 @@ impl Com {
         objects.lookup_alias(self.namespace, pointer)
     }
 
+    /// Borrow the canonical guest interface without acquiring a COM reference.
+    pub fn canonical<T: Any>(&self, objects: &Objects, id: ComIdentity<T>) -> Option<u32> {
+        Some(self.object(objects, id)?.canonical)
+    }
+
     fn object<'a, T: Any>(
         &self,
         objects: &'a Objects,

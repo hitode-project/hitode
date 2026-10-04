@@ -65,9 +65,26 @@ pub(super) fn register(registry: &mut Registry) {
         get_vertex_ABI,
         set_pixel_ABI,
         get_pixel_ABI,
+        set_dialogs_ABI,
     ] {
         registry.register(api);
     }
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetDialogBoxMode", level = implement)]
+fn set_dialogs(env: &mut Env<'_>, this: GuestPtr<()>, _enable_dialogs: i32) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    if d.scene {
+        return INVALID;
+    }
+    // Windowed mode has no dialog-box rendering effect. The fullscreen Reset
+    // restrictions cannot be reached: this profile rejects fullscreen creation
+    // and Reset, rather than advertising a GDI-compatible fullscreen surface.
+    if d.parameters.Windowed == 0 {
+        return UNAVAILABLE;
+    }
+    0
 }
 #[win32(d3d9, name = "IDirect3DDevice9::GetCreationParameters", level = implement)]
 fn parameters(

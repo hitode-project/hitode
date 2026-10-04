@@ -27,7 +27,9 @@ pub(super) fn draw_target(env: &Env<'_>, this: u32) -> Result<Target, u32> {
     let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
         return Err(INVALID);
     };
-    if resources::locked(env, r) {
+    // Authored native D3D9 permits Clear/draw while a lockable back buffer is
+    // locked. Other default-pool resource locks still prohibit GPU drawing.
+    if resources::locked(env, r) && !readback::lockable_back_buffer(env, r.pointer, r) {
         return Err(INVALID);
     }
     let provider = env.ext.get::<State>().provider;

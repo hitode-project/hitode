@@ -11,7 +11,13 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-invalid-parameter-handler-set-thread-local-invalid-parameter-handler",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/execute-onexit-table-initialize-onexit-table-register-onexit-function",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/malloc",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcat-s-wcscat-s-mbscat-s"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcat-s-wcscat-s-mbscat-s",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/onexit-onexit-m",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/atexit",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/exit-exit-exit",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/cexit-c-exit",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/getmainargs-wgetmainargs",
+    "https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -36,5 +42,12 @@
   "corecrt_wstring.h": {
     "header": "ucrt/corecrt_wstring.h",
     "sha256": "c485f918d43f0f846d77a36eaee9e111f57bf2eec32db7d9719ff924771744c6"
+  },
+  "legacy_startup": {
+    "declarations": "Microsoft Learn __getmainargs/__wgetmainargs, x86 cdecl five parameters; these legacy exports are absent from modern UCRT SDK headers and are not advertised for ucrtbase/API-set DLLs"
+  },
+  "process.h": {
+    "header": "ucrt/process.h",
+    "sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490"
   }
 }

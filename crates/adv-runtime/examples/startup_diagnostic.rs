@@ -1,6 +1,7 @@
 //! Local, headless failure evidence with guest code/state snapshots. No game mutation.
 //! startup_diagnostic <exe> <output-directory> [seconds=10] [codepage=932] [hex-pages...]
 //! ADV_STARTUP_API_MODE=strict|discovery selects the diagnostic API policy.
+//! ADV_STARTUP_GPU=1 installs the normal device for GPU initialization evidence.
 use adv_cpu::backend::{ArchitecturalState, Guest, GuestExt, Reg};
 use adv_machine::{
     Env, Outcome, RunResult, SliceResult,
@@ -17,6 +18,26 @@ struct FaultDiagnostics {
     original: ExceptionHandler,
     directory: PathBuf,
     faults: usize,
+}
+
+#[cfg(feature = "gpu")]
+fn initialize<T>(future: impl std::future::Future<Output = T>) -> T {
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Owner(std::thread::Thread);
+    impl Wake for Owner {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(std::sync::Arc::new(Owner(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => std::thread::park(),
+        }
+    }
 }
 
 fn register_value(register: Register, state: &ArchitecturalState, regs: &[u32; 8]) -> Option<u64> {
@@ -211,6 +232,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adv_runtime::vorbis::Policy::Native,
     )?;
     runtime.set_codepage(codepage);
+    if std::env::var("ADV_STARTUP_GPU").as_deref() == Ok("1") {
+        #[cfg(feature = "gpu")]
+        runtime.install_gpu(
+            initialize(adv_device::gpu::Gpu::request(false)).map_err(|error| error.to_string())?,
+        )?;
+        #[cfg(not(feature = "gpu"))]
+        return Err("ADV_STARTUP_GPU requires the gpu feature".into());
+    }
     runtime.set_auto_dialog_ms(Some(50));
     if let Some(mode) = api_mode {
         runtime.set_api_mode(mode);

@@ -72,6 +72,9 @@ impl Resource {
 pub(super) struct Lock {
     pub rectangle: Rect,
     pub flags: u32,
+    /// Pending readback/upload keeps the surface exclusive, but exposes no
+    /// writable guest pointer until its Machine continuation completes.
+    pub ready: bool,
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
@@ -751,6 +754,7 @@ pub(super) fn texture_lock(
         r.levels[level as usize].lock = Some(Lock {
             rectangle: rect,
             flags,
+            ready: true,
         });
     }
     0
@@ -803,7 +807,7 @@ pub(super) fn texture_unlock(env: &mut Env<'_>, this: GuestPtr<()>, level: u32) 
         id,
         Operation::Upload {
             resource: id,
-            level,
+            level: Some(level),
             target,
             pixels,
             pitch,

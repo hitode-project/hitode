@@ -8,6 +8,7 @@ mod convert;
 mod floating;
 mod heap;
 mod onexit;
+mod startup;
 mod wide_string;
 
 #[derive(Default)]
@@ -65,6 +66,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 pub fn register(r: &mut Registry) {
     floating::register(r);
     onexit::register(r);
+    startup::register(r);
     convert::register(r);
     heap::register(r);
     wide_string::register(r);
@@ -141,6 +143,8 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
 
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    onexit::release_process_tables(env)?;
+    startup::release_process_tables(env)?;
     release_errno(env, None)
 }
 

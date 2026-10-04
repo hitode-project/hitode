@@ -264,3 +264,94 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
     ));
     assert_eq!(env.ext.get::<Policy>().serial, 10);
 }
+
+#[test]
+fn get_direct3d_preserves_factory_identity_after_original_release_and_outlives_device() {
+    let mut m = machine();
+    m.sys.objects = Objects::with_limits(ObjectLimits {
+        references: 8,
+        ..ObjectLimits::default()
+    });
+    m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (device, owner, _, back) = setup(&mut env);
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.back_buffer = Some(back);
+    }
+    let factory = self::device(&env, device).unwrap().factory;
+    let original = com(&env).canonical(&env.sys.objects, factory).unwrap();
+    assert_eq!(
+        release(&mut env, original),
+        1,
+        "device retains the actual creator"
+    );
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+    assert_eq!(get_direct3d(&mut env, GuestPtr::new(device), output), 0);
+    assert_eq!(output.read(env.cpu).unwrap(), original);
+    assert_eq!(com(&env).references(&env.sys.objects, factory), Some(2));
+    let iid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
+    iid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    assert!(matches!(
+        query(&mut env, GuestPtr::new(original), iid, output),
+        Outcome::Return(0)
+    ));
+    assert_eq!(output.read(env.cpu).unwrap(), original);
+    assert_eq!(release(&mut env, original), 2);
+    assert_eq!(release(&mut env, device), 0);
+    assert!(com(&env).get_identity(&env.sys.objects, owner).is_none());
+    assert!(com(&env).get_identity(&env.sys.objects, back).is_none());
+    assert_eq!(com(&env).references(&env.sys.objects, factory), Some(1));
+    assert_eq!(adapter_count(&mut env, GuestPtr::new(original)), 1);
+    assert_eq!(release(&mut env, original), 0);
+    assert!(com(&env).canonical(&env.sys.objects, factory).is_none());
+    assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), 0);
+}
+
+#[test]
+fn get_direct3d_output_fault_and_reference_limit_do_not_retain_or_partially_publish() {
+    let mut m = machine();
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (device, owner, resource, _) = setup(&mut env);
+    let factory = self::device(&env, device).unwrap().factory;
+    let original = com(&env).canonical(&env.sys.objects, factory).unwrap();
+    let objects = env.sys.objects.object_count();
+    let refs = env.sys.objects.strong_count(factory);
+    let page = env.sys.vm.alloc(env.cpu, 8192, Prot::RW).unwrap();
+    let cross_page = GuestPtr::<u32>::new(page + 4094);
+    cross_page.write(env.cpu, 0xdeadbeef).unwrap();
+    env.cpu.protect(page + 4096, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        get_direct3d(&mut env, GuestPtr::new(device), cross_page),
+        INVALID
+    );
+    assert_eq!(cross_page.read(env.cpu).unwrap(), 0xdeadbeef);
+    assert_eq!(env.sys.objects.strong_count(factory), refs);
+    let output = GuestPtr::<u32>::new(page);
+    output.write(env.cpu, 123).unwrap();
+    assert_eq!(
+        get_direct3d(&mut env, GuestPtr::new(device), output),
+        OUT_OF_MEMORY
+    );
+    assert_eq!(output.read(env.cpu).unwrap(), 0);
+    assert_eq!(env.sys.objects.strong_count(factory), refs);
+    assert_eq!(env.sys.objects.object_count(), objects);
+    assert_eq!(
+        get_direct3d(&mut env, GuestPtr::new(resource), output),
+        INVALID
+    );
+    assert_eq!(env.sys.objects.strong_count(factory), refs);
+    assert_eq!(release(&mut env, original), 1);
+    assert_eq!(get_direct3d(&mut env, GuestPtr::new(device), output), 0);
+    assert_eq!(output.read(env.cpu).unwrap(), original);
+    assert_eq!(com(&env).references(&env.sys.objects, owner), Some(1));
+}

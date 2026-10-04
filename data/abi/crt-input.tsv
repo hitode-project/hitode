@@ -48,3 +48,32 @@ api-ms-win-crt-heap-l1-1-0.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:si
 api-ms-win-crt-heap-l1-1-0.dll	free	cdecl	void	void	block:void*:ptr:1
 ucrtbase.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
 api-ms-win-crt-string-l1-1-0.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
+msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
+msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcrt.dll	_cexit	cdecl	void	void	
+msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
+msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcr80.dll	_cexit	cdecl	void	void	
+msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcr90.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
+msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcr90.dll	_cexit	cdecl	void	void	
+msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr90.dll	_exit	cdecl	void	void	status:i32:i32:1
+ucrtbase.dll	_crt_atexit	cdecl	i32	i32	function:callback:ptr:1
+ucrtbase.dll	_cexit	cdecl	void	void	
+ucrtbase.dll	exit	cdecl	void	void	status:i32:i32:1
+ucrtbase.dll	_exit	cdecl	void	void	status:i32:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_crt_atexit	cdecl	i32	i32	function:callback:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_cexit	cdecl	void	void	
+api-ms-win-crt-runtime-l1-1-0.dll	exit	cdecl	void	void	status:i32:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcrt.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr90.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr90.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1

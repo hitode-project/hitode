@@ -60,6 +60,24 @@ pub(super) fn value(env: &mut Env<'_>, name: &str) -> Option<Vec<u16>> {
         .map(|v| v.value.clone())
 }
 
+/// A CRT startup snapshot borrows the same process environment, not host variables.
+pub(crate) fn entries(env: &mut Env<'_>) -> Vec<Vec<u16>> {
+    initialize(env);
+    env.ext
+        .get::<Environment>()
+        .variables
+        .values()
+        .map(|v| {
+            v.name
+                .iter()
+                .copied()
+                .chain([u16::from(b'=')])
+                .chain(v.value.iter().copied())
+                .collect()
+        })
+        .collect()
+}
+
 fn read(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Vec<u16>, u32> {
     if pointer == 0 {
         return Err(87);

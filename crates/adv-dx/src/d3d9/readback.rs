@@ -20,6 +20,7 @@ pub(super) struct PendingTransfer {
     ticket: Option<Readback>,
     job: Option<Task>,
     result: Option<u32>,
+    lock_output: Option<GuestPtr<D3DLOCKED_RECT>>,
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [create_offscreen_ABI, transfer_ABI, lock_ABI, unlock_ABI] {
@@ -101,83 +102,249 @@ fn lock(
     output: GuestPtr<D3DLOCKED_RECT>,
     rect: GuestPtr<RECT>,
     flags: u32,
-) -> u32 {
+) -> Outcome {
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
-        return resources::texture_lock(env, GuestPtr::new(container), level, output, rect, flags);
+        return Outcome::Return(resources::texture_lock(
+            env,
+            GuestPtr::new(container),
+            level,
+            output,
+            rect,
+            flags,
+        ));
     }
     let Some(r) = resources::resource(env, this.addr()) else {
-        return INVALID;
+        return Outcome::Return(INVALID);
     };
-    if r.kind != Kind::Surface
-        || r.desc.Pool < 2
-        || r.storage == 0
-        || r.lock.is_some()
-        || flags & !0x10 != 0
-    {
-        return INVALID;
+    let back_buffer = lockable_back_buffer(env, this.addr(), r);
+    // DONOTWAIT needs a genuinely nonblocking readiness protocol. Until that
+    // exists it is rejected, never silently turned into a Machine wait.
+    let allowed_flags = if back_buffer { 0x810 | 0x8000 } else { 0x10 };
+    if r.kind != Kind::Surface || r.lock.is_some() || flags & !allowed_flags != 0 {
+        return Outcome::Return(INVALID);
     }
-    let rectangle = if rect.is_null() {
-        Rect {
+    if !back_buffer && (r.desc.Pool < 2 || r.storage == 0) {
+        return Outcome::Return(INVALID);
+    }
+    let rectangle = match lock_rectangle(env, r.desc.Width, r.desc.Height, rect) {
+        Ok(rectangle) => rectangle,
+        Err(error) => return Outcome::Return(error),
+    };
+    if adv_abi::guest::check_range(env.cpu, output.addr(), 8, Prot::WRITE).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    let id = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .unwrap();
+    let selected = Lock {
+        rectangle,
+        flags,
+        ready: !back_buffer,
+    };
+    if !back_buffer {
+        let value = locked_rect(r, rectangle);
+        if output.write(env.cpu, value).is_err() {
+            return Outcome::Return(INVALID);
+        }
+        set_lock(env, id, Some(selected));
+        return Outcome::Return(0);
+    }
+    let owner = r.device;
+    let state = env.ext.get::<State>();
+    if state.sender.is_none() || state.wake.is_none() {
+        return Outcome::Return(UNAVAILABLE);
+    }
+    let Some(image) = r
+        .surface
+        .and_then(|s| (state.provider.target)(env.ext, s))
+        .map(|t| t.image)
+    else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(length) = r
+        .desc
+        .Width
+        .checked_mul(r.desc.Height)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|&n| n > 0 && n <= 64 * 1024 * 1024)
+    else {
+        return Outcome::Return(INVALID);
+    };
+    let storage = r.storage;
+    // This is explicit guest staging owned by the same Resource, allocated on
+    // the first CPU lock and reused. Creation/Present never read GPU pixels.
+    let storage = if storage == 0 {
+        let Some(storage) = alloc(env, length) else {
+            return Outcome::Return(OUT_OF_MEMORY);
+        };
+        if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
+            r.storage = storage;
+        }
+        storage
+    } else {
+        storage
+    };
+    if adv_abi::guest::check_range(env.cpu, storage, length, Prot::WRITE).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    let event = match retain_transfer(env, owner, id) {
+        Ok(event) => event,
+        Err(error) => return Outcome::Return(error),
+    };
+    set_lock(env, id, Some(selected));
+    enqueue(
+        env,
+        PendingTransfer {
+            context: env.sys.current,
+            event,
+            owner,
+            destination: id,
+            image,
+            storage,
+            length,
+            ticket: None,
+            job: None,
+            result: None,
+            lock_output: Some(output),
+        },
+    )
+}
+
+pub(super) fn lockable_back_buffer(env: &Env<'_>, pointer: u32, r: &Resource) -> bool {
+    if r.desc.Pool != 0 || r.desc.MultiSampleType != 0 || r.desc.MultiSampleQuality != 0 {
+        return false;
+    }
+    let id = com(env).identity::<Payload>(&env.sys.objects, pointer);
+    matches!(com(env).get_identity(&env.sys.objects, r.device),
+        Some(Payload::Device(d)) if d.parameters.Flags & 1 != 0 && d.back_buffer == id)
+}
+fn lock_rectangle(
+    env: &Env<'_>,
+    width: u32,
+    height: u32,
+    rect: GuestPtr<RECT>,
+) -> Result<Rect, u32> {
+    if rect.is_null() {
+        return Ok(Rect {
             x: 0,
             y: 0,
-            w: r.desc.Width,
-            h: r.desc.Height,
-        }
-    } else {
-        let Ok(rect) = rect.read(env.cpu) else {
-            return INVALID;
-        };
-        if rect.left < 0
-            || rect.top < 0
-            || rect.right <= rect.left
-            || rect.bottom <= rect.top
-            || rect.right as u32 > r.desc.Width
-            || rect.bottom as u32 > r.desc.Height
-        {
-            return INVALID;
-        }
-        Rect {
-            x: rect.left as u32,
-            y: rect.top as u32,
-            w: (rect.right - rect.left) as u32,
-            h: (rect.bottom - rect.top) as u32,
-        }
-    };
+            w: width,
+            h: height,
+        });
+    }
+    let rect = rect.read(env.cpu).map_err(|_| INVALID)?;
+    if rect.left < 0
+        || rect.top < 0
+        || rect.right <= rect.left
+        || rect.bottom <= rect.top
+        || rect.right as u32 > width
+        || rect.bottom as u32 > height
+    {
+        return Err(INVALID);
+    }
+    Ok(Rect {
+        x: rect.left as u32,
+        y: rect.top as u32,
+        w: (rect.right - rect.left) as u32,
+        h: (rect.bottom - rect.top) as u32,
+    })
+}
+fn locked_rect(r: &Resource, rectangle: Rect) -> D3DLOCKED_RECT {
     let pitch = r.desc.Width * 4;
-    let bits = r.storage + rectangle.y * pitch + rectangle.x * 4;
-    if output
-        .write(
-            env.cpu,
-            D3DLOCKED_RECT {
-                Pitch: pitch as i32,
-                pBits: bits,
-            },
-        )
-        .is_err()
-    {
-        return INVALID;
+    D3DLOCKED_RECT {
+        Pitch: pitch as i32,
+        pBits: r.storage + rectangle.y * pitch + rectangle.x * 4,
     }
-    if let Some(Payload::Resource(r)) =
-        com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-    {
-        r.lock = Some(Lock { rectangle, flags });
+}
+fn set_lock(env: &mut Env<'_>, resource: Id, lock: Option<Lock>) {
+    if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, resource) {
+        r.lock = lock;
     }
-    0
 }
 #[win32(d3d9,name="IDirect3DSurface9::UnlockRect",level=implement)]
 fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
         return resources::texture_unlock(env, GuestPtr::new(container), level);
     }
-    let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-    else {
+    let Some(r) = resources::resource(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if r.kind != Kind::Surface || r.desc.Pool < 2 || r.lock.is_none() {
+    let Some(lock) = r.lock.filter(|lock| lock.ready) else {
+        return Outcome::Return(INVALID);
+    };
+    if r.kind != Kind::Surface {
         return Outcome::Return(INVALID);
     }
-    r.lock = None;
-    Outcome::Return(0)
+    let id = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .unwrap();
+    if r.desc.Pool >= 2 || lock.flags & 0x10 != 0 {
+        set_lock(env, id, None);
+        return Outcome::Return(0);
+    }
+    if !lockable_back_buffer(env, this.addr(), r) {
+        return Outcome::Return(INVALID);
+    }
+    let provider = env.ext.get::<State>().provider;
+    let Some(target) = r.surface.and_then(|s| (provider.target)(env.ext, s)) else {
+        return Outcome::Return(INVALID);
+    };
+    let pitch = r.desc.Width * 4;
+    let size = (lock.rectangle.h - 1) * pitch + lock.rectangle.w * 4;
+    let address = locked_rect(r, lock.rectangle).pBits;
+    let format = r.desc.Format;
+    let mut pixels = vec![0; size as usize];
+    if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err()
+        || env.cpu.read(address, &mut pixels).is_err()
+    {
+        return Outcome::Return(INVALID);
+    }
+    if format == 22 {
+        for y in 0..lock.rectangle.h as usize {
+            for x in 0..lock.rectangle.w as usize {
+                pixels[y * pitch as usize + x * 4 + 3] = 255;
+            }
+        }
+    }
+    set_lock(
+        env,
+        id,
+        Some(Lock {
+            ready: false,
+            ..lock
+        }),
+    );
+    dispatch(
+        env,
+        id,
+        Operation::Upload {
+            resource: id,
+            level: None,
+            target,
+            pixels,
+            pitch,
+            rectangle: lock.rectangle,
+        },
+    )
+}
+
+/// Surface upload retries reserve the existing lock. Failure leaves it usable
+/// for retry; cancellation of its guest continuation releases the reservation.
+pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled: bool) {
+    if let Operation::Upload {
+        resource,
+        level: None,
+        ..
+    } = operation
+        && let Some(Payload::Resource(r)) =
+            com(env).get_identity_mut(&mut env.sys.objects, *resource)
+    {
+        if cancelled {
+            r.lock = None;
+        } else if let Some(lock) = &mut r.lock {
+            lock.ready = true;
+        }
+    }
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderTargetData",level=implement)]
 pub(super) fn transfer(
@@ -234,12 +401,34 @@ pub(super) fn transfer(
         .identity::<Payload>(&env.sys.objects, destination.addr())
         .unwrap();
     let destination = resources::binding_owner(env, destination);
+    let event = match retain_transfer(env, owner, destination) {
+        Ok(event) => event,
+        Err(error) => return Outcome::Return(error),
+    };
+    enqueue(
+        env,
+        PendingTransfer {
+            context: env.sys.current,
+            event,
+            owner,
+            destination,
+            image,
+            storage,
+            length,
+            ticket: None,
+            job: None,
+            result: None,
+            lock_output: None,
+        },
+    )
+}
+fn retain_transfer(env: &mut Env<'_>, owner: Id, destination: Id) -> Result<u32, u32> {
     if !com(env).retain_internal(&mut env.sys.objects, owner) {
-        return Outcome::Return(OUT_OF_MEMORY);
+        return Err(OUT_OF_MEMORY);
     }
     if !com(env).retain_internal(&mut env.sys.objects, destination) {
         let _ = com(env).release_internal(&mut env.sys.objects, owner);
-        return Outcome::Return(OUT_OF_MEMORY);
+        return Err(OUT_OF_MEMORY);
     }
     let event = env.sys.objects.insert(Object::Event {
         manual_reset: true,
@@ -249,20 +438,13 @@ pub(super) fn transfer(
         for id in [destination, owner] {
             let _ = com(env).release_internal(&mut env.sys.objects, id);
         }
-        return Outcome::Return(OUT_OF_MEMORY);
+        return Err(OUT_OF_MEMORY);
     }
-    env.ext.get_mut::<State>().transfers.push(PendingTransfer {
-        context: env.sys.current,
-        event,
-        owner,
-        destination,
-        image,
-        storage,
-        length,
-        ticket: None,
-        job: None,
-        result: None,
-    });
+    Ok(event)
+}
+fn enqueue(env: &mut Env<'_>, transfer: PendingTransfer) -> Outcome {
+    let event = transfer.event;
+    env.ext.get_mut::<State>().transfers.push(transfer);
     Outcome::block(
         Wait::Object {
             handle: event,
@@ -276,14 +458,51 @@ pub(super) fn transfer(
                 .iter()
                 .position(|p| p.event == event)
                 .expect("owned map wait");
-            let transfer = env.ext.get_mut::<State>().transfers.swap_remove(index);
-            let result = transfer
+            let mut transfer = env.ext.get_mut::<State>().transfers.swap_remove(index);
+            let mut result = transfer
                 .result
                 .expect("readback signals only on typed completion");
+            if let Some(output) = transfer.lock_output {
+                result = publish_lock(env, transfer.destination, output, result);
+                // Published locks belong to the Resource. Failed or cancelled
+                // unpublished locks are still cleared by cleanup below.
+                if result == 0 {
+                    transfer.lock_output = None;
+                }
+            }
             cleanup(env, transfer);
             Outcome::Return(result)
         },
     )
+}
+fn publish_lock(
+    env: &mut Env<'_>,
+    resource: Id,
+    output: GuestPtr<D3DLOCKED_RECT>,
+    result: u32,
+) -> u32 {
+    if result != 0 {
+        return result;
+    }
+    let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, resource) else {
+        return INVALID;
+    };
+    let Some(lock) = r.lock else {
+        return INVALID;
+    };
+    let value = locked_rect(r, lock.rectangle);
+    if output.write(env.cpu, value).is_err() {
+        return INVALID;
+    }
+    set_lock(
+        env,
+        resource,
+        Some(Lock {
+            ready: true,
+            ..lock
+        }),
+    );
+    0
 }
 fn cleanup(env: &mut Env<'_>, transfer: PendingTransfer) {
     if transfer.result.is_none()
@@ -291,8 +510,26 @@ fn cleanup(env: &mut Env<'_>, transfer: PendingTransfer) {
     {
         ticket.cancel();
     }
-    env.sys.objects.close(transfer.event);
-    for id in [transfer.destination, transfer.owner] {
+    release_transfer(
+        env,
+        transfer.event,
+        transfer.destination,
+        transfer.owner,
+        transfer.lock_output.is_some(),
+    );
+}
+fn release_transfer(
+    env: &mut Env<'_>,
+    event: u32,
+    destination: Id,
+    owner: Id,
+    unpublished_lock: bool,
+) {
+    if unpublished_lock {
+        set_lock(env, destination, None);
+    }
+    env.sys.objects.close(event);
+    for id in [destination, owner] {
         if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
             destroy(env, dead);
         }
@@ -357,7 +594,18 @@ pub(super) fn pump(env: &mut Env<'_>) -> bool {
             {
                 transfer.result = Some(match result {
                     Ok(pixels) if pixels.len() == transfer.length as usize => {
-                        if env.cpu.write(transfer.storage, &pixels).is_ok() {
+                        // A different guest thread can change protection while
+                        // this thread is blocked. Revalidate the complete span
+                        // before committing any bytes on every backend.
+                        if adv_abi::guest::check_range(
+                            env.cpu,
+                            transfer.storage,
+                            transfer.length,
+                            Prot::WRITE,
+                        )
+                        .is_ok()
+                            && env.cpu.write(transfer.storage, &pixels).is_ok()
+                        {
                             0
                         } else {
                             INVALID
@@ -375,3 +623,6 @@ pub(super) fn pump(env: &mut Env<'_>) -> bool {
     }
     progress
 }
+
+#[cfg(test)]
+mod tests;

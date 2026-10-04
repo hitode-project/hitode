@@ -120,7 +120,7 @@ enum Operation {
     },
     Upload {
         resource: Id,
-        level: u32,
+        level: Option<u32>,
         target: Target,
         pixels: Vec<u8>,
         pitch: u32,
@@ -152,6 +152,7 @@ pub fn register(registry: &mut Registry) {
         device_add_ref_ABI,
         device_release_ABI,
         cooperative_ABI,
+        get_direct3d_ABI,
         begin_scene_ABI,
         end_scene_ABI,
         clear_ABI,
@@ -454,6 +455,35 @@ fn adapter_count(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         Some(Payload::Factory)
     ))
 }
+#[win32(d3d9, name = "IDirect3DDevice9::GetDirect3D", level = implement)]
+fn get_direct3d(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
+    if output.write(env.cpu, 0).is_err() {
+        return INVALID;
+    }
+    let Some(factory) = device(env, this.addr()).map(|d| d.factory) else {
+        return INVALID;
+    };
+    if !matches!(
+        com(env).get_identity(&env.sys.objects, factory),
+        Some(Payload::Factory)
+    ) {
+        return INVALID;
+    }
+    let Some(pointer) = com(env).canonical(&env.sys.objects, factory) else {
+        return INVALID;
+    };
+    if com(env)
+        .add_ref_identity(&mut env.sys.objects, factory)
+        .is_none()
+    {
+        return OUT_OF_MEMORY;
+    }
+    if output.write(env.cpu, pointer).is_err() {
+        release(env, pointer);
+        return INVALID;
+    }
+    0
+}
 fn normalize(
     env: &Env<'_>,
     mut parameters: D3DPRESENT_PARAMETERS,
@@ -464,7 +494,7 @@ fn normalize(
         || parameters.MultiSampleQuality != 0
         || parameters.SwapEffect != 1
         || parameters.BackBufferCount > 1
-        || parameters.Flags & !2 != 0
+        || parameters.Flags & !3 != 0
         || (parameters.EnableAutoDepthStencil != 0
             && depth::format(parameters.AutoDepthStencilFormat).is_none())
         || parameters.FullScreen_RefreshRateInHz != 0
@@ -852,7 +882,11 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
                 if let Some(Payload::Resource(r)) =
                     com(env).get_identity_mut(&mut env.sys.objects, *resource)
                 {
-                    r.levels[*level as usize].lock = None;
+                    if let Some(level) = level {
+                        r.levels[*level as usize].lock = None;
+                    } else {
+                        r.lock = None;
+                    }
                 }
                 Completion::Command
             }),
@@ -894,6 +928,7 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
         Ok(value) => completed(env, value),
         Err(Error::Busy) => {
             if !com(env).retain_internal(&mut env.sys.objects, owner) {
+                readback::upload_failed(env, &operation, false);
                 return Outcome::Return(OUT_OF_MEMORY);
             }
             let event = env.sys.objects.insert(Object::Event {
@@ -902,6 +937,7 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
             });
             if event == 0 {
                 let _ = com(env).release_internal(&mut env.sys.objects, owner);
+                readback::upload_failed(env, &operation, false);
                 return Outcome::Return(OUT_OF_MEMORY);
             }
             env.ext.get_mut::<State>().pending.push(Pending {
@@ -941,7 +977,10 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                 },
             )
         }
-        Err(error) => gpu_error(error),
+        Err(error) => {
+            readback::upload_failed(env, &operation, false);
+            gpu_error(error)
+        }
     }
 }
 /// Retry only when the execution owner runs after an actual external wake. No
@@ -962,6 +1001,9 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
             .get(wait.context as usize)
             .is_none_or(|ctx| ctx.is_done())
         {
+            if let Some(operation) = &wait.operation {
+                readback::upload_failed(&mut env, operation, true);
+            }
             env.sys.objects.close(wait.event);
             if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, wait.owner) {
                 destroy(&mut env, dead);
@@ -972,6 +1014,9 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
             match execute(&mut env, operation) {
                 Err(Error::Busy) => {}
                 result => {
+                    if result.is_err() {
+                        readback::upload_failed(&mut env, operation, false);
+                    }
                     wait.operation = None;
                     wait.result = Some(result);
                     env.sys.set_event(wait.event);
@@ -1000,6 +1045,9 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
         thunk: 0,
     };
     for wait in pending {
+        if let Some(operation) = &wait.operation {
+            readback::upload_failed(&mut env, operation, true);
+        }
         env.sys.objects.close(wait.event);
         if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, wait.owner) {
             destroy(&mut env, dead);
@@ -1077,6 +1125,12 @@ fn present(
         || override_window.0 != 0
         || !dirty.is_null()
     {
+        return Outcome::Return(INVALID);
+    }
+    if d.back_buffer.is_some_and(|id| {
+        matches!(com(env).get_identity(&env.sys.objects, id),
+            Some(Payload::Resource(r)) if resources::locked(env, r))
+    }) {
         return Outcome::Return(INVALID);
     }
     let surface = d.surface;

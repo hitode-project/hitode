@@ -42,6 +42,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::DELETE_DC, delete_dc_ABI),
     (api::BITBLT, bit_blt_ABI),
     (api::STRETCHBLT, stretch_blt_ABI),
+    (api::STRETCH_DIB, stretch_dib_ABI),
     (api::SET_STRETCH_MODE, set_stretch_mode_ABI),
     (api::FLUSH, flush_ABI),
 ];
@@ -373,6 +374,52 @@ fn stretch_blt(
         )
     })
 }
+#[win32(gdi32, name = "StretchDIBits", level = implement)]
+fn stretch_dib(
+    env: &mut Env<'_>,
+    dst: Handle,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    sx: i32,
+    sy: i32,
+    sw: i32,
+    sh: i32,
+    bits: GuestPtr<()>,
+    info: GuestPtr<()>,
+    usage: u32,
+    rop: u32,
+) -> Outcome {
+    if !available(env) {
+        return fail(env, 6);
+    }
+    if adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err() {
+        return fail(env, 87);
+    }
+    raster_call(env, |r, s, d, o, m| {
+        r.stretch_dib(
+            s,
+            d,
+            o,
+            m,
+            dst.0,
+            x,
+            y,
+            width,
+            height,
+            sx,
+            sy,
+            sw,
+            sh,
+            bits.addr(),
+            info.addr(),
+            usage,
+            rop,
+        )
+    })
+}
+
 #[win32(gdi32, name = "SetStretchBltMode", level = state)]
 fn set_stretch_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
     if !available(env) {

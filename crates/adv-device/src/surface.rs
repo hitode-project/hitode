@@ -367,6 +367,12 @@ pub struct BlitRect {
 pub enum Sampling {
     #[default]
     Nearest,
+    /// Select the source pixel containing the destination pixel's centre.
+    PixelCentre,
+    /// Combine decoded color channels when reducing, selecting pixel centres
+    /// on an enlarged axis. Palette indices are never combined as colors.
+    AndColour,
+    OrColour,
     And,
     Or,
 }
@@ -1309,6 +1315,97 @@ impl<P: Presenter> Surfaces<P> {
             .get(&src)
             .ok_or("unknown source surface")?
             .clone();
+        self.blit_surface(&s, sr, dst, dr, options, m)
+    }
+
+    /// Borrow external pixels for this operation only. No id, storage or guest
+    /// allocation is adopted. Palette and row order use the same blit kernel.
+    pub fn blit_from(
+        &mut self,
+        source: &Surface,
+        sr: Rect,
+        dst: u32,
+        dr: BlitRect,
+        options: BlitOptions,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        if source.width == 0 || source.height == 0 {
+            return Err("empty external surface".into());
+        }
+        size(source.width, source.height)?;
+        let row_bytes = source
+            .width
+            .checked_mul(source.format.bytes())
+            .ok_or("source overflow")?;
+        if source.pitch < row_bytes
+            || source.pixels == 0
+            || (source.format == PixelFormat::Indexed8 && source.palette.is_none())
+            || (source.height - 1)
+                .checked_mul(source.pitch)
+                .and_then(|offset| offset.checked_add(row_bytes))
+                .and_then(|length| source.pixels.checked_add(length - 1))
+                .is_none()
+        {
+            return Err("invalid external surface layout".into());
+        }
+        if sr
+            .x
+            .checked_add(sr.w)
+            .is_none_or(|right| right > source.width)
+            || sr
+                .y
+                .checked_add(sr.h)
+                .is_none_or(|bottom| bottom > source.height)
+        {
+            return Err("source rectangle outside surface".into());
+        }
+        #[cfg(feature = "gpu")]
+        if self.native_surfaces.contains_key(&dst) {
+            return Err("native blit requires GPU copy or explicit asynchronous readback".into());
+        }
+        let d = self
+            .surfaces
+            .get(&dst)
+            .ok_or("unknown destination surface")?;
+        let left = dr.x.max(0);
+        let top = dr.y.max(0);
+        let right =
+            dr.x.checked_add(i64::from(dr.w))
+                .ok_or("destination overflow")?
+                .min(i64::from(d.width));
+        let bottom =
+            dr.y.checked_add(i64::from(dr.h))
+                .ok_or("destination overflow")?
+                .min(i64::from(d.height));
+        if right <= left || bottom <= top || sr.w == 0 || sr.h == 0 {
+            return Ok(());
+        }
+        // Validate every source/destination row before the first write. DIB
+        // padding is not part of a pixel and need not be readable or writable.
+        for y in sr.y..sr.y + sr.h {
+            m.read(
+                source.row(sr.x, y),
+                sr.w as usize * source.format.bytes() as usize,
+            )?;
+        }
+        for y in top..bottom {
+            m.writable(
+                d.row(left as u32, y as u32),
+                (right - left) as usize * d.format.bytes() as usize,
+            )?;
+        }
+        self.blit_surface(source, sr, dst, dr, options, m)
+    }
+
+    fn blit_surface(
+        &mut self,
+        s: &Surface,
+        sr: Rect,
+        dst: u32,
+        dr: BlitRect,
+        options: BlitOptions,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
         let d = self
             .surfaces
             .get(&dst)
@@ -1348,16 +1445,33 @@ impl<P: Presenter> Surfaces<P> {
         let unscaled = sr.w == dr.w && sr.h == dr.h;
         let same_encoding =
             s.format == d.format && (s.format != PixelFormat::Indexed8 || s.palette == d.palette);
+        let colour = matches!(options.sampling, Sampling::AndColour | Sampling::OrColour);
+        let sample_bytes = if colour { 4 } else { sb };
+        let same_samples = same_encoding && (!colour || s.format == PixelFormat::Bgra32);
+        let same_layout = s.pixels == d.pixels
+            && s.pitch == d.pitch
+            && s.height == d.height
+            && s.bottom_up == d.bottom_up
+            && s.format == d.format;
+        let aliases = u64::from(s.pixels)
+            < u64::from(d.pixels) + u64::from(d.pitch) * u64::from(d.height)
+            && u64::from(d.pixels) < u64::from(s.pixels) + u64::from(s.pitch) * u64::from(s.height);
         let remap: Option<[u8; 256]> = (s.format == PixelFormat::Indexed8
             && d.format == PixelFormat::Indexed8
-            && !same_encoding)
+            && !same_encoding
+            && !colour)
             .then(|| {
                 std::array::from_fn(|index| d.encode_pixel(s.decode_pixel(&[index as u8]))[0])
             });
-        if unscaled && !options.mirror_x && !options.mirror_y && same_encoding {
+        if unscaled
+            && !options.mirror_x
+            && !options.mirror_y
+            && same_encoding
+            && (!aliases || same_layout)
+        {
             // Logical row order is independent of top-down/bottom-up storage.
             for row in 0..clipped.h {
-                let y = if src == dst && clipped.y > sr.y + oy {
+                let y = if same_layout && clipped.y > sr.y + oy {
                     clipped.h - 1 - row
                 } else {
                     row
@@ -1371,11 +1485,12 @@ impl<P: Presenter> Surfaces<P> {
         } else {
             // A scaled/mirrored overlap can overwrite pixels needed by a later
             // sample in either direction. Preserve the complete original rectangle.
-            let overlap = src == dst
-                && clipped.x < sr.x + sr.w
-                && sr.x < clipped.x + clipped.w
-                && clipped.y < sr.y + sr.h
-                && sr.y < clipped.y + clipped.h;
+            let overlap = aliases
+                && (!same_layout
+                    || (clipped.x < sr.x + sr.w
+                        && sr.x < clipped.x + clipped.w
+                        && clipped.y < sr.y + sr.h
+                        && sr.y < clipped.y + clipped.h));
             let input_stride = sr.w as usize * sb;
             if overlap {
                 self.blit_source.resize(input_stride * sr.h as usize, 0);
@@ -1385,34 +1500,50 @@ impl<P: Presenter> Surfaces<P> {
                         .copy_from_slice(row.as_ref());
                 }
             }
-            self.blit_sample.resize(clipped.w as usize * sb, 0);
-            if !same_encoding {
+            self.blit_sample
+                .resize(clipped.w as usize * sample_bytes, 0);
+            if !same_samples {
                 self.blit_row.resize(clipped.w as usize * db, 0);
             }
             let mut previous = None;
             for y in 0..clipped.h {
                 let rows = sample_range(oy + y, sr.h, dr.h, options.sampling);
                 if previous != Some(rows) {
-                    self.blit_sample.fill(if options.sampling == Sampling::And {
-                        255
-                    } else {
-                        0
-                    });
+                    self.blit_sample.fill(
+                        if matches!(options.sampling, Sampling::And | Sampling::AndColour) {
+                            255
+                        } else {
+                            0
+                        },
+                    );
                     for sy in rows.0..rows.1 {
                         let sy = if options.mirror_y { sr.h - 1 - sy } else { sy };
-                        if overlap {
-                            sample_row(
+                        let input = if overlap {
+                            Cow::Borrowed(
                                 &self.blit_source
                                     [sy as usize * input_stride..(sy as usize + 1) * input_stride],
+                            )
+                        } else {
+                            m.read(s.row(sr.x, sr.y + sy), input_stride)?
+                        };
+                        if colour {
+                            self.blit_row.resize(sr.w as usize * 4, 0);
+                            for (packed, decoded) in input
+                                .chunks_exact(sb)
+                                .zip(self.blit_row.as_chunks_mut::<4>().0)
+                            {
+                                *decoded = s.decode_pixel(packed);
+                            }
+                            sample_row(
+                                &self.blit_row,
                                 &mut self.blit_sample,
-                                sb,
+                                4,
                                 ox,
                                 sr.w,
                                 dr.w,
                                 options,
                             );
                         } else {
-                            let input = m.read(s.row(sr.x, sr.y + sy), input_stride)?;
                             sample_row(
                                 input.as_ref(),
                                 &mut self.blit_sample,
@@ -1424,23 +1555,28 @@ impl<P: Presenter> Surfaces<P> {
                             );
                         }
                     }
-                    if !same_encoding {
+                    if !same_samples {
+                        self.blit_row.resize(clipped.w as usize * db, 0);
                         for (input, output) in self
                             .blit_sample
-                            .chunks_exact(sb)
+                            .chunks_exact(sample_bytes)
                             .zip(self.blit_row.chunks_exact_mut(db))
                         {
                             if let Some(remap) = &remap {
                                 output[0] = remap[input[0] as usize];
                             } else {
-                                output
-                                    .copy_from_slice(&d.encode_pixel(s.decode_pixel(input))[..db]);
+                                let pixel = if colour {
+                                    input.try_into().unwrap()
+                                } else {
+                                    s.decode_pixel(input)
+                                };
+                                output.copy_from_slice(&d.encode_pixel(pixel)[..db]);
                             }
                         }
                     }
                     previous = Some(rows);
                 }
-                let output = if same_encoding {
+                let output = if same_samples {
                     &self.blit_sample
                 } else {
                     &self.blit_row
@@ -1458,10 +1594,14 @@ impl<P: Presenter> Surfaces<P> {
 fn sample_range(at: u32, src: u32, dst: u32, sampling: Sampling) -> (u32, u32) {
     let start = if src == dst {
         at
+    } else if sampling == Sampling::PixelCentre
+        || (src < dst && matches!(sampling, Sampling::AndColour | Sampling::OrColour))
+    {
+        ((u64::from(at) * u64::from(src) + u64::from(src / 2)) / u64::from(dst)) as u32
     } else {
         (u64::from(at) * u64::from(src) / u64::from(dst)) as u32
     };
-    let end = if sampling == Sampling::Nearest || src <= dst {
+    let end = if matches!(sampling, Sampling::Nearest | Sampling::PixelCentre) || src <= dst {
         start + 1
     } else {
         (u64::from(at + 1) * u64::from(src) / u64::from(dst)) as u32
@@ -1494,9 +1634,13 @@ fn sample_row(
                 * bytes;
             let sample = &input[sx..sx + bytes];
             match options.sampling {
-                Sampling::Nearest => pixel.copy_from_slice(sample),
-                Sampling::And => pixel.iter_mut().zip(sample).for_each(|(p, s)| *p &= s),
-                Sampling::Or => pixel.iter_mut().zip(sample).for_each(|(p, s)| *p |= s),
+                Sampling::Nearest | Sampling::PixelCentre => pixel.copy_from_slice(sample),
+                Sampling::And | Sampling::AndColour => {
+                    pixel.iter_mut().zip(sample).for_each(|(p, s)| *p &= s)
+                }
+                Sampling::Or | Sampling::OrColour => {
+                    pixel.iter_mut().zip(sample).for_each(|(p, s)| *p |= s)
+                }
             }
         }
     }

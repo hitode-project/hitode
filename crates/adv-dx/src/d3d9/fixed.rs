@@ -82,6 +82,7 @@ impl Fixed {
             fvf: 0,
             render: BTreeMap::from([
                 (7, 0),
+                (9, 2), // SHADEMODE: the shared shader interpolates vertex colors.
                 (14, 1),
                 (15, 0),
                 (19, 2),
@@ -91,6 +92,7 @@ impl Fixed {
                 (24, 0),
                 (25, 8),
                 (27, 0),
+                (29, 0), // SPECULARENABLE: supported FVFs supply zero specular RGB.
                 (52, 0),
                 (53, 1),
                 (54, 1),
@@ -164,6 +166,9 @@ fn current<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Fixed> {
     Some(&device(env, pointer)?.fixed)
 }
 fn valid_fvf(fvf: u32) -> bool {
+    // SPECULARENABLE is observable state, but these prelit/lighting-off inputs
+    // have no specular color. Keep SPECULAR (0x80) unavailable until that color
+    // is propagated through the neutral vertex and post-texture RGB stage.
     matches!(fvf & 0x0e, 2 | 4) && fvf & !(0x0e | 0x40 | 0x100) == 0
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetFVF",level=state)]
@@ -247,7 +252,12 @@ fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> 
         return INVALID;
     };
     let valid = match state {
-        7 | 14 | 15 | 27 | 52 | 137 | 174 | 185 | 206 => value <= 1,
+        9 => match value {
+            2 => true, // GOURAUD is the existing neutral renderer's shading mode.
+            1 | 3 => return UNAVAILABLE,
+            _ => false,
+        },
+        7 | 14 | 15 | 27 | 29 | 52 | 137 | 174 | 185 | 206 => value <= 1,
         19 | 20 | 207 | 208 => factor(value).is_some(),
         22 => (1..=3).contains(&value),
         23 | 25 | 56 | 189 => compare(value).is_some(),
@@ -823,4 +833,76 @@ fn draw_up(
         .unwrap();
     super::buffers::clear_up_bindings(env, this.addr(), false);
     dispatch(env, id, Operation::Draw(draw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_specular_fvf_profile_exposes_bool_state_without_accepting_specular_inputs() {
+        let mut m = super::super::tests::machine();
+        let mut env = Env {
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (device, _, _, _) = super::super::tests::setup(&mut env);
+        let this = GuestPtr::new(device);
+        let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+        assert_eq!(get_render(&mut env, this, 29, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 0);
+        assert_eq!(set_fvf(&mut env, this, 0x44), 0);
+        for value in [1, 0, 1] {
+            assert_eq!(set_render(&mut env, this, 29, value), 0);
+            assert_eq!(get_render(&mut env, this, 29, output), 0);
+            assert_eq!(output.read(env.cpu).unwrap(), value);
+        }
+        assert_eq!(set_render(&mut env, this, 29, 2), INVALID);
+        assert_eq!(get_render(&mut env, this, 29, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 1);
+        assert_eq!(set_fvf(&mut env, this, 0xc4), UNAVAILABLE);
+        assert_eq!(get_fvf(&mut env, this, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 0x44);
+        assert!(env.ext.get::<State>().pending.is_empty());
+        assert!(env.ext.get::<State>().transfers.is_empty());
+    }
+
+    #[test]
+    fn gouraud_default_roundtrip_and_rejected_modes_preserve_state_and_output() {
+        let mut m = super::super::tests::machine();
+        let mut env = Env {
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (device, _, _, _) = super::super::tests::setup(&mut env);
+        let this = GuestPtr::new(device);
+        let page = env.sys.vm.alloc(env.cpu, 8192, Prot::RW).unwrap();
+        let output = GuestPtr::<u32>::new(page);
+        assert_eq!(get_render(&mut env, this, 9, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 2);
+        assert_eq!(set_render(&mut env, this, 9, 2), 0);
+        for (value, error) in [
+            (1, UNAVAILABLE),
+            (3, UNAVAILABLE),
+            (0, INVALID),
+            (u32::MAX, INVALID),
+        ] {
+            assert_eq!(set_render(&mut env, this, 9, value), error);
+            assert_eq!(get_render(&mut env, this, 9, output), 0);
+            assert_eq!(output.read(env.cpu).unwrap(), 2);
+        }
+        let crossing = GuestPtr::<u32>::new(page + 4094);
+        crossing.write(env.cpu, 0x12345678).unwrap();
+        env.cpu.protect(page + 4096, 4096, Prot::READ).unwrap();
+        assert_eq!(get_render(&mut env, this, 9, crossing), INVALID);
+        assert_eq!(crossing.read(env.cpu).unwrap(), 0x12345678);
+        assert_eq!(get_render(&mut env, this, 9, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 2);
+        assert!(env.ext.get::<State>().pending.is_empty());
+        assert!(env.ext.get::<State>().transfers.is_empty());
+    }
 }

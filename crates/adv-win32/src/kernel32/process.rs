@@ -24,23 +24,30 @@ fn terminate_process(env: &mut Env<'_>) -> Outcome {
     ))
 }
 
-fn command_line_a(env: &mut Env<'_>) -> Outcome {
+pub(crate) fn command_line(env: &mut Env<'_>, wide: bool) -> u32 {
     let (w, heaps) = env.ext.get2_mut::<Win32, Heaps>();
     let line = format!("\"{}\"", w.exe_path());
-    let mut bytes = w.codec.encode(&line);
-    bytes.push(0);
-    Outcome::Return(w.static_bytes("cmdline_a", env.cpu, env.sys, heaps, &bytes))
+    let (key, bytes) = if wide {
+        (
+            "cmdline_w",
+            line.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        )
+    } else {
+        let mut bytes = w.codec.encode(&line);
+        bytes.push(0);
+        ("cmdline_a", bytes)
+    };
+    w.static_bytes(key, env.cpu, env.sys, heaps, &bytes)
 }
 
+fn command_line_a(env: &mut Env<'_>) -> Outcome {
+    Outcome::Return(command_line(env, false))
+}
 fn command_line_w(env: &mut Env<'_>) -> Outcome {
-    let (w, heaps) = env.ext.get2_mut::<Win32, Heaps>();
-    let line = format!("\"{}\"", w.exe_path());
-    let bytes: Vec<u8> = line
-        .encode_utf16()
-        .chain([0])
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    Outcome::Return(w.static_bytes("cmdline_w", env.cpu, env.sys, heaps, &bytes))
+    Outcome::Return(command_line(env, true))
 }
 
 pub(super) fn environment(w: &Win32) -> Vec<String> {
