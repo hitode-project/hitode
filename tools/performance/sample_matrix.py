@@ -158,6 +158,8 @@ def run(args: argparse.Namespace) -> None:
         write_json(output / "results.json", metadata)
         print(f"END {sample['id']}: {state}, frames={result.get('frames', 0)}, "
               f"wall={result['wall_seconds']:.2f}s", flush=True)
+        if result.get("failure"):
+            print("  " + result["failure"].splitlines()[0], flush=True)
     rows = ["# Startup probes", "", "Sequential, bounded, hardware-muted runs. Frame production does not certify playability.",
             "Unresolved imports and actual runtime failures must be evaluated separately.", "",
             "| Sample | Engine evidence | Result | Reached | Accepted | Frames | First frame (s) | Called API blocker |", "|---|---|---|---|---|---:|---:|---|"]
