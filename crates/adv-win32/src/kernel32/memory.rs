@@ -14,6 +14,10 @@ mod global;
 const HEAP_ZERO_MEMORY: u32 = 0x8;
 const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 
+/// Highest application address in the existing flat x86 Win32 process profile.
+/// GetSystemInfo and VirtualQuery must describe the same address domain.
+pub(super) const MAX_APPLICATION_ADDRESS: u32 = 0x7ffe_ffff;
+
 fn page_span(addr: u32, size: u32) -> Option<(u32, u32)> {
     if size == 0 {
         return None;
@@ -257,6 +261,10 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
     const MEM_MAPPED: u32 = 0x4_0000;
     const MEM_IMAGE: u32 = 0x100_0000;
     let (addr, out, len) = (env.arg(0), env.arg(1), env.arg(2));
+    if addr > MAX_APPLICATION_ADDRESS {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    }
     if len < 28 {
         set_last_error(env, 24); // ERROR_BAD_LENGTH
         return Outcome::Return(0);

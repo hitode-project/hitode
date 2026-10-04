@@ -74,7 +74,7 @@ fn info(env: &mut Env<'_>, output: GuestPtr<[u32; 9]>) -> Result<(), MemFault> {
             0,
             4096,
             0x10000,
-            0x7ffeffff,
+            super::super::memory::MAX_APPLICATION_ADDRESS,
             p.active_mask(),
             p.count(),
             586,
