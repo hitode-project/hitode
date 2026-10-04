@@ -342,11 +342,92 @@ pub struct Text {
     glyphs: BTreeMap<(FontRequest, GlyphRequest), Arc<Glyph>>,
     bytes: usize,
     hits: u64,
+    #[cfg(windows)]
+    resources: BTreeMap<FontResourceId, windows::MemoryFont>,
+    #[cfg(windows)]
+    next_resource: u64,
+    #[cfg(windows)]
+    resource_bytes: usize,
 }
+
+/// A neutral, process-local font-data resource. Never a native or guest handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FontResourceId(u64);
+pub const MAX_FONT_RESOURCES: usize = 64;
+pub const MAX_FONT_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 /// Each cached native font owns a font and a private measurement DC. Glyph
 /// results are immutable and remain valid after the native owner is evicted.
 pub const FONT_CACHE_CAPACITY: usize = 128;
 impl Text {
+    /// Install owned backend font data. Successful resource changes invalidate
+    /// matching and glyph caches; immutable glyph results held by callers live on.
+    pub fn add_resource(&mut self, bytes: &[u8]) -> Result<(FontResourceId, u32), TextError> {
+        #[cfg(windows)]
+        {
+            if bytes.is_empty()
+                || self.resources.len() >= MAX_FONT_RESOURCES
+                || bytes.len() > MAX_FONT_RESOURCE_BYTES.saturating_sub(self.resource_bytes)
+            {
+                return Err(TextError::Font("font resource budget exceeded".into()));
+            }
+            let next = self
+                .next_resource
+                .checked_add(1)
+                .ok_or_else(|| TextError::Font("font resource identity exhausted".into()))?;
+            let resource = windows::MemoryFont::new(bytes)?;
+            let count = resource.faces;
+            self.invalidate_fonts();
+            let id = FontResourceId(next);
+            self.resources.insert(id, resource);
+            self.next_resource = next;
+            self.resource_bytes += bytes.len();
+            Ok((id, count))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = bytes;
+            Err(TextError::Unavailable)
+        }
+    }
+
+    /// Unregister before retiring the cached native font references. A failed
+    /// backend operation preserves the resource and all existing cache owners.
+    pub fn remove_resource(&mut self, id: FontResourceId) -> Result<bool, TextError> {
+        #[cfg(windows)]
+        {
+            let Some(resource) = self.resources.get_mut(&id) else {
+                return Ok(false);
+            };
+            resource.remove()?;
+            self.invalidate_fonts();
+            let resource = self.resources.remove(&id).unwrap();
+            self.resource_bytes -= resource.bytes;
+            Ok(true)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            Err(TextError::Unavailable)
+        }
+    }
+    pub fn resource_stats(&self) -> (usize, usize) {
+        #[cfg(windows)]
+        {
+            (self.resources.len(), self.resource_bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            (0, 0)
+        }
+    }
+    /// Refresh font matching after a resource reference changes without a new
+    /// backend registration (for example a personality's repeated add/remove).
+    pub fn invalidate_fonts(&mut self) {
+        #[cfg(windows)]
+        self.fonts.clear();
+        self.glyphs.clear();
+        self.bytes = 0;
+    }
     /// Rasterize a complete counted run with the same selected font as queries.
     pub fn paint(
         &mut self,
@@ -486,5 +567,14 @@ impl Text {
             }
             Ok(glyph)
         }
+    }
+}
+
+impl Drop for Text {
+    fn drop(&mut self) {
+        // Restore/delete cached selections before the resource owners retire.
+        self.invalidate_fonts();
+        #[cfg(windows)]
+        self.resources.clear();
     }
 }

@@ -9,6 +9,9 @@ use adv_machine::outcome::DeferredContinuation;
 pub(super) const INTERNAL: &str = "<win32>";
 pub(super) const THREAD_START: &str = "thread_start";
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) fn install_startup<B: Backend>(machine: &mut Machine<B>) -> Result<(), MemFault> {
     machine.sys.process_return = Some(exit_process);
     if machine
@@ -99,7 +102,7 @@ fn notifications(env: &Env<'_>, reason: u32) -> VecDeque<Notification> {
                 dllmain: false,
             });
         }
-        if module.is_dll && module.entry != 0 {
+        if module.is_dll && module.entry != 0 && (reason == 0 || module.lifetime.thread_calls) {
             calls.push_back(Notification {
                 module: id,
                 target: module.entry,
@@ -133,6 +136,23 @@ fn run(
         );
     }
     then(env)
+}
+
+/// Terminal APIs must never turn a loader-lock allocation failure into a return.
+/// With no callbacks, cleanup itself needs no loader mutex. If we must wait for
+/// the lock, collect again after acquisition so intervening module changes are
+/// observed; `run` also revalidates each identity before invoking guest code.
+fn terminal_notifications(env: &mut Env<'_>, reason: u32, then: DeferredContinuation) -> Outcome {
+    if notifications(env, reason).is_empty() {
+        return then(env);
+    }
+    if loader_mutex(env).is_none() {
+        return Outcome::Fail("terminal DLL/TLS notification loader lock allocation failed".into());
+    }
+    locked(env, move |env| {
+        let calls = notifications(env, reason);
+        run(env, calls, then)
+    })
 }
 
 pub(crate) fn spawn_thread(
@@ -212,30 +232,27 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
     {
         return Outcome::ExitThread(code);
     }
-    locked(env, move |env| {
-        let calls = notifications(env, 3);
-        run(
-            env,
-            calls,
-            Box::new(move |env| {
-                crate::user32::clipboard::exit_thread(env, move |env| {
-                    if let Err(error) = crate::msvcrt::detach_thread(env) {
-                        return Outcome::Fail(error);
-                    }
-                    if env
-                        .sys
-                        .contexts
-                        .iter()
-                        .all(|context| context.id == env.sys.current || context.is_done())
-                    {
-                        exit_process(env, code)
-                    } else {
-                        Outcome::ExitThread(code)
-                    }
-                })
-            }),
-        )
-    })
+    terminal_notifications(
+        env,
+        3,
+        Box::new(move |env| {
+            crate::user32::clipboard::exit_thread(env, move |env| {
+                if let Err(error) = crate::msvcrt::detach_thread(env) {
+                    return Outcome::Fail(error);
+                }
+                if env
+                    .sys
+                    .contexts
+                    .iter()
+                    .all(|context| context.id == env.sys.current || context.is_done())
+                {
+                    exit_process(env, code)
+                } else {
+                    Outcome::ExitThread(code)
+                }
+            })
+        }),
+    )
 }
 
 pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
@@ -243,15 +260,16 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
         return Outcome::ExitProcess(code);
     }
     env.sys.terminate_other_contexts(code);
-    locked(env, move |env| {
-        let calls = notifications(env, 0);
-        run(
-            env,
-            calls,
-            Box::new(move |env| match crate::msvcrt::detach_process(env) {
+    terminal_notifications(
+        env,
+        0,
+        Box::new(move |env| {
+            match crate::msvcrt::detach_process(env)
+                .and_then(|()| crate::gdi32::font::detach_process(env))
+            {
                 Ok(()) => Outcome::ExitProcess(code),
                 Err(error) => Outcome::Fail(error),
-            }),
-        )
-    })
+            }
+        }),
+    )
 }

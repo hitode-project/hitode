@@ -3,6 +3,60 @@
 use super::*;
 use windows_sys::Win32::Graphics::Gdi::{self as gdi, HDC, HFONT, HGDIOBJ};
 
+pub(super) struct MemoryFont {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    pub faces: u32,
+    pub bytes: usize,
+}
+impl MemoryFont {
+    pub(super) fn new(bytes: &[u8]) -> Result<Self, TextError> {
+        let length = u32::try_from(bytes.len())
+            .map_err(|_| TextError::Font("font resource is too large".into()))?;
+        let mut faces = 0;
+        // SAFETY: bounded immutable input and writable host count; GDI copies
+        // the data and makes it private to this process, never enumerable.
+        let handle = unsafe {
+            gdi::AddFontMemResourceEx(
+                bytes.as_ptr().cast(),
+                length,
+                std::ptr::null(),
+                &raw mut faces,
+            )
+        };
+        if handle.is_null() {
+            return Err(TextError::Font("invalid font resource".into()));
+        }
+        let mut resource = Self {
+            handle,
+            faces,
+            bytes: bytes.len(),
+        };
+        if faces == 0 {
+            resource.remove()?;
+            return Err(TextError::Font("font resource contains no faces".into()));
+        }
+        Ok(resource)
+    }
+    pub(super) fn remove(&mut self) -> Result<(), TextError> {
+        // SAFETY: this owner has the sole registration handle. Existing HFONT
+        // objects retain their own GDI references until the Text cache is cleared.
+        if unsafe { gdi::RemoveFontMemResourceEx(self.handle) } == 0 {
+            return Err(TextError::Font("font resource removal failed".into()));
+        }
+        self.handle = std::ptr::null_mut();
+        Ok(())
+    }
+}
+impl Drop for MemoryFont {
+    fn drop(&mut self) {
+        if !self.handle.is_null()
+            && let Err(error) = self.remove()
+        {
+            log::warn!("{error}");
+        }
+    }
+}
+
 pub(super) struct Font {
     dc: HDC,
     font: HFONT,

@@ -236,18 +236,15 @@ fn timer_exhaustion_and_partial_message_wake_leave_api_resource_baseline_unchang
     assert_eq!(t.word(OUT + 8), 8);
     assert_eq!(t.word(OUT + 12), 1, "one free slot before either API");
     assert_eq!(t.word(OUT + 16), t.word(OUT + 12), "API rollback baseline");
-    // The harness appends ExitProcess, which lazily creates the process loader
-    // mutex. It owns that extra object; the failed APIs left none behind.
-    assert_eq!(
-        t.m.sys.objects.object_count(),
-        t.word(OUT + 16) as usize + 1
-    );
+    // No DLL/TLS notification is pending: ExitProcess runs cleanup directly,
+    // without charging a loader mutex after the API rollback baseline.
+    assert_eq!(t.m.sys.objects.object_count(), t.word(OUT + 16) as usize);
     assert_eq!(
         (0x104..0x140)
             .step_by(4)
             .filter(|&h| matches!(t.m.sys.objects.get(h), Some(Object::Mutex { .. })))
             .count(),
-        1
+        0
     );
     assert_eq!(t.m.sys.contexts.len(), 1);
 }

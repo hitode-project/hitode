@@ -11,6 +11,7 @@ use adv_machine::Machine;
 use std::borrow::Cow;
 
 mod paint;
+mod resource;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -21,10 +22,12 @@ const GDI_ERROR: u32 = u32::MAX;
 #[derive(Default)]
 struct Fonts {
     text: Text,
+    resources: std::collections::BTreeMap<String, resource::Reference>,
 }
 
 pub fn register(registry: &mut Registry) {
     paint::register(registry);
+    resource::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,
@@ -45,6 +48,25 @@ pub fn install<B: adv_cpu::backend::Backend>(machine: &mut Machine<B>) {
 }
 pub fn cache_stats<B: adv_cpu::backend::Backend>(machine: &Machine<B>) -> text::CacheStats {
     machine.ext.get::<Fonts>().text.stats()
+}
+
+/// The caller runs this only after DLL detach/CRT cleanup has completed.
+pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    let Some(fonts) = env.ext.try_get_mut::<Fonts>() else {
+        return Ok(());
+    };
+    while let Some((path, reference)) = fonts.resources.first_key_value() {
+        let (path, id) = (path.clone(), reference.id);
+        if !fonts
+            .text
+            .remove_resource(id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("font resource owner missing during process cleanup".into());
+        }
+        fonts.resources.remove(&path);
+    }
+    Ok(())
 }
 
 fn reject_dc(env: &mut Env<'_>, dc: u32) -> bool {
