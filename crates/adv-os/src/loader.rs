@@ -365,6 +365,7 @@ impl<'a> Loader<'a> {
             exports_by_name,
             exports_by_ordinal,
             resources: None,
+            data_file: None,
             load_count: 1,
             ldr_entry: 0,
             ldr_size: 0,
@@ -466,6 +467,7 @@ impl<'a> Loader<'a> {
             exports_by_name,
             exports_by_ordinal,
             resources: pe.resources().map_err(pe_err)?,
+            data_file: None,
             load_count: 1,
             ldr_entry: 0,
             ldr_size: 0,
@@ -710,6 +712,12 @@ impl<'a> Loader<'a> {
     pub fn retire(&mut self, id: ModuleId) -> Result<(), LoadError> {
         let module = self.modules.get(id);
         let (base, tls) = (module.base, module.lifetime.tls_index);
+        if module.kind == ModuleKind::DataFile {
+            // Raw guest aliases retire before the last shared content owner.
+            self.sys.vm.free(self.cpu, base)?;
+            self.modules.retire(self.cpu, id)?;
+            return Ok(());
+        }
         if let Some(index) = tls {
             self.sys.remove_static_tls(self.cpu, index)?;
         }

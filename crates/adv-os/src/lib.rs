@@ -23,7 +23,6 @@ pub mod system_files;
 pub mod vfs;
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use adv_cpu::backend::{Backend, MemFault};
 use adv_machine::{CtxId, Ext, Machine};
@@ -75,11 +74,14 @@ impl OsConfig {
     }
 }
 
-/// The module table of `ext`'s process (empty before anything is loaded).
-pub fn modules(ext: &Ext) -> &Modules {
-    static EMPTY: OnceLock<Modules> = OnceLock::new();
+/// Read-only probes may observe an uninstalled OS without creating an owner.
+pub fn try_modules(ext: &Ext) -> Option<&Modules> {
     ext.try_get()
-        .unwrap_or_else(|| EMPTY.get_or_init(Modules::default))
+}
+
+/// The process-owned table, installed by OS loading or Win32 installation.
+pub fn modules(ext: &Ext) -> &Modules {
+    ext.get()
 }
 
 /// The module table of `ext`'s process, for loading and reference counts.

@@ -189,6 +189,13 @@ fn find_region(env: &Env<'_>, addr: u32) -> Option<(u32, u32)> {
 
 fn virtual_free(env: &mut Env<'_>) -> Outcome {
     let (addr, _size, ty) = (env.arg(0), env.arg(1), env.arg(2));
+    if adv_os::try_modules(env.ext)
+        .and_then(|modules| modules.data_file_containing(addr))
+        .is_some()
+    {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    }
     if super::file_mapping::contains(env, addr) {
         set_last_error(env, 487);
         return Outcome::Return(0);
@@ -218,6 +225,16 @@ fn page_protection(env: &Env<'_>, page: u32) -> Option<u32> {
     if !env.cpu.accessible(page, PAGE, Prot::default()) {
         return None;
     }
+    if let Some(module) =
+        adv_os::try_modules(env.ext).and_then(|modules| modules.data_file_containing(page))
+    {
+        return Some(
+            module
+                .data_file
+                .as_ref()?
+                .protection(env.cpu, module.base, page),
+        );
+    }
     let read = env.cpu.accessible(page, PAGE, Prot::READ);
     let write = env.cpu.accessible(page, PAGE, Prot::WRITE);
     let exec = env.cpu.accessible(page, PAGE, Prot::EXEC);
@@ -237,6 +254,7 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_FREE: u32 = 0x1_0000;
     const MEM_PRIVATE: u32 = 0x2_0000;
+    const MEM_MAPPED: u32 = 0x4_0000;
     const MEM_IMAGE: u32 = 0x100_0000;
     let (addr, out, len) = (env.arg(0), env.arg(1), env.arg(2));
     if len < 28 {
@@ -250,12 +268,14 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     let page = addr & !0xfff;
-    let image = adv_os::modules(env.ext)
-        .containing(addr)
-        .map(|id| adv_os::modules(env.ext).get(id))
+    let modules = adv_os::try_modules(env.ext);
+    let image = modules
+        .and_then(|modules| modules.containing(addr).map(|id| modules.get(id)))
         .filter(|m| m.size != 0);
+    let data_file = modules.and_then(|modules| modules.data_file_containing(addr));
     let allocation = image
         .map(|m| (m.base, m.size))
+        .or_else(|| data_file.map(|m| (m.base, m.size)))
         .or_else(|| env.sys.vm.containing(addr));
     let info = if let Some(info) = super::file_mapping::query(env, addr) {
         info
@@ -280,11 +300,13 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
                 [
                     begin,
                     base,
-                    protection,
+                    if data_file.is_some() { 2 } else { protection },
                     (end - u64::from(begin)) as u32,
                     MEM_COMMIT,
                     protection,
-                    if image.is_some() {
+                    if data_file.is_some() {
+                        MEM_MAPPED
+                    } else if image.is_some() {
                         MEM_IMAGE
                     } else {
                         MEM_PRIVATE
@@ -332,6 +354,18 @@ fn virtual_protect(env: &mut Env<'_>) -> Outcome {
             }
         };
     }
+    if let Some(raw) =
+        adv_os::try_modules(env.ext).and_then(|modules| modules.data_file_containing(page))
+    {
+        if u64::from(page) + u64::from(len) > u64::from(raw.base) + u64::from(raw.size) {
+            set_last_error(env, 487);
+            return Outcome::Return(0);
+        }
+        if !matches!(protection, 1 | 2 | 8) {
+            set_last_error(env, err::INVALID_PARAMETER);
+            return Outcome::Return(0);
+        }
+    }
     let Some(previous) = page_protection(env, page) else {
         set_last_error(env, 487); // ERROR_INVALID_ADDRESS
         return Outcome::Return(0);
@@ -345,6 +379,17 @@ fn virtual_protect(env: &mut Env<'_>) -> Outcome {
     if env.cpu.protect(page, len, prot).is_err() || env.cpu.write_u32(old, previous).is_err() {
         set_last_error(env, 487);
         return Outcome::Return(0);
+    }
+    if let Some(id) = adv_os::try_modules(env.ext).and_then(|modules| {
+        modules
+            .data_file_containing(page)
+            .and_then(|module| modules.by_handle(module.handle()))
+    }) {
+        let module = adv_os::modules_mut(env.ext).get_mut(id);
+        if let Some(raw) = &mut module.data_file {
+            let begin = ((page - module.base) / PAGE) as usize;
+            raw.protections[begin..begin + (len / PAGE) as usize].fill(protection);
+        }
     }
     Outcome::Return(1)
 }

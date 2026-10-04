@@ -94,6 +94,7 @@ impl Win32 {
     /// Create the Win32 state and the process heap and install them into the machine. The
     /// heaps are their own `Ext` entry: other personalities allocate from them too.
     pub fn install<B: Backend>(m: &mut Machine<B>, cfg: Win32Config) -> Result<(), MemFault> {
+        m.ext.get_or_default::<adv_os::Modules>();
         let mut heaps = Heaps::default();
         let process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm)?;
         heaps.process_heap = process_heap;

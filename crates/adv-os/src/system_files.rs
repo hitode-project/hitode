@@ -63,7 +63,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(Arc::ptr_eq(&first, &alias));
-        assert_eq!(crate::modules(&m.ext).iter().count(), 0);
+        assert!(crate::try_modules(&m.ext).is_none());
         let id = m.load(&Empty, path).unwrap();
         let module = crate::modules(&m.ext).get(id);
         let base = module.base;

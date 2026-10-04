@@ -33,6 +33,8 @@ pub struct FileObj {
     pub file: FileStream,
     pub guest_path: String,
     pub access: u32,
+    /// Read/write/delete share bits of this existing file owner.
+    pub share: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -14,6 +14,7 @@ use super::K32;
 use crate::util::{IntOrStr, cstr, err, put_cstr, put_wstr, set_last_error, wstr};
 use crate::{Win32, stdcall};
 
+mod datafile;
 mod notifications;
 pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn_thread};
 
@@ -244,15 +245,36 @@ fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
         }
         Err(e) => {
             log::warn!("LoadLibrary({name}) failed: {e}");
-            let code = match e {
-                adv_os::LoadError::Pe { .. } | adv_os::LoadError::NoRelocs(..) => 193,
-                adv_os::LoadError::NoSpace(..)
-                | adv_os::LoadError::TooManyHostModules
-                | adv_os::LoadError::Mem(_) => err::NOT_ENOUGH_MEMORY,
-                adv_os::LoadError::MissingExport { .. } => err::PROC_NOT_FOUND,
-                adv_os::LoadError::NotFound(_) => err::MOD_NOT_FOUND,
-            };
-            set_last_error(env, code);
+            set_last_error(env, load_error_code(&e));
+            Outcome::Return(0)
+        }
+    }
+}
+
+fn load_error_code(error: &adv_os::LoadError) -> u32 {
+    match error {
+        adv_os::LoadError::Pe { .. } | adv_os::LoadError::NoRelocs(..) => 193,
+        adv_os::LoadError::NoSpace(..)
+        | adv_os::LoadError::TooManyHostModules
+        | adv_os::LoadError::Mem(_) => err::NOT_ENOUGH_MEMORY,
+        adv_os::LoadError::MissingExport { .. } => err::PROC_NOT_FOUND,
+        adv_os::LoadError::NotFound(_) => err::MOD_NOT_FOUND,
+    }
+}
+
+fn load_library_ex(env: &mut Env<'_>, name: String) -> Outcome {
+    let (file, flags) = (env.arg(1), env.arg(2));
+    if file != 0 || flags & !0x3ffb != 0 || flags & 0x42 == 0x42 {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    }
+    match flags {
+        0 => locked(env, move |env| load_library(env, name)),
+        2 => locked(env, move |env| datafile::load(env, name)),
+        _ => {
+            // IMAGE_RESOURCE/EXCLUSIVE need generic file leases, and DONT_RESOLVE
+            // needs executable-but-uninitialized lifetime. Never run DllMain.
+            set_last_error(env, 50); // ERROR_NOT_SUPPORTED
             Outcome::Return(0)
         }
     }
@@ -306,10 +328,8 @@ fn get_module_handle_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
         return Outcome::Return(0);
     }
     let base = if flags & FROM_ADDRESS != 0 {
-        adv_os::modules(env.ext)
-            .iter()
-            .find(|(_, m)| m.contains(name))
-            .map(|(_, m)| m.base)
+        let modules = adv_os::modules(env.ext);
+        modules.containing(name).map(|id| modules.get(id).base)
     } else if name == 0 {
         module_of(env, 0).map(|id| adv_os::modules(env.ext).get(id).base)
     } else {
@@ -347,6 +367,7 @@ fn module_path(env: &Env<'_>, id: ModuleId) -> String {
         ModuleKind::Host => format!("C:\\Windows\\system32\\{}", m.name),
         ModuleKind::Image if !m.is_dll => w.exe_path(),
         ModuleKind::Image => w.vfs.normalize(&m.path),
+        ModuleKind::DataFile => unreachable!("raw views have no executable path visibility"),
     }
 }
 
@@ -356,6 +377,10 @@ fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
         set_last_error(env, err::MOD_NOT_FOUND);
         return Outcome::Return(0);
     };
+    if !adv_os::modules(env.ext).get(id).executable_visible() {
+        set_last_error(env, err::MOD_NOT_FOUND);
+        return Outcome::Return(0);
+    }
     let path = module_path(env, id);
     let r = if wide {
         let u: Vec<u16> = path.encode_utf16().collect();
@@ -388,7 +413,9 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
 }
 
 fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outcome {
-    let Some(id) = module_of(env, h) else {
+    let Some(id) =
+        module_of(env, h).filter(|&id| adv_os::modules(env.ext).get(id).executable_visible())
+    else {
         env.sys
             .trace
             .resolution(caller, "<invalid-hmodule>", &sym, 0);
@@ -467,6 +494,9 @@ pub(crate) fn find_resource_data(
     name: &ResId,
 ) -> Option<(u32, u32)> {
     let m = adv_os::modules(env.ext).get(module_of(env, h)?);
+    if let Some(raw) = &m.data_file {
+        return raw.data(env.cpu, m.base, raw.find(env.cpu, m.base, ty, name, None)?);
+    }
     let (_, data) = m.resources.as_ref()?.find(ty, name, None)?;
     resource_data(env, h, m.base + data.entry_rva)
 }
@@ -488,6 +518,15 @@ fn find_resource(
         return Outcome::Return(0);
     };
     let m = adv_os::modules(env.ext).get(id);
+    if let Some(raw) = &m.data_file {
+        return match raw.find(env.cpu, m.base, &ty, &name, lang) {
+            Some(entry) => Outcome::Return(entry),
+            None => {
+                set_last_error(env, err::RESOURCE_NAME_NOT_FOUND);
+                Outcome::Return(0)
+            }
+        };
+    }
     let found = m.resources.as_ref().and_then(|r| r.find(&ty, &name, lang));
     let Some((_, data)) = found else {
         log::debug!("FindResource({}, {name:?}, {ty:?}): not found", m.name);
@@ -501,6 +540,9 @@ fn find_resource(
 
 fn resource_data(env: &Env<'_>, module: u32, resource: u32) -> Option<(u32, u32)> {
     let image = adv_os::modules(env.ext).get(module_of(env, module)?);
+    if let Some(raw) = &image.data_file {
+        return raw.data(env.cpu, image.base, resource);
+    }
     let entry = resource.checked_sub(image.base)?;
     if entry.checked_add(16)? > image.size {
         return None;
@@ -556,11 +598,11 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "LoadLibraryExA", 3, |e| {
         let n = arg_a(e, 0);
-        locked(e, move |e| load_library(e, n))
+        load_library_ex(e, n)
     });
     stdcall(reg, K32, "LoadLibraryExW", 3, |e| {
         let n = arg_w(e, 0);
-        locked(e, move |e| load_library(e, n))
+        load_library_ex(e, n)
     });
     reg.register(free_library_ABI);
     reg.register(free_library_and_exit_thread_ABI);

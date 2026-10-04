@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use adv_pe::{ExportTarget, ResourceDir};
+mod datafile;
+pub use datafile::DataFile;
 
 pub type ModuleId = usize;
 
@@ -13,6 +15,8 @@ pub enum ModuleKind {
     Image,
     /// Implemented by the host; `base` addresses a synthetic PE image.
     Host,
+    /// A raw readonly file view; no imports, TLS, initializer or LDR record.
+    DataFile,
 }
 
 #[derive(Debug)]
@@ -31,6 +35,7 @@ pub struct Module {
     pub exports_by_name: HashMap<String, ExportTarget>,
     pub exports_by_ordinal: HashMap<u16, ExportTarget>,
     pub resources: Option<ResourceDir>,
+    pub data_file: Option<DataFile>,
     pub load_count: u32,
     /// Stable x86 LDR_DATA_TABLE_ENTRY in guest memory, zero until published.
     pub ldr_entry: u32,
@@ -69,6 +74,12 @@ impl Default for Lifetime {
 }
 
 impl Module {
+    pub fn handle(&self) -> u32 {
+        self.base | u32::from(self.kind == ModuleKind::DataFile)
+    }
+    pub fn executable_visible(&self) -> bool {
+        self.kind != ModuleKind::DataFile
+    }
     pub fn contains(&self, addr: u32) -> bool {
         addr.wrapping_sub(self.base) < self.size
     }
@@ -127,7 +138,9 @@ impl Modules {
     pub fn add(&mut self, m: Module) -> ModuleId {
         let id = self.next_id;
         self.next_id += 1;
-        self.by_name.entry(m.name.clone()).or_insert(id);
+        if m.executable_visible() {
+            self.by_name.entry(m.name.clone()).or_insert(id);
+        }
         self.list.insert(id, m);
         id
     }
@@ -177,7 +190,7 @@ impl Modules {
             let path = path.replace('/', "\\");
             return self
                 .iter()
-                .find(|(_, m)| m.path.eq_ignore_ascii_case(&path))
+                .find(|(_, m)| m.executable_visible() && m.path.eq_ignore_ascii_case(&path))
                 .map(|(id, _)| id);
         }
         self.by_name.get(&module_key(path)).copied()
@@ -193,15 +206,22 @@ impl Modules {
     /// Module whose HMODULE is `handle`.
     pub fn by_handle(&self, handle: u32) -> Option<ModuleId> {
         self.iter()
-            .find(|(_, m)| m.base == handle)
+            .find(|(_, m)| m.handle() == handle)
             .map(|(id, _)| id)
     }
 
     /// Image module containing guest address `addr`.
     pub fn containing(&self, addr: u32) -> Option<ModuleId> {
         self.iter()
-            .find(|(_, m)| m.contains(addr))
+            .find(|(_, m)| m.executable_visible() && m.contains(addr))
             .map(|(id, _)| id)
+    }
+
+    /// Raw allocation ownership for memory APIs, never executable lookup/LDR.
+    pub fn data_file_containing(&self, addr: u32) -> Option<&Module> {
+        self.iter()
+            .map(|(_, m)| m)
+            .find(|m| m.kind == ModuleKind::DataFile && m.contains(addr))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (ModuleId, &Module)> {
@@ -336,11 +356,17 @@ impl Modules {
             cpu.unmap(entry, size)?;
             self.ldr_free.push((entry, size));
         }
-        let name = self.list.remove(&id).expect("live module id").name;
-        self.by_name.remove(&name);
-        let replacement = self.iter().find(|(_, m)| m.name == name).map(|(id, _)| id);
-        if let Some(replacement) = replacement {
-            self.by_name.insert(name, replacement);
+        let module = self.list.remove(&id).expect("live module id");
+        if module.executable_visible() {
+            let name = module.name;
+            self.by_name.remove(&name);
+            let replacement = self
+                .iter()
+                .find(|(_, m)| m.executable_visible() && m.name == name)
+                .map(|(id, _)| id);
+            if let Some(replacement) = replacement {
+                self.by_name.insert(name, replacement);
+            }
         }
         self.sync_counts(cpu)
     }
@@ -461,6 +487,7 @@ mod tests {
             exports_by_name: HashMap::new(),
             exports_by_ordinal: HashMap::new(),
             resources: None,
+            data_file: None,
             load_count: 1,
             ldr_entry: 0,
             ldr_size: 0,

@@ -119,45 +119,145 @@ impl ResourceDir {
 }
 
 pub(crate) fn parse(pe: &Pe, root: u32) -> Result<ResourceDir> {
-    parse_dir(pe, root, 0, 0)
+    ResourceDir::read(root, |rva, output| {
+        output.copy_from_slice(pe.slice(rva, output.len() as u32)?);
+        Ok(())
+    })
 }
 
-fn parse_dir(pe: &Pe, root: u32, off: u32, depth: u32) -> Result<ResourceDir> {
-    if depth > 8 {
-        return Err(PeError::Malformed("resource tree too deep".into()));
+impl ResourceDir {
+    /// Decode the same resource tree from an image or a checked raw-file RVA
+    /// reader. The reader supplies live bytes; no image-sized buffer is needed.
+    pub fn read(root: u32, read: impl FnMut(u32, &mut [u8]) -> Result<()>) -> Result<Self> {
+        Reader {
+            read,
+            nodes: 65536,
+            bytes: 16 * 1024 * 1024,
+        }
+        .directory(root, 0, 0)
     }
-    let d = root + off;
-    let n = u32::from(pe.u16_at(d + 12)?) + u32::from(pe.u16_at(d + 14)?);
-    let mut entries = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let e = d + 16 + 8 * i;
-        let (name, target) = (pe.u32_at(e)?, pe.u32_at(e + 4)?);
-        let id = if name & 0x8000_0000 != 0 {
-            let s = root + (name & 0x7fff_ffff);
-            let len = u32::from(pe.u16_at(s)?);
-            let units: Vec<u16> = pe
-                .slice(s + 2, len * 2)?
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            ResId::Name(String::from_utf16_lossy(&units))
-        } else {
-            ResId::Id(name as u16)
-        };
-        let node = if target & 0x8000_0000 != 0 {
-            ResourceNode::Dir(parse_dir(pe, root, target & 0x7fff_ffff, depth + 1)?)
-        } else {
-            let de = root + target;
-            ResourceNode::Data(ResourceData {
-                entry_rva: de,
-                rva: pe.u32_at(de)?,
-                size: pe.u32_at(de + 4)?,
-                codepage: pe.u32_at(de + 8)?,
-            })
-        };
-        entries.push(ResourceEntry { id, node });
+}
+
+struct Reader<F> {
+    read: F,
+    nodes: u32,
+    bytes: usize,
+}
+
+fn add(rva: u32, offset: u32) -> Result<u32> {
+    rva.checked_add(offset)
+        .ok_or(PeError::OutOfImage { rva, len: offset })
+}
+
+impl<F: FnMut(u32, &mut [u8]) -> Result<()>> Reader<F> {
+    fn read_bytes(&mut self, rva: u32, output: &mut [u8]) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_sub(output.len())
+            .ok_or_else(|| PeError::Malformed("resource read budget exceeded".into()))?;
+        (self.read)(rva, output)
     }
-    Ok(ResourceDir { entries })
+
+    fn short(&mut self, rva: u32) -> Result<u16> {
+        let mut bytes = [0; 2];
+        self.read_bytes(rva, &mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn word(&mut self, rva: u32) -> Result<u32> {
+        let mut bytes = [0; 4];
+        self.read_bytes(rva, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn directory(&mut self, root: u32, offset: u32, depth: u32) -> Result<ResourceDir> {
+        if depth > 8 {
+            return Err(PeError::Malformed("resource tree too deep".into()));
+        }
+        let directory = add(root, offset)?;
+        let count = u32::from(self.short(add(directory, 12)?)?)
+            + u32::from(self.short(add(directory, 14)?)?);
+        self.nodes = self
+            .nodes
+            .checked_sub(count)
+            .ok_or_else(|| PeError::Malformed("resource node budget exceeded".into()))?;
+        let mut entries = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let entry = add(directory, 16 + 8 * index)?;
+            let (name, target) = (self.word(entry)?, self.word(add(entry, 4)?)?);
+            let id = if name & 0x8000_0000 != 0 {
+                let string = add(root, name & 0x7fff_ffff)?;
+                let length = usize::from(self.short(string)?) * 2;
+                let mut encoded = vec![0; length];
+                self.read_bytes(add(string, 2)?, &mut encoded)?;
+                let units: Vec<_> = encoded
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| u16::from_le_bytes(*bytes))
+                    .collect();
+                ResId::Name(String::from_utf16_lossy(&units))
+            } else {
+                ResId::Id(name as u16)
+            };
+            let node = if target & 0x8000_0000 != 0 {
+                ResourceNode::Dir(self.directory(root, target & 0x7fff_ffff, depth + 1)?)
+            } else {
+                let data = add(root, target)?;
+                ResourceNode::Data(ResourceData {
+                    entry_rva: data,
+                    rva: self.word(data)?,
+                    size: self.word(add(data, 4)?)?,
+                    codepage: self.word(add(data, 8)?)?,
+                })
+            };
+            entries.push(ResourceEntry { id, node });
+        }
+        Ok(ResourceDir { entries })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cyclic_directory_is_bounded_without_recursing_or_reading_forever() {
+        let mut bytes = [0; 24];
+        bytes[14..16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[16..20].copy_from_slice(&10u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&0x80000000u32.to_le_bytes());
+        let mut reads = 0;
+        let result = ResourceDir::read(0, |rva, output| {
+            reads += 1;
+            output.copy_from_slice(&bytes[rva as usize..rva as usize + output.len()]);
+            Ok(())
+        });
+        assert!(matches!(result, Err(PeError::Malformed(_))));
+        assert_eq!(reads, 36);
+    }
+
+    #[test]
+    fn overflowing_root_fails_before_calling_the_reader() {
+        let mut reads = 0;
+        let result = ResourceDir::read(u32::MAX - 8, |_, _| {
+            reads += 1;
+            Ok(())
+        });
+        assert!(matches!(result, Err(PeError::OutOfImage { .. })));
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn oversized_directory_rejects_before_allocating_or_reading_entries() {
+        let mut reads = 0;
+        let result = ResourceDir::read(0, |_, output| {
+            reads += 1;
+            assert_eq!(output.len(), 2);
+            output.copy_from_slice(&u16::MAX.to_le_bytes());
+            Ok(())
+        });
+        assert!(matches!(result, Err(PeError::Malformed(_))));
+        assert_eq!(reads, 2);
+    }
 }

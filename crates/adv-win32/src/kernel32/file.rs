@@ -57,14 +57,24 @@ fn io_error(env: &mut Env<'_>, e: &std::io::Error) {
 }
 
 fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
-    let (access, disposition) = (env.arg(1), env.arg(4));
-    Outcome::Return(open(env, &path, access, disposition))
+    let (access, share, disposition) = (env.arg(1), env.arg(2), env.arg(4));
+    Outcome::Return(open_with_share(env, &path, access, disposition, share))
 }
 
 /// CreateFile's core for host callers (PAL's file API): open `path` with the given access
 /// and creation disposition, register the handle, and set the last error. Returns the
 /// handle or `INVALID_HANDLE_VALUE`.
 pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32 {
+    open_with_share(env, path, access, disposition, 7)
+}
+
+fn open_with_share(
+    env: &mut Env<'_>,
+    path: &str,
+    access: u32,
+    disposition: u32,
+    share: u32,
+) -> u32 {
     // Check ownership capacity before creating or truncating an overlay file.
     if !env.sys.objects.can_insert() {
         set_last_error(env, err::NOT_ENOUGH_MEMORY);
@@ -87,6 +97,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
                 file: adv_os::vfs::FileStream::read_only(bytes),
                 guest_path: guest,
                 access,
+                share,
             });
             set_last_error(
                 env,
@@ -106,6 +117,28 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     }
     let w = env.ext.get::<Win32>();
     let existing = w.vfs.lookup(&guest);
+    if matches!(disposition, CREATE_ALWAYS | TRUNCATE_EXISTING)
+        && w.vfs.sections.has_entries()
+        && let Some(path) = existing.as_ref().filter(|path| path.is_file())
+    {
+        let identity =
+            match std::fs::File::open(path).and_then(|file| adv_os::vfs::file_identity(&file)) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    io_error(env, &error);
+                    return INVALID_HANDLE_VALUE;
+                }
+            };
+        if let Some(section) = w.vfs.sections.lookup(identity)
+            && adv_os::try_modules(env.ext)
+                .and_then(|modules| modules.minimum_data_file_length(&section))
+                .is_some()
+        {
+            // Reject before write_path, copy-up, FD retarget or truncating open.
+            set_last_error(env, 1224); // ERROR_USER_MAPPED_FILE
+            return INVALID_HANDLE_VALUE;
+        }
+    }
     let write = access & GENERIC_WRITE != 0
         || matches!(disposition, CREATE_NEW | CREATE_ALWAYS | TRUNCATE_EXISTING);
     let exists = existing.as_ref().is_some_and(|p| p.is_file());
@@ -208,6 +241,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
                 file: file.into(),
                 guest_path: guest.clone(),
                 access,
+                share,
             });
             log::debug!("CreateFile({guest}, {access:#x}, {disposition}) = {h:#x}");
             // ERROR_ALREADY_EXISTS is reported for CREATE_ALWAYS / OPEN_ALWAYS on success.
@@ -317,6 +351,39 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
             out_u32(env.cpu, written, n);
             Outcome::Return(1)
         }
+        Err(error) => {
+            io_error(env, &error);
+            Outcome::Return(0)
+        }
+    }
+}
+
+fn set_end_of_file(env: &mut Env<'_>) -> Outcome {
+    let Some(file) = env.sys.objects.host_mut::<FileObj>(env.arg(0)) else {
+        set_last_error(env, err::INVALID_HANDLE);
+        return Outcome::Return(0);
+    };
+    let position = match file.file.stream_position() {
+        Ok(position) => position,
+        Err(error) => {
+            io_error(env, &error);
+            return Outcome::Return(0);
+        }
+    };
+    let section = file
+        .file
+        .cached_identity()
+        .and_then(|identity| env.ext.get::<Win32>().vfs.sections.lookup(identity));
+    if let Some(section) = section
+        && adv_os::try_modules(env.ext)
+            .and_then(|modules| modules.minimum_data_file_length(&section))
+            .is_some_and(|minimum| position < minimum)
+    {
+        set_last_error(env, 1224);
+        return Outcome::Return(0);
+    }
+    match file.file.set_len(position) {
+        Ok(()) => Outcome::Return(1),
         Err(error) => {
             io_error(env, &error);
             Outcome::Return(0)
@@ -976,14 +1043,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetFileSizeEx", 2, get_file_size_ex);
     stdcall(reg, K32, "GetFileType", 1, get_file_type);
     stdcall(reg, K32, "FlushFileBuffers", 1, |_| Outcome::Return(1));
-    stdcall(reg, K32, "SetEndOfFile", 1, |e| {
-        let h = e.arg(0);
-        let ok = e.sys.objects.host_mut::<FileObj>(h).is_some_and(|f| {
-            let pos = f.file.stream_position().unwrap_or(0);
-            f.file.set_len(pos).is_ok()
-        });
-        Outcome::Return(u32::from(ok))
-    });
+    stdcall(reg, K32, "SetEndOfFile", 1, set_end_of_file);
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
     stdcall(reg, K32, "SetFileTime", 4, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetFileAttributesA", 1, |e| {
