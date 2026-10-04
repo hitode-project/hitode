@@ -629,6 +629,7 @@ api-ms-win-crt-runtime-l1-1-0.dll	_initialize_onexit_table	cdecl	i32	i32	table:_
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
+api-ms-win-crt-string-l1-1-0.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
 avifil32.dll	AVIBuildFilterA	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PSTR:str8:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIBuildFilterW	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PWSTR:str16:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIClearClipboard	stdcall	i32	Windows.Win32.Foundation.HRESULT	
@@ -5165,6 +5166,7 @@ ucrtbase.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 ucrtbase.dll	free	cdecl	void	void	block:void*:ptr:1
 ucrtbase.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 ucrtbase.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
+ucrtbase.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
 ucrtbase.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
 user32.dll	ActivateKeyboardLayout	stdcall	handle	Windows.Win32.UI.Input.KeyboardAndMouse.HKL	hkl:Windows.Win32.UI.Input.KeyboardAndMouse.HKL:handle:1|Flags:Windows.Win32.UI.Input.KeyboardAndMouse.ACTIVATE_KEYBOARD_LAYOUT_FLAGS:u32:1
 user32.dll	AddClipboardFormatListener	stdcall	i32	Windows.Win32.Foundation.BOOL	hwnd:Windows.Win32.Foundation.HWND:handle:1

@@ -8,6 +8,7 @@ mod convert;
 mod floating;
 mod heap;
 mod onexit;
+mod wide_string;
 
 #[derive(Default)]
 struct CrtState {
@@ -15,6 +16,39 @@ struct CrtState {
     locks: HashMap<(String, u32), u32>,
     globals: HashMap<(String, String), u32>,
     invalid_handlers: HashMap<String, u32>,
+}
+
+// API-set imports and their UCRT exports share the same CRT state owner.
+fn crt_module(module: &str) -> &str {
+    if module.starts_with("api-ms-win-crt-") {
+        "ucrtbase.dll"
+    } else {
+        module
+    }
+}
+
+fn invalid_parameter(env: &mut Env<'_>, function: &str, error: i32) -> Outcome {
+    let errno = floating::errno_address(env);
+    if errno.is_null() || errno.write(env.cpu, error).is_err() {
+        return Outcome::Fail("CRT errno allocation/write failed".into());
+    }
+    let handler = env
+        .ext
+        .get::<CrtState>()
+        .invalid_handlers
+        .get(crt_module(&env.sys.thunks.get(env.thunk).module))
+        .copied()
+        .unwrap_or(0);
+    if handler == 0 {
+        return Outcome::Fail(format!(
+            "{function}: invalid parameter without a returning guest handler"
+        ));
+    }
+    // Release UCRT passes no diagnostic strings. errno is assigned before the
+    // callback, and a returning callback may change it or wait via the Machine.
+    Outcome::call(handler, [0, 0, 0, 0, 0], move |_, _| {
+        Outcome::Return(error as u32)
+    })
 }
 
 pub fn install<B: adv_cpu::backend::Backend>(
@@ -33,6 +67,7 @@ pub fn register(r: &mut Registry) {
     onexit::register(r);
     convert::register(r);
     heap::register(r);
+    wide_string::register(r);
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),

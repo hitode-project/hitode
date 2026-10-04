@@ -46,3 +46,5 @@ api-ms-win-crt-heap-l1-1-0.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 api-ms-win-crt-heap-l1-1-0.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 api-ms-win-crt-heap-l1-1-0.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
 api-ms-win-crt-heap-l1-1-0.dll	free	cdecl	void	void	block:void*:ptr:1
+ucrtbase.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1

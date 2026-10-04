@@ -149,22 +149,7 @@ fn secure(env: &mut Env<'_>, output: GuestPtr<u32>, value: u32, mask: u32) -> Ou
         if !output.is_null() && output.write(env.cpu, merge(current)).is_err() {
             return Outcome::Fail("_controlfp_s: output write failed".into());
         }
-        if env.ext.try_get::<CrtState>().is_none() {
-            env.ext.insert(CrtState::default());
-        }
-        let handler = env
-            .ext
-            .get::<CrtState>()
-            .invalid_handlers
-            .get(env.sys.thunks.get(env.thunk).module.as_str())
-            .copied()
-            .unwrap_or(0);
-        if handler == 0 {
-            return Outcome::Fail(
-                "_controlfp_s: invalid parameter without a returning guest handler".into(),
-            );
-        }
-        return Outcome::call(handler, [0, 0, 0, 0, 0], |env, _| invalid_return(env));
+        return invalid_parameter(env, "_controlfp_s", 22);
     }
     match apply(env, value, mask & VALID & !DENORMAL, true, true) {
         Ok(current) => {
@@ -176,23 +161,12 @@ fn secure(env: &mut Env<'_>, output: GuestPtr<u32>, value: u32, mask: u32) -> Ou
         Err(e) => Outcome::Fail(e),
     }
 }
-fn invalid_return(env: &mut Env<'_>) -> Outcome {
-    let address = errno_address(env);
-    if address.is_null() || address.write(env.cpu, 22).is_err() {
-        return Outcome::Fail("CRT errno allocation/write failed".into());
-    }
-    Outcome::Return(22)
-}
 pub(super) fn errno_address(env: &mut Env<'_>) -> GuestPtr<i32> {
     if env.ext.try_get::<CrtState>().is_none() {
         env.ext.insert(CrtState::default());
     }
     let module = env.sys.thunks.get(env.thunk).module.as_str();
-    let module = if module.starts_with("api-ms-win-crt-") {
-        "ucrtbase.dll"
-    } else {
-        module
-    };
+    let module = crt_module(module);
     let key = (module.to_owned(), env.sys.current);
     let address = if let Some(&address) = env.ext.get::<CrtState>().errno.get(&key) {
         address
@@ -209,7 +183,7 @@ fn invalid_set(env: &mut Env<'_>, handler: GuestPtr<u8>) -> GuestPtr<u8> {
     if env.ext.try_get::<CrtState>().is_none() {
         env.ext.insert(CrtState::default());
     }
-    let module = env.sys.thunks.get(env.thunk).module.as_str().to_owned();
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module).to_owned();
     GuestPtr::new(
         env.ext
             .get_mut::<CrtState>()
@@ -224,7 +198,7 @@ fn invalid_get(env: &mut Env<'_>) -> GuestPtr<u8> {
             .try_get::<CrtState>()
             .and_then(|s| {
                 s.invalid_handlers
-                    .get(env.sys.thunks.get(env.thunk).module.as_str())
+                    .get(crt_module(&env.sys.thunks.get(env.thunk).module))
                     .copied()
             })
             .unwrap_or(0),

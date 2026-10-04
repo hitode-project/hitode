@@ -10,7 +10,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/controlfp-s",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-invalid-parameter-handler-set-thread-local-invalid-parameter-handler",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/execute-onexit-table-initialize-onexit-table-register-onexit-function",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/malloc"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/malloc",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcat-s-wcscat-s-mbscat-s"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -31,5 +32,9 @@
   "corecrt_malloc.h": {
     "sha256": "44bd1bb518e730ba0be045f44a4735869e08f7d54ab85c298270770812fcff80",
     "header": "ucrt/corecrt_malloc.h"
+  },
+  "corecrt_wstring.h": {
+    "header": "ucrt/corecrt_wstring.h",
+    "sha256": "c485f918d43f0f846d77a36eaee9e111f57bf2eec32db7d9719ff924771744c6"
   }
 }
