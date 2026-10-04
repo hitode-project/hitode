@@ -6,6 +6,7 @@ param(
     [switch]$NoTimeSkip
 )
 $ErrorActionPreference='Stop'
+$env:ADV_AUDIO_MUTE_DEVICE='1'
 $Runner=[IO.Path]::GetFullPath($Runner)
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 $acceptanceRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../target/architecture-acceptance'))
@@ -23,8 +24,13 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 Remove-FixtureOutput $fixtureDirectory 'd3d9-environment.bin'
 $fixture=Join-Path $fixtureDirectory 'fixture_d3d9_environment.exe'
 $native=Start-Process -FilePath $fixture -WorkingDirectory $fixtureDirectory -WindowStyle Hidden -PassThru
-if(-not $native.WaitForExit(20000)){$native.Kill();$native.WaitForExit(2000)|Out-Null;throw 'native environment fixture timed out'}
-if($native.ExitCode -ne 0){throw "native fixture failed: $($native.ExitCode)"}
+try {
+    if(-not $native.WaitForExit(5000)){throw 'native environment fixture timed out'}
+    if($native.ExitCode -ne 0){throw "native fixture failed: $($native.ExitCode)"}
+} finally {
+    if(-not $native.HasExited){$native.Kill();$native.WaitForExit(1000)|Out-Null}
+    $native.Dispose()
+}
 $reference=[IO.File]::ReadAllBytes((Join-Path $fixtureDirectory 'd3d9-environment.bin'))
 if($reference.Length -ne 82*4){throw 'native environment output size mismatch'}
 if($GuestVisible){

@@ -43,8 +43,8 @@ static void success(HRESULT hr) {
     if (FAILED(hr)) { save(); ExitProcess(94); }
 }
 void mainCRTStartup(void) {
-    HWND window = CreateWindowExA(0, "STATIC", "D3D9 FPU silent fixture", FIXTURE_STYLE,
-        0, 0, 64, 64, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    HWND window = CreateWindowExA(WS_EX_NOACTIVATE, "STATIC", "D3D9 FPU silent fixture", FIXTURE_STYLE,
+        -32000, -32000, 64, 64, NULL, NULL, GetModuleHandleA(NULL), NULL);
     IDirect3D9 *factory = Direct3DCreate9(D3D_SDK_VERSION);
     UINT index;
     if (!window || !factory) ExitProcess(1);
