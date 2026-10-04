@@ -253,7 +253,7 @@ public static class AbiMetadata
         File.WriteAllText(Path.Combine(output, "structs.rs"), structs.ToString(), new UTF8Encoding(false));
 
         var com = new List<string> { "# Generated x86 COM vtable signatures: interface\tslot\tmethod\treturn kind\treturn type\tparameters (including this)" };
-        foreach (string name in new[] { "IDirectDraw", "IDirectDraw7", "IDirectDrawClipper", "IDirectDrawSurface", "IDirectDrawSurface7", "IDirectSound", "IDirectSound8", "IDirectSoundBuffer", "IDirectSoundBuffer8", "IDirectSoundNotify", "IDirect3D9", "IDirect3DDevice9", "IDirect3DResource9", "IDirect3DBaseTexture9", "IDirect3DTexture9", "IDirect3DSurface9", "IDirect3DVertexBuffer9", "IDirect3DIndexBuffer9", "IDirect3DSwapChain9", "IDirect3DStateBlock9", "IDirect3DVertexDeclaration9", "IDirect3DVertexShader9", "IDirect3DPixelShader9", "IDirect3DQuery9" })
+        foreach (string name in new[] { "IDirectDraw", "IDirectDraw7", "IDirectDrawClipper", "IDirectDrawSurface", "IDirectDrawSurface7", "IDirectSound", "IDirectSound8", "IDirectSoundBuffer", "IDirectSoundBuffer8", "IDirectSoundNotify", "IDirectInput8A", "IDirectInput8W", "IDirect3D9", "IDirect3DDevice9", "IDirect3DResource9", "IDirect3DBaseTexture9", "IDirect3DTexture9", "IDirect3DSurface9", "IDirect3DVertexBuffer9", "IDirect3DIndexBuffer9", "IDirect3DSwapChain9", "IDirect3DStateBlock9", "IDirect3DVertexDeclaration9", "IDirect3DVertexShader9", "IDirect3DPixelShader9", "IDirect3DQuery9" })
         {
             int slot = 0;
             foreach (var mh in ComMethods(r, types, types.Find(name)))
