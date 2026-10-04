@@ -305,3 +305,94 @@ fn consecutive_long_short_runs_reuse_the_bounded_patch_and_cached_font() {
         assert_eq!(text.stats().fonts, 1);
     }
 }
+
+#[test]
+fn indexed_text_preserves_gray_antialiasing_clip_and_unchanged_duplicate_indices() {
+    let mut request = font(3);
+    request.quality = Quality::Antialiased;
+    let paint = Paint {
+        input: TextInput::Encoded(b"AW"),
+        origin: Point { x: 6, y: 4 },
+        horizontal: Horizontal::Left,
+        vertical: Vertical::Top,
+        foreground: [255; 3],
+        background: [0; 3],
+        opaque_background: false,
+        clip: Some(TextBox {
+            left: 4,
+            top: 2,
+            right: 52,
+            bottom: 30,
+        }),
+        fill: None,
+    };
+    for bottom_up in [false, true] {
+        let mut memory = Memory(vec![0; 65536]);
+        let mut store = Surfaces::new(64, 32, 16, 60000, Snapshot::default()).unwrap();
+        let indexed = store
+            .create(64, 32, bottom_up, PixelFormat::Indexed8, &mut memory)
+            .unwrap();
+        let bgra = store
+            .create(64, 32, false, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        let mut palette: [[u8; 4]; 256] = std::array::from_fn(|i| [i as u8, i as u8, i as u8, 0]);
+        palette[50] = palette[49];
+        store.set_palette(indexed, 0, &palette).unwrap();
+        let indices = store.get(indexed).unwrap().clone();
+        let direct = store.get(bgra).unwrap().clone();
+        memory.0
+            [indices.pixels as usize..(indices.pixels + indices.pitch * indices.height) as usize]
+            .fill(50);
+        for pixel in memory.0
+            [direct.pixels as usize..(direct.pixels + direct.pitch * direct.height) as usize]
+            .as_chunks_mut::<4>()
+            .0
+        {
+            *pixel = [49, 49, 49, 0];
+        }
+        let mut text = Text::default();
+        assert!(
+            store
+                .draw_text(bgra, &mut memory, &mut text, &request, paint)
+                .unwrap()
+        );
+        assert!(
+            store
+                .draw_text(indexed, &mut memory, &mut text, &request, paint)
+                .unwrap()
+        );
+        let mut antialiased = false;
+        for y in 0..32 {
+            for x in 0..64 {
+                let index = memory.0[indices.row(x, y) as usize];
+                let address = direct.row(x, y) as usize;
+                let color: [u8; 4] = memory.0[address..address + 4].try_into().unwrap();
+                if color[..3] == [49; 3] {
+                    assert_eq!(index, 50, "unchanged duplicate index at {x},{y}");
+                } else {
+                    assert_eq!(
+                        palette[index as usize][..3],
+                        color[..3],
+                        "coverage at {x},{y}"
+                    );
+                    antialiased |= color[0] > 49 && color[0] < 255;
+                }
+                if !(4..52).contains(&x) || !(2..30).contains(&y) {
+                    assert_eq!(index, 50, "clip exterior at {x},{y}");
+                }
+            }
+        }
+        assert!(
+            antialiased,
+            "font rasterizer must produce intermediate coverage"
+        );
+        let growths = store.stats.text_scratch_growths;
+        store
+            .draw_text(indexed, &mut memory, &mut text, &request, paint)
+            .unwrap();
+        assert_eq!(
+            store.stats.text_scratch_growths, growths,
+            "repeated indexed output reuses scratch"
+        );
+    }
+}

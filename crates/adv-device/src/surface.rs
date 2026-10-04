@@ -1127,9 +1127,6 @@ impl<P: Presenter> Surfaces<P> {
             .get(&id)
             .ok_or("unknown text surface")?
             .clone();
-        if surface.format == PixelFormat::Indexed8 {
-            return Err("indexed text requires explicit palette rasterization".into());
-        }
         if surface.locked.is_some() {
             return Err("text surface is locked".into());
         }
@@ -1185,9 +1182,20 @@ impl<P: Presenter> Surfaces<P> {
             h: (bottom - top) as u32,
         };
         let row = usize::try_from(bounds.w).unwrap() * surface.format.bytes() as usize;
-        let pitch = (row + 3) & !3;
-        let len = pitch
+        let indexed = surface.format == PixelFormat::Indexed8;
+        let paint_format = if indexed {
+            PixelFormat::Bgra32
+        } else {
+            surface.format
+        };
+        let paint_row = bounds.w as usize * paint_format.bytes() as usize;
+        let pitch = (paint_row + 3) & !3;
+        let paint_len = pitch
             .checked_mul(bounds.h as usize)
+            .ok_or("text patch exceeds allocation limit")?;
+        let original_len = if indexed { row * bounds.h as usize } else { 0 };
+        let len = paint_len
+            .checked_add(original_len)
             .filter(|&n| n <= 32 * 1024 * 1024)
             .ok_or("text patch exceeds allocation limit")?;
         if len > self.text_patch.capacity() {
@@ -1197,12 +1205,25 @@ impl<P: Presenter> Surfaces<P> {
         if len > self.text_patch.len() {
             self.text_patch.resize(len, 0);
         }
-        let bytes = &mut self.text_patch[..len];
+        let (bytes, original_indices) = self.text_patch[..len].split_at_mut(paint_len);
         for y in 0..bounds.h {
             let addr = surface.row(bounds.x, bounds.y + y);
             memory.writable(addr, row)?;
-            bytes[y as usize * pitch..y as usize * pitch + row]
-                .copy_from_slice(memory.read(addr, row)?.as_ref());
+            let source = memory.read(addr, row)?;
+            let destination = &mut bytes[y as usize * pitch..y as usize * pitch + paint_row];
+            if indexed {
+                original_indices[y as usize * row..y as usize * row + row].copy_from_slice(&source);
+                for (pixel, index) in destination
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(source.iter())
+                {
+                    *pixel = surface.decode_pixel(&[*index]);
+                }
+            } else {
+                destination.copy_from_slice(&source);
+            }
         }
         text.paint(
             font,
@@ -1210,11 +1231,27 @@ impl<P: Presenter> Surfaces<P> {
             Pixels {
                 bounds,
                 pitch: pitch as u32,
-                format: surface.format,
+                format: paint_format,
                 bytes,
             },
         )
         .map_err(|e| e.to_string())?;
+        if indexed {
+            // Quantize the same antialiased RGB output through this surface's
+            // own table. Retain untouched indices even when multiple entries
+            // have equal RGB values. Compact in place, with no per-pixel allocation.
+            for y in 0..bounds.h as usize {
+                let painted = &mut bytes[y * pitch..y * pitch + paint_row];
+                for (x, &original) in original_indices[y * row..y * row + row].iter().enumerate() {
+                    let pixel: [u8; 4] = painted[x * 4..x * 4 + 4].try_into().unwrap();
+                    painted[x] = if pixel[..3] == surface.decode_pixel(&[original])[..3] {
+                        original
+                    } else {
+                        surface.encode_pixel(pixel)[0]
+                    };
+                }
+            }
+        }
         let changed = (0..bounds.h).try_fold(false, |changed, y| {
             let original = memory.read(surface.row(bounds.x, bounds.y + y), row)?;
             Ok::<bool, String>(
