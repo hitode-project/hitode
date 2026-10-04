@@ -2,10 +2,6 @@
 Guest	<win32>!startup_enter	personality-internal guest entry
 Guest	<win32>!startup_leave	personality-internal guest entry
 Guest	<win32>!thread_start	personality-internal guest entry
-Guest	ddraw.dll!AddRef	internal common COM dispatch
-Guest	ddraw.dll!QueryInterface	internal common COM dispatch
-Guest	ddraw.dll!Release	internal common COM dispatch
-Guest	ddraw.dll!UnsupportedCOMMethod	internal common COM dispatch
 Guest	dsound.dll!#1	ordinal alias (WinMD is name-based)
 Guest	kernel32.dll!GetEnvironmentStringsA	SDK/export name alias
 Guest	kernel32.dll!InterlockedCompareExchange	SDK intrinsic absent from PInvoke metadata
@@ -51,7 +47,6 @@ Guest	msvcrt.dll!__p__commode	CRT outside Win32Metadata
 Guest	msvcrt.dll!__p__fmode	CRT outside Win32Metadata
 Guest	msvcrt.dll!__set_app_type	CRT outside Win32Metadata
 Guest	msvcrt.dll!_adjust_fdiv	CRT outside Win32Metadata
-Guest	msvcrt.dll!_errno	CRT outside Win32Metadata
 Guest	msvcrt.dll!_ftol	CRT outside Win32Metadata
 Guest	msvcrt.dll!_initterm	CRT outside Win32Metadata
 Guest	msvcrt.dll!_initterm_e	CRT outside Win32Metadata
@@ -92,10 +87,6 @@ Guest	ws2_32.dll!#116	ordinal alias (WinMD is name-based)
 Native	<win32>!startup_enter	personality-internal guest entry
 Native	<win32>!startup_leave	personality-internal guest entry
 Native	<win32>!thread_start	personality-internal guest entry
-Native	ddraw.dll!AddRef	internal common COM dispatch
-Native	ddraw.dll!QueryInterface	internal common COM dispatch
-Native	ddraw.dll!Release	internal common COM dispatch
-Native	ddraw.dll!UnsupportedCOMMethod	internal common COM dispatch
 Native	dsound.dll!#1	ordinal alias (WinMD is name-based)
 Native	kernel32.dll!GetEnvironmentStringsA	SDK/export name alias
 Native	kernel32.dll!InterlockedCompareExchange	SDK intrinsic absent from PInvoke metadata
@@ -141,7 +132,6 @@ Native	msvcrt.dll!__p__commode	CRT outside Win32Metadata
 Native	msvcrt.dll!__p__fmode	CRT outside Win32Metadata
 Native	msvcrt.dll!__set_app_type	CRT outside Win32Metadata
 Native	msvcrt.dll!_adjust_fdiv	CRT outside Win32Metadata
-Native	msvcrt.dll!_errno	CRT outside Win32Metadata
 Native	msvcrt.dll!_ftol	CRT outside Win32Metadata
 Native	msvcrt.dll!_initterm	CRT outside Win32Metadata
 Native	msvcrt.dll!_initterm_e	CRT outside Win32Metadata

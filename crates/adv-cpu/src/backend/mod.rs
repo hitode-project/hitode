@@ -156,6 +156,7 @@ pub trait Guest {
     }
     /// Invalid MXCSR leaves both controls unchanged. Changing x87 masks preserves
     /// exception flags, tags and registers, while recomputing pending ES/B status.
+    /// An unchanged x87 control word preserves the complete original x87 state.
     fn set_fpu_environment(
         &mut self,
         _environment: FpuEnvironment,

@@ -8,6 +8,7 @@ use adv_os::Heaps;
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
+mod processor;
 
 fn exit_process(env: &mut Env<'_>) -> Outcome {
     super::module::exit_process(env, env.arg(0))
@@ -44,7 +45,7 @@ fn command_line_w(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn environment(w: &Win32) -> Vec<String> {
     vec![
-        "=C:=C:\\Game".into(),
+        format!("=C:={}", w.vfs.cwd),
         "ALLUSERSPROFILE=C:\\ProgramData".into(),
         format!(
             "APPDATA=C:\\Users\\{}\\AppData\\Roaming",
@@ -294,25 +295,6 @@ fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-/// SYSTEM_INFO for one x86 CPU with 4 KiB pages and 64 KiB granularity.
-fn get_system_info(env: &mut Env<'_>) -> Outcome {
-    let p = env.arg(0);
-    zero(env.cpu, p, 36);
-    for (off, v) in [
-        (4, 0x1000),
-        (8, 0x1_0000),
-        (12, 0x7ffe_ffff),
-        (16, 1),
-        (20, 1),
-        (24, 586),
-        (28, 0x1_0000),
-    ] {
-        let _ = env.cpu.write_u32(p + off, v);
-    }
-    let _ = env.cpu.write(p + 32, &[6, 0, 0x2a, 0x3a]); // wProcessorLevel 6, revision
-    Outcome::Return(0)
-}
-
 /// MEMORYSTATUS / MEMORYSTATUSEX with 2 GiB physical, 2 GiB virtual.
 fn global_memory_status(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
@@ -407,10 +389,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetThreadPriority", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "SetPriorityClass", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetPriorityClass", 1, |_| Outcome::Return(0x20));
-    stdcall(reg, K32, "SetThreadAffinityMask", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "SetProcessAffinityMask", 2, |_| {
-        Outcome::Return(1)
-    });
+    processor::register(reg);
     stdcall(reg, K32, "GetCommandLineA", 0, command_line_a);
     stdcall(reg, K32, "GetCommandLineW", 0, command_line_w);
     stdcall(reg, K32, "GetStartupInfoA", 1, get_startup_info);
@@ -451,7 +430,6 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "DecodePointer", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "GetLastError", 0, get_last_error);
     stdcall(reg, K32, "SetLastError", 1, set_last_error_);
-    stdcall(reg, K32, "GetSystemInfo", 1, get_system_info);
     stdcall(reg, K32, "GlobalMemoryStatus", 1, global_memory_status);
     stdcall(reg, K32, "GlobalMemoryStatusEx", 1, global_memory_status_ex);
     stdcall(reg, K32, "GetComputerNameA", 2, get_computer_name_a);

@@ -137,3 +137,45 @@ fn trap_view_control_change_affects_the_next_guest_instruction() {
     }
     trap_update(setup(UnicornCpu::new(PARK).unwrap()));
 }
+
+fn preserve_raw_status<B: Backend>(mut cpu: B) {
+    let mut state = cpu.capture_architecture().unwrap();
+    state.x87.control = 0x027f;
+    state.x87.status = 0xbdc5; // Imported ES/B, TOP, condition and sticky flags.
+    state.x87.ip = 0x12345678;
+    state.x87.dp = 0x87654321;
+    cpu.restore_architecture(&state).unwrap();
+    let environment = cpu.fpu_environment().unwrap();
+    cpu.set_fpu_environment(environment).unwrap();
+    assert_eq!(cpu.capture_architecture().unwrap(), state);
+    let changed = FpuEnvironment {
+        mxcsr: 0x3fc3,
+        ..environment
+    };
+    cpu.set_fpu_environment(changed).unwrap();
+    state.mxcsr = changed.mxcsr;
+    assert_eq!(
+        cpu.capture_architecture().unwrap(),
+        state,
+        "SSE-only preserves all x87 bytes"
+    );
+    assert!(
+        cpu.set_fpu_environment(FpuEnvironment {
+            mxcsr: 0x10000,
+            ..changed
+        })
+        .is_err()
+    );
+    assert_eq!(
+        cpu.capture_architecture().unwrap(),
+        state,
+        "invalid change remains atomic"
+    );
+}
+#[test]
+fn unchanged_control_and_sse_only_changes_preserve_imported_raw_status() {
+    for jit in [false, true] {
+        preserve_raw_status(setup(JitCpu::new(PARK, jit).unwrap()));
+    }
+    preserve_raw_status(setup(UnicornCpu::new(PARK).unwrap()));
+}

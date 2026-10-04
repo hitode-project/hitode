@@ -25,7 +25,7 @@ if ((Get-FileHash -LiteralPath $Winmd -Algorithm SHA256).Hash -ne $winmdHash) { 
 Add-Type -Path (Join-Path $PSScriptRoot 'Metadata.cs')
 $destination = Join-Path $repoRoot 'data/abi'
 if ($Check) { $destination = Join-Path $cache 'check' }
-[AbiMetadata]::Generate($Winmd, $destination, (Join-Path $repoRoot 'data/abi/modules.txt'))
+[AbiMetadata]::Generate($Winmd, $destination, (Join-Path $repoRoot 'data/abi/modules.txt'), (Join-Path $repoRoot 'data/abi/crt-input.tsv'))
 if ($Check) {
     foreach ($name in @('signatures.tsv', 'structs.rs', 'com.tsv', 'constants.tsv')) {
         $expected = [IO.File]::ReadAllBytes((Join-Path $repoRoot "data/abi/$name"))

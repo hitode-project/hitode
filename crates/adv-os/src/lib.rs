@@ -18,6 +18,7 @@ pub mod heap;
 pub mod loader;
 pub mod module;
 pub mod nls;
+pub mod processor;
 pub mod registry;
 pub mod synthetic;
 pub mod system_files;

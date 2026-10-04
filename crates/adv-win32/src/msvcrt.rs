@@ -4,12 +4,14 @@ use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
+mod floating;
 
 #[derive(Default)]
 struct CrtState {
-    errno: HashMap<u32, u32>,
+    errno: HashMap<(String, u32), u32>,
     locks: HashMap<(String, u32), u32>,
     globals: HashMap<(String, String), u32>,
+    invalid_handlers: HashMap<String, u32>,
 }
 
 pub fn install<B: adv_cpu::backend::Backend>(
@@ -24,6 +26,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 }
 
 pub fn register(r: &mut Registry) {
+    floating::register(r);
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
@@ -44,7 +47,6 @@ pub fn register(r: &mut Registry) {
         ("__p__fmode", 0),
         ("__p__commode", 0),
         ("_adjust_fdiv", 0),
-        ("_errno", 0),
         ("toupper", 1),
         ("qsort", 4),
         ("floor", 2),
@@ -91,6 +93,36 @@ pub fn register(r: &mut Registry) {
         }
     }
 }
+/// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
+pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
+    release_errno(env, Some(env.sys.current))
+}
+
+/// Host CRT modules are pinned. Process detach is their final errno boundary.
+pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    release_errno(env, None)
+}
+
+fn release_errno(env: &mut Env<'_>, context: Option<adv_machine::CtxId>) -> Result<(), String> {
+    let Some(state) = env.ext.try_get::<CrtState>() else {
+        return Ok(());
+    };
+    let cells: Vec<_> = state
+        .errno
+        .iter()
+        .filter(|((_, id), _)| context.is_none_or(|ctx| *id == ctx))
+        .map(|(key, &address)| (key.clone(), address))
+        .collect();
+    for (key, address) in cells {
+        let heaps = env.ext.get_mut::<Heaps>();
+        if address != 0 && !heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, address) {
+            return Err(format!("CRT errno detach: invalid heap cell {address:#x}"));
+        }
+        env.ext.get_mut::<CrtState>().errno.remove(&key);
+    }
+    Ok(())
+}
+
 fn double(e: &Env<'_>) -> Result<f64, String> {
     let mut b = [0; 8];
     e.cpu
@@ -426,19 +458,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             return initializers(e, a, b, name == "_initterm_e");
         }
         "_adjust_fdiv" => 0,
-        "_errno" => {
-            if e.ext.try_get_mut::<CrtState>().is_none() {
-                e.ext.insert(CrtState::default());
-            }
-            let ctx = e.sys.current;
-            if let Some(&p) = e.ext.get::<CrtState>().errno.get(&ctx) {
-                p
-            } else {
-                let p = allocate(e, 4, true);
-                e.ext.get_mut::<CrtState>().errno.insert(ctx, p);
-                p
-            }
-        }
         "toupper" => {
             if a <= 255 {
                 u32::from((a as u8).to_ascii_uppercase())
@@ -663,6 +682,69 @@ mod tests {
             assert_eq!(m.cpu.read_u32(pointer).unwrap(), 2);
         }
     }
+    #[test]
+    fn errno_cells_are_freed_at_thread_and_process_detach_boundaries() {
+        for jit in [false, true] {
+            let mut registry = Registry::default();
+            crate::register(&mut registry);
+            register(&mut registry);
+            registry.add("fixture.dll", "cleanup", Conv::Cdecl { argc: 0 }, |env| {
+                let heap = env.ext.get::<Heaps>().process_heap;
+                let mut cells = Vec::new();
+                for (module, ctx) in [
+                    ("msvcrt.dll", env.sys.current),
+                    ("ucrtbase.dll", env.sys.current),
+                    ("msvcrt.dll", env.sys.current + 1),
+                ] {
+                    let address = allocate(env, 4, true);
+                    if address == 0 {
+                        return Outcome::Fail("fixture allocation failed".into());
+                    }
+                    env.ext
+                        .get_mut::<CrtState>()
+                        .errno
+                        .insert((module.into(), ctx), address);
+                    cells.push(address);
+                }
+                if let Err(error) = detach_thread(env) {
+                    return Outcome::Fail(error);
+                }
+                assert_eq!(env.ext.get::<CrtState>().errno.len(), 1);
+                for &address in &cells[..2] {
+                    assert_eq!(env.ext.get_mut::<Heaps>().size(heap, address), None);
+                }
+                assert_eq!(env.ext.get_mut::<Heaps>().size(heap, cells[2]), Some(4));
+                // Repeated notification cleanup is idempotent.
+                detach_thread(env).unwrap();
+                detach_process(env).unwrap();
+                detach_process(env).unwrap();
+                assert!(env.ext.get::<CrtState>().errno.is_empty());
+                assert_eq!(env.ext.get_mut::<Heaps>().size(heap, cells[2]), None);
+                Outcome::Return(0)
+            });
+            let mut machine = Machine::new(
+                JitCpu::new(adv_machine::layout::PARK_ADDR, jit).unwrap(),
+                registry,
+                Clock::virtual_time(),
+            )
+            .unwrap();
+            crate::Win32::install(
+                &mut machine,
+                crate::Win32Config::new(".", "errno-test.exe", "target/errno-test"),
+            )
+            .unwrap();
+            install(&mut machine).unwrap();
+            let code = 0x400000;
+            machine.cpu.map(code, 4096, Prot::RX).unwrap();
+            let target = machine.resolve_import("fixture.dll", "cleanup").unwrap();
+            let mut asm = adv_cpu::backend::asm::Asm::new(code);
+            asm.call(target).ret();
+            machine.cpu.write(code, &asm.bytes).unwrap();
+            machine.spawn("errno-detach", code, &[], 65536).unwrap();
+            assert!(matches!(machine.run(), RunResult::Exited(0)));
+        }
+    }
+
     #[test]
     fn frexp_ldexp_helpers_preserve_subnormal_sign_and_full_double_precision() {
         for v in [

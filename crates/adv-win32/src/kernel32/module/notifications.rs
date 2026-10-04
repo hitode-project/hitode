@@ -218,6 +218,9 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
             env,
             calls,
             Box::new(move |env| {
+                if let Err(error) = crate::msvcrt::detach_thread(env) {
+                    return Outcome::Fail(error);
+                }
                 if env
                     .sys
                     .contexts
@@ -240,6 +243,13 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     env.sys.terminate_other_contexts(code);
     locked(env, move |env| {
         let calls = notifications(env, 0);
-        run(env, calls, Box::new(move |_| Outcome::ExitProcess(code)))
+        run(
+            env,
+            calls,
+            Box::new(move |env| match crate::msvcrt::detach_process(env) {
+                Ok(()) => Outcome::ExitProcess(code),
+                Err(error) => Outcome::Fail(error),
+            }),
+        )
     })
 }

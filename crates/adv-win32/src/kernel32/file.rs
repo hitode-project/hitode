@@ -3,7 +3,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::SystemTime;
 
-use adv_abi::{Registry, WideStr, win32};
+use adv_abi::Registry;
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Env, Outcome};
 
@@ -13,6 +13,7 @@ use crate::util::{
 };
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
+mod path;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const CREATE_NEW: u32 = 1;
@@ -30,12 +31,6 @@ fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u
     files.open(env.cpu, env.sys, path).map_err(|error| {
         log::warn!("synthetic file {path}: {error}");
     })
-}
-
-#[win32(kernel32, name = "GetSystemDirectoryW", level = implement)]
-fn system_directory_w(env: &mut Env<'_>, output: WideStr, capacity: u32) -> u32 {
-    let path: Vec<u16> = "C:\\Windows\\system32".encode_utf16().collect();
-    put_wstr(env.cpu, output.0.addr(), capacity, &path).unwrap_or(path.len() as u32 + 1)
 }
 
 fn path_a(env: &Env<'_>, p: u32) -> String {
@@ -547,7 +542,7 @@ fn get_file_attributes(env: &mut Env<'_>, path: String) -> Outcome {
     }
 }
 
-fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
+pub(super) fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
     let guest = env.ext.get::<Win32>().vfs.normalize(&path);
     if matches!(system_file(env, &guest), Ok(Some(_))) {
         set_last_error(env, err::ACCESS_DENIED);
@@ -572,7 +567,7 @@ fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
     }
 }
 
-fn copy_file(
+pub(super) fn copy_file(
     env: &mut Env<'_>,
     src: String,
     dst: String,
@@ -588,25 +583,59 @@ fn copy_file(
         set_last_error(env, err::FILE_EXISTS);
         return Outcome::Return(0);
     }
+    let full = w.vfs.normalize(&dst);
+    let parent = full.trim_end_matches('\\').rsplit_once('\\').map(|(p, _)| {
+        if p.len() == 2 {
+            format!("{p}\\")
+        } else {
+            p.to_owned()
+        }
+    });
+    if !parent.is_some_and(|p| w.vfs.is_dir(&p)) {
+        set_last_error(env, err::PATH_NOT_FOUND);
+        return Outcome::Return(0);
+    }
+    if remove_src && w.vfs.is_base_only(&src) {
+        set_last_error(env, err::ACCESS_DENIED);
+        return Outcome::Return(0);
+    }
     let Some(to) = w.vfs.write_path(&dst) else {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
     };
-    let base_only = w.vfs.is_base_only(&src);
+    // Move the actual writable object; a failed removal must not report success.
+    if remove_src {
+        return match std::fs::rename(&from, &to) {
+            Ok(()) => Outcome::Return(1),
+            Err(e) => {
+                io_error(env, &e);
+                Outcome::Return(0)
+            }
+        };
+    }
     if let Err(e) = std::fs::copy(&from, &to) {
         io_error(env, &e);
         return Outcome::Return(0);
     }
-    if remove_src && !base_only {
-        let _ = std::fs::remove_file(from);
-    }
     Outcome::Return(1)
 }
 
-fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
+pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
     let w = env.ext.get::<Win32>();
     if w.vfs.lookup(&path).is_some() {
         set_last_error(env, err::ALREADY_EXISTS);
+        return Outcome::Return(0);
+    }
+    let full = w.vfs.normalize(&path);
+    let parent = full.trim_end_matches('\\').rsplit_once('\\').map(|(p, _)| {
+        if p.len() == 2 {
+            format!("{p}\\")
+        } else {
+            p.to_owned()
+        }
+    });
+    if !parent.is_some_and(|p| w.vfs.is_dir(&p)) {
+        set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
     }
     match w.vfs.write_path(&path).map(std::fs::create_dir) {
@@ -687,50 +716,6 @@ fn find_next_file(env: &mut Env<'_>, wide: bool) -> Outcome {
     f.next += 1;
     fill_find_data(env, data, &e, wide);
     Outcome::Return(1)
-}
-
-fn get_current_directory_a(env: &mut Env<'_>) -> Outcome {
-    let (cap, buf) = (env.arg(0), env.arg(1));
-    let w = env.ext.get::<Win32>();
-    let b = w.codec.encode(&w.vfs.cwd);
-    match put_cstr(env.cpu, buf, cap, &b) {
-        Some(n) => Outcome::Return(n),
-        None => Outcome::Return(b.len() as u32 + 1),
-    }
-}
-
-fn set_current_directory(env: &mut Env<'_>, path: String) -> Outcome {
-    let w = env.ext.get_mut::<Win32>();
-    let n = w.vfs.normalize(&path);
-    if !w.vfs.is_dir(&n) {
-        set_last_error(env, err::PATH_NOT_FOUND);
-        return Outcome::Return(0);
-    }
-    w.vfs.cwd = n;
-    Outcome::Return(1)
-}
-
-fn get_full_path_name_a(env: &mut Env<'_>) -> Outcome {
-    let (path, cap, buf, file_part) = (path_a(env, env.arg(0)), env.arg(1), env.arg(2), env.arg(3));
-    let w = env.ext.get::<Win32>();
-    let full = w.vfs.normalize(&path);
-    let b = w.codec.encode(&full);
-    match put_cstr(env.cpu, buf, cap, &b) {
-        Some(n) => {
-            let last = b.iter().rposition(|&c| c == b'\\').map_or(0, |i| i + 1) as u32;
-            out_u32(env.cpu, file_part, buf + last);
-            Outcome::Return(n)
-        }
-        None => Outcome::Return(b.len() as u32 + 1),
-    }
-}
-
-fn put_dir(env: &mut Env<'_>, s: &str) -> Outcome {
-    let (buf, cap) = (env.arg(0), env.arg(1));
-    match put_cstr(env.cpu, buf, cap, s.as_bytes()) {
-        Some(n) => Outcome::Return(n),
-        None => Outcome::Return(s.len() as u32 + 1),
-    }
 }
 
 // ---- .ini profiles -------------------------------------------------------------------------
@@ -1055,26 +1040,6 @@ pub(super) fn register(reg: &mut Registry) {
         get_file_attributes(e, p)
     });
     stdcall(reg, K32, "SetFileAttributesA", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "DeleteFileA", 1, |e| {
-        let p = path_a(e, e.arg(0));
-        delete_file(e, p)
-    });
-    stdcall(reg, K32, "CopyFileA", 3, |e| {
-        let (s, d, f) = (path_a(e, e.arg(0)), path_a(e, e.arg(1)), e.arg(2) != 0);
-        copy_file(e, s, d, f, false)
-    });
-    stdcall(reg, K32, "MoveFileA", 2, |e| {
-        let (s, d) = (path_a(e, e.arg(0)), path_a(e, e.arg(1)));
-        copy_file(e, s, d, true, true)
-    });
-    stdcall(reg, K32, "CreateDirectoryA", 2, |e| {
-        let p = path_a(e, e.arg(0));
-        create_directory(e, p)
-    });
-    stdcall(reg, K32, "CreateDirectoryW", 2, |e| {
-        let p = path_w(e, e.arg(0));
-        create_directory(e, p)
-    });
     stdcall(reg, K32, "FindFirstFileA", 2, |e| {
         let p = path_a(e, e.arg(0));
         find_first_file(e, p, e.arg(1), false)
@@ -1101,34 +1066,7 @@ pub(super) fn register(reg: &mut Registry) {
         }
         Outcome::Return(u32::from(find))
     });
-    stdcall(reg, K32, "GetCurrentDirectoryA", 2, get_current_directory_a);
-    stdcall(reg, K32, "SetCurrentDirectoryA", 1, |e| {
-        let p = path_a(e, e.arg(0));
-        set_current_directory(e, p)
-    });
-    stdcall(reg, K32, "SetCurrentDirectoryW", 1, |e| {
-        let p = path_w(e, e.arg(0));
-        set_current_directory(e, p)
-    });
-    stdcall(reg, K32, "GetFullPathNameA", 4, get_full_path_name_a);
-    stdcall(reg, K32, "GetWindowsDirectoryA", 2, |e| {
-        put_dir(e, "C:\\Windows")
-    });
-    stdcall(reg, K32, "GetSystemDirectoryA", 2, |e| {
-        put_dir(e, "C:\\Windows\\system32")
-    });
-    reg.register(system_directory_w_ABI);
-    stdcall(reg, K32, "GetTempPathA", 2, |e| {
-        let (cap, buf) = (e.arg(0), e.arg(1));
-        let p = format!(
-            "C:\\Users\\{}\\AppData\\Local\\Temp\\",
-            e.ext.get::<Win32>().cfg.os.user_name
-        );
-        match put_cstr(e.cpu, buf, cap, p.as_bytes()) {
-            Some(n) => Outcome::Return(n),
-            None => Outcome::Return(p.len() as u32 + 1),
-        }
-    });
+    path::register(reg);
     stdcall(
         reg,
         K32,

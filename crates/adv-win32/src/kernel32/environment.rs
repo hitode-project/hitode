@@ -50,6 +50,16 @@ fn initialize(env: &mut Env<'_>) {
     env.ext.insert(state);
 }
 
+/// Personality consumers share the same UTF-16 process environment owner.
+pub(super) fn value(env: &mut Env<'_>, name: &str) -> Option<Vec<u16>> {
+    initialize(env);
+    env.ext
+        .get::<Environment>()
+        .variables
+        .get(&fold(&name.encode_utf16().collect::<Vec<_>>()))
+        .map(|v| v.value.clone())
+}
+
 fn read(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Vec<u16>, u32> {
     if pointer == 0 {
         return Err(87);

@@ -101,3 +101,23 @@ fn a_backend_without_environment_support_reports_unsupported() {
         Err(FpuEnvironmentError::Unsupported)
     );
 }
+
+#[test]
+fn same_control_and_sse_only_changes_preserve_raw_x87_status() {
+    let mut cpu = JitCpu::new(0x7e100000, false).unwrap();
+    let state = &mut cpu.executor_mut().state;
+    state.x87.control = 0x027f;
+    state.x87.status = 0xbdc5;
+    state.x87.ip = 0x12345678;
+    state.x87.dp = 0x87654321;
+    let before = state.x87.clone();
+    let environment = cpu.fpu_environment().unwrap();
+    cpu.set_fpu_environment(environment).unwrap();
+    assert_eq!(cpu.executor().state.x87, before);
+    cpu.set_fpu_environment(FpuEnvironment {
+        mxcsr: 0x3fc3,
+        ..environment
+    })
+    .unwrap();
+    assert_eq!(cpu.executor().state.x87, before);
+}

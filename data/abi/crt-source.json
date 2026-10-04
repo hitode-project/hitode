@@ -1,0 +1,21 @@
+{
+  "source": "Microsoft Windows SDK 10.0.26100.0",
+  "header": "ucrt/float.h",
+  "sha256": "0fbf87532c053b666940a65360f2488f5b6bb2e601632e32a0f1a8a078d8fdcd",
+  "target": "x86 __cdecl; unsigned int and pointer 32 bits",
+  "input": "data/abi/crt-input.tsv",
+  "output": "data/abi/signatures.tsv via tools/abi/Metadata.cs",
+  "documentation": [
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/control87-controlfp-control87-2",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/controlfp-s",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-invalid-parameter-handler-set-thread-local-invalid-parameter-handler"
+  ],
+  "invalid_parameter_header": {
+    "header": "ucrt/stdlib.h",
+    "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+  },
+  "errno_header": {
+    "header": "ucrt/errno.h",
+    "sha256": "c64e8df96f057fdebc0474bd765cee3ae17de34a2b1fc9d197597321f2d1e447"
+  }
+}

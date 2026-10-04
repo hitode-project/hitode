@@ -122,7 +122,9 @@ impl Guest for View<'_> {
     ) -> Result<(), FpuEnvironmentError> {
         environment.validate()?;
         self.state.commit_mmx();
-        self.state.x87.set_control(environment.x87_control);
+        if self.state.x87.control != environment.x87_control {
+            self.state.x87.set_control(environment.x87_control);
+        }
         self.state.mxcsr = environment.mxcsr;
         self.state.refresh_mmx();
         Ok(())

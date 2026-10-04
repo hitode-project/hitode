@@ -351,16 +351,24 @@ impl Guest for Engine<'_> {
         let error = |e: uc_error| FpuEnvironmentError::Backend(e.to_string());
         let previous = self.fpu_environment()?;
         let status = self.reg_read(RegisterX86::FPSW).map_err(error)?;
+        let changed = previous.x87_control != environment.x87_control;
         let pending = status & !u64::from(environment.x87_control) & 0x3f != 0;
-        let updated_status = if pending {
+        let updated_status = if !changed {
+            status
+        } else if pending {
             status | 0x8080
         } else {
             status & !0x8080
         };
-        let result = (|| {
-            self.reg_write(RegisterX86::FPCW, u64::from(environment.x87_control))?;
+        let result: Result<(), uc_error> = (|| {
+            if changed {
+                self.reg_write(RegisterX86::FPCW, u64::from(environment.x87_control))?;
+            }
             self.reg_write(RegisterX86::MXCSR, u64::from(environment.mxcsr))?;
-            self.reg_write(RegisterX86::FPSW, updated_status)
+            if changed {
+                self.reg_write(RegisterX86::FPSW, updated_status)?;
+            }
+            Ok(())
         })();
         if let Err(e) = result {
             // A valid register write is supported by this x86 engine. Preserve
