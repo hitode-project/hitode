@@ -14,6 +14,8 @@ use crate::util::{
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
 mod path;
+#[cfg(test)]
+mod tests;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const CREATE_NEW: u32 = 1;
@@ -42,13 +44,96 @@ fn path_w(env: &Env<'_>, p: u32) -> String {
 }
 
 fn io_error(env: &mut Env<'_>, e: &std::io::Error) {
-    let code = match e.kind() {
+    set_last_error(env, io_code(e));
+}
+
+fn io_code(e: &std::io::Error) -> u32 {
+    match e.kind() {
         std::io::ErrorKind::NotFound => err::FILE_NOT_FOUND,
         std::io::ErrorKind::PermissionDenied => err::ACCESS_DENIED,
         std::io::ErrorKind::AlreadyExists => err::FILE_EXISTS,
         _ => err::ACCESS_DENIED,
+    }
+}
+
+/// Replacement preflight precedes write_path/copy-up and every target write.
+/// Native CopyFile needs an unmapped destination even at unchanged length;
+/// profile writes can update/grow it, but cannot shrink a live section.
+fn replacement_allowed(env: &Env<'_>, path: &str, length: u64, unmapped: bool) -> Result<(), u32> {
+    let vfs = &env.ext.get::<Win32>().vfs;
+    if !vfs.sections.has_entries() {
+        return Ok(());
+    }
+    let Some(path) = vfs.lookup(path).filter(|p| p.is_file()) else {
+        return Ok(());
     };
-    set_last_error(env, code);
+    let file = std::fs::File::open(path).map_err(|e| io_code(&e))?;
+    let identity = adv_os::vfs::file_identity(&file).map_err(|e| io_code(&e))?;
+    if let Some(section) = vfs.sections.lookup(identity)
+        && (unmapped
+            || length < file.metadata().map_err(|e| io_code(&e))?.len()
+            || adv_os::try_modules(env.ext)
+                .and_then(|modules| modules.minimum_data_file_length(&section))
+                .is_some_and(|minimum| length < minimum))
+    {
+        return Err(1224); // ERROR_USER_MAPPED_FILE
+    }
+    Ok(())
+}
+
+/// Open through the ordinary VFS copy-up/FD-retarget path without truncating.
+/// Each successful write prefix is published before a later error is returned.
+fn replace_contents(
+    env: &mut Env<'_>,
+    path: &str,
+    length: u64,
+    unmapped: bool,
+    write: impl FnOnce(
+        &mut adv_os::vfs::FileStream,
+        Option<&adv_os::vfs::FileSection>,
+    ) -> std::io::Result<()>,
+) -> Result<(), u32> {
+    replacement_allowed(env, path, length, unmapped)?;
+    let handle = open(env, path, GENERIC_WRITE, OPEN_ALWAYS);
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(crate::util::last_error(env));
+    }
+    let result = (|| {
+        let file = &mut env.sys.objects.host_mut::<FileObj>(handle).unwrap().file;
+        let sections = &env.ext.get::<Win32>().vfs.sections;
+        let content = if sections.has_entries() {
+            file.cached_identity().and_then(|id| sections.lookup(id))
+        } else {
+            None
+        };
+        file.seek(SeekFrom::Start(0))?;
+        write(file, content.as_deref())?;
+        if file.metadata()?.len() != length {
+            file.set_len(length)?;
+        }
+        Ok::<_, std::io::Error>(())
+    })();
+    env.sys.objects.close(handle);
+    result.map_err(|e| io_code(&e))
+}
+
+fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
+    let vfs = &env.ext.get::<Win32>().vfs;
+    let Some(path) = vfs.lookup(guest) else {
+        return Ok(Vec::new());
+    };
+    let mut file = std::fs::File::open(path)?;
+    let content = if vfs.sections.has_entries() {
+        vfs.sections.lookup(adv_os::vfs::file_identity(&file)?)
+    } else {
+        None
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if let Some(content) = content {
+        content.merge_read(0, &mut bytes)?;
+    }
+    Ok(bytes)
 }
 
 fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
@@ -599,12 +684,12 @@ pub(super) fn copy_file(
         set_last_error(env, err::ACCESS_DENIED);
         return Outcome::Return(0);
     }
-    let Some(to) = w.vfs.write_path(&dst) else {
-        set_last_error(env, err::PATH_NOT_FOUND);
-        return Outcome::Return(0);
-    };
     // Move the actual writable object; a failed removal must not report success.
     if remove_src {
+        let Some(to) = w.vfs.write_path(&dst) else {
+            set_last_error(env, err::PATH_NOT_FOUND);
+            return Outcome::Return(0);
+        };
         return match std::fs::rename(&from, &to) {
             Ok(()) => Outcome::Return(1),
             Err(e) => {
@@ -613,11 +698,75 @@ pub(super) fn copy_file(
             }
         };
     }
-    if let Err(e) = std::fs::copy(&from, &to) {
-        io_error(env, &e);
+    // Resolve alias/hardlink identity before opening or writing the destination.
+    // Normalizing names alone cannot detect two names for the same host file.
+    let mut source = match std::fs::File::open(&from) {
+        Ok(file) => file,
+        Err(error) => {
+            io_error(env, &error);
+            return Outcome::Return(0);
+        }
+    };
+    let identity = match adv_os::vfs::file_identity(&source) {
+        Ok(identity) => identity,
+        Err(error) => {
+            io_error(env, &error);
+            return Outcome::Return(0);
+        }
+    };
+    if w.vfs
+        .normalize(&src)
+        .eq_ignore_ascii_case(&w.vfs.normalize(&dst))
+        || w.vfs
+            .lookup(&dst)
+            .filter(|p| p.is_file())
+            .is_some_and(|path| {
+                std::fs::File::open(path)
+                    .and_then(|file| adv_os::vfs::file_identity(&file))
+                    .ok()
+                    == Some(identity)
+            })
+    {
+        set_last_error(env, 32); // ERROR_SHARING_VIOLATION, before copy-up/truncation.
         return Outcome::Return(0);
     }
-    Outcome::Return(1)
+    let content = if w.vfs.sections.has_entries() {
+        w.vfs.sections.lookup(identity)
+    } else {
+        None
+    };
+    let length = match source.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            io_error(env, &error);
+            return Outcome::Return(0);
+        }
+    };
+    let result = replace_contents(env, &dst, length, true, |destination, target| {
+        let mut bytes = [0; 65536];
+        let mut offset = 0;
+        while offset < length {
+            let count = (length - offset).min(bytes.len() as u64) as usize;
+            source.read_exact(&mut bytes[..count])?;
+            if let Some(content) = &content {
+                content.merge_read(offset, &mut bytes[..count])?;
+            }
+            if let Some(target) = target {
+                target.write_to(destination, offset, &bytes[..count])?;
+            } else {
+                destination.write_all(&bytes[..count])?;
+            }
+            offset += count as u64;
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => Outcome::Return(1),
+        Err(code) => {
+            set_last_error(env, code);
+            Outcome::Return(0)
+        }
+    }
 }
 
 pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
@@ -756,13 +905,10 @@ fn section_name(line: &[u8]) -> Option<&[u8]> {
 
 impl Ini {
     fn load(env: &Env<'_>, guest: &str) -> Ini {
-        let data = env
-            .ext
-            .get::<Win32>()
-            .vfs
-            .lookup(guest)
-            .and_then(|p| std::fs::read(p).ok())
-            .unwrap_or_default();
+        Self::from_bytes(&read_contents(env, guest).unwrap_or_default())
+    }
+
+    fn from_bytes(data: &[u8]) -> Ini {
         Ini {
             lines: data
                 .split(|&c| c == b'\n')
@@ -888,7 +1034,13 @@ fn get_private_profile_int_a(env: &mut Env<'_>) -> Outcome {
 fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     let (sec_p, key_p, val_p) = (env.arg(0), env.arg(1), env.arg(2));
     let file = profile_path(env, env.arg(3));
-    let mut ini = Ini::load(env, &file);
+    let mut ini = match read_contents(env, &file) {
+        Ok(bytes) => Ini::from_bytes(&bytes),
+        Err(error) => {
+            io_error(env, &error);
+            return Outcome::Return(0);
+        }
+    };
     if ini.lines.last().is_some_and(Vec::is_empty) {
         ini.lines.pop();
     }
@@ -930,11 +1082,22 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     }
     let mut out = ini.lines.join(&b"\r\n"[..]);
     out.extend_from_slice(b"\r\n");
-    let w = env.ext.get::<Win32>();
-    match w.vfs.write_path(&file).map(|p| std::fs::write(p, out)) {
-        Some(Ok(())) => Outcome::Return(1),
-        _ => {
-            set_last_error(env, err::ACCESS_DENIED);
+    match replace_contents(
+        env,
+        &file,
+        out.len() as u64,
+        false,
+        |destination, content| {
+            if let Some(content) = content {
+                content.write_to(destination, 0, &out)
+            } else {
+                destination.write_all(&out)
+            }
+        },
+    ) {
+        Ok(()) => Outcome::Return(1),
+        Err(code) => {
+            set_last_error(env, code);
             Outcome::Return(0)
         }
     }
