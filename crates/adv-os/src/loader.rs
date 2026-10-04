@@ -142,6 +142,8 @@ pub struct Loader<'a> {
     pub inits: Vec<InitCall>,
     /// Guest directories of the images whose imports are being bound (innermost last).
     importers: Vec<String>,
+    /// Per-load dependency search root for LOAD_WITH_ALTERED_SEARCH_PATH.
+    altered_directory: Option<String>,
     changes: ResolutionChanges,
 }
 
@@ -182,6 +184,7 @@ impl<'a> Loader<'a> {
             files,
             inits: Vec::new(),
             importers: Vec::new(),
+            altered_directory: None,
             changes: ResolutionChanges::default(),
         }
     }
@@ -195,6 +198,27 @@ impl<'a> Loader<'a> {
             self.inits.truncate(initializers);
             self.rollback_storage(changes)?;
         }
+        result
+    }
+
+    /// Load with the requested absolute DLL's directory ahead of the normal
+    /// dependency search. The policy lasts only for this load and its graph;
+    /// later LoadLibrary calls from DllMain use their own ordinary policy.
+    pub fn load_altered(&mut self, path: &str) -> Result<ModuleId, LoadError> {
+        let normalized = path.replace('/', "\\");
+        let absolute = normalized.starts_with("\\\\")
+            || (normalized.as_bytes().get(1) == Some(&b':')
+                && normalized.as_bytes().get(2) == Some(&b'\\'));
+        let directory = absolute
+            .then(|| {
+                normalized
+                    .rfind('\\')
+                    .map(|end| normalized[..end].to_owned())
+            })
+            .flatten();
+        let previous = std::mem::replace(&mut self.altered_directory, directory);
+        let result = self.load(path);
+        self.altered_directory = previous;
         result
     }
 
@@ -293,8 +317,16 @@ impl<'a> Loader<'a> {
         if self.sys.thunks.resolver().replaces_module(&key) {
             return self.load_host(key, path, retain);
         }
-        if let Some((resolved, bytes)) =
-            module_file(self.files, path, self.importers.last().map(String::as_str))
+        let altered = if !self.importers.is_empty() && !path.contains(['\\', '/']) {
+            self.altered_directory.as_ref().and_then(|directory| {
+                let near = format!("{directory}\\{path}");
+                self.files.read(&near).map(|bytes| (near, bytes))
+            })
+        } else {
+            None
+        };
+        if let Some((resolved, bytes)) = altered
+            .or_else(|| module_file(self.files, path, self.importers.last().map(String::as_str)))
         {
             if resolved != path {
                 log::info!("{path}: found as {resolved}");

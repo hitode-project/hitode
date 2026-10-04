@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use adv_abi::{Handle, Registry, win32};
+use adv_abi::{AnsiStr, Handle, Registry, WideStr, win32};
 use adv_cpu::backend::GuestExt;
 use adv_machine::outcome::DeferredContinuation;
 use adv_machine::{Env, InitCall, Object, Outcome, Wait};
@@ -223,9 +223,17 @@ fn run_inits(
 }
 
 fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
+    load_library_search(env, name, false)
+}
+
+fn load_library_search(env: &mut Env<'_>, name: String, altered: bool) -> Outcome {
     let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
     let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, modules, &w.vfs);
-    let res = l.load(&name);
+    let res = if altered {
+        l.load_altered(&name)
+    } else {
+        l.load(&name)
+    };
     let inits: VecDeque<InitCall> = std::mem::take(&mut l.inits).into();
     drop(l);
     match res {
@@ -272,14 +280,18 @@ fn load_error_code(error: &adv_os::LoadError) -> u32 {
     }
 }
 
-fn load_library_ex(env: &mut Env<'_>, name: String) -> Outcome {
-    let (file, flags) = (env.arg(1), env.arg(2));
-    if file != 0 || flags & !0x3ffb != 0 || flags & 0x42 == 0x42 {
+fn load_library_ex(env: &mut Env<'_>, name: String, file: Handle, flags: u32) -> Outcome {
+    if file.0 != 0
+        || flags & !0x3ffb != 0
+        || flags & 0x42 == 0x42
+        || (flags & 8 != 0 && flags & 0x1f00 != 0)
+    {
         set_last_error(env, err::INVALID_PARAMETER);
         return Outcome::Return(0);
     }
     match flags {
         0 => locked(env, move |env| load_library(env, name)),
+        8 => locked(env, move |env| load_library_search(env, name, true)),
         2 => locked(env, move |env| datafile::load(env, name)),
         _ => {
             // IMAGE_RESOURCE/EXCLUSIVE need generic file leases, and DONT_RESOLVE
@@ -288,6 +300,25 @@ fn load_library_ex(env: &mut Env<'_>, name: String) -> Outcome {
             Outcome::Return(0)
         }
     }
+}
+
+#[win32(kernel32, name = "LoadLibraryExA", level = implement)]
+fn load_library_ex_a(env: &mut Env<'_>, name: AnsiStr, file: Handle, flags: u32) -> Outcome {
+    let Ok(bytes) = name.read(env.cpu, 32768) else {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    };
+    let name = env.ext.get::<Win32>().codec.decode(&bytes);
+    load_library_ex(env, name, file, flags)
+}
+
+#[win32(kernel32, name = "LoadLibraryExW", level = implement)]
+fn load_library_ex_w(env: &mut Env<'_>, name: WideStr, file: Handle, flags: u32) -> Outcome {
+    let Ok(units) = name.read(env.cpu, 32768) else {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    };
+    load_library_ex(env, String::from_utf16_lossy(&units), file, flags)
 }
 
 fn arg_a(env: &Env<'_>, i: u32) -> String {
@@ -606,14 +637,8 @@ pub(super) fn register(reg: &mut Registry) {
         let n = arg_w(e, 0);
         locked(e, move |e| load_library(e, n))
     });
-    stdcall(reg, K32, "LoadLibraryExA", 3, |e| {
-        let n = arg_a(e, 0);
-        load_library_ex(e, n)
-    });
-    stdcall(reg, K32, "LoadLibraryExW", 3, |e| {
-        let n = arg_w(e, 0);
-        load_library_ex(e, n)
-    });
+    reg.register(load_library_ex_a_ABI);
+    reg.register(load_library_ex_w_ABI);
     reg.register(free_library_ABI);
     reg.register(free_library_and_exit_thread_ABI);
     stdcall(reg, K32, "DisableThreadLibraryCalls", 1, |e| {
