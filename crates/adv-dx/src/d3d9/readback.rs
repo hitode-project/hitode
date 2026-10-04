@@ -81,7 +81,9 @@ fn create_offscreen(
             owns_surface: false,
             lock: None,
             container: None,
-            level_surface: None,
+            levels: Vec::new(),
+            level: 0,
+            lod: 0,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);
@@ -100,8 +102,8 @@ fn lock(
     rect: GuestPtr<RECT>,
     flags: u32,
 ) -> u32 {
-    if let Some(container) = resources::container_pointer(env, this.addr()) {
-        return resources::texture_lock(env, GuestPtr::new(container), 0, output, rect, flags);
+    if let Some((container, level)) = resources::container_level(env, this.addr()) {
+        return resources::texture_lock(env, GuestPtr::new(container), level, output, rect, flags);
     }
     let Some(r) = resources::resource(env, this.addr()) else {
         return INVALID;
@@ -164,8 +166,8 @@ fn lock(
 }
 #[win32(d3d9,name="IDirect3DSurface9::UnlockRect",level=implement)]
 fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
-    if let Some(container) = resources::container_pointer(env, this.addr()) {
-        return resources::texture_unlock(env, GuestPtr::new(container), 0);
+    if let Some((container, level)) = resources::container_level(env, this.addr()) {
+        return resources::texture_unlock(env, GuestPtr::new(container), level);
     }
     let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
@@ -178,7 +180,7 @@ fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     Outcome::Return(0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderTargetData",level=implement)]
-fn transfer(
+pub(super) fn transfer(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     source: GuestPtr<()>,
@@ -203,7 +205,7 @@ fn transfer(
         || src.desc.Pool != 0
         || src.desc.Usage & 1 == 0
         || dst.desc.Pool != 2
-        || dst.lock.is_some()
+        || resources::locked(env, dst)
         || src.desc.Width != dst.desc.Width
         || src.desc.Height != dst.desc.Height
         || src.desc.Format != dst.desc.Format
@@ -221,7 +223,9 @@ fn transfer(
     else {
         return Outcome::Return(INVALID);
     };
-    let storage = dst.storage;
+    let Some(storage) = resources::storage(env, dst) else {
+        return Outcome::Return(INVALID);
+    };
     let length = dst.desc.Width * dst.desc.Height * 4;
     if adv_abi::guest::check_range(env.cpu, storage, length, Prot::WRITE).is_err() {
         return Outcome::Return(INVALID);
@@ -229,6 +233,7 @@ fn transfer(
     let destination = com(env)
         .identity::<Payload>(&env.sys.objects, destination.addr())
         .unwrap();
+    let destination = resources::binding_owner(env, destination);
     if !com(env).retain_internal(&mut env.sys.objects, owner) {
         return Outcome::Return(OUT_OF_MEMORY);
     }

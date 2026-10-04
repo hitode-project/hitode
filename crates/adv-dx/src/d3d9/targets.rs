@@ -27,7 +27,7 @@ pub(super) fn draw_target(env: &Env<'_>, this: u32) -> Result<Target, u32> {
     let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
         return Err(INVALID);
     };
-    if r.lock.is_some() {
+    if resources::locked(env, r) {
         return Err(INVALID);
     }
     let provider = env.ext.get::<State>().provider;
@@ -122,7 +122,9 @@ fn create(
             owns_surface: true,
             lock: None,
             container: None,
-            level_surface: None,
+            levels: Vec::new(),
+            level: 0,
+            lod: 0,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);

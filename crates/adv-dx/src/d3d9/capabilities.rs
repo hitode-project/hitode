@@ -162,7 +162,7 @@ fn check_format(
     if !factory(env, this.addr(), adapter) || kind != 1 || check == 0 {
         return INVALID;
     }
-    // Color surface/texture: sampled, dynamic or a single render-target mip.
+    // Color surface/texture: sampled, dynamic or manual render-target mips.
     // Autogen, sRGB, depth textures, cubes and volumes remain unadvertised.
     let supported = (matches!(check, 21 | 22)
         && match resource {
@@ -272,8 +272,8 @@ fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         SrcBlendCaps: 0x7ff,
         DestBlendCaps: 0x7ff,
         ShadeCaps: 0x8 | 0x4000,
-        TextureCaps: 1 | 4 | 0x40,
-        TextureFilterCaps: 0x03000300,
+        TextureCaps: 1 | 4 | 0x40 | 0x4000,
+        TextureFilterCaps: 0x03000300 | 0x00030000,
         TextureAddressCaps: 1 | 2 | 4 | 0x10,
         LineCaps: 1 | 4 | 8,
         MaxTextureWidth: texture_size,
@@ -387,7 +387,9 @@ mod tests {
         );
         assert_eq!(value.StencilCaps, 0x1ff);
         assert_eq!(value.ZCmpCaps, 0xff);
-        assert_eq!(value.TextureCaps & (0x4000 | 0x800 | 0x2000), 0);
+        assert_eq!(value.TextureCaps & 0x4000, 0x4000, "manual mip chains");
+        assert_eq!(value.TextureFilterCaps & 0x30000, 0x30000, "point and linear mip filters");
+        assert_eq!(value.TextureCaps & (0x800 | 0x2000), 0);
         assert_eq!((value.MaxStreams, value.MaxVertexIndex), (16, 0x000f_ffff));
         assert_eq!(value.DevCaps2, 1, "only stream offsets are implemented");
         assert!(

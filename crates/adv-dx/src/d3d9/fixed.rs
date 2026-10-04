@@ -114,7 +114,7 @@ impl Fixed {
                 (209, 1),
             ]),
             stage: BTreeMap::from([(1, 4), (2, 2), (3, 1), (4, 2), (5, 2), (6, 1)]),
-            sampler: BTreeMap::from([(1, 1), (2, 1), (5, 1), (6, 1), (7, 0)]),
+            sampler: BTreeMap::from([(1, 1), (2, 1), (5, 1), (6, 1), (7, 0), (9, 0)]),
             viewport: D3DVIEWPORT9 {
                 X: 0,
                 Y: 0,
@@ -343,6 +343,7 @@ fn set_sampler(env: &mut Env<'_>, this: GuestPtr<()>, sampler: u32, kind: i32, v
         1 | 2 => address(value).is_some(),
         5 | 6 => matches!(value, 1 | 2),
         7 => value <= 2,
+        9 => true,
         _ => return UNAVAILABLE,
     };
     if !valid {
@@ -656,20 +657,20 @@ pub(super) fn prepare(
     } else {
         target
     };
-    let image = if let Some(id) = d.texture {
+    let (image, lod) = if let Some(id) = d.texture {
         let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
             return Err(INVALID);
         };
-        if r.lock.is_some() {
+        if resources::locked(env, r) {
             return Err(INVALID);
         }
-        Some(
+        (Some(
             (provider.target)(env.ext, r.surface.ok_or(INVALID)?)
                 .ok_or(INVALID)?
                 .image,
-        )
+        ), r.lod)
     } else {
-        None
+        (None, 0)
     };
     let mut state = DrawState::new(target.image.width(), target.image.height());
     state.topology = topology;
@@ -769,6 +770,15 @@ pub(super) fn prepare(
     } else {
         Filter::Nearest
     };
+    state.sampler.mip = match f.sampler[&7] {
+        0 => None,
+        1 => Some(Filter::Nearest),
+        _ => Some(Filter::Linear),
+    };
+    // Native D3D ignores MAXMIPLEVEL when MIPFILTER is NONE, but managed
+    // texture residency LOD still selects its most detailed permitted level.
+    let first = if state.sampler.mip.is_none() { lod } else { lod.max(f.sampler[&9]) };
+    state.sampler.first_level = first.min(image.as_ref().map_or(1, Image::mip_levels) - 1);
     if image.is_some() {
         state.texture_op = combine(f.stage[&1], f.stage[&2], f.stage[&3]).ok_or(UNAVAILABLE)?;
         state.alpha_texture_op =

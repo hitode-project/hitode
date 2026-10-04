@@ -96,7 +96,9 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             owns_surface: false,
             lock: None,
             container: None,
-            level_surface: None,
+            levels: Vec::new(),
+            level: 0,
+            lod: 0,
         },
     )
     .unwrap();

@@ -120,6 +120,7 @@ enum Operation {
     },
     Upload {
         resource: Id,
+        level: u32,
         target: Target,
         pixels: Vec<u8>,
         pitch: u32,
@@ -840,6 +841,7 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
             .map(|serial| Completion::Presented(serial, *deadline)),
         Operation::Upload {
             resource,
+            level,
             target,
             pixels,
             pitch,
@@ -850,7 +852,7 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
                 if let Some(Payload::Resource(r)) =
                     com(env).get_identity_mut(&mut env.sys.objects, *resource)
                 {
-                    r.lock = None;
+                    r.levels[*level as usize].lock = None;
                 }
                 Completion::Command
             }),
