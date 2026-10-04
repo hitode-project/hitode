@@ -13,62 +13,21 @@ const PERIODIC: u32 = 1;
 const EVENT_SET: u32 = 0x10;
 const EVENT_PULSE: u32 = 0x20;
 const SYNCHRONOUS: u32 = 0x100;
+// Callback ExitThread is unsupported native timer misuse. We do not restart
+// that process service: synchronous kill observes its thread object, later sets
+// fail, and a subsequent timer API reaps an abandoned active payload. Without
+// another API, that bounded charge lasts until the process's Objects is dropped.
 const WORKER: &str = "__pal_multimedia_timer_worker";
-#[derive(Clone, Copy)]
-struct Timer {
-    due: Option<u64>,
-    interval: u64,
-    target: u32,
-    user: u32,
-    flags: u32,
-    running: bool,
-    canceled: bool,
-}
+mod timer;
+use timer::{Entry, Queue, Timer};
+
 #[derive(Default)]
 struct Timers {
     periods: BTreeMap<u32, u32>,
-    timers: BTreeMap<u32, Timer>,
+    queue: Queue,
     worker: Option<CtxId>,
     wake: u32,
     complete: u32,
-    next_id: u32,
-}
-impl Timers {
-    fn next_due(&self) -> Option<u64> {
-        self.timers
-            .values()
-            .filter(|timer| !timer.canceled)
-            .filter_map(|timer| timer.due)
-            .min()
-    }
-    fn due_id(&self, now: u64) -> Option<u32> {
-        self.timers
-            .iter()
-            .filter(|(_, timer)| !timer.canceled && timer.due.is_some_and(|due| due <= now))
-            .min_by_key(|(id, timer)| (timer.due, *id))
-            .map(|(&id, _)| id)
-    }
-    fn dispatch(&mut self, id: u32, now: u64) -> Timer {
-        let timer = self.timers.get_mut(&id).unwrap();
-        timer.running = true;
-        timer.due = if timer.flags & PERIODIC != 0 {
-            let due = timer.due.unwrap();
-            Some(due.saturating_add(
-                (now.saturating_sub(due) / timer.interval + 1).saturating_mul(timer.interval),
-            ))
-        } else {
-            None
-        };
-        *timer
-    }
-    fn finished(&mut self, id: u32) {
-        if let Some(timer) = self.timers.get_mut(&id) {
-            timer.running = false;
-            if timer.canceled || timer.due.is_none() {
-                self.timers.remove(&id);
-            }
-        }
-    }
 }
 
 pub fn register(registry: &mut Registry) {
@@ -137,8 +96,10 @@ fn end_period(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 fn ensure_worker(env: &mut Env<'_>) -> bool {
-    if state(env).worker.is_some() {
-        return true;
+    if let Some(id) = state(env).worker {
+        // A callback which exits its worker breaks this process service. Do not
+        // silently restart it or fabricate another callback delivery clock.
+        return !env.sys.contexts[id as usize].is_done();
     }
     if env.sys.contexts.len() >= adv_machine::layout::MAX_CONTEXTS as usize {
         return false;
@@ -181,22 +142,19 @@ fn set_event(env: &mut Env<'_>) -> Outcome {
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     if !(MIN_MS..=MAX_MS).contains(&delay)
         || flags & !(PERIODIC | EVENT_SET | EVENT_PULSE | SYNCHRONOUS) != 0
-        || state(env).timers.len() >= MAX_TIMERS
-        || !ensure_worker(env)
+    {
+        return Outcome::Return(0);
+    }
+    reap_dead_worker(env);
+    if state(env)
+        .worker
+        .is_some_and(|id| env.sys.contexts[id as usize].is_done())
     {
         return Outcome::Return(0);
     }
     let now = env.sys.clock.guest_now_us();
-    let timers = state(env);
-    loop {
-        timers.next_id = timers.next_id.wrapping_add(1).max(1);
-        if !timers.timers.contains_key(&timers.next_id) {
-            break;
-        }
-    }
-    let id = timers.next_id;
-    timers.timers.insert(
-        id,
+    let entry = env.ext.get_mut::<Timers>().queue.insert(
+        &mut env.sys.objects,
         Timer {
             due: Some(now.saturating_add(u64::from(delay) * 1000)),
             interval: u64::from(delay) * 1000,
@@ -207,52 +165,105 @@ fn set_event(env: &mut Env<'_>) -> Outcome {
             canceled: false,
         },
     );
-    let wake = timers.wake;
+    let Some(entry) = entry else {
+        return Outcome::Return(0);
+    };
+    // Charge the timer first. If events/thread cannot be allocated, remove the
+    // unpublished alias; ensure_worker rolls back its own partial resources.
+    if !ensure_worker(env) {
+        env.ext
+            .get_mut::<Timers>()
+            .queue
+            .remove(&mut env.sys.objects, entry);
+        return Outcome::Return(0);
+    }
+    env.ext
+        .get_mut::<Timers>()
+        .queue
+        .publish(&env.sys.objects, entry);
+    let wake = state(env).wake;
     env.sys.set_event(wake);
-    Outcome::Return(id)
+    Outcome::Return(entry.id)
 }
 fn kill_event(env: &mut Env<'_>) -> Outcome {
     let id = env.arg(0);
+    reap_dead_worker(env);
     let current = env.sys.current;
-    let timers = state(env);
-    let Some(timer) = timers.timers.get_mut(&id).filter(|timer| !timer.canceled) else {
+    let Some(timer) = env
+        .ext
+        .get_mut::<Timers>()
+        .queue
+        .cancel(&mut env.sys.objects, id)
+    else {
         return Outcome::Return(NOCANDO);
     };
-    timer.canceled = true;
     // Native permits synchronous cancellation from the callback itself. The
     // current invocation may return normally; no subsequent invocation starts.
-    let wait = timer.running && timer.flags & SYNCHRONOUS != 0 && timers.worker != Some(current);
-    if !timer.running {
-        timers.timers.remove(&id);
-    }
+    let timers = state(env);
+    let worker = timers.worker;
+    let wait = timer.running && timer.flags & SYNCHRONOUS != 0 && worker != Some(current);
     let (wake, complete) = (timers.wake, timers.complete);
     env.sys.set_event(wake);
     if wait {
-        Outcome::block_then_return(
-            Wait::Object {
-                handle: complete,
+        // ExitThread discards the callback continuation, so complete alone
+        // could hang forever. The ordinary thread object also ends the wait.
+        let thread = env.sys.contexts[worker.unwrap() as usize].thread_handle;
+        Outcome::block(
+            Wait::Objects {
+                handles: vec![complete, thread],
+                all: false,
                 deadline: None,
+                notification: None,
             },
-            0,
+            |env, _| {
+                reap_dead_worker(env);
+                Outcome::Return(0)
+            },
         )
     } else {
         Outcome::Return(0)
     }
 }
-fn finished(env: &mut Env<'_>, id: u32) -> Outcome {
+fn reap_dead_worker(env: &mut Env<'_>) {
     let timers = state(env);
-    timers.finished(id);
-    let complete = timers.complete;
+    let worker = timers.worker;
+    let active = timers.queue.active;
+    if let (Some(worker), Some(active)) = (worker, active)
+        && env.sys.contexts[worker as usize].is_done()
+    {
+        env.ext
+            .get_mut::<Timers>()
+            .queue
+            .finished(&mut env.sys.objects, active);
+        let complete = state(env).complete;
+        env.sys.set_event(complete);
+    }
+}
+fn finished(env: &mut Env<'_>, entry: Entry) -> Outcome {
+    env.ext
+        .get_mut::<Timers>()
+        .queue
+        .finished(&mut env.sys.objects, entry);
+    let complete = state(env).complete;
     env.sys.set_event(complete);
     // A burst of due callbacks must not monopolize the execution owner.
     Outcome::block(Wait::Yield, |env, _| worker(env))
 }
 fn worker(env: &mut Env<'_>) -> Outcome {
+    let current = env.sys.current;
+    if state(env).worker != Some(current) {
+        return Outcome::Return(0);
+    }
     let now = env.sys.clock.guest_now_us();
     let wake = state(env).wake;
     env.sys.reset_event(wake);
-    let Some(id) = state(env).due_id(now) else {
-        let deadline = state(env).next_due();
+    let next = env
+        .ext
+        .get_mut::<Timers>()
+        .queue
+        .dispatch(&mut env.sys.objects, now);
+    let Some((entry, timer)) = next else {
+        let deadline = state(env).queue.next_due();
         return Outcome::block(
             Wait::Object {
                 handle: wake,
@@ -261,56 +272,25 @@ fn worker(env: &mut Env<'_>) -> Outcome {
             |env, _| worker(env),
         );
     };
-    let timer = state(env).dispatch(id, now);
     let complete = state(env).complete;
     env.sys.reset_event(complete);
     match timer.flags & (EVENT_SET | EVENT_PULSE) {
         EVENT_SET => {
             env.sys.set_event(timer.target);
-            finished(env, id)
+            finished(env, entry)
         }
         EVENT_PULSE => {
             env.sys.set_event(timer.target);
             env.sys.reset_event(timer.target);
-            finished(env, id)
+            finished(env, entry)
         }
-        _ if timer.target == 0 => finished(env, id),
+        _ if timer.target == 0 => finished(env, entry),
         _ => Outcome::call(
             timer.target,
-            vec![id, 0, timer.user, 0, 0],
-            move |env, _| finished(env, id),
+            vec![entry.id, 0, timer.user, 0, 0],
+            move |env, _| finished(env, entry),
         ),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn late_periodic_timer_coalesces_missed_ticks_and_keeps_original_phase() {
-        let mut timers = Timers::default();
-        timers.timers.insert(
-            1,
-            Timer {
-                due: Some(10_000),
-                interval: 10_000,
-                target: 1,
-                user: 0,
-                flags: PERIODIC,
-                running: false,
-                canceled: false,
-            },
-        );
-        // Hundreds of thousands of missed periods produce one callback, then
-        // wait for the first original-phase deadline strictly after now.
-        let now = 3_600_005_000;
-        assert_eq!(timers.due_id(now), Some(1));
-        timers.dispatch(1, now);
-        timers.finished(1);
-        assert_eq!(timers.due_id(now), None);
-        assert_eq!(timers.next_due(), Some(3_600_010_000));
-        assert_eq!(timers.due_id(3_600_010_000), Some(1));
-    }
-}
 pub mod mmio;

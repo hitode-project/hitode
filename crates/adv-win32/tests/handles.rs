@@ -200,12 +200,22 @@ fn exhausted_object_table_reports_api_errors_without_side_effects_or_invalid_wai
 }
 
 #[test]
-fn timer_and_message_wake_partial_allocations_roll_back() {
+fn timer_exhaustion_and_partial_message_wake_leave_api_resource_baseline_unchanged() {
     let mut t = Test::new("partial-wake");
     t.m.sys.objects = Objects::with_limits(ObjectLimits {
         objects: 2,
         ..ObjectLimits::default()
     });
+    t.m.sys.thunks.resolver_mut::<Registry>().unwrap().add(
+        "test.dll",
+        "object_count",
+        adv_machine::Conv::Stdcall { argc: 0 },
+        |env| adv_machine::Outcome::Return(env.sys.objects.object_count() as u32),
+    );
+    // One free slot lets the timer payload be charged before its first service
+    // event fails; MsgWait's first event is allocated before its second fails.
+    // Timer's later partial-event stages are covered by timer_lifetime.rs.
+    t.call_in("test.dll", "object_count", &[], OUT + 12);
     t.call_in(
         "winmm.dll",
         "timeSetEvent",
@@ -218,12 +228,27 @@ fn timer_and_message_wake_partial_allocations_roll_back() {
         &[Value(0), Value(0), Value(0), Value(10), Value(0xff)],
         OUT + 4,
     )
-    .call("GetLastError", &[], OUT + 8);
+    .call("GetLastError", &[], OUT + 8)
+    .call_in("test.dll", "object_count", &[], OUT + 16);
     t.run();
     assert_eq!(t.word(OUT), 0);
     assert_eq!(t.word(OUT + 4), u32::MAX);
     assert_eq!(t.word(OUT + 8), 8);
-    assert_eq!(t.m.sys.objects.object_count(), 1);
+    assert_eq!(t.word(OUT + 12), 1, "one free slot before either API");
+    assert_eq!(t.word(OUT + 16), t.word(OUT + 12), "API rollback baseline");
+    // The harness appends ExitProcess, which lazily creates the process loader
+    // mutex. It owns that extra object; the failed APIs left none behind.
+    assert_eq!(
+        t.m.sys.objects.object_count(),
+        t.word(OUT + 16) as usize + 1
+    );
+    assert_eq!(
+        (0x104..0x140)
+            .step_by(4)
+            .filter(|&h| matches!(t.m.sys.objects.get(h), Some(Object::Mutex { .. })))
+            .count(),
+        1
+    );
     assert_eq!(t.m.sys.contexts.len(), 1);
 }
 
