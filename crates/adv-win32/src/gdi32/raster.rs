@@ -84,6 +84,20 @@ impl Raster {
             let Some(dib) = dib::read(m, info, usage)? else {
                 return Ok(self.fail(87));
             };
+            self.create_decoded_dib(surfaces, dcs, objects, m, dib, bits_out)?
+        })
+    }
+    fn create_decoded_dib<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        m: &mut dyn SurfaceMemory,
+        dib: dib::Dib,
+        bits_out: u32,
+    ) -> Result<u32, String> {
+        m.put_u32(bits_out, 0)?;
+        Ok({
             let (w, height, format) = (
                 dib.width as i32,
                 if dib.bottom_up {

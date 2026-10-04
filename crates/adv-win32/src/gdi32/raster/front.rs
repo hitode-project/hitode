@@ -253,19 +253,64 @@ fn create_dib(
             return fail(env, 87);
         }
     }
+    if section.0 != 0 {
+        let _ = bits.write(env.cpu, 0);
+        return fail(env, 87);
+    }
+    let _ = (dc, offset); // An unbacked DIB does not retain its creation DC.
+    let provider = env.ext.get::<State>().provider.unwrap();
+    let decoded = match super::dib::read(&(provider.memory)(env.cpu), info.addr(), usage) {
+        Ok(Some(dib)) => dib,
+        _ => {
+            let _ = bits.write(env.cpu, 0);
+            return fail(env, 87);
+        }
+    };
+    if bits.write(env.cpu, 0).is_err() {
+        return fail(env, 87);
+    }
+    let Some(bytes) = decoded.pitch.checked_mul(decoded.height) else {
+        return fail(env, 8);
+    };
+    let usage = env.ext.get::<SurfaceStore>().arena_usage();
+    let Some(growth) = env.ext.get::<SurfaceStore>().arena_growth(bytes) else {
+        adv_abi::warn_unavailable(
+            env,
+            "gdi32.dll!CreateDIBSection",
+            &format!("out of surface storage: request {bytes}, {usage:?}"),
+        );
+        return fail(env, 8);
+    };
+    if growth != 0 {
+        let address = match env.sys.vm.alloc(env.cpu, growth, Prot::RW) {
+            Ok(address) => address,
+            Err(error) => {
+                adv_abi::warn_unavailable(
+                    env,
+                    "gdi32.dll!CreateDIBSection",
+                    &format!("storage mapping failed: {error}; {usage:?}"),
+                );
+                return fail(env, 8);
+            }
+        };
+        let length = env.sys.vm.region(address).unwrap();
+        if let Err(error) = env
+            .ext
+            .get_mut::<SurfaceStore>()
+            .extend_arena(address, length)
+        {
+            let _ = env.sys.vm.free(env.cpu, address);
+            adv_abi::warn_unavailable(
+                env,
+                "gdi32.dll!CreateDIBSection",
+                &format!("storage extension failed: {error}; {usage:?}"),
+            );
+            return fail(env, 8);
+        }
+        log::info!("CreateDIBSection surface pool +{length} bytes for {bytes}: {usage:?}");
+    }
     raster_call(env, |r, s, d, o, m| {
-        r.create_dib(
-            s,
-            d,
-            o,
-            m,
-            dc.0,
-            info.addr(),
-            usage,
-            bits.addr(),
-            section.0,
-            offset,
-        )
+        r.create_decoded_dib(s, d, o, m, decoded, bits.addr())
     })
 }
 #[win32(gdi32, name = "SelectObject", level = implement)]
@@ -434,3 +479,6 @@ fn set_stretch_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
 fn flush(_env: &mut Env<'_>) -> i32 {
     1
 }
+
+#[cfg(test)]
+mod tests;

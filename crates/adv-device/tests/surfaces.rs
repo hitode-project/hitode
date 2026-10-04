@@ -56,6 +56,77 @@ impl SurfaceMemory for Memory {
 fn store() -> Surfaces<Snapshot> {
     Surfaces::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
 }
+
+#[test]
+fn segmented_storage_reuses_deleted_blocks_and_rolls_back_initialization_failure() {
+    struct FailedWrite<'a>(&'a mut Memory);
+    impl SurfaceMemory for FailedWrite<'_> {
+        fn read(&self, address: u32, length: usize) -> Result<Cow<'_, [u8]>, String> {
+            self.0.read(address, length)
+        }
+        fn writable(&self, address: u32, length: usize) -> Result<(), String> {
+            self.0.writable(address, length)
+        }
+        fn write(&mut self, _: u32, _: &[u8]) -> Result<(), String> {
+            Err("authored write failure".into())
+        }
+        fn copy(&mut self, source: u32, destination: u32, length: usize) -> Result<(), String> {
+            self.0.copy(source, destination, length)
+        }
+    }
+    let mut memory = Memory::new(false);
+    let mut s = Surfaces::new(4, 4, 16, 128, Snapshot::default()).unwrap();
+    assert!(
+        s.create(
+            4,
+            4,
+            false,
+            PixelFormat::Bgra32,
+            &mut FailedWrite(&mut memory)
+        )
+        .is_err()
+    );
+    assert_eq!((s.arena_usage().free, s.live_surfaces()), (128, 0));
+    let first = s
+        .create(4, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    let second = s
+        .create(4, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    assert_eq!(
+        (s.arena_usage().pixel_bytes, s.arena_usage().largest_free),
+        (128, 0)
+    );
+    assert_ne!(s.arena_growth(80), Some(0));
+    assert!(
+        s.extend_arena(32, 128).is_err(),
+        "overlapping ranges are never adopted"
+    );
+    assert_eq!(s.arena_usage().capacity, 128);
+    s.extend_arena(4096, 128).unwrap();
+    let third = s
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    assert_eq!(s.get(third).unwrap().pixels, 4096);
+    assert!(s.delete(first));
+    assert!(s.delete(second));
+    assert!(s.delete(third));
+    for _ in 0..32 {
+        let id = s
+            .create(8, 4, false, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        assert_eq!(s.get(id).unwrap().pixels, 16);
+        assert!(s.delete(id));
+    }
+    assert_eq!(
+        (
+            s.arena_usage().capacity,
+            s.arena_usage().free,
+            s.live_surfaces()
+        ),
+        (256, 256, 0)
+    );
+}
 fn logical_pixels(s: &Surfaces<Snapshot>, id: u32, m: &Memory) -> Vec<Vec<u8>> {
     let surface = &s[id];
     (0..surface.height)

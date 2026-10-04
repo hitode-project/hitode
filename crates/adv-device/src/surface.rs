@@ -438,6 +438,18 @@ impl Surface {
 
 struct Arena {
     free: Vec<(u32, u32)>,
+    regions: Vec<(u32, u32)>,
+    capacity: u64,
+}
+const ARENA_GROWTH_BYTES: u32 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaUsage {
+    pub capacity: u64,
+    pub free: u64,
+    pub largest_free: u32,
+    pub pixel_bytes: u64,
+    pub live_surfaces: usize,
 }
 impl Arena {
     fn new(start: u32, len: u32) -> Result<Self, String> {
@@ -447,7 +459,26 @@ impl Arena {
         }
         Ok(Self {
             free: vec![(start, len)],
+            regions: vec![(start, len)],
+            capacity: u64::from(len),
         })
+    }
+    fn extend(&mut self, start: u32, len: u32) -> Result<(), String> {
+        let end = start.checked_add(len).ok_or("arena overflow")?;
+        if len == 0
+            || !start.is_multiple_of(16)
+            || !len.is_multiple_of(16)
+            || self
+                .regions
+                .iter()
+                .any(|&(base, length)| start < base + length && base < end)
+        {
+            return Err("invalid or overlapping arena extension".into());
+        }
+        self.regions.push((start, len));
+        self.capacity += u64::from(len);
+        self.release(start, len);
+        Ok(())
     }
     fn alloc(&mut self, n: u32, m: &mut dyn SurfaceMemory) -> Result<u32, String> {
         let n = n.checked_add(15).ok_or("allocation overflow")? & !15;
@@ -562,6 +593,46 @@ impl<P: Presenter> Surfaces<P> {
 
     pub fn get_mut(&mut self, id: u32) -> Option<&mut Surface> {
         self.surfaces.get_mut(&id)
+    }
+
+    /// Cold allocation diagnostics. Released pixels remain reusable in the
+    /// process pool; mappings belong to the assembly's guest address space.
+    pub fn arena_usage(&self) -> ArenaUsage {
+        ArenaUsage {
+            capacity: self.arena.capacity,
+            free: self.arena.free.iter().map(|&(_, len)| u64::from(len)).sum(),
+            largest_free: self
+                .arena
+                .free
+                .iter()
+                .map(|&(_, len)| len)
+                .max()
+                .unwrap_or(0),
+            pixel_bytes: self
+                .surfaces
+                .values()
+                .filter(|s| s.pixels != 0)
+                .map(|s| u64::from(s.pitch) * u64::from(s.height))
+                .sum(),
+            live_surfaces: self.surfaces.len(),
+        }
+    }
+
+    /// Bytes to map when an allocation does not fit a reusable block. A zero
+    /// request fits now; None means the requested byte size overflows.
+    /// Mapping limits remain with the caller's shared guest address space.
+    pub fn arena_growth(&self, needed: u32) -> Option<u32> {
+        let needed = needed.checked_add(15)? & !15;
+        if self.arena.free.iter().any(|&(_, len)| len >= needed) {
+            return Some(0);
+        }
+        Some(needed.max(ARENA_GROWTH_BYTES))
+    }
+
+    /// Adopt a disjoint, already mapped guest range into the same allocator.
+    /// The caller must retire its mapping if this validation fails.
+    pub fn extend_arena(&mut self, address: u32, length: u32) -> Result<(), String> {
+        self.arena.extend(address, length)
     }
 
     pub fn set_palette(
@@ -802,7 +873,10 @@ impl<P: Presenter> Surfaces<P> {
         let mut offset = 0;
         while offset < bytes {
             let n = (bytes - offset).min(4096);
-            m.write(p + offset, &zero[..n as usize])?;
+            if let Err(error) = m.write(p + offset, &zero[..n as usize]) {
+                self.arena.release(p, bytes);
+                return Err(error);
+            }
             offset += n;
         }
         let id = self.new_id();
