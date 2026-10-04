@@ -295,11 +295,25 @@ fn api_report(runtime: &Runtime) -> String {
         },
     );
     let coverage = runtime.api_coverage();
+    let warnings = diagnostics.map_or_else(String::new, |d| {
+        d.warnings
+            .iter()
+            .map(|((api, reason), count)| {
+                format!(
+                    "{{\"api\": {}, \"reason\": {}, \"count\": {count}}}",
+                    json(api),
+                    json(reason)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     format!(
         concat!(
             "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, ",
             "\"called_gaps\": {{{}}}, \"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
-            "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}}}"
+            "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}, ",
+            "\"warnings\": [{}], \"unrecorded_warnings\": {}}}"
         ),
         json(mode),
         runtime.api_acceptance_eligible(),
@@ -312,7 +326,9 @@ fn api_report(runtime: &Runtime) -> String {
         coverage.implement,
         coverage.state,
         coverage.safe_fail,
-        coverage.legacy
+        coverage.legacy,
+        warnings,
+        diagnostics.map_or(0, |d| d.unrecorded_warnings)
     )
 }
 

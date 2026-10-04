@@ -26,6 +26,33 @@ pub struct ApiDiagnostics {
     pub gaps: BTreeMap<String, u64>,
     pub recent_stubs: VecDeque<StubCall>,
     pub stub_calls: u64,
+    /// Explicit capability failures, not ordinary API errors such as missing files.
+    pub warnings: BTreeMap<(String, String), u64>,
+    pub unrecorded_warnings: u64,
+}
+
+/// Keep failures visible even when the caller ignores their return values.
+/// This shares the existing per-machine diagnostics owner and bounds distinct
+/// reasons; repeated glyphs or capability probes do not flood stderr.
+pub fn warn_unavailable(env: &mut Env<'_>, api: &str, reason: &str) {
+    let caller = env.caller();
+    let diagnostics = env.ext.get_or_default::<ApiDiagnostics>();
+    let key = (api.to_owned(), reason.to_owned());
+    if let Some(count) = diagnostics.warnings.get_mut(&key) {
+        *count = count.saturating_add(1);
+    } else if diagnostics.warnings.len() < 64 {
+        diagnostics.warnings.insert(key, 1);
+        eprintln!(
+            "warning: {api}: {reason} (guest caller {caller:#010x}; repetitions counted in report)"
+        );
+    } else {
+        diagnostics.unrecorded_warnings = diagnostics.unrecorded_warnings.saturating_add(1);
+        if diagnostics.unrecorded_warnings == 1 {
+            eprintln!(
+                "warning: additional distinct compatibility warnings omitted; see report count"
+            );
+        }
+    }
 }
 
 impl ApiDiagnostics {

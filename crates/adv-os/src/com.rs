@@ -9,11 +9,32 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 
-use adv_machine::{Identity, Namespace, Objects};
+use adv_machine::{Env, Identity, Namespace, Objects, Outcome};
 
 /// Bytes in the guest GUID's little-endian in-memory layout.
 pub type Iid = [u8; 16];
 pub const IUNKNOWN: Iid = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+
+/// A personality's in-process class constructor. The output was cleared and
+/// checked by COM activation; the constructor owns rollback if publication fails.
+pub type ClassFactory = fn(&mut Env<'_>, Iid, u32, u32) -> Outcome;
+
+/// Process assembly registers classes here without introducing a second object
+/// owner. Constructors still allocate their payloads in the common `Objects`.
+#[derive(Default)]
+pub struct ClassFactories {
+    classes: BTreeMap<Iid, ClassFactory>,
+}
+
+impl ClassFactories {
+    pub fn register(&mut self, class: Iid, factory: ClassFactory) {
+        self.classes.insert(class, factory);
+    }
+
+    pub fn get(&self, class: &Iid) -> Option<ClassFactory> {
+        self.classes.get(class).copied()
+    }
+}
 
 pub type ComIdentity<T> = Identity<ComObject<T>>;
 

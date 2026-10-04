@@ -6,6 +6,14 @@ use adv_device::{
     text::{Horizontal, Paint, Point, TextBox, TextInput, Vertical},
 };
 
+fn unavailable(env: &mut Env<'_>, reason: &str) -> Outcome {
+    let thunk = env.sys.thunks.get(env.thunk);
+    let api = format!("{}!{}", thunk.module, thunk.name);
+    adv_abi::warn_unavailable(env, &api, reason);
+    set_last_error(env, 120);
+    Outcome::Return(0)
+}
+
 pub(super) fn register(registry: &mut Registry) {
     for api in [
         set_align_ABI,
@@ -29,7 +37,10 @@ fn set_align(env: &mut Env<'_>, dc: Handle, flags: u32) -> u32 {
     }
     // UPDATECP needs current-position state, which this slice does not implement.
     if flags & 1 != 0 {
-        set_last_error(env, 120);
+        let _ = unavailable(
+            env,
+            "TA_UPDATECP current-position text alignment is not supported",
+        );
         return GDI_ERROR;
     }
     std::mem::replace(&mut modes(env, dc.0).text_align, flags)
@@ -153,7 +164,10 @@ fn output(
         return Outcome::Return(0);
     }
     if options & !6 != 0 || dx.addr() != 0 {
-        return fail(env, 120);
+        return unavailable(
+            env,
+            "text flags or explicit character spacing are not supported",
+        );
     }
     let Some(count) = count.filter(|&n| n as usize <= text::MAX_PAINT_UNITS) else {
         return fail(env, 87);
@@ -197,7 +211,7 @@ fn output(
     let target = selected[3];
     let align = modes.text_align;
     if *text_color >> 24 == 2 || *bk_color >> 24 == 2 {
-        return fail(env, 120);
+        return unavailable(env, "palette-relative text colors are not supported");
     }
     let Some(foreground) = color(env, *palette, *text_color) else {
         return fail(env, 87);
@@ -206,18 +220,21 @@ fn output(
         return fail(env, 87);
     };
     if !matches!(*bk_mode, 1 | 2) || modes.map != 1 {
-        return fail(env, 120);
+        return unavailable(
+            env,
+            "text background or coordinate mapping mode is not supported",
+        );
     }
     let opaque_background = *bk_mode == 2;
     let font = font_request(env, dc);
     if font.baseline_angle != 0 || font.glyph_angle != 0 || font.face.starts_with('@') {
-        return fail(env, 120);
+        return unavailable(env, "rotated or vertical text is not supported");
     }
     let Some(provider) = super::super::raster::front::provider(env.ext) else {
-        return fail(env, 120);
+        return unavailable(env, "text raster provider is not installed");
     };
     if env.ext.try_get::<SurfaceStore>().is_none() {
-        return fail(env, 120);
+        return unavailable(env, "text surface store is not installed");
     }
     let units;
     let input = if ansi {
@@ -253,13 +270,13 @@ fn output(
     let (result, presented, changed) = {
         let (fonts, store) = env.ext.get2_installed_mut::<Fonts, SurfaceStore>();
         let Some(surface) = store.get(target) else {
-            return fail(env, 120);
+            return unavailable(env, "selected bitmap has no text-renderable surface");
         };
         let Some(size) = surface.pitch.checked_mul(surface.height) else {
             return fail(env, 87);
         };
         if surface.pixels == 0 {
-            return fail(env, 120);
+            return unavailable(env, "selected bitmap has no CPU text backing");
         }
         if adv_abi::guest::check_range(env.cpu, surface.pixels, size, Prot::READ | Prot::WRITE)
             .is_err()
@@ -289,6 +306,6 @@ fn output(
                 Outcome::Return(1)
             }
         }
-        Err(_) => fail(env, 120),
+        Err(error) => unavailable(env, &error),
     }
 }

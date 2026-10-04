@@ -66,6 +66,12 @@ const IID_DEVICE: [u8; 16] = [
 const IID_DEVICE8: [u8; 16] = [
     0x93, 0x7e, 0x0a, 0xc5, 0x95, 0xf3, 0x34, 0x48, 0x9e, 0xf6, 0x7f, 0xa9, 0x9d, 0xe5, 0x09, 0x66,
 ];
+const CLSID_DEVICE: [u8; 16] = [
+    0x46, 0xd9, 0xd4, 0x47, 0xe8, 0x62, 0xcf, 0x11, 0x93, 0xbc, 0x44, 0x45, 0x53, 0x54, 0, 0,
+];
+const CLSID_DEVICE8: [u8; 16] = [
+    0x6d, 0x2e, 0xf0, 0x39, 0x03, 0x04, 0xb8, 0x48, 0x9a, 0x2d, 0xc7, 0xcf, 0x7f, 0x2d, 0x5a, 0x31,
+];
 const IID_BUFFER: [u8; 16] = [
     0x85, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -126,7 +132,7 @@ impl Format {
 }
 #[derive(Clone, Copy)]
 enum Kind {
-    Device,
+    Device { initialized: bool, version8: bool },
     Buffer,
     Notify(u32),
 }
@@ -407,7 +413,50 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         trace_pcm_chunks: std::env::var_os("ADV_AUDIO_DUMP_CHUNKS").is_some(),
         playback_clock,
     });
+    let classes = m.ext.get_or_default::<adv_os::com::ClassFactories>();
+    classes.register(CLSID_DEVICE, create_class);
+    classes.register(CLSID_DEVICE8, create_class8);
     Ok(())
+}
+
+fn create_class(e: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
+    create_com_device(e, iid, outer, output, false)
+}
+
+fn create_class8(e: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
+    create_com_device(e, iid, outer, output, true)
+}
+
+fn create_com_device(
+    e: &mut Env<'_>,
+    iid: [u8; 16],
+    outer: u32,
+    output: u32,
+    version8: bool,
+) -> Outcome {
+    if outer != 0 {
+        return Outcome::Return(0x8004_0110);
+    }
+    if iid != adv_os::com::IUNKNOWN && iid != IID_DEVICE && !(version8 && iid == IID_DEVICE8) {
+        return Outcome::Return(NO_INTERFACE);
+    }
+    let ptr = match object(
+        e,
+        Kind::Device {
+            initialized: false,
+            version8,
+        },
+        false,
+    ) {
+        Ok(Some(ptr)) => ptr,
+        Ok(None) => return Outcome::Return(OUT_OF_MEMORY),
+        Err(error) => return Outcome::Fail(error),
+    };
+    if let Err(error) = e.cpu.write_u32(output, ptr) {
+        release(e, ptr);
+        return Outcome::Fail(error.to_string());
+    }
+    Outcome::Return(0)
 }
 fn alloc(e: &mut Env<'_>, len: u32) -> Option<u32> {
     let heaps = e.ext.get_mut::<Heaps>();
@@ -440,7 +489,7 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
 }
 fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>, String> {
     let i = match kind {
-        Kind::Device => 0,
+        Kind::Device { .. } => 0,
         Kind::Buffer => 1,
         Kind::Notify(_) => unreachable!("notification is an alias of the buffer"),
     };
@@ -467,7 +516,7 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
         0
     };
     let com = e.ext.get::<Sound>().com;
-    let (iid, iid8) = if matches!(kind, Kind::Device) {
+    let (iid, iid8) = if matches!(kind, Kind::Device { .. }) {
         (IID_DEVICE, IID_DEVICE8)
     } else {
         (IID_BUFFER, IID_BUFFER8)
@@ -489,7 +538,14 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
         free(e, ptr);
         return Ok(None);
     };
-    if !com.register_interface(&mut e.sys.objects, id, iid8, ptr)
+    let supports8 = !matches!(
+        kind,
+        Kind::Device {
+            version8: false,
+            ..
+        }
+    );
+    if (supports8 && !com.register_interface(&mut e.sys.objects, id, iid8, ptr))
         || (notify != 0 && !com.register_interface(&mut e.sys.objects, id, IID_NOTIFY, notify))
     {
         // The notify alias is registered last. A failed registration leaves its
@@ -566,7 +622,15 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         if c != 0 {
             return Ok(0x80040110);
         }
-        let Some(obj) = object(e, Kind::Device, false)? else {
+        let Some(obj) = object(
+            e,
+            Kind::Device {
+                initialized: true,
+                version8: true,
+            },
+            false,
+        )?
+        else {
             return Ok(OUT_OF_MEMORY);
         };
         e.cpu.write_u32(b, obj).map_err(|e| e.to_string())?;
@@ -600,7 +664,27 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
         return Ok(0);
     }
-    if matches!(kind, Kind::Device) {
+    if let Kind::Device {
+        initialized,
+        version8,
+    } = kind
+    {
+        if name == "Initialize" {
+            if initialized {
+                return Ok(0x88780082);
+            }
+            if !e.ext.get::<Sound>().enabled || b != 0 {
+                return Ok(0x88780078);
+            }
+            com.get_mut::<Object>(&mut e.sys.objects, a).unwrap().kind = Kind::Device {
+                initialized: true,
+                version8,
+            };
+            return Ok(0);
+        }
+        if !initialized {
+            return Ok(0x887800aa);
+        }
         return match name {
             "CreateSoundBuffer" => {
                 if e.arg(3) != 0 {
@@ -765,7 +849,6 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }
             "SetSpeakerConfig" => Ok(if b & 0xff == 4 { 0 } else { UNSUPPORTED }),
             "Compact" => Ok(0),
-            "Initialize" => Ok(0x88780082),
             "VerifyCertification" => {
                 e.cpu.write_u32(b, 1).map_err(|e| e.to_string())?;
                 Ok(0)
@@ -1311,6 +1394,7 @@ mod tests {
     fn machine_with_limits(limits: adv_machine::ObjectLimits) -> Machine<JitCpu> {
         let mut reg = Registry::default();
         adv_win32::register(&mut reg);
+        adv_win32::ole32::register(&mut reg);
         register(&mut reg);
         let mut m = Machine::new(
             JitCpu::new(adv_machine::layout::PARK_ADDR, true).unwrap(),
@@ -1361,6 +1445,115 @@ mod tests {
     fn device(m: &mut Machine<JitCpu>) -> u32 {
         assert_eq!(invoke(m, "DirectSoundCreate", &[0, DATA + 128, 0]), 0);
         m.cpu.read_u32(DATA + 128).unwrap()
+    }
+    fn activate(
+        m: &mut Machine<JitCpu>,
+        class: [u8; 16],
+        iid: [u8; 16],
+        context: u32,
+        outer: u32,
+        output: u32,
+    ) -> Outcome {
+        m.cpu.write(DATA + 256, &class).unwrap();
+        m.cpu.write(DATA + 272, &iid).unwrap();
+        m.resolve_import("ole32.dll", "CoCreateInstance").unwrap();
+        let thunk = m
+            .sys
+            .thunks
+            .iter()
+            .find(|(_, t)| t.module == "ole32.dll" && t.name == "CoCreateInstance")
+            .unwrap()
+            .0;
+        let handler = m.sys.thunks.get(thunk).f.handler;
+        m.cpu.set_reg(Reg::Esp, STACK);
+        for (i, arg) in [DATA + 256, outer, context, DATA + 272, output]
+            .into_iter()
+            .enumerate()
+        {
+            m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
+        }
+        handler(&mut Env {
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk,
+        })
+    }
+    #[test]
+    fn com_activation_uses_the_same_audio_owner_and_requires_initialize() {
+        let mut m = machine();
+        let owners = m.sys.objects.object_count();
+        for (class, iid) in [(CLSID_DEVICE, IID_DEVICE), (CLSID_DEVICE8, IID_DEVICE8)] {
+            assert!(matches!(
+                activate(&mut m, class, iid, 1, 0, DATA + 128),
+                Outcome::Return(0)
+            ));
+            let ptr = m.cpu.read_u32(DATA + 128).unwrap();
+            assert_ne!(ptr, 0);
+            assert_eq!(m.sys.objects.object_count(), owners + 1);
+            assert_eq!(
+                invoke(&mut m, "IDirectSound8::GetCaps", &[ptr, 0]),
+                0x887800aa
+            );
+            m.ext.get_mut::<Sound>().enabled = false;
+            assert_eq!(
+                invoke(&mut m, "IDirectSound8::Initialize", &[ptr, 0]),
+                0x88780078
+            );
+            m.ext.get_mut::<Sound>().enabled = true;
+            assert_eq!(invoke(&mut m, "IDirectSound8::Initialize", &[ptr, 0]), 0);
+            assert_eq!(
+                invoke(&mut m, "IDirectSound8::Initialize", &[ptr, 0]),
+                0x88780082
+            );
+            assert_eq!(query(&mut m, ptr, &adv_os::com::IUNKNOWN), ptr);
+            assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[ptr]), 1);
+            m.cpu.write_u32(DATA, 96).unwrap();
+            assert_eq!(invoke(&mut m, "IDirectSound8::GetCaps", &[ptr, DATA]), 0);
+            assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[ptr]), 0);
+            assert_eq!(m.sys.objects.object_count(), owners);
+        }
+        let direct = device(&mut m);
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::Initialize", &[direct, 0]),
+            0x88780082
+        );
+        assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[direct]), 0);
+    }
+    #[test]
+    fn com_activation_failures_clear_output_without_allocating_or_leaking() {
+        let mut m = machine();
+        let owners = m.sys.objects.object_count();
+        for (class, iid, context, outer, expected) in [
+            ([0; 16], IID_DEVICE, 1, 0, 0x80040154),
+            (CLSID_DEVICE, IID_DEVICE, 4, 0, 0x80040154),
+            (CLSID_DEVICE, [0xff; 16], 1, 0, NO_INTERFACE),
+            (CLSID_DEVICE, IID_DEVICE8, 1, 0, NO_INTERFACE),
+            (CLSID_DEVICE, IID_DEVICE, 1, DATA, 0x80040110),
+        ] {
+            m.cpu.write_u32(DATA + 128, 0xdeadbeef).unwrap();
+            assert!(
+                matches!(activate(&mut m, class, iid, context, outer, DATA + 128), Outcome::Return(hr) if hr == expected)
+            );
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+            assert_eq!(m.sys.objects.object_count(), owners);
+        }
+        assert!(matches!(
+            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 1, 0, 0),
+            Outcome::Return(0x80004003)
+        ));
+        assert!(matches!(
+            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 1, 0, 0x700000),
+            Outcome::Fail(_)
+        ));
+        assert_eq!(m.sys.objects.object_count(), owners);
+        let warnings = &m.ext.get::<adv_abi::ApiDiagnostics>().warnings;
+        assert_eq!(
+            warnings.len(),
+            2,
+            "class/context failures only; IID probes remain quiet"
+        );
+        assert!(warnings.values().all(|count| *count == 1));
     }
     fn buffer(m: &mut Machine<JitCpu>, format: Format, bytes: u32) -> u32 {
         let device = device(m);
