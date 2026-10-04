@@ -2,13 +2,16 @@
 //! every read, seek, tell and close goes through the supplied guest callbacks.
 //! The Ogg parser accepts complete pages, avoiding synchronous CPU re-entry
 //! from a host Read implementation. PCM decoding is deferred until ov_read.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use adv_abi::Registry;
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::vorbis::{ByteOrder, DecodeError, Next, Packet, PcmFormat, Stream as CodecStream};
-use adv_machine::{Conv, Env, Machine, Outcome};
+use adv_machine::{Conv, Env, Identity, Machine, Outcome};
 use adv_os::FileSource;
+
+mod store;
+use store::{Provider, StreamSlot};
 
 const READ_SIZE: u32 = 65_536;
 const ARENA_SIZE: u32 = 131_072;
@@ -309,13 +312,6 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, policy: Policy) -> Result<(
     Ok(())
 }
 
-#[derive(Default)]
-struct Provider {
-    streams: BTreeMap<u32, Stream>,
-    next_generation: u64,
-    stats: Stats,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub opens: u64,
@@ -335,7 +331,7 @@ pub struct Stats {
 
 pub fn stats<B: Backend>(machine: &Machine<B>) -> Option<Stats> {
     machine.ext.try_get::<Provider>().map(|p| Stats {
-        active_streams: p.streams.len() as u64,
+        active_streams: p.count(&machine.sys.objects) as u64,
         ..p.stats
     })
 }
@@ -366,7 +362,6 @@ fn callback(
 }
 
 struct Stream {
-    generation: u64,
     datasource: u32,
     callbacks: [u32; 4],
     arena: u32,
@@ -421,8 +416,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
     ) && e
         .ext
         .get::<Provider>()
-        .streams
-        .get(&vf)
+        .get(&e.sys.objects, vf)
         .is_some_and(|s| s.busy)
     {
         return error(OV_EINVAL);
@@ -451,7 +445,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
         "ov_pcm_seek" | "ov_time_seek" => {
             let bits = u64::from(e.arg(1)) | (u64::from(e.arg(2)) << 32);
-            let Some(s) = e.ext.get::<Provider>().streams.get(&vf) else {
+            let Some(s) = e.ext.get::<Provider>().get(&e.sys.objects, vf) else {
                 return error(OV_EINVAL);
             };
             if s.partial {
@@ -471,7 +465,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "ov_time_total" | "ov_pcm_total" | "ov_raw_total" => totals(e, vf, e.arg(1) as i32, name),
         _ => {
             let link = e.arg(1) as i32;
-            let Some(s) = e.ext.get_mut::<Provider>().streams.get_mut(&vf) else {
+            let Some(s) = e.ext.get::<Provider>().get_mut(&mut e.sys.objects, vf) else {
                 return if matches!(
                     name.as_str(),
                     "ov_time_tell" | "ov_pcm_tell" | "ov_raw_tell"
@@ -538,7 +532,10 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
     if vf == 0
         || callbacks[0] == 0
         || initial_len > i32::MAX as u32
-        || e.ext.get::<Provider>().streams.contains_key(&vf)
+        || e.ext
+            .get::<Provider>()
+            .identity(&e.sys.objects, vf)
+            .is_some()
     {
         return error(OV_EINVAL);
     }
@@ -552,14 +549,10 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
     let Ok(arena) = e.sys.vm.alloc(e.cpu, ARENA_SIZE, Prot::RW) else {
         return error(OV_EFAULT);
     };
-    let p = e.ext.get_mut::<Provider>();
-    p.stats.opens += 1;
-    p.next_generation = p.next_generation.wrapping_add(1);
-    let generation = p.next_generation;
-    p.streams.insert(
+    let inserted = e.ext.get_mut::<Provider>().insert(
+        &mut e.sys.objects,
         vf,
         Stream {
-            generation,
             datasource,
             callbacks,
             arena,
@@ -570,6 +563,16 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
             comment_memory: Vec::new(),
         },
     );
+    if !inserted {
+        let _ = e.sys.vm.free(e.cpu, arena);
+        return error(OV_EFAULT);
+    }
+    e.ext.get_mut::<Provider>().stats.opens += 1;
+    let identity = e
+        .ext
+        .get::<Provider>()
+        .identity(&e.sys.objects, vf)
+        .unwrap();
     if callbacks[1] == 0 || callbacks[3] == 0 {
         return advance(e, vf, Operation::Open);
     }
@@ -580,6 +583,9 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
         callbacks[1],
         [datasource, 0, 0, 1],
         move |e, r| {
+            if Provider::at(&e.sys.objects, identity).is_none() {
+                return error(OV_EINVAL);
+            }
             if r.value() as i32 != 0 {
                 return advance(e, vf, Operation::Open);
             }
@@ -589,9 +595,10 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
                 callbacks[3],
                 [datasource],
                 move |e, r| {
-                    if let Some(s) = e.ext.get_mut::<Provider>().streams.get_mut(&vf)
-                        && r.value() as i32 >= 0
-                    {
+                    let Some(s) = Provider::at_mut(&mut e.sys.objects, identity) else {
+                        return error(OV_EINVAL);
+                    };
+                    if r.value() as i32 >= 0 {
                         s.seekable = true;
                         s.codec.set_source_position(u64::from(r.value()));
                     }
@@ -603,7 +610,7 @@ fn open(e: &mut Env<'_>, partial: bool) -> Outcome {
 }
 
 fn clear(e: &mut Env<'_>, vf: u32) -> Outcome {
-    let Some(s) = e.ext.get_mut::<Provider>().streams.remove(&vf) else {
+    let Some(s) = e.ext.get::<Provider>().remove(&mut e.sys.objects, vf) else {
         return Outcome::Return(0);
     };
     e.ext.get_mut::<Provider>().stats.clears += 1;
@@ -623,13 +630,13 @@ fn clear(e: &mut Env<'_>, vf: u32) -> Outcome {
 }
 
 fn abandon(e: &mut Env<'_>, vf: u32, code: i32, opening: bool) -> Outcome {
-    if opening && let Some(s) = e.ext.get_mut::<Provider>().streams.remove(&vf) {
+    if opening && let Some(s) = e.ext.get::<Provider>().remove(&mut e.sys.objects, vf) {
         e.ext.get_mut::<Provider>().stats.failed_opens += 1;
         let _ = e.sys.vm.free(e.cpu, s.arena);
         let _ = e.cpu.write(vf, &[0; VF_PREFIX]);
         // Failed open never takes ownership and must not invoke close_func.
     }
-    if !opening && let Some(s) = e.ext.get_mut::<Provider>().streams.get_mut(&vf) {
+    if !opening && let Some(s) = e.ext.get::<Provider>().get_mut(&mut e.sys.objects, vf) {
         s.busy = false;
     }
     error(code)
@@ -684,7 +691,7 @@ fn parse_comments(data: &[u8], base: u32) -> Result<Vec<u8>, i32> {
 }
 
 fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
-    let Some(mut s) = e.ext.get_mut::<Provider>().streams.remove(&vf) else {
+    let Some((identity, mut s)) = e.ext.get::<Provider>().take(&mut e.sys.objects, vf) else {
         return error(OV_EINVAL);
     };
     let opening = matches!(op, Operation::Open);
@@ -693,20 +700,20 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
         && (s.partial || (s.codec.header_count() != 3 && !matches!(op, Operation::Seek { .. })))
     {
         s.busy = false;
-        e.ext.get_mut::<Provider>().streams.insert(vf, s);
+        Provider::put(&mut e.sys.objects, identity, s);
         return error(OV_EINVAL);
     }
     if let Operation::Read { length, word, .. } = &op
         && (*length as usize) < s.codec.format().channels * (*word as usize)
     {
         s.busy = false;
-        e.ext.get_mut::<Provider>().streams.insert(vf, s);
+        Provider::put(&mut e.sys.objects, identity, s);
         return error(OV_EINVAL);
     }
     loop {
         if opening && s.codec.header_count() == 3 {
             s.busy = false;
-            e.ext.get_mut::<Provider>().streams.insert(vf, s);
+            Provider::put(&mut e.sys.objects, identity, s);
             publish(e, vf);
             return Outcome::Return(0);
         }
@@ -740,21 +747,21 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                     Outcome::Return(bytes.len() as u32)
                 };
                 s.busy = false;
-                e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                Provider::put(&mut e.sys.objects, identity, s);
                 publish(e, vf);
                 return result;
             }
             Operation::Seek { target } if s.codec.has_pcm() => {
                 if s.codec.skip_to(*target) {
                     s.busy = false;
-                    e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                    Provider::put(&mut e.sys.objects, identity, s);
                     publish(e, vf);
                     return Outcome::Return(0);
                 }
             }
             Operation::Seek { target: 0 } if s.codec.header_count() == 3 => {
                 s.busy = false;
-                e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                Provider::put(&mut e.sys.objects, identity, s);
                 publish(e, vf);
                 return Outcome::Return(0);
             }
@@ -773,21 +780,23 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                     result
                 };
                 if let Err(code) = result {
-                    e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                    Provider::put(&mut e.sys.objects, identity, s);
                     return abandon(e, vf, code, opening);
                 }
             }
             Next::More => {
                 s.codec.compact_input();
-                let (read, datasource, scratch, generation) =
-                    (s.callbacks[0], s.datasource, s.arena, s.generation);
-                e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                let (read, datasource, scratch) = (s.callbacks[0], s.datasource, s.arena);
+                Provider::put(&mut e.sys.objects, identity, s);
                 return callback(
                     e,
                     Callback::Read,
                     read,
                     [scratch, 1, READ_SIZE, datasource],
                     move |e, r| {
+                        if Provider::at(&e.sys.objects, identity).is_none() {
+                            return error(OV_EINVAL);
+                        }
                         let length = r.value();
                         if length > READ_SIZE {
                             return abandon(e, vf, OV_EREAD, opening);
@@ -797,13 +806,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                         if e.cpu.read(scratch, &mut bytes).is_err() {
                             return abandon(e, vf, OV_EREAD, opening);
                         }
-                        let Some(s) = e
-                            .ext
-                            .get_mut::<Provider>()
-                            .streams
-                            .get_mut(&vf)
-                            .filter(|s| s.generation == generation)
-                        else {
+                        let Some(s) = Provider::at_mut(&mut e.sys.objects, identity) else {
                             return error(OV_EINVAL);
                         };
                         s.codec.feed(bytes);
@@ -812,7 +815,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                 );
             }
             Next::Eof => {
-                e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                Provider::put(&mut e.sys.objects, identity, s);
                 return abandon(
                     e,
                     vf,
@@ -827,7 +830,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
                 );
             }
             Next::Error(code) => {
-                e.ext.get_mut::<Provider>().streams.insert(vf, s);
+                Provider::put(&mut e.sys.objects, identity, s);
                 return abandon(e, vf, codec_error(code), opening);
             }
         }
@@ -835,7 +838,7 @@ fn advance(e: &mut Env<'_>, vf: u32, op: Operation) -> Outcome {
 }
 
 fn publish(e: &mut Env<'_>, vf: u32) {
-    let s = &e.ext.get::<Provider>().streams[&vf];
+    let s = e.ext.get::<Provider>().get(&e.sys.objects, vf).unwrap();
     let info = s.arena + READ_SIZE;
     let mut prefix = [0u8; VF_PREFIX];
     let mut word = |offset: usize, value: u32| {
@@ -882,7 +885,7 @@ fn publish(e: &mut Env<'_>, vf: u32) {
 }
 
 fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
-    let Some(s) = e.ext.get::<Provider>().streams.get(&vf) else {
+    let Some(s) = e.ext.get::<Provider>().get(&e.sys.objects, vf) else {
         return error(OV_EINVAL);
     };
     if !s.seekable {
@@ -891,11 +894,15 @@ fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
     if target > i64::MAX as u64 || s.codec.total_frames().is_some_and(|total| target > total) {
         return error(OV_EINVAL);
     }
-    let (seek_callback, datasource, generation) = (s.callbacks[1], s.datasource, s.generation);
+    let (seek_callback, datasource) = (s.callbacks[1], s.datasource);
+    let identity = e
+        .ext
+        .get::<Provider>()
+        .identity(&e.sys.objects, vf)
+        .unwrap();
     e.ext
-        .get_mut::<Provider>()
-        .streams
-        .get_mut(&vf)
+        .get::<Provider>()
+        .get_mut(&mut e.sys.objects, vf)
         .unwrap()
         .busy = true;
     callback(
@@ -904,13 +911,7 @@ fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
         seek_callback,
         [datasource, 0, 0, 0],
         move |e, r| {
-            let Some(s) = e
-                .ext
-                .get_mut::<Provider>()
-                .streams
-                .get_mut(&vf)
-                .filter(|s| s.generation == generation)
-            else {
+            let Some(s) = Provider::at_mut(&mut e.sys.objects, identity) else {
                 return error(OV_EINVAL);
             };
             if r.value() as i32 != 0 {
@@ -925,7 +926,7 @@ fn seek(e: &mut Env<'_>, vf: u32, target: u64) -> Outcome {
 }
 
 fn totals(e: &mut Env<'_>, vf: u32, link: i32, name: String) -> Outcome {
-    let Some(s) = e.ext.get::<Provider>().streams.get(&vf) else {
+    let Some(s) = e.ext.get::<Provider>().get(&e.sys.objects, vf) else {
         return total_error(&name, OV_EINVAL);
     };
     if link > 0 || !s.seekable || s.partial {
@@ -957,7 +958,7 @@ fn totals(e: &mut Env<'_>, vf: u32, link: i32, name: String) -> Outcome {
 
 struct Scan {
     vf: u32,
-    generation: u64,
+    identity: Identity<StreamSlot>,
     name: String,
     datasource: u32,
     callbacks: [u32; 4],
@@ -969,13 +970,17 @@ struct Scan {
 }
 
 fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
-    let s = &e.ext.get::<Provider>().streams[&vf];
+    let s = e.ext.get::<Provider>().get(&e.sys.objects, vf).unwrap();
     if s.busy {
         return total_error(&name, OV_EINVAL);
     }
     let mut scan = Scan {
         vf,
-        generation: s.generation,
+        identity: e
+            .ext
+            .get::<Provider>()
+            .identity(&e.sys.objects, vf)
+            .unwrap(),
         name,
         datasource: s.datasource,
         callbacks: s.callbacks,
@@ -986,9 +991,8 @@ fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
         bytes: Vec::new(),
     };
     e.ext
-        .get_mut::<Provider>()
-        .streams
-        .get_mut(&vf)
+        .get::<Provider>()
+        .get_mut(&mut e.sys.objects, vf)
         .unwrap()
         .busy = true;
     e.ext.get_mut::<Provider>().stats.metadata_scans += 1;
@@ -998,13 +1002,11 @@ fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
         scan.callbacks[3],
         [scan.datasource],
         move |e, r| {
+            let Some(s) = Provider::at_mut(&mut e.sys.objects, scan.identity) else {
+                return total_error(&scan.name, OV_EINVAL);
+            };
             if (r.value() as i32) < 0 {
-                e.ext
-                    .get_mut::<Provider>()
-                    .streams
-                    .get_mut(&vf)
-                    .unwrap()
-                    .busy = false;
+                s.busy = false;
                 return total_error(&scan.name, OV_EREAD);
             }
             scan.saved = u64::from(r.value());
@@ -1014,6 +1016,9 @@ fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
                 scan.callbacks[1],
                 [scan.datasource, 0, 0, 2],
                 move |e, r| {
+                    if Provider::at(&e.sys.objects, scan.identity).is_none() {
+                        return total_error(&scan.name, OV_EINVAL);
+                    }
                     if r.value() as i32 != 0 {
                         return restore_scan(e, scan, Err(OV_EREAD));
                     }
@@ -1023,6 +1028,9 @@ fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
                         scan.callbacks[3],
                         [scan.datasource],
                         move |e, r| {
+                            if Provider::at(&e.sys.objects, scan.identity).is_none() {
+                                return total_error(&scan.name, OV_EINVAL);
+                            }
                             if (r.value() as i32) < 0 {
                                 return restore_scan(e, scan, Err(OV_EREAD));
                             }
@@ -1037,6 +1045,9 @@ fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
                                 scan.callbacks[1],
                                 [scan.datasource, start as u32, (start >> 32) as u32, 0],
                                 move |e, r| {
+                                    if Provider::at(&e.sys.objects, scan.identity).is_none() {
+                                        return total_error(&scan.name, OV_EINVAL);
+                                    }
                                     if r.value() as i32 != 0 {
                                         return restore_scan(e, scan, Err(OV_EREAD));
                                     }
@@ -1052,17 +1063,14 @@ fn scan_total(e: &mut Env<'_>, vf: u32, name: String) -> Outcome {
 }
 
 fn scan_read(e: &mut Env<'_>, scan: Scan) -> Outcome {
+    if Provider::at(&e.sys.objects, scan.identity).is_none() {
+        return total_error(&scan.name, OV_EINVAL);
+    }
     let remaining = scan
         .end
         .saturating_sub(scan.start + scan.bytes.len() as u64);
     if remaining == 0 {
-        let Some(s) = e
-            .ext
-            .get::<Provider>()
-            .streams
-            .get(&scan.vf)
-            .filter(|s| s.generation == scan.generation)
-        else {
+        let Some(s) = Provider::at(&e.sys.objects, scan.identity) else {
             return total_error(&scan.name, OV_EINVAL);
         };
         let serial = s.codec.format().serial;
@@ -1077,6 +1085,9 @@ fn scan_read(e: &mut Env<'_>, scan: Scan) -> Outcome {
         [scan.scratch, 1, request, scan.datasource],
         move |e, r| {
             let mut scan = scan;
+            if Provider::at(&e.sys.objects, scan.identity).is_none() {
+                return total_error(&scan.name, OV_EINVAL);
+            }
             let length = r.value();
             if length == 0 || length > request {
                 return restore_scan(e, scan, Err(OV_EREAD));
@@ -1093,6 +1104,9 @@ fn scan_read(e: &mut Env<'_>, scan: Scan) -> Outcome {
 }
 
 fn restore_scan(e: &mut Env<'_>, scan: Scan, result: Result<u64, i32>) -> Outcome {
+    if Provider::at(&e.sys.objects, scan.identity).is_none() {
+        return total_error(&scan.name, OV_EINVAL);
+    }
     callback(
         e,
         Callback::Seek,
@@ -1104,13 +1118,7 @@ fn restore_scan(e: &mut Env<'_>, scan: Scan, result: Result<u64, i32>) -> Outcom
             0,
         ],
         move |e, r| {
-            let Some(s) = e
-                .ext
-                .get_mut::<Provider>()
-                .streams
-                .get_mut(&scan.vf)
-                .filter(|s| s.generation == scan.generation)
-            else {
+            let Some(s) = Provider::at_mut(&mut e.sys.objects, scan.identity) else {
                 return total_error(&scan.name, OV_EINVAL);
             };
             s.busy = false;
