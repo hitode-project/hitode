@@ -21,7 +21,8 @@ $variants = @(
     @{Name='parent'; Id=3; Flags=@('/DWITH_DEPENDENCY'); Libs=@('lifecycle_dep.lib')},
     @{Name='fail'; Id=4; Flags=@('/DFAIL_ATTACH'); Libs=@()},
     @{Name='tls'; Id=5; Flags=@('/DWITH_TLS'); Libs=@("$OutputDirectory/tls_array.obj")},
-    @{Name='slow'; Id=6; Flags=@('/DSLOW_ATTACH'); Libs=@()}
+    @{Name='slow'; Id=6; Flags=@('/DSLOW_ATTACH'); Libs=@()},
+    @{Name='self'; Id=7; Flags=@('/DSELF_EXIT'); Libs=@('/export:SelfExit=_SelfExit@4')}
 )
 foreach ($variant in $variants) {
     $name = 'lifecycle_' + $variant.Name
@@ -36,4 +37,6 @@ Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'startu
 Invoke-LifecycleChecked $linker ($link + @('/dll', '/base:0x18000000', '/entry:DllMain@12', "/out:$OutputDirectory/lifecycle_startup.dll", "/implib:$OutputDirectory/lifecycle_startup.lib", "$OutputDirectory/startup_thread.obj", 'kernel32.lib'))
 Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'thread_exit.c'), "/Fo$OutputDirectory/thread_exit.obj"))
 Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_thread_exit.exe", "$OutputDirectory/thread_exit.obj", 'lifecycle_startup.lib', 'kernel32.lib'))
+Invoke-LifecycleChecked $compiler ($compile + @((Join-Path $PSScriptRoot 'module_self_exit.c'), "/Fo$OutputDirectory/module_self_exit.obj"))
+Invoke-LifecycleChecked $linker ($link + @('/subsystem:console', '/base:0x400000', '/entry:mainCRTStartup', "/out:$OutputDirectory/fixture_module_self_exit.exe", "$OutputDirectory/module_self_exit.obj", 'kernel32.lib'))
 Write-Output "Built x86 module lifecycle fixtures in $OutputDirectory"

@@ -2,6 +2,15 @@
 #ifndef MODULE_ID
 #define MODULE_ID 1
 #endif
+
+#ifdef SELF_EXIT
+API __declspec(noreturn) void WINAPI FreeLibraryAndExitThread(HMODULE, DWORD);
+__declspec(dllexport) DWORD WINAPI SelfExit(void *argument) {
+    volatile DWORD count = 0;
+    while (count < 512) count++;
+    FreeLibraryAndExitThread((HMODULE)argument, 23);
+}
+#endif
 typedef void (__cdecl *Recorder)(DWORD);
 static void record(DWORD kind, DWORD reason, void *reserved) {
     Recorder output = (Recorder)GetProcAddress(GetModuleHandleA(NULL), "Record");
@@ -40,6 +49,10 @@ __declspec(allocate(".rdata$T")) const TLS_DIRECTORY _tls_used = {
 #endif
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, void *reserved) {
     (void)module; record(2, reason, reserved);
+#ifdef SELF_EXIT
+    /* Detach is resumable; the worker must never return into this image. */
+    if (reason == 0) Sleep(1);
+#endif
 #ifdef SLOW_ATTACH
     if (reason == 1) { Sleep(20); record(3, reason, reserved); }
 #endif

@@ -166,7 +166,7 @@ pub(super) fn thread_start(env: &mut Env<'_>) -> Outcome {
     )
 }
 
-fn after(env: &mut Env<'_>, outcome: Outcome, then: DeferredContinuation) -> Outcome {
+pub(super) fn after(env: &mut Env<'_>, outcome: Outcome, then: DeferredContinuation) -> Outcome {
     match outcome {
         Outcome::Call {
             target,
@@ -188,6 +188,10 @@ fn after(env: &mut Env<'_>, outcome: Outcome, then: DeferredContinuation) -> Out
                 after(env, next, then)
             }),
         },
+        Outcome::Defer { then: resume } => Outcome::defer(move |env| {
+            let next = resume(env);
+            after(env, next, then)
+        }),
         Outcome::Return(_) => then(env),
         terminal => terminal,
     }

@@ -12,6 +12,75 @@ use adv_runtime::boot::Runtime;
 mod backend;
 
 #[test]
+fn freeing_the_executing_dll_and_exiting_its_thread_matches_windows() {
+    let directory = fixtures();
+    let exe = directory.join("fixture_module_self_exit.exe");
+    let _ = std::fs::remove_file(directory.join("module-self-exit.bin"));
+    let mut child = Command::new(&exe)
+        .current_dir(&directory)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "native self unload: {status:?}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("native self unload timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let decode = |bytes: Vec<u8>| {
+        bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let golden = decode(std::fs::read(directory.join("module-self-exit.bin")).unwrap());
+    assert!(
+        golden
+            .windows(2)
+            .any(|part| part == [0xa0000017, 0xb0000001])
+    );
+    assert!(
+        golden
+            .windows(2)
+            .any(|part| part == [0xa0000017, 0xb0000000])
+    );
+    // The retained image receives THREAD_DETACH once, then only PROCESS_DETACH
+    // when the second worker releases the final reference before exiting.
+    assert_eq!(golden.iter().filter(|&&event| event == 0x70203).count(), 1);
+    assert_eq!(golden.iter().filter(|&&event| event == 0x70200).count(), 1);
+    for name in ["jit", "interpreter", "unicorn"] {
+        let data = directory.join("self-exit").join(name);
+        let _ = std::fs::remove_file(data.join("overlay/module-self-exit.bin"));
+        let mut runtime =
+            Runtime::with_cpu(&exe, &data, backend::Cpu::new(name).unwrap(), 64, 32).unwrap();
+        runtime.machine.sys.clock = adv_machine::Clock::virtual_time();
+        runtime.machine.cpu.set_async_compilation(false);
+        let result = runtime.machine.run_virtual(10_000_000);
+        assert!(
+            matches!(result, RunResult::Exited(0)),
+            "{name}: {result:?}; {:?}",
+            runtime.machine.sys.recent_calls()
+        );
+        assert_eq!(
+            decode(std::fs::read(data.join("overlay/module-self-exit.bin")).unwrap()),
+            golden,
+            "{name}: unloading current code must not return through the retired image"
+        );
+        assert!(
+            adv_os::modules(&runtime.machine.ext)
+                .by_name("lifecycle_self.dll")
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn startup_gate_and_primary_thread_exit_match_windows() {
     let directory = fixtures();
     let exe = directory.join("fixture_thread_exit.exe");

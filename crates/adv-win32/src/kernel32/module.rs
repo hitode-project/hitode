@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use adv_abi::Registry;
+use adv_abi::{Handle, Registry, win32};
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, InitCall, Object, Outcome, Wait};
 use adv_os::{Loader, ModuleId, ModuleKind, Modules};
@@ -165,6 +165,28 @@ fn unload(env: &mut Env<'_>, ids: Vec<ModuleId>, result: u32, error: Option<u32>
         .map(|&id| detach_calls(env, id))
         .unwrap_or_default();
     run_detaches(env, ids, calls, result, error)
+}
+
+#[win32(kernel32, name = "FreeLibrary", level = implement)]
+fn free_library(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    locked(env, move |env| {
+        let Some(id) = adv_os::modules(env.ext).by_handle(handle.0) else {
+            set_last_error(env, err::MOD_NOT_FOUND);
+            return Outcome::Return(0);
+        };
+        match adv_os::modules_mut(env.ext).release(env.cpu, id) {
+            Ok(ids) => unload(env, ids, 1, None),
+            Err(error) => Outcome::Fail(error.to_string()),
+        }
+    })
+}
+
+#[win32(kernel32, name = "FreeLibraryAndExitThread", level = implement)]
+fn free_library_and_exit_thread(env: &mut Env<'_>, handle: Handle, code: u32) -> Outcome {
+    let released = free_library(env, handle);
+    // Finish every detach and release the loader lock before ending the thread.
+    // No guest return may reach the caller, whose DLL may now be unmapped.
+    notifications::after(env, released, Box::new(move |env| exit_thread(env, code)))
 }
 
 /// Run dependency initializers before the requested image. Only guest returns
@@ -527,19 +549,8 @@ pub(super) fn register(reg: &mut Registry) {
         let n = arg_w(e, 0);
         locked(e, move |e| load_library(e, n))
     });
-    stdcall(reg, K32, "FreeLibrary", 1, |e| {
-        let handle = e.arg(0);
-        locked(e, move |e| {
-            let Some(id) = adv_os::modules(e.ext).by_handle(handle) else {
-                set_last_error(e, err::MOD_NOT_FOUND);
-                return Outcome::Return(0);
-            };
-            match adv_os::modules_mut(e.ext).release(e.cpu, id) {
-                Ok(ids) => unload(e, ids, 1, None),
-                Err(error) => Outcome::Fail(error.to_string()),
-            }
-        })
-    });
+    reg.register(free_library_ABI);
+    reg.register(free_library_and_exit_thread_ABI);
     stdcall(reg, K32, "DisableThreadLibraryCalls", 1, |e| {
         let handle = e.arg(0);
         locked(e, move |e| {

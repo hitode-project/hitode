@@ -242,6 +242,11 @@ fn machine_rdtsc_and_win32_qpc_share_the_same_clock_on_both_executors() {
         adv_win32::register(&mut registry);
         let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, native).unwrap();
         let mut machine = GuestMachine::new(cpu, registry, Clock::virtual_time()).unwrap();
+        adv_win32::Win32::install(
+            &mut machine,
+            adv_win32::Win32Config::new(".", "clock-fixture.exe", "target/clock-fixture"),
+        )
+        .unwrap();
         let qpc = machine
             .resolve_import("kernel32.dll", "QueryPerformanceCounter")
             .unwrap();
