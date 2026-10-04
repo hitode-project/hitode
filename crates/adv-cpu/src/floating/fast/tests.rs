@@ -234,3 +234,19 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
         );
     }
 }
+
+#[test]
+fn dekker_product_error_matches_fused_multiply_add() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for _ in 0..100_000 {
+        let mut operand = || {
+            let exponent = (rng.next() % (2 * RANGE as u64 + 1)) as i64 - i64::from(RANGE);
+            let bits = (rng.next() & ((1 << 52) - 1)) | ((exponent + 1023) as u64) << 52;
+            let value = f64::from_bits(bits);
+            if rng.next() & 1 == 0 { value } else { -value }
+        };
+        let (a, b) = (operand(), operand());
+        let p = a * b;
+        assert_eq!(dekker_error(a, b, p), a.mul_add(b, -p), "{a:e} {b:e}");
+    }
+}

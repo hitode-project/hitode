@@ -234,8 +234,27 @@ fn split(a: f64) -> (f64, f64) {
     (high, a - high)
 }
 
-/// Exact `a * b - fl(a * b)` (Dekker); operands are within `2^±RANGE`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+fn fused_error(a: f64, b: f64, p: f64) -> f64 {
+    a.mul_add(b, -p)
+}
+
+/// Exact `a * b - fl(a * b)`; operands are within `2^±RANGE`.
+#[inline]
 fn product_error(a: f64, b: f64, p: f64) -> f64 {
+    #[cfg(target_arch = "aarch64")]
+    return a.mul_add(b, -p);
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the CPU supports FMA.
+        return unsafe { fused_error(a, b, p) };
+    }
+    #[allow(unreachable_code)]
+    dekker_error(a, b, p)
+}
+
+fn dekker_error(a: f64, b: f64, p: f64) -> f64 {
     let (ah, al) = split(a);
     let (bh, bl) = split(b);
     ((ah * bh - p) + ah * bl + al * bh) + al * bl
@@ -298,7 +317,25 @@ fn address(i: &Instruction, state: &CpuState) -> Option<u32> {
     Some(address)
 }
 
+fn writable(memory: &Memory, address: u32, len: usize) -> bool {
+    memory.direct(address, len, true).is_some() || accessible(memory, address, len, true)
+}
+
+/// Store to a location `writable` accepted.
+fn store(memory: &mut Memory, address: u32, bytes: &[u8]) -> Option<()> {
+    if let Some(pointer) = memory.direct(address, bytes.len(), true) {
+        // SAFETY: `direct` bounds the range to one owned ordinary page.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+        return Some(());
+    }
+    memory.write(address, bytes).ok()
+}
+
 fn read<const N: usize>(memory: &Memory, address: u32) -> Option<[u8; N]> {
+    if let Some(pointer) = memory.direct(address, N, false) {
+        // SAFETY: `direct` bounds the range to one owned ordinary page.
+        return Some(unsafe { pointer.cast::<[u8; N]>().read_unaligned() });
+    }
     if !accessible(memory, address, N, false) {
         return None;
     }
@@ -405,7 +442,7 @@ pub(super) fn execute(
             pop,
         } => {
             let at = address(i, state)?;
-            if !accessible(memory, at, usize::from(width), true) {
+            if !writable(memory, at, usize::from(width)) {
                 return None;
             }
             let physical = slot(top, 0);
@@ -451,7 +488,7 @@ pub(super) fn execute(
             if !exact {
                 status |= PE | if up { C1 } else { 0 };
             }
-            memory.write(at, &bytes[..usize::from(width)]).ok()?;
+            store(memory, at, &bytes[..usize::from(width)])?;
             dp = Some(at);
             if pop {
                 tags_freed[0] = physical;
@@ -574,10 +611,10 @@ pub(super) fn execute(
                 state.regs[0] = (state.regs[0] & 0xffff_0000) | u32::from(value);
             } else {
                 let at = address(i, state)?;
-                if !accessible(memory, at, 2, true) {
+                if !writable(memory, at, 2) {
                     return None;
                 }
-                memory.write(at, &value.to_le_bytes()).ok()?;
+                store(memory, at, &value.to_le_bytes())?;
             }
             metadata = false;
         }

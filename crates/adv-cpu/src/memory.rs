@@ -522,6 +522,28 @@ impl Memory {
         Ok(())
     }
 
+    /// Host address of `len` bytes within one ordinary page that guest code
+    /// may access directly: mapped, permitted, not shared, and for writes not
+    /// executable, so no overlay, code invalidation or host protection scope
+    /// is involved. Such pages are host-accessible under native protection.
+    #[inline]
+    pub(crate) fn direct(&self, addr: u32, len: usize, write: bool) -> Option<*mut u8> {
+        let offset = addr.wrapping_sub(self.base) as usize;
+        let last = offset.checked_add(len.checked_sub(1)?)?;
+        if last >= self.len || offset / PAGE_SIZE != last / PAGE_SIZE {
+            return None;
+        }
+        let page = offset / PAGE_SIZE;
+        let perms = self.perms[page];
+        let allowed = if write {
+            perms & WRITE != 0 && perms & (EXEC | SHARED) == 0
+        } else {
+            perms & READ != 0 && perms & SHARED == 0
+        };
+        // SAFETY: offset + len lies inside the owned allocation.
+        (allowed && self.mapped[page]).then(|| unsafe { self.ptr.as_ptr().add(offset) })
+    }
+
     fn overlays(&self, range: &std::ops::Range<usize>) -> bool {
         !range.is_empty()
             && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
