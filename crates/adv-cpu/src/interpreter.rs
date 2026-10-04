@@ -684,7 +684,12 @@ impl Address {
         } else {
             Some(Reg::decode(i.memory_index())?)
         };
-        if base.is_some_and(|r| r.width == 1) || index.is_some_and(|r| r.width == 1) {
+        // XLAT's implicit address is the sole byte-indexed form: iced supplies
+        // BX/EBX + unsigned AL. The usual address-width wrap still precedes FS.
+        if base.is_some_and(|r| r.width == 1)
+            || (index.is_some_and(|r| r.width == 1)
+                && !(i.code() == Code::Xlat_m8 && i.memory_index() == R::AL))
+        {
             return None;
         }
         if !lea && !matches!(i.memory_segment(), R::DS | R::SS | R::ES | R::CS | R::FS) {
@@ -1080,6 +1085,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
         M::Nop | M::Pause => Action::Nop,
         M::Cpuid => Action::Cpuid,
         M::Rdtsc => Action::Rdtsc,
+        M::Xlatb => Action::Mov(Operand::Register(Reg::decode(R::AL)?), op(0)?, false),
         M::Sgdt if i.op0_kind() == OpKind::Memory => Action::StoreGdt(Address::decode(i, false)?),
         M::Mov
             if matches!(
