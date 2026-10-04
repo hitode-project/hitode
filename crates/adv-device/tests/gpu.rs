@@ -79,6 +79,71 @@ fn near(got: [u8; 4], expected: [u8; 4], tolerance: u8) {
 }
 
 #[test]
+fn opaque_images_sample_one_and_preserve_semantics_across_frame_rotation() {
+    use adv_device::surface::{Snapshot, Surfaces, frame_mailbox};
+    let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let opaque = gpu
+        .target(2, 2, false)
+        .unwrap()
+        .with_alpha_mode(AlphaMode::Opaque);
+    let output = gpu.target(2, 2, false).unwrap();
+    let mut state = DrawState::new(2, 2);
+    for (factor, expected) in [
+        (Factor::DestinationAlpha, [0, 0, 255, 255]),
+        (Factor::OneMinusDestinationAlpha, [0, 0, 0, 255]),
+        (Factor::SourceAlphaSaturated, [0, 0, 0, 255]),
+    ] {
+        gpu.draw(
+            &opaque,
+            &quad([1., 1., 1., 0.25], 0., 1.),
+            None,
+            DrawState::new(2, 2),
+        )
+        .unwrap();
+        state.blend = Some(Blend {
+            source: factor,
+            destination: Factor::Zero,
+            operation: BlendOp::Add,
+        });
+        gpu.draw(&opaque, &quad([1., 0., 0., 0.5], 0., 1.), None, state)
+            .unwrap();
+        let mut sampled = DrawState::new(2, 2);
+        sampled.texture_op = TextureOp::Texture;
+        sampled.alpha_texture_op = TextureOp::Texture;
+        gpu.draw(
+            &output,
+            &quad([1.; 4], 0., 1.),
+            Some(&opaque.image),
+            sampled,
+        )
+        .unwrap();
+        assert_eq!(read(&mut gpu, &output.image), expected.repeat(4));
+    }
+    let frame = gpu.present(&opaque.image, 1).unwrap();
+    assert_eq!(frame.image.alpha_mode(), AlphaMode::Opaque);
+    drop(frame);
+    let frame = gpu.present(&output.image, 2).unwrap();
+    assert_eq!(frame.image.alpha_mode(), AlphaMode::Stored);
+    drop(frame);
+    let mut surfaces = Surfaces::new(2, 2, 0x1000, 0x1000, Snapshot::default()).unwrap();
+    let id = surfaces.insert_native(opaque).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    surfaces.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    for _ in 0..3 {
+        surfaces.present_native_rotating(id, &mut gpu).unwrap();
+        assert!(consumer.update());
+        assert_eq!(
+            consumer.current().native().unwrap().image.alpha_mode(),
+            AlphaMode::Opaque
+        );
+        assert_eq!(
+            surfaces.native_target(id).unwrap().image.alpha_mode(),
+            AlphaMode::Opaque
+        );
+    }
+}
+
+#[test]
 fn actual_gpu_color_texture_blend_clip_depth_and_native_frame_readback() {
     color_texture_blend_clip_depth_and_native_frame_readback(false);
 }

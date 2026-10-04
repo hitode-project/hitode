@@ -95,6 +95,7 @@ pub struct Image {
     view: wgpu::TextureView,
     width: u32,
     height: u32,
+    alpha: AlphaMode,
     context: u64,
     id: u64,
     lease: Option<Arc<()>>,
@@ -107,6 +108,9 @@ impl Image {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+    pub fn alpha_mode(&self) -> AlphaMode {
+        self.alpha
     }
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
@@ -148,6 +152,11 @@ pub struct Target {
     depth: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
 impl Target {
+    /// Declare the interpretation of an image before publishing its front-end view.
+    pub fn with_alpha_mode(mut self, alpha: AlphaMode) -> Self {
+        self.image.alpha = alpha;
+        self
+    }
     pub(crate) fn has_depth(&self) -> bool {
         self.depth.is_some()
     }
@@ -511,6 +520,7 @@ impl Gpu {
             view,
             width,
             height,
+            alpha: AlphaMode::Stored,
             context: context.id,
             id: NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed),
             lease: Some(Arc::new(())),
@@ -624,7 +634,11 @@ impl Gpu {
                             r: c[0],
                             g: c[1],
                             b: c[2],
-                            a: c[3],
+                            a: if target.image.alpha == AlphaMode::Opaque {
+                                1.0
+                            } else {
+                                c[3]
+                            },
                         })
                     }),
                     store: wgpu::StoreOp::Store,
@@ -713,7 +727,7 @@ impl Gpu {
         target: &Target,
         vertices: &[Vertex],
         image: Option<&Image>,
-        state: DrawState,
+        mut state: DrawState,
     ) -> Result<(), Error> {
         let context = self.context.clone();
         let submission = context.submission()?;
@@ -726,6 +740,19 @@ impl Gpu {
             }
         }
         validate(target, vertices, &state)?;
+        if target.image.alpha == AlphaMode::Opaque {
+            // RGBX has destination alpha one irrespective of unused storage bits.
+            // Preserve source alpha for color blending and alpha testing.
+            if let Some(blend) = &mut state.blend {
+                let factor = |factor| match factor {
+                    Factor::DestinationAlpha => Factor::One,
+                    Factor::OneMinusDestinationAlpha | Factor::SourceAlphaSaturated => Factor::Zero,
+                    factor => factor,
+                };
+                blend.source = factor(blend.source);
+                blend.destination = factor(blend.destination);
+            }
+        }
         let size = std::mem::size_of_val(vertices) as u64;
         if size > MAX_UPLOAD {
             return Err(invalid("vertex upload exceeds command limit"));
@@ -755,7 +782,12 @@ impl Gpu {
         submission.write_buffer(&self.upload, 0, bytemuck::cast_slice(vertices));
         let parameters = [
             texture_op(state.texture_op),
-            texture_op(state.alpha_texture_op),
+            texture_op(state.alpha_texture_op)
+                | if image.is_some_and(|image| image.alpha == AlphaMode::Opaque) {
+                    1 << 31
+                } else {
+                    0
+                },
             compare_index(state.alpha_test),
             state.alpha_reference.to_bits(),
         ];
@@ -933,6 +965,7 @@ impl Gpu {
             self.stats.native_frame_allocations += 1;
             self.frames.len() - 1
         };
+        self.frames[index].alpha = image.alpha;
         let snapshot = self.frames[index].clone();
         self.copy_under(
             image,

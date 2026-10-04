@@ -44,9 +44,10 @@ fn compare_alpha(alpha: f32) -> bool {
     }
 }
 @fragment fn fragment_main(input: Fragment) -> @location(0) vec4<f32> {
-    let texel = textureSample(image, image_sampler, input.uv);
+    var texel = textureSample(image, image_sampler, input.uv);
+    if (parameters.alpha_op & 0x80000000u) != 0u { texel.a = 1.0; }
     let color = combine(parameters.color_op, input.color, texel).rgb;
-    let alpha = combine(parameters.alpha_op, input.color, texel).a;
+    let alpha = combine(parameters.alpha_op & 0x7fffffffu, input.color, texel).a;
     if !compare_alpha(alpha) { discard; }
     return vec4(color, alpha);
 }

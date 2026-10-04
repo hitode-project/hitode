@@ -7,6 +7,14 @@ pub use renderer::Submission;
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Target};
 pub use submission::SubmissionPause;
 
+/// Whether sampled alpha is stored or implicitly one (RGBX color images).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlphaMode {
+    #[default]
+    Stored,
+    Opaque,
+}
+
 /// Clip-space position, RGBA diffuse color and normalized texture coordinates.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
