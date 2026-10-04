@@ -236,9 +236,13 @@ fn output(
     if env.ext.try_get::<SurfaceStore>().is_none() {
         return unavailable(env, "text surface store is not installed");
     }
+    let converted = ansi.then(|| ansi_units(env, &font, &bytes));
     let units;
-    let input = if ansi {
-        TextInput::Encoded(&bytes)
+    let input = if let Some(converted) = &converted {
+        match converted {
+            Some(units) => TextInput::Unicode(units),
+            None => TextInput::Encoded(&bytes),
+        }
     } else {
         units = bytes
             .as_chunks::<2>()

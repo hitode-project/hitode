@@ -399,6 +399,44 @@ fn invoke(machine: &mut Machine<JitCpu>, data: u32, name: &str, args: &[u32]) ->
     };
     value
 }
+
+#[test]
+#[cfg(windows)]
+fn ansi_extent_uses_guest_locale_instead_of_host_acp() {
+    let (mut machine, data, dc) = fixture();
+    for (codepage, bytes, unicode) in [
+        (932, vec![0xb1, 0x41], vec![0xff71u16, 0x41]),
+        (936, vec![0xd6, 0xd0, 0x41], vec![0x4e2du16, 0x41]),
+    ] {
+        machine.ext.get_mut::<Win32>().codec = adv_os::Codec::new(codepage);
+        machine.cpu.write(data + 512, &bytes).unwrap();
+        let wide: Vec<_> = unicode.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+        machine.cpu.write(data + 640, &wide).unwrap();
+        assert_eq!(
+            invoke(
+                &mut machine,
+                data,
+                "GetTextExtentPoint32A",
+                &[dc, data + 512, bytes.len() as u32, data + 1024]
+            ),
+            1
+        );
+        assert_eq!(
+            invoke(
+                &mut machine,
+                data,
+                "GetTextExtentPoint32W",
+                &[dc, data + 640, unicode.len() as u32, data + 1040]
+            ),
+            1
+        );
+        let mut ansi_size = [0; 8];
+        let mut wide_size = [0; 8];
+        machine.cpu.read(data + 1024, &mut ansi_size).unwrap();
+        machine.cpu.read(data + 1040, &mut wide_size).unwrap();
+        assert_eq!(ansi_size, wide_size, "guest code page {codepage}");
+    }
+}
 #[test]
 fn text_extent_rejects_short_readonly_and_overflowing_ranges_without_partial_size() {
     let (mut machine, data, dc) = fixture();

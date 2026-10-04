@@ -169,6 +169,20 @@ fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
     }
 }
 
+/// ANSI/default text belongs to the guest locale, never the host process ACP.
+/// Explicit supported DBCS repertoires also remain independent of host locale.
+/// Symbol and other explicit repertoires retain their existing backend mapping.
+fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<u16>> {
+    let codec = env.ext.get::<Win32>().codec;
+    let codepage = match request.encoding {
+        Encoding::Automatic | Encoding::Latin | Encoding::Oem => codec.acp,
+        Encoding::Japanese => 932,
+        Encoding::SimplifiedChinese => 936,
+        _ => return None,
+    };
+    Some(codec.to_utf16(codepage, bytes))
+}
+
 #[win32(gdi32, name = "GetTextMetricsA", level = implement)]
 fn metrics_a(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> Outcome {
     if reject_dc(env, dc.0) {
@@ -257,9 +271,14 @@ fn extent(
         set_last_error(env, 87);
         return Outcome::Return(0);
     }
+    let request = font_request(env, dc);
+    let ansi = ansi.then(|| ansi_units(env, &request, &bytes));
     let units;
-    let input = if ansi {
-        text::TextInput::Encoded(&bytes)
+    let input = if let Some(converted) = &ansi {
+        match converted {
+            Some(units) => text::TextInput::Unicode(units),
+            None => text::TextInput::Encoded(&bytes),
+        }
     } else {
         units = bytes
             .as_chunks::<2>()
@@ -269,7 +288,6 @@ fn extent(
             .collect::<Vec<_>>();
         text::TextInput::Unicode(&units)
     };
-    let request = font_request(env, dc);
     match env.ext.get_mut::<Fonts>().text.extent(&request, input) {
         Ok(size) if output.write(env.cpu, [size.width, size.height]).is_ok() => Outcome::Return(1),
         Err(TextError::Unavailable) => Outcome::Fail(TextError::Unavailable.to_string()),
