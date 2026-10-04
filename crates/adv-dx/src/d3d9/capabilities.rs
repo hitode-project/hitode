@@ -388,7 +388,11 @@ mod tests {
         assert_eq!(value.StencilCaps, 0x1ff);
         assert_eq!(value.ZCmpCaps, 0xff);
         assert_eq!(value.TextureCaps & 0x4000, 0x4000, "manual mip chains");
-        assert_eq!(value.TextureFilterCaps & 0x30000, 0x30000, "point and linear mip filters");
+        assert_eq!(
+            value.TextureFilterCaps & 0x30000,
+            0x30000,
+            "point and linear mip filters"
+        );
         assert_eq!(value.TextureCaps & (0x800 | 0x2000), 0);
         assert_eq!((value.MaxStreams, value.MaxVertexIndex), (16, 0x000f_ffff));
         assert_eq!(value.DevCaps2, 1, "only stream offsets are implemented");

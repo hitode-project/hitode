@@ -664,11 +664,14 @@ pub(super) fn prepare(
         if resources::locked(env, r) {
             return Err(INVALID);
         }
-        (Some(
-            (provider.target)(env.ext, r.surface.ok_or(INVALID)?)
-                .ok_or(INVALID)?
-                .image,
-        ), r.lod)
+        (
+            Some(
+                (provider.target)(env.ext, r.surface.ok_or(INVALID)?)
+                    .ok_or(INVALID)?
+                    .image,
+            ),
+            r.lod,
+        )
     } else {
         (None, 0)
     };
@@ -777,7 +780,11 @@ pub(super) fn prepare(
     };
     // Native D3D ignores MAXMIPLEVEL when MIPFILTER is NONE, but managed
     // texture residency LOD still selects its most detailed permitted level.
-    let first = if state.sampler.mip.is_none() { lod } else { lod.max(f.sampler[&9]) };
+    let first = if state.sampler.mip.is_none() {
+        lod
+    } else {
+        lod.max(f.sampler[&9])
+    };
     state.sampler.first_level = first.min(image.as_ref().map_or(1, Image::mip_levels) - 1);
     if image.is_some() {
         state.texture_op = combine(f.stage[&1], f.stage[&2], f.stage[&3]).ok_or(UNAVAILABLE)?;

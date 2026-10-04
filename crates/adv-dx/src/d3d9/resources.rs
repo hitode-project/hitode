@@ -132,13 +132,17 @@ pub(super) fn container_pointer(env: &Env<'_>, pointer: u32) -> Option<u32> {
     }
 }
 pub(super) fn container_level(env: &Env<'_>, pointer: u32) -> Option<(u32, u32)> {
-    Some((container_pointer(env, pointer)?, resource(env, pointer)?.level))
+    Some((
+        container_pointer(env, pointer)?,
+        resource(env, pointer)?.level,
+    ))
 }
 /// Resolve a borrowed surface through its sole pixel owner. The view itself
 /// never caches a heap address that could outlive its controlling texture.
 pub(super) fn storage(env: &Env<'_>, r: &Resource) -> Option<u32> {
     if let Some(container) = r.container {
-        let Some(Payload::Resource(parent)) = com(env).get_identity(&env.sys.objects, container) else {
+        let Some(Payload::Resource(parent)) = com(env).get_identity(&env.sys.objects, container)
+        else {
             return None;
         };
         let selected = parent.levels.get(r.level as usize)?;
@@ -177,8 +181,7 @@ fn texture_surface(
     if output.write(env.cpu, 0).is_err() {
         return INVALID;
     }
-    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture)
-    else {
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
         return INVALID;
     };
     let Some(selected) = r.levels.get(level as usize).copied() else {
@@ -507,8 +510,7 @@ fn create_texture(
         Width: width,
         Height: height,
     };
-    let Some((mut levels, len)) = level_layout(desc, levels)
-    else {
+    let Some((mut levels, len)) = level_layout(desc, levels) else {
         return Outcome::Return(INVALID);
     };
     // SYSTEMMEM/SCRATCH are guest storage, never sampleable GPU copies. The
@@ -593,10 +595,21 @@ fn level_layout(desc: D3DSURFACE_DESC, count: u32) -> Option<(Vec<Level>, u32)> 
         let mut level_desc = desc;
         level_desc.Width = (desc.Width >> index).max(1);
         level_desc.Height = (desc.Height >> index).max(1);
-        let bytes = level_desc.Width.checked_mul(level_desc.Height)?.checked_mul(4)?;
+        let bytes = level_desc
+            .Width
+            .checked_mul(level_desc.Height)?
+            .checked_mul(4)?;
         let offset = length;
-        length = length.checked_add(bytes).filter(|&n| n <= 64 * 1024 * 1024)?;
-        levels.push(Level { desc: level_desc, offset, surface: None, interface: None, lock: None });
+        length = length
+            .checked_add(bytes)
+            .filter(|&n| n <= 64 * 1024 * 1024)?;
+        levels.push(Level {
+            desc: level_desc,
+            offset,
+            surface: None,
+            interface: None,
+            lock: None,
+        });
     }
     Some((levels, length))
 }
@@ -625,8 +638,7 @@ fn texture_desc(
     level: u32,
     output: GuestPtr<D3DSURFACE_DESC>,
 ) -> u32 {
-    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture)
-    else {
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
         return INVALID;
     };
     let Some(selected) = r.levels.get(level as usize) else {
@@ -641,11 +653,14 @@ fn texture_desc(
 }
 #[win32(d3d9,name="IDirect3DTexture9::GetLevelCount",level=implement)]
 fn texture_levels(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    resource(env, this.addr()).filter(|r| r.kind == Kind::Texture).map_or(0, |r| r.levels.len() as u32)
+    resource(env, this.addr())
+        .filter(|r| r.kind == Kind::Texture)
+        .map_or(0, |r| r.levels.len() as u32)
 }
 #[win32(d3d9,name="IDirect3DTexture9::SetLOD",level=state)]
 fn texture_set_lod(env: &mut Env<'_>, this: GuestPtr<()>, lod: u32) -> u32 {
-    let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr()) else {
+    let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    else {
         return 0;
     };
     if r.kind != Kind::Texture || r.desc.Pool != 1 {
@@ -657,7 +672,9 @@ fn texture_set_lod(env: &mut Env<'_>, this: GuestPtr<()>, lod: u32) -> u32 {
 }
 #[win32(d3d9,name="IDirect3DTexture9::GetLOD",level=implement)]
 fn texture_get_lod(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    resource(env, this.addr()).filter(|r| r.kind == Kind::Texture && r.desc.Pool == 1).map_or(0, |r| r.lod)
+    resource(env, this.addr())
+        .filter(|r| r.kind == Kind::Texture && r.desc.Pool == 1)
+        .map_or(0, |r| r.lod)
 }
 #[win32(d3d9,name="IDirect3DTexture9::LockRect",level=implement)]
 pub(super) fn texture_lock(
@@ -668,8 +685,7 @@ pub(super) fn texture_lock(
     rectangle: GuestPtr<RECT>,
     flags: u32,
 ) -> u32 {
-    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture)
-    else {
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
         return INVALID;
     };
     let Some(selected) = r.levels.get(level as usize).copied() else {
@@ -681,7 +697,10 @@ pub(super) fn texture_lock(
         || (r.desc.Pool == 0 && r.desc.Usage & 0x200 == 0)
         || flags & !(0x10 | 0x800 | 0x2000 | 0x8000) != 0
         || (flags & 0x2000 != 0
-            && (r.desc.Usage & 0x200 == 0 || level != 0 || !rectangle.is_null() || flags & 0x10 != 0))
+            && (r.desc.Usage & 0x200 == 0
+                || level != 0
+                || !rectangle.is_null()
+                || flags & 0x10 != 0))
     {
         return INVALID;
     }
@@ -738,8 +757,7 @@ pub(super) fn texture_lock(
 }
 #[win32(d3d9,name="IDirect3DTexture9::UnlockRect",level=implement)]
 pub(super) fn texture_unlock(env: &mut Env<'_>, this: GuestPtr<()>, level: u32) -> Outcome {
-    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture)
-    else {
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
         return Outcome::Return(INVALID);
     };
     let Some(selected) = r.levels.get(level as usize).copied() else {
@@ -878,18 +896,44 @@ mod tests {
 
     #[test]
     fn mip_layout_bounds_the_complete_chain_and_halves_rectangular_npot_dimensions() {
-        let desc = D3DSURFACE_DESC { Width: 3, Height: 5, ..D3DSURFACE_DESC::default() };
+        let desc = D3DSURFACE_DESC {
+            Width: 3,
+            Height: 5,
+            ..D3DSURFACE_DESC::default()
+        };
         let (levels, length) = level_layout(desc, 0).unwrap();
         assert_eq!(length, 72);
-        assert_eq!(levels.iter().map(|l| (l.desc.Width, l.desc.Height, l.offset)).collect::<Vec<_>>(),
-            [(3, 5, 0), (1, 2, 60), (1, 1, 68)]);
+        assert_eq!(
+            levels
+                .iter()
+                .map(|l| (l.desc.Width, l.desc.Height, l.offset))
+                .collect::<Vec<_>>(),
+            [(3, 5, 0), (1, 2, 60), (1, 1, 68)]
+        );
         assert!(level_layout(desc, 4).is_none());
         assert_eq!(level_layout(desc, 2).unwrap().1, 68);
         assert!(level_layout(D3DSURFACE_DESC { Width: 0, ..desc }, 0).is_none());
-        let limit = D3DSURFACE_DESC { Width: 4096, Height: 4096, ..desc };
+        let limit = D3DSURFACE_DESC {
+            Width: 4096,
+            Height: 4096,
+            ..desc
+        };
         assert_eq!(level_layout(limit, 1).unwrap().1, 64 * 1024 * 1024);
-        assert!(level_layout(limit, 0).is_none(), "the base fitting the budget does not exempt lower levels");
-        assert!(level_layout(D3DSURFACE_DESC { Width: u32::MAX, Height: u32::MAX, ..desc }, 0).is_none());
+        assert!(
+            level_layout(limit, 0).is_none(),
+            "the base fitting the budget does not exempt lower levels"
+        );
+        assert!(
+            level_layout(
+                D3DSURFACE_DESC {
+                    Width: u32::MAX,
+                    Height: u32::MAX,
+                    ..desc
+                },
+                0
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -929,10 +973,19 @@ mod tests {
                 owns_surface: false,
                 lock: None,
                 container: None,
-                levels: level_layout(D3DSURFACE_DESC {
-                    Width: 2, Height: 2, Pool: 1, Type: 1, Format: 21,
-                    ..D3DSURFACE_DESC::default()
-                }, 1).unwrap().0,
+                levels: level_layout(
+                    D3DSURFACE_DESC {
+                        Width: 2,
+                        Height: 2,
+                        Pool: 1,
+                        Type: 1,
+                        Format: 21,
+                        ..D3DSURFACE_DESC::default()
+                    },
+                    1,
+                )
+                .unwrap()
+                .0,
                 level: 0,
                 lod: 0,
             },
@@ -977,58 +1030,161 @@ mod tests {
         let mut m = super::super::tests::machine();
         m.sys.objects = Objects::default();
         m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
-        m.ext.get_mut::<State>().tables.insert("IDirect3DTexture9", 0);
+        m.ext
+            .get_mut::<State>()
+            .tables
+            .insert("IDirect3DTexture9", 0);
         let gpu = pollster::block_on(Gpu::request(true)).unwrap();
         m.ext.insert(TestTarget(gpu.target(4, 2, false).unwrap()));
-        m.ext.get_mut::<State>().provider.target = |ext, id| (id == 7).then(|| ext.get::<TestTarget>().0.clone());
+        m.ext.get_mut::<State>().provider.target =
+            |ext, id| (id == 7).then(|| ext.get::<TestTarget>().0.clone());
         let wake = adv_sync::WakeEvent::new().unwrap();
         let mut builder = adv_sync::background::Builder::new(wake.clone()).unwrap();
         let sender = builder.sender(1, 1).unwrap().into_local();
         let _service = builder.start().unwrap();
         m.ext.get_mut::<State>().sender = Some(sender);
         m.ext.get_mut::<State>().wake = Some(std::sync::Arc::new(wake));
-        let mut env = Env { cpu: &mut m.cpu, sys: &mut m.sys, ext: &mut m.ext, thunk: 0 };
+        let mut env = Env {
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
         let (device_pointer, device, _, original) = super::super::tests::setup(&mut env);
         if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, original) {
             super::super::destroy(&mut env, dead);
         }
-        let (source, _) = make(&mut env, Resource {
-            pointer: 0, device, kind: Kind::Surface,
-            desc: D3DSURFACE_DESC { Width: 4, Height: 2, Format: 21, Type: 1, Usage: 1, ..D3DSURFACE_DESC::default() },
-            depth: None, surface: Some(7), storage: 0, owns_surface: false,
-            lock: None, container: None, levels: Vec::new(), level: 0, lod: 0,
-        }).unwrap();
+        let (source, _) = make(
+            &mut env,
+            Resource {
+                pointer: 0,
+                device,
+                kind: Kind::Surface,
+                desc: D3DSURFACE_DESC {
+                    Width: 4,
+                    Height: 2,
+                    Format: 21,
+                    Type: 1,
+                    Usage: 1,
+                    ..D3DSURFACE_DESC::default()
+                },
+                depth: None,
+                surface: Some(7),
+                storage: 0,
+                owns_surface: false,
+                lock: None,
+                container: None,
+                levels: Vec::new(),
+                level: 0,
+                lod: 0,
+            },
+        )
+        .unwrap();
         let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
-        assert!(matches!(create_texture(&mut env, GuestPtr::new(device_pointer), 8, 4, 0, 0, 21, 2, output, GuestPtr::new(0)), Outcome::Return(0)));
+        assert!(matches!(
+            create_texture(
+                &mut env,
+                GuestPtr::new(device_pointer),
+                8,
+                4,
+                0,
+                0,
+                21,
+                2,
+                output,
+                GuestPtr::new(0)
+            ),
+            Outcome::Return(0)
+        ));
         let texture = output.read(env.cpu).unwrap();
-        let texture_id = com(&env).identity::<Payload>(&env.sys.objects, texture).unwrap();
+        let texture_id = com(&env)
+            .identity::<Payload>(&env.sys.objects, texture)
+            .unwrap();
         let parent = resource(&env, texture).unwrap();
         let base = parent.storage;
-        assert!(parent.surface.is_none() && parent.levels.iter().all(|l| l.surface.is_none()), "system memory never calls the GPU surface provider");
+        assert!(
+            parent.surface.is_none() && parent.levels.iter().all(|l| l.surface.is_none()),
+            "system memory never calls the GPU surface provider"
+        );
         assert_eq!(texture_set_lod(&mut env, GuestPtr::new(texture), 3), 0);
         assert_eq!(texture_get_lod(&mut env, GuestPtr::new(texture)), 0);
-        assert_eq!(texture_surface(&mut env, GuestPtr::new(texture), 1, output), 0);
+        assert_eq!(
+            texture_surface(&mut env, GuestPtr::new(texture), 1, output),
+            0
+        );
         let surface = output.read(env.cpu).unwrap();
-        let surface_id = com(&env).identity::<Payload>(&env.sys.objects, surface).unwrap();
-        assert_eq!(storage(&env, resource(&env, surface).unwrap()), Some(base + 128));
+        let surface_id = com(&env)
+            .identity::<Payload>(&env.sys.objects, surface)
+            .unwrap();
+        assert_eq!(
+            storage(&env, resource(&env, surface).unwrap()),
+            Some(base + 128)
+        );
         let locked_rect = GuestPtr::new(alloc(&mut env, 8).unwrap());
-        assert_eq!(texture_lock(&mut env, GuestPtr::new(texture), 1, locked_rect, GuestPtr::new(0), 0x800), 0);
+        assert_eq!(
+            texture_lock(
+                &mut env,
+                GuestPtr::new(texture),
+                1,
+                locked_rect,
+                GuestPtr::new(0),
+                0x800
+            ),
+            0
+        );
         let lock = locked_rect.read(env.cpu).unwrap();
         assert_eq!((lock.Pitch, lock.pBits), (16, base + 128));
-        assert!(matches!(super::super::readback::transfer(&mut env, GuestPtr::new(device_pointer), GuestPtr::new(source), GuestPtr::new(surface)), Outcome::Return(INVALID)), "the borrowed destination sees its parent's level lock");
+        assert!(
+            matches!(
+                super::super::readback::transfer(
+                    &mut env,
+                    GuestPtr::new(device_pointer),
+                    GuestPtr::new(source),
+                    GuestPtr::new(surface)
+                ),
+                Outcome::Return(INVALID)
+            ),
+            "the borrowed destination sees its parent's level lock"
+        );
         env.cpu.write_u32(lock.pBits, 0xff00ffff).unwrap();
-        assert!(matches!(texture_unlock(&mut env, GuestPtr::new(texture), 1), Outcome::Return(0)), "system-memory write unlock needs no GPU upload");
+        assert!(
+            matches!(
+                texture_unlock(&mut env, GuestPtr::new(texture), 1),
+                Outcome::Return(0)
+            ),
+            "system-memory write unlock needs no GPU upload"
+        );
         assert_eq!(env.cpu.read_u32(base + 128).unwrap(), 0xff00ffff);
-        assert!(matches!(super::super::readback::transfer(&mut env, GuestPtr::new(device_pointer), GuestPtr::new(source), GuestPtr::new(surface)), Outcome::Block { .. }));
+        assert!(matches!(
+            super::super::readback::transfer(
+                &mut env,
+                GuestPtr::new(device_pointer),
+                GuestPtr::new(source),
+                GuestPtr::new(surface)
+            ),
+            Outcome::Block { .. }
+        ));
         assert_eq!(env.ext.get::<State>().transfers.len(), 1);
         assert_eq!(release(&mut env, surface), 1);
         assert_eq!(release(&mut env, texture), 0);
         assert_eq!(com(&env).references(&env.sys.objects, texture_id), Some(0));
-        assert!(com(&env).get_identity(&env.sys.objects, surface_id).is_some());
+        assert!(
+            com(&env)
+                .get_identity(&env.sys.objects, surface_id)
+                .is_some()
+        );
         assert!(env.ext.get::<Heaps>().owner(base).is_some());
         super::super::readback::cancel_pending(&mut env);
-        assert!(com(&env).get_identity(&env.sys.objects, texture_id).is_none());
-        assert!(com(&env).get_identity(&env.sys.objects, surface_id).is_none());
+        assert!(
+            com(&env)
+                .get_identity(&env.sys.objects, texture_id)
+                .is_none()
+        );
+        assert!(
+            com(&env)
+                .get_identity(&env.sys.objects, surface_id)
+                .is_none()
+        );
         assert!(env.ext.get::<Heaps>().owner(base).is_none());
         release(&mut env, source);
     }
