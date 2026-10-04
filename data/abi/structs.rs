@@ -468,3 +468,30 @@ impl crate::GuestArg for D3DCAPS9 {
     const WORDS: u8 = 76;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3DADAPTER_IDENTIFIER9 {
+    pub Driver: [i8; 512],
+    pub Description: [i8; 512],
+    pub DeviceName: [i8; 32],
+    pub DriverVersion: i64,
+    pub VendorId: u32,
+    pub DeviceId: u32,
+    pub SubSysId: u32,
+    pub Revision: u32,
+    pub DeviceIdentifier: [u32; 4],
+    pub WHQLLevel: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3DADAPTER_IDENTIFIER9>() == 1100);
+const _: () = assert!(core::mem::align_of::<D3DADAPTER_IDENTIFIER9>() == 4);
+impl Default for D3DADAPTER_IDENTIFIER9 { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, Driver) == 0);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, Description) == 512);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, DeviceName) == 1024);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, DriverVersion) == 1056);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, VendorId) == 1064);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, DeviceId) == 1068);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, SubSysId) == 1072);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, Revision) == 1076);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, DeviceIdentifier) == 1080);
+const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, WHQLLevel) == 1096);

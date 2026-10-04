@@ -14,6 +14,33 @@ const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
 #[test]
+fn packed_large_sdk_output_preserves_guid_bytes_and_four_byte_guest_alignment() {
+    use adv_abi::types::D3DADAPTER_IDENTIFIER9;
+    let mut machine = machine(Registry::default());
+    // Four-byte aligned in guest memory, deliberately not eight-byte aligned.
+    let output = GuestPtr::<D3DADAPTER_IDENTIFIER9>::new(DATA + 4);
+    let mut value = D3DADAPTER_IDENTIFIER9 {
+        DriverVersion: 0x1234_5678_9abc_def0,
+        DeviceIdentifier: [0x0123_4567, 0x89ab_cdef, 0x1020_3040, 0x5060_7080],
+        WHQLLevel: 0x1122_3344,
+        ..D3DADAPTER_IDENTIFIER9::default()
+    };
+    value.Driver[511] = 17;
+    value.Description[511] = 23;
+    output.write(&mut machine.cpu, value).unwrap();
+    assert_eq!(output.read(&machine.cpu).unwrap(), value);
+    assert_eq!(machine.cpu.read_u32(DATA + 4 + 1056).unwrap(), 0x9abc_def0);
+    assert_eq!(machine.cpu.read_u32(DATA + 4 + 1080).unwrap(), 0x0123_4567);
+    assert_eq!(machine.cpu.read_u32(DATA + 4 + 1096).unwrap(), 0x1122_3344);
+    let guid = signature::lookup("gdiplus.dll", "GdipCreateEffect").unwrap();
+    assert_eq!(
+        guid.stack_words(),
+        5,
+        "by-value GUID occupies four x86 words"
+    );
+}
+
+#[test]
 fn sdk_ordinals_and_names_resolve_to_the_same_patchable_entry() {
     let mut m = machine(Registry::default());
     let by_ordinal = m.resolve_import("d2d1.dll", "#1").unwrap();
