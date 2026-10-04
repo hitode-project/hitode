@@ -108,7 +108,7 @@ fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle)
         PixelFormat::Rgb565 => {
             u32::from(rgb[0] >> 3) << 11 | u32::from(rgb[1] >> 2) << 5 | u32::from(rgb[2] >> 3)
         }
-        _ => u32::from_le_bytes(surface.format.encode([rgb[2], rgb[1], rgb[0], 0])),
+        _ => u32::from_le_bytes(surface.encode_pixel([rgb[2], rgb[1], rgb[0], 0])),
     };
     let result = {
         let store = env.ext.get_mut::<SurfaceStore>();

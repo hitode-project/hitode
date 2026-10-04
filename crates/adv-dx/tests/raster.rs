@@ -233,6 +233,44 @@ impl Fixture {
 }
 
 #[test]
+fn indexed_dib_color_table_is_copied_and_blits_to_the_shared_primary() {
+    for height in [-2i32, 2] {
+        let mut f = Fixture::new();
+        let dc = f.gdi(gdi::CREATE_DC, &[0]);
+        let mut info = [0u8; 56];
+        info[..4].copy_from_slice(&40u32.to_le_bytes());
+        info[4..8].copy_from_slice(&3i32.to_le_bytes());
+        info[8..12].copy_from_slice(&height.to_le_bytes());
+        info[12..14].copy_from_slice(&1u16.to_le_bytes());
+        info[14..16].copy_from_slice(&8u16.to_le_bytes());
+        info[32..36].copy_from_slice(&4u32.to_le_bytes());
+        info[40..56].copy_from_slice(&[0, 0, 0, 0, 0, 0, 255, 7, 0, 255, 0, 8, 255, 0, 0, 9]);
+        f.memory.write(256, &info).unwrap();
+        let bitmap = f.gdi(gdi::CREATE_DIB, &[dc, 256, 0, 32, 0, 0]);
+        assert_ne!(bitmap, 0);
+        let bits = f.memory.u32(32).unwrap();
+        assert_eq!(f.surfaces.get(bitmap).unwrap().pitch, 4);
+        let bytes = if height > 0 {
+            [3, 2, 1, 0, 1, 2, 3, 0]
+        } else {
+            [1, 2, 3, 0, 3, 2, 1, 0]
+        };
+        f.memory.write(bits, &bytes).unwrap();
+        // Color ownership is with the bitmap, not the caller's temporary header.
+        f.memory.write(296, &[0; 16]).unwrap();
+        assert_ne!(f.gdi(gdi::SELECT, &[dc, bitmap]), 0);
+        assert_eq!(f.gdi(gdi::GET_DC, &[0]), WINDOW_DC);
+        assert_eq!(
+            f.gdi(gdi::BITBLT, &[WINDOW_DC, 0, 0, 3, 2, dc, 0, 0, 0xcc0020]),
+            1
+        );
+        let pixels = &f.surfaces.presenter.bgra;
+        assert_eq!(&pixels[..12], &[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0]);
+        assert_eq!(&pixels[20..32], &[255, 0, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0]);
+    }
+}
+
+#[test]
 fn failed_com_publication_reclaims_all_unpublished_interface_allocations() {
     for limits in [
         adv_machine::ObjectLimits {

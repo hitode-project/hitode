@@ -410,3 +410,181 @@ fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels
         }
     }
 }
+
+const INDEXED_COLORS: [[u8; 4]; 6] = [
+    [5, 17, 230, 0],
+    [180, 40, 5, 0],
+    [12, 210, 70, 0],
+    [223, 101, 180, 0],
+    [51, 88, 13, 0],
+    [3, 9, 244, 0],
+];
+
+fn indexed_pattern(s: &mut Surfaces<Snapshot>, m: &mut Memory, bottom_up: bool) -> u32 {
+    let id = s.create(3, 2, bottom_up, PixelFormat::Indexed8, m).unwrap();
+    s.set_palette(id, 1, &INDEXED_COLORS).unwrap();
+    m.write(s[id].row(0, 0), &[1, 2, 3, 0xcc]).unwrap();
+    m.write(s[id].row(0, 1), &[4, 5, 6, 0xcc]).unwrap();
+    id
+}
+
+#[test]
+fn indexed_non_gray_rows_convert_to_bgra_with_stride_and_orientation() {
+    assert_eq!(PixelFormat::Indexed8.bytes(), 1);
+    assert_eq!(PixelFormat::Indexed8.masks(), (0, 0, 0));
+    for owned in [false, true] {
+        for bottom_up in [false, true] {
+            let mut m = Memory::new(owned);
+            let mut s = store();
+            let src = indexed_pattern(&mut s, &mut m, bottom_up);
+            let dst = s
+                .create(3, 2, !bottom_up, PixelFormat::Bgra32, &mut m)
+                .unwrap();
+            s.copy(src, s[src].rect(), dst, s[dst].rect(), &mut m)
+                .unwrap();
+            assert_eq!(
+                logical_pixels(&s, dst, &m),
+                INDEXED_COLORS.map(|c| c.to_vec())
+            );
+            assert_eq!(s[src].pitch, 4);
+            for y in 0..2 {
+                assert_eq!(m.read(s[src].row(3, y), 1).unwrap().as_ref(), &[0xcc]);
+            }
+            s.present(src, &m).unwrap();
+            assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
+        }
+    }
+}
+
+#[test]
+fn indexed_palette_bounds_default_and_nearest_rgb_are_explicit() {
+    let mut m = Memory::new(false);
+    let mut s = store();
+    let id = s
+        .create(3, 2, false, PixelFormat::Indexed8, &mut m)
+        .unwrap();
+    assert_eq!(s[id].decode_pixel(&[255]), [0; 4]);
+    assert_eq!(s.palette_entries(id, 0, u32::MAX).unwrap(), &[[0; 4]; 256]);
+    assert_eq!(s.set_palette(id, 254, &INDEXED_COLORS).unwrap(), 2);
+    assert_eq!(
+        s.palette_entries(id, 254, 10).unwrap(),
+        &INDEXED_COLORS[..2]
+    );
+    assert_eq!(
+        s.palette_entries(id, 255, u32::MAX).unwrap(),
+        &INDEXED_COLORS[1..2]
+    );
+    let version = s[id].version;
+    assert_eq!(s.set_palette(id, u32::MAX, &INDEXED_COLORS).unwrap(), 0);
+    assert_eq!(s[id].version, version);
+    assert!(s.palette_entries(id, 256, 1).unwrap().is_empty());
+    s.set_palette(id, 12, &[[30, 60, 90, 0], [30, 60, 90, 255]])
+        .unwrap();
+    // A nearest color may differ from every palette entry; alpha and ties
+    // cannot change its RGB index. No implicit grayscale interpretation exists.
+    assert_eq!(s[id].encode_pixel([31, 59, 90, 128]), [12, 0, 0, 0]);
+    let direct = s.create(3, 2, false, PixelFormat::Bgra32, &mut m).unwrap();
+    assert!(s.set_palette(direct, 0, &INDEXED_COLORS).is_err());
+    assert!(s.palette_entries(direct, 0, 1).is_none());
+    assert!(s.set_palette(u32::MAX, 0, &INDEXED_COLORS).is_err());
+    assert!(s.palette_entries(u32::MAX, 0, 1).is_none());
+}
+
+#[test]
+fn indexed_blits_remap_different_palettes_and_preserve_same_palette_indices() {
+    let mut m = Memory::new(false);
+    let mut s = store();
+    let src = indexed_pattern(&mut s, &mut m, true);
+    s.set_palette(src, 200, &INDEXED_COLORS[..1]).unwrap();
+    m.write(s[src].row(0, 0), &[200, 2, 3]).unwrap();
+    let different = s
+        .create(3, 2, false, PixelFormat::Indexed8, &mut m)
+        .unwrap();
+    let mut reversed = INDEXED_COLORS;
+    reversed.reverse();
+    s.set_palette(different, 20, &reversed).unwrap();
+    for y in 0..2 {
+        m.write(s[different].row(3, y), &[0xa7]).unwrap();
+    }
+    s.copy(src, s[src].rect(), different, s[different].rect(), &mut m)
+        .unwrap();
+    assert_eq!(
+        m.read(s[different].row(0, 0), 4).unwrap().as_ref(),
+        &[25, 24, 23, 0xa7]
+    );
+    assert_eq!(
+        m.read(s[different].row(0, 1), 4).unwrap().as_ref(),
+        &[22, 21, 20, 0xa7]
+    );
+    s.present(different, &m).unwrap();
+    assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
+    let same = s
+        .create(3, 2, false, PixelFormat::Indexed8, &mut m)
+        .unwrap();
+    let table = s[src].palette.clone().unwrap();
+    s.set_palette(same, 0, table.as_ref()).unwrap();
+    s.copy(src, s[src].rect(), same, s[same].rect(), &mut m)
+        .unwrap();
+    // Duplicate colors still retain their actual raw index for identical tables.
+    assert_eq!(m.read(s[same].row(0, 0), 3).unwrap().as_ref(), &[200, 2, 3]);
+    let direct = s.create(3, 2, false, PixelFormat::Bgra32, &mut m).unwrap();
+    s.copy(src, s[src].rect(), direct, s[direct].rect(), &mut m)
+        .unwrap();
+    s.fill_raw(same, s[same].rect(), 0, &mut m).unwrap();
+    s.copy(direct, s[direct].rect(), same, s[same].rect(), &mut m)
+        .unwrap();
+    assert_eq!(m.read(s[same].row(0, 0), 3).unwrap().as_ref(), &[1, 2, 3]);
+}
+
+#[test]
+fn completed_indexed_frames_keep_their_palette_after_live_update_and_delete() {
+    for path in 0..3 {
+        let mut m = Memory::new(false);
+        let mut s = store();
+        let id = indexed_pattern(&mut s, &mut m, true);
+        let old_table = s[id].palette.clone().unwrap();
+        let (producer, mut consumer) = frame_mailbox();
+        if path == 1 {
+            s.set_deferred_presentation(true).unwrap();
+        }
+        if path == 2 {
+            s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+        }
+        s.present(id, &m).unwrap();
+        s.set_palette(id, 1, &[[99, 88, 77, 0]; 6]).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &old_table,
+            s[id].palette.as_ref().unwrap()
+        ));
+        assert_eq!(old_table[1], INDEXED_COLORS[0]);
+        s.fill_raw(id, s[id].rect(), 0, &mut m).unwrap();
+        s.delete(id);
+        if path != 0 {
+            assert!(s.capture_latest().unwrap());
+            assert!(!s.capture_latest().unwrap());
+        }
+        assert_eq!(s.presenter.bgra, INDEXED_COLORS.concat());
+        if path == 2 {
+            assert!(consumer.update());
+            let mut snapshot = Snapshot::default();
+            consumer.current().snapshot(&mut snapshot).unwrap();
+            assert_eq!(snapshot.bgra, INDEXED_COLORS.concat());
+            assert!(!consumer.update());
+        }
+    }
+}
+
+#[test]
+fn indexed_primary_resize_keeps_the_palette_and_overlapping_indices() {
+    let mut m = Memory::new(false);
+    let mut s = store();
+    s.display_format = PixelFormat::Indexed8;
+    let primary = s.primary(&mut m).unwrap();
+    s.set_palette(primary, 1, &INDEXED_COLORS).unwrap();
+    s.fill_raw(primary, s[primary].rect(), 1, &mut m).unwrap();
+    s.configure_window(3, 2, &mut m).unwrap();
+    assert_eq!(s.palette_entries(primary, 1, 6).unwrap(), &INDEXED_COLORS);
+    assert!(logical_pixels(&s, primary, &m).iter().all(|p| p == &[1]));
+    s.present(primary, &m).unwrap();
+    assert_eq!(s.presenter.bgra, INDEXED_COLORS[0].repeat(6));
+}

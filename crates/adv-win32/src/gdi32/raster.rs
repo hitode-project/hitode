@@ -6,8 +6,8 @@ use adv_device::surface::{
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
-pub mod front;
 mod fill;
+pub mod front;
 pub use front::{DrawingProvider, install, register, set_provider};
 
 pub mod api {
@@ -85,7 +85,7 @@ impl Raster {
                 || h[12..14] != 1u16.to_le_bytes()
                 || !matches!(
                     u16::from_le_bytes(h[14..16].try_into().unwrap()),
-                    16 | 24 | 32
+                    8 | 16 | 24 | 32
                 )
                 || !(h[16..20] == [0; 4]
                     || (h[16..20] == 3u32.to_le_bytes() && h[14..16] == 16u16.to_le_bytes()))
@@ -97,7 +97,29 @@ impl Raster {
             if size(w as u32, height.unsigned_abs()).is_err() {
                 return Ok(self.fail(87));
             }
-            let format = if h[14..16] == 16u16.to_le_bytes() {
+            let indexed = h[14..16] == 8u16.to_le_bytes();
+            let palette = if indexed {
+                let used = u32::from_le_bytes(h[32..36].try_into().unwrap());
+                let count = if used == 0 { 256 } else { used };
+                if count > 256 {
+                    return Ok(self.fail(87));
+                }
+                let Some(address) = info.checked_add(40) else {
+                    return Ok(self.fail(87));
+                };
+                let colors = m.read(address, count as usize * 4)?;
+                let mut palette = [[0; 4]; 256];
+                for (entry, color) in palette.iter_mut().zip(colors.as_chunks::<4>().0) {
+                    // RGBQUAD's final byte is reserved, not DIB alpha.
+                    *entry = [color[0], color[1], color[2], 0];
+                }
+                Some(palette)
+            } else {
+                None
+            };
+            let format = if indexed {
+                PixelFormat::Indexed8
+            } else if h[14..16] == 16u16.to_le_bytes() {
                 if h[16..20] == [0; 4] {
                     PixelFormat::Rgb555
                 } else {
@@ -118,6 +140,9 @@ impl Raster {
                 PixelFormat::Bgra32
             };
             let bitmap = surfaces.create(w as u32, height.unsigned_abs(), height > 0, format, m)?;
+            if let Some(palette) = palette {
+                surfaces.set_palette(bitmap, 0, &palette)?;
+            }
             let surface = surfaces.get(bitmap).unwrap();
             let bits = surface.pixels;
             let metadata = GdiObj::Bitmap {

@@ -240,6 +240,17 @@ fn create_dib(
     {
         return fail(env, 87);
     }
+    if header[14..16] == 8u16.to_le_bytes() {
+        let used = u32::from_le_bytes(header[32..36].try_into().unwrap());
+        let count = if used == 0 { 256 } else { used };
+        if count > 256
+            || adv_abi::guest::check_range(env.cpu, info.addr(), 40 + count * 4, Prot::READ)
+                .is_err()
+        {
+            let _ = bits.write(env.cpu, 0);
+            return fail(env, 87);
+        }
+    }
     raster_call(env, |r, s, d, o, m| {
         r.create_dib(
             s,

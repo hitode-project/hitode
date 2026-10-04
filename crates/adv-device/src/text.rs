@@ -354,6 +354,11 @@ impl Text {
         paint: Paint<'_>,
         pixels: Pixels<'_>,
     ) -> Result<(), TextError> {
+        // Pixels carries no color table. Passing an 8-bit BITMAPINFO with only
+        // the direct-color masks would make GDI read beyond that native buffer.
+        if pixels.format == crate::surface::PixelFormat::Indexed8 {
+            return Err(TextError::Font("indexed text requires a palette".into()));
+        }
         let units = match paint.input {
             TextInput::Encoded(bytes) => bytes.len(),
             TextInput::Unicode(units) => units.len(),

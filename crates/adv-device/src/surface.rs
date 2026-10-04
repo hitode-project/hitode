@@ -3,6 +3,7 @@
 //! presenter or the frame mailbox receives every completed frame.
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Memory needed by software surfaces. PAL guests with shared storage borrow pixels;
 /// other CPU backends can supply an owned buffer at this boundary.
@@ -122,6 +123,7 @@ pub struct PendingFrame {
     height: u32,
     pitch: u32,
     format: PixelFormat,
+    palette: Option<Arc<[[u8; 4]; 256]>>,
     serial: u64,
     pixels: Vec<u8>,
     #[cfg(feature = "gpu")]
@@ -134,6 +136,7 @@ impl Default for PendingFrame {
             height: 0,
             pitch: 0,
             format: PixelFormat::Bgra32,
+            palette: None,
             serial: 0,
             pixels: Vec::new(),
             #[cfg(feature = "gpu")]
@@ -151,6 +154,7 @@ impl PendingFrame {
         self.height = surface.height;
         self.pitch = surface.pitch;
         self.format = surface.format;
+        self.palette.clone_from(&surface.palette);
         self.serial = serial;
         self.pixels.resize(pixels.len(), 0);
         if surface.bottom_up {
@@ -186,9 +190,11 @@ impl PendingFrame {
                 dst.copy_from_slice(&src[..dst.len()]);
             } else {
                 for (x, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                    pixel.copy_from_slice(
-                        &self.format.decode(&src[x * self.format.bytes() as usize..]),
-                    );
+                    pixel.copy_from_slice(&decode_pixel(
+                        self.format,
+                        self.palette.as_deref(),
+                        &src[x * self.format.bytes() as usize..],
+                    ));
                 }
             }
         }
@@ -205,6 +211,7 @@ impl PendingFrame {
         self.height = frame.image.height();
         self.pitch = self.width * 4;
         self.format = PixelFormat::Bgra32;
+        self.palette = None;
         self.serial = frame.serial;
         self.pixels.clear();
         self.native = Some(frame);
@@ -238,6 +245,9 @@ pub struct Surface {
     /// Bumped by every write through the store or a writable lock.
     pub version: u64,
     pub format: PixelFormat,
+    /// BGRA entries owned by this surface. Completed frames retain the old Arc
+    /// when the live surface changes its table. Non-indexed formats have no table.
+    pub palette: Option<Arc<[[u8; 4]; 256]>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -245,12 +255,14 @@ pub enum PixelFormat {
     Bgr24,
     Rgb565,
     Rgb555,
+    Indexed8,
 }
 impl PixelFormat {
     pub fn bytes(self) -> u32 {
         match self {
             Self::Bgra32 => 4,
             Self::Bgr24 => 3,
+            Self::Indexed8 => 1,
             _ => 2,
         }
     }
@@ -259,9 +271,14 @@ impl PixelFormat {
             Self::Bgra32 | Self::Bgr24 => (0xff0000, 0xff00, 0xff),
             Self::Rgb565 => (0xf800, 0x7e0, 0x1f),
             Self::Rgb555 => (0x7c00, 0x3e0, 0x1f),
+            Self::Indexed8 => (0, 0, 0),
         }
     }
     pub fn decode(self, p: &[u8]) -> [u8; 4] {
+        assert!(
+            self != Self::Indexed8,
+            "indexed decoding requires a surface palette"
+        );
         if self == Self::Bgra32 {
             return p[..4].try_into().unwrap();
         }
@@ -272,7 +289,7 @@ impl PixelFormat {
         let (r, g) = match self {
             Self::Rgb565 => ((v >> 11) & 31, ((v >> 5) & 63) * 255 / 63),
             Self::Rgb555 => ((v >> 10) & 31, ((v >> 5) & 31) * 255 / 31),
-            Self::Bgra32 | Self::Bgr24 => unreachable!(),
+            Self::Bgra32 | Self::Bgr24 | Self::Indexed8 => unreachable!(),
         };
         [
             ((v & 31) * 255 / 31) as u8,
@@ -283,6 +300,10 @@ impl PixelFormat {
     }
     /// Packed pixel, padded to four bytes. Only the first `bytes()` bytes are stored.
     pub fn encode(self, p: [u8; 4]) -> [u8; 4] {
+        assert!(
+            self != Self::Indexed8,
+            "indexed encoding requires a surface palette"
+        );
         if matches!(self, Self::Bgra32 | Self::Bgr24) {
             return p;
         }
@@ -291,11 +312,45 @@ impl PixelFormat {
         let value = match self {
             Self::Rgb565 => r << 11 | (u16::from(p[1]) * 63 / 255) << 5 | b,
             Self::Rgb555 => r << 10 | (u16::from(p[1]) * 31 / 255) << 5 | b,
-            Self::Bgra32 | Self::Bgr24 => unreachable!(),
+            Self::Bgra32 | Self::Bgr24 | Self::Indexed8 => unreachable!(),
         };
         let [lo, hi] = value.to_le_bytes();
         [lo, hi, 0, 0]
     }
+}
+
+const BLACK_PALETTE: [[u8; 4]; 256] = [[0; 4]; 256];
+
+fn decode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, raw: &[u8]) -> [u8; 4] {
+    if format == PixelFormat::Indexed8 {
+        palette.unwrap_or(&BLACK_PALETTE)[raw[0] as usize]
+    } else {
+        format.decode(raw)
+    }
+}
+
+fn encode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, pixel: [u8; 4]) -> [u8; 4] {
+    if format != PixelFormat::Indexed8 {
+        return format.encode(pixel);
+    }
+    let mut closest = 0;
+    let mut distance = u32::MAX;
+    for (index, color) in palette.unwrap_or(&BLACK_PALETTE).iter().enumerate() {
+        let current = (0..3)
+            .map(|channel| {
+                let difference = i32::from(color[channel]) - i32::from(pixel[channel]);
+                (difference * difference) as u32
+            })
+            .sum();
+        if current < distance {
+            closest = index as u8;
+            distance = current;
+            if current == 0 {
+                break;
+            }
+        }
+    }
+    [closest, 0, 0, 0]
 }
 
 /// Destination bounds before clipping. Signed origins preserve the sampling phase
@@ -337,15 +392,25 @@ fn convert_bgra(s: &Surface, input: &[u8], output: &mut Vec<u8>) {
             dst.copy_from_slice(&src[..stride]);
         } else {
             for (pixel, raw) in dst
-                .chunks_exact_mut(4)
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .zip(src.chunks_exact(s.format.bytes() as usize))
             {
-                pixel.copy_from_slice(&s.format.decode(raw));
+                pixel.copy_from_slice(&s.decode_pixel(raw));
             }
         }
     }
 }
 impl Surface {
+    pub fn decode_pixel(&self, raw: &[u8]) -> [u8; 4] {
+        decode_pixel(self.format, self.palette.as_deref(), raw)
+    }
+    /// Packed pixel, with indexed colors chosen by nearest RGB distance.
+    /// Equal distances choose the first palette entry; alpha is not compared.
+    pub fn encode_pixel(&self, pixel: [u8; 4]) -> [u8; 4] {
+        encode_pixel(self.format, self.palette.as_deref(), pixel)
+    }
     pub fn rect(&self) -> Rect {
         Rect {
             x: 0,
@@ -493,6 +558,41 @@ impl<P: Presenter> Surfaces<P> {
         self.surfaces.get_mut(&id)
     }
 
+    pub fn set_palette(
+        &mut self,
+        id: u32,
+        start: u32,
+        entries: &[[u8; 4]],
+    ) -> Result<usize, String> {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .ok_or("unknown palette surface")?;
+        if surface.format != PixelFormat::Indexed8 {
+            return Err("surface is not indexed".into());
+        }
+        let start = start.min(256) as usize;
+        let count = entries.len().min(256 - start);
+        if count != 0 {
+            let table = surface
+                .palette
+                .get_or_insert_with(|| Arc::new(BLACK_PALETTE));
+            Arc::make_mut(table)[start..start + count].copy_from_slice(&entries[..count]);
+            surface.version = surface.version.wrapping_add(1);
+        }
+        Ok(count)
+    }
+
+    pub fn palette_entries(&self, id: u32, start: u32, count: u32) -> Option<&[[u8; 4]]> {
+        let surface = self.surfaces.get(&id)?;
+        if surface.format != PixelFormat::Indexed8 {
+            return None;
+        }
+        let start = start.min(256) as usize;
+        let count = (count as usize).min(256 - start);
+        Some(&surface.palette.as_deref().unwrap_or(&BLACK_PALETTE)[start..start + count])
+    }
+
     pub fn contains(&self, id: u32) -> bool {
         self.surfaces.contains_key(&id)
     }
@@ -612,7 +712,11 @@ impl<P: Presenter> Surfaces<P> {
                     let at = y * frame.pitch as usize + x * frame.format.bytes() as usize;
                     self.conversion[(y * frame.width as usize + x) * 4
                         ..(y * frame.width as usize + x + 1) * 4]
-                        .copy_from_slice(&frame.format.decode(&frame.pixels[at..]));
+                        .copy_from_slice(&decode_pixel(
+                            frame.format,
+                            frame.palette.as_deref(),
+                            &frame.pixels[at..],
+                        ));
                 }
             }
             self.stats.converted_pixels += u64::from(frame.width) * u64::from(frame.height);
@@ -657,6 +761,11 @@ impl<P: Presenter> Surfaces<P> {
             return Err("primary surface is locked during window resize".into());
         }
         let new = self.create(width, height, false, old.format, m)?;
+        self.surfaces
+            .get_mut(&new)
+            .unwrap()
+            .palette
+            .clone_from(&old.palette);
         let rect = Rect {
             x: 0,
             y: 0,
@@ -702,6 +811,7 @@ impl<P: Presenter> Surfaces<P> {
                 locked: None,
                 version: 0,
                 format,
+                palette: (format == PixelFormat::Indexed8).then(|| Arc::new(BLACK_PALETTE)),
             },
         );
         Ok(id)
@@ -806,6 +916,7 @@ impl<P: Presenter> Surfaces<P> {
                 locked: None,
                 version: 0,
                 format: PixelFormat::Bgra32,
+                palette: None,
             },
         );
         self.native_surfaces.insert(
@@ -1010,6 +1121,9 @@ impl<P: Presenter> Surfaces<P> {
             .get(&id)
             .ok_or("unknown text surface")?
             .clone();
+        if surface.format == PixelFormat::Indexed8 {
+            return Err("indexed text requires explicit palette rasterization".into());
+        }
         if surface.locked.is_some() {
             return Err("text surface is locked".into());
         }
@@ -1232,7 +1346,15 @@ impl<P: Presenter> Surfaces<P> {
         let sb = s.format.bytes() as usize;
         let db = d.format.bytes() as usize;
         let unscaled = sr.w == dr.w && sr.h == dr.h;
-        if unscaled && !options.mirror_x && !options.mirror_y && s.format == d.format {
+        let same_encoding =
+            s.format == d.format && (s.format != PixelFormat::Indexed8 || s.palette == d.palette);
+        let remap: Option<[u8; 256]> = (s.format == PixelFormat::Indexed8
+            && d.format == PixelFormat::Indexed8
+            && !same_encoding)
+            .then(|| {
+                std::array::from_fn(|index| d.encode_pixel(s.decode_pixel(&[index as u8]))[0])
+            });
+        if unscaled && !options.mirror_x && !options.mirror_y && same_encoding {
             // Logical row order is independent of top-down/bottom-up storage.
             for row in 0..clipped.h {
                 let y = if src == dst && clipped.y > sr.y + oy {
@@ -1264,7 +1386,7 @@ impl<P: Presenter> Surfaces<P> {
                 }
             }
             self.blit_sample.resize(clipped.w as usize * sb, 0);
-            if s.format != d.format {
+            if !same_encoding {
                 self.blit_row.resize(clipped.w as usize * db, 0);
             }
             let mut previous = None;
@@ -1302,18 +1424,23 @@ impl<P: Presenter> Surfaces<P> {
                             );
                         }
                     }
-                    if s.format != d.format {
+                    if !same_encoding {
                         for (input, output) in self
                             .blit_sample
                             .chunks_exact(sb)
                             .zip(self.blit_row.chunks_exact_mut(db))
                         {
-                            output.copy_from_slice(&d.format.encode(s.format.decode(input))[..db]);
+                            if let Some(remap) = &remap {
+                                output[0] = remap[input[0] as usize];
+                            } else {
+                                output
+                                    .copy_from_slice(&d.encode_pixel(s.decode_pixel(input))[..db]);
+                            }
                         }
                     }
                     previous = Some(rows);
                 }
-                let output = if s.format == d.format {
+                let output = if same_encoding {
                     &self.blit_sample
                 } else {
                     &self.blit_row
