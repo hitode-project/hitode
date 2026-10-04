@@ -148,11 +148,11 @@ def run(args: argparse.Namespace) -> None:
             state = "frames_observed"
         result["status"] = state
         # missing_apis includes unresolved imports: it does not prove execution.
-        evidence = result.get("failure") or stderr
-        blocker = re.search(r"unimplemented:\s+([A-Za-z0-9_.-]+\.dll![A-Za-z0-9_@?#.$-]+)", evidence)
+        failure_evidence = result.get("failure") or stderr
+        blocker = re.search(r"unimplemented:\s+([A-Za-z0-9_.-]+\.dll![A-Za-z0-9_@?#.$-]+)", failure_evidence)
         result["blocker_api"] = blocker.group(1) if blocker else None
         result["failure_api_evidence"] = sorted(set(re.findall(
-            r"[A-Za-z0-9_.-]+\.dll![A-Za-z0-9_@?#.$-]+", evidence)))
+            r"[A-Za-z0-9_.-]+\.dll![A-Za-z0-9_@?#.$-]+", failure_evidence)))
         metadata["samples"].append(result)
         write_json(folder / "probe.json", result)
         write_json(output / "results.json", metadata)

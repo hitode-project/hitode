@@ -1,7 +1,42 @@
 import copy
+import argparse
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from sample_matrix import milestones
+from sample_matrix import milestones, run
+
+
+class CampaignTests(unittest.TestCase):
+    def test_multiple_samples_keep_review_evidence_separate_from_failure_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game" / "fixture.exe"
+            game.parent.mkdir()
+            game.write_bytes(b"Not executed: subprocess is mocked")
+            manifest = root / "samples.json"
+            manifest.write_text(json.dumps({"samples": [
+                {"id": name, "exe": str(game)} for name in ("one", "two")
+            ]}), encoding="utf-8")
+
+            def launch(command, **kwargs):
+                report = Path(command[command.index("--report") + 1])
+                report.write_text(json.dumps({"frames": 1, "startup": {"loaded": True, "guest_windows": 1},
+                                               "api": {"mode": "discovery"}}), encoding="utf-8")
+                return SimpleNamespace(wait=lambda timeout: 0)
+
+            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=game,
+                                      output=root / "output", seconds=1, timeout_grace=1,
+                                      mode="hidden", api_mode="discovery", codec="native", trace=False)
+            with patch("sample_matrix.subprocess.Popen", side_effect=launch):
+                run(args)
+            result = json.loads((args.output / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(result["samples"]), 2)
+            self.assertTrue(all(row["milestones"]["stage_reached"] == "S1" for row in result["samples"]))
+            self.assertTrue(all(row["milestones"]["accepted_stage"] is None for row in result["samples"]))
 
 
 class MilestoneTests(unittest.TestCase):
