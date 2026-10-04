@@ -99,6 +99,33 @@ pub(crate) unsafe fn code_storage_bytes(functions: [usize; 2]) -> Result<(usize,
     Ok((committed, reserved))
 }
 
+/// Cranelift reaches a module's constants with 32-bit PC-relative
+/// relocations. Unhinted reservations of one module can land more than 2 GiB
+/// apart once other threads reserve guest address spaces in between, so later
+/// pieces are placed in the first free range above the module's first one.
+fn near(anchor: usize, len: usize) -> Option<*mut u8> {
+    const GRANULARITY: usize = 0x1_0000;
+    const REACH: usize = 1 << 30;
+    let mut address = anchor;
+    while address < anchor.checked_add(REACH)? {
+        let region = query(address as *const u8).ok()?;
+        let end = region.base.checked_add(region.region)?;
+        if region.state == 0x10000 {
+            let start = region.base.checked_next_multiple_of(GRANULARITY)?;
+            if start.checked_add(len)? <= end && start + len <= anchor + REACH {
+                // SAFETY: a fresh reservation at a free, granularity-aligned
+                // address; another thread may win the race, which returns null.
+                let base = unsafe { VirtualAlloc(start as *mut c_void, len, 0x3000, 4) };
+                if !base.is_null() {
+                    return Some(base.cast());
+                }
+            }
+        }
+        address = end;
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Code,
@@ -153,9 +180,14 @@ impl WindowsMemory {
         let len = code_len
             .checked_add(if kind == Kind::Code { PAGE } else { 0 })
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let base = NonNull::new(
-            unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000, 4) }.cast::<u8>(),
-        )
+        let anchor = self
+            .allocations
+            .first()
+            .map(|first| first.base.as_ptr() as usize);
+        let base = NonNull::new(match anchor.and_then(|anchor| near(anchor, len)) {
+            Some(base) => base,
+            None => unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000, 4) }.cast::<u8>(),
+        })
         .ok_or_else(io::Error::last_os_error)?;
         let mut allocation = Allocation {
             base,
@@ -311,6 +343,23 @@ mod tests {
             }
             drop(provider);
             assert_eq!(query(interior).unwrap().state, 0x10000);
+        }
+    }
+    #[test]
+    fn module_pieces_stay_within_relative_reach_of_each_other() {
+        let mut provider = WindowsMemory::default();
+        let code = provider.allocate_readexec(64, 16).unwrap() as usize;
+        // Several guest-sized reservations made between pieces of one module.
+        let blockers: Vec<_> = (0..4)
+            .map(|_| unsafe { VirtualAlloc(std::ptr::null_mut(), 1 << 32, 0x2000, 1) })
+            .collect();
+        let constant = provider.allocate_readonly(64, 16).unwrap() as usize;
+        let data = provider.allocate_readwrite(64, 16).unwrap() as usize;
+        for blocker in blockers.into_iter().filter(|blocker| !blocker.is_null()) {
+            assert_ne!(unsafe { VirtualFree(blocker, 0, 0x8000) }, 0);
+        }
+        for piece in [constant, data] {
+            assert!(piece.abs_diff(code) < 1 << 31, "{code:#x} {piece:#x}");
         }
     }
     #[test]

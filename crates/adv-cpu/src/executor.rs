@@ -7,10 +7,14 @@ use crate::compile::{self, Compiled};
 use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
+mod warm;
+
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
     pub compilations: u64,
     pub compile_requests: u64,
+    /// Regions queued from a warm-start profile.
+    pub warm_requests: u64,
     pub tier_up_requests: u64,
     pub tier_up_publications: u64,
     pub compile_failures: u64,
@@ -108,6 +112,9 @@ pub struct Executor {
     deferred_sequence: u64,
     /// Interpreter starts at unowned pcs while compilation work is deferred.
     demand: HashMap<u32, u64>,
+    warm: Option<warm::Pending>,
+    /// Dedicated compile threads; zero shares the background service.
+    compile_threads: usize,
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
     attempted: BTreeSet<u32>,
@@ -244,6 +251,8 @@ impl Executor {
             deferred_order: HashMap::new(),
             deferred_sequence: 0,
             demand: HashMap::new(),
+            warm: None,
+            compile_threads: 0,
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
             attempted: BTreeSet::new(),
@@ -531,14 +540,15 @@ impl Executor {
             return Ok(false);
         }
         let policy = self.background_sender()?.borrow().work_policy();
-        if policy.background_limit().is_none()
-            && self.pending_regions.len() >= crate::compiler::CAPACITY
-        {
+        // Dedicated threads keep the bounded slices: on a real sample, whole
+        // large regions compiled slower and ran no faster than their slices.
+        let limit = policy.background_limit();
+        if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
             return Ok(false);
         }
         let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
-        let fragments = if let Some(limit) = policy.background_limit() {
+        let fragments = if let Some(limit) = limit {
             match crate::compile_budget::plan(snapshot, limit) {
                 Ok(fragments) => fragments,
                 Err(error) => {
@@ -606,7 +616,12 @@ impl Executor {
         }
         if self.compiler.is_none() {
             let sender = self.background_sender()?;
-            let mut worker = crate::compiler::Worker::with_sender(sender);
+            let mut worker = if self.compile_threads == 0 {
+                crate::compiler::Worker::with_sender(sender)
+            } else {
+                crate::compiler::Worker::with_threads(sender, self.compile_threads)
+                    .map_err(|error| error.to_string())?
+            };
             if let Some(wake) = &self.completion_wake {
                 worker.set_waker(wake.clone());
             }
@@ -765,6 +780,17 @@ impl Executor {
                 self.add_region(region)?;
             }
         }
+        Ok(())
+    }
+
+    /// Compile automatic regions on `threads` dedicated threads instead of the
+    /// shared background service. Configure before the first compilation; zero
+    /// (the default) shares the service.
+    pub fn set_compile_threads(&mut self, threads: usize) -> Result<(), String> {
+        if self.compiler.is_some() {
+            return Err("compile threads must be configured before compilation".into());
+        }
+        self.compile_threads = threads;
         Ok(())
     }
 
@@ -1073,6 +1099,9 @@ impl Executor {
         }
         self.state.refresh_mmx();
         self.state.fuel = budget;
+        if !interpreter_only {
+            self.apply_warm()?;
+        }
         loop {
             if bridge.parked {
                 return Ok(RunOutcome::Parked);
@@ -1677,6 +1706,54 @@ mod asynchronous_tests {
         assert!(m.stats.interpreter_instructions > 0);
         assert!(m.stats.compile_requests > 0);
         assert!(m.stats.peak_pending_compilations <= crate::compiler::CAPACITY);
+    }
+    #[test]
+    fn dedicated_compile_threads_publish_automatic_regions() {
+        let mut m = fixture();
+        m.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap(); // inc eax; jmp back
+        m.enable_auto_jit(true);
+        m.set_compile_threads(2).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while m.stats.native_entries == 0 {
+            m.run(0x3000, 1000).unwrap();
+            assert!(Instant::now() < deadline);
+        }
+        assert!(m.compiler.is_some());
+        assert!(m.set_compile_threads(1).is_err());
+    }
+    #[test]
+    fn warm_profile_queues_unchanged_code_before_it_runs() {
+        let mut first = fixture();
+        first.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap(); // inc eax; jmp back
+        first.enable_auto_jit(true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while first.stats.native_entries == 0 {
+            first.run(0x3000, 1000).unwrap();
+            assert!(Instant::now() < deadline);
+        }
+        let profile = first.warm_profile();
+
+        let mut second = fixture();
+        second.write(0x1000, &[0x40, 0xeb, 0xfd]).unwrap();
+        second.enable_auto_jit(true);
+        assert_eq!(second.load_warm_profile(&profile), 1);
+        assert_eq!(second.load_warm_profile(&profile[..profile.len() - 1]), 0);
+        assert_eq!(second.load_warm_profile(&profile), 1);
+        second.run(0x3000, 1).unwrap();
+        assert_eq!(second.stats.warm_requests, 1);
+        while second.stats.native_entries == 0 {
+            second.run(0x3000, 1000).unwrap();
+            assert!(Instant::now() < deadline);
+        }
+
+        // Different code at the same address is left to normal discovery.
+        let mut third = fixture();
+        third.write(0x1000, &[0x48, 0xeb, 0xfd]).unwrap();
+        third.enable_auto_jit(true);
+        third.load_warm_profile(&profile);
+        third.run(0x3000, 1).unwrap();
+        assert_eq!(third.stats.warm_requests, 0);
+        assert!(third.warm.is_none());
     }
     #[test]
     fn automatic_discovery_compiles_up_to_a_stop_boundary() {

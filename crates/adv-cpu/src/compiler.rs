@@ -68,6 +68,45 @@ pub(crate) struct Worker {
     // running compile on the guest execution path.
     service: Option<Service>,
     wake: Option<CompletionWake>,
+    pool: Option<Pool>,
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+/// Dedicated compile threads, so compilation neither waits behind nor delays
+/// audio and presentation jobs on the shared service. Dropping the pool lets
+/// idle threads exit; a running compile finishes detached and is discarded.
+struct Pool {
+    jobs: std::sync::mpsc::Sender<Job>,
+    results: std::sync::mpsc::Receiver<Completion>,
+    deliver: std::sync::mpsc::Sender<Completion>,
+}
+impl Pool {
+    fn new(threads: usize) -> std::io::Result<Self> {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        let queue = Arc::new(std::sync::Mutex::new(queue));
+        for index in 0..threads {
+            let queue = queue.clone();
+            thread::Builder::new()
+                .name(format!("adv-jit-{index}"))
+                .spawn(move || {
+                    loop {
+                        // Hold the lock only to take one job.
+                        let job = queue
+                            .lock()
+                            .map_err(|_| ())
+                            .and_then(|q| q.recv().map_err(|_| ()));
+                        let Ok(job) = job else { return };
+                        job();
+                    }
+                })?;
+        }
+        let (deliver, results) = std::sync::mpsc::channel();
+        Ok(Self {
+            jobs,
+            results,
+            deliver,
+        })
+    }
 }
 
 struct ClientPanic(Arc<AtomicBool>);
@@ -121,7 +160,15 @@ impl Worker {
             jobs: Vec::with_capacity(CAPACITY),
             service: None,
             wake: None,
+            pool: None,
         }
+    }
+
+    /// Compile on `threads` dedicated threads instead of the shared service.
+    pub fn with_threads(sender: LocalSender, threads: usize) -> std::io::Result<Self> {
+        let mut worker = Self::with_sender(sender);
+        worker.pool = Some(Pool::new(threads.max(1))?);
+        Ok(worker)
     }
 
     pub fn set_waker(&mut self, wake: CompletionWake) {
@@ -150,6 +197,9 @@ impl Worker {
         } else {
             0
         }; // Unrestricted clients do not decode solely for statistics.
+        if self.pool.is_some() {
+            return self.submit_pooled(input, work);
+        }
         let ticket = self.next_ticket;
         let compiler = self.compiler.clone();
         let delivery = self.delivery.clone();
@@ -211,9 +261,56 @@ impl Worker {
         Ok(ticket)
     }
 
+    fn submit_pooled(&mut self, input: Snapshot, work: usize) -> Result<u64, SubmitError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SubmitError::Closed);
+        }
+        if self.outstanding >= CAPACITY {
+            return Err(SubmitError::Full);
+        }
+        let pool = self.pool.as_ref().unwrap();
+        let ticket = self.next_ticket;
+        let compiler = self.compiler.clone();
+        let deliver = pool.deliver.clone();
+        let closed = self.closed.clone();
+        let wake = self.wake.clone();
+        let job: Job = Box::new(move || {
+            if closed.load(Ordering::Acquire) {
+                return;
+            }
+            let started = Instant::now();
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler(&input)))
+                    .unwrap_or_else(|_| Err("background compiler panicked".into()));
+            let completion = Completion {
+                ticket,
+                region: (*input.region).clone(),
+                input,
+                result,
+                duration: started.elapsed(),
+            };
+            if closed.load(Ordering::Acquire) || deliver.send(completion).is_err() {
+                return;
+            }
+            if let Some(wake) = wake {
+                wake();
+            }
+        });
+        pool.jobs.send(job).map_err(|_| SubmitError::Closed)?;
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.last_work = work;
+        self.outstanding += 1;
+        Ok(ticket)
+    }
+
     pub fn try_recv(&mut self) -> Result<Completion, TryRecvError> {
         if self.outstanding == 0 {
             return Err(TryRecvError::Empty);
+        }
+        if let Some(pool) = &self.pool {
+            let completion = pool.results.try_recv()?;
+            self.outstanding -= 1;
+            return Ok(completion);
         }
         let results = self.results.as_mut().ok_or(TryRecvError::Disconnected)?;
         if let Some(completion) = results.pop() {

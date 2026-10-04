@@ -710,6 +710,26 @@ fn run_execution(
         .machine
         .cpu
         .set_async_compilation(options.jit && options.async_compilation);
+    // Guest regions resident at the previous exit are compiled in the background
+    // as soon as identical code is mapped, before the guest reaches them.
+    let warm_path = options.data_dir.join("jit-warm.bin");
+    if options.jit && options.async_compilation {
+        // Leave cores for the guest, presentation and audio threads.
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3));
+        runtime
+            .machine
+            .cpu
+            .executor_mut()
+            .set_compile_threads(threads)?;
+        if let Ok(profile) = std::fs::read(&warm_path) {
+            runtime
+                .machine
+                .cpu
+                .executor_mut()
+                .load_warm_profile(&profile);
+        }
+    }
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
     runtime.machine.cpu.set_profiling(options.profile);
@@ -1038,6 +1058,11 @@ fn run_execution(
     let native_frame = runtime.has_native_frame();
     #[cfg(not(all(windows, feature = "gpu")))]
     let native_frame = false;
+    if options.jit && options.async_compilation {
+        let profile = runtime.machine.cpu.executor().warm_profile();
+        let _ = std::fs::create_dir_all(&options.data_dir)
+            .and_then(|_| std::fs::write(&warm_path, profile));
+    }
     if native_frame {
         #[cfg(all(windows, feature = "gpu"))]
         if options.screenshot.is_some() || options.report.is_some() {
