@@ -60,7 +60,11 @@ pub enum Outcome {
         target: u32,
         args: Vec<u32>,
         then: Continuation,
+        /// Optional lower stack boundary, leaving caller-owned guest scratch above it.
+        stack: Option<u32>,
     },
+    /// Resume a checked architectural checkpoint without an API return epilogue.
+    ResumeExecution(crate::exception::Checkpoint),
     /// Suspend the current context until `wait` is satisfied, then run `then`.
     Block {
         wait: Wait,
@@ -88,6 +92,21 @@ impl Outcome {
             target,
             args: args.into(),
             then: Box::new(then),
+            stack: None,
+        }
+    }
+
+    pub fn call_on_stack(
+        target: u32,
+        args: impl Into<Vec<u32>>,
+        stack: u32,
+        then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static,
+    ) -> Self {
+        Self::Call {
+            target,
+            args: args.into(),
+            then: Box::new(then),
+            stack: Some(stack),
         }
     }
 

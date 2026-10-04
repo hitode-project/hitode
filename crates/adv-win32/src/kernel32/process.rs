@@ -108,18 +108,6 @@ fn set_unhandled_exception_filter(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(std::mem::replace(&mut w.unhandled_filter, f))
 }
 
-fn raise_exception(env: &mut Env<'_>) -> Outcome {
-    let (code, flags, n, args) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let a: Vec<String> = (0..n.min(15))
-        .map(|i| format!("{:#x}", env.cpu.read_u32(args + 4 * i).unwrap_or(0)))
-        .collect();
-    Outcome::Fail(format!(
-        "RaiseException(code {code:#010x}, flags {flags:#x}, args [{}]) from {:#010x}: SEH dispatch not implemented",
-        a.join(", "),
-        env.caller()
-    ))
-}
-
 const EXCEPTION_UNWINDING: u32 = 2;
 const EXCEPTION_EXIT_UNWIND: u32 = 4;
 const STATUS_UNWIND: u32 = 0xc000_0027;
@@ -455,7 +443,6 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "UnhandledExceptionFilter", 1, |_| {
         Outcome::Return(0)
     });
-    stdcall(reg, K32, "RaiseException", 4, raise_exception);
     stdcall(reg, K32, "RtlUnwind", 4, rtl_unwind);
     stdcall(reg, K32, "SetErrorMode", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "OutputDebugStringA", 1, output_debug_string_a);

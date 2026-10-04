@@ -2,6 +2,8 @@
 
 mod atom;
 mod environment;
+mod exception;
+pub(crate) use exception::install as install_exceptions;
 mod file;
 mod file_mapping;
 mod handle;
@@ -27,6 +29,7 @@ pub(crate) const K32: &str = "kernel32.dll";
 pub fn register(reg: &mut Registry) {
     atom::register(reg);
     environment::register(reg);
+    exception::register(reg);
     file::register(reg);
     file_mapping::register(reg);
     handle::register(reg);

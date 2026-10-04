@@ -20,10 +20,20 @@ pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn
 
 fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
     match outcome {
-        Outcome::Call { target, args, then } => Outcome::call(target, args, move |env, resume| {
-            let next = then(env, resume);
-            release_lock(env, handle, next)
-        }),
+        Outcome::Call {
+            target,
+            args,
+            then,
+            stack,
+        } => Outcome::Call {
+            target,
+            args,
+            stack,
+            then: Box::new(move |env, resume| {
+                let next = then(env, resume);
+                release_lock(env, handle, next)
+            }),
+        },
         Outcome::Block {
             wait,
             then,

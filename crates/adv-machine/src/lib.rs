@@ -11,6 +11,7 @@
 //!   the urgency of the event that woke it, never an engine-specific thread role.
 
 pub mod clock;
+pub mod exception;
 pub mod ext;
 pub mod layout;
 pub mod objects;
@@ -31,8 +32,7 @@ use std::time::{Duration, Instant};
 
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{
-    Backend, Exit, Fault, Guest, GuestExt, MemFault, Prot, Reg, SegmentSetup, TrapAction,
-    TrapHandler,
+    Backend, Exit, Guest, GuestExt, MemFault, Prot, Reg, SegmentSetup, TrapAction, TrapHandler,
 };
 
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
@@ -95,6 +95,10 @@ pub struct Sys {
     pub process_ready: Vec<InitCall>,
     /// Frontend termination policy when the process entry point returns.
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
+    /// Personality-supplied interpretation of precise CPU stops.
+    pub exception_handler: Option<exception::ExceptionHandler>,
+    checkpoint_identity: std::sync::Arc<()>,
+    next_frame_id: u64,
     /// The last host calls, for failure reports.
     pub recent: RecentCalls,
     /// Host calls handled so far.
@@ -666,6 +670,16 @@ fn apply(
         });
     }
     match out {
+        Outcome::Return(_)
+        | Outcome::Return64(_)
+        | Outcome::ReturnF32(_)
+        | Outcome::ReturnF64(_)
+            if origin.interrupted =>
+        {
+            Err(Parked::Fail(
+                "CPU interruption returned without an architectural resume".into(),
+            ))
+        }
         Outcome::Return(v) => {
             finish(cpu, sys, origin, u64::from(v), false);
             Ok(())
@@ -689,12 +703,39 @@ fn apply(
             cpu.set_reg(Reg::Edx, edx);
             Ok(())
         }
-        Outcome::Call { target, args, then } => {
+        Outcome::Call {
+            target,
+            args,
+            then,
+            stack,
+        } => {
+            let stack = stack.unwrap_or(origin.esp);
+            let Some(bytes) = args
+                .len()
+                .checked_add(1)
+                .and_then(|n| u32::try_from(n).ok())
+                .and_then(|n| n.checked_mul(4))
+            else {
+                return Err(Parked::Fail(
+                    "guest callback arguments exceed address space".into(),
+                ));
+            };
+            let Some(bottom) = stack.checked_sub(bytes) else {
+                return Err(Parked::Fail("guest callback stack underflow".into()));
+            };
+            if stack > origin.esp || !cpu.accessible(bottom, bytes, Prot::WRITE) {
+                return Err(Parked::Fail(
+                    "guest callback stack is not writable below its origin".into(),
+                ));
+            }
+            let Some(id) = sys.next_frame_id.checked_add(1) else {
+                return Err(Parked::Fail("continuation identity exhausted".into()));
+            };
             let push = |cpu: &mut dyn Guest, sp: &mut u32, v: u32| {
                 *sp -= 4;
                 cpu.write_u32(*sp, v)
             };
-            let mut sp = origin.esp;
+            let mut sp = stack;
             let pushed = args
                 .iter()
                 .rev()
@@ -707,11 +748,17 @@ fn apply(
             }
             cpu.set_reg(Reg::Esp, sp);
             cpu.set_reg(Reg::Eip, target);
-            sys.contexts[sys.current as usize]
-                .frames
-                .push(Frame { then, origin });
+            sys.next_frame_id = id;
+            sys.contexts[sys.current as usize].frames.push(Frame {
+                id,
+                stack,
+                return_floor: bottom + 4,
+                then,
+                origin,
+            });
             Ok(())
         }
+        Outcome::ResumeExecution(checkpoint) => checkpoint.restore(cpu, sys).map_err(Parked::Fail),
         Outcome::Block {
             wait,
             then,
@@ -794,9 +841,51 @@ pub fn guess_backtrace(cpu: &dyn Guest, images: &Images, esp: u32) -> Vec<u32> {
 }
 
 impl Dispatch<'_> {
+    fn exception(
+        &mut self,
+        cpu: &mut dyn Guest,
+        event: exception::Exception,
+    ) -> Result<(), Parked> {
+        let Some(handler) = self.sys.exception_handler else {
+            return Err(Parked::Fail(format!("unhandled CPU stop: {event:?}")));
+        };
+        let checkpoint = exception::Checkpoint::capture(cpu, self.sys)
+            .map_err(|error| Parked::Fail(format!("capture exception context: {error}")))?;
+        let origin = Origin {
+            esp: checkpoint.state.regs[4],
+            ret_eip: checkpoint.state.eip,
+            thunk: thunk::EXCEPTION_DISPATCH,
+            trace_args: None,
+            interrupted: true,
+        };
+        let out = handler(
+            &mut Env {
+                cpu: &mut *cpu,
+                sys: &mut *self.sys,
+                ext: &mut *self.ext,
+                thunk: origin.thunk,
+            },
+            event,
+            checkpoint,
+        );
+        apply(cpu, self.sys, self.ext, out, origin, self.defer_work)
+    }
+
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
         let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
+        if self
+            .sys
+            .current_context()
+            .frames
+            .last()
+            .is_some_and(|frame| esp >= frame.stack)
+        {
+            return Err(Parked::Fail(
+                "guest callback escaped its continuation stack; nonlocal unwind is unsupported"
+                    .into(),
+            ));
+        }
         let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all)).then(|| {
             (0..u32::from(f.conv.argc()))
                 .map(|i| cpu.arg(i).unwrap_or(0))
@@ -807,6 +896,7 @@ impl Dispatch<'_> {
             ret_eip: cpu.reg(Reg::Eip),
             thunk: index,
             trace_args,
+            interrupted: false,
         };
         self.sys
             .recent
@@ -839,7 +929,20 @@ impl Dispatch<'_> {
 
     fn guest_return(&mut self, cpu: &mut dyn Guest) -> Result<(), Parked> {
         let eax = cpu.reg(Reg::Eax);
-        let Some(Frame { then, origin }) =
+        let returned_sp = cpu.reg(Reg::Esp);
+        if self
+            .sys
+            .current_context()
+            .frames
+            .last()
+            .is_some_and(|frame| returned_sp < frame.return_floor || returned_sp > frame.stack)
+        {
+            return Err(Parked::Fail(
+                "guest return escaped its continuation stack; nonlocal unwind is unsupported"
+                    .into(),
+            ));
+        }
+        let Some(Frame { then, origin, .. }) =
             self.sys.contexts[self.sys.current as usize].frames.pop()
         else {
             // The context's entry function returned.
@@ -872,7 +975,7 @@ impl TrapHandler for Dispatch<'_> {
         let frame_before = self.sys.completed_frames;
         let eip = cpu.reg(Reg::Eip);
         let res = if vector != adv_cpu::backend::asm::TRAP_VECTOR {
-            Err(Parked::Exception(vector))
+            self.exception(cpu, exception::Exception::Trap { vector, pc: eip })
         } else if eip == thunk_addr(thunk::RETURN_PAD) + 2 {
             self.guest_return(cpu)
         } else {
@@ -885,7 +988,7 @@ impl TrapHandler for Dispatch<'_> {
                 && instruction[0] == 0x68
                 && instruction[5..] == [0xcd, adv_cpu::backend::asm::TRAP_VECTOR]
                 && index.is_some_and(|i| {
-                    i != thunk::RETURN_PAD
+                    i > thunk::EXCEPTION_DISPATCH
                         && i < self.sys.thunks.len()
                         && instruction[1..5] == i.to_le_bytes()
                 });
@@ -1031,6 +1134,9 @@ impl<B: Backend> Machine<B> {
             process_init: VecDeque::new(),
             process_ready: Vec::new(),
             process_return: None,
+            exception_handler: None,
+            checkpoint_identity: std::sync::Arc::new(()),
+            next_frame_id: 0,
             recent: RecentCalls::new(32),
             host_calls: 0,
             call_limit: None,
@@ -1608,14 +1714,21 @@ impl<B: Backend> Machine<B> {
                         return self.frame_boundary(last, started, hard_budget);
                     }
                 }
-                Exit::Fault(Fault { kind, pc }) => {
-                    self.sys.trace.flush();
-                    return SliceResult::Complete(RunResult::Failed(MachineError {
-                        ctx: id,
-                        pc,
-                        message: format!("guest fault: {kind:?}"),
-                        recent: self.sys.recent_calls(),
-                    }));
+                Exit::Fault(fault) => {
+                    let result = Dispatch {
+                        sys: &mut self.sys,
+                        ext: &mut self.ext,
+                        parked: None,
+                        yield_on_frame: frame_handoff,
+                        defer_work: latency_mode,
+                    }
+                    .exception(&mut self.cpu, exception::Exception::Fault(fault));
+                    if let Err(parked) = result
+                        && let Some(result) = self.park(parked)
+                    {
+                        self.sys.trace.flush();
+                        return SliceResult::Complete(result);
+                    }
                 }
                 Exit::BudgetExceeded { pc, budget } => {
                     self.sys.trace.flush();

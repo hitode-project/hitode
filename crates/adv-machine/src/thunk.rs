@@ -82,6 +82,8 @@ pub struct Thunk {
 
 /// Index 0 is reserved: the pad guest callees return to after an [`Outcome::Call`].
 pub const RETURN_PAD: u32 = 0;
+/// Diagnostic binding for a CPU interruption; never emitted as a callable API.
+pub(crate) const EXCEPTION_DISPATCH: u32 = 1;
 
 pub struct ThunkTable {
     resolver: Box<dyn Resolver>,
@@ -117,7 +119,21 @@ impl ThunkTable {
         Self {
             resolver,
             internal: HashMap::new(),
-            thunks: vec![pad],
+            thunks: vec![
+                pad,
+                Thunk {
+                    module: String::new(),
+                    name: "<exception dispatch>".into(),
+                    f: HostFn {
+                        conv: Conv::Cdecl { argc: 0 },
+                        handler: return_pad,
+                        data: 0,
+                        trace: false,
+                    },
+                    implemented: true,
+                    requested: false,
+                },
+            ],
             by_name: HashMap::new(),
         }
     }

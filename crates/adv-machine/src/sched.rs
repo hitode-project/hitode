@@ -5,8 +5,8 @@
 //! guest computation or return a completed frame to the host. The normal scheduling
 //! lane remains round-robin, with a bounded preference for genuinely satisfied waits.
 
-use std::any::Any;
 pub use crate::objects::Objects;
+use std::any::Any;
 
 use crate::outcome::{Continuation, DeferredContinuation, WakeReason};
 
@@ -45,10 +45,16 @@ pub(crate) struct Origin {
     pub thunk: u32,
     /// Raw args, kept when the call is traced.
     pub trace_args: Option<Vec<u32>>,
+    /// CPU interruptions finish through an architectural resume, never ret[n].
+    pub interrupted: bool,
 }
 
 /// A guest call in progress on behalf of a host call.
 pub(crate) struct Frame {
+    pub id: u64,
+    /// Actual caller-owned boundary, possibly below Origin's reserved scratch.
+    pub stack: u32,
+    pub return_floor: u32,
     pub then: Continuation,
     pub origin: Origin,
 }

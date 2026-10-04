@@ -172,10 +172,16 @@ pub(super) fn after(env: &mut Env<'_>, outcome: Outcome, then: DeferredContinuat
             target,
             args,
             then: resume,
-        } => Outcome::call(target, args, move |env, value| {
-            let next = resume(env, value);
-            after(env, next, then)
-        }),
+            stack,
+        } => Outcome::Call {
+            target,
+            args,
+            stack,
+            then: Box::new(move |env, value| {
+                let next = resume(env, value);
+                after(env, next, then)
+            }),
+        },
         Outcome::Block {
             wait,
             then: resume,
