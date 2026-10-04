@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 const SOFT_SLICE: Duration = Duration::from_millis(8);
 
 struct Options {
+    guest_workers: usize,
     exe: PathBuf,
     data_dir: PathBuf,
     jit: bool,
@@ -45,6 +46,7 @@ struct Options {
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
+  --guest-workers 1|2     bounded guest execution pool (default: 1; 2 requires Windows x64/Fast)\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
@@ -75,6 +77,7 @@ impl Options {
         let mut exe = None;
         let mut data_dir = None;
         let mut options = Self {
+            guest_workers: 1,
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
             jit: true,
@@ -132,6 +135,13 @@ impl Options {
                         "936" => 936,
                         _ => return Err("--codepage must be 932 or 936".into()),
                     };
+                }
+                "--guest-workers" => {
+                    options.guest_workers =
+                        value()?.parse().map_err(|_| "invalid guest worker count")?;
+                    if !matches!(options.guest_workers, 1 | 2) {
+                        return Err("--guest-workers must be 1 or 2".into());
+                    }
                 }
                 "--compile" => {
                     options.compile_strategy = match value()?.as_str() {
@@ -198,6 +208,14 @@ impl Options {
         }
         if options.frames == Some(0) {
             return Err("--frames must be positive".into());
+        }
+        if options.guest_workers > 1
+            && (!options.jit
+                || options.compile_strategy != CompileStrategy::Fast
+                || options.profile
+                || !options.async_compilation)
+        {
+            return Err("two guest workers require JIT, Fast and asynchronous compilation; per-PC profiling is not yet supported".into());
         }
         Ok(Some(options))
     }
@@ -375,6 +393,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
     );
     let stats = runtime.machine.cpu.stats();
+    let parallel = runtime.machine.cpu.parallel_stats();
+    let parallel_json = parallel_report(&parallel);
     #[cfg(feature = "gpu")]
     let gpu_diagnostics = {
         let diagnostics = runtime.gpu_diagnostics();
@@ -446,6 +466,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
+            "  \"parallel\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
@@ -476,6 +497,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         idle_waits,
         wait_time.as_secs_f64(),
         inputs,
+        parallel_json,
         runtime.machine.sys.host_calls,
         stats.native_entries,
         stats.interpreter_entries,
@@ -679,6 +701,10 @@ fn run_execution(
         options.codec,
     )?;
     runtime.set_codepage(options.codepage)?;
+    runtime
+        .machine
+        .cpu
+        .set_guest_workers(options.guest_workers)?;
     runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
     runtime
@@ -719,8 +745,12 @@ fn run_execution(
     let warm_path = options.data_dir.join("jit-warm.bin");
     if options.jit && options.async_compilation {
         // Leave cores for the guest, presentation and audio threads.
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |cores| cores.get().saturating_sub(2).clamp(1, 3));
+        let threads = std::thread::available_parallelism().map_or(1, |cores| {
+            cores
+                .get()
+                .saturating_sub(options.guest_workers + 1)
+                .clamp(1, 3)
+        });
         runtime
             .machine
             .cpu
@@ -824,6 +854,101 @@ fn run_execution(
             for command in controller.drain() {
                 let receipt_before = runtime.latest_input_receipt();
                 let result = match command {
+                    control::Command::Dialogs => runtime
+                        .dialogs()
+                        .map(|set| format!("dialogs {}", json(&format!("{set:?}")))),
+                    control::Command::Dialog(id) => {
+                        let set = runtime.dialogs()?;
+                        let found: Vec<_> = set
+                            .dialogs
+                            .iter()
+                            .filter(|d| d.visible && d.enabled)
+                            .flat_map(|d| d.controls.iter())
+                            .filter(|c| c.target.id == id && c.visible && c.enabled)
+                            .map(|c| c.target)
+                            .collect();
+                        if found.len() == 1
+                            && runtime.post_dialog_event(adv_runtime::DialogEvent::Click(found[0]))
+                        {
+                            inputs += 1;
+                            Ok(format!("dialog {id}"))
+                        } else {
+                            Err(format!(
+                                "dialog control {id} is missing, ambiguous or disabled"
+                            ))
+                        }
+                    }
+                    control::Command::DialogClose => {
+                        let set = runtime.dialogs()?;
+                        let found: Vec<_> = set
+                            .dialogs
+                            .iter()
+                            .filter(|d| d.visible && d.enabled)
+                            .map(|d| d.target)
+                            .collect();
+                        if found.len() == 1
+                            && runtime.post_dialog_event(adv_runtime::DialogEvent::Close(found[0]))
+                        {
+                            inputs += 1;
+                            Ok("dialog-close".into())
+                        } else {
+                            Err("dialog-close requires one visible enabled dialog".into())
+                        }
+                    }
+                    control::Command::Menus => runtime.menu_bar().map(|bar| {
+                        fn visit(
+                            items: &[adv_runtime::MenuItem],
+                            path: &str,
+                            rows: &mut Vec<String>,
+                        ) {
+                            for item in items {
+                                let label =
+                                    format!("{path}/{}", String::from_utf16_lossy(&item.text));
+                                if item.children.is_empty() {
+                                    rows.push(format!(
+                                        "{}:{}:{}",
+                                        item.command.id, item.flags, label
+                                    ));
+                                } else {
+                                    visit(&item.children, &label, rows);
+                                }
+                            }
+                        }
+                        let mut rows = Vec::new();
+                        visit(&bar.items, "", &mut rows);
+                        format!(
+                            "menus enabled={} {}",
+                            bar.key.enabled,
+                            json(&rows.join(" | "))
+                        )
+                    }),
+                    control::Command::Menu(id) => {
+                        fn find(
+                            items: &[adv_runtime::MenuItem],
+                            id: u32,
+                            found: &mut Vec<adv_runtime::MenuCommand>,
+                        ) {
+                            for item in items {
+                                if item.children.is_empty() && item.command.id == id {
+                                    found.push(item.command);
+                                }
+                                find(&item.children, id, found);
+                            }
+                        }
+                        let mut found = Vec::new();
+                        let bar = runtime.menu_bar()?;
+                        find(&bar.items, id, &mut found);
+                        if found.len() == 1
+                            && runtime.post_menu_event(adv_runtime::MenuEvent::Command(found[0]))
+                        {
+                            inputs += 1;
+                            Ok(format!("menu {id}"))
+                        } else {
+                            Err(format!(
+                                "menu {id} is missing, ambiguous, detached or disabled"
+                            ))
+                        }
+                    }
                     control::Command::Click(x, y) => {
                         let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
                         let posted = [(0x200, 0), (0x201, 1), (0x202, 0)]
@@ -1107,11 +1232,14 @@ fn run_execution(
         write_report(path, &report)?;
     }
     let stats = runtime.machine.cpu.stats();
+    let parallel = runtime.machine.cpu.parallel_stats();
+    let parallel_json = parallel_report(&parallel);
     println!(
-        "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
+        "{stop_reason}: exit={} frames={} elapsed={:.3}s parallel={} host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
         exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
         runtime.presented_frames(),
         started.elapsed().as_secs_f64(),
+        parallel_json,
         runtime.machine.sys.host_calls,
         stats.native_entries,
         stats.interpreter_entries,
@@ -1141,4 +1269,23 @@ pub fn run_cli() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Wall-time overlap includes the inline lane's API work; it is not CPU usage.
+fn parallel_report(p: &adv_runtime::ParallelStats) -> String {
+    format!(
+        "{{\"workers\":{},\"submitted\":{},\"completed\":{},\"worker_run_ns\":{},\"overlap_ns\":{},\"max_running\":{},\"traps\":{},\"cold_retries\":{},\"quantum_returns\":{},\"quiescence_waits\":{},\"quiescence_wait_ns\":{},\"quiescence_wait_max_ns\":{}}}",
+        p.workers,
+        p.submitted,
+        p.completed,
+        p.worker_run_ns,
+        p.overlap_ns,
+        p.max_running,
+        p.traps,
+        p.cold_retries,
+        p.quantum_returns,
+        p.quiescence_waits,
+        p.quiescence_wait_ns,
+        p.quiescence_wait_max_ns
+    )
 }

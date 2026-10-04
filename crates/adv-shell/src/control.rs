@@ -15,6 +15,11 @@ pub enum Command {
     Key(u32),
     KeyDown(u32),
     KeyUp(u32),
+    Menus,
+    Menu(u32),
+    Dialogs,
+    Dialog(u32),
+    DialogClose,
     Capture(PathBuf),
     Report(PathBuf),
     ResetMetrics,
@@ -26,7 +31,14 @@ impl Command {
     fn interrupts_guest(&self) -> bool {
         matches!(
             self,
-            Self::Click(..) | Self::Key(_) | Self::KeyDown(_) | Self::KeyUp(_) | Self::Close
+            Self::Click(..)
+                | Self::Key(_)
+                | Self::KeyDown(_)
+                | Self::KeyUp(_)
+                | Self::Menu(_)
+                | Self::Dialog(_)
+                | Self::DialogClose
+                | Self::Close
         )
     }
     fn parse(line: &str) -> Result<Self, String> {
@@ -34,6 +46,11 @@ impl Command {
         let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let rest = rest.trim();
         match command {
+            "menus" if rest.is_empty() => Ok(Self::Menus),
+            "dialogs" if rest.is_empty() => Ok(Self::Dialogs),
+            "dialog-close" if rest.is_empty() => Ok(Self::DialogClose),
+            "dialog" => Ok(Self::Dialog(rest.parse().map_err(|_| "dialog requires a decimal control ID")?)),
+            "menu" => Ok(Self::Menu(rest.parse().map_err(|_| "menu requires a decimal command ID")?)),
             "click" => {
                 let values: Vec<_> = rest.split_whitespace().collect();
                 if values.len() != 2 {
@@ -78,7 +95,7 @@ impl Command {
             "close" if rest.is_empty() => Ok(Self::Close),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click X Y, key/key-down/key-up VK, capture PATH, report PATH, reset-metrics or close"
+                "expected click X Y, key/key-down/key-up VK, menus, menu ID, capture PATH, report PATH, reset-metrics or close"
                     .into(),
             ),
         }
@@ -367,6 +384,11 @@ mod tests {
         assert_eq!(Command::parse("key 0x0d"), Ok(Command::Key(13)));
         assert_eq!(Command::parse("key-down 0x11"), Ok(Command::KeyDown(17)));
         assert_eq!(Command::parse("key-up 17"), Ok(Command::KeyUp(17)));
+        assert_eq!(Command::parse("menus"), Ok(Command::Menus));
+        assert_eq!(Command::parse("menu 100"), Ok(Command::Menu(100)));
+        assert_eq!(Command::parse("dialogs"), Ok(Command::Dialogs));
+        assert_eq!(Command::parse("dialog 1"), Ok(Command::Dialog(1)));
+        assert_eq!(Command::parse("dialog-close"), Ok(Command::DialogClose));
         assert_eq!(Command::parse("reset-metrics"), Ok(Command::ResetMetrics));
         assert_eq!(
             Command::parse("capture target/a frame.png"),
@@ -378,6 +400,9 @@ mod tests {
             "key 256",
             "key-down 256",
             "key-up -1",
+            "menu -1",
+            "dialog abc",
+            "dialog-close extra",
             "capture",
             "close extra",
             "reset-metrics extra",

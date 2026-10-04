@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -53,6 +54,10 @@ def run(args: argparse.Namespace) -> None:
     steps = load_schedule(args.schedule)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    if args.seed_data:
+        # Copy an existing data root, never let acceptance mutate a user's save.
+        shutil.copytree(args.seed_data.resolve(strict=True), output / "overlay",
+                        ignore=shutil.ignore_patterns("*.lock"))
     executable = args.binary.resolve(strict=True)
     game = args.exe.resolve(strict=True)
     # Diagnostics can substantially change decoder throughput and scheduling.
@@ -80,6 +85,7 @@ def run(args: argparse.Namespace) -> None:
     if args.audio:
         command.append("--audio")
     command.extend(["--codec", args.codec])
+    command.extend(["--guest-workers", str(args.guest_workers)])
     if args.sync_compilation:
         command.append("--sync-compilation")
     acknowledgement: queue.Queue[str | None] = queue.Queue()
@@ -185,6 +191,8 @@ if __name__ == "__main__":
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--schedule", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--seed-data", type=Path, help="copy an existing runtime data root into the isolated overlay")
+    parser.add_argument("--guest-workers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--mode", choices=("headless", "hidden", "window"), default="headless")
     parser.add_argument("--codepage", choices=(932, 936), type=int, default=936)
     parser.add_argument("--audio", action="store_true")
