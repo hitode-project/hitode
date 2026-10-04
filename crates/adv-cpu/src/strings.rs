@@ -145,7 +145,11 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     if expired(bridge.deadline) {
         return BUDGET;
     }
-    let mut bytes = len.min(CHUNK_BYTES);
+    let mut bytes = len.min(if memory.is_parallel() {
+        16 * 1024
+    } else {
+        CHUNK_BYTES
+    });
     let shared = memory.shared_range(dst, bytes as usize)
         || (copy && memory.shared_range(src, bytes as usize));
     if shared {
@@ -193,6 +197,16 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         // copy/fill cannot encounter a new lazy IO/COW failure after mutation.
         if result.is_err() {
             std::process::abort();
+        }
+    } else if memory.is_parallel() {
+        unsafe {
+            crate::parallel_memory::repeat(
+                memory.ptr.as_ptr().add(src_offset),
+                memory.ptr.as_ptr().add(dst_offset),
+                (bytes / width) as usize,
+                width as usize,
+                (!copy).then_some(state.regs[0]),
+            );
         }
     } else {
         // SAFETY: all pages, permissions, bounds, non-overlap and address arithmetic
@@ -314,6 +328,8 @@ unsafe fn read_element<const KIND: u8>(
             value |= u32::from(atom.load(Ordering::Relaxed)) << (byte * 8);
         }
         value
+    } else if KIND == 0 && memory.is_parallel() {
+        unsafe { crate::parallel_memory::load(pointer, width as usize) as u32 }
     } else {
         unsafe {
             match width {

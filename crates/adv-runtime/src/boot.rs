@@ -461,6 +461,7 @@ impl<B: Backend> Runtime<B> {
     /// Handler context outside any guest call, for host-originated work.
     fn env(&mut self) -> Env<'_> {
         Env {
+            context: self.machine.sys.current,
             cpu: &mut self.machine.cpu,
             sys: &mut self.machine.sys,
             ext: &mut self.machine.ext,

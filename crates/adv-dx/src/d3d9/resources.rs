@@ -948,6 +948,7 @@ mod tests {
             .tables
             .insert("IDirect3DTexture9", 0);
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,
@@ -1049,6 +1050,7 @@ mod tests {
         m.ext.get_mut::<State>().sender = Some(sender);
         m.ext.get_mut::<State>().wake = Some(std::sync::Arc::new(wake));
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,

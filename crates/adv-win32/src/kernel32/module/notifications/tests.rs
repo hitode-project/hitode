@@ -21,7 +21,7 @@ fn machine<B: Backend>(cpu: B, capacity: usize) -> Machine<B> {
     crate::register(&mut registry);
     registry.add("fixture.dll", "notify", Conv::Stdcall { argc: 4 }, |env| {
         let lock = env.ext.get::<Win32>().loader_lock.expect("notification lock");
-        assert!(matches!(env.sys.objects.get(lock), Some(Object::Mutex { owner: Some(owner), recursion }) if *owner == env.sys.current && *recursion > 0));
+        assert!(matches!(env.sys.objects.get(lock), Some(Object::Mutex { owner: Some(owner), recursion }) if *owner == env.context && *recursion > 0));
         let record = core::array::from_fn(|index| env.arg(index as u32));
         env.ext.get_mut::<Calls>().0.push(record);
         Outcome::Return(1)

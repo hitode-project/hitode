@@ -204,7 +204,7 @@ fn set_event(env: &mut Env<'_>) -> Outcome {
 fn kill_event(env: &mut Env<'_>) -> Outcome {
     let id = env.arg(0);
     reap_dead_worker(env);
-    let current = env.sys.current;
+    let current = env.context;
     let Some(timer) = env
         .ext
         .get_mut::<Timers>()
@@ -266,7 +266,7 @@ fn finished(env: &mut Env<'_>, entry: Entry) -> Outcome {
     Outcome::block(Wait::Yield, |env, _| worker(env))
 }
 fn worker(env: &mut Env<'_>) -> Outcome {
-    let current = env.sys.current;
+    let current = env.context;
     if state(env).worker != Some(current) {
         return Outcome::Return(0);
     }

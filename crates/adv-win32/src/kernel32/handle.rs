@@ -36,7 +36,7 @@ fn duplicate(env: &mut Env<'_>, source: u32) -> Result<u32, u32> {
             handle => Ok(handle),
         },
         CURRENT_THREAD => {
-            let ctx = env.sys.current;
+            let ctx = env.context;
             let thread = env.sys.context(ctx).thread_handle;
             // The guest may have closed the handle CreateThread returned.
             Ok(match env.sys.objects.identity(thread) {

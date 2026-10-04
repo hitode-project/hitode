@@ -52,7 +52,7 @@ fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
         }),
         terminal => {
             if let Some(Object::Mutex { owner, recursion }) = env.sys.objects.get_mut(handle) {
-                debug_assert_eq!(*owner, Some(env.sys.current));
+                debug_assert_eq!(*owner, Some(env.context));
                 *recursion -= 1;
                 if *recursion == 0 {
                     *owner = None;

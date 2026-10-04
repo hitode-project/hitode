@@ -334,7 +334,7 @@ fn get_async_key_state(env: &mut Env<'_>) -> Outcome {
 fn queued_key_state(env: &Env<'_>, vk: usize) -> u8 {
     user(env)
         .queues
-        .get(&env.sys.current)
+        .get(&env.context)
         .map_or(0, |queue| queue.keyboard.0[vk])
 }
 
@@ -353,7 +353,7 @@ fn get_keyboard_state(env: &mut Env<'_>) -> Outcome {
     let user = user(env);
     let keys = user
         .queues
-        .get(&env.sys.current)
+        .get(&env.context)
         .map_or([0; 256], |queue| queue.keyboard.0);
     Outcome::Return(u32::from(env.cpu.write(p, &keys).is_ok()))
 }

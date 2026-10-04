@@ -108,6 +108,7 @@ fn dialog_projection_owns_state_and_validates_control_input() {
     assert_eq!(button_target.check, 1);
     assert!(projected.controls.iter().all(|c| c.supported));
     let mut env = adv_machine::Env {
+        context: t.m.sys.current,
         cpu: &mut t.m.cpu,
         sys: &mut t.m.sys,
         ext: &mut t.m.ext,

@@ -139,6 +139,7 @@ mod tests {
         let hwnd = m.ext.get::<crate::Win32>().user.desktop;
         m.ext.get_mut::<crate::Win32>().user.top.push(hwnd);
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,

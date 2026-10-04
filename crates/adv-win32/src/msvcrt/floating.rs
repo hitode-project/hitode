@@ -167,7 +167,7 @@ pub(super) fn errno_address(env: &mut Env<'_>) -> GuestPtr<i32> {
     }
     let module = env.sys.thunks.get(env.thunk).module.as_str();
     let module = crt_module(module);
-    let key = (module.to_owned(), env.sys.current);
+    let key = (module.to_owned(), env.context);
     let address = if let Some(&address) = env.ext.get::<CrtState>().errno.get(&key) {
         address
     } else {

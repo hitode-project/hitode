@@ -324,6 +324,18 @@ fn writable(memory: &Memory, address: u32, len: usize) -> bool {
 /// Store to a location `writable` accepted.
 fn store(memory: &mut Memory, address: u32, bytes: &[u8]) -> Option<()> {
     if let Some(pointer) = memory.direct(address, bytes.len(), true) {
+        if memory.is_parallel() {
+            if matches!(bytes.len(), 1 | 2 | 4 | 8) {
+                let mut value = [0; 8];
+                value[..bytes.len()].copy_from_slice(bytes);
+                unsafe {
+                    crate::parallel_memory::store(pointer, u64::from_le_bytes(value), bytes.len())
+                };
+            } else {
+                unsafe { crate::parallel_memory::copy(bytes.as_ptr(), pointer, bytes.len()) };
+            }
+            return Some(());
+        }
         // SAFETY: `direct` bounds the range to one owned ordinary page.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
         return Some(());
@@ -333,6 +345,16 @@ fn store(memory: &mut Memory, address: u32, bytes: &[u8]) -> Option<()> {
 
 fn read<const N: usize>(memory: &Memory, address: u32) -> Option<[u8; N]> {
     if let Some(pointer) = memory.direct(address, N, false) {
+        if memory.is_parallel() {
+            let mut out = [0; N];
+            if matches!(N, 1 | 2 | 4 | 8) {
+                let value = unsafe { crate::parallel_memory::load(pointer, N) }.to_le_bytes();
+                out.copy_from_slice(&value[..N]);
+            } else {
+                unsafe { crate::parallel_memory::copy(pointer, out.as_mut_ptr(), N) };
+            }
+            return Some(out);
+        }
         // SAFETY: `direct` bounds the range to one owned ordinary page.
         return Some(unsafe { pointer.cast::<[u8; N]>().read_unaligned() });
     }

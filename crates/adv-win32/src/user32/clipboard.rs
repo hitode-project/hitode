@@ -28,7 +28,7 @@ fn opened(env: &mut Env<'_>) -> bool {
     if user(env)
         .clipboard
         .open
-        .is_some_and(|o| o.thread == env.sys.current)
+        .is_some_and(|o| o.thread == env.context)
     {
         true
     } else {
@@ -47,7 +47,7 @@ fn open_clipboard(env: &mut Env<'_>, hwnd: Handle) -> u32 {
     if hwnd.0 != 0 && !live(env, hwnd.0) {
         return fail(env, 1400);
     }
-    let current = env.sys.current;
+    let current = env.context;
     let cb = &mut user_mut(env).clipboard;
     if let Some(open) = cb.open {
         // Reopening the same task/window is idempotent, not a nested lock.
@@ -572,7 +572,7 @@ pub(crate) fn exit_thread(
     env: &mut Env<'_>,
     then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
-    let current = env.sys.current;
+    let current = env.context;
     let windows: Vec<u32> = user(env)
         .windows
         .values(&env.sys.objects)

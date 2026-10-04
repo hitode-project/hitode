@@ -80,14 +80,53 @@ impl SharedPage {
 
 /// A fixed, page-aligned guest window. Both executors borrow this same allocation.
 /// Resizing and host worker writes are deliberately excluded from this prototype.
+/// Immutable mapping description for one native lease. Byte storage remains
+/// owned by the controller, whose fence must outlive and drain every lease.
+#[derive(Clone)]
+pub(crate) struct WorkerLayout {
+    base: u32,
+    len: usize,
+    pointer: usize,
+    perms: Arc<Vec<u8>>,
+    mapped: Arc<Vec<bool>>,
+}
+
+impl WorkerLayout {
+    /// # Safety
+    /// A live parallel permit pins the allocation and OS mappings until this
+    /// facade is dropped. It may execute guarded native helpers only.
+    pub(crate) unsafe fn into_memory(self) -> Memory {
+        Memory {
+            parallel: None,
+            parallel_view: true,
+            base: self.base,
+            len: self.len,
+            ptr: NonNull::new(self.pointer as *mut u8).expect("pinned guest window"),
+            perms: self.perms,
+            mapped: self.mapped,
+            epoch: 0,
+            versions: Vec::new(),
+            dirty_pages: BTreeSet::new(),
+            reservation: None,
+            shared_pages: BTreeMap::new(),
+            #[cfg(windows)]
+            native_protection: false,
+            #[cfg(windows)]
+            native_read_exceptions: 0,
+        }
+    }
+}
+
 pub struct Memory {
+    pub(crate) parallel: Option<Arc<crate::parallel_memory::Fence>>,
+    parallel_view: bool,
     pub(crate) base: u32,
     pub(crate) len: usize,
     pub(crate) ptr: NonNull<u8>,
-    pub(crate) perms: Vec<u8>,
+    pub(crate) perms: Arc<Vec<u8>>,
     pub(crate) epoch: u64,
     pub(crate) versions: Vec<u64>,
-    pub(crate) mapped: Vec<bool>,
+    pub(crate) mapped: Arc<Vec<bool>>,
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: BTreeMap<usize, SharedPage>,
@@ -98,6 +137,47 @@ pub struct Memory {
 }
 
 impl Memory {
+    pub(crate) fn is_parallel(&self) -> bool {
+        self.parallel_view || self.parallel.is_some()
+    }
+
+    pub(crate) fn quiesce_workers(&self) {
+        assert!(
+            !self.parallel_view,
+            "worker attempted to mutate mapping metadata"
+        );
+        if let Some(fence) = &self.parallel {
+            fence.quiesce();
+        }
+    }
+
+    pub(crate) fn worker_layout(&self) -> WorkerLayout {
+        assert!(self.parallel.is_some());
+        WorkerLayout {
+            base: self.base,
+            len: self.len,
+            pointer: self.ptr.as_ptr() as usize,
+            perms: self.perms.clone(),
+            mapped: self.mapped.clone(),
+        }
+    }
+
+    fn worker_access(&self, range: &std::ops::Range<usize>, write: bool) -> Result<(), String> {
+        if !self.parallel_view || range.is_empty() {
+            return Ok(());
+        }
+        let required = if write { WRITE } else { READ };
+        if self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
+            .iter()
+            .any(|p| {
+                p & required == 0 || (write && p & EXEC != 0) || p & (SHARED | AUDIO) == SHARED
+            })
+        {
+            return Err("worker operand requires owner-side recovery".into());
+        }
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn native_permission(perms: u8) -> crate::virtual_memory::HostProtection {
         use crate::virtual_memory::HostProtection as P;
@@ -272,13 +352,15 @@ impl Memory {
         // SAFETY: nonzero, valid layout; Memory exclusively owns this allocation.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or("guest allocation failed")?;
         Ok(Self {
+            parallel: None,
+            parallel_view: false,
             base,
             len,
             ptr,
-            perms: vec![0; len / PAGE_SIZE],
+            perms: Arc::new(vec![0; len / PAGE_SIZE]),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
-            mapped: vec![true; len / PAGE_SIZE],
+            mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
@@ -309,13 +391,15 @@ impl Memory {
         let reserved_len = len;
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
         Ok(Self {
+            parallel: None,
+            parallel_view: false,
             base,
             len,
             ptr: reservation.ptr,
-            perms: vec![0; len / PAGE_SIZE],
+            perms: Arc::new(vec![0; len / PAGE_SIZE]),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
-            mapped: vec![false; len / PAGE_SIZE],
+            mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
@@ -351,6 +435,7 @@ impl Memory {
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
+        self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         if perms & !7 != 0 || self.mapped[pages.clone()].iter().any(|&v| v) {
             return Err("invalid or overlapping mapping".into());
@@ -359,19 +444,20 @@ impl Memory {
             .as_ref()
             .ok_or("mapping requires reserved address space")?
             .commit(pages.start * PAGE_SIZE, len)?;
-        self.mapped[pages.clone()].fill(true);
+        Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         if let Err(error) = self.protect(addr, len, perms) {
             self.reservation
                 .as_ref()
                 .unwrap()
                 .decommit(pages.start * PAGE_SIZE, len)?;
-            self.mapped[pages].fill(false);
+            Arc::make_mut(&mut self.mapped)[pages].fill(false);
             return Err(error);
         }
         Ok(())
     }
 
     pub fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
+        self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         self.committed(addr, len)?;
         let reservation = self
@@ -409,13 +495,14 @@ impl Memory {
             }
             self.shared_pages.remove(&page);
         }
-        self.mapped[pages.clone()].fill(false);
-        self.perms[pages].fill(0);
+        Arc::make_mut(&mut self.mapped)[pages.clone()].fill(false);
+        Arc::make_mut(&mut self.perms)[pages].fill(0);
         self.touch(addr, len);
         Ok(())
     }
 
     pub(crate) fn touch(&mut self, addr: u32, len: usize) {
+        self.quiesce_workers();
         if len == 0 {
             return;
         }
@@ -445,6 +532,9 @@ impl Memory {
     /// Borrow ordinary exclusively owned storage. Shared device pages require
     /// read_into/read_data so no ordinary reference escapes over atomic bytes.
     pub fn read(&self, addr: u32, len: usize) -> Result<&[u8], String> {
+        if self.parallel_view || self.parallel.as_ref().is_some_and(|f| !f.is_idle()) {
+            return Err("parallel guest bytes require a foreign-memory copy".into());
+        }
         let range = self.committed(addr, len)?;
         if self.overlays(&range) {
             return Err("shared bytes require an atomic copy".into());
@@ -459,7 +549,11 @@ impl Memory {
 
     pub fn read_data(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
         let range = self.committed(addr, len)?;
-        if self.overlays(&range) || self.host_copy_required(&range) {
+        if self.parallel_view
+            || self.parallel.as_ref().is_some_and(|f| !f.is_idle())
+            || self.overlays(&range)
+            || self.host_copy_required(&range)
+        {
             let mut bytes = vec![0; len];
             self.read_into(addr, &mut bytes)?;
             return Ok(Cow::Owned(bytes));
@@ -472,6 +566,7 @@ impl Memory {
 
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
         let range = self.committed(addr, destination.len())?;
+        self.worker_access(&range, false)?;
         #[cfg(windows)]
         let _host = Self::host_scope(
             self.reservation.as_ref(),
@@ -481,6 +576,16 @@ impl Memory {
             false,
         )?;
         if !self.overlays(&range) {
+            if self.is_parallel() {
+                unsafe {
+                    crate::parallel_memory::copy(
+                        self.ptr.as_ptr().add(range.start),
+                        destination.as_mut_ptr(),
+                        range.len(),
+                    )
+                };
+                return Ok(());
+            }
             // SAFETY: committed ordinary storage and non-aliasing caller output.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -508,6 +613,17 @@ impl Memory {
             } else if let Some(storage) = self.shared_pages.get(&page) {
                 storage.read_into(at % PAGE_SIZE, output)?;
             } else {
+                if self.is_parallel() {
+                    unsafe {
+                        crate::parallel_memory::copy(
+                            self.ptr.as_ptr().add(at),
+                            output.as_mut_ptr(),
+                            len,
+                        )
+                    };
+                    at += len;
+                    continue;
+                }
                 // SAFETY: committed ordinary page, valid non-aliasing output.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -565,6 +681,9 @@ impl Memory {
         if !self.overlays(&src) || !self.overlays(&dst) {
             return false;
         }
+        if self.parallel_view {
+            return true;
+        }
         if len == 0 {
             return false;
         }
@@ -603,6 +722,7 @@ impl Memory {
         addr: u32,
         len: usize,
     ) -> Result<Arc<SharedAllocation>, String> {
+        self.quiesce_workers();
         if self.reservation.is_none() {
             return Err("shared audio requires reserved guest memory".into());
         }
@@ -622,8 +742,9 @@ impl Memory {
                 },
             );
         }
-        self.mapped[pages.clone()].fill(true);
-        self.perms[pages].fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
+        Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
+        Arc::make_mut(&mut self.perms)[pages]
+            .fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
         self.touch(addr, len);
         Ok(storage)
     }
@@ -639,6 +760,7 @@ impl Memory {
             .len()
             .checked_mul(PAGE_SIZE)
             .ok_or("file view length overflow")?;
+        self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         if self.reservation.is_none()
             || perms & !(READ | WRITE) != 0
@@ -655,8 +777,8 @@ impl Memory {
                 },
             );
         }
-        self.mapped[pages.clone()].fill(true);
-        self.perms[pages].fill(perms | SHARED);
+        Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
+        Arc::make_mut(&mut self.perms)[pages].fill(perms | SHARED);
         self.touch(addr, len);
         Ok(())
     }
@@ -683,6 +805,7 @@ impl Memory {
         write: bool,
     ) -> Result<(), String> {
         let range = self.committed(addr, len)?;
+        self.worker_access(&range, write)?;
         if !range.is_empty() {
             let required = if write { WRITE } else { READ };
             let permissions = &self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE];
@@ -738,7 +861,9 @@ impl Memory {
     pub(crate) fn copy(&mut self, source: u32, destination: u32, len: usize) -> Result<(), String> {
         let src = self.committed(source, len)?;
         let dst = self.committed(destination, len)?;
-        if self.overlays(&src) || self.overlays(&dst) {
+        self.worker_access(&src, false)?;
+        self.worker_access(&dst, true)?;
+        if self.is_parallel() || self.overlays(&src) || self.overlays(&dst) {
             let mut scratch = [0; PAGE_SIZE];
             let backwards =
                 destination > source && u64::from(destination) < u64::from(source) + len as u64;
@@ -812,6 +937,7 @@ impl Memory {
     /// must validate WRITE permission before using this operation.
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         let range = self.committed(addr, bytes.len())?;
+        self.worker_access(&range, true)?;
         let overlays = self.overlays(&range);
         // Keep ordinary stores allocation-free. Overlay stores resolve every
         // fallible page read and private COW snapshot before committing bytes,
@@ -852,6 +978,17 @@ impl Memory {
                 } else if let Some(storage) = self.shared_pages.get_mut(&page) {
                     storage.write(at % PAGE_SIZE, input)?;
                 } else {
+                    if self.is_parallel() {
+                        unsafe {
+                            crate::parallel_memory::copy(
+                                input.as_ptr(),
+                                self.ptr.as_ptr().add(at),
+                                len,
+                            )
+                        };
+                        at += len;
+                        continue;
+                    }
                     // SAFETY: committed ordinary subrange and exclusive borrow.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -863,6 +1000,16 @@ impl Memory {
                 }
                 at += len;
             }
+            return Ok(());
+        }
+        if self.is_parallel() {
+            unsafe {
+                crate::parallel_memory::copy(
+                    bytes.as_ptr(),
+                    self.ptr.as_ptr().add(range.start),
+                    bytes.len(),
+                )
+            };
             return Ok(());
         }
         // SAFETY: checked range and exclusive borrow; source cannot alias this allocation.
@@ -878,6 +1025,7 @@ impl Memory {
 
     /// Set guest permissions and invalidate dependent decoded/compiled code.
     pub fn protect(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
+        self.quiesce_workers();
         if !(addr as usize).is_multiple_of(PAGE_SIZE)
             || len == 0
             || !len.is_multiple_of(PAGE_SIZE)
@@ -915,7 +1063,9 @@ impl Memory {
                 scope.retain();
             }
         }
-        for page in &mut self.perms[range.start / PAGE_SIZE..range.end / PAGE_SIZE] {
+        for page in
+            &mut Arc::make_mut(&mut self.perms)[range.start / PAGE_SIZE..range.end / PAGE_SIZE]
+        {
             #[cfg(windows)]
             {
                 self.native_read_exceptions -= usize::from(Self::native_read_exception(*page));
@@ -942,7 +1092,10 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        if self.reservation.is_some() {
+        if let Some(fence) = &self.parallel {
+            fence.quiesce();
+        }
+        if self.reservation.is_some() || self.parallel_view {
             return;
         }
         // SAFETY: same layout as allocation; executors are dropped before Memory.

@@ -113,6 +113,7 @@ mod windows {
         machine.cpu.set_reg(Reg::Esp, DATA + 2048);
         machine.cpu.write_u32(DATA + 2052, pointer).unwrap();
         let result = handler(&mut Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,

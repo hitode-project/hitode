@@ -101,7 +101,7 @@ pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
         module: signature.module.to_owned(),
         name: signature.name.to_owned(),
         caller: env.caller(),
-        context: env.sys.current,
+        context: env.context,
         arguments: trace::format_arguments(env.cpu, signature),
         failure_value: failure,
     };

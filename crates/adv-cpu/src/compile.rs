@@ -53,7 +53,8 @@ pub(crate) struct Compiled {
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
     /// Owner-side recency sampled at Rust entries, never read by generated code.
-    pub cache_stamp: u64,
+    // Controller-only metadata; native descriptors never reference this cell.
+    pub cache_stamp: std::cell::Cell<u64>,
     #[cfg(all(test, target_arch = "x86_64"))]
     disasm: String,
 }
@@ -69,6 +70,10 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    pub(crate) fn parallel_entry(&self) -> crate::parallel::Entry {
+        assert!(!self.input.shadow_returns);
+        self.entry
+    }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub(crate) fn storage_bytes(&self) -> Result<(usize, usize), String> {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
@@ -197,6 +202,7 @@ impl Compiled {
 /// retained: only bounded instruction bytes and their page stamps are copied.
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
+    parallel: bool,
     pub region: Box<Region>,
     base: u32,
     len: usize,
@@ -238,6 +244,7 @@ impl Snapshot {
         let first = (region.start - self.base) as usize / 4096;
         let last = ((self.region.start - self.base) as usize + end) / 4096;
         Ok(Self {
+            parallel: self.parallel,
             region: Box::new(region),
             base: self.base,
             len: self.len,
@@ -291,6 +298,7 @@ impl Snapshot {
             }
         }
         Ok(Self {
+            parallel: memory.is_parallel(),
             region: Box::new(region.clone()),
             base: memory.base,
             len: memory.len,
@@ -312,7 +320,8 @@ impl Snapshot {
     }
 
     pub fn valid(&self, memory: &Memory) -> bool {
-        memory.base == self.base
+        self.parallel == memory.is_parallel()
+            && memory.base == self.base
             && memory.len == self.len
             && self.pages.iter().all(|stamp| {
                 memory.versions.get(stamp.page) == Some(&stamp.version)
@@ -565,7 +574,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .then(|| fault::candidate(region.start, &instructions))
         .flatten();
 
-    let opt_level = match region.compile_strategy {
+    let opt_level = match if snapshot.parallel {
+        CompileStrategy::Fast
+    } else {
+        region.compile_strategy
+    } {
         CompileStrategy::Speed => "speed",
         CompileStrategy::Fast => "none",
     };
@@ -1271,7 +1284,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         entries,
         code_size,
         _x87: x87,
-        cache_stamp: 0,
+        cache_stamp: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
     })

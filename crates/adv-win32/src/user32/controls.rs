@@ -78,14 +78,14 @@ fn button_proc(env: &mut Env<'_>) -> Outcome {
         }
         wm::LBUTTONDOWN => {
             set_button(env, hwnd, |s| s | BST_PUSHED);
-            let ctx = env.sys.current;
+            let ctx = env.context;
             user_mut(env).queue(ctx).capture = hwnd;
             0
         }
         wm::LBUTTONUP => {
             let pushed = w.control.button & BST_PUSHED != 0;
             set_button(env, hwnd, |s| s & !BST_PUSHED);
-            let ctx = env.sys.current;
+            let ctx = env.context;
             let q = user_mut(env).queue(ctx);
             if q.capture == hwnd {
                 q.capture = 0;

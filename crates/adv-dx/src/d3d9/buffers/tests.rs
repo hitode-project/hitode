@@ -15,6 +15,7 @@ fn setup(env: &mut Env<'_>) -> (u32, Id) {
 fn hardware_mode_rejects_software_buffer_usage_before_publishing_or_retaining_parent() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -61,6 +62,7 @@ fn hardware_mode_rejects_software_buffer_usage_before_publishing_or_retaining_pa
 fn zero_public_binding_resurrects_parent_once_and_unbinding_reclaims_storage() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -150,6 +152,7 @@ fn invalid_lock_output_or_range_does_not_change_existing_locks_or_memory() {
     m.cpu.write_u32(0x550000, 0xaabbccdd).unwrap();
     m.cpu.protect(0x550000, 4096, Prot::READ).unwrap();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -204,6 +207,7 @@ fn getter_validates_every_output_before_retain_or_partial_publication() {
     m.cpu.write_u32(0x550000, 0xcccccccc).unwrap();
     m.cpu.protect(0x550000, 4096, Prot::READ).unwrap();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -261,6 +265,7 @@ fn index_decode_preserves_signed_base_and_observes_guest_writes_without_reusing_
     m.cpu.map(0x550000, 4096, Prot::RW).unwrap();
     m.cpu.write(0x550000, &[1, 0, 2, 0, 3, 0]).unwrap();
     let env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -284,6 +289,7 @@ fn index_decode_preserves_signed_base_and_observes_guest_writes_without_reusing_
 fn zero_indexed_up_frees_zero_public_bindings_and_clears_offset_stride_without_gpu_work() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,

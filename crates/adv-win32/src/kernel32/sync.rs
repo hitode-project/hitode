@@ -69,6 +69,7 @@ fn leave_cs(env: &mut Env<'_>) -> Outcome {
 }
 
 fn interlocked(env: &mut Env<'_>, f: impl Fn(u32, u32, u32) -> (u32, u32)) -> Outcome {
+    env.cpu.quiesce_memory();
     let (p, a, b) = (env.arg(0), env.arg(1), env.arg(2));
     let old = env.cpu.read_u32(p).unwrap_or(0);
     let (new, ret) = f(old, a, b);
@@ -216,7 +217,7 @@ fn release_semaphore(env: &mut Env<'_>) -> Outcome {
 
 fn create_mutex(env: &mut Env<'_>) -> Outcome {
     let owned = env.arg(1) != 0;
-    let cur = env.sys.current;
+    let cur = env.context;
     let owner = owned.then_some(cur);
     created(
         env,
@@ -229,7 +230,7 @@ fn create_mutex(env: &mut Env<'_>) -> Outcome {
 
 fn release_mutex(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
-    let cur = env.sys.current;
+    let cur = env.context;
     let result = match env.sys.objects.get_mut(h) {
         Some(Object::Mutex { owner, recursion }) if *owner == Some(cur) => {
             *recursion -= 1;
@@ -273,6 +274,7 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(0)
     });
     stdcall(reg, K32, "InterlockedPushEntrySList", 2, |e| {
+        e.cpu.quiesce_memory();
         let (head, entry) = (e.arg(0), e.arg(1));
         slist(e, head, |e, next, depth| {
             let _ = e.cpu.write_u32(entry, next);
@@ -280,6 +282,7 @@ pub(super) fn register(reg: &mut Registry) {
         })
     });
     stdcall(reg, K32, "InterlockedPopEntrySList", 1, |e| {
+        e.cpu.quiesce_memory();
         let head = e.arg(0);
         slist(e, head, |e, next, depth| match next {
             0 => (0, 0, 0),
@@ -291,6 +294,7 @@ pub(super) fn register(reg: &mut Registry) {
         })
     });
     stdcall(reg, K32, "InterlockedFlushSList", 1, |e| {
+        e.cpu.quiesce_memory();
         let head = e.arg(0);
         slist(e, head, |_, next, _| (0, 0, next))
     });

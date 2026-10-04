@@ -140,7 +140,7 @@ pub fn register(r: &mut Registry) {
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
-    release_errno(env, Some(env.sys.current))
+    release_errno(env, Some(env.context))
 }
 
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
@@ -390,7 +390,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
             match e.sys.objects.get_mut(handle) {
                 Some(adv_machine::Object::Mutex { owner, recursion })
-                    if *owner == Some(e.sys.current) =>
+                    if *owner == Some(e.context) =>
                 {
                     *recursion -= 1;
                     if *recursion == 0 {
@@ -811,9 +811,9 @@ mod tests {
                 let heap = env.ext.get::<Heaps>().process_heap;
                 let mut cells = Vec::new();
                 for (module, ctx) in [
-                    ("msvcrt.dll", env.sys.current),
-                    ("ucrtbase.dll", env.sys.current),
-                    ("msvcrt.dll", env.sys.current + 1),
+                    ("msvcrt.dll", env.context),
+                    ("ucrtbase.dll", env.context),
+                    ("msvcrt.dll", env.context + 1),
                 ] {
                     let address = allocate(env, 4, true);
                     if address == 0 {

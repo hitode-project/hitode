@@ -294,6 +294,7 @@ mod tests {
                     )
                     .unwrap();
                 let mut env = Env {
+                    context: machine.sys.current,
                     cpu: &mut machine.cpu,
                     sys: &mut machine.sys,
                     ext: &mut machine.ext,
@@ -327,6 +328,7 @@ mod tests {
             assert!(machine.ext.get::<Heaps>().owner(pointer).is_some());
         }
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,

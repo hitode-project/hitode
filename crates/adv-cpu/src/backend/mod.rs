@@ -73,6 +73,9 @@ pub struct MemFault {
 /// Why [`Backend::run`] returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
+    /// CPU state has been leased to a worker. The controller must not restore
+    /// this context until poll_parallel returns the matching token.
+    Dispatched { token: u64 },
     /// A trap handler returned [`TrapAction::Park`]. EIP is at the park address and the rest
     /// of the guest state is exactly what the handler left.
     Parked,
@@ -141,6 +144,9 @@ impl FpuEnvironment {
 
 /// Registers and memory as seen from inside a trap handler.
 pub trait Guest {
+    /// Establish an exclusive guest-memory boundary for composite atomics or
+    /// mapping-sensitive host operations. Synchronous backends need no action.
+    fn quiesce_memory(&mut self) {}
     /// Capture architecture at a paused boundary, materializing floating aliases.
     /// This contains no scheduler, REP continuation, clock or host IRQ metadata.
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
@@ -311,6 +317,21 @@ pub struct SegmentSetup {
 
 pub trait Backend: Guest {
     type Context;
+
+    fn guest_workers(&self) -> usize {
+        1
+    }
+    fn parallel_capacity_available(&self) -> bool {
+        true
+    }
+    /// Offload only when another ready context can use the inline lane.
+    fn set_parallel_demand(&mut self, _ready_peer: bool) {}
+    fn poll_parallel(&mut self) -> Option<(u64, Self::Context)> {
+        None
+    }
+    fn wait_parallel(&mut self, _duration: Duration) -> Result<(), String> {
+        Err("backend has no parallel execution workers".into())
+    }
 
     /// Install the GDT and load flat CS/DS/ES/SS. Must be called once before running.
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault>;

@@ -843,6 +843,7 @@ mod tests {
     fn no_specular_fvf_profile_exposes_bool_state_without_accepting_specular_inputs() {
         let mut m = super::super::tests::machine();
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,
@@ -873,6 +874,7 @@ mod tests {
     fn gouraud_default_roundtrip_and_rejected_modes_preserve_state_and_output() {
         let mut m = super::super::tests::machine();
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,

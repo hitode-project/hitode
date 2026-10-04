@@ -228,7 +228,7 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
         .ext
         .get_mut::<Win32>()
         .exiting_threads
-        .insert(env.sys.current)
+        .insert(env.context)
     {
         return Outcome::ExitThread(code);
     }
@@ -244,7 +244,7 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
                     .sys
                     .contexts
                     .iter()
-                    .all(|context| context.id == env.sys.current || context.is_done())
+                    .all(|context| context.id == env.context || context.is_done())
                 {
                     exit_process(env, code)
                 } else {

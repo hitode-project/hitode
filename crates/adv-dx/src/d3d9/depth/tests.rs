@@ -8,6 +8,7 @@ fn binding_public_zero_getter_parent_retain_failures_and_final_release_are_one_c
     let equal = gpu.target(16, 12, false).unwrap();
     let smaller = gpu.target(8, 6, false).unwrap();
     let mut env = Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,

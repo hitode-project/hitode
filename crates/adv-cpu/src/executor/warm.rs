@@ -50,10 +50,13 @@ impl Executor {
     /// Serialize resident automatic regions, most recently used last.
     pub fn warm_profile(&self) -> Vec<u8> {
         let mut regions: Vec<_> = self
+            .code
             .compiled
             .iter()
             .filter(|(start, _)| self.automatic_regions.contains(start))
-            .filter_map(|(start, compiled)| Some((compiled.cache_stamp, self.regions.get(start)?)))
+            .filter_map(|(start, compiled)| {
+                Some((compiled.cache_stamp.get(), self.code.regions.get(start)?))
+            })
             .collect();
         regions.sort_by_key(|(stamp, _)| *stamp);
         let skip = regions.len().saturating_sub(LIMIT);
@@ -151,10 +154,12 @@ impl Executor {
                 .memory
                 .read(region.start, region.len)
                 .is_ok_and(|bytes| hash(bytes) == expected);
-            let known = self.regions.contains_key(&region.start)
+            let known = self.code.regions.contains_key(&region.start)
                 || std::iter::once(&region.start)
                     .chain(&region.entries)
-                    .any(|pc| self.entry_owner.contains_key(pc) || self.attempted.contains(pc));
+                    .any(|pc| {
+                        self.code.entry_owner.contains_key(pc) || self.attempted.contains(pc)
+                    });
             if !matches || known {
                 continue;
             }

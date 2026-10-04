@@ -15,6 +15,15 @@ pub struct JitCpu {
     jit: bool,
 }
 impl JitCpu {
+    pub fn set_guest_workers(&mut self, count: usize) -> Result<(), String> {
+        if count > 1 && !self.jit {
+            return Err("parallel execution requires the JIT backend".into());
+        }
+        self.inner.set_guest_workers(count)
+    }
+    pub fn parallel_stats(&self) -> crate::ParallelStats {
+        self.inner.parallel_stats()
+    }
     pub fn new(park: u32, jit: bool) -> Result<Self, String> {
         let mut machine = Executor::address_space()?;
         machine.enable_auto_jit(jit);
@@ -103,6 +112,9 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn quiesce_memory(&mut self) {
+        self.memory.quiesce_workers();
+    }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         Ok(self.state.capture_architecture())
     }
@@ -232,6 +244,9 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn quiesce_memory(&mut self) {
+        self.inner.memory.quiesce_workers();
+    }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         self.view(|g| g.capture_architecture())
     }
@@ -337,6 +352,23 @@ impl crate::ExecutionTrap for Raw<'_> {
 
 impl Backend for JitCpu {
     type Context = Option<ExecutionContext>;
+    fn guest_workers(&self) -> usize {
+        self.inner.guest_workers()
+    }
+    fn parallel_capacity_available(&self) -> bool {
+        true // the controller's inline execution lane is always available
+    }
+    fn set_parallel_demand(&mut self, ready_peer: bool) {
+        self.inner.parallel_demand = ready_peer;
+    }
+    fn poll_parallel(&mut self) -> Option<(u64, Self::Context)> {
+        self.inner
+            .poll_parallel()
+            .map(|(token, context)| (token, Some(context)))
+    }
+    fn wait_parallel(&mut self, duration: Duration) -> Result<(), String> {
+        self.inner.wait_parallel(duration)
+    }
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault> {
         self.inner
             .setup_wow64_segments(seg.gdt_addr)
@@ -373,8 +405,37 @@ impl Backend for JitCpu {
         self.inner.set_host_interrupts(enabled);
     }
     fn run(&mut self, handler: &mut dyn TrapHandler) -> Exit {
+        let _activity = self.inner.inline_activity();
         let start = Instant::now();
         self.inner.deadline = self.budget.and_then(|b| start.checked_add(b));
+        if let Some(stop) = self.inner.take_parallel_stop() {
+            match stop {
+                crate::parallel::Stop::Trap(vector) => {
+                    self.inner.stats.trap_calls += 1;
+                    let action = self.view(|view| handler.on_trap(view, vector));
+                    if action == TrapAction::Park {
+                        self.inner.state.eip = self.park;
+                        return Exit::Parked;
+                    }
+                }
+                crate::parallel::Stop::Fallback => self.inner.cold_parallel_retry(),
+                // Completion was requeued by the machine; this selection is
+                // already a fresh turn, not a second expiration of the old one.
+                crate::parallel::Stop::Quantum => {}
+                crate::parallel::Stop::Interrupted => {
+                    return Exit::Interrupted {
+                        pc: self.inner.state.eip,
+                    };
+                }
+                crate::parallel::Stop::Parked => return Exit::Parked,
+                crate::parallel::Stop::Failed(message) => {
+                    return Exit::Fault(Fault {
+                        pc: self.inner.state.eip,
+                        kind: FaultKind::Other(message),
+                    });
+                }
+            }
+        }
         loop {
             let m = &mut self.inner;
             if m.state.eip == self.park {
@@ -391,6 +452,29 @@ impl Backend for JitCpu {
             let mut raw = Raw { handler };
             let result = m.run_with_traps(self.park, 32_768, &mut raw, !self.jit);
             match result {
+                Ok(RunOutcome::NativeReady) => {
+                    let remaining = self.budget.map_or(Duration::from_millis(1), |budget| {
+                        budget.saturating_sub(start.elapsed())
+                    });
+                    if remaining.is_zero() {
+                        return Exit::BudgetExceeded {
+                            pc: m.state.eip,
+                            budget: self.budget.unwrap(),
+                        };
+                    }
+                    let now = handler.guest_time_us().unwrap_or(0);
+                    return match m.dispatch_parallel(
+                        self.park,
+                        remaining.min(Duration::from_millis(1)),
+                        now,
+                    ) {
+                        Ok(token) => Exit::Dispatched { token },
+                        Err(message) => Exit::Fault(Fault {
+                            pc: m.state.eip,
+                            kind: FaultKind::Other(message),
+                        }),
+                    };
+                }
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;
                     return Exit::Parked;

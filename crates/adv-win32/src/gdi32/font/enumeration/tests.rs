@@ -36,6 +36,7 @@ fn fixture() -> (Machine<JitCpu>, u32) {
     machine.cpu.write_u32(stack + 4, 0).unwrap();
     let handler = machine.sys.thunks.get(index).f.handler;
     let Outcome::Return(dc) = handler(&mut Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,
@@ -47,6 +48,7 @@ fn fixture() -> (Machine<JitCpu>, u32) {
 }
 fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,

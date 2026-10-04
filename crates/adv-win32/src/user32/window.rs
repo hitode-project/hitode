@@ -861,7 +861,7 @@ pub fn create_window(
     p: CreateParams,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(ci) = u.find_class(&p.class, p.instance) else {
@@ -1325,7 +1325,7 @@ pub fn set_focus(
     hwnd: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     if hwnd != 0 && !u.windows.contains_key(&env.sys.objects, &hwnd) {
         return then(env, 0);
@@ -1523,7 +1523,7 @@ fn set_focus_api(env: &mut Env<'_>) -> Outcome {
 
 fn set_active_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let old = user_mut(env).queue(ctx).active;
     activate_window(env, hwnd, move |_| Outcome::Return(old))
 }
@@ -1836,12 +1836,12 @@ fn is_zoomed(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_focus(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     Outcome::Return(user_mut(env).queue(ctx).focus)
 }
 
 fn get_active_window(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     Outcome::Return(user_mut(env).queue(ctx).active)
 }
 
@@ -1932,7 +1932,7 @@ fn get_window_text_length_a(env: &mut Env<'_>) -> Outcome {
 
 fn set_capture(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     Outcome::Return(std::mem::replace(
         &mut user_mut(env).queue(ctx).capture,
         hwnd,
@@ -1940,13 +1940,13 @@ fn set_capture(env: &mut Env<'_>) -> Outcome {
 }
 
 fn release_capture(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     user_mut(env).queue(ctx).capture = 0;
     Outcome::Return(1)
 }
 
 fn get_capture(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     Outcome::Return(user_mut(env).queue(ctx).capture)
 }
 

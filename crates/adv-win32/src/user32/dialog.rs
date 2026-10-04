@@ -570,7 +570,7 @@ fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> O
     match next_any(env) {
         Some(m) if m.msg == wm::QUIT => {
             // Leave WM_QUIT for the application's own loop.
-            let ctx = env.sys.current;
+            let ctx = env.context;
             user_mut(env).queue(ctx).quit = Some(m.wparam);
             finish(env, 0)
         }

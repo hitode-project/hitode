@@ -1195,6 +1195,7 @@ mod tests {
         let command = items[0].command;
         let disabled = items[1].command;
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,

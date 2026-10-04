@@ -5,6 +5,7 @@ use adv_cpu::backend::Guest;
 fn windowed_dialog_box_mode_is_inert_outside_scene_even_with_locked_argb_backbuffer() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -68,6 +69,7 @@ fn windowed_dialog_box_mode_is_inert_outside_scene_even_with_locked_argb_backbuf
 fn creation_rejects_missing_combined_and_unimplemented_policies_before_publication() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -113,6 +115,7 @@ fn creation_rejects_missing_combined_and_unimplemented_policies_before_publicati
 fn fixed_modes_reject_changes_and_mixed_normalizes_bool_without_changing_creation_flags() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -156,6 +159,7 @@ fn fixed_modes_reject_changes_and_mixed_normalizes_bool_without_changing_creatio
 fn rejected_reset_keeps_mixed_mode_and_does_not_replace_creation_identity() {
     let mut m = super::super::tests::machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -184,6 +188,7 @@ fn output_faults_and_nonnull_shader_rejection_preserve_memory_and_ownership() {
     m.cpu.write(0x550000, &[0xa5; 8192]).unwrap();
     m.cpu.protect(0x551000, 4096, Prot::READ).unwrap();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,

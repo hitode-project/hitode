@@ -28,6 +28,7 @@ fn fixture(references: u32) -> Machine<JitCpu> {
 }
 fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,

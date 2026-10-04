@@ -68,7 +68,7 @@ fn finish(env: &mut Env<'_>, lock: u32, result: u32, action: Action) -> Outcome 
     else {
         return Outcome::Fail("UCRT exit lock disappeared".into());
     };
-    if *owner != Some(env.sys.current) {
+    if *owner != Some(env.context) {
         return Outcome::Fail("UCRT exit lock owner changed".into());
     }
     *recursion -= 1;
@@ -370,6 +370,7 @@ mod tests {
             .resolve_import("ucrtbase.dll", "_initialize_onexit_table")
             .unwrap();
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,
@@ -438,6 +439,7 @@ mod tests {
         ] {
             let entry = machine.resolve_import(module, name).unwrap();
             let mut env = Env {
+                context: machine.sys.current,
                 cpu: &mut machine.cpu,
                 sys: &mut machine.sys,
                 ext: &mut machine.ext,
@@ -473,6 +475,7 @@ mod tests {
             .collect();
         assert_eq!(allocations.len(), 2); // UCRT/API-set share the same header.
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,

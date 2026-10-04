@@ -345,7 +345,7 @@ fn post_kind(
 ) -> bool {
     let time = env.sys.clock.now_ms();
     let ctx = if hwnd == 0 {
-        env.sys.current
+        env.context
     } else {
         match user(env).windows.get(&env.sys.objects, &hwnd) {
             Some(w) => w.thread,
@@ -456,7 +456,7 @@ fn queue_changed(env: &mut Env<'_>, ctx: adv_machine::CtxId) {
 /// Arm the input condition and deadline invalidation after MsgWait checks its
 /// queue. Waiting does not itself mark any input old.
 pub fn message_wait_events(env: &mut Env<'_>, mask: u32) -> Option<(u32, u32)> {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let q = user_mut(env).queue(ctx);
     let original = [q.message_wait_event, q.message_wait_notification];
     let mut handles = original;
@@ -512,7 +512,7 @@ pub(super) fn posted_status(m: &Msg) -> u32 {
 /// Current pending and new-input bits. Observing these internally does not make
 /// input old; MsgWaitForMultipleObjects can report the same new post repeatedly.
 pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
-    queue_status_for(env, env.sys.current)
+    queue_status_for(env, env.context)
 }
 
 fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
@@ -540,7 +540,7 @@ fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
 
 fn observe_retrieval(env: &mut Env<'_>, f: Filter) {
     queue_status(env);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     // Even a filtered miss observes QS_POSTMESSAGE. QS_ALLPOSTMESSAGE is
     // preserved until retrieval without a message-range filter (or GQS).
     user_mut(env).queue(ctx).changed_status &= if f.min == 0 && f.max == 0 {
@@ -591,7 +591,7 @@ fn is_descendant(
 /// The next message for the current thread, removed from the queue with `remove`.
 fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
     observe_retrieval(env, f);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let now = env.sys.clock.now_us();
     let now_ms = env.sys.clock.now_ms();
     let frame = env.sys.frame;
@@ -721,7 +721,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
 
 /// Earliest time something may appear in the current thread's queue on its own.
 fn next_deadline(env: &mut Env<'_>, f: Filter) -> Option<u64> {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let u = user(env);
     let timers = u
         .queues
@@ -794,7 +794,7 @@ fn headless_deadline(
 /// Headless mode: press the button of a dialog that has been waiting long enough, by
 /// posting a real click to it. Returns whether something was posted.
 fn headless_idle(env: &mut Env<'_>) -> bool {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some((top, button)) = headless_target(u, &env.sys.objects, ctx) else {
@@ -821,7 +821,7 @@ const PM_REMOVE: u32 = 1;
 
 fn write_message(env: &mut Env<'_>, message: Msg, out: u32, removed: bool) {
     let written = message.write(env.cpu, out);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     if let Some(tracking) = &mut user_mut(env).input_tracking {
         tracking.remember(ctx, out, message, removed && written);
     }
@@ -900,7 +900,7 @@ pub fn wait_for_message(
 /// Arm the wake-up event after the caller found no matching message. Unmatched posted
 /// messages must not keep a filtered GetMessage runnable; a new post signals it again.
 fn queue_event(env: &mut Env<'_>) -> u32 {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let q = user_mut(env).queue(ctx);
     let ev = q.event;
     let ev = if ev == 0 {
@@ -969,7 +969,7 @@ fn wait_message(env: &mut Env<'_>) -> Outcome {
 fn get_queue_status(env: &mut Env<'_>) -> Outcome {
     let flags = env.arg(0) & 0xffff;
     let (pending, changed) = queue_status(env);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     user_mut(env).queue(ctx).changed_status &= !flags;
     Outcome::Return((pending & flags) << 16 | (changed & flags))
 }
@@ -1029,7 +1029,7 @@ fn post_quit_message(env: &mut Env<'_>) -> Outcome {
 
 /// PostQuitMessage for the current thread.
 pub fn post_quit(env: &mut Env<'_>, code: u32) {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let q = user_mut(env).queue(ctx);
     q.quit = Some(code);
     q.changed_status |= QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
@@ -1058,7 +1058,7 @@ fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
 fn dispatch_message_a(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
     let m = Msg::read(env.cpu, address);
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let m = user_mut(env)
         .input_tracking
         .as_mut()
@@ -1120,12 +1120,12 @@ pub fn translate(env: &mut Env<'_>, m: &Msg) -> bool {
 }
 
 fn get_message_time(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     Outcome::Return(user_mut(env).queue(ctx).last_time)
 }
 
 fn get_message_pos(env: &mut Env<'_>) -> Outcome {
-    let ctx = env.sys.current;
+    let ctx = env.context;
     let (x, y) = user_mut(env).queue(ctx).last_pos;
     Outcome::Return(make_long(x, y))
 }
@@ -1135,7 +1135,7 @@ fn get_message_pos(env: &mut Env<'_>) -> Outcome {
 fn set_timer(env: &mut Env<'_>) -> Outcome {
     let (hwnd, id, ms, proc) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let ctx = if hwnd == 0 {
-        env.sys.current
+        env.context
     } else {
         let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
             return Outcome::Return(0);
@@ -1169,7 +1169,7 @@ fn set_timer(env: &mut Env<'_>) -> Outcome {
 fn kill_timer(env: &mut Env<'_>) -> Outcome {
     let (hwnd, id) = (env.arg(0), env.arg(1));
     let ctx = if hwnd == 0 {
-        env.sys.current
+        env.context
     } else {
         let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
             return Outcome::Return(0);

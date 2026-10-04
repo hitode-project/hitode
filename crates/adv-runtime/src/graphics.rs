@@ -293,6 +293,7 @@ mod tests {
                 .unwrap();
         }
         let result = handler(&mut Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,

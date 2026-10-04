@@ -195,7 +195,7 @@ fn lock(
     enqueue(
         env,
         PendingTransfer {
-            context: env.sys.current,
+            context: env.context,
             event,
             owner,
             destination: id,
@@ -408,7 +408,7 @@ pub(super) fn transfer(
     enqueue(
         env,
         PendingTransfer {
-            context: env.sys.current,
+            context: env.context,
             event,
             owner,
             destination,

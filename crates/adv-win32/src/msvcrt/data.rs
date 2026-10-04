@@ -38,6 +38,7 @@ pub(crate) fn initialize<B: Backend>(
         return Ok(());
     }
     let mut env = Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,

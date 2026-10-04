@@ -118,7 +118,7 @@ fn diagnostic_wsprintf(e: &mut Env<'_>) -> Outcome {
             let value = value.trim().trim_start_matches("0x");
             u32::from_str_radix(value, 16).ok().map(|address| (address, e.cpu.read_u32(address).ok()))
         }).collect();
-        (path, format!("ctx={} caller={:#x} dst={:#x} fmt={:#x} format={:?} out_len={} out_prefix={:?} return_offset_bytes={:?} args={strings:?} words={words:?}", e.sys.current, e.caller(), e.arg(0), e.arg(1), format, out.len(), &out[..out.len().min(64)], out.get(296..300)))
+        (path, format!("ctx={} caller={:#x} dst={:#x} fmt={:#x} format={:?} out_len={} out_prefix={:?} return_offset_bytes={:?} args={strings:?} words={words:?}", e.context, e.caller(), e.arg(0), e.arg(1), format, out.len(), &out[..out.len().min(64)], out.get(296..300)))
     });
     let result = ORIGINAL(e);
     if let Some((path, message)) = diagnostic {
@@ -160,7 +160,7 @@ fn diagnostic_peek(e: &mut Env<'_>) -> Outcome {
             let _ = writeln!(
                 file,
                 "peek ctx={} frame={} caller={:#x} ptr={pointer:#x} msg_words={words:?}",
-                e.sys.current,
+                e.context,
                 e.sys.frame,
                 e.caller()
             );
@@ -177,7 +177,7 @@ fn message_wait(
 ) -> Outcome {
     use adv_machine::{Object, Resume, Wait, WakeReason};
     let now = e.sys.clock.now_us();
-    let ctx = e.sys.current;
+    let ctx = e.context;
     for &h in &handles {
         if !matches!(
             e.sys.objects.get(h),
@@ -330,6 +330,7 @@ mod tests {
             }
             assert_eq!(m.sys.host_calls, calls);
             let mut env = Env {
+                context: m.sys.current,
                 cpu: &mut m.cpu,
                 sys: &mut m.sys,
                 ext: &mut m.ext,
@@ -346,6 +347,7 @@ mod tests {
                 "mouse movement must not satisfy QS_KEY"
             );
             let mut env = Env {
+                context: m.sys.current,
                 cpu: &mut m.cpu,
                 sys: &mut m.sys,
                 ext: &mut m.ext,

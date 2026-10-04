@@ -194,7 +194,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
     if env
         .ext
         .try_get::<FrameDispatch>()
-        .and_then(|state| state.0.get(&env.sys.current))
+        .and_then(|state| state.0.get(&env.context))
         .and_then(Weak::upgrade)
         .is_some()
     {
@@ -304,7 +304,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
     env.ext
         .get_or_default::<FrameDispatch>()
         .0
-        .insert(env.sys.current, Rc::downgrade(&active));
+        .insert(env.context, Rc::downgrade(&active));
     Outcome::call_on_stack(
         handler,
         [
@@ -364,6 +364,7 @@ mod tests {
         });
         let kernel = machine.sys.objects.insert_host(123_u32);
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,

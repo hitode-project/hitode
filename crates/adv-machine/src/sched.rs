@@ -1,7 +1,7 @@
 //! Guest contexts ("threads") and the cooperative scheduler.
 //!
-//! Any number of guest threads (up to the resource limit) run as contexts on one
-//! host execution thread. Blocking switches contexts; real-time slices can preempt
+//! Guest threads (up to the resource limit) run under exclusive context leases
+//! on a bounded execution pool. Blocking releases execution; real-time slices preempt
 //! guest computation or return a completed frame to the host. The normal scheduling
 //! lane remains round-robin, with a bounded preference for genuinely satisfied waits.
 
@@ -80,6 +80,11 @@ impl ReadyResume {
 }
 
 pub(crate) enum State {
+    /// Exclusive native lease. No scheduler path may select this context until
+    /// the backend returns the matching token and complete register state.
+    Running {
+        token: u64,
+    },
     /// Runnable. `resume` completes a satisfied guest wait or deferred host work before
     /// the guest continues. Only satisfied waits enter the wake-priority queue.
     Ready {
@@ -117,6 +122,7 @@ impl Context {
     /// Read-only scheduler diagnostics for frontends and failure reports.
     pub fn state_name(&self) -> &'static str {
         match self.state {
+            State::Running { .. } => "Running",
             State::Ready { .. } => "Ready",
             State::Blocked { .. } => "Blocked",
             State::Done { .. } => "Done",

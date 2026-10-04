@@ -611,7 +611,7 @@ fn create_device(
         factory,
         surface,
         parameters: normalized,
-        creator: env.sys.current,
+        creator: env.context,
         preserve_fpu: flags & 2 != 0,
         creation,
         scene: false,
@@ -711,7 +711,7 @@ fn reset(
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if d.creator != env.sys.current || d.scene {
+    if d.creator != env.context || d.scene {
         return Outcome::Return(INVALID);
     }
     let focus = d.parameters.hDeviceWindow;
@@ -941,7 +941,7 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                 return Outcome::Return(OUT_OF_MEMORY);
             }
             env.ext.get_mut::<State>().pending.push(Pending {
-                context: env.sys.current,
+                context: env.context,
                 event,
                 owner,
                 operation: Some(Box::new(operation)),
@@ -990,6 +990,7 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
     let mut progress = false;
     for mut wait in pending {
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,
@@ -1027,6 +1028,7 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
         env.ext.get_mut::<State>().pending.push(wait);
     }
     let mut env = Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,
@@ -1039,6 +1041,7 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
 pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
     let pending = std::mem::take(&mut machine.ext.get_mut::<State>().pending);
     let mut env = Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,

@@ -572,7 +572,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         .now_us(e.sys.clock.now_us());
     if e.ext.get::<Sound>().trace.is_some() {
         let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
-        let ctx = e.sys.current;
+        let ctx = e.context;
         let caller = e.caller();
         let files: Vec<_> = if matches!(name, "Play" | "Stop" | "SetCurrentPosition" | "Release") {
             e.sys
@@ -1435,6 +1435,7 @@ mod tests {
             m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
         }
         result(&mut Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,
@@ -1473,6 +1474,7 @@ mod tests {
             m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
         }
         handler(&mut Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,

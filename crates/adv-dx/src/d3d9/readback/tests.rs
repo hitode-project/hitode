@@ -20,6 +20,7 @@ fn fixture(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
 }
 fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,

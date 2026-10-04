@@ -141,6 +141,8 @@ impl RecentCalls {
 
 /// What a handler sees.
 pub struct Env<'a> {
+    /// Guest identity of this call; independent of the controller's diagnostic current slot.
+    pub context: CtxId,
     pub cpu: &'a mut dyn Guest,
     pub sys: &'a mut Sys,
     pub ext: &'a mut Ext,
@@ -163,7 +165,7 @@ impl Env<'_> {
     }
 
     pub fn ctx(&self) -> &Context {
-        &self.sys.contexts[self.sys.current as usize]
+        &self.sys.contexts[self.context as usize]
     }
 }
 
@@ -562,6 +564,13 @@ impl Sys {
 
     /// Some context is ready, and every ready one is only yielding (a polling loop).
     fn only_polling(&self) -> bool {
+        if self
+            .contexts
+            .iter()
+            .any(|c| matches!(c.state, State::Running { .. }))
+        {
+            return false;
+        }
         let mut ready = self
             .contexts
             .iter()
@@ -663,6 +672,7 @@ fn apply(
         }
         let thunk = origin.thunk;
         out = then(&mut Env {
+            context: sys.current,
             cpu: &mut *cpu,
             sys: &mut *sys,
             ext: &mut *ext,
@@ -860,6 +870,7 @@ impl Dispatch<'_> {
         };
         let out = handler(
             &mut Env {
+                context: self.sys.current,
                 cpu: &mut *cpu,
                 sys: &mut *self.sys,
                 ext: &mut *self.ext,
@@ -917,6 +928,7 @@ impl Dispatch<'_> {
         }
         let t0 = self.sys.stats.start();
         let out = (f.handler)(&mut Env {
+            context: self.sys.current,
             cpu: &mut *cpu,
             sys: &mut *self.sys,
             ext: &mut *self.ext,
@@ -953,6 +965,7 @@ impl Dispatch<'_> {
         let t0 = self.sys.stats.start();
         let out = then(
             &mut Env {
+                context: self.sys.current,
                 cpu: &mut *cpu,
                 sys: &mut *self.sys,
                 ext: &mut *self.ext,
@@ -1056,6 +1069,7 @@ impl std::fmt::Display for MachineError {
 }
 
 pub struct Machine<B: Backend> {
+    leases: std::collections::BTreeMap<u64, CtxId>,
     pub cpu: B,
     pub sys: Sys,
     pub ext: Ext,
@@ -1146,6 +1160,7 @@ impl<B: Backend> Machine<B> {
             rr_last: None,
         };
         Ok(Self {
+            leases: std::collections::BTreeMap::new(),
             cpu,
             sys,
             ext: Ext::default(),
@@ -1181,6 +1196,9 @@ impl<B: Backend> Machine<B> {
     }
 
     fn skip_idle_time(&mut self) -> bool {
+        if !self.leases.is_empty() {
+            return false;
+        }
         let Some(source) = &self.time_skip_source else {
             return false;
         };
@@ -1417,10 +1435,15 @@ impl<B: Backend> Machine<B> {
         }
         self.slice_elapsed = Duration::ZERO;
         // Without a Machine policy, preserve the original per-backend-run default.
-        match self.run_scheduler(None, Instant::now(), self.execution_budget.flatten()) {
+        let result = match self.run_scheduler(None, Instant::now(), self.execution_budget.flatten())
+        {
             SliceResult::Complete(result) => result,
             SliceResult::Yielded => unreachable!("an unsliced run cannot soft-yield"),
+        };
+        if let Err(error) = self.collect_at_boundary() {
+            return self.fail(error);
         }
+        result
     }
 
     /// Return to the host after approximately `slice` of active wall time, preserving
@@ -1436,7 +1459,17 @@ impl<B: Backend> Machine<B> {
             .get_or_insert_with(|| self.cpu.execution_budget());
         let hard_budget = self.execution_budget.unwrap_or(previous);
         let started = Instant::now();
-        let result = self.run_scheduler(Some(slice), started, hard_budget);
+        let mut result = self.run_scheduler(Some(slice), started, hard_budget);
+        let had_leases = !self.leases.is_empty();
+        if let Err(error) = self.collect_at_boundary() {
+            return SliceResult::Complete(self.fail(error));
+        }
+        if had_leases
+            && matches!(result, SliceResult::Complete(RunResult::Idle { .. }))
+            && self.sys.contexts.iter().any(Context::is_ready)
+        {
+            result = SliceResult::Yielded;
+        }
         match result {
             SliceResult::Yielded => {
                 self.slice_elapsed = self.slice_elapsed.saturating_add(started.elapsed())
@@ -1450,6 +1483,77 @@ impl<B: Backend> Machine<B> {
         result
     }
 
+    fn collect_parallel(&mut self) -> Result<(), String> {
+        while let Some((token, state)) = self.cpu.poll_parallel() {
+            let id = self
+                .leases
+                .remove(&token)
+                .ok_or("CPU returned an unknown execution lease")?;
+            let context = &mut self.sys.contexts[id as usize];
+            if context.is_done() {
+                continue;
+            }
+            if !matches!(context.state, State::Running { token: expected } if expected == token) {
+                return Err("CPU completion crossed its context generation".into());
+            }
+            self.regs.resize_with(self.sys.contexts.len(), || None);
+            self.regs[id as usize] = Some(state);
+            self.sys.contexts[id as usize].state = State::Ready { resume: None };
+        }
+        Ok(())
+    }
+
+    fn collect_at_boundary(&mut self) -> Result<(), String> {
+        if self.leases.is_empty() {
+            return Ok(());
+        }
+        self.cpu.quiesce_memory();
+        while !self.leases.is_empty() {
+            self.collect_parallel()?;
+            if !self.leases.is_empty() {
+                self.cpu.wait_parallel(Duration::from_millis(10))?;
+            }
+        }
+        if self.loaded.is_none()
+            && self
+                .sys
+                .contexts
+                .get(self.sys.current as usize)
+                .is_some_and(Context::is_ready)
+        {
+            self.switch_to(self.sys.current)
+                .map_err(|e| format!("restore completed CPU context: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn wait_parallel(
+        &mut self,
+        started: Instant,
+        slice: Option<Duration>,
+        hard: Option<Duration>,
+    ) -> Result<(), String> {
+        if self.leases.is_empty() {
+            return Err("full execution pool without a guest lease".into());
+        }
+        let elapsed = started.elapsed();
+        let mut wait = slice.map_or(Duration::from_millis(1), |limit| {
+            limit.saturating_sub(elapsed)
+        });
+        if let Some(hard) = hard {
+            wait = wait.min(hard.saturating_sub(self.slice_elapsed.saturating_add(elapsed)));
+        }
+        if let Some(at) = self.sys.next_deadline() {
+            wait = wait.min(Duration::from_micros(
+                at.saturating_sub(self.sys.clock.now_us()),
+            ));
+        }
+        if !wait.is_zero() {
+            self.cpu.wait_parallel(wait)?;
+        }
+        Ok(())
+    }
+
     fn run_scheduler(
         &mut self,
         slice: Option<Duration>,
@@ -1457,6 +1561,11 @@ impl<B: Backend> Machine<B> {
         hard_budget: Option<Duration>,
     ) -> SliceResult {
         self.sys.clock.begin_work();
+        if self.cpu.guest_workers() > 1 && self.sys.clock.is_virtual() {
+            return SliceResult::Complete(
+                self.fail("parallel execution requires the real-time guest clock".into()),
+            );
+        }
         // Only a sliced host driver can service external channels on a soft
         // return. The synchronous run() API retains its run-until-blocked contract.
         self.cpu.set_host_interrupts(slice.is_some());
@@ -1472,6 +1581,9 @@ impl<B: Backend> Machine<B> {
         let mut ran = vec![false; self.sys.contexts.len()];
         let mut polled = vec![false; self.sys.contexts.len()];
         loop {
+            if let Err(error) = self.collect_parallel() {
+                return SliceResult::Complete(self.fail(error));
+            }
             if let Some(budget) = hard_budget {
                 let remaining =
                     budget.saturating_sub(self.slice_elapsed.saturating_add(started.elapsed()));
@@ -1488,6 +1600,12 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Yielded;
             }
             self.sys.wake();
+            if !self.cpu.parallel_capacity_available() {
+                if let Err(error) = self.wait_parallel(started, slice, hard_budget) {
+                    return SliceResult::Complete(self.fail(error));
+                }
+                continue;
+            }
             self.sys.advance_if_only_polling(&mut polled);
             // Real time: polling contexts would spin the host. Hand control back so the host
             // can wait (at most 1 ms) like the OS would schedule them.
@@ -1514,6 +1632,12 @@ impl<B: Backend> Machine<B> {
                 latency_mode,
             );
             let Some(selection) = selection else {
+                if !self.leases.is_empty() {
+                    if let Err(error) = self.wait_parallel(started, slice, hard_budget) {
+                        return SliceResult::Complete(self.fail(error));
+                    }
+                    continue;
+                }
                 if self.skip_idle_time() {
                     continue;
                 }
@@ -1553,6 +1677,7 @@ impl<B: Backend> Machine<B> {
                         let thunk = origin.thunk;
                         let out = then(
                             &mut Env {
+                                context: self.sys.current,
                                 cpu: &mut self.cpu,
                                 sys: &mut self.sys,
                                 ext: &mut self.ext,
@@ -1565,6 +1690,7 @@ impl<B: Backend> Machine<B> {
                     ReadyResume::Deferred { then, origin } => {
                         let thunk = origin.thunk;
                         let out = then(&mut Env {
+                            context: self.sys.current,
                             cpu: &mut self.cpu,
                             sys: &mut self.sys,
                             ext: &mut self.ext,
@@ -1662,6 +1788,14 @@ impl<B: Backend> Machine<B> {
             }
 
             let run_started = Instant::now();
+            // A polling/yielded peer has no useful work to overlap yet. Its
+            // message/signal wake clears yielded before it can demand a worker.
+            self.cpu.set_parallel_demand(
+                self.sys
+                    .contexts
+                    .iter()
+                    .any(|c| c.id != id && c.is_ready() && !c.yielded),
+            );
             let t0 = self.sys.stats.start();
             let frame_before = self.sys.completed_frames;
             let mut d = Dispatch {
@@ -1686,6 +1820,16 @@ impl<B: Backend> Machine<B> {
             self.sys.stats.total.cpu_runs += 1;
             self.note_frame();
             match exit {
+                Exit::Dispatched { token } => {
+                    if self.leases.insert(token, id).is_some() {
+                        return SliceResult::Complete(
+                            self.fail("duplicate CPU execution lease".into()),
+                        );
+                    }
+                    self.sys.contexts[id as usize].state = State::Running { token };
+                    self.sys.contexts[id as usize].yielded = false;
+                    self.loaded = None;
+                }
                 Exit::Interrupted { pc } => {
                     self.sys.trace.flush();
                     if let Some(hard) = hard_budget

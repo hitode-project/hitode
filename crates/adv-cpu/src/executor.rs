@@ -7,7 +7,10 @@ use crate::compile::{self, Compiled};
 use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
+mod code_store;
+mod parallel;
 mod warm;
+use code_store::CodeStore;
 
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
@@ -65,29 +68,47 @@ pub struct ProfileSample {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunOutcome {
+    /// The controller found a compiled entry; a native worker must execute it.
+    NativeReady,
     ReachedStop,
     Budget,
     Interrupted,
-    ReadFault { pc: u32, address: u32 },
-    WriteFault { pc: u32, address: u32 },
-    FetchFault { pc: u32, address: u32 },
-    InvalidInstruction { pc: u32 },
-    UnsupportedInstruction { pc: u32, code: iced_x86::Code },
-    Trap { pc: u32, vector: u8 },
+    ReadFault {
+        pc: u32,
+        address: u32,
+    },
+    WriteFault {
+        pc: u32,
+        address: u32,
+    },
+    FetchFault {
+        pc: u32,
+        address: u32,
+    },
+    InvalidInstruction {
+        pc: u32,
+    },
+    UnsupportedInstruction {
+        pc: u32,
+        code: iced_x86::Code,
+    },
+    Trap {
+        pc: u32,
+        vector: u8,
+    },
     Parked,
 }
 
 /// Owns the guest CPU, decoded instructions and native cache. Both executors
 /// access the same state and address space; only this owner publishes links.
 pub struct Executor {
+    parallel: Option<crate::parallel::Pool>,
+    parallel_image: Option<(u64, Arc<crate::parallel::Image>)>,
+    parallel_stop: Option<crate::parallel::Stop>,
+    offload: bool,
+    pub(crate) parallel_demand: bool,
+    code: CodeStore,
     pub(crate) memory: Memory,
-    compiled: BTreeMap<u32, Compiled>,
-    regions: BTreeMap<u32, Region>,
-    page_regions: BTreeMap<u32, BTreeSet<u32>>,
-    region_pages: BTreeMap<u32, BTreeSet<u32>>,
-    entry_owner: BTreeMap<u32, u32>,
-    links: crate::linking::Table,
-    links_revision: u64,
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     interpreter: crate::interpreter::Interpreter,
@@ -118,7 +139,6 @@ pub struct Executor {
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
     attempted: BTreeSet<u32>,
-    cache_revision: u64,
     cache_region_limit: usize,
     cache_byte_limit: usize,
     cache_clock: u64,
@@ -141,6 +161,8 @@ pub struct Executor {
 pub struct ExecutionContext {
     cpu: CpuState,
     deferred_fallback: Option<u32>,
+    parallel_stop: Option<crate::parallel::Stop>,
+    offload: bool,
 }
 
 impl ExecutionContext {
@@ -160,12 +182,16 @@ impl Executor {
         Ok(ExecutionContext {
             cpu,
             deferred_fallback: self.deferred_fallback,
+            parallel_stop: self.parallel_stop.clone(),
+            offload: self.offload,
         })
     }
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
         self.deferred_fallback = context.deferred_fallback;
+        self.parallel_stop = context.parallel_stop.clone();
+        self.offload = context.offload;
         Ok(())
     }
 
@@ -188,6 +214,8 @@ impl Executor {
         handler: Option<&mut dyn ExecutionTrap>,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
+        let started = Instant::now();
+        let interpreted_before = self.stats.interpreter_entries;
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
             memory: &mut self.memory,
@@ -201,6 +229,16 @@ impl Executor {
             bulk_bytes: 0,
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
+        if self.parallel.is_some() {
+            if bridge.calls != 0 {
+                self.offload = false;
+            } else if self.stats.interpreter_entries == interpreted_before
+                && matches!(result, Ok(RunOutcome::Budget))
+                && started.elapsed() >= Duration::from_micros(100)
+            {
+                self.offload = true;
+            }
+        }
         // Export canonical floating state at every public CPU boundary. Context
         // saves can then borrow immutably without hiding MMX updates in RefCell.
         self.state.refresh_mmx();
@@ -221,14 +259,13 @@ impl Executor {
 
     fn create(memory: Memory) -> Result<Self, String> {
         Ok(Self {
+            parallel: None,
+            parallel_image: None,
+            parallel_stop: None,
+            offload: false,
+            parallel_demand: true,
+            code: CodeStore::default(),
             memory,
-            compiled: BTreeMap::new(),
-            regions: BTreeMap::new(),
-            page_regions: BTreeMap::new(),
-            region_pages: BTreeMap::new(),
-            entry_owner: BTreeMap::new(),
-            links: crate::linking::Table::default(),
-            links_revision: 0,
             region_linking: true,
             shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
@@ -256,7 +293,6 @@ impl Executor {
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
             attempted: BTreeSet::new(),
-            cache_revision: 1,
             cache_region_limit: 16384,
             cache_byte_limit: 128 * 1024 * 1024,
             cache_clock: 0,
@@ -324,7 +360,8 @@ impl Executor {
     /// Module/Rust heap data and unrelated guest storage are not included.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub fn native_code_storage_bytes(&self) -> Result<(usize, usize), String> {
-        self.compiled
+        self.code
+            .compiled
             .values()
             .try_fold((0, 0), |(committed, reserved), code| {
                 let (code_committed, code_reserved) = code.storage_bytes()?;
@@ -342,16 +379,17 @@ impl Executor {
 
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
-        self.links.rebuild(std::iter::empty());
-        self.cache_revision += 1;
-        self.compiled.clear();
+        self.memory.quiesce_workers();
+        self.code.links.rebuild(std::iter::empty());
+        self.code.cache_revision += 1;
+        self.code.compiled.clear();
         self.stats.native_code_bytes = 0;
         self.stats.native_regions = 0;
         self.rejected_entries.clear();
-        self.regions.clear();
-        self.page_regions.clear();
-        self.region_pages.clear();
-        self.entry_owner.clear();
+        self.code.regions.clear();
+        self.code.page_regions.clear();
+        self.code.region_pages.clear();
+        self.code.entry_owner.clear();
         self.pending_regions.clear();
         self.deferred_compilations.clear();
         self.stats.deferred_compilations = 0;
@@ -363,7 +401,7 @@ impl Executor {
         self.deferred_order.clear();
         self.attempted.clear();
         self.stats.pending_compilations = 0;
-        self.cache_revision += 1;
+        self.code.cache_revision += 1;
         self.add_region(region)
     }
 
@@ -381,7 +419,7 @@ impl Executor {
         Ok(())
     }
 
-    fn publish(&mut self, region: Region, mut compiled: Compiled) {
+    fn publish(&mut self, region: Region, compiled: Compiled) {
         if self.cache_region_limit == 0 || compiled.code_size > self.cache_byte_limit {
             self.stats.cache_rejections += 1;
             for &pc in region.entries.iter().chain(std::iter::once(&region.start)) {
@@ -391,7 +429,7 @@ impl Executor {
                 let (pc, _) = self.rejected_entries.pop_first().unwrap();
                 self.attempted.remove(&pc);
             }
-            if !self.compiled.contains_key(&region.start) {
+            if !self.code.compiled.contains_key(&region.start) {
                 self.forget_region(region.start);
             }
             return;
@@ -400,59 +438,62 @@ impl Executor {
         self.tier_attempted.remove(&region.start);
         self.compile_errors.remove(&region.start);
         self.retire_compiled(region.start);
-        while self.compiled.len() >= self.cache_region_limit
+        while self.code.compiled.len() >= self.cache_region_limit
             || self.stats.native_code_bytes > self.cache_byte_limit - compiled.code_size
         {
             self.evict_oldest();
         }
         self.cache_clock = self.cache_clock.saturating_add(1);
-        compiled.cache_stamp = self.cache_clock;
+        compiled.cache_stamp.set(self.cache_clock);
         for &pc in &compiled.entries {
-            self.entry_owner.insert(pc, region.start);
+            self.code.entry_owner.insert(pc, region.start);
             self.demand.remove(&pc);
         }
         self.stats.native_code_bytes += compiled.code_size;
-        self.compiled.insert(region.start, compiled);
-        self.stats.native_regions = self.compiled.len();
-        let pages = self.compiled[&region.start]
+        self.code.compiled.insert(region.start, compiled);
+        self.stats.native_regions = self.code.compiled.len();
+        let pages = self.code.compiled[&region.start]
             .pages
             .iter()
             .map(|&(page, _)| self.memory.base + (page * 4096) as u32)
             .collect();
         self.index_region_with_pages(region, Some(pages));
-        self.cache_revision += 1;
+        self.code.cache_revision += 1;
     }
 
     fn retire_compiled(&mut self, start: u32) {
-        if let Some(old) = self.compiled.remove(&start) {
+        if self.code.compiled.contains_key(&start) {
+            self.memory.quiesce_workers();
+        }
+        if let Some(old) = self.code.compiled.remove(&start) {
             // Only the execution owner reaches this path, after every generated
             // call has returned. Remove all published raw targets before Drop
             // unregisters unwind tables and releases executable memory.
-            self.links.rebuild(std::iter::empty());
-            self.cache_revision += 1;
+            self.code.links.rebuild(std::iter::empty());
+            self.code.cache_revision += 1;
             self.stats.native_code_bytes -= old.code_size;
             for entry in old.entries.iter() {
-                if self.entry_owner.get(entry) == Some(&start) {
-                    self.entry_owner.remove(entry);
+                if self.code.entry_owner.get(entry) == Some(&start) {
+                    self.code.entry_owner.remove(entry);
                 }
             }
-            self.stats.native_regions = self.compiled.len();
+            self.stats.native_regions = self.code.compiled.len();
         }
     }
 
     fn forget_region(&mut self, start: u32) {
-        if let Some(region) = self.regions.remove(&start) {
+        if let Some(region) = self.code.regions.remove(&start) {
             for pc in region.entries {
                 self.attempted.remove(&pc);
                 self.hits.remove(&pc);
             }
         }
-        if let Some(pages) = self.region_pages.remove(&start) {
+        if let Some(pages) = self.code.region_pages.remove(&start) {
             for page in pages {
-                if let Some(owners) = self.page_regions.get_mut(&page) {
+                if let Some(owners) = self.code.page_regions.get_mut(&page) {
                     owners.remove(&start);
                     if owners.is_empty() {
-                        self.page_regions.remove(&page);
+                        self.code.page_regions.remove(&page);
                     }
                 }
             }
@@ -470,9 +511,10 @@ impl Executor {
 
     fn evict_oldest(&mut self) {
         let owner = *self
+            .code
             .compiled
             .iter()
-            .min_by_key(|(_, compiled)| compiled.cache_stamp)
+            .min_by_key(|(_, compiled)| compiled.cache_stamp.get())
             .expect("every published native region has cache age")
             .0;
         self.retire_compiled(owner);
@@ -490,7 +532,7 @@ impl Executor {
         self.cache_byte_limit = bytes;
         self.rejected_entries.clear();
         self.attempted.clear();
-        while self.compiled.len() > regions || self.stats.native_code_bytes > bytes {
+        while self.code.compiled.len() > regions || self.stats.native_code_bytes > bytes {
             self.evict_oldest();
         }
     }
@@ -500,12 +542,12 @@ impl Executor {
     }
 
     fn index_region_with_pages(&mut self, region: Region, dependencies: Option<BTreeSet<u32>>) {
-        if let Some(old) = self.region_pages.remove(&region.start) {
+        if let Some(old) = self.code.region_pages.remove(&region.start) {
             for page in old {
-                if let Some(owners) = self.page_regions.get_mut(&page) {
+                if let Some(owners) = self.code.page_regions.get_mut(&page) {
                     owners.remove(&region.start);
                     if owners.is_empty() {
-                        self.page_regions.remove(&page);
+                        self.code.page_regions.remove(&page);
                     }
                 }
             }
@@ -524,13 +566,14 @@ impl Executor {
                 .collect()
         });
         for &page in &pages {
-            self.page_regions
+            self.code
+                .page_regions
                 .entry(page)
                 .or_default()
                 .insert(region.start);
         }
-        self.region_pages.insert(region.start, pages);
-        self.regions.insert(region.start, region);
+        self.code.region_pages.insert(region.start, pages);
+        self.code.regions.insert(region.start, region);
     }
 
     fn queue_region(&mut self, region: Region) -> Result<bool, String> {
@@ -713,7 +756,7 @@ impl Executor {
             match completion.result {
                 Ok(compiled) => {
                     if completion.region.compile_strategy == CompileStrategy::Speed
-                        && self.compiled.contains_key(&start)
+                        && self.code.compiled.contains_key(&start)
                         && self.tier_attempted.contains(&start)
                     {
                         self.stats.tier_up_publications += 1;
@@ -741,13 +784,13 @@ impl Executor {
         self.observed_epoch = self.memory.epoch;
         let mut affected = BTreeSet::new();
         for page in std::mem::take(&mut self.memory.dirty_pages) {
-            if let Some(owners) = self.page_regions.get(&page) {
+            if let Some(owners) = self.code.page_regions.get(&page) {
                 affected.extend(owners.iter().copied());
             }
         }
         let mut missing = Vec::new();
         for pc in affected {
-            if let Some(compiled) = self.compiled.get_mut(&pc) {
+            if let Some(compiled) = self.code.compiled.get_mut(&pc) {
                 self.stats.invalidation_candidates += 1;
                 if compiled.valid(&self.memory) {
                     continue;
@@ -760,14 +803,14 @@ impl Executor {
                 self.native_heat.remove(&pc);
                 self.tier_attempted.remove(&pc);
                 self.stats.invalidations += 1;
-                self.cache_revision += 1;
-                if let Some(region) = self.regions.get(&pc) {
+                self.code.cache_revision += 1;
+                if let Some(region) = self.code.regions.get(&pc) {
                     for entry in &region.entries {
                         self.attempted.remove(entry);
                     }
                 }
             }
-            if let Some(region) = self.regions.get(&pc)
+            if let Some(region) = self.code.regions.get(&pc)
                 && self.memory.executable(region.start, region.len)
             {
                 missing.push(region.clone());
@@ -814,6 +857,9 @@ impl Executor {
     /// Hints are private to one bounded native chain and never enter a saved CPU
     /// context. Default false preserves the existing checked CALL/RET path.
     pub fn set_shadow_returns(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled && self.parallel.is_some() {
+            return Err("parallel return-stack hints are not enabled in this release".into());
+        }
         if self.shadow_returns.is_some() == enabled {
             return Ok(());
         }
@@ -940,7 +986,7 @@ impl Executor {
         if !self.auto_jit || !self.async_compilation || !self.tiered_compilation || blocks == 0 {
             return;
         }
-        let Some(&owner) = self.entry_owner.get(&entry) else {
+        let Some(&owner) = self.code.entry_owner.get(&entry) else {
             return;
         };
         if !self.automatic_regions.contains(&owner)
@@ -951,11 +997,12 @@ impl Executor {
         {
             return;
         }
-        let Some(region) = self.regions.get(&owner) else {
+        let Some(region) = self.code.regions.get(&owner) else {
             return;
         };
         if region.compile_strategy != CompileStrategy::Fast
             || !self
+                .code
                 .compiled
                 .get(&owner)
                 .is_some_and(|c| c.valid(&self.memory))
@@ -977,7 +1024,7 @@ impl Executor {
             Ok(true) => {
                 // Keep Fast code AND its published metadata live while Speed is
                 // compiling. Failure must not demote hot code to interpretation.
-                self.regions.insert(owner, old_region);
+                self.code.regions.insert(owner, old_region);
                 self.tier_attempted.insert(owner);
                 self.stats.tier_up_requests += 1;
             }
@@ -993,20 +1040,25 @@ impl Executor {
     }
 
     fn refresh_links(&mut self) {
-        if self.links_revision == self.cache_revision {
+        if self.code.links_revision == self.code.cache_revision {
             return;
         }
-        self.links
-            .rebuild(self.entry_owner.iter().filter_map(|(&pc, owner)| {
-                self.compiled
+        self.code
+            .links
+            .rebuild(self.code.entry_owner.iter().filter_map(|(&pc, owner)| {
+                self.code
+                    .compiled
                     .get(owner)
                     .map(|compiled| (pc, compiled.tail_entry))
             }));
-        self.links_revision = self.cache_revision;
+        self.code.links_revision = self.code.cache_revision;
     }
     fn discover(&mut self, stop: u32) -> Result<(), String> {
         let pc = self.state.eip;
-        if !self.auto_jit || self.entry_owner.contains_key(&pc) || !self.memory.executable(pc, 1) {
+        if !self.auto_jit
+            || self.code.entry_owner.contains_key(&pc)
+            || !self.memory.executable(pc, 1)
+        {
             return Ok(());
         }
         if let Some(pages) = self.rejected_entries.get(&pc) {
@@ -1028,13 +1080,14 @@ impl Executor {
             return Ok(());
         }
         let boundaries = self
+            .code
             .entry_owner
             .keys()
             .copied()
             .chain(
                 self.pending_regions
                     .keys()
-                    .filter_map(|owner| self.regions.get(owner))
+                    .filter_map(|owner| self.code.regions.get(owner))
                     .flat_map(|region| {
                         region
                             .entries
@@ -1091,7 +1144,7 @@ impl Executor {
         bridge: &mut Bridge<'_>,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
-        if self.regions.values().any(|r| {
+        if self.code.regions.values().any(|r| {
             u64::from(stop) >= u64::from(r.start)
                 && u64::from(stop) < u64::from(r.start) + r.len as u64
         }) {
@@ -1136,20 +1189,50 @@ impl Executor {
                 self.discover(stop)?;
             }
             self.refresh_links();
-            let native = self
+            if let Some(native) = self
+                .code
                 .entry_owner
                 .get(&self.state.eip)
-                .and_then(|owner| self.compiled.get_mut(owner))
-                .filter(|c| {
-                    !interpreter_only
-                        && !single_step
-                        && !pending_fpu
-                        && c.entries.contains(&self.state.eip)
-                        && self.deferred_fallback != Some(self.state.eip)
-                });
-            if let Some(native) = native {
+                .and_then(|owner| self.code.compiled.get(owner))
+            {
                 self.cache_clock = self.cache_clock.saturating_add(1);
-                native.cache_stamp = self.cache_clock;
+                native.cache_stamp.set(self.cache_clock);
+            }
+            let native = if self.parallel.is_some()
+                && self.parallel_demand
+                && self.offload
+                && self.has_parallel_capacity()
+            {
+                let ready = self
+                    .code
+                    .entry_owner
+                    .get(&self.state.eip)
+                    .and_then(|owner| self.code.compiled.get(owner))
+                    .is_some_and(|c| {
+                        !interpreter_only
+                            && !single_step
+                            && !pending_fpu
+                            && c.entries.contains(&self.state.eip)
+                            && self.deferred_fallback != Some(self.state.eip)
+                    });
+                if ready {
+                    return Ok(RunOutcome::NativeReady);
+                }
+                None
+            } else {
+                self.code
+                    .entry_owner
+                    .get(&self.state.eip)
+                    .and_then(|owner| self.code.compiled.get(owner))
+                    .filter(|c| {
+                        !interpreter_only
+                            && !single_step
+                            && !pending_fpu
+                            && c.entries.contains(&self.state.eip)
+                            && self.deferred_fallback != Some(self.state.eip)
+                    })
+            };
+            if let Some(native) = native {
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
                 // while a wall deadline is active, without charging extra work.
@@ -1168,7 +1251,7 @@ impl Executor {
                     &mut self.memory,
                     bridge,
                     compile::NativeRun {
-                        links: (self.region_linking && !self.profiling).then_some(&self.links),
+                        links: (self.region_linking && !self.profiling).then_some(&self.code.links),
                         stop,
                         interrupt: if self.host_interrupts {
                             self.interrupt.as_ref()
@@ -1244,6 +1327,9 @@ impl Executor {
                 }
             }
             use crate::interpreter::Step;
+            // LOCK/implicit atomic operations and cold helpers share one
+            // exclusive fallback lane. No other native guest runs during it.
+            self.memory.quiesce_workers();
             let pc = self.state.eip;
             let timer = self.profiling.then(Instant::now);
             // Contiguous integer and floating fallback instructions share a bounded
@@ -1264,13 +1350,13 @@ impl Executor {
                     (!interpreter_only
                         && !single_step
                         && !pending_fpu
-                        && !self.entry_owner.is_empty())
-                    .then_some((&self.entry_owner, self.cache_revision)),
+                        && !self.code.entry_owner.is_empty())
+                    .then_some((&self.code.entry_owner, self.code.cache_revision)),
                 )
             };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
-            if !self.deferred_compilations.is_empty() && !self.entry_owner.contains_key(&pc) {
+            if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {
                 if self.demand.len() >= 65_536 {
                     self.demand.clear();
                 }
@@ -1419,7 +1505,7 @@ mod responsive_compile_tests {
         let region = region(&mut m, &bytes);
         assert!(m.queue_region(region.clone()).unwrap());
         drain(&mut m);
-        assert!(m.compiled.len() > 1);
+        assert!(m.code.compiled.len() > 1);
         assert!(m.stats.max_compile_work <= crate::RESPONSIVE_COMPILE_WORK);
         seed(&mut m, 2);
         loop {
@@ -1469,16 +1555,16 @@ mod responsive_compile_tests {
         m.write(CODE, &[0xb8, 42, 0, 0, 0, 0x90]).unwrap();
         drain(&mut m);
         assert!(
-            m.compiled.is_empty(),
+            m.code.compiled.is_empty(),
             "old deferred/active inputs must never publish"
         );
         assert!(m.stats.stale_compilations > 0);
         assert!(m.queue_region(original.clone()).unwrap());
         drain(&mut m);
-        let old = m.compiled[&CODE].tail_entry;
+        let old = m.code.compiled[&CODE].tail_entry;
         original.compile_strategy = CompileStrategy::Speed;
         assert!(!m.queue_region(original).unwrap());
-        assert_eq!(m.compiled[&CODE].tail_entry, old);
+        assert_eq!(m.code.compiled[&CODE].tail_entry, old);
         assert!(m.tier_attempted.contains(&CODE));
         assert_eq!(m.stats.compile_work_rejections, 1);
     }
@@ -1570,7 +1656,7 @@ mod responsive_compile_tests {
                     drain(&mut m);
                     cold.push(begun.elapsed().as_secs_f64() * 1000.0);
                     compilation.push(m.stats.compile_time.as_secs_f64() * 1000.0);
-                    sizes = (m.compiled.len(), m.stats.native_code_bytes);
+                    sizes = (m.code.compiled.len(), m.stats.native_code_bytes);
                     let before_linked = m.stats.linked_entries;
                     for _ in 0..7 {
                         seed(&mut m, 20_000);
@@ -1671,8 +1757,8 @@ mod asynchronous_tests {
         m.write(0x1001, &42u32.to_le_bytes()).unwrap();
         collect_one(&mut m);
         assert_eq!(m.stats.stale_compilations, 1);
-        assert!(m.compiled.is_empty());
-        assert!(m.entry_owner.is_empty());
+        assert!(m.code.compiled.is_empty());
+        assert!(m.code.entry_owner.is_empty());
         assert_eq!(m.stats.pending_compilations, 0);
         assert!(m.queue_region(Region::new(0x1000, 6)).unwrap());
         collect_one(&mut m);
@@ -1868,9 +1954,12 @@ mod topology_tests {
             a.ret().unwrap();
         });
         discover(&mut m, 0x1000);
-        assert_eq!(m.compiled.len(), 1);
-        assert!(m.entry_owner.contains_key(&0x4000));
-        assert_eq!(m.region_pages[&0x1000], BTreeSet::from([0x1000, 0x4000]));
+        assert_eq!(m.code.compiled.len(), 1);
+        assert!(m.code.entry_owner.contains_key(&0x4000));
+        assert_eq!(
+            m.code.region_pages[&0x1000],
+            BTreeSet::from([0x1000, 0x4000])
+        );
         m.refresh().unwrap();
         let checks = m.stats.invalidation_candidates;
         m.write(0x2000, &[42]).unwrap();
@@ -1890,14 +1979,14 @@ mod topology_tests {
         // The immediate is also valid overlapping x86: INC EAX; RET.
         m.write(0x1000, &[0xb8, 0x40, 0xc3, 0, 0, 0xc3]).unwrap();
         discover(&mut m, 0x1000);
-        let entry = m.compiled[&0x1000].tail_entry;
-        let size = m.compiled[&0x1000].code_size;
+        let entry = m.code.compiled[&0x1000].tail_entry;
+        let size = m.code.compiled[&0x1000].code_size;
         discover(&mut m, 0x1001);
-        assert_eq!(m.compiled.len(), 2);
-        assert_eq!(m.compiled[&0x1000].tail_entry, entry);
-        assert_eq!(m.compiled[&0x1000].code_size, size);
-        assert_eq!(m.entry_owner[&0x1000], 0x1000);
-        assert_eq!(m.entry_owner[&0x1001], 0x1001);
+        assert_eq!(m.code.compiled.len(), 2);
+        assert_eq!(m.code.compiled[&0x1000].tail_entry, entry);
+        assert_eq!(m.code.compiled[&0x1000].code_size, size);
+        assert_eq!(m.code.entry_owner[&0x1000], 0x1000);
+        assert_eq!(m.code.entry_owner[&0x1001], 0x1001);
         m.state.regs[0] = 7;
         assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 8);
@@ -1907,7 +1996,7 @@ mod topology_tests {
         assert_eq!(m.stats.compilations, 4);
         assert_eq!(
             m.stats.native_code_bytes,
-            m.compiled.values().map(|c| c.code_size).sum::<usize>()
+            m.code.compiled.values().map(|c| c.code_size).sum::<usize>()
         );
     }
 
@@ -1919,14 +2008,14 @@ mod topology_tests {
             a.ret().unwrap();
         });
         discover(&mut m, 0x1300);
-        let old_entry = m.compiled[&0x1300].tail_entry;
+        let old_entry = m.code.compiled[&0x1300].tail_entry;
         write(&mut m, 0x1100, |a| {
             a.inc(eax).unwrap();
             a.jmp(0x1300u64).unwrap();
         });
         discover(&mut m, 0x1100);
-        assert_eq!(m.regions[&0x1100].frontier, [0x1300]);
-        assert_eq!(m.compiled[&0x1300].tail_entry, old_entry);
+        assert_eq!(m.code.regions[&0x1100].frontier, [0x1300]);
+        assert_eq!(m.code.compiled[&0x1300].tail_entry, old_entry);
         assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 4);
         assert_eq!(m.stats.linked_entries, 1);
@@ -1949,13 +2038,13 @@ mod topology_tests {
             a.ret().unwrap();
         });
         discover(&mut m, 0x1000);
-        assert!(!m.entry_owner.contains_key(&0x1100));
-        assert!(m.regions[&0x1000].frontier.contains(&0x1100));
+        assert!(!m.code.entry_owner.contains_key(&0x1100));
+        assert!(m.code.regions[&0x1000].frontier.contains(&0x1100));
         discover(&mut m, 0x1100);
         m.state.eip = 0x1000;
         assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 5);
-        assert_eq!(m.compiled.len(), 2);
+        assert_eq!(m.code.compiled.len(), 2);
         assert_eq!(m.stats.interpreter_instructions, 0);
     }
 
@@ -1971,8 +2060,8 @@ mod topology_tests {
             a.ret().unwrap();
         });
         discover(&mut m, 0x1000);
-        assert!(m.regions[&0x1000].len < 512);
-        assert!(m.regions[&0x1000].frontier.contains(&0x6000));
+        assert!(m.code.regions[&0x1000].len < 512);
+        assert!(m.code.regions[&0x1000].frontier.contains(&0x6000));
         discover(&mut m, 0x6000);
         m.state.eip = 0x1000;
         assert_eq!(m.run(0x8000, 100).unwrap(), RunOutcome::ReachedStop);
@@ -1980,8 +2069,8 @@ mod topology_tests {
         m.write(0x2000, &[0x40; 300]).unwrap();
         m.write(0x212c, &[0xc3]).unwrap();
         discover(&mut m, 0x2000);
-        assert_eq!(m.regions[&0x2000].len, 256);
-        assert!(m.regions[&0x2000].frontier.contains(&0x2100));
+        assert_eq!(m.code.regions[&0x2000].len, 256);
+        assert!(m.code.regions[&0x2000].frontier.contains(&0x2100));
         discover(&mut m, 0x2100);
         m.state.eip = 0x2000;
         m.state.regs[4] = 0x9f00;
@@ -1995,7 +2084,7 @@ mod topology_tests {
         m.write(0x1ffe, &[0xb8, 7, 0, 0, 0, 0xc3]).unwrap();
         m.protect(0x2000, 4096, crate::READ).unwrap();
         discover(&mut m, 0x1ffe);
-        assert!(m.region_pages[&0x1ffe].contains(&0x2000));
+        assert!(m.code.region_pages[&0x1ffe].contains(&0x2000));
         assert_eq!(
             m.run(0x8000, 10).unwrap(),
             RunOutcome::FetchFault {
@@ -2021,22 +2110,22 @@ mod topology_tests {
         discover(&mut m, 0x1200);
         m.state.eip = 0x1000;
         assert_eq!(m.run(0x8000, 10).unwrap(), RunOutcome::ReachedStop);
-        let recent = m.compiled[&0x1000].tail_entry;
-        let revision = m.cache_revision;
+        let recent = m.code.compiled[&0x1000].tail_entry;
+        let revision = m.code.cache_revision;
         discover(&mut m, 0x1400);
-        assert_eq!(m.compiled.len(), 2);
+        assert_eq!(m.code.compiled.len(), 2);
         assert_eq!(m.stats.native_regions, 2);
         assert_eq!(m.stats.cache_evictions, 1);
-        assert_eq!(m.compiled[&0x1000].tail_entry, recent);
-        assert!(!m.entry_owner.contains_key(&0x1200));
-        assert!(!m.region_pages.contains_key(&0x1200));
-        assert!(!m.regions.contains_key(&0x1200));
-        assert!(m.cache_revision > revision);
-        assert_ne!(m.links_revision, m.cache_revision);
+        assert_eq!(m.code.compiled[&0x1000].tail_entry, recent);
+        assert!(!m.code.entry_owner.contains_key(&0x1200));
+        assert!(!m.code.region_pages.contains_key(&0x1200));
+        assert!(!m.code.regions.contains_key(&0x1200));
+        assert!(m.code.cache_revision > revision);
+        assert_ne!(m.code.links_revision, m.code.cache_revision);
         m.set_code_cache_limits(0, 0);
-        assert!(m.compiled.is_empty());
-        assert!(m.entry_owner.is_empty());
-        assert!(m.page_regions.is_empty());
+        assert!(m.code.compiled.is_empty());
+        assert!(m.code.entry_owner.is_empty());
+        assert!(m.code.page_regions.is_empty());
         assert_eq!(m.stats.native_code_bytes, 0);
         m.state.eip = 0x1200;
         m.state.regs[4] = 0x9f00;
@@ -2071,7 +2160,7 @@ mod topology_tests {
         assert_eq!(m.stats.compilations, compilations + 1);
         m.set_code_cache_limits(8, 1 << 20);
         discover(&mut m, 0x1000);
-        assert!(m.entry_owner.contains_key(&0x1000));
+        assert!(m.code.entry_owner.contains_key(&0x1000));
         assert_eq!(m.stats.cache_rejections, 2);
     }
 
@@ -2093,8 +2182,8 @@ mod topology_tests {
         }
         assert_eq!(m.stats.cache_rejections, 1);
         assert_eq!(m.stats.native_regions, 0);
-        assert!(m.regions.is_empty());
-        assert!(m.page_regions.is_empty());
+        assert!(m.code.regions.is_empty());
+        assert!(m.code.page_regions.is_empty());
         let requests = m.stats.compile_requests;
         for _ in 0..64 {
             m.discover(0x8000).unwrap();
@@ -2112,12 +2201,12 @@ mod topology_tests {
         m.write(0x1300, &[0xc3]).unwrap();
         discover(&mut m, 0x1000);
         m.refresh().unwrap();
-        let entry = m.compiled[&0x1000].tail_entry;
+        let entry = m.code.compiled[&0x1000].tail_entry;
         m.write(0x1200, &[0xcc]).unwrap();
         m.refresh().unwrap();
         assert_eq!(m.stats.code_revalidations, 1);
         assert_eq!(m.stats.invalidations, 0);
-        assert_eq!(m.compiled[&0x1000].tail_entry, entry);
+        assert_eq!(m.code.compiled[&0x1000].tail_entry, entry);
     }
 }
 
@@ -2281,17 +2370,23 @@ mod tiering_tests {
     #[test]
     fn speed_compilation_keeps_fast_code_live_and_publishes_once() {
         let mut m = hot_machine();
-        let entry = m.compiled[&0x1000].tail_entry;
+        let entry = m.code.compiled[&0x1000].tail_entry;
         m.record_native_work(0x1000, 16_383);
         assert_eq!(m.stats.tier_up_requests, 0);
         m.record_native_work(0x1000, 1);
         assert_eq!(m.stats.tier_up_requests, 1);
-        assert_eq!(m.compiled[&0x1000].tail_entry, entry);
-        assert_eq!(m.regions[&0x1000].compile_strategy, CompileStrategy::Fast);
+        assert_eq!(m.code.compiled[&0x1000].tail_entry, entry);
+        assert_eq!(
+            m.code.regions[&0x1000].compile_strategy,
+            CompileStrategy::Fast
+        );
         m.record_native_work(0x1000, 100_000);
         assert_eq!(m.stats.tier_up_requests, 1);
         collect(&mut m);
-        assert_eq!(m.regions[&0x1000].compile_strategy, CompileStrategy::Speed);
+        assert_eq!(
+            m.code.regions[&0x1000].compile_strategy,
+            CompileStrategy::Speed
+        );
         assert_eq!(m.stats.tier_up_publications, 1);
         assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 1);
@@ -2403,6 +2498,7 @@ mod native_deadline_tests {
         let checks = m.stats.invalidation_candidates;
         let compilations = m.stats.compilations;
         let entries: Vec<_> = m
+            .code
             .compiled
             .iter()
             .map(|(&pc, c)| (pc, c.tail_entry))
@@ -2424,12 +2520,12 @@ mod native_deadline_tests {
         assert_eq!(m.stats.invalidations, 1);
         assert_eq!(m.stats.compilations, compilations + 1);
         for (pc, entry) in entries.into_iter().filter(|(pc, _)| *pc != 0x1000) {
-            assert_eq!(m.compiled[&pc].tail_entry, entry);
+            assert_eq!(m.code.compiled[&pc].tail_entry, entry);
         }
         assert!(m.memory.dirty_pages.is_empty());
         assert_eq!(
             m.stats.native_code_bytes,
-            m.compiled.values().map(|c| c.code_size).sum::<usize>()
+            m.code.compiled.values().map(|c| c.code_size).sum::<usize>()
         );
     }
 
@@ -2454,13 +2550,13 @@ mod native_deadline_tests {
         assert!(m.stats.compilations > after_protect);
         m.unmap(0x1000, 4096).unwrap();
         m.refresh().unwrap();
-        assert!(!m.compiled.contains_key(&0x1ffe));
+        assert!(!m.code.compiled.contains_key(&0x1ffe));
         m.map(0x1000, 4096, crate::READ | crate::WRITE | crate::EXEC)
             .unwrap();
         m.write(0x1ffe, &[0xb8, 9]).unwrap();
         m.refresh().unwrap();
-        assert!(m.compiled.contains_key(&0x1ffe));
-        assert!(m.page_regions[&0x2000].contains(&0x1ffe));
+        assert!(m.code.compiled.contains_key(&0x1ffe));
+        assert!(m.code.page_regions[&0x2000].contains(&0x1ffe));
     }
 
     // This source is copied unchanged into baseline and candidate for the probe.

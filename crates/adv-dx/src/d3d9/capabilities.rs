@@ -332,6 +332,7 @@ mod tests {
     fn unavailable_backend_and_invalid_outputs_do_not_report_a_working_renderer() {
         let mut m = super::super::tests::machine();
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,
@@ -364,6 +365,7 @@ mod tests {
         let gpu = pollster::block_on(Gpu::request(true)).expect("capability GPU fixture adapter");
         set_gpu(&mut m.ext, gpu).unwrap();
         let mut env = Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,

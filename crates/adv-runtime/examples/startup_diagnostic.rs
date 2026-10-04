@@ -95,7 +95,7 @@ fn save_fault(
     let branch = env.cpu.last_indirect_branch();
     let mut report = format!(
         "context={} event={event:#x?}\narchitecture={state:#x?}\nlast_indirect={branch:#x?}\n",
-        env.sys.current
+        env.context
     );
     let mut pages = BTreeSet::from([
         state.eip & !4095,

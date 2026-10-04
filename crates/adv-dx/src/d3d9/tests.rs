@@ -111,6 +111,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
 fn native_sdk_31_and_32_create_real_factories_with_one_initial_reference() {
     let mut machine = machine();
     let mut env = Env {
+        context: machine.sys.current,
         cpu: &mut machine.cpu,
         sys: &mut machine.sys,
         ext: &mut machine.ext,
@@ -147,6 +148,7 @@ fn native_sdk_31_and_32_create_real_factories_with_one_initial_reference() {
 fn query_of_bound_zero_reference_resource_retains_parent_once_and_failed_query_rolls_back() {
     let mut m = machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -187,6 +189,7 @@ fn query_of_bound_zero_reference_resource_retains_parent_once_and_failed_query_r
 fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts() {
     let mut m = machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -234,6 +237,7 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
             .then(|| Outcome::block_then_return(Wait::Until(env.sys.clock.now_us() + 2_000), 0))
     };
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -274,6 +278,7 @@ fn get_direct3d_preserves_factory_identity_after_original_release_and_outlives_d
     });
     m.ext.get_mut::<State>().com = Com::new(&mut m.sys.objects).unwrap();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -316,6 +321,7 @@ fn get_direct3d_preserves_factory_identity_after_original_release_and_outlives_d
 fn get_direct3d_output_fault_and_reference_limit_do_not_retain_or_partially_publish() {
     let mut m = machine();
     let mut env = Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,

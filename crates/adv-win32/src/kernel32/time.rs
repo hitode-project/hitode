@@ -568,6 +568,7 @@ mod tests {
             .unwrap();
         machine.sys.current = context;
         let mut env = Env {
+            context: machine.sys.current,
             cpu: &mut machine.cpu,
             sys: &mut machine.sys,
             ext: &mut machine.ext,
@@ -614,7 +615,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let fault = file_time_to_dos_date_time(&mut env, input, date, GuestPtr::new(0x401000)).unwrap_err();
+        let fault =
+            file_time_to_dos_date_time(&mut env, input, date, GuestPtr::new(0x401000)).unwrap_err();
         assert_eq!(fault.addr, 0x401000);
         assert_eq!(date.read(env.cpu).unwrap(), 0xcafe);
         assert_eq!(

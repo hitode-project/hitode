@@ -99,7 +99,7 @@ fn opt_out_keeps_slice_only_policy() {
 fn real_pollers_all_get_a_turn_before_each_host_idle() {
     let mut registry = Registry::default();
     registry.add("test", "yield", Conv::Stdcall { argc: 0 }, |e| {
-        e.ext.get_mut::<[u32; 3]>()[e.sys.current as usize] += 1;
+        e.ext.get_mut::<[u32; 3]>()[e.context as usize] += 1;
         Outcome::block_then_return(Wait::Yield, 0)
     });
     let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), registry, Clock::real()).unwrap();

@@ -30,6 +30,7 @@ fn invoke(m: &mut Machine<JitCpu>, data: u32, api: adv_abi::Api, args: &[u32]) -
         m.cpu.write_u32(data + 4 * (i as u32 + 1), arg).unwrap();
     }
     match (api.handler)(&mut Env {
+        context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
@@ -116,6 +117,7 @@ fn dib_growth_uses_shared_vm_and_releases_pixels_with_standard_gdi_lifetime() {
     );
     assert_eq!(
         crate::util::last_error(&Env {
+            context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,
