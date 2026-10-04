@@ -1,9 +1,9 @@
 //! In-place USER32 case conversion, with ACP and DBCS character boundaries.
 use adv_abi::{AnsiStr, Registry, win32};
-use adv_cpu::backend::{GuestExt, Prot};
+use adv_cpu::backend::{GuestExt, MemFault, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::Codec;
-use adv_os::nls::unit_case;
+use adv_os::nls::{CP_ACP, CP_OEMCP, unit_case};
 
 use crate::{Win32, stdcall};
 
@@ -45,6 +45,31 @@ fn packed_case(character: u32, codec: Codec, upper: bool) -> u32 {
     let mut byte = [character as u8];
     ansi_case(&mut byte, codec, upper);
     (character & !0xff) | u32::from(byte[0])
+}
+
+#[win32(user32, name = "OemToCharA", level = implement)]
+fn oem_to_char(env: &mut Env<'_>, source: AnsiStr, destination: AnsiStr) -> Result<i32, MemFault> {
+    // Read before writing: the ANSI API explicitly permits identical pointers.
+    let input = source.read(env.cpu, 16 * 1024 * 1024)?;
+    let codec = env.ext.get::<Win32>().codec;
+    let mut output = if codec.resolve(CP_OEMCP) == codec.resolve(CP_ACP) {
+        // Windows copies bytes when the two pages coincide, including an
+        // isolated DBCS lead byte. A Unicode round trip would corrupt those.
+        input
+    } else {
+        codec
+            .from_utf16(CP_ACP, &codec.to_utf16(CP_OEMCP, &input))
+            .0
+    };
+    output.push(0);
+    adv_abi::guest::check_range(
+        env.cpu,
+        destination.0.addr(),
+        output.len() as u32,
+        Prot::WRITE,
+    )?;
+    env.cpu.write(destination.0.addr(), &output)?;
+    Ok(1)
 }
 
 #[win32(user32, name = "CharUpperA", level = implement)]
@@ -127,6 +152,7 @@ fn convert(env: &mut Env<'_>, wide: bool, upper: bool) -> Outcome {
 pub(super) fn register(reg: &mut Registry) {
     reg.register(char_upper_ABI);
     reg.register(char_lower_ABI);
+    reg.register(oem_to_char_ABI);
     for (name, handler) in [
         (
             "CharUpperBuffA",
