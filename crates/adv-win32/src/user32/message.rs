@@ -1,10 +1,8 @@
 //! Messages: sending (a guest call into the window procedure), per-thread posted-message
 //! queues, GetMessage/PeekMessage, timers, and DefWindowProc.
 //!
-//! SendMessage always calls the procedure on the *calling* context, also for windows of
-//! other threads; Win32 would switch to the owner thread. PAL-era games only send across
-//! threads to PAL's own window, whose procedure is host code, so the difference is not
-//! observable there.
+//! Cross-thread sends run on the receiving guest thread at message retrieval,
+//! including reentrant sends while the sender waits. Host workers never own a WndProc.
 //!
 //! Retrieval order follows Win32: posted messages, then WM_QUIT once nothing is posted,
 //! then WM_PAINT for invalid windows, then due WM_TIMERs. An empty queue yields
@@ -22,6 +20,7 @@ use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr};
 use crate::{Win32, stdcall};
+pub(crate) mod sent;
 
 #[cfg(test)]
 mod dwm_tests;
@@ -284,14 +283,29 @@ pub fn send(
     lparam: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let Some(proc) = user(env)
+    let Some((proc, thread)) = user(env)
         .windows
         .get(&env.sys.objects, &hwnd)
-        .map(|w| w.proc)
+        .map(|w| (w.proc, w.thread))
     else {
         return then(env, 0);
     };
-    call_proc(proc, hwnd, msg, wparam, lparam, then)
+    if thread == env.context {
+        call_proc(proc, hwnd, msg, wparam, lparam, then)
+    } else {
+        sent::send(
+            env,
+            thread,
+            [hwnd, msg, wparam, lparam],
+            sent::Options::default(),
+            move |env, result| {
+                if let Err(error) = result {
+                    crate::util::set_last_error(env, error);
+                }
+                then(env, result.unwrap_or(0))
+            },
+        )
+    }
 }
 
 pub fn call_proc(
@@ -516,6 +530,7 @@ pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
 }
 
 fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
+    let sent = u32::from(sent::pending(env, ctx)) * sent::QS_SEND;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let paint = u
@@ -525,7 +540,7 @@ fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
     let q = u.queue(ctx);
     let generated = (u32::from(paint) * QS_PAINT)
         | (u32::from(q.timers.iter().any(|t| t.due_us <= now)) * QS_TIMER);
-    let mut pending = generated;
+    let mut pending = generated | sent;
     for m in &q.posted {
         pending |= posted_status(m);
     }
@@ -831,6 +846,14 @@ fn peek_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max, flags) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let f = Filter { hwnd, min, max };
     let remove = flags & PM_REMOVE != 0;
+    if flags >> 16 == 0 || flags & (sent::QS_SEND << 16) != 0 {
+        sent::drain(env, move |env| peek_message(env, out, f, remove))
+    } else {
+        peek_message(env, out, f, remove)
+    }
+}
+
+fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool) -> Outcome {
     if let Some(m) = next_message(env, f, remove).or_else(|| {
         headless_idle(env)
             .then(|| next_message(env, f, remove))
@@ -849,6 +872,10 @@ fn get_message_a(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
+    sent::drain(env, move |env| get_message_inner(env, out, f))
+}
+
+fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
     if let Some(m) = next_message(env, f, true) {
         write_message(env, m, out, true);
         return Outcome::Return(u32::from(m.msg != wm::QUIT));
@@ -893,7 +920,7 @@ pub fn wait_for_message(
             handle: event,
             deadline,
         },
-        move |env, _| then(env),
+        move |env, _| sent::drain(env, then),
     )
 }
 
@@ -946,6 +973,10 @@ pub fn next_any(env: &mut Env<'_>) -> Option<Msg> {
 }
 
 fn wait_message(env: &mut Env<'_>) -> Outcome {
+    sent::drain(env, wait_message_inner)
+}
+
+fn wait_message_inner(env: &mut Env<'_>) -> Outcome {
     if next_message(
         env,
         Filter {
@@ -1046,13 +1077,98 @@ fn send_message_a(env: &mut Env<'_>) -> Outcome {
 }
 
 fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, msg, wp, lp, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(6));
-    send(env, hwnd, msg, wp, lp, move |env, r| {
-        if out != 0 {
-            let _ = env.cpu.write_u32(out, r);
+    let (hwnd, msg, wp, lp, flags, timeout, out) = (
+        env.arg(0),
+        env.arg(1),
+        env.arg(2),
+        env.arg(3),
+        env.arg(4),
+        env.arg(5),
+        env.arg(6),
+    );
+    if flags & !0x2b != 0 {
+        crate::util::set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let then = move |env: &mut Env<'_>, result: Result<u32, u32>| match result {
+        Ok(value) => {
+            if out != 0 && env.cpu.write_u32(out, value).is_err() {
+                crate::util::set_last_error(env, 998);
+                return Outcome::Return(0);
+            }
+            Outcome::Return(1)
         }
-        Outcome::Return(1)
-    })
+        Err(error) => {
+            crate::util::set_last_error(env, error);
+            Outcome::Return(0)
+        }
+    };
+    if hwnd == 0xffff {
+        let targets = user(env)
+            .top
+            .iter()
+            .map(|&window| [window, msg, wp, lp])
+            .collect();
+        return timeout_broadcast(env, targets, flags, timeout, Ok(0), Box::new(then));
+    }
+    timeout_to(env, [hwnd, msg, wp, lp], flags, timeout, Box::new(then))
+}
+
+fn timeout_broadcast(
+    env: &mut Env<'_>,
+    mut targets: VecDeque<[u32; 4]>,
+    flags: u32,
+    timeout: u32,
+    result: Result<u32, u32>,
+    then: sent::Done,
+) -> Outcome {
+    let Some(target) = targets.pop_front() else {
+        return then(env, result);
+    };
+    timeout_to(
+        env,
+        target,
+        flags,
+        timeout,
+        Box::new(move |env, next| {
+            timeout_broadcast(env, targets, flags, timeout, result.and(next), then)
+        }),
+    )
+}
+
+fn timeout_to(
+    env: &mut Env<'_>,
+    args: [u32; 4],
+    flags: u32,
+    timeout: u32,
+    then: sent::Done,
+) -> Outcome {
+    let [hwnd, msg, wp, lp] = args;
+    let Some(thread) = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map(|w| w.thread)
+    else {
+        return then(env, Err(1400));
+    };
+    if thread == env.context {
+        return send(env, hwnd, msg, wp, lp, move |env, value| {
+            then(env, Ok(value))
+        });
+    }
+    let options = sent::Options {
+        deadline: Some(
+            env.sys
+                .clock
+                .now_us()
+                .saturating_add(u64::from(timeout) * 1000),
+        ),
+        block: flags & 1 != 0,
+        abort_if_hung: flags & 2 != 0,
+        no_timeout_if_responsive: flags & 8 != 0,
+        error_on_exit: flags & 0x20 != 0,
+    };
+    sent::send(env, thread, [hwnd, msg, wp, lp], options, then)
 }
 
 fn dispatch_message_a(env: &mut Env<'_>) -> Outcome {
@@ -1368,6 +1484,8 @@ pub fn register(reg: &mut Registry) {
     s(reg, "PostQuitMessage", 1, post_quit_message);
     s(reg, "SendMessageA", 4, send_message_a);
     s(reg, "SendMessageTimeoutA", 7, send_message_timeout_a);
+    s(reg, "InSendMessage", 0, sent::in_send);
+    s(reg, "ReplyMessage", 1, sent::reply_message);
     s(reg, "DispatchMessageA", 1, dispatch_message_a);
     s(reg, "TranslateMessage", 1, translate_message);
     s(reg, "GetMessageTime", 0, get_message_time);

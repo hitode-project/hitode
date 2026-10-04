@@ -240,6 +240,7 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
                 if let Err(error) = crate::msvcrt::detach_thread(env) {
                     return Outcome::Fail(error);
                 }
+                crate::user32::message::sent::exit_thread(env);
                 if env
                     .sys
                     .contexts
@@ -259,6 +260,9 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     if std::mem::replace(&mut env.ext.get_mut::<Win32>().process_exiting, true) {
         return Outcome::ExitProcess(code);
     }
+    // DLL detach callbacks must not race a native lease belonging to a thread
+    // that Windows has already terminated as part of process shutdown.
+    env.cpu.quiesce_memory();
     env.sys.terminate_other_contexts(code);
     terminal_notifications(
         env,

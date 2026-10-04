@@ -549,6 +549,12 @@ fn restore_owner(env: &mut Env<'_>, owner: u32, was_enabled: bool) {
 }
 
 fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> Outcome {
+    super::message::sent::drain(env, move |env| {
+        modal_loop_inner(env, dlg, owner, owner_enabled)
+    })
+}
+
+fn modal_loop_inner(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> Outcome {
     let state = user(env)
         .windows
         .get(&env.sys.objects, &dlg)

@@ -348,6 +348,7 @@ impl Default for QueueKeys {
 
 #[derive(Default)]
 pub struct Queue {
+    pub(super) sent: super::message::sent::Queue,
     pub posted: std::collections::VecDeque<super::message::Msg>,
     /// Logical key state of input already removed from this thread's queue.
     pub keyboard: QueueKeys,
@@ -1120,8 +1121,9 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
         send_all(env, msgs, move |env| {
             let removed = all.clone();
             super::clipboard::remove_windows(env, &removed, move |env| {
-                let u = &mut env.ext.get_mut::<crate::Win32>().user;
                 for h in all.iter().rev() {
+                    super::message::sent::cancel_window(env, *h);
+                    let u = &mut env.ext.get_mut::<crate::Win32>().user;
                     u.remove_window(*h, &mut env.sys.objects);
                 }
                 then(env, true)

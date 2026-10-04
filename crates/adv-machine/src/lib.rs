@@ -1414,6 +1414,7 @@ impl<B: Backend> Machine<B> {
                 }
             }
             Parked::ExitProcess(code) => {
+                self.cpu.quiesce_memory();
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
                 self.sys.terminate_other_contexts(code);

@@ -19,6 +19,13 @@ fn machine(workers: usize) -> Machine<JitCpu> {
         e.ext.get_mut::<Vec<u32>>().push(e.context);
         Outcome::ExitThread(e.context)
     });
+    registry.add("test", "stop", Conv::Stdcall { argc: 0 }, |e| {
+        if e.sys.contexts.iter().any(|c| c.state_name() == "Running") {
+            Outcome::ExitProcess(0)
+        } else {
+            Outcome::Return(0)
+        }
+    });
     registry.add("test", "patch", Conv::Stdcall { argc: 0 }, |e| {
         if !e.sys.contexts.iter().any(|c| c.state_name() == "Running") {
             return Outcome::Return(0);
@@ -47,7 +54,10 @@ fn machine(workers: usize) -> Machine<JitCpu> {
             assert_eq!(result.value(), 7);
             assert_eq!(e.cpu.reg(Reg::Ebx), e.ctx().teb);
             let state = e.cpu.capture_architecture().unwrap();
-            assert_eq!(u32::from_le_bytes(state.xmm[0][..4].try_into().unwrap()), e.ctx().teb);
+            assert_eq!(
+                u32::from_le_bytes(state.xmm[0][..4].try_into().unwrap()),
+                e.ctx().teb
+            );
             assert_eq!(state.mxcsr, 0x1f80);
             assert_eq!(e.cpu.pop_f64(), Some(1.0));
             Outcome::Return(0)
@@ -55,10 +65,13 @@ fn machine(workers: usize) -> Machine<JitCpu> {
     });
     registry.add("test", "wait", Conv::Stdcall { argc: 0 }, |e| {
         let context = e.context;
-        Outcome::block(adv_machine::Wait::Until(e.sys.clock.now_us() + 1000), move |e, _| {
-            assert_eq!(e.context, context);
-            Outcome::Return(7)
-        })
+        Outcome::block(
+            adv_machine::Wait::Until(e.sys.clock.now_us() + 1000),
+            move |e, _| {
+                assert_eq!(e.context, context);
+                Outcome::Return(7)
+            },
+        )
     });
     let mut cpu = JitCpu::new(PARK_ADDR, true).unwrap();
     cpu.set_guest_workers(workers).unwrap();
@@ -81,7 +94,9 @@ fn finish(m: &mut Machine<JitCpu>) {
         match m.run_slice(Duration::from_millis(8)) {
             SliceResult::Complete(RunResult::Exited(_)) => break,
             SliceResult::Complete(RunResult::Failed(error)) => panic!("{error:?}"),
-            SliceResult::Complete(RunResult::Idle { .. }) => std::thread::sleep(Duration::from_millis(1)),
+            SliceResult::Complete(RunResult::Idle { .. }) => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
             SliceResult::Yielded => {}
         }
     }
@@ -100,7 +115,8 @@ fn two_workers_execute_three_contexts_and_deliver_each_trap_once() {
         let address = CODE + id * 256;
         let mut a = Asm::new(address);
         a.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(2_000_000);
-        a.bytes.extend_from_slice(&[0x66, 0x0f, 0x6e, 0xc3, 0xd9, 0xe8]); // movd xmm0,ebx; fld1
+        a.bytes
+            .extend_from_slice(&[0x66, 0x0f, 0x6e, 0xc3, 0xd9, 0xe8]); // movd xmm0,ebx; fld1
         let top = a.here();
         a.dec_ecx().jnz(top).call(callback).call(done).hlt();
         m.cpu.write(address, &a.bytes).unwrap();
@@ -195,4 +211,32 @@ fn api_patch_unmap_and_native_polling_observe_one_published_generation() {
         m.cpu.parallel_stats().submitted,
         m.cpu.parallel_stats().completed
     );
+}
+
+#[test]
+fn process_exit_drains_late_completions_without_resurrecting_running_contexts() {
+    let mut m = machine(2);
+    let stop = m.resolve_import("test", "stop").unwrap();
+    let mut a = Asm::new(CODE);
+    a.bytes.extend_from_slice(&[0xff, 0x05]); // inc dword [DATA]
+    a.bytes.extend_from_slice(&DATA.to_le_bytes());
+    a.jmp(CODE);
+    let mut b = Asm::new(CODE + 0x100);
+    b.call(stop).jmp(CODE + 0x100);
+    for (pc, code) in [(CODE, a), (CODE + 0x100, b)] {
+        m.cpu.write(pc, &code.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
+        m.spawn("exit", pc, &[], 65536).unwrap();
+    }
+    finish(&mut m);
+    assert!(m.sys.contexts.iter().all(|c| c.is_done()));
+    let stats = m.cpu.parallel_stats();
+    assert!(stats.submitted > 0);
+    assert_eq!(stats.submitted, stats.completed);
+    let final_value = m.cpu.read_u32(DATA).unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), final_value);
 }
