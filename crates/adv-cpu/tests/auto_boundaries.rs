@@ -76,18 +76,18 @@ fn root_interpreter_entries(m: &Executor, root: u32) -> u64 {
 }
 
 #[test]
-fn automatic_tail_completes_seven_and_fifteen_byte_instructions_without_moving_the_window() {
-    // An authored CMP of a stack local crosses the 512-byte boundary by one byte.
+fn automatic_regions_complete_seven_and_fifteen_byte_instructions_across_execute_pages() {
+    // An authored CMP of a stack local crosses the execute-page boundary by one byte.
     let mut cases = vec![(6, vec![0x81, 0x7d, 0xe0, 0xff, 0, 0, 0])];
     // Redundant DS prefixes make a legal maximum-length register MOV. Exercise
-    // one, six and fourteen tail bytes rather than extending the region's root range.
-    for distance in [1, 9, 14] {
+    // every possible one-through-fourteen-byte tail on the following execute page.
+    for distance in 1..15 {
         let mut instruction = vec![0x3e; 10];
         instruction.extend([0xb8, 0x78, 0x56, 0x34, 0x12]);
         cases.push((distance, instruction));
     }
     for (distance, instruction) in cases {
-        let root = CODE + 512 - distance;
+        let root = CODE + 4096 - distance;
         let bytes = program(root, &instruction);
         let mut jit = machine(false);
         let mut uc = machine(false);
@@ -97,6 +97,8 @@ fn automatic_tail_completes_seven_and_fifteen_byte_instructions_without_moving_t
         jit.enable_auto_jit(true);
         compare(&mut jit, &mut uc, root);
         let interpreted = root_interpreter_entries(&jit, root);
+        let compiled = jit.stats.compilations;
+        assert!(compiled > 0, "cross-page instruction needs a native owner");
         assert!(jit.stats.native_entries > 0);
         assert!(
             interpreted <= 32,
@@ -109,8 +111,8 @@ fn automatic_tail_completes_seven_and_fifteen_byte_instructions_without_moving_t
             "warm tail must stay native"
         );
         assert_eq!(
-            jit.stats.compilations, 2,
-            "each nominal 512-byte window owns its instruction starts"
+            jit.stats.compilations, compiled,
+            "a warm cross-page instruction must retain its native owner"
         );
     }
 }
@@ -136,21 +138,29 @@ fn changing_only_a_tail_byte_on_the_next_page_invalidates_its_decoder_owner() {
     start(&mut jit, unrelated);
     assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     let compiles = jit.stats.compilations;
+    // Every automatic owner covers some part of this short cross-page loop.
+    // The explicit unrelated owner is the only one outside the edited page.
+    let affected = jit.stats.native_regions as u64 - 1;
+    assert!(affected > 0);
+    let invalidations = jit.stats.invalidations;
     for m in [&mut jit, &mut uc] {
         m.write(CODE + 4096, &[1]).unwrap();
     }
     compare(&mut jit, &mut uc, root);
     assert_eq!(jit.state.regs[3] & 255, 0);
+    assert_eq!(jit.memory().read(root, 6).unwrap(), &bytes[..6]);
+    assert_eq!(jit.memory().read(CODE + 4096, 1).unwrap(), [1]);
     assert_eq!(root_interpreter_entries(&jit, root), interpreted);
-    assert_eq!(jit.stats.compilations, compiles + 2);
+    assert_eq!(jit.stats.compilations, compiles + affected);
     assert_eq!(
-        jit.stats.invalidations, 2,
-        "tail owner and following region share the edited page"
+        jit.stats.invalidations,
+        invalidations + affected,
+        "invalidate every owner of the edited tail page and retain the unrelated owner"
     );
     start(&mut jit, unrelated);
     assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(jit.state.regs[0], 77);
-    assert_eq!(jit.stats.compilations, compiles + 2);
+    assert_eq!(jit.stats.compilations, compiles + affected);
 }
 
 #[test]
@@ -172,13 +182,23 @@ fn a_guest_store_to_the_tail_page_recompiles_the_cross_page_instruction() {
     jit.enable_auto_jit(true);
     compare(&mut jit, &mut uc, root);
     assert_eq!(jit.state.regs[3] & 255, 1);
+    let affected = jit.stats.native_regions as u64;
+    assert!(affected > 0);
+    let interpreted = root_interpreter_entries(&jit, root);
     jit.add_region(Region::new(writer, modification.len()))
         .unwrap();
+    let compiles = jit.stats.compilations;
+    let invalidations = jit.stats.invalidations;
     compare(&mut jit, &mut uc, writer);
     assert_eq!(jit.state.regs[3] & 255, 0);
+    assert_eq!(jit.memory().read(root, 6).unwrap(), &bytes[..6]);
     assert_eq!(jit.memory().read(CODE + 4096, 1).unwrap(), [1]);
-    assert_eq!(jit.stats.invalidations, 2);
-    assert_eq!(jit.stats.compilations, 5);
+    assert_eq!(jit.stats.invalidations, invalidations + affected);
+    assert_eq!(jit.stats.compilations, compiles + affected);
+    assert_eq!(root_interpreter_entries(&jit, root), interpreted);
+    compare(&mut jit, &mut uc, root);
+    assert_eq!(jit.state.regs[3] & 255, 0);
+    assert_eq!(jit.stats.compilations, compiles + affected);
 }
 
 #[test]
@@ -201,10 +221,16 @@ fn a_missing_tail_execute_page_faults_before_the_instruction_and_can_be_restored
             }
             start(m, root);
         }
+        let before = jit.state.regs;
         let outcome = jit.run(STOP, 10000).unwrap();
         assert_eq!(outcome, uc.run_unicorn(STOP, 10000).unwrap());
         assert!(matches!(outcome, RunOutcome::FetchFault { .. }));
         assert_eq!(jit.state.eip, root);
+        assert_eq!(
+            jit.state.regs, before,
+            "truncated CMP must not commit any register or following instruction"
+        );
+        assert_eq!(jit.state.eflags, 2, "truncated CMP must not change flags");
         assert_eq!(jit.state.regs, uc.state.regs);
         assert_eq!(jit.state.eflags, uc.state.eflags);
         let interpreted = root_interpreter_entries(&jit, root);

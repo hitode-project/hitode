@@ -24,9 +24,13 @@ static void WINAPI callback(UINT id,UINT message,DWORD user,DWORD one,DWORD two)
 }
 void mainCRTStartup(void) {
     DWORD i,pass,written; HANDLE file,thread;
-    HMODULE mm=GetModuleHandleA("winmm.dll");
+    /* The test registers this private module before guest execution. Its EAT
+       must be created after registration, unlike imported winmm.dll. */
+    HMODULE mm=LoadLibraryA("adv_winmm_test.dll");
+    if(!mm) ExitProcess(3);
     signal_audio=(TESTCALL)GetProcAddress(mm,"__test_audio_ready");
     advance_guest=(TESTCALL)GetProcAddress(mm,"__test_advance_guest");
+    if(!signal_audio||!advance_guest) ExitProcess(4);
     emit(timeEndPeriod(1));emit(timeBeginPeriod(1));emit(timeBeginPeriod(1));
     emit(timeEndPeriod(1));emit(timeEndPeriod(1));emit(timeEndPeriod(1));
     emit(timeBeginPeriod(0));emit(timeEndPeriod(0));

@@ -7,11 +7,13 @@ use adv_machine::{Clock, Machine, ObjectLimits, Objects, RunResult};
 use adv_os::Codec;
 use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const READ_ONLY: u32 = 0x430000;
 const HKCU: u32 = 0x80000001;
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 enum Arg {
@@ -31,13 +33,22 @@ impl Fixture {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        Self::with_data(
-            cp,
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                "../../target/registry-fixture/{}-{unique}",
-                std::process::id()
-            )),
-        )
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/registry-fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        // Windows wall-clock timestamps need not distinguish simultaneous test
+        // threads. Atomically reserve a fresh directory so private registries
+        // never contend for another fixture's legitimate exclusive file lock.
+        let data = loop {
+            let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!("{}-{unique}-{serial}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("reserve registry fixture directory: {error}"),
+            }
+        };
+        Self::with_data(cp, data)
     }
     fn with_data(cp: u32, data: std::path::PathBuf) -> Self {
         let mut reg = Registry::default();
@@ -238,6 +249,17 @@ fn object_exhaustion_does_not_create_a_key_or_write_output_handles() {
 #[test]
 fn registry_handles_share_ownership_without_entering_the_kernel_namespace() {
     let mut f = Fixture::new(932);
+    let installed_objects = f.machine.sys.objects.object_count();
+    let desktop = f.machine.ext.get::<Win32>().user.desktop;
+    assert!(
+        f.machine
+            .ext
+            .get::<Win32>()
+            .user
+            .windows
+            .get(&f.machine.sys.objects, &desktop)
+            .is_some()
+    );
     let path = f.a("Software\\Namespace Fixture", 932);
     let (created, key, _) = f.create(path, false, 3);
     let wrong_close = f.call_in("kernel32.dll", "CloseHandle", &[L(key)]);
@@ -256,8 +278,21 @@ fn registry_handles_share_ownership_without_entering_the_kernel_namespace() {
             .count(),
         0
     );
-    // Closing a key did not release the executing thread.
-    assert_eq!(f.machine.sys.objects.object_count(), 1);
+    // Installation owns the desktop in the same table. Closing a registry key
+    // releases only its payload, retaining the desktop and executing thread.
+    assert_eq!(f.machine.sys.objects.object_count(), installed_objects + 1);
+    let context = &f.machine.sys.contexts[0];
+    assert!(matches!(f.machine.sys.objects.get(context.thread_handle),
+        Some(adv_machine::Object::Thread { ctx }) if *ctx == context.id));
+    assert!(
+        f.machine
+            .ext
+            .get::<Win32>()
+            .user
+            .windows
+            .get(&f.machine.sys.objects, &desktop)
+            .is_some()
+    );
 }
 
 #[test]

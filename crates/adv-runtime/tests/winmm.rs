@@ -44,6 +44,9 @@ fn run(backend: &str, executable: &str, profile: &Path, budget_probe: bool) {
     .unwrap();
     runtime.machine.sys.clock = Clock::virtual_time();
     if budget_probe {
+        // Runtime loading has already finalized winmm.dll's live EAT. These
+        // private probes belong to a fixture module that the guest loads only
+        // after registration; never fabricate late exports in a published DLL.
         let registry = runtime
             .machine
             .sys
@@ -51,7 +54,7 @@ fn run(backend: &str, executable: &str, profile: &Path, budget_probe: bool) {
             .resolver_mut::<adv_abi::Registry>()
             .unwrap();
         registry.add(
-            "winmm.dll",
+            "adv_winmm_test.dll",
             "__test_audio_ready",
             Conv::Stdcall { argc: 1 },
             |env| {
@@ -61,7 +64,7 @@ fn run(backend: &str, executable: &str, profile: &Path, budget_probe: bool) {
             },
         );
         registry.add(
-            "winmm.dll",
+            "adv_winmm_test.dll",
             "__test_advance_guest",
             Conv::Stdcall { argc: 1 },
             |env| {

@@ -689,6 +689,8 @@ fn failed_input_without_a_window_does_not_block_diagnostic_report_or_close() {
 fn host_deadline_stops_a_continuously_ready_compute_context() {
     let directory = fixtures();
     let report_path = directory.join("compute-deadline.json");
+    // The CLI deadline includes cold loading. Leave startup headroom before
+    // requiring a cooperative yield from the continuously ready worker.
     let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
         .arg(directory.join("fixture_compute.exe"))
         .args([
@@ -696,7 +698,7 @@ fn host_deadline_stops_a_continuously_ready_compute_context() {
             "--backend",
             "interpreter",
             "--seconds",
-            "0.1",
+            "1",
             "--report",
         ])
         .arg(&report_path)
@@ -711,7 +713,7 @@ fn host_deadline_stops_a_continuously_ready_compute_context() {
     assert!(report.contains("\"stop_reason\": \"time_limit\""));
     assert!(report.contains("\"guest_exit_code\": null"));
     assert!(report.contains("\"failure\": null"));
-    assert!(number(&report, "runtime_soft_yields") > 0.0);
+    assert!(number(&report, "runtime_soft_yields") > 0.0, "{report}");
     assert_eq!(number(&report, "guest_contexts"), 2.0);
 }
 

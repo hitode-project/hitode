@@ -706,6 +706,12 @@ fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
         Outcome::Return(0)
     });
     r.add("test", "normal", Conv::Stdcall { argc: 0 }, |e| {
+        assert_eq!(
+            e.sys.context(0).state_name(),
+            "Blocked",
+            "the granted turn must reblock before the normal peer runs"
+        );
+        assert_eq!(*e.ext.get::<Vec<u32>>(), [1, 0]);
         e.ext.get_mut::<Vec<u32>>().push(2);
         Outcome::ExitProcess(0)
     });
@@ -752,7 +758,13 @@ fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
     assert_eq!(m.sys.scheduling.wake_dispatches, 1);
     assert_eq!(m.sys.scheduling.wake_priority_dispatches, 1);
     assert_eq!(m.sys.scheduling.timed_dispatches, 0);
-    assert_eq!(m.sys.context(0).state_name(), "Blocked");
+    assert!(
+        m.sys
+            .contexts
+            .iter()
+            .all(|context| context.exit_code() == Some(0)),
+        "ExitProcess terminates both the blocked receiver and computing signaler"
+    );
     assert!(!m.sys.try_acquire(event));
 }
 
