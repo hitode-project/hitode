@@ -163,3 +163,57 @@ fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts(
     assert!(add_ref(&mut env, resource).is_none());
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
 }
+
+#[test]
+fn base_present_completion_returns_success_without_changing_wait_policy() {
+    struct Policy {
+        held: bool,
+        fence: bool,
+        serial: u64,
+    }
+    let mut m = machine();
+    m.ext.insert(Policy {
+        held: false,
+        fence: false,
+        serial: 0,
+    });
+    let provider = &mut m.ext.get_mut::<State>().provider;
+    provider.fast_forward = |ext| ext.get::<Policy>().held;
+    provider.completed = |env, serial| {
+        let policy = env.ext.get_mut::<Policy>();
+        policy.serial = serial;
+        policy
+            .fence
+            .then(|| Outcome::block_then_return(Wait::Until(env.sys.clock.now_us() + 2_000), 0))
+    };
+    let mut env = Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    // Native base Present returns D3D_OK even while hidden or minimized. These
+    // states already suppress the refresh deadline; they do not imply 9Ex status.
+    assert!(matches!(
+        completed(&mut env, Completion::Presented(7, None)),
+        Outcome::Return(0)
+    ));
+    assert_eq!(env.ext.get::<Policy>().serial, 7);
+    let at = env.sys.clock.now_us() + 1_000;
+    assert!(matches!(
+        completed(&mut env, Completion::Presented(8, Some(at))),
+        Outcome::Block { wait: Wait::Until(time), .. } if time == at
+    ));
+    env.ext.get_mut::<Policy>().held = true;
+    assert!(matches!(
+        completed(&mut env, Completion::Presented(9, Some(at))),
+        Outcome::Return(0)
+    ));
+    env.ext.get_mut::<Policy>().fence = true;
+    assert!(matches!(
+        completed(&mut env, Completion::Presented(10, Some(at))),
+        Outcome::Block { wait: Wait::Until(time), .. }
+            if time == env.sys.clock.now_us() + 2_000
+    ));
+    assert_eq!(env.ext.get::<Policy>().serial, 10);
+}

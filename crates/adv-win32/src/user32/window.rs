@@ -1200,6 +1200,13 @@ pub fn show_window(
                 let (cw, ch) = w.client_size();
                 msgs.push([hwnd, wm::SIZE, 0, make_long(cw, ch)]);
             }
+            SW_SHOWNOACTIVATE if w.style & WS_MINIMIZE != 0 => {
+                // Unlike SW_SHOWNA, native SHOWNOACTIVATE restores a minimized
+                // window. Keep the existing no-activation path below.
+                w.style &= !WS_MINIMIZE;
+                let (cw, ch) = w.client_size();
+                msgs.push([hwnd, wm::SIZE, 0, make_long(cw, ch)]);
+            }
             _ => {}
         }
         if !w.initial_geometry_reported {

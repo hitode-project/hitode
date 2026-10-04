@@ -1,6 +1,6 @@
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/fixtures'),
-    [ValidateSet('d3d9','d3d9-capabilities')][string]$Name = 'd3d9'
+    [ValidateSet('d3d9','d3d9-capabilities','d3d9-present')][string]$Name = 'd3d9'
 )
 $ErrorActionPreference = 'Stop'
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)

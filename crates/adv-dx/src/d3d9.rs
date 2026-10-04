@@ -25,7 +25,6 @@ const INVALID: u32 = 0x8876086c;
 const UNAVAILABLE: u32 = 0x8876086a;
 const DEVICE_LOST: u32 = 0x88760868;
 const DEVICE_NOT_RESET: u32 = 0x88760869;
-const PRESENT_OCCLUDED: u32 = 0x08760878;
 const OUT_OF_MEMORY: u32 = 0x8007000e;
 const NO_INTERFACE: u32 = 0x80004002;
 // Official SDK d3d9.h DEFINE_GUIDs in guest little-endian memory order.
@@ -107,7 +106,6 @@ enum Operation {
     },
     Present {
         surface: u32,
-        occluded: bool,
         deadline: Option<u64>,
     },
     Upload {
@@ -128,7 +126,7 @@ struct Pending {
 }
 enum Completion {
     Command,
-    Presented(u64, bool, Option<u64>),
+    Presented(u64, Option<u64>),
 }
 
 pub fn register(registry: &mut Registry) {
@@ -744,12 +742,8 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
         } => gpu
             .clear(target, *color, *depth)
             .map(|()| Completion::Command),
-        Operation::Present {
-            surface,
-            occluded,
-            deadline,
-        } => (provider.present)(env.ext, *surface, &mut gpu)
-            .map(|serial| Completion::Presented(serial, *occluded, *deadline)),
+        Operation::Present { surface, deadline } => (provider.present)(env.ext, *surface, &mut gpu)
+            .map(|serial| Completion::Presented(serial, *deadline)),
         Operation::Upload {
             resource,
             target,
@@ -779,18 +773,15 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
     result
 }
 fn completed(env: &mut Env<'_>, result: Completion) -> Outcome {
-    if let Completion::Presented(serial, occluded, deadline) = result {
+    if let Completion::Presented(serial, deadline) = result {
         let provider = env.ext.get::<State>().provider;
         if let Some(outcome) = (provider.completed)(env, serial) {
             return outcome;
         }
         let fast_forward = (provider.fast_forward)(env.ext);
-        return pacing::finish(
-            env,
-            deadline,
-            if occluded { PRESENT_OCCLUDED } else { 0 },
-            fast_forward,
-        );
+        // S_PRESENT_OCCLUDED belongs to D3D9Ex. Base Present still succeeds;
+        // visibility only suppresses the refresh deadline calculated below.
+        return pacing::finish(env, deadline, 0, fast_forward);
     }
     Outcome::Return(0)
 }
@@ -996,13 +987,5 @@ fn present(
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
-    dispatch(
-        env,
-        id,
-        Operation::Present {
-            surface,
-            occluded,
-            deadline,
-        },
-    )
+    dispatch(env, id, Operation::Present { surface, deadline })
 }
