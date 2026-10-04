@@ -13,6 +13,7 @@
 
 pub mod com;
 pub mod gdi;
+pub mod global;
 pub mod heap;
 pub mod loader;
 pub mod module;
