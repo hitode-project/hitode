@@ -108,8 +108,50 @@ pub enum TrapAction {
     Park,
 }
 
+/// Canonical guest floating-point control state, independent of the host FPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpuEnvironment {
+    pub x87_control: u16,
+    pub mxcsr: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum FpuEnvironmentError {
+    #[error("backend does not support the guest floating-point environment")]
+    Unsupported,
+    #[error("MXCSR contains reserved bits: {0:#x}")]
+    InvalidMxcsr(u32),
+    #[error("backend floating-point environment access failed: {0}")]
+    Backend(String),
+}
+
+impl FpuEnvironment {
+    /// The virtual x86 profile exposes every architectural low MXCSR bit.
+    pub const MXCSR_MASK: u32 = 0xffff;
+
+    pub fn validate(self) -> Result<(), FpuEnvironmentError> {
+        if self.mxcsr & !Self::MXCSR_MASK != 0 {
+            Err(FpuEnvironmentError::InvalidMxcsr(self.mxcsr))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Registers and memory as seen from inside a trap handler.
 pub trait Guest {
+    /// Materialize deferred floating aliases and read canonical control state.
+    fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
+        Err(FpuEnvironmentError::Unsupported)
+    }
+    /// Invalid MXCSR leaves both controls unchanged. Changing x87 masks preserves
+    /// exception flags, tags and registers, while recomputing pending ES/B status.
+    fn set_fpu_environment(
+        &mut self,
+        _environment: FpuEnvironment,
+    ) -> Result<(), FpuEnvironmentError> {
+        Err(FpuEnvironmentError::Unsupported)
+    }
     /// Most recent committed indirect transfer for fetch-fault diagnostics.
     /// Backends without this observation return None.
     fn last_indirect_branch(&self) -> Option<crate::IndirectBranch> {

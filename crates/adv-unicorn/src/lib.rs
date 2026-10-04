@@ -16,8 +16,8 @@ use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot as UcPro
 use unicorn_engine::{RegisterX86, Unicorn};
 
 use adv_cpu::backend::{
-    Backend, Exit, Fault, FaultKind, FilePage, Guest, MemFault, Prot, Reg, SegmentSetup,
-    TrapAction, TrapHandler,
+    Backend, Exit, Fault, FaultKind, FilePage, FpuEnvironment, FpuEnvironmentError, Guest,
+    MemFault, Prot, Reg, SegmentSetup, TrapAction, TrapHandler,
 };
 
 struct FileBinding {
@@ -316,6 +316,45 @@ fn descriptor(base: u32, limit: u32, code: bool, dpl: u64) -> u64 {
 
 // Implemented on the raw engine so trap handlers can receive it directly as `&mut dyn Guest`.
 impl Guest for Engine<'_> {
+    fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
+        let error = |e: uc_error| FpuEnvironmentError::Backend(e.to_string());
+        Ok(FpuEnvironment {
+            x87_control: self.reg_read(RegisterX86::FPCW).map_err(error)? as u16,
+            mxcsr: self.reg_read(RegisterX86::MXCSR).map_err(error)? as u32,
+        })
+    }
+    fn set_fpu_environment(
+        &mut self,
+        environment: FpuEnvironment,
+    ) -> Result<(), FpuEnvironmentError> {
+        environment.validate()?;
+        let error = |e: uc_error| FpuEnvironmentError::Backend(e.to_string());
+        let previous = self.fpu_environment()?;
+        let status = self.reg_read(RegisterX86::FPSW).map_err(error)?;
+        let pending = status & !u64::from(environment.x87_control) & 0x3f != 0;
+        let updated_status = if pending {
+            status | 0x8080
+        } else {
+            status & !0x8080
+        };
+        let result = (|| {
+            self.reg_write(RegisterX86::FPCW, u64::from(environment.x87_control))?;
+            self.reg_write(RegisterX86::MXCSR, u64::from(environment.mxcsr))?;
+            self.reg_write(RegisterX86::FPSW, updated_status)
+        })();
+        if let Err(e) = result {
+            // A valid register write is supported by this x86 engine. Preserve
+            // the original environment if a backend error nevertheless occurs.
+            let restored = self
+                .reg_write(RegisterX86::FPCW, u64::from(previous.x87_control))
+                .and_then(|()| self.reg_write(RegisterX86::MXCSR, u64::from(previous.mxcsr)))
+                .and_then(|()| self.reg_write(RegisterX86::FPSW, status));
+            return Err(FpuEnvironmentError::Backend(format!(
+                "{e}; restore={restored:?}"
+            )));
+        }
+        Ok(())
+    }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.get_data()
             .file_pages
@@ -594,6 +633,15 @@ impl Guest for Engine<'_> {
 }
 
 impl Guest for UnicornCpu {
+    fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
+        self.uc.fpu_environment()
+    }
+    fn set_fpu_environment(
+        &mut self,
+        environment: FpuEnvironment,
+    ) -> Result<(), FpuEnvironmentError> {
+        self.uc.set_fpu_environment(environment)
+    }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.uc.file_page_copy_on_write(addr)
     }

@@ -285,12 +285,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         M::Fldcw => {
             let addr = tx.address(i)?;
             let cw = u16::from_le_bytes(tx.read(memory, addr, 2)?.as_ref().try_into().unwrap());
-            tx.state.x87.control = cw;
-            if tx.state.x87.status & !cw & 0x3f != 0 {
-                tx.state.x87.status |= 0x8080;
-            } else {
-                tx.state.x87.status &= !0x8080;
-            }
+            tx.state.x87.set_control(cw);
         }
         M::Fnstcw | M::Fstcw => {
             let addr = tx.address(i)?;

@@ -1,7 +1,7 @@
 //! CPU backend adapter for a caller-owned trap dispatcher.
 use crate::backend::{
-    Backend, Exit, Fault, FaultKind, Guest, MemFault, Prot, Reg, SegmentSetup, TrapAction,
-    TrapHandler,
+    Backend, Exit, Fault, FaultKind, FpuEnvironment, FpuEnvironmentError, Guest, MemFault, Prot,
+    Reg, SegmentSetup, TrapAction, TrapHandler,
 };
 use crate::{
     CompileStrategy, CpuState, ExecutionContext, Executor, Memory, RunOutcome, Stats, X87Register,
@@ -100,6 +100,24 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
+        self.state.commit_mmx();
+        Ok(FpuEnvironment {
+            x87_control: self.state.x87.control,
+            mxcsr: self.state.mxcsr,
+        })
+    }
+    fn set_fpu_environment(
+        &mut self,
+        environment: FpuEnvironment,
+    ) -> Result<(), FpuEnvironmentError> {
+        environment.validate()?;
+        self.state.commit_mmx();
+        self.state.x87.set_control(environment.x87_control);
+        self.state.mxcsr = environment.mxcsr;
+        self.state.refresh_mmx();
+        Ok(())
+    }
     fn last_indirect_branch(&self) -> Option<crate::IndirectBranch> {
         self.state.last_indirect_branch.observed()
     }
@@ -203,6 +221,15 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn fpu_environment(&mut self) -> Result<FpuEnvironment, FpuEnvironmentError> {
+        self.view(|g| g.fpu_environment())
+    }
+    fn set_fpu_environment(
+        &mut self,
+        environment: FpuEnvironment,
+    ) -> Result<(), FpuEnvironmentError> {
+        self.view(|g| g.set_fpu_environment(environment))
+    }
     fn last_indirect_branch(&self) -> Option<crate::IndirectBranch> {
         self.inner.state.last_indirect_branch.observed()
     }

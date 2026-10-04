@@ -95,6 +95,16 @@ impl Default for X87State {
 }
 
 impl X87State {
+    /// Apply FLDCW mask semantics without clearing sticky exceptions or stack state.
+    pub fn set_control(&mut self, control: u16) {
+        self.control = control;
+        if self.status & !control & 0x3f != 0 {
+            self.status |= 0x8080;
+        } else {
+            self.status &= !0x8080;
+        }
+    }
+
     pub fn top(&self) -> usize {
         usize::from((self.status >> 11) & 7)
     }
