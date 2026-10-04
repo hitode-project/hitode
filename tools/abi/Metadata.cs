@@ -193,12 +193,12 @@ public static class AbiMetadata
         foreach (var row in File.ReadLines(supplement).Where(line => line.Length != 0 && !line.StartsWith('#')))
         {
             var f = row.Split('\t');
-            if (f.Length != 6 || f[2] != "cdecl" || !new[] { "u32", "i32", "void", "ptr" }.Contains(f[3]))
+            if (f.Length != 6 || f[2] != "cdecl" || !new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !new[] { "u32", "ptr" }.Contains(p[2]) || p[3] != "1")
+                if (p.Length != 4 || !new[] { "u32", "i32", "ptr", "str16" }.Contains(p[2]) || p[3] != "1")
                     throw new InvalidDataException("Invalid supplemental x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

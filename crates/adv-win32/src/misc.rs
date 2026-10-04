@@ -5,6 +5,7 @@
 use adv_abi::Registry;
 use adv_machine::{Env, Outcome};
 
+mod internet;
 mod ole_memory;
 
 use crate::util::{cstr, put_cstr, set_last_error};
@@ -280,6 +281,7 @@ fn shell_execute_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    internet::register(reg);
     stdcall(
         reg,
         SHLWAPI,

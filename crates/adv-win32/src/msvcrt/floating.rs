@@ -187,10 +187,13 @@ pub(super) fn errno_address(env: &mut Env<'_>) -> GuestPtr<i32> {
     if env.ext.try_get::<CrtState>().is_none() {
         env.ext.insert(CrtState::default());
     }
-    let key = (
-        env.sys.thunks.get(env.thunk).module.as_str().to_owned(),
-        env.sys.current,
-    );
+    let module = env.sys.thunks.get(env.thunk).module.as_str();
+    let module = if module.starts_with("api-ms-win-crt-") {
+        "ucrtbase.dll"
+    } else {
+        module
+    };
+    let key = (module.to_owned(), env.sys.current);
     let address = if let Some(&address) = env.ext.get::<CrtState>().errno.get(&key) {
         address
     } else {

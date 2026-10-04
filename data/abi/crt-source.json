@@ -8,7 +8,8 @@
   "documentation": [
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/control87-controlfp-control87-2",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/controlfp-s",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-invalid-parameter-handler-set-thread-local-invalid-parameter-handler"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/set-invalid-parameter-handler-set-thread-local-invalid-parameter-handler",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/execute-onexit-table-initialize-onexit-table-register-onexit-function"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -17,5 +18,13 @@
   "errno_header": {
     "header": "ucrt/errno.h",
     "sha256": "c64e8df96f057fdebc0474bd765cee3ae17de34a2b1fc9d197597321f2d1e447"
+  },
+  "corecrt_startup.h": {
+    "header": "ucrt/corecrt_startup.h",
+    "sha256": "2e2e27515bfe462435f5222022e5afdc84a50f093f87ade27db8afcaea202cb7"
+  },
+  "corecrt_wstdlib.h": {
+    "header": "ucrt/corecrt_wstdlib.h",
+    "sha256": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
   }
 }

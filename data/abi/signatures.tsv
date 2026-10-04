@@ -619,6 +619,12 @@ advapi32.dll	UpdateTraceA	stdcall	u32	Windows.Win32.Foundation.WIN32_ERROR	Trace
 advapi32.dll	UpdateTraceW	stdcall	u32	Windows.Win32.Foundation.WIN32_ERROR	TraceId:u64:u64:2|InstanceName:Windows.Win32.Foundation.PWSTR:str16:1|Properties:Windows.Win32.System.Diagnostics.Etw.EVENT_TRACE_PROPERTIES*:ptr:1
 advapi32.dll	WaitServiceState	stdcall	u32	u32	hService:Windows.Win32.System.Services.SC_HANDLE:ptr:1|dwNotify:u32:u32:1|dwTimeout:u32:u32:1|hCancelEvent:Windows.Win32.Foundation.HANDLE:handle:1
 advapi32.dll	WriteEncryptedFileRaw	stdcall	u32	u32	pfImportCallback:Windows.Win32.Storage.FileSystem.PFE_IMPORT_FUNC:ptr:1|pvCallbackContext:void*:ptr:1|pvContext:void*:ptr:1
+api-ms-win-crt-convert-l1-1-0.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	_execute_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_initialize_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
 avifil32.dll	AVIBuildFilterA	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PSTR:str8:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIBuildFilterW	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PWSTR:str16:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIClearClipboard	stdcall	i32	Windows.Win32.Foundation.HRESULT	
@@ -5144,8 +5150,14 @@ ucrtbase.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_errno	cdecl	ptr	i32*	
+ucrtbase.dll	_execute_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
 ucrtbase.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+ucrtbase.dll	_initialize_onexit_table	cdecl	i32	i32	table:_onexit_table_t*:ptr:1
+ucrtbase.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
+ucrtbase.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
+ucrtbase.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
 ucrtbase.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
 user32.dll	ActivateKeyboardLayout	stdcall	handle	Windows.Win32.UI.Input.KeyboardAndMouse.HKL	hkl:Windows.Win32.UI.Input.KeyboardAndMouse.HKL:handle:1|Flags:Windows.Win32.UI.Input.KeyboardAndMouse.ACTIVATE_KEYBOARD_LAYOUT_FLAGS:u32:1
 user32.dll	AddClipboardFormatListener	stdcall	i32	Windows.Win32.Foundation.BOOL	hwnd:Windows.Win32.Foundation.HWND:handle:1
 user32.dll	AdjustWindowRect	stdcall	i32	Windows.Win32.Foundation.BOOL	lpRect:Windows.Win32.Foundation.RECT*:ptr:1|dwStyle:Windows.Win32.UI.WindowsAndMessaging.WINDOW_STYLE:u32:1|bMenu:Windows.Win32.Foundation.BOOL:i32:1

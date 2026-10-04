@@ -4,7 +4,9 @@ use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
+mod convert;
 mod floating;
+mod onexit;
 
 #[derive(Default)]
 struct CrtState {
@@ -27,6 +29,8 @@ pub fn install<B: adv_cpu::backend::Backend>(
 
 pub fn register(r: &mut Registry) {
     floating::register(r);
+    onexit::register(r);
+    convert::register(r);
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
