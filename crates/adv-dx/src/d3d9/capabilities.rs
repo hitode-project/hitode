@@ -162,11 +162,11 @@ fn check_format(
     if !factory(env, this.addr(), adapter) || kind != 1 || check == 0 {
         return INVALID;
     }
-    // Surface: offscreen CPU storage. Texture: one mip, sampled or dynamic.
-    // Arbitrary RT/depth binding, autogen, sRGB, cubes and volumes are absent.
+    // Color surface/texture: sampled, dynamic or a single render-target mip.
+    // Depth, autogen, sRGB, cubes and volumes remain unadvertised.
     let supported = match resource {
-        1 => usage == 0,
-        3 => usage == 0 || usage == 0x200,
+        1 => usage == 0 || usage == 1,
+        3 => matches!(usage, 0 | 1 | 0x200),
         _ => false,
     };
     if available(env) && format == 22 && matches!(check, 21 | 22) && supported {
@@ -276,7 +276,10 @@ fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         MaxSimultaneousTextures: 1,
         MaxPointSize: 1.0,
         MaxPrimitiveCount: 131072,
+        MaxStreams: 16,
+        MaxVertexIndex: 0x000f_ffff,
         MaxStreamStride: 2048,
+        DevCaps2: 1, // STREAMOFFSET: SetStreamSource offsets are used by drawing.
         NumSimultaneousRTs: 1,
         ..D3DCAPS9::default()
     })
@@ -373,20 +376,20 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(value.TextureCaps & (0x4000 | 0x800 | 0x2000), 0);
-        assert_eq!((value.MaxStreams, value.MaxVertexIndex), (0, 0));
+        assert_eq!((value.MaxStreams, value.MaxVertexIndex), (16, 0x000f_ffff));
+        assert_eq!(value.DevCaps2, 1, "only stream offsets are implemented");
         assert!(
             u64::from(value.MaxTextureWidth) * u64::from(value.MaxTextureHeight) * 4
                 <= 16 * 1024 * 1024
         );
         assert!(u64::from(value.MaxPrimitiveCount) * 3 * 40 <= 16 * 1024 * 1024);
-        for (usage, kind, format) in [(0, 3, 21), (0x200, 3, 22), (0, 1, 21)] {
+        for (usage, kind, format) in [(0, 3, 21), (0x200, 3, 22), (0, 1, 21), (1, 3, 21), (1, 1, 22)] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),
                 0
             );
         }
         for (usage, kind, format) in [
-            (1, 3, 21),
             (2, 1, 75),
             (0x400, 3, 21),
             (0, 4, 21),

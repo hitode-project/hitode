@@ -17,6 +17,7 @@ mod capabilities;
 mod fixed;
 mod pacing;
 mod readback;
+mod targets;
 #[cfg(test)]
 mod tests;
 use std::collections::BTreeMap;
@@ -56,6 +57,7 @@ enum Payload {
     Factory,
     Device(Box<Device>),
     Resource(Resource),
+    Buffer(buffers::Buffer),
 }
 struct Device {
     pointer: u32,
@@ -68,6 +70,9 @@ struct Device {
     needs_reset: bool,
     back_buffer: Option<Id>,
     texture: Option<Id>,
+    /// Borrowed surface identity; its controlling resource has one internal ref.
+    render_target: Option<Id>,
+    buffers: buffers::Bindings,
     fixed: fixed::Fixed,
 }
 pub struct State {
@@ -153,6 +158,8 @@ pub fn register(registry: &mut Registry) {
     fixed::register(registry);
     readback::register(registry);
     capabilities::register(registry);
+    targets::register(registry);
+    buffers::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -166,6 +173,8 @@ pub fn install<B: Backend>(
         "IDirect3DDevice9",
         "IDirect3DTexture9",
         "IDirect3DSurface9",
+        "IDirect3DVertexBuffer9",
+        "IDirect3DIndexBuffer9",
     ] {
         let signatures: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
@@ -266,6 +275,8 @@ fn object(
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
     if let Payload::Device(device) = destroyed.value {
         let provider = env.ext.get::<State>().provider;
+        targets::release_binding(env, device.render_target);
+        buffers::release_bindings(env, device.buffers);
         for binding in [device.texture, device.back_buffer].into_iter().flatten() {
             if let Some(Some(resource)) = com(env).release_internal(&mut env.sys.objects, binding) {
                 destroy(env, resource);
@@ -279,13 +290,19 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         }
     } else if let Payload::Resource(resource) = destroyed.value {
         resources::destroy(env, resource);
+    } else if let Payload::Buffer(buffer) = destroyed.value {
+        buffers::destroy(env, buffer);
     }
     for pointer in destroyed.interfaces {
         free(env, pointer);
     }
 }
 fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
-    let parent = resources::parent_on_last_public_release(env, pointer);
+    if let Some(parent) = resources::container_pointer(env, pointer) {
+        return release(env, parent);
+    }
+    let parent = resources::parent_on_last_public_release(env, pointer)
+        .or_else(|| buffers::parent_on_last_public_release(env, pointer));
     let Some(released) = com(env).release::<Payload>(&mut env.sys.objects, pointer) else {
         return 0;
     };
@@ -301,7 +318,11 @@ fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
     released.references
 }
 fn add_ref(env: &mut Env<'_>, pointer: u32) -> Option<u32> {
-    let parent = resources::parent_on_first_public_retain(env, pointer);
+    if let Some(parent) = resources::container_pointer(env, pointer) {
+        return add_ref(env, parent);
+    }
+    let parent = resources::parent_on_first_public_retain(env, pointer)
+        .or_else(|| buffers::parent_on_first_public_retain(env, pointer));
     if let Some(parent) = parent {
         com(env).add_ref_identity(&mut env.sys.objects, parent)?;
     }
@@ -325,7 +346,24 @@ fn query(
     let Ok(iid) = iid.read(env.cpu) else {
         return Outcome::Return(INVALID);
     };
-    let parent = resources::parent_on_first_public_retain(env, this.addr());
+    if resources::container_pointer(env, this.addr()).is_some() {
+        let pointer =
+            match com(env).resolve_interface::<Payload>(&mut env.sys.objects, this.addr(), iid) {
+                Ok(pointer) => pointer,
+                Err(QueryError::NoInterface) => return Outcome::Return(NO_INTERFACE),
+                Err(_) => return Outcome::Return(INVALID),
+            };
+        if add_ref(env, pointer).is_none() {
+            return Outcome::Return(OUT_OF_MEMORY);
+        }
+        if output.write(env.cpu, pointer).is_err() {
+            release(env, pointer);
+            return Outcome::Return(INVALID);
+        }
+        return Outcome::Return(0);
+    }
+    let parent = resources::parent_on_first_public_retain(env, this.addr())
+        .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()));
     if let Some(parent) = parent
         && com(env)
             .add_ref_identity(&mut env.sys.objects, parent)
@@ -373,6 +411,7 @@ macro_rules! unknown {
         }
     };
 }
+mod buffers;
 mod resources;
 unknown!(
     factory_query,
@@ -514,7 +553,10 @@ fn create_device(
         return Outcome::Return(OUT_OF_MEMORY);
     }
     let provider = env.ext.get::<State>().provider;
-    let surface = match (provider.insert)(env.ext, target) {
+    let surface = match (provider.insert)(
+        env.ext,
+        target.with_alpha_mode(targets::alpha_mode(normalized.BackBufferFormat)),
+    ) {
         Ok(s) => s,
         Err(_) => {
             let _ = com(env).release_identity(&mut env.sys.objects, factory);
@@ -532,6 +574,8 @@ fn create_device(
         needs_reset: false,
         back_buffer: None,
         texture: None,
+        render_target: None,
+        buffers: buffers::Bindings::default(),
         fixed: fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight),
     };
     let Some((pointer, id)) = object(
@@ -627,7 +671,7 @@ fn reset(
     let outstanding_default = env.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace())
         .any(|(id,_)| matches!(com.get_identity(&env.sys.objects,id), Some(Payload::Resource(r))
             if r.device == device_id && r.desc.Pool == 0 && com.references(&env.sys.objects,id).is_some_and(|n| n != 0)));
-    if outstanding_default {
+    if outstanding_default || buffers::has_outstanding_default(env, device_id) {
         if let Some(Payload::Device(d)) = com.get_identity_mut(&mut env.sys.objects, device_id) {
             d.needs_reset = true;
         }
@@ -679,7 +723,13 @@ fn reset(
         }
         return Outcome::Return(UNAVAILABLE);
     }
-    if (provider.replace)(env.ext, surface, target).is_err() {
+    if (provider.replace)(
+        env.ext,
+        surface,
+        target.with_alpha_mode(targets::alpha_mode(normalized.BackBufferFormat)),
+    )
+    .is_err()
+    {
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
             destroy(env, dead);
         }
@@ -692,6 +742,8 @@ fn reset(
         d.needs_reset = false;
         d.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
     }
+    buffers::reset_bindings(env, device_id);
+    targets::reset_binding(env, device_id);
     for binding in [old_texture, old_buffer].into_iter().flatten() {
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, binding) {
             destroy(env, dead);
@@ -922,15 +974,12 @@ fn clear(
     z: f32,
     _stencil: u32,
 ) -> Outcome {
-    let Some(d) = device(env, this.addr()) else {
-        return Outcome::Return(INVALID);
-    };
     if count != 0 || flags == 0 || flags & !1 != 0 {
         return Outcome::Return(INVALID);
     }
-    let provider = env.ext.get::<State>().provider;
-    let Some(target) = (provider.target)(env.ext, d.surface) else {
-        return Outcome::Return(INVALID);
+    let target = match targets::draw_target(env, this.addr()) {
+        Ok(target) => target,
+        Err(error) => return Outcome::Return(error),
     };
     let color = [
         ((color >> 16) & 255) as f64 / 255.,

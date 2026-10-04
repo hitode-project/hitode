@@ -2,7 +2,7 @@
 use super::*;
 use adv_abi::types::{D3DLOCKED_RECT, D3DSURFACE_DESC};
 use adv_device::surface::Rect;
-const IID_RESOURCE: Iid = [
+pub(super) const IID_RESOURCE: Iid = [
     0x5d, 0xc0, 0xee, 5, 0x7d, 0x8f, 0x62, 0x43, 0xb9, 0x99, 0xd1, 0xba, 0xf3, 0x57, 0xc7, 4,
 ];
 const IID_BASE_TEXTURE: Iid = [
@@ -28,6 +28,10 @@ pub(super) struct Resource {
     pub storage: u32,
     pub owns_surface: bool,
     pub lock: Option<Lock>,
+    /// Texture levels borrow the parent's storage and delegate public counts.
+    pub container: Option<Id>,
+    /// The texture owns this interface metadata through an internal Objects ref.
+    pub level_surface: Option<Id>,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Lock {
@@ -51,6 +55,12 @@ pub(super) fn register(registry: &mut Registry) {
         set_texture_ABI,
         get_texture_ABI,
         texture_levels_ABI,
+        texture_surface_ABI,
+        surface_container_ABI,
+        surface_device_ABI,
+        texture_device_ABI,
+        surface_type_ABI,
+        texture_type_ABI,
     ] {
         registry.register(api);
     }
@@ -77,6 +87,172 @@ pub(super) fn resource<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Resourc
         _ => None,
     }
 }
+pub(super) fn container_pointer(env: &Env<'_>, pointer: u32) -> Option<u32> {
+    let id = resource(env, pointer)?.container?;
+    match com(env).get_identity(&env.sys.objects, id)? {
+        Payload::Resource(r) if r.kind == Kind::Texture => Some(r.pointer),
+        _ => None,
+    }
+}
+/// Bindings keep the texture's single backing alive when they refer to a level.
+pub(super) fn binding_owner(env: &Env<'_>, id: Id) -> Id {
+    match com(env).get_identity(&env.sys.objects, id) {
+        Some(Payload::Resource(r)) => r.container.unwrap_or(id),
+        _ => id,
+    }
+}
+
+#[win32(d3d9,name="IDirect3DTexture9::GetSurfaceLevel",level=implement)]
+fn texture_surface(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    level: u32,
+    output: GuestPtr<u32>,
+) -> u32 {
+    if output.write(env.cpu, 0).is_err() {
+        return INVALID;
+    }
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture && level == 0)
+    else {
+        return INVALID;
+    };
+    let container = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .unwrap();
+    let level_id = if let Some(id) = r.level_surface {
+        id
+    } else {
+        // Only interface metadata is new. Storage and lock state remain owned
+        // by the texture; the level neither copies pixels nor owns a parent ref.
+        let value = Resource {
+            pointer: 0,
+            device: r.device,
+            kind: Kind::Surface,
+            desc: r.desc,
+            surface: r.surface,
+            storage: 0,
+            owns_surface: false,
+            lock: None,
+            container: Some(container),
+            level_surface: None,
+        };
+        let Some((pointer, id)) = object(
+            env,
+            "IDirect3DSurface9",
+            IID_SURFACE,
+            Payload::Resource(value),
+        ) else {
+            return OUT_OF_MEMORY;
+        };
+        if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
+            r.pointer = pointer;
+        }
+        assert!(com(env).register_interface(&mut env.sys.objects, id, IID_RESOURCE, pointer));
+        if !com(env).retain_internal(&mut env.sys.objects, id) {
+            if let Some(released) = com(env).release_identity(&mut env.sys.objects, id)
+                && let Some(dead) = released.destroyed
+            {
+                super::destroy(env, dead);
+            }
+            return OUT_OF_MEMORY;
+        }
+        // This is the interface metadata's initial owner, not a public view
+        // Release (which delegates to the texture's public reference count).
+        assert!(
+            com(env)
+                .release_identity(&mut env.sys.objects, id)
+                .is_some()
+        );
+        if let Some(Payload::Resource(r)) =
+            com(env).get_identity_mut(&mut env.sys.objects, container)
+        {
+            r.level_surface = Some(id);
+        }
+        id
+    };
+    let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, level_id) else {
+        return INVALID;
+    };
+    let pointer = r.pointer;
+    if add_ref(env, pointer).is_none() {
+        return OUT_OF_MEMORY;
+    }
+    if output.write(env.cpu, pointer).is_err() {
+        release(env, pointer);
+        return INVALID;
+    }
+    0
+}
+
+#[win32(d3d9,name="IDirect3DSurface9::GetContainer",level=implement)]
+fn surface_container(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    iid: GuestPtr<Iid>,
+    output: GuestPtr<u32>,
+) -> Outcome {
+    if output.write(env.cpu, 0).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Surface) else {
+        return Outcome::Return(INVALID);
+    };
+    let parent = if let Some(container) = r.container {
+        container
+    } else if r.owns_surface || r.desc.Pool >= 2 {
+        r.device
+    } else {
+        // Back buffers have a swap-chain container, not a device container.
+        return Outcome::Return(UNAVAILABLE);
+    };
+    let pointer = match com(env).get_identity(&env.sys.objects, parent) {
+        Some(Payload::Resource(r)) => r.pointer,
+        Some(Payload::Device(d)) => d.pointer,
+        _ => return Outcome::Return(INVALID),
+    };
+    query(env, GuestPtr::new(pointer), iid, output)
+}
+
+fn resource_device(env: &mut Env<'_>, this: u32, output: GuestPtr<u32>) -> u32 {
+    if output.write(env.cpu, 0).is_err() {
+        return INVALID;
+    }
+    let Some(r) = resource(env, this) else {
+        return INVALID;
+    };
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, r.device) else {
+        return INVALID;
+    };
+    let pointer = d.pointer;
+    if add_ref(env, pointer).is_none() {
+        return OUT_OF_MEMORY;
+    }
+    if output.write(env.cpu, pointer).is_err() {
+        release(env, pointer);
+        return INVALID;
+    }
+    0
+}
+#[win32(d3d9,name="IDirect3DSurface9::GetDevice",level=implement)]
+fn surface_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
+    resource_device(env, this.addr(), output)
+}
+#[win32(d3d9,name="IDirect3DTexture9::GetDevice",level=implement)]
+fn texture_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
+    resource_device(env, this.addr(), output)
+}
+#[win32(d3d9,name="IDirect3DSurface9::GetType",level=implement)]
+fn surface_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    u32::from(resource(env, this.addr()).is_some_and(|r| r.kind == Kind::Surface))
+}
+#[win32(d3d9,name="IDirect3DTexture9::GetType",level=implement)]
+fn texture_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    if resource(env, this.addr()).is_some_and(|r| r.kind == Kind::Texture) {
+        3
+    } else {
+        0
+    }
+}
 pub(super) fn parent_on_last_public_release(env: &Env<'_>, pointer: u32) -> Option<Id> {
     let r = resource(env, pointer)?;
     let id = com(env).identity::<Payload>(&env.sys.objects, pointer)?;
@@ -88,6 +264,11 @@ pub(super) fn parent_on_first_public_retain(env: &Env<'_>, pointer: u32) -> Opti
     (com(env).references(&env.sys.objects, id)? == 0).then_some(r.device)
 }
 pub(super) fn destroy(env: &mut Env<'_>, r: Resource) {
+    if let Some(level) = r.level_surface
+        && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, level)
+    {
+        super::destroy(env, dead);
+    }
     if r.storage != 0 {
         free(env, r.storage);
     }
@@ -161,6 +342,8 @@ pub(super) fn implicit_back_buffer(
             storage: 0,
             owns_surface: false,
             lock: None,
+            container: None,
+            level_surface: None,
         },
     )?;
     if !com(env).retain_internal(&mut env.sys.objects, id) {
@@ -248,10 +431,11 @@ fn create_texture(
         Err(e) => return gpu_error(e),
     };
     let provider = env.ext.get::<State>().provider;
-    let surface = match (provider.insert)(env.ext, target) {
-        Ok(s) => s,
-        Err(_) => return Outcome::Return(OUT_OF_MEMORY),
-    };
+    let surface =
+        match (provider.insert)(env.ext, target.with_alpha_mode(targets::alpha_mode(format))) {
+            Ok(s) => s,
+            Err(_) => return Outcome::Return(OUT_OF_MEMORY),
+        };
     let storage = if usage & 1 == 0 {
         alloc(env, len)
     } else {
@@ -284,6 +468,8 @@ fn create_texture(
             storage,
             owns_surface: true,
             lock: None,
+            container: None,
+            level_surface: None,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);
@@ -329,7 +515,7 @@ fn texture_levels(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     u32::from(resource(env, this.addr()).is_some_and(|r| r.kind == Kind::Texture))
 }
 #[win32(d3d9,name="IDirect3DTexture9::LockRect",level=implement)]
-fn texture_lock(
+pub(super) fn texture_lock(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     level: u32,
@@ -403,7 +589,7 @@ fn texture_lock(
     0
 }
 #[win32(d3d9,name="IDirect3DTexture9::UnlockRect",level=implement)]
-fn texture_unlock(env: &mut Env<'_>, this: GuestPtr<()>, level: u32) -> Outcome {
+pub(super) fn texture_unlock(env: &mut Env<'_>, this: GuestPtr<()>, level: u32) -> Outcome {
     let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture && level == 0)
     else {
         return Outcome::Return(INVALID);
@@ -530,4 +716,82 @@ fn get_texture(
         return Outcome::Return(INVALID);
     }
     Outcome::Return(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_reference_limit_and_invalid_output_preserve_parent_and_single_backing() {
+        let mut m = super::super::tests::machine();
+        m.ext
+            .get_mut::<State>()
+            .tables
+            .insert("IDirect3DTexture9", 0);
+        let mut env = Env {
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (_, device, _, original) = super::super::tests::setup(&mut env);
+        if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, original) {
+            super::super::destroy(&mut env, dead);
+        }
+        let (texture, identity) = make(
+            &mut env,
+            Resource {
+                pointer: 0,
+                device,
+                kind: Kind::Texture,
+                desc: D3DSURFACE_DESC {
+                    Width: 2,
+                    Height: 2,
+                    Pool: 1,
+                    Type: 1,
+                    Format: 21,
+                    ..D3DSURFACE_DESC::default()
+                },
+                surface: None,
+                storage: 0,
+                owns_surface: false,
+                lock: None,
+                container: None,
+                level_surface: None,
+            },
+        )
+        .unwrap();
+        let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
+        let count = env.sys.objects.object_count();
+        assert_eq!(
+            texture_surface(&mut env, GuestPtr::new(texture), 0, GuestPtr::new(0)),
+            INVALID
+        );
+        assert_eq!(env.sys.objects.object_count(), count);
+        assert_eq!(add_ref(&mut env, texture), Some(2));
+        assert_eq!(
+            texture_surface(&mut env, GuestPtr::new(texture), 0, output),
+            OUT_OF_MEMORY
+        );
+        assert_eq!(output.read(env.cpu).unwrap(), 0);
+        assert_eq!(com(&env).references(&env.sys.objects, identity), Some(2));
+        assert_eq!(release(&mut env, texture), 1);
+        assert_eq!(
+            texture_surface(&mut env, GuestPtr::new(texture), 0, output),
+            0
+        );
+        let surface = output.read(env.cpu).unwrap();
+        let level = com(&env)
+            .identity::<Payload>(&env.sys.objects, surface)
+            .unwrap();
+        assert_eq!(binding_owner(&env, level), identity);
+        assert_eq!(com(&env).references(&env.sys.objects, level), Some(0));
+        assert_eq!(add_ref(&mut env, surface), None);
+        assert_eq!(release(&mut env, surface), 1);
+        assert_eq!(release(&mut env, texture), 0);
+        assert!(com(&env).get_identity(&env.sys.objects, level).is_none());
+        assert!(com(&env).get_identity(&env.sys.objects, identity).is_none());
+        assert_eq!(env.sys.objects.object_count(), count - 1);
+    }
 }

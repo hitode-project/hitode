@@ -34,6 +34,8 @@ pub(super) fn machine() -> Machine<JitCpu> {
             ("IDirect3D9", 0),
             ("IDirect3DDevice9", 0),
             ("IDirect3DSurface9", 0),
+            ("IDirect3DVertexBuffer9", 0),
+            ("IDirect3DIndexBuffer9", 0),
         ]),
         gpu: None,
         provider,
@@ -44,7 +46,7 @@ pub(super) fn machine() -> Machine<JitCpu> {
     });
     m
 }
-fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
+pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     let (_, factory) = object(env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
     com(env)
         .add_ref_identity(&mut env.sys.objects, factory)
@@ -64,6 +66,8 @@ fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             needs_reset: false,
             back_buffer: None,
             texture: None,
+            render_target: None,
+            buffers: buffers::Bindings::default(),
             fixed: fixed::Fixed::new(16, 12),
         })),
     )
@@ -88,6 +92,8 @@ fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             storage: 0,
             owns_surface: false,
             lock: None,
+            container: None,
+            level_surface: None,
         },
     )
     .unwrap();

@@ -23,6 +23,16 @@ pub(super) struct Draw {
     pub state: DrawState,
 }
 impl Fixed {
+    pub(super) fn target_changed(&mut self, width: u32, height: u32) {
+        self.viewport = D3DVIEWPORT9 {
+            X: 0,
+            Y: 0,
+            Width: width,
+            Height: height,
+            MinZ: 0.,
+            MaxZ: 1.,
+        };
+    }
     pub fn new(width: u32, height: u32) -> Self {
         let identity = [
             1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
@@ -298,17 +308,17 @@ fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIE
     let Ok(v) = viewport.read(env.cpu) else {
         return INVALID;
     };
-    let Some(d) = device(env, this.addr()) else {
+    let Ok(target) = super::targets::draw_target(env, this.addr()) else {
         return INVALID;
     };
     if v.Width == 0
         || v.Height == 0
         || v.X
             .checked_add(v.Width)
-            .is_none_or(|x| x > d.parameters.BackBufferWidth)
+            .is_none_or(|x| x > target.image.width())
         || v.Y
             .checked_add(v.Height)
-            .is_none_or(|y| y > d.parameters.BackBufferHeight)
+            .is_none_or(|y| y > target.image.height())
         || !v.MinZ.is_finite()
         || !v.MaxZ.is_finite()
         || v.MinZ < 0.
@@ -432,13 +442,45 @@ fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
 fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
     std::array::from_fn(|column| (0..4).map(|i| vector[i] * matrix[i * 4 + column]).sum())
 }
-fn prepare(
+pub(super) fn vertex_size(env: &Env<'_>, pointer: u32) -> Result<u32, u32> {
+    let f = current(env, pointer).ok_or(INVALID)?;
+    if !valid_fvf(f.fvf) {
+        return Err(INVALID);
+    }
+    let position = if f.fvf & 0x0e == 4 { 4 } else { 3 };
+    Ok((position + u32::from(f.fvf & 0x40 != 0) + 2 * u32::from(f.fvf & 0x100 != 0)) * 4)
+}
+pub(super) fn primitive_length(kind: i32, count: u32) -> Result<u32, u32> {
+    if count == 0 || count > 131_072 {
+        return Err(INVALID);
+    }
+    match kind {
+        1 => Some(count),
+        2 => count.checked_mul(2),
+        3 => count.checked_add(1),
+        4 => count.checked_mul(3),
+        5 | 6 => count.checked_add(2),
+        _ => None,
+    }
+    .ok_or(INVALID)
+}
+pub(super) fn empty_draw(env: &Env<'_>, pointer: u32, kind: i32) -> Result<(), u32> {
+    let d = device(env, pointer).ok_or(INVALID)?;
+    if !d.scene || d.needs_reset || !matches!(kind, 1..=6) {
+        return Err(INVALID);
+    }
+    // Zero batches do not dereference data, transform vertices or enqueue GPU
+    // work. Their UP binding side effects remain the caller's responsibility.
+    Ok(())
+}
+pub(super) fn prepare(
     env: &Env<'_>,
     pointer: u32,
     kind: i32,
     count: u32,
     data: GuestPtr<u8>,
     stride: u32,
+    indices: Option<&[u32]>,
 ) -> Result<Draw, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
     let f = &d.fixed;
@@ -449,33 +491,36 @@ fn prepare(
     if position == 3 && f.render[&137] != 0 {
         return Err(UNAVAILABLE);
     }
-    let minimum = (position + u32::from(f.fvf & 0x40 != 0) + 2 * u32::from(f.fvf & 0x100 != 0)) * 4;
+    let minimum = vertex_size(env, pointer)?;
     if stride < minimum || stride > 2048 || data.is_null() {
         return Err(INVALID);
     }
-    let (topology, length) = match kind {
-        1 => (Topology::Points, Some(count)),
-        2 => (Topology::Lines, count.checked_mul(2)),
-        3 => (Topology::LineStrip, count.checked_add(1)),
-        4 => (Topology::Triangles, count.checked_mul(3)),
-        5 | 6 => (
-            if kind == 5 {
-                Topology::TriangleStrip
-            } else {
-                Topology::Triangles
-            },
-            count.checked_add(2),
-        ),
+    let topology = match kind {
+        1 => Topology::Points,
+        2 => Topology::Lines,
+        3 => Topology::LineStrip,
+        4 | 6 => Topology::Triangles,
+        5 => Topology::TriangleStrip,
         _ => return Err(INVALID),
     };
-    let length = length.filter(|&n| n > 0 && n <= 1_000_000).ok_or(INVALID)?;
-    let bytes = (length - 1)
+    let length = primitive_length(kind, count)?;
+    if indices.is_some_and(|v| v.len() != length as usize) {
+        return Err(INVALID);
+    }
+    let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
+    let last = indices
+        .and_then(|v| v.iter().max().copied())
+        .unwrap_or(length - 1);
+    let offset = first.checked_mul(stride).ok_or(INVALID)?;
+    let bytes = (last - first)
         .checked_mul(stride)
         .and_then(|n| n.checked_add(minimum))
         .ok_or(INVALID)?;
-    adv_abi::guest::check_range(env.cpu, data.addr(), bytes, Prot::READ).map_err(|_| INVALID)?;
+    let span = data.addr().checked_add(offset).ok_or(INVALID)?;
+    adv_abi::guest::check_range(env.cpu, span, bytes, Prot::READ).map_err(|_| INVALID)?;
     let mut vertices = Vec::with_capacity(length as usize);
-    for index in 0..length {
+    for ordinal in 0..length {
+        let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         let mut raw = [0; 28];
         env.cpu
             .read(data.addr() + index * stride, &mut raw[..minimum as usize])
@@ -537,7 +582,7 @@ fn prepare(
         vertices = fan;
     }
     let provider = env.ext.get::<State>().provider;
-    let target = (provider.target)(env.ext, d.surface).ok_or(INVALID)?;
+    let target = super::targets::draw_target(env, pointer)?;
     let image = if let Some(id) = d.texture {
         let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
             return Err(INVALID);
@@ -639,12 +684,20 @@ fn draw_up(
     data: GuestPtr<u8>,
     stride: u32,
 ) -> Outcome {
-    let draw = match prepare(env, this.addr(), kind, count, data, stride) {
+    if count == 0 {
+        if let Err(error) = empty_draw(env, this.addr(), kind) {
+            return Outcome::Return(error);
+        }
+        super::buffers::clear_up_bindings(env, this.addr(), false);
+        return Outcome::Return(0);
+    }
+    let draw = match prepare(env, this.addr(), kind, count, data, stride, None) {
         Ok(d) => d,
         Err(e) => return Outcome::Return(e),
     };
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
+    super::buffers::clear_up_bindings(env, this.addr(), false);
     dispatch(env, id, Operation::Draw(draw))
 }
