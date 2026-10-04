@@ -274,6 +274,92 @@ fn callback_partitioning_is_sample_identical_at_every_rate_ratio() {
 }
 
 #[test]
+fn same_dac_format_reacquisition_preserves_ring_and_owned_samples() {
+    for rate in [44_100, 48_000, 96_000, 192_000] {
+        for owned in [false, true] {
+            let run = |reacquire: bool| {
+                let control = AudioControl::new(false);
+                let state = if owned {
+                    let samples = (0..72_000)
+                        .flat_map(|frame| {
+                            [997.0, 503.0].map(|frequency| {
+                                (frame as f64 * std::f64::consts::TAU * frequency / 48_000.0).sin()
+                                    as f32
+                                    * 0.25
+                            })
+                        })
+                        .collect();
+                    control
+                        .push_pcm(adv_device::mixer::PcmBlock {
+                            stream_id: 1,
+                            guest_pts_us: 0,
+                            sample_rate: 48_000,
+                            channels: 2,
+                            samples,
+                        })
+                        .ok()
+                        .expect("valid synthetic PCM");
+                    None
+                } else {
+                    Some(source(&control, 48_000, 2))
+                };
+                let stream = control.stream();
+                let mut reader = stream.device_reader(rate, 2).unwrap();
+                let frames = rate as usize * 5 / 4;
+                let mut output = vec![0.0; frames * 2];
+                let mut first = 0;
+                let mut index = 0;
+                let mut pts = Vec::new();
+                while first < frames {
+                    let count =
+                        [4224, 1, 257, 1919, 4096, 128, 2053][index % 7].min(frames - first);
+                    pts.push(
+                        reader
+                            .read(&mut output[first * 2..(first + count) * 2], 20_000)
+                            .first_pts_us,
+                    );
+                    first += count;
+                    index += 1;
+                    if reacquire {
+                        drop(reader);
+                        control.maintain();
+                        reader = stream.device_reader(rate, 2).unwrap();
+                    }
+                }
+                let cursor = state.map(|state| state.cursor(1_250_000, 1));
+                let notices: Vec<_> = control
+                    .take_events()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        AudioEvent::Notification { event, due_us, .. } => Some((event, due_us)),
+                        AudioEvent::Released { .. } => None,
+                    })
+                    .collect();
+                assert_eq!(stream.metrics().missing_output_frames, 0);
+                (output, pts, cursor, notices)
+            };
+            let continuous = run(false);
+            let reacquired = run(true);
+            assert_eq!(continuous.1, reacquired.1, "PTS: {rate}, owned={owned}");
+            assert_eq!(continuous.2, reacquired.2, "cursor: {rate}, owned={owned}");
+            assert_eq!(continuous.3, reacquired.3, "events: {rate}, owned={owned}");
+            if let Some((at, (expected, actual))) = continuous
+                .0
+                .iter()
+                .zip(&reacquired.0)
+                .enumerate()
+                .find(|(_, (expected, actual))| expected != actual)
+            {
+                panic!(
+                    "same configuration and continuous clock changed sample {at}: \
+                     {expected} vs {actual}, rate={rate}, owned={owned}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unsigned_eight_bit_pcm_has_no_dc_offset_at_different_dac_rates() {
     for rate in OUTPUT_RATES {
         let input_rate = 22_050;

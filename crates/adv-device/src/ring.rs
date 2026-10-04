@@ -160,6 +160,16 @@ impl RingVoice {
     pub fn frequency(&self) -> u32 {
         self.frequency
     }
+    pub(crate) fn prepare(&mut self, rate: u32, reset: bool) -> Result<(), String> {
+        if !self.converter.matches(self.frequency, rate) {
+            let converter = Converter::new(self.frequency, rate)?;
+            let _ = self.retune(self.frequency, converter);
+        } else if reset {
+            self.read_frame = self.phase >> 32;
+            self.converter.reset();
+        }
+        Ok(())
+    }
     pub fn alignment(&self) -> u32 {
         self.align()
     }

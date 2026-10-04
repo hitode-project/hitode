@@ -632,6 +632,157 @@ fn an_ongoing_loop_advances_across_a_device_gap_while_a_new_play_starts_at_its_o
     );
 }
 
+#[test]
+fn same_rate_new_epochs_and_channel_changes_reuse_prepared_storage_without_callback_allocation() {
+    for device_time in [false, true] {
+        let control = AudioControl::new(device_time);
+        let view = Arc::new(View(
+            (0..48_000)
+                .flat_map(|_| 8192i16.to_le_bytes())
+                .map(AtomicU8::new)
+                .collect(),
+        ));
+        add(&control, 1, view, 48_000, vec![]);
+        assert!(control.play_ring(1, true, 1));
+        assert!(
+            control
+                .push_pcm(adv_device::mixer::PcmBlock {
+                    stream_id: 2,
+                    guest_pts_us: 0,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    samples: vec![0.125; 48_000],
+                })
+                .is_ok()
+        );
+        let stream = control.stream();
+        let mut reader = Some(stream.device_reader(96_000, 2).unwrap());
+        let mut out = [0.0; 1536];
+        no_alloc(|| {
+            reader.as_mut().unwrap().read(&mut out[..514], 0);
+        });
+        let fresh_start = out[0];
+        let mut previous_channels = 2;
+        for channels in [2, 1, 6, 2] {
+            // A new native epoch and a changed speaker count both reset history;
+            // neither needs a second allocation of an identical sinc kernel.
+            no_alloc(|| {
+                drop(reader.take());
+                reader = Some(stream.device_reader(96_000, channels).unwrap());
+                reader
+                    .as_mut()
+                    .unwrap()
+                    .read(&mut out[..256 * usize::from(channels)], 0);
+            });
+            if device_time || channels != previous_channels {
+                assert_eq!(
+                    out[0], fresh_start,
+                    "new clock epoch or changed speaker layout must reset history"
+                );
+            }
+            previous_channels = channels;
+            control.maintain();
+        }
+        assert_eq!(stream.metrics().missing_output_frames, 0);
+        assert!(out.iter().all(|sample| sample.is_finite()));
+    }
+}
+
+#[test]
+fn guest_fast_forward_does_not_change_native_dma_samples_cursors_or_notifications() {
+    for rate in [44_100, 48_000, 96_000, 192_000] {
+        let run =
+            |fast_forward: bool| {
+                let control = AudioControl::new(true);
+                let view = sine(48_000, 997.0, 48_000);
+                let bytes = view.len() as u32;
+                let state = control
+                    .add_ring(
+                        1,
+                        RingConfig {
+                            view,
+                            bytes,
+                            channels: 1,
+                            bits: 16,
+                            frequency: 48_000,
+                            output_rate: 44_100,
+                            notifications: vec![(48_000, 7)],
+                        },
+                    )
+                    .unwrap();
+                assert!(control.written(1, 0, bytes));
+                assert!(control.play_ring(1, true, 5));
+                let stream = control.stream();
+                let clock = control.playback_clock();
+                let mut reader = stream.device_reader(rate, 2).unwrap();
+                let frames = rate as usize * 5 / 4;
+                let mut out = vec![0.0; frames * 2];
+                let mut callbacks = Vec::new();
+                let mut notices = Vec::new();
+                let mut first = 0;
+                let mut index = 0;
+                while first < frames {
+                    let consumed_us = first as u64 * 1_000_000 / u64::from(rate);
+                    let guest_us = if fast_forward {
+                        60_000_000 + index * 10_000_000
+                    } else {
+                        consumed_us
+                    };
+                    control.sync_clock(guest_us);
+                    let count = [1, 257, rate as usize / 100, 128, 2053][index as usize % 5]
+                        .min(frames - first);
+                    let mut read = None;
+                    no_alloc(|| {
+                        read = Some(reader.read_with_clock(
+                            &mut out[first * 2..(first + count) * 2],
+                            90_000,
+                            Some(adv_device::DeviceClock {
+                                consumed_frames: first as u64,
+                                queued_frames: rate / 200,
+                            }),
+                        ));
+                    });
+                    let read = read.unwrap();
+                    assert!(
+                        clock.now_us(guest_us) < 5_000_000,
+                        "device clock followed guest fast forward at {rate}"
+                    );
+                    assert_eq!(read.missing_output_frames, 0);
+                    callbacks.push((read.first_pts_us, state.cursor(read.first_pts_us, 5)));
+                    notices.extend(control.take_events().into_iter().filter_map(
+                        |event| match event {
+                            adv_device::AudioEvent::Notification {
+                                event,
+                                generation,
+                                due_us,
+                                ..
+                            } => Some((event, generation, due_us)),
+                            adv_device::AudioEvent::Released { .. } => None,
+                        },
+                    ));
+                    first += count;
+                    index += 1;
+                }
+                assert_eq!(notices.len(), 1);
+                (out, callbacks, notices)
+            };
+        let normal = run(false);
+        let fast = run(true);
+        assert!(
+            normal.0 == fast.0,
+            "guest time changed native PCM at {rate}"
+        );
+        assert_eq!(
+            normal.1, fast.1,
+            "guest time changed native cursor at {rate}"
+        );
+        assert_eq!(
+            normal.2, fast.2,
+            "guest time changed notifications at {rate}"
+        );
+    }
+}
+
 fn owned_output(
     rate: u32,
     channels: u16,

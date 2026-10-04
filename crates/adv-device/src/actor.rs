@@ -154,12 +154,6 @@ impl Voice {
             Self::Owned { voice, .. } => voice.active(),
         }
     }
-    fn frequency(&self) -> u32 {
-        match self {
-            Self::Ring { voice, .. } => voice.frequency(),
-            Self::Owned { voice, .. } => voice.frequency(),
-        }
-    }
     fn retire(self) -> Retired {
         match self {
             Self::Ring { voice, state, .. } => Retired::Ring(voice, state),
@@ -248,6 +242,7 @@ impl AudioControl {
             cursor_us: 0.0,
             virtual_us: 0,
             rate: 44100,
+            channels: 2,
             notification_retry: None,
         });
         shared
@@ -571,6 +566,7 @@ pub(crate) struct Engine {
     cursor_us: f64,
     virtual_us: u64,
     rate: u32,
+    channels: u16,
     notification_retry: Option<AudioEvent>,
 }
 impl Engine {
@@ -758,19 +754,20 @@ impl Engine {
             self.retire(voice.retire());
         }
     }
-    fn prepare(&mut self, rate: u32) -> Result<(), String> {
+    fn prepare(&mut self, rate: u32, channels: u16, new_device_epoch: bool) -> Result<(), String> {
+        // The physical backend owns one reader per stream, so reacquiring after
+        // device time starts means a new consumed-frame epoch. Reuse its kernel
+        // and buffers, but reset history just as a fresh converter did. Virtual
+        // pulls retain history only while the output configuration is unchanged.
+        let reset = new_device_epoch || channels != self.channels;
         for voice in self.voices.iter_mut().flatten() {
-            let converter = Converter::new(voice.frequency(), rate)?;
             match voice {
-                Voice::Ring { voice, .. } => {
-                    let _ = voice.retune(voice.frequency(), converter);
-                }
-                Voice::Owned { voice, .. } => {
-                    let _ = voice.retune(voice.frequency(), converter);
-                }
+                Voice::Ring { voice, .. } => voice.prepare(rate, reset)?,
+                Voice::Owned { voice, .. } => voice.prepare(rate, reset)?,
             }
         }
         self.rate = rate;
+        self.channels = channels;
         Ok(())
     }
     fn advance_virtual(&mut self, now: u64, shared: &Shared) {
@@ -986,7 +983,9 @@ impl crate::AudioStream {
             reader.engine.cursor_us = now;
         }
         reader.engine.service(&self.shared);
-        reader.engine.prepare(rate)?;
+        reader
+            .engine
+            .prepare(rate, channels, self.shared.clock.uses_device_time())?;
         self.shared.rate.store(rate, Ordering::Release);
         reader.channels = channels;
         reader.device_origin_us = reader.engine.cursor_us;

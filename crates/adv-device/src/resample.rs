@@ -8,6 +8,7 @@ pub(crate) struct Converter {
     input: Vec<Vec<f32>>,
     output: Vec<Vec<f32>>,
     at: usize,
+    frequency: u32,
     pub rate: u32,
 }
 impl Converter {
@@ -46,8 +47,12 @@ impl Converter {
             input,
             output,
             at: 128,
+            frequency,
             rate,
         })
+    }
+    pub fn matches(&self, frequency: u32, rate: u32) -> bool {
+        self.frequency == frequency && self.rate == rate
     }
     pub fn reset(&mut self) {
         if let Some(inner) = self.inner.as_mut() {
@@ -134,6 +139,44 @@ mod tests {
         for i in 0..1024 {
             let value = [i as f32 / 2048.0, -(i as f32) / 2048.0];
             assert_eq!(converter.next(|| value), value);
+        }
+    }
+
+    #[test]
+    fn restarting_an_epoch_matches_a_fresh_converter_even_inside_a_prepared_block() {
+        for rate in [44_100, 48_000, 96_000, 192_000] {
+            let source = |frame: u64| {
+                let value =
+                    (frame as f64 * std::f64::consts::TAU * 997.0 / 48_000.0).sin() as f32 * 0.25;
+                [value, -value]
+            };
+            let mut reused = Converter::new(48_000, rate).unwrap();
+            let mut old_input = 0;
+            for _ in 0..4097 {
+                reused.next(|| {
+                    let value = source(old_input);
+                    old_input += 1;
+                    value
+                });
+            }
+            reused.reset();
+            let mut fresh = Converter::new(48_000, rate).unwrap();
+            let mut reused_input = 12_345;
+            let mut fresh_input = reused_input;
+            for output in 0..3000 {
+                let expected = fresh.next(|| {
+                    let value = source(fresh_input);
+                    fresh_input += 1;
+                    value
+                });
+                let actual = reused.next(|| {
+                    let value = source(reused_input);
+                    reused_input += 1;
+                    value
+                });
+                assert_eq!(actual, expected, "epoch restart at {rate}, output {output}");
+            }
+            assert_eq!(reused_input, fresh_input, "input consumption at {rate}");
         }
     }
 }

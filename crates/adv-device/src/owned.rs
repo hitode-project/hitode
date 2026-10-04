@@ -81,8 +81,15 @@ impl OwnedVoice {
             rendered_until: 0.0,
         }))
     }
-    pub fn frequency(&self) -> u32 {
-        self.frequency
+    pub(crate) fn prepare(&mut self, rate: u32, reset: bool) -> Result<(), String> {
+        if !self.converter.matches(self.frequency, rate) {
+            let converter = Converter::new(self.frequency, rate)?;
+            let _ = self.retune(self.frequency, converter);
+        } else if reset {
+            self.initialized = false;
+            self.converter.reset();
+        }
+        Ok(())
     }
     pub fn retune(&mut self, frequency: u32, converter: Converter) -> Converter {
         self.frequency = frequency;
