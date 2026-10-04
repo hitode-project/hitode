@@ -216,10 +216,10 @@ impl Com {
         Some(None)
     }
 
-    /// QueryInterface succeeds only for declared IIDs and retains exactly once.
-    /// Unsupported IIDs and exhausted limits do not change reference ownership.
-    /// Distinct errors let the frontend return E_NOINTERFACE or E_OUTOFMEMORY.
-    pub fn query<T: Any>(
+    /// Resolve and seal the declared interface set without taking ownership.
+    /// Aggregated frontend interfaces can then retain their controlling object
+    /// using the same object table. The returned pointer is only borrowed.
+    pub fn resolve_interface<T: Any>(
         &self,
         objects: &mut Objects,
         pointer: u32,
@@ -232,12 +232,27 @@ impl Com {
             .owned_mut(id)
             .ok_or(QueryError::InvalidObject)?
             .sealed = true;
-        let target = *self
-            .object(objects, id)
+        self.object(objects, id)
             .ok_or(QueryError::InvalidObject)?
             .interfaces
             .get(&iid)
-            .ok_or(QueryError::NoInterface)?;
+            .copied()
+            .ok_or(QueryError::NoInterface)
+    }
+
+    /// QueryInterface succeeds only for declared IIDs and retains exactly once.
+    /// Unsupported IIDs and exhausted limits do not change reference ownership.
+    /// Distinct errors let the frontend return E_NOINTERFACE or E_OUTOFMEMORY.
+    pub fn query<T: Any>(
+        &self,
+        objects: &mut Objects,
+        pointer: u32,
+        iid: Iid,
+    ) -> Result<u32, QueryError> {
+        let id = self
+            .identity::<T>(objects, pointer)
+            .ok_or(QueryError::InvalidObject)?;
+        let target = self.resolve_interface::<T>(objects, pointer, iid)?;
         self.add_ref_identity(objects, id)
             .ok_or(QueryError::ReferenceLimit)?;
         Ok(target)

@@ -11,6 +11,42 @@ const B: [u8; 16] = [2; 16];
 const C: [u8; 16] = [3; 16];
 
 #[test]
+fn aggregated_interface_lookup_is_borrowed_even_at_reference_limit_and_seals_iids() {
+    let mut objects = Objects::with_limits(ObjectLimits {
+        references: 2,
+        ..ObjectLimits::default()
+    });
+    let com = Com::new(&mut objects).unwrap();
+    let id = com.create(&mut objects, 0x1000, A, 7_u32).unwrap();
+    assert_eq!(
+        com.resolve_interface::<u32>(&mut objects, 0x1000, A),
+        Ok(0x1000)
+    );
+    assert_eq!(com.references(&objects, id), Some(1));
+    assert_eq!(
+        com.query::<u32>(&mut objects, 0x1000, A),
+        Err(QueryError::ReferenceLimit)
+    );
+    assert!(!com.register_interface(&mut objects, id, B, 0x1000));
+    assert_eq!(
+        com.resolve_interface::<u32>(&mut objects, 0x1000, B),
+        Err(QueryError::NoInterface)
+    );
+    assert_eq!(com.references(&objects, id), Some(1));
+    assert!(
+        com.release_identity(&mut objects, id)
+            .unwrap()
+            .destroyed
+            .is_some()
+    );
+    assert_eq!(
+        com.resolve_interface::<u32>(&mut objects, 0x1000, A),
+        Err(QueryError::InvalidObject)
+    );
+    assert_eq!(objects.object_count(), 0);
+}
+
+#[test]
 fn bindings_keep_zero_public_reference_identity_and_getters_can_retain_it_again() {
     let mut objects = Objects::default();
     let com = Com::new(&mut objects).unwrap();
