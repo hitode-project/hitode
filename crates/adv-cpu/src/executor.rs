@@ -21,6 +21,7 @@ pub struct Stats {
     pub peak_deferred_compilations: usize,
     pub compile_slices: u64,
     pub compile_work_rejections: u64,
+    /// Largest responsive work estimate; zero means unrestricted/unmeasured.
     pub max_compile_work: usize,
     pub compile_time: Duration,
     pub native_code_bytes: usize,

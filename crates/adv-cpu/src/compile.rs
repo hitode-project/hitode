@@ -18,6 +18,7 @@ mod fault;
 mod mmx;
 mod scalar;
 mod simd;
+mod write_summary;
 
 type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
@@ -794,7 +795,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.set_cold_block(shared_exit);
         b.append_block_param(shared_exit, types::I32); // Exit reason.
         b.append_block_param(shared_exit, types::I32); // Exact guest PC.
-        b.ins().jump(dispatch, &[pc.into()]);
+        let hot_dispatch = b.create_block();
+        b.append_block_param(hot_dispatch, types::I32);
+        let write_summary = write_summary::Summary::for_region(&instructions);
+        let hot_exits = write_summary.is_some() && write_summary::crosses_regions(&instructions);
+        if !hot_exits {
+            b.ins().jump(dispatch, &[pc.into()]);
+        }
         let mut e = Emitter {
             b,
             regs,
@@ -819,6 +826,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             shared_exit,
             pc: region.start,
             return_hint,
+            hot_dispatch,
+            direct_footers: BTreeMap::new(),
+            write_summary,
+            hot_exits,
             bridge,
             trap_ref,
             repeat_ref,
@@ -842,6 +853,23 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_return: None,
         };
+        // The initial entry carries canonical flags, whereas runtime indirect
+        // transfers carry the guest instruction's lazy flags. Do not merge the
+        // two paths before a normal exit: that would force every return through
+        // a generic flags materialization.
+        if hot_exits {
+            e.interrupt_at(pc, true);
+            let entry_miss = e.b.create_block();
+            e.b.set_cold_block(entry_miss);
+            let mut switch = Switch::new();
+            for (&pc, &block) in &e.blocks {
+                switch.set_entry(u128::from(pc), block);
+            }
+            switch.emit(&mut e.b, pc, entry_miss);
+            e.b.switch_to_block(entry_miss);
+            let reason = e.constant(Exit::Dispatch as u32);
+            e.b.ins().return_(&[reason]);
+        }
         for (&start, &block) in &e.blocks.clone() {
             e.b.switch_to_block(block);
             e.pc = start;
@@ -892,8 +920,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 pc = instruction.next_ip32();
             }
         }
-        // Dispatch merges prologue/indirect predecessors, each already carrying
-        // its own mode. No individual guest block's recipe dominates this block.
+        // Runtime indirect predecessors each carry their own mode. No
+        // individual guest block's recipe dominates this block.
         e.mmx_effects = None;
         e.b.switch_to_block(dispatch);
         let target = e.b.block_params(dispatch)[0];
@@ -901,7 +929,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // change while a generated loop is running and must not be hoisted.
         e.interrupt_at(target, true);
         let outside = e.b.create_block();
-        e.b.set_cold_block(outside);
+        if !hot_exits {
+            e.b.set_cold_block(outside);
+        }
         let mut switch = Switch::new();
         for (&pc, &block) in &e.blocks {
             switch.set_entry(u128::from(pc), block);
@@ -919,7 +949,41 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let reason = e.b.block_params(shared_exit)[0];
         let pc = e.b.block_params(shared_exit)[1];
         e.save_state(pc);
-        e.chain_or_return(reason, pc);
+        if hot_exits {
+            e.b.ins().return_(&[reason]);
+        } else {
+            e.chain_or_return(pc, None, Some(reason));
+        }
+        // Normal transfers do not merge with fault/budget prefixes. Bound the
+        // number of constant-target footers, sharing all remaining destinations.
+        let direct_footers = std::mem::take(&mut e.direct_footers);
+        let hot_chain = e.b.create_block();
+        e.b.append_block_param(hot_chain, types::I32); // PC.
+        e.b.append_block_param(hot_chain, types::I32); // Precomputed target hash.
+        for (target, block) in direct_footers {
+            e.b.switch_to_block(block);
+            e.mmx_effects = None;
+            let pc = e.constant(target);
+            e.save_hot_state(pc);
+            let hash = e.constant(crate::linking::hash(target));
+            e.b.ins().jump(hot_chain, &[pc.into(), hash.into()]);
+        }
+        if hot_exits {
+            e.b.switch_to_block(hot_dispatch);
+            e.mmx_effects = None;
+            let pc = e.b.block_params(hot_dispatch)[0];
+            e.save_hot_state(pc);
+            let high = e.b.ins().ushr_imm(pc, 16);
+            let mixed = e.b.ins().bxor(pc, high);
+            let mixed = e.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
+            let high = e.b.ins().ushr_imm(mixed, 16);
+            let hash = e.b.ins().bxor(mixed, high);
+            e.b.ins().jump(hot_chain, &[pc.into(), hash.into()]);
+            e.b.switch_to_block(hot_chain);
+            let pc = e.b.block_params(hot_chain)[0];
+            let hash = e.b.block_params(hot_chain)[1];
+            e.chain_or_return(pc, Some(hash), None);
+        }
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if let Some(block) = e.fault_return {
             e.b.switch_to_block(block);
@@ -1399,6 +1463,10 @@ struct Emitter<'a> {
     shared_exit: ir::Block,
     pc: u32,
     return_hint: Option<u32>,
+    hot_dispatch: ir::Block,
+    hot_exits: bool,
+    direct_footers: BTreeMap<u32, ir::Block>,
+    write_summary: Option<write_summary::Summary>,
     bridge: Value,
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
@@ -1424,15 +1492,17 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    fn chain_or_return(&mut self, reason: Value, pc: Value) {
+    fn chain_or_return(&mut self, pc: Value, target_hash: Option<Value>, reason: Option<Value>) {
         let returned = self.b.create_block();
-        let candidate = self.b.create_block();
-        let dispatch = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
-        self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
-        self.b.switch_to_block(candidate);
+        if let Some(reason) = reason {
+            let candidate = self.b.create_block();
+            let dispatch = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
+            self.b.ins().brif(dispatch, candidate, &[], returned, &[]);
+            self.b.switch_to_block(candidate);
+        }
         let slots = self.b.ins().load(
             self.ptr_ty,
             MemFlags::trusted(),
@@ -1485,11 +1555,15 @@ impl Emitter<'_> {
             self.context,
             offset_of!(NativeContext, mask) as i32,
         );
-        let high = self.b.ins().ushr_imm(pc, 16);
-        let mixed = self.b.ins().bxor(pc, high);
-        let mixed = self.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
-        let high = self.b.ins().ushr_imm(mixed, 16);
-        let hashed = self.b.ins().bxor(mixed, high);
+        let hashed = if let Some(hash) = target_hash {
+            hash
+        } else {
+            let high = self.b.ins().ushr_imm(pc, 16);
+            let mixed = self.b.ins().bxor(pc, high);
+            let mixed = self.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
+            let high = self.b.ins().ushr_imm(mixed, 16);
+            self.b.ins().bxor(mixed, high)
+        };
         let index = self.b.ins().band(hashed, mask);
         let search = self.b.create_block();
         self.b.append_block_param(search, types::I32);
@@ -1578,17 +1652,41 @@ impl Emitter<'_> {
             .ins()
             .return_call_indirect(self.tail_ref, entry, &[self.context, self.mem]);
         self.b.switch_to_block(returned);
+        let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
         self.b.ins().return_(&[reason]);
     }
     fn constant(&mut self, value: u32) -> Value {
         self.b.ins().iconst(types::I32, i64::from(value))
     }
     fn exit_const(&mut self, reason: Exit, pc: u32) {
+        if reason == Exit::Dispatch && self.hot_exits {
+            self.flush_mmx_effects();
+            let block = if let Some(&block) = self.direct_footers.get(&pc) {
+                Some(block)
+            } else if self.direct_footers.len() < 2 {
+                let block = self.b.create_block();
+                self.direct_footers.insert(pc, block);
+                Some(block)
+            } else {
+                None
+            };
+            if let Some(block) = block {
+                self.b.ins().jump(block, &[]);
+            } else {
+                let target = self.constant(pc);
+                self.b.ins().jump(self.hot_dispatch, &[target.into()]);
+            }
+            return;
+        }
         let pc = self.constant(pc);
         self.exit(reason, pc);
     }
     fn exit(&mut self, reason: Exit, pc: Value) {
         self.flush_mmx_effects();
+        if reason == Exit::Dispatch && self.hot_exits {
+            self.b.ins().jump(self.hot_dispatch, &[pc.into()]);
+            return;
+        }
         let reason = self.constant(reason as u32);
         self.b
             .ins()
@@ -1646,6 +1744,53 @@ impl Emitter<'_> {
             self.state,
             offset_of!(CpuState, eflags) as i32,
         );
+        let fuel = self.b.use_var(self.fuel);
+        self.b.ins().store(
+            MemFlags::trusted(),
+            fuel,
+            self.state,
+            offset_of!(CpuState, fuel) as i32,
+        );
+        self.b.ins().store(
+            MemFlags::trusted(),
+            pc,
+            self.state,
+            offset_of!(CpuState, eip) as i32,
+        );
+    }
+    fn save_hot_state(&mut self, pc: Value) {
+        let Some(summary) = self.write_summary else {
+            self.save_state(pc);
+            return;
+        };
+        for index in 0..8 {
+            if summary.gpr & (1 << index) != 0 {
+                let value = self.b.use_var(self.regs[index]);
+                self.b
+                    .ins()
+                    .store(MemFlags::trusted(), value, self.state, (index * 4) as i32);
+            }
+            if summary.xmm & (1 << index) != 0 {
+                let value = self
+                    .b
+                    .use_var(self.xmm[index].expect("written XMM was initialized"));
+                self.b.ins().store(
+                    MemFlags::new(),
+                    value,
+                    self.state,
+                    (offset_of!(CpuState, xmm) + index * 16) as i32,
+                );
+            }
+        }
+        if summary.flags {
+            let flags = self.materialize_flags();
+            self.b.ins().store(
+                MemFlags::trusted(),
+                flags,
+                self.state,
+                offset_of!(CpuState, eflags) as i32,
+            );
+        }
         let fuel = self.b.use_var(self.fuel);
         self.b.ins().store(
             MemFlags::trusted(),

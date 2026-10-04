@@ -141,12 +141,15 @@ impl Worker {
         if self.sender.borrow().is_closed() {
             return Err(SubmitError::Closed);
         }
-        let work = crate::compile_budget::work(&input);
-        if let Some(limit) = self.sender.borrow().work_policy().background_limit()
-            && work > limit
-        {
-            return Err(SubmitError::WorkLimit { work, limit });
-        }
+        let work = if let Some(limit) = self.sender.borrow().work_policy().background_limit() {
+            let work = crate::compile_budget::work(&input);
+            if work > limit {
+                return Err(SubmitError::WorkLimit { work, limit });
+            }
+            work
+        } else {
+            0
+        }; // Unrestricted clients do not decode solely for statistics.
         let ticket = self.next_ticket;
         let compiler = self.compiler.clone();
         let delivery = self.delivery.clone();
