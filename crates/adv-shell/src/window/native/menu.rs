@@ -165,6 +165,9 @@ impl Window {
         }
         // Old handles are now detached; replacing the model retires the whole tree.
         self.state.menu = next;
+        if bar.key.window != 0 {
+            self.dialogs.set_main_enabled(self.hwnd, bar.key.enabled);
+        }
         if unsafe { DrawMenuBar(self.hwnd) } == 0 {
             return Err(failure("DrawMenuBar"));
         }

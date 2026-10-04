@@ -17,6 +17,12 @@ use super::window::{
 use super::{USER32, user, user_mut};
 use crate::{Win32, stdcall};
 
+mod presentation;
+pub use presentation::{
+    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, post_host_event,
+    presentation,
+};
+
 const RT_DIALOG: u16 = 5;
 const DS_ABSALIGN: u32 = 0x1;
 const DS_SETFONT: u32 = 0x40;
@@ -383,6 +389,22 @@ fn create_items(
         window::temp_free(env, title_ptr);
         if ctl == 0 {
             log::warn!("dialog control {} could not be created", it.id);
+            adv_abi::warn_unavailable(
+                env,
+                "user32.dll!CreateDialog",
+                &format!("dialog control {} could not be created", it.id),
+            );
+        } else {
+            let u = user(env);
+            let w = u.windows.get(&env.sys.objects, &ctl).unwrap();
+            let class = &u.classes[w.class].name;
+            if !presentation::supported(class, w.style) {
+                let reason = format!(
+                    "dialog control class {class} with style {:#x} cannot be projected",
+                    w.style
+                );
+                adv_abi::warn_unavailable(env, "user32.dll!CreateDialog", &reason);
+            }
         }
         let next =
             move |env: &mut Env<'_>| create_items(env, dlg, instance, items, (bx, by), font, then);

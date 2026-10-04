@@ -365,7 +365,11 @@ fn build_report(context: ReportContext<'_>) -> String {
         audio,
     } = context;
     let frame = runtime.frame();
-    let arena = runtime.machine.ext.get::<adv_runtime::Graphics>().arena_usage();
+    let arena = runtime
+        .machine
+        .ext
+        .get::<adv_runtime::Graphics>()
+        .arena_usage();
     let graphics_memory = format!(
         "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}}}",
         arena.capacity, arena.free, arena.largest_free, arena.pixel_bytes, arena.live_surfaces
@@ -807,7 +811,12 @@ fn run_execution(
                     }
                     window::Event::Repaint => {}
                     window::Event::FocusLost => inputs += runtime.release_input() as u64,
-                    window::Event::Menu(event) => inputs += u64::from(runtime.post_menu_event(event)),
+                    window::Event::Menu(event) => {
+                        inputs += u64::from(runtime.post_menu_event(event))
+                    }
+                    window::Event::Dialog(event) => {
+                        inputs += u64::from(runtime.post_dialog_event(event));
+                    }
                 }
             }
         }
@@ -938,6 +947,9 @@ fn run_execution(
             && worker.needs_menu(runtime.menu_key())
         {
             worker.publish_menu(runtime.menu_bar()?);
+        }
+        if let Some(worker) = window.as_mut() {
+            worker.publish_dialogs(runtime.dialogs()?);
         }
         if let Some(controller) = control.as_mut() {
             let ordinary = runtime.machine.sys.scheduling.external_interrupts == interrupts_before;

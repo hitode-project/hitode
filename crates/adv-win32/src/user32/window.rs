@@ -190,6 +190,31 @@ pub struct ControlState {
     pub modal: bool,
     /// Dialog: base units (DLU -> pixels).
     pub base_units: (i32, i32),
+    pub trackbar: Option<TrackbarState>,
+    pub choices: Option<ChoiceState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackbarState {
+    pub min: i32,
+    pub max: i32,
+    pub value: i32,
+}
+impl Default for TrackbarState {
+    fn default() -> Self {
+        Self {
+            min: 0,
+            max: 100,
+            value: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ChoiceState {
+    pub items: Vec<String>,
+    pub data: Vec<u32>,
+    pub selected: Option<usize>,
 }
 
 pub struct Window {
@@ -363,6 +388,8 @@ pub struct SysProcs {
     pub button: u32,
     pub static_: u32,
     pub edit: u32,
+    pub combo: u32,
+    pub trackbar: u32,
 }
 
 pub struct User {
@@ -504,13 +531,9 @@ impl User {
         self.add_class_raw("Button", 0, procs.button, 0, 0);
         self.add_class_raw("Static", 0, procs.static_, 0, 0);
         self.add_class_raw("Edit", 0, procs.edit, 0, 0);
-        for c in [
-            "ListBox",
-            "ComboBox",
-            "ScrollBar",
-            "msctls_progress32",
-            "SysListView32",
-        ] {
+        self.add_class_raw("ComboBox", 0, procs.combo, 0, 0);
+        self.add_class_raw("msctls_trackbar32", 0, procs.trackbar, 0, 0);
+        for c in ["ListBox", "ScrollBar", "msctls_progress32", "SysListView32"] {
             self.add_class_raw(c, 0, procs.def_window, 0, 0);
         }
         self.add_class_raw("#32770", 0, procs.def_dlg, DLGWINDOWEXTRA, 0);
@@ -2008,6 +2031,7 @@ mod tests {
             button: 3,
             static_: 4,
             edit: 5,
+            ..SysProcs::default()
         });
         let local = u.add_class_raw("BUTTON", 0, 9, 0, 0x40_0000);
         assert_eq!(

@@ -75,7 +75,7 @@ pub enum MenuEvent {
     },
 }
 
-/// The same foremost visible window used by the host input frontend.
+/// Keep the visible menu owner's bar while a modal dialog disables its owner.
 pub fn presentation_key(user: &super::User, objects: &Objects) -> MenuKey {
     let window = user
         .top
@@ -85,6 +85,7 @@ pub fn presentation_key(user: &super::User, objects: &Objects) -> MenuKey {
             user.windows
                 .get(objects, hwnd)
                 .is_some_and(|window| window.visible() && !window.destroying)
+                && user.menus.attached.contains_key(hwnd)
         })
         .unwrap_or(0);
     MenuKey {

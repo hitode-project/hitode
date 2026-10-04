@@ -442,6 +442,17 @@ impl<B: Backend> Runtime<B> {
         adv_win32::user32::menu::post_host_event(&mut self.env(), event)
     }
 
+    /// Immutable dialog presentation, obtained only by the execution owner.
+    pub fn dialogs(&self) -> Result<crate::DialogSet, String> {
+        adv_win32::user32::dialog::presentation(
+            self.machine.ext.get::<Win32>(),
+            &self.machine.sys.objects,
+        )
+    }
+    pub fn post_dialog_event(&mut self, event: crate::DialogEvent) -> bool {
+        adv_win32::user32::dialog::post_host_event(&mut self.env(), event)
+    }
+
     /// Release held keys and buttons when the host loses focus.
     pub fn release_input(&mut self) -> usize {
         adv_win32::user32::host_input::release(&mut self.env())

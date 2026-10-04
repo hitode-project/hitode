@@ -13,6 +13,8 @@ use crate::stdcall;
 pub const BUTTON_PROC: &str = "<ButtonWndProc>";
 pub const STATIC_PROC: &str = "<StaticWndProc>";
 pub const EDIT_PROC: &str = "<EditWndProc>";
+pub const COMBO_PROC: &str = "<ComboWndProc>";
+pub const TRACKBAR_PROC: &str = "<TrackbarWndProc>";
 
 const BM_GETCHECK: u32 = 0xf0;
 const BM_SETCHECK: u32 = 0xf1;
@@ -201,6 +203,229 @@ fn edit_proc(env: &mut Env<'_>) -> Outcome {
     }
 }
 
+fn trackbar_proc(env: &mut Env<'_>) -> Outcome {
+    use super::window::TrackbarState;
+    let (hwnd, msg, wp, lp) = args(env);
+    if msg == wm::GETDLGCODE {
+        return Outcome::Return(0x1);
+    } // DLGC_WANTARROWS
+    if msg == wm::PAINT {
+        validate(env, hwnd);
+        return Outcome::Return(0);
+    }
+    if !(0x400..=0x420).contains(&msg) {
+        return def_window_proc(env, hwnd, msg, wp, lp, |_, r| Outcome::Return(r));
+    }
+    let Some(window) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    else {
+        return Outcome::Return(0);
+    };
+    let track = window
+        .control
+        .trackbar
+        .get_or_insert_with(TrackbarState::default);
+    let result = match msg {
+        0x400 => track.value as u32,
+        0x401 => track.min as u32,
+        0x402 => track.max as u32,
+        0x405 => {
+            track.value = (lp as i32).clamp(track.min.min(track.max), track.min.max(track.max));
+            0
+        }
+        0x406 => {
+            track.min = i32::from(lp as u16 as i16);
+            track.max = i32::from((lp >> 16) as u16 as i16);
+            track.value = track
+                .value
+                .clamp(track.min.min(track.max), track.min.max(track.max));
+            0
+        }
+        0x407 | 0x408 => {
+            if msg == 0x407 {
+                track.min = lp as i32;
+            } else {
+                track.max = lp as i32;
+            }
+            track.value = track
+                .value
+                .clamp(track.min.min(track.max), track.min.max(track.max));
+            0
+        }
+        _ => {
+            adv_abi::warn_unavailable(
+                env,
+                "user32.dll!<TrackbarWndProc>",
+                &format!("trackbar message {msg:#x} is unsupported"),
+            );
+            return Outcome::Return(0);
+        }
+    };
+    if wp != 0 && matches!(msg, 0x405..=0x408) {
+        window.needs_paint = true;
+    }
+    Outcome::Return(result)
+}
+
+fn combo_proc(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, msg, wp, lp) = args(env);
+    if msg == wm::GETDLGCODE {
+        return Outcome::Return(0x81);
+    }
+    if msg == wm::PAINT {
+        validate(env, hwnd);
+        return Outcome::Return(0);
+    }
+    if !(0x140..=0x164).contains(&msg) {
+        return def_window_proc(env, hwnd, msg, wp, lp, |_, r| Outcome::Return(r));
+    }
+    let source_text = if matches!(msg, 0x143 | 0x14a | 0x14c | 0x14d | 0x158) {
+        Some(
+            env.ext
+                .get::<crate::Win32>()
+                .codec
+                .decode(&crate::util::cstr(env.cpu, lp)),
+        )
+    } else {
+        None
+    };
+    let Some(window) = env
+        .ext
+        .get::<crate::Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &hwnd)
+    else {
+        return Outcome::Return(u32::MAX);
+    };
+    let sorted = window.style & 0x100 != 0;
+    let choices = window.control.choices.get_or_insert_with(Default::default);
+    let result = match msg {
+        0x143 | 0x14a => {
+            if choices.items.len() >= 16384 {
+                return Outcome::Return(0xffff_fffe);
+            } // CB_ERRSPACE
+            let text = source_text.unwrap();
+            let index = if sorted && msg == 0x143 {
+                choices
+                    .items
+                    .partition_point(|item| item.to_lowercase() <= text.to_lowercase())
+            } else if msg == 0x14a && (wp as usize) < choices.items.len() {
+                wp as usize
+            } else {
+                choices.items.len()
+            };
+            choices.items.insert(index, text);
+            choices.data.insert(index, 0);
+            if let Some(selected) = &mut choices.selected
+                && *selected >= index
+            {
+                *selected += 1;
+            }
+            index as u32
+        }
+        0x144 => {
+            let index = wp as usize;
+            if index >= choices.items.len() {
+                return Outcome::Return(u32::MAX);
+            }
+            choices.items.remove(index);
+            choices.data.remove(index);
+            if choices.selected == Some(index) {
+                choices.selected = None;
+                window.text.clear();
+            } else if let Some(selected) = &mut choices.selected
+                && *selected > index
+            {
+                *selected -= 1;
+            }
+            choices.items.len() as u32
+        }
+        0x146 => choices.items.len() as u32,
+        0x147 => choices.selected.map_or(u32::MAX, |i| i as u32),
+        0x148 | 0x149 => {
+            let Some(text) = choices.items.get(wp as usize) else {
+                return Outcome::Return(u32::MAX);
+            };
+            let bytes = env.ext.get::<crate::Win32>().codec.encode(text);
+            if msg == 0x148
+                && crate::util::put_cstr(env.cpu, lp, bytes.len() as u32 + 1, &bytes).is_none()
+            {
+                return Outcome::Return(u32::MAX);
+            }
+            bytes.len() as u32
+        }
+        0x14b => {
+            choices.items.clear();
+            choices.data.clear();
+            choices.selected = None;
+            window.text.clear();
+            0
+        }
+        0x14e => {
+            if wp == u32::MAX {
+                choices.selected = None;
+                window.text.clear();
+                u32::MAX
+            } else if let Some(text) = choices.items.get(wp as usize) {
+                choices.selected = Some(wp as usize);
+                window.text = text.clone();
+                wp
+            } else {
+                u32::MAX
+            }
+        }
+        0x14c | 0x14d | 0x158 => {
+            let text = source_text.unwrap().to_lowercase();
+            let count = choices.items.len();
+            let start = if wp == u32::MAX {
+                0
+            } else {
+                (wp as usize).saturating_add(1)
+            };
+            let found = (0..count)
+                .map(|offset| (start + offset) % count)
+                .find(|&i| {
+                    let item = choices.items[i].to_lowercase();
+                    if msg == 0x158 {
+                        item == text
+                    } else {
+                        item.starts_with(&text)
+                    }
+                });
+            if msg == 0x14d
+                && let Some(i) = found
+            {
+                choices.selected = Some(i);
+                window.text = choices.items[i].clone();
+            }
+            found.map_or(u32::MAX, |i| i as u32)
+        }
+        0x150 => choices.data.get(wp as usize).copied().unwrap_or(u32::MAX),
+        0x151 => {
+            let Some(data) = choices.data.get_mut(wp as usize) else {
+                return Outcome::Return(u32::MAX);
+            };
+            *data = lp;
+            0
+        }
+        _ => {
+            adv_abi::warn_unavailable(
+                env,
+                "user32.dll!<ComboWndProc>",
+                &format!("combo box message {msg:#x} is unsupported"),
+            );
+            return Outcome::Return(u32::MAX);
+        }
+    };
+    window.needs_paint = true;
+    Outcome::Return(result)
+}
+
 /// Messages whose dialog-procedure result is returned as-is rather than via DWL_MSGRESULT.
 fn returns_directly(msg: u32) -> bool {
     matches!(msg, 0x110 | 0x132..=0x138 | 0x39 | 0x2e | 0x2f | 0x37) // INITDIALOG, CTLCOLOR*, COMPAREITEM, VKEYTOITEM, CHARTOITEM, QUERYDRAGICON
@@ -248,5 +473,7 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, USER32, BUTTON_PROC, 4, button_proc);
     stdcall(reg, USER32, STATIC_PROC, 4, static_proc);
     stdcall(reg, USER32, EDIT_PROC, 4, edit_proc);
+    stdcall(reg, USER32, COMBO_PROC, 4, combo_proc);
+    stdcall(reg, USER32, TRACKBAR_PROC, 4, trackbar_proc);
     stdcall(reg, USER32, "DefDlgProcA", 4, def_dlg_proc_a);
 }

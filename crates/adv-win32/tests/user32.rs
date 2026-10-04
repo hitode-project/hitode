@@ -21,6 +21,209 @@ const BM_GETCHECK: u32 = 0xf0;
 const WS_GROUP: u32 = 0x0002_0000;
 const APP: u32 = 0x8000;
 
+#[test]
+fn dialog_projection_owns_state_and_validates_control_input() {
+    use adv_win32::user32::dialog::{self, DialogEvent};
+    use adv_win32::user32::window::WS_DISABLED;
+    let mut t = T::new();
+    let empty = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+    assert!(empty.dialogs.is_empty());
+    assert_eq!(empty.dialogs.capacity(), 0);
+    let mut a = Asm::new(CODE);
+    let dialog_class = t.text("#32770");
+    let track_class = t.text("msctls_trackbar32");
+    let combo_class = t.text("ComboBox");
+    let button_class = t.text("Button");
+    let dlg = t.window(&mut a, dialog_class, WS_POPUP | WS_VISIBLE, I(0), 0);
+    let track = t.window(
+        &mut a,
+        track_class,
+        WS_CHILD | WS_VISIBLE | 0x10018,
+        M(dlg),
+        1001,
+    );
+    let combo = t.window(
+        &mut a,
+        combo_class,
+        WS_CHILD | WS_VISIBLE | 0x10103,
+        M(dlg),
+        1009,
+    );
+    let button = t.window(
+        &mut a,
+        button_class,
+        WS_CHILD | WS_VISIBLE | 0x10003,
+        M(dlg),
+        1004,
+    );
+    t.call(
+        &mut a,
+        "SendMessageA",
+        &[M(track), I(0x406), I(1), I(1000 << 16)],
+    );
+    t.call(&mut a, "SendMessageA", &[M(track), I(0x405), I(1), I(2000)]);
+    let clamped = t.call(&mut a, "SendMessageA", &[M(track), I(0x400), I(0), I(0)]);
+    let zulu = t.text("Zulu");
+    let alpha = t.text("Alpha");
+    t.call(&mut a, "SendMessageA", &[M(combo), I(0x143), I(0), I(zulu)]);
+    t.call(
+        &mut a,
+        "SendMessageA",
+        &[M(combo), I(0x143), I(0), I(alpha)],
+    );
+    t.call(&mut a, "SendMessageA", &[M(combo), I(0x14e), I(0), I(0)]);
+    let text = t.alloc(64);
+    let length = t.call(&mut a, "SendMessageA", &[M(combo), I(0x148), I(0), I(text)]);
+    t.call(&mut a, "SendMessageA", &[M(button), I(0xf1), I(1), I(0)]);
+    t.run(a);
+    assert_eq!(t.u32(clamped), 1000);
+    assert_eq!(t.u32(length), 5);
+    let mut actual = [0; 6];
+    t.m.cpu.read(text, &mut actual).unwrap();
+    assert_eq!(&actual, b"Alpha\0");
+    let objects = t.m.sys.objects.object_count();
+    let snapshot = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+    assert_eq!(t.m.sys.objects.object_count(), objects);
+    let projected = &snapshot.dialogs[0];
+    assert_eq!(projected.target.hwnd, t.u32(dlg));
+    let track_target = projected
+        .controls
+        .iter()
+        .find(|c| c.target.id == 1001)
+        .unwrap();
+    let combo_target = projected
+        .controls
+        .iter()
+        .find(|c| c.target.id == 1009)
+        .unwrap();
+    let button_target = projected
+        .controls
+        .iter()
+        .find(|c| c.target.id == 1004)
+        .unwrap();
+    assert_eq!(track_target.range, Some((0, 1000)));
+    assert_eq!(track_target.value, 1000);
+    assert_eq!(combo_target.items, ["Alpha", "Zulu"]);
+    assert_eq!(combo_target.selection, 0);
+    assert_eq!(button_target.check, 1);
+    assert!(projected.controls.iter().all(|c| c.supported));
+    let mut env = adv_machine::Env {
+        cpu: &mut t.m.cpu,
+        sys: &mut t.m.sys,
+        ext: &mut t.m.ext,
+        thunk: 0,
+    };
+    for queue in env.ext.get_mut::<Win32>().user.queues.values_mut() {
+        queue.posted.clear();
+    }
+    assert!(dialog::post_host_event(
+        &mut env,
+        DialogEvent::Track {
+            target: track_target.target,
+            value: 375,
+            code: 5
+        }
+    ));
+    assert!(dialog::post_host_event(
+        &mut env,
+        DialogEvent::Select {
+            target: combo_target.target,
+            index: 1
+        }
+    ));
+    assert!(dialog::post_host_event(
+        &mut env,
+        DialogEvent::Click(button_target.target)
+    ));
+    let actual: Vec<_> = env.ext.get::<Win32>().user.queues[&0]
+        .posted
+        .iter()
+        .map(|m| (m.hwnd, m.msg, m.wparam, m.lparam))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                projected.target.hwnd,
+                0x114,
+                5 | (375 << 16),
+                track_target.target.hwnd
+            ),
+            (
+                projected.target.hwnd,
+                wm::COMMAND,
+                1009 | (1 << 16),
+                combo_target.target.hwnd
+            ),
+            (button_target.target.hwnd, 0xf5, 0, 0),
+        ]
+    );
+    let current = dialog::presentation(env.ext.get::<Win32>(), &env.sys.objects).unwrap();
+    assert_eq!(current.dialogs[0].controls[0].value, 375);
+    assert_eq!(
+        snapshot.dialogs[0].controls[0].value, 1000,
+        "snapshot owns its state"
+    );
+    assert_eq!(current.dialogs[0].controls[1].selection, 1);
+    let mut stale = track_target.target;
+    stale.created_us = stale.created_us.wrapping_add(1);
+    assert!(!dialog::post_host_event(
+        &mut env,
+        DialogEvent::Track {
+            target: stale,
+            value: 0,
+            code: 5
+        }
+    ));
+    stale = track_target.target;
+    stale.parent = 0;
+    assert!(!dialog::post_host_event(
+        &mut env,
+        DialogEvent::Track {
+            target: stale,
+            value: 0,
+            code: 5
+        }
+    ));
+    assert!(!dialog::post_host_event(
+        &mut env,
+        DialogEvent::Select {
+            target: combo_target.target,
+            index: 99
+        }
+    ));
+    let window = env
+        .ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &button_target.target.hwnd)
+        .unwrap();
+    window.style |= WS_DISABLED;
+    assert!(!dialog::post_host_event(
+        &mut env,
+        DialogEvent::Click(button_target.target)
+    ));
+    let window = env
+        .ext
+        .get::<Win32>()
+        .user
+        .windows
+        .get_mut(&mut env.sys.objects, &projected.target.hwnd)
+        .unwrap();
+    window.style &= !WS_VISIBLE;
+    assert!(!dialog::post_host_event(
+        &mut env,
+        DialogEvent::Click(button_target.target)
+    ));
+    assert!(
+        dialog::presentation(env.ext.get::<Win32>(), &env.sys.objects)
+            .unwrap()
+            .dialogs
+            .is_empty()
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Arg {
     Imm(u32),

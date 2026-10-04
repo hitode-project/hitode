@@ -1,7 +1,7 @@
 //! UI owns the native window. The execution worker owns the entire guest machine.
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
-use adv_runtime::{FrameConsumer, FrameProducer, MenuBar, MenuKey, Snapshot};
+use adv_runtime::{DialogSet, FrameConsumer, FrameProducer, MenuBar, MenuKey, Snapshot};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
 use std::sync::{
     Arc,
@@ -32,6 +32,8 @@ pub struct Worker {
     frames: Option<FrameProducer>,
     menus: adv_sync::mailbox::Producer<MenuBar>,
     menu_key: Option<MenuKey>,
+    dialogs: adv_sync::mailbox::Producer<DialogSet>,
+    dialog_set: DialogSet,
     pub ui_wake: WakeEvent,
     stopped: Arc<AtomicBool>,
     metrics_dropped: Arc<AtomicU64>,
@@ -41,6 +43,7 @@ pub struct Ui {
     requests: spsc::Consumer<Request>,
     frames: Option<FrameConsumer>,
     menus: adv_sync::mailbox::Consumer<MenuBar>,
+    dialogs: adv_sync::mailbox::Consumer<DialogSet>,
     #[cfg(all(windows, feature = "gpu"))]
     native: Option<crate::native_gpu::UiPresenter>,
     keys: Arc<KeyState>,
@@ -56,6 +59,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     let (frames_tx, frames_rx) = adv_runtime::frame_mailbox();
     let (menus_tx, menus_rx) =
         adv_sync::mailbox::channel(std::array::from_fn(|_| MenuBar::default()));
+    let (dialogs_tx, dialogs_rx) =
+        adv_sync::mailbox::channel(std::array::from_fn(|_| DialogSet::default()));
     let stopped = Arc::new(AtomicBool::new(false));
     let metrics_dropped = Arc::new(AtomicU64::new(0));
     Ok((
@@ -67,6 +72,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             frames: Some(frames_tx),
             menus: menus_tx,
             menu_key: None,
+            dialogs: dialogs_tx,
+            dialog_set: DialogSet::default(),
             ui_wake: ui_wake.clone(),
             stopped: stopped.clone(),
             metrics_dropped: metrics_dropped.clone(),
@@ -76,6 +83,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             requests: requests_rx,
             frames: Some(frames_rx),
             menus: menus_rx,
+            dialogs: dialogs_rx,
             #[cfg(all(windows, feature = "gpu"))]
             native: None,
             keys,
@@ -87,6 +95,14 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     ))
 }
 impl Worker {
+    pub fn publish_dialogs(&mut self, dialogs: DialogSet) {
+        if dialogs == self.dialog_set {
+            return;
+        }
+        self.dialog_set = dialogs.clone();
+        self.dialogs.publish(move |slot| *slot = dialogs);
+        self.ui_wake.signal();
+    }
     pub fn needs_menu(&self, key: MenuKey) -> bool {
         self.menu_key != Some(key)
     }
@@ -177,7 +193,7 @@ impl Ui {
                     repaint = true;
                     continue;
                 }
-                window::Event::Menu(_) => {}
+                window::Event::Menu(_) | window::Event::Dialog(_) => {}
             }
             had_input = true;
             self.deliver(Delivery::Input(event))?;
@@ -208,6 +224,16 @@ impl Ui {
             execution_wake.signal();
             Ok(())
         }));
+        let events = self.events.clone();
+        let execution_wake = self.execution_wake.clone();
+        window.set_dialog_event_sink(Box::new(move |event| {
+            events
+                .borrow_mut()
+                .push(Delivery::Input(window::Event::Dialog(event)))
+                .map_err(|_| "UI dialog input channel capacity exceeded".to_owned())?;
+            execution_wake.signal();
+            Ok(())
+        }));
         let mut next = window.next_refresh();
         let mut snapshot = Snapshot::default();
         let mut candidate = Snapshot::default();
@@ -224,6 +250,15 @@ impl Ui {
             }
             if self.menus.update() {
                 window.set_menu_bar(self.menus.current())?;
+            }
+            let had_dialogs = !self.dialogs.current().dialogs.is_empty();
+            if self.dialogs.update() {
+                if !had_dialogs && !self.dialogs.current().dialogs.is_empty() {
+                    // Physical focus moves to the native controls; their key
+                    // releases no longer pass through the canvas procedure.
+                    self.keys.release_all();
+                }
+                window.set_dialogs(self.dialogs.current())?;
             }
             let started = Instant::now();
             let events = window.pump();

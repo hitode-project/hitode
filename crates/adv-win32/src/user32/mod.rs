@@ -11,8 +11,9 @@ mod input;
 pub mod menu;
 pub mod message;
 mod resources;
-mod system_parameters;
 pub(crate) mod strings;
+pub(crate) mod system_colors;
+mod system_parameters;
 pub mod window;
 
 use adv_abi::{Conv, Registry};
@@ -47,6 +48,8 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
         button: proc(controls::BUTTON_PROC)?,
         static_: proc(controls::STATIC_PROC)?,
         edit: proc(controls::EDIT_PROC)?,
+        combo: proc(controls::COMBO_PROC)?,
+        trackbar: proc(controls::TRACKBAR_PROC)?,
     };
     let win32 = m.ext.get_mut::<Win32>();
     win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);
@@ -394,6 +397,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
     message::register(reg);

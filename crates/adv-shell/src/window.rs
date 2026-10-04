@@ -7,6 +7,7 @@ use std::time::Duration;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum Event {
     Menu(adv_runtime::MenuEvent),
+    Dialog(adv_runtime::DialogEvent),
     Input {
         message: u32,
         wparam: u32,
@@ -17,6 +18,7 @@ pub enum Event {
     Repaint,
 }
 pub type MenuSink = Box<dyn FnMut(adv_runtime::MenuEvent) -> Result<(), String>>;
+pub type DialogSink = Box<dyn FnMut(adv_runtime::DialogEvent) -> Result<(), String>>;
 
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -30,6 +32,7 @@ mod native {
     use super::*;
     use std::collections::VecDeque;
     use std::ptr::{null, null_mut};
+    mod dialog;
     mod menu;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0,
@@ -64,6 +67,8 @@ mod native {
         state: Box<State>,
         timer: HANDLE,
         frame_size: Option<(u32, u32)>,
+        dialogs: dialog::HostDialogs,
+        hidden: bool,
     }
 
     pub fn initialize_dpi() -> Result<(), String> {
@@ -506,6 +511,11 @@ mod native {
                         return 0;
                     }
                     WM_KILLFOCUS => {
+                        // The owned dialog projects the guest's own focus transfer.
+                        // Moving into it is not an application focus loss.
+                        if wparam != 0 && GetAncestor(wparam as HWND, GA_ROOTOWNER) == hwnd {
+                            return 0;
+                        }
                         state.events.push_back(Event::FocusLost);
                         return 0;
                     }
@@ -707,6 +717,8 @@ mod native {
                 state,
                 timer,
                 frame_size: None,
+                dialogs: dialog::HostDialogs::default(),
+                hidden,
             })
         }
 
@@ -723,6 +735,9 @@ mod native {
                     }
                 }
             }
+            self.state
+                .events
+                .extend(self.dialogs.take_events().map(Event::Dialog));
             self.state.events.drain(..).collect()
         }
 
@@ -837,6 +852,8 @@ mod native {
         }
 
         pub fn hide(&mut self) {
+            self.hidden = true;
+            self.dialogs.hide();
             unsafe {
                 ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -847,6 +864,9 @@ mod native {
             duration: Option<Duration>,
             wake: Option<&WakeEvent>,
         ) -> Result<WaitOutcome, String> {
+            if let Some(error) = self.dialogs.take_error() {
+                return Err(error);
+            }
             if let Some(error) = self.state.paint_error.take() {
                 return Err(error);
             }
@@ -909,6 +929,7 @@ mod native {
 
     impl Drop for Window {
         fn drop(&mut self) {
+            self.dialogs.clear();
             // SAFETY: state remains live until synchronous destruction and callbacks finish.
             unsafe {
                 if self.state.menu.is_some() {
@@ -1198,6 +1219,10 @@ pub fn initialize_dpi() -> Result<(), String> {
 pub struct Window;
 #[cfg(not(windows))]
 impl Window {
+    pub fn set_dialogs(&mut self, _: &adv_runtime::DialogSet) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn set_dialog_event_sink(&mut self, _: DialogSink) {}
     pub fn set_menu_bar(&mut self, _: &adv_runtime::MenuBar) -> Result<(), String> {
         Ok(())
     }

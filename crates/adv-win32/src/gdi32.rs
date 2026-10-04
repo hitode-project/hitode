@@ -223,7 +223,9 @@ fn create_pen(env: &mut Env<'_>, _style: i32, _width: i32, color: u32) -> Outcom
 }
 
 pub(super) fn delete_object_value(env: &mut Env<'_>, h: u32) -> Outcome {
-    if (STOCK_BASE..STOCK_BASE + STOCK_COUNT).contains(&h) {
+    if (STOCK_BASE..STOCK_BASE + STOCK_COUNT).contains(&h)
+        || crate::user32::system_colors::is_system_brush(h)
+    {
         return Outcome::Return(1);
     }
     if env.sys.objects.all_hosts::<GdiObj>()
