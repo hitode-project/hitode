@@ -2,8 +2,8 @@
 //! ([`controls`]) and dialogs ([`dialog`]), plus resources, input state, monitors and the
 //! formatting/message-box helpers Game.exe uses.
 
-pub mod compat;
 pub(crate) mod clipboard;
+pub mod compat;
 pub mod controls;
 pub mod dialog;
 pub mod host_input;
@@ -327,23 +327,30 @@ fn get_async_key_state(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(if key & 0x80 != 0 { 0x8000 } else { 0 })
 }
 
+fn queued_key_state(env: &Env<'_>, vk: usize) -> u8 {
+    user(env)
+        .queues
+        .get(&env.sys.current)
+        .map_or(0, |queue| queue.keyboard.0[vk])
+}
+
 fn get_key_state(env: &mut Env<'_>) -> Outcome {
     let vk = env.arg(0) as usize & 0xff;
-    let user = user(env);
-    let k = user
-        .host_keys
-        .as_ref()
-        .map_or(user.keys[vk], |keys| keys.get(vk as u32));
+    let k = queued_key_state(env, vk);
     Outcome::Return(u32::from(k & 1) | if k & 0x80 != 0 { 0xffff_8000 } else { 0 })
 }
 
 fn get_keyboard_state(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
+    if adv_abi::guest::check_range(env.cpu, p, 256, adv_cpu::backend::Prot::WRITE).is_err() {
+        crate::util::set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
     let user = user(env);
     let keys = user
-        .host_keys
-        .as_ref()
-        .map_or(user.keys, |keys| keys.snapshot());
+        .queues
+        .get(&env.sys.current)
+        .map_or([0; 256], |queue| queue.keyboard.0);
     Outcome::Return(u32::from(env.cpu.write(p, &keys).is_ok()))
 }
 

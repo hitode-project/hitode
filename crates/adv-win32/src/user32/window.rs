@@ -313,9 +313,18 @@ impl Window {
 }
 
 /// Thread message queue and per-thread input state.
+pub struct QueueKeys(pub [u8; 256]);
+impl Default for QueueKeys {
+    fn default() -> Self {
+        Self([0; 256])
+    }
+}
+
 #[derive(Default)]
 pub struct Queue {
     pub posted: std::collections::VecDeque<super::message::Msg>,
+    /// Logical key state of input already removed from this thread's queue.
+    pub keyboard: QueueKeys,
     pub quit: Option<u32>,
     /// Input not yet observed by Peek/GetMessage or GetQueueStatus.
     pub changed_status: u32,

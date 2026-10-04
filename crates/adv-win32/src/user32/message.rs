@@ -23,6 +23,9 @@ use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr};
 use crate::{Win32, stdcall};
 
+#[cfg(test)]
+mod keyboard_tests;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Msg {
     pub hwnd: u32,
@@ -36,6 +39,39 @@ pub struct Msg {
     pub input: bool,
     /// Identity of this posted host message, never part of the guest MSG bytes.
     pub input_receipt: u64,
+    /// Queue-local key update captured from this input message, independent of
+    /// the live physical state which may already include later releases.
+    pub input_key: Option<KeyTransition>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KeyTransition {
+    pub key: u8,
+    pub pressed: bool,
+    pub toggle: bool,
+}
+
+fn key_transition(message: u32, wparam: u32, lparam: u32) -> Option<KeyTransition> {
+    let (key, pressed) = match message {
+        0x100 | 0x104 if wparam < 256 => (wparam as u8, true),
+        0x101 | 0x105 if wparam < 256 => (wparam as u8, false),
+        0x201 | 0x203 => (1, true),
+        0x202 => (1, false),
+        0x204 | 0x206 => (2, true),
+        0x205 => (2, false),
+        0x207 | 0x209 => (4, true),
+        0x208 => (4, false),
+        0x20b..=0x20d if matches!(wparam >> 16, 1 | 2) => {
+            ((wparam >> 16) as u8 + 4, message != 0x20c)
+        }
+        _ => return None,
+    };
+    Some(KeyTransition {
+        key,
+        pressed,
+        // Only the first keyboard down toggles; autorepeat has bit 30 set.
+        toggle: pressed && matches!(key, 0x14 | 0x90 | 0x91) && lparam & (1 << 30) == 0,
+    })
 }
 
 #[derive(Default)]
@@ -220,6 +256,7 @@ impl Msg {
             pt: (r(5) as i32, r(6) as i32),
             input: false,
             input_receipt: 0,
+            input_key: None,
         }
     }
 }
@@ -345,6 +382,7 @@ fn post_kind(
             pt: user(env).cursor_pos,
             input,
             input_receipt,
+            input_key: input.then(|| key_transition(msg, wparam, lparam)).flatten(),
         },
     );
     if posted && input {
@@ -548,6 +586,14 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
         q.last_time = m.time;
         q.last_pos = m.pt;
         if remove
+            && m.input
+            && let Some(key) = m.input_key
+        {
+            let previous = q.keyboard.0[key.key as usize];
+            q.keyboard.0[key.key as usize] =
+                ((previous & 1) ^ u8::from(key.toggle)) | if key.pressed { 0x80 } else { 0 };
+        }
+        if remove
             && m.input_receipt != 0
             && let Some(tracking) = &mut u.input_tracking
         {
@@ -571,6 +617,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
             pt: pos,
             input: false,
             input_receipt: 0,
+            input_key: None,
         });
     }
     if f.range(wm::PAINT) {
@@ -593,6 +640,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 pt: pos,
                 input: false,
                 input_receipt: 0,
+                input_key: None,
             });
         }
     }
@@ -615,6 +663,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 pt: pos,
                 input: false,
                 input_receipt: 0,
+                input_key: None,
             };
             if remove {
                 t.due_us = now + t.interval_us;
@@ -927,6 +976,7 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
             pt: (0, 0),
             input: false,
             input_receipt: 0,
+            input_key: None,
         },
     )))
 }
@@ -1014,7 +1064,7 @@ pub fn translate(env: &mut Env<'_>, m: &Msg) -> bool {
     if m.msg != wm::KEYDOWN && m.msg != wm::SYSKEYDOWN {
         return false;
     }
-    let shift = user(env).keys[0x10] & 0x80 != 0;
+    let shift = super::queued_key_state(env, 0x10) & 0x80 != 0;
     let ch = match m.wparam {
         v @ 0x41..=0x5a => Some(if shift { v } else { v + 0x20 }),
         v @ (0x30..=0x39 | 0x20 | 0x0d | 0x08 | 0x1b | 0x09) => Some(v),
@@ -1306,6 +1356,7 @@ mod receipt_tests {
             pt: (2, 3),
             input: receipt != 0,
             input_receipt: receipt,
+            input_key: None,
         }
     }
 
