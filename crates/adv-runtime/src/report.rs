@@ -172,14 +172,20 @@ impl<B: Backend> Runtime<B> {
             ));
         }
         let now = self.machine.sys.clock.now_us();
+        report.push_str(&format!(
+            "\nScheduling: relative-priority dispatches {}; promoted event-wake dispatches {}",
+            self.machine.sys.scheduling.relative_priority_dispatches,
+            self.machine.sys.scheduling.wake_priority_dispatches
+        ));
         report.push_str(&format!("\nGuest contexts (clock {now} us):"));
         for context in &self.machine.sys.contexts {
             report.push_str(&format!(
-                "\n  [{}] {:?} tid {:#x}: {}",
+                "\n  [{}] {:?} tid {:#x}: {} priority {}",
                 context.id,
                 context.name,
                 context.tid,
-                context.state_name()
+                context.state_name(),
+                context.relative_priority
             ));
             if let Some(wait) = context.waiting_on() {
                 report.push_str(&format!(" {wait:?}"));

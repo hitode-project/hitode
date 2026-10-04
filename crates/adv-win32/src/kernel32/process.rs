@@ -339,6 +339,54 @@ fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
+fn priority_context(env: &Env<'_>, handle: u32) -> Option<adv_machine::CtxId> {
+    if handle == u32::MAX - 1 {
+        return Some(env.sys.current);
+    }
+    match env.sys.objects.get(handle) {
+        Some(adv_machine::Object::Thread { ctx }) => Some(*ctx),
+        _ => None,
+    }
+}
+
+fn set_thread_priority(env: &mut Env<'_>) -> Outcome {
+    let Some(context) = priority_context(env, env.arg(0)) else {
+        set_last_error(env, err::INVALID_HANDLE);
+        return Outcome::Return(0);
+    };
+    let priority = env.arg(1) as i32;
+    if matches!(priority, 0x10000 | 0x20000) {
+        // Background mode changes CPU, I/O and memory scheduling resources;
+        // relative CPU preference alone cannot faithfully implement it.
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!SetThreadPriority",
+            "thread background resource scheduling mode is unavailable",
+        );
+        set_last_error(env, 50); // ERROR_NOT_SUPPORTED
+        return Outcome::Return(0);
+    }
+    if !matches!(priority, -15 | -2 | -1 | 0 | 1 | 2 | 15) {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Outcome::Return(0);
+    }
+    if !env.sys.set_relative_priority(context, priority as i8) {
+        set_last_error(env, err::INVALID_HANDLE);
+        return Outcome::Return(0);
+    }
+    Outcome::Return(1)
+}
+
+fn get_thread_priority(env: &mut Env<'_>) -> Outcome {
+    if let Some(priority) =
+        priority_context(env, env.arg(0)).and_then(|context| env.sys.relative_priority(context))
+    {
+        return Outcome::Return(priority as i32 as u32);
+    }
+    set_last_error(env, err::INVALID_HANDLE);
+    Outcome::Return(0x7fff_ffff) // THREAD_PRIORITY_ERROR_RETURN
+}
+
 /// MEMORYSTATUS / MEMORYSTATUSEX with 2 GiB physical, 2 GiB virtual.
 fn global_memory_status(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
@@ -429,8 +477,8 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "CreateThread", 6, create_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);
-    stdcall(reg, K32, "SetThreadPriority", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "GetThreadPriority", 1, |_| Outcome::Return(0));
+    stdcall(reg, K32, "SetThreadPriority", 2, set_thread_priority);
+    stdcall(reg, K32, "GetThreadPriority", 1, get_thread_priority);
     stdcall(reg, K32, "SetPriorityClass", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetPriorityClass", 1, |_| Outcome::Return(0x20));
     processor::register(reg);
