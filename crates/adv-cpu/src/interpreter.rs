@@ -1103,7 +1103,9 @@ fn predecode(i: &Instruction) -> Option<Action> {
         }
         M::Movsx | M::Movzx => {
             let (dst, src) = (op(0)?, op(1)?);
-            if !matches!(dst, Operand::Register(_)) || src.width()? >= dst.width()? {
+            // 66 0F B7/BF word->word forms preserve the destination's upper
+            // half and flags, as observed on 386EX and current WoW64 hardware.
+            if !matches!(dst, Operand::Register(_)) || src.width()? > dst.width()? {
                 return None;
             }
             Action::Mov(dst, src, i.mnemonic() == M::Movsx)

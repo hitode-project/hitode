@@ -41,6 +41,7 @@ dependencies = [
  "cranelift-module",
  "iced-x86",
  "libc",
+ "serde_json",
  "thiserror 2.0.21",
  "unicorn-engine",
 ]
