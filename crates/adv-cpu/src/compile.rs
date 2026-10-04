@@ -50,6 +50,8 @@ pub(crate) struct Compiled {
     window_len: usize,
     pub entries: BTreeSet<u32>,
     pub code_size: usize,
+    /// x87 instructions called from generated code by address.
+    _x87: Box<[crate::floating::NativeX87]>,
     /// Owner-side recency sampled at Rust entries, never read by generated code.
     pub cache_stamp: u64,
     #[cfg(all(test, target_arch = "x86_64"))]
@@ -499,9 +501,30 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         }
     }
+    // x87 stays in the region as a call into the interpreter's own transaction,
+    // instead of a region exit followed by an interpreted block.
+    let x87: Box<[crate::floating::NativeX87]> = instructions
+        .values()
+        .filter(|i| !supported(i) && crate::floating::native_x87(i))
+        .map(|i| {
+            // The snapshot bytes begin at the region start.
+            let start = (i.ip32() - region.start) as usize;
+            // Same FOP derivation as the interpreter's decoded entry.
+            let opcode = bytes[start..start + i.len()]
+                .windows(2)
+                .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
+                .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16);
+            crate::floating::NativeX87 {
+                instruction: *i,
+                opcode,
+            }
+        })
+        .collect();
     let mut entries = BTreeSet::from([region.start]);
     for instruction in instructions.values() {
-        if crate::strings::operation(instruction).is_some() {
+        if crate::strings::operation(instruction).is_some()
+            || (!supported(instruction) && crate::floating::native_x87(instruction))
+        {
             entries.insert(instruction.ip32());
             entries.insert(instruction.next_ip32());
         }
@@ -557,6 +580,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
+    builder.symbol("adv_x87", crate::floating::x87_call as *const u8);
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
     builder.symbol("adv_file_read", crate::file_memory::read as *const u8);
     builder.symbol("adv_file_write", crate::file_memory::write as *const u8);
@@ -610,6 +634,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_repeat", Linkage::Import, &repeat_signature)
         .map_err(|e| e.to_string())?;
     let repeat_ref = module.declare_func_in_func(repeat_id, &mut ctx.func);
+    let mut x87_signature = module.make_signature();
+    x87_signature.params.extend([AbiParam::new(ptr_ty); 3]);
+    x87_signature.returns.push(AbiParam::new(types::I32));
+    let x87_id = module
+        .declare_function("adv_x87", Linkage::Import, &x87_signature)
+        .map_err(|e| e.to_string())?;
+    let x87_ref = module.declare_func_in_func(x87_id, &mut ctx.func);
     let mut atomic_store_signature = module.make_signature();
     atomic_store_signature.params.extend([
         AbiParam::new(ptr_ty),
@@ -903,6 +934,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             bridge,
             trap_ref,
             repeat_ref,
+            x87_ref,
+            x87: x87
+                .iter()
+                .map(|op| (op.instruction.ip32(), op as *const _ as usize))
+                .collect(),
             atomic_store_ref,
             atomic_load_ref,
             file_read_ref,
@@ -980,7 +1016,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     break;
                 };
                 e.pc = pc;
-                if !supported(instruction) {
+                if !supported(instruction) && !e.x87.contains_key(&pc) {
                     e.exit_const(Exit::Fallback, pc);
                     break;
                 }
@@ -1197,7 +1233,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
-    entries.retain(|pc| supported(&instructions[pc]));
+    entries.retain(|pc| {
+        supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc)
+    });
     let input = snapshot.with_coverage(&instructions, &pages);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let (fault_sites, fault_recipes) = if unwind.len() == 2 {
@@ -1231,6 +1269,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         window_len: snapshot.len,
         entries,
         code_size,
+        _x87: x87,
         cache_stamp: 0,
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
@@ -1410,6 +1449,14 @@ fn reg_index(reg: R) -> Option<usize> {
     })
 }
 
+/// Integer operations the JIT also emits at 8/16-bit width; see `narrow_alu`.
+fn narrow_alu(mnemonic: M) -> bool {
+    matches!(
+        mnemonic,
+        M::Add | M::Sub | M::And | M::Or | M::Xor | M::Cmp | M::Test | M::Inc | M::Dec
+    )
+}
+
 fn supported(i: &Instruction) -> bool {
     if crate::strings::operation(i).is_some() {
         return true;
@@ -1468,21 +1515,16 @@ fn supported(i: &Instruction) -> bool {
     ) {
         return simd::supported(i) || scalar::supported(i) || mmx::supported(i);
     }
+    let narrow = matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx) || narrow_alu(i.mnemonic());
     for n in 0..i.op_count() {
         match i.op_kind(n) {
             OpKind::Register
                 if reg_index(i.op_register(n)).is_some()
-                    || (matches!(
-                        i.mnemonic(),
-                        M::Mov | M::Movzx | M::Movsx | M::Cmp | M::Test
-                    ) && (i.op_register(n).is_gpr8() || i.op_register(n).is_gpr16())) => {}
+                    || (narrow && (i.op_register(n).is_gpr8() || i.op_register(n).is_gpr16())) => {}
             OpKind::Memory => {
                 if i.memory_size().size() != 4
                     && i.mnemonic() != M::Lea
-                    && !(matches!(
-                        i.mnemonic(),
-                        M::Mov | M::Movzx | M::Movsx | M::Cmp | M::Test
-                    ) && matches!(i.memory_size().size(), 1 | 2))
+                    && !(narrow && matches!(i.memory_size().size(), 1 | 2))
                 {
                     return false;
                 }
@@ -1494,13 +1536,16 @@ fn supported(i: &Instruction) -> bool {
                 }
             }
             OpKind::Immediate32 | OpKind::Immediate8to32 | OpKind::NearBranch32 => {}
-            OpKind::Immediate16 if matches!(i.mnemonic(), M::Ret | M::Mov | M::Cmp | M::Test) => {}
-            OpKind::Immediate8 if matches!(i.mnemonic(), M::Mov | M::Cmp | M::Test) => {}
-            OpKind::Immediate8to16 if matches!(i.mnemonic(), M::Cmp | M::Test) => {}
+            OpKind::Immediate16 if i.mnemonic() == M::Ret || narrow => {}
+            OpKind::Immediate8 if narrow => {}
+            OpKind::Immediate8to16 if narrow_alu(i.mnemonic()) => {}
             _ => return false,
         }
     }
-    if matches!(i.mnemonic(), M::Movzx | M::Movsx) && reg_index(i.op0_register()).is_none() {
+    if matches!(i.mnemonic(), M::Movzx | M::Movsx)
+        && reg_index(i.op0_register()).is_none()
+        && !i.op0_register().is_gpr16()
+    {
         return false;
     }
     // POP r/m has special ESP-relative addressing; leave that form to the fallback.
@@ -1562,6 +1607,9 @@ struct Emitter<'a> {
     bridge: Value,
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
+    x87_ref: ir::FuncRef,
+    /// Guest PC -> address of its NativeX87, owned by the resulting Compiled.
+    x87: BTreeMap<u32, usize>,
     atomic_store_ref: ir::FuncRef,
     atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,
@@ -1790,6 +1838,52 @@ impl Emitter<'_> {
         }
         let pc = self.constant(pc);
         self.exit(reason, pc);
+    }
+    fn x87_instruction(&mut self, i: &Instruction, operation: usize) {
+        let pc = self.constant(i.ip32());
+        self.save_state(pc);
+        let operation = self.b.ins().iconst(self.ptr_ty, operation as i64);
+        let call = self
+            .b
+            .ins()
+            .call(self.x87_ref, &[self.bridge, self.state, operation]);
+        let result = self.b.inst_results(call)[0];
+        self.reload_state();
+        if self.mmx_effects.is_some() {
+            // The call committed and refreshed the MMX aliases in CpuState.
+            self.begin_mmx_block();
+        }
+        let done = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let completed =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::Equal, result, i64::from(crate::floating::X87_DONE));
+        self.b.ins().brif(completed, done, &[], slow, &[]);
+        self.b.switch_to_block(slow);
+        let retry = self.b.create_block();
+        let read_fault = self.b.create_block();
+        let write_fault = self.b.create_block();
+        let after = self.b.create_block();
+        for block in [retry, read_fault, write_fault, after] {
+            self.b.set_cold_block(block);
+        }
+        let mut switch = Switch::new();
+        switch.set_entry(u128::from(crate::floating::X87_FALLBACK), retry);
+        switch.set_entry(u128::from(crate::floating::X87_READ_FAULT), read_fault);
+        switch.set_entry(u128::from(crate::floating::X87_WRITE_FAULT), write_fault);
+        switch.emit(&mut self.b, result, after);
+        self.b.switch_to_block(retry);
+        self.exit_const(Exit::Fallback, i.ip32());
+        self.b.switch_to_block(read_fault);
+        self.exit_const(Exit::ReadFault, i.ip32());
+        self.b.switch_to_block(write_fault);
+        self.exit_const(Exit::WriteFault, i.ip32());
+        // Completed with SMC or a pending #MF: let the executor re-check both.
+        self.b.switch_to_block(after);
+        self.exit_const(Exit::Fallback, i.next_ip32());
+        self.b.switch_to_block(done);
     }
     fn exit(&mut self, reason: Exit, pc: Value) {
         self.exit_predicted(reason, pc, None);
@@ -2721,18 +2815,24 @@ impl Emitter<'_> {
             }
             7 => self.b.ins().ushr_imm(result, 31),
             2 => {
-                let byte = self.b.ins().band_imm(result, 255);
+                // Narrow operations keep their operands shifted to bit 31.
+                let shift = self.b.ins().ushr_imm(kind, 8);
+                let low = self.b.ins().ushr(result, shift);
+                let byte = self.b.ins().band_imm(low, 255);
                 let count = self.b.ins().popcnt(byte);
                 let count = self.b.ins().band_imm(count, 1);
                 self.b.ins().bxor_imm(count, 1)
             }
             4 | 11 => {
                 let ab = self.b.ins().bxor(a, b);
+                let base = self.b.ins().band_imm(kind, 255);
                 let value = if bit == 4 {
                     let xor = self.b.ins().bxor(ab, result);
+                    let shift = self.b.ins().ushr_imm(kind, 8);
+                    let xor = self.b.ins().ushr(xor, shift);
                     self.b.ins().ushr_imm(xor, 4)
                 } else {
-                    let add = self.b.ins().icmp_imm(IntCC::Equal, kind, 1);
+                    let add = self.b.ins().icmp_imm(IntCC::Equal, base, 1);
                     let not = self.b.ins().bnot(ab);
                     let first = self.b.ins().select(add, not, ab);
                     let ar = self.b.ins().bxor(a, result);
@@ -2740,7 +2840,7 @@ impl Emitter<'_> {
                     self.b.ins().ushr_imm(of, 31)
                 };
                 let value = self.b.ins().band_imm(value, 1);
-                let logical = self.b.ins().icmp_imm(IntCC::Equal, kind, 3);
+                let logical = self.b.ins().icmp_imm(IntCC::Equal, base, 3);
                 let zero = self.constant(0);
                 self.b.ins().select(logical, zero, value)
             }
@@ -2796,6 +2896,10 @@ impl Emitter<'_> {
         )
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
+        if let Some(&operation) = self.x87.get(&i.ip32()) {
+            self.x87_instruction(i, operation);
+            return false;
+        }
         if let Some(operation) = crate::strings::operation(i) {
             let pc = self.constant(i.ip32());
             self.save_state(pc);
@@ -2835,14 +2939,14 @@ impl Emitter<'_> {
             self.exit_const(Exit::WriteFault, i.ip32());
             return true;
         }
-        if matches!(i.mnemonic(), M::Cmp | M::Test) {
+        if narrow_alu(i.mnemonic()) {
             let size = if i.op0_kind() == OpKind::Memory {
                 i.memory_size().size()
             } else {
                 i.op0_register().size()
             };
             if size < 4 {
-                self.narrow_compare(i, size);
+                self.narrow_alu(i, size);
                 return false;
             }
         }

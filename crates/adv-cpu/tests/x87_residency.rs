@@ -114,11 +114,9 @@ fn shared_float_execution_matches_pcm_with_linking_and_oracle() {
     assert_pcm_registers(&on, &uc, 0x20);
     assert_eq!(on.state.eflags, off.state.eflags);
     assert_eq!(on.state.eflags, uc.state.eflags);
-    assert!(on.stats.interpreter_instructions > 0);
-    assert_eq!(
-        on.stats.interpreter_instructions,
-        off.stats.interpreter_instructions
-    );
+    // x87 runs inside the native region with and without linking.
+    assert_eq!(on.stats.interpreter_instructions, 0);
+    assert_eq!(off.stats.interpreter_instructions, 0);
 }
 
 #[test]
@@ -162,7 +160,8 @@ fn float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
     assert_pcm_registers(&off, &uc, 0x23);
     assert_eq!(on.state.mmx, uc.state.mmx);
     // Invalid, denormal and precision flags were checked independently above.
-    assert!(on.stats.interpreter_instructions > 0);
+    // Special operands use the same shared transaction without leaving the region.
+    assert_eq!(on.stats.interpreter_instructions, 0);
 }
 
 #[test]
@@ -220,11 +219,10 @@ fn execution_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
         m.memory().read(OUT + 0x4000, SAMPLES * 4).unwrap(),
         expected(true)
     );
-    assert!(m.stats.interpreter_instructions > 0);
 }
 
 #[test]
-fn interpreted_x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
+fn x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
     let bytes = pcm_code();
     let mut machines = [
         machine(&bytes, true, false),
@@ -268,7 +266,6 @@ fn interpreted_x87_fault_keeps_restartable_stack_and_finishes_after_permission_r
     assert_eq!(faults[1], faults[2]);
     assert_eq!(machines[0].state.regs, machines[1].state.regs);
     assert_pcm_registers(&machines[1], &machines[2], 0x20);
-    assert!(machines[1].stats.interpreter_instructions > 0);
 }
 
 #[test]
@@ -278,13 +275,11 @@ fn code_writes_invalidate_before_native_reentry() {
     m.write(SRC, &samples()).unwrap();
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    let interpreted_before = m.stats.interpreter_instructions;
-    assert!(interpreted_before > 0);
     m.write(CODE, &bytes).unwrap();
     start(&mut m, SRC, OUT, STACK);
     m.state.regs[1] = 16;
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    assert!(m.stats.interpreter_instructions > interpreted_before);
+    assert_eq!(m.memory().read(OUT, 64).unwrap(), &expected(false)[..64]);
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
     let interpreted_before = m.stats.interpreter_instructions;
@@ -304,7 +299,7 @@ fn code_writes_invalidate_before_native_reentry() {
 }
 
 #[test]
-fn interpreted_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss() {
+fn busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss() {
     use adv_cpu::JitCpu;
     use adv_cpu::backend::{Backend, Exit, Guest, GuestExt, Prot, Reg, TrapAction, TrapHandler};
     use std::time::{Duration, Instant};
@@ -351,7 +346,6 @@ fn interpreted_busy_x87_loop_obeys_wall_deadline_and_restarts_without_state_loss
     }
     cpu.set_execution_budget(Some(Duration::from_secs(2)));
     assert_eq!(cpu.run(&mut NoTrap), Exit::Parked);
-    assert!(cpu.stats().interpreter_instructions > 0);
     for (reg, value) in [(Reg::Eip, CODE), (Reg::Esp, STACK), (Reg::Ecx, 5_000_000)] {
         cpu.set_reg(reg, value);
     }

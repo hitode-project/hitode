@@ -155,7 +155,7 @@ impl Recipe {
         }
         let output = |index: usize| values[self.outputs[index] as usize];
         let lazy: [u32; 7] = std::array::from_fn(|index| output(index + 9) as u32);
-        if lazy[3] > 3 || lazy[6] > 1 {
+        if lazy[3] & 0xff > 3 || !matches!(lazy[3] >> 8, 0 | 16 | 24) || lazy[6] > 1 {
             return None;
         }
         Some(Recovered {
@@ -185,13 +185,16 @@ fn flags(old: u32, lazy: [u32; 7]) -> u32 {
         u32::from(carry_left < carry_right)
     };
     let mut flags = (old & !0x8d5) | (carry & 1);
+    // Narrow operations keep operands shifted to bit 31; the high byte is the shift.
+    let shift = kind >> 8;
+    let kind = kind & 0xff;
     for bit in [2, 4, 6, 7, 11] {
         let value = if kind == 0 {
             (old >> bit) & 1
         } else {
             match bit {
-                2 => ((result as u8).count_ones() ^ 1) & 1,
-                4 if kind != 3 => ((left ^ right ^ result) >> 4) & 1,
+                2 => (((result >> shift) as u8).count_ones() ^ 1) & 1,
+                4 if kind != 3 => ((left ^ right ^ result) >> shift >> 4) & 1,
                 6 => u32::from(result == 0),
                 7 => result >> 31,
                 11 if kind != 3 => {

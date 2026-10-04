@@ -272,7 +272,7 @@ fn data_writes_on_the_code_page_do_not_force_single_step_redecoding() {
 }
 
 #[test]
-fn native_fallback_batches_consecutive_x87_before_returning_to_native_code() {
+fn native_region_executes_x87_without_leaving_for_the_interpreter() {
     // INC EBX; FLD1; FADD ST0,ST0; FSTP dword [DATA]; MOV EAX,91; RET.
     let data = CODE + 0x2000;
     let mut code = vec![0x43, 0xd9, 0xe8, 0xd8, 0xc0, 0xd9, 0x1d];
@@ -286,9 +286,8 @@ fn native_fallback_batches_consecutive_x87_before_returning_to_native_code() {
     assert_eq!(m.state.regs[0], 91);
     assert_eq!(m.state.regs[3], 1);
     assert_eq!(m.memory().read(data, 4).unwrap(), 2.0f32.to_le_bytes());
-    assert_eq!(m.stats.interpreter_entries, 1);
-    assert_eq!(m.stats.interpreter_instructions, 3);
-    assert_eq!(m.stats.native_entries, 2);
+    assert_eq!(m.stats.interpreter_entries, 0);
+    assert_eq!(m.stats.native_entries, 1);
 }
 
 #[test]

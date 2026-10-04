@@ -66,7 +66,7 @@ fn both_strategies_match_unicorn_across_mmx_repeat_fpu_and_region_calls() {
         a.dec(ecx).unwrap();
         a.jnz(blend).unwrap();
         a.emms().unwrap();
-        // Unsupported x87 instructions force a native -> Unicorn -> native handoff.
+        // x87 after EMMS runs inside the native region through the shared x87 call.
         a.fld1().unwrap();
         a.fstp(qword_ptr(DOUBLE as i32)).unwrap();
         a.mov(esi, WORK).unwrap();
@@ -122,7 +122,7 @@ fn both_strategies_match_unicorn_across_mmx_repeat_fpu_and_region_calls() {
         assert_eq!(jit.memory().read(WORK, 512).unwrap(), expected);
         assert_eq!(jit.memory().read(DOUBLE, 8).unwrap(), 1.0f64.to_le_bytes());
         assert!(jit.stats.native_entries > 0);
-        assert!(jit.stats.interpreter_entries > 0);
+        assert_eq!(jit.stats.interpreter_entries, 0);
         assert_eq!(jit.stats.bulk_bytes, 1024);
     }
 }

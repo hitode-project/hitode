@@ -88,56 +88,56 @@ pub(super) fn supported(i: &Instruction) -> bool {
 }
 
 impl Emitter<'_> {
-    pub(super) fn narrow_compare(&mut self, i: &Instruction, size: usize) {
+    /// 8/16-bit ADD/SUB/AND/OR/XOR/CMP/TEST/INC/DEC. Lazy flags keep the
+    /// operands shifted to bit 31 and record the shift in the kind's high byte,
+    /// so ZF/SF/CF/OF need no width; PF and AF shift the result back.
+    pub(super) fn narrow_alu(&mut self, i: &Instruction, size: usize) {
+        let shift = (32 - size * 8) as i64;
         let a = self.read(i, 0);
-        let b = self.read(i, 1);
-        let subtract = i.mnemonic() == M::Cmp;
-        let result = if subtract {
-            self.b.ins().isub(a, b)
+        let b = if i.op_count() == 2 {
+            self.read(i, 1)
         } else {
-            self.b.ins().band(a, b)
+            self.constant(1)
         };
-        let result = self.b.ins().band_imm(result, (1i64 << (size * 8)) - 1);
-        let carry = if subtract {
-            let value = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
-            self.b.ins().uextend(types::I32, value)
+        // Validate the destination before changing flags or registers.
+        let ptr = if matches!(i.mnemonic(), M::Cmp | M::Test) {
+            None
         } else {
-            self.constant(0)
+            self.destination(i)
         };
-        let sign = self.b.ins().ushr_imm(result, (size * 8 - 1) as i64);
-        let zero = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
-        let zero = self.b.ins().uextend(types::I32, zero);
-        let byte = self.b.ins().band_imm(result, 255);
-        let parity = self.b.ins().popcnt(byte);
-        let parity = self.b.ins().band_imm(parity, 1);
-        let parity = self.b.ins().bxor_imm(parity, 1);
-        let (aux, overflow) = if subtract {
-            let ab = self.b.ins().bxor(a, b);
-            let ar = self.b.ins().bxor(a, result);
-            let overflow = self.b.ins().band(ab, ar);
-            let overflow = self.b.ins().ushr_imm(overflow, (size * 8 - 1) as i64);
-            let overflow = self.b.ins().band_imm(overflow, 1);
-            let aux = self.b.ins().bxor(ab, result);
-            let aux = self.b.ins().ushr_imm(aux, 4);
-            let aux = self.b.ins().band_imm(aux, 1);
-            (aux, overflow)
+        let result = match i.mnemonic() {
+            M::Add | M::Inc => self.b.ins().iadd(a, b),
+            M::Sub | M::Cmp | M::Dec => self.b.ins().isub(a, b),
+            M::And | M::Test => self.b.ins().band(a, b),
+            M::Or => self.b.ins().bor(a, b),
+            M::Xor => self.b.ins().bxor(a, b),
+            _ => unreachable!(),
+        };
+        let subtract = matches!(i.mnemonic(), M::Sub | M::Cmp | M::Dec);
+        let logical = matches!(i.mnemonic(), M::And | M::Or | M::Xor | M::Test);
+        let wide_a = self.b.ins().ishl_imm(a, shift);
+        let wide_b = self.b.ins().ishl_imm(b, shift);
+        let wide = self.b.ins().ishl_imm(result, shift);
+        self.flags(
+            wide_a,
+            wide_b,
+            wide,
+            subtract,
+            logical,
+            matches!(i.mnemonic(), M::Inc | M::Dec),
+        );
+        let kind = if logical {
+            3
+        } else if subtract {
+            2
         } else {
-            (self.constant(0), self.constant(0))
+            1
         };
-        let old = self.materialize_flags();
-        let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
-        for (value, bit) in [
-            (carry, 0),
-            (parity, 2),
-            (aux, 4),
-            (zero, 6),
-            (sign, 7),
-            (overflow, 11),
-        ] {
-            let value = self.b.ins().ishl_imm(value, bit);
-            flags = self.b.ins().bor(flags, value);
+        let kind = self.constant(kind | (shift as u32) << 8);
+        self.b.def_var(self.lazy[3], kind);
+        if !matches!(i.mnemonic(), M::Cmp | M::Test) {
+            self.write(i, ptr, result);
         }
-        self.set_raw_flags(flags);
     }
 
     fn set_raw_flags(&mut self, flags: Value) {

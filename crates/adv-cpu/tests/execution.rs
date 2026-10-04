@@ -360,7 +360,8 @@ fn interpreted_floating_state_survives_native_islands() {
     reset(&mut uc, regs, 2);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.memory().read(DATA, 4).unwrap(), 10f32.to_le_bytes());
-    assert!(jit.stats.native_entries >= 9);
+    // The loop's x87 instructions stay inside the native region.
+    assert_eq!(jit.stats.interpreter_entries, 0);
 }
 
 #[test]

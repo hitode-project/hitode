@@ -27,6 +27,72 @@ pub(crate) fn operation(i: &Instruction) -> Option<Operation> {
     }
 }
 
+/// One x87 instruction executed from generated code without leaving the region.
+/// Generated code holds a pointer to it; the owning `Compiled` keeps it alive.
+pub(crate) struct NativeX87 {
+    pub instruction: Instruction,
+    pub opcode: Option<u16>,
+}
+
+/// The instruction completed; generated code continues at the next instruction.
+pub(crate) const X87_DONE: u32 = 0;
+/// Nothing changed; the instruction is retried by the interpreter.
+pub(crate) const X87_FALLBACK: u32 = 1;
+pub(crate) const X87_READ_FAULT: u32 = 2;
+pub(crate) const X87_WRITE_FAULT: u32 = 3;
+/// The instruction completed, but it wrote executable memory or left an
+/// unmasked exception pending. Generated code must return to the executor.
+pub(crate) const X87_EXIT: u32 = 4;
+
+pub(crate) fn native_x87(i: &Instruction) -> bool {
+    // FXSAVE/FXRSTOR also own XMM and MXCSR state.
+    operation(i) == Some(Operation::X87) && !matches!(i.mnemonic(), M::Fxsave | M::Fxrstor)
+}
+
+/// Called only by native code with the Executor's live bridge and saved CpuState.
+/// Runs the interpreter's own x87 transaction, so results are bit-identical.
+pub(crate) unsafe extern "C" fn x87_call(
+    bridge: *mut std::ffi::c_void,
+    state: *mut CpuState,
+    operation: *const NativeX87,
+) -> u32 {
+    // SAFETY: same ABI/lifetime contract as strings::repeat; the instruction is
+    // owned by the Compiled that is executing.
+    let (bridge, state, operation) = unsafe {
+        (
+            &mut *bridge.cast::<crate::trap::Bridge<'_>>(),
+            &mut *state,
+            &*operation,
+        )
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the bridge's memory is the executor's exclusively borrowed Memory.
+        let memory = unsafe { &mut *bridge.memory };
+        let epoch = memory.epoch;
+        match execute(
+            &operation.instruction,
+            Operation::X87,
+            operation.opcode,
+            state,
+            memory,
+            true,
+        ) {
+            Step::Executed if memory.epoch != epoch || state.x87.status & 0x80 != 0 => X87_EXIT,
+            Step::Executed => X87_DONE,
+            Step::ReadFault { address, .. } => {
+                state.fault_addr = address;
+                X87_READ_FAULT
+            }
+            Step::WriteFault { address, .. } => {
+                state.fault_addr = address;
+                X87_WRITE_FAULT
+            }
+            _ => X87_FALLBACK,
+        }
+    }))
+    .unwrap_or(X87_FALLBACK)
+}
+
 pub(crate) fn execute(
     i: &Instruction,
     operation: Operation,
