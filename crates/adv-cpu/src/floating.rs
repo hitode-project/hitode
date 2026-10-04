@@ -1,6 +1,7 @@
 //! Transactional x87, SSE and packed-integer execution on canonical CPU state.
 use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, interpreter::Step};
 use iced_x86::{Instruction, Mnemonic as M, Register as R};
+pub(crate) mod fast;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod native_x87;
 mod simd;
@@ -32,6 +33,8 @@ pub(crate) fn operation(i: &Instruction) -> Option<Operation> {
 pub(crate) struct NativeX87 {
     pub instruction: Instruction,
     pub opcode: Option<u16>,
+    /// Set when the instruction has a host-double fast path.
+    pub fast: Option<fast::Fast>,
 }
 
 /// The instruction completed; generated code continues at the next instruction.
@@ -68,6 +71,11 @@ pub(crate) unsafe extern "C" fn x87_call(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the bridge's memory is the executor's exclusively borrowed Memory.
         let memory = unsafe { &mut *bridge.memory };
+        if let Some(fast) = operation.fast
+            && let Some(result) = fast::execute(operation, fast, state, memory)
+        {
+            return result;
+        }
         let epoch = memory.epoch;
         match execute(
             &operation.instruction,

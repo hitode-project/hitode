@@ -517,6 +517,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             crate::floating::NativeX87 {
                 instruction: *i,
                 opcode,
+                fast: crate::floating::fast::classify(i),
             }
         })
         .collect();
