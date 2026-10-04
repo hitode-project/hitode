@@ -1,6 +1,6 @@
-//! Multimedia timers on one cooperative guest worker. No host thread, polling,
-//! or system timer-resolution request is used by this persona.
-use adv_abi::Registry;
+//! Multimedia timers and joystick queries on the cooperative guest owner.
+//! No host thread, device polling or timer-resolution request is used here.
+use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{CtxId, Env, Object, Outcome, Wait};
 use std::collections::BTreeMap;
@@ -31,6 +31,7 @@ struct Timers {
 }
 
 pub fn register(registry: &mut Registry) {
+    registry.register(joy_position_ABI);
     for (name, argc, handler) in [
         ("timeGetDevCaps", 2, caps as adv_machine::Handler),
         ("timeGetTime", 0, get_time),
@@ -43,6 +44,21 @@ pub fn register(registry: &mut Registry) {
         crate::stdcall(registry, "winmm.dll", name, argc, handler);
     }
 }
+
+/// The virtual input profile has no configured game controllers, matching
+/// DirectInput's empty GAMECTRL enumeration. Native WinMM on that profile
+/// returns JOYERR_PARMS even for IDs 0..15; JOYERR_UNPLUGGED describes a
+/// configured joystick that has been disconnected. Failure leaves JOYINFO
+/// untouched, so neither guest output permissions nor host devices are probed.
+#[win32(winmm, name = "joyGetPos", level = safe_fail)]
+fn joy_position(_env: &mut Env<'_>, _id: u32, output: GuestPtr<()>) -> u32 {
+    if output.is_null() {
+        11 // MMSYSERR_INVALPARAM
+    } else {
+        165 // JOYERR_PARMS
+    }
+}
+
 fn state<'a>(env: &'a mut Env<'_>) -> &'a mut Timers {
     if env.ext.try_get::<Timers>().is_none() {
         env.ext.insert(Timers::default());
