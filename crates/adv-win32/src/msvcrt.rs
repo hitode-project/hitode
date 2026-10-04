@@ -6,6 +6,7 @@ use adv_os::Heaps;
 use std::collections::HashMap;
 mod convert;
 mod floating;
+mod heap;
 mod onexit;
 
 #[derive(Default)]
@@ -31,6 +32,7 @@ pub fn register(r: &mut Registry) {
     floating::register(r);
     onexit::register(r);
     convert::register(r);
+    heap::register(r);
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
@@ -553,6 +555,79 @@ mod tests {
         .unwrap();
         install(&mut m).unwrap();
         m
+    }
+    #[test]
+    fn ucrt_heap_apisets_share_allocations_and_preserve_contents_on_failed_growth() {
+        for jit in [false, true] {
+            let mut m = machine(jit);
+            let code = 0x400000;
+            let data = 0x500000;
+            m.cpu.map(code, 4096, Prot::RX).unwrap();
+            m.cpu.map(data, 4096, Prot::RW).unwrap();
+            let heap = "api-ms-win-crt-heap-l1-1-0.dll";
+            let malloc = m.resolve_import(heap, "malloc").unwrap();
+            let calloc = m.resolve_import(heap, "calloc").unwrap();
+            let realloc = m.resolve_import("ucrtbase.dll", "realloc").unwrap();
+            let free = m.resolve_import("ucrtbase.dll", "free").unwrap();
+            let errno = m.resolve_import("ucrtbase.dll", "_errno").unwrap();
+            let mut a = CodeAssembler::new(32).unwrap();
+            a.push(16).unwrap();
+            a.call(u64::from(malloc)).unwrap();
+            a.add(esp, 4).unwrap();
+            a.mov(dword_ptr(data as i32), eax).unwrap();
+            a.mov(ebx, eax).unwrap();
+            a.mov(dword_ptr(ebx), 0x1234abcd).unwrap();
+            a.push(64).unwrap();
+            a.push(ebx).unwrap();
+            a.call(u64::from(realloc)).unwrap();
+            a.add(esp, 8).unwrap();
+            a.mov(ebx, eax).unwrap();
+            a.mov(dword_ptr((data + 4) as i32), ebx).unwrap();
+            a.push(-1).unwrap();
+            a.push(ebx).unwrap();
+            a.call(u64::from(realloc)).unwrap();
+            a.add(esp, 8).unwrap();
+            a.mov(dword_ptr((data + 8) as i32), eax).unwrap();
+            a.mov(eax, dword_ptr(ebx)).unwrap();
+            a.mov(dword_ptr((data + 12) as i32), eax).unwrap();
+            a.call(u64::from(errno)).unwrap();
+            a.mov(eax, dword_ptr(eax)).unwrap();
+            a.mov(dword_ptr((data + 16) as i32), eax).unwrap();
+            a.push(ebx).unwrap();
+            a.call(u64::from(free)).unwrap();
+            a.add(esp, 4).unwrap();
+            a.push(4).unwrap();
+            a.push(8).unwrap();
+            a.call(u64::from(calloc)).unwrap();
+            a.add(esp, 8).unwrap();
+            a.mov(ebx, eax).unwrap();
+            a.mov(eax, dword_ptr(ebx + 28)).unwrap();
+            a.mov(dword_ptr((data + 20) as i32), eax).unwrap();
+            a.push(ebx).unwrap();
+            a.call(u64::from(free)).unwrap();
+            a.add(esp, 4).unwrap();
+            a.push(4).unwrap();
+            a.push(-1).unwrap();
+            a.call(u64::from(calloc)).unwrap();
+            a.add(esp, 8).unwrap();
+            a.mov(dword_ptr((data + 24) as i32), eax).unwrap();
+            a.xor(eax, eax).unwrap();
+            a.ret().unwrap();
+            m.cpu
+                .write(code, &a.assemble(u64::from(code)).unwrap())
+                .unwrap();
+            m.spawn("ucrt-heap", code, &[], 65536).unwrap();
+            assert!(matches!(m.run(), RunResult::Exited(0)));
+            let original = m.cpu.read_u32(data).unwrap();
+            let resized = m.cpu.read_u32(data + 4).unwrap();
+            assert_ne!(original, 0);
+            assert_ne!(resized, 0);
+            assert!(m.ext.get::<Heaps>().owner(original).is_none());
+            assert!(m.ext.get::<Heaps>().owner(resized).is_none());
+            for (offset, expected) in [(8, 0), (12, 0x1234abcd), (16, 12), (20, 0), (24, 0)] {
+                assert_eq!(m.cpu.read_u32(data + offset).unwrap(), expected);
+            }
+        }
     }
     #[test]
     fn qsort_calls_guest_comparator_and_initializer_callbacks_in_order() {
