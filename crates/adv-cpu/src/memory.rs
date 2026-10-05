@@ -109,6 +109,7 @@ impl WorkerLayout {
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
+            resident: BTreeMap::new(),
             #[cfg(windows)]
             native_protection: false,
             #[cfg(windows)]
@@ -130,6 +131,8 @@ pub struct Memory {
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: BTreeMap<usize, SharedPage>,
+    /// File pages whose bytes live in this window's committed pages.
+    resident: BTreeMap<usize, std::rc::Rc<crate::backend::FilePage>>,
     #[cfg(windows)]
     native_protection: bool,
     #[cfg(windows)]
@@ -286,6 +289,9 @@ impl Memory {
             if self.native_protection {
                 return Ok(());
             }
+            if !self.resident.is_empty() {
+                return Err("native protection excludes resident file views".into());
+            }
             let reservation = self
                 .reservation
                 .as_ref()
@@ -372,6 +378,7 @@ impl Memory {
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
+            resident: BTreeMap::new(),
             #[cfg(windows)]
             native_protection: false,
             #[cfg(windows)]
@@ -411,6 +418,7 @@ impl Memory {
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
+            resident: BTreeMap::new(),
             #[cfg(windows)]
             native_protection: false,
             #[cfg(windows)]
@@ -472,6 +480,11 @@ impl Memory {
             .reservation
             .as_ref()
             .ok_or("unmapping requires reserved address space")?;
+        for page in pages.clone() {
+            if let Some(file) = self.resident.remove(&page) {
+                file.evict();
+            }
+        }
         // File overlays are not linear. PCM pages have their own section views
         // in the reservation, whose removal cannot invalidate a callback alias.
         let mut start = pages.start;
@@ -686,7 +699,16 @@ impl Memory {
         let (Ok(src), Ok(dst)) = (self.range(source, len), self.range(destination, len)) else {
             return true;
         };
-        if !self.overlays(&src) || !self.overlays(&dst) {
+        let aliased = |range: &std::ops::Range<usize>| {
+            self.overlays(range)
+                || (!range.is_empty()
+                    && self
+                        .resident
+                        .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                        .next()
+                        .is_some())
+        };
+        if !aliased(&src) || !aliased(&dst) {
             return false;
         }
         if self.parallel_view {
@@ -696,11 +718,7 @@ impl Memory {
             return false;
         }
         let mut source_spans = std::collections::HashMap::<(u8, usize), Vec<(usize, usize)>>::new();
-        for (page, storage) in self
-            .shared_pages
-            .range(src.start / PAGE_SIZE..=(src.end - 1) / PAGE_SIZE)
-        {
-            let (kind, id, base) = storage.identity();
+        for (page, (kind, id, base)) in self.identities(&src) {
             let begin = src.start.max(page * PAGE_SIZE) - page * PAGE_SIZE + base;
             let end = src.end.min((page + 1) * PAGE_SIZE) - page * PAGE_SIZE + base;
             source_spans
@@ -708,11 +726,7 @@ impl Memory {
                 .or_default()
                 .push((begin, end));
         }
-        for (page, storage) in self
-            .shared_pages
-            .range(dst.start / PAGE_SIZE..=(dst.end - 1) / PAGE_SIZE)
-        {
-            let (kind, id, base) = storage.identity();
+        for (page, (kind, id, base)) in self.identities(&dst) {
             let begin = dst.start.max(page * PAGE_SIZE) - page * PAGE_SIZE + base;
             let end = dst.end.min((page + 1) * PAGE_SIZE) - page * PAGE_SIZE + base;
             if source_spans
@@ -723,6 +737,23 @@ impl Memory {
             }
         }
         false
+    }
+
+    /// The storage behind each overlay or resident file page of `range`.
+    fn identities(
+        &self,
+        range: &std::ops::Range<usize>,
+    ) -> impl Iterator<Item = (usize, (u8, usize, usize))> + '_ {
+        let pages = range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE;
+        let shared = self
+            .shared_pages
+            .range(pages.clone())
+            .map(|(&page, storage)| (page, storage.identity()));
+        let resident = self
+            .resident
+            .range(pages)
+            .map(|(&page, file)| (page, (1, std::rc::Rc::as_ptr(file) as usize, 0)));
+        shared.chain(resident)
     }
 
     pub(crate) fn map_shared_audio(
@@ -790,8 +821,47 @@ impl Memory {
         self.touch(addr, len);
         Ok(())
     }
+
+    /// Moves a prepared, non-copy-on-write file page into this window while
+    /// no other view holds it there. Native code then accesses it as ordinary
+    /// memory, and every other accessor reaches the same bytes through the
+    /// page. Dropping SHARED never invalidates a native assumption: code
+    /// still holding the old permission takes the helper path to these bytes.
+    fn make_resident(&mut self, page: usize) {
+        #[cfg(windows)]
+        if self.native_protection {
+            return;
+        }
+        let Some(reservation) = self.reservation.as_ref() else {
+            return;
+        };
+        let Some(SharedPage::File {
+            page: storage,
+            copy_on_write: false,
+        }) = self.shared_pages.get(&page)
+        else {
+            return;
+        };
+        if storage.resident() || reservation.commit(page * PAGE_SIZE, PAGE_SIZE).is_err() {
+            return;
+        }
+        let storage = storage.clone();
+        // SAFETY: the committed window page stays valid until unmap or drop
+        // evicts it, and FilePage access is confined to this worker.
+        if unsafe { storage.make_resident(self.ptr.as_ptr().add(page * PAGE_SIZE)) }.is_err() {
+            let _ = reservation.decommit(page * PAGE_SIZE, PAGE_SIZE);
+            return;
+        }
+        self.shared_pages.remove(&page);
+        self.resident.insert(page, storage);
+        Arc::make_mut(&mut self.perms)[page] &= !SHARED;
+        self.touch(self.base + (page * PAGE_SIZE) as u32, PAGE_SIZE);
+    }
     pub(crate) fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         let page = addr.checked_sub(self.base)? as usize / PAGE_SIZE;
+        if self.resident.contains_key(&page) {
+            return Some(false);
+        }
         match self.shared_pages.get(&page)? {
             SharedPage::File { copy_on_write, .. } => Some(*copy_on_write),
             _ => None,
@@ -862,6 +932,11 @@ impl Memory {
             };
             *page = prepared;
             *copy_on_write = false;
+        }
+        if !self.parallel_view {
+            for page in range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE {
+                self.make_resident(page);
+            }
         }
         Ok(())
     }
@@ -1043,10 +1118,15 @@ impl Memory {
         }
         let range = self.committed(addr, len)?;
         if perms & EXEC != 0
-            && self
+            && (self
                 .shared_pages
                 .range(range.start / PAGE_SIZE..range.end / PAGE_SIZE)
                 .any(|(_, page)| page.file_page())
+                || self
+                    .resident
+                    .range(range.start / PAGE_SIZE..range.end / PAGE_SIZE)
+                    .next()
+                    .is_some())
         {
             return Err("executable file views are not supported".into());
         }
@@ -1102,6 +1182,10 @@ impl Drop for Memory {
     fn drop(&mut self) {
         if let Some(fence) = &self.parallel {
             fence.quiesce();
+        }
+        // Sections outlive their views; give them their bytes back.
+        for file in std::mem::take(&mut self.resident).into_values() {
+            file.evict();
         }
         if self.reservation.is_some() || self.parallel_view {
             return;
@@ -2000,5 +2084,83 @@ mod file_page_tests {
         let mut bytes = [0; 4];
         memory.read_into(0x10ffe, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+
+    /// Stores a value through the native path, as compiled guest code does.
+    fn native_store(memory: &Memory, address: u32, bytes: &[u8]) {
+        let pointer = memory.direct(address, bytes.len(), true).unwrap();
+        // SAFETY: `direct` checked the range lies in one ordinary page.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    }
+
+    #[test]
+    fn first_native_access_makes_a_shared_view_resident_and_coherent() {
+        let page = crate::backend::FilePage::lazy(|| Ok([0; PAGE_SIZE]));
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        for at in [0x10000, 0x20000] {
+            memory
+                .map_file_pages(at, &[page.clone()], READ | WRITE, false)
+                .unwrap();
+        }
+        assert!(memory.shared_range(0x10000, 4));
+        assert!(!page.initialized());
+
+        memory.prepare_native_access(0x10000, 4, true).unwrap();
+        assert!(!memory.shared_range(0x10000, PAGE_SIZE));
+        assert!(memory.shared_range(0x20000, 4));
+        assert_eq!(memory.file_page_copy_on_write(0x10000), Some(false));
+        assert!(!page.dirty());
+        // The other view reaches the bytes stored natively, and back.
+        native_store(&memory, 0x10000, &[1, 2, 3, 4]);
+        assert!(page.dirty());
+        let mut bytes = [0; 5];
+        memory.read_into(0x20000, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 0]);
+        memory.write(0x20004, &[5]).unwrap();
+        memory.read_into(0x10000, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 5]);
+        assert!(memory.rep_alias_hazard(0x10000, 0x20002, 4));
+        assert!(!memory.rep_alias_hazard(0x10000, 0x20010, 4));
+        page.clear_dirty();
+        assert!(!page.dirty());
+        native_store(&memory, 0x10006, &[6]);
+        assert!(page.dirty());
+
+        // Unmapping the resident view hands the bytes to the other one.
+        memory.unmap(0x10000, PAGE_SIZE).unwrap();
+        assert_eq!(&page.snapshot().unwrap()[..7], &[1, 2, 3, 4, 5, 0, 6]);
+        memory.prepare_native_access(0x20000, 4, false).unwrap();
+        assert!(!memory.shared_range(0x20000, PAGE_SIZE));
+        native_store(&memory, 0x20007, &[7]);
+        drop(memory);
+        assert_eq!(&page.snapshot().unwrap()[..8], &[1, 2, 3, 4, 5, 0, 6, 7]);
+        assert!(page.dirty());
+    }
+
+    #[test]
+    fn copy_on_write_views_stay_overlays_and_unchanged_resident_pages_stay_clean() {
+        let page = crate::backend::FilePage::new([0x17; PAGE_SIZE]);
+        let mut memory = Memory::reserve(0, 0x30000).unwrap();
+        memory
+            .map_file_pages(0x10000, &[page.clone()], READ | WRITE, true)
+            .unwrap();
+        memory
+            .map_file_pages(0x20000, &[page.clone()], READ, false)
+            .unwrap();
+        memory.prepare_native_access(0x10000, 4, false).unwrap();
+        assert!(memory.shared_range(0x10000, 4));
+        memory.prepare_native_access(0x20000, 4, false).unwrap();
+        assert!(!memory.shared_range(0x20000, 4));
+        assert!(memory.direct(0x20000, 4, true).is_none());
+        // A COPY store detaches a private page, which then is resident too.
+        memory.prepare_native_access(0x10000, 4, true).unwrap();
+        assert!(!memory.shared_range(0x10000, 4));
+        native_store(&memory, 0x10000, &[1]);
+        let mut byte = [0];
+        memory.read_into(0x20000, &mut byte).unwrap();
+        assert_eq!(byte, [0x17]);
+        drop(memory);
+        assert!(!page.dirty());
+        assert_eq!(page.snapshot().unwrap(), [0x17; PAGE_SIZE]);
     }
 }
