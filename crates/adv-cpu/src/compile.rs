@@ -2130,6 +2130,7 @@ impl Emitter<'_> {
         self.b.switch_to_block(after);
         self.exit_const(Exit::Fallback, i.next_ip32());
         self.b.switch_to_block(done);
+        self.b.seal_block(done);
     }
     fn exit(&mut self, reason: Exit, pc: Value) {
         self.exit_predicted(reason, pc, None);
@@ -2391,6 +2392,7 @@ impl Emitter<'_> {
             let ok = self.b.create_block();
             self.b.ins().brif(bad, lane, &[], ok, &[]);
             self.b.switch_to_block(ok);
+            self.b.seal_block(ok);
             return;
         }
         let fail = self.b.create_block();
@@ -2408,6 +2410,7 @@ impl Emitter<'_> {
         }
         self.exit_const(reason, self.pc);
         self.b.switch_to_block(ok);
+        self.b.seal_block(ok);
     }
     fn direct(&mut self, pc: u32) {
         if let Some(index) = self.fast
@@ -2746,6 +2749,7 @@ impl Emitter<'_> {
                 let ok = self.b.create_block();
                 self.b.ins().brif(bad, lane, &[], ok, &[]);
                 self.b.switch_to_block(ok);
+                self.b.seal_block(ok);
             }
             self.guard(executable, Exit::Fallback, None);
             self.mark(diagnostics::Part::Body);
@@ -2774,6 +2778,7 @@ impl Emitter<'_> {
             let ok = self.b.create_block();
             self.b.ins().brif(bad, cold, &[], ok, &[]);
             self.b.switch_to_block(ok);
+            self.b.seal_block(ok);
         }
         self.guard(executable, Exit::Fallback, None);
         self.b.ins().jump(done, &[no_file.into()]);
@@ -2821,6 +2826,7 @@ impl Emitter<'_> {
         let is_file = self.b.ins().iconst(types::I8, 1);
         self.b.ins().jump(done, &[is_file.into()]);
         self.b.switch_to_block(done);
+        self.b.seal_block(done);
         self.mark(diagnostics::Part::Body);
         let file = self.b.block_params(done)[0];
         let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
@@ -2919,6 +2925,7 @@ impl Emitter<'_> {
             let ok = self.b.create_block();
             self.b.ins().brif(bad, atomic, &[], ok, &[]);
             self.b.switch_to_block(ok);
+            self.b.seal_block(ok);
             combined = Some(if let Some(old) = combined {
                 self.b.ins().bor(old, p)
             } else {
@@ -2940,6 +2947,7 @@ impl Emitter<'_> {
         }
         if self.lane.is_some() {
             self.b.switch_to_block(done);
+            self.b.seal_block(done);
             return (!write).then(|| self.b.block_params(done)[0]);
         }
         self.b.switch_to_block(atomic);
@@ -3030,6 +3038,7 @@ impl Emitter<'_> {
             self.b.ins().jump(done, &[result.into()]);
         }
         self.b.switch_to_block(done);
+        self.b.seal_block(done);
         self.mark(diagnostics::Part::Body);
         (!write).then(|| self.b.block_params(done)[0])
     }
@@ -3169,6 +3178,7 @@ impl Emitter<'_> {
         );
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
+        self.b.seal_block(done);
     }
     fn store_atomic(&mut self, pointer: Value, value: Value) {
         let ty = self.b.func.dfg.value_type(value);
@@ -3407,7 +3417,70 @@ impl Emitter<'_> {
         }
         flags
     }
+    /// Whether `result` is the instruction `opcode` applied to `a` and `b`.
+    fn computes(&self, result: Value, opcode: ir::Opcode, a: Value, b: Value) -> bool {
+        let dfg = &self.b.func.dfg;
+        let resolve = |v| dfg.resolve_aliases(v);
+        dfg.value_def(resolve(result)).inst().is_some_and(|inst| {
+            matches!(
+                dfg.insts[inst],
+                ir::InstructionData::Binary { opcode: op, args: [x, y] }
+                    if op == opcode && resolve(x) == resolve(a) && resolve(y) == resolve(b)
+            )
+        })
+    }
+    /// A signed or unsigned order condition as one comparison when the lazy
+    /// flags statically come from a 32-bit SUB/CMP/ADD or any logical result.
+    fn fused_condition(&mut self, m: M) -> Option<Value> {
+        let kind = self.b.use_var(self.lazy[3]);
+        let kind = self.known(kind)?;
+        let a = self.b.use_var(self.lazy[0]);
+        let b = self.b.use_var(self.lazy[1]);
+        let result = self.b.use_var(self.lazy[2]);
+        let signed = |m| match m {
+            M::Jl => Some(IntCC::SignedLessThan),
+            M::Jge => Some(IntCC::SignedGreaterThanOrEqual),
+            M::Jle => Some(IntCC::SignedLessThanOrEqual),
+            M::Jg => Some(IntCC::SignedGreaterThan),
+            _ => None,
+        };
+        match kind {
+            // SUB, CMP and DEC: OF and SF order a and b exactly.
+            2 if self.computes(result, ir::Opcode::Isub, a, b) => {
+                // DEC keeps the old CF, so unsigned orders also need CF's
+                // lazy operands to be this subtraction's.
+                let carry = [self.lazy[4], self.lazy[5], self.lazy[6]].map(|v| self.b.use_var(v));
+                let dfg = &self.b.func.dfg;
+                let borrows = dfg.resolve_aliases(carry[0]) == dfg.resolve_aliases(a)
+                    && dfg.resolve_aliases(carry[1]) == dfg.resolve_aliases(b)
+                    && self.known(carry[2]) == Some(1);
+                let cc = signed(m).or(match m {
+                    M::Jbe if borrows => Some(IntCC::UnsignedLessThanOrEqual),
+                    M::Ja if borrows => Some(IntCC::UnsignedGreaterThan),
+                    _ => None,
+                })?;
+                Some(self.b.ins().icmp(cc, a, b))
+            }
+            // ADD and INC: SF ^ OF is the sign of the exact sum.
+            1 if self.computes(result, ir::Opcode::Iadd, a, b) => {
+                let cc = signed(m)?;
+                let a = self.b.ins().sextend(types::I64, a);
+                let b = self.b.ins().sextend(types::I64, b);
+                let sum = self.b.ins().iadd(a, b);
+                Some(self.b.ins().icmp_imm(cc, sum, 0))
+            }
+            // Logical operations clear OF; narrow ones keep the sign at bit 31.
+            _ if kind & 7 == 3 => {
+                let cc = signed(m)?;
+                Some(self.b.ins().icmp_imm(cc, result, 0))
+            }
+            _ => None,
+        }
+    }
     fn condition(&mut self, m: M) -> Value {
+        if let Some(fused) = self.fused_condition(m) {
+            return fused;
+        }
         // Emit just what the condition needs; in particular JZ/JNZ needs no parity,
         // carry or overflow work in an interpreter's loop backedge.
         let (v, is_zero) = match m {
@@ -3474,6 +3547,7 @@ impl Emitter<'_> {
             switch.set_entry(u128::from(crate::strings::WRITE_FAULT), write_fault);
             switch.emit(&mut self.b, result, fallback);
             self.b.switch_to_block(done);
+            self.b.seal_block(done);
             self.direct(i.next_ip32());
             self.b.switch_to_block(retry);
             self.direct(i.ip32());

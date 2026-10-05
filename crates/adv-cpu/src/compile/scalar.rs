@@ -373,6 +373,8 @@ impl Emitter<'_> {
             .jump(done, &[low_quotient.into(), remainder.into()]);
 
         self.b.switch_to_block(done);
+
+        self.b.seal_block(done);
         let quotient = self.b.block_params(done)[0];
         let remainder = self.b.block_params(done)[1];
         self.b.def_var(self.regs[0], quotient);
@@ -425,6 +427,8 @@ impl Emitter<'_> {
             .jump(done, &[quotient.into(), remainder.into()]);
 
         self.b.switch_to_block(done);
+
+        self.b.seal_block(done);
         let quotient = self.b.block_params(done)[0];
         let remainder = self.b.block_params(done)[1];
         self.b.def_var(self.regs[0], quotient);

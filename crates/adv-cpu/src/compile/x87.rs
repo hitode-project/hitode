@@ -134,6 +134,7 @@ impl Emitter<'_> {
         self.b.switch_to_block(after);
         self.exit(Exit::Fallback, next);
         self.b.switch_to_block(done);
+        self.b.seal_block(done);
         if self.shadow_ref.is_some() {
             let absent = self.b.ins().iconst(self.ptr_ty, 0);
             self.b
@@ -436,6 +437,7 @@ impl Emitter<'_> {
         self.x87_instruction(i, operation);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(done);
+        self.b.seal_block(done);
     }
 
     fn x87_reject(&mut self, bad: Value, slow: ir::Block) {
