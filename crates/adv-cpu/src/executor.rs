@@ -146,6 +146,9 @@ pub struct Executor {
     observed_epoch: u64,
     profiling: bool,
     pub(crate) deadline: Option<Instant>,
+    /// Measured native blocks per microsecond, which sizes the safepoint
+    /// allowance under a wall deadline; zero until measured.
+    native_rate: u64,
     pub profile: BTreeMap<u32, ProfileSample>,
     /// Bounded diagnostics for automatic compilation failures. Guest execution
     /// continues in the interpreter; explicit compilation still returns errors.
@@ -302,6 +305,7 @@ impl Executor {
             observed_epoch: 0,
             profiling: false,
             deadline: None,
+            native_rate: 0,
             profile: BTreeMap::new(),
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
@@ -1198,7 +1202,8 @@ impl Executor {
             if self.state.eip == stop {
                 return Ok(RunOutcome::ReachedStop);
             }
-            if self.deadline.is_some_and(|t| Instant::now() >= t) {
+            let now = self.deadline.map(|_| Instant::now());
+            if self.deadline.zip(now).is_some_and(|(t, now)| now >= t) {
                 return Ok(RunOutcome::Budget);
             }
             if self.state.fuel == 0 {
@@ -1264,13 +1269,16 @@ impl Executor {
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
                 // while a wall deadline is active, without charging extra work.
-                let reserved = if self.deadline.is_some() {
-                    let reserved = self.state.fuel.saturating_sub(256);
-                    self.state.fuel -= reserved;
-                    reserved
-                } else {
-                    0
-                };
+                // At the measured rate, the allowance covers about half the time
+                // left, so hot loops rarely leave native code early.
+                const SAFEPOINT: u64 = 256;
+                let timed = self.deadline.zip(now);
+                let allowance = timed.map_or(u64::MAX, |(deadline, now)| {
+                    let left = deadline.saturating_duration_since(now).as_micros() as u64;
+                    (left / 2).saturating_mul(self.native_rate).max(SAFEPOINT)
+                });
+                let reserved = self.state.fuel.saturating_sub(allowance);
+                self.state.fuel -= reserved;
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
@@ -1303,6 +1311,18 @@ impl Executor {
                     self.stats.shadow_overflows = shadow.overflows;
                 }
                 let completed = before - self.state.fuel;
+                if let Some((_, now)) = timed
+                    && reserved != 0
+                    && result == Exit::Budget as u32
+                {
+                    let elapsed = (now.elapsed().as_micros() as u64).max(1);
+                    let rate = completed / elapsed;
+                    self.native_rate = if self.native_rate == 0 {
+                        rate
+                    } else {
+                        (3 * self.native_rate + rate) / 4
+                    };
+                }
                 self.state.fuel += reserved;
                 self.stats.native_blocks += completed;
                 self.record_native_work(owner, completed);
