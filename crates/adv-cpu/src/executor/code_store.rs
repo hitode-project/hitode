@@ -12,6 +12,8 @@ pub(super) struct CodeStore {
     pub(super) entry_owner: BTreeMap<u32, u32>,
     /// Published targets mirror entry_owner, including overlapping owners.
     pub(super) link_targets: BTreeMap<u32, usize>,
+    /// Targets changed since `links` last mirrored link_targets. None rebuilds.
+    link_updates: Option<BTreeSet<u32>>,
     /// Only resident Fast code can acquire promotion heat.
     pub(super) fast_regions: BTreeSet<u32>,
     pub(super) links: Arc<crate::linking::Table>,
@@ -35,6 +37,7 @@ impl Default for CodeStore {
             region_pages: BTreeMap::new(),
             entry_owner: BTreeMap::new(),
             link_targets: BTreeMap::new(),
+            link_updates: Some(BTreeSet::new()),
             fast_regions: BTreeSet::new(),
             links: Arc::default(),
             parallel_entries: HashMap::new(),
@@ -94,14 +97,82 @@ impl CodeStore {
         outside
     }
 
-    pub(super) fn updated_links(&self) -> Option<Arc<crate::linking::Table>> {
-        if self.links_revision == self.cache_revision {
-            return None;
+    pub(super) fn link(&mut self, pc: u32, target: usize) {
+        self.link_targets.insert(pc, target);
+        if let Some(updates) = &mut self.link_updates {
+            updates.insert(pc);
         }
-        let mut links = crate::linking::Table::default();
-        links.rebuild(self.link_targets.iter().map(|(&pc, &target)| (pc, target)));
-        // A worker may still hold the previous immutable Arc generation.
-        Some(Arc::new(links))
+    }
+
+    /// Callers prepare with `retire_links` before code named by `pc` is dropped.
+    pub(super) fn unlink(&mut self, pc: u32) {
+        self.link_targets.remove(&pc);
+        if let Some(updates) = &mut self.link_updates {
+            updates.remove(&pc);
+        }
+        match Arc::get_mut(&mut self.links) {
+            Some(links) => links.remove(pc),
+            None => self.drop_links(),
+        }
+    }
+
+    pub(super) fn clear_links(&mut self) {
+        self.link_targets.clear();
+        self.links = Arc::default();
+        self.link_updates = Some(BTreeSet::new());
+    }
+
+    /// Before retirement the table may name only live code: pending updates can
+    /// still point an overlapped entry at its previous owner.
+    pub(super) fn retire_links(&mut self) {
+        if !self.apply_link_updates() {
+            self.drop_links();
+        }
+    }
+
+    pub(super) fn refresh_links(&mut self) {
+        if self.links_revision == self.cache_revision {
+            return;
+        }
+        if !self.apply_link_updates() {
+            let mut links = crate::linking::Table::default();
+            links.rebuild(self.link_targets.iter().map(|(&pc, &target)| (pc, target)));
+            // A worker may still hold the previous immutable Arc generation.
+            self.links = Arc::new(links);
+            self.link_updates = Some(BTreeSet::new());
+        }
+        self.links_revision = self.cache_revision;
+    }
+
+    fn drop_links(&mut self) {
+        self.links = Arc::default();
+        self.link_updates = None;
+    }
+
+    /// Updates an unshared table in place. False leaves a rebuild to the caller.
+    fn apply_link_updates(&mut self) -> bool {
+        let Some(updates) = &mut self.link_updates else {
+            return false;
+        };
+        if updates.is_empty() {
+            return true;
+        }
+        let Some(links) = Arc::get_mut(&mut self.links) else {
+            return false;
+        };
+        let targets = &self.link_targets;
+        let applied = updates.iter().all(|&pc| match targets.get(&pc) {
+            Some(&target) => links.insert(pc, target),
+            None => {
+                links.remove(pc);
+                true
+            }
+        });
+        updates.clear();
+        if !applied {
+            self.link_updates = None;
+        }
+        applied
     }
 }
 

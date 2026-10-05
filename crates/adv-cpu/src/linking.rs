@@ -23,11 +23,13 @@ pub(crate) struct Slot {
 #[derive(Default)]
 pub(crate) struct Table {
     slots: Vec<Slot>,
+    len: usize,
 }
 
 impl Table {
     pub fn rebuild(&mut self, entries: impl Iterator<Item = (u32, usize)>) {
         let entries: Vec<_> = entries.collect();
+        self.len = entries.len();
         if entries.is_empty() {
             self.slots.clear();
             return;
@@ -62,6 +64,68 @@ impl Table {
         }
     }
 
+    /// Updates one key in an exclusively owned table. False asks the caller to
+    /// rebuild: the table is empty, would pass half load, or the probe window is full.
+    pub fn insert(&mut self, pc: u32, entry: usize) -> bool {
+        debug_assert_ne!(entry, 0);
+        let Some(mask) = self.slots.len().checked_sub(1) else {
+            return false;
+        };
+        let first = hash(pc) as usize & mask;
+        for offset in 0..PROBES {
+            let slot = &mut self.slots[(first + offset) & mask];
+            let current = slot.entry.get_mut();
+            if *current == 0 {
+                if (self.len + 1) * 2 > mask + 1 {
+                    return false;
+                }
+                self.len += 1;
+                slot.pc = pc;
+                *current = entry;
+                return true;
+            }
+            if slot.pc == pc {
+                *current = entry;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Removes one key by shifting later members of its probe run backward.
+    /// Lookups stop at the first empty slot, so no tombstone may remain.
+    pub fn remove(&mut self, pc: u32) {
+        let Some(mask) = self.slots.len().checked_sub(1) else {
+            return;
+        };
+        let first = hash(pc) as usize & mask;
+        let Some(mut hole) = (0..PROBES)
+            .map(|offset| (first + offset) & mask)
+            .take_while(|&index| self.slots[index].entry.load(Ordering::Relaxed) != 0)
+            .find(|&index| self.slots[index].pc == pc)
+        else {
+            return;
+        };
+        self.len -= 1;
+        let mut next = hole;
+        loop {
+            next = (next + 1) & mask;
+            let entry = *self.slots[next].entry.get_mut();
+            if entry == 0 {
+                break;
+            }
+            let home = hash(self.slots[next].pc) as usize & mask;
+            // Move a key only when the hole lies on its own probe path.
+            if next.wrapping_sub(home) & mask >= next.wrapping_sub(hole) & mask {
+                self.slots[hole].pc = self.slots[next].pc;
+                *self.slots[hole].entry.get_mut() = entry;
+                hole = next;
+            }
+        }
+        self.slots[hole].pc = 0;
+        *self.slots[hole].entry.get_mut() = 0;
+    }
+
     pub fn parts(&self) -> (*const Slot, u32) {
         if self.slots.is_empty() {
             (std::ptr::null(), 0)
@@ -93,4 +157,58 @@ pub(crate) struct NativeContext {
     /// Exclusive metadata borrowed for this chain. Cleared before/after native
     /// execution, so it cannot retain a target across publication or retirement.
     pub shadow: *mut shadow::Stack,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// The probe generated code performs.
+    fn lookup(table: &Table, pc: u32) -> Option<usize> {
+        let (slots, mask) = table.parts();
+        if slots.is_null() {
+            return None;
+        }
+        // SAFETY: parts belongs to this borrowed table.
+        let slots = unsafe { std::slice::from_raw_parts(slots, mask as usize + 1) };
+        (0..PROBES)
+            .map(|offset| &slots[(hash(pc) as usize + offset) & mask as usize])
+            .map(|slot| (slot.pc, slot.entry.load(Ordering::Acquire)))
+            .take_while(|&(_, entry)| entry != 0)
+            .find(|&(key, _)| key == pc)
+            .map(|(_, entry)| entry)
+    }
+
+    #[test]
+    fn in_place_updates_match_a_rebuilt_table() {
+        let mut expected = BTreeMap::new();
+        let mut table = Table::default();
+        let mut seed = 0x2545_f491_u32;
+        let mut rebuilds = 0;
+        for step in 0..20_000usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            // Few distinct, clustered keys keep probe runs long and collisions frequent.
+            let pc = 0x40_0000 + (seed % 1500) * 4;
+            if seed & 0x3000 == 0 {
+                expected.remove(&pc);
+                table.remove(pc);
+            } else {
+                expected.insert(pc, step + 1);
+                if !table.insert(pc, step + 1) {
+                    rebuilds += 1;
+                    table.rebuild(expected.iter().map(|(&pc, &entry)| (pc, entry)));
+                }
+            }
+            if step % 997 == 0 {
+                for key in (0..1500).map(|n| 0x40_0000 + n * 4) {
+                    assert_eq!(lookup(&table, key), expected.get(&key).copied(), "{key:#x}");
+                }
+            }
+        }
+        assert_eq!(table.len, expected.len());
+        assert!(rebuilds < 20, "{rebuilds}");
+    }
 }

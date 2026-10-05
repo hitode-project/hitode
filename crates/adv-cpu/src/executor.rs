@@ -382,7 +382,7 @@ impl Executor {
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
         self.memory.quiesce_workers();
-        self.code.links = Arc::default();
+        self.code.clear_links();
         self.code.cache_revision += 1;
         self.code.compiled.clear();
         self.stats.native_code_bytes = 0;
@@ -392,7 +392,6 @@ impl Executor {
         self.code.page_regions.clear();
         self.code.region_pages.clear();
         self.code.entry_owner.clear();
-        self.code.link_targets.clear();
         self.code.fast_regions.clear();
         self.code.parallel_entries.clear();
         self.pending_regions.clear();
@@ -452,7 +451,7 @@ impl Executor {
         compiled.cache_stamp.set(self.cache_clock);
         for &pc in &compiled.entries {
             self.code.entry_owner.insert(pc, region.start);
-            self.code.link_targets.insert(pc, compiled.tail_entry);
+            self.code.link(pc, compiled.tail_entry);
             if self.parallel.is_some() {
                 self.code
                     .parallel_entries
@@ -482,15 +481,17 @@ impl Executor {
         if let Some(old) = self.code.compiled.remove(&start) {
             // Only the execution owner reaches this path, after every generated
             // call has returned. Remove all published raw targets before Drop
-            // unregisters unwind tables and releases executable memory.
-            self.code.links = Arc::default();
+            // unregisters unwind tables and releases executable memory. A stale
+            // worker image would keep the table shared and force a rebuild.
+            self.parallel_image = None;
+            self.code.retire_links();
             self.code.cache_revision += 1;
             self.stats.native_code_bytes -= old.code_size;
             self.code.fast_regions.remove(&start);
             for entry in old.entries.iter() {
                 if self.code.entry_owner.get(entry) == Some(&start) {
                     self.code.entry_owner.remove(entry);
-                    self.code.link_targets.remove(entry);
+                    self.code.unlink(*entry);
                     self.code.parallel_entries.remove(entry);
                 }
             }
@@ -1062,10 +1063,11 @@ impl Executor {
     }
 
     fn refresh_links(&mut self) {
-        if let Some(links) = self.code.updated_links() {
-            self.code.links = links;
-            self.code.links_revision = self.code.cache_revision;
+        if self.code.links_revision != self.code.cache_revision {
+            // Rebuilt on the next parallel dispatch; dropping it lets the table update in place.
+            self.parallel_image = None;
         }
+        self.code.refresh_links();
     }
 
     fn validate_stop(&mut self, stop: u32) -> Result<(), String> {
@@ -1226,6 +1228,7 @@ impl Executor {
                     && code.entries.contains(&self.state.eip)
                     && self.deferred_fallback != Some(self.state.eip)
             });
+            let native = native.map(|(owner, _)| owner);
             if native.is_some()
                 && self.parallel.is_some()
                 && self.parallel_demand
@@ -1237,14 +1240,11 @@ impl Executor {
             {
                 return Ok(RunOutcome::NativeReady);
             }
-            if let Some((owner, native)) = native {
-                if self.region_linking
-                    && !self.profiling
-                    && let Some(links) = self.code.updated_links()
-                {
-                    self.code.links = links;
-                    self.code.links_revision = self.code.cache_revision;
+            if let Some(owner) = native {
+                if self.region_linking && !self.profiling {
+                    self.refresh_links();
                 }
+                let native = &self.code.compiled[&owner];
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
                 // while a wall deadline is active, without charging extra work.
@@ -2497,6 +2497,35 @@ mod publication_tests {
         assert_eq!(m.code.link_targets[&0x1001], target);
         m.refresh_links();
         assert_eq!(targets(&m.code.links), BTreeMap::from([(0x1001, target)]));
+    }
+
+    #[test]
+    fn unshared_links_update_in_place_and_never_name_retired_code() {
+        let mut m = machine();
+        let mut region = Region::new(0x1000, 2);
+        region.entries.push(0x1001);
+        m.add_region(region).unwrap();
+        m.refresh_links();
+        let table = Arc::as_ptr(&m.code.links);
+        let retired = m.code.compiled[&0x1000].tail_entry;
+        // Both publications stay pending: 0x1001 still names the old owner.
+        m.add_region(Region::new(0x1001, 1)).unwrap();
+        m.add_region(Region::new(0x1002, 2)).unwrap();
+        m.retire_compiled(0x1000);
+        assert_eq!(Arc::as_ptr(&m.code.links), table);
+        assert_eq!(targets(&m.code.links), m.code.link_targets);
+        assert!(!targets(&m.code.links).values().any(|&t| t == retired));
+        let borrowed = m.code.links.clone();
+        let before = targets(&borrowed);
+        m.retire_compiled(0x1002);
+        assert!(!Arc::ptr_eq(&borrowed, &m.code.links));
+        assert_eq!(targets(&borrowed), before);
+        m.refresh_links();
+        assert_eq!(targets(&m.code.links), m.code.link_targets);
+        assert_eq!(
+            m.code.link_targets.keys().copied().collect::<Vec<_>>(),
+            [0x1001]
+        );
     }
 
     #[test]
