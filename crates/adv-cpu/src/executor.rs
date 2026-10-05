@@ -1103,6 +1103,22 @@ impl Executor {
         if *hits < 32 {
             return Ok(());
         }
+        // The interpreter keeps running a loop while its region compiles. Its
+        // interior PCs must not become regions of their own: each would bound
+        // later discoveries and turn every iteration into region transfers.
+        let covers = |region: &Region| pc.wrapping_sub(region.start) < region.len as u32;
+        if self
+            .pending_regions
+            .keys()
+            .filter_map(|owner| self.code.regions.get(owner))
+            .any(covers)
+            || self
+                .deferred_compilations
+                .values()
+                .any(|input| covers(&input.region))
+        {
+            return Ok(());
+        }
         let boundaries = self
             .code
             .entry_owner
@@ -1508,7 +1524,8 @@ mod responsive_compile_tests {
         let bytes = assemble(|a| {
             let mut begin = a.create_label();
             a.set_label(&mut begin).unwrap();
-            for _ in 0..40 {
+            // Too large even for the loop allowance, so it must still be sliced.
+            for _ in 0..200 {
                 a.add(dword_ptr(DATA), 1).unwrap();
             }
             a.dec(ecx).unwrap();
@@ -1530,7 +1547,7 @@ mod responsive_compile_tests {
         }
         assert_eq!(
             m.memory.read_data(DATA, 4).unwrap().as_ref(),
-            &80u32.to_le_bytes()
+            &400u32.to_le_bytes()
         );
         assert_eq!(m.state.regs[1], 0);
         assert_eq!(m.state.regs[4], STACK + 4);
@@ -1547,7 +1564,7 @@ mod responsive_compile_tests {
         assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(
             m.memory.read_data(DATA, 4).unwrap().as_ref(),
-            &121u32.to_le_bytes()
+            &601u32.to_le_bytes()
         );
         drain(&mut m);
         assert!(m.stats.invalidations > 0);

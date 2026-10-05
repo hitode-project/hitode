@@ -8,6 +8,10 @@ use crate::{CompileStrategy, Region, compile::Snapshot};
 
 /// Suggested starting limit for interactive owners; empirical, not real time.
 pub const RESPONSIVE_WORK: usize = 128;
+/// Slicing a loop makes every iteration cross regions, which costs far more
+/// than one longer compile. A region with a back edge may use this multiple of
+/// the slice limit as one unit, including its Speed recompilation.
+const LOOP_ALLOWANCE: usize = 8;
 
 fn successors(instruction: &Instruction) -> Vec<u32> {
     let mut next = Vec::with_capacity(2);
@@ -200,6 +204,23 @@ fn total(
         .saturating_mul(multiplier)
 }
 
+fn has_loop(instructions: &BTreeMap<u32, Instruction>) -> bool {
+    instructions.iter().any(|(&pc, i)| {
+        i.op0_kind() == OpKind::NearBranch32
+            && i.near_branch32() <= pc
+            && instructions.contains_key(&i.near_branch32())
+    })
+}
+
+fn allowance(instructions: &BTreeMap<u32, Instruction>, limit: usize, loops: usize) -> usize {
+    if has_loop(instructions) {
+        limit.saturating_mul(loops)
+    } else {
+        limit
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn work(input: &Snapshot) -> usize {
     total(
         &decoded(input),
@@ -208,9 +229,24 @@ pub(crate) fn work(input: &Snapshot) -> usize {
     )
 }
 
+/// The input's work and the most a single job for it may take under `limit`.
+pub(crate) fn work_and_allowance(input: &Snapshot, limit: usize) -> (usize, usize) {
+    let instructions = decoded(input);
+    let work = total(
+        &instructions,
+        input.region.compile_strategy,
+        input.shadow_returns,
+    );
+    (work, allowance(&instructions, limit, LOOP_ALLOWANCE))
+}
+
 /// Partition Fast work while retaining exact guest instruction/edge semantics.
 /// Speed is deliberately never partially substituted for a live larger Fast unit.
 pub(crate) fn plan(input: Snapshot, limit: usize) -> Result<Vec<Snapshot>, String> {
+    plan_within(input, limit, LOOP_ALLOWANCE)
+}
+
+fn plan_within(input: Snapshot, limit: usize, loops: usize) -> Result<Vec<Snapshot>, String> {
     let instructions = decoded(&input);
     if let Some(entry) = input
         .region
@@ -225,12 +261,13 @@ pub(crate) fn plan(input: Snapshot, limit: usize) -> Result<Vec<Snapshot>, Strin
         input.region.compile_strategy,
         input.shadow_returns,
     );
-    if amount <= limit {
+    let whole = allowance(&instructions, limit, loops);
+    if amount <= whole {
         return Ok(vec![input]);
     }
     if input.region.compile_strategy == CompileStrategy::Speed {
         return Err(format!(
-            "Speed work {amount} exceeds background budget {limit}"
+            "Speed work {amount} exceeds background budget {whole}"
         ));
     }
     let mut groups: Vec<BTreeSet<u32>> = Vec::new();
@@ -371,6 +408,25 @@ mod tests {
     }
 
     #[test]
+    fn small_loops_compile_whole_and_may_tier_up() {
+        // mov eax,[eax] x4; dec ecx; jnz back; ret: work 49 over a limit of 16.
+        let mut bytes = [0x8b, 0x00].repeat(4);
+        bytes.extend([0x49, 0x75, 0xf7, 0xc3]);
+        let original = input(&bytes);
+        assert_eq!(work(&original), 49);
+        assert_eq!(plan(original.clone(), 16).unwrap().len(), 1);
+        assert_eq!(work_and_allowance(&original, 16), (49, 128));
+        let mut speed = original;
+        speed.region.compile_strategy = CompileStrategy::Speed;
+        assert_eq!(plan(speed.clone(), 32).unwrap().len(), 1);
+        assert!(plan(speed, 16).is_err());
+        // Without a back edge the same work is still sliced.
+        let mut straight = [0x8b, 0x00].repeat(6);
+        straight.push(0xc3);
+        assert!(plan(input(&straight), 16).unwrap().len() > 1);
+    }
+
+    #[test]
     fn crossing_branches_and_overlapping_decode_roots_keep_the_original_graph() {
         // Jump into the immediate of a linear MOV; then branch back across a
         // partition boundary. These are legitimate independent x86 decodes.
@@ -379,7 +435,7 @@ mod tests {
         ];
         let original = input(&bytes);
         let expected = decoded(&original);
-        let fragments = plan(original, 16).unwrap();
+        let fragments = plan_within(original, 16, 1).unwrap();
         let mut actual = BTreeMap::new();
         for fragment in fragments {
             assert!(work(&fragment) <= 16);
