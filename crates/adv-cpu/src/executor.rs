@@ -388,10 +388,12 @@ impl Executor {
         self.stats.native_code_bytes = 0;
         self.stats.native_regions = 0;
         self.rejected_entries.clear();
-        self.code.regions.clear();
+        self.code.clear_regions();
         self.code.page_regions.clear();
         self.code.region_pages.clear();
         self.code.entry_owner.clear();
+        self.code.link_targets.clear();
+        self.code.fast_regions.clear();
         self.code.parallel_entries.clear();
         self.pending_regions.clear();
         self.deferred_compilations.clear();
@@ -450,6 +452,7 @@ impl Executor {
         compiled.cache_stamp.set(self.cache_clock);
         for &pc in &compiled.entries {
             self.code.entry_owner.insert(pc, region.start);
+            self.code.link_targets.insert(pc, compiled.tail_entry);
             if self.parallel.is_some() {
                 self.code
                     .parallel_entries
@@ -459,6 +462,9 @@ impl Executor {
         }
         self.stats.native_code_bytes += compiled.code_size;
         self.code.compiled.insert(region.start, compiled);
+        if region.compile_strategy == CompileStrategy::Fast {
+            self.code.fast_regions.insert(region.start);
+        }
         self.stats.native_regions = self.code.compiled.len();
         let pages = self.code.compiled[&region.start]
             .pages
@@ -480,9 +486,11 @@ impl Executor {
             self.code.links = Arc::default();
             self.code.cache_revision += 1;
             self.stats.native_code_bytes -= old.code_size;
+            self.code.fast_regions.remove(&start);
             for entry in old.entries.iter() {
                 if self.code.entry_owner.get(entry) == Some(&start) {
                     self.code.entry_owner.remove(entry);
+                    self.code.link_targets.remove(entry);
                     self.code.parallel_entries.remove(entry);
                 }
             }
@@ -491,7 +499,7 @@ impl Executor {
     }
 
     fn forget_region(&mut self, start: u32) {
-        if let Some(region) = self.code.regions.remove(&start) {
+        if let Some(region) = self.code.remove_region(start) {
             for pc in region.entries {
                 self.attempted.remove(&pc);
                 self.hits.remove(&pc);
@@ -582,7 +590,7 @@ impl Executor {
                 .insert(region.start);
         }
         self.code.region_pages.insert(region.start, pages);
-        self.code.regions.insert(region.start, region);
+        self.code.insert_region(region);
     }
 
     fn queue_region(&mut self, region: Region) -> Result<bool, String> {
@@ -997,19 +1005,17 @@ impl Executor {
         self.host_interrupts = enabled;
     }
 
-    fn record_native_work(&mut self, entry: u32, blocks: u64) {
+    fn record_native_work(&mut self, owner: u32, blocks: u64) {
         const HOT_BLOCKS: u64 = 16_384;
         if !self.auto_jit || !self.async_compilation || !self.tiered_compilation || blocks == 0 {
             return;
         }
-        let Some(&owner) = self.code.entry_owner.get(&entry) else {
-            return;
-        };
-        if !self.automatic_regions.contains(&owner)
+        if !self.code.fast_regions.contains(&owner)
+            || self.tier_attempted.contains(&owner)
+            || !self.automatic_regions.contains(&owner)
             // Reserve at least half the bounded queue for cold discoveries.
             || self.pending_regions.len() >= crate::compiler::CAPACITY / 2
             || self.pending_regions.contains_key(&owner)
-            || self.tier_attempted.contains(&owner)
         {
             return;
         }
@@ -1040,7 +1046,7 @@ impl Executor {
             Ok(true) => {
                 // Keep Fast code AND its published metadata live while Speed is
                 // compiling. Failure must not demote hot code to interpretation.
-                self.code.regions.insert(owner, old_region);
+                self.code.insert_region(old_region);
                 self.tier_attempted.insert(owner);
                 self.stats.tier_up_requests += 1;
             }
@@ -1056,20 +1062,18 @@ impl Executor {
     }
 
     fn refresh_links(&mut self) {
-        if self.code.links_revision == self.code.cache_revision {
-            return;
+        if let Some(links) = self.code.updated_links() {
+            self.code.links = links;
+            self.code.links_revision = self.code.cache_revision;
         }
-        let mut links = crate::linking::Table::default();
-        links.rebuild(self.code.entry_owner.iter().filter_map(|(&pc, owner)| {
-            self.code
-                .compiled
-                .get(owner)
-                .map(|compiled| (pc, compiled.tail_entry))
-        }));
-        // Both inline execution and workers borrow this immutable generation.
-        // Publication replaces the Arc; retirement still drains native leases.
-        self.code.links = Arc::new(links);
-        self.code.links_revision = self.code.cache_revision;
+    }
+
+    fn validate_stop(&mut self, stop: u32) -> Result<(), String> {
+        if self.code.stop_is_outside(stop) {
+            Ok(())
+        } else {
+            Err("stop address must be outside the compiled region".into())
+        }
     }
     fn discover(&mut self, stop: u32) -> Result<(), String> {
         let pc = self.state.eip;
@@ -1162,16 +1166,12 @@ impl Executor {
         bridge: &mut Bridge<'_>,
         interpreter_only: bool,
     ) -> Result<RunOutcome, String> {
-        if self.code.regions.values().any(|r| {
-            u64::from(stop) >= u64::from(r.start)
-                && u64::from(stop) < u64::from(r.start) + r.len as u64
-        }) {
-            return Err("stop address must be outside the compiled region".into());
-        }
+        self.validate_stop(stop)?;
         self.state.refresh_mmx();
         self.state.fuel = budget;
         if !interpreter_only {
             self.apply_warm()?;
+            self.validate_stop(stop)?;
         }
         loop {
             if bridge.parked {
@@ -1206,53 +1206,45 @@ impl Executor {
             if !interpreter_only && !single_step && !pending_fpu {
                 self.discover(stop)?;
             }
-            self.refresh_links();
-            if let Some(native) = self
+            // Publications and queued regions can change the ranges during this
+            // run. The same stop fact remains reusable until their generation changes.
+            self.validate_stop(stop)?;
+            let native = self
                 .code
                 .entry_owner
                 .get(&self.state.eip)
-                .and_then(|owner| self.code.compiled.get(owner))
-            {
+                .copied()
+                .and_then(|owner| self.code.compiled.get(&owner).map(|native| (owner, native)));
+            if let Some((_, native)) = native {
                 self.cache_clock = self.cache_clock.saturating_add(1);
                 native.cache_stamp.set(self.cache_clock);
             }
-            let native = if self.parallel.is_some()
+            let native = native.filter(|(_, code)| {
+                !interpreter_only
+                    && !single_step
+                    && !pending_fpu
+                    && code.entries.contains(&self.state.eip)
+                    && self.deferred_fallback != Some(self.state.eip)
+            });
+            if native.is_some()
+                && self.parallel.is_some()
                 && self.parallel_demand
                 && self.admission.ready()
                 && self.has_parallel_capacity()
                 && self.deadline.is_none_or(|deadline| {
                     deadline.saturating_duration_since(Instant::now()) >= Duration::from_micros(100)
-                }) {
-                let ready = self
-                    .code
-                    .entry_owner
-                    .get(&self.state.eip)
-                    .and_then(|owner| self.code.compiled.get(owner))
-                    .is_some_and(|c| {
-                        !interpreter_only
-                            && !single_step
-                            && !pending_fpu
-                            && c.entries.contains(&self.state.eip)
-                            && self.deferred_fallback != Some(self.state.eip)
-                    });
-                if ready {
-                    return Ok(RunOutcome::NativeReady);
+                })
+            {
+                return Ok(RunOutcome::NativeReady);
+            }
+            if let Some((owner, native)) = native {
+                if self.region_linking
+                    && !self.profiling
+                    && let Some(links) = self.code.updated_links()
+                {
+                    self.code.links = links;
+                    self.code.links_revision = self.code.cache_revision;
                 }
-                None
-            } else {
-                self.code
-                    .entry_owner
-                    .get(&self.state.eip)
-                    .and_then(|owner| self.code.compiled.get(owner))
-                    .filter(|c| {
-                        !interpreter_only
-                            && !single_step
-                            && !pending_fpu
-                            && c.entries.contains(&self.state.eip)
-                            && self.deferred_fallback != Some(self.state.eip)
-                    })
-            };
-            if let Some(native) = native {
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
                 // while a wall deadline is active, without charging extra work.
@@ -1297,7 +1289,7 @@ impl Executor {
                 let completed = before - self.state.fuel;
                 self.state.fuel += reserved;
                 self.stats.native_blocks += completed;
-                self.record_native_work(pc, completed);
+                self.record_native_work(owner, completed);
                 match result {
                     n if n == Exit::Trap as u32 => {
                         if let Some(error) = bridge.error.take() {
@@ -2409,6 +2401,10 @@ mod tiering_tests {
             CompileStrategy::Speed
         );
         assert_eq!(m.stats.tier_up_publications, 1);
+        assert!(!m.code.fast_regions.contains(&0x1000));
+        m.record_native_work(0x1000, 100_000);
+        assert!(!m.native_heat.contains_key(&0x1000));
+        assert_eq!(m.stats.tier_up_requests, 1);
         assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 1);
     }
@@ -2434,6 +2430,115 @@ mod tiering_tests {
         m.automatic_regions.clear();
         m.record_native_work(0x1000, 100_000);
         assert_eq!(m.stats.tier_up_requests, 0);
+    }
+
+    #[test]
+    fn a_secondary_native_entry_records_heat_for_its_resolved_owner() {
+        let mut m = hot_machine();
+        let mut region = m.code.regions[&0x1000].clone();
+        region.entries.push(0x1001);
+        m.add_region(region).unwrap();
+        m.automatic_regions.insert(0x1000);
+        m.state.eip = 0x1001;
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.native_heat.get(&0x1000), Some(&1));
+        assert!(!m.native_heat.contains_key(&0x1001));
+        assert_eq!(m.state.regs[0], 0);
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn machine() -> Executor {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
+            .unwrap();
+        m.write(0x1000, &[0x40, 0xc3, 0x43, 0xc3]).unwrap();
+        m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
+        m
+    }
+
+    fn seed(m: &mut Executor) {
+        m.state.eip = 0x1000;
+        m.state.regs[4] = 0x4f00;
+        m.write(0x4f00, &0x3000u32.to_le_bytes()).unwrap();
+    }
+
+    fn targets(table: &crate::linking::Table) -> BTreeMap<u32, usize> {
+        let (pointer, mask) = table.parts();
+        if pointer.is_null() {
+            return BTreeMap::new();
+        }
+        // SAFETY: parts belongs to this borrowed immutable table generation.
+        unsafe { std::slice::from_raw_parts(pointer, mask as usize + 1) }
+            .iter()
+            .filter_map(|slot| {
+                let entry = slot.entry.load(Ordering::Acquire);
+                (entry != 0).then_some((slot.pc, entry))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retiring_an_overlapped_owner_preserves_the_new_entry_target() {
+        let mut m = machine();
+        let mut region = Region::new(0x1000, 2);
+        region.entries.push(0x1001);
+        m.add_region(region).unwrap();
+        m.add_region(Region::new(0x1001, 1)).unwrap();
+        let target = m.code.compiled[&0x1001].tail_entry;
+        assert_eq!(m.code.entry_owner[&0x1001], 0x1001);
+        assert_eq!(m.code.link_targets[&0x1001], target);
+        m.retire_compiled(0x1000);
+        assert!(!m.code.link_targets.contains_key(&0x1000));
+        assert_eq!(m.code.entry_owner[&0x1001], 0x1001);
+        assert_eq!(m.code.link_targets[&0x1001], target);
+        m.refresh_links();
+        assert_eq!(targets(&m.code.links), BTreeMap::from([(0x1001, target)]));
+    }
+
+    #[test]
+    fn deferred_link_builds_preserve_borrowed_generations_and_follow_native_demand() {
+        let mut m = machine();
+        m.add_region(Region::new(0x1000, 2)).unwrap();
+        seed(&mut m);
+        assert_eq!(
+            m.run_execution(0x3000, 100, None, true).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        assert_ne!(m.code.links_revision, m.code.cache_revision);
+        assert!(targets(&m.code.links).is_empty());
+        m.set_profiling(true);
+        seed(&mut m);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_ne!(m.code.links_revision, m.code.cache_revision);
+        m.set_profiling(false);
+        m.set_region_linking(false);
+        seed(&mut m);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_ne!(m.code.links_revision, m.code.cache_revision);
+        m.set_region_linking(true);
+        seed(&mut m);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.code.links_revision, m.code.cache_revision);
+        let borrowed = m.code.links.clone();
+        let before = targets(&borrowed);
+        m.add_region(Region::new(0x1002, 2)).unwrap();
+        assert!(Arc::ptr_eq(&borrowed, &m.code.links));
+        seed(&mut m);
+        assert_eq!(m.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert!(!Arc::ptr_eq(&borrowed, &m.code.links));
+        assert_eq!(targets(&borrowed), before);
+        assert_eq!(targets(&m.code.links), m.code.link_targets);
+        assert!(targets(&m.code.links).contains_key(&0x1002));
+        m.set_region(Region::new(0x1002, 2)).unwrap();
+        assert_eq!(
+            m.code.link_targets.keys().copied().collect::<Vec<_>>(),
+            [0x1002]
+        );
+        assert!(m.validate_stop(0x1000).is_ok());
     }
 }
 

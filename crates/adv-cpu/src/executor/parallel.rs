@@ -89,7 +89,6 @@ impl Executor {
         // Publication/retirement belongs to this owner. Never run a saved PC
         // against metadata that predates a mapping or executable-page change.
         self.refresh()?;
-        self.refresh_links();
         if !self
             .code
             .entry_owner
@@ -115,6 +114,10 @@ impl Executor {
         duration: Duration,
         guest_us: u64,
     ) -> Result<Option<u64>, String> {
+        self.validate_stop(stop)?;
+        if self.region_linking {
+            self.refresh_links();
+        }
         if self
             .parallel_image
             .as_ref()
