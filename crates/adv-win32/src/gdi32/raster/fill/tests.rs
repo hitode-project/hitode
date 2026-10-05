@@ -222,3 +222,58 @@ fn a_later_readonly_row_rejects_before_mutating_writable_rows() {
     );
     assert_eq!(machine.cpu.read_u32(pixels).unwrap(), 0xffffff);
 }
+
+#[test]
+fn set_pixel_writes_color_and_returns_rgb() {
+    let (mut machine, _data, dc, pixels) = fixture(4, 4, PixelFormat::Bgra32, false);
+    let color = 0x0033_2211; // R=0x11, G=0x22, B=0x33
+    let res = match set_pixel(&mut env(&mut machine), Handle(dc), 1, 1, color) {
+        Outcome::Return(v) => v,
+        _ => panic!("set_pixel failed"),
+    };
+    assert_eq!(res, color);
+    let mut pixel = [0u8; 4];
+    machine.cpu.read(pixels + 20, &mut pixel).unwrap();
+    assert_eq!(pixel, [0x33, 0x22, 0x11, 0]);
+
+    // Also test SetPixelV
+    let res_v = match set_pixel_v(&mut env(&mut machine), Handle(dc), 1, 1, color) {
+        Outcome::Return(v) => v,
+        _ => panic!("set_pixel_v failed"),
+    };
+    assert_eq!(res_v, 1);
+}
+
+#[test]
+fn set_pixel_out_of_bounds_returns_invalid() {
+    let (mut machine, _data, dc, _pixels) = fixture(4, 4, PixelFormat::Bgra32, false);
+    let res = match set_pixel(&mut env(&mut machine), Handle(dc), 10, 10, 0x00ffffff) {
+        Outcome::Return(v) => v,
+        _ => panic!("set_pixel failed"),
+    };
+    assert_eq!(res, CLR_INVALID);
+
+    let res_v = match set_pixel_v(&mut env(&mut machine), Handle(dc), 10, 10, 0x00ffffff) {
+        Outcome::Return(v) => v,
+        _ => panic!("set_pixel_v failed"),
+    };
+    assert_eq!(res_v, 0);
+}
+
+#[test]
+fn get_pixel_reads_back_set_pixel() {
+    let (mut machine, _data, dc, _pixels) = fixture(4, 4, PixelFormat::Bgra32, false);
+    let color = 0x00aabbcc;
+    assert!(matches!(
+        set_pixel(&mut env(&mut machine), Handle(dc), 2, 2, color),
+        Outcome::Return(v) if v == color
+    ));
+    assert!(matches!(
+        get_pixel(&mut env(&mut machine), Handle(dc), 2, 2),
+        Outcome::Return(v) if v == color
+    ));
+    assert!(matches!(
+        get_pixel(&mut env(&mut machine), Handle(dc), 10, 10),
+        Outcome::Return(CLR_INVALID)
+    ));
+}

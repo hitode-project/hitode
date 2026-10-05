@@ -348,6 +348,15 @@ fn load_cursor_a(env: &mut Env<'_>) -> Outcome {
     load_user_object(env, "cursor", inst, name)
 }
 
+fn load_cursor_from_file_a(env: &mut Env<'_>) -> Outcome {
+    let filename_ptr = env.arg(0);
+    if filename_ptr == 0 {
+        crate::util::set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    stock_object(env, window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
+}
+
 fn load_icon_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name) = (env.arg(0), env.arg(1));
     load_user_object(env, "icon", inst, name)
@@ -588,6 +597,8 @@ pub fn register(reg: &mut Registry) {
     s(reg, "EnumDisplaySettingsW", 3, enum_display_settings);
     s(reg, "WINNLSEnableIME", 2, |_| Outcome::Return(1));
     s(reg, "LoadCursorA", 2, load_cursor_a);
+    s(reg, "LoadCursorFromFileA", 1, load_cursor_from_file_a);
+    s(reg, "LoadCursorFromFileW", 1, load_cursor_from_file_a);
     s(reg, "LoadIconA", 2, load_icon_a);
     s(reg, "LoadImageA", 6, load_image_a);
     s(reg, "CreateIconIndirect", 1, create_icon_indirect);

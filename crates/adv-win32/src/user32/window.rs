@@ -1218,6 +1218,38 @@ fn show_window_api(env: &mut Env<'_>) -> Outcome {
     show_window(env, hwnd, cmd, |_, was| Outcome::Return(u32::from(was)))
 }
 
+fn animate_window(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, _time, flags) = (env.arg(0), env.arg(1), env.arg(2));
+    if !user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| !w.destroying)
+    {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
+    const AW_HIDE: u32 = 0x0001_0000;
+    let cmd = if flags & AW_HIDE != 0 {
+        SW_HIDE
+    } else {
+        SW_SHOW
+    };
+    show_window(env, hwnd, cmd, |_, _| Outcome::Return(1))
+}
+
+fn set_layered_window_attributes(env: &mut Env<'_>) -> Outcome {
+    let hwnd = env.arg(0);
+    if !user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| !w.destroying)
+    {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
+    Outcome::Return(1)
+}
+
 /// ShowWindow. `then` gets whether the window was visible before.
 pub fn show_window(
     env: &mut Env<'_>,
@@ -1989,6 +2021,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "RegisterClassExW", 1, |e| register_class_w(e, true));
     s(reg, "DestroyWindow", 1, destroy_window_api);
     s(reg, "ShowWindow", 2, show_window_api);
+    s(reg, "AnimateWindow", 3, animate_window);
     s(reg, "UpdateWindow", 1, update_window);
     s(reg, "LockWindowUpdate", 1, lock_window_update);
     s(reg, "SetWindowPos", 7, set_window_pos_api);
@@ -2008,6 +2041,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "AdjustWindowRectEx", 4, adjust_window_rect_ex);
     s(reg, "GetWindowLongA", 2, get_window_long_a);
     s(reg, "SetWindowLongA", 3, set_window_long_a);
+    s(reg, "SetLayeredWindowAttributes", 4, set_layered_window_attributes);
     s(reg, "GetClassLongA", 2, get_class_long_a);
     s(reg, "SetClassLongA", 3, set_class_long_a);
     s(reg, "GetParent", 1, get_parent);

@@ -7,6 +7,9 @@ use adv_os::gdi::{GdiObj, WINDOW_DC, stock_object};
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(fill_ABI);
+    registry.register(set_pixel_ABI);
+    registry.register(set_pixel_v_ABI);
+    registry.register(get_pixel_ABI);
 }
 fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
     set_last_error(env, error);
@@ -145,6 +148,176 @@ fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle)
         }
         Err(error) => Outcome::Fail(format!("FillRect: {error}")),
     }
+}
+
+const CLR_INVALID: u32 = 0xffff_ffff;
+
+#[win32(gdi32, name = "SetPixel", level = implement)]
+fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outcome {
+    let Some(GdiObj::Dc {
+        selected,
+        palette,
+        modes,
+        ..
+    }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
+    else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    if modes.map != 1 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let (target, palette) = (selected[3], *palette);
+    let rgb = match color >> 24 {
+        0 => [color as u8, (color >> 8) as u8, (color >> 16) as u8],
+        1 => {
+            let Some(entry) = super::super::palette::entries(env, palette)
+                .and_then(|entries| entries.get((color & 0xffff) as usize))
+            else {
+                return Outcome::Return(CLR_INVALID);
+            };
+            [entry[0], entry[1], entry[2]]
+        }
+        _ => return Outcome::Return(CLR_INVALID),
+    };
+    let Some(provider) = super::front::provider(env.ext) else {
+        return Outcome::Return(color & 0x00ff_ffff);
+    };
+    let Some(store) = env.ext.try_get::<SurfaceStore>() else {
+        return Outcome::Return(color & 0x00ff_ffff);
+    };
+    let Some(surface) = store.get(target) else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    if surface.pixels == 0 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    if x < 0 || x >= surface.width as i32 || y < 0 || y >= surface.height as i32 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let (ux, uy) = (x as u32, y as u32);
+    let row = if surface.bottom_up {
+        surface.height - uy - 1
+    } else {
+        uy
+    };
+    let bytes = surface.format.bytes();
+    let Some(address) = row
+        .checked_mul(surface.pitch)
+        .and_then(|offset| surface.pixels.checked_add(offset))
+        .and_then(|address| address.checked_add(ux * bytes))
+    else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    if adv_abi::guest::check_range(env.cpu, address, bytes, Prot::WRITE).is_err() {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let value = match surface.format {
+        PixelFormat::Rgb555 => {
+            u32::from(rgb[0] >> 3) << 10 | u32::from(rgb[1] >> 3) << 5 | u32::from(rgb[2] >> 3)
+        }
+        PixelFormat::Rgb565 => {
+            u32::from(rgb[0] >> 3) << 11 | u32::from(rgb[1] >> 2) << 5 | u32::from(rgb[2] >> 3)
+        }
+        _ => u32::from_le_bytes(surface.encode_pixel([rgb[2], rgb[1], rgb[0], 0])),
+    };
+    let result = {
+        let store = env.ext.get_mut::<SurfaceStore>();
+        let mut memory = (provider.memory)(env.cpu);
+        store
+            .fill_raw(
+                target,
+                Rect {
+                    x: ux,
+                    y: uy,
+                    w: 1,
+                    h: 1,
+                },
+                value,
+                &mut memory,
+            )
+            .and_then(|()| {
+                if dc.0 == WINDOW_DC {
+                    store.present(target, &memory)
+                } else {
+                    Ok(())
+                }
+            })
+    };
+    match result {
+        Ok(()) => {
+            if dc.0 == WINDOW_DC {
+                let serial = env.ext.get::<SurfaceStore>().stats.presentations;
+                if let Some(outcome) = (provider.completed)(env, serial) {
+                    return outcome;
+                }
+            }
+            Outcome::Return((rgb[0] as u32) | ((rgb[1] as u32) << 8) | ((rgb[2] as u32) << 16))
+        }
+        Err(_) => Outcome::Return(CLR_INVALID),
+    }
+}
+
+#[win32(gdi32, name = "SetPixelV", level = implement)]
+fn set_pixel_v(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outcome {
+    match set_pixel(env, dc, x, y, color) {
+        Outcome::Return(v) if v != CLR_INVALID => Outcome::Return(1),
+        Outcome::Return(_) => Outcome::Return(0),
+        other => other,
+    }
+}
+
+#[win32(gdi32, name = "GetPixel", level = implement)]
+fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
+    let Some(GdiObj::Dc {
+        selected,
+        modes,
+        ..
+    }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
+    else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    if modes.map != 1 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let target = selected[3];
+    let Some(_provider) = super::front::provider(env.ext) else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    let Some(store) = env.ext.try_get::<SurfaceStore>() else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    let Some(surface) = store.get(target) else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    if surface.pixels == 0 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    if x < 0 || x >= surface.width as i32 || y < 0 || y >= surface.height as i32 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let (ux, uy) = (x as u32, y as u32);
+    let row = if surface.bottom_up {
+        surface.height - uy - 1
+    } else {
+        uy
+    };
+    let bytes = surface.format.bytes();
+    let Some(address) = row
+        .checked_mul(surface.pitch)
+        .and_then(|offset| surface.pixels.checked_add(offset))
+        .and_then(|address| address.checked_add(ux * bytes))
+    else {
+        return Outcome::Return(CLR_INVALID);
+    };
+    if adv_abi::guest::check_range(env.cpu, address, bytes, Prot::READ).is_err() {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let mut raw = [0u8; 4];
+    if env.cpu.read(address, &mut raw[..bytes as usize]).is_err() {
+        return Outcome::Return(CLR_INVALID);
+    }
+    let [b, g, r, _a] = surface.decode_pixel(&raw[..bytes as usize]);
+    Outcome::Return((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
 #[cfg(test)]
