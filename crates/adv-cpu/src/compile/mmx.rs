@@ -150,8 +150,10 @@ impl Emitter<'_> {
                 .use_var(self.mmx[register(i.op_register(n)).unwrap()].unwrap())
         }
     }
-    fn mmx_shuffle(&mut self, a: Value, b: Value, mut mask: Vec<u8>) -> Value {
-        mask.resize(16, 0);
+    /// Masks name all 16 lanes. Upper MMX lanes are don't-care, but choosing
+    /// them to match an SSE pattern lets the backend emit a single instruction.
+    fn mmx_shuffle(&mut self, a: Value, b: Value, mask: Vec<u8>) -> Value {
+        debug_assert_eq!(mask.len(), 16);
         let imm = self
             .b
             .func
@@ -225,6 +227,7 @@ impl Emitter<'_> {
                     let word = (order >> (lane * 2)) & 3;
                     [word * 2, word * 2 + 1]
                 })
+                .chain(8..16)
                 .collect();
             let value = self.mmx_shuffle(b, b, mask);
             self.set_mmx(i, value);
@@ -377,13 +380,19 @@ impl Emitter<'_> {
                     self.b.ins().scalar_to_vector(types::I64X2, sum)
                 }
                 M::Packuswb | M::Packsswb | M::Packssdw => {
-                    let value = if i.mnemonic() == M::Packuswb {
-                        self.b.ins().unarrow(a, b)
+                    // Join both low quadwords first, then one SSE pack yields
+                    // the MMX result in the low quadword.
+                    let (a8, b8) = (
+                        self.mmx_cast(a, types::I8X16),
+                        self.mmx_cast(b, types::I8X16),
+                    );
+                    let joined = self.mmx_shuffle(a8, b8, (0..8).chain(16..24).collect());
+                    let joined = self.mmx_cast(joined, ty);
+                    if i.mnemonic() == M::Packuswb {
+                        self.b.ins().unarrow(joined, joined)
                     } else {
-                        self.b.ins().snarrow(a, b)
-                    };
-                    let value = self.mmx_cast(value, types::I8X16);
-                    self.mmx_shuffle(value, value, vec![0, 1, 2, 3, 8, 9, 10, 11])
+                        self.b.ins().snarrow(joined, joined)
+                    }
                 }
                 M::Punpcklbw
                 | M::Punpckhbw
@@ -396,20 +405,21 @@ impl Emitter<'_> {
                         M::Punpckldq | M::Punpckhdq => 4,
                         _ => 1,
                     };
-                    let base = if matches!(i.mnemonic(), M::Punpckhbw | M::Punpckhwd | M::Punpckhdq)
-                    {
-                        4
-                    } else {
-                        0
-                    };
-                    let mask = (0..4 / width)
+                    // The SSE low unpack of both quadwords; its upper half is the
+                    // MMX high unpack.
+                    let mask = (0..8 / width)
                         .flat_map(|lane| {
                             (0..width)
-                                .map(move |byte| base + lane * width + byte)
-                                .chain((0..width).map(move |byte| 16 + base + lane * width + byte))
+                                .map(move |byte| lane * width + byte)
+                                .chain((0..width).map(move |byte| 16 + lane * width + byte))
                         })
                         .collect();
-                    self.mmx_shuffle(a, b, mask)
+                    let low = self.mmx_shuffle(a, b, mask);
+                    if matches!(i.mnemonic(), M::Punpckhbw | M::Punpckhwd | M::Punpckhdq) {
+                        self.mmx_shuffle(low, low, (8..16).chain(8..16).collect())
+                    } else {
+                        low
+                    }
                 }
                 _ => unreachable!(),
             };
