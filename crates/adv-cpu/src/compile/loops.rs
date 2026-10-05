@@ -3,6 +3,12 @@
 //! iteration ends. Checking that range once lets a clone of the loop access
 //! those operands without per-access guards.
 //!
+//! A clone also forwards loop-invariant stack slots, such as `[ebp-8]`, through
+//! SSA values. Stores still write memory, so every exit sees current memory;
+//! loads read the value instead. That needs every write that could reach a
+//! slot to update its value: the loop may contain no unproven write, and the
+//! proof also checks that the other proven writes miss every slot.
+//!
 //! The permission table is read-only for one native invocation: every change
 //! advances the memory epoch and a trap that observes a new epoch leaves native
 //! code. A versioned loop contains no guest calls, and the memory helpers its
@@ -41,6 +47,22 @@ pub(super) struct Plan {
     /// Instructions whose single memory operand is covered by a group, with
     /// the operand width in bytes.
     pub proven: BTreeMap<u32, u32>,
+    /// Forwarded doubleword slots: invariant base register and displacement.
+    pub slots: Vec<(usize, i64)>,
+    /// Instructions whose memory operand is exactly a slot, and its index.
+    pub promoted: BTreeMap<u32, usize>,
+    /// Proven writes outside the slots, which the proof must keep off them.
+    pub writes: Vec<Access>,
+}
+
+/// One proven memory operand: like a [`Group`] of a single instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Access {
+    pub base: Option<usize>,
+    pub index: Option<(usize, u32)>,
+    pub step: i64,
+    pub low: i64,
+    pub high: i64,
 }
 
 impl Plan {
@@ -191,6 +213,8 @@ fn plan(
     };
     let mut groups: Vec<Group> = Vec::new();
     let mut proven = BTreeMap::new();
+    // (pc, access, writes, writer forwards its store) for each proven operand.
+    let mut accesses = Vec::new();
     for i in &body {
         let info = factory.info(i);
         let memory: Vec<_> = info.used_memory().to_vec();
@@ -241,6 +265,18 @@ fn plan(
         }
         let index = index.map(|index| (index, scale));
         proven.insert(pc, size as u32);
+        accesses.push((
+            pc,
+            Access {
+                base,
+                index,
+                step,
+                low: offset,
+                high: offset + size,
+            },
+            write,
+            forwards_store(i),
+        ));
         if let Some(group) = groups.iter_mut().find(|g| {
             g.base == base
                 && g.index == index
@@ -266,6 +302,55 @@ fn plan(
         return None;
     }
     let starts = entries.range(header..=latch.ip32()).copied().collect();
+    // Any write the clone does not prove could reach a slot unseen.
+    let unproven_write = body.iter().any(|i| {
+        !proven.contains_key(&i.ip32())
+            && factory.info(i).used_memory().iter().any(|m| {
+                matches!(
+                    m.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+            })
+    });
+    let mut slots = Vec::new();
+    let mut promoted = BTreeMap::new();
+    if !unproven_write {
+        for (_, access, _, _) in &accesses {
+            let Some(base) = access.base else { continue };
+            let slot = (base, access.low);
+            if access.index.is_some()
+                || !steps[base].is_empty()
+                || access.high - access.low != 4
+                || slots.contains(&slot)
+            {
+                continue;
+            }
+            // Every operand overlapping the slot through the same base must be
+            // exactly it, and every write to it must forward its value.
+            let overlapping = accesses.iter().filter(|(_, other, _, _)| {
+                other.base == Some(base)
+                    && other.index.is_none()
+                    && other.low < access.high
+                    && access.low < other.high
+            });
+            if overlapping.clone().all(|(_, other, write, forwards)| {
+                other.low == access.low && other.high == access.high && (!write || *forwards)
+            }) {
+                for (pc, ..) in overlapping {
+                    promoted.insert(*pc, slots.len());
+                }
+                slots.push(slot);
+            }
+        }
+    }
+    let writes = accesses
+        .into_iter()
+        .filter(|(pc, _, write, _)| *write && !promoted.contains_key(pc))
+        .map(|(_, access, ..)| access)
+        .collect();
     Some(Plan {
         header,
         latch: latch.ip32(),
@@ -274,7 +359,32 @@ fn plan(
         starts,
         groups,
         proven,
+        slots,
+        promoted,
+        writes,
     })
+}
+
+/// Integer forms whose doubleword memory destination the emitter stores
+/// through `store_memory` or `direct_store`, where a clone forwards it.
+fn forwards_store(i: &Instruction) -> bool {
+    i.op0_kind() == OpKind::Memory
+        && i.memory_size().size() == 4
+        && matches!(
+            i.mnemonic(),
+            M::Mov
+                | M::Add
+                | M::Sub
+                | M::And
+                | M::Or
+                | M::Xor
+                | M::Inc
+                | M::Dec
+                | M::Not
+                | M::Neg
+                | M::Adc
+                | M::Sbb
+        )
 }
 
 /// A full-register constant step, or None for any other write.
@@ -432,6 +542,37 @@ mod tests {
         let plans = super::plans(&instructions, &entries, |_| true);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].counter, 2);
+    }
+
+    #[test]
+    fn invariant_doubleword_slots_are_forwarded_unless_written_unseen() {
+        let body = |a: &mut CodeAssembler, extra: fn(&mut CodeAssembler)| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(ebp + 8)).unwrap();
+            a.add(dword_ptr(ebp - 4), eax).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            extra(a);
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(top).unwrap();
+            a.ret().unwrap();
+        };
+        let (instructions, entries) = decode(|a| body(a, |_| {}));
+        let plan = &super::plans(&instructions, &entries, |_| true)[0];
+        assert_eq!(plan.slots, [(5, 8), (5, -4)]);
+        assert_eq!(plan.promoted.len(), 2);
+        assert_eq!(plan.writes.len(), 1, "the [edi] store");
+        // A narrow store overlapping [ebp+8] keeps that slot in memory.
+        let (instructions, entries) =
+            decode(|a| body(a, |a| a.mov(byte_ptr(ebp + 10), al).unwrap()));
+        let plan = &super::plans(&instructions, &entries, |_| true)[0];
+        assert_eq!(plan.slots, [(5, -4)]);
+        // An unproven indexed store could reach any slot.
+        let (instructions, entries) =
+            decode(|a| body(a, |a| a.mov(dword_ptr(esi + eax * 4), eax).unwrap()));
+        let plan = &super::plans(&instructions, &entries, |_| true)[0];
+        assert!(plan.slots.is_empty());
     }
 
     #[test]

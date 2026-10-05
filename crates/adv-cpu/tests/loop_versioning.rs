@@ -89,11 +89,19 @@ fn differential(
         assert_eq!(jit.state.eip, uc.state.eip, "{context}");
         assert_eq!(jit.state.regs, uc.state.regs, "{context}");
         assert_eq!(jit.state.mmx, uc.state.mmx, "{context}");
-        assert_eq!(
-            jit.state.eflags & 0x8d5,
-            uc.state.eflags & 0x8d5,
-            "{context}"
+        // These bodies rewrite every arithmetic flag before reading one, so a
+        // fault leaves them unspecified.
+        let faulted = matches!(
+            outcome,
+            RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
         );
+        if !faulted {
+            assert_eq!(
+                jit.state.eflags & 0x8d5,
+                uc.state.eflags & 0x8d5,
+                "{context}"
+            );
+        }
         for page in (SRC..END).step_by(4096) {
             let (Ok(left), Ok(right)) =
                 (jit.memory().read(page, 4096), uc.memory().read(page, 4096))
@@ -261,4 +269,47 @@ fn versioned_invariant_loop_interrupts_and_resumes_exactly() {
     assert_eq!(m.state.regs[3], completed + 10);
     let sum = u32::from_le_bytes(m.memory().read(DST, 4).unwrap().try_into().unwrap());
     assert_eq!(sum, completed + 10);
+}
+
+#[test]
+fn forwarded_stack_slots_match_unicorn_and_respect_aliasing_writes() {
+    // Locals at [ebp+8] and [ebp+12], read and written every iteration.
+    let locals = counted(false, |a| {
+        a.mov(eax, dword_ptr(ebp + 8)).unwrap();
+        a.add(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(ebp + 8), eax).unwrap();
+        a.add(dword_ptr(ebp + 12), eax).unwrap();
+        a.mov(ebx, dword_ptr(ebp + 12)).unwrap();
+        a.mov(dword_ptr(edi), ebx).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+    });
+    let frame = |m: &mut Executor| m.write(DST + 0x3000, &[0x11; 32]).unwrap();
+    let mut r = regs(1000, SRC, DST);
+    r[5] = DST + 0x3000;
+    differential("slots", &locals, r, frame, 1 << 30);
+    differential("slots-sliced", &locals, r, frame, 23);
+    // The destination sweeps across the frame: forwarding must not hide it.
+    r[1] = 0xc80;
+    differential("slots-aliased", &locals, r, frame, 1 << 30);
+    differential("slots-aliased-sliced", &locals, r, frame, 41);
+    // The frame turns read-only: its stores fault.
+    let readonly = |m: &mut Executor| {
+        frame(m);
+        m.protect(DST + 0x3000, 4096, READ).unwrap();
+    };
+    r[1] = 1000;
+    differential("slots-readonly", &locals, r, readonly, 1 << 30);
+    // A narrow store into a slot and an indexed store keep both unforwarded.
+    let mixed = counted(false, |a| {
+        a.mov(eax, dword_ptr(ebp + 8)).unwrap();
+        a.add(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(ebp + 8), eax).unwrap();
+        a.mov(byte_ptr(ebp + 9), cl).unwrap();
+        a.and(eax, 0xfc).unwrap();
+        a.mov(dword_ptr(ebp + eax), ecx).unwrap();
+        a.add(dword_ptr(ebp + 12), eax).unwrap();
+        a.add(esi, 4).unwrap();
+    });
+    differential("slots-mixed", &mixed, r, frame, 1 << 30);
 }

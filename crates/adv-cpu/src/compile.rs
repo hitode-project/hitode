@@ -927,6 +927,19 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 variable
             })
             .collect();
+        let slot_vars: Vec<Vec<Variable>> = plans
+            .iter()
+            .map(|plan| {
+                plan.slots
+                    .iter()
+                    .map(|_| {
+                        let variable = b.declare_var(types::I32);
+                        b.def_var(variable, zero);
+                        variable
+                    })
+                    .collect()
+            })
+            .collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
         if shadow_ref.is_some() {
@@ -993,6 +1006,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             plans,
             fast_blocks,
             cooldowns,
+            slot_vars,
             fast: None,
             range_ok_ref,
             dispatch,
@@ -1784,6 +1798,8 @@ struct Emitter<'a> {
     fast_blocks: Vec<BTreeMap<u32, ir::Block>>,
     /// Checked iterations left before a versioned loop retries its proof.
     cooldowns: Vec<Variable>,
+    /// Forwarded slot values of each loop, valid inside its clone.
+    slot_vars: Vec<Vec<Variable>>,
     fast: Option<usize>,
     range_ok_ref: ir::FuncRef,
     dispatch: ir::Block,
@@ -2527,7 +2543,19 @@ impl Emitter<'_> {
         let proven = self.loop_proof(index);
         let failed = self.b.create_block();
         self.b.set_cold_block(failed);
-        self.b.ins().brif(proven, fast, &[], failed, &[]);
+        let load = self.b.create_block();
+        self.b.ins().brif(proven, load, &[], failed, &[]);
+        self.b.switch_to_block(load);
+        self.b.seal_block(load);
+        let slots = self.plans[index].slots.clone();
+        for (slot, (base, displacement)) in slots.into_iter().enumerate() {
+            let address = self.b.use_var(self.regs[base]);
+            let address = self.b.ins().iadd_imm(address, displacement);
+            let address = self.proven_address(address);
+            let value = self.b.ins().load(types::I32, MemFlags::new(), address, 0);
+            self.b.def_var(self.slot_vars[index][slot], value);
+        }
+        self.b.ins().jump(fast, &[]);
         self.b.switch_to_block(failed);
         let wait = self.constant(COOLDOWN as u32);
         self.b.def_var(cooldown, wait);
@@ -2589,7 +2617,65 @@ impl Emitter<'_> {
             let result = self.b.inst_results(call)[0];
             ok = self.b.ins().band(ok, result);
         }
+        // Forwarded slots must lie outside every other proven write. Writes
+        // through a slot's own base without an index are disjoint by plan.
+        let plan = &self.plans[index];
+        let (slots, writes) = (plan.slots.clone(), plan.writes.clone());
+        for (slot_base, displacement) in slots {
+            let slot = self.b.use_var(self.regs[slot_base]);
+            let slot = self.b.ins().uextend(types::I64, slot);
+            let slot_start = self.b.ins().iadd_imm(slot, displacement);
+            let slot_end = self.b.ins().iadd_imm(slot_start, 4);
+            for write in &writes {
+                if write.base == Some(slot_base) && write.index.is_none() {
+                    continue;
+                }
+                let (start, end) = self.access_span(write, more);
+                let below = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, end, slot_start);
+                let above = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, slot_end, start);
+                let apart = self.b.ins().bor(below, above);
+                let apart = self.b.ins().uextend(types::I32, apart);
+                ok = self.b.ins().band(ok, apart);
+            }
+        }
         ok
+    }
+    /// Guest byte range `[start, end)` of a proven operand over the
+    /// iterations left: iteration zero's bytes extended by `more` steps.
+    fn access_span(&mut self, access: &loops::Access, more: Value) -> (Value, Value) {
+        let mut address = self.b.ins().iconst(types::I64, 0);
+        if let Some(base) = access.base {
+            let value = self.b.use_var(self.regs[base]);
+            let value = self.b.ins().uextend(types::I64, value);
+            address = self.b.ins().iadd(address, value);
+        }
+        if let Some((index, scale)) = access.index {
+            let value = self.b.use_var(self.regs[index]);
+            let value = self.b.ins().uextend(types::I64, value);
+            let scaled = self.b.ins().imul_imm(value, i64::from(scale));
+            address = self.b.ins().iadd(address, scaled);
+        }
+        let mut start = self.b.ins().iadd_imm(address, access.low);
+        let mut end = self.b.ins().iadd_imm(address, access.high);
+        let span = self.b.ins().imul_imm(more, access.step.abs());
+        if access.step >= 0 {
+            end = self.b.ins().iadd(end, span);
+        } else {
+            start = self.b.ins().isub(start, span);
+        }
+        (start, end)
+    }
+    /// The forwarded slot variable for the current instruction's operand.
+    fn slot(&self, ty: ir::Type) -> Option<Variable> {
+        let index = self.fast?;
+        let slot = *self.plans[index].promoted.get(&self.pc)?;
+        (ty == types::I32).then(|| self.slot_vars[index][slot])
     }
     /// The host address of an operand the current loop clone has proven.
     fn proven(&mut self, addr: Value, size: usize) -> Option<Value> {
@@ -2601,9 +2687,12 @@ impl Emitter<'_> {
         {
             return None;
         }
+        Some(self.proven_address(addr))
+    }
+    fn proven_address(&mut self, addr: Value) -> Value {
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
         let offset = self.b.ins().uextend(self.ptr_ty, offset);
-        Some(self.b.ins().iadd(self.mem, offset))
+        self.b.ins().iadd(self.mem, offset)
     }
     fn indirect(&mut self, target: Value) {
         self.indirect_predicted(target, None);
@@ -2877,6 +2966,13 @@ impl Emitter<'_> {
     fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
+        // A forwarded slot loads its value; stores also write memory below.
+        if let Some(slot) = self.slot(ty) {
+            match value {
+                None => return Some(self.b.use_var(slot)),
+                Some(value) => self.b.def_var(slot, value),
+            }
+        }
         if let Some(address) = self.proven(addr, size) {
             return match value {
                 Some(value) => {
@@ -3168,6 +3264,9 @@ impl Emitter<'_> {
         value
     }
     fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
+        if let Some(slot) = self.slot(self.b.func.dfg.value_type(value)) {
+            self.b.def_var(slot, value);
+        }
         if self.known(pointer.shared) == Some(0) {
             self.b
                 .ins()
