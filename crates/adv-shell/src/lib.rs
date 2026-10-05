@@ -42,6 +42,8 @@ struct Options {
     control_stdin: bool,
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
+    codec_kernels: adv_runtime::codec_kernels::Mode,
+    codec_signatures: Option<PathBuf>,
     api_mode: adv_runtime::RunMode,
     time_skip: bool,
 }
@@ -59,6 +61,8 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
   --headless              run without a host window\n\
   --codec guest|native    whole-module Vorbis provider (default: native)\n\
+  --codec-kernels guest|verify|native  static codec math (default: guest; native allows FP rounding differences)\n\
+  --codec-signatures PATH external reviewed library signatures; required for verify/native kernels\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
@@ -110,6 +114,8 @@ impl Options {
             control_stdin: false,
             audio: false,
             codec: adv_runtime::vorbis::Policy::Native,
+            codec_kernels: adv_runtime::codec_kernels::Mode::Guest,
+            codec_signatures: None,
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
         };
@@ -177,6 +183,15 @@ impl Options {
                     }
                 }
                 "--width" => options.width = value()?.parse().map_err(|_| "invalid width")?,
+                "--codec-kernels" => {
+                    options.codec_kernels = match value()?.as_str() {
+                        "guest" => adv_runtime::codec_kernels::Mode::Guest,
+                        "verify" => adv_runtime::codec_kernels::Mode::Verify,
+                        "native" => adv_runtime::codec_kernels::Mode::Native,
+                        _ => return Err("--codec-kernels must be guest, verify or native".into()),
+                    };
+                }
+                "--codec-signatures" => options.codec_signatures = Some(value()?.into()),
                 "--height" => options.height = value()?.parse().map_err(|_| "invalid height")?,
                 "--frames" => {
                     options.frames = Some(value()?.parse().map_err(|_| "invalid frame limit")?)
@@ -199,6 +214,11 @@ impl Options {
             }
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
+        if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest
+            && options.codec_signatures.is_none()
+        {
+            return Err("--codec-kernels verify/native requires --codec-signatures PATH".into());
+        }
         options.data_dir = data_dir.unwrap_or_else(|| {
             PathBuf::from("target/adv-data").join(options.exe.file_stem().unwrap_or_default())
         });
@@ -444,6 +464,25 @@ fn build_report(context: ReportContext<'_>) -> String {
                 .map_or_else(|| "null".into(), json)
         ));
     }
+    let codec_kernels = adv_runtime::codec_kernels::stats(&runtime.machine).map_or_else(
+        || "{\"mode\":\"guest\",\"installed\":0}".into(),
+        |s| {
+            let reasons = s.fallback_reasons.iter()
+                .map(|(reason, count)| format!("{}:{count}", json(reason)))
+                .collect::<Vec<_>>().join(",");
+            format!(concat!(
+                "{{\"mode\":{},\"installed\":{},\"calls\":{},\"native_calls\":{},\"verify_calls\":{},",
+                "\"fallback_calls\":{},\"revocations\":{},\"errors\":{},\"compared_floats\":{},",
+                "\"different_floats\":{},\"nonfinite_floats\":{},\"max_abs\":{},\"rms\":{},",
+                "\"relative_rms\":{},\"total_kernel_ns\":{},\"max_kernel_ns\":{},",
+                "\"last_rejection\":{},\"table_mismatch\":{},\"fallback_reasons\":{{{}}}}}"
+            ), json(s.mode.as_str()), s.installed, s.calls, s.native_calls, s.verify_calls,
+                s.fallback_calls, s.revocations, s.errors, s.compared_floats, s.different_floats,
+                s.nonfinite_floats, s.max_abs, s.rms, s.relative_rms, s.total_kernel_ns, s.max_kernel_ns,
+                s.last_rejection.as_deref().map_or_else(|| "null".into(), json),
+                s.table_mismatch.as_deref().map_or_else(|| "null".into(), json), reasons)
+        },
+    );
     let pcm = runtime.audio_pcm_metrics();
     let sources = runtime.audio_source_status();
     let pcm_metrics = format!(
@@ -488,7 +527,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"runtime\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -552,6 +591,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         audio.json(),
         pcm_metrics,
         codec,
+        codec_kernels,
         gpu_diagnostics,
         graphics_memory,
         json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
@@ -726,6 +766,21 @@ fn run_execution(
         .machine
         .cpu
         .set_guest_workers(options.guest_workers)?;
+    if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest {
+        use std::io::Read;
+        let path = options.codec_signatures.as_ref().unwrap();
+        let mut signatures = String::new();
+        std::fs::File::open(path)
+            .map_err(|e| format!("codec signatures {}: {e}", path.display()))?
+            .take(1_048_577)
+            .read_to_string(&mut signatures)
+            .map_err(|e| format!("codec signatures {}: {e}", path.display()))?;
+        if signatures.len() > 1_048_576 {
+            return Err("codec signatures exceed 1 MiB".into());
+        }
+        let installed = runtime.install_codec_kernels(options.codec_kernels, &signatures)?;
+        eprintln!("codec kernels: {installed:?}");
+    }
     runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
     runtime

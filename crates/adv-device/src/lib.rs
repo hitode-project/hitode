@@ -5,10 +5,11 @@ mod actor;
 mod capture;
 pub mod clock;
 pub mod codec;
-#[cfg(feature = "gpu")]
-pub mod gpu;
+pub mod codec_kernel;
 #[cfg(feature = "device")]
 mod device;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod mixer;
 mod owned;
 mod resample;

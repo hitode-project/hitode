@@ -1,0 +1,43 @@
+# Exact library-function fingerprints; no executable bytes, image hash, module
+# name, game name, guest address or RVA is distributed in this file.
+# Source algorithm: Xiph libvorbis lib/mdct.c (BSD-3-Clause), reviewed compiled
+# x87/f32 variant. Exact upstream release/compiler version remains unknown;
+# this signature admits only the full reviewed function closure below.
+# https://github.com/xiph/vorbis/blob/master/lib/mdct.c
+# https://github.com/xiph/vorbis/blob/master/COPYING
+# Schema: format/id/source/license/profile/candidate/entry are unique fields.
+# property NAME U32 records ABI/layout limits, interpreted only by the adapter.
+# function ROLE LENGTH NORMALIZED_SHA256 SAFE_PROLOGUE_LENGTH (helpers use 0).
+# constant ROLE F32_BITS_HEX ABS32_OPERAND_OFFSETS zeros only each declared
+# 4-byte absolute address operand for SHA256 and then verifies pointed-to bits.
+# call ROLE E8_OPCODE_OFFSET TARGET_ROLE retains all five bytes in the digest.
+# Every unlisted byte, including every relative displacement, must match.
+format 1
+id libvorbis-mdct-x87-f32-cdecl32
+source verified libvorbis x87 f32 compiled variant; exact upstream release unknown
+license source algorithm BSD-3-Clause; metadata contains fingerprints only
+profile vorbis-mdct-backward-f32-cdecl32
+candidate cdecl-stack32
+entry main
+property lookup_bytes 20
+property n_offset 0
+property log2n_offset 4
+property trig_offset 8
+property bitrev_offset 12
+property scale_offset 16
+property min_n 64
+property max_n 8192
+# Numerical build contract: this reviewed initializer uses a binary32 PI load,
+# then x87 FSIN/FCOS. This is not an allowance to accept arbitrary altered tables.
+property table_pi_bits 0x40490fdb
+function main 0x500 9b18390d2399783e1a35ae29d3ddeb88556daa2b089b3e59a4293e2206aaf9b3 8
+function generic 0x117 1e549408667dd8e0a423d9baf14e5bcab09a41e5dbdbb2ea33908ea3cff5a541 0
+function butterfly32 0x4f5 2f3d712d7b99acac6eb9af32079dde02dd955f5f88651bff12db7eda62e05be2 0
+function butterfly8 0x8c b27844b1213d4e379060e93172f29cb4800c7e6f5e9cc404c0cab99f197eff2c 0
+call main 0x258 generic
+call main 0x29b butterfly32
+call butterfly32 0x4ec butterfly8
+constant main 3f000000 0x306 0x310 0x375 0x37f
+constant butterfly32 3f6c835e 0x55 0x68 0xdb 0xee 0x13d 0x158 0x1c1 0x1cd
+constant butterfly32 3ec3ef15 0x5d 0x70 0xd3 0xe6 0x145 0x150 0x1b9 0x1d5
+constant butterfly32 3f3504f3 0x9d 0xa8 0x185 0x190 0x209 0x219 0x270 0x27b 0x3cd 0x3da 0x433 0x43e

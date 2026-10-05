@@ -136,6 +136,15 @@ impl<B: Backend> Runtime<B> {
         Ok(Self { machine })
     }
 
+    /// Install reviewed codec-library bindings after loading, before guest execution.
+    pub fn install_codec_kernels(
+        &mut self,
+        mode: crate::codec_kernels::Mode,
+        signatures: &str,
+    ) -> Result<crate::codec_kernels::InstallReport, String> {
+        crate::codec_kernels::install(&mut self.machine, mode, signatures)
+    }
+
     /// Run until every context waits, the process exits, or a named failure occurs.
     pub fn step(&mut self) -> RunResult {
         loop {

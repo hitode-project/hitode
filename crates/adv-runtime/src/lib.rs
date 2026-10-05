@@ -1,5 +1,6 @@
 //! Small real-ABI GDI and DirectDraw paths on a shared guest pixel store.
 pub use adv_win32::avifil32 as avi;
+pub use adv_win32::codec_kernels;
 pub use adv_win32::msacm32 as acm;
 pub mod boot;
 pub mod compat;

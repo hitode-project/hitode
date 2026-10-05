@@ -12,6 +12,7 @@
 mod advapi32;
 pub mod gdi32;
 pub mod kernel32;
+pub mod codec_kernels;
 mod misc;
 pub mod printf;
 pub mod user32;
