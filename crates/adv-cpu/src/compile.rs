@@ -2831,6 +2831,26 @@ impl Emitter<'_> {
         let at = self.b.ins().iadd(self.perms, page);
         self.b.ins().load(types::I8, flags, at, 0)
     }
+    /// Nonzero unless every page grants `permission` and none has a
+    /// `forbidden` bit: one branch however many pages an access touches.
+    fn denied(&mut self, permissions: &[Value], permission: u8, forbidden: u8) -> Value {
+        let mask = if let [p] = permissions {
+            self.b.ins().band_imm(*p, i64::from(permission | forbidden))
+        } else {
+            let all = permissions[1..]
+                .iter()
+                .fold(permissions[0], |all, &p| self.b.ins().band(all, p));
+            let any = permissions[1..]
+                .iter()
+                .fold(permissions[0], |any, &p| self.b.ins().bor(any, p));
+            let granted = self.b.ins().band_imm(all, i64::from(permission));
+            let forbidden = self.b.ins().band_imm(any, i64::from(forbidden));
+            self.b.ins().bor(granted, forbidden)
+        };
+        self.b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, mask, i64::from(permission))
+    }
     fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
         if let Some(address) = self.proven(addr, size) {
             let ordinary = self.b.ins().iconst(types::I8, 0);
@@ -2858,20 +2878,11 @@ impl Emitter<'_> {
         let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
         let no_file = self.b.ins().iconst(types::I8, 0);
         if let Some(lane) = self.lane {
-            for &p in &permissions {
-                let mask = self
-                    .b
-                    .ins()
-                    .band_imm(p, i64::from(WRITE | crate::memory::SHARED));
-                let bad = self
-                    .b
-                    .ins()
-                    .icmp_imm(IntCC::NotEqual, mask, i64::from(WRITE));
-                let ok = self.b.create_block();
-                self.b.ins().brif(bad, lane, &[], ok, &[]);
-                self.b.switch_to_block(ok);
-                self.b.seal_block(ok);
-            }
+            let bad = self.denied(&permissions, WRITE, crate::memory::SHARED);
+            let ok = self.b.create_block();
+            self.b.ins().brif(bad, lane, &[], ok, &[]);
+            self.b.switch_to_block(ok);
+            self.b.seal_block(ok);
             self.guard(executable, Exit::Fallback, None);
             self.mark(diagnostics::Part::Body);
             let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
@@ -2887,21 +2898,12 @@ impl Emitter<'_> {
         self.b.set_cold_block(cold);
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I8);
-        for &p in &permissions {
-            let mask = self
-                .b
-                .ins()
-                .band_imm(p, i64::from(WRITE | crate::memory::SHARED));
-            let bad = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::NotEqual, mask, i64::from(WRITE));
-            let ok = self.b.create_block();
-            self.b.ins().brif(bad, cold, &[], ok, &[]);
-            self.b.switch_to_block(ok);
-            self.b.seal_block(ok);
-        }
-        self.guard(executable, Exit::Fallback, None);
+        // The cold path also takes the Fallback exit for executable pages.
+        let bad = self.denied(&permissions, WRITE, crate::memory::SHARED | EXEC);
+        let ok = self.b.create_block();
+        self.b.ins().brif(bad, cold, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        self.b.seal_block(ok);
         self.b.ins().jump(done, &[no_file.into()]);
         self.b.switch_to_block(cold);
         self.mark(diagnostics::Part::Slow);
@@ -3039,29 +3041,25 @@ impl Emitter<'_> {
             self.b.switch_to_block(checked);
         }
         let permission = if write { WRITE } else { READ };
-        let mut combined = None;
-        for &position in &positions {
-            let p = self.permission(position);
-            let mask = self
-                .b
-                .ins()
-                .band_imm(p, i64::from(permission | crate::memory::SHARED));
-            let bad = self
-                .b
-                .ins()
-                .icmp_imm(IntCC::NotEqual, mask, i64::from(permission));
-            let ok = self.b.create_block();
-            self.b.ins().brif(bad, atomic, &[], ok, &[]);
-            self.b.switch_to_block(ok);
-            self.b.seal_block(ok);
-            combined = Some(if let Some(old) = combined {
-                self.b.ins().bor(old, p)
-            } else {
-                p
-            });
-        }
-        if write {
-            let executable = self.b.ins().band_imm(combined.unwrap(), i64::from(EXEC));
+        let permissions: Vec<_> = positions.iter().map(|&p| self.permission(p)).collect();
+        // The slow path revalidates and takes the Fallback exit for executable
+        // pages, so outside lanes one branch covers every page and EXEC.
+        let fused = write && self.lane.is_none();
+        let forbidden = if fused {
+            crate::memory::SHARED | EXEC
+        } else {
+            crate::memory::SHARED
+        };
+        let bad = self.denied(&permissions, permission, forbidden);
+        let ok = self.b.create_block();
+        self.b.ins().brif(bad, atomic, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        self.b.seal_block(ok);
+        if write && !fused {
+            let combined = permissions[1..]
+                .iter()
+                .fold(permissions[0], |all, &p| self.b.ins().bor(all, p));
+            let executable = self.b.ins().band_imm(combined, i64::from(EXEC));
             let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
             self.guard(executable, Exit::Fallback, None);
         }
