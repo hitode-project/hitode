@@ -131,7 +131,7 @@ impl Emitter<'_> {
         let mut recoveries = Vec::with_capacity(instructions.len() * 2);
         let mut arithmetic_admitted = false;
         for (index, i) in instructions.iter().enumerate() {
-            self.pc = i.ip32();
+            self.at(i.ip32());
             if index != 0 {
                 let exhausted = self.b.create_block();
                 self.b.set_cold_block(exhausted);
@@ -346,9 +346,10 @@ impl Emitter<'_> {
         self.materialize_x87_prefix(&prefix);
         let done = self.b.create_block();
         self.b.ins().jump(done, &[]);
+        self.mark_source(super::diagnostics::x87_recovery_source());
         self.resident_recoveries(recoveries);
         self.b.switch_to_block(done);
-        self.pc = instructions.last().unwrap().ip32();
+        self.at(instructions.last().unwrap().ip32());
     }
 
     fn resident_recoveries(&mut self, recoveries: Vec<(ir::Block, Prefix, Instruction, bool)>) {

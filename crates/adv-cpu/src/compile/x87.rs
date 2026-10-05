@@ -85,6 +85,7 @@ impl Emitter<'_> {
     pub(super) fn emit_canonical_x87_recovery(&mut self) {
         let Some(block) = self.x87_cold else { return };
         self.b.switch_to_block(block);
+        self.mark_source(super::diagnostics::x87_recovery_source());
         let pc = self.b.block_params(block)[0];
         let next = self.b.block_params(block)[1];
         let operation = self.b.block_params(block)[2];

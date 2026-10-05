@@ -60,14 +60,29 @@ def gap_cause(producer, waits, segments, begin, end):
     return max(shares, key=shares.get) if shares else "unknown", shares
 
 
-def frame_gaps(rows, runs, waits, segments, lo, hi):
+def consecutive_frames(rows, lo, hi):
     frames = [r for r in rows if r["event"] == "frame"]
-    gaps = [
+    return [
         (b["time_ns"] - a["time_ns"], a, b)
         for a, b in zip(frames, frames[1:])
         if lo <= a["time_ns"] < b["time_ns"] <= hi
         and b["a"] == ((a["a"] + 1) & 0xffffffff)
     ]
+
+
+def labelled_gaps(rows, model):
+    """Every consecutive-frame interval in the window with its cause."""
+    return [
+        {"begin_ns": first["time_ns"], "end_ns": last["time_ns"], "wall_ms": duration / 1e6,
+         "producer": last["context"],
+         "cause": gap_cause(last["context"], model["waits"], model["segments"],
+                            first["time_ns"], last["time_ns"])[0]}
+        for duration, first, last in consecutive_frames(rows, model["lo"], model["hi"])
+    ]
+
+
+def frame_gaps(rows, runs, waits, segments, lo, hi):
+    gaps = consecutive_frames(rows, lo, hi)
     causes = defaultdict(list)
     for duration, first, last in gaps:
         cause, _ = gap_cause(last["context"], waits, segments, first["time_ns"], last["time_ns"])
@@ -110,7 +125,8 @@ def frame_gaps(rows, runs, waits, segments, lo, hi):
     return result, summary
 
 
-def analyze(rows):
+def trace_model(rows):
+    """Measurement window, inline runs, completed lock waits and per-context states."""
     if not rows:
         raise ValueError("empty scheduling trace")
     if any(row["event"] == "truncated" for row in rows):
@@ -175,7 +191,13 @@ def analyze(rows):
                     wait["release"] = time
     for context in state:
         change(context, rows[-1]["time_ns"], state[context])
+    return {"lo": lo, "hi": hi, "runs": runs, "waits": records,
+            "open_waits": len(waits), "segments": segments}
 
+
+def analyze(rows):
+    model = trace_model(rows)
+    lo, hi, runs, records, segments = (model[k] for k in ("lo", "hi", "runs", "waits", "segments"))
     active, pcs = Counter(), Counter()
     states = defaultdict(Counter)
     for begin, end, context, end_pc, wall, host in runs:
@@ -219,7 +241,7 @@ def analyze(rows):
         "interval_kind": "host wall; leased includes queueing and completion delivery",
         "boundary_note": "host/end-PC time is prorated for runs crossing the measurement boundary",
         "lock_note": "count is completed attempts; handoff includes competing acquisition, not only scheduler delay",
-        "incomplete_lock_waits": len(waits),
+        "incomplete_lock_waits": model["open_waits"],
         "excluded_boundary_lock_waits": len(records) - len(selected),
         "measured_ms": (hi - lo) / 1e6,
         "inline_runs": dict(active),

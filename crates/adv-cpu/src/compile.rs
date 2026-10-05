@@ -735,11 +735,20 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     if fault_pc.is_some() {
         ctx.func.collect_debug_info();
     }
+    // Fault recipes read their own source locations; keep them untagged.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
+    #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+    let source_map = diagnostics::instruction_map_enabled();
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
         let prologue = b.create_block();
         b.append_block_params_for_function_params(prologue);
         b.switch_to_block(prologue);
+        if source_map {
+            // Context and guest-state loads on region entry.
+            b.set_srcloc(diagnostics::overhead_source(diagnostics::Overhead::Entry));
+        }
         b.seal_block(prologue);
         let params = b.block_params(prologue).to_vec();
         let state = b.ins().load(
@@ -975,6 +984,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
+            source_map,
+            source_origin: region.start,
+            source: if source_map {
+                diagnostics::overhead_source(diagnostics::Overhead::Entry)
+            } else {
+                ir::SourceLoc::default()
+            },
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_pc,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -1011,6 +1027,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             e.b.switch_to_block(block);
             e.pc = start;
+            e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Budget));
             e.begin_mmx_block();
             let budget = e.b.use_var(e.fuel);
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -1040,14 +1057,20 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             let mut pc = start;
             loop {
                 if pc != start && e.blocks.contains_key(&pc) {
+                    e.mark_source(diagnostics::overhead_source(
+                        diagnostics::Overhead::Transfer,
+                    ));
                     e.direct(pc);
                     break;
                 }
                 let Some(instruction) = instructions.get(&pc) else {
+                    e.mark_source(diagnostics::overhead_source(
+                        diagnostics::Overhead::Transfer,
+                    ));
                     e.exit_const(Exit::Dispatch, pc);
                     break;
                 };
-                e.pc = pc;
+                e.at(pc);
                 if !supported(instruction) && !e.x87.contains_key(&pc) {
                     e.exit_const(Exit::Fallback, pc);
                     break;
@@ -1069,6 +1092,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         }
         e.emit_canonical_x87_recovery();
+        e.mark_source(diagnostics::overhead_source(
+            diagnostics::Overhead::Transfer,
+        ));
         // Runtime indirect predecessors each carry their own mode. No
         // individual guest block's recipe dominates this block.
         e.mmx_effects = None;
@@ -1093,6 +1119,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // and one lazy-flags materialization instead of duplicating them at every
         // memory/budget guard. Fault addresses are still stored at the fault site.
         e.b.switch_to_block(shared_exit);
+        e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
         // Every predecessor has materialized its own MMX prefix. The last
         // emitted guest block's compile-time recipe does not describe this merge.
         e.mmx_effects = None;
@@ -1179,6 +1206,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .map_err(|e| e.to_string())?;
         }
     }
+    let source_ranges = diagnostics::instruction_map_enabled().then(|| {
+        ctx.compiled_code().map_or_else(Vec::new, |code| {
+            code.buffer
+                .get_srclocs_sorted()
+                .iter()
+                .map(|range| (range.start, range.end, range.loc))
+                .collect::<Vec<_>>()
+        })
+    });
     let mut code_size = ctx
         .compiled_code()
         .map_or(0, |code| code.code_buffer().len());
@@ -1201,7 +1237,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let tail_entry = module.get_finalized_function(id) as usize;
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
-    diagnostics::record_body(region, opt_level, tail_entry, code_size, instructions.len());
+    let recorded =
+        diagnostics::record_body(region, opt_level, tail_entry, code_size, instructions.len());
+    if let Some(ranges) = source_ranges {
+        diagnostics::record_instructions(region, recorded, tail_entry, ranges, &instructions);
+    }
     let mut wrapper = module.make_context();
     wrapper.func.signature = module.make_signature();
     wrapper
@@ -1666,6 +1706,11 @@ struct Emitter<'a> {
     file_prepare_ref: ir::FuncRef,
     file_prepared_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
+    // Optional sampler attribution (compile::diagnostics); `source` is the
+    // current tag, restored after fault markers.
+    source_map: bool,
+    source_origin: u32,
+    source: ir::SourceLoc,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fault_pc: Option<u32>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2230,6 +2275,21 @@ impl Emitter<'_> {
         self.b.switch_to_block(resume);
         self.direct(next);
     }
+    /// Starts guest instruction `pc`. Source tags are sampler metadata only.
+    fn at(&mut self, pc: u32) {
+        self.pc = pc;
+        self.mark(diagnostics::Part::Body);
+    }
+    fn mark(&mut self, part: diagnostics::Part) {
+        let offset = self.pc.wrapping_sub(self.source_origin);
+        self.mark_source(diagnostics::guest_source(offset, part));
+    }
+    fn mark_source(&mut self, source: ir::SourceLoc) {
+        if self.source_map {
+            self.source = source;
+            self.b.set_srcloc(source);
+        }
+    }
     fn guard(&mut self, bad: Value, reason: Exit, addr: Option<Value>) {
         let fail = self.b.create_block();
         self.b.set_cold_block(fail);
@@ -2342,6 +2402,7 @@ impl Emitter<'_> {
         addr
     }
     fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
+        self.mark(diagnostics::Part::Check);
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
         let bad =
             self.b
@@ -2386,6 +2447,7 @@ impl Emitter<'_> {
         self.guard(executable, Exit::Fallback, None);
         self.b.ins().jump(done, &[no_file.into()]);
         self.b.switch_to_block(cold);
+        self.mark(diagnostics::Part::Slow);
         for p in permissions {
             let access = self.b.ins().band_imm(p, i64::from(WRITE));
             let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
@@ -2423,6 +2485,7 @@ impl Emitter<'_> {
         let is_file = self.b.ins().iconst(types::I8, 1);
         self.b.ins().jump(done, &[is_file.into()]);
         self.b.switch_to_block(done);
+        self.mark(diagnostics::Part::Body);
         let file = self.b.block_params(done)[0];
         let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
         let address = self.b.ins().iadd(self.mem, host_offset);
@@ -2440,6 +2503,7 @@ impl Emitter<'_> {
     fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
+        self.mark(diagnostics::Part::Check);
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let hardware = if !write
             && self.fault_pc == Some(self.pc)
@@ -2496,7 +2560,7 @@ impl Emitter<'_> {
                 address,
                 0,
             );
-            self.b.set_srcloc(ir::SourceLoc::default());
+            self.b.set_srcloc(self.source);
             self.b.ins().jump(done, &[result.into()]);
             self.b.switch_to_block(checked);
         }
@@ -2529,6 +2593,7 @@ impl Emitter<'_> {
             let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
             self.guard(executable, Exit::Fallback, None);
         }
+        self.mark(diagnostics::Part::Body);
         if let Some(value) = value {
             self.b.ins().store(MemFlags::new(), value, address, 0);
             self.b.ins().jump(done, &[]);
@@ -2537,6 +2602,7 @@ impl Emitter<'_> {
             self.b.ins().jump(done, &[result.into()]);
         }
         self.b.switch_to_block(atomic);
+        self.mark(diagnostics::Part::Slow);
         // Either boundary guard can enter here. Revalidate *both* pages before
         // any byte is read/written. Mixed file/AUDIO elements use checked Memory
         // helpers, which keep PCM subranges byte atomic.
@@ -2624,6 +2690,7 @@ impl Emitter<'_> {
             self.b.ins().jump(done, &[result.into()]);
         }
         self.b.switch_to_block(done);
+        self.mark(diagnostics::Part::Body);
         (!write).then(|| self.b.block_params(done)[0])
     }
     fn direct_load(&mut self, addr: Value, ty: ir::Type) -> Value {
