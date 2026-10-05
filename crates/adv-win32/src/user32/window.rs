@@ -424,6 +424,7 @@ pub struct User {
     pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
     pub cursor_count: i32,
+    pub locked_window: Option<u32>,
 }
 
 /// Handles of USER objects loaded from the system (IDC_*, IDI_*), by resource id.
@@ -460,6 +461,7 @@ impl User {
             clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
             cursor_count: 0,
+            locked_window: None,
         };
         let desktop = u.add_class_raw("#32769", 0, 0, 0, 0);
         u.desktop = u.alloc_hwnd()?;
@@ -616,6 +618,9 @@ impl User {
     }
 
     fn remove_window(&mut self, hwnd: u32, objects: &mut adv_machine::Objects) {
+        if self.locked_window == Some(hwnd) {
+            self.locked_window = None;
+        }
         self.clipboard.remove_window(hwnd);
         self.menus.remove_window(hwnd, objects);
         let Some(w) = self.windows.remove(objects, &hwnd) else {
@@ -1519,6 +1524,25 @@ fn update_window(env: &mut Env<'_>) -> Outcome {
     send(env, hwnd, wm::PAINT, 0, 0, |_, _| Outcome::Return(1))
 }
 
+fn lock_window_update(env: &mut Env<'_>) -> Outcome {
+    let hwnd = env.arg(0);
+    if hwnd == 0 {
+        user_mut(env).locked_window = None;
+        return Outcome::Return(1);
+    }
+    if !user(env).windows.contains_key(&env.sys.objects, &hwnd) {
+        return Outcome::Return(0);
+    }
+    let u = user_mut(env);
+    match u.locked_window {
+        Some(existing) if existing != hwnd => Outcome::Return(0),
+        _ => {
+            u.locked_window = Some(hwnd);
+            Outcome::Return(1)
+        }
+    }
+}
+
 fn set_focus_api(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     set_focus(env, hwnd, |_, old| Outcome::Return(old))
@@ -1966,6 +1990,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "DestroyWindow", 1, destroy_window_api);
     s(reg, "ShowWindow", 2, show_window_api);
     s(reg, "UpdateWindow", 1, update_window);
+    s(reg, "LockWindowUpdate", 1, lock_window_update);
     s(reg, "SetWindowPos", 7, set_window_pos_api);
     s(reg, "MoveWindow", 6, move_window);
     s(reg, "SetFocus", 1, set_focus_api);
@@ -2043,5 +2068,32 @@ mod tests {
         );
         let sys = u.find_class(&ClassKey::Name("Button".into()), 0).unwrap();
         assert_eq!(u.classes[sys].proc, 3);
+    }
+
+    #[test]
+    fn lock_window_update_lifecycle() {
+        let mut objects = Objects::default();
+        let mut u = User::new(&mut objects, (1920, 1080), None).unwrap();
+        let cls = u.add_class_raw("TEST", 0, 0, 0, 0);
+        let h1 = u.alloc_hwnd().unwrap();
+        u.windows.insert(
+            &mut objects,
+            h1,
+            Window::new(h1, cls, 0, WS_VISIBLE, 0, 0, Rect::new(0, 0, 100, 100), 0),
+        );
+        let h2 = u.alloc_hwnd().unwrap();
+        u.windows.insert(
+            &mut objects,
+            h2,
+            Window::new(h2, cls, 0, WS_VISIBLE, 0, 0, Rect::new(0, 0, 100, 100), 0),
+        );
+
+        assert_eq!(u.locked_window, None);
+        u.locked_window = Some(h1);
+        assert_eq!(u.locked_window, Some(h1));
+
+        // When locked window is removed, locked_window is reset to None
+        u.remove_window(h1, &mut objects);
+        assert_eq!(u.locked_window, None);
     }
 }

@@ -20,6 +20,7 @@ const SHFOLDER: &str = "shfolder.dll";
 const IMM32: &str = "imm32.dll";
 const COMDLG32: &str = "comdlg32.dll";
 const SENSAPI: &str = "sensapi.dll";
+const COMCTL32: &str = "comctl32.dll";
 const MAX_PATH: u32 = 260;
 
 /// Byte offsets of each character start (DBCS-aware: a trail byte may be 0x5C `\`).
@@ -406,6 +407,8 @@ pub fn register(reg: &mut Registry) {
         Outcome::Return(0)
     });
     stdcall(reg, "gdiplus.dll", "GdiplusShutdown", 1, |_| Outcome::Return(0));
+    stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| Outcome::Return(0));
+    stdcall(reg, COMCTL32, "InitCommonControlsEx", 1, |_| Outcome::Return(1));
 }
 
 #[cfg(test)]
@@ -420,5 +423,13 @@ mod tests {
         assert_eq!(last_sep(&c, &s), Some(2));
         let s = [b'a', 0x95, 0x5c, b'.', b't', b'x', b't'];
         assert_eq!(ext_dot(&c, &s), Some(3));
+    }
+
+    #[test]
+    fn common_controls_registered() {
+        let mut reg = Registry::default();
+        register(&mut reg);
+        assert!(reg.get("comctl32.dll", "InitCommonControls").is_some());
+        assert!(reg.get("comctl32.dll", "InitCommonControlsEx").is_some());
     }
 }

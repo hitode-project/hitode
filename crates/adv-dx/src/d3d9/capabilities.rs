@@ -9,6 +9,7 @@ pub(super) fn register(registry: &mut Registry) {
         display_ABI,
         mode_count_ABI,
         mode_ABI,
+        adapter_monitor_ABI,
         check_type_ABI,
         check_format_ABI,
         check_multisample_ABI,
@@ -116,6 +117,14 @@ fn mode(
         return INVALID;
     }
     put(env, output, mode_value(env))
+}
+const HMONITOR_PRIMARY: u32 = 0x0001_0001;
+#[win32(d3d9, name = "IDirect3D9::GetAdapterMonitor", level = implement)]
+fn adapter_monitor(env: &mut Env<'_>, this: GuestPtr<()>, adapter: u32) -> adv_abi::Handle {
+    if !factory(env, this.addr(), adapter) {
+        return adv_abi::Handle(0);
+    }
+    adv_abi::Handle(HMONITOR_PRIMARY)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetDisplayMode",level=implement)]
 fn device_display(
@@ -436,6 +445,9 @@ mod tests {
             check_multisample(&mut env, this, 0, 1, 21, 1, 2, GuestPtr::new(0)),
             UNAVAILABLE
         );
+        assert_eq!(adapter_monitor(&mut env, this, 0), adv_abi::Handle(HMONITOR_PRIMARY));
+        assert_eq!(adapter_monitor(&mut env, this, 1), adv_abi::Handle(0));
+        assert_eq!(adapter_monitor(&mut env, GuestPtr::new(0), 0), adv_abi::Handle(0));
         let at = alloc(&mut env, 4096).unwrap();
         assert_eq!(factory_caps(&mut env, this, 0, 1, GuestPtr::new(at)), 0);
         assert_eq!(GuestPtr::<D3DCAPS9>::new(at).read(env.cpu).unwrap(), value);
