@@ -1095,8 +1095,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     ));
                 }
             }
-            let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
-            e.guard(zero, Exit::Budget, None);
+            // A clone's entry prepaid every block of its remaining iterations.
+            if fast.is_none() {
+                let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
+                e.guard(zero, Exit::Budget, None);
+            }
             let remaining = e.b.ins().iadd_imm(budget, -1);
             e.b.def_var(e.fuel, remaining);
             let mut pc = start;
@@ -2416,7 +2419,7 @@ impl Emitter<'_> {
                 })
                 .flatten();
             if let Some(index) = versioned {
-                let proven = self.loop_ranges_ok(index);
+                let proven = self.loop_proof(index);
                 self.flush_mmx_effects();
                 let fast = self.fast_blocks[index][&pc];
                 self.b.ins().brif(proven, fast, &[], block, &[]);
@@ -2428,12 +2431,14 @@ impl Emitter<'_> {
             self.exit_const(Exit::Dispatch, pc);
         }
     }
-    /// Whether every group of loop `index` stays in ordinary memory for the
-    /// iterations left when its latch branches back: the counter, already
-    /// decremented and nonzero, is that count.
-    fn loop_ranges_ok(&mut self, index: usize) -> Value {
+    /// Whether the iterations left when loop `index` branches back can run in
+    /// its clone: every group stays in ordinary memory, and the fuel covers
+    /// each block of every iteration. The counter, already decremented and
+    /// nonzero, is the iteration count.
+    fn loop_proof(&mut self, index: usize) -> Value {
         let plan = &self.plans[index];
         let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let blocks = plan.starts.len() as i64;
         let groups = plan.groups.clone();
         let count = self.b.use_var(self.regs[counter]);
         let count = if counter_size == 2 {
@@ -2444,7 +2449,13 @@ impl Emitter<'_> {
         let count = self.b.ins().uextend(types::I64, count);
         let more = self.b.ins().iadd_imm(count, -1);
         let len = self.b.ins().iconst(types::I64, self.len as i64);
-        let mut ok = None;
+        let fuel = self.b.use_var(self.fuel);
+        let needed = self.b.ins().imul_imm(count, blocks);
+        let funded = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, fuel, needed);
+        let mut ok = self.b.ins().uextend(types::I32, funded);
         for group in groups {
             let mut address = self.constant(0);
             if let Some(base) = group.base {
@@ -2482,12 +2493,9 @@ impl Emitter<'_> {
                 &[self.perms, start, end, len, required, forbidden],
             );
             let result = self.b.inst_results(call)[0];
-            ok = Some(match ok {
-                Some(all) => self.b.ins().band(all, result),
-                None => result,
-            });
+            ok = self.b.ins().band(ok, result);
         }
-        ok.unwrap_or_else(|| self.constant(1))
+        ok
     }
     /// The host address of an operand the current loop clone has proven.
     fn proven(&mut self, addr: Value, size: usize) -> Option<Value> {

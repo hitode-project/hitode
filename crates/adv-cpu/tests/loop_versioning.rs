@@ -78,6 +78,7 @@ fn differential(
         let mut outcome = RunOutcome::Budget;
         for _ in 0..100_000 {
             outcome = jit.run(STOP, slice).unwrap();
+            assert!(jit.state.fuel <= slice, "{name}: fuel overran its slice");
             if outcome != RunOutcome::Budget {
                 break;
             }
