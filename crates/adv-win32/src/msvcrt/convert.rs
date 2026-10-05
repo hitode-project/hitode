@@ -19,7 +19,7 @@ fn digit(unit: u16) -> Option<u32> {
         _ => None,
     }
 }
-fn parse(text: &[u16], base: i32) -> (u64, usize, Option<i32>) {
+pub(super) fn parse(text: &[u16], base: i32) -> (u64, usize, Option<i32>) {
     if base != 0 && !(2..=36).contains(&base) {
         return (0, 0, Some(22));
     }

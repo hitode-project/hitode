@@ -100,6 +100,20 @@ pub fn register(r: &mut Registry) {
         ("frexp", 3),
         ("_CIpow", 0),
         ("_ftol", 0),
+        ("time", 1),
+        ("_time32", 1),
+        ("strncmp", 3),
+        ("strchr", 2),
+        ("strstr", 2),
+        ("_strdup", 1),
+        ("strtoul", 3),
+        ("_mbsinc", 1),
+        ("_mbsnbcpy", 3),
+        ("_splitpath", 5),
+        ("_makepath", 5),
+        ("_beginthread", 3),
+        ("_XcptFilter", 2),
+        ("__setusermatherr", 1),
     ] {
         r.add("msvcrt.dll", name, Conv::Cdecl { argc }, call);
     }
@@ -133,6 +147,8 @@ pub fn register(r: &mut Registry) {
             ("_encode_pointer", 1),
             ("_decode_pointer", 1),
             ("_encoded_null", 0),
+            ("time", 1),
+            ("_time32", 1),
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
@@ -269,6 +285,24 @@ fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> O
         }
     }
     Outcome::Return(0)
+}
+fn split_path_a(path: &[u8]) -> (&[u8], &[u8], &[u8], &[u8]) {
+    let (drive, rest) = if path.len() >= 2 && path[1] == b':' {
+        (&path[..2], &path[2..])
+    } else {
+        (&[][..], path)
+    };
+    let last_slash = rest.iter().rposition(|&c| c == b'/' || c == b'\\');
+    let (dir, file_part) = match last_slash {
+        Some(idx) => (&rest[..=idx], &rest[idx + 1..]),
+        None => (&[][..], rest),
+    };
+    let last_dot = file_part.iter().rposition(|&c| c == b'.');
+    let (fname, ext) = match last_dot {
+        Some(idx) => (&file_part[..idx], &file_part[idx..]),
+        None => (file_part, &[][..]),
+    };
+    (drive, dir, fname, ext)
 }
 fn call(e: &mut Env<'_>) -> Outcome {
     let name = e.sys.thunks.get(e.thunk).name.clone();
@@ -521,6 +555,197 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let cmp = e.arg(3);
             return sort_step(e, a, b, c, cmp, 1, 1);
         }
+        "time" | "_time32" => {
+            let ft = crate::kernel32::filetime_now(e);
+            let unix_sec = (ft.saturating_sub(116_444_736_000_000_000) / 10_000_000) as u32;
+            if a != 0 {
+                if let Err(error) = e.cpu.write_u32(a, unix_sec) {
+                    return Outcome::Fail(error.to_string());
+                }
+            }
+            unix_sec
+        }
+        "strncmp" => {
+            let n = c as usize;
+            if n == 0 {
+                return Outcome::Return(0);
+            }
+            let mut diff = 0i32;
+            for i in 0..n {
+                let Ok(b1) = e.cpu.read_u8(a.wrapping_add(i as u32)) else {
+                    return Outcome::Fail("CRT string unmapped".into());
+                };
+                let Ok(b2) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
+                    return Outcome::Fail("CRT string unmapped".into());
+                };
+                if b1 != b2 {
+                    diff = (b1 as i32) - (b2 as i32);
+                    break;
+                }
+                if b1 == 0 {
+                    break;
+                }
+            }
+            match diff.cmp(&0) {
+                std::cmp::Ordering::Less => u32::MAX,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+        "strchr" => {
+            let target = b as u8;
+            let mut ptr = a;
+            loop {
+                let Ok(byte) = e.cpu.read_u8(ptr) else {
+                    return Outcome::Fail("CRT string unmapped".into());
+                };
+                if byte == target {
+                    return Outcome::Return(ptr);
+                }
+                if byte == 0 {
+                    return Outcome::Return(0);
+                }
+                ptr = ptr.wrapping_add(1);
+            }
+        }
+        "strstr" => {
+            let Ok(needle) = e.cpu.read_cstr(b, 65536) else {
+                return Outcome::Fail("CRT needle unmapped".into());
+            };
+            if needle.is_empty() {
+                return Outcome::Return(a);
+            }
+            let Ok(haystack) = e.cpu.read_cstr(a, 16 * 1024 * 1024) else {
+                return Outcome::Fail("CRT haystack unmapped".into());
+            };
+            if let Some(pos) = haystack.windows(needle.len()).position(|w| w == needle) {
+                a.wrapping_add(pos as u32)
+            } else {
+                0
+            }
+        }
+        "_strdup" => {
+            if a == 0 {
+                return Outcome::Return(0);
+            }
+            let Ok(s) = e.cpu.read_cstr(a, 16 * 1024 * 1024) else {
+                return Outcome::Fail("CRT string unmapped".into());
+            };
+            let len = (s.len() + 1) as u32;
+            let ptr = allocate(e, len, false);
+            if ptr != 0 {
+                let _ = e.cpu.write(ptr, &s);
+                let _ = e.cpu.write(ptr.wrapping_add(s.len() as u32), &[0]);
+            }
+            ptr
+        }
+        "strtoul" => {
+            let Ok(s) = e.cpu.read_cstr(a, 1024) else {
+                return Outcome::Fail("CRT string unmapped".into());
+            };
+            let wide: Vec<u16> = s.iter().map(|&byte| byte as u16).collect();
+            let (val, consumed, _) = convert::parse(&wide, c as i32);
+            if b != 0 {
+                let end = a.wrapping_add(consumed as u32);
+                let _ = e.cpu.write_u32(b, end);
+            }
+            val as u32
+        }
+        "_mbsinc" => {
+            let Ok(b1) = e.cpu.read_u8(a) else {
+                return Outcome::Fail("CRT string unmapped".into());
+            };
+            if (0x81..=0x9f).contains(&b1) || (0xe0..=0xfc).contains(&b1) {
+                a.wrapping_add(2)
+            } else {
+                a.wrapping_add(1)
+            }
+        }
+        "_mbsnbcpy" => {
+            let n = c as usize;
+            let mut null_hit = false;
+            for i in 0..n {
+                let byte = if null_hit {
+                    0
+                } else {
+                    let Ok(val) = e.cpu.read_u8(b.wrapping_add(i as u32)) else {
+                        return Outcome::Fail("CRT string unmapped".into());
+                    };
+                    if val == 0 {
+                        null_hit = true;
+                    }
+                    val
+                };
+                if let Err(err) = e.cpu.write(a.wrapping_add(i as u32), &[byte]) {
+                    return Outcome::Fail(err.to_string());
+                }
+            }
+            a
+        }
+        "_splitpath" => {
+            let Ok(path) = e.cpu.read_cstr(a, 4096) else {
+                return Outcome::Fail("CRT path unmapped".into());
+            };
+            let (drive, dir, fname, ext) = split_path_a(&path);
+            let ptrs = [b, c, e.arg(3), e.arg(4)];
+            let parts = [drive, dir, fname, ext];
+            for (p, part) in ptrs.into_iter().zip(parts) {
+                if p != 0 {
+                    let _ = e.cpu.write(p, part);
+                    let _ = e.cpu.write(p.wrapping_add(part.len() as u32), &[0]);
+                }
+            }
+            0
+        }
+        "_makepath" => {
+            let mut out = Vec::new();
+            if b != 0 && let Ok(drive) = e.cpu.read_cstr(b, 260) {
+                out.extend_from_slice(&drive);
+                if drive.len() == 1 && drive[0] != b':' {
+                    out.push(b':');
+                }
+            }
+            if c != 0 && let Ok(dir) = e.cpu.read_cstr(c, 260) {
+                out.extend_from_slice(&dir);
+                if !dir.is_empty() && dir.last() != Some(&b'/') && dir.last() != Some(&b'\\') {
+                    out.push(b'\\');
+                }
+            }
+            let d = e.arg(3);
+            if d != 0 && let Ok(fname) = e.cpu.read_cstr(d, 260) {
+                out.extend_from_slice(&fname);
+            }
+            let ext_ptr = e.arg(4);
+            if ext_ptr != 0 && let Ok(ext) = e.cpu.read_cstr(ext_ptr, 260) {
+                if !ext.is_empty() && ext[0] != b'.' {
+                    out.push(b'.');
+                }
+                out.extend_from_slice(&ext);
+            }
+            out.push(0);
+            if let Err(err) = e.cpu.write(a, &out) {
+                return Outcome::Fail(err.to_string());
+            }
+            0
+        }
+        "_beginthread" => {
+            let start = a;
+            let stack = b;
+            let arg = c;
+            let name = format!("CrtT{}", e.sys.contexts.len());
+            match crate::kernel32::spawn_thread(
+                e,
+                &name,
+                start,
+                arg,
+                if stack == 0 { 0x10_0000 } else { stack },
+            ) {
+                Ok(id) => e.sys.context(id).thread_handle,
+                Err(_) => u32::MAX,
+            }
+        }
+        "_XcptFilter" => 1,
+        "__setusermatherr" => 0,
         "floor" | "ceil" | "ldexp" | "frexp" => {
             let x = match double(e) {
                 Ok(v) => v,
