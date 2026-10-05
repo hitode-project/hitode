@@ -1,4 +1,4 @@
-//! Explicit library-ABI acceleration for verified static codec kernels.
+//! Library-ABI acceleration for verified static codec kernels (shell default: Native).
 //!
 //! Guest owns all stream, seek, cancellation and allocation state. Native mode
 //! replaces only an admitted inverse MDCT and permits decoder rounding differences;
@@ -16,6 +16,9 @@ use adv_machine::layout::thunk_addr;
 use adv_machine::patch::Detour;
 use adv_machine::{Conv, Env, Machine, Outcome};
 use adv_os::{ModuleId, ModuleKind};
+
+/// Reviewed signatures shipped with the runtime; fingerprints only, no code bytes.
+pub const BUNDLED_SIGNATURES: &str = include_str!("../../../data/codec/vorbis-mdct-x86.txt");
 
 const MAX_BINDINGS: usize = 64;
 const MAX_CODE_BYTES: usize = 16 * 1024;

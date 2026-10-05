@@ -43,6 +43,7 @@ struct Options {
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
     codec_kernels: adv_runtime::codec_kernels::Mode,
+    codec_kernels_explicit: bool,
     codec_signatures: Option<PathBuf>,
     api_mode: adv_runtime::RunMode,
     time_skip: bool,
@@ -61,8 +62,8 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
   --headless              run without a host window\n\
   --codec guest|native    whole-module Vorbis provider (default: native)\n\
-  --codec-kernels guest|verify|native  static codec math (default: guest; native allows FP rounding differences)\n\
-  --codec-signatures PATH external reviewed library signatures; required for verify/native kernels\n\
+  --codec-kernels guest|verify|native  static codec math (default: native; allows FP rounding differences)\n\
+  --codec-signatures PATH reviewed library signatures (default: the bundled set)\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
@@ -114,7 +115,8 @@ impl Options {
             control_stdin: false,
             audio: false,
             codec: adv_runtime::vorbis::Policy::Native,
-            codec_kernels: adv_runtime::codec_kernels::Mode::Guest,
+            codec_kernels: adv_runtime::codec_kernels::Mode::Native,
+            codec_kernels_explicit: false,
             codec_signatures: None,
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
@@ -190,6 +192,7 @@ impl Options {
                         "native" => adv_runtime::codec_kernels::Mode::Native,
                         _ => return Err("--codec-kernels must be guest, verify or native".into()),
                     };
+                    options.codec_kernels_explicit = true;
                 }
                 "--codec-signatures" => options.codec_signatures = Some(value()?.into()),
                 "--height" => options.height = value()?.parse().map_err(|_| "invalid height")?,
@@ -214,11 +217,6 @@ impl Options {
             }
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
-        if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest
-            && options.codec_signatures.is_none()
-        {
-            return Err("--codec-kernels verify/native requires --codec-signatures PATH".into());
-        }
         options.data_dir = data_dir.unwrap_or_else(|| {
             PathBuf::from("target/adv-data").join(options.exe.file_stem().unwrap_or_default())
         });
@@ -768,18 +766,28 @@ fn run_execution(
         .set_guest_workers(options.guest_workers)?;
     if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest {
         use std::io::Read;
-        let path = options.codec_signatures.as_ref().unwrap();
         let mut signatures = String::new();
-        std::fs::File::open(path)
-            .map_err(|e| format!("codec signatures {}: {e}", path.display()))?
-            .take(1_048_577)
-            .read_to_string(&mut signatures)
-            .map_err(|e| format!("codec signatures {}: {e}", path.display()))?;
-        if signatures.len() > 1_048_576 {
-            return Err("codec signatures exceed 1 MiB".into());
+        if let Some(path) = &options.codec_signatures {
+            std::fs::File::open(path)
+                .map_err(|e| format!("codec signatures {}: {e}", path.display()))?
+                .take(1_048_577)
+                .read_to_string(&mut signatures)
+                .map_err(|e| format!("codec signatures {}: {e}", path.display()))?;
+            if signatures.len() > 1_048_576 {
+                return Err("codec signatures exceed 1 MiB".into());
+            }
+        } else {
+            signatures.push_str(adv_runtime::codec_kernels::BUNDLED_SIGNATURES);
         }
-        let installed = runtime.install_codec_kernels(options.codec_kernels, &signatures)?;
-        eprintln!("codec kernels: {installed:?}");
+        match runtime.install_codec_kernels(options.codec_kernels, &signatures) {
+            Ok(installed) => eprintln!("codec kernels: {installed:?}"),
+            // The default is an optimization: a binding is recorded only after
+            // its detour is complete, so the guest path stays usable.
+            Err(error) if !options.codec_kernels_explicit => {
+                eprintln!("warning: codec kernels disabled: {error}")
+            }
+            Err(error) => return Err(error),
+        }
     }
     runtime.set_api_mode(options.api_mode);
     runtime.machine.cpu.set_waker(wake.clone())?;
