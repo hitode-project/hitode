@@ -1352,6 +1352,7 @@ pub const SWP_NOSIZE: u32 = 0x1;
 pub const SWP_NOMOVE: u32 = 0x2;
 pub const SWP_NOZORDER: u32 = 0x4;
 pub const SWP_NOACTIVATE: u32 = 0x10;
+pub const SWP_FRAMECHANGED: u32 = 0x20;
 pub const SWP_SHOWWINDOW: u32 = 0x40;
 pub const SWP_HIDEWINDOW: u32 = 0x80;
 const SWP_NOCLIENTSIZE: u32 = 0x800;
@@ -1382,10 +1383,10 @@ pub fn set_window_pos(
     } else {
         (rect.width(), rect.height())
     };
-    if (x, y) == (old.left, old.top) {
+    if (x, y) == (old.left, old.top) && flags & SWP_FRAMECHANGED == 0 {
         flags |= SWP_NOMOVE | SWP_NOCLIENTMOVE;
     }
-    if (cx, cy) == (old.width(), old.height()) {
+    if (cx, cy) == (old.width(), old.height()) && flags & SWP_FRAMECHANGED == 0 {
         flags |= SWP_NOSIZE | SWP_NOCLIENTSIZE;
     }
     // WINDOWPOS: hwnd, hwndInsertAfter, x, y, cx, cy, flags.

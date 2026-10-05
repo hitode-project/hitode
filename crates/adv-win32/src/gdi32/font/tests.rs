@@ -773,6 +773,84 @@ fn glyph_cache_shares_decoded_characters_and_separates_transform_and_font() {
 
 #[test]
 #[cfg(windows)]
+fn explicit_dbcs_charsets_share_unicode_glyphs_across_guest_codepages() {
+    for (charset, guest_codepage, face, characters) in [
+        (
+            128,
+            936,
+            "MS Gothic",
+            vec![(0x82a0, 'あ'), (0xad, 'ｭ'), (0x1234, '4')],
+        ),
+        (
+            134,
+            932,
+            "SimSun",
+            vec![(0xd6d0, '中'), (0xcec4, '文'), (0x1234, '4')],
+        ),
+    ] {
+        let (mut machine, data, dc) = fixture();
+        machine.ext.get_mut::<Win32>().codec = adv_os::Codec::new(guest_codepage);
+        let mut raw = [0u8; 60];
+        raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
+        raw[16..20].copy_from_slice(&400i32.to_le_bytes());
+        raw[23] = charset;
+        raw[28..28 + face.len()].copy_from_slice(face.as_bytes());
+        machine.cpu.write(data, &raw).unwrap();
+        let font = invoke(&mut machine, data, "CreateFontIndirectA", &[data]);
+        assert_ne!(font, 0);
+        invoke(&mut machine, data, "SelectObject", &[dc, font]);
+        let matrix = data + 128;
+        let metrics = data + 160;
+        let buffer = data + 256;
+        let mut identity = [0u8; 16];
+        identity[2..4].copy_from_slice(&1i16.to_le_bytes());
+        identity[14..16].copy_from_slice(&1i16.to_le_bytes());
+        machine.cpu.write(matrix, &identity).unwrap();
+        for (packed, character) in characters {
+            let mut outputs = Vec::new();
+            let before = machine.ext.get::<Fonts>().text.stats();
+            for (api, code) in [
+                ("GetGlyphOutlineA", packed),
+                ("GetGlyphOutlineW", character as u32),
+            ] {
+                let size = invoke(
+                    &mut machine,
+                    data,
+                    api,
+                    &[dc, code, 6, metrics, 0, 0, matrix],
+                );
+                assert_ne!(size, GDI_ERROR);
+                assert!(size > 0);
+                assert_eq!(
+                    invoke(
+                        &mut machine,
+                        data,
+                        api,
+                        &[dc, code, 6, metrics, size, buffer, matrix]
+                    ),
+                    size
+                );
+                let mut pixels = vec![0; size as usize];
+                let mut layout = [0; 20];
+                machine.cpu.read(buffer, &mut pixels).unwrap();
+                machine.cpu.read(metrics, &mut layout).unwrap();
+                outputs.push((layout, pixels));
+            }
+            assert_eq!(
+                outputs[0], outputs[1],
+                "charset={charset} packed={packed:04x}"
+            );
+            assert_eq!(
+                machine.ext.get::<Fonts>().text.stats().glyphs,
+                before.glyphs + 1,
+                "ANSI and Unicode must identify the same cached glyph"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn gbk_packed_characters_match_unicode_glyph_pixels() {
     let (mut machine, data, dc) = fixture();
     let win32 = machine.ext.get_mut::<Win32>();
@@ -919,7 +997,7 @@ fn selected_charset_and_metrics_match_native_gdi_across_process_acp() {
     identity[2..4].copy_from_slice(&1i16.to_le_bytes());
     identity[14..16].copy_from_slice(&1i16.to_le_bytes());
     machine.cpu.write(matrix, &identity).unwrap();
-    for character in [0xad, 0x82a0, 0x00ff_ecff] {
+    for character in [0xad, 0x82a0, 0xecff, 0x00ff_ecff, 0xffff_82a0] {
         let size = invoke(
             &mut machine,
             data,
@@ -946,7 +1024,7 @@ fn selected_charset_and_metrics_match_native_gdi_across_process_acp() {
                 &transform,
             )
         };
-        assert_eq!(size, expected);
+        assert_eq!(size, expected, "packed character={character:08x}");
         assert_eq!(
             machine.cpu.read_u32(metrics).unwrap(),
             native_metrics.gmBlackBoxX

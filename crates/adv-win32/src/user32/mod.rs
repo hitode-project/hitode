@@ -6,6 +6,7 @@ pub(crate) mod clipboard;
 pub mod compat;
 pub mod controls;
 pub mod dialog;
+pub mod display;
 pub mod host_input;
 mod input;
 pub mod menu;

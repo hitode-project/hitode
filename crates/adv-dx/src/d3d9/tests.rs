@@ -26,6 +26,8 @@ pub(super) fn machine() -> Machine<JitCpu> {
         visible: |_, _, _| Some(false),
         fast_forward: |_| false,
         display: |_| (16, 12, 60),
+        mode_changed: |_, _, _| Outcome::Return(0),
+        device_released: |_, _| {},
         completed: |_, _| None,
     };
     m.ext.insert(State {

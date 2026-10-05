@@ -50,6 +50,9 @@ pub struct SurfaceProvider {
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
     pub fast_forward: fn(&Ext) -> bool,
     pub display: fn(&Ext) -> (u32, u32, u32),
+    /// Apply guest display/window state only after device creation/reset succeeds.
+    pub mode_changed: fn(&mut Env<'_>, u32, D3DPRESENT_PARAMETERS) -> Outcome,
+    pub device_released: fn(&mut Env<'_>, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
 }
 
@@ -284,6 +287,7 @@ fn object(
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
     if let Payload::Device(device) = destroyed.value {
         let provider = env.ext.get::<State>().provider;
+        (provider.device_released)(env, device.pointer);
         targets::release_binding(env, device.render_target);
         depth::release_binding(env, device.depth_stencil);
         buffers::release_bindings(env, device.buffers);
@@ -662,7 +666,7 @@ fn create_device(
         release(env, pointer);
         return Outcome::Return(INVALID);
     }
-    Outcome::Return(0)
+    (provider.mode_changed)(env, pointer, normalized)
 }
 fn device<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Device> {
     match com(env).get::<Payload>(&env.sys.objects, pointer)? {
@@ -821,7 +825,7 @@ fn reset(
     if parameters.write(env.cpu, normalized).is_err() {
         return Outcome::Return(INVALID);
     }
-    Outcome::Return(0)
+    (provider.mode_changed)(env, this.addr(), normalized)
 }
 #[win32(d3d9, name = "IDirect3DDevice9::BeginScene", level = state)]
 fn begin_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
