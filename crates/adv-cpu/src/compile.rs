@@ -16,6 +16,7 @@ use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
+mod flag_liveness;
 mod loops;
 mod mmx;
 mod scalar;
@@ -1012,6 +1013,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             hot_dispatch,
             direct_footers: BTreeMap::new(),
             write_summary,
+            dead_flags: flag_liveness::dead_on_entry(&instructions),
             hot_exits,
             bridge,
             trap_ref,
@@ -1795,6 +1797,8 @@ struct Emitter<'a> {
     hot_exits: bool,
     direct_footers: BTreeMap<u32, ir::Block>,
     write_summary: Option<write_summary::Summary>,
+    /// Exit PCs that need no lazy-flag materialization.
+    dead_flags: BTreeSet<u32>,
     bridge: Value,
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
@@ -2150,6 +2154,21 @@ impl Emitter<'_> {
     }
     fn exit_predicted(&mut self, reason: Exit, pc: Value, prediction: Option<Value>) {
         self.flush_mmx_effects();
+        // No guest instruction can observe the arithmetic flags at this PC:
+        // exit with the last canonical EFLAGS instead of keeping the lazy
+        // values alive. That is still exact when nothing changed them since.
+        if self
+            .known(pc)
+            .is_some_and(|pc| self.dead_flags.contains(&pc))
+        {
+            let zero = self.constant(0);
+            for var in self.lazy {
+                self.b.def_var(var, zero);
+            }
+            let flags = self.b.use_var(self.flags);
+            let carry = self.b.ins().band_imm(flags, 1);
+            self.b.def_var(self.lazy[4], carry);
+        }
         if reason == Exit::Dispatch && self.hot_exits {
             if self.shadow_ref.is_some() {
                 let prediction = prediction.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));

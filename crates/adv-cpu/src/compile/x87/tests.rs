@@ -90,6 +90,9 @@ fn compare(bytes: &[u8], initial: CpuState, setup: impl Fn(&mut Memory), calls: 
         assert_eq!(testing::calls() - before, calls, "{bytes:02x?}");
     }
     expected.fuel = actual.fuel;
+    let unspecified = crate::compile::flag_liveness::unspecified_at(bytes, CODE, actual.eip);
+    actual.eflags &= !unspecified;
+    expected.eflags &= !unspecified;
     assert_eq!(actual, expected, "{bytes:02x?}");
     assert_eq!(actual_memory.epoch, reference_memory.epoch);
     for page in 0..6 {

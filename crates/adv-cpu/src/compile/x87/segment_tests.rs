@@ -347,6 +347,10 @@ fn lane_matches_single(code: &[u8]) {
                 let shared = m.read_data(DATA + 0x3000, 64).unwrap().to_vec();
                 (exit, s, data, code, shared, m.epoch)
             });
+            for run in &mut runs {
+                run.1.eflags &=
+                    !crate::compile::flag_liveness::unspecified_at(code, CODE, run.1.eip);
+            }
             let (single_run, lane_run) = (runs[1].clone(), &mut runs[0]);
             assert_eq!(
                 *lane_run,
