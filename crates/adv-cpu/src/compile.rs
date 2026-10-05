@@ -1618,6 +1618,15 @@ fn reg_index(reg: R) -> Option<usize> {
 }
 
 /// Integer operations the JIT also emits at 8/16-bit width; see `narrow_alu`.
+/// PUSH and POP forms that move a 16-bit word and adjust ESP by two.
+fn word_stack(i: &Instruction) -> bool {
+    use iced_x86::Code as C;
+    matches!(
+        i.code(),
+        C::Push_r16 | C::Push_rm16 | C::Push_imm16 | C::Pushw_imm8 | C::Pop_r16
+    )
+}
+
 fn narrow_alu(mnemonic: M) -> bool {
     matches!(
         mnemonic,
@@ -1629,9 +1638,11 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     if crate::strings::operation(i).is_some() {
         return true;
     }
+    // `rep ret` is the branch-predictor idiom for a plain return.
+    let rep_ret = i.mnemonic() == M::Ret && !i.has_repne_prefix();
     if i.is_invalid()
         || i.has_lock_prefix()
-        || i.has_rep_prefix()
+        || (i.has_rep_prefix() && !rep_ret)
         || i.has_repne_prefix()
         || !matches!(i.segment_prefix(), R::None | R::DS | R::SS | R::ES | R::FS)
     {
@@ -1684,7 +1695,9 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     ) {
         return simd::supported(i) || scalar::supported(i) || mmx::supported(i);
     }
-    let narrow = matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx) || narrow_alu(i.mnemonic());
+    let narrow = matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx)
+        || narrow_alu(i.mnemonic())
+        || word_stack(i);
     for n in 0..i.op_count() {
         match i.op_kind(n) {
             OpKind::Register
@@ -1707,7 +1720,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
             OpKind::Immediate32 | OpKind::Immediate8to32 | OpKind::NearBranch32 => {}
             OpKind::Immediate16 if i.mnemonic() == M::Ret || narrow => {}
             OpKind::Immediate8 if narrow => {}
-            OpKind::Immediate8to16 if narrow_alu(i.mnemonic()) => {}
+            OpKind::Immediate8to16 if narrow_alu(i.mnemonic()) || word_stack(i) => {}
             _ => return false,
         }
     }
@@ -3679,11 +3692,14 @@ impl Emitter<'_> {
             }
             M::Push | M::Call => {
                 let v = self.read(i, 0);
+                let width = if word_stack(i) { 2 } else { 4 };
                 let sp = self.b.use_var(self.regs[4]);
-                let sp = self.b.ins().iadd_imm(sp, -4);
-                let ptr = self.pointer(sp, 4);
+                let sp = self.b.ins().iadd_imm(sp, -(width as i64));
+                let ptr = self.pointer(sp, width);
                 let pushed = if i.mnemonic() == M::Call {
                     self.constant(i.next_ip32())
+                } else if width == 2 {
+                    self.b.ins().ireduce(types::I16, v)
                 } else {
                     v
                 };
@@ -3703,13 +3719,19 @@ impl Emitter<'_> {
             M::Pop | M::Ret => {
                 let sp = self.b.use_var(self.regs[4]);
                 let original_sp = sp;
-                let value = self.direct_load(sp, types::I32);
+                let width = if word_stack(i) { 2 } else { 4 };
+                let value = if width == 2 {
+                    let word = self.direct_load(sp, types::I16);
+                    self.b.ins().uextend(types::I32, word)
+                } else {
+                    self.direct_load(sp, types::I32)
+                };
                 let adjustment = if i.mnemonic() == M::Ret && i.op_count() != 0 {
                     i64::from(i.immediate16())
                 } else {
                     0
                 };
-                let sp = self.b.ins().iadd_imm(sp, 4 + adjustment);
+                let sp = self.b.ins().iadd_imm(sp, width + adjustment);
                 self.b.def_var(self.regs[4], sp);
                 if i.mnemonic() == M::Ret {
                     self.record_indirect(value, crate::IndirectBranchKind::Return);

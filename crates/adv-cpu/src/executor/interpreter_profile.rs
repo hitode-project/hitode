@@ -2,8 +2,8 @@
 //!
 //! With `ADV_INTERP_PROFILE=<file>`, the executor rewrites `<file>` every five
 //! seconds with the interpreted blocks that ran the most guest instructions in
-//! that window, why each ran in the interpreter, and the first instruction of
-//! the block that native code does not support. The file is a local
+//! that window, why each ran in the interpreter, and the instructions within
+//! the block's average run that native code does not support. The file is a local
 //! diagnostic: it names guest addresses and instructions, never bytes.
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -74,10 +74,15 @@ impl Profile {
         self.written = Instant::now();
         let mut rows: Vec<_> = self.blocks.drain().collect();
         rows.sort_unstable_by_key(|(_, block)| std::cmp::Reverse(block.units));
-        let mut text = String::from("units\tpc\tentries\treason\tfirst_unsupported\n");
+        let mut text = String::from("units\tpc\tentries\treason\tunsupported\n");
         for (pc, block) in rows.into_iter().take(ROWS) {
-            let unsupported = first_unsupported(memory, pc)
-                .map_or_else(|| "-".into(), |(at, code)| format!("{at:#x} {code}"));
+            let run = block.units.div_ceil(block.entries.max(1)).max(1) as usize;
+            let unsupported = unsupported(memory, pc, run);
+            let unsupported = if unsupported.is_empty() {
+                "-".into()
+            } else {
+                unsupported.join(" ")
+            };
             let _ = writeln!(
                 text,
                 "{}\t{pc:#x}\t{}\t{:?}\t{unsupported}",
@@ -88,16 +93,24 @@ impl Profile {
     }
 }
 
-fn first_unsupported(memory: &Memory, pc: u32) -> Option<(u32, String)> {
-    let available = (0..=SCAN * 15)
+/// The unsupported instructions among the first `run` from `pc`, at most
+/// [`SCAN`], as `address:code`.
+fn unsupported(memory: &Memory, pc: u32, run: usize) -> Vec<String> {
+    let Some(available) = (0..=SCAN * 15)
         .rev()
         .step_by(16)
-        .find(|&len| memory.read_data(pc, len).is_ok())?;
-    let bytes = memory.read_data(pc, available).ok()?;
+        .find(|&len| memory.read_data(pc, len).is_ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = memory.read_data(pc, available) else {
+        return Vec::new();
+    };
     let mut decoder = Decoder::with_ip(32, &bytes, u64::from(pc), DecoderOptions::NONE);
     decoder
         .iter()
-        .take(SCAN)
-        .find(|i| !i.is_invalid() && !crate::compile::supported(i))
-        .map(|i| (i.ip32(), format!("{:?}", i.code())))
+        .take(run.min(SCAN))
+        .filter(|i| !i.is_invalid() && !crate::compile::supported(i))
+        .map(|i| format!("{:#x}:{:?}", i.ip32(), i.code()))
+        .collect()
 }
