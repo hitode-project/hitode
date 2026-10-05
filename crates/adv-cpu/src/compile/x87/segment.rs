@@ -1,14 +1,52 @@
 //! A success-only straight-line lane. Rejection materializes the precise prefix
 //! and resumes at canonical single-instruction entries, never replaying a load
 //! or store. No resident state crosses a CFG edge, helper, or environment op.
+//!
+//! Compilers interleave integer address and counter updates with x87 code, so a
+//! lane may also carry plain integer instructions. Their guards and shared/file
+//! paths reject before the instruction commits; the recovery re-executes it on
+//! the canonical path with the x87 prefix materialized.
 use super::*;
 
+/// x87 instructions per lane, and all instructions per lane.
 const LIMIT: usize = 8;
+const SPAN: usize = 24;
 
 #[derive(Default)]
 pub(in crate::compile) struct Segments {
     pub(in crate::compile) starts: BTreeMap<u32, Vec<Instruction>>,
+    /// x87 members after the first: canonical restart entries use the helper.
     pub(in crate::compile) interiors: BTreeSet<u32>,
+    /// Integer members: only recovery and restarts reach their canonical code.
+    pub(in crate::compile) integers: BTreeSet<u32>,
+}
+
+/// Integer forms whose only side exits are access guards and whose writes all
+/// follow those guards, so a rejected attempt has committed nothing.
+fn lane_integer(i: &Instruction) -> bool {
+    matches!(
+        i.mnemonic(),
+        M::Mov
+            | M::Movzx
+            | M::Movsx
+            | M::Lea
+            | M::Add
+            | M::Sub
+            | M::And
+            | M::Or
+            | M::Xor
+            | M::Cmp
+            | M::Test
+            | M::Inc
+            | M::Dec
+            | M::Not
+            | M::Neg
+            | M::Nop
+    ) && supported(i)
+        && crate::strings::operation(i).is_none()
+        && !mmx::supported(i)
+        && !scalar::supported(i)
+        && !simd::supported(i)
 }
 
 pub(in crate::compile) fn segments(
@@ -34,13 +72,16 @@ pub(in crate::compile) fn segments(
             boundaries.insert(i.near_branch32());
         }
     }
-    let eligible = |i: &Instruction| {
+    let linear = |i: &Instruction| {
         i.next_ip32() > i.ip32()
             && i.memory_base().size() != 2
             && i.memory_index().size() != 2
             // A second decode may enter in the middle of a linear instruction.
             // Keep its overlapping bytes out of any resident segment.
             && boundaries.range((std::ops::Bound::Excluded(i.ip32()), std::ops::Bound::Excluded(i.next_ip32()))).next().is_none()
+    };
+    let floating = |i: &Instruction| {
+        linear(i)
             && crate::floating::fast::classify(i).is_some_and(|fast| {
                 !matches!(
                     fast,
@@ -48,13 +89,16 @@ pub(in crate::compile) fn segments(
                 )
             })
     };
+    let integer =
+        |i: &Instruction| linear(i) && i.flow_control() == FlowControl::Next && lane_integer(i);
     let mut result = Segments::default();
     for (&start, i) in instructions {
-        if result.interiors.contains(&start) || !eligible(i) {
+        if result.interiors.contains(&start) || !floating(i) {
             continue;
         }
         let mut run = vec![*i];
-        while run.len() < LIMIT {
+        let mut count = 1;
+        while count < LIMIT && run.len() < SPAN {
             let next = run.last().unwrap().next_ip32();
             if boundaries.contains(&next)
                 || result.interiors.contains(&next)
@@ -62,19 +106,38 @@ pub(in crate::compile) fn segments(
             {
                 break;
             }
-            let Some(i) = instructions.get(&next).filter(|i| eligible(i)) else {
+            let Some(i) = instructions
+                .get(&next)
+                .filter(|i| floating(i) || integer(i))
+            else {
                 break;
             };
+            count += usize::from(floating(i));
             run.push(*i);
         }
-        if run.len() > 1 {
-            result
-                .interiors
-                .extend(run.iter().skip(1).map(Instruction::ip32));
+        // Trailing integer instructions gain nothing from residency.
+        while run.last().is_some_and(|i| !floating(i)) {
+            run.pop();
+        }
+        if count > 1 {
+            for i in &run[1..] {
+                if floating(i) {
+                    result.interiors.insert(i.ip32());
+                } else {
+                    result.integers.insert(i.ip32());
+                }
+            }
             result.starts.insert(start, run);
         }
     }
     result
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Recovery {
+    Budget,
+    Floating,
+    Integer,
 }
 
 #[derive(Clone, Copy)]
@@ -107,7 +170,10 @@ impl Prefix {
 impl Emitter<'_> {
     pub(in crate::compile) fn native_x87_segment(&mut self, instructions: &[Instruction]) {
         debug_assert!(self.x87_native && self.mmx_mode.is_none());
-        for i in instructions {
+        for i in instructions
+            .iter()
+            .filter(|i| self.x87.contains_key(&i.ip32()))
+        {
             let effects = crate::floating::x87_effects(i).unwrap();
             debug_assert!(!effects.read_flags && !effects.write_flags && effects.write_gpr == 0);
             self.x87_cold_reads |= effects.read_gpr;
@@ -132,19 +198,30 @@ impl Emitter<'_> {
         let mut arithmetic_admitted = false;
         for (index, i) in instructions.iter().enumerate() {
             self.at(i.ip32());
-            if index != 0 {
+            // Mirror the canonical code's per-block fuel accounting.
+            if index != 0 && self.blocks.contains_key(&i.ip32()) {
                 let exhausted = self.b.create_block();
                 self.b.set_cold_block(exhausted);
-                recoveries.push((exhausted, prefix.clone(), *i, true));
+                recoveries.push((exhausted, prefix.clone(), *i, Recovery::Budget));
                 let budget = self.b.use_var(self.fuel);
                 let zero = self.b.ins().icmp_imm(IntCC::Equal, budget, 0);
                 self.x87_reject(zero, exhausted);
                 let remaining = self.b.ins().iadd_imm(budget, -1);
                 self.b.def_var(self.fuel, remaining);
             }
+            if !self.x87.contains_key(&i.ip32()) {
+                let rejected = self.b.create_block();
+                self.b.set_cold_block(rejected);
+                recoveries.push((rejected, prefix.clone(), *i, Recovery::Integer));
+                self.lane = Some(rejected);
+                let ended = self.instruction(i);
+                self.lane = None;
+                debug_assert!(!ended);
+                continue;
+            }
             let slow = self.b.create_block();
             self.b.set_cold_block(slow);
-            recoveries.push((slow, prefix.clone(), *i, false));
+            recoveries.push((slow, prefix.clone(), *i, Recovery::Floating));
             if index == 0 {
                 let mode = self.b.ins().load(
                     types::I32,
@@ -347,12 +424,16 @@ impl Emitter<'_> {
         let done = self.b.create_block();
         self.b.ins().jump(done, &[]);
         self.mark_source(super::diagnostics::x87_recovery_source());
-        self.resident_recoveries(recoveries);
+        self.resident_recoveries(recoveries, instructions);
         self.b.switch_to_block(done);
         self.at(instructions.last().unwrap().ip32());
     }
 
-    fn resident_recoveries(&mut self, recoveries: Vec<(ir::Block, Prefix, Instruction, bool)>) {
+    fn resident_recoveries(
+        &mut self,
+        recoveries: Vec<(ir::Block, Prefix, Instruction, Recovery)>,
+        instructions: &[Instruction],
+    ) {
         let dirty_slots: Vec<_> = (0..8)
             .filter(|&slot| recoveries.iter().any(|(_, p, _, _)| p.dirty[slot]))
             .collect();
@@ -379,8 +460,19 @@ impl Emitter<'_> {
         for _ in &tag_slots {
             self.b.append_block_param(restore, types::I32);
         }
-        for (block, p, i, budget) in recoveries {
+        let integers: Vec<_> = recoveries
+            .iter()
+            .filter(|(_, _, _, kind)| *kind == Recovery::Integer)
+            .map(|(_, _, i, _)| i.ip32())
+            .collect();
+        for (block, p, i, kind) in recoveries {
             self.b.switch_to_block(block);
+            if kind == Recovery::Integer && self.blocks.contains_key(&i.ip32()) {
+                // The canonical block entry charges this instruction's fuel again.
+                let fuel = self.b.use_var(self.fuel);
+                let fuel = self.b.ins().iadd_imm(fuel, 1);
+                self.b.def_var(self.fuel, fuel);
+            }
             let mask = (0..8).fold(u32::from(p.top) << 16, |mask, slot| {
                 mask | (u32::from(p.dirty[slot]) << slot)
                     | (u32::from(p.tag_changes[slot].is_some()) << (slot + 8))
@@ -389,13 +481,14 @@ impl Emitter<'_> {
             self.materialize_x87_metadata(&p);
             let pcs = u64::from(i.ip32()) | (u64::from(i.next_ip32()) << 32);
             let pcs = self.b.ins().iconst(types::I64, pcs as i64);
-            // Null is an internal budget sentinel, never an operation pointer.
+            // Null and one are internal budget/integer sentinels, never
+            // operation pointers.
             let operation = self.b.ins().iconst(
                 self.ptr_ty,
-                if budget {
-                    0
-                } else {
-                    self.x87[&i.ip32()].0 as i64
+                match kind {
+                    Recovery::Budget => 0,
+                    Recovery::Integer => 1,
+                    Recovery::Floating => self.x87[&i.ip32()].0 as i64,
                 },
             );
             let mut args: Vec<ir::BlockArg> =
@@ -457,7 +550,53 @@ impl Emitter<'_> {
         self.b.switch_to_block(exhausted);
         self.exit(Exit::Budget, pc);
         self.b.switch_to_block(helper);
+        if !integers.is_empty() {
+            let integer = self.b.ins().icmp_imm(IntCC::Equal, args[3], 1);
+            let resume = self.b.create_block();
+            let floating = self.b.create_block();
+            self.b.set_cold_block(resume);
+            self.b.set_cold_block(floating);
+            self.b.ins().brif(integer, resume, &[], floating, &[]);
+            self.b.switch_to_block(resume);
+            let mut switch = Switch::new();
+            let tails: Vec<_> = integers
+                .iter()
+                .map(|&pc| {
+                    let block = self.b.create_block();
+                    self.b.set_cold_block(block);
+                    switch.set_entry(u128::from(pc), block);
+                    (pc, block)
+                })
+                .collect();
+            let unknown = self.b.create_block();
+            self.b.set_cold_block(unknown);
+            switch.emit(&mut self.b, pc, unknown);
+            self.b.switch_to_block(unknown);
+            self.exit(Exit::Fallback, pc);
+            for (pc, block) in tails {
+                self.b.switch_to_block(block);
+                self.canonical_integer_tail(pc, instructions);
+            }
+            self.b.switch_to_block(floating);
+        }
         self.canonical_x87_recovery(pc, next, args[3]);
+    }
+
+    /// Re-executes lane members from `pc` on the canonical path up to the next
+    /// block entry. Every x87 member is an entry, so only integers run here.
+    fn canonical_integer_tail(&mut self, mut pc: u32, instructions: &[Instruction]) {
+        while !self.blocks.contains_key(&pc) {
+            let i = instructions
+                .iter()
+                .find(|i| i.ip32() == pc)
+                .expect("lane members end at a block entry");
+            debug_assert!(!self.x87.contains_key(&pc));
+            self.at(pc);
+            let ended = self.instruction(i);
+            debug_assert!(!ended);
+            pc = i.next_ip32();
+        }
+        self.direct(pc);
     }
 
     fn resident_empty(&mut self, p: &mut Prefix, slot: usize, empty: bool, slow: ir::Block) {

@@ -51,6 +51,21 @@ fn program(kind: usize) -> (Vec<u8>, u32) {
             a.fistp(dword_ptr(DATA + 40)).unwrap();
             3
         }
+        6 => {
+            // Compiler-scheduled integer address/counter updates between x87 ops.
+            a.mov(eax, dword_ptr(DATA + 48)).unwrap();
+            a.fld(dword_ptr(eax + 32)).unwrap();
+            a.add(edx, 4).unwrap();
+            a.fmul(dword_ptr(eax + 36)).unwrap();
+            a.mov(ebx, dword_ptr(DATA + 52)).unwrap();
+            a.fld(dword_ptr(eax + 32)).unwrap();
+            a.xor(ebx, 1).unwrap();
+            a.fmul(dword_ptr(eax + 36)).unwrap();
+            a.mov(dword_ptr(DATA + 52), ebx).unwrap();
+            a.faddp(st1, st0).unwrap();
+            a.fstp(dword_ptr(eax + 40)).unwrap();
+            6
+        }
         _ => {
             a.fld(qword_ptr(DATA)).unwrap();
             a.fsub(qword_ptr(DATA + 8)).unwrap();
@@ -80,6 +95,8 @@ fn machine(code: &[u8], jit: bool) -> Executor {
         .unwrap();
     m.write(DATA as u32 + 36, &32768.0f32.to_le_bytes())
         .unwrap();
+    m.write(DATA as u32 + 48, &(DATA as u32).to_le_bytes())
+        .unwrap();
     m.enable_auto_jit(false);
     if jit {
         m.add_region(Region::new(CODE, code.len())).unwrap();
@@ -102,8 +119,8 @@ fn check(m: &Executor, reference: &Executor) {
     assert_eq!(m.state.eflags, reference.state.eflags);
     assert_eq!(m.state.eip, reference.state.eip);
     assert_eq!(
-        m.memory().read(DATA as u32, 48).unwrap(),
-        reference.memory().read(DATA as u32, 48).unwrap()
+        m.memory().read(DATA as u32, 56).unwrap(),
+        reference.memory().read(DATA as u32, 56).unwrap()
     );
     assert_eq!(m.stats.interpreter_instructions, 0);
 }
@@ -127,6 +144,7 @@ fn main() {
         "compare_exchange",
         "pcm",
         "interpolation",
+        "interleaved",
     ]
     .iter()
     .enumerate()

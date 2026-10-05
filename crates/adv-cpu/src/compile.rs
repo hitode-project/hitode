@@ -973,6 +973,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             x87_native: x87::enabled(),
             x87_cold: None,
             x87_cold_reads: 0,
+            lane: None,
             x87: x87
                 .iter()
                 .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
@@ -1022,7 +1023,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             e.b.ins().return_(&[reason]);
         }
         for (&start, &block) in &e.blocks.clone() {
-            if x87_segments.interiors.contains(&start) {
+            if x87_segments.interiors.contains(&start) || x87_segments.integers.contains(&start) {
                 e.b.set_cold_block(block);
             }
             e.b.switch_to_block(block);
@@ -1699,6 +1700,10 @@ struct Emitter<'a> {
     x87_native: bool,
     x87_cold: Option<ir::Block>,
     x87_cold_reads: u8,
+    /// Inside a resident x87 lane, every guard and shared/file access path of an
+    /// integer instruction branches here before the instruction commits; the
+    /// lane then materializes its prefix and re-executes canonically.
+    lane: Option<ir::Block>,
     atomic_store_ref: ir::FuncRef,
     atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,
@@ -2291,6 +2296,12 @@ impl Emitter<'_> {
         }
     }
     fn guard(&mut self, bad: Value, reason: Exit, addr: Option<Value>) {
+        if let Some(lane) = self.lane {
+            let ok = self.b.create_block();
+            self.b.ins().brif(bad, lane, &[], ok, &[]);
+            self.b.switch_to_block(ok);
+            return;
+        }
         let fail = self.b.create_block();
         self.b.set_cold_block(fail);
         let ok = self.b.create_block();
@@ -2470,6 +2481,31 @@ impl Emitter<'_> {
         let executable = self.b.ins().band_imm(combined, i64::from(EXEC));
         let executable = self.b.ins().icmp_imm(IntCC::NotEqual, executable, 0);
         let no_file = self.b.ins().iconst(types::I8, 0);
+        if let Some(lane) = self.lane {
+            for &p in &permissions {
+                let mask = self
+                    .b
+                    .ins()
+                    .band_imm(p, i64::from(WRITE | crate::memory::SHARED));
+                let bad = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, mask, i64::from(WRITE));
+                let ok = self.b.create_block();
+                self.b.ins().brif(bad, lane, &[], ok, &[]);
+                self.b.switch_to_block(ok);
+            }
+            self.guard(executable, Exit::Fallback, None);
+            self.mark(diagnostics::Part::Body);
+            let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
+            let address = self.b.ins().iadd(self.mem, host_offset);
+            return GuestPointer {
+                address,
+                guest: addr,
+                shared: no_file,
+                file: no_file,
+            };
+        }
         let cold = self.b.create_block();
         self.b.set_cold_block(cold);
         let done = self.b.create_block();
@@ -2554,6 +2590,7 @@ impl Emitter<'_> {
         self.mark(diagnostics::Part::Check);
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let hardware = if !write
+            && self.lane.is_none()
             && self.fault_pc == Some(self.pc)
             && matches!(ty, types::I8 | types::I16 | types::I32)
         {
@@ -2569,8 +2606,11 @@ impl Emitter<'_> {
         let (offset, positions) = self.access_range(addr, size, reason);
         let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
         let address = self.b.ins().iadd(self.mem, host_offset);
-        let atomic = self.b.create_block();
-        self.b.set_cold_block(atomic);
+        let atomic = self.lane.unwrap_or_else(|| {
+            let block = self.b.create_block();
+            self.b.set_cold_block(block);
+            block
+        });
         let done = self.b.create_block();
         if !write {
             self.b.append_block_param(done, ty);
@@ -2636,6 +2676,10 @@ impl Emitter<'_> {
         } else {
             let result = self.b.ins().load(ty, MemFlags::new(), address, 0);
             self.b.ins().jump(done, &[result.into()]);
+        }
+        if self.lane.is_some() {
+            self.b.switch_to_block(done);
+            return (!write).then(|| self.b.block_params(done)[0]);
         }
         self.b.switch_to_block(atomic);
         self.mark(diagnostics::Part::Slow);
@@ -2822,6 +2866,12 @@ impl Emitter<'_> {
         value
     }
     fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
+        if self.known(pointer.shared) == Some(0) {
+            self.b
+                .ins()
+                .store(MemFlags::new(), value, pointer.address, 0);
+            return;
+        }
         let ordinary = self.b.create_block();
         let atomic = self.b.create_block();
         self.b.set_cold_block(atomic);

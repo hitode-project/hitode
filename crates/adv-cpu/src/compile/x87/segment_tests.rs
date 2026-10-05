@@ -241,3 +241,119 @@ fn segment_planning_respects_real_entries_and_bounds_native_body_size() {
         single.code_size
     );
 }
+
+/// Compiler-scheduled integer updates between x87 operations. `moved` sends one
+/// integer access (0 load, 1 store, 2 read-modify-write) to another page:
+/// +0x1000 is inaccessible, +0x2000 is writable code, +0x3000 is shared audio.
+fn interleaved(moved: Option<(usize, i32)>) -> Vec<u8> {
+    bytes(|a| {
+        let away = |index| match moved {
+            Some((at, offset)) if at == index => offset,
+            _ => 0,
+        };
+        a.fld(dword_ptr(esi)).unwrap();
+        a.mov(eax, dword_ptr(esi + 24 + away(0))).unwrap();
+        a.add(ecx, 4).unwrap();
+        a.fmul(dword_ptr(esi + 4)).unwrap();
+        a.fld(dword_ptr(esi + 4)).unwrap();
+        a.mov(dword_ptr(esi + 28 + away(1)), ecx).unwrap();
+        a.lea(edx, ptr(eax + ecx * 4)).unwrap();
+        a.fmul(dword_ptr(esi)).unwrap();
+        a.add(dword_ptr(esi + 32 + away(2)), edx).unwrap();
+        a.dec(ecx).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fstp(dword_ptr(esi + 8)).unwrap();
+    })
+}
+
+fn interleaved_data(m: &mut Memory) {
+    m.write(DATA, &1.3f32.to_le_bytes()).unwrap();
+    m.write(DATA + 4, &0.7f32.to_le_bytes()).unwrap();
+    m.write(DATA + 24, &0x1234u32.to_le_bytes()).unwrap();
+    m.protect(DATA + 0x1000, 4096, 0).unwrap();
+    m.protect(DATA + 0x2000, 4096, READ | WRITE | EXEC).unwrap();
+}
+
+/// memory() with the last page as shared audio where the host supports it.
+fn lane_memory(code: &[u8]) -> Memory {
+    if !cfg!(windows) {
+        return memory(code);
+    }
+    let mut m = Memory::reserve(CODE, 0x6000).unwrap();
+    m.map(CODE, 0x5000, READ | WRITE).unwrap();
+    m.write(CODE, code).unwrap();
+    m.protect(CODE, 4096, READ | EXEC).unwrap();
+    m.write(DATA, &1.25f64.to_le_bytes()).unwrap();
+    let shared = m.map_shared_audio(DATA + 0x3000, 4096).unwrap();
+    shared.store_bytes(24, &0x5678u32.to_le_bytes());
+    m
+}
+
+const MOVED: [Option<(usize, i32)>; 9] = [
+    None,
+    Some((0, 0x1000)),
+    Some((1, 0x1000)),
+    Some((2, 0x1000)),
+    Some((1, 0x2000)),
+    Some((2, 0x2000)),
+    Some((0, 0x3000)),
+    Some((1, 0x3000)),
+    Some((2, 0x3000)),
+];
+
+#[test]
+fn integer_lane_members_fault_after_the_completed_x87_prefix() {
+    for moved in &MOVED[..4] {
+        let code = interleaved(*moved);
+        let instructions: BTreeMap<_, _> =
+            decoded(&code).into_iter().map(|i| (i.ip32(), i)).collect();
+        let plan = segments(&instructions, &[CODE]);
+        assert_eq!(plan.starts.len(), 1);
+        assert_eq!(plan.starts[&CODE].len(), instructions.len());
+        assert_eq!(plan.integers.len(), 6);
+        // Integer rejections re-execute canonically; only a fault, never an
+        // x87 operation, leaves the native lane.
+        compare(&code, state(), interleaved_data, Some(0));
+    }
+}
+
+#[test]
+fn integer_lanes_match_single_instruction_code_for_every_budget_and_entry() {
+    for moved in MOVED {
+        if cfg!(windows) || moved.is_none_or(|(_, offset)| offset != 0x3000) {
+            lane_matches_single(&interleaved(moved));
+        }
+    }
+}
+
+fn lane_matches_single(code: &[u8]) {
+    let instructions = decoded(code);
+    let m = lane_memory(code);
+    let lanes = compile(&Region::new(CODE, code.len()), &m, false).unwrap();
+    testing::SINGLE_ONLY.set(true);
+    let single = compile(&Region::new(CODE, code.len()), &m, false);
+    testing::SINGLE_ONLY.set(false);
+    let single = single.unwrap();
+    for i in &instructions {
+        for budget in 0..=instructions.len() as u64 {
+            let mut runs = [(&lanes, state()), (&single, state())].map(|(compiled, mut s)| {
+                s.eip = i.ip32();
+                s.fuel = budget;
+                let mut m = lane_memory(code);
+                interleaved_data(&mut m);
+                let exit = testing::run(compiled, &mut s, &mut m);
+                let data = m.read_data(DATA, 64).unwrap().to_vec();
+                let code = m.read_data(DATA + 0x2000, 64).unwrap().to_vec();
+                let shared = m.read_data(DATA + 0x3000, 64).unwrap().to_vec();
+                (exit, s, data, code, shared, m.epoch)
+            });
+            let (single_run, lane_run) = (runs[1].clone(), &mut runs[0]);
+            assert_eq!(
+                *lane_run,
+                single_run,
+                "entry {:#x}, budget {budget}",
+                i.ip32()
+            );
+        }
+    }
+}
