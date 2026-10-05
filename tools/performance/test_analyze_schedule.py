@@ -41,6 +41,21 @@ class ScheduleAnalysisTests(unittest.TestCase):
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 analyze(rows)
 
+    def test_frame_gap_clips_runs_and_includes_crossing_wait(self):
+        summary, _ = analyze([
+            row(0, "mark"), row(0, "cs_take", 1, 16, 1),
+            row(1, "cs_wait", 0, 16), row(1, "run_start", 1),
+            row(2, "frame", a=10), row(5, "frame", a=11),
+            row(6, "run_end", 1, 32, 5_000_000, 1_000_000),
+            row(7, "cs_release", 1, 16, 0), row(8, "cs_take", 0, 16, 1),
+            row(9, "frame", a=13), row(10, "observe"),
+        ])
+        gaps = summary["longest_frame_gaps"]
+        self.assertEqual(len(gaps), 1)  # A missing frame cannot define a gap.
+        self.assertEqual(gaps[0]["wall_ms"], 3)
+        self.assertEqual(gaps[0]["inline_runs"][1], {"runs": 1, "wall_ms": 3, "host_ms": 0.6})
+        self.assertEqual(gaps[0]["completed_lock_waits"][0]["overlap_ms"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

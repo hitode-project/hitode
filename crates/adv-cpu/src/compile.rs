@@ -13,6 +13,7 @@ use iced_x86::{
 
 use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
+mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
 mod mmx;
@@ -615,7 +616,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let mut module = JITModule::new(builder);
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
-    let dump_dir = std::env::var_os("ADV_JIT_DUMP_DIR");
+    let dump_dir = std::env::var_os("ADV_JIT_DUMP_DIR").filter(|_| {
+        std::env::var("ADV_JIT_DUMP_REGIONS")
+            .ok()
+            .is_none_or(|list| {
+                list.split(',').any(|pc| {
+                    u32::from_str_radix(pc.trim().trim_start_matches("0x"), 16).ok()
+                        == Some(region.start)
+                })
+            })
+    });
     if dump_dir.is_some() {
         ctx.set_disasm(true);
     }
@@ -1172,6 +1182,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // platform-ABI trampoline. Region-to-region transfers already use slots.
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let tail_entry = module.get_finalized_function(id) as usize;
+    // Optional native-PC attribution for external sampling. Addresses are
+    // process-local; this does not enable execution profiling or disable links.
+    diagnostics::record_body(region, opt_level, tail_entry, code_size, instructions.len());
     let mut wrapper = module.make_context();
     wrapper.func.signature = module.make_signature();
     wrapper

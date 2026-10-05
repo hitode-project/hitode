@@ -429,6 +429,13 @@ impl Sys {
     /// A host handler can then return normally or defer its following work.
     pub fn complete_frame(&mut self) {
         self.completed_frames = self.completed_frames.wrapping_add(1);
+        self.schedule_trace.event(
+            "frame",
+            self.current,
+            u64::from(self.completed_frames),
+            0,
+            0,
+        );
     }
 
     pub fn reset_event(&mut self, h: Handle) -> bool {

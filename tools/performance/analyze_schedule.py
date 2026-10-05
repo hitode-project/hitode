@@ -6,6 +6,8 @@ Reads schedule.tsv from the first reset-metrics mark to the final report event.
 Only completed lock-wait attempts wholly inside that window enter the lock table.
 A failed reacquire starts a new attempt; it is not attributed to the old owner.
 End-PC attribution is a boundary observation, not instruction-level profiling.
+Frame gaps use consecutive guest completions, not shell observations or scanout;
+static reading and intentional sleeps can also produce long gaps.
 """
 
 import argparse
@@ -25,6 +27,38 @@ def read_trace(path):
 
 def overlap(begin, end, lo, hi):
     return max(0, min(end, hi) - max(begin, lo))
+
+
+def frame_gaps(rows, runs, waits, lo, hi):
+    frames = [r for r in rows if r["event"] == "frame"]
+    gaps = [
+        (b["time_ns"] - a["time_ns"], a, b)
+        for a, b in zip(frames, frames[1:])
+        if lo <= a["time_ns"] < b["time_ns"] <= hi
+        and b["a"] == ((a["a"] + 1) & 0xffffffff)
+    ]
+    result = []
+    for duration, first, last in sorted(gaps, key=lambda gap: gap[0], reverse=True)[:10]:
+        begin, end = first["time_ns"], last["time_ns"]
+        active = defaultdict(lambda: {"runs": 0, "wall_ms": 0, "host_ms": 0})
+        for start, stop, context, _, _, host in runs:
+            ns = overlap(start, stop, begin, end)
+            if ns:
+                active[context]["runs"] += 1
+                active[context]["wall_ms"] += ns / 1e6
+                active[context]["host_ms"] += host * ns / max(stop - start, 1) / 1e6
+        # Include waits crossing the frame boundary, but retain actual begin/end
+        # so overlap is never mistaken for the full acquisition latency.
+        relevant = [
+            {**wait, "overlap_ms": overlap(wait["begin"], wait["end"], begin, end) / 1e6}
+            for wait in waits if overlap(wait["begin"], wait["end"], begin, end)
+        ]
+        result.append({
+            "frame_start": first["a"], "frame_end": last["a"],
+            "begin_ns": begin, "end_ns": end, "wall_ms": duration / 1e6,
+            "inline_runs": dict(active), "completed_lock_waits": relevant,
+        })
+    return result
 
 
 def analyze(rows):
@@ -148,6 +182,8 @@ def analyze(rows):
             {"context": context, "pc": hex(pc), "ms": ms}
             for (context, pc), ms in pcs.most_common(20)
         ],
+        "frame_gap_note": "guest completions; inline host time is prorated at boundaries; completed waits only",
+        "longest_frame_gaps": frame_gaps(rows, runs, records, lo, hi),
     }
     return summary, selected
 

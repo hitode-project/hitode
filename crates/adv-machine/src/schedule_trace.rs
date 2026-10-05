@@ -4,6 +4,7 @@
 //! pick: yielded; lease/collect: token. block: kind (1 timer/2 object/3 set),
 //! deadline or handle, thunk. wake: thunk. CS: address, owner TID/recursion, event.
 //! Lease-to-collect includes queueing and completion delivery, not worker CPU time.
+//! frame: completed guest-frame serial (not a shell observation or scanout).
 use std::io::{self, Write};
 use std::time::Instant;
 
