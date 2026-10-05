@@ -154,12 +154,27 @@ struct ChunkDump {
     path: std::path::PathBuf,
     bytes: u64,
 }
+#[derive(Clone)]
+struct SampleStorage {
+    id: u64,
+    addr: u32,
+    #[allow(dead_code)]
+    len: u32,
+    read_alias: Arc<dyn adv_sync::shared::SharedReadView>,
+}
+
+struct StorageRecord {
+    addr: u32,
+    live_buffers: usize,
+    pending_voices: std::collections::BTreeSet<u64>,
+}
+
 struct Buffer {
     audio_id: u64,
     voice: Option<Arc<RingState>>,
     playback_clock: Arc<adv_device::clock::PlaybackClock>,
     generation: u64,
-    storage: u32,
+    storage: Option<SampleStorage>,
     len: u32,
     flags: u32,
     format: Format,
@@ -179,6 +194,9 @@ struct Buffer {
     trace_chunks: Option<ChunkDump>,
 }
 impl Buffer {
+    fn storage_addr(&self) -> u32 {
+        self.storage.as_ref().map_or(0, |s| s.addr)
+    }
     fn stereo_gain(&self) -> [f32; 2] {
         let db = |value: i32| {
             if value <= -10000 {
@@ -256,7 +274,9 @@ pub struct Sound {
     buffer_ids: BTreeMap<u64, ComIdentity<Object>>,
     pub audio: AudioControl,
     next_audio_id: u64,
-    pending_release: BTreeMap<u64, (u32, bool)>,
+    next_storage_id: u64,
+    storage_records: BTreeMap<u64, StorageRecord>,
+    pending_release: BTreeMap<u64, (u64, bool)>,
     pending_notices: Vec<(u64, u32, u64, u64)>,
     ready_notices: Vec<u32>,
     pub queued_samples: u64,
@@ -401,6 +421,8 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         buffer_ids: BTreeMap::new(),
         audio,
         next_audio_id: 1,
+        next_storage_id: 1,
+        storage_records: BTreeMap::new(),
         pending_release: BTreeMap::new(),
         pending_notices: Vec::new(),
         ready_notices: Vec::new(),
@@ -476,10 +498,14 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     };
     if let Some(buffer) = destroyed.value.buffer {
         s.buffer_ids.remove(&buffer.audio_id);
-        if buffer.storage != 0 {
+        if let Some(storage) = buffer.storage {
             let queued = s.audio.remove_pcm(buffer.audio_id);
             s.pending_release
-                .insert(buffer.audio_id, (buffer.storage, queued));
+                .insert(buffer.audio_id, (storage.id, queued));
+            if let Some(record) = s.storage_records.get_mut(&storage.id) {
+                record.live_buffers = record.live_buffers.saturating_sub(1);
+                record.pending_voices.insert(buffer.audio_id);
+            }
         }
     }
     for pointer in destroyed.interfaces {
@@ -593,7 +619,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         let s = e.ext.get_mut::<Sound>();
         let snapshot = s.buffer(&e.sys.objects, a).map(|buf| {
             (
-                buf.storage,
+                buf.storage_addr(),
                 buf.len,
                 buf.playing,
                 buf.base,
@@ -737,7 +763,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 let Some(ptr) = object(e, Kind::Buffer, flags & 0x100 != 0)? else {
                     return Ok(OUT_OF_MEMORY);
                 };
-                let (storage, region) = if primary {
+                let (base, region) = if primary {
                     (0, None)
                 } else {
                     let mapped_len = adv_machine::vm::align_up(len, 4096);
@@ -757,10 +783,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 };
                 if !primary && format.bits == 8 {
                     let silence = vec![128; len as usize];
-                    if let Err(error) = e.cpu.write(storage, &silence) {
+                    if let Err(error) = e.cpu.write(base, &silence) {
                         e.sys
                             .vm
-                            .free(e.cpu, storage)
+                            .free(e.cpu, base)
                             .map_err(|error| error.to_string())?;
                         release(e, ptr);
                         return Err(error.to_string());
@@ -768,11 +794,12 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 }
                 let s = e.ext.get_mut::<Sound>();
                 let voice = region
+                    .as_ref()
                     .map(|region| {
                         s.audio.add_ring(
                             audio_id,
                             RingConfig {
-                                view: region.read_alias,
+                                view: region.read_alias.clone(),
                                 bytes: len,
                                 channels: format.channels,
                                 bits: format.bits,
@@ -791,10 +818,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         }
                         // add_ring publishes nothing on failure, so there is no
                         // callback-owned alias requiring deferred retirement.
-                        if storage != 0 {
+                        if base != 0 {
                             e.sys
                                 .vm
-                                .free(e.cpu, storage)
+                                .free(e.cpu, base)
                                 .map_err(|error| error.to_string())?;
                         }
                         release(e, ptr);
@@ -802,13 +829,31 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     }
                 };
                 s.next_audio_id = next_audio_id;
+                let sample_storage = region.map(|region| {
+                    let storage_id = s.next_storage_id;
+                    s.next_storage_id += 1;
+                    s.storage_records.insert(
+                        storage_id,
+                        StorageRecord {
+                            addr: base,
+                            live_buffers: 1,
+                            pending_voices: std::collections::BTreeSet::new(),
+                        },
+                    );
+                    SampleStorage {
+                        id: storage_id,
+                        addr: base,
+                        len,
+                        read_alias: region.read_alias,
+                    }
+                });
                 let id = com.identity::<Object>(&e.sys.objects, ptr).unwrap();
                 com.get_identity_mut(&mut e.sys.objects, id).unwrap().buffer = Some(Buffer {
                     audio_id,
                     voice,
                     playback_clock: s.playback_clock.clone(),
                     generation: 0,
-                    storage,
+                    storage: sample_storage,
                     len,
                     flags,
                     format,
@@ -827,6 +872,106 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     trace_generation: 0,
                     trace_chunks: None,
                 });
+                s.buffer_ids.insert(audio_id, id);
+                e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
+                Ok(0)
+            }
+            "DuplicateSoundBuffer" => {
+                if c == 0 {
+                    return Ok(INVALID);
+                }
+                e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                if b == 0 {
+                    return Ok(INVALID);
+                }
+                let Some(orig_id) = com.identity::<Object>(&e.sys.objects, b) else {
+                    return Ok(INVALID);
+                };
+                let (orig_storage, orig_len, orig_flags, orig_format, orig_vol, orig_pan, orig_freq) = match com
+                    .get_identity(&e.sys.objects, orig_id)
+                    .and_then(|o| o.buffer.as_ref())
+                {
+                    Some(buf) => (
+                        buf.storage.clone(),
+                        buf.len,
+                        buf.flags,
+                        buf.format,
+                        buf.volume,
+                        buf.pan,
+                        buf.frequency,
+                    ),
+                    None => return Ok(INVALID),
+                };
+                if orig_flags & 1 != 0 {
+                    // Cannot duplicate primary buffer
+                    return Ok(INVALID_CALL);
+                }
+                let Some(sample_storage) = orig_storage else {
+                    return Ok(INVALID_CALL);
+                };
+                let audio_id = e.ext.get::<Sound>().next_audio_id;
+                let Some(next_audio_id) = audio_id.checked_add(1) else {
+                    return Ok(OUT_OF_MEMORY);
+                };
+                let Some(ptr) = object(e, Kind::Buffer, orig_flags & 0x100 != 0)? else {
+                    return Ok(OUT_OF_MEMORY);
+                };
+                let s = e.ext.get_mut::<Sound>();
+                let voice = match s.audio.add_ring(
+                    audio_id,
+                    RingConfig {
+                        view: sample_storage.read_alias.clone(),
+                        bytes: orig_len,
+                        channels: orig_format.channels,
+                        bits: orig_format.bits,
+                        frequency: orig_format.rate,
+                        output_rate: 44100,
+                        notifications: Vec::new(),
+                    },
+                ) {
+                    Ok(voice) => voice,
+                    Err(error) => {
+                        if let Some(trace) = s.trace.as_mut() {
+                            let _ = writeln!(trace, "duplicate-buffer rejected: {error}");
+                        }
+                        release(e, ptr);
+                        return Ok(OUT_OF_MEMORY);
+                    }
+                };
+                s.next_audio_id = next_audio_id;
+                if let Some(record) = s.storage_records.get_mut(&sample_storage.id) {
+                    record.live_buffers += 1;
+                }
+                let id = com.identity::<Object>(&e.sys.objects, ptr).unwrap();
+                let dup_buffer = Buffer {
+                    audio_id,
+                    voice: Some(voice),
+                    playback_clock: s.playback_clock.clone(),
+                    generation: 0,
+                    storage: Some(sample_storage),
+                    len: orig_len,
+                    flags: orig_flags,
+                    format: orig_format,
+                    frequency: orig_freq,
+                    volume: orig_vol,
+                    pan: orig_pan,
+                    playing: false,
+                    looping: false,
+                    base: 0,
+                    anchor: now,
+                    queued_frames: 0,
+                    notice_bytes: 0,
+                    notifications: Vec::new(),
+                    lock: None,
+                    trace_pcm: None,
+                    trace_generation: 0,
+                    trace_chunks: None,
+                };
+                s.audio.set_stereo_gain(audio_id, dup_buffer.stereo_gain());
+                if orig_freq != orig_format.rate {
+                    s.audio.set_frequency(audio_id, orig_freq)?;
+                }
+                com.get_identity_mut(&mut e.sys.objects, id).unwrap().buffer = Some(dup_buffer);
                 s.buffer_ids.insert(audio_id, id);
                 e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
                 Ok(0)
@@ -1041,7 +1186,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     let mut bytes = vec![0; buf.len as usize];
                     if buf.len != 0 {
                         e.cpu
-                            .read(buf.storage, &mut bytes)
+                            .read(buf.storage_addr(), &mut bytes)
                             .map_err(|error| error.to_string())?;
                     }
                     let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
@@ -1052,7 +1197,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     let _ = writeln!(
                         trace,
                         "start us={now} id={a:08x} generation={generation} storage={:08x} bytes={} hash={hash:016x} base={} loop={} rate={} channels={} bits={}",
-                        buf.storage,
+                        buf.storage_addr(),
                         buf.len,
                         buf.base,
                         args[3] & 1,
@@ -1089,7 +1234,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 if s.capture_digests && s.digests.len() < 4 && buf.len != 0 {
                     let mut bytes = vec![0; buf.len as usize];
                     e.cpu
-                        .read(buf.storage, &mut bytes)
+                        .read(buf.storage_addr(), &mut bytes)
                         .map_err(|error| error.to_string())?;
                     let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
                         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
@@ -1157,10 +1302,13 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if n2 != 0 && args[6] == 0 {
                 return Ok(INVALID);
             }
+            let Some(storage) = buf.storage.as_ref() else {
+                return Ok(INVALID_CALL);
+            };
             let lock = Lock {
-                p1: buf.storage + offset,
+                p1: storage.addr + offset,
                 n1,
-                p2: if n2 != 0 { buf.storage } else { 0 },
+                p2: if n2 != 0 { storage.addr } else { 0 },
                 n2,
             };
             for (ptr, value) in [
@@ -1176,7 +1324,18 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 }
             }
             buf.lock = Some(lock);
-            s.audio.written(buf.audio_id, offset, n1 + n2);
+            let storage_id = storage.id;
+            let sharing_audio_ids: Vec<u64> = s
+                .buffer_ids
+                .values()
+                .filter_map(|&ident| {
+                    let other = s.com.get_identity(&e.sys.objects, ident)?.buffer.as_ref()?;
+                    (other.storage.as_ref()?.id == storage_id).then_some(other.audio_id)
+                })
+                .collect();
+            for audio_id in sharing_audio_ids {
+                s.audio.written(audio_id, offset, n1 + n2);
+            }
             0
         }
         "Unlock" => {
@@ -1185,6 +1344,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }) {
                 return Ok(INVALID);
             }
+            let storage_addr = buf.storage_addr();
             if let Some(lock) = buf.lock.take()
                 && let Some(dump) = buf.trace_chunks.as_mut()
             {
@@ -1206,7 +1366,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         trace,
                         "dma-write us={now} id={a:08x} generation={} byte_offset={} count={} file_offset={file_offset} path={:?}",
                         buf.trace_generation,
-                        lock.p1 - buf.storage,
+                        lock.p1 - storage_addr,
                         c + args[4],
                         dump.path
                     );
@@ -1254,11 +1414,21 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                 }
             }
             AudioEvent::Released { source } => {
-                if let Some((storage, _)) = s.pending_release.remove(&source) {
-                    m.sys
-                        .vm
-                        .free(&mut m.cpu, storage)
-                        .map_err(|error| error.to_string())?;
+                if let Some((storage_id, _)) = s.pending_release.remove(&source) {
+                    let should_free = if let Some(record) = s.storage_records.get_mut(&storage_id) {
+                        record.pending_voices.remove(&source);
+                        record.live_buffers == 0 && record.pending_voices.is_empty()
+                    } else {
+                        false
+                    };
+                    if should_free {
+                        if let Some(record) = s.storage_records.remove(&storage_id) {
+                            m.sys
+                                .vm
+                                .free(&mut m.cpu, record.addr)
+                                .map_err(|error| error.to_string())?;
+                        }
+                    }
                 }
             }
         }
@@ -1927,7 +2097,7 @@ mod tests {
                 .get::<Sound>()
                 .buffer(&m.sys.objects, b)
                 .unwrap()
-                .storage;
+                .storage_addr();
             let bytes = if format.bits == 8 {
                 vec![192; 100]
             } else {
@@ -1982,7 +2152,7 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, b)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(ptr, &[192; 100]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         pump(&mut m).unwrap();
@@ -2047,13 +2217,13 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, voice)
             .unwrap()
-            .storage;
+            .storage_addr();
         let music_storage = m
             .ext
             .get::<Sound>()
             .buffer(&m.sys.objects, music)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(voice_storage, &[192; 1000]).unwrap();
         m.cpu.write(music_storage, &[160; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
@@ -2107,7 +2277,7 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, voice)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(storage, &[192; 30]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
         pump(&mut m).unwrap();
@@ -2140,7 +2310,7 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, voice)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(storage, &[192; 500]).unwrap();
         m.cpu.write(storage + 500, &[64; 500]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
@@ -2178,13 +2348,13 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, voice)
             .unwrap()
-            .storage;
+            .storage_addr();
         let music_storage = m
             .ext
             .get::<Sound>()
             .buffer(&m.sys.objects, music)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(voice_storage, &[192; 1000]).unwrap();
         m.cpu.write(music_storage, &[160; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 0]);
@@ -2197,7 +2367,7 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, next_voice)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(next_storage, &[64; 1000]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[next_voice, 0, 0, 0]);
         pump(&mut m).unwrap();
@@ -2220,7 +2390,7 @@ mod tests {
         );
         let (source, storage) = {
             let buffer = &m.ext.get::<Sound>().buffer(&m.sys.objects, voice).unwrap();
-            (buffer.audio_id, buffer.storage)
+            (buffer.audio_id, buffer.storage_addr())
         };
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[voice, 0, 0, 1]);
         let audio = m.ext.get::<Sound>().audio.clone();
@@ -2336,7 +2506,7 @@ mod tests {
             .get::<Sound>()
             .buffer(&m.sys.objects, b)
             .unwrap()
-            .storage;
+            .storage_addr();
         m.cpu.write(ptr, &[192; 100]).unwrap();
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         for _ in 0..1000 {
@@ -2388,5 +2558,210 @@ mod tests {
                 .unwrap()
                 .playing
         );
+    }
+
+    #[test]
+    fn duplicate_sound_buffer_plays_concurrently_and_controls_independently() {
+        let mut m = machine();
+        let dev = device(&mut m);
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+        let orig = buffer(&mut m, format, 100);
+        let orig_storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, orig)
+            .unwrap()
+            .storage_addr();
+        m.cpu.write(orig_storage, &[192; 100]).unwrap(); // amplitude 0.5
+
+        // Duplicate orig -> dup
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, orig, DATA + 128]),
+            0
+        );
+        let dup = m.cpu.read_u32(DATA + 128).unwrap();
+        assert_ne!(orig, dup);
+
+        // Both can play simultaneously
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[orig, 0, 0, 1]);
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[dup, 0, 0, 1]);
+        pump(&mut m).unwrap();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let mut out = [0.0; 20];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [1.0; 20], "both voices play concurrently and mix: 0.5 + 0.5 = 1.0");
+
+        // Stop orig, dup keeps playing
+        invoke(&mut m, "IDirectSoundBuffer8::Stop", &[orig]);
+        pump(&mut m).unwrap();
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [0.5; 20], "dup continues playing after orig stops");
+
+        // Adjust volume on dup, orig is unaffected
+        invoke(&mut m, "IDirectSoundBuffer8::SetVolume", &[dup, (-600i32) as u32]);
+        assert_eq!(m.ext.get::<Sound>().buffer(&m.sys.objects, dup).unwrap().volume, -600);
+        assert_eq!(m.ext.get::<Sound>().buffer(&m.sys.objects, orig).unwrap().volume, 0);
+
+        // Seek on dup, orig cursor is unaffected
+        invoke(&mut m, "IDirectSoundBuffer8::SetCurrentPosition", &[dup, 50]);
+        assert_eq!(position(&mut m, dup), 50);
+        assert_eq!(position(&mut m, orig), 0);
+
+        // Lock & Unlock on orig writes to shared storage and affects both
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::Lock",
+            &[orig, 0, 100, DATA + 132, DATA + 136, 0, 0, 2],
+        );
+        let p1 = m.cpu.read_u32(DATA + 132).unwrap();
+        assert_eq!(p1, orig_storage);
+        // Lock on dup while orig is locked must be independent (orig is locked, dup is not)
+        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, orig).unwrap().lock.is_some());
+        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, dup).unwrap().lock.is_none());
+
+        // Write new samples via orig lock
+        m.cpu.write(p1, &[128; 100]).unwrap(); // silence
+        invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[orig, p1, 100, 0, 0]);
+
+        // Lock dup to verify it points to the exact same shared memory
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::Lock",
+            &[dup, 0, 100, DATA + 140, DATA + 144, 0, 0, 2],
+        );
+        let dup_p1 = m.cpu.read_u32(DATA + 140).unwrap();
+        assert_eq!(dup_p1, orig_storage);
+        invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[dup, dup_p1, 100, 0, 0]);
+
+        // Clean up
+        invoke(&mut m, "IDirectSoundBuffer8::Release", &[orig]);
+        invoke(&mut m, "IDirectSoundBuffer8::Release", &[dup]);
+        invoke(&mut m, "IDirectSound8::Release", &[dev]);
+    }
+
+    #[test]
+    fn releasing_original_keeps_duplicate_alive_for_playback_lock_and_further_cloning() {
+        let mut m = machine();
+        let dev = device(&mut m);
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+        let orig = buffer(&mut m, format, 100);
+        let storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, orig)
+            .unwrap()
+            .storage_addr();
+        m.cpu.write(storage, &[192; 100]).unwrap();
+
+        // Duplicate orig -> dup1
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, orig, DATA + 128]),
+            0
+        );
+        let dup1 = m.cpu.read_u32(DATA + 128).unwrap();
+
+        // Release original buffer
+        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[orig]), 0);
+        pump(&mut m).unwrap();
+
+        // Storage MUST still be mapped and valid in guest memory
+        assert!(m.cpu.read_u8(storage).is_ok());
+
+        // dup1 can still play
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[dup1, 0, 0, 1]);
+        pump(&mut m).unwrap();
+        let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
+        let mut out = [0.0; 20];
+        stream.read_stereo(&mut out, 1000);
+        assert_eq!(out, [0.5; 20]);
+
+        // dup1 can still Lock and write
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::Lock",
+            &[dup1, 0, 100, DATA + 132, DATA + 136, 0, 0, 2],
+        );
+        let p = m.cpu.read_u32(DATA + 132).unwrap();
+        assert_eq!(p, storage);
+        m.cpu.write(p, &[255; 100]).unwrap(); // amplitude ~1.0
+        invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[dup1, p, 100, 0, 0]);
+
+        // dup1 can be cloned to dup2 even after original is long dead!
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, dup1, DATA + 140]),
+            0
+        );
+        let dup2 = m.cpu.read_u32(DATA + 140).unwrap();
+        invoke(&mut m, "IDirectSoundBuffer8::Play", &[dup2, 0, 0, 1]);
+        pump(&mut m).unwrap();
+
+        // Now test saturated retirement when releasing remaining clones
+        let audio = m.ext.get::<Sound>().audio.clone();
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        for _ in 0..7000 {
+            audio.set_gain(1, 0.5);
+        }
+
+        // Release dup1
+        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[dup1]), 0);
+        pump(&mut m).unwrap();
+        // dup2 is still alive, so storage MUST NOT be freed yet
+        assert!(m.cpu.read_u8(storage).is_ok());
+
+        // Release dup2
+        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[dup2]), 0);
+
+        // Drain reader & pump to let retirement complete
+        let mut output = [0.0; 512];
+        for _ in 0..8 {
+            reader.read(&mut output, 0);
+            pump(&mut m).unwrap();
+        }
+
+        assert!(m.ext.get::<Sound>().pending_release.is_empty());
+        assert!(m.ext.get::<Sound>().storage_records.is_empty());
+        assert!(
+            m.cpu.read_u8(storage).is_err(),
+            "shared storage reclaimed exactly once after all clones release"
+        );
+    }
+
+    #[test]
+    fn duplicate_sound_buffer_rejects_primary_buffer_and_invalid_args() {
+        let mut m = machine();
+        let dev = device(&mut m);
+        // Create primary buffer
+        m.cpu.write_u32(DATA, 20).unwrap();
+        m.cpu.write_u32(DATA + 4, 1).unwrap(); // DSBCAPS_PRIMARYBUFFER
+        m.cpu.write_u32(DATA + 8, 0).unwrap();
+        m.cpu.write_u32(DATA + 12, 0).unwrap();
+        m.cpu.write_u32(DATA + 16, 0).unwrap();
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &[dev, DATA, DATA + 128, 0]),
+            0
+        );
+        let primary = m.cpu.read_u32(DATA + 128).unwrap();
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, primary, DATA + 132]),
+            0x88780032, // DSERR_INVALIDCALL
+        );
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, primary, 0]),
+            INVALID,
+        );
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, 0, DATA + 132]),
+            INVALID,
+        );
+        invoke(&mut m, "IDirectSoundBuffer8::Release", &[primary]);
+        invoke(&mut m, "IDirectSound8::Release", &[dev]);
     }
 }
