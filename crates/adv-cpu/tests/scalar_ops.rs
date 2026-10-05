@@ -150,6 +150,90 @@ fn shifts_match_unicorn_at_zero_one_and_masked_counts() {
 }
 
 #[test]
+fn rotates_match_unicorn_and_the_interpreter_at_zero_one_and_masked_counts() {
+    let values = [
+        0,
+        1,
+        0x4000_0000,
+        0x1234_5678,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ffff,
+    ];
+    let counts = [0u8, 1, 2, 8, 16, 31, 32, 33, 255];
+    for left in [true, false] {
+        for immediate in [false, true] {
+            for &count in &counts {
+                let bytes = assemble(|a| {
+                    match (left, immediate) {
+                        (true, false) => a.rol(ebx, cl),
+                        (true, true) => a.rol(ebx, count as i32),
+                        (false, false) => a.ror(ebx, cl),
+                        (false, true) => a.ror(ebx, count as i32),
+                    }
+                    .unwrap();
+                    a.ret().unwrap();
+                });
+                let mut jit = machine(&bytes, true);
+                let mut uc = machine(&bytes, false);
+                let mut interpreted = machine(&bytes, false);
+                for &value in &values {
+                    for flags in [2, 0xcd7] {
+                        let regs = [0, u32::from(count) | 0x1234_5600, 0, value, 0, 0, 0, 0];
+                        for m in [&mut jit, &mut uc, &mut interpreted] {
+                            reset(m, regs, flags);
+                        }
+                        // Rotates never define SF/ZF/AF/PF; OF only for one bit.
+                        let mask = match count & 31 {
+                            0 => 0xcd5,
+                            1 => 0x8d5 | 0x400,
+                            _ => 0xd5 | 0x400,
+                        };
+                        differential(&mut jit, &mut uc, mask);
+                        assert_eq!(
+                            interpreted.run(STOP, 10000).unwrap(),
+                            RunOutcome::ReachedStop
+                        );
+                        // Fuel counts native blocks or interpreted instructions.
+                        interpreted.state.fuel = jit.state.fuel;
+                        assert_eq!(jit.state, interpreted.state, "value {value:#x}");
+                    }
+                }
+                assert_eq!(
+                    jit.stats.interpreter_entries, 0,
+                    "rotate left {left}, immediate {immediate}, count {count}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loop_decrements_ecx_without_flags_and_matches_unicorn() {
+    let bytes = assemble(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.cmp(eax, 3).unwrap();
+        a.loop_(top).unwrap();
+        a.ret().unwrap();
+    });
+    let mut jit = machine(&bytes, true);
+    let mut uc = machine(&bytes, false);
+    // ECX = 0 wraps and runs 2^32 times; keep the counts finite.
+    for count in [1, 2, 7, 300] {
+        for flags in [2, 0xcd7] {
+            let regs = [0, count, 0, 0, 0, 0, 0, 0];
+            reset(&mut jit, regs, flags);
+            reset(&mut uc, regs, flags);
+            differential(&mut jit, &mut uc, 0xcd5);
+            assert_eq!(jit.state.regs[1], 0);
+        }
+    }
+    assert_eq!(jit.stats.interpreter_entries, 0);
+}
+
+#[test]
 fn multiplication_memory_fault_is_atomic_and_short_forms_fall_back() {
     let bytes = assemble(|a| {
         a.mul(dword_ptr(edi)).unwrap();

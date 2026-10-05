@@ -1599,6 +1599,7 @@ fn supported(i: &Instruction) -> bool {
             | M::Jns
             | M::Jp
             | M::Jnp
+            | M::Loop
     ) {
         return simd::supported(i) || scalar::supported(i) || mmx::supported(i);
     }
@@ -1646,6 +1647,8 @@ fn supported(i: &Instruction) -> bool {
             iced_x86::Code::Retnd | iced_x86::Code::Retnd_imm16
         ),
         M::Nop => i.op_count() == 0,
+        // ECX address size; CX loops keep the interpreter.
+        M::Loop => i.code() == iced_x86::Code::Loop_rel8_32_ECX,
         _ => true,
     }
 }
@@ -3385,6 +3388,21 @@ impl Emitter<'_> {
                     self.record_indirect(target, crate::IndirectBranchKind::Jump);
                     self.indirect(target);
                 }
+                return true;
+            }
+            M::Loop => {
+                // LOOP decrements ECX without touching flags.
+                let count = self.b.use_var(self.regs[1]);
+                let count = self.b.ins().iadd_imm(count, -1);
+                self.b.def_var(self.regs[1], count);
+                let condition = self.b.ins().icmp_imm(IntCC::NotEqual, count, 0);
+                let yes = self.b.create_block();
+                let no = self.b.create_block();
+                self.b.ins().brif(condition, yes, &[], no, &[]);
+                self.b.switch_to_block(yes);
+                self.direct(i.near_branch32());
+                self.b.switch_to_block(no);
+                self.direct(i.next_ip32());
                 return true;
             }
             branch => {

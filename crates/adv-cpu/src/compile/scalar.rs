@@ -76,7 +76,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
             }
             _ => false,
         },
-        M::Shl | M::Shr | M::Sar => {
+        M::Shl | M::Shr | M::Sar | M::Rol | M::Ror => {
             i.op_count() == 2
                 && i.op0_kind() == OpKind::Register
                 && reg_index(i.op0_register()).is_some()
@@ -191,6 +191,10 @@ impl Emitter<'_> {
         }
         if matches!(i.mnemonic(), M::Shl | M::Shr | M::Sar) {
             self.scalar_shift(i);
+            return;
+        }
+        if matches!(i.mnemonic(), M::Rol | M::Ror) {
+            self.scalar_rotate(i);
             return;
         }
         let signed = i.mnemonic() == M::Imul;
@@ -444,6 +448,42 @@ impl Emitter<'_> {
         }
         let no_shift = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
         let flags = self.b.ins().select(no_shift, old, flags);
+        self.write(i, None, result);
+        self.set_raw_flags(flags);
+    }
+
+    /// ROL/ROR change only CF, and OF for a one-bit rotate; a zero masked
+    /// count leaves every flag unchanged.
+    fn scalar_rotate(&mut self, i: &Instruction) {
+        let input = self.read(i, 0);
+        let count = self.read(i, 1);
+        let count = self.b.ins().band_imm(count, 31);
+        let left = i.mnemonic() == M::Rol;
+        let result = if left {
+            self.b.ins().rotl(input, count)
+        } else {
+            self.b.ins().rotr(input, count)
+        };
+        let sign = self.b.ins().ushr_imm(result, 31);
+        let (carry, overflow) = if left {
+            let carry = self.b.ins().band_imm(result, 1);
+            (carry, self.b.ins().bxor(sign, carry))
+        } else {
+            let next = self.b.ins().ushr_imm(result, 30);
+            let next = self.b.ins().band_imm(next, 1);
+            (sign, self.b.ins().bxor(sign, next))
+        };
+        let old = self.materialize_flags();
+        let old_overflow = self.b.ins().ushr_imm(old, 11);
+        let old_overflow = self.b.ins().band_imm(old_overflow, 1);
+        let one = self.b.ins().icmp_imm(IntCC::Equal, count, 1);
+        let overflow = self.b.ins().select(one, overflow, old_overflow);
+        let overflow = self.b.ins().ishl_imm(overflow, 11);
+        let flags = self.b.ins().band_imm(old, !0x801_i64);
+        let flags = self.b.ins().bor(flags, carry);
+        let flags = self.b.ins().bor(flags, overflow);
+        let no_rotate = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
+        let flags = self.b.ins().select(no_rotate, old, flags);
         self.write(i, None, result);
         self.set_raw_flags(flags);
     }
