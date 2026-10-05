@@ -9,7 +9,9 @@ Inputs in RUN_DIRECTORY (all local; none belong in the repository):
   sample-modules.json  {"modules": [{"base", "size", "path"}, ...]}, runner first
   jit-*.tsv, insn-*.tsv  written by the runner under ADV_JIT_MAP_DIR
   schedule.tsv         --schedule-profile; driver-clock.json + inputs.jsonl give
-                       the reset-metrics control bracket used for alignment
+                       the reset-metrics control bracket used for alignment.
+                       Optional: without it (a live, interactive run) every
+                       sample lands in one "all" window with no run contexts.
 
 Samples are wall-clock RIP observations of one thread, not CPU counters: waits
 appear as system-module samples and suspension perturbs timing. JIT parts come
@@ -315,13 +317,18 @@ def main():
     parser.add_argument("--symbolizer", default=SYMBOLIZER)
     args = parser.parse_args()
     directory = args.run_directory
+    live = not (directory / "schedule.tsv").exists()
     try:
-        rows = read_trace(directory / "schedule.tsv")
-        model = trace_model(rows)
-        gaps = labelled_gaps(rows, model)
         samples = read_samples(directory / "pc-samples.tsv")
         modules = json.loads((directory / "sample-modules.json").read_text(encoding="utf-8"))["modules"]
-        offset, uncertainty_ms = align(directory, rows)
+        if live:
+            model = {"lo": float("-inf"), "hi": float("inf"), "runs": []}
+            gaps, offset, uncertainty_ms = [], 0, None
+        else:
+            rows = read_trace(directory / "schedule.tsv")
+            model = trace_model(rows)
+            gaps = labelled_gaps(rows, model)
+            offset, uncertainty_ms = align(directory, rows)
     except (OSError, ValueError, KeyError, StopIteration) as error:
         parser.exit(1, f"pc attribution: {error!r}\n")
     jit = JitMap(directory)
@@ -332,7 +339,7 @@ def main():
     labels = label_samples(samples, modules, jit, symbols)
     times = [sample["perf_ns"] + offset for sample, label in zip(samples, labels)
              if label["kind"] == "jit" and model["lo"] <= sample["perf_ns"] + offset < model["hi"]]
-    shift, share_before, share_after = refine(times, model["runs"])
+    shift, share_before, share_after = (0, 0.0, 0.0) if live else refine(times, model["runs"])
     for sample in samples:
         sample["trace_ns"] = sample["perf_ns"] + offset + shift
     windows = attribute(samples, labels, model, gaps, args.long_ms)

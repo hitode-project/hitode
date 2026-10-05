@@ -171,10 +171,11 @@ def sample(thread, seconds, interval):
     return rows
 
 
-def dump_regions(process, directory, wanted):
+def dump_regions(process, pid, directory, wanted):
     """Copies the newest native code of each wanted guest region start."""
     latest = {}
-    for path in sorted(directory.glob("jit-*.tsv")):
+    path = directory / f"jit-{pid}.tsv"
+    if path.exists():
         for line in path.read_text().splitlines():
             fields = line.split("\t")
             base, size, guest = map(int, fields[1:4])
@@ -215,7 +216,7 @@ def main():
             for row in rows:
                 stream.write("\t".join(map(str, row)) + "\n")
         wanted = {int(x, 16) for x in arguments.dump_regions.split(",") if x}
-        dumps = dump_regions(process, directory, wanted) if wanted else []
+        dumps = dump_regions(process, pid, directory, wanted) if wanted else []
     finally:
         CloseHandle(thread)
         CloseHandle(process)
