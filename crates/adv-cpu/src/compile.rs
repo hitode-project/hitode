@@ -2546,10 +2546,13 @@ impl Emitter<'_> {
             .b
             .ins()
             .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
-        let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
-        let fuel = self.b.use_var(self.fuel);
-        let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
-        let mut pending = self.b.ins().band(pending, work);
+        let mut pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+        // A loop clone's remaining blocks are prepaid, so its fuel is nonzero.
+        if self.fast.is_none() {
+            let fuel = self.b.use_var(self.fuel);
+            let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
+            pending = self.b.ins().band(pending, work);
+        }
         if respect_stops {
             let stop = self.b.ins().load(
                 types::I32,
