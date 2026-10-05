@@ -324,6 +324,16 @@ pub trait Backend: Guest {
     fn parallel_capacity_available(&self) -> bool {
         true
     }
+    /// Lease a ready peer without disturbing the controller's loaded CPU state.
+    /// A backend may decline cold, pending-trap or otherwise unsuitable contexts.
+    fn dispatch_ready_context(
+        &mut self,
+        _context: &Self::Context,
+        _duration: Duration,
+        _guest_us: u64,
+    ) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
     /// Offload only when another ready context can use the inline lane.
     fn set_parallel_demand(&mut self, _ready_peer: bool) {}
     fn poll_parallel(&mut self) -> Option<(u64, Self::Context)> {

@@ -65,6 +65,50 @@ impl Executor {
         self.parallel.as_ref().is_some_and(Pool::has_capacity)
     }
 
+    pub(crate) fn dispatch_ready_context(
+        &mut self,
+        context: &ExecutionContext,
+        stop: u32,
+        duration: Duration,
+        guest_us: u64,
+    ) -> Result<Option<u64>, String> {
+        if !self.has_parallel_capacity()
+            || !context.admission.ready()
+            || duration < Duration::from_micros(100)
+            || context.deferred_fallback.is_some()
+            || context
+                .parallel_stop
+                .as_ref()
+                .is_some_and(|s| !matches!(s, Stop::Quantum))
+            || context.cpu.eflags & (1 << 8) != 0
+            || context.cpu.x87.status & 0x80 != 0
+        {
+            return Ok(None);
+        }
+        let dispatch_deadline = Instant::now().checked_add(duration.min(Duration::from_millis(1)));
+        // Publication/retirement belongs to this owner. Never run a saved PC
+        // against metadata that predates a mapping or executable-page change.
+        self.refresh()?;
+        self.refresh_links();
+        if !self
+            .code
+            .entry_owner
+            .get(&context.cpu.eip)
+            .and_then(|owner| self.code.compiled.get(owner))
+            .is_some_and(|code| code.entries.contains(&context.cpu.eip))
+        {
+            return Ok(None);
+        }
+        let saved = self.save_context()?;
+        let deadline = self.deadline;
+        self.restore_context(context)?;
+        self.deadline = dispatch_deadline;
+        let result = self.dispatch_parallel(stop, duration.min(Duration::from_millis(1)), guest_us);
+        self.restore_context(&saved)?;
+        self.deadline = deadline;
+        result
+    }
+
     pub(crate) fn dispatch_parallel(
         &mut self,
         stop: u32,

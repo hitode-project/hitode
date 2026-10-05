@@ -26,6 +26,11 @@ fn machine(workers: usize) -> Machine<JitCpu> {
             Outcome::Return(0)
         }
     });
+    registry.add("test", "wake_overlap", Conv::Stdcall { argc: 0 }, |e| {
+        Outcome::Return(u32::from(
+            e.sys.contexts.iter().any(|c| c.state_name() == "Running"),
+        ))
+    });
     registry.add("test", "patch", Conv::Stdcall { argc: 0 }, |e| {
         if !e.sys.contexts.iter().any(|c| c.state_name() == "Running") {
             return Outcome::Return(0);
@@ -138,6 +143,55 @@ fn two_workers_execute_three_contexts_and_deliver_each_trap_once() {
     assert_eq!(stats.max_running, 2);
     assert!(stats.overlap_ns > 0);
     assert!(m.sys.contexts.iter().all(|c| c.is_done()));
+}
+
+#[test]
+fn a_woken_controller_context_does_not_leave_its_hot_ready_peer_idle() {
+    let mut m = machine(2);
+    let wait = m.resolve_import("test", "wait").unwrap();
+    let observe = m.resolve_import("test", "wake_overlap").unwrap();
+    let done = m.resolve_import("test", "finish").unwrap();
+    let mut observer = Asm::new(CODE);
+    observer
+        .mov_eax_fs(0x18)
+        .mov_ebx_eax()
+        .mov_ecx_imm(0)
+        .call(wait)
+        .call(observe)
+        .mov_mem_eax(DATA)
+        .call(done)
+        .hlt();
+    let mut compute = Asm::new(CODE + 0x100);
+    compute
+        .mov_eax_fs(0x18)
+        .mov_ebx_eax()
+        .mov_ecx_imm(20_000_000);
+    let top = compute.here();
+    compute.dec_ecx().jnz(top).call(done).hlt();
+    for (name, a) in [("observer", observer), ("compute", compute)] {
+        let address = if name == "observer" {
+            CODE
+        } else {
+            CODE + 0x100
+        };
+        m.cpu.write(address, &a.bytes).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(address, a.bytes.len()))
+            .unwrap();
+        m.spawn(name, address, &[], 65536).unwrap();
+    }
+    finish(&mut m);
+    assert_eq!(
+        m.cpu.read_u32(DATA).unwrap(),
+        1,
+        "ready peer was left on the controller queue"
+    );
+    assert!(m.sys.scheduling.contexts[1].parallel_dispatches > 0);
+    assert_eq!(
+        m.cpu.parallel_stats().submitted,
+        m.cpu.parallel_stats().completed
+    );
 }
 
 #[test]

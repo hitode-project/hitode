@@ -1670,6 +1670,50 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Complete(self.fail(format!("context switch: {e}")));
             }
 
+            // Keep a latency-selected/API-heavy context on the controller while
+            // an already-qualified ready peer computes. Selecting only the
+            // current context for offload leaves the other lane idle at wakes.
+            if self.cpu.guest_workers() > 1 && !self.sys.contexts[id as usize].yielded {
+                let elapsed = started.elapsed();
+                let mut duration =
+                    slice.map_or(Duration::from_millis(1), |s| s.saturating_sub(elapsed));
+                if let Some(hard) = hard_budget {
+                    duration = duration
+                        .min(hard.saturating_sub(self.slice_elapsed.saturating_add(elapsed)));
+                }
+                for peer in 0..self.sys.contexts.len() {
+                    if peer == id as usize
+                        || self.sys.contexts[peer].yielded
+                        || !matches!(self.sys.contexts[peer].state, State::Ready { resume: None })
+                    {
+                        continue;
+                    }
+                    let Some(context) = self.regs.get(peer).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    let setup = Instant::now();
+                    match self.cpu.dispatch_ready_context(
+                        context,
+                        duration,
+                        self.sys.clock.now_us(),
+                    ) {
+                        Ok(Some(token)) => {
+                            if self.leases.insert(token, peer as CtxId).is_some() {
+                                return SliceResult::Complete(
+                                    self.fail("duplicate ready-peer execution lease".into()),
+                                );
+                            }
+                            self.sys.contexts[peer].state = State::Running { token };
+                            self.sys
+                                .scheduling
+                                .context_run(peer, setup.elapsed(), 0, true, true);
+                        }
+                        Ok(None) => {}
+                        Err(error) => return SliceResult::Complete(self.fail(error)),
+                    }
+                }
+            }
+
             self.sys.scheduling.dispatch(
                 selection.wake,
                 self.sys.clock.now_us(),

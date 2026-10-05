@@ -1,5 +1,7 @@
-//! Synchronization. Guest threads are cooperative contexts, so atomics are trivially atomic;
-//! contended locks and waits block the context and let others run.
+//! Synchronization. API object ownership stays on the controller; guest atomics
+//! synchronize with native leases, and contended locks park until release.
+
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -19,8 +21,40 @@ const CS_LOCK_COUNT: u32 = 4;
 const CS_RECURSION: u32 = 8;
 const CS_OWNER: u32 = 12;
 
+#[derive(Default)]
+struct CriticalWaits(HashMap<u32, CriticalWait>);
+
+struct CriticalWait {
+    event: u32,
+    pending: Rc<Cell<usize>>,
+}
+
+/// Continuation cancellation (including thread exit) also drops its wait count.
+struct CriticalTicket(Rc<Cell<usize>>);
+impl Drop for CriticalTicket {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+fn release_cs_wait(env: &mut Env<'_>, cs: u32) -> Result<(), String> {
+    let waits = env.ext.get_or_default::<CriticalWaits>();
+    if waits.0.get(&cs).is_some_and(|wait| wait.pending.get() != 0) {
+        return Err(format!(
+            "critical section {cs:#x} deleted or initialized with live waiters"
+        ));
+    }
+    if let Some(wait) = waits.0.remove(&cs) {
+        env.sys.objects.close(wait.event);
+    }
+    Ok(())
+}
+
 fn init_cs(env: &mut Env<'_>) -> Outcome {
     let cs = env.arg(0);
+    if let Err(error) = release_cs_wait(env, cs) {
+        return Outcome::Fail(error);
+    }
     crate::util::zero(env.cpu, cs, 24);
     let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, u32::MAX);
     Outcome::Return(1)
@@ -45,8 +79,49 @@ fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
     if try_take(env, cs) {
         return Outcome::Return(0);
     }
-    // Held by another context: let it run, then retry.
-    Outcome::block(Wait::Yield, move |env, _| enter_cs(env, cs))
+    // One lazily allocated private event per contended critical section. Signal,
+    // registration and reacquisition all run on the owner, so no release can be
+    // lost between this check and installing the scheduler wait.
+    let waits = env.ext.get_or_default::<CriticalWaits>();
+    if let std::collections::hash_map::Entry::Vacant(entry) = waits.0.entry(cs) {
+        let event = env.sys.objects.insert(Object::Event {
+            manual_reset: false,
+            signaled: false,
+        });
+        if event == 0 {
+            return Outcome::Fail("critical section wait resource limit exhausted".into());
+        }
+        entry.insert(CriticalWait {
+            event,
+            pending: Rc::new(Cell::new(0)),
+        });
+    }
+    let wait = &waits.0[&cs];
+    let event = wait.event;
+    wait.pending.set(wait.pending.get() + 1);
+    let ticket = CriticalTicket(wait.pending.clone());
+    // Discard an old unconsumed signal when somebody has already reacquired.
+    // Previously granted ready continuations keep their wake independently.
+    env.sys.reset_event(event);
+    Outcome::block(
+        Wait::Object {
+            handle: event,
+            deadline: None,
+        },
+        move |env, _| {
+            drop(ticket);
+            if env
+                .ext
+                .get_or_default::<CriticalWaits>()
+                .0
+                .get(&cs)
+                .is_none_or(|wait| wait.event != event)
+            {
+                return Outcome::Fail(format!("critical section {cs:#x} changed while waiting"));
+            }
+            enter_cs(env, cs)
+        },
+    )
 }
 
 fn leave_cs(env: &mut Env<'_>) -> Outcome {
@@ -64,6 +139,11 @@ fn leave_cs(env: &mut Env<'_>) -> Outcome {
     let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_sub(1));
     if rec == 1 {
         let _ = env.cpu.write_u32(cs + CS_OWNER, 0);
+        if let Some(wait) = env.ext.get_or_default::<CriticalWaits>().0.get(&cs)
+            && wait.pending.get() != 0
+        {
+            env.sys.set_event(wait.event);
+        }
     }
     Outcome::Return(0)
 }
@@ -250,8 +330,8 @@ fn release_mutex(env: &mut Env<'_>) -> Outcome {
     result
 }
 
-/// SLIST_HEADER (x86): `Next` pointer, then `Depth` and `Sequence` u16s. Guest threads never
-/// run concurrently, so the lock-free list is plain pushes and pops.
+/// SLIST_HEADER (x86): `Next`, then `Depth` and `Sequence` u16s. The interlocked
+/// entry points quiesce native leases before updating the list.
 fn slist(
     env: &mut Env<'_>,
     head: u32,
@@ -266,6 +346,123 @@ fn slist(
         .cpu
         .write_u32(head + 4, u32::from(depth2) | (seq2 << 16));
     Outcome::Return(ret)
+}
+
+#[cfg(all(test, windows, target_arch = "x86_64", target_env = "msvc"))]
+mod critical_tests {
+    use super::*;
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, Prot, asm::Asm},
+    };
+    use adv_machine::{Clock, Conv, Machine, RunResult, SliceResult, layout::PARK_ADDR};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Observed {
+        event: u32,
+        acquired: Vec<u32>,
+    }
+
+    #[test]
+    fn contended_critical_sections_park_wake_recurse_and_release_their_event() {
+        const CODE: u32 = 0x400000;
+        const CS: u32 = 0x410000;
+        for workers in [1, 2] {
+            let mut registry = Registry::default();
+            register(&mut registry);
+            registry.add("test", "hold", Conv::Stdcall { argc: 0 }, |e| {
+                Outcome::block_then_return(Wait::Until(e.sys.clock.now_us() + 3000), 0)
+            });
+            registry.add("test", "probe", Conv::Stdcall { argc: 0 }, |e| {
+                let wait = &e.ext.get_or_default::<CriticalWaits>().0[&CS];
+                assert_eq!(wait.pending.get(), 2);
+                let event = wait.event;
+                assert_eq!(e.cpu.read_u32(CS + CS_RECURSION).unwrap(), 1);
+                assert_eq!(e.sys.contexts.iter().filter(|c| matches!(c.waiting_on(), Some(Wait::Object {handle, ..}) if *handle == event)).count(), 2);
+                e.ext.get_mut::<Observed>().event = event;
+                Outcome::Return(0)
+            });
+            registry.add("test", "acquired", Conv::Stdcall { argc: 0 }, |e| {
+                assert_eq!(e.cpu.read_u32(CS + CS_OWNER).unwrap(), e.ctx().tid);
+                e.ext.get_mut::<Observed>().acquired.push(e.context);
+                Outcome::Return(0)
+            });
+            registry.add("test", "cleanup", Conv::Stdcall { argc: 0 }, |e| {
+                if e.ext.get::<Observed>().acquired.len() == 2 {
+                    release_cs_wait(e, CS).unwrap();
+                }
+                Outcome::ExitThread(0)
+            });
+            registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+                Outcome::ExitThread(0)
+            });
+            let mut cpu = JitCpu::new(PARK_ADDR, true).unwrap();
+            cpu.set_guest_workers(workers).unwrap();
+            let mut m = Machine::new(cpu, registry, Clock::real()).unwrap();
+            m.ext.insert(Observed::default());
+            m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+            m.cpu.map(CS, 4096, Prot::RW).unwrap();
+            m.set_frame_handoff(false);
+            let init = m.resolve_import(K32, "InitializeCriticalSection").unwrap();
+            let enter = m.resolve_import(K32, "EnterCriticalSection").unwrap();
+            let leave = m.resolve_import(K32, "LeaveCriticalSection").unwrap();
+            let hold = m.resolve_import("test", "hold").unwrap();
+            let probe = m.resolve_import("test", "probe").unwrap();
+            let acquired = m.resolve_import("test", "acquired").unwrap();
+            let cleanup = m.resolve_import("test", "cleanup").unwrap();
+            let done = m.resolve_import("test", "done").unwrap();
+            let mut owner = Asm::new(CODE);
+            owner
+                .push_imm(CS)
+                .call(init)
+                .push_imm(CS)
+                .call(enter)
+                .push_imm(CS)
+                .call(enter)
+                .call(hold)
+                .push_imm(CS)
+                .call(leave)
+                .call(probe)
+                .push_imm(CS)
+                .call(leave)
+                .call(done)
+                .hlt();
+            m.cpu.write(CODE, &owner.bytes).unwrap();
+            m.spawn("owner", CODE, &[], 65536).unwrap();
+            for index in 1..=2 {
+                let address = CODE + index * 256;
+                let mut waiter = Asm::new(address);
+                waiter
+                    .push_imm(CS)
+                    .call(enter)
+                    .call(acquired)
+                    .push_imm(CS)
+                    .call(leave)
+                    .call(cleanup)
+                    .hlt();
+                m.cpu.write(address, &waiter.bytes).unwrap();
+                m.spawn("waiter", address, &[], 65536).unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                assert!(Instant::now() < deadline);
+                match m.run_slice(Duration::from_millis(8)) {
+                    SliceResult::Complete(RunResult::Exited(_)) => break,
+                    SliceResult::Complete(RunResult::Failed(error)) => panic!("{error}"),
+                    SliceResult::Complete(RunResult::Idle { .. }) => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    _ => {}
+                }
+            }
+            let observed = m.ext.get::<Observed>();
+            assert_eq!(observed.acquired.len(), 2);
+            assert_ne!(observed.acquired[0], observed.acquired[1]);
+            assert!(m.sys.objects.get(observed.event).is_none());
+            assert!(m.ext.get::<CriticalWaits>().0.is_empty());
+        }
+    }
 }
 
 pub(super) fn register(reg: &mut Registry) {
@@ -310,7 +507,16 @@ pub(super) fn register(reg: &mut Registry) {
         init_cs,
     );
     stdcall(reg, K32, "InitializeCriticalSectionEx", 3, init_cs);
-    stdcall(reg, K32, "DeleteCriticalSection", 1, |_| Outcome::Return(0));
+    stdcall(
+        reg,
+        K32,
+        "DeleteCriticalSection",
+        1,
+        |e| match release_cs_wait(e, e.arg(0)) {
+            Ok(()) => Outcome::Return(0),
+            Err(error) => Outcome::Fail(error),
+        },
+    );
     stdcall(reg, K32, "EnterCriticalSection", 1, |e| {
         let cs = e.arg(0);
         enter_cs(e, cs)

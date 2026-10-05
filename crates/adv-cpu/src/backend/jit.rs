@@ -358,6 +358,18 @@ impl Backend for JitCpu {
     fn parallel_capacity_available(&self) -> bool {
         true // the controller's inline execution lane is always available
     }
+    fn dispatch_ready_context(
+        &mut self,
+        context: &Self::Context,
+        duration: Duration,
+        guest_us: u64,
+    ) -> Result<Option<u64>, String> {
+        let Some(context) = context else {
+            return Ok(None);
+        };
+        self.inner
+            .dispatch_ready_context(context, self.park, duration, guest_us)
+    }
     fn set_parallel_demand(&mut self, ready_peer: bool) {
         self.inner.parallel_demand = ready_peer;
     }
