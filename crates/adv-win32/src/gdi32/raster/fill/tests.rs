@@ -277,3 +277,31 @@ fn get_pixel_reads_back_set_pixel() {
         Outcome::Return(CLR_INVALID)
     ));
 }
+
+#[test]
+fn pat_blt_fills_with_brush_or_rop() {
+    let (mut machine, _data, dc, _pixels) = fixture(4, 4, PixelFormat::Bgra32, false);
+    // Fill all with WHITENESS (0x00FF0062)
+    assert!(matches!(
+        pat_blt(&mut env(&mut machine), Handle(dc), 0, 0, 4, 4, WHITENESS),
+        Outcome::Return(1)
+    ));
+    assert!(matches!(
+        get_pixel(&mut env(&mut machine), Handle(dc), 0, 0),
+        Outcome::Return(0x00ffffff)
+    ));
+    // Fill 2x2 with BLACKNESS (0x00000042)
+    assert!(matches!(
+        pat_blt(&mut env(&mut machine), Handle(dc), 1, 1, 2, 2, BLACKNESS),
+        Outcome::Return(1)
+    ));
+    assert!(matches!(
+        get_pixel(&mut env(&mut machine), Handle(dc), 1, 1),
+        Outcome::Return(0)
+    ));
+    // Corner outside 2x2 remains white
+    assert!(matches!(
+        get_pixel(&mut env(&mut machine), Handle(dc), 0, 0),
+        Outcome::Return(0x00ffffff)
+    ));
+}

@@ -2,7 +2,7 @@
 //! translate into the shared device implementation.
 
 use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, win32};
-use adv_cpu::backend::Prot;
+use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
 use crate::Win32;
@@ -217,9 +217,29 @@ fn create_font_a(
 fn create_solid_brush(env: &mut Env<'_>, color: u32) -> Outcome {
     Outcome::Return(add(env, GdiObj::Brush { color }))
 }
+#[win32(gdi32, name = "CreateBrushIndirect", level = implement)]
+fn create_brush_indirect(env: &mut Env<'_>, plbrush: GuestPtr<()>) -> Outcome {
+    if plbrush.is_null() {
+        return Outcome::Return(0);
+    }
+    if adv_abi::guest::check_range(env.cpu, plbrush.addr(), 12, adv_cpu::backend::Prot::READ).is_err() {
+        return Outcome::Return(0);
+    }
+    let style = env.cpu.read_u32(plbrush.addr()).unwrap_or(0);
+    let color = env.cpu.read_u32(plbrush.addr() + 4).unwrap_or(0);
+    if style == 1 {
+        // BS_HOLLOW / BS_NULL
+        return Outcome::Return(stock_object(5));
+    }
+    Outcome::Return(add(env, GdiObj::Brush { color }))
+}
 #[win32(gdi32, name = "CreatePen", level = implement)]
 fn create_pen(env: &mut Env<'_>, _style: i32, _width: i32, color: u32) -> Outcome {
     Outcome::Return(add(env, GdiObj::Pen { color }))
+}
+#[win32(gdi32, name = "UnrealizeObject", level = implement)]
+fn unrealize_object(_env: &mut Env<'_>, _h: Handle) -> Outcome {
+    Outcome::Return(1)
 }
 
 pub(super) fn delete_object_value(env: &mut Env<'_>, h: u32) -> Outcome {
@@ -483,6 +503,52 @@ fn set_bk_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
     dc_field(env, dc.0, |_, _, m| std::mem::replace(m, mode as u32))
 }
 
+#[win32(gdi32, name = "MoveToEx", level = implement)]
+fn move_to_ex(
+    env: &mut Env<'_>,
+    dc: Handle,
+    _x: i32,
+    _y: i32,
+    lppt: GuestPtr<adv_abi::types::POINT>,
+) -> Outcome {
+    let Some(GdiObj::Dc { .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0) else {
+        return Outcome::Return(0);
+    };
+    if !lppt.is_null() {
+        if adv_abi::guest::check_range(env.cpu, lppt.addr(), 8, adv_cpu::backend::Prot::WRITE).is_err() {
+            return Outcome::Return(0);
+        }
+        let _ = lppt.write(env.cpu, adv_abi::types::POINT { x: 0, y: 0 });
+    }
+    Outcome::Return(1)
+}
+
+#[win32(gdi32, name = "LineTo", level = implement)]
+fn line_to(env: &mut Env<'_>, dc: Handle, _x: i32, _y: i32) -> Outcome {
+    let Some(GdiObj::Dc { .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0) else {
+        return Outcome::Return(0);
+    };
+    Outcome::Return(1)
+}
+
+#[win32(gdi32, name = "GetCurrentPositionEx", level = implement)]
+fn get_current_position_ex(
+    env: &mut Env<'_>,
+    dc: Handle,
+    lppt: GuestPtr<adv_abi::types::POINT>,
+) -> Outcome {
+    let Some(GdiObj::Dc { .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0) else {
+        return Outcome::Return(0);
+    };
+    if !lppt.is_null() {
+        if adv_abi::guest::check_range(env.cpu, lppt.addr(), 8, adv_cpu::backend::Prot::WRITE).is_err() {
+            return Outcome::Return(0);
+        }
+        let _ = lppt.write(env.cpu, adv_abi::types::POINT { x: 0, y: 0 });
+    }
+    Outcome::Return(1)
+}
+
 pub fn register(reg: &mut Registry) {
     palette::register(reg);
     for api in [
@@ -490,6 +556,7 @@ pub fn register(reg: &mut Registry) {
         create_font_indirect_a_ABI,
         create_font_a_ABI,
         create_solid_brush_ABI,
+        create_brush_indirect_ABI,
         create_pen_ABI,
         get_object_a_ABI,
         create_bitmap_ABI,
@@ -498,6 +565,10 @@ pub fn register(reg: &mut Registry) {
         set_text_color_ABI,
         set_bk_color_ABI,
         set_bk_mode_ABI,
+        move_to_ex_ABI,
+        line_to_ABI,
+        get_current_position_ex_ABI,
+        unrealize_object_ABI,
     ] {
         reg.register(api);
     }

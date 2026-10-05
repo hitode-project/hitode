@@ -109,6 +109,8 @@ pub fn register(r: &mut Registry) {
         ("strtoul", 3),
         ("_mbsinc", 1),
         ("_mbsnbcpy", 3),
+        ("_ismbblead", 1),
+        ("_ismbbtrail", 1),
         ("_splitpath", 5),
         ("_makepath", 5),
         ("_beginthread", 3),
@@ -149,6 +151,8 @@ pub fn register(r: &mut Registry) {
             ("_encoded_null", 0),
             ("time", 1),
             ("_time32", 1),
+            ("_ismbblead", 1),
+            ("_ismbbtrail", 1),
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
@@ -659,6 +663,34 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 a.wrapping_add(2)
             } else {
                 a.wrapping_add(1)
+            }
+        }
+        "_ismbblead" => {
+            let acp = e.ext.get::<crate::Win32>().codec.acp;
+            let byte = a as u8;
+            let is_lead = a <= 0xff
+                && match acp {
+                    936 => (0x81..=0xfe).contains(&byte),
+                    _ => (0x81..=0x9f).contains(&byte) || (0xe0..=0xfc).contains(&byte),
+                };
+            if is_lead {
+                1
+            } else {
+                0
+            }
+        }
+        "_ismbbtrail" => {
+            let acp = e.ext.get::<crate::Win32>().codec.acp;
+            let byte = a as u8;
+            let is_trail = a <= 0xff
+                && match acp {
+                    936 => (0x40..=0x7e).contains(&byte) || (0x80..=0xfe).contains(&byte),
+                    _ => (0x40..=0x7e).contains(&byte) || (0x80..=0xfc).contains(&byte),
+                };
+            if is_trail {
+                1
+            } else {
+                0
             }
         }
         "_mbsnbcpy" => {

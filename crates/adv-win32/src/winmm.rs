@@ -41,10 +41,31 @@ pub fn register(registry: &mut Registry) {
         ("timeKillEvent", 1, kill_event),
         ("waveOutGetNumDevs", 0, wave_out_get_num_devs),
         ("waveOutGetDevCapsA", 3, wave_out_get_dev_caps_a),
+        ("mixerGetNumDevs", 0, mixer_get_num_devs),
+        ("mixerOpen", 5, mixer_open),
+        ("mixerClose", 1, mixer_close),
+        ("midiOutGetNumDevs", 0, midi_out_get_num_devs),
+        ("midiOutGetDevCapsA", 3, midi_out_get_dev_caps_a),
         (WORKER, 0, worker),
     ] {
         crate::stdcall(registry, "winmm.dll", name, argc, handler);
     }
+}
+
+fn mixer_get_num_devs(_env: &mut Env<'_>) -> Outcome {
+    Outcome::Return(0)
+}
+
+fn mixer_open(env: &mut Env<'_>) -> Outcome {
+    let phmx = env.arg(0);
+    if phmx == 0 {
+        return Outcome::Return(11); // MMSYSERR_INVALPARAM
+    }
+    Outcome::Return(6) // MMSYSERR_NODRIVER
+}
+
+fn mixer_close(_env: &mut Env<'_>) -> Outcome {
+    Outcome::Return(0) // MMSYSERR_NOERROR
 }
 
 fn wave_out_get_num_devs(_env: &mut Env<'_>) -> Outcome {
@@ -69,6 +90,42 @@ fn wave_out_get_dev_caps_a(env: &mut Env<'_>) -> Outcome {
     caps[40..44].copy_from_slice(&0x000f_ffffu32.to_le_bytes());
     // wChannels = 2
     caps[44..46].copy_from_slice(&2u16.to_le_bytes());
+    // dwSupport = 0
+    caps[48..52].copy_from_slice(&0u32.to_le_bytes());
+
+    let write_len = (size as usize).min(caps.len());
+    if env.cpu.write(output, &caps[..write_len]).is_err() {
+        return Outcome::Return(11); // MMSYSERR_INVALPARAM
+    }
+    Outcome::Return(0) // MMSYSERR_NOERROR
+}
+
+fn midi_out_get_num_devs(_env: &mut Env<'_>) -> Outcome {
+    Outcome::Return(1)
+}
+
+fn midi_out_get_dev_caps_a(env: &mut Env<'_>) -> Outcome {
+    let (device_id, output, size) = (env.arg(0), env.arg(1), env.arg(2));
+    if device_id != 0xffff_ffff && device_id != 0 {
+        return Outcome::Return(2); // MMSYSERR_BADDEVICEID
+    }
+    if output == 0 || size == 0 {
+        return Outcome::Return(11); // MMSYSERR_INVALPARAM
+    }
+    let mut caps = [0u8; 52];
+    caps[0..2].copy_from_slice(&1u16.to_le_bytes()); // wMid = 1 (MM_MICROSOFT)
+    caps[2..4].copy_from_slice(&1u16.to_le_bytes()); // wPid = 1 (MM_MSFT_GENERIC_MIDIOUT)
+    caps[4..8].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // vDriverVersion = 1.0
+    let name = b"Generic MIDI Output\0";
+    caps[8..8 + name.len()].copy_from_slice(name);
+    // wTechnology: MOD_SWSYNTH = 7
+    caps[40..42].copy_from_slice(&7u16.to_le_bytes());
+    // wVoices = 32
+    caps[42..44].copy_from_slice(&32u16.to_le_bytes());
+    // wNotes = 32
+    caps[44..46].copy_from_slice(&32u16.to_le_bytes());
+    // wChannelMask = 0xffff
+    caps[46..48].copy_from_slice(&0xffffu16.to_le_bytes());
     // dwSupport = 0
     caps[48..52].copy_from_slice(&0u32.to_le_bytes());
 
