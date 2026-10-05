@@ -22,6 +22,7 @@ struct Options {
     compile_strategy: CompileStrategy,
     region_linking: bool,
     async_compilation: bool,
+    tiered_compilation: bool,
     codepage: u32,
     headless: bool,
     hidden: bool,
@@ -51,6 +52,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
+  --no-tiering            keep automatic regions at the selected compile strategy\n\
   --no-region-linking     return to the dispatcher between native regions\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
   --codepage 932|936      guest ANSI encoding: Japanese or GBK (default: 932)\n\
@@ -86,6 +88,7 @@ impl Options {
             compile_strategy: CompileStrategy::Fast,
             region_linking: true,
             async_compilation: true,
+            tiered_compilation: true,
             codepage: 932,
             headless: false,
             hidden: false,
@@ -153,6 +156,7 @@ impl Options {
                         _ => return Err("--compile must be fast or speed".into()),
                     };
                 }
+                "--no-tiering" => options.tiered_compilation = false,
                 "--no-region-linking" => options.region_linking = false,
                 "--sync-compilation" => options.async_compilation = false,
                 "--headless" => options.headless = true,
@@ -464,13 +468,17 @@ fn build_report(context: ReportContext<'_>) -> String {
         "{{\"name\": {}, \"kind\": {}, \"base\": \"{:#010x}\", \"size\": {}, \"exports\": {}}}",
         json(&module.name), json(&format!("{:?}", module.kind)), module.base, module.size, module.exports_by_name.len()
     )).collect::<Vec<_>>().join(", ");
+    let context_runs = runtime.machine.sys.scheduling.contexts.iter().enumerate()
+        .map(|(id, r)| format!("{{\"id\":{id},\"runs\":{},\"owner_wall_ns\":{},\"host_calls\":{},\"competing_wall_ns\":{},\"parallel_dispatches\":{}}}",
+            r.runs, r.owner_wall_ns, r.host_calls, r.competing_wall_ns, r.parallel_dispatches))
+        .collect::<Vec<_>>().join(",");
     format!(
         concat!(
             "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
             "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
-            "  \"parallel\": {},\n",
+            "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
@@ -502,6 +510,11 @@ fn build_report(context: ReportContext<'_>) -> String {
         wait_time.as_secs_f64(),
         inputs,
         parallel_json,
+        context_runs,
+        options.jit
+            && options.async_compilation
+            && options.tiered_compilation
+            && options.guest_workers == 1,
         runtime.machine.sys.host_calls,
         stats.native_entries,
         stats.interpreter_entries,
@@ -736,6 +749,11 @@ fn run_execution(
         .machine
         .cpu
         .set_auto_compile_strategy(options.compile_strategy);
+    runtime
+        .machine
+        .cpu
+        .executor_mut()
+        .set_tiered_compilation(options.tiered_compilation);
     runtime
         .machine
         .cpu
@@ -1293,15 +1311,22 @@ pub fn run_cli() -> std::process::ExitCode {
 /// Wall-time overlap includes the inline lane's API work; it is not CPU usage.
 fn parallel_report(p: &adv_runtime::ParallelStats) -> String {
     format!(
-        "{{\"workers\":{},\"submitted\":{},\"completed\":{},\"worker_run_ns\":{},\"overlap_ns\":{},\"max_running\":{},\"traps\":{},\"cold_retries\":{},\"quantum_returns\":{},\"quiescence_waits\":{},\"quiescence_wait_ns\":{},\"quiescence_wait_max_ns\":{}}}",
+        "{{\"workers\":{},\"submitted\":{},\"completed\":{},\"worker_run_ns\":{},\"queue_wait_ns\":{},\"queue_wait_max_ns\":{},\"image_builds\":{},\"image_build_ns\":{},\"empty_jobs\":{},\"short_traps\":{},\"overlap_ns\":{},\"max_running\":{},\"traps\":{},\"cold_retries\":{},\"cache_misses\":{},\"quantum_returns\":{},\"quiescence_waits\":{},\"quiescence_wait_ns\":{},\"quiescence_wait_max_ns\":{}}}",
         p.workers,
         p.submitted,
         p.completed,
         p.worker_run_ns,
+        p.queue_wait_ns,
+        p.queue_wait_max_ns,
+        p.image_builds,
+        p.image_build_ns,
+        p.empty_jobs,
+        p.short_traps,
         p.overlap_ns,
         p.max_running,
         p.traps,
         p.cold_retries,
+        p.cache_misses,
         p.quantum_returns,
         p.quiescence_waits,
         p.quiescence_wait_ns,

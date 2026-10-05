@@ -1809,12 +1809,13 @@ impl<B: Backend> Machine<B> {
             let run_started = Instant::now();
             // A polling/yielded peer has no useful work to overlap yet. Its
             // message/signal wake clears yielded before it can demand a worker.
-            self.cpu.set_parallel_demand(
-                self.sys
-                    .contexts
-                    .iter()
-                    .any(|c| c.id != id && c.is_ready() && !c.yielded),
-            );
+            let ready_peer = self
+                .sys
+                .contexts
+                .iter()
+                .any(|c| c.id != id && c.is_ready() && !c.yielded);
+            self.cpu.set_parallel_demand(ready_peer);
+            let calls_before = self.sys.host_calls;
             let t0 = self.sys.stats.start();
             let frame_before = self.sys.completed_frames;
             let mut d = Dispatch {
@@ -1828,10 +1829,16 @@ impl<B: Backend> Machine<B> {
             };
             let exit = self.cpu.run(&mut d);
             let parked = d.parked.take();
+            let run_elapsed = run_started.elapsed();
+            self.sys.scheduling.context_run(
+                id as usize,
+                run_elapsed,
+                self.sys.host_calls.saturating_sub(calls_before),
+                ready_peer,
+                matches!(exit, Exit::Dispatched { .. }),
+            );
             if let Some(allowance) = allowance {
-                self.sys
-                    .scheduling
-                    .cpu_run(allowance.duration, run_started.elapsed());
+                self.sys.scheduling.cpu_run(allowance.duration, run_elapsed);
             }
             if let Some(t0) = t0 {
                 self.sys.stats.total.run_ns += t0.elapsed().as_nanos() as u64;

@@ -36,11 +36,24 @@ impl Allowance {
     }
 }
 
+/// Owner-lane service per guest context. Includes inline native/interpreted work,
+/// synchronous API handlers and dispatch setup; excludes background worker time
+/// and continuations resumed outside Backend::run. Not CPU utilization.
+#[derive(Clone, Debug, Default)]
+pub struct ContextRunStats {
+    pub runs: u64,
+    pub owner_wall_ns: u64,
+    pub host_calls: u64,
+    pub competing_wall_ns: u64,
+    pub parallel_dispatches: u64,
+}
+
 /// Cheap cumulative diagnostics. Wake lateness is sampled when the scheduler observes
 /// a timed wait becoming ready, NOT when that thread subsequently executes.
 /// Counters are host observations; no timing is inferred from guest instruction fuel.
 #[derive(Clone, Debug, Default)]
 pub struct SchedulingStats {
+    pub contexts: Vec<ContextRunStats>,
     pub external_interrupts: u64,
     pub internal_preemptions: u64,
     pub polling_rounds: u64,
@@ -77,6 +90,27 @@ pub(crate) fn reschedule_after(
 }
 
 impl SchedulingStats {
+    pub(crate) fn context_run(
+        &mut self,
+        id: usize,
+        wall: Duration,
+        calls: u64,
+        competing: bool,
+        dispatched: bool,
+    ) {
+        self.contexts
+            .resize_with(self.contexts.len().max(id + 1), Default::default);
+        let row = &mut self.contexts[id];
+        let ns = wall.as_nanos().min(u128::from(u64::MAX)) as u64;
+        row.runs += 1;
+        row.owner_wall_ns = row.owner_wall_ns.saturating_add(ns);
+        row.host_calls += calls;
+        row.competing_wall_ns =
+            row.competing_wall_ns
+                .saturating_add(if competing { ns } else { 0 });
+        row.parallel_dispatches += u64::from(dispatched);
+    }
+
     pub(crate) fn dispatch(
         &mut self,
         stamp: Option<crate::wake_queue::WakeStamp>,

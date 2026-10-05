@@ -88,6 +88,8 @@ def run(args: argparse.Namespace) -> None:
     command.extend(["--guest-workers", str(args.guest_workers)])
     if args.sync_compilation:
         command.append("--sync-compilation")
+    if args.no_tiering:
+        command.append("--no-tiering")
     acknowledgement: queue.Queue[str | None] = queue.Queue()
     actions = []
     metadata = {"command": command, "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -199,6 +201,8 @@ if __name__ == "__main__":
     parser.add_argument("--capture-audio", action="store_true", help="capture actual callbacks and source PCM; hardware receives zeros; excludes performance comparisons")
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--sync-compilation", action="store_true")
+    parser.add_argument("--no-tiering", action="store_true",
+                        help="disable Fast-to-Speed promotion for matched worker comparisons")
     parser.add_argument("--tail-seconds", type=float, default=3)
     options = parser.parse_args()
     if not math.isfinite(options.tail_seconds) or not 0 <= options.tail_seconds <= 3600:
