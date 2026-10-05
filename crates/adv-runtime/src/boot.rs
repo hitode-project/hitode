@@ -284,6 +284,19 @@ impl<B: Backend> Runtime<B> {
         // intermediate guest frame would only repeat the outer service loop.
         self.machine.set_frame_handoff(false);
     }
+    /// Explicit bounded, read-only diagnostics at a completed execution boundary.
+    pub fn inspect_memory(&self, address: u32, len: u32) -> Result<Vec<u8>, String> {
+        if !(1..=64).contains(&len) {
+            return Err("diagnostic memory length must be 1..=64".into());
+        }
+        let mut bytes = vec![0; len as usize];
+        self.machine
+            .cpu
+            .read(address, &mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+
     pub fn set_host_keys(&mut self, keys: std::sync::Arc<adv_sync::input::KeyState>) {
         self.machine.ext.get_mut::<Win32>().user.host_keys = Some(keys);
     }

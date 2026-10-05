@@ -1011,6 +1011,16 @@ fn run_execution(
                             Err("key has no guest target window".into())
                         }
                     }
+                    control::Command::Memory(address, len) => {
+                        runtime.inspect_memory(address, len).map(|bytes| {
+                            let hex = bytes
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>()
+                                .join("");
+                            format!("memory {address:#010x} {hex}")
+                        })
+                    }
                     control::Command::Capture(path) => {
                         runtime.capture_latest_frame()?;
                         save_frame(&path, runtime.frame())

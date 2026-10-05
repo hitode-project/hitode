@@ -22,6 +22,7 @@ pub enum Command {
     DialogClose,
     Capture(PathBuf),
     Report(PathBuf),
+    Memory(u32, u32),
     ResetMetrics,
     Close,
     Error(String),
@@ -77,6 +78,20 @@ impl Command {
                     _ => Self::Key(key),
                 })
             }
+            "memory" => {
+                let mut fields = rest.split_whitespace();
+                let address = fields.next().ok_or("memory requires ADDRESS LENGTH")?;
+                let address = if let Some(hex) = address.strip_prefix("0x") {
+                    u32::from_str_radix(hex, 16)
+                } else { address.parse() }.map_err(|_| "invalid guest address")?;
+                let len: u32 = fields.next().ok_or("memory requires LENGTH")?
+                    .parse().map_err(|_| "invalid memory length")?;
+                if !(1..=64).contains(&len) || fields.next().is_some()
+                    || u64::from(address) + u64::from(len) > 1u64 << 32 {
+                    return Err("memory range must be 1..=64 bytes inside guest address space".into());
+                }
+                Ok(Self::Memory(address, len))
+            }
             "capture" | "report" => {
                 if rest.is_empty() {
                     return Err(format!("{command} requires a path"));
@@ -95,7 +110,7 @@ impl Command {
             "close" if rest.is_empty() => Ok(Self::Close),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click X Y, key/key-down/key-up VK, menus, menu ID, capture PATH, report PATH, reset-metrics or close"
+                "expected click X Y, key/key-down/key-up VK, menus, menu ID, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics or close"
                     .into(),
             ),
         }
@@ -391,6 +406,10 @@ mod tests {
         assert_eq!(Command::parse("dialog-close"), Ok(Command::DialogClose));
         assert_eq!(Command::parse("reset-metrics"), Ok(Command::ResetMetrics));
         assert_eq!(
+            Command::parse("memory 0x400000 16"),
+            Ok(Command::Memory(0x400000, 16))
+        );
+        assert_eq!(
             Command::parse("capture target/a frame.png"),
             Ok(Command::Capture("target/a frame.png".into()))
         );
@@ -406,6 +425,10 @@ mod tests {
             "capture",
             "close extra",
             "reset-metrics extra",
+            "memory 0xffffffff 2",
+            "memory 0x400000 65",
+            "memory 0x400000 0",
+            "memory 0x400000 4 extra",
             "garbage",
         ] {
             assert!(Command::parse(line).is_err(), "{line}");
