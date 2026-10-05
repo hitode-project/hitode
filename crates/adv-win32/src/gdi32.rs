@@ -3,6 +3,7 @@
 
 use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
+use adv_device::surface::SurfaceStore;
 use adv_machine::{Env, Outcome};
 
 use crate::Win32;
@@ -549,6 +550,244 @@ fn get_current_position_ex(
     Outcome::Return(1)
 }
 
+#[win32(gdi32, name = "SetDIBits", level = implement)]
+fn set_di_bits(
+    env: &mut Env<'_>,
+    _dc: Handle,
+    hbm: Handle,
+    start: u32,
+    lines: u32,
+    bits: GuestPtr<()>,
+    info: GuestPtr<()>,
+    _usage: u32,
+) -> Outcome {
+    if hbm.0 == 0 || lines == 0 || bits.is_null() || info.is_null() {
+        return Outcome::Return(0);
+    }
+    let mut header = [0u8; 40];
+    if adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err()
+        || env.cpu.read(info.addr(), &mut header).is_err()
+    {
+        return Outcome::Return(0);
+    }
+    let bi_size = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    if bi_size < 40 {
+        return Outcome::Return(0);
+    }
+    let bi_width = i32::from_le_bytes(header[4..8].try_into().unwrap());
+    let bi_height = i32::from_le_bytes(header[8..12].try_into().unwrap());
+    let bi_planes = u16::from_le_bytes(header[12..14].try_into().unwrap());
+    let bi_bit_count = u16::from_le_bytes(header[14..16].try_into().unwrap());
+    let bi_compression = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let bi_clr_used = u32::from_le_bytes(header[32..36].try_into().unwrap());
+
+    if bi_width <= 0 || bi_height == 0 || bi_planes != 1 {
+        return Outcome::Return(0);
+    }
+
+    let src_w = bi_width as u32;
+    let src_h = bi_height.unsigned_abs();
+    let src_bottom_up = bi_height > 0;
+    let src_bpp = bi_bit_count;
+
+    if start >= src_h {
+        return Outcome::Return(0);
+    }
+    let count = lines.min(src_h - start);
+    if count == 0 {
+        return Outcome::Return(0);
+    }
+
+    let Some(src_row_bits) = src_w.checked_mul(src_bpp as u32) else {
+        return Outcome::Return(0);
+    };
+    let src_pitch = (src_row_bits + 31) / 32 * 4;
+    let Some(src_bytes) = src_pitch.checked_mul(count) else {
+        return Outcome::Return(0);
+    };
+    if adv_abi::guest::check_range(env.cpu, bits.addr(), src_bytes, Prot::READ).is_err() {
+        return Outcome::Return(0);
+    }
+
+    let mut palette = [[0u8; 4]; 256];
+    if src_bpp <= 8 {
+        let num_colors = if bi_clr_used > 0 && bi_clr_used <= 256 {
+            bi_clr_used as usize
+        } else {
+            1usize << src_bpp
+        };
+        let pal_addr = info.addr() + bi_size;
+        let mut pal_bytes = vec![0u8; num_colors * 4];
+        if env.cpu.read(pal_addr, &mut pal_bytes).is_ok() {
+            for (entry, chunk) in palette.iter_mut().zip(pal_bytes.chunks_exact(4)) {
+                *entry = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            }
+        }
+    }
+
+    let bitmap_meta = match env.ext.get::<Win32>().gdi.get(&env.sys.objects, hbm.0) {
+        Some(GdiObj::Bitmap {
+            width,
+            height,
+            bpp,
+            bits: dst_bits,
+            stride: dst_pitch,
+            ..
+        }) => Some((*width, *height, *bpp, *dst_bits, *dst_pitch)),
+        _ => None,
+    };
+
+    let (dst_w, dst_h, dst_bpp, dst_bits, dst_pitch) = if let Some(meta) = bitmap_meta {
+        meta
+    } else if let Some(store) = env.ext.try_get::<SurfaceStore>() {
+        if let Some(surf) = store.get(hbm.0) {
+            (
+                surf.width as i32,
+                if surf.bottom_up {
+                    surf.height as i32
+                } else {
+                    -(surf.height as i32)
+                },
+                (surf.format.bytes() * 8) as u16,
+                surf.pixels,
+                surf.pitch,
+            )
+        } else {
+            return Outcome::Return(0);
+        }
+    } else {
+        return Outcome::Return(0);
+    };
+
+    let dest_h = dst_h.unsigned_abs();
+    let actual_lines = count.min(dest_h.saturating_sub(start));
+
+    for l in 0..actual_lines {
+        let src_line_addr = bits.addr() + l * src_pitch;
+        let dst_y = if src_bottom_up {
+            dest_h - 1 - (start + l)
+        } else {
+            start + l
+        };
+        if dst_y >= dest_h {
+            continue;
+        }
+        let dst_line_addr = dst_bits + dst_y * dst_pitch;
+
+        if src_bpp == dst_bpp {
+            let row_len = (src_w * (src_bpp as u32) / 8).min(dst_pitch);
+            let mut row = vec![0u8; row_len as usize];
+            if env.cpu.read(src_line_addr, &mut row).is_ok() {
+                let _ = env.cpu.write(dst_line_addr, &row);
+            }
+        } else if src_bpp == 24 && dst_bpp == 32 {
+            let copy_w = src_w.min(dst_w as u32);
+            let mut src_pixels = vec![0u8; (copy_w * 3) as usize];
+            if env.cpu.read(src_line_addr, &mut src_pixels).is_ok() {
+                let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
+                for (s_pix, d_pix) in src_pixels.chunks_exact(3).zip(dst_pixels.chunks_exact_mut(4)) {
+                    d_pix[0] = s_pix[0];
+                    d_pix[1] = s_pix[1];
+                    d_pix[2] = s_pix[2];
+                    d_pix[3] = 0xff;
+                }
+                let write_len = ((copy_w * 4).min(dst_pitch)) as usize;
+                let _ = env.cpu.write(dst_line_addr, &dst_pixels[..write_len]);
+            }
+        } else if src_bpp == 8 && dst_bpp == 32 {
+            let copy_w = src_w.min(dst_w as u32);
+            let mut src_indices = vec![0u8; copy_w as usize];
+            if env.cpu.read(src_line_addr, &mut src_indices).is_ok() {
+                let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
+                for (idx, d_pix) in src_indices.iter().zip(dst_pixels.chunks_exact_mut(4)) {
+                    let pal = palette[*idx as usize];
+                    d_pix[0] = pal[0];
+                    d_pix[1] = pal[1];
+                    d_pix[2] = pal[2];
+                    d_pix[3] = 0xff;
+                }
+                let write_len = ((copy_w * 4).min(dst_pitch)) as usize;
+                let _ = env.cpu.write(dst_line_addr, &dst_pixels[..write_len]);
+            }
+        } else if src_bpp == 16 && dst_bpp == 32 {
+            let copy_w = src_w.min(dst_w as u32);
+            let mut src_words = vec![0u8; (copy_w * 2) as usize];
+            if env.cpu.read(src_line_addr, &mut src_words).is_ok() {
+                let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
+                let is_565 = bi_compression == 3;
+                for (s_pix, d_pix) in src_words.chunks_exact(2).zip(dst_pixels.chunks_exact_mut(4)) {
+                    let w = u16::from_le_bytes([s_pix[0], s_pix[1]]);
+                    let (r, g, b) = if is_565 {
+                        (((w >> 11) & 0x1f) * 255 / 31, ((w >> 5) & 0x3f) * 255 / 63, (w & 0x1f) * 255 / 31)
+                    } else {
+                        (((w >> 10) & 0x1f) * 255 / 31, ((w >> 5) & 0x1f) * 255 / 31, (w & 0x1f) * 255 / 31)
+                    };
+                    d_pix[0] = b as u8;
+                    d_pix[1] = g as u8;
+                    d_pix[2] = r as u8;
+                    d_pix[3] = 0xff;
+                }
+                let write_len = ((copy_w * 4).min(dst_pitch)) as usize;
+                let _ = env.cpu.write(dst_line_addr, &dst_pixels[..write_len]);
+            }
+        } else if src_bpp == 32 && dst_bpp == 24 {
+            let copy_w = src_w.min(dst_w as u32);
+            let mut src_pixels = vec![0u8; (copy_w * 4) as usize];
+            if env.cpu.read(src_line_addr, &mut src_pixels).is_ok() {
+                let mut dst_pixels = vec![0u8; (copy_w * 3) as usize];
+                for (s_pix, d_pix) in src_pixels.chunks_exact(4).zip(dst_pixels.chunks_exact_mut(3)) {
+                    d_pix[0] = s_pix[0];
+                    d_pix[1] = s_pix[1];
+                    d_pix[2] = s_pix[2];
+                }
+                let write_len = ((copy_w * 3).min(dst_pitch)) as usize;
+                let _ = env.cpu.write(dst_line_addr, &dst_pixels[..write_len]);
+            }
+        }
+    }
+
+    if let Some(store) = env.ext.try_get_mut::<SurfaceStore>() {
+        if let Some(surf) = store.get_mut(hbm.0) {
+            surf.version = surf.version.wrapping_add(1);
+        }
+    }
+
+    Outcome::Return(actual_lines)
+}
+
+#[win32(gdi32, name = "CreateDIBitmap", level = implement)]
+fn create_di_bitmap(
+    env: &mut Env<'_>,
+    hdc: Handle,
+    pbmih: GuestPtr<()>,
+    fl_init: u32,
+    pj_bits: GuestPtr<()>,
+    pbmi: GuestPtr<()>,
+    usage: u32,
+) -> Outcome {
+    if pbmih.is_null() {
+        return Outcome::Return(0);
+    }
+    let mut header = [0u8; 40];
+    if adv_abi::guest::check_range(env.cpu, pbmih.addr(), 40, Prot::READ).is_err()
+        || env.cpu.read(pbmih.addr(), &mut header).is_err()
+    {
+        return Outcome::Return(0);
+    }
+    let width = i32::from_le_bytes(header[4..8].try_into().unwrap());
+    let height = i32::from_le_bytes(header[8..12].try_into().unwrap());
+    let hbm = new_bitmap(env, width.abs(), height.abs(), 32).map_or(0, |(h, _)| h);
+    if hbm == 0 {
+        return Outcome::Return(0);
+    }
+    // CBM_INIT = 4
+    if (fl_init & 4) != 0 && !pj_bits.is_null() && !pbmi.is_null() {
+        let lines = height.unsigned_abs();
+        set_di_bits(env, hdc, Handle(hbm), 0, lines, pj_bits, pbmi, usage);
+    }
+    Outcome::Return(hbm)
+}
+
 pub fn register(reg: &mut Registry) {
     palette::register(reg);
     for api in [
@@ -569,6 +808,8 @@ pub fn register(reg: &mut Registry) {
         line_to_ABI,
         get_current_position_ex_ABI,
         unrealize_object_ABI,
+        set_di_bits_ABI,
+        create_di_bitmap_ABI,
     ] {
         reg.register(api);
     }

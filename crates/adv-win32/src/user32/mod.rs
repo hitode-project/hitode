@@ -610,6 +610,16 @@ pub fn register(reg: &mut Registry) {
     s(reg, "GetCursorPos", 1, get_cursor_pos);
     s(reg, "SetCursorPos", 2, set_cursor_pos);
     s(reg, "ClipCursor", 1, |_| Outcome::Return(1));
+    s(reg, "GetPropA", 2, |_| Outcome::Return(0));
+    s(reg, "SetPropA", 3, |_| Outcome::Return(1));
+    s(reg, "RemovePropA", 2, |_| Outcome::Return(0));
+    s(reg, "GetPropW", 2, |_| Outcome::Return(0));
+    s(reg, "SetPropW", 3, |_| Outcome::Return(1));
+    s(reg, "RemovePropW", 2, |_| Outcome::Return(0));
+    s(reg, "SetScrollInfo", 4, |_| Outcome::Return(0));
+    s(reg, "GetScrollInfo", 3, |_| Outcome::Return(0));
+    s(reg, "EnableScrollBar", 3, |_| Outcome::Return(1));
+    s(reg, "ShowScrollBar", 3, |_| Outcome::Return(1));
     s(reg, "GetAsyncKeyState", 1, get_async_key_state);
     s(reg, "GetKeyState", 1, get_key_state);
     s(reg, "GetKeyboardState", 1, get_keyboard_state);

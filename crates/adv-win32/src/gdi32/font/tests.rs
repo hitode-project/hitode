@@ -595,6 +595,48 @@ fn bitmap_source_and_palette_outputs_obey_permissions_and_never_wrap_or_leak() {
         0
     );
 }
+
+#[test]
+fn set_di_bits_copies_rows_to_bitmap() {
+    let (mut machine, data, _dc) = fixture();
+    let hbm = invoke(&mut machine, data, "CreateBitmap", &[2, 2, 1, 32, 0]);
+    assert_ne!(hbm, 0);
+
+    let info = machine.sys.vm.alloc(&mut machine.cpu, 4096, Prot::RW).unwrap();
+    let mut header = [0u8; 40];
+    header[0..4].copy_from_slice(&40u32.to_le_bytes());
+    header[4..8].copy_from_slice(&2i32.to_le_bytes());
+    header[8..12].copy_from_slice(&2i32.to_le_bytes()); // biHeight positive = bottom-up
+    header[12..14].copy_from_slice(&1u16.to_le_bytes());
+    header[14..16].copy_from_slice(&24u16.to_le_bytes()); // 24 bpp
+    machine.cpu.write(info, &header).unwrap();
+
+    let bits = machine.sys.vm.alloc(&mut machine.cpu, 4096, Prot::RW).unwrap();
+    let dib_data = [
+        0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, // bottom row (Red, Green, 2 pad)
+        0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, // top row (Blue, White, 2 pad)
+    ];
+    machine.cpu.write(bits, &dib_data).unwrap();
+
+    let result = invoke(&mut machine, data, "SetDIBits", &[0, hbm, 0, 2, bits, info, 0]);
+    assert_eq!(result, 2);
+
+    let Some(GdiObj::Bitmap { bits: dst_bits, stride, .. }) = machine.ext.get::<Win32>().gdi.get(&machine.sys.objects, hbm) else {
+        panic!("bitmap missing");
+    };
+    let mut top_row = [0u8; 8];
+    machine.cpu.read(*dst_bits, &mut top_row).unwrap();
+    assert_eq!(&top_row[0..4], &[0xff, 0x00, 0x00, 0xff]); // Blue
+    assert_eq!(&top_row[4..8], &[0xff, 0xff, 0xff, 0xff]); // White
+
+    let mut bottom_row = [0u8; 8];
+    machine.cpu.read(*dst_bits + stride, &mut bottom_row).unwrap();
+    assert_eq!(&bottom_row[0..4], &[0x00, 0x00, 0xff, 0xff]); // Red
+    assert_eq!(&bottom_row[4..8], &[0x00, 0xff, 0x00, 0xff]); // Green
+
+    assert_eq!(invoke(&mut machine, data, "DeleteObject", &[hbm]), 1);
+}
+
 #[test]
 fn software_dc_preserves_font_and_mapping_state() {
     let (mut machine, data, dc) = fixture();

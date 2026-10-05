@@ -1965,6 +1965,48 @@ fn find_window_a(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(found.unwrap_or(0))
 }
 
+fn find_window_w(env: &mut Env<'_>) -> Outcome {
+    let (class, title) = (env.arg(0), env.arg(1));
+    let class = if class == 0 {
+        None
+    } else if class > 0xffff {
+        let mut u16_chars = Vec::new();
+        let mut p = class;
+        while let Ok(u) = env.cpu.read_u16(p) {
+            if u == 0 { break; }
+            u16_chars.push(u);
+            p += 2;
+        }
+        Some(ClassKey::Name(String::from_utf16_lossy(&u16_chars)))
+    } else {
+        Some(ClassKey::Atom(class as u16))
+    };
+    let title = if title == 0 {
+        None
+    } else {
+        let mut u16_chars = Vec::new();
+        let mut p = title;
+        while let Ok(u) = env.cpu.read_u16(p) {
+            if u == 0 { break; }
+            u16_chars.push(u);
+            p += 2;
+        }
+        Some(String::from_utf16_lossy(&u16_chars))
+    };
+    let u = user(env);
+    let found = u.top.iter().copied().find(|t| {
+        let w = u.windows.get(&env.sys.objects, t).unwrap();
+        let c = &u.classes[w.class];
+        let class_ok = match &class {
+            None => true,
+            Some(ClassKey::Atom(a)) => c.atom == *a,
+            Some(ClassKey::Name(n)) => c.name.eq_ignore_ascii_case(n),
+        };
+        class_ok && title.as_ref().is_none_or(|t| *t == w.text)
+    });
+    Outcome::Return(found.unwrap_or(0))
+}
+
 // ---- text ----
 
 fn set_window_text_a(env: &mut Env<'_>) -> Outcome {
@@ -2060,6 +2102,7 @@ pub fn register(reg: &mut Registry) {
         get_window_thread_process_id,
     );
     s(reg, "FindWindowA", 2, find_window_a);
+    s(reg, "FindWindowW", 2, find_window_w);
     s(reg, "SetWindowTextA", 2, set_window_text_a);
     s(reg, "GetWindowTextA", 3, get_window_text_a);
     s(reg, "GetWindowTextLengthA", 1, get_window_text_length_a);
