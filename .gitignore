@@ -8,3 +8,4 @@ __pycache__/
 *.bmp
 # local privacy-scan terms (tools/privacy/scan.py)
 /.privacy-terms
+/dist
