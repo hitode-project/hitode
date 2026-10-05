@@ -145,6 +145,140 @@ fn set_rect(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
+fn set_rect_empty(env: &mut Env<'_>) -> Outcome {
+    let p = env.arg(0);
+    if p != 0 {
+        let _ = env.cpu.write(p, &[0u8; 16]);
+    }
+    Outcome::Return(1)
+}
+
+fn is_rect_empty(env: &mut Env<'_>) -> Outcome {
+    let p = env.arg(0);
+    let l = env.cpu.read_u32(p).unwrap_or(0) as i32;
+    let t = env.cpu.read_u32(p + 4).unwrap_or(0) as i32;
+    let r = env.cpu.read_u32(p + 8).unwrap_or(0) as i32;
+    let b = env.cpu.read_u32(p + 12).unwrap_or(0) as i32;
+    Outcome::Return(u32::from(l >= r || t >= b))
+}
+
+fn equal_rect(env: &mut Env<'_>) -> Outcome {
+    let (p1, p2) = (env.arg(0), env.arg(1));
+    let mut b1 = [0u8; 16];
+    let mut b2 = [0u8; 16];
+    let _ = env.cpu.read(p1, &mut b1);
+    let _ = env.cpu.read(p2, &mut b2);
+    Outcome::Return(u32::from(b1 == b2))
+}
+
+fn offset_rect(env: &mut Env<'_>) -> Outcome {
+    let (p, dx, dy) = (env.arg(0), env.arg(1) as i32, env.arg(2) as i32);
+    if p != 0 {
+        let l = env.cpu.read_u32(p).unwrap_or(0) as i32;
+        let t = env.cpu.read_u32(p + 4).unwrap_or(0) as i32;
+        let r = env.cpu.read_u32(p + 8).unwrap_or(0) as i32;
+        let b = env.cpu.read_u32(p + 12).unwrap_or(0) as i32;
+        let _ = env.cpu.write_u32(p, (l + dx) as u32);
+        let _ = env.cpu.write_u32(p + 4, (t + dy) as u32);
+        let _ = env.cpu.write_u32(p + 8, (r + dx) as u32);
+        let _ = env.cpu.write_u32(p + 12, (b + dy) as u32);
+    }
+    Outcome::Return(1)
+}
+
+fn intersect_rect(env: &mut Env<'_>) -> Outcome {
+    let (dst, s1, s2) = (env.arg(0), env.arg(1), env.arg(2));
+    let l1 = env.cpu.read_u32(s1).unwrap_or(0) as i32;
+    let t1 = env.cpu.read_u32(s1 + 4).unwrap_or(0) as i32;
+    let r1 = env.cpu.read_u32(s1 + 8).unwrap_or(0) as i32;
+    let b1 = env.cpu.read_u32(s1 + 12).unwrap_or(0) as i32;
+
+    let l2 = env.cpu.read_u32(s2).unwrap_or(0) as i32;
+    let t2 = env.cpu.read_u32(s2 + 4).unwrap_or(0) as i32;
+    let r2 = env.cpu.read_u32(s2 + 8).unwrap_or(0) as i32;
+    let b2 = env.cpu.read_u32(s2 + 12).unwrap_or(0) as i32;
+
+    let l = l1.max(l2);
+    let t = t1.max(t2);
+    let r = r1.min(r2);
+    let b = b1.min(b2);
+
+    if l < r && t < b {
+        if dst != 0 {
+            let _ = env.cpu.write_u32(dst, l as u32);
+            let _ = env.cpu.write_u32(dst + 4, t as u32);
+            let _ = env.cpu.write_u32(dst + 8, r as u32);
+            let _ = env.cpu.write_u32(dst + 12, b as u32);
+        }
+        Outcome::Return(1)
+    } else {
+        if dst != 0 {
+            let _ = env.cpu.write(dst, &[0u8; 16]);
+        }
+        Outcome::Return(0)
+    }
+}
+
+fn union_rect(env: &mut Env<'_>) -> Outcome {
+    let (dst, s1, s2) = (env.arg(0), env.arg(1), env.arg(2));
+    let l1 = env.cpu.read_u32(s1).unwrap_or(0) as i32;
+    let t1 = env.cpu.read_u32(s1 + 4).unwrap_or(0) as i32;
+    let r1 = env.cpu.read_u32(s1 + 8).unwrap_or(0) as i32;
+    let b1 = env.cpu.read_u32(s1 + 12).unwrap_or(0) as i32;
+
+    let l2 = env.cpu.read_u32(s2).unwrap_or(0) as i32;
+    let t2 = env.cpu.read_u32(s2 + 4).unwrap_or(0) as i32;
+    let r2 = env.cpu.read_u32(s2 + 8).unwrap_or(0) as i32;
+    let b2 = env.cpu.read_u32(s2 + 12).unwrap_or(0) as i32;
+
+    let empty1 = l1 >= r1 || t1 >= b1;
+    let empty2 = l2 >= r2 || t2 >= b2;
+
+    if empty1 && empty2 {
+        if dst != 0 {
+            let _ = env.cpu.write(dst, &[0u8; 16]);
+        }
+        Outcome::Return(0)
+    } else if empty1 {
+        if dst != 0 {
+            let mut buf = [0u8; 16];
+            let _ = env.cpu.read(s2, &mut buf);
+            let _ = env.cpu.write(dst, &buf);
+        }
+        Outcome::Return(1)
+    } else if empty2 {
+        if dst != 0 {
+            let mut buf = [0u8; 16];
+            let _ = env.cpu.read(s1, &mut buf);
+            let _ = env.cpu.write(dst, &buf);
+        }
+        Outcome::Return(1)
+    } else {
+        if dst != 0 {
+            let _ = env.cpu.write_u32(dst, l1.min(l2) as u32);
+            let _ = env.cpu.write_u32(dst + 4, t1.min(t2) as u32);
+            let _ = env.cpu.write_u32(dst + 8, r1.max(r2) as u32);
+            let _ = env.cpu.write_u32(dst + 12, b1.max(b2) as u32);
+        }
+        Outcome::Return(1)
+    }
+}
+
+fn enum_display_settings(env: &mut Env<'_>) -> Outcome {
+    let (_dev, mode, out) = (env.arg(0), env.arg(1) as i32, env.arg(2));
+    if (mode == 0 || mode == -1 || mode == -2) && out != 0 {
+        let (w, h) = user(env).screen;
+        let _ = env.cpu.write_u32(out + 40, 0x001c_0000);
+        let _ = env.cpu.write_u32(out + 104, 32);
+        let _ = env.cpu.write_u32(out + 108, w as u32);
+        let _ = env.cpu.write_u32(out + 112, h as u32);
+        let _ = env.cpu.write_u32(out + 120, 60);
+        Outcome::Return(1)
+    } else {
+        Outcome::Return(0)
+    }
+}
+
 // ---- resources ----
 
 const RT_STRING: u16 = 6;
@@ -433,6 +567,24 @@ pub fn register(reg: &mut Registry) {
         })
     });
     s(reg, "SetRect", 5, set_rect);
+    s(reg, "SetRectEmpty", 1, set_rect_empty);
+    s(reg, "IsRectEmpty", 1, is_rect_empty);
+    s(reg, "EqualRect", 2, equal_rect);
+    s(reg, "OffsetRect", 3, offset_rect);
+    s(reg, "IntersectRect", 3, intersect_rect);
+    s(reg, "UnionRect", 3, union_rect);
+    s(reg, "TranslateAcceleratorA", 3, |_| Outcome::Return(0));
+    s(reg, "TranslateAcceleratorW", 3, |_| Outcome::Return(0));
+    s(reg, "AttachThreadInput", 3, |_| Outcome::Return(1));
+    s(reg, "WindowFromPoint", 2, |_| Outcome::Return(0));
+    s(reg, "EnumWindows", 2, |_| Outcome::Return(1));
+    s(reg, "EnumChildWindows", 3, |_| Outcome::Return(1));
+    s(reg, "ChangeDisplaySettingsA", 2, |_| Outcome::Return(0));
+    s(reg, "ChangeDisplaySettingsExA", 5, |_| Outcome::Return(0));
+    s(reg, "ChangeDisplaySettingsW", 2, |_| Outcome::Return(0));
+    s(reg, "ChangeDisplaySettingsExW", 5, |_| Outcome::Return(0));
+    s(reg, "EnumDisplaySettingsA", 3, enum_display_settings);
+    s(reg, "EnumDisplaySettingsW", 3, enum_display_settings);
     s(reg, "WINNLSEnableIME", 2, |_| Outcome::Return(1));
     s(reg, "LoadCursorA", 2, load_cursor_a);
     s(reg, "LoadIconA", 2, load_icon_a);
@@ -454,4 +606,33 @@ pub fn register(reg: &mut Registry) {
     s(reg, "MonitorFromRect", 2, monitor_from);
     s(reg, "GetMonitorInfoA", 2, get_monitor_info_a);
     s(reg, "EnumDisplayMonitors", 4, enum_display_monitors);
+    s(reg, "DdeInitializeA", 4, |e| {
+        let p = e.arg(0);
+        if p != 0 {
+            let _ = e.cpu.write_u32(p, 1);
+        }
+        Outcome::Return(0)
+    });
+    s(reg, "DdeInitializeW", 4, |e| {
+        let p = e.arg(0);
+        if p != 0 {
+            let _ = e.cpu.write_u32(p, 1);
+        }
+        Outcome::Return(0)
+    });
+    s(reg, "DdeUninitialize", 1, |_| Outcome::Return(1));
+    s(reg, "DdeConnect", 4, |_| Outcome::Return(0));
+    s(reg, "DdeDisconnect", 1, |_| Outcome::Return(1));
+    s(reg, "DdeNameService", 4, |_| Outcome::Return(0));
+    s(reg, "DdeClientTransaction", 8, |_| Outcome::Return(0));
+    s(reg, "DdeCreateDataHandle", 7, |_| Outcome::Return(0));
+    s(reg, "DdeGetData", 4, |_| Outcome::Return(0));
+    s(reg, "DdeFreeDataHandle", 1, |_| Outcome::Return(1));
+    s(reg, "DdeGetLastError", 1, |_| Outcome::Return(0));
+    s(reg, "DdeCreateStringHandleA", 3, |_| Outcome::Return(1));
+    s(reg, "DdeCreateStringHandleW", 3, |_| Outcome::Return(1));
+    s(reg, "DdeQueryStringA", 5, |_| Outcome::Return(0));
+    s(reg, "DdeQueryStringW", 5, |_| Outcome::Return(0));
+    s(reg, "DdeFreeStringHandle", 2, |_| Outcome::Return(1));
+    s(reg, "DdeCmpStringHandles", 2, |_| Outcome::Return(0));
 }

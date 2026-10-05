@@ -34,6 +34,7 @@ pub fn register(registry: &mut Registry) {
         glyph_a_ABI,
         glyph_w_ABI,
         metrics_a_ABI,
+        outline_metrics_a_ABI,
         set_map_mode_ABI,
         get_map_mode_ABI,
         set_poly_fill_ABI,
@@ -237,6 +238,43 @@ fn metrics_a(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> Outcome {
         }
     }
 }
+
+#[win32(gdi32, name = "GetOutlineTextMetricsA", level = implement)]
+fn outline_metrics_a(env: &mut Env<'_>, dc: Handle, size: u32, output: GuestPtr<u8>) -> Outcome {
+    const OUTLINE_SIZE: u32 = 212;
+    if reject_dc(env, dc.0) {
+        return Outcome::Return(0);
+    }
+    if size == 0 || output.is_null() {
+        return Outcome::Return(OUTLINE_SIZE);
+    }
+    let request = font_request(env, dc.0);
+    match env.ext.get_mut::<Fonts>().text.metrics(&request) {
+        Ok(metrics) => {
+            let mut buf = vec![0u8; size as usize];
+            let packed = pack_metrics(&metrics);
+            let size_bytes = size.to_le_bytes();
+            let buf_len = buf.len();
+            let header_len = 4.min(buf_len);
+            buf[..header_len].copy_from_slice(&size_bytes[..header_len]);
+            if buf_len > 4 {
+                let copy_len = packed.len().min(buf_len - 4);
+                buf[4..4 + copy_len].copy_from_slice(&packed[..copy_len]);
+            }
+            if env.cpu.write(output.addr(), &buf).is_ok() {
+                Outcome::Return(size)
+            } else {
+                set_last_error(env, 87);
+                Outcome::Return(0)
+            }
+        }
+        _ => {
+            set_last_error(env, 87);
+            Outcome::Return(0)
+        }
+    }
+}
+
 #[win32(gdi32, name = "GetTextExtentPoint32A", level = implement)]
 fn extent_a(
     env: &mut Env<'_>,

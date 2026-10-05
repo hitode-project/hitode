@@ -3,6 +3,7 @@
 //! COM task memory and Automation strings.
 
 use adv_abi::Registry;
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 mod internet;
@@ -391,6 +392,20 @@ pub fn register(reg: &mut Registry) {
         Outcome::Return(1)
     });
     stdcall(reg, IMM32, "ImmAssociateContext", 2, |_| Outcome::Return(0));
+    stdcall(reg, "mpr.dll", "WNetGetUniversalNameA", 4, |_| {
+        Outcome::Return(2250) // ERROR_NOT_CONNECTED
+    });
+    stdcall(reg, "mpr.dll", "WNetGetUniversalNameW", 4, |_| {
+        Outcome::Return(2250) // ERROR_NOT_CONNECTED
+    });
+    stdcall(reg, "gdiplus.dll", "GdiplusStartup", 3, |e| {
+        let token = e.arg(0);
+        if token != 0 {
+            let _ = e.cpu.write_u32(token, 1);
+        }
+        Outcome::Return(0)
+    });
+    stdcall(reg, "gdiplus.dll", "GdiplusShutdown", 1, |_| Outcome::Return(0));
 }
 
 #[cfg(test)]

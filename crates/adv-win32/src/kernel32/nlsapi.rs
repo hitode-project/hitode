@@ -322,7 +322,34 @@ fn compare_string_w(env: &mut Env<'_>) -> Outcome {
     Outcome::Return((ord as i32 + 2) as u32)
 }
 
+fn compare_string_a(env: &mut Env<'_>) -> Outcome {
+    const NORM_IGNORECASE: u32 = 1;
+    let flags = env.arg(1);
+    let a_bytes = bytes_or_cstr(env.cpu, env.arg(2), env.arg(3) as i32);
+    let b_bytes = bytes_or_cstr(env.cpu, env.arg(4), env.arg(5) as i32);
+    let codec = env.ext.get::<Win32>().codec;
+    let a = codec.to_utf16(0, &a_bytes);
+    let b = codec.to_utf16(0, &b_bytes);
+    let fold = |u: u16| {
+        if flags & NORM_IGNORECASE == 0 {
+            return u;
+        }
+        char::from_u32(u32::from(u))
+            .and_then(|c| {
+                let mut l = c.to_lowercase();
+                match (l.next(), l.next()) {
+                    (Some(x), None) if (x as u32) < 0x1_0000 => Some(x as u16),
+                    _ => None,
+                }
+            })
+            .unwrap_or(u)
+    };
+    let ord = a.iter().map(|&u| fold(u)).cmp(b.iter().map(|&u| fold(u)));
+    Outcome::Return((ord as i32 + 2) as u32)
+}
+
 pub(super) fn register(reg: &mut Registry) {
+    stdcall(reg, K32, "CompareStringA", 6, compare_string_a);
     stdcall(reg, K32, "CompareStringW", 6, compare_string_w);
     // Enumerates nothing: callers probing for a locale name find none and use their default.
     stdcall(reg, K32, "EnumSystemLocalesW", 2, |_| Outcome::Return(1));

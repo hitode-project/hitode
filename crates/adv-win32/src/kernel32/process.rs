@@ -462,6 +462,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetStdHandle", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "GetConsoleMode", 2, |_| Outcome::Return(0));
+    stdcall(reg, K32, "SetConsoleMode", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetConsoleCP", 0, |e| {
         Outcome::Return(e.ext.get::<Win32>().codec.acp)
     });

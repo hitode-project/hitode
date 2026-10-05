@@ -48,6 +48,8 @@ pub const HOST_MODULES: &[&str] = &[
     "wininet.dll",
     "uxtheme.dll",
     "dwmapi.dll",
+    "mpr.dll",
+    "gdiplus.dll",
 ];
 
 const DLL_PROCESS_ATTACH: u32 = 1;

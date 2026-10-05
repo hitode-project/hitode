@@ -6,7 +6,14 @@ use adv_device::text::{EnumeratedFont, FontEnumeration, FontKind};
 use std::collections::VecDeque;
 
 pub(super) fn register(registry: &mut Registry) {
-    for api in [families_a_ABI, families_w_ABI, fonts_a_ABI, fonts_w_ABI] {
+    for api in [
+        families_a_ABI,
+        families_w_ABI,
+        families_ex_a_ABI,
+        families_ex_w_ABI,
+        fonts_a_ABI,
+        fonts_w_ABI,
+    ] {
         registry.register(api);
     }
 }
@@ -43,6 +50,62 @@ fn families_w(
         param,
         FontEnumeration::Families,
     )
+}
+#[win32(gdi32, name = "EnumFontFamiliesExA", level = implement)]
+fn families_ex_a(
+    env: &mut Env<'_>,
+    dc: Handle,
+    logfont: GuestPtr<()>,
+    callback: GuestPtr<()>,
+    param: u32,
+    _flags: u32,
+) -> Outcome {
+    let face = if logfont.is_null() {
+        None
+    } else {
+        let mut face_bytes = [0u8; 32];
+        if env.cpu.read(logfont.addr() + 28, &mut face_bytes).is_ok() {
+            let len = face_bytes.iter().position(|&b| b == 0).unwrap_or(face_bytes.len());
+            if len == 0 {
+                None
+            } else {
+                Some(env.ext.get::<Win32>().codec.decode(&face_bytes[..len]))
+            }
+        } else {
+            None
+        }
+    };
+    start(env, dc.0, face, callback.addr(), param, FontEnumeration::Families, false)
+}
+#[win32(gdi32, name = "EnumFontFamiliesExW", level = implement)]
+fn families_ex_w(
+    env: &mut Env<'_>,
+    dc: Handle,
+    logfont: GuestPtr<()>,
+    callback: GuestPtr<()>,
+    param: u32,
+    _flags: u32,
+) -> Outcome {
+    let face = if logfont.is_null() {
+        None
+    } else {
+        let mut units = [0u16; 32];
+        let mut bytes = [0u8; 64];
+        if env.cpu.read(logfont.addr() + 28, &mut bytes).is_ok() {
+            for i in 0..32 {
+                units[i] = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+            }
+            let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            if len == 0 {
+                None
+            } else {
+                Some(String::from_utf16_lossy(&units[..len]))
+            }
+        } else {
+            None
+        }
+    };
+    start(env, dc.0, face, callback.addr(), param, FontEnumeration::Families, true)
 }
 #[win32(gdi32, name = "EnumFontsA", level = implement)]
 fn fonts_a(

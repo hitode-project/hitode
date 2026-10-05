@@ -1317,6 +1317,9 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "QueryDosDeviceA", 3, query_dos_device_a);
     stdcall(reg, K32, "QueryDosDeviceW", 3, query_dos_device_w);
     stdcall(reg, K32, "GetVolumeInformationA", 8, get_volume_information);
+    stdcall(reg, K32, "AreFileApisANSI", 0, |_| Outcome::Return(1));
+    stdcall(reg, K32, "SetFileApisToOEM", 0, |_| Outcome::Return(0));
+    stdcall(reg, K32, "SetFileApisToANSI", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "GetDiskFreeSpaceA", 5, |e| get_disk_free_space(e, false));
     stdcall(reg, K32, "GetDiskFreeSpaceW", 5, |e| get_disk_free_space(e, true));
     stdcall(reg, K32, "GetDiskFreeSpaceExA", 4, |e| get_disk_free_space_ex(e, false));

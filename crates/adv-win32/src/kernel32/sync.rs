@@ -349,6 +349,48 @@ fn release_mutex(env: &mut Env<'_>) -> Outcome {
     result
 }
 
+fn create_waitable_timer(env: &mut Env<'_>) -> Outcome {
+    let manual = env.arg(1) != 0;
+    let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
+    super::file_mapping::sync_created(
+        env,
+        Object::Event {
+            manual_reset: manual,
+            signaled: false,
+        },
+        env.arg(2),
+        wide,
+    )
+}
+
+fn set_waitable_timer(env: &mut Env<'_>) -> Outcome {
+    let h = env.arg(0);
+    if let Some(Object::Event { signaled, .. }) = env.sys.objects.get_mut(h) {
+        *signaled = true;
+        env.sys.signal_waiters(h);
+        Outcome::Return(1)
+    } else {
+        set_last_error(env, err::INVALID_HANDLE);
+        Outcome::Return(0)
+    }
+}
+
+fn cancel_waitable_timer(env: &mut Env<'_>) -> Outcome {
+    let h = env.arg(0);
+    if let Some(Object::Event { signaled, .. }) = env.sys.objects.get_mut(h) {
+        *signaled = false;
+        Outcome::Return(1)
+    } else {
+        set_last_error(env, err::INVALID_HANDLE);
+        Outcome::Return(0)
+    }
+}
+
+fn open_waitable_timer(env: &mut Env<'_>) -> Outcome {
+    set_last_error(env, 2); // ERROR_FILE_NOT_FOUND
+    Outcome::Return(0)
+}
+
 /// SLIST_HEADER (x86): `Next`, then `Depth` and `Sequence` u16s. The interlocked
 /// entry points quiesce native leases before updating the list.
 fn slist(
@@ -576,6 +618,12 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "CreateMutexA", 3, create_mutex);
     stdcall(reg, K32, "CreateMutexW", 3, create_mutex);
     stdcall(reg, K32, "ReleaseMutex", 1, release_mutex);
+    stdcall(reg, K32, "CreateWaitableTimerA", 3, create_waitable_timer);
+    stdcall(reg, K32, "CreateWaitableTimerW", 3, create_waitable_timer);
+    stdcall(reg, K32, "SetWaitableTimer", 6, set_waitable_timer);
+    stdcall(reg, K32, "CancelWaitableTimer", 1, cancel_waitable_timer);
+    stdcall(reg, K32, "OpenWaitableTimerA", 3, open_waitable_timer);
+    stdcall(reg, K32, "OpenWaitableTimerW", 3, open_waitable_timer);
     stdcall(reg, K32, "WaitForSingleObject", 2, |e| {
         let (h, ms) = (e.arg(0), e.arg(1));
         wait_one(e, h, ms)
