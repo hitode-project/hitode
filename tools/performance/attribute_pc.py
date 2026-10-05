@@ -176,6 +176,29 @@ def align(directory, rows):
     return round(mark - reset_perf), (reset["ack"] - reset["at"]) * 1e3 / 2
 
 
+def in_run_share(times, runs, shift):
+    begins = [run[0] for run in runs]
+    inside = 0
+    for time in times:
+        index = bisect.bisect_right(begins, time + shift) - 1
+        inside += index >= 0 and time + shift < runs[index][1]
+    return inside / len(times) if times else 0.0
+
+
+def refine(times, runs, span_ns=3_000_000, step_ns=25_000):
+    """Shift maximizing the share of JIT samples inside inline runs.
+
+    Generated code executes only inside a run, so the true alignment puts nearly
+    every JIT sample in one. Runs are often shorter than the control bracket's
+    real error, so the bracket alone can misplace whole runs. Returns (shift,
+    share at zero, share at shift); ties keep the shift closest to zero.
+    """
+    runs = sorted((begin, end) for begin, end, *_ in runs)
+    candidates = range(-span_ns, span_ns + 1, step_ns)
+    best = max(candidates, key=lambda shift: (in_run_share(times, runs, shift), -abs(shift)))
+    return best, in_run_share(times, runs, 0), in_run_share(times, runs, best)
+
+
 def bucket(label):
     if label["kind"] == "jit":
         return f"jit/{label['class']}/{label['part']}"
@@ -301,17 +324,23 @@ def main():
         offset, uncertainty_ms = align(directory, rows)
     except (OSError, ValueError, KeyError, StopIteration) as error:
         parser.exit(1, f"pc attribution: {error!r}\n")
-    for sample in samples:
-        sample["trace_ns"] = sample["perf_ns"] + offset
     jit = JitMap(directory)
     runner = modules[0]
     rvas = sorted({s["rip"] - runner["base"] for s in samples
                    if runner["base"] <= s["rip"] < runner["base"] + runner["size"]})
     symbols = symbolize(runner["path"], rvas, args.symbolizer)
-    windows = attribute(samples, label_samples(samples, modules, jit, symbols), model, gaps, args.long_ms)
+    labels = label_samples(samples, modules, jit, symbols)
+    times = [sample["perf_ns"] + offset for sample, label in zip(samples, labels)
+             if label["kind"] == "jit" and model["lo"] <= sample["perf_ns"] + offset < model["hi"]]
+    shift, share_before, share_after = refine(times, model["runs"])
+    for sample in samples:
+        sample["trace_ns"] = sample["perf_ns"] + offset + shift
+    windows = attribute(samples, labels, model, gaps, args.long_ms)
     summary = {
         "note": "wall-clock RIP samples of one thread; JIT parts approximate; suspension perturbs timing",
         "alignment_uncertainty_ms": uncertainty_ms,
+        "alignment_refinement": {"shift_ms": shift / 1e6, "jit_in_run_before": round(share_before, 3),
+                                 "jit_in_run_after": round(share_after, 3)},
         "instruction_map": jit.tagged,
         "long_ms": args.long_ms,
         "windows": {name: summarize(window, args.top)

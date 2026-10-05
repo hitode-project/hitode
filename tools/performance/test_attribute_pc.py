@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from analyze_schedule import labelled_gaps, trace_model
+import attribute_pc
 from attribute_pc import JitMap, attribute, component, label_samples, summarize
 from test_analyze_schedule import row
 
@@ -77,6 +78,20 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(summarize(windows["short"], 5)["buckets_pct"], {"module/ntdll.dll": 100.0})
         self.assertEqual(summarize(windows["short"], 5)["contexts_pct"], {"outside-run": 100.0})
 
+
+
+class RefineTest(unittest.TestCase):
+    def test_shift_recovers_jit_samples_hidden_by_a_bracket_error(self):
+        runs = [(begin, begin + 100_000, 0) for begin in range(0, 50_000_000, 2_000_000)]
+        times = [begin + 50_000 - 975_000 for begin, _, _ in runs]
+        shift, before, after = attribute_pc.refine(times, runs)
+        self.assertEqual(before, 0.0)
+        self.assertEqual(after, 1.0)
+        self.assertTrue(925_000 <= shift <= 1_025_000, shift)
+
+    def test_aligned_samples_keep_zero_shift(self):
+        runs = [(0, 10_000_000, 0)]
+        self.assertEqual(attribute_pc.refine([5_000_000], runs)[0], 0)
 
 if __name__ == "__main__":
     unittest.main()
