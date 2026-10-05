@@ -19,6 +19,7 @@ pub enum Command {
     Menu(u32),
     Dialogs,
     Dialog(u32),
+    DialogTrack(u32, i32),
     DialogClose,
     Capture(PathBuf),
     Report(PathBuf),
@@ -38,6 +39,7 @@ impl Command {
                 | Self::KeyUp(_)
                 | Self::Menu(_)
                 | Self::Dialog(_)
+                | Self::DialogTrack(..)
                 | Self::DialogClose
                 | Self::Close
         )
@@ -51,6 +53,15 @@ impl Command {
             "dialogs" if rest.is_empty() => Ok(Self::Dialogs),
             "dialog-close" if rest.is_empty() => Ok(Self::DialogClose),
             "dialog" => Ok(Self::Dialog(rest.parse().map_err(|_| "dialog requires a decimal control ID")?)),
+            "dialog-track" => {
+                let mut fields = rest.split_whitespace();
+                let id = fields.next().ok_or("dialog-track requires ID VALUE")?
+                    .parse().map_err(|_| "invalid control ID")?;
+                let value = fields.next().ok_or("dialog-track requires ID VALUE")?
+                    .parse().map_err(|_| "invalid trackbar value")?;
+                if fields.next().is_some() { return Err("dialog-track requires ID VALUE".into()); }
+                Ok(Self::DialogTrack(id, value))
+            }
             "menu" => Ok(Self::Menu(rest.parse().map_err(|_| "menu requires a decimal command ID")?)),
             "click" => {
                 let values: Vec<_> = rest.split_whitespace().collect();
@@ -110,7 +121,7 @@ impl Command {
             "close" if rest.is_empty() => Ok(Self::Close),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click X Y, key/key-down/key-up VK, menus, menu ID, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics or close"
+                "expected click X Y, key/key-down/key-up VK, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics or close"
                     .into(),
             ),
         }
@@ -403,6 +414,10 @@ mod tests {
         assert_eq!(Command::parse("menu 100"), Ok(Command::Menu(100)));
         assert_eq!(Command::parse("dialogs"), Ok(Command::Dialogs));
         assert_eq!(Command::parse("dialog 1"), Ok(Command::Dialog(1)));
+        assert_eq!(
+            Command::parse("dialog-track 1002 0"),
+            Ok(Command::DialogTrack(1002, 0))
+        );
         assert_eq!(Command::parse("dialog-close"), Ok(Command::DialogClose));
         assert_eq!(Command::parse("reset-metrics"), Ok(Command::ResetMetrics));
         assert_eq!(
@@ -429,6 +444,8 @@ mod tests {
             "memory 0x400000 65",
             "memory 0x400000 0",
             "memory 0x400000 4 extra",
+            "dialog-track 1002",
+            "dialog-track 1002 0 extra",
             "garbage",
         ] {
             assert!(Command::parse(line).is_err(), "{line}");
@@ -436,7 +453,14 @@ mod tests {
     }
     #[test]
     fn only_input_and_close_commands_request_guest_preemption() {
-        for line in ["click 1 2", "key 65", "key-down 17", "key-up 17", "close"] {
+        for line in [
+            "click 1 2",
+            "key 65",
+            "key-down 17",
+            "key-up 17",
+            "dialog-track 1002 0",
+            "close",
+        ] {
             assert!(Command::parse(line).unwrap().interrupts_guest(), "{line}");
         }
         for command in [

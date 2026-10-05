@@ -880,7 +880,7 @@ fn run_execution(
                     control::Command::Dialogs => runtime
                         .dialogs()
                         .map(|set| format!("dialogs {}", json(&format!("{set:?}")))),
-                    control::Command::Dialog(id) => {
+                    control::Command::Dialog(id) | control::Command::DialogTrack(id, _) => {
                         let set = runtime.dialogs()?;
                         let found: Vec<_> = set
                             .dialogs
@@ -891,7 +891,16 @@ fn run_execution(
                             .map(|c| c.target)
                             .collect();
                         if found.len() == 1
-                            && runtime.post_dialog_event(adv_runtime::DialogEvent::Click(found[0]))
+                            && runtime.post_dialog_event(match command {
+                                control::Command::DialogTrack(_, value) => {
+                                    adv_runtime::DialogEvent::Track {
+                                        target: found[0],
+                                        value,
+                                        code: 4,
+                                    }
+                                }
+                                _ => adv_runtime::DialogEvent::Click(found[0]),
+                            })
                         {
                             inputs += 1;
                             Ok(format!("dialog {id}"))
