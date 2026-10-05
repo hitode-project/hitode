@@ -57,14 +57,14 @@ impl Samples {
     fn json(&self) -> String {
         if self.recent.is_empty() {
             return format!(
-                "{{\"samples\": 0, \"total_ms\": 0, \"percentile_window_samples\": 0, \"percentile_window_capacity\": {SAMPLE_CAPACITY}, \"mean_ms\": null, \"p50_ms\": null, \"p95_ms\": null, \"max_ms\": null}}"
+                "{{\"samples\": 0, \"total_ms\": 0, \"percentile_window_samples\": 0, \"percentile_window_capacity\": {SAMPLE_CAPACITY}, \"mean_ms\": null, \"p50_ms\": null, \"p95_ms\": null, \"p99_ms\": null, \"max_ms\": null}}"
             );
         }
         let mut values: Vec<_> = self.recent.iter().copied().collect();
         values.sort_by(f64::total_cmp);
         let rank = |percent: usize| (values.len() * percent).div_ceil(100).saturating_sub(1);
         format!(
-            "{{\"samples\": {}, \"total_ms\": {:.6}, \"percentile_window_samples\": {}, \"percentile_window_capacity\": {}, \"mean_ms\": {:.6}, \"p50_ms\": {:.6}, \"p95_ms\": {:.6}, \"max_ms\": {:.6}}}",
+            "{{\"samples\": {}, \"total_ms\": {:.6}, \"percentile_window_samples\": {}, \"percentile_window_capacity\": {}, \"mean_ms\": {:.6}, \"p50_ms\": {:.6}, \"p95_ms\": {:.6}, \"p99_ms\": {:.6}, \"max_ms\": {:.6}}}",
             self.total_count,
             self.total_ms,
             values.len(),
@@ -72,6 +72,7 @@ impl Samples {
             self.total_ms / self.total_count as f64,
             values[rank(50)],
             values[rank(95)],
+            values[rank(99)],
             self.max_ms
         )
     }
@@ -97,6 +98,10 @@ pub struct Performance {
     warm_frame_steps: Samples,
     active_since_frame: Duration,
     warm_active_intervals: Samples,
+    // Completion observations include host waits/idle; they are neither CPU
+    // time nor physical display scanout. Inspect during an active interaction.
+    last_frame_observation: Option<Instant>,
+    warm_frame_wall_intervals: Samples,
     host_presentations: u64,
     host_present_total: Duration,
     host_present_max: Duration,
@@ -158,6 +163,11 @@ impl Performance {
             self.active_since_frame += elapsed;
         }
         if serial > self.observed_serial {
+            let now = Instant::now();
+            if let Some(previous) = self.last_frame_observation.replace(now) {
+                self.warm_frame_wall_intervals
+                    .add(now.saturating_duration_since(previous));
+            }
             let delta = serial - self.observed_serial;
             self.observations += 1;
             self.serial_skipped += delta - 1;
@@ -220,6 +230,7 @@ impl Performance {
                 "    \"frame_observations\": {}, \"guest_serial_skipped_between_observations\": {}, \"guest_serial_delta_max\": {},\n",
                 "    \"warm_steps_producing_available_frames\": {},\n",
                 "    \"warm_active_runtime_between_frame_observations\": {},\n",
+                "    \"warm_wall_time_between_frame_observations\": {},\n",
                 "    \"host_presentations\": {}, \"host_present_seconds\": {:.6}, \"host_present_max_seconds\": {:.6},\n",
                 "    \"warm_host_present_cost\": {}, \"warm_host_present_intervals\": {},\n",
                 "    \"host_repaints\": {}, \"host_repaint_seconds\": {:.6},\n",
@@ -245,6 +256,7 @@ impl Performance {
             self.serial_delta_max,
             self.warm_frame_steps.json(),
             self.warm_active_intervals.json(),
+            self.warm_frame_wall_intervals.json(),
             self.host_presentations,
             self.host_present_total.as_secs_f64(),
             self.host_present_max.as_secs_f64(),

@@ -49,7 +49,7 @@ struct Options {
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
-  --guest-workers 1|2     bounded guest execution pool (default: 1; 2 requires Windows x64/Fast)\n\
+  --guest-workers 1|2     default: 1; experimental 2 requires Windows x64/Fast\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
