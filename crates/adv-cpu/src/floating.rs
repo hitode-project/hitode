@@ -37,6 +37,22 @@ pub(crate) struct NativeX87 {
     pub fast: Option<fast::Fast>,
 }
 
+/// Integer effects of an audited x87 helper. The canonical x87/MMX image,
+/// memory/fault address and EIP may change; XMM, segment bases and fuel do not.
+/// Memory writes remain transactional; faults retry at the saved EIP, while
+/// SMC/pending #MF exits materialize the completed instruction's full state.
+#[derive(Default)]
+pub(crate) struct X87Effects {
+    pub read_gpr: u8,
+    pub write_gpr: u8,
+    pub read_flags: bool,
+    pub write_flags: bool,
+}
+
+pub(crate) fn x87_effects(i: &Instruction) -> Option<X87Effects> {
+    x87::helper_effects(i)
+}
+
 /// The instruction completed; generated code continues at the next instruction.
 pub(crate) const X87_DONE: u32 = 0;
 /// Nothing changed; the instruction is retried by the interpreter.
@@ -52,7 +68,9 @@ pub(crate) fn native_x87(i: &Instruction) -> bool {
     operation(i) == Some(Operation::X87) && !matches!(i.mnemonic(), M::Fxsave | M::Fxrstor)
 }
 
-/// Called only by native code with the Executor's live bridge and saved CpuState.
+/// Called only by native code with the Executor's live bridge and CpuState.
+/// GPRs/flags need only be current where X87Effects declares an input; x87/MMX
+/// and EIP must be canonical. Generated exits materialize all remaining state.
 /// Runs the interpreter's own x87 transaction, so results are bit-identical.
 pub(crate) unsafe extern "C" fn x87_call(
     bridge: *mut std::ffi::c_void,

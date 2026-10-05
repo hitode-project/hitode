@@ -491,3 +491,162 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
 
 #[path = "hardware_tests.rs"]
 mod hardware_tests;
+
+#[test]
+fn helper_effects_preserve_dirty_address_aliases_integer_flags_and_xmm() {
+    for vectors in [false, true] {
+        let code = bytes(|a| {
+            a.mov(ebx, 0xabcd_fff0u32).unwrap();
+            a.mov(esi, 0xffff_2028u32).unwrap();
+            if vectors {
+                a.movdqu(xmm0, ptr(DATA as i32 + 0x100)).unwrap();
+                a.paddd(xmm0, xmm1).unwrap();
+            }
+            a.mov(eax, 0x1234_ffffu32).unwrap();
+            a.add(eax, 1).unwrap();
+            // addr16 wraps before FS addition; neither address register is current
+            // in CpuState until the helper's declared inputs are synchronized.
+            a.fld(tbyte_ptr(bx + si).fs()).unwrap();
+            a.fstp(tbyte_ptr(bx + si + 16).fs()).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(edx, eax).unwrap(); // Observe the preserved upper EAX half.
+            a.setb(cl).unwrap();
+            a.setp(al).unwrap();
+            if vectors {
+                a.movdqu(ptr(DATA as i32 + 0x110), xmm0).unwrap();
+            }
+            a.mov(edi, u32::MAX - 3).unwrap();
+            a.mov(ecx, (DATA - 0x10000 - 8) / 4).unwrap();
+            a.fld(qword_ptr(edi + ecx * 4 + 12).fs()).unwrap();
+        });
+        let mut s = state();
+        s.fs_base = 0x10000;
+        testing::HELPER_ONLY.set(true);
+        compare(
+            &code,
+            s,
+            |m| {
+                m.write(
+                    DATA + 0x18,
+                    &X87Register::from_parts((1 << 63) | 13, 0x4000).0,
+                )
+                .unwrap();
+                m.write(DATA + 0x100, &[0x5a; 16]).unwrap();
+            },
+            Some(4),
+        );
+        testing::HELPER_ONLY.set(false);
+    }
+}
+
+#[test]
+fn helper_integer_flag_effects_cover_conditions_and_compare_rollback() {
+    testing::HELPER_ONLY.set(true);
+    for predicate in 0..8 {
+        for value in [0u32, 1, u32::MAX] {
+            let code = bytes(|a| {
+                a.mov(eax, value).unwrap();
+                a.add(eax, 1).unwrap();
+                a.inc(ecx).unwrap(); // INC preserves ADD's lazy carry.
+                match predicate {
+                    0 => a.fcmovb(st0, st1),
+                    1 => a.fcmovbe(st0, st1),
+                    2 => a.fcmove(st0, st1),
+                    3 => a.fcmovnb(st0, st1),
+                    4 => a.fcmovnbe(st0, st1),
+                    5 => a.fcmovne(st0, st1),
+                    6 => a.fcmovnu(st0, st1),
+                    _ => a.fcmovu(st0, st1),
+                }
+                .unwrap();
+                a.setb(dl).unwrap();
+                a.setp(bl).unwrap();
+                a.sete(cl).unwrap();
+            });
+            compare(&code, state(), |_| {}, Some(1));
+        }
+    }
+    for instruction in 0..4 {
+        for bits in [
+            0.5f64.to_bits(),
+            1.25f64.to_bits(),
+            2.5f64.to_bits(),
+            0x7ff8_0000_0000_0001,
+        ] {
+            for masked in [false, true] {
+                let code = bytes(|a| {
+                    a.add(eax, -1).unwrap();
+                    match instruction {
+                        0 => a.fcomi(st0, st1),
+                        1 => a.fcomip(st0, st1),
+                        2 => a.fucomi(st0, st1),
+                        _ => a.fucomip(st0, st1),
+                    }
+                    .unwrap();
+                    a.setb(dl).unwrap();
+                    a.setp(bl).unwrap();
+                    a.sete(cl).unwrap();
+                });
+                let mut s = state();
+                let top = s.x87.top();
+                s.x87.regs[top] =
+                    X87Register(crate::backend::x87::encode_f64(f64::from_bits(bits)));
+                s.x87.set_physical_tag(top, s.x87.regs[top].tag());
+                if !masked {
+                    s.x87.control &= !1;
+                }
+                s.refresh_mmx();
+                compare(&code, s, |_| {}, Some(1));
+            }
+        }
+    }
+    testing::HELPER_ONLY.set(false);
+}
+
+#[test]
+fn helper_effects_keep_fuel_and_exact_state_across_budget_resumptions() {
+    let code = bytes(|a| {
+        for _ in 0..4 {
+            a.inc(ebx).unwrap();
+            a.fsin().unwrap();
+            a.fnstsw(ax).unwrap();
+        }
+    });
+    let mut actual_memory = memory(&code);
+    let mut expected_memory = memory(&code);
+    let mut region = Region::new(CODE, code.len());
+    // Every instruction is a legal budget resumption entry.
+    let instructions: Vec<_> =
+        iced_x86::Decoder::with_ip(32, &code, CODE as u64, iced_x86::DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+    for i in &instructions {
+        if i.ip32() != CODE {
+            region.entries.push(i.ip32());
+        }
+    }
+    let compiled = compile(&region, &actual_memory, false).unwrap();
+    let mut actual = state();
+    let mut expected = actual.clone();
+    let mut interpreter = Interpreter::new();
+    while actual.eip < CODE + code.len() as u32 {
+        actual.fuel = 2;
+        let before = actual.eip;
+        let exit = testing::run(&compiled, &mut actual, &mut actual_memory);
+        assert!(exit == Exit::Budget as u32 || exit == Exit::Dispatch as u32);
+        let executed = instructions
+            .iter()
+            .filter(|i| i.ip32() >= before && i.ip32() < actual.eip)
+            .count();
+        assert!(executed > 0);
+        assert_eq!(actual.fuel, 2 - executed as u64);
+        for _ in 0..executed {
+            assert!(matches!(
+                interpreter.step(&mut expected, &mut expected_memory),
+                Step::Executed
+            ));
+        }
+        expected.fuel = 2 - executed as u64;
+        assert_eq!(actual, expected);
+    }
+}

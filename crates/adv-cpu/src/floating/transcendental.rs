@@ -3,6 +3,71 @@
 //! bit identity with every Intel/AMD microcode implementation (SDM Vol. 1, 8.3.10).
 use super::softfloat::{self as sf, Quad as Q};
 use crate::X87Register as Ext;
+use std::cell::RefCell;
+
+// This cache owns only pure binary128 intermediates, never guest state or RAM.
+// A host thread may execute different guests/control words: every invocation
+// still performs start()/finish() and their SoftFloat TLS effects. Final Ext
+// results cannot be cached: rounded() also observes flags and rounded_up().
+const TRIG_CAPACITY: usize = 8192;
+const TRIG_WAYS: usize = 4;
+#[derive(Clone, Copy, Default)]
+struct TrigEntry {
+    key: [u8; 10],
+    value: (Q, Q),
+    valid: bool,
+}
+#[derive(Clone, Copy, Default)]
+struct TrigBucket {
+    entries: [TrigEntry; TRIG_WAYS],
+    next: usize,
+}
+struct TrigCache {
+    buckets: Box<[TrigBucket]>,
+}
+impl Default for TrigCache {
+    fn default() -> Self {
+        Self {
+            buckets: vec![TrigBucket::default(); TRIG_CAPACITY / TRIG_WAYS].into_boxed_slice(),
+        }
+    }
+}
+impl TrigCache {
+    fn resolve(&mut self, x: Ext, compute: impl FnOnce(Ext) -> (Q, Q)) -> (Q, Q) {
+        // Mix all raw input bits; equality below, never the hash, decides a hit.
+        // Fixed associativity bounds memory and lookup/eviction cost even for
+        // adversarial inputs. Collisions only lose performance, not precision.
+        let mut hash =
+            x.significand() ^ u64::from(x.sign_exponent()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        let bucket = &mut self.buckets[hash as usize & (TRIG_CAPACITY / TRIG_WAYS - 1)];
+        if let Some(entry) = bucket
+            .entries
+            .iter()
+            .find(|entry| entry.valid && entry.key == x.0)
+        {
+            return entry.value;
+        }
+        let value = compute(x);
+        bucket.entries[bucket.next] = TrigEntry {
+            key: x.0,
+            value,
+            valid: true,
+        };
+        bucket.next = (bucket.next + 1) % TRIG_WAYS;
+        value
+    }
+}
+thread_local! {
+    // Lazy allocation, bounded per host execution thread; no lock across workers.
+    static TRIG_CACHE: RefCell<TrigCache> = RefCell::default();
+}
+
+fn cached_sin_cos_series(x: Ext) -> (Q, Q) {
+    TRIG_CACHE.with(|cache| cache.borrow_mut().resolve(x, sin_cos_series))
+}
 
 const INDEFINITE: Ext = Ext([0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0xff]);
 fn infinity(negative: bool) -> Ext {
@@ -159,6 +224,14 @@ pub(super) fn scale(a: Ext, b: Ext, control: u16) -> (Ext, u16) {
 /// Range reduction uses binary128 pi. The architecture permits |x|<2^63;
 /// callers set C2 without modifying the stack outside that range.
 pub(super) fn sin_cos(x: Ext, control: u16) -> Option<((Ext, Ext), u16)> {
+    sin_cos_with(x, control, cached_sin_cos_series)
+}
+
+fn sin_cos_with(
+    x: Ext,
+    control: u16,
+    series: impl FnOnce(Ext) -> (Q, Q),
+) -> Option<((Ext, Ext), u16)> {
     if nan(x) {
         let (v, f) = propagate(x, x, control);
         return Some(((v, v), f));
@@ -173,6 +246,15 @@ pub(super) fn sin_cos(x: Ext, control: u16) -> Option<((Ext, Ext), u16)> {
         return Some(((x, Ext::from_parts(1 << 63, 0x3fff)), 0));
     }
     start();
+    let (sine, cosine) = series(x);
+    let (s, sf) = finish(sine, control, 0x20);
+    let (c, cf) = finish(cosine, control, 0x20);
+    Some(((s, c), sf | cf))
+}
+
+// Deterministic under start()'s fixed binary128 mode. Internal flags are
+// discarded by finish(), so only these pre-rounding values may be reused.
+fn sin_cos_series(x: Ext) -> (Q, Q) {
     let a = Q::from_ext(x);
     let half_pi = Q::PI.div(Q::integer(2));
     let quotient = a.div(half_pi).round(0);
@@ -193,15 +275,12 @@ pub(super) fn sin_cos(x: Ext, control: u16) -> Option<((Ext, Ext), u16)> {
         sine = sine.add(sin_term);
         cosine = cosine.add(cos_term);
     }
-    let (sine, cosine) = match quadrant {
+    match quadrant {
         0 => (sine, cosine),
         1 => (cosine, sine.neg()),
         2 => (sine.neg(), cosine.neg()),
         _ => (cosine.neg(), sine),
-    };
-    let (s, sf) = finish(sine, control, 0x20);
-    let (c, cf) = finish(cosine, control, 0x20);
-    Some(((s, c), sf | cf))
+    }
 }
 fn atan_unit(a: Q) -> Q {
     let reduce = Q([0, 0x3ffe_0000_0000_0000]).lt(a);
@@ -261,4 +340,65 @@ pub(super) fn atan2(y: Ext, x: Ext, control: u16) -> (Ext, u16) {
         control,
         if zero(y) && !negative(x) { 0 } else { 0x20 },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_trig_preserves_raw_results_rounding_and_tls_effects() {
+        // Reuse entries across every precision/rounding mode, as after guest
+        // context switches. Include exceptional encodings that bypass caching.
+        let mut inputs = vec![
+            Ext::from_parts(0, 0),
+            Ext::from_parts(0, 0x8000),
+            Ext::from_parts(1, 0),
+            Ext::from_parts(1 << 63, 0),
+            Ext::from_parts(1 << 63, 0x403e),
+            Ext::from_parts(1 << 63, 0x7fff),
+            Ext::from_parts(0xc000_0000_0000_0123, 0x7fff),
+            Ext::from_parts(0x8000_0000_0000_0123, 0x7fff),
+        ];
+        inputs.extend((0..32).map(|n| {
+            Ext::from_parts(
+                0x8000_0000_0000_0001 + n * 0x0301_0101_0101_0101,
+                0x3ffb + (n % 8) as u16 | if n % 2 != 0 { 0x8000 } else { 0 },
+            )
+        }));
+        for precision in [0, 2, 3] {
+            for rounding in 0..4 {
+                let control = 0x7f | precision << 8 | rounding << 10;
+                for &x in &inputs {
+                    sf::configure(0x37f);
+                    let expected = sin_cos_with(x, control, sin_cos_series);
+                    let expected_tls = (sf::flags(), sf::rounded_up());
+                    for _ in 0..2 {
+                        sf::configure(0x37f);
+                        assert_eq!(sin_cos(x, control), expected, "{x:?}, {control:#x}");
+                        assert_eq!((sf::flags(), sf::rounded_up()), expected_tls);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trig_cache_evicts_without_growing_or_aliasing_raw_keys() {
+        let mut cache = TrigCache::default();
+        let key = |n| Ext::from_parts(n, 0x3fff);
+        let allocation = cache.buckets.as_ptr();
+        for n in 0..(TRIG_CAPACITY * 3) as u64 {
+            let value = (Q([n, 0]), Q::ZERO);
+            assert!(cache.resolve(key(n), |_| value) == value);
+            assert!(cache.resolve(key(n), |_| panic!("cache hit recomputed")) == value);
+        }
+        assert_eq!(cache.buckets.len() * TRIG_WAYS, TRIG_CAPACITY);
+        assert_eq!(cache.buckets.as_ptr(), allocation);
+        // Differ only below binary64 precision: these must not alias.
+        for n in [1 << 63, (1 << 63) | 1] {
+            let value = (Q([n, 0]), Q::ONE);
+            assert!(cache.resolve(key(n), |_| value) == value);
+        }
+    }
 }

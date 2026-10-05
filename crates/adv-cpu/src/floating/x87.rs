@@ -11,105 +11,122 @@ const C2: u16 = 0x400;
 const C3: u16 = 0x4000;
 
 pub(super) fn supported(i: &Instruction) -> bool {
-    matches!(
-        i.mnemonic(),
+    helper_effects(i).is_some() || matches!(i.mnemonic(), M::Fxsave | M::Fxrstor)
+}
+
+/// Closed over the audited set: new helpers must declare their integer
+/// effects before generated code may omit synchronization around them.
+pub(super) fn helper_effects(i: &Instruction) -> Option<X87Effects> {
+    let mut effects = X87Effects::default();
+    match i.mnemonic() {
         M::Fld
-            | M::Fst
-            | M::Fstp
-            | M::Fild
-            | M::Fist
-            | M::Fistp
-            | M::Fisttp
-            | M::Fbld
-            | M::Fbstp
-            | M::Fld1
-            | M::Fldz
-            | M::Fldpi
-            | M::Fldl2e
-            | M::Fldl2t
-            | M::Fldlg2
-            | M::Fldln2
-            | M::Fadd
-            | M::Faddp
-            | M::Fiadd
-            | M::Fsub
-            | M::Fsubp
-            | M::Fsubr
-            | M::Fsubrp
-            | M::Fisub
-            | M::Fisubr
-            | M::Fmul
-            | M::Fmulp
-            | M::Fimul
-            | M::Fdiv
-            | M::Fdivp
-            | M::Fdivr
-            | M::Fdivrp
-            | M::Fidiv
-            | M::Fidivr
-            | M::Fsqrt
-            | M::Frndint
-            | M::Fscale
-            | M::Fyl2x
-            | M::Fyl2xp1
-            | M::F2xm1
-            | M::Fsin
-            | M::Fcos
-            | M::Fsincos
-            | M::Fptan
-            | M::Fpatan
-            | M::Fxtract
-            | M::Fprem
-            | M::Fprem1
-            | M::Fabs
-            | M::Fchs
-            | M::Fxch
-            | M::Ffree
-            | M::Ffreep
-            | M::Fincstp
-            | M::Fdecstp
-            | M::Fcom
-            | M::Fcomp
-            | M::Fcompp
-            | M::Fucom
-            | M::Fucomp
-            | M::Fucompp
-            | M::Ficom
-            | M::Ficomp
-            | M::Ftst
-            | M::Fcomi
-            | M::Fcomip
-            | M::Fucomi
-            | M::Fucomip
-            | M::Fxam
-            | M::Fcmovb
-            | M::Fcmovbe
-            | M::Fcmove
-            | M::Fcmovnb
-            | M::Fcmovnbe
-            | M::Fcmovne
-            | M::Fcmovnu
-            | M::Fcmovu
-            | M::Fldcw
-            | M::Fnstcw
-            | M::Fstcw
-            | M::Fnstsw
-            | M::Fstsw
-            | M::Fnclex
-            | M::Fclex
-            | M::Fninit
-            | M::Finit
-            | M::Fnop
-            | M::Wait
-            | M::Fldenv
-            | M::Fnstenv
-            | M::Fstenv
-            | M::Fnsave
-            | M::Fsave
-            | M::Frstor
-            | M::Fxsave
-            | M::Fxrstor
-    )
+        | M::Fst
+        | M::Fstp
+        | M::Fild
+        | M::Fist
+        | M::Fistp
+        | M::Fisttp
+        | M::Fbld
+        | M::Fbstp
+        | M::Fld1
+        | M::Fldz
+        | M::Fldpi
+        | M::Fldl2e
+        | M::Fldl2t
+        | M::Fldlg2
+        | M::Fldln2
+        | M::Fadd
+        | M::Faddp
+        | M::Fiadd
+        | M::Fsub
+        | M::Fsubp
+        | M::Fsubr
+        | M::Fsubrp
+        | M::Fisub
+        | M::Fisubr
+        | M::Fmul
+        | M::Fmulp
+        | M::Fimul
+        | M::Fdiv
+        | M::Fdivp
+        | M::Fdivr
+        | M::Fdivrp
+        | M::Fidiv
+        | M::Fidivr
+        | M::Fsqrt
+        | M::Frndint
+        | M::Fscale
+        | M::Fyl2x
+        | M::Fyl2xp1
+        | M::F2xm1
+        | M::Fsin
+        | M::Fcos
+        | M::Fsincos
+        | M::Fptan
+        | M::Fpatan
+        | M::Fxtract
+        | M::Fprem
+        | M::Fprem1
+        | M::Fabs
+        | M::Fchs
+        | M::Fxch
+        | M::Ffree
+        | M::Ffreep
+        | M::Fincstp
+        | M::Fdecstp
+        | M::Fcom
+        | M::Fcomp
+        | M::Fcompp
+        | M::Fucom
+        | M::Fucomp
+        | M::Fucompp
+        | M::Ficom
+        | M::Ficomp
+        | M::Ftst
+        | M::Fxam
+        | M::Fldcw
+        | M::Fnstcw
+        | M::Fstcw
+        | M::Fnclex
+        | M::Fclex
+        | M::Fninit
+        | M::Finit
+        | M::Fnop
+        | M::Wait
+        | M::Fldenv
+        | M::Fnstenv
+        | M::Fstenv
+        | M::Fnsave
+        | M::Fsave
+        | M::Frstor => {}
+        M::Fnstsw | M::Fstsw => {
+            if i.op0_kind() == OpKind::Register {
+                // AX is a partial write: preserve the current upper EAX half.
+                effects.read_gpr = 1;
+                effects.write_gpr = 1;
+            }
+        }
+        M::Fcomi | M::Fcomip | M::Fucomi | M::Fucomip => {
+            effects.read_flags = true; // Preserve unaffected bits and rollback.
+            effects.write_flags = true;
+        }
+        M::Fcmovb
+        | M::Fcmovbe
+        | M::Fcmove
+        | M::Fcmovnb
+        | M::Fcmovnbe
+        | M::Fcmovne
+        | M::Fcmovnu
+        | M::Fcmovu => effects.read_flags = true,
+        _ => return None,
+    }
+    // Use the same alias mapping as Transaction::address, including addr16.
+    for register in [i.memory_base(), i.memory_index()] {
+        if register != R::None {
+            effects.read_gpr |= 1 << reg_index(register)?;
+        }
+    }
+    Some(effects)
 }
 fn exceptions(tx: &mut Transaction, flags: u16) {
     tx.state.x87.status |= flags;

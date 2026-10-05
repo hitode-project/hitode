@@ -1858,14 +1858,70 @@ impl Emitter<'_> {
     }
     fn x87_instruction(&mut self, i: &Instruction, operation: usize) {
         let pc = self.constant(i.ip32());
-        self.save_state(pc);
+        // MMX aliases require synchronization for correctness. XMM and integer
+        // flag/partial-register effects retain the full lane for code quality:
+        // keeping their SSA values across a helper can increase hot-path spills.
+        let effects = if self.mmx_mode.is_none()
+            && self.mmx_effects.is_none()
+            && self.mmx.iter().all(Option::is_none)
+            && self.xmm.iter().all(Option::is_none)
+        {
+            crate::floating::x87_effects(i)
+                .filter(|e| !e.read_flags && !e.write_flags && e.write_gpr == 0)
+        } else {
+            None
+        };
+        if let Some(effects) = &effects {
+            for index in 0..8 {
+                if effects.read_gpr & (1 << index) != 0 {
+                    let value = self.b.use_var(self.regs[index]);
+                    self.b
+                        .ins()
+                        .store(MemFlags::trusted(), value, self.state, (index * 4) as i32);
+                }
+            }
+            if effects.read_flags {
+                let flags = self.materialize_flags();
+                self.b.ins().store(
+                    MemFlags::trusted(),
+                    flags,
+                    self.state,
+                    offset_of!(CpuState, eflags) as i32,
+                );
+            }
+            self.b.ins().store(
+                MemFlags::trusted(),
+                pc,
+                self.state,
+                offset_of!(CpuState, eip) as i32,
+            );
+        } else {
+            self.save_state(pc);
+        }
         let operation = self.b.ins().iconst(self.ptr_ty, operation as i64);
         let call = self
             .b
             .ins()
             .call(self.x87_ref, &[self.bridge, self.state, operation]);
         let result = self.b.inst_results(call)[0];
-        self.reload_state();
+        if let Some(effects) = &effects {
+            for index in 0..8 {
+                if effects.write_gpr & (1 << index) != 0 {
+                    let value = self.b.ins().load(
+                        types::I32,
+                        MemFlags::trusted(),
+                        self.state,
+                        (index * 4) as i32,
+                    );
+                    self.b.def_var(self.regs[index], value);
+                }
+            }
+            if effects.write_flags {
+                self.reload_flags();
+            }
+        } else {
+            self.reload_state();
+        }
         if self.mmx_effects.is_some() {
             // The call committed and refreshed the MMX aliases in CpuState.
             self.begin_mmx_block();
@@ -2089,6 +2145,19 @@ impl Emitter<'_> {
                 self.b.def_var(*var, v);
             }
         }
+        self.reload_flags();
+        let fuel = self.b.ins().load(
+            types::I64,
+            MemFlags::trusted(),
+            self.state,
+            offset_of!(CpuState, fuel) as i32,
+        );
+        self.b.def_var(self.fuel, fuel);
+        // Host/REP helpers can edit canonical x87/MMX state, so restart the
+        // current prefix from the freshly reloaded pending mode.
+        self.begin_mmx_block();
+    }
+    fn reload_flags(&mut self) {
         let flags = self.b.ins().load(
             types::I32,
             MemFlags::trusted(),
@@ -2102,16 +2171,6 @@ impl Emitter<'_> {
         }
         let carry = self.b.ins().band_imm(flags, 1);
         self.b.def_var(self.lazy[4], carry);
-        let fuel = self.b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            self.state,
-            offset_of!(CpuState, fuel) as i32,
-        );
-        self.b.def_var(self.fuel, fuel);
-        // Host/REP helpers can edit canonical x87/MMX state, so restart the
-        // current prefix from the freshly reloaded pending mode.
-        self.begin_mmx_block();
     }
     fn trap_call(&mut self, next: u32) {
         let pc = self.constant(next);
