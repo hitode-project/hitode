@@ -3086,9 +3086,10 @@ impl Emitter<'_> {
                 let count = self.b.ins().band_imm(count, 1);
                 self.b.ins().bxor_imm(count, 1)
             }
+            11 if self.carries_overflow(kind) => return b,
             4 | 11 => {
                 let ab = self.b.ins().bxor(a, b);
-                let base = self.b.ins().band_imm(kind, 255);
+                let base = self.b.ins().band_imm(kind, 3);
                 let value = if bit == 4 {
                     let xor = self.b.ins().bxor(ab, result);
                     let shift = self.b.ins().ushr_imm(kind, 8);
@@ -3109,20 +3110,34 @@ impl Emitter<'_> {
             }
             _ => unreachable!(),
         };
-        // Kind bit 4 carries AF and OF as the operands (each 0 or 1), so
-        // shifts, rotates and multiplies need not rebuild EFLAGS to keep them;
-        // the low two bits still say whether PF/ZF/SF are raw (0) or derived
-        // from the result.
-        let (value, raw) = if matches!(bit, 4 | 11) {
+        // Kind bit 4 means a later CF/OF writer replaced OF with b (0 or 1)
+        // and folded the old b into a, which leaves AF's a ^ b ^ result intact.
+        // The low two bits still say whether the rest are raw (0) or derived.
+        let (value, raw) = if bit == 11 {
             let carried = self.b.ins().band_imm(kind, 4);
-            let operand = if bit == 4 { a } else { b };
-            let value = self.b.ins().select(carried, operand, value);
+            let value = self.b.ins().select(carried, b, value);
             (value, self.b.ins().icmp_imm(IntCC::Equal, kind, 0))
         } else {
             let base = self.b.ins().band_imm(kind, 3);
             (value, self.b.ins().icmp_imm(IntCC::Equal, base, 0))
         };
         self.b.ins().select(raw, old, value)
+    }
+    /// Whether this kind value is statically known to carry OF in b.
+    fn carries_overflow(&self, kind: Value) -> bool {
+        if let Some(kind) = self.known(kind) {
+            return kind & 4 != 0;
+        }
+        self.b.func.dfg.value_def(kind).inst().is_some_and(|inst| {
+            matches!(
+                self.b.func.dfg.insts[inst],
+                ir::InstructionData::BinaryImm64 {
+                    opcode: ir::Opcode::BorImm,
+                    imm,
+                    ..
+                } if imm.bits() & 4 != 0
+            )
+        })
     }
     fn materialize_flags(&mut self) -> Value {
         let old = self.b.use_var(self.flags);

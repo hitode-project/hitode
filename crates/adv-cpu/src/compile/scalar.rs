@@ -150,13 +150,15 @@ impl Emitter<'_> {
     }
 
     /// Replace CF and OF while keeping the other arithmetic flags, without
-    /// rebuilding EFLAGS: kind bit 4 carries AF/OF in the operands while PF/ZF/SF
-    /// keep coming from the raw word or the retained result.
+    /// computing any of them: kind bit 4 puts OF in b and folds the old b into
+    /// a, so AF's a ^ b ^ result is unchanged and PF/ZF/SF stay as they were.
     fn set_carry_overflow(&mut self, carry: Value, overflow: Value) {
-        let adjust = self.flag(4);
+        let a = self.b.use_var(self.lazy[0]);
+        let b = self.b.use_var(self.lazy[1]);
+        let a = self.b.ins().bxor(a, b);
         let kind = self.b.use_var(self.lazy[3]);
         let kind = self.b.ins().bor_imm(kind, 4);
-        self.b.def_var(self.lazy[0], adjust);
+        self.b.def_var(self.lazy[0], a);
         self.b.def_var(self.lazy[1], overflow);
         self.b.def_var(self.lazy[3], kind);
         let zero = self.constant(0);
@@ -488,11 +490,13 @@ impl Emitter<'_> {
         let overflow = self.b.ins().select(one, overflow, old_overflow);
         let adjust = self.flag(4);
         let saved = self.flags_state();
-        // AF and a multi-bit OF are undefined; kind bit 4 carries the retained
-        // values and the result (shifted to bit 31 like narrow ALU) supplies
-        // PF/ZF/SF.
+        // AF and a multi-bit OF are undefined but retained. The result
+        // (shifted to bit 31 like narrow ALU) supplies PF/ZF/SF; a places the
+        // old AF where a ^ b ^ result reads it, and kind bit 4 puts OF in b.
         let shift = 32 - bits;
         let wide = self.b.ins().ishl_imm(result, shift);
+        let adjust = self.b.ins().ishl_imm(adjust, 4 + shift);
+        let adjust = self.b.ins().bxor(adjust, wide);
         let zero = self.constant(0);
         let kind = self.constant(5 | (shift as u32) << 8);
         for (var, value) in self

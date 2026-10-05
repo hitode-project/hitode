@@ -189,22 +189,23 @@ fn flags(old: u32, lazy: [u32; 7]) -> u32 {
     // Narrow operations keep operands shifted to bit 31; the high byte is the shift.
     let shift = kind >> 8;
     let kind = kind & 0xff;
+    // Bit 4: a CF/OF writer moved OF into right and folded the old right into
+    // left, keeping AF's left ^ right ^ result.
+    let base = kind & 3;
     for bit in [2, 4, 6, 7, 11] {
-        let adjust_or_overflow = matches!(bit, 4 | 11);
-        let value = if adjust_or_overflow && kind & 4 != 0 {
-            // Shift/rotate/multiply results carry AF and OF as operand bits.
-            (if bit == 4 { left } else { right }) & 1
-        } else if kind == 0 || !adjust_or_overflow && kind & 3 == 0 {
+        let value = if bit == 11 && kind & 4 != 0 {
+            right & 1
+        } else if kind == 0 || bit != 11 && base == 0 {
             (old >> bit) & 1
         } else {
             match bit {
                 2 => (((result >> shift) as u8).count_ones() ^ 1) & 1,
-                4 if kind != 3 => ((left ^ right ^ result) >> shift >> 4) & 1,
+                4 if base != 3 => ((left ^ right ^ result) >> shift >> 4) & 1,
                 6 => u32::from(result == 0),
                 7 => result >> 31,
-                11 if kind != 3 => {
+                11 if base != 3 => {
                     let lr = left ^ right;
-                    let first = if kind == 1 { !lr } else { lr };
+                    let first = if base == 1 { !lr } else { lr };
                     (first & (left ^ result)) >> 31
                 }
                 _ => 0,
