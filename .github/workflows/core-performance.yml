@@ -43,12 +43,20 @@ jobs:
       - name: Test execution layer
         run: |
           set -o pipefail
-          cargo test --release -p adv-cpu --lib --tests 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
+          cargo test --release --locked -p adv-cpu --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
+      - name: Run explicitly ignored CPU diagnostics
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --lib -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/core-diagnostics.txt"
       - name: Record diagnostic synthetic benchmark
         run: |
           set -o pipefail
-          cargo build --release -p adv-cpu --example execution_bench
+          cargo build --release --locked -p adv-cpu --example execution_bench
           "$CARGO_TARGET_DIR/release/examples/execution_bench" 7 | tee "$RUNNER_TEMP/core-bench.csv"
+      - name: Compare x87 helper and native emission
+        run: |
+          cargo build --release --locked -p adv-cpu --example x87_native_bench
+          python3 tools/performance/x87_ab.py "$CARGO_TARGET_DIR/release/examples/x87_native_bench" "$RUNNER_TEMP/x87-ab" --rounds 5 --samples 31
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -56,7 +64,9 @@ jobs:
           path: |
             ${{ runner.temp }}/core-environment.txt
             ${{ runner.temp }}/core-tests.txt
+            ${{ runner.temp }}/core-diagnostics.txt
             ${{ runner.temp }}/core-bench.csv
+            ${{ runner.temp }}/x87-ab/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -67,9 +77,71 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Test the whole workspace
-        run: cargo test-full --release --locked
-      - name: Lint
+      - name: Test the whole workspace without stopping at the first failed target
         run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --release --locked -- -D warnings
+          cargo test-full --release --locked --no-fail-fast 2>&1 | Tee-Object "$env:RUNNER_TEMP/workspace-tests.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check formatting independently
+        if: always()
+        run: |
+          cargo fmt --all -- --check 2>&1 | Tee-Object "$env:RUNNER_TEMP/workspace-fmt.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Lint independently
+        if: always()
+        run: |
+          cargo clippy --workspace --all-targets --release --locked -- -D warnings 2>&1 | Tee-Object "$env:RUNNER_TEMP/workspace-clippy.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: workspace-validation-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/workspace-tests.txt
+            ${{ runner.temp }}/workspace-fmt.txt
+            ${{ runner.temp }}/workspace-clippy.txt
+          retention-days: 14
+
+  x87-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record Windows environment
+        run: |
+          git rev-parse HEAD | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt"
+          rustc -Vv | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt" -Append
+          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt" -Append
+          Get-Content "$env:RUNNER_TEMP/x87-windows-environment.txt"
+      - name: Check Windows execution and x87 guards
+        run: |
+          cargo test --release --locked -p adv-cpu --lib --tests -- --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/x87-windows-tests.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --release --locked -p adv-cpu --lib -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stress callback progress and lifetime checkpoints
+        run: |
+          for ($n = 0; $n -lt 50; $n++) {
+            cargo test --release --locked -p adv-cpu --test shared_audio concurrent_callback -- --test-threads=1 2>&1 | Tee-Object "$env:RUNNER_TEMP/x87-callback-stress.txt" -Append
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Compare Windows x87 helper and native emission
+        run: |
+          cargo build --release --locked -p adv-cpu --example x87_native_bench
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/performance/x87_ab.py target/release/examples/x87_native_bench.exe "$env:RUNNER_TEMP/x87-ab" --rounds 5 --samples 31
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: x87-windows-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/x87-windows-environment.txt
+            ${{ runner.temp }}/x87-windows-tests.txt
+            ${{ runner.temp }}/x87-callback-stress.txt
+            ${{ runner.temp }}/x87-ab/
+          if-no-files-found: ignore
+          retention-days: 14

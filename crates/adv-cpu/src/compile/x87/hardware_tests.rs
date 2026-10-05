@@ -1,0 +1,166 @@
+//! Independent hardware oracle: neither the interpreter nor floating::fast
+//! computes these expected results. Save and restore the complete host FP image
+//! within one asm block, including the caller's x87 stack and MXCSR.
+use super::*;
+
+#[repr(C, align(16))]
+struct HostFp([u8; 512]);
+
+fn hardware(a: f64, b: f64, op: Op) -> ([u8; 10], u16) {
+    let mut saved = HostFp([0; 512]);
+    let mut raw = [0u8; 10];
+    let mut status = 0u16;
+    let control = 0x027fu16;
+    macro_rules! execute {
+        ($instruction:literal) => {
+            // SAFETY: every operand points to a live, correctly sized object;
+            // FXSAVE's image is 16-byte aligned. All exceptions are masked.
+            // FXRSTOR restores the original x87/MMX/XMM/MXCSR image before Rust
+            // resumes; no stack pointer or general-purpose register is changed.
+            unsafe {
+                core::arch::asm!(
+                    "fxsave64 [{saved}]",
+                    "fninit",
+                    "fldcw word ptr [{control}]",
+                    "fld qword ptr [{a}]",
+                    $instruction,
+                    "fnstsw word ptr [{status}]",
+                    "fstp tbyte ptr [{raw}]",
+                    "fxrstor64 [{saved}]",
+                    saved = in(reg) &mut saved,
+                    control = in(reg) &control,
+                    a = in(reg) &a,
+                    b = in(reg) &b,
+                    status = in(reg) &mut status,
+                    raw = in(reg) &mut raw,
+                    options(nostack),
+                );
+            }
+        };
+    }
+    match op {
+        Op::Add => execute!("fadd qword ptr [{b}]"),
+        Op::Sub => execute!("fsub qword ptr [{b}]"),
+        Op::Mul => execute!("fmul qword ptr [{b}]"),
+        Op::Div => execute!("fdiv qword ptr [{b}]"),
+    }
+    (raw, status)
+}
+
+struct DekkerGuard(bool);
+impl DekkerGuard {
+    fn set(value: bool) -> Self {
+        Self(testing::FORCE_DEKKER.replace(value))
+    }
+}
+impl Drop for DekkerGuard {
+    fn drop(&mut self) {
+        testing::FORCE_DEKKER.set(self.0);
+    }
+}
+
+fn next(seed: &mut u64) -> u64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed
+}
+fn bounded(seed: &mut u64) -> f64 {
+    let bits = next(seed);
+    let exponent = ((bits >> 52) % 801) + (1023 - 400);
+    f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (exponent << 52))
+}
+
+#[test]
+fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
+    let edge = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        1.5,
+        -1.5,
+        3.0,
+        -3.0,
+        1.0 + f64::EPSILON,
+        1.0 - f64::EPSILON / 2.0,
+        2f64.powi(-400),
+        -2f64.powi(-400),
+        2f64.powi(400),
+        -2f64.powi(400),
+        2f64.powi(-53),
+        -2f64.powi(-53),
+    ];
+    let mut count = 0usize;
+    let before = testing::calls();
+    for dekker in [false, true] {
+        let _guard = DekkerGuard::set(dekker);
+        for op in [Op::Add, Op::Sub, Op::Mul, Op::Div] {
+            let code = bytes(|a| {
+                match op {
+                    Op::Add => a.fadd(qword_ptr(esi)),
+                    Op::Sub => a.fsub(qword_ptr(esi)),
+                    Op::Mul => a.fmul(qword_ptr(esi)),
+                    Op::Div => a.fdiv(qword_ptr(esi)),
+                }
+                .unwrap();
+            });
+            let mut mem = memory(&code);
+            let compiled = compile(&Region::new(CODE, code.len()), &mem, false).unwrap();
+            let mut seed = 0xd93f_517a_982b_410du64;
+            let random = (0..8192).map(|_| (bounded(&mut seed), bounded(&mut seed)));
+            let edges = edge.iter().flat_map(|&a| edge.iter().map(move |&b| (a, b)));
+            let mut exact = 0;
+            let mut down = 0;
+            let mut up = 0;
+            for (a, b) in edges.chain(random) {
+                if op == Op::Div && b == 0.0 {
+                    continue; // Divide-by-zero rejection is tested separately.
+                }
+                let (raw, status) = hardware(a, b, op);
+                let mut actual = state();
+                actual.x87.control = 0x027f;
+                let slot = actual.x87.top();
+                let value = X87Register(crate::backend::x87::encode_f64(a));
+                actual.x87.regs[slot] = value;
+                actual.x87.set_physical_tag(slot, value.tag());
+                actual.refresh_mmx();
+                mem.write(DATA, &b.to_le_bytes()).unwrap();
+                assert_eq!(
+                    testing::run(&compiled, &mut actual, &mut mem),
+                    Exit::Dispatch as u32
+                );
+                assert_eq!(
+                    actual.x87.regs[slot].0,
+                    raw,
+                    "raw80 op={op:?} dekker={dekker} a={:016x} b={:016x}",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+                assert_eq!(
+                    actual.x87.status & 0x023f,
+                    status & 0x023f,
+                    "exceptions/C1 op={op:?} dekker={dekker} a={:016x} b={:016x}",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+                if status & 0x20 == 0 {
+                    exact += 1;
+                } else if status & 0x200 == 0 {
+                    down += 1;
+                } else {
+                    up += 1;
+                }
+                count += 1;
+            }
+            assert!(exact > 0 && down > 0 && up > 0, "oracle coverage: {op:?}");
+        }
+    }
+    assert_eq!(
+        testing::calls() - before,
+        0,
+        "hardware corpus must exercise native emission"
+    );
+    assert_eq!(count, 67520);
+    eprintln!("hardware x87 oracle: {count} cases, raw80 + exception/C1 bits, zero helper calls");
+}

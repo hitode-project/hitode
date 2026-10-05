@@ -483,37 +483,33 @@ fn protected_cross_page_store_faults_without_partial_commit_then_restarts() {
     assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
 }
 
+#[path = "support/callback_reader.rs"]
+mod callback_reader;
+use callback_reader::CallbackReader;
+
 #[test]
 fn concurrent_callback_reads_never_observe_invalidated_or_reused_guest_storage() {
     let (mut cpu, shared) = fixture(&[0xc3], false);
     cpu.write(DATA, &[0x11; 8192]).unwrap();
-    let done = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(std::sync::Barrier::new(2));
-    let reader_ready = ready.clone();
-    let stop = done.clone();
     let alias = shared.read_alias.clone();
-    let reader = std::thread::spawn(move || {
-        let mut loops = 0;
+    let mut reader = CallbackReader::new(move |reads| {
         let mut bytes = [0; 128];
-        reader_ready.wait();
-        while !stop.load(Ordering::Acquire) {
-            alias.copy_into(loops % 8000, &mut bytes);
-            assert!(bytes.iter().all(|&b| b == 0x11 || b == 0xee));
-            loops += 1;
-        }
-        loops
+        alias.copy_into(reads % 8000, &mut bytes);
+        assert!(bytes.iter().all(|&b| b == 0x11 || b == 0xee));
     });
-    ready.wait();
+    reader.checkpoint();
     for _ in 0..64 {
         cpu.write(DATA, &[0xee; 8192]).unwrap();
+        reader.checkpoint();
         cpu.write(DATA, &[0x11; 8192]).unwrap();
     }
     cpu.unmap(DATA, 8192).unwrap();
     cpu.map(DATA, 8192, Prot::RW).unwrap();
     cpu.write(DATA, &[0xa5; 8192]).unwrap();
+    reader.checkpoint();
     drop(cpu);
-    done.store(true, Ordering::Release);
-    assert!(reader.join().unwrap() > 0);
+    reader.checkpoint();
+    assert!(reader.finish() > 0);
     assert_eq!(shared.read_alias.load_u8(0), 0x11);
 }
 
@@ -530,23 +526,13 @@ fn concurrent_callback_reads_accept_byte_mixtures_during_native_simd_stores() {
     });
     let (mut cpu, shared) = fixture(&code, true);
     cpu.write(DATA, &[0x11; 8192]).unwrap();
-    let done = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(std::sync::Barrier::new(2));
-    let reader_ready = ready.clone();
-    let stop = done.clone();
     let alias = shared.read_alias.clone();
-    let reader = std::thread::spawn(move || {
-        let mut loops = 0;
+    let mut reader = CallbackReader::new(move |reads| {
         let mut data = [0; 128];
-        reader_ready.wait();
-        while !stop.load(Ordering::Acquire) {
-            alias.copy_into(loops % 8000, &mut data);
-            assert!(data.iter().all(|&byte| byte == 0x11 || byte == 0xee));
-            loops += 1;
-        }
-        loops
+        alias.copy_into(reads % 8000, &mut data);
+        assert!(data.iter().all(|&byte| byte == 0x11 || byte == 0xee));
     });
-    ready.wait();
+    reader.checkpoint();
     for _ in 0..64 {
         for pattern in [0xee, 0x11] {
             let state = &mut cpu.executor_mut().state;
@@ -556,10 +542,10 @@ fn concurrent_callback_reads_accept_byte_mixtures_during_native_simd_stores() {
             state.regs[7] = DATA;
             state.xmm[0] = [pattern; 16];
             run(&mut cpu);
+            reader.checkpoint();
         }
     }
-    done.store(true, Ordering::Release);
-    assert!(reader.join().unwrap() > 0);
+    assert!(reader.finish() > 0);
     assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
     let mut actual = [0; 8192];
     shared.read_alias.copy_into(0, &mut actual);

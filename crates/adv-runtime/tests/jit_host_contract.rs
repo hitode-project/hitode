@@ -382,7 +382,7 @@ fn callback_return_trap_is_dispatched_after_cross_region_tail_calls() {
 }
 
 #[test]
-fn interpreted_floating_execution_delivers_api_callback_and_return_trap_in_order() {
+fn floating_execution_keeps_native_regions_and_delivers_callbacks_in_order() {
     const SOURCE: u32 = DATA + 0x1000;
     const OUTPUT: u32 = DATA + 0x4000;
     const CALLBACK_OUTPUT: u32 = DATA + 0x7000;
@@ -464,7 +464,8 @@ fn interpreted_floating_execution_delivers_api_callback_and_return_trap_in_order
         assert_eq!(output, expected[..256 * 4]);
         assert_eq!(m.ext.get::<Calls>().log, ["call:callback", "returned:13"]);
         if backend == "jit" {
-            assert!(m.cpu.stats().interpreter_instructions > 0);
+            assert!(m.cpu.stats().native_entries > 0);
+            assert_eq!(m.cpu.stats().interpreter_instructions, 0);
         }
     }
 }

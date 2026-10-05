@@ -202,7 +202,11 @@ fn double(v: Ext, range: i32) -> Option<f64> {
         return Some(f64::from_bits(sign));
     }
     let unbiased = exponent - 0x3fff;
-    if significand >> 63 == 0 || significand & 0x7ff != 0 || unbiased.abs() > range {
+    if significand >> 63 == 0
+        || significand & 0x7ff != 0
+        || !(-1022..=1023).contains(&unbiased)
+        || unbiased.abs() > range
+    {
         return None;
     }
     let bits = sign | (((unbiased + 1023) as u64) << 52) | ((significand << 1) >> 12);
@@ -318,7 +322,8 @@ fn address(i: &Instruction, state: &CpuState) -> Option<u32> {
 }
 
 fn writable(memory: &Memory, address: u32, len: usize) -> bool {
-    memory.direct(address, len, true).is_some() || accessible(memory, address, len, true)
+    memory.direct(address, len, true).is_some()
+        || (!memory.shared_range(address, len) && accessible(memory, address, len, true))
 }
 
 /// Store to a location `writable` accepted.
@@ -358,7 +363,11 @@ fn read<const N: usize>(memory: &Memory, address: u32) -> Option<[u8; N]> {
         // SAFETY: `direct` bounds the range to one owned ordinary page.
         return Some(unsafe { pointer.cast::<[u8; N]>().read_unaligned() });
     }
-    if !accessible(memory, address, N, false) {
+    // A lazy file read may fail observably. Returning None after attempting it
+    // would retry I/O inside the same instruction and could swallow the fault.
+    // Shared/file/audio accesses therefore belong to the transaction, not this
+    // speculative fast path. Ordinary cross-page reads remain eligible.
+    if memory.shared_range(address, N) || !accessible(memory, address, N, false) {
         return None;
     }
     memory.read_data(address, N).ok()?.as_ref().try_into().ok()
@@ -419,7 +428,7 @@ pub(super) fn execute(
 ) -> Option<u32> {
     let i = &op.instruction;
     let x87 = &state.x87;
-    if x87.status & 0x80 != 0 || state.mmx_mode & 1 != 0 {
+    if x87.status & 0x80 != 0 || state.mmx_mode != 0 {
         return None;
     }
     let control = x87.control;

@@ -3,6 +3,7 @@ use crate::{EXEC, interpreter::Step};
 use iced_x86::code_asm::*;
 
 const BASE: u32 = 0x10000;
+const CODE: u32 = BASE + 0x4000;
 type Asm = fn(&mut CodeAssembler, AsmRegisterSt) -> Result<(), IcedError>;
 
 fn programs() -> Vec<Asm> {
@@ -99,6 +100,12 @@ fn value(rng: &mut Rng) -> f64 {
 }
 
 fn register(rng: &mut Rng) -> Ext {
+    if rng.next().is_multiple_of(16) {
+        return Ext::from_parts(
+            rng.pick(&[0, 1, 1 << 63, (1 << 63) | 0x800, u64::MAX]),
+            rng.pick(&[0, 0x3bff, 0x43ff, 0x7ffe, 0x7fff, 0x8000, 0xffff]),
+        );
+    }
     if rng.next().is_multiple_of(8) {
         // Not an exact double: a full extended significand.
         return Ext::from_parts(rng.next() | 1 << 63, (rng.next() as u16 & 0x8000) | 0x3fff);
@@ -111,8 +118,11 @@ fn register(rng: &mut Rng) -> Ext {
     }
 }
 
-fn memory(data: u64) -> Memory {
-    let mut memory = Memory::new(BASE, 0x4000).unwrap();
+fn memory(data: u64, bytes: &[u8]) -> Memory {
+    let mut memory = Memory::new(BASE, 0x5000).unwrap();
+    memory.protect(CODE, 0x1000, READ | WRITE).unwrap();
+    memory.write(CODE, bytes).unwrap();
+    memory.protect(CODE, 0x1000, READ | EXEC).unwrap();
     memory.protect(BASE, 0x3000, READ | WRITE).unwrap();
     for page in 0..3 {
         let at = BASE + page * 0x1000;
@@ -129,17 +139,39 @@ fn memory(data: u64) -> Memory {
 
 #[test]
 fn fast_x87_matches_the_transactional_path_bit_for_bit() {
+    differential(false);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn compiled_x87_matches_the_transactional_path_bit_for_bit() {
+    differential(true);
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn compiled_x87_without_fma_matches_the_transactional_path() {
+    crate::compile::x87::testing::FORCE_DEKKER.set(true);
+    differential(true);
+    crate::compile::x87::testing::FORCE_DEKKER.set(false);
+}
+
+fn differential(compiled: bool) {
+    use crate::compile::x87::testing;
+    let mut cache = std::collections::BTreeMap::new();
+    let mut fallbacks = 0;
+    let mut faults = 0;
     let programs = programs();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut taken = vec![0u32; programs.len()];
     let (mut rounded_up, mut inexact) = (0, 0);
-    for round in 0..150_000 {
+    for round in 0..300_000 {
         let index = round % programs.len();
         let mut asm = CodeAssembler::new(32).unwrap();
         let st = rng.pick(&[st0, st1, st2, st5, st7]);
         programs[index](&mut asm, st).unwrap();
-        let bytes = asm.assemble(0x1000).unwrap();
-        let instruction = iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode();
+        let bytes = asm.assemble(u64::from(CODE)).unwrap();
+        let instruction = iced_x86::Decoder::with_ip(32, &bytes, u64::from(CODE), 0).decode();
         let opcode = bytes
             .windows(2)
             .find(|b| (0xd8..=0xdf).contains(&b[0]))
@@ -154,13 +186,18 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
             .unwrap_or_else(|| panic!("{:?} has no fast path", instruction.mnemonic()));
 
         let mut state = CpuState {
-            eip: 0x1000,
+            eip: CODE,
+            fuel: 1,
             ..CpuState::default()
         };
+        state.fault_addr = rng.next() as u32;
+        state.xmm = std::array::from_fn(|_| std::array::from_fn(|_| rng.next() as u8));
+        state.mxcsr = rng.pick(&[0x1f80, 0x3f80, 0x5f80, 0x7f80, 0xdfc0]);
         state.x87.control = rng.pick(&[
-            0x027f, 0x027f, 0x037f, 0x0e7f, 0x0c7f, 0x007f, 0x025f, 0x021f,
+            0x027f, 0x027f, 0x027f, 0x027f, 0x037f, 0x0e7f, 0x0c7f, 0x007f, 0x025f, 0x021f, 0x047f,
+            0x087f, 0x067f, 0x0a7f, 0x077f, 0x0b7f, 0x0f7f,
         ]);
-        state.x87.status = rng.pick(&[0, 0x20, 0x3800, 0x4100, 0x0001]);
+        state.x87.status = rng.pick(&[0, 0x20, 0x3800, 0x4100, 0x0001, 0x80, 0x8081]);
         state.x87.set_top(rng.next() as usize);
         state.x87.tag = rng.next() as u16;
         for slot in 0..8 {
@@ -170,9 +207,24 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
                 state.x87.set_physical_tag(slot, tag);
             }
         }
+        state.x87.ip = rng.next() as u32;
+        state.x87.dp = rng.next() as u32;
+        state.x87.opcode = rng.next() as u16 & 0x7ff;
+        state.x87.cs = rng.next() as u16;
+        state.x87.ds = rng.next() as u16;
         state.mmx = state.x87.regs.map(Ext::significand);
         state.regs[0] = rng.next() as u32;
-        state.regs[6] = BASE + rng.pick(&[0x10, 0xffc, 0x1010, 0x2010, 0x3010, 0xff8]);
+        state.regs[6] = BASE.wrapping_add(rng.pick(&[
+            0x10,
+            0x10,
+            0x10,
+            0xffc,
+            0x1010,
+            0x2010,
+            0x3010,
+            0xff8,
+            u32::MAX - BASE - 3,
+        ]));
         let mut data = match rng.next() % 3 {
             0 => u64::from((value(&mut rng) as f32).to_bits()) | rng.next() << 32,
             1 => value(&mut rng).to_bits(),
@@ -184,7 +236,7 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
         }
 
         let mut expected = state.clone();
-        let mut reference = memory(data);
+        let mut reference = memory(data, &bytes);
         let epoch = reference.epoch;
         let step = super::super::execute(
             &instruction,
@@ -195,11 +247,27 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
             true,
         );
         let mut actual = state.clone();
-        let mut fast_memory = memory(data);
-        let Some(result) = execute(&native, fast, &mut actual, &mut fast_memory) else {
-            continue;
+        let mut fast_memory = memory(data, &bytes);
+        let before = testing::calls();
+        let result = if compiled {
+            let code = cache.entry(bytes.clone()).or_insert_with(|| {
+                crate::compile::compile(&crate::Region::new(CODE, bytes.len()), &fast_memory, false)
+                    .unwrap_or_else(|error| panic!("compile {:?}: {error}", instruction.mnemonic()))
+            });
+            testing::run(code, &mut actual, &mut fast_memory)
+        } else {
+            let Some(result) = execute(&native, fast, &mut actual, &mut fast_memory) else {
+                assert_eq!(actual, state, "helper rejection must not mutate state");
+                continue;
+            };
+            result
         };
-        taken[index] += 1;
+        let helper = compiled && testing::calls() != before;
+        if helper {
+            fallbacks += 1;
+        } else {
+            taken[index] += 1;
+        }
         // Inexact results and magnitude round-ups are the delicate cases.
         rounded_up += u32::from(actual.x87.status & !state.x87.status & C1 != 0);
         inexact += u32::from(actual.x87.status & !state.x87.status & PE != 0);
@@ -210,7 +278,36 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
             instruction.op0_register(),
             state.x87
         );
-        assert!(matches!(step, Step::Executed), "{context}: {step:?}");
+        if compiled {
+            let expected_exit = match step {
+                Step::Executed if reference.epoch != epoch || expected.x87.status & 0x80 != 0 => {
+                    crate::Exit::Fallback
+                }
+                Step::Executed => crate::Exit::Dispatch,
+                Step::ReadFault { address, .. } => {
+                    expected.fault_addr = address;
+                    faults += 1;
+                    crate::Exit::ReadFault
+                }
+                Step::WriteFault { address, .. } => {
+                    expected.fault_addr = address;
+                    faults += 1;
+                    crate::Exit::WriteFault
+                }
+                Step::Trap { .. } => crate::Exit::Fallback,
+                _ => panic!("unexpected {step:?}: {context}"),
+            };
+            assert_eq!(result, expected_exit as u32, "{context}: {step:?}");
+            assert_eq!(
+                actual.fuel, 0,
+                "one compiled x87 block must charge exactly one unit"
+            );
+            expected.fuel = actual.fuel;
+        } else {
+            assert!(matches!(step, Step::Executed), "{context}: {step:?}");
+            assert_eq!(result == X87_EXIT, reference.epoch != epoch, "{context}");
+        }
+        assert_eq!(actual, expected, "{context}");
         assert_eq!(actual.x87, expected.x87, "{context}");
         assert_eq!(actual.mmx, expected.mmx, "{context}");
         assert_eq!(actual.regs, expected.regs, "{context}");
@@ -224,7 +321,14 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
                 "{context}"
             );
         }
-        assert_eq!(result == X87_EXIT, reference.epoch != epoch, "{context}");
+        assert_eq!(fast_memory.epoch, reference.epoch, "{context}");
+    }
+    eprintln!(
+        "compiled={compiled} native_hits={} helper_fallbacks={fallbacks} faults={faults} PE={inexact} C1={rounded_up}",
+        taken.iter().sum::<u32>()
+    );
+    if compiled {
+        assert!(fallbacks > 10_000 && faults > 1000, "{fallbacks} {faults}");
     }
     assert!(rounded_up > 500 && inexact > 1000, "{rounded_up} {inexact}");
     for (index, count) in taken.iter().enumerate() {

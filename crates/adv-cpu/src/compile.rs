@@ -20,6 +20,7 @@ mod scalar;
 mod shadow;
 mod simd;
 mod write_summary;
+pub(crate) mod x87;
 
 type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
@@ -510,8 +511,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         }
     }
-    // x87 stays in the region as a call into the interpreter's own transaction,
-    // instead of a region exit followed by an interpreted block.
+    // x87 stays in the region: guarded scalar lowering handles the exact subset,
+    // and the remaining cases call the interpreter's transaction in place.
     let x87: Box<[crate::floating::NativeX87]> = instructions
         .values()
         .filter(|i| !supported(i) && crate::floating::native_x87(i))
@@ -594,7 +595,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
-    builder.symbol("adv_x87", crate::floating::x87_call as *const u8);
+    builder.symbol("adv_x87", x87::helper_address());
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
     builder.symbol("adv_file_read", crate::file_memory::read as *const u8);
     builder.symbol("adv_file_write", crate::file_memory::write as *const u8);
@@ -949,9 +950,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             trap_ref,
             repeat_ref,
             x87_ref,
+            x87_native: x87::enabled(),
             x87: x87
                 .iter()
-                .map(|op| (op.instruction.ip32(), op as *const _ as usize))
+                .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
                 .collect(),
             atomic_store_ref,
             atomic_load_ref,
@@ -1623,7 +1625,8 @@ struct Emitter<'a> {
     repeat_ref: ir::FuncRef,
     x87_ref: ir::FuncRef,
     /// Guest PC -> address of its NativeX87, owned by the resulting Compiled.
-    x87: BTreeMap<u32, usize>,
+    x87: BTreeMap<u32, (usize, Option<u16>)>,
+    x87_native: bool,
     atomic_store_ref: ir::FuncRef,
     atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,
@@ -2910,8 +2913,8 @@ impl Emitter<'_> {
         )
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
-        if let Some(&operation) = self.x87.get(&i.ip32()) {
-            self.x87_instruction(i, operation);
+        if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
+            self.native_x87_instruction(i, operation, opcode);
             return false;
         }
         if let Some(operation) = crate::strings::operation(i) {
@@ -3162,6 +3165,7 @@ fn integer_type(size: usize) -> ir::Type {
         1 => types::I8,
         2 => types::I16,
         4 => types::I32,
+        8 => types::I64,
         _ => unreachable!(),
     }
 }
