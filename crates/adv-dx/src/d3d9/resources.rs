@@ -694,6 +694,11 @@ pub(super) fn texture_lock(
     let Some(selected) = r.levels.get(level as usize).copied() else {
         return INVALID;
     };
+    let flags = if r.desc.Usage & 0x200 == 0 {
+        flags & !0x2000
+    } else {
+        flags
+    };
     if selected.lock.is_some()
         || r.storage == 0
         || r.desc.Usage & 1 != 0
