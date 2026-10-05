@@ -114,7 +114,10 @@ fn two_workers_execute_three_contexts_and_deliver_each_trap_once() {
     for id in 0..3 {
         let address = CODE + id * 256;
         let mut a = Asm::new(address);
-        a.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(2_000_000);
+        // Keep a sustained runnable interval after all three cold thread
+        // entries are initialized; a tiny loop can finish before an OS worker
+        // is scheduled and cannot prove actual overlap.
+        a.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(20_000_000);
         a.bytes
             .extend_from_slice(&[0x66, 0x0f, 0x6e, 0xc3, 0xd9, 0xe8]); // movd xmm0,ebx; fld1
         let top = a.here();
@@ -248,8 +251,13 @@ fn unsliced_parallel_run_still_observes_a_timed_wake_during_guest_computation() 
     let wait = m.resolve_import("test", "wait").unwrap();
     let done = m.resolve_import("test", "finish").unwrap();
     let mut a = Asm::new(CODE);
-    a.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(0).call(wait)
-        .mov_mem_imm(DATA, 1).call(done).hlt();
+    a.mov_eax_fs(0x18)
+        .mov_ebx_eax()
+        .mov_ecx_imm(0)
+        .call(wait)
+        .mov_mem_imm(DATA, 1)
+        .call(done)
+        .hlt();
     let mut b = Asm::new(CODE + 0x100);
     b.mov_eax_fs(0x18).mov_ebx_eax().mov_ecx_imm(0);
     let spin = b.here();
@@ -258,7 +266,10 @@ fn unsliced_parallel_run_still_observes_a_timed_wake_during_guest_computation() 
     b.dec_ecx().jnz(finish_work).call(done).hlt();
     for (pc, code) in [(CODE, a), (CODE + 0x100, b)] {
         m.cpu.write(pc, &code.bytes).unwrap();
-        m.cpu.executor_mut().add_region(Region::new(pc, code.bytes.len())).unwrap();
+        m.cpu
+            .executor_mut()
+            .add_region(Region::new(pc, code.bytes.len()))
+            .unwrap();
         m.spawn("timed", pc, &[], 65536).unwrap();
     }
     assert!(matches!(m.run(), RunResult::Exited(_)));

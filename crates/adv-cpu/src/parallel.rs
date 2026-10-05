@@ -19,17 +19,52 @@ pub(crate) type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32
 /// descriptor. Publication/retirement must quiesce its fence before freeing code.
 pub(crate) struct Image {
     pub entries: HashMap<u32, Entry>,
-    pub links: Table,
+    pub links: Arc<Table>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum Stop {
     Trap(u8),
     Fallback,
+    CacheMiss,
     Quantum,
     Interrupted,
     Parked,
     Failed(String),
+}
+
+/// Per-guest-context admission history; never a guest priority or fixed role.
+/// Two useful bursts earn tolerance for occasional short API boundaries. Cold
+/// execution returns to the inline lane until it demonstrates native work again.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Admission {
+    credit: u8,
+    pub preferred: Option<usize>,
+}
+
+impl Admission {
+    pub fn ready(self) -> bool {
+        self.credit != 0
+    }
+    pub fn native_burst(&mut self) {
+        self.credit = self.credit.saturating_add(2).min(4);
+    }
+    pub fn cold(&mut self) {
+        self.credit = 0;
+    }
+    fn completed(&mut self, stop: &Stop, elapsed: Duration, blocks: u64) {
+        if matches!(stop, Stop::Fallback | Stop::Failed(_)) {
+            self.cold();
+        } else if blocks != 0 && !matches!(stop, Stop::Interrupted) {
+            if elapsed >= Duration::from_micros(100) {
+                self.native_burst();
+            } else if matches!(stop, Stop::Trap(_) | Stop::Parked) {
+                self.credit = self.credit.saturating_sub(1);
+            }
+            // A short quantum may be a host/fence interruption, not a short
+            // guest burst. Do not penalize it or the idle/expired job.
+        }
+    }
 }
 
 pub(crate) struct Job {
@@ -38,7 +73,9 @@ pub(crate) struct Job {
     pub memory: WorkerLayout,
     pub image: Arc<Image>,
     pub stop: u32,
-    pub duration: Duration,
+    pub submitted_at: Instant,
+    pub deadline: Instant,
+    pub admission: Admission,
     pub guest_clock: (u64, Instant),
     pub host_interrupt: Arc<AtomicBool>,
     pub permit: Permit,
@@ -54,6 +91,8 @@ pub(crate) struct Completion {
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
     pub elapsed: Duration,
+    pub queue_time: Duration,
+    pub admission: Admission,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -63,10 +102,17 @@ pub struct ParallelStats {
     pub completed: u64,
     /// Sum of worker run wall time, not process CPU utilization.
     pub worker_run_ns: u64,
+    pub queue_wait_ns: u64,
+    pub queue_wait_max_ns: u64,
+    pub image_builds: u64,
+    pub image_build_ns: u64,
+    pub empty_jobs: u64,
+    pub short_traps: u64,
     pub overlap_ns: u64,
     pub max_running: usize,
     pub traps: u64,
     pub cold_retries: u64,
+    pub cache_misses: u64,
     pub quantum_returns: u64,
     pub quiescence_waits: u64,
     pub quiescence_wait_ns: u64,
@@ -189,6 +235,11 @@ impl Pool {
         Ok(pool)
     }
 
+    pub fn record_image_build(&mut self, elapsed: Duration) {
+        self.stats.image_builds += 1;
+        self.stats.image_build_ns += elapsed.as_nanos() as u64;
+    }
+
     pub fn capacity(&self) -> usize {
         self.workers.len()
     }
@@ -210,11 +261,13 @@ impl Pool {
         Ok(self.next_token)
     }
     pub fn submit(&mut self, job: Job) -> Result<u64, String> {
-        let worker = self
-            .workers
-            .iter_mut()
-            .find(|w| w.token.is_none())
+        let index = job
+            .admission
+            .preferred
+            .filter(|&i| self.workers.get(i).is_some_and(|w| w.token.is_none()))
+            .or_else(|| self.workers.iter().position(|w| w.token.is_none()))
             .ok_or("guest execution pool is full")?;
+        let worker = &mut self.workers[index];
         let token = job.token;
         worker
             .sender
@@ -234,9 +287,20 @@ impl Pool {
         );
         self.stats.completed += 1;
         self.stats.worker_run_ns += completion.elapsed.as_nanos() as u64;
+        self.stats.queue_wait_ns += completion.queue_time.as_nanos() as u64;
+        self.stats.queue_wait_max_ns = self
+            .stats
+            .queue_wait_max_ns
+            .max(completion.queue_time.as_nanos() as u64);
+        self.stats.empty_jobs += u64::from(completion.blocks == 0);
+        self.stats.short_traps += u64::from(
+            matches!(completion.stop, Stop::Trap(_))
+                && completion.elapsed < Duration::from_micros(100),
+        );
         match completion.stop {
             Stop::Trap(_) => self.stats.traps += 1,
             Stop::Fallback => self.stats.cold_retries += 1,
+            Stop::CacheMiss => self.stats.cache_misses += 1,
             Stop::Quantum => self.stats.quantum_returns += 1,
             _ => {}
         }
@@ -283,13 +347,15 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
         memory,
         image,
         stop,
-        duration,
+        submitted_at,
+        deadline,
+        mut admission,
         guest_clock,
         host_interrupt,
         permit,
     } = job;
     let started = Instant::now();
-    let deadline = started.checked_add(duration).unwrap_or(started);
+    let queue_time = started.saturating_duration_since(submitted_at);
     // SAFETY: permit pins the owner allocation/mappings/code; no API state or
     // Rc file object enters this worker. Helpers use the restricted facade.
     let mut memory = unsafe { memory.into_memory() };
@@ -325,7 +391,7 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
                 return Stop::Fallback;
             }
             let Some(entry) = image.entries.get(&cpu.eip) else {
-                return Stop::Fallback;
+                return Stop::CacheMiss;
             };
             cpu.fuel = 256;
             let (slots, mask) = image.links.parts();
@@ -379,6 +445,9 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
     }))
     .unwrap_or_else(|_| Stop::Failed("guest native worker panicked".into()));
     cpu.refresh_mmx();
+    let elapsed = started.elapsed();
+    admission.preferred = Some(worker);
+    admission.completed(&outcome, elapsed, blocks);
     let completion = Completion {
         token,
         cpu,
@@ -388,11 +457,87 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
         blocks,
         bulk_calls: bridge.bulk_calls,
         bulk_bytes: bridge.bulk_bytes,
-        elapsed: started.elapsed(),
+        elapsed,
+        queue_time,
+        admission,
     };
     drop(bridge);
     drop(memory);
     drop(image);
     drop(permit);
     completion
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn useful_history_survives_an_api_but_repeated_short_traps_and_cold_code_demote() {
+        let mut admission = Admission::default();
+        admission.native_burst();
+        admission.native_burst();
+        admission.completed(&Stop::Trap(0x80), Duration::from_micros(20), 1);
+        assert!(admission.ready());
+        for _ in 0..4 {
+            admission.completed(&Stop::Trap(0x80), Duration::from_micros(20), 1);
+        }
+        assert!(!admission.ready());
+        admission.native_burst();
+        admission.completed(&Stop::Quantum, Duration::ZERO, 0);
+        admission.completed(&Stop::CacheMiss, Duration::from_micros(10), 0);
+        assert!(
+            admission.ready(),
+            "host interruption or missing publication is not guest cold code"
+        );
+        admission.completed(&Stop::Fallback, Duration::from_millis(1), 50);
+        assert!(!admission.ready());
+    }
+
+    #[test]
+    fn expired_lease_and_missing_image_return_the_exact_cpu_state() {
+        let mut memory = crate::Memory::new(0x1000, 4096).unwrap();
+        let fence = Arc::new(Fence::default());
+        memory.parallel = Some(fence.clone());
+        let tsc = Arc::new(AtomicU64::new(0));
+        for expired in [true, false] {
+            let now = Instant::now();
+            let mut cpu = CpuState::default();
+            cpu.eip = 0x1000;
+            let completion = execute(
+                Job {
+                    token: 7,
+                    cpu,
+                    memory: memory.worker_layout(),
+                    image: Arc::new(Image {
+                        entries: HashMap::new(),
+                        links: Arc::default(),
+                    }),
+                    stop: 0x2000,
+                    submitted_at: now,
+                    deadline: if expired {
+                        now
+                    } else {
+                        now + Duration::from_secs(10)
+                    },
+                    admission: Admission::default(),
+                    guest_clock: (0, now),
+                    host_interrupt: Arc::new(AtomicBool::new(false)),
+                    permit: fence.enter(),
+                },
+                0,
+                &fence,
+                &tsc,
+            );
+            assert_eq!(completion.cpu.eip, 0x1000);
+            assert_eq!(completion.blocks, 0);
+            assert_eq!(completion.token, 7);
+            assert!(fence.is_idle());
+            if expired {
+                assert!(matches!(completion.stop, Stop::Quantum));
+            } else {
+                assert!(matches!(completion.stop, Stop::CacheMiss));
+            }
+        }
+    }
 }

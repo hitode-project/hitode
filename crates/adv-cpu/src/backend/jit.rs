@@ -423,6 +423,10 @@ impl Backend for JitCpu {
                     }
                 }
                 crate::parallel::Stop::Fallback => self.inner.cold_parallel_retry(),
+                // The immutable worker image can trail owner publication. A
+                // lookup miss must redispatch at the same PC, not force an
+                // interpreted instruction or discard useful execution history.
+                crate::parallel::Stop::CacheMiss => {}
                 // Completion was requeued by the machine; this selection is
                 // already a fresh turn, not a second expiration of the old one.
                 crate::parallel::Stop::Quantum => {}
@@ -467,17 +471,20 @@ impl Backend for JitCpu {
                         };
                     }
                     let now = handler.guest_time_us().unwrap_or(0);
-                    return match m.dispatch_parallel(
+                    match m.dispatch_parallel(
                         self.park,
                         remaining.min(Duration::from_millis(1)),
                         now,
                     ) {
-                        Ok(token) => Exit::Dispatched { token },
-                        Err(message) => Exit::Fault(Fault {
-                            pc: m.state.eip,
-                            kind: FaultKind::Other(message),
-                        }),
-                    };
+                        Ok(Some(token)) => return Exit::Dispatched { token },
+                        Ok(None) => continue,
+                        Err(message) => {
+                            return Exit::Fault(Fault {
+                                pc: m.state.eip,
+                                kind: FaultKind::Other(message),
+                            });
+                        }
+                    }
                 }
                 Ok(RunOutcome::Parked | RunOutcome::ReachedStop) => {
                     m.state.eip = self.park;

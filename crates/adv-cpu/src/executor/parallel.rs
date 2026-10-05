@@ -52,15 +52,11 @@ impl Executor {
         )
     }
     pub(crate) fn take_parallel_stop(&mut self) -> Option<Stop> {
-        let stop = self.parallel_stop.take();
-        if matches!(stop, Some(Stop::Trap(_))) {
-            self.offload = false;
-        }
-        stop
+        self.parallel_stop.take()
     }
     pub(crate) fn cold_parallel_retry(&mut self) {
         self.deferred_fallback = Some(self.state.eip);
-        self.offload = false;
+        self.admission.cold();
     }
     pub(crate) fn inline_activity(&self) -> Option<crate::parallel::InlineActivity> {
         self.parallel.as_ref().map(Pool::inline_activity)
@@ -74,30 +70,38 @@ impl Executor {
         stop: u32,
         duration: Duration,
         guest_us: u64,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         if self
             .parallel_image
             .as_ref()
             .is_none_or(|(revision, _)| *revision != self.code.cache_revision)
         {
-            let mut entries = HashMap::new();
-            for (&pc, &owner) in &self.code.entry_owner {
-                if let Some(compiled) = self.code.compiled.get(&owner) {
-                    entries.insert(pc, compiled.parallel_entry());
-                }
-            }
-            let mut links = crate::linking::Table::default();
-            if self.region_linking {
-                links.rebuild(self.code.entry_owner.iter().filter_map(|(&pc, owner)| {
-                    self.code.compiled.get(owner).map(|c| (pc, c.tail_entry))
-                }));
-            }
+            let started = Instant::now();
+            let entries = self.code.parallel_entries.clone();
+            let links = if self.region_linking {
+                self.code.links.clone()
+            } else {
+                Arc::default()
+            };
             self.parallel_image =
                 Some((self.code.cache_revision, Arc::new(Image { entries, links })));
+            self.parallel
+                .as_mut()
+                .unwrap()
+                .record_image_build(started.elapsed());
         }
         let image = self.parallel_image.as_ref().unwrap().1.clone();
         if !image.entries.contains_key(&self.state.eip) {
             return Err("parallel entry vanished before dispatch".into());
+        }
+        // Building a new publication can consume the remaining host allowance.
+        // Recheck after setup so an almost-expired job stays on the inline lane.
+        if self.host_interrupt_pending()
+            || self.deadline.is_some_and(|deadline| {
+                deadline.saturating_duration_since(Instant::now()) < Duration::from_micros(100)
+            })
+        {
+            return Ok(None);
         }
         self.state.refresh_mmx();
         let memory = self.memory.worker_layout();
@@ -106,13 +110,20 @@ impl Executor {
             .as_mut()
             .ok_or("parallel execution is not enabled")?;
         let token = pool.next_token()?;
+        let submitted_at = Instant::now();
+        let deadline = submitted_at
+            .checked_add(duration)
+            .ok_or("native deadline overflow")?;
+        let deadline = self.deadline.map_or(deadline, |outer| outer.min(deadline));
         pool.submit(Job {
             token,
             cpu: self.state.clone(),
             memory,
             image,
             stop,
-            duration,
+            submitted_at,
+            deadline,
+            admission: self.admission,
             guest_clock: (guest_us, Instant::now()),
             host_interrupt: if self.host_interrupts {
                 self.interrupt.clone()
@@ -121,6 +132,7 @@ impl Executor {
             },
             permit: pool.fence.enter(),
         })
+        .map(Some)
     }
 
     pub(crate) fn poll_parallel(&mut self) -> Option<(u64, ExecutionContext)> {
@@ -134,7 +146,7 @@ impl Executor {
             ExecutionContext {
                 cpu: completion.cpu,
                 deferred_fallback: None,
-                offload: true,
+                admission: completion.admission,
                 parallel_stop: Some(completion.stop),
             },
         ))

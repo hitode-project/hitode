@@ -105,7 +105,7 @@ pub struct Executor {
     parallel: Option<crate::parallel::Pool>,
     parallel_image: Option<(u64, Arc<crate::parallel::Image>)>,
     parallel_stop: Option<crate::parallel::Stop>,
-    offload: bool,
+    admission: crate::parallel::Admission,
     pub(crate) parallel_demand: bool,
     code: CodeStore,
     pub(crate) memory: Memory,
@@ -162,7 +162,7 @@ pub struct ExecutionContext {
     cpu: CpuState,
     deferred_fallback: Option<u32>,
     parallel_stop: Option<crate::parallel::Stop>,
-    offload: bool,
+    admission: crate::parallel::Admission,
 }
 
 impl ExecutionContext {
@@ -183,7 +183,7 @@ impl Executor {
             cpu,
             deferred_fallback: self.deferred_fallback,
             parallel_stop: self.parallel_stop.clone(),
-            offload: self.offload,
+            admission: self.admission,
         })
     }
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
@@ -191,7 +191,7 @@ impl Executor {
         self.state.refresh_mmx();
         self.deferred_fallback = context.deferred_fallback;
         self.parallel_stop = context.parallel_stop.clone();
-        self.offload = context.offload;
+        self.admission = context.admission;
         Ok(())
     }
 
@@ -216,6 +216,7 @@ impl Executor {
     ) -> Result<RunOutcome, String> {
         let started = Instant::now();
         let interpreted_before = self.stats.interpreter_entries;
+        let native_before = self.stats.native_blocks;
         let mut bridge = Bridge {
             timestamp: std::mem::take(&mut self.timestamp),
             memory: &mut self.memory,
@@ -230,13 +231,14 @@ impl Executor {
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
         if self.parallel.is_some() {
-            if bridge.calls != 0 {
-                self.offload = false;
-            } else if self.stats.interpreter_entries == interpreted_before
+            if self.stats.interpreter_entries != interpreted_before {
+                self.admission.cold();
+            } else if bridge.calls == 0
+                && self.stats.native_blocks != native_before
                 && matches!(result, Ok(RunOutcome::Budget))
                 && started.elapsed() >= Duration::from_micros(100)
             {
-                self.offload = true;
+                self.admission.native_burst();
             }
         }
         // Export canonical floating state at every public CPU boundary. Context
@@ -262,7 +264,7 @@ impl Executor {
             parallel: None,
             parallel_image: None,
             parallel_stop: None,
-            offload: false,
+            admission: crate::parallel::Admission::default(),
             parallel_demand: true,
             code: CodeStore::default(),
             memory,
@@ -380,7 +382,7 @@ impl Executor {
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
         self.memory.quiesce_workers();
-        self.code.links.rebuild(std::iter::empty());
+        self.code.links = Arc::default();
         self.code.cache_revision += 1;
         self.code.compiled.clear();
         self.stats.native_code_bytes = 0;
@@ -390,6 +392,7 @@ impl Executor {
         self.code.page_regions.clear();
         self.code.region_pages.clear();
         self.code.entry_owner.clear();
+        self.code.parallel_entries.clear();
         self.pending_regions.clear();
         self.deferred_compilations.clear();
         self.stats.deferred_compilations = 0;
@@ -447,6 +450,11 @@ impl Executor {
         compiled.cache_stamp.set(self.cache_clock);
         for &pc in &compiled.entries {
             self.code.entry_owner.insert(pc, region.start);
+            if self.parallel.is_some() {
+                self.code
+                    .parallel_entries
+                    .insert(pc, compiled.parallel_entry());
+            }
             self.demand.remove(&pc);
         }
         self.stats.native_code_bytes += compiled.code_size;
@@ -469,12 +477,13 @@ impl Executor {
             // Only the execution owner reaches this path, after every generated
             // call has returned. Remove all published raw targets before Drop
             // unregisters unwind tables and releases executable memory.
-            self.code.links.rebuild(std::iter::empty());
+            self.code.links = Arc::default();
             self.code.cache_revision += 1;
             self.stats.native_code_bytes -= old.code_size;
             for entry in old.entries.iter() {
                 if self.code.entry_owner.get(entry) == Some(&start) {
                     self.code.entry_owner.remove(entry);
+                    self.code.parallel_entries.remove(entry);
                 }
             }
             self.stats.native_regions = self.code.compiled.len();
@@ -847,9 +856,12 @@ impl Executor {
     /// only submits bounded asynchronous work; explicit regions are never tiered.
     /// Disabling prevents new promotions; in-flight compilation may still publish.
     pub fn set_tiered_compilation(&mut self, enabled: bool) {
-        self.tiered_compilation = enabled;
+        self.tiered_compilation = enabled && self.parallel.is_none();
     }
     pub fn set_region_linking(&mut self, enabled: bool) {
+        if self.region_linking != enabled {
+            self.parallel_image = None;
+        }
         self.region_linking = enabled;
     }
 
@@ -1047,14 +1059,16 @@ impl Executor {
         if self.code.links_revision == self.code.cache_revision {
             return;
         }
-        self.code
-            .links
-            .rebuild(self.code.entry_owner.iter().filter_map(|(&pc, owner)| {
-                self.code
-                    .compiled
-                    .get(owner)
-                    .map(|compiled| (pc, compiled.tail_entry))
-            }));
+        let mut links = crate::linking::Table::default();
+        links.rebuild(self.code.entry_owner.iter().filter_map(|(&pc, owner)| {
+            self.code
+                .compiled
+                .get(owner)
+                .map(|compiled| (pc, compiled.tail_entry))
+        }));
+        // Both inline execution and workers borrow this immutable generation.
+        // Publication replaces the Arc; retirement still drains native leases.
+        self.code.links = Arc::new(links);
         self.code.links_revision = self.code.cache_revision;
     }
     fn discover(&mut self, stop: u32) -> Result<(), String> {
@@ -1204,9 +1218,11 @@ impl Executor {
             }
             let native = if self.parallel.is_some()
                 && self.parallel_demand
-                && self.offload
+                && self.admission.ready()
                 && self.has_parallel_capacity()
-            {
+                && self.deadline.is_none_or(|deadline| {
+                    deadline.saturating_duration_since(Instant::now()) >= Duration::from_micros(100)
+                }) {
                 let ready = self
                     .code
                     .entry_owner
@@ -2436,6 +2452,28 @@ mod native_deadline_tests {
         m.state.regs[4] = 0x5f00;
         m.write(0x5f00, &0x4000u32.to_le_bytes()).unwrap();
         m
+    }
+
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    fn native_time_slice_exhaustion_qualifies_for_parallel_execution() {
+        let mut m = Executor::new(0x1000, 0x5000).unwrap();
+        m.set_guest_workers(2).unwrap();
+        m.protect(0x1000, 0x5000, READ | WRITE).unwrap();
+        let code = [0x40, 0x83, 0xc3, 3, 0xeb, 0xfa];
+        m.write(0x1000, &code).unwrap();
+        m.protect(0x1000, 0x1000, READ | EXEC).unwrap();
+        m.add_region(Region::new(0x1000, code.len())).unwrap();
+        m.state.eip = 0x1000;
+        m.parallel_demand = false;
+        m.deadline = Some(Instant::now() + Duration::from_millis(5));
+        assert_eq!(m.run(0x4000, u64::MAX).unwrap(), RunOutcome::Budget);
+        assert!(m.stats.native_blocks > 0);
+        assert_eq!(m.stats.interpreter_entries, 0);
+        assert!(
+            m.admission.ready(),
+            "wall-time exhaustion must qualify just like instruction fuel"
+        );
     }
 
     #[test]
