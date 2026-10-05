@@ -10,6 +10,8 @@ publish.workspace = true
 [features]
 default = []
 gpu = ["adv-device/gpu"]
+# DirectShow movie decoding through FFmpeg (needs FFMPEG_DIR at build time).
+media = ["adv-device/media"]
 
 [dependencies]
 adv-abi.workspace = true
@@ -19,6 +21,7 @@ adv-os.workspace = true
 adv-device = { path = "../adv-device" }
 adv-sync = { path = "../adv-sync" }
 bytemuck = "1"
+log.workspace = true
 
 [dev-dependencies]
 adv-win32 = { path = "../adv-win32" }

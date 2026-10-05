@@ -36,6 +36,48 @@ impl ClassFactories {
     }
 }
 
+/// Live CoTaskMemAlloc blocks. Every COM front allocates task memory through
+/// [`task_alloc`] so that a guest CoTaskMemFree accepts what any front returned.
+#[derive(Default)]
+pub struct TaskMemory {
+    pub allocations: BTreeSet<u32>,
+}
+
+/// CoTaskMemAlloc: zero on failure. The process heap backs task memory.
+pub fn task_alloc(env: &mut Env<'_>, size: u32) -> u32 {
+    if size.checked_add(0xffff).is_none() {
+        return 0;
+    }
+    let pointer = env
+        .ext
+        .get_mut::<crate::Heaps>()
+        .alloc(env.cpu, &mut env.sys.vm, 0, size, false)
+        .unwrap_or(0);
+    if pointer != 0 {
+        env.ext
+            .get_or_default::<TaskMemory>()
+            .allocations
+            .insert(pointer);
+    }
+    pointer
+}
+
+/// CoTaskMemFree for a block this process allocated; false for a foreign pointer.
+pub fn task_free(env: &mut Env<'_>, pointer: u32) -> bool {
+    if !env
+        .ext
+        .get_or_default::<TaskMemory>()
+        .allocations
+        .remove(&pointer)
+    {
+        return false;
+    }
+    env.ext
+        .get_mut::<crate::Heaps>()
+        .free(env.cpu, &mut env.sys.vm, 0, pointer);
+    true
+}
+
 pub type ComIdentity<T> = Identity<ComObject<T>>;
 
 /// Typed payload and interface metadata stored in `adv_machine::Objects`.

@@ -5,14 +5,18 @@ use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::Heaps;
+use adv_os::com::TaskMemory;
 
 use crate::stdcall;
 
 const MAX_BSTR_BYTES: u32 = 16 * 1024 * 1024;
 #[derive(Default)]
 struct Memory {
-    task: BTreeSet<u32>,
     strings: BTreeSet<u32>,
+}
+/// Task allocations are shared with other COM fronts (DirectShow media types).
+fn task<'a>(env: &'a mut Env<'_>) -> &'a mut BTreeSet<u32> {
+    &mut env.ext.get_or_default::<TaskMemory>().allocations
 }
 fn state<'a>(env: &'a mut Env<'_>) -> &'a mut Memory {
     if env.ext.try_get::<Memory>().is_none() {
@@ -37,14 +41,14 @@ fn free(env: &mut Env<'_>, pointer: u32) {
 fn task_alloc(env: &mut Env<'_>) -> Outcome {
     let pointer = allocate(env, env.arg(0));
     if pointer != 0 {
-        state(env).task.insert(pointer);
+        task(env).insert(pointer);
     }
     Outcome::Return(pointer)
 }
 fn task_free(env: &mut Env<'_>) -> Outcome {
     let pointer = env.arg(0);
     if pointer != 0 {
-        if !state(env).task.remove(&pointer) {
+        if !task(env).remove(&pointer) {
             return Outcome::Fail(format!(
                 "CoTaskMemFree: invalid task allocation {pointer:#x}"
             ));
@@ -58,17 +62,17 @@ fn task_realloc(env: &mut Env<'_>) -> Outcome {
     if old == 0 {
         let pointer = allocate(env, size);
         if pointer != 0 {
-            state(env).task.insert(pointer);
+            task(env).insert(pointer);
         }
         return Outcome::Return(pointer);
     }
-    if !state(env).task.contains(&old) {
+    if !task(env).contains(&old) {
         return Outcome::Fail(format!(
             "CoTaskMemRealloc: invalid task allocation {old:#x}"
         ));
     }
     if size == 0 {
-        state(env).task.remove(&old);
+        task(env).remove(&old);
         free(env, old);
         return Outcome::Return(0);
     }
@@ -81,9 +85,9 @@ fn task_realloc(env: &mut Env<'_>) -> Outcome {
         .realloc(env.cpu, &mut env.sys.vm, 0, old, size, false, false)
         .unwrap_or(0);
     if pointer != 0 {
-        let memory = state(env);
-        memory.task.remove(&old);
-        memory.task.insert(pointer);
+        let memory = task(env);
+        memory.remove(&old);
+        memory.insert(pointer);
     }
     Outcome::Return(pointer)
 }
@@ -300,14 +304,14 @@ fn string_from_clsid(env: &mut Env<'_>) -> Outcome {
     if pointer == 0 {
         return Outcome::Return(0x8007_000E); // E_OUTOFMEMORY
     }
-    state(env).task.insert(pointer);
+    task(env).insert(pointer);
     if env.cpu.write(pointer, &utf16).is_err() {
-        state(env).task.remove(&pointer);
+        task(env).remove(&pointer);
         free(env, pointer);
         return Outcome::Return(0x8007_000E);
     }
     if env.cpu.write_u32(lplpsz, pointer).is_err() {
-        state(env).task.remove(&pointer);
+        task(env).remove(&pointer);
         free(env, pointer);
         return Outcome::Return(0x8000_4003);
     }

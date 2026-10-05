@@ -4,6 +4,7 @@
 
 pub mod ddraw;
 pub mod dsound;
+pub mod dshow;
 pub mod dinput;
 #[cfg(feature = "gpu")]
 pub mod d3d9;
