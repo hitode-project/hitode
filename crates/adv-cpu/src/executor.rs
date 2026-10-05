@@ -1347,9 +1347,10 @@ impl Executor {
                 }
             }
             use crate::interpreter::Step;
-            // LOCK/implicit atomic operations and cold helpers share one
-            // exclusive fallback lane. No other native guest runs during it.
-            self.memory.quiesce_workers();
+            // The interpreter owns its decode cache and this CPU state. Ordinary
+            // scalar memory operations use the same foreign-memory accessors as
+            // API handlers; only atomic/extended operations request a barrier.
+            // Executable writes and mapping changes also retain Memory's barrier.
             let pc = self.state.eip;
             let timer = self.profiling.then(Instant::now);
             // Contiguous integer and floating fallback instructions share a bounded
