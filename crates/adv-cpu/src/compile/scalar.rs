@@ -76,7 +76,16 @@ pub(super) fn supported(i: &Instruction) -> bool {
             }
             _ => false,
         },
-        M::Shl | M::Shr | M::Sar | M::Rol | M::Ror => {
+        M::Shl | M::Shr | M::Sar => {
+            i.op_count() == 2
+                && i.op0_kind() == OpKind::Register
+                && (reg_index(i.op0_register()).is_some()
+                    || i.op0_register().is_gpr8()
+                    || i.op0_register().is_gpr16())
+                && (i.op1_kind() == OpKind::Immediate8
+                    || (i.op1_kind() == OpKind::Register && i.op1_register() == R::CL))
+        }
+        M::Rol | M::Ror => {
             i.op_count() == 2
                 && i.op0_kind() == OpKind::Register
                 && reg_index(i.op0_register()).is_some()
@@ -405,29 +414,56 @@ impl Emitter<'_> {
         let input = self.read(i, 0);
         let count = self.read(i, 1);
         let count = self.b.ins().band_imm(count, 31);
+        let size = i.op0_register().size();
+        let bits = (size * 8) as i64;
+        // Keep the operation in I32: x86 masks the count to five bits even
+        // for a byte/word, so counts >= the operand width must not wrap.
+        let signed_input = if i.mnemonic() == M::Sar && size < 4 {
+            let narrow = self.b.ins().ireduce(integer_type(size), input);
+            self.b.ins().sextend(types::I32, narrow)
+        } else {
+            input
+        };
         let result = match i.mnemonic() {
             M::Shl => self.b.ins().ishl(input, count),
             M::Shr => self.b.ins().ushr(input, count),
-            M::Sar => self.b.ins().sshr(input, count),
+            M::Sar => self.b.ins().sshr(signed_input, count),
             _ => unreachable!(),
         };
+        let result = if size < 4 {
+            self.b.ins().band_imm(result, (1i64 << bits) - 1)
+        } else {
+            result
+        };
         let carry = if i.mnemonic() == M::Shl {
-            let width = self.constant(32);
+            let width = self.constant(bits as u32);
             let shift = self.b.ins().isub(width, count);
             self.b.ins().ushr(input, shift)
         } else {
             let shift = self.b.ins().iadd_imm(count, -1);
-            self.b.ins().ushr(input, shift)
+            self.b.ins().ushr(signed_input, shift)
         };
         let carry = self.b.ins().band_imm(carry, 1);
-        let sign = self.b.ins().ushr_imm(result, 31);
+        let old = self.materialize_flags();
+        let carry = if size < 4 && i.mnemonic() != M::Sar {
+            // CF is undefined beyond the operand width. Match the
+            // interpreter's deterministic convention of retaining it.
+            let oversized = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, count, bits);
+            let old_carry = self.b.ins().band_imm(old, 1);
+            self.b.ins().select(oversized, old_carry, carry)
+        } else {
+            carry
+        };
+        let sign = self.b.ins().ushr_imm(result, bits - 1);
         let overflow = match i.mnemonic() {
             M::Shl => self.b.ins().bxor(sign, carry),
-            M::Shr => self.b.ins().ushr_imm(input, 31),
+            M::Shr => self.b.ins().ushr_imm(input, bits - 1),
             M::Sar => self.constant(0),
             _ => unreachable!(),
         };
-        let old = self.materialize_flags();
         let old_overflow = self.b.ins().ushr_imm(old, 11);
         let old_overflow = self.b.ins().band_imm(old_overflow, 1);
         let one = self.b.ins().icmp_imm(IntCC::Equal, count, 1);
