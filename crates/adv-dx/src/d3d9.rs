@@ -489,15 +489,13 @@ fn normalize(
     mut parameters: D3DPRESENT_PARAMETERS,
     focus: u32,
 ) -> Result<D3DPRESENT_PARAMETERS, u32> {
-    if parameters.Windowed == 0
-        || parameters.MultiSampleType != 0
+    if parameters.MultiSampleType != 0
         || parameters.MultiSampleQuality != 0
         || parameters.SwapEffect != 1
         || parameters.BackBufferCount > 1
         || parameters.Flags & !3 != 0
         || (parameters.EnableAutoDepthStencil != 0
             && depth::format(parameters.AutoDepthStencilFormat).is_none())
-        || parameters.FullScreen_RefreshRateInHz != 0
         || !matches!(parameters.PresentationInterval, 0 | 1 | 0x80000000)
         || !matches!(parameters.BackBufferFormat, 0 | 21 | 22)
     {

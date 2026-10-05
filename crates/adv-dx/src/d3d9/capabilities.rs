@@ -137,12 +137,12 @@ fn check_type(
     kind: i32,
     format: u32,
     back: u32,
-    windowed: i32,
+    _windowed: i32,
 ) -> u32 {
     if !factory(env, this.addr(), adapter) || kind != 1 {
         return INVALID;
     }
-    if available(env) && format == 22 && matches!(back, 0 | 21 | 22) && windowed != 0 {
+    if available(env) && matches!(format, 21 | 22) && matches!(back, 0 | 21 | 22) {
         0
     } else {
         UNAVAILABLE
@@ -184,7 +184,7 @@ fn check_multisample(
     adapter: u32,
     kind: i32,
     format: u32,
-    windowed: i32,
+    _windowed: i32,
     samples: i32,
     quality: GuestPtr<u32>,
 ) -> u32 {
@@ -196,7 +196,6 @@ fn check_multisample(
     } // D3DERR_INVALIDDEVICE
     if !available(env)
         || !(matches!(format, 21 | 22) || depth::format(format).is_some())
-        || windowed == 0
         || samples != 0
     {
         return UNAVAILABLE;
@@ -431,7 +430,8 @@ mod tests {
             );
         }
         assert_eq!(check_depth(&mut env, this, 0, 1, 22, 21, 75), 0);
-        assert_eq!(check_type(&mut env, this, 0, 1, 22, 21, 0), UNAVAILABLE);
+        assert_eq!(check_type(&mut env, this, 0, 1, 22, 21, 0), 0);
+        assert_eq!(check_type(&mut env, this, 0, 1, 99, 21, 0), UNAVAILABLE);
         assert_eq!(
             check_multisample(&mut env, this, 0, 1, 21, 1, 2, GuestPtr::new(0)),
             UNAVAILABLE
