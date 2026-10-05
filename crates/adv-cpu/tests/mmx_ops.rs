@@ -240,3 +240,105 @@ fn mmx_values_survive_native_region_dispatch_and_x87_emms_boundary() {
     assert_eq!(jit.state.mmx, uc.state.mmx);
     assert!(jit.stats.native_entries >= 3);
 }
+
+#[test]
+fn extended_mmx_operations_match_unicorn_natively() {
+    let values = [
+        0u64,
+        u64::MAX,
+        0x0123_4567_89ab_cdef,
+        0x8000_7fff_ffff_0001,
+        0x00ff_0100_ff00_0080,
+        0x8080_8080_7f7f_7f7f,
+        0x0000_0000_0000_0011,
+        0x0000_0000_0000_0040,
+    ];
+    for operation in 0..48 {
+        let bytes = code(|a| {
+            a.movq(mm0, qword_ptr(DATA as i32)).unwrap();
+            a.movq(mm1, qword_ptr(DATA as i32 + 8)).unwrap();
+            a.mov(eax, 0x5555_5555).unwrap();
+            match operation {
+                0 => a.paddsb(mm0, mm1),
+                1 => a.paddsw(mm0, mm1),
+                2 => a.psubsb(mm0, mm1),
+                3 => a.psubsw(mm0, mm1),
+                4 => a.pcmpeqb(mm0, mm1),
+                5 => a.pcmpeqw(mm0, mm1),
+                6 => a.pcmpeqd(mm0, mm1),
+                7 => a.pcmpgtb(mm0, mm1),
+                8 => a.pcmpgtw(mm0, mm1),
+                9 => a.pcmpgtd(mm0, mm1),
+                10 => a.pmulhw(mm0, mm1),
+                11 => a.pmaddwd(mm0, mm1),
+                12 => a.pmuludq(mm0, mm1),
+                13 => a.pmaxsw(mm0, mm1),
+                14 => a.pminsw(mm0, mm1),
+                15 => a.pmaxub(mm0, mm1),
+                16 => a.pminub(mm0, mm1),
+                17 => a.psadbw(mm0, mm1),
+                18 => a.packssdw(mm0, mm1),
+                19 => a.paddq(mm0, mm1),
+                20 => a.psubq(mm0, mm1),
+                21 => a.psraw(mm0, 3),
+                22 => a.psraw(mm0, 40),
+                23 => a.psrad(mm0, 31),
+                24 => a.psllq(mm0, 12),
+                25 => a.psrlq(mm0, 63),
+                26 => a.psrlq(mm0, 64),
+                27 => a.psrlw(mm0, mm1),
+                28 => a.psllw(mm0, mm1),
+                29 => a.psrld(mm0, mm1),
+                30 => a.pslld(mm0, mm1),
+                31 => a.psrlq(mm0, mm1),
+                32 => a.psllq(mm0, mm1),
+                33 => a.psraw(mm0, mm1),
+                34 => a.psrad(mm0, mm1),
+                35 => a.psraw(mm0, qword_ptr(DATA as i32 + 8)),
+                36 => a.pshufw(mm0, mm1, 0x1b),
+                37 => a.pshufw(mm0, qword_ptr(DATA as i32 + 8), 0xe4),
+                38 => a.pextrw(eax, mm1, 2),
+                39 => a.pinsrw(mm0, eax, 1),
+                40 => a.pinsrw(mm0, word_ptr(DATA as i32 + 10), 3),
+                41 => a.pmovmskb(eax, mm1),
+                42 => a.pmulhw(mm0, qword_ptr(DATA as i32 + 8)),
+                43 => a.pcmpgtw(mm0, qword_ptr(DATA as i32 + 8)),
+                44 => a.psadbw(mm0, qword_ptr(DATA as i32 + 8)),
+                45 => a.pmaddwd(mm0, qword_ptr(DATA as i32 + 8)),
+                46 => a.movntq(qword_ptr(DATA as i32 + 32), mm1),
+                _ => a.pmuludq(mm0, qword_ptr(DATA as i32 + 8)),
+            }
+            .unwrap();
+            if operation != 46 {
+                a.movq(qword_ptr(DATA as i32 + 32), mm0).unwrap();
+            }
+            a.mov(dword_ptr(DATA as i32 + 40), eax).unwrap();
+            a.emms().unwrap();
+            a.ret().unwrap();
+        });
+        let mut jit = machine(&bytes, true);
+        let mut uc = machine(&bytes, false);
+        for &left in &values {
+            for &right in &values {
+                for m in [&mut jit, &mut uc] {
+                    start(m);
+                    m.write(DATA, &left.to_le_bytes()).unwrap();
+                    m.write(DATA + 8, &right.to_le_bytes()).unwrap();
+                }
+                assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+                assert_eq!(
+                    uc.run_unicorn(STOP, 10000).unwrap(),
+                    RunOutcome::ReachedStop
+                );
+                assert_eq!(
+                    jit.memory().read(DATA + 32, 12).unwrap(),
+                    uc.memory().read(DATA + 32, 12).unwrap(),
+                    "operation {operation}, left {left:x}, right {right:x}"
+                );
+                assert_eq!(jit.state.mmx, uc.state.mmx, "operation {operation}");
+                assert_eq!(jit.state.regs, uc.state.regs, "operation {operation}");
+            }
+        }
+        assert_eq!(jit.stats.interpreter_entries, 0, "operation {operation}");
+    }
+}
