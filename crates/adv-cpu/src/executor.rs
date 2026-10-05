@@ -8,6 +8,7 @@ use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
 mod code_store;
+mod interpreter_profile;
 mod parallel;
 mod warm;
 use code_store::CodeStore;
@@ -154,6 +155,7 @@ pub struct Executor {
     /// continues in the interpreter; explicit compilation still returns errors.
     pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
+    interpreter_profile: Option<Box<interpreter_profile::Profile>>,
     timestamp: crate::timestamp::Counter,
     pub state: CpuState,
     pub stats: Stats,
@@ -309,6 +311,7 @@ impl Executor {
             profile: BTreeMap::new(),
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
+            interpreter_profile: interpreter_profile::Profile::from_env(),
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
@@ -1405,6 +1408,22 @@ impl Executor {
             };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
+            if let Some(profile) = &mut self.interpreter_profile {
+                use interpreter_profile::Reason;
+                let reason = if interpreter_only || single_step || pending_fpu {
+                    Reason::Forced
+                } else if self.deferred_fallback == Some(pc) {
+                    Reason::Fallback
+                } else {
+                    match self.code.entry_owner.get(&pc) {
+                        Some(owner) if self.code.compiled.contains_key(owner) => Reason::Interior,
+                        Some(_) => Reason::Pending,
+                        None if self.attempted.contains(&pc) => Reason::Rejected,
+                        None => Reason::Uncovered,
+                    }
+                };
+                profile.record(pc, execution.units, reason, &self.memory);
+            }
             if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {
                 if self.demand.len() >= 65_536 {
                     self.demand.clear();

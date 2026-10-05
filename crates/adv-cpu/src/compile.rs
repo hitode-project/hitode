@@ -1625,7 +1625,7 @@ fn narrow_alu(mnemonic: M) -> bool {
     )
 }
 
-fn supported(i: &Instruction) -> bool {
+pub(crate) fn supported(i: &Instruction) -> bool {
     if crate::strings::operation(i).is_some() {
         return true;
     }
