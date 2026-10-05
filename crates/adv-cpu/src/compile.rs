@@ -918,6 +918,14 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .iter()
             .map(|plan| plan.starts.iter().map(|&pc| (pc, b.create_block())).collect())
             .collect();
+        let cooldowns: Vec<Variable> = plans
+            .iter()
+            .map(|_| {
+                let variable = b.declare_var(types::I32);
+                b.def_var(variable, zero);
+                variable
+            })
+            .collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
         if shadow_ref.is_some() {
@@ -983,6 +991,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             blocks,
             plans,
             fast_blocks,
+            cooldowns,
             fast: None,
             range_ok_ref,
             dispatch,
@@ -1095,7 +1104,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     ));
                 }
             }
-            // A clone's entry prepaid every block of its remaining iterations.
+            // Entering a clone iteration paid for all of its blocks.
             if fast.is_none() {
                 let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
                 e.guard(zero, Exit::Budget, None);
@@ -1758,6 +1767,8 @@ struct Emitter<'a> {
     /// Versioned loops, their cloned blocks, and the clone being emitted.
     plans: Vec<loops::Plan>,
     fast_blocks: Vec<BTreeMap<u32, ir::Block>>,
+    /// Checked iterations left before a versioned loop retries its proof.
+    cooldowns: Vec<Variable>,
     fast: Option<usize>,
     range_ok_ref: ir::FuncRef,
     dispatch: ir::Block,
@@ -2399,6 +2410,13 @@ impl Emitter<'_> {
         self.b.switch_to_block(ok);
     }
     fn direct(&mut self, pc: u32) {
+        if let Some(index) = self.fast
+            && self.plans[index].header == pc
+            && self.plans[index].latch == self.pc
+        {
+            self.continue_clone(index);
+            return;
+        }
         let clone = self
             .fast
             .and_then(|index| self.fast_blocks[index].get(&pc).copied());
@@ -2407,8 +2425,7 @@ impl Emitter<'_> {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
             }
-            // A checked back edge enters the clone once the remaining
-            // iterations' operand ranges are proven.
+            self.flush_mmx_effects();
             let versioned = self
                 .fast
                 .is_none()
@@ -2418,27 +2435,75 @@ impl Emitter<'_> {
                         .position(|plan| plan.latch == self.pc && plan.header == pc)
                 })
                 .flatten();
-            if let Some(index) = versioned {
-                let proven = self.loop_proof(index);
-                self.flush_mmx_effects();
-                let fast = self.fast_blocks[index][&pc];
-                self.b.ins().brif(proven, fast, &[], block, &[]);
-            } else {
-                self.flush_mmx_effects();
-                self.b.ins().jump(block, &[]);
+            match versioned {
+                Some(index) => self.enter_clone(index, block),
+                None => {
+                    self.b.ins().jump(block, &[]);
+                }
             }
         } else {
             self.exit_const(Exit::Dispatch, pc);
         }
     }
-    /// Whether the iterations left when loop `index` branches back can run in
-    /// its clone: every group stays in ordinary memory, and the fuel covers
-    /// each block of every iteration. The counter, already decremented and
-    /// nonzero, is the iteration count.
+    /// Whether the fuel pays for every block of one more iteration of loop
+    /// `index`; clone blocks charge fuel without their own guards.
+    fn funded(&mut self, index: usize) -> Value {
+        let blocks = self.plans[index].starts.len() as i64;
+        let fuel = self.b.use_var(self.fuel);
+        self.b
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, fuel, blocks)
+    }
+    /// A clone's back edge stays in the clone while the fuel pays for the next
+    /// iteration; otherwise the checked header takes the budget exit.
+    fn continue_clone(&mut self, index: usize) {
+        let header = self.plans[index].header;
+        let checked = self.blocks[&header];
+        let fast = self.fast_blocks[index][&header];
+        self.flush_mmx_effects();
+        let funded = self.funded(index);
+        let next = self.b.create_block();
+        self.b.ins().brif(funded, next, &[], checked, &[]);
+        self.b.switch_to_block(next);
+        let target = self.constant(header);
+        self.interrupt_at(target, false);
+        self.b.ins().jump(fast, &[]);
+    }
+    /// A checked back edge enters the clone once the remaining iterations'
+    /// operand ranges are proven. A failed proof waits `COOLDOWN` iterations
+    /// before the next attempt, so unprovable loops stay cheap.
+    fn enter_clone(&mut self, index: usize, checked: ir::Block) {
+        const COOLDOWN: i64 = 63;
+        let fast = self.fast_blocks[index][&self.plans[index].header];
+        let cooldown = self.cooldowns[index];
+        let wait = self.b.use_var(cooldown);
+        let attempt = self.b.create_block();
+        let waiting = self.b.create_block();
+        self.b.ins().brif(wait, waiting, &[], attempt, &[]);
+        self.b.switch_to_block(waiting);
+        let left = self.b.ins().iadd_imm(wait, -1);
+        self.b.def_var(cooldown, left);
+        self.b.ins().jump(checked, &[]);
+        self.b.switch_to_block(attempt);
+        let funded = self.funded(index);
+        let prove = self.b.create_block();
+        self.b.ins().brif(funded, prove, &[], checked, &[]);
+        self.b.switch_to_block(prove);
+        let proven = self.loop_proof(index);
+        let failed = self.b.create_block();
+        self.b.set_cold_block(failed);
+        self.b.ins().brif(proven, fast, &[], failed, &[]);
+        self.b.switch_to_block(failed);
+        let wait = self.constant(COOLDOWN as u32);
+        self.b.def_var(cooldown, wait);
+        self.b.ins().jump(checked, &[]);
+    }
+    /// Whether every group of loop `index` stays in ordinary memory for the
+    /// iterations left when its latch branches back: the counter, already
+    /// decremented and nonzero, is that count.
     fn loop_proof(&mut self, index: usize) -> Value {
         let plan = &self.plans[index];
         let (counter, counter_size) = (plan.counter, plan.counter_size);
-        let blocks = plan.starts.len() as i64;
         let groups = plan.groups.clone();
         let count = self.b.use_var(self.regs[counter]);
         let count = if counter_size == 2 {
@@ -2449,13 +2514,7 @@ impl Emitter<'_> {
         let count = self.b.ins().uextend(types::I64, count);
         let more = self.b.ins().iadd_imm(count, -1);
         let len = self.b.ins().iconst(types::I64, self.len as i64);
-        let fuel = self.b.use_var(self.fuel);
-        let needed = self.b.ins().imul_imm(count, blocks);
-        let funded = self
-            .b
-            .ins()
-            .icmp(IntCC::UnsignedGreaterThanOrEqual, fuel, needed);
-        let mut ok = self.b.ins().uextend(types::I32, funded);
+        let mut ok = self.constant(1);
         for group in groups {
             let mut address = self.constant(0);
             if let Some(base) = group.base {
@@ -2547,7 +2606,7 @@ impl Emitter<'_> {
             .ins()
             .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
         let mut pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
-        // A loop clone's remaining blocks are prepaid, so its fuel is nonzero.
+        // A clone checks interrupts after funding its next iteration.
         if self.fast.is_none() {
             let fuel = self.b.use_var(self.fuel);
             let work = self.b.ins().icmp_imm(IntCC::NotEqual, fuel, 0);
