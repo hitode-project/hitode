@@ -7,7 +7,9 @@ Only completed lock-wait attempts wholly inside that window enter the lock table
 A failed reacquire starts a new attempt; it is not attributed to the old owner.
 End-PC attribution is a boundary observation, not instruction-level profiling.
 Frame gaps use consecutive guest completions, not shell observations or scanout;
-static reading and intentional sleeps can also produce long gaps.
+static reading and intentional sleeps can also produce long gaps. Each gap is
+labelled by the dominant state of the context that completed the frame, and
+non-idle gaps get separate percentiles so pacing gaps do not read as stalls.
 """
 
 import argparse
@@ -29,7 +31,36 @@ def overlap(begin, end, lo, hi):
     return max(0, min(end, hi) - max(begin, lo))
 
 
-def frame_gaps(rows, runs, waits, lo, hi):
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * fraction))] if ordered else None
+
+
+def gap_cause(producer, waits, segments, begin, end):
+    """Dominant state of the frame-producing context during one gap.
+
+    Lock waits are split from other object waits; leased counts as execution.
+    Idle (timer sleep or polling yield) includes text pacing and static images,
+    but can also hide polling for a late device or audio state.
+    """
+    shares = Counter()
+    for start, stop, state_name in segments.get(producer, ()):
+        ns = overlap(start, stop, begin, end)
+        if ns:
+            shares[{"owner": "execution", "leased": "execution", "timer": "idle",
+                    "polling": "idle"}.get(state_name, state_name)] += ns
+    locked = sum(
+        overlap(wait["begin"], wait["end"], begin, end)
+        for wait in waits if wait["ctx"] == producer
+    )
+    moved = min(locked, shares["object"])
+    shares["object"] -= moved
+    shares["lock_wait"] += moved
+    shares = {name: ns / 1e6 for name, ns in shares.items() if ns}
+    return max(shares, key=shares.get) if shares else "unknown", shares
+
+
+def frame_gaps(rows, runs, waits, segments, lo, hi):
     frames = [r for r in rows if r["event"] == "frame"]
     gaps = [
         (b["time_ns"] - a["time_ns"], a, b)
@@ -37,9 +68,26 @@ def frame_gaps(rows, runs, waits, lo, hi):
         if lo <= a["time_ns"] < b["time_ns"] <= hi
         and b["a"] == ((a["a"] + 1) & 0xffffffff)
     ]
+    causes = defaultdict(list)
+    for duration, first, last in gaps:
+        cause, _ = gap_cause(last["context"], waits, segments, first["time_ns"], last["time_ns"])
+        causes[cause].append(duration / 1e6)
+    busy = [ms for cause, values in causes.items() if cause != "idle" for ms in values]
+    summary = {
+        "gaps": len(gaps),
+        "by_cause": {
+            cause: {"count": len(values), "total_ms": sum(values), "max_ms": max(values)}
+            for cause, values in sorted(causes.items())
+        },
+        "non_idle_ms": {
+            "count": len(busy), "p95": percentile(busy, 0.95),
+            "p99": percentile(busy, 0.99), "max": max(busy, default=None),
+        },
+    }
     result = []
     for duration, first, last in sorted(gaps, key=lambda gap: gap[0], reverse=True)[:10]:
         begin, end = first["time_ns"], last["time_ns"]
+        cause, shares = gap_cause(last["context"], waits, segments, begin, end)
         active = defaultdict(lambda: {"runs": 0, "wall_ms": 0, "host_ms": 0})
         for start, stop, context, _, _, host in runs:
             ns = overlap(start, stop, begin, end)
@@ -56,9 +104,10 @@ def frame_gaps(rows, runs, waits, lo, hi):
         result.append({
             "frame_start": first["a"], "frame_end": last["a"],
             "begin_ns": begin, "end_ns": end, "wall_ms": duration / 1e6,
+            "producer": last["context"], "cause": cause, "producer_state_ms": shares,
             "inline_runs": dict(active), "completed_lock_waits": relevant,
         })
-    return result
+    return result, summary
 
 
 def analyze(rows):
@@ -165,6 +214,7 @@ def analyze(rows):
             if duration:
                 entry["owner_state_ms"][state_name] += duration / 1e6
 
+    longest, gap_summary = frame_gaps(rows, runs, records, segments, lo, hi)
     summary = {
         "interval_kind": "host wall; leased includes queueing and completion delivery",
         "boundary_note": "host/end-PC time is prorated for runs crossing the measurement boundary",
@@ -183,7 +233,9 @@ def analyze(rows):
             for (context, pc), ms in pcs.most_common(20)
         ],
         "frame_gap_note": "guest completions; inline host time is prorated at boundaries; completed waits only",
-        "longest_frame_gaps": frame_gaps(rows, runs, records, lo, hi),
+        "cause_note": "dominant producer state; idle (sleep/poll) includes text pacing and static images",
+        "frame_gap_causes": gap_summary,
+        "longest_frame_gaps": longest,
     }
     return summary, selected
 

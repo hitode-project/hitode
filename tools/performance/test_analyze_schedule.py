@@ -56,6 +56,30 @@ class ScheduleAnalysisTests(unittest.TestCase):
         self.assertEqual(gaps[0]["inline_runs"][1], {"runs": 1, "wall_ms": 3, "host_ms": 0.6})
         self.assertEqual(gaps[0]["completed_lock_waits"][0]["overlap_ms"], 3)
 
+    def test_frame_gaps_are_labelled_by_the_producer_state(self):
+        summary, _ = analyze([
+            row(0, "mark"), row(0, "cs_take", 1, 16, 1), row(0, "frame", a=1),
+            # Lock wait: context 0 blocks on a lock context 1 holds.
+            row(1, "cs_wait", 0, 16), row(1, "block", 0, 2), row(1, "run_start", 1),
+            row(9, "run_end", 1, 32, 8_000_000, 0), row(9, "cs_release", 1, 16, 0),
+            row(9, "wake", 0), row(9, "run_start", 0), row(9, "cs_take", 0, 16, 1),
+            row(10, "frame", a=2),
+            # Execution: context 0 computes most of the gap.
+            row(16, "run_end", 0, 32, 6_000_000, 0), row(16, "run_start", 0),
+            row(17, "frame", a=3),
+            # Idle: sleeping and polling are pacing, not stalls.
+            row(17, "block", 0, 1), row(30, "wake", 0), row(30, "yield", 0),
+            row(39, "run_start", 0), row(40, "frame", a=4), row(41, "observe"),
+        ])
+        causes = summary["frame_gap_causes"]
+        self.assertEqual({k: v["count"] for k, v in causes["by_cause"].items()},
+                         {"lock_wait": 1, "execution": 1, "idle": 1})
+        self.assertEqual(causes["non_idle_ms"]["max"], 10)
+        longest = summary["longest_frame_gaps"]
+        self.assertEqual([(g["wall_ms"], g["cause"]) for g in longest],
+                         [(23, "idle"), (10, "lock_wait"), (7, "execution")])
+        self.assertEqual(longest[1]["producer_state_ms"], {"lock_wait": 8, "execution": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
