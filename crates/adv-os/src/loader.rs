@@ -301,7 +301,7 @@ impl<'a> Loader<'a> {
         let loaded = if system {
             self.modules.system(&key)
         } else {
-            self.modules.by_name(path)
+            self.modules.by_name(path).or_else(|| self.same_file(path))
         };
         if let Some(id) = loaded {
             if retain {
@@ -339,6 +339,26 @@ impl<'a> Loader<'a> {
         // into unimplemented functions fail by name.
         log::info!("{path}: not in the game files, treating as a system module");
         self.load_host(key, path, retain)
+    }
+
+    /// A path naming an image already loaded through another spelling, such as
+    /// an absolute path to a DLL first found relative to the game directory.
+    fn same_file(&self, path: &str) -> Option<ModuleId> {
+        if !path.contains(['\\', '/']) {
+            return None;
+        }
+        let wanted = self.files.absolute_path(path);
+        self.modules
+            .iter()
+            .find(|(_, m)| {
+                m.kind == ModuleKind::Image
+                    && m.executable_visible()
+                    && self
+                        .files
+                        .absolute_path(&m.path)
+                        .eq_ignore_ascii_case(&wanted)
+            })
+            .map(|(id, _)| id)
     }
 
     fn load_host(&mut self, key: String, _path: &str, retain: bool) -> Result<ModuleId, LoadError> {

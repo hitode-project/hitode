@@ -136,3 +136,25 @@ fn malformed_altered_dependency_rolls_back_and_does_not_leak_search_policy() {
     let dep = loader.modules.by_name("owned_dep.dll").unwrap();
     assert_eq!(loader.modules.get(dep).path, "owned_dep.dll");
 }
+
+#[test]
+fn absolute_path_to_a_relatively_loaded_image_reuses_the_module() {
+    let files = Files(BTreeMap::from([
+        ("dll\\owned_dep.dll".into(), dependency(11)),
+        ("C:\\Game\\dll\\owned_dep.dll".into(), dependency(11)),
+    ]));
+    let mut machine = fixture();
+    let mut loader = Loader::new(
+        &mut machine.cpu,
+        &mut machine.sys,
+        machine.ext.get_mut::<Modules>(),
+        &files,
+    );
+    let first = loader.load("dll\\owned_dep.dll").unwrap();
+    for path in ["C:\\Game\\dll\\owned_dep.dll", "c:/game/DLL/owned_dep.dll"] {
+        assert_eq!(loader.load_altered(path).unwrap(), first);
+    }
+    assert_eq!(loader.load("C:\\Game\\dll\\owned_dep.dll").unwrap(), first);
+    assert_eq!(loader.modules.iter().count(), 1);
+    assert_eq!(loader.modules.get(first).lifetime.external_refs, 4);
+}
