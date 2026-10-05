@@ -107,7 +107,7 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         return 0;
     }
     if state.eflags & (1 << 10) != 0 {
-        return FALLBACK;
+        return backwards(bridge, state, copy, width);
     }
     let Some(len) = count.checked_mul(width) else {
         return FALLBACK;
@@ -117,16 +117,14 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         return FALLBACK;
     };
     let src = state.regs[6];
-    if copy {
+    let overlap = if copy {
         let Some(src_end) = src.checked_add(len) else {
             return FALLBACK;
         };
-        // REP is a sequence of element reads/writes, not memmove. Conservatively
-        // hand every overlap back before its first element can change memory.
-        if src < dst_end && dst < src_end {
-            return FALLBACK;
-        }
-    }
+        src < dst_end && dst < src_end
+    } else {
+        false
+    };
     // SAFETY: Executor supplies its live, exclusively borrowed shared allocation;
     // generated code has stopped and no trap or scheduler runs during this call.
     let memory = unsafe { &mut *bridge.memory };
@@ -145,13 +143,19 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     if expired(bridge.deadline) {
         return BUDGET;
     }
-    let mut bytes = len.min(if memory.is_parallel() {
+    let mut bytes = len.min(if memory.foreign_access_required() {
         16 * 1024
     } else {
         CHUNK_BYTES
     });
     let shared = memory.shared_range(dst, bytes as usize)
         || (copy && memory.shared_range(src, bytes as usize));
+    // Ordinary x64 RAM can use the real forward REP instruction even when its
+    // writes feed subsequent reads. memmove would change that guest behavior.
+    // Overlays need their own ordered element accesses, not this raw RAM path.
+    if overlap && (shared || !cfg!(target_arch = "x86_64")) {
+        return FALLBACK;
+    }
     if shared {
         bytes = bytes.min(SHARED_CHUNK_BYTES);
         // A file first-touch failure must belong to the next guest element,
@@ -198,7 +202,7 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
         if result.is_err() {
             std::process::abort();
         }
-    } else if memory.is_parallel() {
+    } else if overlap || memory.foreign_access_required() {
         unsafe {
             crate::parallel_memory::repeat(
                 memory.ptr.as_ptr().add(src_offset),
@@ -245,6 +249,85 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     state.regs[7] += bytes;
     if copy {
         state.regs[6] += bytes;
+    }
+    bridge.bulk_calls += 1;
+    bridge.bulk_bytes += u64::from(bytes);
+    if state.regs[1] == 0 { 0 } else { MORE }
+}
+
+/// Descending REP retains element order even for propagating overlaps. Keep DF
+/// on the guest CPU only: no Rust call or host fault path may inherit host DF=1.
+fn backwards(
+    bridge: &mut crate::trap::Bridge<'_>,
+    state: &mut CpuState,
+    copy: bool,
+    width: u32,
+) -> u32 {
+    if !cfg!(target_arch = "x86_64") {
+        return FALLBACK;
+    }
+    let Some(len) = state.regs[1].checked_mul(width) else {
+        return FALLBACK;
+    };
+    let Some(dst_start) = state.regs[7].checked_sub(len - width) else {
+        return FALLBACK;
+    };
+    let src_start = if copy {
+        let Some(start) = state.regs[6].checked_sub(len - width) else {
+            return FALLBACK;
+        };
+        start
+    } else {
+        0
+    };
+    // The owner or worker lease pins the allocation and mapping metadata.
+    let memory = unsafe { &mut *bridge.memory };
+    let dst_offset = match checked_range(memory, dst_start, len, true, bridge.deadline) {
+        Ok(at) => at,
+        Err(exit) => return exit,
+    };
+    let src_offset = if copy {
+        match checked_range(memory, src_start, len, false, bridge.deadline) {
+            Ok(at) => at,
+            Err(exit) => return exit,
+        }
+    } else {
+        0
+    };
+    let bytes = len.min(16 * 1024);
+    if memory.shared_range(dst_start + (len - bytes), bytes as usize)
+        || copy && memory.shared_range(src_start + (len - bytes), bytes as usize)
+    {
+        return FALLBACK;
+    }
+    if expired(bridge.deadline) {
+        return BUDGET;
+    }
+    // Every access lies in the checked ordinary RAM chunk. Explicit machine
+    // loads/stores permit concurrent guest access without Rust byte references.
+    unsafe {
+        let mut left = len as usize;
+        while left > (len - bytes) as usize {
+            left -= width as usize;
+            let value = if copy {
+                crate::parallel_memory::load(
+                    memory.ptr.as_ptr().add(src_offset + left),
+                    width as usize,
+                )
+            } else {
+                u64::from(state.regs[0])
+            };
+            crate::parallel_memory::store(
+                memory.ptr.as_ptr().add(dst_offset + left),
+                value,
+                width as usize,
+            );
+        }
+    }
+    state.regs[1] -= bytes / width;
+    state.regs[7] = state.regs[7].wrapping_sub(bytes);
+    if copy {
+        state.regs[6] = state.regs[6].wrapping_sub(bytes);
     }
     bridge.bulk_calls += 1;
     bridge.bulk_bytes += u64::from(bytes);
@@ -328,7 +411,7 @@ unsafe fn read_element<const KIND: u8>(
             value |= u32::from(atom.load(Ordering::Relaxed)) << (byte * 8);
         }
         value
-    } else if KIND == 0 && memory.is_parallel() {
+    } else if KIND == 0 && memory.foreign_access_required() {
         unsafe { crate::parallel_memory::load(pointer, width as usize) as u32 }
     } else {
         unsafe {

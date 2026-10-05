@@ -105,7 +105,7 @@ fn zero_count_ignores_invalid_addresses_and_direction_flag() {
 }
 
 #[test]
-fn backwards_and_overlapping_ranges_fall_back_without_changing_rep_semantics() {
+fn backwards_ranges_retain_rep_semantics() {
     for operation in 0..6 {
         let mut jit = machine(operation, true, 0x50000);
         let mut uc = machine(operation, false, 0x50000);
@@ -120,30 +120,11 @@ fn backwards_and_overlapping_ranges_fall_back_without_changing_rep_semantics() {
             jit.memory().read(DST, 4096).unwrap(),
             uc.memory().read(DST, 4096).unwrap()
         );
-        assert_eq!(jit.stats.bulk_bytes, 0);
-        assert!(jit.stats.interpreter_entries > 0);
-    }
-    for operation in 0..3 {
-        for delta in [0i32, 1, -1, 4, -4] {
-            let mut jit = machine(operation, true, 0x50000);
-            let mut uc = machine(operation, false, 0x50000);
-            for m in [&mut jit, &mut uc] {
-                init(m);
-                start(
-                    m,
-                    27,
-                    SRC + 0x100,
-                    (SRC as i32 + 0x100 + delta) as u32,
-                    0x8d7,
-                );
-            }
-            assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-            assert_eq!(uc.run_unicorn(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
-            assert_eq!(jit.state.regs, uc.state.regs);
-            assert_eq!(
-                jit.memory().read(SRC, 4096).unwrap(),
-                uc.memory().read(SRC, 4096).unwrap()
-            );
+        assert_eq!(jit.state.eflags, uc.state.eflags);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(jit.stats.bulk_bytes, 27 * u64::from(width(operation)));
+            assert_eq!(jit.stats.interpreter_entries, 0);
+        } else {
             assert_eq!(jit.stats.bulk_bytes, 0);
             assert!(jit.stats.interpreter_entries > 0);
         }
@@ -151,42 +132,119 @@ fn backwards_and_overlapping_ranges_fall_back_without_changing_rep_semantics() {
 }
 
 #[test]
-fn protected_later_pages_preserve_unicorn_partial_fault_progress() {
-    for operation in [0, 2, 3, 5] {
-        for read_fault in [false, true] {
-            if read_fault && operation >= 3 {
-                continue;
-            }
-            let mut jit = machine(operation, true, 0x50000);
-            let mut uc = machine(operation, false, 0x50000);
-            for m in [&mut jit, &mut uc] {
-                init(m);
-                start(m, 32, SRC + 4096 - 16, DST + 4096 - 16, 0x8d7);
-                if read_fault {
-                    m.protect(SRC + 4096, 4096, 0).unwrap();
+fn overlapping_copies_retain_element_order_and_flags() {
+    for operation in 0..3 {
+        for flags in [0x8d7, 0xcd7] {
+            for delta in [0i32, 1, -1, 4, -4] {
+                let mut jit = machine(operation, true, 0x50000);
+                let mut uc = machine(operation, false, 0x50000);
+                for m in [&mut jit, &mut uc] {
+                    init(m);
+                    start(
+                        m,
+                        27,
+                        SRC + 0x100,
+                        (SRC as i32 + 0x100 + delta) as u32,
+                        flags,
+                    );
+                }
+                assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
+                assert_eq!(uc.run_unicorn(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
+                assert_eq!(jit.state.regs, uc.state.regs);
+                assert_eq!(
+                    jit.memory().read(SRC, 4096).unwrap(),
+                    uc.memory().read(SRC, 4096).unwrap()
+                );
+                assert_eq!(jit.state.eflags, uc.state.eflags);
+                if cfg!(target_arch = "x86_64") {
+                    assert_eq!(jit.stats.bulk_bytes, 27 * u64::from(width(operation)));
+                    assert_eq!(jit.stats.interpreter_entries, 0);
                 } else {
-                    m.protect(DST + 4096, 4096, READ).unwrap();
+                    assert_eq!(jit.stats.bulk_bytes, 0);
+                    assert!(jit.stats.interpreter_entries > 0);
                 }
             }
-            let actual = jit.run(STOP, 1000).unwrap();
-            let expected = uc.run_unicorn(STOP, 1000).unwrap();
-            assert_eq!(
-                actual, expected,
-                "operation {operation}, read_fault {read_fault}"
-            );
-            assert!(matches!(
-                actual,
-                RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
-            ));
-            assert_eq!(jit.state.regs, uc.state.regs);
-            assert_eq!(jit.state.eflags, uc.state.eflags);
-            assert_eq!(jit.state.eip, CODE);
-            assert_eq!(
-                jit.memory().read(DST, 8192).unwrap(),
-                uc.memory().read(DST, 8192).unwrap()
-            );
-            assert_eq!(jit.stats.bulk_bytes, 0);
-            assert_eq!(jit.state.regs[1], 32 - 16 / width(operation));
+        }
+    }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn descending_overlap_yields_and_resumes_without_snapshotting_the_source() {
+    let mut jit = machine(2, true, 0x50000);
+    let mut uc = machine(2, false, 0x50000);
+    for m in [&mut jit, &mut uc] {
+        init(m);
+        start(m, 10000, SRC + 50000, SRC + 49999, 0xcd7);
+    }
+    assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
+    assert_eq!(jit.state.eip, CODE);
+    assert_eq!(jit.state.regs[1], 10000 - 4096);
+    assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(
+        uc.run_unicorn(STOP, 20000).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    assert_eq!(jit.state.regs, uc.state.regs);
+    assert_eq!(jit.state.eflags, uc.state.eflags);
+    assert_eq!(
+        jit.memory().read(SRC, 65536).unwrap(),
+        uc.memory().read(SRC, 65536).unwrap()
+    );
+    assert_eq!(jit.stats.interpreter_entries, 0);
+}
+
+#[test]
+fn protected_later_pages_preserve_unicorn_partial_fault_progress() {
+    for operation in [0, 2, 3, 5] {
+        for backwards in [false, true] {
+            for read_fault in [false, true] {
+                if read_fault && operation >= 3 {
+                    continue;
+                }
+                let mut jit = machine(operation, true, 0x50000);
+                let mut uc = machine(operation, false, 0x50000);
+                for m in [&mut jit, &mut uc] {
+                    init(m);
+                    let offset = if backwards {
+                        4096 + 16 - width(operation)
+                    } else {
+                        4096 - 16
+                    };
+                    start(
+                        m,
+                        32,
+                        SRC + offset,
+                        DST + offset,
+                        if backwards { 0xcd7 } else { 0x8d7 },
+                    );
+                    let protected = if backwards { 0 } else { 4096 };
+                    if read_fault {
+                        m.protect(SRC + protected, 4096, 0).unwrap();
+                    } else {
+                        m.protect(DST + protected, 4096, READ).unwrap();
+                    }
+                }
+                let actual = jit.run(STOP, 1000).unwrap();
+                let expected = uc.run_unicorn(STOP, 1000).unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "operation {operation}, read_fault {read_fault}"
+                );
+                assert!(matches!(
+                    actual,
+                    RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+                ));
+                assert_eq!(jit.state.regs, uc.state.regs);
+                assert_eq!(jit.state.eflags, uc.state.eflags);
+                assert_eq!(jit.state.eip, CODE);
+                assert_eq!(
+                    jit.memory().read(DST, 8192).unwrap(),
+                    uc.memory().read(DST, 8192).unwrap()
+                );
+                assert_eq!(jit.stats.bulk_bytes, 0);
+                assert_eq!(jit.state.regs[1], 32 - 16 / width(operation));
+            }
         }
     }
 }

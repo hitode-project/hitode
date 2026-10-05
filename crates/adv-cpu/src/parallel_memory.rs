@@ -134,7 +134,9 @@ pub(crate) unsafe fn copy(source: *const u8, destination: *mut u8, len: usize) {
 }
 
 /// # Safety
-/// Validated, nonoverlapping forward REP operands. Retain guest element width.
+/// Validated, pinned forward REP operands in ordinary machine memory, with no
+/// live Rust references. Overlap is allowed: each element is read before it is
+/// written, retaining guest width and propagation (not memmove semantics).
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn repeat(
     source: *const u8,

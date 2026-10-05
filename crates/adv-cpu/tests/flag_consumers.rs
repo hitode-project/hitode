@@ -94,18 +94,40 @@ macro_rules! setcc {
 
 #[test]
 fn sbb_forms_match_results_all_flags_and_live_conditions_at_borrow_boundaries() {
+    carry_forms_match(true);
+}
+
+#[test]
+fn adc_forms_match_results_all_flags_and_live_conditions_at_carry_boundaries() {
+    carry_forms_match(false);
+}
+
+fn carry_forms_match(subtract: bool) {
     for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
         for form in 0..8 {
             let bytes = assemble(|a| {
-                match form {
-                    0 => a.sbb(eax, ecx),
-                    1 => a.sbb(eax, eax),
-                    2 => a.sbb(eax, -1),
-                    3 => a.sbb(eax, i32::MIN),
-                    4 => a.sbb(eax, dword_ptr(edi)),
-                    5 => a.sbb(dword_ptr(edi), ecx),
-                    6 => a.sbb(dword_ptr(edi), -1),
-                    _ => a.sbb(dword_ptr(edi), i32::MIN),
+                if subtract {
+                    match form {
+                        0 => a.sbb(eax, ecx),
+                        1 => a.sbb(eax, eax),
+                        2 => a.sbb(eax, -1),
+                        3 => a.sbb(eax, i32::MIN),
+                        4 => a.sbb(eax, dword_ptr(edi)),
+                        5 => a.sbb(dword_ptr(edi), ecx),
+                        6 => a.sbb(dword_ptr(edi), -1),
+                        _ => a.sbb(dword_ptr(edi), i32::MIN),
+                    }
+                } else {
+                    match form {
+                        0 => a.adc(eax, ecx),
+                        1 => a.adc(eax, eax),
+                        2 => a.adc(eax, -1),
+                        3 => a.adc(eax, i32::MIN),
+                        4 => a.adc(eax, dword_ptr(edi)),
+                        5 => a.adc(dword_ptr(edi), ecx),
+                        6 => a.adc(dword_ptr(edi), -1),
+                        _ => a.adc(dword_ptr(edi), i32::MIN),
+                    }
                 }
                 .unwrap();
                 for condition in 0..16 {
@@ -136,7 +158,10 @@ fn sbb_forms_match_results_all_flags_and_live_conditions_at_borrow_boundaries() 
                     }
                 }
             }
-            assert_eq!(jit.stats.interpreter_entries, 0, "SBB form {form}");
+            assert_eq!(
+                jit.stats.interpreter_entries, 0,
+                "carry form {form}, subtract={subtract}"
+            );
         }
     }
 }
@@ -172,6 +197,54 @@ fn sbb_chain_uses_lazy_carry_preserved_by_inc_dec_then_feeds_setcc() {
         }
         assert_eq!(jit.stats.interpreter_entries, 0);
     }
+}
+
+#[test]
+fn adc_chain_preserves_lazy_carry_across_inc_dec_and_faulting_stores() {
+    let bytes = assemble(|a| {
+        a.add(edx, ebx).unwrap();
+        a.inc(esi).unwrap();
+        a.dec(ebp).unwrap();
+        a.adc(eax, ecx).unwrap();
+        a.adc(eax, -1).unwrap();
+        a.adc(dword_ptr(edi), ecx).unwrap();
+        a.ret().unwrap();
+    });
+    for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+        let mut jit = machine(&bytes, Some(strategy));
+        let mut reference = machine(&bytes, None);
+        for left in VALUES {
+            for right in VALUES {
+                for m in [&mut jit, &mut reference] {
+                    reset(m, left, right, 0xed7, DATA);
+                    m.write(DATA, &left.to_le_bytes()).unwrap();
+                }
+                compare(&mut jit, &mut reference);
+                assert_eq!(
+                    jit.memory().read(DATA, 4).unwrap(),
+                    reference.memory().read(DATA, 4).unwrap()
+                );
+            }
+        }
+        assert_eq!(jit.stats.interpreter_entries, 0);
+    }
+    let bytes = assemble(|a| {
+        a.adc(dword_ptr(edi), ecx).unwrap();
+        a.ret().unwrap();
+    });
+    let mut jit = machine(&bytes, Some(CompileStrategy::Fast));
+    reset(&mut jit, 1, u32::MAX, 0xed7, DATA);
+    jit.protect(DATA, 4096, READ).unwrap();
+    let before = jit.state.clone();
+    assert_eq!(
+        jit.run(STOP, 100).unwrap(),
+        RunOutcome::WriteFault {
+            pc: CODE,
+            address: DATA
+        }
+    );
+    assert_eq!(jit.state.regs, before.regs);
+    assert_eq!(jit.state.eflags, before.eflags);
 }
 
 #[test]

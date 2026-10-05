@@ -147,7 +147,7 @@ fn divide_source_fault_precedes_division_checks_and_preserves_all_registers() {
 }
 
 #[test]
-fn short_and_signed_divide_forms_execute_in_the_interpreter() {
+fn short_divide_fallbacks_mix_with_native_signed_division() {
     let bytes = code(|a| {
         a.div(cl).unwrap();
         a.mov(dx, 0).unwrap();
@@ -168,6 +168,102 @@ fn short_and_signed_divide_forms_execute_in_the_interpreter() {
     );
     assert_eq!(jit.state.regs, reference.state.regs);
     assert!(jit.stats.interpreter_entries > 0);
+}
+
+#[test]
+fn signed_divide_handles_signs_aliases_and_exact_exception_boundaries() {
+    let dividends: [i64; 12] = [
+        i64::MIN,
+        i64::MIN + 1,
+        -0x1_0000_0001,
+        -0x8000_0001,
+        -0x8000_0000,
+        -101,
+        -1,
+        0,
+        101,
+        0x7fff_ffff,
+        0x1_0000_0001,
+        i64::MAX,
+    ];
+    for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+        for form in 0..4 {
+            let bytes = code(|a| {
+                match form {
+                    0 => a.idiv(ecx),
+                    1 => a.idiv(dword_ptr(edi)),
+                    2 => a.idiv(eax),
+                    _ => a.idiv(edx),
+                }
+                .unwrap();
+                a.ret().unwrap();
+            });
+            let mut jit = machine(&bytes, Some(strategy));
+            let mut reference = machine(&bytes, None);
+            for dividend in dividends {
+                for divisor in [i32::MIN, -7, -1, 0, 1, 7, i32::MAX] {
+                    let low = dividend as u32;
+                    let high = (dividend >> 32) as u32;
+                    let actual = match form {
+                        2 => low as i32,
+                        3 => high as i32,
+                        _ => divisor,
+                    };
+                    for m in [&mut jit, &mut reference] {
+                        reset(m, low, high, divisor as u32, DATA + 4094);
+                        m.write(DATA + 4094, &divisor.to_le_bytes()).unwrap();
+                    }
+                    let before = jit.state.clone();
+                    let quotient = (actual != 0).then(|| i128::from(dividend) / i128::from(actual));
+                    if quotient.is_none_or(|q| q < i128::from(i32::MIN) || q > i128::from(i32::MAX))
+                    {
+                        assert_eq!(
+                            jit.run(STOP, 100).unwrap(),
+                            RunOutcome::Trap {
+                                pc: CODE,
+                                vector: 0
+                            }
+                        );
+                        assert_eq!(jit.state.regs, before.regs);
+                        assert_eq!(jit.state.eflags, before.eflags);
+                        assert_eq!(jit.state.eip, CODE);
+                    } else {
+                        let fallbacks = jit.stats.interpreter_entries;
+                        assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                        assert_eq!(
+                            reference.run_unicorn(STOP, 100).unwrap(),
+                            RunOutcome::ReachedStop
+                        );
+                        assert_eq!(
+                            jit.state.regs, reference.state.regs,
+                            "{dividend}/{actual}, {form}"
+                        );
+                        assert_eq!(jit.state.regs[0] as i32, quotient.unwrap() as i32);
+                        assert_eq!(
+                            jit.state.regs[2] as i32,
+                            (i128::from(dividend) % i128::from(actual)) as i32
+                        );
+                        assert_eq!(jit.state.eflags, before.eflags);
+                        assert_eq!(jit.stats.interpreter_entries, fallbacks);
+                    }
+                }
+            }
+            reset(&mut jit, 1, 0, 0, DATA);
+            if form == 1 {
+                jit.protect(DATA, 4096, 0).unwrap();
+                let before = jit.state.clone();
+                assert_eq!(
+                    jit.run(STOP, 100).unwrap(),
+                    RunOutcome::ReadFault {
+                        pc: CODE,
+                        address: DATA
+                    }
+                );
+                assert_eq!(jit.state.regs, before.regs);
+                assert_eq!(jit.state.eflags, before.eflags);
+            }
+        }
+    }
 }
 
 #[test]

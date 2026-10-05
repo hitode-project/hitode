@@ -12,7 +12,8 @@ fn setup(fault: bool) -> Executor {
     let mut a = CodeAssembler::new(32).unwrap();
     a.mov(eax, -101).unwrap();
     a.cdq().unwrap();
-    a.idiv(dword_ptr(edi)).unwrap();
+    // The 32-bit form is native; keep this bridge check on a cold 16-bit form.
+    a.idiv(word_ptr(edi)).unwrap();
     a.add(ebx, eax).unwrap();
     a.ret().unwrap();
     let bytes = a.assemble(CODE as u64).unwrap();
@@ -42,7 +43,7 @@ fn setup(fault: bool) -> Executor {
 }
 
 #[test]
-fn native_idiv_exit_uses_shared_state_then_resumes_native_without_unicorn() {
+fn native_word_idiv_exit_uses_shared_state_then_resumes_native_without_unicorn() {
     let mut hybrid = setup(false);
     let mut reference = setup(false);
     assert_eq!(hybrid.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);

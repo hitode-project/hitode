@@ -54,13 +54,13 @@ pub(super) fn supported(i: &Instruction) -> bool {
     match i.mnemonic() {
         M::Cdq => i.code() == Code::Cdq,
         M::Leave => i.code() == Code::Leaved,
-        M::Sbb => {
+        M::Adc | M::Sbb => {
             i.op_count() == 2
                 && source32(i, 0)
                 && (source32(i, 1)
                     || matches!(i.op1_kind(), OpKind::Immediate32 | OpKind::Immediate8to32))
         }
-        M::Mul | M::Div => i.op_count() == 1 && source32(i, 0),
+        M::Mul | M::Div | M::Idiv => i.op_count() == 1 && source32(i, 0),
         M::Imul => match i.op_count() {
             1 => source32(i, 0),
             2 => {
@@ -177,8 +177,16 @@ impl Emitter<'_> {
             self.subtract_with_borrow(i);
             return;
         }
+        if i.mnemonic() == M::Adc {
+            self.add_with_carry(i);
+            return;
+        }
         if i.mnemonic() == M::Div {
             self.unsigned_divide(i);
+            return;
+        }
+        if i.mnemonic() == M::Idiv {
+            self.signed_divide(i);
             return;
         }
         if matches!(i.mnemonic(), M::Shl | M::Shr | M::Sar) {
@@ -229,6 +237,29 @@ impl Emitter<'_> {
         self.set_raw_flags(flags);
     }
 
+    fn add_with_carry(&mut self, i: &Instruction) {
+        let a = self.read(i, 0);
+        let b = self.read(i, 1);
+        let ptr = self.destination(i);
+        let carry = self.flag(0);
+        let sum = self.b.ins().iadd(a, b);
+        let result = self.b.ins().iadd(sum, carry);
+        // Carry is result < a, or result == a with an incoming carry.
+        // Use the original b for AF/OF, including b == UINT32_MAX and CF=1.
+        let less = self.b.ins().icmp(IntCC::UnsignedLessThan, result, a);
+        let less = self.b.ins().uextend(types::I32, less);
+        let equal = self.b.ins().icmp(IntCC::Equal, result, a);
+        let equal = self.b.ins().uextend(types::I32, equal);
+        let equal_and_carry = self.b.ins().band(equal, carry);
+        let carry_out = self.b.ins().bor(less, equal_and_carry);
+        self.flags(a, b, result, false, false, true);
+        let zero = self.constant(0);
+        for (var, value) in self.lazy[4..].iter().zip([carry_out, zero, zero]) {
+            self.b.def_var(*var, value);
+        }
+        self.write(i, ptr, result);
+    }
+
     fn subtract_with_borrow(&mut self, i: &Instruction) {
         let a = self.read(i, 0);
         let b = self.read(i, 1);
@@ -251,6 +282,67 @@ impl Emitter<'_> {
             self.b.def_var(*var, value);
         }
         self.write(i, ptr, result);
+    }
+
+    fn signed_divide(&mut self, i: &Instruction) {
+        let divisor = self.read(i, 0);
+        let low = self.b.use_var(self.regs[0]);
+        let high = self.b.use_var(self.regs[2]);
+        let zero = self.b.ins().icmp_imm(IntCC::Equal, divisor, 0);
+        self.guard(zero, Exit::Fallback, None);
+        let sign = self.b.ins().sshr_imm(low, 31);
+        let is_narrow = self.b.ins().icmp(IntCC::Equal, high, sign);
+        let narrow = self.b.create_block();
+        let wide = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.append_block_param(done, types::I32);
+        self.b.append_block_param(done, types::I32);
+        self.b.ins().brif(is_narrow, narrow, &[], wide, &[]);
+
+        self.b.switch_to_block(narrow);
+        let minimum = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, low, i64::from(i32::MIN));
+        let negative_one = self.b.ins().icmp_imm(IntCC::Equal, divisor, -1);
+        let overflow = self.b.ins().band(minimum, negative_one);
+        self.guard(overflow, Exit::Fallback, None);
+        let quotient = self.b.ins().sdiv(low, divisor);
+        let product = self.b.ins().imul(quotient, divisor);
+        let remainder = self.b.ins().isub(low, product);
+        self.b
+            .ins()
+            .jump(done, &[quotient.into(), remainder.into()]);
+
+        self.b.switch_to_block(wide);
+        let wide_low = self.b.ins().uextend(types::I64, low);
+        let wide_high = self.b.ins().uextend(types::I64, high);
+        let wide_high = self.b.ins().ishl_imm(wide_high, 32);
+        let dividend = self.b.ins().bor(wide_high, wide_low);
+        let wide_divisor = self.b.ins().sextend(types::I64, divisor);
+        // Guard the host's own exceptional divide before computing a quotient.
+        let minimum = self.b.ins().icmp_imm(IntCC::Equal, dividend, i64::MIN);
+        let negative_one = self.b.ins().icmp_imm(IntCC::Equal, divisor, -1);
+        let overflow = self.b.ins().band(minimum, negative_one);
+        self.guard(overflow, Exit::Fallback, None);
+        let quotient = self.b.ins().sdiv(dividend, wide_divisor);
+        let low_quotient = self.b.ins().ireduce(types::I32, quotient);
+        let extended = self.b.ins().sextend(types::I64, low_quotient);
+        let overflow = self.b.ins().icmp(IntCC::NotEqual, extended, quotient);
+        self.guard(overflow, Exit::Fallback, None);
+        let product = self.b.ins().imul(quotient, wide_divisor);
+        let remainder = self.b.ins().isub(dividend, product);
+        let remainder = self.b.ins().ireduce(types::I32, remainder);
+        self.b
+            .ins()
+            .jump(done, &[low_quotient.into(), remainder.into()]);
+
+        self.b.switch_to_block(done);
+        let quotient = self.b.block_params(done)[0];
+        let remainder = self.b.block_params(done)[1];
+        self.b.def_var(self.regs[0], quotient);
+        self.b.def_var(self.regs[2], remainder);
+        // All flags are undefined after IDIV; retain the existing values.
     }
 
     fn unsigned_divide(&mut self, i: &Instruction) {

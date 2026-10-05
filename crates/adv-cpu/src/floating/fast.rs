@@ -324,7 +324,7 @@ fn writable(memory: &Memory, address: u32, len: usize) -> bool {
 /// Store to a location `writable` accepted.
 fn store(memory: &mut Memory, address: u32, bytes: &[u8]) -> Option<()> {
     if let Some(pointer) = memory.direct(address, bytes.len(), true) {
-        if memory.is_parallel() {
+        if memory.foreign_access_required() {
             if matches!(bytes.len(), 1 | 2 | 4 | 8) {
                 let mut value = [0; 8];
                 value[..bytes.len()].copy_from_slice(bytes);
@@ -345,7 +345,7 @@ fn store(memory: &mut Memory, address: u32, bytes: &[u8]) -> Option<()> {
 
 fn read<const N: usize>(memory: &Memory, address: u32) -> Option<[u8; N]> {
     if let Some(pointer) = memory.direct(address, N, false) {
-        if memory.is_parallel() {
+        if memory.foreign_access_required() {
             let mut out = [0; N];
             if matches!(N, 1 | 2 | 4 | 8) {
                 let value = unsafe { crate::parallel_memory::load(pointer, N) }.to_le_bytes();

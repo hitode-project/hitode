@@ -141,6 +141,14 @@ impl Memory {
         self.parallel_view || self.parallel.is_some()
     }
 
+    /// A worker always uses machine-memory accesses. The owner may use ordinary
+    /// private accesses once the last lease releases: only this owner can issue
+    /// another lease, and it cannot do so while a helper borrows its Memory.
+    /// Keep is_parallel separate: code generation must allow future concurrency.
+    pub(crate) fn foreign_access_required(&self) -> bool {
+        self.parallel_view || self.parallel.as_ref().is_some_and(|f| !f.is_idle())
+    }
+
     pub(crate) fn quiesce_workers(&self) {
         assert!(
             !self.parallel_view,
@@ -576,7 +584,7 @@ impl Memory {
             false,
         )?;
         if !self.overlays(&range) {
-            if self.is_parallel() {
+            if self.foreign_access_required() {
                 unsafe {
                     crate::parallel_memory::copy(
                         self.ptr.as_ptr().add(range.start),
@@ -613,7 +621,7 @@ impl Memory {
             } else if let Some(storage) = self.shared_pages.get(&page) {
                 storage.read_into(at % PAGE_SIZE, output)?;
             } else {
-                if self.is_parallel() {
+                if self.foreign_access_required() {
                     unsafe {
                         crate::parallel_memory::copy(
                             self.ptr.as_ptr().add(at),
@@ -863,7 +871,7 @@ impl Memory {
         let dst = self.committed(destination, len)?;
         self.worker_access(&src, false)?;
         self.worker_access(&dst, true)?;
-        if self.is_parallel() || self.overlays(&src) || self.overlays(&dst) {
+        if self.foreign_access_required() || self.overlays(&src) || self.overlays(&dst) {
             let mut scratch = [0; PAGE_SIZE];
             let backwards =
                 destination > source && u64::from(destination) < u64::from(source) + len as u64;
@@ -978,7 +986,7 @@ impl Memory {
                 } else if let Some(storage) = self.shared_pages.get_mut(&page) {
                     storage.write(at % PAGE_SIZE, input)?;
                 } else {
-                    if self.is_parallel() {
+                    if self.foreign_access_required() {
                         unsafe {
                             crate::parallel_memory::copy(
                                 input.as_ptr(),
@@ -1002,7 +1010,7 @@ impl Memory {
             }
             return Ok(());
         }
-        if self.is_parallel() {
+        if self.foreign_access_required() {
             unsafe {
                 crate::parallel_memory::copy(
                     bytes.as_ptr(),
@@ -1111,6 +1119,39 @@ impl Drop for Memory {
 #[cfg(all(test, windows))]
 mod linear_audio_tests {
     use super::*;
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn idle_owner_copy_preserves_parallel_codegen_contract_and_active_lease_accesses() {
+        let mut memory = Memory::new(0x1000, 4 * PAGE_SIZE).unwrap();
+        memory.protect(0x1000, 4 * PAGE_SIZE, READ | WRITE).unwrap();
+        let fence = Arc::new(crate::parallel_memory::Fence::default());
+        memory.parallel = Some(fence.clone());
+        for active in [false, true, false] {
+            let bytes: Vec<u8> = (0..3 * PAGE_SIZE).map(|i| i as u8).collect();
+            memory.write(0x1000, &bytes).unwrap();
+            let permit = active.then(|| fence.enter());
+            assert!(
+                memory.is_parallel(),
+                "code contract cannot follow transient activity"
+            );
+            assert_eq!(memory.foreign_access_required(), active);
+            assert_eq!(
+                matches!(memory.read_data(0x1000, 4).unwrap(), Cow::Owned(_)),
+                active
+            );
+            let mut expected = bytes.clone();
+            expected.copy_within(..2 * PAGE_SIZE, 3);
+            memory.copy(0x1000, 0x1003, 2 * PAGE_SIZE).unwrap();
+            let mut actual = vec![0; expected.len()];
+            memory.read_into(0x1000, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            expected.copy_within(3..2 * PAGE_SIZE + 3, 0);
+            memory.copy(0x1003, 0x1000, 2 * PAGE_SIZE).unwrap();
+            memory.read_into(0x1000, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            drop(permit);
+        }
+    }
     #[repr(C)]
     #[derive(Default)]
     struct MemoryInfo {
