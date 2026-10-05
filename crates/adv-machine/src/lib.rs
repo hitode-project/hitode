@@ -357,6 +357,22 @@ impl Sys {
         }
     }
 
+    /// TerminateThread: end another context where it stands. Its host
+    /// continuations drop and its thread object becomes signaled through
+    /// State::Done; no thread-detach work runs, as on Windows.
+    pub fn terminate_context(&mut self, id: CtxId, exit_code: u32) -> bool {
+        let Some(context) = self.contexts.get_mut(id as usize) else {
+            return false;
+        };
+        if id == self.current || context.is_done() {
+            return false;
+        }
+        context.state = State::Done { exit_code };
+        context.frames.clear();
+        context.start = None;
+        true
+    }
+
     /// Grant already blocked event waits now, without running their continuations.
     /// ResetEvent and a later waiter cannot revoke or steal an existing grant.
     pub fn set_event(&mut self, h: Handle) -> bool {
