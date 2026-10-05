@@ -19,6 +19,7 @@ pub mod outcome;
 pub mod patch;
 pub mod process;
 pub mod sched;
+pub mod schedule_trace;
 pub mod scheduling;
 pub mod stats;
 pub mod thunk;
@@ -110,6 +111,7 @@ pub struct Sys {
     pub stats: Stats,
     /// Scheduler latency observations, independent of optional execution profiling.
     pub scheduling: scheduling::SchedulingStats,
+    pub schedule_trace: schedule_trace::ScheduleTrace,
     wakes: wake_queue::WakeQueue,
 }
 
@@ -531,6 +533,8 @@ impl Sys {
             self.scheduling.timed_wake(now, deadline);
         }
         self.wakes.wake(i as CtxId, now, deadline);
+        self.schedule_trace
+            .event("wake", i as u32, u64::from(origin.thunk), 0, 0);
         self.contexts[i].state = State::Ready {
             resume: Some(ReadyResume::Woke {
                 then,
@@ -1155,6 +1159,7 @@ impl<B: Backend> Machine<B> {
             host_calls: 0,
             call_limit: None,
             stats: Stats::new(),
+            schedule_trace: schedule_trace::ScheduleTrace::default(),
             scheduling: scheduling::SchedulingStats::default(),
             wakes: wake_queue::WakeQueue::default(),
             rr_last: None,
@@ -1391,6 +1396,7 @@ impl<B: Backend> Machine<B> {
                     }),
                 };
                 ctx.yielded = true;
+                self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::Block {
                 wait,
@@ -1398,6 +1404,15 @@ impl<B: Backend> Machine<B> {
                 origin,
                 allow_time_skip,
             } => {
+                let (kind, resource) = match &wait {
+                    Wait::Until(at) => (1, *at),
+                    Wait::Object { handle, .. } => (2, u64::from(*handle)),
+                    Wait::Objects { .. } => (3, 0),
+                    Wait::Yield => unreachable!(),
+                };
+                self.sys
+                    .schedule_trace
+                    .event("block", id, kind, resource, u64::from(origin.thunk));
                 ctx.state = State::Blocked {
                     wait,
                     then,
@@ -1502,6 +1517,7 @@ impl<B: Backend> Machine<B> {
             self.regs.resize_with(self.sys.contexts.len(), || None);
             self.regs[id as usize] = Some(state);
             self.sys.contexts[id as usize].state = State::Ready { resume: None };
+            self.sys.schedule_trace.event("collect", id, token, 0, 0);
         }
         Ok(())
     }
@@ -1670,6 +1686,14 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Complete(self.fail(format!("context switch: {e}")));
             }
 
+            self.sys.schedule_trace.event(
+                "pick",
+                id,
+                u64::from(self.sys.contexts[id as usize].yielded),
+                0,
+                0,
+            );
+
             // Keep a latency-selected/API-heavy context on the controller while
             // an already-qualified ready peer computes. Selecting only the
             // current context for offload leaves the other lane idle at wakes.
@@ -1704,6 +1728,9 @@ impl<B: Backend> Machine<B> {
                                 );
                             }
                             self.sys.contexts[peer].state = State::Running { token };
+                            self.sys
+                                .schedule_trace
+                                .event("lease", peer as u32, token, 0, 0);
                             self.sys
                                 .scheduling
                                 .context_run(peer, setup.elapsed(), 0, true, true);
@@ -1851,6 +1878,16 @@ impl<B: Backend> Machine<B> {
             }
 
             let run_started = Instant::now();
+            let hook_before = self.sys.stats.total.hook_ns;
+            if self.sys.schedule_trace.enabled() {
+                self.sys.schedule_trace.event(
+                    "run_start",
+                    id,
+                    u64::from(self.cpu.reg(Reg::Eip)),
+                    0,
+                    0,
+                );
+            }
             // A polling/yielded peer has no useful work to overlap yet. Its
             // message/signal wake clears yielded before it can demand a worker.
             let ready_peer = self
@@ -1874,6 +1911,15 @@ impl<B: Backend> Machine<B> {
             let exit = self.cpu.run(&mut d);
             let parked = d.parked.take();
             let run_elapsed = run_started.elapsed();
+            if self.sys.schedule_trace.enabled() {
+                self.sys.schedule_trace.event(
+                    "run_end",
+                    id,
+                    u64::from(self.cpu.reg(Reg::Eip)),
+                    run_elapsed.as_nanos() as u64,
+                    self.sys.stats.total.hook_ns.saturating_sub(hook_before),
+                );
+            }
             self.sys.scheduling.context_run(
                 id as usize,
                 run_elapsed,
@@ -1897,6 +1943,7 @@ impl<B: Backend> Machine<B> {
                         );
                     }
                     self.sys.contexts[id as usize].state = State::Running { token };
+                    self.sys.schedule_trace.event("lease", id, token, 0, 0);
                     self.sys.contexts[id as usize].yielded = false;
                     self.loaded = None;
                 }

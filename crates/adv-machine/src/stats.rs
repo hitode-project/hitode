@@ -97,6 +97,8 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
 pub struct Stats {
     /// Take wall-clock timings and keep per-frame rows.
     pub enabled: bool,
+    /// API timings without per-frame rows or forcing a frame handoff.
+    pub services_enabled: bool,
     /// Running totals; `total.frame`/`guest_us` are those of the frame being accumulated.
     pub total: FrameRow,
     /// Totals when the current frame started.
@@ -120,7 +122,7 @@ impl Stats {
     /// Start a timing, if enabled.
     #[inline]
     pub fn start(&self) -> Option<Instant> {
-        self.enabled.then(Instant::now)
+        (self.enabled || self.services_enabled).then(Instant::now)
     }
 
     /// Host handler or continuation time for `thunk`, inside or outside `Backend::run`.

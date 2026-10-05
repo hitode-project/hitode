@@ -72,6 +72,9 @@ fn try_take(env: &mut Env<'_>, cs: u32) -> bool {
     let _ = env.cpu.write_u32(cs + CS_OWNER, tid);
     let _ = env.cpu.write_u32(cs + CS_RECURSION, rec + 1);
     let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_add(1));
+    env.sys
+        .schedule_trace
+        .event("cs_take", env.context, u64::from(cs), u64::from(rec + 1), 0);
     true
 }
 
@@ -100,6 +103,15 @@ fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
     let event = wait.event;
     wait.pending.set(wait.pending.get() + 1);
     let ticket = CriticalTicket(wait.pending.clone());
+    if env.sys.schedule_trace.enabled() {
+        env.sys.schedule_trace.event(
+            "cs_wait",
+            env.context,
+            u64::from(cs),
+            u64::from(env.cpu.read_u32(cs + CS_OWNER).unwrap_or(0)),
+            u64::from(event),
+        );
+    }
     // Discard an old unconsumed signal when somebody has already reacquired.
     // Previously granted ready continuations keep their wake independently.
     env.sys.reset_event(event);
@@ -137,6 +149,13 @@ fn leave_cs(env: &mut Env<'_>) -> Outcome {
     let lock = env.cpu.read_u32(cs + CS_LOCK_COUNT).unwrap_or(0);
     let _ = env.cpu.write_u32(cs + CS_RECURSION, rec - 1);
     let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_sub(1));
+    env.sys.schedule_trace.event(
+        "cs_release",
+        env.context,
+        u64::from(cs),
+        u64::from(rec - 1),
+        0,
+    );
     if rec == 1 {
         let _ = env.cpu.write_u32(cs + CS_OWNER, 0);
         if let Some(wait) = env.ext.get_or_default::<CriticalWaits>().0.get(&cs)
