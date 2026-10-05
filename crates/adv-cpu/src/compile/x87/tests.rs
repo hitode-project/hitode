@@ -477,7 +477,9 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
         );
         assert_eq!(
             testing::calls() - before,
-            if control == 0x027f { 2 } else { 3 }
+            // A rejected segment resumes the remaining instruction at its
+            // canonical cold helper entry before the two extended transfers.
+            if control == 0x027f { 2 } else { 4 }
         );
         assert_eq!(actual, expected);
         assert_eq!(actual_memory.epoch, reference_memory.epoch);
@@ -488,6 +490,9 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
         drop(permit);
     }
 }
+
+#[path = "segment_tests.rs"]
+mod segment_tests;
 
 #[path = "hardware_tests.rs"]
 mod hardware_tests;

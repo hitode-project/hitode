@@ -532,6 +532,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         })
         .collect();
+    let x87_segments = x87::segments(&instructions, &region.entries);
     let mut entries = BTreeSet::from([region.start]);
     for instruction in instructions.values() {
         if crate::strings::operation(instruction).is_some()
@@ -961,6 +962,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             repeat_ref,
             x87_ref,
             x87_native: x87::enabled(),
+            x87_cold: None,
+            x87_cold_reads: 0,
             x87: x87
                 .iter()
                 .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
@@ -1003,6 +1006,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             e.b.ins().return_(&[reason]);
         }
         for (&start, &block) in &e.blocks.clone() {
+            if x87_segments.interiors.contains(&start) {
+                e.b.set_cold_block(block);
+            }
             e.b.switch_to_block(block);
             e.pc = start;
             e.begin_mmx_block();
@@ -1046,12 +1052,23 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     e.exit_const(Exit::Fallback, pc);
                     break;
                 }
-                if e.instruction(instruction) {
+                if let Some(segment) = x87_segments.starts.get(&pc) {
+                    e.native_x87_segment(segment);
+                    pc = segment.last().unwrap().next_ip32();
+                    continue;
+                }
+                if x87_segments.interiors.contains(&pc) {
+                    // Alternate/restart entries see fully canonical state. The
+                    // normal success lane bypasses these cold helper blocks.
+                    e.canonical_x87_instruction(instruction);
+                    break;
+                } else if e.instruction(instruction) {
                     break;
                 }
                 pc = instruction.next_ip32();
             }
         }
+        e.emit_canonical_x87_recovery();
         // Runtime indirect predecessors each carry their own mode. No
         // individual guest block's recipe dominates this block.
         e.mmx_effects = None;
@@ -1640,6 +1657,8 @@ struct Emitter<'a> {
     /// Guest PC -> address of its NativeX87, owned by the resulting Compiled.
     x87: BTreeMap<u32, (usize, Option<u16>)>,
     x87_native: bool,
+    x87_cold: Option<ir::Block>,
+    x87_cold_reads: u8,
     atomic_store_ref: ir::FuncRef,
     atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,

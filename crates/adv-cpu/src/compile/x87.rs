@@ -1,6 +1,8 @@
 //! Guarded x87 lowering to native scalar FP instructions, not calls per opcode.
 //!
-//! Canonical 80-bit registers remain authoritative. Only exact binary64 inputs
+//! Canonical 80-bit registers are materialized at every observable boundary.
+//! Bounded straight-line segments retain admitted binary64 values between ops.
+//! Only exact binary64 inputs
 //! are admitted; arithmetic additionally requires PC=53, RC=nearest, masked
 //! exceptions and the same 2^+-400 bounds as floating::fast. Error-free residuals
 //! reproduce PE/C1, including signed zero. Every rejection precedes guest writes
@@ -13,6 +15,8 @@ use super::*;
 use crate::X87State;
 use crate::floating::fast::{Fast, Op, Source};
 use cranelift_codegen::ir::condcodes::FloatCC;
+mod segment;
+pub(super) use segment::segments;
 
 const FP: usize = offset_of!(CpuState, x87);
 const C1: i64 = 0x200;
@@ -48,6 +52,97 @@ pub(super) fn helper_address() -> *const u8 {
 }
 
 impl Emitter<'_> {
+    pub(super) fn canonical_x87_instruction(&mut self, i: &Instruction) {
+        self.x87_cold_reads |= crate::floating::x87_effects(i).unwrap().read_gpr;
+        let pc = self.constant(i.ip32());
+        let next = self.constant(i.next_ip32());
+        let operation = self
+            .b
+            .ins()
+            .iconst(self.ptr_ty, self.x87[&i.ip32()].0 as i64);
+        self.canonical_x87_recovery(pc, next, operation);
+    }
+
+    fn canonical_x87_recovery(&mut self, pc: Value, next: Value, operation: Value) {
+        let block = if let Some(block) = self.x87_cold {
+            block
+        } else {
+            let block = self.b.create_block();
+            self.b.set_cold_block(block);
+            self.b.append_block_param(block, types::I32);
+            self.b.append_block_param(block, types::I32);
+            self.b.append_block_param(block, self.ptr_ty);
+            self.x87_cold = Some(block);
+            block
+        };
+        self.b
+            .ins()
+            .jump(block, &[pc.into(), next.into(), operation.into()]);
+    }
+
+    /// Interior recovery entries share one synchronization/helper call.
+    /// No resident state reaches this block; each caller commits its prefix.
+    pub(super) fn emit_canonical_x87_recovery(&mut self) {
+        let Some(block) = self.x87_cold else { return };
+        self.b.switch_to_block(block);
+        let pc = self.b.block_params(block)[0];
+        let next = self.b.block_params(block)[1];
+        let operation = self.b.block_params(block)[2];
+        // This bridge only receives classified segment ops: no integer flags,
+        // GPR/XMM writes or MMX SSA aliases. Keep their unrelated values live;
+        // reloading them here would add phis to every native guest entry.
+        for index in 0..8 {
+            if self.x87_cold_reads & (1 << index) != 0 {
+                let value = self.b.use_var(self.regs[index]);
+                self.b
+                    .ins()
+                    .store(MemFlags::trusted(), value, self.state, (index * 4) as i32);
+            }
+        }
+        self.b.ins().store(
+            MemFlags::trusted(),
+            pc,
+            self.state,
+            offset_of!(CpuState, eip) as i32,
+        );
+        let call = self
+            .b
+            .ins()
+            .call(self.x87_ref, &[self.bridge, self.state, operation]);
+        let result = self.b.inst_results(call)[0];
+        let mut switch = Switch::new();
+        let done = self.b.create_block();
+        let retry = self.b.create_block();
+        let read_fault = self.b.create_block();
+        let write_fault = self.b.create_block();
+        let after = self.b.create_block();
+        for block in [done, retry, read_fault, write_fault, after] {
+            self.b.set_cold_block(block);
+        }
+        switch.set_entry(u128::from(crate::floating::X87_DONE), done);
+        switch.set_entry(u128::from(crate::floating::X87_FALLBACK), retry);
+        switch.set_entry(u128::from(crate::floating::X87_READ_FAULT), read_fault);
+        switch.set_entry(u128::from(crate::floating::X87_WRITE_FAULT), write_fault);
+        switch.emit(&mut self.b, result, after);
+        self.b.switch_to_block(retry);
+        self.exit(Exit::Fallback, pc);
+        self.b.switch_to_block(read_fault);
+        self.exit(Exit::ReadFault, pc);
+        self.b.switch_to_block(write_fault);
+        self.exit(Exit::WriteFault, pc);
+        self.b.switch_to_block(after);
+        self.exit(Exit::Fallback, next);
+        self.b.switch_to_block(done);
+        if self.shadow_ref.is_some() {
+            let absent = self.b.ins().iconst(self.ptr_ty, 0);
+            self.b
+                .ins()
+                .jump(self.dispatch, &[next.into(), absent.into()]);
+        } else {
+            self.b.ins().jump(self.dispatch, &[next.into()]);
+        }
+    }
+
     /// Emit an admitted operation plus a cold, in-region helper continuation.
     pub(super) fn native_x87_instruction(
         &mut self,
@@ -560,7 +655,8 @@ impl Emitter<'_> {
             }
             Source::St(_) => unreachable!(),
         };
-        if range == RANGE {
+        // Normal f32 and signed 16/32-bit integers already fit 2^+-400.
+        if range == RANGE && source == Source::F64 {
             let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), value);
             let magnitude = self.b.ins().ishl_imm(bits, 1);
             let zero = self.b.ins().icmp_imm(IntCC::Equal, magnitude, 0);
@@ -655,6 +751,7 @@ pub(crate) mod testing {
     thread_local! {
         pub(crate) static FORCE_DEKKER: Cell<bool> = const { Cell::new(false) };
         pub(crate) static HELPER_ONLY: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static SINGLE_ONLY: Cell<bool> = const { Cell::new(false) };
         static CALLS: Cell<u64> = const { Cell::new(0) };
     }
     pub(crate) fn calls() -> u64 {
