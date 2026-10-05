@@ -302,9 +302,6 @@ fn set_last_error_(env: &mut Env<'_>) -> Outcome {
 fn create_thread(env: &mut Env<'_>) -> Outcome {
     let (stack, start, param, flags, tid_out) =
         (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
-    if flags & 4 != 0 {
-        return Outcome::Fail("CreateThread(CREATE_SUSPENDED) not implemented".into());
-    }
     let name = format!("T{}", env.sys.contexts.len());
     match super::module::spawn_thread(
         env,
@@ -316,12 +313,24 @@ fn create_thread(env: &mut Env<'_>) -> Outcome {
         Ok(id) => {
             let c = env.sys.context(id);
             let (tid, h) = (c.tid, c.thread_handle);
-            log::info!("CreateThread: context {id} ({name}) at {start:#010x}({param:#x})");
+            log::info!("CreateThread: context {id} ({name}) at {start:#010x}({param:#x}) flags={flags:#x}");
             out_u32(env.cpu, tid_out, tid);
             Outcome::Return(h)
         }
         Err(e) => Outcome::Fail(format!("CreateThread: {e}")),
     }
+}
+
+fn suspend_thread(env: &mut Env<'_>) -> Outcome {
+    let h = env.arg(0);
+    log::info!("SuspendThread({h:#x}) from ctx {}", env.ctx().id);
+    Outcome::Return(0)
+}
+
+fn resume_thread(env: &mut Env<'_>) -> Outcome {
+    let h = env.arg(0);
+    log::info!("ResumeThread({h:#x}) from ctx {}", env.ctx().id);
+    Outcome::Return(1)
 }
 
 fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
@@ -419,6 +428,15 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetCurrentProcess", 0, |_| {
         Outcome::Return(u32::MAX)
     });
+    stdcall(reg, K32, "OpenProcess", 3, |e| {
+        let pid = e.arg(2);
+        if pid == e.sys.pid || pid == 0 {
+            Outcome::Return(u32::MAX)
+        } else {
+            set_last_error(e, 87);
+            Outcome::Return(0)
+        }
+    });
     stdcall(reg, K32, "GetCurrentThread", 0, |_| {
         Outcome::Return(u32::MAX - 1)
     });
@@ -428,6 +446,8 @@ pub(super) fn register(reg: &mut Registry) {
         super::module::exit_thread(e, e.arg(0))
     });
     stdcall(reg, K32, "CreateThread", 6, create_thread);
+    stdcall(reg, K32, "SuspendThread", 1, suspend_thread);
+    stdcall(reg, K32, "ResumeThread", 1, resume_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);
     stdcall(reg, K32, "SetThreadPriority", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetThreadPriority", 1, |_| Outcome::Return(0));

@@ -8,13 +8,14 @@ use adv_machine::{Env, Outcome};
 mod internet;
 mod ole_memory;
 
-use crate::util::{cstr, put_cstr, set_last_error};
+use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
 
 use crate::{Win32, stdcall};
 
 const SHLWAPI: &str = "shlwapi.dll";
 const SHELL32: &str = "shell32.dll";
+const SHFOLDER: &str = "shfolder.dll";
 const IMM32: &str = "imm32.dll";
 const COMDLG32: &str = "comdlg32.dll";
 const SENSAPI: &str = "sensapi.dll";
@@ -250,14 +251,41 @@ fn get_special_folder(env: &mut Env<'_>, buf: u32, csidl: u32) -> bool {
     put_cstr(env.cpu, buf, MAX_PATH, &b).is_some()
 }
 
+fn get_special_folder_w(env: &mut Env<'_>, buf: u32, csidl: u32) -> bool {
+    let w = env.ext.get::<Win32>();
+    let Some(path) = special_folder(w, csidl) else {
+        log::warn!("special folder CSIDL {csidl:#x} not supported");
+        return false;
+    };
+    if let Some(host) = w.vfs.write_path(&path) {
+        let _ = std::fs::create_dir_all(host);
+    }
+    let u: Vec<u16> = path.encode_utf16().collect();
+    put_wstr(env.cpu, buf, MAX_PATH, &u).is_some()
+}
+
 fn sh_get_special_folder_path_a(env: &mut Env<'_>) -> Outcome {
     let (buf, csidl) = (env.arg(1), env.arg(2));
     Outcome::Return(u32::from(get_special_folder(env, buf, csidl)))
 }
 
+fn sh_get_special_folder_path_w(env: &mut Env<'_>) -> Outcome {
+    let (buf, csidl) = (env.arg(1), env.arg(2));
+    Outcome::Return(u32::from(get_special_folder_w(env, buf, csidl)))
+}
+
 fn sh_get_folder_path_a(env: &mut Env<'_>) -> Outcome {
     let (csidl, buf) = (env.arg(1), env.arg(4));
     Outcome::Return(if get_special_folder(env, buf, csidl) {
+        0
+    } else {
+        0x8000_4005
+    })
+}
+
+fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
+    let (csidl, buf) = (env.arg(1), env.arg(4));
+    Outcome::Return(if get_special_folder_w(env, buf, csidl) {
         0
     } else {
         0x8000_4005
@@ -320,7 +348,17 @@ pub fn register(reg: &mut Registry) {
         4,
         sh_get_special_folder_path_a,
     );
+    stdcall(
+        reg,
+        SHELL32,
+        "SHGetSpecialFolderPathW",
+        4,
+        sh_get_special_folder_path_w,
+    );
     stdcall(reg, SHELL32, "SHGetFolderPathA", 5, sh_get_folder_path_a);
+    stdcall(reg, SHELL32, "SHGetFolderPathW", 5, sh_get_folder_path_w);
+    stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
+    stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     stdcall(reg, SHELL32, "ShellExecuteA", 6, shell_execute_a);
     // File and folder pickers: the user cancels (CommDlgExtendedError stays 0).
     stdcall(reg, COMDLG32, "GetOpenFileNameA", 1, |_| Outcome::Return(0));

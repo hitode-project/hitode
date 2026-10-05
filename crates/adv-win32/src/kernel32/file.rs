@@ -1130,6 +1130,101 @@ fn get_drive_type(env: &mut Env<'_>) -> Outcome {
     })
 }
 
+fn drive_of_w(env: &Env<'_>, root: u32) -> Option<u8> {
+    if root == 0 {
+        return Some(env.ext.get::<Win32>().vfs.cwd.as_bytes()[0].to_ascii_uppercase());
+    }
+    let p = wstr(env.cpu, root);
+    let d = match p.get(1) {
+        Some(&0x3a) => p[0] as u8,
+        _ => env.ext.get::<Win32>().vfs.cwd.as_bytes()[0],
+    };
+    Some(d.to_ascii_uppercase()).filter(|d| d.is_ascii_uppercase())
+}
+
+fn get_drive_type_w(env: &mut Env<'_>) -> Outcome {
+    let d = drive_of_w(env, env.arg(0));
+    Outcome::Return(if d == Some(b'C') {
+        DRIVE_FIXED
+    } else {
+        DRIVE_NO_ROOT_DIR
+    })
+}
+
+fn query_dos_device(
+    env: &mut Env<'_>,
+    name: Option<String>,
+    target: u32,
+    cap: u32,
+    wide: bool,
+) -> Outcome {
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    if cap == 0 || target == 0 {
+        set_last_error(env, ERROR_INSUFFICIENT_BUFFER);
+        return Outcome::Return(0);
+    }
+    let mapping = match name {
+        None => vec!["C:".to_string()],
+        Some(s) => {
+            let trimmed = s.trim_end_matches('\\');
+            if trimmed.eq_ignore_ascii_case("C:") || trimmed.eq_ignore_ascii_case("C") {
+                vec![r"\Device\HarddiskVolume1".to_string()]
+            } else {
+                set_last_error(env, ERROR_FILE_NOT_FOUND);
+                return Outcome::Return(0);
+            }
+        }
+    };
+    if wide {
+        let mut units = Vec::new();
+        for item in &mapping {
+            units.extend(item.encode_utf16());
+            units.push(0);
+        }
+        units.push(0);
+        if cap < units.len() as u32 {
+            set_last_error(env, ERROR_INSUFFICIENT_BUFFER);
+            return Outcome::Return(0);
+        }
+        crate::util::write_units(env.cpu, target, &units);
+        Outcome::Return(units.len() as u32)
+    } else {
+        let mut bytes = Vec::new();
+        for item in &mapping {
+            bytes.extend_from_slice(item.as_bytes());
+            bytes.push(0);
+        }
+        bytes.push(0);
+        if cap < bytes.len() as u32 {
+            set_last_error(env, ERROR_INSUFFICIENT_BUFFER);
+            return Outcome::Return(0);
+        }
+        let _ = env.cpu.write(target, &bytes);
+        Outcome::Return(bytes.len() as u32)
+    }
+}
+
+fn query_dos_device_a(env: &mut Env<'_>) -> Outcome {
+    let (name_p, target, cap) = (env.arg(0), env.arg(1), env.arg(2));
+    let name = if name_p == 0 {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&cstr(env.cpu, name_p)).into_owned())
+    };
+    query_dos_device(env, name, target, cap, false)
+}
+
+fn query_dos_device_w(env: &mut Env<'_>) -> Outcome {
+    let (name_p, target, cap) = (env.arg(0), env.arg(1), env.arg(2));
+    let name = if name_p == 0 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&wstr(env.cpu, name_p)))
+    };
+    query_dos_device(env, name, target, cap, true)
+}
+
 /// GetVolumeInformationA(root, name, name_cap, serial, max_component, flags, fs, fs_cap).
 fn get_volume_information(env: &mut Env<'_>) -> Outcome {
     if drive_of(env, env.arg(0)) != Some(b'C') {
@@ -1151,12 +1246,29 @@ fn get_volume_information(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-/// GetDiskFreeSpaceExA(dir, free_to_caller*, total*, total_free*): a fixed, roomy `C:`
-/// (64 GiB free of 256 GiB) so save-space checks pass the same way on every host.
-fn get_disk_free_space_ex(env: &mut Env<'_>) -> Outcome {
+fn get_disk_free_space(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let root = env.arg(0);
+    let drive = if wide { drive_of_w(env, root) } else { drive_of(env, root) };
+    if drive != Some(b'C') {
+        set_last_error(env, err::PATH_NOT_FOUND);
+        return Outcome::Return(0);
+    }
+    let (sectors, bytes, free, total) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    out_u32(env.cpu, sectors, 8);
+    out_u32(env.cpu, bytes, 512);
+    out_u32(env.cpu, free, 500_000);
+    out_u32(env.cpu, total, 524_288);
+    Outcome::Return(1)
+}
+
+/// GetDiskFreeSpaceEx: a fixed, roomy `C:` (64 GiB free of 256 GiB) so save-space checks
+/// pass the same way on every host.
+fn get_disk_free_space_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     const FREE: u64 = 64 << 30;
     const TOTAL: u64 = 256 << 30;
-    if drive_of(env, env.arg(0)) != Some(b'C') {
+    let root = env.arg(0);
+    let drive = if wide { drive_of_w(env, root) } else { drive_of(env, root) };
+    if drive != Some(b'C') {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
     }
@@ -1170,11 +1282,45 @@ fn get_disk_free_space_ex(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
+fn get_logical_drive_strings(env: &mut Env<'_>, cap: u32, buf: u32, wide: bool) -> Outcome {
+    const REQUIRED: u32 = 5;
+    const RETURN_LEN: u32 = 4;
+    if cap < REQUIRED || buf == 0 {
+        return Outcome::Return(REQUIRED);
+    }
+    if wide {
+        let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0, 0];
+        crate::util::write_units(env.cpu, buf, &units);
+    } else {
+        let bytes = [b'C', b':', b'\\', 0, 0];
+        let _ = env.cpu.write(buf, &bytes);
+    }
+    Outcome::Return(RETURN_LEN)
+}
+
+fn get_logical_drive_strings_a(env: &mut Env<'_>) -> Outcome {
+    let (cap, buf) = (env.arg(0), env.arg(1));
+    get_logical_drive_strings(env, cap, buf, false)
+}
+
+fn get_logical_drive_strings_w(env: &mut Env<'_>) -> Outcome {
+    let (cap, buf) = (env.arg(0), env.arg(1));
+    get_logical_drive_strings(env, cap, buf, true)
+}
+
 pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetLogicalDrives", 0, |_| Outcome::Return(1 << 2));
+    stdcall(reg, K32, "GetLogicalDriveStringsA", 2, get_logical_drive_strings_a);
+    stdcall(reg, K32, "GetLogicalDriveStringsW", 2, get_logical_drive_strings_w);
     stdcall(reg, K32, "GetDriveTypeA", 1, get_drive_type);
+    stdcall(reg, K32, "GetDriveTypeW", 1, get_drive_type_w);
+    stdcall(reg, K32, "QueryDosDeviceA", 3, query_dos_device_a);
+    stdcall(reg, K32, "QueryDosDeviceW", 3, query_dos_device_w);
     stdcall(reg, K32, "GetVolumeInformationA", 8, get_volume_information);
-    stdcall(reg, K32, "GetDiskFreeSpaceExA", 4, get_disk_free_space_ex);
+    stdcall(reg, K32, "GetDiskFreeSpaceA", 5, |e| get_disk_free_space(e, false));
+    stdcall(reg, K32, "GetDiskFreeSpaceW", 5, |e| get_disk_free_space(e, true));
+    stdcall(reg, K32, "GetDiskFreeSpaceExA", 4, |e| get_disk_free_space_ex(e, false));
+    stdcall(reg, K32, "GetDiskFreeSpaceExW", 4, |e| get_disk_free_space_ex(e, true));
     stdcall(reg, K32, "CreateFileA", 7, |e| {
         let p = path_a(e, e.arg(0));
         create_file(e, p)

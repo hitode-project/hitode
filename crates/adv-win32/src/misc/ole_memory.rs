@@ -206,6 +206,34 @@ fn string_realloc(env: &mut Env<'_>, counted: bool) -> Outcome {
     Outcome::Return(1)
 }
 
+fn variant_init(env: &mut Env<'_>) -> Outcome {
+    let p = env.arg(0);
+    if p != 0 {
+        let _ = env.cpu.write(p, &[0u8; 16]);
+    }
+    Outcome::Return(0)
+}
+
+fn variant_clear(env: &mut Env<'_>) -> Outcome {
+    let p = env.arg(0);
+    if p != 0 {
+        let mut vt_bytes = [0u8; 2];
+        if env.cpu.read(p, &mut vt_bytes).is_ok() {
+            let vt = u16::from_le_bytes(vt_bytes);
+            if vt == 8 {
+                if let Ok(bstr) = env.cpu.read_u32(p + 8) {
+                    if bstr != 0 {
+                        state(env).strings.remove(&bstr);
+                        free(env, bstr.saturating_sub(4));
+                    }
+                }
+            }
+        }
+        let _ = env.cpu.write(p, &[0u8; 16]);
+    }
+    Outcome::Return(0)
+}
+
 pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, "ole32.dll", "CoTaskMemAlloc", 1, task_alloc);
     stdcall(registry, "ole32.dll", "CoTaskMemRealloc", 2, task_realloc);
@@ -224,6 +252,8 @@ pub(super) fn register(registry: &mut Registry) {
         ("SysStringLen", "#7", 1, |e| string_length(e, false)),
         ("SysAllocStringByteLen", "#150", 2, |e| string_alloc(e, 2)),
         ("SysStringByteLen", "#149", 1, |e| string_length(e, true)),
+        ("VariantInit", "#8", 1, variant_init),
+        ("VariantClear", "#9", 1, variant_clear),
     ] {
         stdcall(registry, "oleaut32.dll", name, argc, handler);
         stdcall(registry, "oleaut32.dll", ordinal, argc, handler);

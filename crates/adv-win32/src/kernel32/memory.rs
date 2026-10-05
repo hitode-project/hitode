@@ -402,6 +402,55 @@ fn virtual_protect(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
+fn read_process_memory(env: &mut Env<'_>) -> Outcome {
+    let (_process, base, buf, size, out_read) = (
+        env.arg(0),
+        env.arg(1),
+        env.arg(2),
+        env.arg(3),
+        env.arg(4),
+    );
+    let mut data = vec![0u8; size as usize];
+    if env.cpu.read(base, &mut data).is_err() || env.cpu.write(buf, &data).is_err() {
+        set_last_error(env, 299);
+        return Outcome::Return(0);
+    }
+    if out_read != 0 {
+        let _ = env.cpu.write_u32(out_read, size);
+    }
+    Outcome::Return(1)
+}
+
+fn write_process_memory(env: &mut Env<'_>) -> Outcome {
+    let (_process, base, buf, size, out_written) = (
+        env.arg(0),
+        env.arg(1),
+        env.arg(2),
+        env.arg(3),
+        env.arg(4),
+    );
+    let mut data = vec![0u8; size as usize];
+    if env.cpu.read(buf, &mut data).is_err() {
+        set_last_error(env, 299);
+        return Outcome::Return(0);
+    }
+    if env.cpu.write(base, &data).is_err() {
+        let Some((page, len)) = page_span(base, size) else {
+            set_last_error(env, 299);
+            return Outcome::Return(0);
+        };
+        let _ = env.cpu.protect(page, len, Prot::RW);
+        if env.cpu.write(base, &data).is_err() {
+            set_last_error(env, 299);
+            return Outcome::Return(0);
+        }
+    }
+    if out_written != 0 {
+        let _ = env.cpu.write_u32(out_written, size);
+    }
+    Outcome::Return(1)
+}
+
 pub(super) fn register(reg: &mut Registry) {
     global::register(reg);
     stdcall(reg, K32, "HeapCreate", 3, heap_create);
@@ -420,6 +469,8 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "VirtualFree", 3, virtual_free);
     stdcall(reg, K32, "VirtualProtect", 4, virtual_protect);
     stdcall(reg, K32, "VirtualQuery", 3, virtual_query);
+    stdcall(reg, K32, "ReadProcessMemory", 5, read_process_memory);
+    stdcall(reg, K32, "WriteProcessMemory", 5, write_process_memory);
     // Guest writes/protection changes already invalidate translated code in both
     // executors. There is no separate guest instruction cache to drain.
     stdcall(reg, K32, "FlushInstructionCache", 3, |_| Outcome::Return(1));

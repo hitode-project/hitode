@@ -205,6 +205,76 @@ fn temp_a(env: &mut Env<'_>, cap: u32, output: AnsiStr) -> Result<u32, MemFault>
 fn temp_w(env: &mut Env<'_>, cap: u32, output: WideStr) -> Result<u32, MemFault> {
     temp(env, cap, output.0.addr(), true)
 }
+
+static TEMP_FILE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn get_temp_file_name(
+    env: &mut Env<'_>,
+    dir: &str,
+    prefix: &str,
+    unique: u32,
+    output: u32,
+    wide: bool,
+) -> Result<u32, MemFault> {
+    let w = env.ext.get::<Win32>();
+    let norm_dir = w.vfs.normalize(dir);
+    let pfx: String = prefix.chars().take(3).collect();
+    let (num, create_file) = if unique == 0 {
+        let n = TEMP_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xffff;
+        let n = if n == 0 { 1 } else { n };
+        (n, true)
+    } else {
+        (unique & 0xffff, false)
+    };
+    let filename = format!("{}{num:04X}.tmp", pfx);
+    let full = if norm_dir.ends_with('\\') {
+        format!("{norm_dir}{filename}")
+    } else {
+        format!("{norm_dir}\\{filename}")
+    };
+    if create_file {
+        if let Some(host) = w.vfs.write_path(&full) {
+            if let Some(parent) = host.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(host, b"");
+        }
+    }
+    if wide {
+        let u: Vec<u16> = full.encode_utf16().collect();
+        crate::util::put_wstr(env.cpu, output, 260, &u);
+    } else {
+        let b = w.codec.encode(&full);
+        crate::util::put_cstr(env.cpu, output, 260, &b);
+    }
+    Ok(num)
+}
+
+#[win32(kernel32, name = "GetTempFileNameA", level = implement)]
+fn temp_file_name_a(
+    env: &mut Env<'_>,
+    dir: AnsiStr,
+    prefix: AnsiStr,
+    unique: u32,
+    output: AnsiStr,
+) -> Result<u32, MemFault> {
+    let d = ansi(env, dir)?;
+    let p = ansi(env, prefix)?;
+    get_temp_file_name(env, &d, &p, unique, output.0.addr(), false)
+}
+
+#[win32(kernel32, name = "GetTempFileNameW", level = implement)]
+fn temp_file_name_w(
+    env: &mut Env<'_>,
+    dir: WideStr,
+    prefix: WideStr,
+    unique: u32,
+    output: WideStr,
+) -> Result<u32, MemFault> {
+    let d = wide(env, dir)?;
+    let p = wide(env, prefix)?;
+    get_temp_file_name(env, &d, &p, unique, output.0.addr(), true)
+}
 #[win32(kernel32, name = "CreateDirectoryA", level = implement)]
 fn create_a(
     env: &mut Env<'_>,
@@ -321,6 +391,8 @@ pub(super) fn register(reg: &mut Registry) {
         system_w_ABI,
         temp_a_ABI,
         temp_w_ABI,
+        temp_file_name_a_ABI,
+        temp_file_name_w_ABI,
         create_a_ABI,
         create_w_ABI,
         remove_a_ABI,

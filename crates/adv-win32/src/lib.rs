@@ -14,6 +14,7 @@ pub mod gdi32;
 pub mod kernel32;
 pub mod codec_kernels;
 mod misc;
+mod ntdll;
 pub mod printf;
 pub mod user32;
 pub mod util;
@@ -171,6 +172,7 @@ pub fn register(reg: &mut Registry) {
     version::register(reg);
     winsock::register(reg);
     winmm::register(reg);
+    ntdll::register(reg);
 }
 
 /// `reg.add` for stdcall functions.
