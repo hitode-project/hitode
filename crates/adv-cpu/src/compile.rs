@@ -16,6 +16,7 @@ use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
+mod loops;
 mod mmx;
 mod scalar;
 mod shadow;
@@ -59,6 +60,8 @@ pub(crate) struct Compiled {
     pub cache_stamp: std::cell::Cell<u64>,
     #[cfg(all(test, target_arch = "x86_64"))]
     disasm: String,
+    #[cfg(test)]
+    versioned_loops: usize,
 }
 
 impl Drop for Compiled {
@@ -566,16 +569,33 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .map(Instruction::next_ip32)
         .filter(|pc| entries.contains(pc))
         .collect();
-    let return_hint = if returns.len() == 1 {
-        returns.first().copied()
-    } else {
-        None
-    };
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_pc = snapshot
         .native_fault_reads
         .then(|| fault::candidate(region.start, &instructions))
         .flatten();
+    // Hardware-fault recipes describe one checked entry path; keep such
+    // regions unversioned.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let versioned = fault_pc.is_none();
+    #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+    let versioned = true;
+    let plans = if versioned {
+        loops::plans(&instructions, &entries, |i| {
+            supported(i)
+                && crate::strings::operation(i).is_none()
+                && !matches!(i.mnemonic(), M::Int | M::Rdtsc)
+        })
+    } else {
+        Vec::new()
+    };
+    #[cfg(test)]
+    let versioned_loops = plans.len();
+    let return_hint = if returns.len() == 1 {
+        returns.first().copied()
+    } else {
+        None
+    };
 
     let opt_level = match if snapshot.parallel {
         CompileStrategy::Fast
@@ -610,6 +630,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         "adv_atomic_load_vector",
         crate::atomic_memory::load_vector as *const u8,
     );
+    builder.symbol("adv_range_ok", loops::range_ok as *const u8);
     builder.symbol(
         "adv_read_timestamp",
         crate::trap::read_timestamp as *const u8,
@@ -729,6 +750,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_read_timestamp", Linkage::Import, &timestamp_signature)
         .map_err(|e| e.to_string())?;
     let timestamp_ref = module.declare_func_in_func(timestamp_id, &mut ctx.func);
+    let mut range_signature = module.make_signature();
+    range_signature.params.push(AbiParam::new(ptr_ty));
+    range_signature.params.extend([AbiParam::new(types::I64); 3]);
+    range_signature.params.extend([AbiParam::new(types::I32); 2]);
+    range_signature.returns.push(AbiParam::new(types::I32));
+    let range_id = module
+        .declare_function("adv_range_ok", Linkage::Import, &range_signature)
+        .map_err(|e| e.to_string())?;
+    let range_ok_ref = module.declare_func_in_func(range_id, &mut ctx.func);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let mut fault_draft = None;
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -884,6 +914,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             offset_of!(CpuState, eip) as i32,
         );
         let blocks: BTreeMap<_, _> = entries.iter().map(|&pc| (pc, b.create_block())).collect();
+        let fast_blocks: Vec<BTreeMap<_, _>> = plans
+            .iter()
+            .map(|plan| plan.starts.iter().map(|&pc| (pc, b.create_block())).collect())
+            .collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
         if shadow_ref.is_some() {
@@ -947,6 +981,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             base: snapshot.base,
             len: snapshot.len,
             blocks,
+            plans,
+            fast_blocks,
+            fast: None,
+            range_ok_ref,
             dispatch,
             shared_exit,
             pc: region.start,
@@ -1022,7 +1060,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             let reason = e.constant(Exit::Dispatch as u32);
             e.b.ins().return_(&[reason]);
         }
-        for (&start, &block) in &e.blocks.clone() {
+        // Versioned loop clones follow the ordinary blocks and share their body.
+        let mut work: Vec<_> = e.blocks.iter().map(|(&pc, &block)| (pc, block, None)).collect();
+        for (index, blocks) in e.fast_blocks.iter().enumerate() {
+            work.extend(blocks.iter().map(|(&pc, &block)| (pc, block, Some(index))));
+        }
+        for (start, block, fast) in work {
+            e.fast = fast;
             if x87_segments.interiors.contains(&start) || x87_segments.integers.contains(&start) {
                 e.b.set_cold_block(block);
             }
@@ -1032,7 +1076,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             e.begin_mmx_block();
             let budget = e.b.use_var(e.fuel);
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-            if start == region.start && fault_pc.is_some() {
+            if start == region.start && fast.is_none() && fault_pc.is_some() {
                 use crate::host_fault::recipe::Input;
                 for (index, variable) in e.regs.iter().enumerate() {
                     e.fault_seeds
@@ -1092,6 +1136,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 pc = instruction.next_ip32();
             }
         }
+        e.fast = None;
         e.emit_canonical_x87_recovery();
         e.mark_source(diagnostics::overhead_source(
             diagnostics::Overhead::Transfer,
@@ -1360,6 +1405,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         cache_stamp: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
+        #[cfg(test)]
+        versioned_loops,
     })
 }
 
@@ -1487,6 +1534,28 @@ mod tests {
         drop(compiled);
     }
     use iced_x86::code_asm::*;
+
+    #[test]
+    fn counted_pointer_loops_are_versioned() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        a.xor(eax, eax).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut machine = crate::Executor::new(0x10000, 4096).unwrap();
+        machine.write(0x10000, &bytes).unwrap();
+        machine.protect(0x10000, 4096, READ | EXEC).unwrap();
+        let region = Region::new(0x10000, bytes.len());
+        let compiled = compile(&region, machine.memory(), false).unwrap();
+        assert_eq!(compiled.versioned_loops, 1);
+    }
 
     #[test]
     fn divide_uses_distinct_host_widths_without_a_second_remainder_division() {
@@ -1683,6 +1752,11 @@ struct Emitter<'a> {
     base: u32,
     len: usize,
     blocks: BTreeMap<u32, ir::Block>,
+    /// Versioned loops, their cloned blocks, and the clone being emitted.
+    plans: Vec<loops::Plan>,
+    fast_blocks: Vec<BTreeMap<u32, ir::Block>>,
+    fast: Option<usize>,
+    range_ok_ref: ir::FuncRef,
     dispatch: ir::Block,
     shared_exit: ir::Block,
     pc: u32,
@@ -2322,16 +2396,112 @@ impl Emitter<'_> {
         self.b.switch_to_block(ok);
     }
     fn direct(&mut self, pc: u32) {
-        if let Some(&block) = self.blocks.get(&pc) {
+        let clone = self
+            .fast
+            .and_then(|index| self.fast_blocks[index].get(&pc).copied());
+        if let Some(block) = clone.or_else(|| self.blocks.get(&pc).copied()) {
             if pc <= self.pc {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
             }
-            self.flush_mmx_effects();
-            self.b.ins().jump(block, &[]);
+            // A checked back edge enters the clone once the remaining
+            // iterations' operand ranges are proven.
+            let versioned = self
+                .fast
+                .is_none()
+                .then(|| {
+                    self.plans
+                        .iter()
+                        .position(|plan| plan.latch == self.pc && plan.header == pc)
+                })
+                .flatten();
+            if let Some(index) = versioned {
+                let proven = self.loop_ranges_ok(index);
+                self.flush_mmx_effects();
+                let fast = self.fast_blocks[index][&pc];
+                self.b.ins().brif(proven, fast, &[], block, &[]);
+            } else {
+                self.flush_mmx_effects();
+                self.b.ins().jump(block, &[]);
+            }
         } else {
             self.exit_const(Exit::Dispatch, pc);
         }
+    }
+    /// Whether every group of loop `index` stays in ordinary memory for the
+    /// iterations left when its latch branches back: the counter, already
+    /// decremented and nonzero, is that count.
+    fn loop_ranges_ok(&mut self, index: usize) -> Value {
+        let plan = &self.plans[index];
+        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let groups = plan.groups.clone();
+        let count = self.b.use_var(self.regs[counter]);
+        let count = if counter_size == 2 {
+            self.b.ins().band_imm(count, 0xffff)
+        } else {
+            count
+        };
+        let count = self.b.ins().uextend(types::I64, count);
+        let more = self.b.ins().iadd_imm(count, -1);
+        let len = self.b.ins().iconst(types::I64, self.len as i64);
+        let mut ok = None;
+        for group in groups {
+            let mut address = self.constant(0);
+            if let Some(base) = group.base {
+                let value = self.b.use_var(self.regs[base]);
+                address = self.b.ins().iadd(address, value);
+            }
+            if let Some((index, scale)) = group.index {
+                let value = self.b.use_var(self.regs[index]);
+                let scaled = self.b.ins().imul_imm(value, i64::from(scale));
+                address = self.b.ins().iadd(address, scaled);
+            }
+            let address = self.b.ins().uextend(types::I64, address);
+            let base = i64::from(self.base);
+            let mut start = self.b.ins().iadd_imm(address, group.low - base);
+            let mut end = self.b.ins().iadd_imm(address, group.high - base);
+            let span = self.b.ins().imul_imm(more, group.step.abs());
+            if group.step >= 0 {
+                end = self.b.ins().iadd(end, span);
+            } else {
+                start = self.b.ins().isub(start, span);
+            }
+            let mut required = 0;
+            let mut forbidden = u32::from(crate::memory::SHARED);
+            if group.read {
+                required |= u32::from(READ);
+            }
+            if group.write {
+                required |= u32::from(WRITE);
+                forbidden |= u32::from(EXEC);
+            }
+            let required = self.constant(required);
+            let forbidden = self.constant(forbidden);
+            let call = self.b.ins().call(
+                self.range_ok_ref,
+                &[self.perms, start, end, len, required, forbidden],
+            );
+            let result = self.b.inst_results(call)[0];
+            ok = Some(match ok {
+                Some(all) => self.b.ins().band(all, result),
+                None => result,
+            });
+        }
+        ok.unwrap_or_else(|| self.constant(1))
+    }
+    /// The host address of an operand the current loop clone has proven.
+    fn proven(&mut self, addr: Value, size: usize) -> Option<Value> {
+        let plan = &self.plans[self.fast?];
+        if plan
+            .proven
+            .get(&self.pc)
+            .is_none_or(|&width| size as u32 > width)
+        {
+            return None;
+        }
+        let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
+        let offset = self.b.ins().uextend(self.ptr_ty, offset);
+        Some(self.b.ins().iadd(self.mem, offset))
     }
     fn indirect(&mut self, target: Value) {
         self.indirect_predicted(target, None);
@@ -2468,6 +2638,15 @@ impl Emitter<'_> {
         self.b.ins().load(types::I8, flags, at, 0)
     }
     fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
+        if let Some(address) = self.proven(addr, size) {
+            let ordinary = self.b.ins().iconst(types::I8, 0);
+            return GuestPointer {
+                address,
+                guest: addr,
+                shared: ordinary,
+                file: ordinary,
+            };
+        }
         self.mark(diagnostics::Part::Check);
         let (offset, positions) = self.access_range(addr, size, Exit::WriteFault);
         // Both metadata addresses are safe after the range guard. Loading them
@@ -2590,6 +2769,15 @@ impl Emitter<'_> {
     fn direct_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
+        if let Some(address) = self.proven(addr, size) {
+            return match value {
+                Some(value) => {
+                    self.b.ins().store(MemFlags::new(), value, address, 0);
+                    None
+                }
+                None => Some(self.b.ins().load(ty, MemFlags::new(), address, 0)),
+            };
+        }
         self.mark(diagnostics::Part::Check);
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let hardware = if !write
