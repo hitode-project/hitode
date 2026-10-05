@@ -149,14 +149,39 @@ impl Emitter<'_> {
         }
     }
 
-    fn set_raw_flags(&mut self, flags: Value) {
-        self.b.def_var(self.flags, flags);
+    /// Replace CF and OF while keeping the other arithmetic flags, without
+    /// rebuilding EFLAGS: kind bit 4 carries AF/OF in the operands while PF/ZF/SF
+    /// keep coming from the raw word or the retained result.
+    fn set_carry_overflow(&mut self, carry: Value, overflow: Value) {
+        let adjust = self.flag(4);
+        let kind = self.b.use_var(self.lazy[3]);
+        let kind = self.b.ins().bor_imm(kind, 4);
+        self.b.def_var(self.lazy[0], adjust);
+        self.b.def_var(self.lazy[1], overflow);
+        self.b.def_var(self.lazy[3], kind);
         let zero = self.constant(0);
-        for var in self.lazy {
-            self.b.def_var(var, zero);
+        for (var, value) in self.lazy[4..].iter().zip([carry, zero, zero]) {
+            self.b.def_var(*var, value);
         }
-        let carry = self.b.ins().band_imm(flags, 1);
-        self.b.def_var(self.lazy[4], carry);
+    }
+
+    fn flags_state(&mut self) -> [Value; 8] {
+        let mut state = [self.b.use_var(self.flags); 8];
+        for (value, var) in state[1..].iter_mut().zip(self.lazy) {
+            *value = self.b.use_var(var);
+        }
+        state
+    }
+
+    /// A zero masked count leaves every flag unchanged.
+    fn keep_flags_if(&mut self, keep: Value, saved: [Value; 8]) {
+        let mut vars = [self.flags; 8];
+        vars[1..].copy_from_slice(&self.lazy);
+        for (var, old) in vars.into_iter().zip(saved) {
+            let new = self.b.use_var(var);
+            let value = self.b.ins().select(keep, old, new);
+            self.b.def_var(var, value);
+        }
     }
 
     pub(super) fn scalar_instruction(&mut self, i: &Instruction) {
@@ -241,13 +266,8 @@ impl Emitter<'_> {
         }
         // MUL/IMUL only define CF and OF. Preserve the other flags rather than
         // inventing arithmetic flags for the low half of the product.
-        let old = self.materialize_flags();
-        let flags = self.b.ins().band_imm(old, !0x801_i64);
         let carry = self.b.ins().uextend(types::I32, overflow);
-        let overflow = self.b.ins().ishl_imm(carry, 11);
-        let bits = self.b.ins().bor(carry, overflow);
-        let flags = self.b.ins().bor(flags, bits);
-        self.set_raw_flags(flags);
+        self.set_carry_overflow(carry, carry);
     }
 
     fn add_with_carry(&mut self, i: &Instruction) {
@@ -444,7 +464,6 @@ impl Emitter<'_> {
             self.b.ins().ushr(signed_input, shift)
         };
         let carry = self.b.ins().band_imm(carry, 1);
-        let old = self.materialize_flags();
         let carry = if size < 4 && i.mnemonic() != M::Sar {
             // CF is undefined beyond the operand width. Match the
             // interpreter's deterministic convention of retaining it.
@@ -452,7 +471,7 @@ impl Emitter<'_> {
                 .b
                 .ins()
                 .icmp_imm(IntCC::UnsignedGreaterThan, count, bits);
-            let old_carry = self.b.ins().band_imm(old, 1);
+            let old_carry = self.flag(0);
             self.b.ins().select(oversized, old_carry, carry)
         } else {
             carry
@@ -464,28 +483,28 @@ impl Emitter<'_> {
             M::Sar => self.constant(0),
             _ => unreachable!(),
         };
-        let old_overflow = self.b.ins().ushr_imm(old, 11);
-        let old_overflow = self.b.ins().band_imm(old_overflow, 1);
         let one = self.b.ins().icmp_imm(IntCC::Equal, count, 1);
+        let old_overflow = self.flag(11);
         let overflow = self.b.ins().select(one, overflow, old_overflow);
-        let overflow = self.b.ins().ishl_imm(overflow, 11);
-        let byte = self.b.ins().band_imm(result, 255);
-        let parity = self.b.ins().popcnt(byte);
-        let parity = self.b.ins().band_imm(parity, 1);
-        let parity = self.b.ins().bxor_imm(parity, 1);
-        let parity = self.b.ins().ishl_imm(parity, 2);
-        let zero = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
-        let zero = self.b.ins().uextend(types::I32, zero);
-        let zero = self.b.ins().ishl_imm(zero, 6);
-        let sign = self.b.ins().ishl_imm(sign, 7);
-        let mut flags = self.b.ins().band_imm(old, !0x8c5_i64);
-        for bits in [carry, parity, zero, sign, overflow] {
-            flags = self.b.ins().bor(flags, bits);
+        let adjust = self.flag(4);
+        let saved = self.flags_state();
+        // AF and a multi-bit OF are undefined; kind bit 4 carries the retained
+        // values and the result (shifted to bit 31 like narrow ALU) supplies
+        // PF/ZF/SF.
+        let shift = 32 - bits;
+        let wide = self.b.ins().ishl_imm(result, shift);
+        let zero = self.constant(0);
+        let kind = self.constant(5 | (shift as u32) << 8);
+        for (var, value) in self
+            .lazy
+            .iter()
+            .zip([adjust, overflow, wide, kind, carry, zero, zero])
+        {
+            self.b.def_var(*var, value);
         }
         let no_shift = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
-        let flags = self.b.ins().select(no_shift, old, flags);
+        self.keep_flags_if(no_shift, saved);
         self.write(i, None, result);
-        self.set_raw_flags(flags);
     }
 
     /// ROL/ROR change only CF, and OF for a one-bit rotate; a zero masked
@@ -509,18 +528,13 @@ impl Emitter<'_> {
             let next = self.b.ins().band_imm(next, 1);
             (sign, self.b.ins().bxor(sign, next))
         };
-        let old = self.materialize_flags();
-        let old_overflow = self.b.ins().ushr_imm(old, 11);
-        let old_overflow = self.b.ins().band_imm(old_overflow, 1);
+        let old_overflow = self.flag(11);
         let one = self.b.ins().icmp_imm(IntCC::Equal, count, 1);
         let overflow = self.b.ins().select(one, overflow, old_overflow);
-        let overflow = self.b.ins().ishl_imm(overflow, 11);
-        let flags = self.b.ins().band_imm(old, !0x801_i64);
-        let flags = self.b.ins().bor(flags, carry);
-        let flags = self.b.ins().bor(flags, overflow);
+        let saved = self.flags_state();
+        self.set_carry_overflow(carry, overflow);
         let no_rotate = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
-        let flags = self.b.ins().select(no_rotate, old, flags);
+        self.keep_flags_if(no_rotate, saved);
         self.write(i, None, result);
-        self.set_raw_flags(flags);
     }
 }

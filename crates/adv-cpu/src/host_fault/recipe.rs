@@ -155,7 +155,7 @@ impl Recipe {
         }
         let output = |index: usize| values[self.outputs[index] as usize];
         let lazy: [u32; 7] = std::array::from_fn(|index| output(index + 9) as u32);
-        if lazy[3] & 0xff > 3 || !matches!(lazy[3] >> 8, 0 | 16 | 24) || lazy[6] > 1 {
+        if lazy[3] & 0xff > 7 || !matches!(lazy[3] >> 8, 0 | 16 | 24) || lazy[6] > 1 {
             return None;
         }
         Some(Recovered {
@@ -167,8 +167,9 @@ impl Recipe {
     }
 }
 
-// Identical raw/add/sub/logic and separately preserved carry representation used
-// by the integer emitter. This runs only after a verified hardware exception.
+// Identical raw/add/sub/logic (plus carried AF/OF) and separately preserved
+// carry representation used by the integer emitter. This runs only after a
+// verified hardware exception.
 fn flags(old: u32, lazy: [u32; 7]) -> u32 {
     let [
         left,
@@ -189,7 +190,11 @@ fn flags(old: u32, lazy: [u32; 7]) -> u32 {
     let shift = kind >> 8;
     let kind = kind & 0xff;
     for bit in [2, 4, 6, 7, 11] {
-        let value = if kind == 0 {
+        let adjust_or_overflow = matches!(bit, 4 | 11);
+        let value = if adjust_or_overflow && kind & 4 != 0 {
+            // Shift/rotate/multiply results carry AF and OF as operand bits.
+            (if bit == 4 { left } else { right }) & 1
+        } else if kind == 0 || !adjust_or_overflow && kind & 3 == 0 {
             (old >> bit) & 1
         } else {
             match bit {

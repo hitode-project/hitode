@@ -3109,7 +3109,19 @@ impl Emitter<'_> {
             }
             _ => unreachable!(),
         };
-        let raw = self.b.ins().icmp_imm(IntCC::Equal, kind, 0);
+        // Kind bit 4 carries AF and OF as the operands (each 0 or 1), so
+        // shifts, rotates and multiplies need not rebuild EFLAGS to keep them;
+        // the low two bits still say whether PF/ZF/SF are raw (0) or derived
+        // from the result.
+        let (value, raw) = if matches!(bit, 4 | 11) {
+            let carried = self.b.ins().band_imm(kind, 4);
+            let operand = if bit == 4 { a } else { b };
+            let value = self.b.ins().select(carried, operand, value);
+            (value, self.b.ins().icmp_imm(IntCC::Equal, kind, 0))
+        } else {
+            let base = self.b.ins().band_imm(kind, 3);
+            (value, self.b.ins().icmp_imm(IntCC::Equal, base, 0))
+        };
         self.b.ins().select(raw, old, value)
     }
     fn materialize_flags(&mut self) -> Value {
