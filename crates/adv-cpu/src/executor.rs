@@ -2224,6 +2224,84 @@ mod topology_tests {
 }
 
 #[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use crate::{EXEC, READ, WRITE};
+
+    fn machine(code: &[u8]) -> Executor {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, READ | WRITE).unwrap();
+        m.write(0x1000, code).unwrap();
+        m.protect(0x1000, 4096, READ | EXEC).unwrap();
+        m.add_region(Region::new(0x1000, code.len())).unwrap();
+        m.state.eip = 0x1000;
+        m
+    }
+
+    #[test]
+    fn protection_by_a_trap_reaches_hoisted_constant_address_checks() {
+        struct Revoke(u32);
+        impl crate::ExecutionTrap for Revoke {
+            fn call(
+                &mut self,
+                _: &mut CpuState,
+                memory: &mut Memory,
+                _: u32,
+            ) -> Result<bool, String> {
+                self.0 += 1;
+                if self.0 == 2 {
+                    memory.protect(0x2000, 4096, 0)?;
+                }
+                Ok(false)
+            }
+        }
+        // top: mov ebx,[0x2000]; int 0x2e; dec ecx; jnz top; ret
+        let mut m = machine(&[
+            0x8b, 0x1d, 0, 0x20, 0, 0, 0xcd, 0x2e, 0x49, 0x75, 0xf5, 0xc3,
+        ]);
+        m.state.regs[1] = 5;
+        let mut handler = Revoke(0);
+        assert_eq!(
+            m.run_with_traps(0x3000, 1000, &mut handler, false).unwrap(),
+            RunOutcome::ReadFault {
+                pc: 0x1000,
+                address: 0x2000
+            }
+        );
+        assert_eq!(handler.0, 2);
+        assert_eq!(m.state.regs[1], 3);
+        assert!(m.stats.native_entries > 0);
+    }
+
+    #[test]
+    fn constant_addresses_check_both_pages_only_when_crossing() {
+        // mov eax,[0x2ffe]; mov [0x2ff8],eax; ret
+        let code = [0xa1, 0xfe, 0x2f, 0, 0, 0xa3, 0xf8, 0x2f, 0, 0, 0xc3];
+        let mut m = machine(&code);
+        m.protect(0x3000, 4096, 0).unwrap();
+        assert_eq!(
+            m.run(0x4000, 100).unwrap(),
+            RunOutcome::ReadFault {
+                pc: 0x1000,
+                address: 0x2ffe
+            }
+        );
+        let mut m = machine(&code);
+        m.protect(0x2000, 4096, READ).unwrap();
+        m.write(0x2ffe, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(
+            m.run(0x4000, 100).unwrap(),
+            RunOutcome::WriteFault {
+                pc: 0x1005,
+                address: 0x2ff8
+            }
+        );
+        assert_eq!(m.state.regs[0], 0x0403_0201);
+        assert!(m.stats.native_entries > 0);
+    }
+}
+
+#[cfg(test)]
 mod floating_boundary_tests {
     use super::*;
     use crate::{EXEC, READ, WRITE};

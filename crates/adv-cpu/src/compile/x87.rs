@@ -586,13 +586,7 @@ impl Emitter<'_> {
                 .ins()
                 .icmp_imm(IntCC::UnsignedGreaterThan, in_page, 4096 - i64::from(width));
         self.x87_reject(crosses, slow);
-        let page = self.b.ins().ushr_imm(offset, 12);
-        let page = self.b.ins().uextend(self.ptr_ty, page);
-        let permission = self.b.ins().iadd(self.perms, page);
-        let permission = self
-            .b
-            .ins()
-            .load(types::I8, MemFlags::trusted(), permission, 0);
+        let permission = self.permission(offset);
         let need = if write { WRITE } else { READ };
         let mask = need | crate::memory::SHARED | if write { EXEC } else { 0 };
         let permission = self.b.ins().band_imm(permission, i64::from(mask));

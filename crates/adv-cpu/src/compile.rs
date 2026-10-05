@@ -2401,25 +2401,68 @@ impl Emitter<'_> {
         }
         addr
     }
-    fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
-        self.mark(diagnostics::Part::Check);
+    fn known(&self, value: Value) -> Option<u32> {
+        let inst = self.b.func.dfg.value_def(value).inst()?;
+        match self.b.func.dfg.insts[inst] {
+            ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+            } => Some(imm.bits() as u32),
+            _ => None,
+        }
+    }
+    /// Range-checks one access. Returns its window offset and the distinct page
+    /// positions to validate; an in-range constant address needs no guard.
+    fn access_range(&mut self, addr: Value, size: usize, reason: Exit) -> (Value, Vec<Value>) {
+        if let Some(offset) = self.known(addr).map(|addr| addr.wrapping_sub(self.base))
+            && offset as usize <= self.len - size
+        {
+            let end = offset + size as u32 - 1;
+            let mut positions = vec![self.constant(offset)];
+            if end >> 12 != offset >> 12 {
+                positions.push(self.constant(end));
+            }
+            return (positions[0], positions);
+        }
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
         let bad =
             self.b
                 .ins()
                 .icmp_imm(IntCC::UnsignedGreaterThan, offset, (self.len - size) as i64);
-        self.guard(bad, Exit::WriteFault, Some(addr));
+        self.guard(bad, reason, Some(addr));
+        if size == 1 {
+            return (offset, vec![offset]);
+        }
         let end = self.b.ins().iadd_imm(offset, size as i64 - 1);
+        (offset, vec![offset, end])
+    }
+    /// Loads the permission byte for an in-window position. Every permission
+    /// change advances the memory epoch, and a trap that observes a new epoch
+    /// leaves native code (trap.rs), so the table is read-only for one native
+    /// invocation. Equal loads merge; constant in-window positions may leave loops.
+    fn permission(&mut self, position: Value) -> Value {
+        let mut flags = MemFlags::trusted().with_readonly();
+        if self
+            .known(position)
+            .is_some_and(|position| (position as usize) < self.len)
+        {
+            flags = flags.with_can_move();
+        }
+        let page = self.b.ins().ushr_imm(position, 12);
+        let page = self.b.ins().uextend(self.ptr_ty, page);
+        let at = self.b.ins().iadd(self.perms, page);
+        self.b.ins().load(types::I8, flags, at, 0)
+    }
+    fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
+        self.mark(diagnostics::Part::Check);
+        let (offset, positions) = self.access_range(addr, size, Exit::WriteFault);
         // Both metadata addresses are safe after the range guard. Loading them
         // together lets either original SHARED guard enter one cold path, where
         // all permissions are checked before file preparation or SSA mutation.
-        let permissions = [offset, end].map(|position| {
-            let page = self.b.ins().ushr_imm(position, 12);
-            let page = self.b.ins().uextend(self.ptr_ty, page);
-            let at = self.b.ins().iadd(self.perms, page);
-            self.b.ins().load(types::I8, MemFlags::trusted(), at, 0)
-        });
-        let combined = self.b.ins().bor(permissions[0], permissions[1]);
+        let permissions: Vec<_> = positions.iter().map(|&p| self.permission(p)).collect();
+        let combined = permissions[1..]
+            .iter()
+            .fold(permissions[0], |all, &p| self.b.ins().bor(all, p));
         let shared = self
             .b
             .ins()
@@ -2431,7 +2474,7 @@ impl Emitter<'_> {
         self.b.set_cold_block(cold);
         let done = self.b.create_block();
         self.b.append_block_param(done, types::I8);
-        for p in permissions {
+        for &p in &permissions {
             let mask = self
                 .b
                 .ins()
@@ -2448,7 +2491,7 @@ impl Emitter<'_> {
         self.b.ins().jump(done, &[no_file.into()]);
         self.b.switch_to_block(cold);
         self.mark(diagnostics::Part::Slow);
-        for p in permissions {
+        for &p in &permissions {
             let access = self.b.ins().band_imm(p, i64::from(WRITE));
             let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
             self.guard(missing, Exit::WriteFault, Some(addr));
@@ -2456,16 +2499,21 @@ impl Emitter<'_> {
         }
         self.guard(executable, Exit::Fallback, None);
         self.b.set_cold_block(self.b.current_block().unwrap());
-        let file = permissions.map(|p| {
-            let kind = self
-                .b
-                .ins()
-                .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
-            self.b
-                .ins()
-                .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
-        });
-        let file = self.b.ins().bor(file[0], file[1]);
+        let file: Vec<_> = permissions
+            .iter()
+            .map(|&p| {
+                let kind = self
+                    .b
+                    .ins()
+                    .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
+                self.b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
+            })
+            .collect();
+        let file = file[1..]
+            .iter()
+            .fold(file[0], |all, &f| self.b.ins().bor(all, f));
         let prepare = self.b.create_block();
         self.b.set_cold_block(prepare);
         let pcm = self.b.create_block();
@@ -2513,18 +2561,12 @@ impl Emitter<'_> {
         } else {
             None
         };
-        let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
-        let bad =
-            self.b
-                .ins()
-                .icmp_imm(IntCC::UnsignedGreaterThan, offset, (self.len - size) as i64);
         let reason = if write {
             Exit::WriteFault
         } else {
             Exit::ReadFault
         };
-        self.guard(bad, reason, Some(addr));
-        let end = self.b.ins().iadd_imm(offset, size as i64 - 1);
+        let (offset, positions) = self.access_range(addr, size, reason);
         let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
         let address = self.b.ins().iadd(self.mem, host_offset);
         let atomic = self.b.create_block();
@@ -2540,13 +2582,10 @@ impl Emitter<'_> {
             let raw = self.b.create_block();
             self.b.ins().brif(enabled, classify, &[], checked, &[]);
             self.b.switch_to_block(classify);
-            let permissions = [offset, end].map(|position| {
-                let page = self.b.ins().ushr_imm(position, 12);
-                let page = self.b.ins().uextend(self.ptr_ty, page);
-                let at = self.b.ins().iadd(self.perms, page);
-                self.b.ins().load(types::I8, MemFlags::trusted(), at, 0)
-            });
-            let combined = self.b.ins().bor(permissions[0], permissions[1]);
+            let permissions: Vec<_> = positions.iter().map(|&p| self.permission(p)).collect();
+            let combined = permissions[1..]
+                .iter()
+                .fold(permissions[0], |all, &p| self.b.ins().bor(all, p));
             let shared = self
                 .b
                 .ins()
@@ -2566,11 +2605,8 @@ impl Emitter<'_> {
         }
         let permission = if write { WRITE } else { READ };
         let mut combined = None;
-        for position in [offset, end] {
-            let page = self.b.ins().ushr_imm(position, 12);
-            let page = self.b.ins().uextend(self.ptr_ty, page);
-            let at = self.b.ins().iadd(self.perms, page);
-            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
+        for &position in &positions {
+            let p = self.permission(position);
             let mask = self
                 .b
                 .ins()
@@ -2607,11 +2643,8 @@ impl Emitter<'_> {
         // any byte is read/written. Mixed file/AUDIO elements use checked Memory
         // helpers, which keep PCM subranges byte atomic.
         let mut combined = None;
-        for position in [offset, end] {
-            let page = self.b.ins().ushr_imm(position, 12);
-            let page = self.b.ins().uextend(self.ptr_ty, page);
-            let at = self.b.ins().iadd(self.perms, page);
-            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
+        for &position in &positions {
+            let p = self.permission(position);
             let access = self.b.ins().band_imm(p, i64::from(permission));
             let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2635,20 +2668,22 @@ impl Emitter<'_> {
             self.guard(executable, Exit::Fallback, None);
             self.b.set_cold_block(self.b.current_block().unwrap());
         }
-        let file = [offset, end].map(|position| {
-            let page = self.b.ins().ushr_imm(position, 12);
-            let page = self.b.ins().uextend(self.ptr_ty, page);
-            let at = self.b.ins().iadd(self.perms, page);
-            let p = self.b.ins().load(types::I8, MemFlags::trusted(), at, 0);
-            let kind = self
-                .b
-                .ins()
-                .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
-            self.b
-                .ins()
-                .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
-        });
-        let file = self.b.ins().bor(file[0], file[1]);
+        let file: Vec<_> = positions
+            .iter()
+            .map(|&position| {
+                let p = self.permission(position);
+                let kind = self
+                    .b
+                    .ins()
+                    .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
+                self.b
+                    .ins()
+                    .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
+            })
+            .collect();
+        let file = file[1..]
+            .iter()
+            .fold(file[0], |all, &f| self.b.ins().bor(all, f));
         let overlay = self.b.create_block();
         self.b.set_cold_block(overlay);
         let pcm = self.b.create_block();
