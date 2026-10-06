@@ -29,6 +29,9 @@ fn add(env: &mut Env<'_>, this: GuestPtr<()>, rectangle: GuestPtr<RECT>) -> Outc
             return Outcome::Return(INVALID);
         }
     }
+    // An upload can complete before its ReleaseDC continuation runs. Keep
+    // dirtiness, but do not start another upload while the DC lease is live.
+    let deferred = dc::leased(env, r);
     let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
         return Outcome::Return(INVALID);
@@ -38,7 +41,11 @@ fn add(env: &mut Env<'_>, this: GuestPtr<()>, rectangle: GuestPtr<RECT>) -> Outc
     for level in &mut r.levels {
         level.dirty = true;
     }
-    flush(env, this.addr())
+    if deferred {
+        Outcome::Return(0)
+    } else {
+        flush(env, this.addr())
+    }
 }
 
 pub(super) fn flush(env: &mut Env<'_>, pointer: u32) -> Outcome {

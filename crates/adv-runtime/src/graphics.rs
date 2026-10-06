@@ -158,6 +158,9 @@ fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
 #[cfg(feature = "gpu")]
 pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
+        acquire_dc: adv_win32::gdi32::raster::front::surface_dc::acquire,
+        writeback_dc: adv_win32::gdi32::raster::front::surface_dc::writeback,
+        release_dc: adv_win32::gdi32::raster::front::surface_dc::release,
         mode_changed: |env, device, parameters| {
             if parameters.Windowed == 0 {
                 adv_win32::user32::display::fullscreen(
@@ -329,6 +332,70 @@ mod tests {
             panic!("graphics must return; {module}!{name}")
         };
         value
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn d3d9_provider_lends_a_real_gdi_canvas_without_presenting() {
+        let mut m = test_machine();
+        let data = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+        let original: Vec<u8> = (0..32).collect();
+        m.cpu.write(data, &original).unwrap();
+        let provider = d3d9_provider();
+        let dc = (provider.acquire_dc)(
+            &mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk: 0,
+            },
+            4,
+            2,
+            data,
+            16,
+        )
+        .unwrap();
+        assert!(matches!(
+            m.ext.get::<Win32>().gdi.get(&m.sys.objects, dc),
+            Some(adv_os::gdi::GdiObj::Dc { raster: true, .. })
+        ));
+        assert_eq!(
+            invoke(&mut m, "gdi32.dll", "SetPixel", &[dc, 2, 1, 0x00554433]),
+            0x00554433
+        );
+        assert_eq!(graphics(&mut m, api::DELETE_DC, &[dc]), 0);
+        (provider.writeback_dc)(
+            &mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk: 0,
+            },
+            dc,
+            data + 64,
+            16,
+        )
+        .unwrap();
+        let mut actual = [0; 32];
+        m.cpu.read(data + 64, &mut actual).unwrap();
+        assert_eq!(&actual[..24], &original[..24]);
+        assert_eq!(&actual[24..27], &[0x55, 0x44, 0x33]);
+        assert_eq!(&actual[28..], &original[28..]);
+        (provider.release_dc)(
+            &mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk: 0,
+            },
+            dc,
+        );
+        assert_eq!(m.ext.get::<SurfaceStore>().live_surfaces(), 0);
+        assert_eq!(m.ext.get::<SurfaceStore>().stats.presentations, 0);
+        assert!(m.ext.get::<Win32>().gdi.get(&m.sys.objects, dc).is_none());
     }
 
     #[cfg(feature = "gpu")]
