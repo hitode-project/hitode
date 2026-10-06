@@ -17,6 +17,7 @@ members = [
     "crates/adv-win32",
     "apps/adv-run",
     "apps/adv-android-probe",
+    "apps/adv-android",
 ]
 exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]
 

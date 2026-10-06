@@ -242,6 +242,21 @@ impl<B: Backend> Runtime<B> {
             .stream()
     }
 
+    /// Frontend lifecycle pause. Stop/join the device callback before calling
+    /// this, and reopen it only after resuming. Emulated audio stays enabled.
+    pub fn set_suspended(&mut self, suspended: bool) -> bool {
+        if suspended {
+            self.machine.sys.clock.pause();
+        } else {
+            self.machine.sys.clock.resume();
+        }
+        self.machine
+            .ext
+            .get::<adv_dx::dsound::Sound>()
+            .audio
+            .suspend(suspended)
+    }
+
     /// Queue and missing-PCM observations, independent of audible sample values.
     pub fn audio_pcm_metrics(&self) -> adv_device::PcmMetrics {
         self.audio_stream().metrics()

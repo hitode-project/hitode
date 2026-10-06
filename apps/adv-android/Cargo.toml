@@ -1,0 +1,30 @@
+[package]
+name = "adv-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Android JNI player with one owned guest execution worker"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:pollster"]
+
+[dependencies]
+adv-runtime = { path = "../../crates/adv-runtime" }
+adv-device = { path = "../../crates/adv-device", features = ["device"] }
+adv-machine = { path = "../../crates/adv-machine" }
+adv-sync = { path = "../../crates/adv-sync" }
+jni = "0.21.1"
+serde_json = "1"
+pollster = { version = "0.4", optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1.1"
+
+[lints]
+workspace = true

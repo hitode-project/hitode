@@ -29,6 +29,8 @@ RULES: dict[str, set[str]] = {
     "adv-run": {"adv-shell"},
     # Standalone Android CPU acceptance app, outside the game runtime graph.
     "adv-android-probe": {"adv-cpu"},
+    # Android platform frontend owns runtime, presentation and audio output.
+    "adv-android": {"adv-runtime", "adv-device", "adv-sync"},
     "adv-tune": {"adv-abi", "adv-device"},
     # Test support: reachable only from dev-dependencies.
     "adv-unicorn": {"adv-cpu"},
