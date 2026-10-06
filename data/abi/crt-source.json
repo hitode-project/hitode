@@ -227,5 +227,11 @@
     ],
     "projection": "FILE* __cdecl _fsopen/_wfsopen(filename, mode, int share), three x86 slots; legacy CRT aliases only.",
     "profile": "Use the existing CRT stream and VFS owner; unsupported sharing modes must fail with qualified warning rather than fabricated success."
+  },
+  "stream_position": {
+    "header": "ucrt/stdio.h:73,191-194,263-266",
+    "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "projection": "int __cdecl fgetpos(FILE*, fpos_t*) and fsetpos(FILE*, const fpos_t*), two x86 pointer slots; fpos_t typedef signed __int64, 8-byte guest position; legacy CRT aliases only.",
+    "profile": "Use the existing CRT stream cursor; bounded atomic guest position accesses, no separate stream or host pathname owner."
   }
 }
