@@ -22,6 +22,7 @@ mod scalar_float;
 mod secure_memory;
 mod shared_file;
 mod startup;
+mod stream_position;
 mod time64;
 mod wide_string;
 
@@ -110,6 +111,7 @@ pub fn register(r: &mut Registry) {
     scan::register(r);
     secure_memory::register(r);
     shared_file::register(r);
+    stream_position::register(r);
     heap::register(r);
     locale::register(r);
     wide_string::register(r);
