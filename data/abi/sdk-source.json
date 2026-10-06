@@ -9,6 +9,16 @@
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icinstall",
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icremove"
   ],
+  "legacy_nt_dos_path": {
+    "scope": "ntdll.dll!RtlDosPathNameToNtPathName_U only; no WithStatus export is projected",
+    "source": "Microsoft Learn WithStatus four-pointer declaration, Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib, and the installed Microsoft x86 ntdll.dll BOOLEAN wrapper; neither function is present in pinned WinMD",
+    "return": "BOOLEAN is an unsigned byte returned in AL, projected to the same u32 ABI kind used for byte primitives; upper EAX bits are unspecified and are not NTSTATUS",
+    "stack": "SDK import _RtlDosPathNameToNtPathName_U@16 and native wrapper RET 16; four 32-bit pointers",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "oracle_dll_sha256": "56770f0c0b47f313662444f3ecf77257be36f1b82ddb36be14555790fca2f430",
+    "native_abi_verification": "RVA 0x6a5a0 U wrapper calls the same path conversion as WithStatus, returns setns AL or xor AL,AL, and pops 16 bytes. Authored x86 oracle checks BOOLEAN, descriptor byte lengths, FilePart/RelativeName aliasing, empty failure, and RtlFreeUnicodeString allocation ownership. No DLL bytes are bundled.",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/devnotes/rtldospathnametontpathname_u_withstatus"
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",
