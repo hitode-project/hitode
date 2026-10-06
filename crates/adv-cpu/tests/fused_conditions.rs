@@ -23,7 +23,7 @@ const EDGES: [u32; 10] = [
 ];
 
 /// For every operand pair of the table, applies `op` and records each
-/// condition, both as SETcc straight after it and through a JLE.
+/// condition, both as SETcc straight after it and through JLE/JL branches.
 fn program(op: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
     let mut a = CodeAssembler::new(32).unwrap();
     let mut top = a.create_label();
@@ -49,6 +49,14 @@ fn program(op: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
     a.jle(skip).unwrap();
     a.mov(byte_ptr(edi + 10), 1).unwrap();
     a.set_label(&mut skip).unwrap();
+    let mut less = a.create_label();
+    let mut done = a.create_label();
+    a.jl(less).unwrap();
+    a.mov(byte_ptr(edi + 11), 1).unwrap();
+    a.jmp(done).unwrap();
+    a.set_label(&mut less).unwrap();
+    a.mov(byte_ptr(edi + 11), 2).unwrap();
+    a.set_label(&mut done).unwrap();
     a.add(esi, 8).unwrap();
     a.add(edi, 16).unwrap();
     a.dec(ecx).unwrap();

@@ -102,7 +102,12 @@ impl Emitter<'_> {
     /// so ZF/SF/CF/OF need no width; PF and AF shift the result back.
     pub(super) fn narrow_alu(&mut self, i: &Instruction, size: usize) {
         let shift = (32 - size * 8) as i64;
-        let a = self.read(i, 0);
+        let counter = self.counting(i);
+        // The whole counter register: the shifts below drop its high half.
+        let a = match counter {
+            Some(counter) => self.b.use_var(self.regs[counter]),
+            None => self.read(i, 0),
+        };
         let b = if i.op_count() == 2 {
             self.read(i, 1)
         } else {
@@ -144,7 +149,9 @@ impl Emitter<'_> {
         };
         let kind = self.constant(kind | (shift as u32) << 8);
         self.b.def_var(self.lazy[3], kind);
-        if !matches!(i.mnemonic(), M::Cmp | M::Test) {
+        if let Some(counter) = counter {
+            self.b.def_var(self.regs[counter], result);
+        } else if !matches!(i.mnemonic(), M::Cmp | M::Test) {
             self.write(i, ptr, result);
         }
     }
@@ -240,27 +247,22 @@ impl Emitter<'_> {
             3 => (self.read(i, 1), self.read(i, 2)),
             _ => unreachable!(),
         };
-        let a = if signed {
-            self.b.ins().sextend(types::I64, a)
+        // Two 32-bit halves rather than one 64-bit product: AArch64 has a
+        // multiply-high, and an unused half costs nothing.
+        let low = self.b.ins().imul(a, b);
+        let high = if signed {
+            self.b.ins().smulhi(a, b)
         } else {
-            self.b.ins().uextend(types::I64, a)
+            self.b.ins().umulhi(a, b)
         };
-        let b = if signed {
-            self.b.ins().sextend(types::I64, b)
+        // The product fits when the high half only extends the low half.
+        let extension = if signed {
+            self.b.ins().sshr_imm(low, 31)
         } else {
-            self.b.ins().uextend(types::I64, b)
+            self.constant(0)
         };
-        let product = self.b.ins().imul(a, b);
-        let low = self.b.ins().ireduce(types::I32, product);
-        let high = self.b.ins().ushr_imm(product, 32);
-        let overflow = if signed {
-            let extended = self.b.ins().sextend(types::I64, low);
-            self.b.ins().icmp(IntCC::NotEqual, product, extended)
-        } else {
-            self.b.ins().icmp_imm(IntCC::NotEqual, high, 0)
-        };
+        let overflow = self.b.ins().icmp(IntCC::NotEqual, high, extension);
         if i.op_count() == 1 {
-            let high = self.b.ins().ireduce(types::I32, high);
             self.b.def_var(self.regs[0], low);
             self.b.def_var(self.regs[2], high);
         } else {

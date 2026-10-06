@@ -365,3 +365,462 @@ fn rewriting_a_narrow_counter_keeps_memory_checks_on_every_iteration() {
         assert_eq!(jit.memory().read(DST + 4096, 32).unwrap(), [0xa5; 32]);
     }
 }
+
+#[test]
+fn windowed_gathers_and_scatters_match_unicorn() {
+    // Offsets loaded from the source address a table at EBX: each access
+    // depends on data, so the clone checks it against a validated window.
+    let gather = counted(false, |a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.and(eax, 0x3ffc).unwrap();
+        a.mov(edx, dword_ptr(ebx + eax)).unwrap();
+        a.mov(dword_ptr(edi), edx).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+    });
+    let mut r = regs(3000, SRC, DST);
+    r[3] = SRC + 0x8000;
+    let all = |_: &mut Executor| {};
+    differential("gather", &gather, r, all, 1 << 30);
+    differential("gather-sliced", &gather, r, all, 29);
+    let hole = |m: &mut Executor| m.protect(SRC + 0x9000, 4096, 0).unwrap();
+    differential("gather-fault", &gather, r, hole, 1 << 30);
+    // Unaligned table reads straddle pages.
+    r[3] = SRC + 0x8002;
+    differential("gather-straddle", &gather, r, all, 1 << 30);
+    differential("gather-straddle-fault", &gather, r, hole, 1 << 30);
+    // The same addressing as a store, into read-only and executable pages.
+    let scatter = counted(false, |a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.and(eax, 0x3ffc).unwrap();
+        a.mov(dword_ptr(ebx + eax), ecx).unwrap();
+        a.add(esi, 4).unwrap();
+    });
+    r[3] = DST;
+    differential("scatter", &scatter, r, all, 1 << 30);
+    differential("scatter-sliced", &scatter, r, all, 31);
+    let readonly = |m: &mut Executor| m.protect(DST + 0x2000, 4096, READ).unwrap();
+    differential("scatter-readonly", &scatter, r, readonly, 1 << 30);
+    let executable = |m: &mut Executor| m.protect(DST + 0x1000, 4096, READ | WRITE | EXEC).unwrap();
+    differential("scatter-executable", &scatter, r, executable, 1 << 30);
+}
+
+#[test]
+fn loops_leaving_through_a_side_exit_resume_after_it() {
+    // Copies until a marker word, then finishes outside the loop.
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        let mut found = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.cmp(eax, 0x5555_5555).unwrap();
+        a.je(found).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.set_label(&mut found).unwrap();
+        a.lea(ebx, dword_ptr(ecx + 7)).unwrap();
+        a.ret().unwrap();
+    });
+    for at in [0u32, 1, 100, 2999] {
+        let marker = move |m: &mut Executor| {
+            m.write(SRC + at * 4, &0x5555_5555u32.to_le_bytes())
+                .unwrap()
+        };
+        differential("side", &bytes, regs(3000, SRC, DST), marker, 1 << 30);
+        differential("side-sliced", &bytes, regs(3000, SRC, DST), marker, 43);
+    }
+}
+
+/// The blend loop of a sprite renderer: skip transparent pixels, otherwise
+/// mix source and destination by the source alpha and a global factor.
+fn blend() -> Vec<u8> {
+    code(|a| {
+        let mut top = a.create_label();
+        let mut skip = a.create_label();
+        a.pxor(mm0, mm0).unwrap();
+        a.movd(mm5, dword_ptr(ebp)).unwrap();
+        a.movq(mm7, qword_ptr(ebp + 8)).unwrap();
+        a.punpcklbw(mm5, mm0).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.and(eax, 0xff00_0000u32 as i32).unwrap();
+        a.je(skip).unwrap();
+        a.movd(mm1, dword_ptr(esi)).unwrap();
+        a.movd(mm2, dword_ptr(edi)).unwrap();
+        a.punpcklbw(mm1, mm0).unwrap();
+        a.punpcklbw(mm2, mm0).unwrap();
+        a.pmullw(mm1, mm5).unwrap();
+        a.psrlw(mm1, 8).unwrap();
+        a.movq(mm6, mm7).unwrap();
+        a.movq(mm3, mm1).unwrap();
+        a.packuswb(mm3, mm0).unwrap();
+        a.movd(ebx, mm3).unwrap();
+        a.rol(ebx, 8).unwrap();
+        a.mov(bh, bl).unwrap();
+        a.mov(ax, bx).unwrap();
+        a.rol(eax, 16).unwrap();
+        a.mov(ax, bx).unwrap();
+        a.movd(mm3, eax).unwrap();
+        a.punpcklbw(mm3, mm0).unwrap();
+        a.psubusw(mm6, mm3).unwrap();
+        a.pmullw(mm1, mm3).unwrap();
+        a.pmullw(mm2, mm6).unwrap();
+        a.paddusw(mm2, mm1).unwrap();
+        a.psrlw(mm2, 8).unwrap();
+        a.packuswb(mm2, mm0).unwrap();
+        a.movd(dword_ptr(edi), mm2).unwrap();
+        a.mov(byte_ptr(edi + 3), 0xff).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(edi, 4).unwrap();
+        a.add(esi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.emms().unwrap();
+        a.ret().unwrap();
+    })
+}
+
+const VARS: u32 = END - 0x100;
+
+#[test]
+fn batched_blends_match_unicorn_for_every_alpha_pattern_and_overlap() {
+    let bytes = blend();
+    // The destination starts as a second pattern; the factors sit at VARS.
+    let base = |m: &mut Executor| {
+        let pattern: Vec<u8> = (0..0x8000u32).map(|n| (n * 13 + 5) as u8).collect();
+        m.write(DST, &pattern).unwrap();
+        m.write(VARS, &[0x80, 0xa0, 0xc0, 0x00, 0, 0, 0, 0])
+            .unwrap();
+        m.write(VARS + 8, &0x00ff_00ff_00ff_00ffu64.to_le_bytes())
+            .unwrap();
+    };
+    // Every 64th source pixel is transparent: most batches agree, some split.
+    let mut r = regs(3000, SRC, DST);
+    r[5] = VARS;
+    for count in [1, 2, 3, 5, 64, 1001, 3000] {
+        r[1] = count;
+        differential("blend", &bytes, r, base, 1 << 30);
+    }
+    r[1] = 3000;
+    differential("blend-sliced", &bytes, r, base, 37);
+    differential("blend-sliced-odd", &bytes, r, base, 101);
+    // Long transparent and opaque runs, alternating pixels, and runs whose
+    // length leaves a lone pixel at either end of a batch.
+    let runs = move |m: &mut Executor| {
+        base(m);
+        m.write(SRC + 0x400, &[0; 0x400]).unwrap();
+        for n in 0..0x200u32 {
+            m.write(SRC + 0x800 + n * 4 + 3, &[0x80]).unwrap();
+        }
+        for n in 0..0x100u32 {
+            let alpha = if n % 2 == 0 { 0 } else { 0x40 };
+            m.write(SRC + 0x1000 + n * 4 + 3, &[alpha]).unwrap();
+        }
+        for n in 0..0x100u32 {
+            let alpha = if n % 3 == 0 { 0 } else { 0x40 };
+            m.write(SRC + 0x1400 + n * 4 + 3, &[alpha]).unwrap();
+        }
+    };
+    differential("blend-runs", &bytes, r, runs, 1 << 30);
+    differential("blend-runs-sliced", &bytes, r, runs, 53);
+    // In place, and overlapping by a pixel either way, or by part of one.
+    for (name, dst) in [
+        ("blend-inplace", SRC),
+        ("blend-ahead", SRC + 4),
+        ("blend-behind", SRC - 4),
+        ("blend-straddle", SRC + 2),
+        ("blend-far", SRC + 8),
+    ] {
+        let mut r = r;
+        r[7] = dst;
+        r[1] = 2000;
+        differential(name, &bytes, r, runs, 1 << 30);
+    }
+    // The destination turns read-only midway.
+    let readonly = move |m: &mut Executor| {
+        runs(m);
+        m.protect(DST + 0x2000, 4096, READ).unwrap();
+    };
+    differential("blend-readonly", &bytes, r, readonly, 1 << 30);
+}
+
+#[test]
+fn batched_copies_and_integer_bodies_match_unicorn() {
+    let all = |_: &mut Executor| {};
+    // Quadword copies, a 16-bit counter included.
+    for narrow in [false, true] {
+        let quadwords = counted(narrow, |a| {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 8).unwrap();
+        });
+        let mut r = regs(1500, SRC, DST);
+        differential("movq", &quadwords, r, all, 1 << 30);
+        differential("movq-sliced", &quadwords, r, all, 41);
+        r[1] = 0x0003_0000 | 999;
+        differential("movq-wide", &quadwords, r, all, 1 << 30);
+    }
+    let dwords = counted(true, |a| {
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+    });
+    let mut r = regs(0x7fff_0000 | 3001, SRC, DST);
+    differential("movd-narrow", &dwords, r, all, 1 << 30);
+    // Overlapping copies smear or shift the source.
+    r[7] = SRC + 4;
+    differential("movd-smear", &dwords, r, all, 1 << 30);
+    r[7] = SRC - 4;
+    differential("movd-shift", &dwords, r, all, 1 << 30);
+    // Byte averages through zero and sign extension and a byte store.
+    let bytes = counted(false, |a| {
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.movsx(ebx, byte_ptr(esi + 1)).unwrap();
+        a.add(eax, ebx).unwrap();
+        a.sar(eax, 1).unwrap();
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.movzx(edx, ah).unwrap();
+        a.add(esi, 2).unwrap();
+        a.add(edi, 1).unwrap();
+    });
+    let r = regs(5001, SRC, DST);
+    differential("bytes", &bytes, r, all, 1 << 30);
+    differential("bytes-sliced", &bytes, r, all, 29);
+    // Stepping by INC keeps the carry of the body's last addition, which a
+    // batch does not compute: the scalar iteration after it does.
+    let increments = counted(false, |a| {
+        let mut skip = a.create_label();
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.add(al, 0x90).unwrap();
+        a.cmp(eax, 0x40).unwrap();
+        a.je(skip).unwrap();
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.inc(esi).unwrap();
+        a.inc(edi).unwrap();
+    });
+    for count in [1, 2, 3, 4, 7, 5001] {
+        let r = regs(count, SRC, DST);
+        differential("increments", &increments, r, all, 1 << 30);
+    }
+    let r = regs(5001, SRC, DST);
+    differential("increments-sliced", &increments, r, all, 31);
+    // The same loop leaving early at the first byte 0xb0, the 171st, with
+    // the exit at every position within a batch.
+    let search = code(|a| {
+        let mut top = a.create_label();
+        let mut found = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.add(al, 0x90).unwrap();
+        a.cmp(eax, 0x40).unwrap();
+        a.je(found).unwrap();
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.inc(esi).unwrap();
+        a.inc(edi).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.set_label(&mut found).unwrap();
+        a.ret().unwrap();
+    });
+    for start in 0..4 {
+        for count in [100, 171 - start, 172 - start, 5001] {
+            let r = regs(count, SRC + start, DST);
+            differential("search", &search, r, all, 1 << 30);
+            differential("search-sliced", &search, r, all, 23);
+        }
+    }
+    // Integer arithmetic choosing between two results per element.
+    let integers = counted(false, |a| {
+        let mut odd = a.create_label();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(ebx, eax).unwrap();
+        a.imul_3(ebx, ebx, 3).unwrap();
+        a.lea(edx, dword_ptr(eax + ebx * 2 + 5)).unwrap();
+        a.sar(edx, 3).unwrap();
+        a.xor(edx, eax).unwrap();
+        a.ror(edx, 7).unwrap();
+        a.test(dl, 1).unwrap();
+        a.jne(odd).unwrap();
+        a.neg(edx).unwrap();
+        a.not(ebx).unwrap();
+        a.set_label(&mut odd).unwrap();
+        a.or(edx, ebp).unwrap();
+        a.mov(dword_ptr(edi), edx).unwrap();
+        a.mov(word_ptr(edi + 4), bx).unwrap();
+        a.lea(edx, dword_ptr(esi + 3)).unwrap();
+        a.mov(dword_ptr(edi + 8), edx).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 12).unwrap();
+    });
+    let mut r = regs(2001, SRC, DST);
+    r[5] = 0x1000_0001;
+    differential("integers", &integers, r, all, 1 << 30);
+    differential("integers-sliced", &integers, r, all, 47);
+}
+
+#[test]
+fn batched_loop_interrupts_and_resumes_exactly() {
+    let bytes = counted(false, |a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, ebx).unwrap();
+        // A doubleword store here would be a forwarded slot instead.
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.add(edx, 1).unwrap();
+    });
+    let mut m = machine(&bytes, Some(CompileStrategy::Speed));
+    m.state.regs = regs(100_000_000, SRC, DST);
+    m.state.regs[3] = 5;
+    m.write(SRC, &1u32.to_le_bytes()).unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    m.set_host_interrupt_flag(flag.clone());
+    let notify = flag.clone();
+    let producer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(2));
+        notify.store(true, Ordering::Release);
+    });
+    let outcome = m.run(STOP, 1 << 40).unwrap();
+    producer.join().unwrap();
+    assert_eq!(outcome, RunOutcome::Interrupted);
+    let completed = m.state.regs[2];
+    assert!(completed > 0 && completed < 100_000_000);
+    assert_eq!(m.state.regs[1], 100_000_000 - completed);
+    assert_eq!(m.state.regs[0], 6);
+    assert_eq!(m.memory().read(DST, 1).unwrap(), [6]);
+    flag.store(false, Ordering::Release);
+    m.state.regs[1] = 11;
+    assert_eq!(m.run(STOP, 1 << 20).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(m.state.regs[2], completed + 11);
+}
+
+#[test]
+fn compact_copies_cover_four_lane_aliases_tails_and_observable_budget_state() {
+    for packed in [false, true] {
+        let bytes = counted(true, |a| {
+            if packed {
+                a.movd(mm0, dword_ptr(esi)).unwrap();
+                a.movd(dword_ptr(edi), mm0).unwrap();
+            } else {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            }
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+        });
+        for count in [3, 4, 5, 8, 9, 129] {
+            // +/-8 and +/-12 distinguish a four-lane alias proof from V=2.
+            for destination in [
+                DST,
+                SRC,
+                SRC + 8,
+                SRC + 12,
+                SRC - 8,
+                SRC - 12,
+                SRC + 15,
+                SRC - 15,
+                SRC + 16,
+                SRC - 16,
+            ] {
+                differential(
+                    "compact-copy",
+                    &bytes,
+                    regs(0x2345_0000 | count, SRC, destination),
+                    |_| {},
+                    37,
+                );
+            }
+        }
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            for fuel in [6, 7, 8, 9, 10, 11, 13, 17, 33, 34, 35] {
+                let mut jit = machine(&bytes, Some(strategy));
+                let mut uc = machine(&bytes, None);
+                for m in [&mut jit, &mut uc] {
+                    m.state.regs = regs(0x2345_0000 | 200, SRC, DST);
+                }
+                assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
+                let done = (jit.state.regs[6] - SRC) / 4;
+                assert!(done > 0 && done < 200);
+                // One prologue instruction, six per complete iteration.
+                assert_eq!(
+                    uc.run_unicorn(STOP, 1 + 6 * done as usize).unwrap(),
+                    RunOutcome::Budget
+                );
+                assert_eq!(jit.state.eip, uc.state.eip);
+                assert_eq!(jit.state.regs, uc.state.regs, "packed={packed} fuel={fuel}");
+                assert_eq!(jit.state.mmx, uc.state.mmx);
+                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+                assert_eq!(
+                    jit.memory().read(DST, 804).unwrap(),
+                    uc.memory().read(DST, 804).unwrap()
+                );
+                // Fault before the next MOV/MOVD overwrites its result: the
+                // last completed element and flags must remain observable.
+                for m in [&mut jit, &mut uc] {
+                    m.protect(SRC, 4096, 0).unwrap();
+                }
+                let expected = uc.run_unicorn(STOP, 100).unwrap();
+                assert_eq!(jit.run(STOP, 100).unwrap(), expected);
+                assert_eq!(jit.state.regs, uc.state.regs);
+                assert_eq!(jit.state.mmx, uc.state.mmx);
+                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_copy_interrupt_publishes_progress_and_resumes() {
+    let bytes = counted(false, |a| {
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+    });
+    // A sufficiently long in-place copy allows an asynchronous interrupt;
+    // one zero-filled allocation, without a second large oracle allocation.
+    const COUNT: u32 = 16_000_000;
+    let mut m = adv_cpu::Executor::new(CODE, 0x4200000).unwrap();
+    m.protect(CODE, 0x4200000, READ | WRITE).unwrap();
+    m.write(CODE, &bytes).unwrap();
+    m.protect(CODE, 4096, READ | EXEC).unwrap();
+    m.protect(STOP, 4096, READ | EXEC).unwrap();
+    m.add_region(Region::new(CODE, bytes.len())).unwrap();
+    m.write(STACK, &STOP.to_le_bytes()).unwrap();
+    m.state.regs = regs(COUNT, SRC, SRC);
+    m.state.eip = CODE;
+    // Finish compilation before starting the interrupt producer.
+    assert_eq!(m.run(STOP, 64).unwrap(), RunOutcome::Budget);
+    m.state.regs = regs(COUNT, SRC, SRC);
+    m.state.eip = CODE;
+    let flag = Arc::new(AtomicBool::new(false));
+    m.set_host_interrupt_flag(flag.clone());
+    let notify = flag.clone();
+    let producer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(2));
+        notify.store(true, Ordering::Release);
+    });
+    let budget = 1 << 40;
+    let outcome = m.run(STOP, budget).unwrap();
+    producer.join().unwrap();
+    assert_eq!(outcome, RunOutcome::Interrupted);
+    let done = COUNT - m.state.regs[1];
+    assert!(
+        done >= 5 && done < COUNT,
+        "must interrupt after a packed batch"
+    );
+    assert_eq!(m.state.regs[6], SRC + done * 4);
+    assert_eq!(m.state.regs[7], SRC + done * 4);
+    assert_eq!(m.state.mmx[0], 0);
+    assert_eq!(budget - m.state.fuel, u64::from(done) + 1);
+    assert_eq!(m.stats.interpreter_instructions, 0);
+    flag.store(false, Ordering::Release);
+    m.state.regs[1] = 11;
+    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(m.state.regs[6], SRC + (done + 11) * 4);
+    assert_eq!(m.state.regs[7], m.state.regs[6]);
+}
