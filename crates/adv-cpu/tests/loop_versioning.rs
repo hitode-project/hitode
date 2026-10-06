@@ -67,6 +67,19 @@ fn differential(
     setup: impl Fn(&mut Executor),
     slice: u64,
 ) {
+    differential_with_oracle_slice(name, bytes, regs, setup, slice, 10_000_000);
+}
+
+/// A one-instruction oracle slice canonicalizes flags before a faulting
+/// memory CMP: Unicorn otherwise loses preceding ADD's lazy carry/auxiliary flags.
+fn differential_with_oracle_slice(
+    name: &str,
+    bytes: &[u8],
+    regs: [u32; 8],
+    setup: impl Fn(&mut Executor),
+    slice: u64,
+    oracle_slice: usize,
+) {
     for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
         let mut jit = machine(bytes, Some(strategy));
         let mut uc = machine(bytes, None);
@@ -83,7 +96,13 @@ fn differential(
                 break;
             }
         }
-        let expected = uc.run_unicorn(STOP, 10_000_000).unwrap();
+        let mut expected = RunOutcome::Budget;
+        let mut oracle_left = 10_000_000;
+        while expected == RunOutcome::Budget && oracle_left != 0 {
+            let budget = oracle_slice.min(oracle_left);
+            expected = uc.run_unicorn(STOP, budget).unwrap();
+            oracle_left -= budget;
+        }
         let context = format!("{name} {strategy:?}");
         assert_eq!(outcome, expected, "{context}");
         assert_eq!(jit.state.eip, uc.state.eip, "{context}");
@@ -431,6 +450,673 @@ fn loops_leaving_through_a_side_exit_resume_after_it() {
         };
         differential("side", &bytes, regs(3000, SRC, DST), marker, 1 << 30);
         differential("side-sliced", &bytes, regs(3000, SRC, DST), marker, 43);
+    }
+}
+
+/// A loop around `body` that `close` steps and tests.
+fn closed(
+    body: impl FnOnce(&mut CodeAssembler),
+    close: impl FnOnce(&mut CodeAssembler, CodeLabel),
+) -> Vec<u8> {
+    code(|a| {
+        let mut top = a.create_label();
+        a.pxor(mm0, mm0).unwrap();
+        a.mov(eax, 0x0060_00a0).unwrap();
+        a.movd(mm5, eax).unwrap();
+        a.punpckldq(mm5, mm5).unwrap();
+        a.set_label(&mut top).unwrap();
+        body(a);
+        close(a, top);
+        a.emms().unwrap();
+        a.ret().unwrap();
+    })
+}
+
+#[test]
+fn stores_between_the_counter_step_and_the_latch_match_unicorn() {
+    let all = |_: &mut Executor| {};
+    // Batched bodies whose decrement precedes a store: of a lane value, of
+    // the counter itself, and to a slot the next iteration reads.
+    let lane = counted_store(|a| a.mov(dword_ptr(edi - 4), eax).unwrap());
+    let counter = counted_store(|a| a.mov(dword_ptr(edi - 4), ecx).unwrap());
+    let slot = counted_store(|a| a.mov(dword_ptr(ebp), eax).unwrap());
+    for (name, bytes) in [("lane", &lane), ("counter", &counter), ("slot", &slot)] {
+        for count in [1u32, 2, 3, 4, 5, 3000] {
+            let mut r = regs(count, SRC, DST);
+            r[5] = END - 0x100;
+            differential(name, bytes, r, all, 1 << 30);
+            differential(name, bytes, r, all, 37);
+        }
+    }
+}
+
+#[test]
+fn interleaved_pointer_steps_and_a_store_after_the_decrement_match_unicorn() {
+    // A delayed recurrence: update the address between loads, then decrement
+    // a separate counter before storing a result that later iterations read.
+    // The two-lane batch is legal, since its reads and writes stay apart.
+    // The latch reads the first lane's flags, so a batch is never exact,
+    // even when the code after the loop overwrites every flag.
+    for (displacement, clobber) in [(4, false), (12, false), (4, true)] {
+        let bytes = code(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(edx, dword_ptr(eax - 8)).unwrap();
+            a.mov(ebx, dword_ptr(eax)).unwrap();
+            a.add(eax, 4).unwrap();
+            a.xor(edx, ebx).unwrap();
+            a.mov(ebx, dword_ptr(eax - 28)).unwrap();
+            a.shl(ebx, 1).unwrap();
+            a.add(edx, ebx).unwrap();
+            a.dec(esi).unwrap();
+            a.mov(dword_ptr(eax + displacement), edx).unwrap();
+            a.jne(top).unwrap();
+            if clobber {
+                a.xor(ecx, ecx).unwrap();
+            }
+            a.ret().unwrap();
+        });
+        for count in [1, 2, 3, 4, 5, 8, 9, 3000] {
+            let mut r = regs(0, count, 0);
+            r[0] = SRC + 0x100;
+            differential("interleaved-recurrence", &bytes, r, |_| {}, 1 << 30);
+            differential("interleaved-recurrence-sliced", &bytes, r, |_| {}, 37);
+        }
+        let mut r = regs(0, 3000, 0);
+        r[0] = SRC + 0x100;
+        differential(
+            "interleaved-recurrence-read-fault",
+            &bytes,
+            r,
+            |m| m.protect(SRC + 0x2000, 4096, 0).unwrap(),
+            1 << 30,
+        );
+        differential(
+            "interleaved-recurrence-store-fault",
+            &bytes,
+            r,
+            |m| m.protect(SRC + 0x2000, 4096, READ).unwrap(),
+            41,
+        );
+    }
+}
+
+#[test]
+fn large_counter_steps_do_not_wrap_the_batch_funding_threshold() {
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        // An invariant byte store keeps the range proof valid for this very
+        // large stride, and avoids slot forwarding or a compact copy batch.
+        a.mov(byte_ptr(edi), cl).unwrap();
+        a.inc(edx).unwrap();
+        a.sub(ecx, i32::MIN).unwrap();
+        a.cmp(ecx, 0).unwrap();
+        a.jne(top).unwrap();
+        a.ret().unwrap();
+    });
+    let initial = regs(0, SRC, DST);
+    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+        let mut jit = machine(&bytes, Some(strategy));
+        let mut uc = machine(&bytes, None);
+        for m in [&mut jit, &mut uc] {
+            m.state.regs = initial;
+        }
+        // Finish compilation before starting the interrupt that bounds a
+        // broken batch: two steps wrap the counter back to its initial value.
+        assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
+        jit.state.regs = initial;
+        jit.state.eip = CODE;
+        jit.state.eflags = 0x202;
+        let flag = Arc::new(AtomicBool::new(false));
+        jit.set_host_interrupt_flag(flag.clone());
+        let notify = flag.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            notify.store(true, Ordering::Release);
+        });
+        let result = jit.run(STOP, 1 << 30).unwrap();
+        producer.join().unwrap();
+        assert_eq!(result, RunOutcome::ReachedStop, "{strategy:?}");
+        assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), result);
+        assert_eq!(jit.state.eip, uc.state.eip);
+        assert_eq!(jit.state.regs, uc.state.regs);
+        assert_eq!(jit.state.regs[2], 2);
+        assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+        assert_eq!(jit.memory().read(DST, 1), uc.memory().read(DST, 1));
+    }
+}
+
+#[test]
+fn invariant_memory_bounds_and_reloaded_bounds_match_unicorn() {
+    const BOUND: u32 = END - 0x104;
+    for reloaded in [false, true] {
+        for (first, bound, stride, inclusive) in [
+            (0, 3000, 1, false),
+            (-7i32, 2990, 2, true),
+            (3000, 4, -1, false),
+            (2999, 7, -2, true),
+        ] {
+            let bytes = closed(
+                |a| {
+                    a.mov(eax, dword_ptr(esi + ebx * 4)).unwrap();
+                    a.mov(dword_ptr(edi + ebx * 4), eax).unwrap();
+                    if reloaded {
+                        // The full bound load replaces an earlier temporary
+                        // partial value in this register on every iteration.
+                        a.mov(dx, word_ptr(esi + ebx * 4)).unwrap();
+                    }
+                },
+                |a, top| {
+                    a.add(ebx, stride).unwrap();
+                    if reloaded {
+                        a.mov(edx, dword_ptr(ebp + ecx * 4 - 8)).unwrap();
+                        a.cmp(ebx, edx).unwrap();
+                    } else {
+                        a.cmp(ebx, dword_ptr(ebp + ecx * 4 - 8)).unwrap();
+                    }
+                    match (stride > 0, inclusive) {
+                        (true, false) => a.jl(top).unwrap(),
+                        (true, true) => a.jle(top).unwrap(),
+                        (false, false) => a.jg(top).unwrap(),
+                        (false, true) => a.jge(top).unwrap(),
+                    }
+                },
+            );
+            let mut r = regs(2, SRC + 0x100, DST + 0x100);
+            r[3] = first as u32;
+            r[5] = BOUND;
+            let setup = |m: &mut Executor| m.write(BOUND, &(bound as u32).to_le_bytes()).unwrap();
+            let context = format!(
+                "memory-bound first={first} bound={bound} stride={stride} inclusive={inclusive} reloaded={reloaded}"
+            );
+            differential(&context, &bytes, r, setup, 1 << 30);
+            differential(&format!("{context}-sliced"), &bytes, r, setup, 29);
+            differential_with_oracle_slice(
+                &format!("{context}-unreadable"),
+                &bytes,
+                r,
+                |m| {
+                    setup(m);
+                    m.protect(END - 4096, 4096, 0).unwrap();
+                },
+                1 << 30,
+                1,
+            );
+        }
+    }
+}
+
+#[test]
+fn writes_aliasing_a_memory_bound_keep_the_comparison_current() {
+    // The destination eventually overwrites the bound through another base.
+    // The new value ends the loop at 130 rather than the original 3000.
+    for reloaded in [false, true] {
+        let bytes = code(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi + ebx * 4)).unwrap();
+            a.mov(dword_ptr(edi + ebx * 4), eax).unwrap();
+            a.inc(ebx).unwrap();
+            if reloaded {
+                a.mov(edx, dword_ptr(ebp)).unwrap();
+                a.cmp(ebx, edx).unwrap();
+            } else {
+                a.cmp(ebx, dword_ptr(ebp)).unwrap();
+            }
+            a.jb(top).unwrap();
+            a.ret().unwrap();
+        });
+        let mut r = regs(0, SRC, DST);
+        r[5] = DST + 128 * 4;
+        let setup = |m: &mut Executor| {
+            m.write(DST + 128 * 4, &3000u32.to_le_bytes()).unwrap();
+            m.write(SRC + 128 * 4, &130u32.to_le_bytes()).unwrap();
+        };
+        differential("bound-alias", &bytes, r, setup, 1 << 30);
+        differential("bound-alias-sliced", &bytes, r, setup, 17);
+    }
+    // A wrapping scaled address aliases the bound's invariant slot.
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(dword_ptr(esi + edx * 4), 7).unwrap();
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+    });
+    for (base, index) in [(0xffff_ffe8, 0xc008), (DST, 0x4000_0002)] {
+        let mut r = regs(0, base, 0);
+        r[2] = index;
+        r[5] = DST + 8;
+        differential(
+            "bound-wrapping-alias",
+            &bytes,
+            r,
+            |m| m.write(DST + 8, &1000u32.to_le_bytes()).unwrap(),
+            1 << 30,
+        );
+    }
+    // The doubleword mutation is a forwarded slot. Its write is absent from
+    // Plan::writes, but must still take part in the bound alias check.
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.add(dword_ptr(ebp), 1).unwrap();
+        a.add(ebx, 2).unwrap();
+        a.cmp(ebx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+    });
+    let mut r = regs(0, SRC, DST);
+    r[5] = DST;
+    differential(
+        "bound-forwarded-slot-alias",
+        &bytes,
+        r,
+        |m| m.write(DST, &3u32.to_le_bytes()).unwrap(),
+        13,
+    );
+    // A mixed-width overwrite prevents slot forwarding; both writes still
+    // need to participate in the invariant-bound alias check.
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(dword_ptr(ebp), 15).unwrap();
+        a.mov(byte_ptr(ebp), 7).unwrap();
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+    });
+    let mut r = regs(0, SRC, DST);
+    r[5] = DST;
+    differential("bound-slot-alias", &bytes, r, |_| {}, 13);
+}
+
+#[test]
+fn memory_bound_permissions_changed_between_slices_preserve_the_fault_prefix() {
+    const BOUND: u32 = END - 0x104;
+    for reloaded in [false, true] {
+        let bytes = code(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi + ebx * 4)).unwrap();
+            a.mov(dword_ptr(edi + ebx * 4), eax).unwrap();
+            a.inc(ebx).unwrap();
+            if reloaded {
+                a.mov(edx, dword_ptr(ebp)).unwrap();
+                a.cmp(ebx, edx).unwrap();
+            } else {
+                a.cmp(ebx, dword_ptr(ebp)).unwrap();
+            }
+            a.jb(top).unwrap();
+            a.ret().unwrap();
+        });
+        for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+            let mut jit = machine(&bytes, Some(strategy));
+            let mut uc = machine(&bytes, None);
+            for m in [&mut jit, &mut uc] {
+                m.state.regs = regs(0, SRC, DST);
+                m.state.regs[5] = BOUND;
+                m.write(BOUND, &3000u32.to_le_bytes()).unwrap();
+            }
+            assert_eq!(jit.run(STOP, 37).unwrap(), RunOutcome::Budget);
+            let completed = jit.state.regs[3];
+            assert!(completed > 0 && completed < 3000);
+            let cost = if reloaded { 6 } else { 5 };
+            assert_eq!(
+                uc.run_unicorn(STOP, cost * completed as usize).unwrap(),
+                RunOutcome::Budget
+            );
+            assert_eq!(jit.state.eip, uc.state.eip);
+            assert_eq!(jit.state.regs, uc.state.regs);
+            assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+            for m in [&mut jit, &mut uc] {
+                m.protect(END - 4096, 4096, 0).unwrap();
+            }
+            let mut expected = RunOutcome::Budget;
+            for _ in 0..100 {
+                expected = uc.run_unicorn(STOP, 1).unwrap();
+                if expected != RunOutcome::Budget {
+                    break;
+                }
+            }
+            assert!(matches!(expected, RunOutcome::ReadFault { address, .. } if address == BOUND));
+            assert_eq!(jit.run(STOP, 100).unwrap(), expected);
+            assert_eq!(jit.state.eip, uc.state.eip);
+            assert_eq!(jit.state.regs, uc.state.regs);
+            assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+            assert_eq!(jit.memory().read(DST, 4096), uc.memory().read(DST, 4096));
+        }
+    }
+}
+
+#[test]
+fn memory_bounds_crossing_page_permissions_match_unicorn() {
+    const BOUND: u32 = END - 4098;
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(byte_ptr(edi), cl).unwrap();
+        a.inc(ecx).unwrap();
+        a.cmp(ecx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+    });
+    let mut r = regs(0, SRC, DST);
+    r[5] = BOUND;
+    differential(
+        "bound-two-pages",
+        &bytes,
+        r,
+        |m| m.write(BOUND, &3000u32.to_le_bytes()).unwrap(),
+        37,
+    );
+    // Unicorn allows this straddling read despite the second page's
+    // protection. Use its exact pre-CMP prefix as the fault-state oracle.
+    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+        let mut jit = machine(&bytes, Some(strategy));
+        let mut uc = machine(&bytes, None);
+        for m in [&mut jit, &mut uc] {
+            m.state.regs = r;
+            m.write(BOUND, &3000u32.to_le_bytes()).unwrap();
+            m.write(DST, &[0xa5]).unwrap();
+            m.protect(END - 4096, 4096, 0).unwrap();
+        }
+        assert_eq!(uc.run_unicorn(STOP, 2).unwrap(), RunOutcome::Budget);
+        assert_eq!(
+            jit.run(STOP, 100).unwrap(),
+            RunOutcome::ReadFault {
+                pc: uc.state.eip,
+                address: BOUND,
+            }
+        );
+        assert_eq!(jit.state.eip, uc.state.eip);
+        assert_eq!(jit.state.regs, uc.state.regs);
+        assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+        assert_eq!(jit.memory().read(DST, 1).unwrap(), [0]);
+        assert_eq!(jit.memory().read(DST, 1), uc.memory().read(DST, 1));
+    }
+}
+
+#[test]
+fn absolute_memory_bounds_in_the_high_address_half_match_unicorn() {
+    const HIGH_CODE: u32 = 0x9001_0000;
+    const HIGH_STOP: u32 = HIGH_CODE + 0x1000;
+    const HIGH_STACK: u32 = HIGH_CODE + 0x2f00;
+    const HIGH_DATA: u32 = HIGH_CODE + 0x20000;
+    const HIGH_BOUND: u32 = HIGH_CODE + 0x30000;
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.mov(byte_ptr(edi), cl).unwrap();
+    a.inc(ecx).unwrap();
+    a.cmp(ecx, dword_ptr(HIGH_BOUND as i32)).unwrap();
+    a.jb(top).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(u64::from(HIGH_CODE)).unwrap();
+    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+        let mut jit = Executor::new(HIGH_CODE, 0x40000).unwrap();
+        let mut uc = Executor::new(HIGH_CODE, 0x40000).unwrap();
+        for m in [&mut jit, &mut uc] {
+            m.protect(HIGH_CODE, 0x40000, READ | WRITE).unwrap();
+            m.write(HIGH_CODE, &bytes).unwrap();
+            m.protect(HIGH_CODE, 4096, READ | EXEC).unwrap();
+            m.protect(HIGH_STOP, 4096, READ | EXEC).unwrap();
+            m.write(HIGH_STACK, &HIGH_STOP.to_le_bytes()).unwrap();
+            m.write(HIGH_BOUND, &3000u32.to_le_bytes()).unwrap();
+            m.state.regs = [0, 0, 0, 0, HIGH_STACK, 0, 0, HIGH_DATA];
+            m.state.eip = HIGH_CODE;
+            m.state.eflags = 0x202;
+        }
+        let mut region = Region::new(HIGH_CODE, bytes.len());
+        region.compile_strategy = strategy;
+        jit.add_region(region).unwrap();
+        let expected = uc.run_unicorn(HIGH_STOP, 100_000).unwrap();
+        assert_eq!(jit.run(HIGH_STOP, 100_000).unwrap(), expected);
+        assert_eq!(expected, RunOutcome::ReachedStop);
+        assert_eq!(jit.state.eip, uc.state.eip);
+        assert_eq!(jit.state.regs, uc.state.regs);
+        assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+        assert_eq!(
+            jit.memory().read(HIGH_DATA, 1),
+            uc.memory().read(HIGH_DATA, 1)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn shared_memory_bounds_use_checked_reads_and_keep_exact_state() {
+    use adv_cpu::backend::{Guest, Prot};
+    const BOUND: u32 = END - 4096;
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(byte_ptr(edi), bl).unwrap();
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+    });
+    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+        let mut cpu = adv_cpu::JitCpu::new(STOP, false).unwrap();
+        cpu.map(CODE, 4096, Prot::RX).unwrap();
+        cpu.map(STOP, 4096, Prot::RX).unwrap();
+        cpu.map(STACK & !4095, 4096, Prot::RW).unwrap();
+        cpu.map(DST, 4096, Prot::RW).unwrap();
+        let shared = cpu.map_shared_audio(BOUND, 4096).unwrap();
+        cpu.write(CODE, &bytes).unwrap();
+        cpu.write(STACK, &STOP.to_le_bytes()).unwrap();
+        cpu.write(BOUND, &3000u32.to_le_bytes()).unwrap();
+        let mut initial = regs(0, 0, DST);
+        initial[5] = BOUND;
+        let jit = cpu.executor_mut();
+        jit.state.regs = initial;
+        jit.state.eip = CODE;
+        jit.state.eflags = 0x202;
+        let mut region = Region::new(CODE, bytes.len());
+        region.compile_strategy = strategy;
+        jit.add_region(region).unwrap();
+        let mut uc = machine(&bytes, None);
+        uc.state.regs = initial;
+        uc.write(BOUND, &3000u32.to_le_bytes()).unwrap();
+        assert_eq!(jit.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(
+            uc.run_unicorn(STOP, 100_000).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        assert_eq!(jit.state.eip, uc.state.eip);
+        assert_eq!(jit.state.regs, uc.state.regs);
+        assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+        assert_eq!(jit.memory().read(DST, 1), uc.memory().read(DST, 1));
+        let mut bound = [0; 4];
+        shared.read_alias.copy_into(0, &mut bound);
+        assert_eq!(bound, 3000u32.to_le_bytes());
+    }
+}
+
+/// A rotate-and-mix body stepping its pointers, then `dec ecx`, `store`, `jne`.
+fn counted_store(store: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
+    code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(edx, dword_ptr(esi + 4)).unwrap();
+        a.mov(ebx, eax).unwrap();
+        a.ror(ebx, 7).unwrap();
+        a.xor(eax, ebx).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        store(a);
+        a.jne(top).unwrap();
+        a.ret().unwrap();
+    })
+}
+
+#[test]
+fn compare_latched_and_signed_counters_match_unicorn() {
+    let all = |_: &mut Executor| {};
+    let copy = |a: &mut CodeAssembler| {
+        a.mov(eax, dword_ptr(esi + ebx * 4)).unwrap();
+        a.mov(dword_ptr(edi + ebx * 4), eax).unwrap();
+    };
+    // Up to a register bound, exclusive and inclusive, and to a constant.
+    let below = closed(copy, |a, top| {
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, edx).unwrap();
+        a.jb(top).unwrap();
+    });
+    let through = closed(copy, |a, top| {
+        a.add(ebx, 1).unwrap();
+        a.cmp(ebx, edx).unwrap();
+        a.jle(top).unwrap();
+    });
+    let constant = closed(copy, |a, top| {
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, 2500).unwrap();
+        a.jne(top).unwrap();
+    });
+    for (name, bytes) in [
+        ("below", &below),
+        ("through", &through),
+        ("constant", &constant),
+    ] {
+        for (first, bound) in [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (5, 3000),
+            (2499, 2500),
+            (-3i32 as u32, 7),
+        ] {
+            if name == "below" && first > bound || name == "constant" && first >= 2500 {
+                continue;
+            }
+            let mut r = regs(0, SRC + 12, DST + 12);
+            (r[3], r[2]) = (first, bound);
+            differential(name, bytes, r, all, 1 << 30);
+            differential(name, bytes, r, all, 37);
+        }
+    }
+    // Down to an inclusive register bound, the destination read-only midway.
+    let down = closed(copy, |a, top| {
+        a.dec(ebx).unwrap();
+        a.cmp(ebx, ebp).unwrap();
+        a.jge(top).unwrap();
+    });
+    let mut r = regs(0, SRC, DST);
+    (r[3], r[5]) = (3000, 7);
+    differential("down", &down, r, all, 1 << 30);
+    differential("down-sliced", &down, r, all, 41);
+    let readonly = |m: &mut Executor| m.protect(DST + 0x1000, 4096, READ).unwrap();
+    differential("down-fault", &down, r, readonly, 1 << 30);
+    // Pointer bounds: an end pointer met exactly, and one stepped past,
+    // which runs on until the source ends.
+    let pointers = closed(
+        |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        },
+        |a, top| {
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.cmp(esi, edx).unwrap();
+            a.jne(top).unwrap();
+        },
+    );
+    for (name, end) in [
+        ("end", SRC + 4 * 3001),
+        ("end-one", SRC + 4),
+        ("end-missed", SRC + 4 * 3001 + 2),
+    ] {
+        let mut r = regs(0, SRC, DST + 0x8000);
+        r[2] = end;
+        differential(name, &pointers, r, all, 1 << 30);
+        differential(name, &pointers, r, all, 43);
+    }
+    // A negative index stepping up to zero, and a positive one down past it:
+    // an MMX scale with the counter as the address index.
+    let negative = closed(copy, |a, top| {
+        a.add(ebx, 1).unwrap();
+        a.jne(top).unwrap();
+    });
+    for count in [1u32, 2, 3, 3000] {
+        let r = regs(0, SRC + 0x4000, DST + 0x4000);
+        let mut r = r;
+        r[3] = count.wrapping_neg();
+        differential("negative", &negative, r, all, 1 << 30);
+        differential("negative-sliced", &negative, r, all, 31);
+    }
+    let scale = closed(
+        |a| {
+            a.movd(mm1, dword_ptr(esi + ecx)).unwrap();
+            a.punpcklbw(mm1, mm0).unwrap();
+            a.pmullw(mm1, mm5).unwrap();
+            a.psrlw(mm1, 8).unwrap();
+            a.packuswb(mm1, mm0).unwrap();
+            a.movd(dword_ptr(edi + ecx), mm1).unwrap();
+        },
+        |a, top| {
+            a.sub(ecx, 4).unwrap();
+            a.jns(top).unwrap();
+        },
+    );
+    for count in [1u32, 2, 3, 4, 3000] {
+        let r = regs(4 * (count - 1), SRC, DST);
+        differential("scale", &scale, r, all, 1 << 30);
+        differential("scale-sliced", &scale, r, all, 29);
+    }
+    let r = regs(4 * 2999, SRC, DST);
+    differential("scale-fault", &scale, r, readonly, 1 << 30);
+    // A signed bound with a side exit, counting from below zero, and a
+    // decrement whose flags the latch tests after a store and through TEST.
+    let search = code(|a| {
+        let mut top = a.create_label();
+        let mut found = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi + ebx * 4 + 0x400)).unwrap();
+        a.cmp(eax, 0x5555_5555).unwrap();
+        a.je(found).unwrap();
+        a.mov(dword_ptr(edi + ebx * 4 + 0x400), eax).unwrap();
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, edx).unwrap();
+        a.jl(top).unwrap();
+        a.set_label(&mut found).unwrap();
+        a.ret().unwrap();
+    });
+    let marker = |m: &mut Executor| {
+        m.write(SRC + 0x400 + 4 * 1000, &0x5555_5555u32.to_le_bytes())
+            .unwrap()
+    };
+    for bound in [-200i32, 40, 3000] {
+        let mut r = regs(0, SRC, DST);
+        (r[3], r[2]) = (-250i32 as u32, bound as u32);
+        differential("search", &search, r, marker, 1 << 30);
+        differential("search-sliced", &search, r, marker, 23);
+    }
+    let late = closed(
+        |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(esi, 4).unwrap();
+        },
+        |a, top| {
+            a.dec(ecx).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.lea(edi, dword_ptr(edi + 4)).unwrap();
+            a.test(ecx, ecx).unwrap();
+            a.jg(top).unwrap();
+        },
+    );
+    for count in [1u32, 2, 3000] {
+        let r = regs(count, SRC, DST);
+        differential("late", &late, r, all, 1 << 30);
+        differential("late-sliced", &late, r, all, 19);
     }
 }
 

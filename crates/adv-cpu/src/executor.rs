@@ -103,6 +103,7 @@ pub enum RunOutcome {
 /// Owns the guest CPU, decoded instructions and native cache. Both executors
 /// access the same state and address space; only this owner publishes links.
 pub struct Executor {
+    rows: Option<Box<crate::rows::RowPool>>,
     parallel: Option<crate::parallel::Pool>,
     parallel_image: Option<(u64, Arc<crate::parallel::Image>)>,
     parallel_stop: Option<crate::parallel::Stop>,
@@ -256,6 +257,31 @@ impl Executor {
         self.timestamp = bridge.timestamp;
         result
     }
+    /// Select helper threads before execution. Zero runs admitted batches inline.
+    pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
+        if self.stats.native_entries != 0 || self.stats.interpreter_entries != 0 {
+            return Err("row workers must be selected before execution".into());
+        }
+        if self.parallel.is_some() {
+            return Err("row batching is disabled with multiple guest workers".into());
+        }
+        self.rows = Some(Box::new(crate::rows::RowPool::new(count)?));
+        Ok(())
+    }
+    /// Disable row batching without changing guest thread scheduling.
+    pub fn disable_row_batching(&mut self) {
+        self.rows = None;
+    }
+    pub fn set_row_threshold(&mut self, work: u64) {
+        if let Some(pool) = &mut self.rows {
+            pool.set_threshold(work);
+        }
+    }
+    pub fn row_parallel_stats(&self) -> crate::RowStats {
+        self.rows
+            .as_ref()
+            .map_or_else(Default::default, |pool| pool.stats())
+    }
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Self::create(Memory::new(base, len)?)
     }
@@ -266,7 +292,16 @@ impl Executor {
     }
 
     fn create(memory: Memory) -> Result<Self, String> {
+        // An optional acceleration must not prevent a guest from starting.
+        let rows = match crate::rows::RowPool::new(crate::rows::RowPool::default_workers()) {
+            Ok(pool) => Some(Box::new(pool)),
+            Err(error) => {
+                eprintln!("warning: row helpers unavailable ({error}); using serial execution");
+                None
+            }
+        };
         Ok(Self {
+            rows,
             parallel: None,
             parallel_image: None,
             parallel_stop: None,
@@ -1291,6 +1326,11 @@ impl Executor {
                     &mut self.memory,
                     bridge,
                     compile::NativeRun {
+                        rows: if self.parallel.is_none() {
+                            self.rows.as_deref()
+                        } else {
+                            None
+                        },
                         links: (self.region_linking && !self.profiling).then_some(&self.code.links),
                         stop,
                         interrupt: if self.host_interrupts {

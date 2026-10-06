@@ -16,6 +16,8 @@ const SOFT_SLICE: Duration = Duration::from_millis(8);
 
 struct Options {
     guest_workers: usize,
+    row_workers: Option<usize>,
+    row_batching: bool,
     exe: PathBuf,
     data_dir: PathBuf,
     jit: bool,
@@ -53,6 +55,8 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --guest-workers 1|2     default: 1; experimental 2 requires Windows x64/Fast\n\
+  --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
+  --no-row-batching       disable proven row batches for comparison\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
@@ -89,6 +93,8 @@ impl Options {
         let mut data_dir = None;
         let mut options = Self {
             guest_workers: 1,
+            row_workers: None,
+            row_batching: true,
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
             jit: true,
@@ -160,6 +166,15 @@ impl Options {
                         return Err("--guest-workers must be 1 or 2".into());
                     }
                 }
+                "--row-workers" => {
+                    let workers: usize =
+                        value()?.parse().map_err(|_| "invalid row worker count")?;
+                    if workers > 64 {
+                        return Err("--row-workers must be between 0 and 64".into());
+                    }
+                    options.row_workers = Some(workers);
+                }
+                "--no-row-batching" => options.row_batching = false,
                 "--compile" => {
                     options.compile_strategy = match value()?.as_str() {
                         "fast" => CompileStrategy::Fast,
@@ -725,7 +740,12 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(path, report).map_err(|e| e.to_string())
+    std::fs::write(path, report).map_err(|e| e.to_string())?;
+    // ADV_LOOP_COVERAGE: the loop table goes beside the report.
+    if let Some(loops) = adv_runtime::loop_coverage() {
+        std::fs::write(path.with_extension("loops.tsv"), loops).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
@@ -934,6 +954,11 @@ fn run_execution(
         .machine
         .cpu
         .set_guest_workers(options.guest_workers)?;
+    if !options.row_batching || !options.jit || options.guest_workers > 1 {
+        runtime.machine.cpu.disable_row_batching();
+    } else if let Some(workers) = options.row_workers {
+        runtime.machine.cpu.set_row_workers(workers)?;
+    }
     if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest {
         use std::io::Read;
         let mut signatures = String::new();

@@ -13,11 +13,14 @@ use iced_x86::{
 
 use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
+pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
 mod loops;
 mod mmx;
+mod nest;
+mod nest_emit;
 // Retain the analysis tests; observable exits cannot discard guest state.
 #[cfg(test)]
 mod register_liveness;
@@ -32,6 +35,7 @@ type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
 /// Borrowed controls for one bounded native entry and its linked regions.
 pub(crate) struct NativeRun<'a> {
+    pub rows: Option<&'a crate::rows::RowPool>,
     pub links: Option<&'a Table>,
     pub stop: u32,
     pub interrupt: &'a std::sync::atomic::AtomicBool,
@@ -59,6 +63,7 @@ pub(crate) struct Compiled {
     pub code_size: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
+    _nests: Box<[crate::rows::Descriptor]>,
     /// Owner-side recency sampled at Rust entries, never read by generated code.
     // Controller-only metadata; native descriptors never reference this cell.
     pub cache_stamp: std::cell::Cell<u64>,
@@ -130,6 +135,10 @@ impl Compiled {
         let (slots, mask) = controls.links.map_or((std::ptr::null(), 0), Table::parts);
         let mut context = NativeContext {
             state,
+            rows: controls
+                .rows
+                .map_or(std::ptr::null(), |pool| pool as *const _),
+            written: 0,
             perms: memory.perms.as_ptr(),
             bridge: (bridge as *mut crate::trap::Bridge<'_>).cast(),
             interrupt: controls.interrupt,
@@ -586,24 +595,54 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let versioned = fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let versioned = true;
-    let plans = if versioned {
-        loops::plans(&instructions, &entries, |i| {
+    let (mut plans, mut rejected) = if versioned {
+        loops::survey(&instructions, &entries, |i| {
             supported(i)
                 && crate::strings::operation(i).is_none()
                 && !matches!(i.mnemonic(), M::Int | M::Rdtsc)
         })
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    // A memory bound is stable only while this guest thread owns execution.
+    // Another guest worker may change it even if this loop never does.
+    if snapshot.parallel {
+        plans.retain(|plan| {
+            if matches!(plan.bound, loops::Bound::Memory(_)) {
+                rejected.push(loops::Rejected {
+                    header: plan.header,
+                    latch: plan.latch,
+                    reason: "shared execution memory bound".into(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+    }
     // A kernel leaves at an access its windows reject; the region resumes
     // the loop's checked code there.
     for plan in &plans {
         entries.extend(plan.windows.iter().map(|&(pc, _)| pc));
     }
-    let batches: Vec<_> = plans
+    let nests = if snapshot.parallel || plans.is_empty() {
+        Vec::new()
+    } else {
+        nest::nests(&instructions, &entries, &plans)
+    };
+    let analyzed: Vec<_> = plans
         .iter()
         .map(|plan| vector::batch(plan, &instructions))
         .collect();
+    let batches: Vec<_> = analyzed
+        .iter()
+        .map(|batch| batch.as_ref().ok().cloned())
+        .collect();
+    let coverage = if coverage::enabled() {
+        coverage::record(region.start, &instructions, &plans, &rejected, &analyzed)
+    } else {
+        BTreeMap::new()
+    };
     #[cfg(test)]
     let vectorized_loops = batches.iter().flatten().count();
     #[cfg(test)]
@@ -650,6 +689,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         crate::atomic_memory::load_vector as *const u8,
     );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
+    builder.symbol("adv_nest_run", crate::rows::run as *const u8);
     builder.symbol(
         "adv_read_timestamp",
         crate::trap::read_timestamp as *const u8,
@@ -782,6 +822,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let source_map = diagnostics::instruction_map_enabled();
+    let mut nest_signature = module.make_signature();
+    nest_signature.params.extend([AbiParam::new(ptr_ty); 4]);
+    nest_signature.returns.push(AbiParam::new(types::I32));
+    let nest_id = module
+        .declare_function("adv_nest_run", Linkage::Import, &nest_signature)
+        .map_err(|e| e.to_string())?;
     // Builds the region function, or with `kernel` the separate function for
     // that versioned loop's clone. `kernels` holds each loop's finalized kernel
     // address for the region to call.
@@ -794,7 +840,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     func: &mut ir::Function,
                     fb_ctx: &mut FunctionBuilderContext,
                     kernel: Option<usize>,
-                    kernels: &[usize]| {
+                    kernels: &[usize],
+                    track_writes: bool,
+                    descriptors: &[usize]| {
+        let nest_ref = module.declare_func_in_func(nest_id, func);
         let trap_ref = module.declare_func_in_func(host_id, func);
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
         let x87_ref = module.declare_func_in_func(x87_id, func);
@@ -923,6 +972,34 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         for var in lazy {
             b.def_var(var, zero);
         }
+        let written = track_writes.then(|| {
+            let var = b.declare_var(types::I32);
+            b.def_var(var, zero);
+            var
+        });
+        let row_hooks = if kernel.is_none() {
+            nests
+                .iter()
+                .zip(descriptors)
+                .map(|(nest, &descriptor)| {
+                    let valid = b.declare_var(types::I32);
+                    b.def_var(valid, zero);
+                    let previous = std::array::from_fn(|_| {
+                        let var = b.declare_var(types::I32);
+                        b.def_var(var, zero);
+                        var
+                    });
+                    nest_emit::Hook {
+                        nest: nest.clone(),
+                        descriptor,
+                        valid,
+                        previous,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let fuel = b.declare_var(types::I64);
         for (i, reg) in regs.iter().enumerate() {
             let v = b
@@ -1045,6 +1122,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         });
         let mut e = Emitter {
             b,
+            row_hooks,
+            nest_ref,
+            written,
             regs,
             xmm,
             mmx,
@@ -1072,6 +1152,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             kernels: kernels.to_vec(),
             batches: batches.clone(),
             lanes: None,
+            coverage: coverage.clone(),
             range_ok_ref,
             site: None,
             unchanged: 0,
@@ -1180,6 +1261,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Budget));
             e.begin_mmx_block();
+            if e.written.is_some()
+                && let Some(index) = fast
+            {
+                let mask = nest_emit::block_writes(&instructions, start, &e.plans[index].starts);
+                e.record_writes(mask);
+            }
             let budget = e.b.use_var(e.fuel);
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             if start == region.start && fast.is_none() && fault_pc.is_some() {
@@ -1263,6 +1350,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // individual guest block's recipe dominates this block.
         e.mmx_effects = None;
         e.b.switch_to_block(dispatch);
+        e.reset_rows();
         let target = e.b.block_params(dispatch)[0];
         let prediction = shadow_ref.map(|_| e.b.block_params(dispatch)[1]);
         // Atomic rather than readonly/trusted ordinary data: this flag can
@@ -1290,6 +1378,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let reason = e.b.block_params(shared_exit)[0];
         let pc = e.b.block_params(shared_exit)[1];
         e.save_state(pc);
+        if let Some(written) = e.written {
+            let value = e.b.use_var(written);
+            e.b.ins().store(
+                MemFlags::trusted(),
+                value,
+                e.context,
+                offset_of!(NativeContext, written) as i32,
+            );
+        }
         if hot_exits || kernel.is_some() {
             e.b.ins().return_(&[reason]);
         } else {
@@ -1357,7 +1454,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // Kernels are finalized first: the region calls their absolute addresses,
     // since JIT allocations need not stay within a rel32 reach of each other.
     let mut kernel_functions = Vec::new();
-    for index in 0..plans.len() {
+    let mut kernel_locations = Vec::new();
+    let jobs: Vec<_> = (0..plans.len())
+        .flat_map(|index| {
+            std::iter::once((index, false)).chain(
+                nests
+                    .iter()
+                    .any(|nest| nest.inner == index)
+                    .then_some((index, true)),
+            )
+        })
+        .collect();
+    for (index, row) in jobs {
         let mut kernel_ctx = module.make_context();
         if dump_dir.is_some() {
             kernel_ctx.set_disasm(true);
@@ -1369,10 +1477,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             &mut fb_ctx,
             Some(index),
             &[],
+            row,
+            &[],
         );
         let kernel_id = module
             .declare_function(
-                &format!("guest_kernel_{index}"),
+                &format!("guest_kernel_{index}_row_{row}"),
                 Linkage::Local,
                 &tail_signature,
             )
@@ -1382,7 +1492,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         module
             .define_function(kernel_id, &mut kernel_ctx)
             .map_err(|e| format!("{e:?}"))?;
-        let name = format!("region-{:08x}.kernel-{index}", region.start);
+        let name = if row {
+            format!("region-{:08x}.row-kernel-{index}", region.start)
+        } else {
+            format!("region-{:08x}.kernel-{index}", region.start)
+        };
         dump(&dump_dir, &name, &kernel_ctx)?;
         #[cfg(feature = "cross-dump")]
         if let (Some(directory), Some(function)) = (&dump_dir, cross) {
@@ -1394,15 +1508,56 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .map_err(|e| e.to_string())?;
         }
         kernel_functions.push((kernel_id, kernel_ctx));
+        kernel_locations.push((index, row));
     }
+    let row_thunk = if nests.is_empty() {
+        None
+    } else {
+        let result = nest_emit::thunk(&mut module, &mut fb_ctx, &tail_signature)?;
+        let id = result.0;
+        kernel_functions.push(result);
+        Some(id)
+    };
     if !kernel_functions.is_empty() {
         module.finalize_definitions().map_err(|e| e.to_string())?;
     }
-    let kernels: Vec<usize> = kernel_functions
+    let mut kernels = vec![0; plans.len()];
+    let mut row_kernels = vec![0; plans.len()];
+    for (&(index, row), &(id, _)) in kernel_locations.iter().zip(&kernel_functions) {
+        let address = module.get_finalized_function(id) as usize;
+        if row {
+            row_kernels[index] = address;
+        } else {
+            kernels[index] = address;
+        }
+    }
+    let thunk = row_thunk.map_or(0, |id| module.get_finalized_function(id) as usize);
+    let descriptors: Box<[_]> = nests
         .iter()
-        .map(|&(id, _)| module.get_finalized_function(id) as usize)
+        .map(|nest| {
+            nest_emit::descriptor(
+                nest,
+                &plans[nest.inner],
+                snapshot.base,
+                snapshot.len,
+                thunk,
+                row_kernels[nest.inner],
+            )
+        })
         .collect();
-    emit(&mut module, &mut ctx.func, &mut fb_ctx, None, &kernels);
+    let addresses: Vec<_> = descriptors
+        .iter()
+        .map(|desc| desc as *const _ as usize)
+        .collect();
+    emit(
+        &mut module,
+        &mut ctx.func,
+        &mut fb_ctx,
+        None,
+        &kernels,
+        false,
+        &addresses,
+    );
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
     #[cfg(feature = "cross-dump")]
@@ -1607,6 +1762,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         entries,
         code_size,
         _x87: x87,
+        _nests: descriptors,
         cache_stamp: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
@@ -1763,6 +1919,107 @@ mod tests {
         let compiled = compile(&region, machine.memory(), false).unwrap();
         assert_eq!(compiled.versioned_loops, 1);
         assert_eq!(compiled.vectorized_loops, 1);
+    }
+
+    #[test]
+    fn memory_bound_kernels_require_single_guest_execution() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.inc(ecx).unwrap();
+        a.cmp(ecx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &bytes).unwrap();
+        let region = Region::new(0x10000, bytes.len());
+        let mut snapshot = Snapshot::capture(&region, &memory).unwrap();
+        let serial = compile_snapshot(&snapshot).unwrap();
+        assert_eq!(serial.versioned_loops, 1);
+        assert_eq!(serial.vectorized_loops, 0);
+        snapshot.parallel = true;
+        let parallel = compile_snapshot(&snapshot).unwrap();
+        assert_eq!(parallel.versioned_loops, 0);
+    }
+
+    #[test]
+    fn loop_coverage_counts_iterations_by_outcome() {
+        const CODE: u32 = 0x5_0000;
+        const STOP: u32 = 0x5_1000;
+        const STACK: u32 = 0x5_2f00;
+        const SRC: u32 = 0x6_0000;
+        const DST: u32 = 0x7_0000;
+        coverage::testing::FORCE.set(true);
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut copy = a.create_label();
+        let mut count = a.create_label();
+        a.mov(ecx, 100).unwrap();
+        a.set_label(&mut copy).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(copy).unwrap();
+        a.xor(edx, edx).unwrap();
+        a.set_label(&mut count).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, 50).unwrap();
+        a.jl(count).unwrap();
+        // Halves 200 pixels from the last down, stepping the index past zero.
+        let mut scale = a.create_label();
+        a.pxor(mm0, mm0).unwrap();
+        a.mov(ecx, 4 * 199).unwrap();
+        a.set_label(&mut scale).unwrap();
+        a.movd(mm1, dword_ptr(esi + ecx)).unwrap();
+        a.punpcklbw(mm1, mm0).unwrap();
+        a.psrlw(mm1, 1).unwrap();
+        a.packuswb(mm1, mm0).unwrap();
+        a.movd(dword_ptr(edi + ecx), mm1).unwrap();
+        a.sub(ecx, 4).unwrap();
+        a.jns(scale).unwrap();
+        a.emms().unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(u64::from(CODE)).unwrap();
+        let mut machine = crate::Executor::new(CODE, 0x3_0000).unwrap();
+        machine.protect(CODE, 0x3_0000, READ | WRITE).unwrap();
+        machine.write(CODE, &bytes).unwrap();
+        machine.protect(CODE, 4096, READ | EXEC).unwrap();
+        machine.protect(STOP, 4096, READ | EXEC).unwrap();
+        machine.write(STACK, &STOP.to_le_bytes()).unwrap();
+        machine.add_region(Region::new(CODE, bytes.len())).unwrap();
+        machine.state.eip = CODE;
+        machine.state.regs[4] = STACK;
+        machine.state.regs[6] = SRC;
+        machine.state.regs[7] = DST;
+        assert_eq!(
+            machine.run(STOP, 1 << 30).unwrap(),
+            crate::RunOutcome::ReachedStop
+        );
+        let report = coverage::report().unwrap();
+        coverage::testing::FORCE.set(false);
+        let row = |outcome: &str| -> Vec<u64> {
+            let line = report
+                .lines()
+                .find(|line| line.starts_with("0x00050000") && line.contains(outcome))
+                .unwrap_or_else(|| panic!("{outcome} in {report}"));
+            let fields: Vec<&str> = line.split('\t').collect();
+            fields[6..10].iter().map(|n| n.parse().unwrap()).collect()
+        };
+        // One checked back edge proves the copy; its kernel runs the rest.
+        let copied = row("\tkernel copy\t");
+        assert_eq!(copied[0] + copied[1], 100, "{report}");
+        assert_eq!(copied[2], 1);
+        assert_eq!(row("\trejected: nothing proven\t"), [49, 0, 0, 0]);
+        let scaled = row("\tkernel batch\t");
+        assert_eq!(scaled[0] + scaled[1], 200, "{report}");
+        assert_eq!(scaled[2], 1);
     }
 
     #[test]
@@ -2004,6 +2261,9 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
+    row_hooks: Vec<nest_emit::Hook>,
+    nest_ref: ir::FuncRef,
+    written: Option<Variable>,
     b: FunctionBuilder<'a>,
     regs: [Variable; 8],
     xmm: [Option<Variable>; 8],
@@ -2041,6 +2301,8 @@ struct Emitter<'a> {
     /// Each loop's batch form, and in its kernel the batch being emitted.
     batches: Vec<Option<vector::Batch>>,
     lanes: Option<vector::Lanes>,
+    /// With loop coverage on, each loop's counters by header and latch.
+    coverage: BTreeMap<(u32, u32), usize>,
     range_ok_ref: ir::FuncRef,
     /// The current instruction's operand address and size once a kernel
     /// validated its windows (`precheck`).
@@ -2706,6 +2968,9 @@ impl Emitter<'_> {
         self.b.seal_block(ok);
     }
     fn direct(&mut self, pc: u32) {
+        if self.row_edge(pc) {
+            return;
+        }
         if let Some(index) = self.fast
             && self.plans[index].header == pc
             && self.plans[index].latch == self.pc
@@ -2720,6 +2985,11 @@ impl Emitter<'_> {
             if pc <= self.pc {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
+                if self.kernel.is_none()
+                    && let Some(&counters) = self.coverage.get(&(pc, self.pc))
+                {
+                    self.count_one(counters, offset_of!(coverage::Counters, checked));
+                }
             }
             self.flush_mmx_effects();
             let versioned = self
@@ -2798,7 +3068,7 @@ impl Emitter<'_> {
         let (index, ..) = self.kernel?;
         self.fast?;
         let plan = &self.plans[index];
-        (plan.counter_size == 2 && i.next_ip32() == plan.latch).then_some(plan.counter)
+        (plan.counter_size == 2 && i.ip32() == plan.counter_step).then_some(plan.counter)
     }
     /// The iteration count in a counter register's value of `size` bytes.
     fn counter_value(&mut self, size: u32, value: Value) -> Value {
@@ -2806,6 +3076,57 @@ impl Emitter<'_> {
             self.b.ins().band_imm(value, 0xffff)
         } else {
             value
+        }
+    }
+    /// How far loop `index`'s counter moves from `from` to reach `to`.
+    pub(super) fn counter_distance(&mut self, index: usize, from: Value, to: Value) -> Value {
+        let plan = &self.plans[index];
+        let (size, step) = (plan.counter_size, plan.steps[plan.counter]);
+        let distance = if step > 0 {
+            self.b.ins().isub(to, from)
+        } else {
+            self.b.ins().isub(from, to)
+        };
+        self.counter_value(size, distance)
+    }
+    /// The counter steps from `from` to `to`, a value it reaches by them.
+    pub(super) fn counter_steps(&mut self, index: usize, from: Value, to: Value) -> Value {
+        let magnitude = self.plans[index].steps[self.plans[index].counter].abs();
+        let distance = self.counter_distance(index, from, to);
+        if magnitude == 1 {
+            distance
+        } else {
+            self.b.ins().udiv_imm(distance, magnitude)
+        }
+    }
+    /// The iterations loop `index` has left, as an `I64`, when its latch
+    /// branches back: the counter's steps to its bound, rounded up, and one
+    /// more for an inclusive bound.
+    pub(super) fn remaining(&mut self, index: usize) -> Value {
+        let plan = &self.plans[index];
+        let (counter, bound, inclusive) = (plan.counter, plan.bound, plan.inclusive);
+        let magnitude = plan.steps[counter].abs();
+        let count = self.b.use_var(self.regs[counter]);
+        let bound = match bound {
+            loops::Bound::Constant(value) => self.constant(value),
+            loops::Bound::Register(register) => self.b.use_var(self.regs[register]),
+            loops::Bound::Memory(operand) => {
+                // enter_clone checked these exact bytes before the proof can
+                // read them. The proof excludes every loop write; kernel
+                // entry sees the same bound with no intervening guest call.
+                let address = self.bound_address(operand);
+                let address = self.proven_address(address);
+                self.b.ins().load(types::I32, MemFlags::new(), address, 0)
+            }
+        };
+        let distance = self.counter_distance(index, count, bound);
+        let distance = self.b.ins().uextend(types::I64, distance);
+        let bias = if inclusive { magnitude } else { magnitude - 1 };
+        let distance = self.b.ins().iadd_imm(distance, bias);
+        if magnitude == 1 {
+            distance
+        } else {
+            self.b.ins().udiv_imm(distance, magnitude)
         }
     }
     /// A kernel's fuel when it leaves at `pc`: every iteration its counter
@@ -2816,19 +3137,18 @@ impl Emitter<'_> {
             return;
         };
         let plan = &self.plans[index];
-        let (header, latch) = (plan.header, plan.latch);
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let (header, step) = (plan.header, plan.counter_step);
+        let counter = plan.counter;
         let blocks = plan.starts.len() as i64;
         let fuel = self.b.ins().stack_load(types::I64, entry, 0);
         let first = self.b.ins().stack_load(types::I32, entry, 8);
         let count = self.b.use_var(self.regs[counter]);
-        let done = self.b.ins().isub(first, count);
-        let done = self.counter_value(counter_size, done);
+        let done = self.counter_steps(index, first, count);
         let mut done = self.b.ins().uextend(types::I64, done);
-        // Before the counter's decrement, right ahead of the latch.
+        // Inside an iteration, up to the counter's step.
         match self.known(pc) {
             Some(pc) => {
-                if header < pc && pc < latch {
+                if header < pc && pc <= step {
                     done = self.b.ins().iadd_imm(done, 1);
                 }
             }
@@ -2837,11 +3157,14 @@ impl Emitter<'_> {
                 let inside = self.b.ins().icmp_imm(
                     IntCC::UnsignedLessThan,
                     relative,
-                    i64::from(latch - header - 1),
+                    i64::from(step - header),
                 );
                 let inside = self.b.ins().uextend(types::I64, inside);
                 done = self.b.ins().iadd(done, inside);
             }
+        }
+        if let Some(counters) = self.plan_counters(index) {
+            self.count(counters, offset_of!(coverage::Counters, kernel), done);
         }
         let charge = self.b.ins().imul_imm(done, blocks);
         let fuel = self.b.ins().isub(fuel, charge);
@@ -2872,15 +3195,37 @@ impl Emitter<'_> {
         let prove = self.b.create_block();
         self.b.ins().brif(funded, prove, &[], checked, &[]);
         self.b.switch_to_block(prove);
-        let proven = self.loop_proof(index);
         let failed = self.b.create_block();
         self.b.set_cold_block(failed);
+        if let loops::Bound::Memory(operand) = self.plans[index].bound {
+            // Failure is a refusal to optimize, not an early guest fault.
+            // The checked loop must still commit its prefix before CMP faults.
+            let address = self.bound_address(operand);
+            let address = self.b.ins().uextend(types::I64, address);
+            let start = self.b.ins().iadd_imm(address, -i64::from(self.base));
+            let end = self.b.ins().iadd_imm(start, 4);
+            let len = self.b.ins().iconst(types::I64, self.len as i64);
+            let required = self.constant(u32::from(READ));
+            let forbidden = self.constant(u32::from(crate::memory::SHARED));
+            let call = self.b.ins().call(
+                self.range_ok_ref,
+                &[self.perms, start, end, len, required, forbidden],
+            );
+            let valid = self.b.inst_results(call)[0];
+            let readable = self.b.create_block();
+            self.b.ins().brif(valid, readable, &[], failed, &[]);
+            self.b.switch_to_block(readable);
+        }
+        let proven = self.loop_proof(index);
         let load = self.b.create_block();
         self.b.ins().brif(proven, load, &[], failed, &[]);
         self.b.switch_to_block(load);
         self.b.seal_block(load);
         self.call_kernel(index);
         self.b.switch_to_block(failed);
+        if let Some(counters) = self.plan_counters(index) {
+            self.count_one(counters, offset_of!(coverage::Counters, failures));
+        }
         let wait = self.constant(COOLDOWN);
         self.b.def_var(cooldown, wait);
         self.b.ins().jump(checked, &[]);
@@ -2922,6 +3267,19 @@ impl Emitter<'_> {
         );
         // A kernel that stopped inside its loop met memory its windows
         // reject; the checked loop runs a while before the next call.
+        if let Some(exit) = self
+            .row_hooks
+            .iter()
+            .find(|hook| hook.nest.inner == index)
+            .map(|hook| hook.nest.exit)
+        {
+            if let Some(&block) = self.blocks.get(&exit) {
+                let same = self.b.ins().icmp_imm(IntCC::Equal, pc, i64::from(exit));
+                let other = self.b.create_block();
+                self.b.ins().brif(same, block, &[], other, &[]);
+                self.b.switch_to_block(other);
+            }
+        }
         let (first, last) = (self.plans[index].header, self.plans[index].latch);
         let inside = self.b.ins().iadd_imm(pc, -i64::from(first) - 1);
         let inside =
@@ -2946,8 +3304,13 @@ impl Emitter<'_> {
     /// A kernel's entry: the region proved the loop and saved the state at
     /// its header. Forwarded slots start from memory; windows start empty.
     fn enter_kernel(&mut self, index: usize) {
+        // Count at the actual entry, including row-pool calls which bypass
+        // the region's ordinary call_kernel path. These are atomic counters.
+        if let Some(counters) = self.plan_counters(index) {
+            self.count_one(counters, offset_of!(coverage::Counters, calls));
+        }
         let plan = &self.plans[index];
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let (counter, step) = (plan.counter, plan.steps[plan.counter]);
         let blocks = plan.starts.len() as i64;
         // The fuel pays for whole iterations: the loop stops early when the
         // counter reaches `stop` and charges what ran when it leaves.
@@ -2960,17 +3323,19 @@ impl Emitter<'_> {
         ));
         self.b.ins().stack_store(fuel, entry, 0);
         self.b.ins().stack_store(first, entry, 8);
-        let count = self.counter_value(counter_size, first);
-        let count = self.b.ins().uextend(types::I64, count);
+        let count = self.remaining(index);
         let affordable = self.b.ins().udiv_imm(fuel, blocks);
         let limit = self.b.ins().umin(affordable, count);
-        let stop = self.b.ins().isub(count, limit);
-        let mut stop = self.b.ins().ireduce(types::I32, stop);
-        if counter_size == 2 {
-            // The high half never changes (`counting`): compare whole registers.
-            let high = self.b.ins().band_imm(first, 0xffff_0000);
-            stop = self.b.ins().bor(high, stop);
-        }
+        // Fewer steps than wrap the counter: it meets `stop` only there. A
+        // 16-bit counter's high half never changes (`counting`).
+        let most = self
+            .b
+            .ins()
+            .iconst(types::I64, u32::MAX as i64 / step.abs());
+        let limit = self.b.ins().umin(limit, most);
+        let limit = self.b.ins().ireduce(types::I32, limit);
+        let advance = self.b.ins().imul_imm(limit, step);
+        let stop = self.b.ins().iadd(first, advance);
         let stop_var = self.b.declare_var(types::I32);
         self.b.def_var(stop_var, stop);
         self.kernel = Some((index, stop_var, entry));
@@ -3000,23 +3365,29 @@ impl Emitter<'_> {
         self.begin_lanes(index);
         self.resume_clone(index);
     }
+    /// The bound's exact x86 effective address, including 32-bit wrapping.
+    fn bound_address(&mut self, operand: loops::Operand) -> Value {
+        let mut address = self.constant(operand.displacement as u32);
+        if let Some(base) = operand.base {
+            let base = self.b.use_var(self.regs[base]);
+            address = self.b.ins().iadd(address, base);
+        }
+        if let Some((index, scale)) = operand.index {
+            let index = self.b.use_var(self.regs[index]);
+            let index = self.b.ins().imul_imm(index, i64::from(scale));
+            address = self.b.ins().iadd(address, index);
+        }
+        address
+    }
     /// Whether every group of loop `index` stays in ordinary memory for the
-    /// iterations left when its latch branches back: the counter, already
-    /// decremented and nonzero, is that count.
+    /// iterations left when its latch branches back, at least one.
     fn loop_proof(&mut self, index: usize) -> Value {
-        let plan = &self.plans[index];
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
-        let groups = plan.groups.clone();
-        let count = self.b.use_var(self.regs[counter]);
-        let count = if counter_size == 2 {
-            self.b.ins().band_imm(count, 0xffff)
-        } else {
-            count
-        };
-        let count = self.b.ins().uextend(types::I64, count);
+        let groups = self.plans[index].groups.clone();
+        let count = self.remaining(index);
         let more = self.b.ins().iadd_imm(count, -1);
         let len = self.b.ins().iconst(types::I64, self.len as i64);
-        let mut ok = self.constant(1);
+        let some = self.b.ins().icmp_imm(IntCC::NotEqual, count, 0);
+        let mut ok = self.b.ins().uextend(types::I32, some);
         for group in groups {
             let mut address = self.constant(0);
             if let Some(base) = group.base {
@@ -3055,6 +3426,31 @@ impl Emitter<'_> {
             );
             let result = self.b.inst_results(call)[0];
             ok = self.b.ins().band(ok, result);
+        }
+        // A speculative trip count is valid only if ALL stores miss its
+        // bound, including stores forwarded through a promoted stack slot.
+        if let loops::Bound::Memory(operand) = self.plans[index].bound {
+            let address = self.bound_address(operand);
+            let start = self.b.ins().uextend(types::I64, address);
+            let end = self.b.ins().iadd_imm(start, 4);
+            let accesses = self.plans[index].accesses.clone();
+            for (_, access, _, write) in accesses {
+                if !write {
+                    continue;
+                }
+                let (write_start, write_end) = self.access_span(&access, more);
+                let below = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, write_end, start);
+                let above = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, end, write_start);
+                let apart = self.b.ins().bor(below, above);
+                let apart = self.b.ins().uextend(types::I32, apart);
+                ok = self.b.ins().band(ok, apart);
+            }
         }
         // Forwarded slots must lie outside every other proven write. Writes
         // through a slot's own base without an index are disjoint by plan.
@@ -3129,6 +3525,13 @@ impl Emitter<'_> {
         let operand = *plan.proven.get(&self.pc)?;
         if size as u32 > operand.width {
             return None;
+        }
+        if matches!(plan.bound, loops::Bound::Memory(bound) if bound == operand) {
+            // The dedicated precheck proves the fully wrapped address, not
+            // a signed displacement from an unwrapped host base. In
+            // particular absolute guest addresses above 2 GiB stay positive.
+            let address = self.bound_address(operand);
+            return Some((self.proven_address(address), 0));
         }
         if operand.index.is_none()
             && let Some(frame) = operand.base.and_then(|base| self.frames.get(&base))
