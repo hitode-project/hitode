@@ -255,3 +255,77 @@ fn depth_only_stencil_never_is_ignored_but_real_stencil_and_depth_tests_still_re
         gpu = env.ext.get_mut::<State>().gpu.take().unwrap();
     }
 }
+
+#[test]
+fn untransformed_vertices_cover_d3d9_pixel_centres() {
+    // Identity transforms: a quad spanning screen x 0.25..4.25 covers the D3D9 centres
+    // 1..=4. Host centres sit half a pixel further, so without the offset the GPU
+    // would cover columns 0..=3 and point-sampled scenes would land on texel edges.
+    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software drawing adapter");
+    let mut machine = super::super::tests::machine();
+    let color = gpu.target(16, 12, false).unwrap();
+    gpu.clear_with_stencil(&color, Some([0., 0., 0., 1.]), None, None)
+        .unwrap();
+    machine.ext.insert(StencilTarget(color.clone()));
+    let mut env = Env {
+        context: machine.sys.current,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    let (pointer, owner, _, back) = super::super::tests::setup(&mut env);
+    let factory = device(&env, pointer).unwrap().factory;
+    let factory = com(&env).canonical(&env.sys.objects, factory).unwrap();
+    if let Some(Payload::Resource(r)) = com(&env).get_identity_mut(&mut env.sys.objects, back) {
+        r.surface = Some(1);
+        r.desc.Format = 21;
+        r.desc.Pool = 0;
+        r.desc.Width = 16;
+        r.desc.Height = 12;
+    }
+    if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.scene = true;
+        d.render_target = Some(back);
+    }
+    env.ext.get_mut::<State>().provider.target =
+        |ext, key| (key == 1).then(|| ext.get::<StencilTarget>().0.clone());
+    env.ext.get_mut::<State>().gpu = Some(gpu);
+    let this = GuestPtr::new(pointer);
+    assert_eq!(set_fvf(&mut env, this, 0x42), 0); // XYZ | DIFFUSE
+    assert_eq!(set_render(&mut env, this, 22, 1), 0); // no culling
+    assert_eq!(set_render(&mut env, this, 137, 0), 0); // no lighting
+    let ndc = |x: f32| x / 16. * 2. - 1.;
+    let bytes: Vec<_> = [(0.25f32, 1f32), (4.25, 1.), (0.25, -1.), (4.25, -1.)]
+        .into_iter()
+        .flat_map(|(x, y)| {
+            [ndc(x).to_bits(), y.to_bits(), 0.5f32.to_bits(), 0xffff0000]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+        })
+        .collect();
+    let vertices = alloc(&mut env, bytes.len() as u32).unwrap();
+    env.cpu.write(vertices, &bytes).unwrap();
+    assert!(matches!(
+        draw_up(&mut env, this, 5, 2, GuestPtr::new(vertices), 16),
+        Outcome::Return(0)
+    ));
+    let mut transfer = env
+        .ext
+        .get_mut::<State>()
+        .gpu
+        .as_mut()
+        .unwrap()
+        .readback(&color.image, None)
+        .unwrap();
+    std::thread::spawn(transfer.take_completion_job().unwrap())
+        .join()
+        .unwrap();
+    let pixels = transfer.poll().expect("completed readback").unwrap();
+    let covered: Vec<bool> = (0..16).map(|x| pixels[x * 4 + 2] == 255).collect();
+    let expected: Vec<bool> = (0..16).map(|x| (1..=4).contains(&x)).collect();
+    assert_eq!(covered, expected);
+    free(&mut env, vertices);
+    assert_eq!(release(&mut env, pointer), 0);
+    assert_eq!(release(&mut env, factory), 0);
+}

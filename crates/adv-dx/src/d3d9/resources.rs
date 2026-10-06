@@ -157,7 +157,7 @@ pub(super) fn storage(env: &Env<'_>, r: &Resource) -> Option<u32> {
     }
 }
 pub(super) fn locked(env: &Env<'_>, r: &Resource) -> bool {
-    if dc::leased(env, r) {
+    if dc::leased(env, r) || update_texture::reserved(env, r) {
         return true;
     }
     if let Some(container) = r.container {
@@ -704,7 +704,9 @@ pub(super) fn texture_lock(
     rectangle: GuestPtr<RECT>,
     flags: u32,
 ) -> u32 {
-    if resource(env, this.addr()).is_some_and(|r| dc::leased(env, r)) {
+    if resource(env, this.addr())
+        .is_some_and(|r| dc::leased(env, r) || update_texture::reserved(env, r))
+    {
         return INVALID;
     }
     let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
@@ -807,6 +809,9 @@ pub(super) fn texture_unlock_internal(
     this: GuestPtr<()>,
     level: u32,
 ) -> Outcome {
+    if resource(env, this.addr()).is_some_and(|r| update_texture::reserved(env, r)) {
+        return Outcome::Return(INVALID);
+    }
     let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
         return Outcome::Return(INVALID);
     };

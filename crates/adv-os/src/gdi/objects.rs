@@ -65,6 +65,8 @@ pub enum GdiObj {
         bits: u32,
         stride: u32,
         owned: bool,
+        /// Private shared-memory view retained by a mapped DIB until deletion.
+        mapping_view: Option<u32>,
         /// Number of RGB entries in a DIB's table; zero for DDB/truecolor.
         /// The colors themselves belong to the common device surface.
         dib_colors: u16,

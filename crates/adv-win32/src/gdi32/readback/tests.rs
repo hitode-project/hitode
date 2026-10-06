@@ -97,6 +97,7 @@ fn fixture(dib: bool, bottom_up: bool) -> (Machine<JitCpu>, u32, u32) {
                 bits: s.pixels,
                 stride: 8,
                 owned: false,
+                mapping_view: None,
                 dib_colors: 0
             }
         ));

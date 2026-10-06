@@ -279,7 +279,11 @@ public static class AbiMetadata
             bool ntClose = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwClose"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "Handle:Windows.Win32.Foundation.HANDLE:handle:1";
-            if ((!vcm && !d3dx && !d3dxEffect && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose) || f[2] != "stdcall")
+            // Legacy desktop declaration plus the SDK's _EnableEUDC@4 import.
+            bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
+                && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
+                && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
+            if ((!vcm && !d3dx && !d3dxEffect && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" => 4, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };

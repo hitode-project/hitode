@@ -240,8 +240,8 @@ fn gs_stays_outside_the_flat_profile_and_lock_is_invalid() {
 }
 
 #[test]
-fn native_fallback_bridge_commits_xlat_before_resuming_native_code() {
-    // Native MOV EAX, imm; XLAT fallback; native MOV ECX, EAX.
+fn native_xlat_reads_the_table_between_native_instructions() {
+    // MOV EAX, imm; XLAT; MOV ECX, EAX, all native.
     let code = [0xb8, 0xff, 0x56, 0x34, 0x12, 0xd7, 0x89, 0xc1];
     let mut executor = Executor::new(0, LENGTH).unwrap();
     executor.protect(0, LENGTH, READ | WRITE).unwrap();
@@ -259,6 +259,6 @@ fn native_fallback_bridge_commits_xlat_before_resuming_native_code() {
     assert_eq!(executor.state.regs[0], 0x1234_56a9);
     assert_eq!(executor.state.regs[1], 0x1234_56a9);
     assert_eq!(executor.state.eflags, 0xed7);
-    assert!(executor.stats.native_entries >= 2);
-    assert_eq!(executor.stats.interpreter_instructions, 1);
+    assert!(executor.stats.native_entries >= 1);
+    assert_eq!(executor.stats.interpreter_instructions, 0);
 }

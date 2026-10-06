@@ -108,5 +108,17 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreateeffect",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetshaderoutputsemantics"
     ]
+  },
+  "legacy_eudc": {
+    "scope": "gdi32.dll!EnableEUDC only; no EUDC font-link exports are projected",
+    "source": "Microsoft Learn desktop and legacy EnableEUDC BOOL declaration, corroborated by Microsoft Windows SDK 10.0.26100.0 x86 gdi32.lib",
+    "sdk_library_sha256": "9455e9bd270bdfe2d159ae0750241c20c07e94b8962db91f18e24af0cf3ac30d",
+    "oracle_dll_sha256": "7c3cb17bc41a00e5167a82aef67d0da4a09e73e6deba9addcdc8b20a90b5186c",
+    "target": "x86 __stdcall, signed 32-bit BOOL input and return; SDK imports _EnableEUDC@4 / __imp__EnableEUDC@4",
+    "native_verification": "Installed Microsoft x86 gdi32.dll exports EnableEUDC; authored interpreter/JIT/Unicorn callers verify one stack word and BOOL return. Native EUDC session state is not modified by the fixture.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/gdi/enableeudc",
+      "https://learn.microsoft.com/en-us/previous-versions/windows/embedded/ms901122(v=msdn.10)"
+    ]
   }
 }

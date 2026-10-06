@@ -9,6 +9,7 @@ use adv_machine::{Env, Outcome};
 use crate::Win32;
 
 pub mod font;
+mod batch;
 mod palette;
 mod pen;
 mod readback;
@@ -397,6 +398,7 @@ fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u
             bits,
             stride,
             owned: true,
+            mapping_view: None,
             dib_colors: 0,
         },
     );
@@ -893,6 +895,7 @@ fn create_di_bitmap(
 }
 
 pub fn register(reg: &mut Registry) {
+    batch::register(reg);
     palette::register(reg);
     pen::register(reg);
     readback::register(reg);

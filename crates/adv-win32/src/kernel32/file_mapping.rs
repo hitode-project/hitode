@@ -525,6 +525,37 @@ pub(crate) fn map_section(
     Outcome::Return(address)
 }
 
+/// DIBs use DWORD offsets inside a private view of the same shared section.
+/// The mapping owner already retains the section after its handle is closed.
+pub(crate) fn map_dib_section(
+    env: &mut Env<'_>,
+    handle: u32,
+    offset: u32,
+    bytes: u32,
+) -> Result<(u32, u32), u32> {
+    if offset & 3 != 0 || bytes == 0 {
+        return Err(87);
+    }
+    let protection = env
+        .sys
+        .objects
+        .host::<SectionHandle>(handle)
+        .ok_or(6u32)?
+        .section
+        .protection;
+    let access = match protection {
+        4 => WRITE,
+        8 => COPY,
+        _ => return Err(87),
+    };
+    let aligned = u64::from(offset) / GRANULE * GRANULE;
+    let delta = u64::from(offset) - aligned;
+    match map_section(env, handle, access, aligned, u64::from(bytes) + delta, 0) {
+        Outcome::Return(0) => Err(crate::util::last_error(env)),
+        Outcome::Return(base) => Ok((base, base + delta as u32)),
+        _ => unreachable!("mapping a data section is synchronous"),
+    }
+}
 fn flush(env: &mut Env<'_>) -> Outcome {
     let (address, count) = (env.arg(0), env.arg(1));
     let Some((&base, view)) = state(env).views.range(..=address).next_back() else {
@@ -595,6 +626,7 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
         Object::Event { .. } => 1,
         Object::Mutex { .. } => 2,
         Object::Semaphore { .. } => 3,
+        Object::Timer { .. } => 4,
         _ => unreachable!(),
     };
     if let Some(name) = &name {
@@ -641,6 +673,16 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
 
 /// Open an existing process-owned mutex through the same namespace as Create.
 pub(super) fn open_mutex(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
+    open_sync(env, pointer, wide, 2, 0x001f0001)
+}
+
+pub(super) fn open_sync(
+    env: &mut Env<'_>,
+    pointer: u32,
+    wide: bool,
+    kind: u32,
+    full_access: u32,
+) -> Outcome {
     if pointer == 0 {
         return fail(env, 87);
     }
@@ -652,13 +694,27 @@ pub(super) fn open_mutex(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome
     };
     prune(env);
     let identity = match state(env).names.get(&name) {
-        Some(Named::Sync { identity, kind: 2 }) => *identity,
+        Some(Named::Sync {
+            identity,
+            kind: existing,
+        }) if *existing == kind => *identity,
         Some(_) => return fail(env, 6),
         None => return fail(env, 2),
     };
     // Kernel aliases currently carry full access and do not implement process
     // inheritance. Do not silently broaden a restricted access request.
-    if !matches!(env.arg(0), 0x001f0001 | 0x10000000) || env.arg(1) != 0 {
+    if (env.arg(0) != full_access && env.arg(0) != 0x10000000) || env.arg(1) != 0 {
+        if kind == 4 {
+            adv_abi::warn_unavailable(
+                env,
+                if wide {
+                    "OpenWaitableTimerW"
+                } else {
+                    "OpenWaitableTimerA"
+                },
+                "restricted access and inherited timer handles are not modeled",
+            );
+        }
         return fail(env, 50);
     }
     match env.sys.objects.alias_identity(identity) {

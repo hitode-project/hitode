@@ -166,6 +166,9 @@ fn general_supported(i: &Instruction) -> bool {
         )
     };
     let count = i.op_count();
+    if i.has_lock_prefix() {
+        return false;
+    }
     match i.mnemonic() {
         M::Nop => true,
         M::Mov | M::Add | M::Sub | M::And | M::Or | M::Xor | M::Cmp | M::Test => {

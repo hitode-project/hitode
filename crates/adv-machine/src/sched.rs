@@ -186,13 +186,19 @@ impl Context {
     }
 }
 
-/// A kernel object. The scheduler waits on the first four; everything else a higher layer
-/// keeps behind a handle (files, enumerations, sections, ...) is a [`Object::Host`] payload,
-/// dropped when its last handle closes.
+/// A kernel object. The scheduler waits on synchronization variants; everything
+/// else a higher layer keeps behind a handle (files, enumerations, sections, ...)
+/// is a [`Object::Host`] payload, dropped when its last handle closes.
 pub enum Object {
     Event {
         manual_reset: bool,
         signaled: bool,
+    },
+    Timer {
+        manual_reset: bool,
+        signaled: bool,
+        deadline: Option<u64>,
+        period_us: u64,
     },
     Thread {
         ctx: CtxId,
@@ -221,6 +227,18 @@ impl std::fmt::Debug for Object {
                 .field("signaled", signaled)
                 .finish(),
             Self::Thread { ctx } => f.debug_struct("Thread").field("ctx", ctx).finish(),
+            Self::Timer {
+                manual_reset,
+                signaled,
+                deadline,
+                period_us,
+            } => f
+                .debug_struct("Timer")
+                .field("manual_reset", manual_reset)
+                .field("signaled", signaled)
+                .field("deadline", deadline)
+                .field("period_us", period_us)
+                .finish(),
             Self::Semaphore { count, max } => f
                 .debug_struct("Semaphore")
                 .field("count", count)
@@ -264,10 +282,17 @@ pub(crate) fn poll_object(
             }
             s
         }
-        Some(Object::Event {
-            manual_reset,
-            signaled,
-        }) => {
+        Some(
+            Object::Event {
+                manual_reset,
+                signaled,
+            }
+            | Object::Timer {
+                manual_reset,
+                signaled,
+                ..
+            },
+        ) => {
             let s = *signaled;
             if s && consume && !*manual_reset {
                 *signaled = false;

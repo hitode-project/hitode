@@ -158,7 +158,7 @@ fn interpreted_instruction_returns_without_replaying_native_writes() {
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
         a.inc(dword_ptr(edi)).unwrap();
-        a.bswap(eax).unwrap();
+        a.cwde().unwrap();
         a.add(eax, 1).unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
@@ -391,7 +391,7 @@ fn interpreted_sse_state_survives_native_islands() {
         a.set_label(&mut top).unwrap();
         a.inc(eax).unwrap();
         a.paddd(xmm0, xmmword_ptr(esi)).unwrap();
-        a.bswap(ebx).unwrap();
+        a.cwde().unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
         a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
@@ -418,13 +418,13 @@ fn interpreted_sse_state_survives_native_islands() {
 #[test]
 fn tiny_budget_can_advance_a_cold_entry() {
     let code = assemble(|a| {
-        a.bswap(eax).unwrap();
+        a.cwde().unwrap();
         a.ret().unwrap();
     });
     let mut jit = machine(&code, true);
-    jit.state.regs[0] = 0x12345678;
+    jit.state.regs[0] = 0x1234_8678;
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.state.regs[0], 0x78563412);
+    assert_eq!(jit.state.regs[0], 0xffff_8678);
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::ReachedStop);
 }
 

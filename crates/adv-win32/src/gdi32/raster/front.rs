@@ -8,6 +8,7 @@ use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine, Objects};
 
 mod display;
+mod mapped;
 pub mod surface_dc;
 
 #[derive(Clone, Copy)]
@@ -260,10 +261,6 @@ fn create_dib(
             return fail(env, 87);
         }
     }
-    if section.0 != 0 {
-        let _ = bits.write(env.cpu, 0);
-        return fail(env, 87);
-    }
     let _ = (dc, offset); // An unbacked DIB does not retain its creation DC.
     let provider = env.ext.get::<State>().provider.unwrap();
     let decoded = match super::dib::read(&(provider.memory)(env.cpu), info.addr(), usage) {
@@ -279,6 +276,9 @@ fn create_dib(
     let Some(bytes) = decoded.pitch.checked_mul(decoded.height) else {
         return fail(env, 8);
     };
+    if section.0 != 0 {
+        return mapped::create(env, decoded, bits.addr(), section.0, offset);
+    }
     let usage = env.ext.get::<SurfaceStore>().arena_usage();
     let Some(growth) = env.ext.get::<SurfaceStore>().arena_growth(bytes) else {
         adv_abi::warn_unavailable(
@@ -359,6 +359,9 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
         return Outcome::Return(0); // DCs are retired with DeleteDC/ReleaseDC.
     }
     if available(env) && env.ext.get::<SurfaceStore>().contains(object.0) {
+        if let Some(outcome) = mapped::release(env, object.0) {
+            return outcome;
+        }
         return raster_call(env, |r, s, d, o, m| r.delete_bitmap(s, d, o, m, object.0));
     }
     if env

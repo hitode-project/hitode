@@ -27,6 +27,7 @@ pub(crate) use process::install_parameters;
 mod string;
 mod sync;
 mod time;
+mod timer;
 mod toolhelp;
 pub use time::filetime_now;
 
@@ -49,6 +50,7 @@ pub fn register(reg: &mut Registry) {
     string::register(reg);
     sync::register(reg);
     time::register(reg);
+    timer::register(reg);
     toolhelp::register(reg);
 }
 pub mod unsupported_process;

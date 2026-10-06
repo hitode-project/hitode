@@ -934,6 +934,9 @@ fn prepare_checked(
             for matrix in &f.transforms {
                 p = row(p, matrix);
             }
+            // D3D9 integer pixel centres map to the host's half-integer centres.
+            p[0] += p[3] / f.viewport.Width as f32;
+            p[1] -= p[3] / f.viewport.Height as f32;
         }
         if p.iter().any(|v| !v.is_finite()) {
             return Err(rejected(

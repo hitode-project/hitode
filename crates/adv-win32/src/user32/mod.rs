@@ -426,7 +426,12 @@ fn put_empty(env: &mut Env<'_>, buf: u32, cap: u32) -> Outcome {
 // ---- cursor and keyboard ----
 
 fn set_cursor(env: &mut Env<'_>) -> Outcome {
-    stock_object(env, window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
+    let handle = env.arg(0);
+    if handle != 0 && !user(env).objects.contains(&env.sys.objects, handle) {
+        crate::util::set_last_error(env, 1402); // ERROR_INVALID_CURSOR_HANDLE
+        return Outcome::Return(0);
+    }
+    Outcome::Return(std::mem::replace(&mut user_mut(env).cursor_handle, handle))
 }
 
 fn show_cursor(env: &mut Env<'_>) -> Outcome {
