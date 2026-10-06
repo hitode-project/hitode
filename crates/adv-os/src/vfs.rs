@@ -25,6 +25,8 @@ pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    pub created: Option<SystemTime>,
+    pub accessed: Option<SystemTime>,
     pub modified: Option<SystemTime>,
     /// The same process-owned attribute view queried through Vfs::file_attributes.
     pub attributes: u32,
@@ -302,6 +304,8 @@ impl Vfs {
                         name,
                         is_dir: md.is_dir(),
                         size: md.len(),
+                        created: md.created().ok(),
+                        accessed: md.accessed().ok(),
                         modified: md.modified().ok(),
                         attributes: self.attributes.read(&e.path(), &md).ok()?,
                     },

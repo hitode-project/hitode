@@ -9,6 +9,7 @@ mod cpp_alloc;
 mod data;
 mod directory;
 mod exceptions;
+mod find;
 mod formatting;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
@@ -83,6 +84,7 @@ pub fn register(r: &mut Registry) {
     data::register(r);
     directory::register(r);
     exceptions::register(r);
+    find::register(r);
     formatting::register(r);
     floating::register(r);
     onexit::register(r);
