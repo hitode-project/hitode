@@ -831,6 +831,37 @@ mod tests {
     }
 
     #[test]
+    fn carry_controls_do_not_supply_a_counter_comparison() {
+        for carry in [
+            (|a: &mut CodeAssembler| a.clc().unwrap()) as fn(&mut CodeAssembler),
+            |a| a.stc().unwrap(),
+            |a| a.cmc().unwrap(),
+        ] {
+            for after_counter in [false, true] {
+                let (instructions, entries) = decode(|a| {
+                    let mut top = a.create_label();
+                    a.set_label(&mut top).unwrap();
+                    a.mov(eax, dword_ptr(esi)).unwrap();
+                    a.add(esi, 4).unwrap();
+                    if !after_counter {
+                        carry(a);
+                    }
+                    a.dec(ecx).unwrap();
+                    if after_counter {
+                        carry(a);
+                    }
+                    a.jne(top).unwrap();
+                    a.ret().unwrap();
+                });
+                // A later partial flag writer conservatively rejects the
+                // proof, even though this particular JNE does not read CF.
+                let plans = super::plans(&instructions, &entries, super::super::supported);
+                assert_eq!(plans.len(), usize::from(!after_counter));
+            }
+        }
+    }
+
+    #[test]
     fn copy_loop_groups_source_and_destination() {
         let (instructions, entries) = decode(|a| {
             let mut top = a.create_label();

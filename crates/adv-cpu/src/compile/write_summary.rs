@@ -102,6 +102,14 @@ mod tests {
         assert!(s.flags);
     }
     #[test]
+    fn carry_controls_write_flags_without_clobbering_registers() {
+        for opcode in [0xf8, 0xf9, 0xf5] {
+            let s = summary(&[opcode]).unwrap();
+            assert!(s.flags);
+            assert_eq!((s.gpr, s.xmm), (0, 0));
+        }
+    }
+    #[test]
     fn helpers_and_mmx_aliases_require_full_canonical_state() {
         assert!(summary(&[0xf3, 0xa5]).is_none()); // rep movsd
         assert!(summary(&[0x0f, 0x6f, 0xc1]).is_none()); // movq mm0,mm1

@@ -54,6 +54,43 @@ fn consumer(a: &mut CodeAssembler, form: usize) {
 }
 
 #[test]
+fn carry_controls_preserve_carried_overflow_after_rotate_and_multiply() {
+    for operation in [0, 3] {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.cmp(eax, ebx).unwrap();
+        consumer(&mut a, operation);
+        a.cmc().unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(u64::from(CODE)).unwrap();
+        for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+            let mut jit = machine(&bytes, Some(strategy));
+            let mut reference = machine(&bytes, None);
+            for left in [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
+                for right in [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
+                    for flags in [0x202, 0xad7] {
+                        for m in [&mut jit, &mut reference] {
+                            m.state = CpuState {
+                                regs: [left, 0, 0, right, STACK, 0, left ^ right, 0],
+                                eflags: flags,
+                                eip: CODE,
+                                ..CpuState::default()
+                            };
+                            m.write(STACK, &STOP.to_le_bytes()).unwrap();
+                            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                        }
+                        // MUL's undefined flags follow the interpreter's
+                        // convention, while CMC must preserve all of them.
+                        assert_eq!(jit.state.regs, reference.state.regs);
+                        assert_eq!(jit.state.eflags, reference.state.eflags);
+                    }
+                }
+            }
+            assert_eq!(jit.stats.interpreter_entries, 0);
+        }
+    }
+}
+
+#[test]
 fn undefined_flags_after_shift_rotate_and_multiply_match_the_interpreter() {
     let values = [0, 1, 0x0f, 0x10, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
     for producer_form in 0..7 {
