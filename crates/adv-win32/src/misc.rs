@@ -12,6 +12,7 @@ mod property_sheet;
 mod shell_execute;
 mod shell_icon;
 mod shell_drop;
+mod theme;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
@@ -299,6 +300,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    theme::register(reg);
     internet::register(reg);
     shell_execute::register(reg);
     shell_icon::register(reg);
