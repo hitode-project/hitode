@@ -9,6 +9,7 @@ mod preshader;
 
 type Matrix = [f32; 16];
 type Vector = [f32; 3];
+type Vector4 = [f32; 4];
 
 pub fn register(registry: &mut Registry) {
     for api in [
@@ -16,6 +17,10 @@ pub fn register(registry: &mut Registry) {
         transpose_ABI,
         scaling_ABI,
         translation_ABI,
+        rotation_yaw_pitch_roll_ABI,
+        rotation_y_ABI,
+        perspective_fov_lh_ABI,
+        transform4_ABI,
         look_at_ABI,
         project_ABI,
     ] {
@@ -64,6 +69,121 @@ fn translation(
 ) -> GuestPtr<Matrix> {
     // D3DX uses row vectors: the translation occupies the fourth matrix row.
     let value = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, z, 1.];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixRotationYawPitchRoll", level = implement)]
+fn rotation_yaw_pitch_roll(
+    env: &mut Env<'_>,
+    output: GuestPtr<Matrix>,
+    yaw: f32,
+    pitch: f32,
+    roll: f32,
+) -> GuestPtr<Matrix> {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let (sr, cr) = roll.sin_cos();
+    // Row vectors apply roll, then pitch, then yaw: Rz * Rx * Ry. Expanding
+    // that product keeps the affine coefficients explicitly zero/one even
+    // when the trigonometric part produces an IEEE non-finite result.
+    let value = [
+        cr * cy + sr * sp * sy,
+        sr * cp,
+        -cr * sy + sr * sp * cy,
+        0.,
+        -sr * cy + cr * sp * sy,
+        cr * cp,
+        sr * sy + cr * sp * cy,
+        0.,
+        cp * sy,
+        -sp,
+        cp * cy,
+        0.,
+        0.,
+        0.,
+        0.,
+        1.,
+    ];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixRotationY", level = implement)]
+fn rotation_y(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestPtr<Matrix> {
+    let (sin, cos) = angle.sin_cos();
+    let value = [
+        cos, 0., -sin, 0., 0., 1., 0., 0., sin, 0., cos, 0., 0., 0., 0., 1.,
+    ];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixPerspectiveFovLH", level = implement)]
+fn perspective_fov_lh(
+    env: &mut Env<'_>,
+    output: GuestPtr<Matrix>,
+    fovy: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> GuestPtr<Matrix> {
+    let y_scale = 1. / (fovy * 0.5).tan();
+    let x_scale = y_scale / aspect;
+    let depth = far / (far - near);
+    // D3DX produces arithmetic infinities/NaNs for degenerate inputs rather
+    // than substituting an identity projection or a clipping result.
+    let value = [
+        x_scale,
+        0.,
+        0.,
+        0.,
+        0.,
+        y_scale,
+        0.,
+        0.,
+        0.,
+        0.,
+        depth,
+        1.,
+        0.,
+        0.,
+        -near * depth,
+        0.,
+    ];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXVec4Transform", level = implement)]
+fn transform4(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector4>,
+    vector: GuestPtr<Vector4>,
+    matrix: GuestPtr<Matrix>,
+) -> GuestPtr<Vector4> {
+    let (Ok(vector), Ok(matrix)) = (vector.read(env.cpu), matrix.read(env.cpu)) else {
+        return GuestPtr::default();
+    };
+    // Both full inputs are snapshots, including a partially overlapping
+    // destination. This is homogeneous multiplication, without a W divide.
+    let value = std::array::from_fn(|column| {
+        (0..4)
+            .map(|row| vector[row] * matrix[row * 4 + column])
+            .sum()
+    });
     if output.write(env.cpu, value).is_ok() {
         output
     } else {
