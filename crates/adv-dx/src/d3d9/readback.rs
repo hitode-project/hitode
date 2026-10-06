@@ -146,6 +146,18 @@ fn lock(
     rect: GuestPtr<RECT>,
     flags: u32,
 ) -> Outcome {
+    if resources::resource(env, this.addr()).is_some_and(|r| dc::leased(env, r)) {
+        return Outcome::Return(INVALID);
+    }
+    lock_internal(env, this, output, rect, flags)
+}
+pub(super) fn lock_internal(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    output: GuestPtr<D3DLOCKED_RECT>,
+    rect: GuestPtr<RECT>,
+    flags: u32,
+) -> Outcome {
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
         return Outcome::Return(resources::texture_lock(
             env,
@@ -315,8 +327,14 @@ fn set_lock(env: &mut Env<'_>, resource: Id, lock: Option<Lock>) {
 }
 #[win32(d3d9,name="IDirect3DSurface9::UnlockRect",level=implement)]
 fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    if resources::resource(env, this.addr()).is_some_and(|r| dc::leased(env, r)) {
+        return Outcome::Return(INVALID);
+    }
+    unlock_internal(env, this)
+}
+pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
-        return resources::texture_unlock(env, GuestPtr::new(container), level);
+        return resources::texture_unlock_internal(env, GuestPtr::new(container), level);
     }
     let Some(r) = resources::resource(env, this.addr()) else {
         return Outcome::Return(INVALID);
@@ -430,6 +448,7 @@ pub(super) fn transfer(
         || src.desc.Pool != 0
         || src.desc.Usage & 1 == 0
         || dst.desc.Pool != 2
+        || dc::leased(env, src)
         || resources::locked(env, dst)
         || src.desc.Width != dst.desc.Width
         || src.desc.Height != dst.desc.Height

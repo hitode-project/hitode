@@ -29,7 +29,9 @@ pub(super) fn draw_target(env: &Env<'_>, this: u32) -> Result<Target, u32> {
     };
     // Authored native D3D9 permits Clear/draw while a lockable back buffer is
     // locked. Other default-pool resource locks still prohibit GPU drawing.
-    if resources::locked(env, r) && !readback::lockable_back_buffer(env, r.pointer, r) {
+    if dc::leased(env, r)
+        || (resources::locked(env, r) && !readback::lockable_back_buffer(env, r.pointer, r))
+    {
         return Err(INVALID);
     }
     let provider = env.ext.get::<State>().provider;

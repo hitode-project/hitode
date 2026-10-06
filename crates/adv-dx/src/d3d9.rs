@@ -16,6 +16,7 @@ use resources::Resource;
 mod capabilities;
 mod creation;
 mod cursor;
+mod dc;
 mod dirty;
 mod fixed;
 mod format;
@@ -46,6 +47,11 @@ const IID_DEVICE: Iid = [
 /// Thin assembly operations; no higher-layer payload is owned by this frontend.
 #[derive(Clone, Copy)]
 pub struct SurfaceProvider {
+    /// Explicit CPU/GDI access, assembled by the runtime without a frontend
+    /// dependency. The borrowed canvas is owned until `release_dc`.
+    pub acquire_dc: fn(&mut Env<'_>, u32, u32, u32, u32) -> Result<u32, String>,
+    pub writeback_dc: fn(&mut Env<'_>, u32, u32, u32) -> Result<(), String>,
+    pub release_dc: fn(&mut Env<'_>, u32),
     pub insert: fn(&mut Ext, Target) -> Result<u32, String>,
     pub target: fn(&Ext, u32) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
@@ -99,6 +105,7 @@ pub struct State {
     provider: SurfaceProvider,
     pending: Vec<Pending>,
     transfers: Vec<readback::PendingTransfer>,
+    dcs: Vec<dc::Lease>,
     sender: Option<adv_sync::background::LocalSender>,
     wake: Option<std::sync::Arc<adv_sync::WakeEvent>>,
     /// Whether creation offers COPY presentation. Accepting a swap effect
@@ -204,6 +211,7 @@ pub fn register(registry: &mut Registry) {
     memory::register(registry);
     cursor::register(registry);
     dirty::register(registry);
+    dc::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -255,6 +263,7 @@ pub fn install<B: Backend>(
         provider,
         pending: Vec::new(),
         transfers: Vec::new(),
+        dcs: Vec::new(),
         sender: None,
         wake: None,
         copy: true,
@@ -1255,7 +1264,9 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
         ext: &mut machine.ext,
         thunk: 0,
     };
-    Ok(readback::pump(&mut env) || progress)
+    let readback = readback::pump(&mut env);
+    dc::reap_cancelled(&mut env);
+    Ok(readback || progress)
 }
 /// Process stop cancels map ownership and closes internal wait handles. Accepted
 /// fence tasks still finish on the one service before the host window is destroyed.
@@ -1276,6 +1287,7 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
         release_pending_owners(&mut env, wait.owner, wait.resources);
     }
     readback::cancel_pending(&mut env);
+    dc::cancel_all(&mut env);
 }
 #[win32(d3d9, name = "IDirect3DDevice9::Clear", level = implement)]
 fn clear(
