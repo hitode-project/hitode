@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use crate::OsConfig;
 
 mod portable_saves;
+mod attributes;
 mod section;
 mod stream;
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
@@ -25,6 +26,8 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// The same process-owned attribute view queried through Vfs::file_attributes.
+    pub attributes: u32,
 }
 
 /// An open guest file: a host object in the machine's handle table. Every personality
@@ -47,6 +50,7 @@ enum Loc {
 
 pub struct Vfs {
     pub sections: SharedFiles,
+    attributes: attributes::Attributes,
     /// Current directory (normalized guest path).
     pub cwd: String,
     game_root: String,
@@ -109,6 +113,7 @@ impl Vfs {
             };
         Self {
             sections: SharedFiles::default(),
+            attributes: attributes::Attributes::default(),
             cwd: root.clone(),
             game_root: root,
             game_host: cfg.game_dir.clone(),
@@ -298,6 +303,7 @@ impl Vfs {
                         is_dir: md.is_dir(),
                         size: md.len(),
                         modified: md.modified().ok(),
+                        attributes: self.attributes.read(&e.path(), &md).ok()?,
                     },
                 );
             }

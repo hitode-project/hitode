@@ -15,6 +15,7 @@ use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
 mod path;
 mod profile;
+mod attributes;
 #[cfg(test)]
 mod tests;
 
@@ -24,7 +25,6 @@ const CREATE_ALWAYS: u32 = 2;
 const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 
 fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u8]>>, ()> {
@@ -629,28 +629,6 @@ fn get_file_time(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn attributes(is_dir: bool) -> u32 {
-    if is_dir {
-        FILE_ATTRIBUTE_DIRECTORY
-    } else {
-        FILE_ATTRIBUTE_ARCHIVE
-    }
-}
-
-fn get_file_attributes(env: &mut Env<'_>, path: String) -> Outcome {
-    let guest = env.ext.get::<Win32>().vfs.normalize(&path);
-    if matches!(system_file(env, &guest), Ok(Some(_))) {
-        return Outcome::Return(FILE_ATTRIBUTE_ARCHIVE | 1);
-    }
-    match env.ext.get::<Win32>().vfs.lookup(&path) {
-        Some(p) => Outcome::Return(attributes(p.is_dir())),
-        None => {
-            set_last_error(env, err::FILE_NOT_FOUND);
-            Outcome::Return(u32::MAX)
-        }
-    }
-}
-
 pub(super) fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
     let guest = env.ext.get::<Win32>().vfs.normalize(&path);
     if matches!(system_file(env, &guest), Ok(Some(_))) {
@@ -824,7 +802,7 @@ pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
 /// (in bytes for A, UTF-16 units for W).
 fn fill_find_data(env: &mut Env<'_>, p: u32, e: &DirEntry, wide: bool) {
     zero(env.cpu, p, if wide { 592 } else { 320 });
-    let _ = env.cpu.write_u32(p, attributes(e.is_dir));
+    let _ = env.cpu.write_u32(p, e.attributes);
     let ft = filetime(e.modified);
     for off in [4, 12, 20] {
         write_filetime(env.cpu, p + off, ft);
@@ -1319,15 +1297,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetEndOfFile", 1, set_end_of_file);
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
     stdcall(reg, K32, "SetFileTime", 4, |_| Outcome::Return(1));
-    stdcall(reg, K32, "GetFileAttributesA", 1, |e| {
-        let p = path_a(e, e.arg(0));
-        get_file_attributes(e, p)
-    });
-    stdcall(reg, K32, "GetFileAttributesW", 1, |e| {
-        let p = path_w(e, e.arg(0));
-        get_file_attributes(e, p)
-    });
-    stdcall(reg, K32, "SetFileAttributesA", 2, |_| Outcome::Return(1));
+    attributes::register(reg);
     stdcall(reg, K32, "FindFirstFileA", 2, |e| {
         let p = path_a(e, e.arg(0));
         find_first_file(e, p, e.arg(1), false)
