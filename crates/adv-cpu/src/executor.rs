@@ -241,9 +241,10 @@ impl Executor {
             } else if bridge.calls == 0
                 && self.stats.native_blocks != native_before
                 && matches!(result, Ok(RunOutcome::Budget))
-                && started.elapsed() >= Duration::from_micros(100)
             {
-                self.admission.native_burst();
+                self.admission.inline_native(started.elapsed());
+            } else {
+                self.admission.inline_boundary();
             }
         }
         // Export canonical floating state at every public CPU boundary. Context

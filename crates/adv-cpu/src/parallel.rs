@@ -39,8 +39,14 @@ pub(crate) enum Stop {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Admission {
     credit: u8,
+    /// Inline native time since the last boundary. Safepoints sized from the
+    /// block rate split one burst into many short runs.
+    inline: Duration,
     pub preferred: Option<usize>,
 }
+
+/// Native execution long enough to be worth a worker lease.
+const BURST: Duration = Duration::from_micros(100);
 
 impl Admission {
     pub fn ready(self) -> bool {
@@ -51,12 +57,25 @@ impl Admission {
     }
     pub fn cold(&mut self) {
         self.credit = 0;
+        self.inline = Duration::ZERO;
+    }
+    /// An inline run that executed only native code and ended at its budget.
+    pub fn inline_native(&mut self, elapsed: Duration) {
+        self.inline = self.inline.saturating_add(elapsed);
+        if self.inline >= BURST {
+            self.inline = Duration::ZERO;
+            self.native_burst();
+        }
+    }
+    /// An inline run that ended at a host call or other boundary.
+    pub fn inline_boundary(&mut self) {
+        self.inline = Duration::ZERO;
     }
     fn completed(&mut self, stop: &Stop, elapsed: Duration, blocks: u64) {
         if matches!(stop, Stop::Fallback | Stop::Failed(_)) {
             self.cold();
         } else if blocks != 0 && !matches!(stop, Stop::Interrupted) {
-            if elapsed >= Duration::from_micros(100) {
+            if elapsed >= BURST {
                 self.native_burst();
             } else if matches!(stop, Stop::Trap(_) | Stop::Parked) {
                 self.credit = self.credit.saturating_sub(1);
@@ -492,6 +511,21 @@ mod tests {
         );
         admission.completed(&Stop::Fallback, Duration::from_millis(1), 50);
         assert!(!admission.ready());
+    }
+
+    #[test]
+    fn consecutive_short_native_runs_form_one_burst_until_a_boundary() {
+        let mut admission = Admission::default();
+        for _ in 0..3 {
+            admission.inline_native(Duration::from_micros(30));
+        }
+        admission.inline_boundary();
+        admission.inline_native(Duration::from_micros(30));
+        assert!(!admission.ready());
+        for _ in 0..3 {
+            admission.inline_native(Duration::from_micros(30));
+        }
+        assert!(admission.ready());
     }
 
     #[test]
