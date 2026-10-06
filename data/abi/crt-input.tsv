@@ -160,3 +160,15 @@ msvcr80.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8
 msvcr80.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|arguments:va_list:ptr:1
 msvcr90.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcr90.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcrt.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
+msvcrt.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcrt.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcrt.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcr80.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
+msvcr80.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr80.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr80.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcr90.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
+msvcr90.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr90.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr90.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2

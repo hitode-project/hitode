@@ -191,6 +191,16 @@
     "limitations": "Nonfinite, hexadecimal floating, capital F, extended precision, unknown numeric locale and non-nearest rounding remain explicit unsupported failures. Legacy count-output/prefix callback and permissive unknown/trailing syntax are rejected without a fabricated native invalid callback; no complete CRT/C99 equivalence is claimed.",
     "oracle_source_sha256": "c0d739a468416bebb6b94629f2ba15f75a328c4fb632206cdcd33bb17b29a476"
   },
+  "time64": {
+    "header": "ucrt/time.h:193-196,212-214,236-238,321-323",
+    "sha256": "b775fe03a3288dfcd68a72caad43e8198283164eae94b665fdd3375a3baea44c",
+    "tm_header": "ucrt/corecrt_wtime.h:26-37",
+    "tm_sha256": "4e487fddafbc724cf4e6df45feb920bc46dae80f54ffe5d983bf742a1fd9a12f",
+    "projection": "Legacy _time64 uses one pointer slot and signed time64 bits in EDX:EAX; _gmtime64/_localtime64 use one pointer slot and return a thread-owned pointer to nine signed32 tm fields. _difftime64 consumes two signed time64 values as four x86 DWORD slots and returns binary64 in ST0. Only existing MSVCRT/VC80/VC90 profiles.",
+    "behavior": "Authored VC80 oracle confirms one shared per-thread 36-byte gm/local buffer, NULL input clears tm fields to -1 before returning invalid handler errno22, negative seconds clear the buffer and fail errno22 without a callback. Differences subtract integers before rounding to binary64, preserving a one-second delta above2^53; negative input fails errno22, while negative valid difference is supported.",
+    "profile": "Clock and civil conversion reuse the existing Win32 owner, including configured fixed UTC offset and no DST; supported UTC input is1970-3000, with larger native ranges explicitly unavailable. No independent host clock or time-zone cache.",
+    "oracle_source_sha256": "74d0058010cd20aa7a42778e4f1e68805f41a54da45591494defffcfe1ffaee2"
+  },
   "strtod": {
     "header": "ucrt/stdlib.h:502-505",
     "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",

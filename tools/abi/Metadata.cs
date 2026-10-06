@@ -230,13 +230,18 @@ public static class AbiMetadata
             bool crtStrtod = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && f[1] == "strtod" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
                 && f[5] == "text:const char*:str8:1|end:char**:ptr:1";
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod)
+            bool crtDifftime = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "_difftime64" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
+                && f[5] == "end:__time64_t:u64:2|begin:__time64_t:u64:2";
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1")
+                bool crtTime64Parameter = crtDifftime && p.Length == 4
+                    && p[1] == "__time64_t" && p[2] == "u64" && p[3] == "2";
+                if (p.Length != 4 || ((!new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1") && !crtTime64Parameter))
                     throw new InvalidDataException("Invalid supplemental x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];
