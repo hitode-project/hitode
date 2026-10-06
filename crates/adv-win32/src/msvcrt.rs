@@ -17,6 +17,7 @@ mod heap;
 mod locale;
 mod onexit;
 mod scan;
+mod scalar_float;
 mod secure_memory;
 mod startup;
 mod wide_string;
@@ -50,6 +51,15 @@ fn invalid_parameter_result(
     error: i32,
     result: u32,
 ) -> Outcome {
+    invalid_parameter_then(env, function, error, move |_| Outcome::Return(result))
+}
+
+fn invalid_parameter_then(
+    env: &mut Env<'_>,
+    function: &str,
+    error: i32,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
     let errno = floating::errno_address(env);
     if errno.is_null() || errno.write(env.cpu, error).is_err() {
         return Outcome::Fail("CRT errno allocation/write failed".into());
@@ -68,9 +78,7 @@ fn invalid_parameter_result(
     }
     // Release UCRT passes no diagnostic strings. errno is assigned before the
     // callback, and a returning callback may change it or wait via the Machine.
-    Outcome::call(handler, [0, 0, 0, 0, 0], move |_, _| {
-        Outcome::Return(result)
-    })
+    Outcome::call(handler, [0, 0, 0, 0, 0], move |env, _| then(env))
 }
 
 pub fn install<B: adv_cpu::backend::Backend>(
@@ -87,6 +95,7 @@ pub fn register(r: &mut Registry) {
     find::register(r);
     formatting::register(r);
     floating::register(r);
+    scalar_float::register(r);
     onexit::register(r);
     startup::register(r);
     convert::register(r);

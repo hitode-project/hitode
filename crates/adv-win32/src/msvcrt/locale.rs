@@ -78,6 +78,19 @@ pub(super) fn formatting_codepage(env: &Env<'_>) -> u32 {
         .map_or(0, |state| state.categories[1].codepage)
 }
 
+/// Decimal conversions observe NUMERIC and CTYPE independently. The existing
+/// four language profiles all publish decimal dot through localeconv.
+pub(super) fn scalar_float_profile(env: &Env<'_>) -> Option<([bool; 256], u8)> {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    let state = env.ext.try_get::<CrtState>().and_then(|s| s.locales.get(module));
+    let numeric = state.map_or(Locale::default(), |s| s.categories[3]);
+    if !matches!(numeric.codepage, 0 | 932 | 936 | 1252) {
+        return None;
+    }
+    let codepage = state.map_or(0, |s| s.categories[1].codepage);
+    ctype::byte_spaces(codepage).map(|spaces| (spaces, b'.'))
+}
+
 fn default_language(acp: u32) -> Language {
     // Match kernel32's existing virtual GetUserDefaultLCID profile, not the
     // machine running the host: CP936 is zh-CN, otherwise the profile is ja-JP.

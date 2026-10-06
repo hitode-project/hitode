@@ -87,6 +87,10 @@ fn table(codepage: u32) -> Option<[u16; 257]> {
     Some(words)
 }
 
+pub(super) fn byte_spaces(codepage: u32) -> Option<[bool; 256]> {
+    table(codepage).map(|words| std::array::from_fn(|i| words[i + 1] & 8 != 0))
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_ABI);
 }
