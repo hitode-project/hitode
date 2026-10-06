@@ -341,47 +341,53 @@ pub(crate) fn open_with_share(
     }
 }
 
-fn read_file(env: &mut Env<'_>) -> Outcome {
-    let (h, buf, n, read_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
-        set_last_error(env, err::INVALID_HANDLE);
-        return Outcome::Return(0);
-    };
-    let section = &env.ext.get::<Win32>().vfs.sections;
+/// Read the shared stream cursor, then merge dirty mapped-file content over
+/// the bytes obtained from the backing file. All API fronts use this owner.
+pub(crate) fn read_coherent(
+    f: &mut FileObj,
+    section: &adv_os::vfs::SharedFiles,
+    data: &mut [u8],
+) -> std::io::Result<usize> {
     let content = if section.has_entries() {
         f.file.cached_identity().and_then(|id| section.lookup(id))
     } else {
         None
     };
     let coherence = if let Some(content) = content {
-        match f.file.stream_position() {
-            Ok(offset) => Some((content, offset)),
-            Err(error) => {
-                io_error(env, &error);
-                return Outcome::Return(0);
-            }
-        }
+        Some((content, f.file.stream_position()?))
     } else {
         None
     };
-    let mut data = vec![0u8; n as usize];
     let mut got = 0;
     while got < data.len() {
         match f.file.read(&mut data[got..]) {
             Ok(0) => break,
             Ok(k) => got += k,
-            Err(e) => {
-                io_error(env, &e);
-                return Outcome::Return(0);
-            }
+            Err(e) => return Err(e),
         }
     }
     if let Some((content, offset)) = coherence
         && let Err(error) = content.merge_read(offset, &mut data[..got])
     {
-        io_error(env, &error);
-        return Outcome::Return(0);
+        return Err(error);
     }
+    Ok(got)
+}
+
+fn read_file(env: &mut Env<'_>) -> Outcome {
+    let (h, buf, n, read_out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    let Some(f) = env.sys.objects.host_mut::<FileObj>(h) else {
+        set_last_error(env, err::INVALID_HANDLE);
+        return Outcome::Return(0);
+    };
+    let mut data = vec![0u8; n as usize];
+    let got = match read_coherent(f, &env.ext.get::<Win32>().vfs.sections, &mut data) {
+        Ok(got) => got,
+        Err(error) => {
+            io_error(env, &error);
+            return Outcome::Return(0);
+        }
+    };
     if env.cpu.write(buf, &data[..got]).is_err() {
         set_last_error(env, 998); // ERROR_NOACCESS
         return Outcome::Return(0);

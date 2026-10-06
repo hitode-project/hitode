@@ -55,6 +55,17 @@
       "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
     ]
   },
+  "native_read_file": {
+    "scope": "ntdll.dll!ZwReadFile only; synchronous current-position or explicit-offset reads through the shared file owner",
+    "source": "Microsoft Learn WDM ZwReadFile nine-parameter declaration and user-mode Nt/Zw equivalence; absent from installed user-mode winternl.h and pinned WinMD",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS and nine 32-bit stack words; SDK ntdll.lib declares both _NtReadFile@36 and _ZwReadFile@36; PIO_APC_ROUTINE pointer type from SDK winternl.h",
+    "native_verification": "Authored x86 read oracle verifies current/explicit/-2 sentinel positions, partial and complete EOF, zero length, failed explicit EOF preserving the cursor, read-access checks, and writable IOSB/buffer preflight before any data or cursor changes; LastError remains unchanged",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwreadfile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",

@@ -425,7 +425,16 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
         Some(ImplementationLevel::Implement)
     );
     assert!(registry.dynamic_available("ntdll.dll", "ZwSetInformationFile"));
-    for name in ["NtCreateFile", "ZwReadFile", "ZwClose"] {
+    assert_eq!(
+        registry.get("ntdll.dll", "ZwReadFile").unwrap().conv,
+        Conv::Stdcall { argc: 9 }
+    );
+    assert_eq!(
+        registry.level("ntdll.dll", "ZwReadFile"),
+        Some(ImplementationLevel::Implement)
+    );
+    assert!(registry.dynamic_available("ntdll.dll", "ZwReadFile"));
+    for name in ["NtCreateFile", "NtReadFile", "ZwClose"] {
         assert!(!registry.dynamic_available("ntdll.dll", name));
     }
     assert!(registry.signature_conflicts().is_empty());
@@ -780,4 +789,264 @@ fn position_setter_shares_alias_cursor_and_preserves_native_failure_ordering() {
         set_position(cpu);
     }
     set_position(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn read_call<B: Backend>(m: &mut Machine<B>, code: &mut Asm, args: [u32; 9], result: u32) {
+    let set = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let read = m.resolve_import("ntdll.dll", "ZwReadFile").unwrap();
+    code.push_imm(MARKER).call(set);
+    for value in args.into_iter().rev() {
+        code.push_imm(value);
+    }
+    code.call(read).mov_mem_eax(result);
+    code.call(get).mov_mem_eax(result + 4);
+}
+
+fn read_positions<B: Backend>(cpu: B) {
+    let (mut m, root) = fixture(cpu);
+    std::fs::write(root.join("game/nt-read.txt"), b"abcdefgh").unwrap();
+    input(&mut m, DATA, SOURCE, r"\??\C:\Game\nt-read.txt");
+    let mut code = Asm::new(CODE);
+    create(&mut m, &mut code, arguments(DATA), DATA + 16);
+    run(&mut m, code);
+    let handle = m.cpu.read_u32(DATA).unwrap();
+    let alias = m.sys.objects.duplicate(handle).unwrap();
+    let seek = m
+        .resolve_import("kernel32.dll", "SetFilePointerEx")
+        .unwrap();
+    let close = m.resolve_import("kernel32.dll", "CloseHandle").unwrap();
+    let cases = [
+        (5u32, None, b"abcde".as_slice(), 0u32, 5u64),
+        (3, Some(2i64), b"cde".as_slice(), 0, 5),
+        (8, Some(7), b"h".as_slice(), 0, 8),
+        (1, None, b"".as_slice(), 0xc0000011, 8),
+        (3, Some(20), b"".as_slice(), 0xc0000011, 8),
+        (0, None, b"".as_slice(), 0, 8),
+        (0, Some(2), b"".as_slice(), 0, 8),
+        (2, Some(-2), b"".as_slice(), 0xc0000011, 8),
+        (2, Some(-2), b"cd".as_slice(), 0, 4),
+    ];
+    let mut code = Asm::new(CODE);
+    for (index, (length, offset, _, _, _)) in cases.iter().enumerate() {
+        let base = DATA + 0x100 + index as u32 * 128;
+        m.cpu.write(base, &[0xcd; 128]).unwrap();
+        if index == 8 {
+            code.push_imm(0)
+                .push_imm(DATA + 0xe00)
+                .push_imm(0)
+                .push_imm(2)
+                .push_imm(alias)
+                .call(seek);
+        }
+        let offset_pointer = if let Some(value) = offset {
+            m.cpu.write(base + 32, &value.to_le_bytes()).unwrap();
+            base + 32
+        } else {
+            0
+        };
+        read_call(
+            &mut m,
+            &mut code,
+            [
+                alias,
+                0,
+                0,
+                0,
+                base,
+                if *length == 0 { 0 } else { base + 8 },
+                *length,
+                offset_pointer,
+                0,
+            ],
+            base + 24,
+        );
+        query(
+            &mut m,
+            &mut code,
+            [handle, base + 40, base + 48, 8, 14],
+            base + 56,
+        );
+    }
+    code.push_imm(alias)
+        .call(close)
+        .push_imm(handle)
+        .call(close);
+    run(&mut m, code);
+    for (index, (_, _, expected, status, position)) in cases.into_iter().enumerate() {
+        let base = DATA + 0x100 + index as u32 * 128;
+        assert_eq!(m.cpu.read_u32(base + 24).unwrap(), status);
+        assert_eq!(m.cpu.read_u32(base + 28).unwrap(), MARKER);
+        assert_eq!(m.cpu.read_u32(base).unwrap(), status);
+        assert_eq!(m.cpu.read_u32(base + 4).unwrap(), expected.len() as u32);
+        let mut bytes = [0xcd; 16];
+        m.cpu.read(base + 8, &mut bytes).unwrap();
+        assert_eq!(&bytes[..expected.len()], expected);
+        assert!(bytes[expected.len()..].iter().all(|byte| *byte == 0xcd));
+        let mut cursor = [0; 8];
+        m.cpu.read(base + 48, &mut cursor).unwrap();
+        assert_eq!(u64::from_le_bytes(cursor), position);
+    }
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 0);
+    assert_eq!(
+        std::fs::read(root.join("game/nt-read.txt")).unwrap(),
+        b"abcdefgh"
+    );
+}
+
+#[test]
+fn synchronous_reads_use_shared_cursor_and_match_native_explicit_eof_and_zero_rules() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        read_positions(cpu);
+    }
+    read_positions(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn read_coherence_and_guards<B: Backend>(cpu: B) {
+    const VIEW: u32 = 0x450000;
+    let (mut m, root) = fixture(cpu);
+    std::fs::write(root.join("game/nt-read.txt"), b"abcdefgh").unwrap();
+    input(&mut m, DATA, SOURCE, r"\??\C:\Game\nt-read.txt");
+    let mut code = Asm::new(CODE);
+    create(&mut m, &mut code, arguments(DATA), DATA + 16);
+    run(&mut m, code);
+    let handle = m.cpu.read_u32(DATA).unwrap();
+    let alias = m.sys.objects.duplicate(handle).unwrap();
+    // A real backend file page is shared with this file identity, and is dirty
+    // before it is flushed to disk. Raw FileStream reads still return abcdefgh.
+    let backing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("game/nt-read.txt"))
+        .unwrap();
+    let section = m
+        .ext
+        .get::<Win32>()
+        .vfs
+        .sections
+        .file(backing, 8, true)
+        .unwrap();
+    let page = section.page(0);
+    m.cpu
+        .map_file_pages(VIEW, &[page.clone()], Prot::RW, false)
+        .unwrap();
+    m.cpu.write(READ_ONLY, &[0x77; 32]).unwrap();
+    let seek = m
+        .resolve_import("kernel32.dll", "SetFilePointerEx")
+        .unwrap();
+    let close = m.resolve_import("kernel32.dll", "CloseHandle").unwrap();
+    let mut code = Asm::new(CODE);
+    code.mov_mem_imm(VIEW, 0x34333231);
+    let failures = [
+        ("readonly IOSB", 0xc0000005),
+        ("readonly buffer", 0xc0000005),
+        ("negative", 0xc000000d),
+        ("invalid", 0xc0000008),
+        ("range", 0xc0000005),
+        ("event", 0xc00000bb),
+        ("APC", 0xc00000bb),
+    ];
+    for (index, (label, _)) in failures.iter().enumerate() {
+        let base = DATA + 0x100 + index as u32 * 128;
+        m.cpu.write(base, &[0xcd; 128]).unwrap();
+        let mut args = [alias, 0, 0, 0, base, base + 8, 2, 0, 0];
+        match *label {
+            "readonly IOSB" => args[4] = READ_ONLY,
+            "readonly buffer" => args[5] = READ_ONLY,
+            "negative" => {
+                args[7] = base + 32;
+                m.cpu.write(base + 32, &(-1i64).to_le_bytes()).unwrap();
+            }
+            "invalid" => args[0] = 0x13572468,
+            "range" => args[5] = SOURCE + 0xffff,
+            "event" => args[1] = 1,
+            "APC" => args[2] = CODE,
+            _ => unreachable!(),
+        }
+        read_call(&mut m, &mut code, args, base + 24);
+        query(
+            &mut m,
+            &mut code,
+            [handle, base + 40, base + 48, 8, 14],
+            base + 56,
+        );
+    }
+    let nt = DATA + 0x900;
+    m.cpu.write(nt, &[0xcd; 128]).unwrap();
+    read_call(
+        &mut m,
+        &mut code,
+        [alias, 0, 0, 0, nt, nt + 8, 4, 0, 0],
+        nt + 24,
+    );
+    query(
+        &mut m,
+        &mut code,
+        [handle, nt + 40, nt + 48, 8, 14],
+        nt + 56,
+    );
+    code.push_imm(0)
+        .push_imm(DATA + 0xf00)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(handle)
+        .call(seek);
+    let ordinary = m.resolve_import("kernel32.dll", "ReadFile").unwrap();
+    code.push_imm(0)
+        .push_imm(DATA + 0xa10)
+        .push_imm(4)
+        .push_imm(DATA + 0xa00)
+        .push_imm(handle)
+        .call(ordinary)
+        .mov_mem_eax(DATA + 0xa14);
+    code.push_imm(alias)
+        .call(close)
+        .push_imm(handle)
+        .call(close);
+    run(&mut m, code);
+    for (index, (_, status)) in failures.into_iter().enumerate() {
+        let base = DATA + 0x100 + index as u32 * 128;
+        assert_eq!(m.cpu.read_u32(base + 24).unwrap(), status);
+        assert_eq!(m.cpu.read_u32(base + 28).unwrap(), MARKER);
+        let mut bytes = [0; 24];
+        m.cpu.read(base, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xcd; 24]);
+        m.cpu.read(base + 48, &mut bytes[..8]).unwrap();
+        assert_eq!(&bytes[..8], &[0; 8]);
+    }
+    assert_eq!(m.cpu.read_u32(nt + 24).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(nt + 4).unwrap(), 4);
+    assert_eq!(m.cpu.read_u32(nt + 8).unwrap(), 0x34333231);
+    assert_eq!(m.cpu.read_u32(nt + 48).unwrap(), 4);
+    assert_eq!(m.cpu.read_u32(DATA + 0xa14).unwrap(), 1);
+    assert_eq!(m.cpu.read_u32(DATA + 0xa00).unwrap(), 0x34333231);
+    assert_eq!(
+        std::fs::read(root.join("game/nt-read.txt")).unwrap(),
+        b"abcdefgh",
+        "dirty mapping has not been flushed to disk"
+    );
+    assert!(page.dirty());
+    let mut bytes = [0; 32];
+    m.cpu.read(READ_ONLY, &mut bytes).unwrap();
+    assert_eq!(bytes, [0x77; 32]);
+    assert!(
+        m.ext
+            .get::<ApiDiagnostics>()
+            .warnings
+            .keys()
+            .any(|(api, _)| api.ends_with("ZwReadFile"))
+    );
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 0);
+}
+
+#[test]
+fn native_read_guards_preserve_cursor_and_reads_merge_actual_dirty_mapped_content() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        read_coherence_and_guards(cpu);
+    }
+    read_coherence_and_guards(UnicornCpu::new(PARK_ADDR).unwrap());
 }

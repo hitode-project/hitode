@@ -368,8 +368,9 @@ fn sort_step(
         }
     })
 }
+const CRT_ALLOCATION_LIMIT: u32 = 0x40000000;
 fn allocate(e: &mut Env<'_>, size: u32, zero: bool) -> u32 {
-    if size > 0x40000000 {
+    if size > CRT_ALLOCATION_LIMIT {
         return 0;
     }
     let heaps = e.ext.get_mut::<Heaps>();

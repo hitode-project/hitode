@@ -26,6 +26,121 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(create_ABI);
     registry.register(query_ABI);
     registry.register(set_ABI);
+    registry.register(read_ABI);
+}
+
+fn completion(env: &mut Env<'_>, iosb: GuestPtr<()>, status: i32, count: u32) -> i32 {
+    let mut bytes = [0; 8];
+    bytes[..4].copy_from_slice(&status.to_le_bytes());
+    bytes[4..].copy_from_slice(&count.to_le_bytes());
+    if env.cpu.write(iosb.addr(), &bytes).is_err() {
+        ACCESS_VIOLATION
+    } else {
+        status
+    }
+}
+
+#[win32(ntdll, name = "ZwReadFile", level = implement)]
+fn read(
+    env: &mut Env<'_>,
+    handle: Handle,
+    event: Handle,
+    apc: GuestPtr<()>,
+    context: GuestPtr<()>,
+    iosb: GuestPtr<()>,
+    buffer: GuestPtr<()>,
+    length: u32,
+    offset: GuestPtr<()>,
+    key: GuestPtr<u32>,
+) -> i32 {
+    if event.0 != 0 || !apc.is_null() || !context.is_null() || !key.is_null() {
+        warn_unavailable(
+            env,
+            "ntdll.dll!ZwReadFile",
+            "asynchronous/event/APC completion and range-lock keys are unavailable",
+        );
+        return NOT_SUPPORTED;
+    }
+    // Unlike SetInformationFile, native ReadFile probes both writable outputs
+    // before consuming any bytes or changing the current-position cursor.
+    if check_range(env.cpu, iosb.addr(), 8, Prot::WRITE).is_err()
+        || check_range(env.cpu, buffer.addr(), length, Prot::WRITE).is_err()
+    {
+        return ACCESS_VIOLATION;
+    }
+    let requested = if offset.is_null() {
+        None
+    } else {
+        if check_range(env.cpu, offset.addr(), 8, Prot::READ).is_err() {
+            return ACCESS_VIOLATION;
+        }
+        let mut bytes = [0; 8];
+        if env.cpu.read(offset.addr(), &mut bytes).is_err() {
+            return ACCESS_VIOLATION;
+        }
+        match i64::from_le_bytes(bytes) {
+            -2 => None, // FILE_USE_FILE_POINTER_POSITION, sign-extended LARGE_INTEGER
+            value if value >= 0 => Some(value as u64),
+            _ => return INVALID_PARAMETER,
+        }
+    };
+    let Some(file) = env.sys.objects.host_mut::<FileObj>(handle.0) else {
+        return if env.sys.objects.get(handle.0).is_some()
+            || matches!(handle.0, 0xffff_ffff | 0xffff_fffe)
+        {
+            0xc000_0024u32 as i32
+        } else {
+            INVALID_HANDLE
+        };
+    };
+    if file.access & (GENERIC_READ | 0x1000_0000 | 1) == 0 {
+        return ACCESS_DENIED;
+    }
+    if length == 0 {
+        return completion(env, iosb, 0, 0);
+    }
+    let old = match file.file.stream_position() {
+        Ok(position) => position,
+        Err(_) => return completion(env, iosb, 0xc000_0001u32 as i32, 0),
+    };
+    let start = requested.unwrap_or(old);
+    let size = match file.file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return completion(env, iosb, 0xc000_0001u32 as i32, 0),
+    };
+    if start >= size {
+        return completion(env, iosb, 0xc000_0011u32 as i32, 0);
+    }
+    // Allocate only bytes that can be read, with fallible reservation before
+    // seeking. A short file does not require a Length-sized host allocation.
+    let capacity = u64::from(length).min(size - start) as usize;
+    let mut data = Vec::new();
+    if data.try_reserve_exact(capacity).is_err() {
+        return INSUFFICIENT_RESOURCES;
+    }
+    data.resize(capacity, 0);
+    if requested.is_some() && file.file.seek(SeekFrom::Start(start)).is_err() {
+        return completion(env, iosb, INVALID_PARAMETER, 0);
+    }
+    let count =
+        match crate::kernel32::read_coherent(file, &env.ext.get::<Win32>().vfs.sections, &mut data)
+        {
+            Ok(count) => count,
+            Err(error) => {
+                log::warn!("ZwReadFile shared stream read failed: {error}");
+                return completion(env, iosb, 0xc000_0001u32 as i32, 0);
+            }
+        };
+    if count == 0 {
+        // A backing file truncated between metadata and read also reports EOF
+        // without publishing an explicit offset as the current file position.
+        let _ = file.file.seek(SeekFrom::Start(old));
+        return completion(env, iosb, 0xc000_0011u32 as i32, 0);
+    }
+    if env.cpu.write(buffer.addr(), &data[..count]).is_err() {
+        return ACCESS_VIOLATION;
+    }
+    completion(env, iosb, 0, count as u32)
 }
 
 #[win32(ntdll, name = "ZwSetInformationFile", level = implement)]

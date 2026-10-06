@@ -26,7 +26,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setlocale-wsetlocale",
     "https://learn.microsoft.com/en-us/previous-versions/ff730814(v=vs.120)",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/lc-codepage-func"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/lc-codepage-func",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/calloc"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -79,6 +80,12 @@
     "declaration": "Microsoft Learn previous-versions ff730814(v=vs.120) declares LCID* ___lc_handle_func(void), indexed by locale.h categories. This legacy LCID-array getter is absent from modern UCRT headers; no modern header declaration is claimed.",
     "projection": "msvcr90 x86 CRT cdecl zero parameters, pointer to six 32-bit LCIDs (LC_ALL reserved zero, categories1..5). Authored x86 Microsoft SysWOW64/msvcrt.dll probe confirms C=0, Japanese=0x411, Simplified Chinese=0x804, English=0x409 and mixed category indices; this is a legacy MSVCRT semantic oracle, not a VC90 binary oracle.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
+  },
+  "legacy_calloc_crt": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "declaration": "Modern SDK corecrt_malloc.h declares public void* __cdecl calloc(size_t,size_t); it does not declare this legacy internal export. The VC90 PE export _calloc_crt RVA0x63797 reads stack count/size and returns with RET, and the actual x86 guest call removes both arguments. This is a VC90 binary-backed declaration, not a claimed modern SDK declaration.",
+    "behavior": "Authored x86 activation-context VC90 oracle confirms zero-filled allocation and non-NULL freeable zero-count/size blocks; successful allocation preserves errno. Product beyond 0xffffffe0 sets ENOMEM(12), calls the installed invalid-parameter handler with five NULL arguments and returns NULL. Valid-size allocation failure preserves prior errno and sets LastError8, sampled immediately on return. The internal entry explicitly disables new-handler invocation even with native newmode1/handler installed; only its default zero allocation-retry-delay profile is supported."
   },
   "process.h": {
     "header": "ucrt/process.h",
