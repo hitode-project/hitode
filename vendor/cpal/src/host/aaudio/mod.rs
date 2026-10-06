@@ -280,10 +280,29 @@ where
     let channel_count = config.channels as i32;
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
-            let cb_info = OutputCallbackInfo::new(OutputStreamTimestamp {
-                callback: to_stream_instant(created.elapsed()),
-                playback: stream_instant(stream),
-            });
+            // AAudio timestamps use CLOCK_MONOTONIC's boot epoch, whereas
+            // created.elapsed() is stream-relative. Never subtract the two.
+            // Read the write head first so a concurrently advancing endpoint
+            // can only shorten the queue, not include the new callback buffer.
+            let written = stream.frames_written().max(0) as u64;
+            let consumed = stream.frames_read().max(0) as u64;
+            let queued = written.saturating_sub(consumed).min(u32::MAX as u64) as u32;
+            let callback = created.elapsed();
+            let delay = Duration::from_secs_f64(
+                f64::from(queued) / f64::from(stream.sample_rate().max(1)),
+            );
+            let cb_info = OutputCallbackInfo {
+                timestamp: OutputStreamTimestamp {
+                    callback: to_stream_instant(callback),
+                    playback: to_stream_instant(callback + delay),
+                },
+                device_clock: crate::OutputDeviceClock::from_position(
+                    consumed,
+                    stream.sample_rate().max(1) as u64,
+                    SampleRate(stream.sample_rate().max(1) as u32),
+                    queued,
+                ),
+            };
             (data_callback)(
                 &mut unsafe {
                     Data::from_parts(
