@@ -737,7 +737,12 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(path, report).map_err(|e| e.to_string())
+    std::fs::write(path, report).map_err(|e| e.to_string())?;
+    // ADV_LOOP_COVERAGE: the loop table goes beside the report.
+    if let Some(loops) = adv_runtime::loop_coverage() {
+        std::fs::write(path.with_extension("loops.tsv"), loops).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {

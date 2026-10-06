@@ -511,6 +511,13 @@ fn nest(
             && header <= p.latch
             && (p.header != plan.header || p.latch != plan.latch)
     }) || plan.counter_size != 4
+        // Row summaries currently require an exact countdown to zero. General
+        // scalar kernels also accept bounds and strides; those are not yet
+        // covered by the row runtime's width/fuel and final-state contract.
+        || !matches!(plan.bound, loops::Bound::Constant(0))
+        || plan.inclusive
+        || plan.steps[plan.counter] != -1
+        || instructions.get(&plan.counter_step)?.next_ip32() != plan.latch
         || !plan.windows.is_empty()
         || !plan.slots.is_empty()
     {
@@ -743,6 +750,48 @@ mod tests {
     fn analyze(build: impl FnOnce(&mut CodeAssembler)) -> Vec<Nest> {
         let (instructions, entries, plans) = decode(build);
         nests(&instructions, &entries, &plans)
+    }
+
+    #[test]
+    fn generalized_inner_counters_stay_on_scalar_or_vector_kernels() {
+        for shape in 0..3 {
+            let (instructions, entries, plans) = decode(|a| {
+                let mut outer = a.create_label();
+                let mut inner = a.create_label();
+                a.set_label(&mut outer).unwrap();
+                a.mov(ecx, 20).unwrap();
+                a.set_label(&mut inner).unwrap();
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.add(esi, 4).unwrap();
+                a.add(edi, 4).unwrap();
+                match shape {
+                    0 => {
+                        a.sub(ecx, 2).unwrap();
+                        a.mov(dword_ptr(edi), eax).unwrap();
+                        a.jne(inner).unwrap();
+                    }
+                    1 => {
+                        a.mov(dword_ptr(edi), eax).unwrap();
+                        a.dec(ecx).unwrap();
+                        a.cmp(ecx, 4).unwrap();
+                        a.ja(inner).unwrap();
+                    }
+                    _ => {
+                        a.dec(ecx).unwrap();
+                        a.mov(dword_ptr(edi), eax).unwrap();
+                        a.jne(inner).unwrap();
+                    }
+                }
+                a.dec(edx).unwrap();
+                a.jne(outer).unwrap();
+                a.ret().unwrap();
+            });
+            assert_eq!(plans.len(), 1, "shape {shape}");
+            assert!(
+                nests(&instructions, &entries, &plans).is_empty(),
+                "shape {shape}"
+            );
+        }
     }
 
     #[test]
