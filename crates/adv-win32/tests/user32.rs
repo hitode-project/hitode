@@ -864,6 +864,27 @@ fn validating_then_invalidating_paint_becomes_new_without_an_intervening_query()
 }
 
 #[test]
+fn invalidating_every_window_never_queues_a_desktop_paint() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let desktop = t.call(&mut a, "GetDesktopWindow", &[]);
+    t.call(&mut a, "InvalidateRect", &[I(0), I(0), I(0)]);
+    let status = t.call(&mut a, "GetQueueStatus", &[I(0x20)]);
+    let msg = t.alloc(28);
+    let peeked = t.call(
+        &mut a,
+        "PeekMessageA",
+        &[I(msg), I(0), I(wm::PAINT), I(wm::PAINT), I(1)],
+    );
+    // The desktop has no guest window procedure; the system paints it.
+    let updated = t.call(&mut a, "UpdateWindow", &[M(desktop)]);
+    t.run(a);
+    assert_eq!(t.u32(status), 0);
+    assert_eq!(t.u32(peeked), 0);
+    assert_eq!(t.u32(updated), 1);
+}
+
+#[test]
 fn create_visible_windows_notifies_parent_then_shows_and_activates() {
     let mut t = T::new();
     let mut a = Asm::new(CODE);
@@ -1030,6 +1051,42 @@ fn destroy_owned_first_and_all_children_before_parent_ncdestroy() {
             (c, wm::NCDESTROY),
             (p, wm::NCDESTROY)
         ]
+    );
+}
+
+#[test]
+fn show_owned_popups_restores_only_the_popups_it_hid() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let proc = t.wndproc(|_| {});
+    let class = t.class(&mut a, proc);
+    let owner = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, I(0), 0);
+    let shown = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, M(owner), 0);
+    let hidden = t.window(&mut a, class, WS_POPUP, M(owner), 0);
+    let child = t.window(&mut a, class, WS_CHILD | WS_VISIBLE, M(owner), 1);
+    a.mov_mem_imm(LOG_NEXT, LOG);
+    let hide = t.call(&mut a, "ShowOwnedPopups", &[M(owner), I(0)]);
+    let after_hide: Vec<_> = [owner, shown, hidden, child]
+        .map(|h| t.call(&mut a, "IsWindowVisible", &[M(h)]))
+        .into();
+    let show = t.call(&mut a, "ShowOwnedPopups", &[M(owner), I(1)]);
+    let after_show: Vec<_> = [owner, shown, hidden, child]
+        .map(|h| t.call(&mut a, "IsWindowVisible", &[M(h)]))
+        .into();
+    let invalid = t.call(&mut a, "ShowOwnedPopups", &[I(0xdead), I(1)]);
+    t.run(a);
+    assert_eq!((t.u32(hide), t.u32(show), t.u32(invalid)), (1, 1, 0));
+    let visible = |v: &[u32]| v.iter().map(|&p| t.u32(p) != 0).collect::<Vec<_>>();
+    assert_eq!(visible(&after_hide), [true, false, false, true]);
+    assert_eq!(visible(&after_show), [true, true, false, true]);
+    // Each change is the owner's notice, then DefWindowProc's own ShowWindow notice.
+    let s = t.u32(shown);
+    assert_eq!(
+        t.messages()
+            .into_iter()
+            .filter(|&(_, m)| m == wm::SHOWWINDOW)
+            .collect::<Vec<_>>(),
+        [(s, wm::SHOWWINDOW); 4]
     );
 }
 

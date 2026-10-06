@@ -5,8 +5,43 @@ use std::sync::{
 };
 
 use super::*;
+mod pipeline_disk;
+mod program;
+pub use program::validate_program;
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
+
+/// The software adapter (WARP on Windows) has crashed the whole process when
+/// several of its devices render concurrently, so a process runs one software
+/// device at a time. One thread may hold several, as a fixture comparing two
+/// devices does; others wait. Hardware devices are not affected.
+struct SoftwareTurn;
+static SOFTWARE: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)> =
+    std::sync::Mutex::new((None, 0));
+static SOFTWARE_FREE: std::sync::Condvar = std::sync::Condvar::new();
+
+impl SoftwareTurn {
+    fn take() -> Self {
+        let me = std::thread::current().id();
+        let mut turn = SOFTWARE.lock().unwrap_or_else(|e| e.into_inner());
+        while turn.0.is_some_and(|owner| owner != me) {
+            turn = SOFTWARE_FREE.wait(turn).unwrap_or_else(|e| e.into_inner());
+        }
+        *turn = (Some(me), turn.1 + 1);
+        Self
+    }
+}
+
+impl Drop for SoftwareTurn {
+    fn drop(&mut self) {
+        let mut turn = SOFTWARE.lock().unwrap_or_else(|e| e.into_inner());
+        turn.1 -= 1;
+        if turn.1 == 0 {
+            turn.0 = None;
+            SOFTWARE_FREE.notify_all();
+        }
+    }
+}
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const MAX_PIPELINES: usize = 512;
 const MAX_UPLOAD: u64 = 16 * 1024 * 1024;
@@ -340,6 +375,7 @@ pub struct Gpu {
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     pipeline_order: VecDeque<PipelineKey>,
     pipeline_limit: usize,
+    programmable: program::Cache,
     samplers: HashMap<Sampler, wgpu::Sampler>,
     white: Image,
     upload: wgpu::Buffer,
@@ -349,13 +385,26 @@ pub struct Gpu {
     frames: Vec<Image>,
     readbacks: Arc<AtomicUsize>,
     readback_limit: usize,
+    _software: Option<SoftwareTurn>,
 }
 
 impl Gpu {
     /// Request a real host adapter. `fallback` requests a software adapter; an
     /// unavailable adapter is an error, never a no-op renderer.
     pub async fn request(fallback: bool) -> Result<Self, Error> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        Self::request_backend(fallback, GpuBackend::Automatic).await
+    }
+    /// Select a backend for host portability validation without changing the
+    /// compositor's adapter/surface selection policy.
+    pub async fn request_backend(fallback: bool, backend: GpuBackend) -> Result<Self, Error> {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = match backend {
+            GpuBackend::Automatic => wgpu::Backends::all(),
+            GpuBackend::Vulkan => wgpu::Backends::VULKAN,
+            GpuBackend::Gl => wgpu::Backends::GL,
+            GpuBackend::Direct3D12 => wgpu::Backends::DX12,
+        };
+        let instance = wgpu::Instance::new(descriptor);
         Self::request_from(instance, None, fallback).await
     }
 
@@ -375,6 +424,7 @@ impl Gpu {
         surface: Option<&wgpu::Surface<'_>>,
         fallback: bool,
     ) -> Result<Self, Error> {
+        let software = fallback.then(SoftwareTurn::take);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -384,11 +434,13 @@ impl Gpu {
             })
             .await
             .map_err(|error| Error::Unavailable(error.to_string()))?;
+        let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+        limits.max_vertex_buffers = 16.min(adapter.limits().max_vertex_buffers);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("adv neutral graphics"),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
+                required_limits: limits,
+                required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
                 ..Default::default()
             })
             .await
@@ -418,7 +470,14 @@ impl Gpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("adv fixed drawing"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("fixed.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "{}\n{}",
+                        include_str!("border.wgsl"),
+                        include_str!("fixed.wgsl")
+                    )
+                    .into(),
+                ),
             });
         let bindings = context
             .device
@@ -447,7 +506,7 @@ impl Gpu {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(16),
+                            min_binding_size: wgpu::BufferSize::new(32),
                         },
                         count: None,
                     },
@@ -462,7 +521,7 @@ impl Gpu {
             });
         let uniform = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("adv draw parameters"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -494,6 +553,7 @@ impl Gpu {
             pipelines: HashMap::new(),
             pipeline_order: VecDeque::new(),
             pipeline_limit: MAX_PIPELINES,
+            programmable: program::Cache::default(),
             samplers: HashMap::new(),
             white,
             upload,
@@ -506,6 +566,7 @@ impl Gpu {
             frames: Vec::new(),
             readbacks: Arc::new(AtomicUsize::new(0)),
             readback_limit: MAX_READBACKS,
+            _software: software,
         })
     }
 
@@ -845,7 +906,10 @@ impl Gpu {
         Ok(pipeline)
     }
 
-    fn sampler(&mut self, spec: Sampler) -> wgpu::Sampler {
+    fn sampler(&mut self, mut spec: Sampler) -> wgpu::Sampler {
+        // Arbitrary border RGBA is shader uniform data, not native sampler state.
+        // Exclude it from the key so animating a color cannot grow this cache.
+        spec.border_color = 0;
         self.samplers
             .entry(spec)
             .or_insert_with(|| {
@@ -959,6 +1023,10 @@ impl Gpu {
             first_level: state.sampler.first_level.min(image_levels - 1),
             ..state.sampler
         });
+        let sampler_parameters = super::sampler_parameters(Sampler {
+            first_level: state.sampler.first_level.min(image_levels - 1),
+            ..state.sampler
+        });
         submission.write_buffer(&self.upload, 0, bytemuck::cast_slice(vertices));
         let parameters = [
             texture_op(state.texture_op),
@@ -970,6 +1038,10 @@ impl Gpu {
                 },
             compare_index(state.alpha_test),
             state.alpha_reference.to_bits(),
+            sampler_parameters[0],
+            sampler_parameters[1],
+            sampler_parameters[2],
+            sampler_parameters[3],
         ];
         submission.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&parameters));
         let binding = self
@@ -1504,7 +1576,7 @@ fn filter(f: Filter) -> wgpu::FilterMode {
 }
 fn address(a: Address) -> wgpu::AddressMode {
     match a {
-        Address::Clamp => wgpu::AddressMode::ClampToEdge,
+        Address::Clamp | Address::Border => wgpu::AddressMode::ClampToEdge,
         Address::Repeat => wgpu::AddressMode::Repeat,
         Address::Mirror => wgpu::AddressMode::MirrorRepeat,
     }

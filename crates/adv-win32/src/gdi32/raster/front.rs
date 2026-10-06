@@ -339,6 +339,10 @@ fn select_object(env: &mut Env<'_>, dc: Handle, object: Handle) -> Outcome {
     }
     super::super::select_object_value(env, dc.0, object.0)
 }
+/// Reselect a bitmap through the drawing provider so its surface binding follows (RestoreDC).
+pub(in crate::gdi32) fn reselect_bitmap(env: &mut Env<'_>, dc: u32, bitmap: u32) {
+    let _ = select_object(env, Handle(dc), Handle(bitmap));
+}
 #[win32(gdi32, name = "DeleteObject", level = implement)]
 fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
     if env

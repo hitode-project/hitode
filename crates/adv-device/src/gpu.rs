@@ -4,12 +4,25 @@ use crate::surface::Rect;
 mod clear;
 mod depth;
 mod line;
+mod programmable;
 mod renderer;
 mod submission;
 pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
+pub use programmable::{
+    Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
+    VertexStream,
+};
 pub use renderer::Submission;
+pub use renderer::validate_program;
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Target};
 pub use submission::SubmissionPause;
+#[derive(Clone, Copy, Debug)]
+pub enum GpuBackend {
+    Automatic,
+    Vulkan,
+    Gl,
+    Direct3D12,
+}
 
 /// Whether sampled alpha is stored or implicitly one (RGBX color images).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +103,7 @@ pub enum Address {
     Clamp,
     Repeat,
     Mirror,
+    Border,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Sampler {
@@ -100,6 +114,30 @@ pub struct Sampler {
     pub first_level: u32,
     pub u: Address,
     pub v: Address,
+    /// Border color, packed RGBA with red in the least significant byte.
+    pub border_color: u32,
+}
+/// Shared portable border sampling source for composed shader modules.
+pub const BORDER_WGSL: &str = include_str!("gpu/border.wgsl");
+pub fn sampler_parameters(sampler: Sampler) -> [u32; 4] {
+    let mode = |a| match a {
+        Address::Repeat => 0,
+        Address::Mirror => 1,
+        Address::Clamp => 2,
+        Address::Border => 3,
+    };
+    [
+        u32::from(sampler.u == Address::Border)
+            | (u32::from(sampler.v == Address::Border) << 1)
+            | (mode(sampler.u) << 4)
+            | (mode(sampler.v) << 6),
+        sampler.border_color,
+        sampler.first_level,
+        u32::from(sampler.min == Filter::Linear)
+            | (u32::from(sampler.mag == Filter::Linear) << 1)
+            | (u32::from(sampler.mip == Some(Filter::Linear)) << 2)
+            | (u32::from(sampler.mip.is_some()) << 3),
+    ]
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextureOp {
@@ -169,6 +207,7 @@ impl DrawState {
                 mag: Filter::Nearest,
                 u: Address::Clamp,
                 v: Address::Clamp,
+                border_color: 0,
             },
             texture_op: TextureOp::Color,
             alpha_texture_op: TextureOp::Color,

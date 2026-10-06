@@ -34,9 +34,32 @@ fn omission_reason(name: &str) -> &'static str {
         // SDK 10.0.26100.0 um/x86/ntdll.lib independently records
         // _RtlFormatCurrentUserKeyPath@4. Do not invent a full metadata signature.
         "documented legacy RTL export absent from pinned WinMD"
+    } else if module == "ntdll.dll" && native_argc(export).is_some() {
+        "NT native API (WDK, outside the Win32 WinMD)"
     } else {
         "uncategorized metadata gap"
     }
+}
+
+/// x86 stdcall argument counts of the NT native APIs, from the decorated
+/// `_Name@bytes` imports in SDK 10.0.26100.0 um/x86/ntdll.lib. Zw aliases share them.
+fn native_argc(export: &str) -> Option<u8> {
+    let name = export
+        .strip_prefix("Nt")
+        .or_else(|| export.strip_prefix("Zw"))?;
+    let bytes = match name {
+        "Close" => 4,
+        "CreateSection" => 28,
+        "MapViewOfSection" => 40,
+        "OpenFile" => 24,
+        "ProtectVirtualMemory" => 20,
+        "QueryInformationProcess" => 20,
+        "QuerySystemInformation" => 16,
+        "SetInformationThread" => 16,
+        "UnmapViewOfSection" => 8,
+        _ => return None,
+    };
+    Some(bytes / 4)
 }
 
 #[test]
@@ -78,6 +101,16 @@ fn all_fronts_signature_audit() {
                 reason, "uncategorized metadata gap",
                 "new omission needs investigation: {name}"
             );
+            if let Some(argc) = native_argc(name.trim_start_matches("ntdll.dll!")) {
+                assert_eq!(
+                    registry
+                        .get("ntdll.dll", &name["ntdll.dll!".len()..])
+                        .unwrap()
+                        .conv,
+                    adv_abi::Conv::Stdcall { argc },
+                    "{name}"
+                );
+            }
             *categories.entry(reason).or_insert(0usize) += 1;
             report.push(format!("{policy:?}\t{name}\t{reason}"));
         }
@@ -158,4 +191,48 @@ fn gdi_object_extent_and_text_output_bindings_are_generated_without_dispatch_dat
         registry.get("gdi32.dll", "TextOutA").unwrap().conv,
         adv_abi::Conv::Stdcall { argc: 5 }
     );
+}
+
+#[test]
+fn shader_and_effect_fronts_match_the_complete_sdk_contract() {
+    let registry = adv_runtime::boot::api_registry(adv_runtime::vorbis::Policy::Guest);
+    let effects: Vec<_> = adv_abi::signature::com_signatures()
+        .iter()
+        .filter(|s| s.module == "ID3DXEffect")
+        .collect();
+    assert_eq!(effects.len(), 79);
+    for (slot, signature) in effects.iter().enumerate() {
+        assert_eq!(signature.com_slot, Some(slot as u16));
+        let name = format!("ID3DXEffect::{}", signature.name);
+        let host = registry
+            .get("d3dx9_43.dll", &name)
+            .expect("effect slot registered");
+        assert_eq!(Some(host.conv), signature.conv, "{name}");
+        assert!(registry.level("d3dx9_43.dll", &name).is_some());
+    }
+    for name in ["D3DXCreateEffect", "D3DXGetShaderOutputSemantics"] {
+        let signature = adv_abi::signature::lookup("d3dx9_43.dll", name).unwrap();
+        let host = registry.get("d3dx9_43.dll", name).unwrap();
+        assert_eq!(Some(host.conv), signature.conv, "{name}");
+        assert!(registry.is_implemented("d3dx9_43.dll", name));
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let shaders: Vec<_> = adv_abi::signature::com_signatures()
+            .iter()
+            .filter(|s| {
+                (s.module == "IDirect3DDevice9" && s.name.contains("Shader"))
+                    || matches!(s.module, "IDirect3DVertexShader9" | "IDirect3DPixelShader9")
+            })
+            .collect();
+        assert_eq!(shaders.len(), 28);
+        for signature in shaders {
+            let name = format!("{}::{}", signature.module, signature.name);
+            let host = registry
+                .get("d3d9.dll", &name)
+                .expect("shader entry registered");
+            assert_eq!(Some(host.conv), signature.conv, "{name}");
+            assert!(registry.is_implemented("d3d9.dll", &name));
+        }
+    }
 }

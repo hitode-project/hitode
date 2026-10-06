@@ -316,25 +316,6 @@ fn divide_classification_decodes_register_width_aliases_and_memory_addressing() 
 fn failure<B: TestCpu>(cpu: B, mode: u8) {
     let mut machine = machine(cpu);
     let mut code = Asm::new(CODE);
-    let mut handler = Asm::new(HANDLER);
-    if mode == 2 {
-        code.push_imm(HANDLER);
-        code.bytes
-            .extend_from_slice(&[0x64, 0xff, 0x35, 0, 0, 0, 0, 0x64, 0x89, 0x25, 0, 0, 0, 0]);
-        let raise = machine
-            .resolve_import("kernel32.dll", "RaiseException")
-            .unwrap();
-        // A second hardware #DE in a Unicorn/QEMU interrupt callback becomes
-        // vector8. Use explicit nested dispatch to test the existing frame
-        // protection consistently, without treating vector8 as a mapped #DE.
-        handler
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(0)
-            .push_imm(0xe0420003)
-            .call(raise);
-        handler.ret();
-    }
     code.bytes.extend_from_slice(if mode == 1 {
         &[0xcd, 0x07][..]
     } else {
@@ -343,8 +324,7 @@ fn failure<B: TestCpu>(cpu: B, mode: u8) {
     store(&mut code, &[0xc7, 0x05], DONE, 1);
     code.ret();
     machine.cpu.write(CODE, &code.bytes).unwrap();
-    machine.cpu.write(HANDLER, &handler.bytes).unwrap();
-    machine.cpu.regions(code.bytes.len(), handler.bytes.len());
+    machine.cpu.regions(code.bytes.len(), 0);
     machine
         .spawn("unsupported or unhandled CPU exception", CODE, &[], 65536)
         .unwrap();
@@ -355,7 +335,7 @@ fn failure<B: TestCpu>(cpu: B, mode: u8) {
         failure.message.contains(match mode {
             0 => "unhandled Windows exception 0xc0000094",
             1 => "unmapped x86 CPU exception vector 7",
-            _ => "nested frame-based exception dispatch is not implemented",
+            _ => unreachable!("only unhandled and unmapped stops are negative cases"),
         }),
         "{}",
         failure.message
@@ -369,8 +349,10 @@ fn failure<B: TestCpu>(cpu: B, mode: u8) {
 }
 
 #[test]
-fn unhandled_unmapped_and_nested_frame_exceptions_fail_without_advancing_guest_work() {
-    for mode in 0..3 {
+fn unhandled_and_unmapped_exceptions_fail_without_advancing_guest_work() {
+    // Legitimate nested frame searches are covered by the native-backed
+    // adv-runtime exception_dispatch fixture, including EXCEPTION_NESTED_CALL.
+    for mode in 0..2 {
         failure(UnicornCpu::new(PARK_ADDR).unwrap(), mode);
         failure(JitCpu::new(PARK_ADDR, true).unwrap(), mode);
     }

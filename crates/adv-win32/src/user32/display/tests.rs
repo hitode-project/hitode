@@ -51,6 +51,7 @@ fn fixture() -> Machine<JitCpu> {
         destroying: false,
         control: ControlState::default(),
         auto_clicks: 0,
+        hidden_popup: false,
     };
     let user = &mut machine.ext.get_mut::<Win32>().user;
     assert!(

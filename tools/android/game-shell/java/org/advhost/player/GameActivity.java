@@ -18,9 +18,12 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Process;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.Choreographer;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
@@ -33,12 +36,16 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.FrameLayout;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Locale;
@@ -58,7 +65,14 @@ public final class GameActivity extends Activity {
     private static final int TEXT = Color.rgb(235, 240, 247);
     private static final int MUTED = Color.rgb(166, 180, 199);
     private static final int ACCENT = Color.rgb(119, 192, 255);
+    private static final int FRAME_CHANGED = 1, STATE_CHANGED = 2;
+    private static volatile WeakReference<GameActivity> currentActivity = new WeakReference<>(null);
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Object nativeUpdateLock = new Object();
+    private final Runnable deliverNativeUpdate = this::deliverNativeUpdate;
+    private long nativeUpdateHandle;
+    private int nativeUpdateFlags;
+    private boolean nativeUpdateQueued;
     private final ExecutorService work = Executors.newSingleThreadExecutor();
     private final AtomicInteger generation = new AtomicInteger();
     private final AtomicBoolean importCancelled = new AtomicBoolean();
@@ -66,7 +80,9 @@ public final class GameActivity extends Activity {
     private volatile boolean resumed, destroyed;
     private GameLibrary library;
     private Throwable libraryError, nativeError;
-    private LinearLayout root;
+    private View root;
+    private View gameChrome;
+    private Button chromeToggle;
     private TextView status, importStatus;
     private AlertDialog importDialog, guestDialog;
     private int shownDialog = -1;
@@ -87,11 +103,37 @@ public final class GameActivity extends Activity {
     private static native long nativeStart(String exe, String dataDir, int codepage);
     private static native void nativeCommand(long session, String json);
     private static native String nativePoll(long session);
+    private static native void nativeFrameInfo(long session, long[] info);
     private static native long nativeCopyFrame(long session, Bitmap target);
     private static native void nativeStop(long session);
 
+    // Called by the native worker. Keep both queues bounded while it publishes updates.
+    private static void onNativeUpdate(long handle, int flags) {
+        GameActivity activity = currentActivity.get();
+        if (activity == null || activity.destroyed || activity.session != handle) return;
+        synchronized (activity.nativeUpdateLock) {
+            if (activity.destroyed || activity.session != handle) return;
+            if (activity.nativeUpdateHandle != handle) activity.nativeUpdateFlags = 0;
+            activity.nativeUpdateHandle = handle;
+            activity.nativeUpdateFlags |= flags & (FRAME_CHANGED | STATE_CHANGED);
+            if (activity.nativeUpdateQueued || activity.nativeUpdateFlags == 0) return;
+            activity.nativeUpdateQueued = true;
+            activity.main.post(activity.deliverNativeUpdate);
+        }
+    }
+    private void deliverNativeUpdate() {
+        final long handle;
+        final int flags;
+        synchronized (nativeUpdateLock) {
+            handle = nativeUpdateHandle; flags = nativeUpdateFlags;
+            nativeUpdateFlags = 0; nativeUpdateQueued = false;
+        }
+        if (!destroyed && session == handle && gameSurface != null) gameSurface.nativeChanged(flags);
+    }
+
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        currentActivity = new WeakReference<>(this);
         getWindow().setStatusBarColor(BACKGROUND);
         getWindow().setNavigationBarColor(BACKGROUND);
         audioManager = (AudioManager)getSystemService(AUDIO_SERVICE);
@@ -149,6 +191,8 @@ public final class GameActivity extends Activity {
     }
     private void showLibrary() {
         if (destroyed) return;
+        gameChrome = null; chromeToggle = null;
+        applyImmersiveMode(false);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         LinearLayout layout = makeRoot();
         layout.addView(text("ADV 遊戲庫", 27, TEXT));
@@ -284,16 +328,23 @@ public final class GameActivity extends Activity {
     }
     private void showGame() {
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
-        LinearLayout layout = makeRoot();
+        FrameLayout layout = new FrameLayout(this);
+        layout.setBackgroundColor(Color.BLACK);
+        setContentView(layout); root = layout;
+        gameSurface = new GameSurface();
+        layout.addView(gameSurface, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout overlay = new FrameLayout(this);
+        layout.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        gameChrome = overlay;
         LinearLayout top = new LinearLayout(this); top.setGravity(Gravity.CENTER_VERTICAL);
+        top.setBackgroundColor(0xdd10141c);
         Button back = button("‹ 遊戲庫", view -> confirmStop()); top.addView(back);
         status = text(currentTitle, 13, MUTED); status.setMaxLines(2); status.setPadding(dp(12), 0, dp(8), 0);
         top.addView(status, new LinearLayout.LayoutParams(0, -2, 1));
         menuButton = button("選單", view -> showMenus(menus, "遊戲選單")); menuButton.setEnabled(false); top.addView(menuButton);
-        layout.addView(top);
-        gameSurface = new GameSurface();
-        layout.addView(gameSurface, new LinearLayout.LayoutParams(-1, 0, 1));
+        overlay.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
         LinearLayout controls = new LinearLayout(this); controls.setGravity(Gravity.CENTER);
+        controls.setBackgroundColor(0xdd10141c);
         controls.addView(button("確認", view -> tapKey(13)), new LinearLayout.LayoutParams(0, -2, 1));
         controls.addView(button("右鍵", view -> { if (gameSurface != null) gameSurface.rightClick(); }), new LinearLayout.LayoutParams(0, -2, 1));
         controls.addView(button("Esc", view -> tapKey(27)), new LinearLayout.LayoutParams(0, -2, 1));
@@ -306,7 +357,57 @@ public final class GameActivity extends Activity {
             return true;
         });
         controls.addView(fastButton, new LinearLayout.LayoutParams(0, -2, 1));
-        layout.addView(controls);
+        overlay.addView(controls, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        chromeToggle = button("☰", view -> setChromeVisible(gameChrome.getVisibility() != View.VISIBLE));
+        chromeToggle.setContentDescription("顯示或隱藏遊戲控制列");
+        chromeToggle.setAlpha(0.65f);
+        layout.addView(chromeToggle, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL));
+        final Button edgeToggle = chromeToggle;
+        layout.setOnApplyWindowInsetsListener((view, insets) -> {
+            int left, right, topInset, bottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets safe = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                left = safe.left; right = safe.right; topInset = safe.top; bottom = safe.bottom;
+            } else {
+                left = insets.getSystemWindowInsetLeft(); right = insets.getSystemWindowInsetRight();
+                topInset = insets.getSystemWindowInsetTop(); bottom = insets.getSystemWindowInsetBottom();
+                if (insets.getDisplayCutout() != null) {
+                    left = Math.max(left, insets.getDisplayCutout().getSafeInsetLeft());
+                    right = Math.max(right, insets.getDisplayCutout().getSafeInsetRight());
+                }
+            }
+            overlay.setPadding(left, topInset, right, bottom);
+            FrameLayout.LayoutParams toggle = (FrameLayout.LayoutParams)edgeToggle.getLayoutParams();
+            toggle.rightMargin = right + dp(4); edgeToggle.setLayoutParams(toggle);
+            return insets;
+        });
+        setChromeVisible(false); applyImmersiveMode(true); layout.requestApplyInsets();
+    }
+    private void setChromeVisible(boolean visible) {
+        releaseInputs();
+        if (gameChrome != null) gameChrome.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (chromeToggle != null) chromeToggle.setText(visible ? "×" : "☰");
+    }
+    private void applyImmersiveMode(boolean enabled) {
+        // The initial library calls this before setContentView creates the decor.
+        getWindow().getDecorView();
+        WindowManager.LayoutParams params = getWindow().getAttributes();
+        params.layoutInDisplayCutoutMode = enabled
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+        getWindow().setAttributes(params);
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().setDecorFitsSystemWindows(!enabled);
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                if (enabled) controller.hide(WindowInsets.Type.systemBars());
+                else controller.show(WindowInsets.Type.systemBars());
+            }
+        } else getWindow().getDecorView().setSystemUiVisibility(enabled
+            ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            : View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
     }
     private void confirmStop() {
         releaseInputs();
@@ -457,68 +558,205 @@ public final class GameActivity extends Activity {
         if (view instanceof SeekBar && !view.isPressed()) ((SeekBar)view).setProgress(control.optInt("value"));
     }
 
-    private final class GameSurface extends SurfaceView implements SurfaceHolder.Callback, Runnable {
+    private final class GameSurface extends SurfaceView implements SurfaceHolder.Callback, Choreographer.FrameCallback {
         private volatile boolean open = true, ready;
         private volatile int frameWidth, frameHeight;
         private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
-        private final Thread renderer;
+        private final Object surfaceLock = new Object();
+        private final HandlerThread renderer;
+        private final Handler renderHandler;
+        private final long[] frameInfo = new long[3];
+        private final AtomicInteger pendingChanges = new AtomicInteger();
+        private final AtomicBoolean changeQueued = new AtomicBoolean();
+        private final Runnable synchronizeState = this::synchronizeState;
+        private final Runnable consumeNativeChanges = this::consumeNativeChanges;
+        private final Runnable pollState = this::pollState;
+        private final Runnable fixtureReport = this::fixtureReport;
+        // These fields and the Bitmap belong to the render looper.
+        private Choreographer choreographer;
+        private Bitmap bitmap;
+        private boolean frameScheduled, stateScheduled, fixtureScheduled, redraw = true, disposed, copyRetry;
+        private long copied = -1, presented = -1, observedHandle;
+        private long canvasPosts, frameCopies, statePolls, vsyncCallbacks;
+        private boolean hardwareCanvas;
         private volatile RectF destination = new RectF();
         private boolean pointerDown;
         private int pointerId = -1, lastX, lastY;
         GameSurface() {
             super(GameActivity.this); getHolder().addCallback(this); setFocusable(true);
             // Paint letterboxing on the Surface canvas; a View background obscures the Surface below it.
-            renderer = new Thread(this, "adv-frame-presenter"); renderer.start();
+            renderer = new HandlerThread("adv-frame-presenter", Process.THREAD_PRIORITY_DISPLAY);
+            renderer.start();
+            renderHandler = new Handler(renderer.getLooper());
+            renderHandler.post(() -> { choreographer = Choreographer.getInstance(); synchronizeState(); });
         }
-        public void surfaceCreated(SurfaceHolder holder) { ready = true; wake(); }
-        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) { ready = true; wake(); }
-        public void surfaceDestroyed(SurfaceHolder holder) { ready = false; releasePointer(); }
-        void wake() { synchronized (this) { notifyAll(); } }
-        void close() { open = false; ready = false; wake(); }
-        @Override public void run() {
-            Bitmap bitmap = null; long copied = -1, lastState = 0, observedHandle = 0, lastFixtureReport = 0;
-            while (open && !destroyed) {
-                long handle = session;
-                if (!ready || !resumed || handle == 0) { synchronized (this) { try { wait(100); } catch (InterruptedException ignored) { } } continue; }
-                try {
-                    JSONObject snapshot = new JSONObject(nativePoll(handle)); JSONObject frame = snapshot.optJSONObject("frame");
-                    if (handle != observedHandle) { observedHandle = handle; copied = -1; }
-                    int width = frame == null ? 0 : frame.optInt("width"), height = frame == null ? 0 : frame.optInt("height");
-                    long serial = frame == null ? -1 : frame.optLong("serial", -1);
-                    if (width > 0 && height > 0 && width <= 4096 && height <= 4096 && (long)width * height <= 16777216) {
-                        if (bitmap == null || bitmap.getWidth() != width || bitmap.getHeight() != height) {
-                            if (bitmap != null) bitmap.recycle(); bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888); copied = -1;
-                        }
-                        if (serial != copied) { long complete = nativeCopyFrame(handle, bitmap); if (complete >= 0) { copied = complete; frameWidth = width; frameHeight = height; } }
-                    }
-                    Canvas canvas = null;
-                    try {
-                        if (ready && open && resumed) canvas = getHolder().lockCanvas();
-                        if (canvas != null) {
-                            canvas.drawColor(Color.BLACK);
-                            if (bitmap != null && copied >= 0) {
-                                float scale = Math.min(canvas.getWidth() / (float)bitmap.getWidth(), canvas.getHeight() / (float)bitmap.getHeight());
-                                float w = bitmap.getWidth() * scale, h = bitmap.getHeight() * scale;
-                                RectF rect = new RectF((canvas.getWidth() - w) / 2, (canvas.getHeight() - h) / 2, (canvas.getWidth() + w) / 2, (canvas.getHeight() + h) / 2);
-                                destination = rect; canvas.drawBitmap(bitmap, null, rect, paint);
-                            }
-                        }
-                    } finally { if (canvas != null) getHolder().unlockCanvasAndPost(canvas); }
-                    long now = android.os.SystemClock.uptimeMillis();
-                    if (activeFixture && now - lastFixtureReport >= 500) {
-                        lastFixtureReport = now;
-                        snapshot.put("presented_serial", copied);
-                        writeFixtureReport(snapshot);
-                    }
-                    if (now - lastState >= 100) { lastState = now; main.post(() -> updateState(handle, snapshot)); }
-                } catch (Throwable error) {
-                    Log.e(TAG, "Presentation", error);
-                    main.post(() -> { if (session == handle && !destroyed) { stopSession(); showError("無法顯示遊戲", message(error)); } });
-                    break;
-                }
-                try { Thread.sleep(16); } catch (InterruptedException ignored) { }
+        public void surfaceCreated(SurfaceHolder holder) { synchronized (surfaceLock) { ready = true; } wake(); }
+        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) { synchronized (surfaceLock) { ready = true; } wake(); }
+        public void surfaceDestroyed(SurfaceHolder holder) {
+            // Wait for a hardware canvas already in use before returning the Surface to Android.
+            synchronized (surfaceLock) { ready = false; }
+            releasePointer(); wake();
+        }
+        void wake() { if (open) renderHandler.post(synchronizeState); }
+        void nativeChanged(int flags) {
+            if (!open) return;
+            pendingChanges.getAndAccumulate(flags, (pending, update) -> pending | update);
+            queueNativeChanges();
+        }
+        private void queueNativeChanges() {
+            if (open && pendingChanges.get() != 0 && changeQueued.compareAndSet(false, true)) {
+                if (!renderHandler.post(consumeNativeChanges)) changeQueued.set(false);
             }
-            if (bitmap != null) bitmap.recycle();
+        }
+        private void consumeNativeChanges() {
+            int flags = pendingChanges.getAndSet(0);
+            changeQueued.set(false);
+            // An update between the atomic drain and clearing the guard needs its own handoff.
+            queueNativeChanges();
+            if (disposed) return;
+            if (!open || destroyed) { dispose(); return; }
+            if ((flags & STATE_CHANGED) != 0) requestState();
+            if ((flags & FRAME_CHANGED) != 0) { copyRetry = false; scheduleFrame(); }
+        }
+        void close() {
+            synchronized (surfaceLock) { open = false; ready = false; }
+            renderHandler.post(this::dispose);
+        }
+        private boolean canPoll() { return open && !destroyed && resumed && session != 0; }
+        private boolean canPresent() { return ready && canPoll(); }
+        private void synchronizeState() {
+            if (disposed) return;
+            if (!open || destroyed) { dispose(); return; }
+            redraw = true;
+            if (canPoll()) {
+                requestState();
+                if (activeFixture && !fixtureScheduled) {
+                    fixtureScheduled = true; renderHandler.postDelayed(fixtureReport, 500);
+                }
+            } else {
+                renderHandler.removeCallbacks(pollState); stateScheduled = false;
+                renderHandler.removeCallbacks(fixtureReport); fixtureScheduled = false;
+            }
+            if (canPresent()) { copyRetry = false; scheduleFrame(); }
+            else if (frameScheduled) { choreographer.removeFrameCallback(this); frameScheduled = false; }
+        }
+        private void requestState() {
+            if (!disposed && canPoll() && !stateScheduled) {
+                stateScheduled = true; renderHandler.post(pollState);
+            }
+        }
+        private void scheduleFrame() {
+            if (!disposed && canPresent() && !frameScheduled) {
+                frameScheduled = true; choreographer.postFrameCallback(this);
+            }
+        }
+        @Override public void doFrame(long frameTimeNanos) {
+            frameScheduled = false; ++vsyncCallbacks;
+            if (disposed || !canPresent()) return;
+            boolean allowRetry = !copyRetry;
+            copyRetry = false;
+            long handle = session;
+            try {
+                if (handle != observedHandle) {
+                    observedHandle = handle; copied = presented = -1; redraw = true;
+                    frameWidth = frameHeight = 0; destination = new RectF();
+                }
+                // A native update requests one vsync; unchanged scenes leave the presenter idle.
+                nativeFrameInfo(handle, frameInfo);
+                long serial = frameInfo[0], width = frameInfo[1], height = frameInfo[2];
+                if (serial >= 0 && width > 0 && height > 0 && width <= 4096 && height <= 4096 && width * height <= 16777216) {
+                    if (bitmap == null || bitmap.getWidth() != (int)width || bitmap.getHeight() != (int)height) {
+                        Bitmap next = Bitmap.createBitmap((int)width, (int)height, Bitmap.Config.ARGB_8888);
+                        ++frameCopies;
+                        long complete = nativeCopyFrame(handle, next);
+                        if (complete >= 0) {
+                            if (bitmap != null) bitmap.recycle();
+                            bitmap = next; copied = complete; redraw = true;
+                            frameWidth = (int)width; frameHeight = (int)height;
+                        } else { next.recycle(); copyRetry = allowRetry; }
+                    } else if (serial != copied) {
+                        ++frameCopies;
+                        long complete = nativeCopyFrame(handle, bitmap);
+                        if (complete >= 0) { copied = complete; frameWidth = (int)width; frameHeight = (int)height; }
+                        else copyRetry = allowRetry;
+                    }
+                }
+                if (redraw || copied != presented) present(handle);
+            } catch (Throwable error) { presentationFailed(handle, error); }
+            // Metadata and copy can observe opposite sides of a resize. Retry once next vsync.
+            if (copyRetry) scheduleFrame();
+        }
+        private void present(long handle) {
+            synchronized (surfaceLock) {
+                if (!canPresent() || session != handle) return;
+                Canvas canvas = getHolder().lockHardwareCanvas();
+                if (canvas == null) return;
+                hardwareCanvas = canvas.isHardwareAccelerated();
+                try {
+                    canvas.drawColor(Color.BLACK);
+                    if (bitmap != null && copied >= 0) {
+                        float scale = Math.min(canvas.getWidth() / (float)bitmap.getWidth(), canvas.getHeight() / (float)bitmap.getHeight());
+                        float w = bitmap.getWidth() * scale, h = bitmap.getHeight() * scale;
+                        RectF rect = new RectF((canvas.getWidth() - w) / 2, (canvas.getHeight() - h) / 2, (canvas.getWidth() + w) / 2, (canvas.getHeight() + h) / 2);
+                        destination = rect; canvas.drawBitmap(bitmap, null, rect, paint);
+                    }
+                } finally { getHolder().unlockCanvasAndPost(canvas); }
+                ++canvasPosts; presented = copied; redraw = false;
+            }
+        }
+        private void pollState() {
+            stateScheduled = false;
+            if (disposed || !canPoll()) return;
+            long handle = session;
+            try {
+                ++statePolls;
+                JSONObject snapshot = new JSONObject(nativePoll(handle));
+                main.post(() -> updateState(handle, snapshot));
+            } catch (Throwable error) { presentationFailed(handle, error); }
+        }
+        private JSONObject diagnosticSnapshot(long handle) throws Exception {
+            ++statePolls;
+            return new JSONObject(nativePoll(handle)).put("presented_serial", presented)
+                .put("canvas_posts", canvasPosts).put("frame_copies", frameCopies)
+                .put("state_polls", statePolls).put("vsync_callbacks", vsyncCallbacks)
+                .put("hardware_canvas", hardwareCanvas);
+        }
+        private void fixtureReport() {
+            fixtureScheduled = false;
+            if (disposed || !activeFixture || !canPoll()) return;
+            long handle = session;
+            try { writeFixtureReport(diagnosticSnapshot(handle)); }
+            catch (Throwable error) { presentationFailed(handle, error); }
+            if (!disposed && activeFixture && canPoll()) {
+                fixtureScheduled = true; renderHandler.postDelayed(fixtureReport, 500);
+            }
+        }
+        void snapshot() {
+            long handle = session;
+            if (!open || handle == 0) return;
+            renderHandler.post(() -> {
+                if (disposed || !open || destroyed || session != handle) return;
+                try { writeReport("player-state.json", diagnosticSnapshot(handle)); }
+                catch (Throwable error) { Log.w(TAG, "Player snapshot", error); }
+            });
+        }
+        private void presentationFailed(long handle, Throwable error) {
+            Log.e(TAG, "Presentation", error);
+            synchronized (surfaceLock) { open = false; ready = false; }
+            dispose();
+            main.post(() -> { if (session == handle && !destroyed) { stopSession(); showError("無法顯示遊戲", message(error)); } });
+        }
+        private void dispose() {
+            if (disposed) return;
+            disposed = true;
+            if (choreographer != null) choreographer.removeFrameCallback(this);
+            renderHandler.removeCallbacks(pollState); renderHandler.removeCallbacks(synchronizeState);
+            renderHandler.removeCallbacks(consumeNativeChanges); renderHandler.removeCallbacks(fixtureReport);
+            pendingChanges.set(0); changeQueued.set(false);
+            frameScheduled = stateScheduled = fixtureScheduled = false;
+            if (bitmap != null) { bitmap.recycle(); bitmap = null; }
+            frameWidth = frameHeight = 0; destination = new RectF();
+            renderer.quitSafely();
         }
         private boolean map(float x, float y) {
             RectF rect = destination;
@@ -552,13 +790,18 @@ public final class GameActivity extends Activity {
         }
     }
 
-    // Debug-only, fixed private fixture. No intent supplies an executable path or native JSON.
+    // Debug-only diagnostics and a fixed private fixture. Intents supply no executable path or native JSON.
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0) return;
         String action = intent.getStringExtra("probe_action");
         if (action == null) {
             if (session == 0 && gameSurface == null && "shell-probe".equals(intent.getStringExtra("fixture"))) launchFixture();
+            return;
+        }
+        if (action.equals("snapshot")) {
+            if (session != 0 && gameSurface != null) gameSurface.snapshot();
+            else Log.w(TAG, "Rejected snapshot without an active game");
             return;
         }
         if (!activeFixture || session == 0 || gameSurface == null) { Log.w(TAG, "Rejected fixture action outside fixture"); return; }
@@ -614,7 +857,10 @@ public final class GameActivity extends Activity {
         return false;
     }
     private void writeFixtureReport(JSONObject snapshot) {
-        android.util.AtomicFile report = new android.util.AtomicFile(new File(getFilesDir(), "shell-state.json"));
+        writeReport("shell-state.json", snapshot);
+    }
+    private void writeReport(String filename, JSONObject snapshot) {
+        android.util.AtomicFile report = new android.util.AtomicFile(new File(getFilesDir(), filename));
         java.io.FileOutputStream output = null;
         try { output = report.startWrite(); output.write(snapshot.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); report.finishWrite(output); }
         catch (Exception error) { if (output != null) report.failWrite(output); Log.w(TAG, "Fixture report", error); }
@@ -637,13 +883,15 @@ public final class GameActivity extends Activity {
             case KeyEvent.KEYCODE_CTRL_LEFT: case KeyEvent.KEYCODE_CTRL_RIGHT: return 17; case KeyEvent.KEYCODE_SPACE: return 32;
             case KeyEvent.KEYCODE_DPAD_LEFT: return 37; case KeyEvent.KEYCODE_DPAD_UP: return 38; case KeyEvent.KEYCODE_DPAD_RIGHT: return 39; case KeyEvent.KEYCODE_DPAD_DOWN: return 40; default: return 0; }
     }
-    @Override public void onBackPressed() { if (session != 0 || gameSurface != null) confirmStop(); else super.onBackPressed(); }
-    @Override public void onWindowFocusChanged(boolean focused) { super.onWindowFocusChanged(focused); if (!focused) { releaseInputs(); for (int key : new int[]{13, 17, 27, 32, 37, 38, 39, 40}) command(object("type", "key", "key", key, "pressed", false)); } }
-    @Override protected void onPause() { resumed = false; releaseInputs(); command(object("type", "pause")); command(object("type", "audio_focus", "active", false)); abandonAudioFocus(); super.onPause(); }
+    @Override public void onBackPressed() { if (gameChrome != null) setChromeVisible(gameChrome.getVisibility() != View.VISIBLE); else super.onBackPressed(); }
+    @Override public void onWindowFocusChanged(boolean focused) { super.onWindowFocusChanged(focused); if (focused && gameSurface != null) applyImmersiveMode(true); if (!focused) { releaseInputs(); for (int key : new int[]{13, 17, 27, 32, 37, 38, 39, 40}) command(object("type", "key", "key", key, "pressed", false)); } }
+    @Override protected void onPause() { resumed = false; if (gameSurface != null) gameSurface.wake(); releaseInputs(); command(object("type", "pause")); command(object("type", "audio_focus", "active", false)); abandonAudioFocus(); super.onPause(); }
     @Override protected void onResume() { super.onResume(); resumed = true; if (session != 0) { requestAudioFocus(); command(object("type", "audio_focus", "active", audioFocused)); command(object("type", "resume")); if (gameSurface != null) gameSurface.wake(); } }
     @Override public void onConfigurationChanged(Configuration configuration) { super.onConfigurationChanged(configuration); releaseInputs(); if (root != null) root.requestApplyInsets(); }
     @Override protected void onDestroy() {
+        if (currentActivity.get() == this) currentActivity = new WeakReference<>(null);
         destroyed = true; generation.incrementAndGet(); importCancelled.set(true); if (importing && library != null) new Thread(() -> library.cancelImport(), "adv-import-cancel").start(); releaseInputs();
+        main.removeCallbacks(deliverNativeUpdate);
         long handle = session; session = 0; if (gameSurface != null) gameSurface.close(); if (handle != 0) nativeStop(handle);
         if (pendingImport != null) {
             GameLibrary.Imported pending = pendingImport; pendingImport = null;

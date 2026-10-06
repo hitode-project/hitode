@@ -323,6 +323,10 @@ fn combo_proc(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(u32::MAX);
     };
     let sorted = window.style & 0x100 != 0;
+    // CB_LIMITTEXT: a drop-down list has no edit field to limit.
+    if msg == 0x141 {
+        return Outcome::Return(if window.style & 3 == 3 { u32::MAX } else { 1 });
+    }
     let choices = window.control.choices.get_or_insert_with(Default::default);
     let result = match msg {
         0x143 | 0x14a => {
@@ -505,6 +509,7 @@ fn def_dlg_default(
 }
 
 pub fn register(reg: &mut Registry) {
+    super::tab::register(reg);
     reg.register(def_dlg_proc_w_ABI);
     stdcall(reg, USER32, DIALOG_PROC, 4, dialog_proc);
     stdcall(reg, USER32, BUTTON_PROC, 4, button_proc);

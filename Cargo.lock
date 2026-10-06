@@ -39,6 +39,7 @@ dependencies = [
  "adv-runtime",
  "adv-sync",
  "jni",
+ "libc",
  "ndk-context",
  "pollster",
  "serde_json",
@@ -112,7 +113,9 @@ dependencies = [
  "bytemuck",
  "iced-x86",
  "log",
+ "naga",
  "pollster",
+ "sha2",
 ]
 
 [[package]]

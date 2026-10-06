@@ -348,7 +348,7 @@ fn failed_forwarders_keep_requested_and_target_names_and_rollback_guest_dependen
         &[
             export(
                 "NeedSDK",
-                Target::Forwarder("user32.LoadAcceleratorsW".into()),
+                Target::Forwarder("kernel32.FlsAlloc".into()),
             ),
             export(
                 "NeedGuest",
@@ -382,11 +382,8 @@ fn failed_forwarders_keep_requested_and_target_names_and_rollback_guest_dependen
     assert_eq!(records[0].kind, DynamicLookupKind::Unimplemented);
     assert_eq!(records[0].module, "proxy.dll");
     assert_eq!(records[0].name, "NeedSDK");
-    assert_eq!(records[0].failure_module.as_deref(), Some("user32.dll"));
-    assert_eq!(
-        records[0].failure_name.as_deref(),
-        Some("LoadAcceleratorsW")
-    );
+    assert_eq!(records[0].failure_module.as_deref(), Some("kernel32.dll"));
+    assert_eq!(records[0].failure_name.as_deref(), Some("FlsAlloc"));
     assert_eq!(records[1].kind, DynamicLookupKind::MissingExport);
     assert_eq!(records[1].failure_module.as_deref(), Some("owned.dll"));
     assert_eq!(records[1].failure_name.as_deref(), Some("MissingFeature"));

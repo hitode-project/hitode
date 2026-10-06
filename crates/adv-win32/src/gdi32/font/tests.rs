@@ -668,6 +668,287 @@ fn software_dc_preserves_font_and_mapping_state() {
 }
 
 #[test]
+fn restore_dc_returns_selections_colors_and_the_bitmap_by_level() {
+    let (mut machine, data, dc) = fixture();
+    let font = selected_font(&machine, dc);
+    let bitmap = invoke(&mut machine, data, "CreateCompatibleBitmap", &[dc, 4, 4]);
+    assert_ne!(bitmap, 0);
+    invoke(&mut machine, data, "SetTextColor", &[dc, 0x11]);
+    assert_eq!(invoke(&mut machine, data, "SaveDC", &[dc]), 1);
+    let stock_bitmap = invoke(&mut machine, data, "SelectObject", &[dc, bitmap]);
+    invoke(&mut machine, data, "SelectObject", &[dc, STOCK_FONT]);
+    invoke(&mut machine, data, "SetTextColor", &[dc, 0x22]);
+    invoke(&mut machine, data, "SetBkMode", &[dc, 1]);
+    assert_eq!(invoke(&mut machine, data, "SaveDC", &[dc]), 2);
+    invoke(&mut machine, data, "SetTextColor", &[dc, 0x33]);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 0]), 0);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 3]), 0);
+    assert_eq!(
+        invoke(&mut machine, data, "RestoreDC", &[dc, (-3i32) as u32]),
+        0
+    );
+    // -1 brings back the newest state and pops it.
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, u32::MAX]), 1);
+    assert_eq!(
+        invoke(&mut machine, data, "SetTextColor", &[dc, 0x22]),
+        0x22
+    );
+    assert_eq!(invoke(&mut machine, data, "SetBkMode", &[dc, 1]), 1);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 2]), 0);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 1]), 1);
+    assert_eq!(
+        invoke(&mut machine, data, "SetTextColor", &[dc, 0x11]),
+        0x11
+    );
+    assert_eq!(invoke(&mut machine, data, "SetBkMode", &[dc, 2]), 2);
+    assert_eq!(selected_font(&machine, dc), font);
+    assert_eq!(
+        invoke(&mut machine, data, "SelectObject", &[dc, stock_bitmap]),
+        stock_bitmap
+    );
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, u32::MAX]), 0);
+    assert_eq!(invoke(&mut machine, data, "SaveDC", &[0x1234]), 0);
+}
+
+fn invoke_draw_text(machine: &mut Machine<JitCpu>, data: u32, wide: bool, args: &[u32]) -> u32 {
+    let address = machine
+        .resolve_import("user32.dll", if wide { "DrawTextW" } else { "DrawTextA" })
+        .unwrap();
+    let index = (address - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+    let handler = machine.sys.thunks.get(index).f.handler;
+    machine.cpu.set_reg(Reg::Esp, data + 2048);
+    for (i, &arg) in args.iter().enumerate() {
+        machine
+            .cpu
+            .write_u32(data + 2052 + i as u32 * 4, arg)
+            .unwrap();
+    }
+    let result = handler(&mut Env {
+        context: machine.sys.current,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: index,
+    });
+    let Outcome::Return(value) = result else {
+        panic!("DrawText measurement must return")
+    };
+    value
+}
+
+#[test]
+fn draw_text_measurement_rejects_unwritable_rectangles_and_unsupported_layouts() {
+    let (mut m, data, dc) = fixture();
+    let rect = data + 128;
+    let original = [3i32, 4, 100, 100]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    m.cpu.write(rect, &original).unwrap();
+    m.cpu.write(data, b"A\0").unwrap();
+    for (hdc, pointer, count, rectangle, flags) in [
+        (0xdeadbeef, data, 1, rect, 0x440),
+        (dc, data, -2i32 as u32, rect, 0x440),
+        (dc, 0xdeadbeef, 1, rect, 0x440),
+        (dc, data, 1, 0xdeadbeef, 0x440),
+        (dc, data, 1, rect, 0),
+        (dc, data, 1, rect, 0x410),
+    ] {
+        assert_eq!(
+            invoke_draw_text(
+                &mut m,
+                data,
+                false,
+                &[hdc, pointer, count, rectangle, flags]
+            ),
+            0
+        );
+        let mut actual = vec![0; 16];
+        m.cpu.read(rect, &mut actual).unwrap();
+        assert_eq!(actual, original);
+    }
+    let protected = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+    m.cpu.write(protected, &original).unwrap();
+    m.cpu.protect(protected, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        invoke_draw_text(&mut m, data, false, &[dc, data, 1, protected, 0x440]),
+        0
+    );
+    let mut actual = vec![0; 16];
+    m.cpu.read(protected, &mut actual).unwrap();
+    assert_eq!(actual, original);
+}
+
+#[test]
+fn draw_text_ansi_measurement_uses_guest_acp_before_font_formatting() {
+    let (mut m, data, dc) = fixture();
+    let rect = data + 129;
+    let initial = [3i32, 4, 150, 150]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    for (cp, raw) in [
+        (932, vec![0xb1]),
+        (936, vec![0xb1]),
+        (1252, vec![0xb1]),
+        (932, vec![0x82, 0xa0]),
+        (936, vec![0xd6, 0xd0]),
+    ] {
+        m.ext.get_mut::<Win32>().codec = adv_os::Codec::new(cp);
+        let units = m.ext.get::<Win32>().codec.to_utf16(0, &raw);
+        m.cpu
+            .write(data + 512, &[raw.as_slice(), &[0]].concat())
+            .unwrap();
+        m.cpu
+            .write(
+                data + 640,
+                &units
+                    .iter()
+                    .copied()
+                    .chain([0])
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        for (ansi_count, wide_count) in
+            [(raw.len() as u32, units.len() as u32), (u32::MAX, u32::MAX)]
+        {
+            m.cpu.write(rect, &initial).unwrap();
+            let a = invoke_draw_text(
+                &mut m,
+                data,
+                false,
+                &[dc, data + 512, ansi_count, rect, 0x440],
+            );
+            let mut a_rect = [0; 16];
+            m.cpu.read(rect, &mut a_rect).unwrap();
+            m.cpu.write(rect, &initial).unwrap();
+            let w = invoke_draw_text(
+                &mut m,
+                data,
+                true,
+                &[dc, data + 640, wide_count, rect, 0x440],
+            );
+            let mut w_rect = [0; 16];
+            m.cpu.read(rect, &mut w_rect).unwrap();
+            assert_eq!((a, a_rect), (w, w_rect), "guest cp={cp}");
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn draw_text_calc_rect_matches_native_selected_font_tabs_prefixes_and_line_breaks() {
+    use core::ffi::c_void;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn DrawTextA(
+            dc: *mut c_void,
+            input: *const u8,
+            count: i32,
+            rect: *mut i32,
+            flags: u32,
+        ) -> i32;
+        fn DrawTextW(
+            dc: *mut c_void,
+            input: *const u16,
+            count: i32,
+            rect: *mut i32,
+            flags: u32,
+        ) -> i32;
+    }
+    let (mut m, data, dc) = fixture();
+    let native = native_font(&m, dc);
+    let before = m
+        .ext
+        .try_get::<adv_device::surface::SurfaceStore>()
+        .map(|s| s.stats.presentations);
+    for wide in [false, true] {
+        for input in ["", "A", "A\n", "A\r\nB", "A\tB", "\t", "&A&&B", "A\0B"] {
+            for flags in [0x400, 0x440, 0xc40, 0x460, 0x640] {
+                let mut rectangle = [3i32, 4, 150, 150];
+                let units = input.encode_utf16().chain([0]).collect::<Vec<_>>();
+                let raw = input
+                    .as_bytes()
+                    .iter()
+                    .copied()
+                    .chain([0])
+                    .collect::<Vec<_>>();
+                // SAFETY: counted input and a complete mutable RECT; the oracle owns its DC.
+                let expected = unsafe {
+                    if wide {
+                        DrawTextW(
+                            native.dc,
+                            units.as_ptr(),
+                            input.encode_utf16().count() as i32,
+                            rectangle.as_mut_ptr(),
+                            flags,
+                        )
+                    } else {
+                        DrawTextA(
+                            native.dc,
+                            raw.as_ptr(),
+                            input.len() as i32,
+                            rectangle.as_mut_ptr(),
+                            flags,
+                        )
+                    }
+                };
+                m.cpu
+                    .write(
+                        data,
+                        &if wide {
+                            units
+                                .iter()
+                                .flat_map(|u| u.to_le_bytes())
+                                .collect::<Vec<_>>()
+                        } else {
+                            raw
+                        },
+                    )
+                    .unwrap();
+                let rect = data + 129; // guest RECT need not be aligned
+                m.cpu
+                    .write(
+                        rect,
+                        &[3i32, 4, 150, 150]
+                            .into_iter()
+                            .flat_map(i32::to_le_bytes)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let actual = invoke_draw_text(
+                    &mut m,
+                    data,
+                    wide,
+                    &[dc, data, input.len() as u32, rect, flags],
+                );
+                assert_eq!(
+                    actual, expected as u32,
+                    "input={input:?} flags={flags:x} wide={wide}"
+                );
+                let mut actual_rect = [0; 16];
+                m.cpu.read(rect, &mut actual_rect).unwrap();
+                assert_eq!(
+                    actual_rect.to_vec(),
+                    rectangle
+                        .into_iter()
+                        .flat_map(i32::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                    "input={input:?} flags={flags:x} wide={wide}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        m.ext
+            .try_get::<adv_device::surface::SurfaceStore>()
+            .map(|s| s.stats.presentations),
+        before
+    );
+}
+
+#[test]
 fn software_dc_preserves_rop2_per_context_and_normalizes_the_native_byte() {
     let (mut machine, data, dc) = fixture();
     let other = invoke(&mut machine, data, "CreateCompatibleDC", &[0]);

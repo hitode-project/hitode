@@ -29,6 +29,9 @@ struct Options {
     headless: bool,
     hidden: bool,
     gpu_software: bool,
+    d3d9_sm2: bool,
+    d3d9_sm3: bool,
+    d3d9_shader_cache: Option<PathBuf>,
     width: u32,
     height: u32,
     frames: Option<u64>,
@@ -71,6 +74,9 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
+  --d3d9-sm2             opt in to the SM2 capability milestone (default: off)\n\
+  --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
+  --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
   --frames N              stop after N presented guest frames\n\
   --seconds N             stop after N seconds of host wall time\n\
@@ -106,6 +112,9 @@ impl Options {
             headless: false,
             hidden: false,
             gpu_software: false,
+            d3d9_sm2: false,
+            d3d9_sm3: false,
+            d3d9_shader_cache: None,
             width: 640,
             height: 480,
             frames: None,
@@ -188,6 +197,9 @@ impl Options {
                 "--headless" => options.headless = true,
                 "--hidden" => options.hidden = true,
                 "--gpu-software" => options.gpu_software = true,
+                "--d3d9-sm2" => options.d3d9_sm2 = true,
+                "--d3d9-sm3" => options.d3d9_sm3 = true,
+                "--d3d9-shader-cache" => options.d3d9_shader_cache = Some(value()?.into()),
                 "--self-test-input" => options.self_test_input = true,
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
@@ -232,6 +244,10 @@ impl Options {
             }
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
+        #[cfg(not(feature = "gpu"))]
+        if options.d3d9_sm2 || options.d3d9_sm3 || options.d3d9_shader_cache.is_some() {
+            return Err("D3D9 shader capability switches require the gpu feature".into());
+        }
         options.data_dir = data_dir.unwrap_or_else(|| {
             PathBuf::from("target/adv-data").join(options.exe.file_stem().unwrap_or_default())
         });
@@ -565,13 +581,29 @@ fn build_report(context: ReportContext<'_>) -> String {
     #[cfg(feature = "gpu")]
     let gpu_diagnostics = {
         let diagnostics = runtime.gpu_diagnostics();
+        let versions = |counts: [u64; 7]| {
+            ["1.1", "1.2", "1.3", "1.4", "2.0", "2.1", "3.0"]
+                .iter()
+                .zip(counts)
+                .map(|(version, count)| format!("\"{version}\":{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let shader_versions = format!(
+            "{{\"vertex\":{{{}}},\"pixel\":{{{}}},\"malformed\":{},\"untranslated\":{}}}",
+            versions(diagnostics.shaders.vertex),
+            versions(diagnostics.shaders.pixel),
+            diagnostics.shaders.malformed,
+            diagnostics.shaders.untranslated
+        );
         let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.native_frame_allocations,g.vertex_buffer_allocations));
         format!(
-            "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{}}}",
+            "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"shader_versions\":{}}}",
             diagnostics.live_interfaces,
             diagnostics.pending_waits,
             diagnostics.pending_readbacks,
-            commands
+            commands,
+            shader_versions
         )
     };
     #[cfg(not(feature = "gpu"))]
@@ -1050,6 +1082,10 @@ fn run_execution(
     }
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
+    #[cfg(feature = "gpu")]
+    runtime.set_d3d9_shader_caps(options.d3d9_sm2, options.d3d9_sm3);
+    #[cfg(feature = "gpu")]
+    runtime.set_d3d9_shader_cache(options.d3d9_shader_cache.clone());
     runtime.machine.cpu.set_profiling(options.profile);
     runtime.machine.sys.stats.services_enabled =
         options.host_profile.is_some() || options.schedule_profile.is_some();
@@ -1640,25 +1676,36 @@ fn run_execution(
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            let mut output = std::io::BufWriter::new(
-                std::fs::File::create(&path).map_err(|e| e.to_string())?,
-            );
+            let mut output =
+                std::io::BufWriter::new(std::fs::File::create(&path).map_err(|e| e.to_string())?);
             writeln!(output, "pc\tnative_entries\tnative_ns\tinterpreter_entries\tinterpreter_instructions\tinterpreter_ns")
                 .map_err(|e| e.to_string())?;
             for (pc, sample) in &entries {
-                writeln!(output, "{pc:#010x}\t{}\t{}\t{}\t{}\t{}",
-                    sample.native_entries, sample.native_ns, sample.interpreter_entries,
-                    sample.interpreter_instructions, sample.interpreter_ns,
-                ).map_err(|e| e.to_string())?;
+                writeln!(
+                    output,
+                    "{pc:#010x}\t{}\t{}\t{}\t{}\t{}",
+                    sample.native_entries,
+                    sample.native_ns,
+                    sample.interpreter_entries,
+                    sample.interpreter_instructions,
+                    sample.interpreter_ns,
+                )
+                .map_err(|e| e.to_string())?;
             }
             output.flush().map_err(|e| e.to_string())?;
-            eprintln!("CPU execution profile: {} (region linking is disabled while profiling)",
-                path.display());
+            eprintln!(
+                "CPU execution profile: {} (region linking is disabled while profiling)",
+                path.display()
+            );
         } else {
             for (pc, sample) in entries.iter().take(20) {
-                eprintln!("CPU {pc:#010x}: native {} ns / {} entries; interpreter {} ns / {} instructions",
-                    sample.native_ns, sample.native_entries, sample.interpreter_ns,
-                    sample.interpreter_instructions);
+                eprintln!(
+                    "CPU {pc:#010x}: native {} ns / {} entries; interpreter {} ns / {} instructions",
+                    sample.native_ns,
+                    sample.native_entries,
+                    sample.interpreter_ns,
+                    sample.interpreter_instructions
+                );
             }
         }
     }

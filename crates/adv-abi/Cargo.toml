@@ -11,7 +11,7 @@ publish.workspace = true
 adv-machine.workspace = true
 adv-cpu = { path = "../adv-cpu" }
 adv-abi-macros = { path = "../adv-abi-macros" }
-bytemuck = { version = "1", features = ["derive"] }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 sha2 = "0.10"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 

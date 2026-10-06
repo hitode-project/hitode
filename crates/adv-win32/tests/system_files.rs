@@ -167,7 +167,13 @@ fn system_pe_files_read_map_copy_and_close_without_loading_modules_or_writing_di
         assert_ne!(copied, 0);
         assert_eq!(m.cpu.read_u16(mapped).unwrap(), 0x5a4d);
         assert_eq!(m.cpu.read_u8(copied).unwrap(), b'Z');
-        assert_eq!(adv_os::modules(&m.ext).iter().count(), 0);
+        // The startup gate keeps NTDLL and kernel32 resident; reading the file
+        // must not load it as a module.
+        assert!(
+            adv_os::modules(&m.ext)
+                .iter()
+                .all(|(_, module)| !module.name.eq_ignore_ascii_case("version.dll"))
+        );
         assert_eq!(m.sys.objects.hosts::<adv_win32::FileObj>().count(), 0);
         assert!(!root.join("data/c/Windows/system32/version.dll").exists());
     }

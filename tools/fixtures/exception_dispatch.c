@@ -47,6 +47,11 @@ static void observe(EXCEPTION_RECORD *record_, CONTEXT *context) {
 
 static LONG CALLBACK observer(EXCEPTION_POINTERS *p) {
     record(0x100 + phase);
+    if (phase == 13) { // The nested raise: vectored handlers see no nested flag.
+        record(p->ExceptionRecord->ExceptionCode);
+        record(p->ExceptionRecord->ExceptionFlags);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     observe(p->ExceptionRecord, p->ContextRecord);
     Sleep(0); // The runtime must allow a handler to yield on its ordinary scheduler.
     return EXCEPTION_CONTINUE_SEARCH;
@@ -54,7 +59,7 @@ static LONG CALLBACK observer(EXCEPTION_POINTERS *p) {
 
 static LONG CALLBACK resolver(EXCEPTION_POINTERS *p) {
     record(0x200 + phase);
-    if (phase == 10) return EXCEPTION_CONTINUE_SEARCH;
+    if (phase >= 10 && phase != 11) return EXCEPTION_CONTINUE_SEARCH;
     if (phase == 5) {
         __asm__ volatile("movl %0,%%fs:0" : : "r"(repaired_seh_head) : "memory");
         return EXCEPTION_CONTINUE_SEARCH;
@@ -86,15 +91,19 @@ typedef struct Registration {
 } Registration;
 static Registration *expected_frame;
 
+// ntdll calls frame handlers with EBP at a frame holding their four arguments
+// at [ebp+8]; Borland handler entries read them there without a frame.
+static __attribute__((noinline)) DWORD caller_frame_holds(void *a, void *b, void *c, void *d, void **ebp) {
+    return ebp[2] == a && ebp[3] == b && ebp[4] == c && ebp[5] == d;
+}
+#define RECORD_CALLER_FRAME(a, b, c, d) \
+    record(caller_frame_holds(a, b, c, d, *(void ***)__builtin_frame_address(0)))
+
 static LONG __cdecl stack_handler(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
-    (void)dispatcher;
     record(0x300 + phase);
+    RECORD_CALLER_FRAME(exception, frame, context, dispatcher);
     record(frame == expected_frame);
     record(exception->ExceptionCode);
-#ifdef NESTED_FRAME
-    RaiseException(0xe0420003, 0, 0, NULL);
-    ExitProcess(77); // The unsupported runtime case must stop before re-entering this frame.
-#endif
     context->Eip = resume_pc;
     context->Eax = 0xaabbccdd;
     return 0; // ExceptionContinueExecution for a frame-based handler.
@@ -105,8 +114,8 @@ static LONG __cdecl stack_handler(EXCEPTION_RECORD *exception, void *frame, CONT
 // of returning to the dispatcher.
 static DWORD establisher_esp, establisher_ebp, continuation;
 static LONG __cdecl inner_handler(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
-    (void)frame; (void)context; (void)dispatcher;
     record(0x600 + phase);
+    RECORD_CALLER_FRAME(exception, frame, context, dispatcher);
     record(exception->ExceptionFlags);
     return 1; // ExceptionContinueSearch, also during unwind.
 }
@@ -120,6 +129,33 @@ static LONG __cdecl execute_handler(EXCEPTION_RECORD *exception, void *frame, CO
     __asm__ volatile("movl %0,%%esp\n\tmovl %1,%%ebp\n\tjmpl *%2"
         : : "m"(establisher_esp), "m"(establisher_ebp), "m"(continuation) : "memory");
     __builtin_unreachable();
+}
+
+// Phase 12 raises again from inside a frame handler. The nested search meets
+// the dispatcher's own registration, then re-enters this frame with
+// EXCEPTION_NESTED_CALL until it passes that frame; the outer frame sees none.
+static DWORD nested_entries;
+static LONG __cdecl nested_inner(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
+    record(0x800 + nested_entries);
+    RECORD_CALLER_FRAME(exception, frame, context, dispatcher);
+    record(exception->ExceptionCode);
+    record(exception->ExceptionFlags);
+    record(frame == expected_frame);
+    if (nested_entries++ != 0) return 1;
+    phase = 13;
+    RaiseException(0xe0420004, 0, 0, NULL);
+    phase = 12;
+    record(0x8ff);
+    context->Eip = resume_pc;
+    context->Eax = 0xaabbccdd;
+    return 0;
+}
+static LONG __cdecl nested_outer(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
+    (void)frame; (void)context; (void)dispatcher;
+    record(0x900);
+    record(exception->ExceptionCode);
+    record(exception->ExceptionFlags);
+    return 0; // Continue the nested raise.
 }
 
 static void read_fault(void) {
@@ -203,6 +239,16 @@ void mainCRTStartup(void) {
     __asm__ volatile("movl %0,%%fs:0" : : "r"(frames[1].previous) : "memory");
     phase = 11; // A later fault must not see the abandoned dispatch as live.
     read_fault();
+    phase = 12;
+    frames[0].handler = nested_inner;
+    frames[0].previous = &frames[1];
+    frames[1].handler = nested_outer;
+    expected_frame = &frames[0];
+    __asm__ volatile("movl %%fs:0,%0" : "=r"(frames[1].previous) : : "memory");
+    __asm__ volatile("movl %0,%%fs:0" : : "r"(&frames[0]) : "memory");
+    read_fault();
+    __asm__ volatile("movl %0,%%fs:0" : : "r"(frames[1].previous) : "memory");
+    record(nested_entries);
     record(RemoveVectoredExceptionHandler(first));
     record(RemoveVectoredExceptionHandler(second));
     fail_if(!VirtualProtect((void *)page, 4096, PAGE_READWRITE, &protection), 13);

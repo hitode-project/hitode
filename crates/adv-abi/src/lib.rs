@@ -14,6 +14,7 @@
 //! }
 //! ```
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub use adv_abi_macros::win32;
 pub use adv_machine::{Conv, Env, Handler, HostFn, Outcome};
@@ -71,6 +72,7 @@ pub struct SignatureConflict {
 /// Legacy registrations coexist with generated adapters and are audited separately.
 pub struct Registry {
     fns: HashMap<(String, String), Entry>,
+    signature_conflicts_cache: OnceLock<Vec<SignatureConflict>>,
     data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
     replacements: std::collections::BTreeSet<String>,
@@ -80,6 +82,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             fns: HashMap::new(),
+            signature_conflicts_cache: OnceLock::new(),
             data: HashMap::new(),
             mode: RunMode::Strict,
             replacements: Default::default(),
@@ -126,6 +129,10 @@ impl Registry {
                 level: None,
             },
         );
+        // Every function descriptor insertion/replacement comes through here.
+        // Trace, mode, data bytes and replacement policy do not change the
+        // registered conventions checked against immutable signature metadata.
+        self.signature_conflicts_cache.take();
     }
 
     /// Register a data cell against the same generated export declarations.
@@ -307,6 +314,12 @@ impl Registry {
     }
 
     pub fn signature_conflicts(&self) -> Vec<SignatureConflict> {
+        self.signature_conflicts_cache
+            .get_or_init(|| self.scan_signature_conflicts())
+            .clone()
+    }
+
+    fn scan_signature_conflicts(&self) -> Vec<SignatureConflict> {
         let mut conflicts = Vec::new();
         for ((module, name), entry) in &self.fns {
             let metadata = if let Some((interface, method)) = name.split_once("::") {
@@ -362,6 +375,104 @@ impl Registry {
         }
         coverage.state += self.data.len();
         coverage
+    }
+}
+
+#[cfg(test)]
+mod signature_conflict_cache_tests {
+    use super::*;
+
+    fn file_pointer_api(conv: Conv) -> Api {
+        Api {
+            module: "kernel32.dll",
+            name: "SetFilePointerEx",
+            conv,
+            handler: |_| Outcome::Return(0),
+            level: ImplementationLevel::Implement,
+        }
+    }
+
+    #[test]
+    fn function_registration_replacements_invalidate_cached_conflicts() {
+        let mut registry = Registry::default();
+        assert!(registry.signature_conflicts().is_empty());
+        assert!(registry.signature_conflicts_cache.get().is_some());
+        registry.add_traced(
+            "KERNEL32.DLL",
+            "SetFilePointerEx",
+            Conv::Stdcall { argc: 4 },
+            |_| Outcome::Return(0),
+        );
+        assert!(registry.signature_conflicts_cache.get().is_none());
+        assert_eq!(registry.signature_conflicts().len(), 1);
+        registry.register_with_data(file_pointer_api(Conv::Stdcall { argc: 5 }), 17);
+        assert!(registry.signature_conflicts_cache.get().is_none());
+        assert!(registry.signature_conflicts().is_empty());
+        registry.add_with_data(
+            "kernel32.dll",
+            "SetFilePointerEx",
+            Conv::Stdcall { argc: 4 },
+            |_| Outcome::Return(0),
+            23,
+        );
+        assert_eq!(registry.signature_conflicts().len(), 1);
+        registry.register(file_pointer_api(Conv::Stdcall { argc: 5 }));
+        assert!(registry.signature_conflicts().is_empty());
+    }
+
+    #[test]
+    fn cached_com_and_dll_conflicts_remain_sorted_and_independently_owned() {
+        let mut registry = Registry::default();
+        registry.add(
+            "z.dll",
+            "IDirect3DDevice9::Present",
+            Conv::Stdcall { argc: 4 },
+            |_| Outcome::Return(0),
+        );
+        registry.register(file_pointer_api(Conv::Stdcall { argc: 4 }));
+        let expected = vec![
+            SignatureConflict {
+                module: "kernel32.dll".into(),
+                name: "SetFilePointerEx".into(),
+                registered: Conv::Stdcall { argc: 4 },
+                metadata: Some(Conv::Stdcall { argc: 5 }),
+            },
+            SignatureConflict {
+                module: "z.dll".into(),
+                name: "IDirect3DDevice9::Present".into(),
+                registered: Conv::Stdcall { argc: 4 },
+                metadata: Some(Conv::Stdcall { argc: 5 }),
+            },
+        ];
+        assert_eq!(registry.signature_conflicts(), expected);
+        let mut returned = registry.signature_conflicts();
+        returned[0].name.clear();
+        assert_eq!(registry.signature_conflicts(), expected);
+        registry.add(
+            "z.dll",
+            "IDirect3DDevice9::Present",
+            Conv::Stdcall { argc: 5 },
+            |_| Outcome::Return(0),
+        );
+        assert_eq!(registry.signature_conflicts(), expected[..1]);
+    }
+
+    #[test]
+    fn unrelated_registry_mutations_preserve_cached_signature_diagnostics() {
+        let mut registry = Registry::default();
+        registry.register(file_pointer_api(Conv::Stdcall { argc: 4 }));
+        let expected = registry.signature_conflicts();
+        registry.set_trace("kernel32.dll", "SetFilePointerEx", true);
+        registry.set_mode(RunMode::Discovery);
+        registry.replace_module("kernel32.dll");
+        registry
+            .register_data("msvcr90.dll", "_acmdln", &[0; 4])
+            .unwrap();
+        registry
+            .set_data("msvcr90.dll", "_acmdln", &17u32.to_le_bytes())
+            .unwrap();
+        assert!(registry.signature_conflicts_cache.get().is_some());
+        assert_eq!(registry.signature_conflicts(), expected);
     }
 }
 
