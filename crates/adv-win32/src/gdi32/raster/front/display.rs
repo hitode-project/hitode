@@ -1,10 +1,12 @@
-//! A/W device-name decoding over one display DC construction and GDI owner.
+//! A/W display drawing/information contexts share device validation and GDI ownership.
 use super::*;
 use adv_abi::{AnsiStr, WideStr};
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_a_ABI);
     registry.register(create_w_ABI);
+    registry.register(information_a_ABI);
+    registry.register(information_w_ABI);
 }
 fn ansi(env: &Env<'_>, value: AnsiStr) -> Result<Option<String>, ()> {
     if value.0.is_null() {
@@ -30,6 +32,7 @@ fn create(
     driver: Option<String>,
     device: Option<String>,
     mode: GuestPtr<()>,
+    information: bool,
 ) -> Outcome {
     if driver.is_none() && device.is_none() {
         return fail(env, 87);
@@ -53,6 +56,16 @@ fn create(
             "non-NULL DEVMODE display initialization is unavailable",
         );
         return fail(env, 50);
+    }
+    if information {
+        // Query-only contexts have the common font/palette/DC payload without
+        // a raster bitmap, surface allocation or presentation side effect.
+        let dc = super::super::super::window_dc(env, 0);
+        return if dc == 0 {
+            fail(env, 8)
+        } else {
+            Outcome::Return(dc)
+        };
     }
     if !available(env) {
         adv_abi::warn_unavailable(env, api, "display raster provider is not installed");
@@ -79,7 +92,7 @@ fn create_a(
         return fail(env, 87);
     };
     // The obsolete port argument is ignored by the SDK, even if non-NULL.
-    create(env, "gdi32.dll!CreateDCA", driver, device, mode)
+    create(env, "gdi32.dll!CreateDCA", driver, device, mode, false)
 }
 #[win32(gdi32, name = "CreateDCW", level = implement)]
 fn create_w(
@@ -92,7 +105,35 @@ fn create_w(
     let (Ok(driver), Ok(device)) = (wide(env, driver), wide(env, device)) else {
         return fail(env, 87);
     };
-    create(env, "gdi32.dll!CreateDCW", driver, device, mode)
+    create(env, "gdi32.dll!CreateDCW", driver, device, mode, false)
+}
+
+#[win32(gdi32, name = "CreateICA", level = state)]
+fn information_a(
+    env: &mut Env<'_>,
+    driver: AnsiStr,
+    device: AnsiStr,
+    _port: AnsiStr,
+    mode: GuestPtr<()>,
+) -> Outcome {
+    let (Ok(driver), Ok(device)) = (ansi(env, driver), ansi(env, device)) else {
+        return fail(env, 87);
+    };
+    create(env, "gdi32.dll!CreateICA", driver, device, mode, true)
+}
+
+#[win32(gdi32, name = "CreateICW", level = state)]
+fn information_w(
+    env: &mut Env<'_>,
+    driver: WideStr,
+    device: WideStr,
+    _port: WideStr,
+    mode: GuestPtr<()>,
+) -> Outcome {
+    let (Ok(driver), Ok(device)) = (wide(env, driver), wide(env, device)) else {
+        return fail(env, 87);
+    };
+    create(env, "gdi32.dll!CreateICW", driver, device, mode, true)
 }
 
 #[cfg(test)]

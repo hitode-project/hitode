@@ -8,6 +8,7 @@ const SYSTEM_FONT: u32 = 13;
 pub struct DcModes {
     pub map: i32,
     pub poly_fill: i32,
+    pub rop2: i32,
     pub stretch: u32,
     pub text_align: u32,
 }
@@ -16,6 +17,7 @@ impl Default for DcModes {
         Self {
             map: 1,
             poly_fill: 1,
+            rop2: 13, // R2_COPYPEN
             stretch: 1,
             text_align: 0,
         }
@@ -41,6 +43,8 @@ pub enum GdiObj {
         color: u32,
     },
     Pen {
+        style: u32,
+        width: u32,
         color: u32,
     },
     Bitmap {

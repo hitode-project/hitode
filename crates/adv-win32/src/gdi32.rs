@@ -10,6 +10,8 @@ use crate::Win32;
 
 pub mod font;
 mod palette;
+mod pen;
+mod readback;
 pub mod raster;
 
 #[cfg(test)]
@@ -235,8 +237,8 @@ fn create_brush_indirect(env: &mut Env<'_>, plbrush: GuestPtr<()>) -> Outcome {
     Outcome::Return(add(env, GdiObj::Brush { color }))
 }
 #[win32(gdi32, name = "CreatePen", level = implement)]
-fn create_pen(env: &mut Env<'_>, _style: i32, _width: i32, color: u32) -> Outcome {
-    Outcome::Return(add(env, GdiObj::Pen { color }))
+fn create_pen(env: &mut Env<'_>, style: i32, width: i32, color: u32) -> Outcome {
+    pen::create(env, style as u32, width, color)
 }
 #[win32(gdi32, name = "UnrealizeObject", level = implement)]
 fn unrealize_object(_env: &mut Env<'_>, _h: Handle) -> Outcome {
@@ -302,6 +304,19 @@ pub(super) fn select_object_value(env: &mut Env<'_>, hdc: u32, h: u32) -> Outcom
 #[win32(gdi32, name = "GetObjectA", level = implement)]
 fn get_object_a(env: &mut Env<'_>, object: Handle, count: i32, output: GuestPtr<()>) -> Outcome {
     let (h, size, out) = (object.0, count.max(0) as u32, output.addr());
+    if let Some(bytes) = pen::describe(env, h) {
+        if out == 0 {
+            return Outcome::Return(16);
+        }
+        if size < 16 || adv_abi::guest::check_range(env.cpu, out, 16, Prot::WRITE).is_err() {
+            return Outcome::Return(0);
+        }
+        return Outcome::Return(if env.cpu.write(out, &bytes).is_ok() {
+            16
+        } else {
+            0
+        });
+    }
     if let Some(entries) = palette::entries(env, h) {
         let count = entries.len() as u16;
         if out == 0 {
@@ -454,7 +469,10 @@ fn create_compatible_bitmap(env: &mut Env<'_>, _dc: Handle, w: i32, h: i32) -> O
     Outcome::Return(new_bitmap(env, w, h, 32).map_or(0, |(h, _)| h))
 }
 #[win32(gdi32, name = "GetDeviceCaps", level = state)]
-fn get_device_caps(env: &mut Env<'_>, _dc: Handle, index: i32) -> Outcome {
+fn get_device_caps(env: &mut Env<'_>, dc: Handle, index: i32) -> Outcome {
+    if !matches!(get(env, dc.0), Some(GdiObj::Dc { .. })) {
+        return Outcome::Return(0);
+    }
     let (w, h) = env.ext.get::<Win32>().user.screen;
     Outcome::Return(match index {
         8 => w as u32,
@@ -790,6 +808,8 @@ fn create_di_bitmap(
 
 pub fn register(reg: &mut Registry) {
     palette::register(reg);
+    pen::register(reg);
+    readback::register(reg);
     for api in [
         get_stock_object_ABI,
         create_font_indirect_a_ABI,
