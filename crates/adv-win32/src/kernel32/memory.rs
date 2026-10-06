@@ -335,6 +335,16 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
 
 fn virtual_protect(env: &mut Env<'_>) -> Outcome {
     let (addr, size, protection, old) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    protect_memory(env, addr, size, protection, old)
+}
+
+pub(crate) fn protect_memory(
+    env: &mut Env<'_>,
+    addr: u32,
+    size: u32,
+    protection: u32,
+    old: u32,
+) -> Outcome {
     let Some(prot) = decode_protection(protection) else {
         set_last_error(env, err::INVALID_PARAMETER);
         return Outcome::Return(0);

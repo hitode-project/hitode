@@ -11,6 +11,119 @@ const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const OUTPUT: u32 = DATA + 0x2000;
 
+#[test]
+fn nt_process_debug_queries_match_the_virtual_process() {
+    let mut m = machine(false, "nt-debug-query");
+    m.cpu.write_u32(DATA, 0x12345678).unwrap();
+    let mut code = Asm::new(CODE);
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQueryInformationProcess",
+        &[u32::MAX, 30, DATA, 4, DATA + 16],
+        0,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQueryInformationProcess",
+        &[u32::MAX, 7, DATA + 4, 4, 0],
+        4,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "ZwQueryInformationProcess",
+        &[u32::MAX, 31, DATA + 8, 4, 0],
+        8,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQueryInformationProcess",
+        &[u32::MAX, 7, DATA + 4, 3, 0],
+        12,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQueryInformationProcess",
+        &[0, 7, DATA + 4, 4, 0],
+        16,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQueryInformationProcess",
+        &[u32::MAX, 7, DATA + 0x4000, 4, 0],
+        20,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtSetInformationThread",
+        &[u32::MAX - 1, 17, 0, 0],
+        24,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtSetInformationThread",
+        &[0, 17, 0, 0],
+        28,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQuerySystemInformation",
+        &[35, DATA + 24, 2, DATA + 28],
+        32,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "ntdll.dll",
+        "NtQuerySystemInformation",
+        &[35, DATA + 24, 1, DATA + 32],
+        36,
+    );
+    run(&mut m, code);
+    for (offset, expected) in [
+        (0, 0x12345678),
+        (4, 0),
+        (8, 1),
+        (16, 4),
+        (24, 256),
+        (28, 2),
+        (32, 2),
+    ] {
+        assert_eq!(m.cpu.read_u32(DATA + offset).unwrap(), expected);
+    }
+    for (offset, expected) in [
+        (0, 0xc0000353),
+        (4, 0),
+        (8, 0),
+        (12, 0xc0000004),
+        (16, 0xc0000008),
+        (20, 0xc0000005),
+        (24, 0),
+        (28, 0xc0000008),
+        (32, 0),
+        (36, 0xc0000004),
+    ] {
+        assert_eq!(m.cpu.read_u32(OUTPUT + offset).unwrap(), expected);
+    }
+}
+
 fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
 }

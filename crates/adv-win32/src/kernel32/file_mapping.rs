@@ -35,6 +35,22 @@ struct SectionHandle {
     section: Rc<Section>,
     access: u32,
 }
+
+pub(crate) fn restrict_section_access(env: &mut Env<'_>, handle: u32, access: u32) {
+    if let Some(handle) = env.sys.objects.host_mut::<SectionHandle>(handle) {
+        handle.access = access & (READ | WRITE);
+    }
+}
+
+pub(crate) fn view_extent(env: &Env<'_>, address: u32) -> Option<(u32, u32)> {
+    let (&base, view) = env
+        .ext
+        .try_get::<Mappings>()?
+        .views
+        .range(..=address)
+        .next_back()?;
+    (address - base < view.len).then_some((base, view.len))
+}
 impl SectionHandle {
     fn new(section: Rc<Section>, access: u32) -> Self {
         section.handles.set(section.handles.get() + 1);
@@ -265,6 +281,17 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
         Ok(name) => name,
         Err(e) => return fail(env, e),
     };
+    create_section(env, file, attributes, protection, maximum, name)
+}
+
+pub(crate) fn create_section(
+    env: &mut Env<'_>,
+    file: u32,
+    attributes: u32,
+    protection: u32,
+    maximum: u64,
+    name: Option<Vec<u16>>,
+) -> Outcome {
     if protection & !(0x08000000 | 0xff) != 0 || protection & 0xff >= 0x10 {
         return fail(env, 50);
     }
@@ -401,6 +428,17 @@ fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
     let offset = (u64::from(env.arg(2)) << 32) | u64::from(env.arg(3));
     let count = u64::from(env.arg(4));
     let base = if requested { env.arg(5) } else { 0 };
+    map_section(env, handle, access, offset, count, base)
+}
+
+pub(crate) fn map_section(
+    env: &mut Env<'_>,
+    handle: u32,
+    access: u32,
+    offset: u64,
+    count: u64,
+    base: u32,
+) -> Outcome {
     let Some(handle) = env.sys.objects.host::<SectionHandle>(handle) else {
         return fail(env, 6);
     };
@@ -515,6 +553,10 @@ fn flush(env: &mut Env<'_>) -> Outcome {
 
 fn unmap(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
+    unmap_section(env, address)
+}
+
+pub(crate) fn unmap_section(env: &mut Env<'_>, address: u32) -> Outcome {
     let Some(view) = state(env).views.get(&address) else {
         return fail(env, 487);
     };
@@ -538,7 +580,7 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
 }
 
 /// Forget names whose objects are gone, after a handle closes.
-pub(super) fn prune(env: &mut Env<'_>) {
+pub(crate) fn prune(env: &mut Env<'_>) {
     if let Some(state) = env.ext.try_get_mut::<Mappings>() {
         state.prune(&env.sys.objects);
     }

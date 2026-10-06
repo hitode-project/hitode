@@ -148,7 +148,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     open_with_share(env, path, access, disposition, 7)
 }
 
-fn open_with_share(
+pub(crate) fn open_with_share(
     env: &mut Env<'_>,
     path: &str,
     access: u32,
@@ -161,6 +161,23 @@ fn open_with_share(
         return INVALID_HANDLE_VALUE;
     }
     let guest = env.ext.get::<Win32>().vfs.normalize(path);
+    if share & !7 != 0 {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    let share_access = |rights: u32| {
+        u32::from(rights & (0x80000000 | 0x10000000 | 1 | 0x20) != 0)
+            | (u32::from(rights & (GENERIC_WRITE | 0x10000000 | 2 | 4) != 0) << 1)
+            | (u32::from(rights & (0x10000 | 0x10000000) != 0) << 2)
+    };
+    let key = guest.to_lowercase();
+    if env.sys.objects.all_hosts::<FileObj>().any(|(_, file)| {
+        file.guest_path.to_lowercase() == key
+            && (share_access(access) & !file.share != 0 || share_access(file.access) & !share != 0)
+    }) {
+        set_last_error(env, 32); // ERROR_SHARING_VIOLATION, before opening/truncating.
+        return INVALID_HANDLE_VALUE;
+    }
     match system_file(env, &guest) {
         Ok(Some(bytes)) => {
             if disposition == CREATE_NEW {
