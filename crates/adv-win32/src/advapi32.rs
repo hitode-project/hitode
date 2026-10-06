@@ -2,6 +2,7 @@
 use std::collections::BTreeMap;
 
 mod groups;
+mod identity;
 
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
@@ -430,6 +431,7 @@ fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     groups::register(reg);
+    identity::register(reg);
     for (name, argc, handler) in [
         (
             "RegOpenKeyExA",
