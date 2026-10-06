@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use adv_abi::{AnsiStr, Handle as AbiHandle, Registry, WideStr, win32};
+use adv_abi::{AnsiStr, GuestPtr, Handle as AbiHandle, Registry, WideStr, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{CtxId, Env, Handle, Identity, Namespace, Objects, Outcome};
 use adv_os::Heaps;
@@ -860,15 +860,65 @@ pub struct CreateParams {
 }
 
 fn create_window_ex_a(env: &mut Env<'_>) -> Outcome {
-    let a: Vec<u32> = (0..12).map(|i| env.arg(i)).collect();
-    let text = if a[2] == 0 {
-        String::new()
+    let args = std::array::from_fn(|i| env.arg(i as u32));
+    create_window_ex(env, args, false)
+}
+
+#[win32(user32, name = "CreateWindowExW", level = implement)]
+#[allow(clippy::too_many_arguments)]
+fn create_window_ex_w(
+    env: &mut Env<'_>,
+    ex_style: u32,
+    class: WideStr,
+    name: WideStr,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    parent: AbiHandle,
+    menu: AbiHandle,
+    instance: AbiHandle,
+    param: GuestPtr<u8>,
+) -> Outcome {
+    create_window_ex(
+        env,
+        [
+            ex_style,
+            class.0.addr(),
+            name.0.addr(),
+            style,
+            x as u32,
+            y as u32,
+            width as u32,
+            height as u32,
+            parent.0,
+            menu.0,
+            instance.0,
+            param.addr(),
+        ],
+        true,
+    )
+}
+
+fn create_window_ex(env: &mut Env<'_>, a: [u32; 12], wide: bool) -> Outcome {
+    let class = if a[1] < 0x1_0000 {
+        ClassKey::Atom(a[1] as u16)
     } else {
-        env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, a[2]))
+        let Some(name) = super::message::read_text(env, a[1], wide) else {
+            // Guarded guest-pointer failure, rather than claiming native bad-pointer AVs.
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        };
+        ClassKey::Name(name)
+    };
+    let Some(text) = super::message::read_text(env, a[2], wide) else {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
     };
     let p = CreateParams {
         ex_style: a[0],
-        class: ClassKey::read(env, a[1]),
+        class,
         class_ptr: a[1],
         name_ptr: a[2],
         text,
@@ -882,7 +932,7 @@ fn create_window_ex_a(env: &mut Env<'_>) -> Outcome {
         instance: a[10],
         param: a[11],
     };
-    create_window(env, p, |_, hwnd| Outcome::Return(hwnd))
+    create_window_encoded(env, p, wide, |_, hwnd| Outcome::Return(hwnd))
 }
 
 /// CreateWindowEx: make the window, then send WM_NCCREATE, WM_CREATE, WM_SIZE, WM_MOVE
@@ -909,6 +959,19 @@ pub(super) fn create_window_encoded(
         .unwrap_or(wide);
     let mut scratch = Vec::new();
     if unicode != wide {
+        if !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+            adv_abi::warn_unavailable(
+                env,
+                if wide {
+                    "user32.dll!CreateWindowExW"
+                } else {
+                    "user32.dll!CreateWindowExA"
+                },
+                "CREATESTRUCT ANSI conversion has no supported encoder",
+            );
+            set_last_error(env, 50);
+            return then(env, 0);
+        }
         if p.class_ptr >= 0x1_0000
             && let ClassKey::Name(name) = &p.class
         {
@@ -1033,8 +1096,8 @@ fn create_window_inner(
         }
     };
 
-    // CREATESTRUCTA: lpCreateParams, hInstance, hMenu, hwndParent, cy, cx, y, x, style,
-    // lpszName, lpszClass, dwExStyle.
+    // CREATESTRUCTA/W share the x86 layout. String pointers use the registered
+    // procedure's encoding; class atoms and opaque lpCreateParams remain unchanged.
     let cs = temp_alloc(env, 48);
     let fields = [
         p.param,
@@ -1050,8 +1113,15 @@ fn create_window_inner(
         p.class_ptr,
         p.ex_style,
     ];
-    for (i, v) in fields.into_iter().enumerate() {
-        let _ = env.cpu.write_u32(cs + 4 * i as u32, v);
+    let bytes: Vec<_> = fields.into_iter().flat_map(u32::to_le_bytes).collect();
+    if cs == 0 || env.cpu.write(cs, &bytes).is_err() {
+        temp_free(env, cs);
+        env.ext
+            .get_mut::<crate::Win32>()
+            .user
+            .remove_window(hwnd, &mut env.sys.objects);
+        set_last_error(env, 8);
+        return then(env, 0);
     }
     let visible = p.style & WS_VISIBLE != 0;
     let notify = child && p.ex_style & WS_EX_NOPARENTNOTIFY == 0;
@@ -2325,6 +2395,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "GetClassInfoA", 3, get_class_info_a);
     s(reg, "GetClassNameA", 3, get_class_name_a);
     s(reg, "CreateWindowExA", 12, create_window_ex_a);
+    reg.register(create_window_ex_w_ABI);
     s(reg, "RegisterClassW", 1, |e| register_class_w(e, false));
     s(reg, "RegisterClassExW", 1, |e| register_class_w(e, true));
     s(reg, "DestroyWindow", 1, destroy_window_api);
