@@ -55,6 +55,8 @@ pub(crate) struct Frame {
     /// Actual caller-owned boundary, possibly below Origin's reserved scratch.
     pub stack: u32,
     pub return_floor: u32,
+    /// Abandoned, not failed, when the guest unwinds past `stack`.
+    pub unwindable: bool,
     pub then: Continuation,
     pub origin: Origin,
 }

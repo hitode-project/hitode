@@ -62,6 +62,10 @@ pub enum Outcome {
         then: Continuation,
         /// Optional lower stack boundary, leaving caller-owned guest scratch above it.
         stack: Option<u32>,
+        /// The callee may leave by nonlocal unwind instead of returning, as a
+        /// Windows exception handler does when it resumes in an `__except`
+        /// block or catch continuation. Its continuation is then dropped.
+        unwindable: bool,
     },
     /// Resume a checked architectural checkpoint without an API return epilogue.
     ResumeExecution(crate::exception::Checkpoint),
@@ -93,6 +97,7 @@ impl Outcome {
             args: args.into(),
             then: Box::new(then),
             stack: None,
+            unwindable: false,
         }
     }
 
@@ -107,7 +112,17 @@ impl Outcome {
             args: args.into(),
             then: Box::new(then),
             stack: Some(stack),
+            unwindable: false,
         }
+    }
+
+    /// Mark a guest call as one native code may abandon by nonlocal unwind;
+    /// other outcomes are unchanged.
+    pub fn unwindable(mut self) -> Self {
+        if let Self::Call { unwindable, .. } = &mut self {
+            *unwindable = true;
+        }
+        self
     }
 
     pub fn block(wait: Wait, then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static) -> Self {

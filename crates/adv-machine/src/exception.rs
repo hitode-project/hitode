@@ -175,6 +175,7 @@ mod tests {
             id,
             stack: 0x1000,
             return_floor: 0xffc,
+            unwindable: false,
             then: Box::new(|_, _| Outcome::Return(0)),
             origin: Origin {
                 esp: 0x1000,

@@ -28,10 +28,12 @@ fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
             args,
             then,
             stack,
+            unwindable,
         } => Outcome::Call {
             target,
             args,
             stack,
+            unwindable,
             then: Box::new(move |env, resume| {
                 let next = then(env, resume);
                 release_lock(env, handle, next)
