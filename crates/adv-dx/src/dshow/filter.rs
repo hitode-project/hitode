@@ -19,6 +19,7 @@ const READ_CHUNK: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
+    FileSource,
     Splitter,
     VideoDecoder,
     AudioDecoder,
@@ -28,6 +29,7 @@ pub(crate) enum Role {
 /// Demuxed media owned by a splitter. Failed probes never attach a source;
 /// a missing decoder during delivery is a stream error, not successful EOF.
 pub(crate) struct Source {
+    pub file_handle: Option<u32>,
     pub decoder: Option<Decoder>,
     pub duration_us: u64,
     pub info: Option<StreamInfo>,
@@ -41,6 +43,7 @@ pub(crate) struct Filter {
     pub name: Vec<u16>,
     pub state: u32,
     pub source: Option<Source>,
+    pub source_path: Vec<u16>,
 }
 
 pub(crate) struct Pin {
@@ -126,11 +129,29 @@ fn create_filter(
     if outer != 0 {
         return Outcome::Return(CLASS_E_NOAGGREGATION);
     }
-    let faces = match super::create(env, &[Face::BaseFilter], Obj::Filter) {
-        Ok(faces) => faces,
+    let base = match new_filter(env, role, clsid) {
+        Ok(base) => base,
         Err(error) => return Outcome::Return(error),
     };
-    let base = faces[0];
+    let com = state(env).com;
+    let result = match com.query::<Obj>(&mut env.sys.objects, base, iid) {
+        Ok(pointer) => {
+            let _ = env.cpu.write_u32(output, pointer);
+            S_OK
+        }
+        Err(_) => E_NOINTERFACE,
+    };
+    release(env, base);
+    Outcome::Return(result)
+}
+
+pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u32, u32> {
+    let faces: &[Face] = if role == Role::FileSource {
+        &[Face::BaseFilter, Face::FileSource]
+    } else {
+        &[Face::BaseFilter]
+    };
+    let base = super::create(env, faces, Obj::Filter)?[0];
     state(env).filters.insert(
         base,
         Filter {
@@ -141,9 +162,11 @@ fn create_filter(
             name: Vec::new(),
             state: graph::STOPPED,
             source: None,
+            source_path: Vec::new(),
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {
+        Role::FileSource => &[(OUTPUT, "Output", MEDIATYPE_STREAM)],
         Role::Splitter => &[(INPUT, "Input", MEDIATYPE_STREAM)],
         Role::VideoDecoder => &[
             (INPUT, "In", MEDIATYPE_VIDEO),
@@ -158,23 +181,14 @@ fn create_filter(
     for &(dir, name, major) in pins {
         if let Err(error) = new_pin(env, base, dir, name, major, None) {
             release(env, base);
-            return Outcome::Return(error);
+            return Err(error);
         }
     }
-    let com = state(env).com;
-    let result = match com.query::<Obj>(&mut env.sys.objects, base, iid) {
-        Ok(pointer) => {
-            let _ = env.cpu.write_u32(output, pointer);
-            S_OK
-        }
-        Err(_) => E_NOINTERFACE,
-    };
-    release(env, base);
-    Outcome::Return(result)
+    Ok(base)
 }
 
 /// A pin lives as long as the process: its filter holds an internal reference.
-fn new_pin(
+pub(super) fn new_pin(
     env: &mut Env<'_>,
     filter: u32,
     dir: u32,
@@ -230,6 +244,11 @@ fn host_filter(env: &Env<'_>, pointer: u32) -> Option<u32> {
 
 pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<Outcome> {
     match face {
+        Face::FileSource => Some(super::graph::source::file_method(
+            env,
+            host_filter(env, this)?,
+            method,
+        )),
         Face::BaseFilter => filter_method(env, host_filter(env, this)?, method),
         Face::Pin => pin_method(env, host_pin(env, this)?, method),
         Face::MemInputPin => input_method(env, method),
@@ -515,7 +534,7 @@ fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
             format_type: GUID_NULL,
             format: Vec::new(),
         }],
-        (Some(Role::Splitter), OUTPUT) => p.mt.iter().cloned().collect(),
+        (Some(Role::Splitter | Role::FileSource), OUTPUT) => p.mt.iter().cloned().collect(),
         (Some(Role::VideoDecoder), OUTPUT) => decoded_video_types(env, pin),
         (Some(Role::AudioDecoder), OUTPUT) => decoded_audio_type(env, pin).into_iter().collect(),
         _ => Vec::new(),
@@ -706,13 +725,13 @@ fn finish_guest_connection(
             free(env, scratch);
             if results[1] != S_OK || mem == 0 {
                 log::warn!("DirectShow: guest input {input:#x} has no IMemInputPin");
-                state(env).pins.get_mut(&out).unwrap().mem = 0;
-                return Outcome::Return(VFW_E_NO_TRANSPORT);
+                return abort_guest_connection(env, out, input, VFW_E_NO_TRANSPORT);
             }
+            state(env).pins.get_mut(&out).unwrap().mem = mem;
             let size = mt.sample_size.max(1);
             let allocator = match sample::create_allocator(env, 3, size) {
                 Ok(allocator) => allocator,
-                Err(error) => return Outcome::Return(error),
+                Err(error) => return abort_guest_connection(env, out, input, error),
             };
             let p = state(env).pins.get_mut(&out).unwrap();
             p.mem = mem;
@@ -721,6 +740,7 @@ fn finish_guest_connection(
             guest_call(env, mem, 4, vec![face, 0], move |env, hr| {
                 if hr & 0x8000_0000 != 0 {
                     log::warn!("DirectShow: NotifyAllocator refused ({hr:#x})");
+                    return abort_guest_connection(env, out, input, hr);
                 }
                 log::info!(
                     "DirectShow: host pin {out:#x} connected to guest pin {input:#x} ({})",
@@ -730,6 +750,23 @@ fn finish_guest_connection(
                 Outcome::Return(S_OK)
             })
         }),
+    )
+}
+
+fn abort_guest_connection(env: &mut Env<'_>, out: u32, input: u32, error: u32) -> Outcome {
+    let mem = state(env).pins[&out].mem;
+    disconnect_host(env, out);
+    let mut calls = VecDeque::new();
+    if mem != 0 {
+        calls.push_back(Call(mem, 2, vec![]));
+    }
+    calls.push_back(Call(input, 5, vec![]));
+    calls.push_back(Call(input, 2, vec![]));
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |_, _| Outcome::Return(error)),
     )
 }
 
@@ -915,6 +952,7 @@ pub(super) fn attach_source(
         ))
     );
     state(env).filters.get_mut(&filter).unwrap().source = Some(Source {
+        file_handle: None,
         duration_us: info.as_ref().map_or(0, |i| i.duration_us),
         decoder,
         info,

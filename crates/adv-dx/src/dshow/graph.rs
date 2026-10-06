@@ -8,6 +8,9 @@ use adv_os::com::Iid;
 
 use super::*;
 
+pub(super) mod source;
+mod render;
+
 pub(crate) const STOPPED: u32 = 0;
 pub(crate) const PAUSED: u32 = 1;
 pub(crate) const RUNNING: u32 = 2;
@@ -218,7 +221,11 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         (Face::FilterGraph, "Disconnect") => Some(filter::disconnect(env, env.arg(1))),
         (Face::FilterGraph, "Reconnect" | "ReconnectEx") => r(E_NOTIMPL),
         (Face::FilterGraph, "SetDefaultSyncSource") => r(S_OK),
-        (Face::FilterGraph, "Render" | "RenderFile" | "RenderEx" | "AddSourceFilter") => {
+        (Face::FilterGraph, "AddSourceFilter") => {
+            Some(source::add(env, graph, env.arg(1), env.arg(2), env.arg(3)))
+        }
+        (Face::FilterGraph, "Render") => Some(render::pin(env, graph, env.arg(1))),
+        (Face::FilterGraph, "RenderFile" | "RenderEx") => {
             adv_abi::warn_unavailable(
                 env,
                 &format!("IGraphBuilder::{method}"),

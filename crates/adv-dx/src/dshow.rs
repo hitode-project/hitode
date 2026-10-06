@@ -476,7 +476,13 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             state.graphs.remove(&canonical);
         }
         Obj::Filter => {
-            state.filters.remove(&canonical);
+            let handle = state
+                .filters
+                .remove(&canonical)
+                .and_then(|f| f.source.and_then(|s| s.file_handle));
+            if let Some(handle) = handle {
+                env.sys.objects.close(handle);
+            }
         }
         Obj::Pin => {
             state.pins.remove(&canonical);

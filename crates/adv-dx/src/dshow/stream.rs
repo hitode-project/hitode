@@ -58,7 +58,7 @@ fn follow(env: &Env<'_>, mut out: u32) -> Option<End> {
             Role::VideoDecoder | Role::AudioDecoder => {
                 out = *filter.pins.iter().find(|p| state.pins[p].dir == OUTPUT)?;
             }
-            Role::Splitter => return None,
+            Role::Splitter | Role::FileSource => return None,
         }
     }
     None
