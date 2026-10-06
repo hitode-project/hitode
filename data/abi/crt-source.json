@@ -38,7 +38,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/scprintf-scprintf-l-scwprintf-scwprintf-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localeconv",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memchr-wmemchr"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memchr-wmemchr",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkdir-wmkdir"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -147,6 +148,16 @@
     "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
     "header": "ucrt/stdio.h",
     "projection": "x86 cdecl fixed va_list and variadic mandatory parameters for six paired buffer/count families, limited to VC80/90 export profiles"
+  },
+  "direct.h": {
+    "header": "ucrt/direct.h",
+    "sha256": "06177549ad0ab3f269f44895a70c31cbe65f02446457b21b1aa393cb9fd77b2a",
+    "projection": "int __cdecl _mkdir(char const* _Path), one x86 pointer argument, 32-bit signed int result; projected only for the existing MSVCRT/VC80/VC90 profiles. No deprecated mkdir alias or other directory API is projected."
+  },
+  "corecrt_wdirect.h": {
+    "header": "ucrt/corecrt_wdirect.h",
+    "sha256": "b8477593983d23ed4ef93c3efcabb8239375b518ba589a65338db29bb0dc2237",
+    "projection": "int __cdecl _wmkdir(wchar_t const* _Path), one x86 pointer to UTF16 code units; the parameter remains str16, not ANSI. Same three legacy CRT profiles and no other wide directory API."
   },
   "corecrt_wstdio.h": {
     "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515",
