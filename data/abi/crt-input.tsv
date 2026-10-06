@@ -131,3 +131,8 @@ msvcr90.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list
 msvcr90.dll	_scwprintf	variadic	i32	int	format:const wchar_t*:str16:1
 msvcr90.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	localeconv	cdecl	ptr	struct lconv*	
+msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr80.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+msvcr90.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+ucrtbase.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1

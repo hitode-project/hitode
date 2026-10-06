@@ -37,7 +37,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsnprintf-s-vsnprintf-s-l-vsnwprintf-s-vsnwprintf-s-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/scprintf-scprintf-l-scwprintf-scwprintf-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localeconv"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localeconv",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memchr-wmemchr"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -71,6 +72,12 @@
     "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_new.h",
     "sha256": "8ee45e7db7f08475d1ddf33d493fd7cb5cd10b54b4756b39156c8548281b3e63",
     "projection": "x86 __cdecl scalar operator new(size_t) and operator delete(void*), legacy MSVC decorated names"
+  },
+  "vcruntime_string.h": {
+    "source": "Microsoft Visual C++ Build Tools 14.44.35207",
+    "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h (included by SDK ucrt/corecrt_memory.h)",
+    "sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
+    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT and UCRT/string API-set profiles; no wide scan or other string function is projected."
   },
   "corecrt_memcpy_s.h": {
     "header": "ucrt/corecrt_memcpy_s.h",

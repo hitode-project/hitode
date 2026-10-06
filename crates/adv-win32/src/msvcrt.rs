@@ -14,6 +14,7 @@ mod floating;
 mod heap;
 mod locale;
 mod onexit;
+mod scan;
 mod secure_memory;
 mod startup;
 mod wide_string;
@@ -86,6 +87,7 @@ pub fn register(r: &mut Registry) {
     startup::register(r);
     convert::register(r);
     cpp_alloc::register(r);
+    scan::register(r);
     secure_memory::register(r);
     heap::register(r);
     locale::register(r);

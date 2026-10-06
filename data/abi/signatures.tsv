@@ -633,6 +633,7 @@ api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	exit	cdecl	void	void	status:i32:i32:1
+api-ms-win-crt-string-l1-1-0.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 api-ms-win-crt-string-l1-1-0.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 api-ms-win-crt-string-l1-1-0.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 api-ms-win-crt-string-l1-1-0.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
@@ -3484,6 +3485,7 @@ msvcr80.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:
 msvcr80.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcr80.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
@@ -3522,6 +3524,7 @@ msvcr90.dll	_wcmdln	data	ptr	wchar_t*
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
 msvcr90.dll	localeconv	cdecl	ptr	struct lconv*	
+msvcr90.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcr90.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
@@ -3545,6 +3548,7 @@ msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
@@ -5264,6 +5268,7 @@ ucrtbase.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 ucrtbase.dll	exit	cdecl	void	void	status:i32:i32:1
 ucrtbase.dll	free	cdecl	void	void	block:void*:ptr:1
 ucrtbase.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+ucrtbase.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 ucrtbase.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
