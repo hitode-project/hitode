@@ -15,6 +15,36 @@ const TEXT: u32 = DATA + 0x100;
 const CAPTION: u32 = DATA + 0x300;
 const LAST_ERROR: u32 = 0x8765_abcd;
 
+#[test]
+fn unicode_message_box_records_text_independently_of_ansi_codepage() {
+    let mut machine = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), 932);
+    let text = "初始化失败／初期化エラー 🌸";
+    let caption = "Unicode";
+    for (address, value) in [(TEXT, text), (CAPTION, caption)] {
+        let bytes: Vec<_> = value
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        machine.cpu.write(address, &bytes).unwrap();
+    }
+    let api = machine.resolve_import("user32.dll", "MessageBoxW").unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(0)
+        .push_imm(CAPTION)
+        .push_imm(TEXT)
+        .push_imm(0)
+        .call(api);
+    run(&mut machine, code);
+    let diagnostics = machine.ext.get::<ApiDiagnostics>();
+    let message = diagnostics.message_boxes.back().unwrap();
+    assert_eq!(message.api, "user32.dll!MessageBoxW");
+    assert_eq!(message.text, text);
+    assert_eq!(message.caption, caption);
+    assert_eq!(message.result, 1);
+    assert_eq!(diagnostics.stub_calls, 0);
+}
+
 fn fixture<B: Backend>(cpu: B, codepage: u32) -> Machine<B> {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
