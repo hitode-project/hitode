@@ -56,7 +56,6 @@ pub struct Stats {
     pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    pub memo: crate::MemoStats,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -158,8 +157,6 @@ pub struct Executor {
     deferred_fallback: Option<u32>,
     interpreter_profile: Option<Box<interpreter_profile::Profile>>,
     timestamp: crate::timestamp::Counter,
-    /// Guest function result reuse; None unless enabled.
-    memo: Option<Box<crate::memo::Memo>>,
     pub state: CpuState,
     pub stats: Stats,
 }
@@ -236,15 +233,8 @@ impl Executor {
             deadline: self.deadline,
             bulk_calls: 0,
             bulk_bytes: 0,
-            memo: std::ptr::null_mut(),
-            recorder: std::ptr::null_mut(),
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
-        // A recording covers one uninterrupted execution of its function.
-        self.memo_abort(crate::memo::Abort::Context);
-        if let Some(memo) = &self.memo {
-            self.stats.memo = memo.stats();
-        }
         if self.parallel.is_some() {
             if self.stats.interpreter_entries != interpreted_before {
                 self.admission.cold();
@@ -323,7 +313,6 @@ impl Executor {
             deferred_fallback: None,
             interpreter_profile: interpreter_profile::Profile::from_env(),
             timestamp: crate::timestamp::Counter::default(),
-            memo: crate::memo::Memo::from_env(),
             state: CpuState::default(),
             stats: Stats::default(),
         })
@@ -429,7 +418,7 @@ impl Executor {
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
         let start = Instant::now();
-        let compiled = compile::compile_snapshot(&self.capture(&region)?)?;
+        let compiled = compile::compile(&region, &self.memory, self.shadow_returns.is_some())?;
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
         self.pending_regions.remove(&region.start);
@@ -439,331 +428,6 @@ impl Executor {
         self.automatic_regions.remove(&region.start);
         self.publish(region, compiled);
         Ok(())
-    }
-
-    fn capture(&self, region: &Region) -> Result<compile::Snapshot, String> {
-        let mut snapshot = compile::Snapshot::capture(region, &self.memory)?;
-        snapshot.shadow_returns = self.shadow_returns.is_some();
-        if let Some(memo) = &self.memo {
-            // Room for a completed final instruction.
-            snapshot.memo_hooks = memo.hooks_in(region.start, region.len + 16);
-        }
-        Ok(snapshot)
-    }
-
-    /// Enables guest function result reuse with these options, or disables it.
-    pub fn set_memo(&mut self, options: Option<crate::MemoOptions>) {
-        self.memo_abort(crate::memo::Abort::Context);
-        self.memo = options.map(|options| Box::new(crate::memo::Memo::new(options)));
-    }
-
-    /// Hooks a guest function entry for result reuse.
-    pub fn memo_hook(&mut self, pc: u32) {
-        if let Some(memo) = &mut self.memo {
-            memo.hook(pc);
-        }
-        self.memo_rehook();
-    }
-
-    pub fn memo_stats(&self) -> Option<crate::MemoStats> {
-        self.memo.as_ref().map(|memo| memo.stats())
-    }
-
-    /// Recompiles published owners of functions whose hook changed.
-    fn memo_rehook(&mut self) {
-        let Some(memo) = self.memo.as_deref_mut() else {
-            return;
-        };
-        if memo.changed.is_empty() {
-            return;
-        }
-        let changed = std::mem::take(&mut memo.changed);
-        let owners: Vec<u32> = self
-            .code
-            .compiled
-            .iter()
-            .filter(|(_, compiled)| changed.iter().any(|pc| compiled.entries.contains(pc)))
-            .map(|(&owner, _)| owner)
-            .collect();
-        for owner in owners {
-            let Some(region) = self.code.regions.get(&owner).cloned() else {
-                continue;
-            };
-            let Ok(snapshot) = self.capture(&region) else {
-                continue;
-            };
-            if let Ok(compiled) = compile::compile_snapshot(&snapshot) {
-                self.stats.compilations += 1;
-                self.publish(region, compiled);
-            }
-        }
-    }
-
-    /// Starts, completes or bounds the current recording at an executor
-    /// boundary. True while a recording continues.
-    fn memo_progress(&mut self) -> bool {
-        let Some(memo) = self.memo.as_deref_mut() else {
-            return false;
-        };
-        let Some(recorder) = memo.recording.as_deref_mut() else {
-            return false;
-        };
-        if !recorder.armed {
-            recorder.armed = true;
-            recorder.saved_fuel = self.state.fuel;
-            self.state.fuel = crate::memo::RECORD_FUEL;
-            memo.prune_code(&self.memory);
-            return true;
-        }
-        let blocks = crate::memo::RECORD_FUEL.saturating_sub(self.state.fuel);
-        if self.state.eip == recorder.ret && self.state.regs[4] > recorder.entry_esp {
-            let recorder = memo.recording.take().unwrap();
-            self.state.fuel = recorder.saved_fuel;
-            memo.finish(recorder, &self.state, &self.memory, blocks);
-            return false;
-        }
-        if blocks > crate::memo::RECORD_LIMIT {
-            self.memo_abort(crate::memo::Abort::Limit);
-            return false;
-        }
-        true
-    }
-
-    fn memo_abort(&mut self, reason: crate::memo::Abort) {
-        let Some(memo) = self.memo.as_deref_mut() else {
-            return;
-        };
-        let Some(recorder) = memo.recording.take() else {
-            return;
-        };
-        if recorder.armed {
-            self.state.fuel = recorder.saved_fuel;
-        }
-        let detail = if memo.logging() {
-            let pc = self.state.eip;
-            let instruction = self.memory.read_data(pc, 15).ok().map(|bytes| {
-                iced_x86::Decoder::with_ip(
-                    32,
-                    &bytes,
-                    u64::from(pc),
-                    iced_x86::DecoderOptions::NONE,
-                )
-                .decode()
-                .code()
-            });
-            format!("at {pc:#x} {instruction:?}")
-        } else {
-            String::new()
-        };
-        memo.abort(recorder, reason, detail);
-    }
-
-    /// Interprets one instruction or REP element of the current recording
-    /// after recording the memory it may access. Any step other than Executed
-    /// abandons the recording and is handled as usual.
-    fn memo_step(&mut self) -> crate::interpreter::Execution {
-        use iced_x86::{Mnemonic, OpAccess, OpKind, Register};
-        let pc = self.state.eip;
-        let mut bytes = [0; 15];
-        let len = (1..=15)
-            .rev()
-            .find(|&len| self.memory.read_into(pc, &mut bytes[..len]).is_ok())
-            .unwrap_or(0);
-        let instruction = iced_x86::Decoder::with_ip(
-            32,
-            &bytes[..len],
-            u64::from(pc),
-            iced_x86::DecoderOptions::NONE,
-        )
-        .decode();
-        let state = &self.state;
-        // REP elements access exactly their operands; an exhausted count
-        // accesses nothing.
-        let string = instruction.op_kinds().find(|kind| {
-            matches!(
-                kind,
-                OpKind::MemorySegSI
-                    | OpKind::MemorySegESI
-                    | OpKind::MemorySegDI
-                    | OpKind::MemorySegEDI
-                    | OpKind::MemoryESDI
-                    | OpKind::MemoryESEDI
-            )
-        });
-        let repeated =
-            string.is_some() && (instruction.has_rep_prefix() || instruction.has_repne_prefix());
-        let narrow = matches!(
-            string,
-            Some(OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI)
-        );
-        let count = state.regs[1] & if narrow { 0xffff } else { u32::MAX };
-        let mut footprint = Vec::new();
-        let mut known = !instruction.is_invalid();
-        if known && !(repeated && count == 0) {
-            let info = iced_x86::InstructionInfoFactory::new()
-                .info(&instruction)
-                .used_memory()
-                .to_vec();
-            for used in info {
-                let (read, write) = match used.access() {
-                    OpAccess::NoMemAccess => continue,
-                    OpAccess::Read => (true, false),
-                    OpAccess::CondRead => (!repeated, false),
-                    OpAccess::Write => (false, true),
-                    // A write that may not happen keeps the old bytes, which
-                    // makes them an input unless a REP count guarantees it.
-                    OpAccess::CondWrite => (!repeated, true),
-                    _ => (true, true),
-                };
-                let address = used.virtual_address(0, |register, _, _| {
-                    if register.is_segment_register() {
-                        return Some(if register == Register::FS {
-                            u64::from(state.fs_base)
-                        } else {
-                            0
-                        });
-                    }
-                    let index = (register.full_register32() as usize)
-                        .checked_sub(Register::EAX as usize)
-                        .filter(|&index| index < 8)?;
-                    let value = state.regs[index];
-                    Some(u64::from(match register.size() {
-                        1 if register >= Register::AH && register <= Register::BH => {
-                            value >> 8 & 0xff
-                        }
-                        1 => value & 0xff,
-                        2 => value & 0xffff,
-                        _ => value,
-                    }))
-                });
-                // A REP access spans the remaining elements; one step does one.
-                let size = if repeated {
-                    instruction.memory_size().size()
-                } else {
-                    used.memory_size().size()
-                } as u32;
-                match address {
-                    Some(address) if size != 0 => {
-                        footprint.push((address as u32, size, read, write))
-                    }
-                    _ => known = false,
-                }
-            }
-        }
-        let recorder = self
-            .memo
-            .as_deref_mut()
-            .and_then(|memo| memo.recording.as_deref_mut())
-            .expect("recording");
-        for &(address, size, read, write) in &footprint {
-            if read {
-                recorder.access(&self.memory, address, size, false);
-            }
-            if write {
-                recorder.access(&self.memory, address, size, true);
-            }
-        }
-        // Environment stores read x87 pointer fields the recording may not
-        // have overwritten yet.
-        let environment = matches!(
-            instruction.mnemonic(),
-            Mnemonic::Fnstenv
-                | Mnemonic::Fstenv
-                | Mnemonic::Fnsave
-                | Mnemonic::Fsave
-                | Mnemonic::Fxsave
-                | Mnemonic::Fxsave64
-        );
-        // These observe or reload the contents of empty x87 registers.
-        let opaque = environment
-            || matches!(
-                instruction.mnemonic(),
-                Mnemonic::Emms
-                    | Mnemonic::Femms
-                    | Mnemonic::Fldenv
-                    | Mnemonic::Frstor
-                    | Mnemonic::Fxrstor
-                    | Mnemonic::Fxrstor64
-            )
-            || (0..instruction.op_count()).any(|operand| {
-                instruction.op_kind(operand) == OpKind::Register
-                    && instruction.op_register(operand).is_mm()
-            });
-        recorder.x87_opaque |= opaque;
-        recorder.x87_status |= opaque
-            || matches!(
-                instruction.mnemonic(),
-                Mnemonic::Fnstsw
-                    | Mnemonic::Fstsw
-                    | Mnemonic::Fnclex
-                    | Mnemonic::Fclex
-                    | Mnemonic::Fninit
-                    | Mnemonic::Finit
-                    | Mnemonic::Fldcw
-            );
-        if !known || environment && recorder.x87_written != 0x1f {
-            self.memo_abort(crate::memo::Abort::Impure);
-            return self
-                .interpreter
-                .run_chunk(&mut self.state, &mut self.memory, 1);
-        }
-        let before = crate::memo::x87_pointers(&self.state);
-        let (regs, empty) = (self.state.x87.regs, crate::memo::x87_empty(&self.state));
-        let status = self.state.x87.status;
-        let execution = self
-            .interpreter
-            .run_chunk(&mut self.state, &mut self.memory, 1);
-        let after = crate::memo::x87_pointers(&self.state);
-        for index in 0..5 {
-            if before[index] != after[index] {
-                recorder.x87_written |= 1 << index;
-            }
-        }
-        recorder.x87_conditions |= (status ^ self.state.x87.status) & crate::memo::CONDITIONS;
-        // A register is loaded when it stops being empty, even with the
-        // value it already held.
-        recorder.x87_touched |= empty & !crate::memo::x87_empty(&self.state);
-        for slot in 0..8 {
-            if regs[slot] != self.state.x87.regs[slot] {
-                recorder.x87_touched |= 1 << slot;
-            }
-        }
-        if execution.step != crate::interpreter::Step::Executed {
-            self.memo_abort(crate::memo::Abort::Impure);
-        }
-        execution
-    }
-
-    fn recording(&self) -> bool {
-        self.memo
-            .as_ref()
-            .is_some_and(|memo| memo.recording.is_some())
-    }
-
-    /// The record-mode variant of `owner` for the current PC.
-    fn memo_code(&mut self, owner: u32) -> bool {
-        let pc = self.state.eip;
-        let Some(memo) = self.memo.as_deref_mut() else {
-            return false;
-        };
-        if memo
-            .code
-            .get(&owner)
-            .is_some_and(|code| code.entries.contains(&pc) && code.valid(&self.memory))
-        {
-            return true;
-        }
-        let input = self.code.compiled[&owner].input().for_recording();
-        if !input.valid(&self.memory) {
-            return false;
-        }
-        match compile::compile_snapshot(&input) {
-            Ok(code) if code.entries.contains(&pc) => {
-                memo.add_code(owner, code);
-                true
-            }
-            _ => false,
-        }
     }
 
     fn publish(&mut self, region: Region, compiled: Compiled) {
@@ -950,7 +614,8 @@ impl Executor {
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
             return Ok(false);
         }
-        let snapshot = self.capture(&region)?;
+        let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        snapshot.shadow_returns = self.shadow_returns.is_some();
         let fragments = if let Some(limit) = limit {
             match crate::compile_budget::plan(snapshot, limit) {
                 Ok(fragments) => fragments,
@@ -1534,8 +1199,6 @@ impl Executor {
             self.validate_stop(stop)?;
         }
         loop {
-            // A recording finishes its function before the slice may end.
-            let recording = self.memo_progress();
             if bridge.parked {
                 return Ok(RunOutcome::Parked);
             }
@@ -1543,13 +1206,13 @@ impl Executor {
                 return Ok(RunOutcome::ReachedStop);
             }
             let now = self.deadline.map(|_| Instant::now());
-            if !recording && self.deadline.zip(now).is_some_and(|(t, now)| now >= t) {
+            if self.deadline.zip(now).is_some_and(|(t, now)| now >= t) {
                 return Ok(RunOutcome::Budget);
             }
             if self.state.fuel == 0 {
                 return Ok(RunOutcome::Budget);
             }
-            if !recording && self.host_interrupts && self.interrupt.load(Ordering::Acquire) {
+            if self.host_interrupts && self.interrupt.load(Ordering::Acquire) {
                 return Ok(RunOutcome::Interrupted);
             }
             if self
@@ -1590,14 +1253,7 @@ impl Executor {
                     && self.deferred_fallback != Some(self.state.eip)
             });
             let native = native.map(|(owner, _)| owner);
-            // Without a record-mode variant, a recording interprets the instruction.
-            let native = if recording {
-                native.filter(|&owner| self.memo_code(owner))
-            } else {
-                native
-            };
             if native.is_some()
-                && !recording
                 && self.parallel.is_some()
                 && self.parallel_demand
                 && self.admission.ready()
@@ -1619,11 +1275,7 @@ impl Executor {
                 // At the measured rate, the allowance covers about half the time
                 // left, so hot loops rarely leave native code early.
                 const SAFEPOINT: u64 = 256;
-                let timed = if recording {
-                    None
-                } else {
-                    self.deadline.zip(now)
-                };
+                let timed = self.deadline.zip(now);
                 let allowance = timed.map_or(u64::MAX, |(deadline, now)| {
                     let left = deadline.saturating_duration_since(now).as_micros() as u64;
                     (left / 2).saturating_mul(self.native_rate).max(SAFEPOINT)
@@ -1633,57 +1285,21 @@ impl Executor {
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
-                let (result, linked) = if let Some(memo) = self.memo.as_deref_mut()
-                    && recording
-                {
-                    // Record-mode variants link only to one another and leave
-                    // native code when execution returns to the caller.
-                    let crate::memo::Memo {
-                        code,
-                        links,
-                        recording: recorder,
-                        ..
-                    } = memo;
-                    let recorder = recorder.as_deref_mut().unwrap();
-                    let ret = recorder.ret;
-                    bridge.recorder = recorder;
-                    let result = code[&owner].run(
-                        &mut self.state,
-                        &mut self.memory,
-                        bridge,
-                        compile::NativeRun {
-                            links: Some(links),
-                            stop: ret,
-                            interrupt: &self.inactive_interrupt,
-                            shadow: None,
+                let (result, linked) = native.run(
+                    &mut self.state,
+                    &mut self.memory,
+                    bridge,
+                    compile::NativeRun {
+                        links: (self.region_linking && !self.profiling).then_some(&self.code.links),
+                        stop,
+                        interrupt: if self.host_interrupts {
+                            self.interrupt.as_ref()
+                        } else {
+                            &self.inactive_interrupt
                         },
-                    );
-                    bridge.recorder = std::ptr::null_mut();
-                    result
-                } else {
-                    bridge.memo = self
-                        .memo
-                        .as_deref_mut()
-                        .map_or(std::ptr::null_mut(), |memo| memo as *mut _);
-                    let result = native.run(
-                        &mut self.state,
-                        &mut self.memory,
-                        bridge,
-                        compile::NativeRun {
-                            links: (self.region_linking && !self.profiling)
-                                .then_some(&self.code.links),
-                            stop,
-                            interrupt: if self.host_interrupts {
-                                self.interrupt.as_ref()
-                            } else {
-                                &self.inactive_interrupt
-                            },
-                            shadow: self.shadow_returns.as_deref_mut(),
-                        },
-                    );
-                    bridge.memo = std::ptr::null_mut();
-                    result
-                };
+                        shadow: self.shadow_returns.as_deref_mut(),
+                    },
+                );
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
                     p.native_entries += 1;
@@ -1712,19 +1328,7 @@ impl Executor {
                 }
                 self.state.fuel += reserved;
                 self.stats.native_blocks += completed;
-                if recording {
-                    if result == Exit::Budget as u32 || result == Exit::Interrupted as u32 {
-                        self.memo_abort(crate::memo::Abort::Context);
-                    } else if result != Exit::Dispatch as u32 && result != Exit::Fallback as u32 {
-                        self.memo_abort(crate::memo::Abort::Impure);
-                    }
-                } else {
-                    self.record_native_work(owner, completed);
-                    if let Some(memo) = self.memo.as_deref_mut() {
-                        memo.sample(&self.state, &self.memory);
-                        self.memo_rehook();
-                    }
-                }
+                self.record_native_work(owner, completed);
                 match result {
                     n if n == Exit::Trap as u32 => {
                         if let Some(error) = bridge.error.take() {
@@ -1784,10 +1388,7 @@ impl Executor {
             // decoded block. Transfers, exceptions, SMC and REP return here; native
             // publications change the revision used to build fallthrough boundaries.
             let units = self.state.fuel.min(256) as u32;
-            let (execution, last_units) = if self.recording() {
-                let execution = self.memo_step();
-                (execution, execution.units)
-            } else if self.profiling || single_step {
+            let (execution, last_units) = if self.profiling || single_step {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1829,8 +1430,7 @@ impl Executor {
                 }
                 *self.demand.entry(pc).or_default() += 1;
             }
-            // An abandoned recording has restored the caller's fuel.
-            self.state.fuel = self.state.fuel.saturating_sub(u64::from(execution.units));
+            self.state.fuel -= u64::from(execution.units);
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
                 p.interpreter_entries += 1;

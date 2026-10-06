@@ -20,7 +20,6 @@ pub mod interpreter;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod jit_memory;
 mod linking;
-mod memo;
 mod memory;
 mod parallel;
 mod parallel_memory;
@@ -36,7 +35,6 @@ pub use backend::jit::JitCpu;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::SegmentState;
 pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats};
-pub use memo::{MemoOptions, MemoStats};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;
 pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};

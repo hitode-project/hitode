@@ -18,7 +18,6 @@ mod diagnostics;
 mod fault;
 mod flag_liveness;
 mod loops;
-mod memo_probe;
 mod mmx;
 mod scalar;
 mod shadow;
@@ -84,9 +83,6 @@ impl Compiled {
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub(crate) fn storage_bytes(&self) -> Result<(usize, usize), String> {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
-    }
-    pub(crate) fn input(&self) -> &Snapshot {
-        &self.input
     }
     pub fn valid(&self, memory: &Memory) -> bool {
         memory.base == self.window_base
@@ -224,12 +220,6 @@ pub(crate) struct Snapshot {
     pub(crate) shadow_returns: bool,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     native_fault_reads: bool,
-    /// Record-mode code for result reuse (crate::memo): every guest access
-    /// calls the recorder first, and helpers, traps and loop versioning are
-    /// left out so that nothing else can touch guest memory.
-    pub(crate) record: bool,
-    /// Guest PCs that ask crate::memo for a recorded result on entry.
-    pub(crate) memo_hooks: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,20 +233,6 @@ struct PageStamp {
 impl Snapshot {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
-    }
-
-    /// The record-mode input for the same code; it runs only on the owner.
-    pub(crate) fn for_recording(&self) -> Self {
-        let mut input = self.clone();
-        input.record = true;
-        input.memo_hooks.clear();
-        input.shadow_returns = false;
-        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        {
-            input.native_fault_reads = false;
-        }
-        input.region.compile_strategy = CompileStrategy::Fast;
-        input
     }
 
     /// Slice an immutable input without consulting active guest memory. Keep
@@ -289,8 +265,6 @@ impl Snapshot {
             shadow_returns: self.shadow_returns,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             native_fault_reads: self.native_fault_reads,
-            record: self.record,
-            memo_hooks: self.memo_hooks.clone(),
         })
     }
 
@@ -339,8 +313,6 @@ impl Snapshot {
             shadow_returns: false,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             native_fault_reads: memory.native_fault_reads_available(),
-            record: false,
-            memo_hooks: Vec::new(),
             pages: pages
                 .into_iter()
                 .map(|page| PageStamp {
@@ -451,7 +423,6 @@ fn record_tail_dependencies(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn compile(
     region: &Region,
     memory: &Memory,
@@ -549,7 +520,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // and the remaining cases call the interpreter's transaction in place.
     let x87: Box<[crate::floating::NativeX87]> = instructions
         .values()
-        .filter(|i| !snapshot.record && !supported(i) && crate::floating::native_x87(i))
+        .filter(|i| !supported(i) && crate::floating::native_x87(i))
         .map(|i| {
             // The snapshot bytes begin at the region start.
             let start = (i.ip32() - region.start) as usize;
@@ -565,11 +536,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         })
         .collect();
-    let x87_segments = if snapshot.record {
-        Default::default()
-    } else {
-        x87::segments(&instructions, &region.entries)
-    };
+    let x87_segments = x87::segments(&instructions, &region.entries);
     let mut entries = BTreeSet::from([region.start]);
     for instruction in instructions.values() {
         if crate::strings::operation(instruction).is_some()
@@ -604,15 +571,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .filter(|pc| entries.contains(pc))
         .collect();
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    let fault_pc = (snapshot.native_fault_reads && snapshot.memo_hooks.is_empty())
+    let fault_pc = snapshot
+        .native_fault_reads
         .then(|| fault::candidate(region.start, &instructions))
         .flatten();
     // Hardware-fault recipes describe one checked entry path; keep such
     // regions unversioned.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    let versioned = fault_pc.is_none() && !snapshot.record;
+    let versioned = fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
-    let versioned = !snapshot.record;
+    let versioned = true;
     let plans = if versioned {
         loops::plans(&instructions, &entries, |i| {
             supported(i)
@@ -624,7 +592,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     };
     #[cfg(test)]
     let versioned_loops = plans.len();
-    let return_hint = if returns.len() == 1 && !snapshot.record {
+    let return_hint = if returns.len() == 1 {
         returns.first().copied()
     } else {
         None
@@ -664,9 +632,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         crate::atomic_memory::load_vector as *const u8,
     );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
-    builder.symbol("adv_memo_probe", memo_probe::record as *const u8);
-    builder.symbol("adv_memo_enter", crate::memo::enter as *const u8);
-    builder.symbol("adv_memo_access", crate::memo::access as *const u8);
     builder.symbol(
         "adv_read_timestamp",
         crate::trap::read_timestamp as *const u8,
@@ -709,25 +674,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_trap_call", Linkage::Import, &trap_signature)
         .map_err(|e| e.to_string())?;
     let trap_ref = module.declare_func_in_func(host_id, &mut ctx.func);
-    let memo_enter_ref = if snapshot.record || snapshot.memo_hooks.is_empty() {
-        None
-    } else {
-        let id = module
-            .declare_function("adv_memo_enter", Linkage::Import, &trap_signature)
-            .map_err(|e| e.to_string())?;
-        Some(module.declare_func_in_func(id, &mut ctx.func))
-    };
-    let memo_access_ref = if snapshot.record {
-        let mut signature = module.make_signature();
-        signature.params.push(AbiParam::new(ptr_ty));
-        signature.params.extend([AbiParam::new(types::I32); 3]);
-        let id = module
-            .declare_function("adv_memo_access", Linkage::Import, &signature)
-            .map_err(|e| e.to_string())?;
-        Some(module.declare_func_in_func(id, &mut ctx.func))
-    } else {
-        None
-    };
     let mut repeat_signature = module.make_signature();
     repeat_signature.params.extend([AbiParam::new(ptr_ty); 2]);
     repeat_signature.returns.push(AbiParam::new(types::I32));
@@ -805,17 +751,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_read_timestamp", Linkage::Import, &timestamp_signature)
         .map_err(|e| e.to_string())?;
     let timestamp_ref = module.declare_func_in_func(timestamp_id, &mut ctx.func);
-    let memo_probe_ref = if memo_probe::pcs().is_empty() {
-        None
-    } else {
-        let mut signature = module.make_signature();
-        signature.params.push(AbiParam::new(ptr_ty));
-        signature.params.extend([AbiParam::new(types::I32); 11]);
-        let id = module
-            .declare_function("adv_memo_probe", Linkage::Import, &signature)
-            .map_err(|e| e.to_string())?;
-        Some(module.declare_func_in_func(id, &mut ctx.func))
-    };
     let mut range_signature = module.make_signature();
     range_signature.params.push(AbiParam::new(ptr_ty));
     range_signature.params.extend([AbiParam::new(types::I64); 3]);
@@ -1113,11 +1048,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
-            memo_probe_ref,
-            record: snapshot.record,
-            memo_hooks: snapshot.memo_hooks.iter().copied().collect(),
-            memo_enter_ref,
-            memo_access_ref,
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -1214,19 +1144,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     break;
                 };
                 e.at(pc);
-                // The executor interprets these while recording: it records
-                // their footprint and which x87 state they observe.
-                if e.record
-                    && (crate::strings::operation(instruction).is_some()
-                        || matches!(instruction.mnemonic(), M::Int | M::Rdtsc | M::Emms)
-                        || (0..instruction.op_count()).any(|operand| {
-                            instruction.op_kind(operand) == OpKind::Register
-                                && instruction.op_register(operand).is_mm()
-                        }))
-                {
-                    e.exit_const(Exit::Fallback, pc);
-                    break;
-                }
                 if !supported(instruction) && !e.x87.contains_key(&pc) {
                     e.exit_const(Exit::Fallback, pc);
                     break;
@@ -1264,18 +1181,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let outside = e.b.create_block();
         if !hot_exits {
             e.b.set_cold_block(outside);
-        }
-        if e.record {
-            let stop = e.b.ins().load(
-                types::I32,
-                MemFlags::trusted(),
-                e.context,
-                offset_of!(NativeContext, stop) as i32,
-            );
-            let returned = e.b.ins().icmp(IntCC::Equal, target, stop);
-            let local = e.b.create_block();
-            e.b.ins().brif(returned, outside, &[], local, &[]);
-            e.b.switch_to_block(local);
         }
         let mut switch = Switch::new();
         for (&pc, &block) in &e.blocks {
@@ -1930,11 +1835,6 @@ struct Emitter<'a> {
     file_prepare_ref: ir::FuncRef,
     file_prepared_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
-    memo_probe_ref: Option<ir::FuncRef>,
-    record: bool,
-    memo_hooks: BTreeSet<u32>,
-    memo_enter_ref: Option<ir::FuncRef>,
-    memo_access_ref: Option<ir::FuncRef>,
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
     source_map: bool,
@@ -2524,66 +2424,6 @@ impl Emitter<'_> {
     fn at(&mut self, pc: u32) {
         self.pc = pc;
         self.mark(diagnostics::Part::Body);
-        if let Some(probe) = self.memo_probe_ref
-            && memo_probe::pcs().contains(&pc)
-        {
-            let mut args = vec![self.mem];
-            for value in [self.base, self.len as u32, pc] {
-                args.push(self.constant(value));
-            }
-            for reg in 0..8 {
-                args.push(self.b.use_var(self.regs[reg]));
-            }
-            self.b.ins().call(probe, &args);
-        }
-        if let Some(enter) = self.memo_enter_ref
-            && self.lane.is_none()
-            && self.fast.is_none()
-            && self.memo_hooks.contains(&pc)
-        {
-            self.memo_entry(enter, pc);
-        }
-    }
-    /// Asks crate::memo for a recorded result. A hit has replaced the state
-    /// and continues at its return address; a recording request leaves
-    /// native code without chaining so the executor runs record-mode code.
-    fn memo_entry(&mut self, enter: ir::FuncRef, pc: u32) {
-        let pc = self.constant(pc);
-        self.save_state(pc);
-        self.shadow_clear();
-        let call = self.b.ins().call(enter, &[self.bridge, self.state, pc]);
-        let result = self.b.inst_results(call)[0];
-        self.reload_state();
-        let resume = self.b.create_block();
-        let leave = self.b.create_block();
-        self.b.set_cold_block(leave);
-        self.b.ins().brif(result, leave, &[], resume, &[]);
-        self.b.switch_to_block(leave);
-        let target = self.b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            self.state,
-            offset_of!(CpuState, eip) as i32,
-        );
-        let reused = self.b.create_block();
-        self.b.set_cold_block(reused);
-        let record = self.b.create_block();
-        self.b.set_cold_block(record);
-        let hit = self.b.ins().icmp_imm(IntCC::Equal, result, 1);
-        self.b.ins().brif(hit, reused, &[], record, &[]);
-        self.b.switch_to_block(reused);
-        self.exit(Exit::Dispatch, target);
-        self.b.switch_to_block(record);
-        self.exit(Exit::Trap, target);
-        self.b.switch_to_block(resume);
-    }
-    /// Record mode reports each guest access before it happens.
-    fn memo_access(&mut self, addr: Value, size: usize, write: bool) {
-        if let Some(access) = self.memo_access_ref {
-            let size = self.constant(size as u32);
-            let write = self.constant(u32::from(write));
-            self.b.ins().call(access, &[self.bridge, addr, size, write]);
-        }
     }
     fn mark(&mut self, part: diagnostics::Part) {
         let offset = self.pc.wrapping_sub(self.source_origin);
@@ -3021,7 +2861,6 @@ impl Emitter<'_> {
                 file: ordinary,
             };
         }
-        self.memo_access(addr, size, true);
         self.mark(diagnostics::Part::Check);
         let (offset, positions) = self.access_range(addr, size, Exit::WriteFault);
         // Both metadata addresses are safe after the range guard. Loading them
@@ -3145,7 +2984,6 @@ impl Emitter<'_> {
                 None => Some(self.b.ins().load(ty, MemFlags::new(), address, 0)),
             };
         }
-        self.memo_access(addr, size, write);
         self.mark(diagnostics::Part::Check);
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let hardware = if !write

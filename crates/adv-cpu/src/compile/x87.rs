@@ -775,8 +775,6 @@ pub(crate) mod testing {
             deadline: None,
             bulk_calls: 0,
             bulk_bytes: 0,
-            memo: std::ptr::null_mut(),
-            recorder: std::ptr::null_mut(),
         };
         let interrupt = std::sync::atomic::AtomicBool::new(false);
         compiled

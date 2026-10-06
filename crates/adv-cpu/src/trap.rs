@@ -33,10 +33,6 @@ pub(crate) struct Bridge<'a> {
     pub deadline: Option<std::time::Instant>,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
-    /// Result reuse of the owner's hooked functions; null elsewhere.
-    pub memo: *mut crate::memo::Memo,
-    /// The recording that record-mode code reports accesses to, if any.
-    pub recorder: *mut crate::memo::Recorder,
 }
 
 impl Bridge<'_> {

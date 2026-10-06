@@ -370,8 +370,6 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
         deadline: Some(deadline),
         bulk_calls: 0,
         bulk_bytes: 0,
-        memo: std::ptr::null_mut(),
-        recorder: std::ptr::null_mut(),
     };
     let mut entries = 0;
     let mut blocks = 0;
