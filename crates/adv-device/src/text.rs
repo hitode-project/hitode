@@ -123,6 +123,8 @@ pub struct FontRequest {
 pub enum FontEnumeration {
     Families,
     Faces,
+    /// Extended enumeration selects a character repertoire as well as a face.
+    FamiliesEx(Encoding),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontKind {
@@ -156,7 +158,14 @@ pub struct EnumeratedFont {
     pub device: bool,
     pub full_name: String,
     pub style: String,
+    pub script: String,
     pub design: Option<FontDesign>,
+    pub signature: Option<FontSignature>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FontSignature {
+    pub unicode: [u32; 4],
+    pub codepages: [u32; 2],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DefaultFont {

@@ -422,6 +422,61 @@ fn directdraw_scaled_blt_keeps_clipper_phase_and_rejects_color_key_flags() {
 }
 
 #[test]
+fn directdraw_copy_accepts_unused_effects_and_validates_them_before_pixels() {
+    let mut f = Fixture::new();
+    let (source, pixels, pitch) = f.surface(5, 4, PixelFormat::Bgra32, false);
+    let (primary, _, _) = f.surface(5, 4, PixelFormat::Bgra32, true);
+    for y in 0..4 {
+        for x in 0..5 {
+            f.memory
+                .write(pixels + y * pitch + x * 4, &[x as u8, y as u8, 42, 0])
+                .unwrap();
+        }
+    }
+    let mut effects = [0xcc; 100];
+    effects[..4].copy_from_slice(&100u32.to_le_bytes());
+    f.memory.write(256, &effects).unwrap();
+    for flags in [0, 0x01000000] {
+        assert_eq!(f.dd(dd::BLT, &[primary, 0, source, 0, flags, 256]), 0);
+        for (index, pixel) in f
+            .surfaces
+            .presenter
+            .bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(pixel, &[index as u8 % 5, index as u8 / 5, 42, 0]);
+        }
+    }
+    let before = f.surfaces.presenter.bgra.clone();
+    let frames = f.surfaces.stats.presentations;
+    for size in [0u32, 4, 128, u32::MAX] {
+        f.memory.put_u32(256, size).unwrap();
+        assert_eq!(
+            f.dd(dd::BLT, &[primary, 0, source, 0, 0x01000000, 256]),
+            0x80070057
+        );
+    }
+    for pointer in [65500, 0xdeadbeef, u32::MAX - 20] {
+        assert_eq!(
+            f.dd(dd::BLT, &[primary, 0, source, 0, 0x01000000, pointer]),
+            0x80070057
+        );
+    }
+    f.memory.put_u32(256, 100).unwrap();
+    assert_eq!(f.dd(dd::LOCK, &[source, 0, 64, 0, 0]), 0);
+    assert_eq!(
+        f.dd(dd::BLT, &[primary, 0, source, 0, 0x01000000, 256]),
+        0x887601ae
+    );
+    assert_eq!(f.surfaces.stats.presentations, frames);
+    assert_eq!(f.surfaces.presenter.bgra, before);
+    assert_eq!(f.dd(dd::UNLOCK, &[source, 0]), 0);
+}
+
+#[test]
 fn directdraw_overlapping_scaling_and_conversion_preserve_original_pixels() {
     let mut f = Fixture::new();
     let (source, pixels, pitch) = f.surface(5, 4, PixelFormat::Rgb565, false);
