@@ -9,3 +9,7 @@ __pycache__/
 # local privacy-scan terms (tools/privacy/scan.py)
 /.privacy-terms
 /dist
+# Local trial packaging and machine-specific launchers
+/tools/windows/package-trial.ps1
+/tools/windows/launch-trial.ps1
+/tools/windows/trial-readme.txt
