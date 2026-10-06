@@ -158,7 +158,7 @@ fn interpreted_instruction_returns_without_replaying_native_writes() {
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
         a.inc(dword_ptr(edi)).unwrap();
-        a.xlatb().unwrap();
+        a.cwde().unwrap();
         a.add(eax, 1).unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
@@ -166,7 +166,7 @@ fn interpreted_instruction_returns_without_replaying_native_writes() {
     });
     let mut jit = machine(&code, true);
     let mut uc = machine(&code, false);
-    let regs = [0x12345678, 5, 0, DATA + 0x100, 0, 0, 0, DATA];
+    let regs = [0x12345678, 5, 0, 0, 0, 0, 0, DATA];
     reset(&mut jit, regs, 2);
     reset(&mut uc, regs, 2);
     equal(&mut jit, &mut uc, 0x8d5);
@@ -391,7 +391,7 @@ fn interpreted_sse_state_survives_native_islands() {
         a.set_label(&mut top).unwrap();
         a.inc(eax).unwrap();
         a.paddd(xmm0, xmmword_ptr(esi)).unwrap();
-        a.xlatb().unwrap();
+        a.cwde().unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
         a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
@@ -400,7 +400,7 @@ fn interpreted_sse_state_survives_native_islands() {
     let mut jit = machine(&code, true);
     let mut uc = machine(&code, false);
     for m in [&mut jit, &mut uc] {
-        reset(m, [0, 9, 0, DATA + 0x100, 0, 0, DATA, DATA + 32], 2);
+        reset(m, [0, 9, 0, 0, 0, 0, DATA, DATA + 32], 2);
         m.write(
             DATA,
             &[1u32, 2, 3, 4]
@@ -418,15 +418,13 @@ fn interpreted_sse_state_survives_native_islands() {
 #[test]
 fn tiny_budget_can_advance_a_cold_entry() {
     let code = assemble(|a| {
-        a.xlatb().unwrap();
+        a.cwde().unwrap();
         a.ret().unwrap();
     });
     let mut jit = machine(&code, true);
-    jit.state.regs[0] = 0x12345678;
-    jit.state.regs[3] = DATA;
-    jit.write(DATA + 0x78, &[0xa5]).unwrap();
+    jit.state.regs[0] = 0x1234_8678;
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.state.regs[0], 0x123456a5);
+    assert_eq!(jit.state.regs[0], 0xffff_8678);
     assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::ReachedStop);
 }
 

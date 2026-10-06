@@ -1185,6 +1185,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             x87_native: x87::enabled(),
             x87_cold: None,
             x87_cold_reads: 0,
+            parallel: snapshot.parallel,
             lane: None,
             x87: x87
                 .iter()
@@ -2138,6 +2139,40 @@ fn narrow_alu(mnemonic: M) -> bool {
     )
 }
 
+/// LOCK forms the emitter lowers as ordinary read-modify-writes. They are
+/// atomic only while this guest thread owns execution; a parallel snapshot
+/// sends them to the interpreter, which quiesces the native workers.
+fn lockable(i: &Instruction) -> bool {
+    i.op0_kind() == OpKind::Memory
+        && matches!(
+            i.mnemonic(),
+            M::Add
+                | M::Adc
+                | M::Sub
+                | M::Sbb
+                | M::And
+                | M::Or
+                | M::Xor
+                | M::Inc
+                | M::Dec
+                | M::Not
+                | M::Neg
+                | M::Xchg
+                | M::Xadd
+                | M::Cmpxchg
+                | M::Bts
+                | M::Btr
+                | M::Btc
+        )
+}
+
+/// Whether this instruction must be one transaction relative to other guest
+/// threads: LOCK, or XCHG's implicit lock on a memory operand.
+fn exclusive(i: &Instruction) -> bool {
+    i.has_lock_prefix()
+        || i.mnemonic() == M::Xchg && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
+}
+
 pub(crate) fn supported(i: &Instruction) -> bool {
     if crate::strings::operation(i).is_some() {
         return true;
@@ -2145,7 +2180,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     // `rep ret` is the branch-predictor idiom for a plain return.
     let rep_ret = i.mnemonic() == M::Ret && !i.has_repne_prefix();
     if i.is_invalid()
-        || i.has_lock_prefix()
+        || (i.has_lock_prefix() && !lockable(i))
         || (i.has_rep_prefix() && !rep_ret)
         || i.has_repne_prefix()
         || !matches!(i.segment_prefix(), R::None | R::DS | R::SS | R::ES | R::FS)
@@ -2339,6 +2374,8 @@ struct Emitter<'a> {
     x87_native: bool,
     x87_cold: Option<ir::Block>,
     x87_cold_reads: u8,
+    /// Other guest threads may run native code at the same time.
+    parallel: bool,
     /// Inside a resident x87 lane, every guard and shared/file access path of an
     /// integer instruction branches here before the instruction commits; the
     /// lane then materializes its prefix and re-executes canonically.
@@ -4441,24 +4478,7 @@ impl Emitter<'_> {
     }
     fn read(&mut self, i: &Instruction, n: u32) -> Value {
         match i.op_kind(n) {
-            OpKind::Register => {
-                let reg = i.op_register(n);
-                let full = self
-                    .b
-                    .use_var(self.regs[reg_index(reg.full_register32()).unwrap()]);
-                if reg.size() == 4 {
-                    full
-                } else {
-                    let value = if matches!(reg, R::AH | R::CH | R::DH | R::BH) {
-                        self.b.ins().ushr_imm(full, 8)
-                    } else {
-                        full
-                    };
-                    self.b
-                        .ins()
-                        .band_imm(value, if reg.size() == 1 { 255 } else { 65535 })
-                }
-            }
+            OpKind::Register => self.read_register(i.op_register(n)),
             OpKind::Memory => {
                 let addr = self.address(i);
                 let size = i.memory_size().size();
@@ -4476,6 +4496,24 @@ impl Emitter<'_> {
             OpKind::Immediate8to16 => self.constant(u32::from(i.immediate8to16() as u16)),
             OpKind::NearBranch32 => self.constant(i.near_branch32()),
             _ => unreachable!(),
+        }
+    }
+    /// A general register, zero-extended from its width.
+    fn read_register(&mut self, reg: R) -> Value {
+        let full = self
+            .b
+            .use_var(self.regs[reg_index(reg.full_register32()).unwrap()]);
+        if reg.size() == 4 {
+            full
+        } else {
+            let value = if matches!(reg, R::AH | R::CH | R::DH | R::BH) {
+                self.b.ins().ushr_imm(full, 8)
+            } else {
+                full
+            };
+            self.b
+                .ins()
+                .band_imm(value, if reg.size() == 1 { 255 } else { 65535 })
         }
     }
     fn destination(&mut self, i: &Instruction) -> Option<GuestPointer> {
@@ -4496,28 +4534,31 @@ impl Emitter<'_> {
             };
             self.store_memory(ptr, value);
         } else {
-            let reg = i.op0_register();
-            let var = self.regs[reg_index(reg.full_register32()).unwrap()];
-            let value = if reg.size() == 4 {
-                value
-            } else {
-                let high = matches!(reg, R::AH | R::CH | R::DH | R::BH);
-                let mask = if reg.size() == 1 { 255 } else { 65535 };
-                let value = self.b.ins().band_imm(value, mask);
-                let value = if high {
-                    self.b.ins().ishl_imm(value, 8)
-                } else {
-                    value
-                };
-                let old = self.b.use_var(var);
-                let old = self
-                    .b
-                    .ins()
-                    .band_imm(old, !(mask << if high { 8 } else { 0 }));
-                self.b.ins().bor(old, value)
-            };
-            self.b.def_var(var, value);
+            self.write_register(i.op0_register(), value);
         }
+    }
+    /// Writes a general register's width, keeping the rest of its full register.
+    fn write_register(&mut self, reg: R, value: Value) {
+        let var = self.regs[reg_index(reg.full_register32()).unwrap()];
+        let value = if reg.size() == 4 {
+            value
+        } else {
+            let high = matches!(reg, R::AH | R::CH | R::DH | R::BH);
+            let mask = if reg.size() == 1 { 255 } else { 65535 };
+            let value = self.b.ins().band_imm(value, mask);
+            let value = if high {
+                self.b.ins().ishl_imm(value, 8)
+            } else {
+                value
+            };
+            let old = self.b.use_var(var);
+            let old = self
+                .b
+                .ins()
+                .band_imm(old, !(mask << if high { 8 } else { 0 }));
+            self.b.ins().bor(old, value)
+        };
+        self.b.def_var(var, value);
     }
     fn flags(
         &mut self,
@@ -4768,6 +4809,10 @@ impl Emitter<'_> {
         if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
             self.native_x87_instruction(i, operation, opcode);
             return false;
+        }
+        if self.parallel && exclusive(i) {
+            let always = self.b.ins().iconst(types::I8, 1);
+            self.guard(always, Exit::Fallback, None);
         }
         if let Some(operation) = crate::strings::operation(i) {
             let pc = self.constant(i.ip32());

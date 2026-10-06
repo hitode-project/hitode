@@ -401,3 +401,128 @@ fn flag_transfers_direction_and_byte_swap_match_unicorn() {
         assert_eq!(jit.stats.interpreter_entries, 0, "form {form}");
     }
 }
+
+#[test]
+fn conditional_moves_memory_shifts_bit_tests_and_exchanges_stay_native() {
+    let values = [
+        0,
+        1,
+        0x7f,
+        0x80,
+        0xff,
+        0x8000_0000,
+        0xffff_ffff,
+        0x1234_5678,
+    ];
+    for form in 0..29 {
+        let bytes = assemble(|a| {
+            // A lazy producer first: CMOV and RCL/RCR consume derived flags.
+            a.cmp(eax, edx).unwrap();
+            let memory = dword_ptr(edi);
+            match form {
+                0 => a.cmovl(ebx, ecx),
+                1 => a.cmovbe(ebx, memory),
+                2 => a.shr(memory, cl),
+                3 => a.shl(memory, 1),
+                4 => a.sar(word_ptr(edi), cl),
+                5 => a.rol(al, 1),
+                6 => a.ror(byte_ptr(edi), cl),
+                7 => a.rol(bx, cl),
+                8 => a.rcr(memory, 1),
+                9 => a.rcl(bl, 1),
+                10 => a.bt(ecx, edx),
+                11 => a.bt(memory, 13),
+                12 => a.bts(ebx, ecx),
+                13 => a.btr(memory, 7),
+                14 => a.btc(ebx, 33),
+                15 => {
+                    a.mov(ebx, edi).unwrap();
+                    a.xlatb()
+                }
+                16 => a.xchg(memory, ecx),
+                17 => a.xchg(ecx, eax),
+                18 => a.lock().inc(memory),
+                19 => a.lock().dec(memory),
+                20 => a.lock().xadd(memory, ecx),
+                21 => a.lock().cmpxchg(memory, ecx),
+                22 => a.cmpxchg(bl, cl),
+                23 => a.lock().cmpxchg(byte_ptr(edi), cl),
+                24 => a.xadd(bl, cl),
+                25 => a.lock().add(memory, ecx),
+                26 => a.lock().bts(memory, 5),
+                27 => a.cmpxchg(eax, ecx),
+                _ => a.xadd(ecx, ecx),
+            }
+            .unwrap();
+            // Observe CF through a native consumer before the state export.
+            a.setb(dh).unwrap();
+            a.ret().unwrap();
+        });
+        let mut jit = machine(&bytes, true);
+        let mut uc = machine(&bytes, false);
+        let mut interpreted = machine(&bytes, false);
+        for &left in &values {
+            for &right in &values {
+                for &stored in &values {
+                    let context = format!(
+                        "form {form}, eax {left:#x}, ecx/edx {right:#x}, memory {stored:#x}"
+                    );
+                    let regs = [left, right, right ^ 0x55, stored ^ 0x0f0f, 0, 0, 0, DATA];
+                    let table: Vec<u8> = (0..=255u8).map(|n| n.wrapping_mul(37)).collect();
+                    for m in [&mut jit, &mut uc, &mut interpreted] {
+                        reset(m, regs, 0x202);
+                        m.write(DATA, &table).unwrap();
+                        m.write(DATA, &stored.to_le_bytes()).unwrap();
+                    }
+                    assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(
+                        uc.run_unicorn(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    assert_eq!(
+                        interpreted.run(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    let memory = |m: &Executor| m.memory().read(DATA, 8).unwrap().to_vec();
+                    assert_eq!(jit.state.regs, uc.state.regs, "{context}");
+                    assert_eq!(memory(&jit), memory(&uc), "{context}");
+                    // Undefined flags follow the interpreter's convention.
+                    interpreted.state.fuel = jit.state.fuel;
+                    assert_eq!(jit.state, interpreted.state, "{context}");
+                    assert_eq!(memory(&jit), memory(&interpreted), "{context}");
+                }
+            }
+        }
+        assert_eq!(jit.stats.interpreter_entries, 0, "form {form}");
+    }
+}
+
+#[test]
+fn locked_forms_fall_back_while_other_guest_threads_may_run() {
+    let bytes = assemble(|a| {
+        a.lock().inc(dword_ptr(edi)).unwrap();
+        a.xchg(dword_ptr(edi + 4), ecx).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.ret().unwrap();
+    });
+    let mut jit = machine(&bytes, false);
+    jit.set_guest_workers(2).unwrap();
+    jit.set_region(Region::new(CODE, bytes.len())).unwrap();
+    let mut interpreted = machine(&bytes, false);
+    for m in [&mut jit, &mut interpreted] {
+        reset(m, [5, 7, 0, 0, 0, 0, 0, DATA], 0x202);
+        m.write(DATA, &[0xff, 0xff, 0xff, 0xff, 9, 0, 0, 0])
+            .unwrap();
+        assert_eq!(m.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+    }
+    interpreted.state.fuel = jit.state.fuel;
+    assert_eq!(jit.state, interpreted.state);
+    assert_eq!(
+        jit.memory().read(DATA, 8).unwrap().to_vec(),
+        [0, 0, 0, 0, 7, 0, 0, 0]
+    );
+    assert_eq!(jit.state.regs[0], 14);
+    // Both atomic forms execute in the interpreter, which quiesces workers.
+    assert!(jit.stats.interpreter_instructions >= 2);
+    assert!(jit.stats.native_entries > 0);
+}

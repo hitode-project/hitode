@@ -1,6 +1,6 @@
 //! Scalar arithmetic and flag consumers used by profiled guest loops.
 use super::*;
-use iced_x86::Code;
+use iced_x86::{Code, ConditionCode};
 
 fn source32(i: &Instruction, operand: u32) -> bool {
     match i.op_kind(operand) {
@@ -13,6 +13,75 @@ fn source32(i: &Instruction, operand: u32) -> bool {
         }
         _ => false,
     }
+}
+
+/// A general register or flat memory operand of the given widths.
+fn operand(i: &Instruction, n: u32, sizes: &[usize]) -> bool {
+    match i.op_kind(n) {
+        OpKind::Register => {
+            let reg = i.op_register(n);
+            (reg.is_gpr8() || reg.is_gpr16() || reg.is_gpr32()) && sizes.contains(&reg.size())
+        }
+        OpKind::Memory => {
+            sizes.contains(&i.memory_size().size())
+                && [i.memory_base(), i.memory_index()]
+                    .iter()
+                    .all(|&reg| reg == R::None || reg_index(reg).is_some())
+        }
+        _ => false,
+    }
+}
+
+fn operand_size(i: &Instruction, n: u32) -> usize {
+    if i.op_kind(n) == OpKind::Memory {
+        i.memory_size().size()
+    } else {
+        i.op_register(n).size()
+    }
+}
+
+/// The conditional jump testing the same flags as a CMOVcc.
+fn move_condition(i: &Instruction) -> Option<M> {
+    if !matches!(
+        i.mnemonic(),
+        M::Cmovo
+            | M::Cmovno
+            | M::Cmovb
+            | M::Cmovae
+            | M::Cmove
+            | M::Cmovne
+            | M::Cmovbe
+            | M::Cmova
+            | M::Cmovs
+            | M::Cmovns
+            | M::Cmovp
+            | M::Cmovnp
+            | M::Cmovl
+            | M::Cmovge
+            | M::Cmovle
+            | M::Cmovg
+    ) {
+        return None;
+    }
+    Some(match i.condition_code() {
+        ConditionCode::o => M::Jo,
+        ConditionCode::no => M::Jno,
+        ConditionCode::b => M::Jb,
+        ConditionCode::ae => M::Jae,
+        ConditionCode::e => M::Je,
+        ConditionCode::ne => M::Jne,
+        ConditionCode::be => M::Jbe,
+        ConditionCode::a => M::Ja,
+        ConditionCode::s => M::Js,
+        ConditionCode::ns => M::Jns,
+        ConditionCode::p => M::Jp,
+        ConditionCode::np => M::Jnp,
+        ConditionCode::l => M::Jl,
+        ConditionCode::ge => M::Jge,
+        ConditionCode::le => M::Jle,
+        ConditionCode::g => M::Jg,
+        _ => return None,
+    })
 }
 
 fn set_condition(mnemonic: M) -> Option<M> {
@@ -51,7 +120,41 @@ pub(super) fn supported(i: &Instruction) -> bool {
                 _ => false,
             };
     }
+    if move_condition(i).is_some() {
+        return i.op_count() == 2
+            && i.op0_kind() == OpKind::Register
+            && i.op0_register().is_gpr32()
+            && source32(i, 1);
+    }
+    let count = |i: &Instruction| {
+        i.op1_kind() == OpKind::Immediate8
+            || (i.op1_kind() == OpKind::Register && i.op1_register() == R::CL)
+    };
+    let register = |i: &Instruction, n: u32| {
+        i.op_kind(n) == OpKind::Register && operand(i, n, &[operand_size(i, 0)])
+    };
     match i.mnemonic() {
+        M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
+            i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && count(i)
+        }
+        // Only the one-bit form, which is the one compilers emit.
+        M::Rcl | M::Rcr => {
+            i.op_count() == 2
+                && operand(i, 0, &[1, 2, 4])
+                && i.op1_kind() == OpKind::Immediate8
+                && i.immediate8() == 1
+        }
+        // A register bit offset addresses memory outside the operand, which
+        // loop versioning would not see; leave that form to the interpreter.
+        M::Bt | M::Bts | M::Btr | M::Btc => {
+            i.op_count() == 2
+                && operand(i, 0, &[4])
+                && (i.op1_kind() == OpKind::Immediate8
+                    || i.op0_kind() == OpKind::Register && register(i, 1))
+        }
+        M::Xlatb => i.code() == Code::Xlat_m8 && i.memory_base() == R::EBX,
+        M::Xchg => i.op_count() == 2 && operand(i, 0, &[4]) && register(i, 1),
+        M::Xadd | M::Cmpxchg => i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && register(i, 1),
         M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Lahf | M::Sahf => i.op_count() == 0,
         M::Bswap => i.code() == Code::Bswap_r32,
         M::Pushf | M::Pushfd | M::Popf | M::Popfd => matches!(
@@ -82,22 +185,6 @@ pub(super) fn supported(i: &Instruction) -> bool {
             }
             _ => false,
         },
-        M::Shl | M::Shr | M::Sar => {
-            i.op_count() == 2
-                && i.op0_kind() == OpKind::Register
-                && (reg_index(i.op0_register()).is_some()
-                    || i.op0_register().is_gpr8()
-                    || i.op0_register().is_gpr16())
-                && (i.op1_kind() == OpKind::Immediate8
-                    || (i.op1_kind() == OpKind::Register && i.op1_register() == R::CL))
-        }
-        M::Rol | M::Ror => {
-            i.op_count() == 2
-                && i.op0_kind() == OpKind::Register
-                && reg_index(i.op0_register()).is_some()
-                && (i.op1_kind() == OpKind::Immediate8
-                    || (i.op1_kind() == OpKind::Register && i.op1_register() == R::CL))
-        }
         _ => false,
     }
 }
@@ -327,6 +414,24 @@ impl Emitter<'_> {
             self.b.def_var(self.regs[4], stack);
             return;
         }
+        match i.mnemonic() {
+            M::Xchg => return self.exchange(i),
+            M::Xadd => return self.exchange_add(i),
+            M::Cmpxchg => return self.compare_exchange(i),
+            M::Bt | M::Bts | M::Btr | M::Btc => return self.bit_test(i),
+            M::Xlatb => return self.translate(i),
+            M::Rcl | M::Rcr => return self.rotate_through_carry(i),
+            _ => {}
+        }
+        if let Some(condition) = move_condition(i) {
+            // CMOV reads its source even when the condition is false.
+            let value = self.read(i, 1);
+            let old = self.read(i, 0);
+            let condition = self.condition(condition);
+            let value = self.b.ins().select(condition, value, old);
+            self.write(i, None, value);
+            return;
+        }
         if let Some(condition) = set_condition(i.mnemonic()) {
             let ptr = self.destination(i);
             let value = self.condition(condition);
@@ -350,7 +455,7 @@ impl Emitter<'_> {
             self.signed_divide(i);
             return;
         }
-        if matches!(i.mnemonic(), M::Shl | M::Shr | M::Sar) {
+        if matches!(i.mnemonic(), M::Shl | M::Sal | M::Shr | M::Sar) {
             self.scalar_shift(i);
             return;
         }
@@ -557,20 +662,28 @@ impl Emitter<'_> {
     }
 
     fn scalar_shift(&mut self, i: &Instruction) {
+        // The group-2 /6 SAL encoding is SHL.
+        let kind = if i.mnemonic() == M::Sal {
+            M::Shl
+        } else {
+            i.mnemonic()
+        };
         let input = self.read(i, 0);
         let count = self.read(i, 1);
+        // A zero count still requires a writable destination.
+        let ptr = self.destination(i);
         let count = self.b.ins().band_imm(count, 31);
-        let size = i.op0_register().size();
+        let size = operand_size(i, 0);
         let bits = (size * 8) as i64;
         // Keep the operation in I32: x86 masks the count to five bits even
         // for a byte/word, so counts >= the operand width must not wrap.
-        let signed_input = if i.mnemonic() == M::Sar && size < 4 {
+        let signed_input = if kind == M::Sar && size < 4 {
             let narrow = self.b.ins().ireduce(integer_type(size), input);
             self.b.ins().sextend(types::I32, narrow)
         } else {
             input
         };
-        let result = match i.mnemonic() {
+        let result = match kind {
             M::Shl => self.b.ins().ishl(input, count),
             M::Shr => self.b.ins().ushr(input, count),
             M::Sar => self.b.ins().sshr(signed_input, count),
@@ -581,7 +694,7 @@ impl Emitter<'_> {
         } else {
             result
         };
-        let carry = if i.mnemonic() == M::Shl {
+        let carry = if kind == M::Shl {
             let width = self.constant(bits as u32);
             let shift = self.b.ins().isub(width, count);
             self.b.ins().ushr(input, shift)
@@ -590,7 +703,7 @@ impl Emitter<'_> {
             self.b.ins().ushr(signed_input, shift)
         };
         let carry = self.b.ins().band_imm(carry, 1);
-        let carry = if size < 4 && i.mnemonic() != M::Sar {
+        let carry = if size < 4 && kind != M::Sar {
             // CF is undefined beyond the operand width. Match the
             // interpreter's deterministic convention of retaining it.
             let oversized = self
@@ -603,7 +716,7 @@ impl Emitter<'_> {
             carry
         };
         let sign = self.b.ins().ushr_imm(result, bits - 1);
-        let overflow = match i.mnemonic() {
+        let overflow = match kind {
             M::Shl => self.b.ins().bxor(sign, carry),
             M::Shr => self.b.ins().ushr_imm(input, bits - 1),
             M::Sar => self.constant(0),
@@ -632,7 +745,7 @@ impl Emitter<'_> {
         }
         let no_shift = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
         self.keep_flags_if(no_shift, saved);
-        self.write(i, None, result);
+        self.write(i, ptr, result);
     }
 
     /// ROL/ROR change only CF, and OF for a one-bit rotate; a zero masked
@@ -640,19 +753,37 @@ impl Emitter<'_> {
     fn scalar_rotate(&mut self, i: &Instruction) {
         let input = self.read(i, 0);
         let count = self.read(i, 1);
+        let ptr = self.destination(i);
         let count = self.b.ins().band_imm(count, 31);
+        let size = operand_size(i, 0);
+        let bits = (size * 8) as i64;
+        // Repeat a byte or word across 32 bits: its low part then rotates by
+        // the count modulo its own width.
+        let repeated = match size {
+            1 => self.b.ins().imul_imm(input, 0x0101_0101),
+            2 => {
+                let high = self.b.ins().ishl_imm(input, 16);
+                self.b.ins().bor(input, high)
+            }
+            _ => input,
+        };
         let left = i.mnemonic() == M::Rol;
         let result = if left {
-            self.b.ins().rotl(input, count)
+            self.b.ins().rotl(repeated, count)
         } else {
-            self.b.ins().rotr(input, count)
+            self.b.ins().rotr(repeated, count)
         };
-        let sign = self.b.ins().ushr_imm(result, 31);
+        let result = if size < 4 {
+            self.b.ins().band_imm(result, (1i64 << bits) - 1)
+        } else {
+            result
+        };
+        let sign = self.b.ins().ushr_imm(result, bits - 1);
         let (carry, overflow) = if left {
             let carry = self.b.ins().band_imm(result, 1);
             (carry, self.b.ins().bxor(sign, carry))
         } else {
-            let next = self.b.ins().ushr_imm(result, 30);
+            let next = self.b.ins().ushr_imm(result, bits - 2);
             let next = self.b.ins().band_imm(next, 1);
             (sign, self.b.ins().bxor(sign, next))
         };
@@ -663,6 +794,136 @@ impl Emitter<'_> {
         self.set_carry_overflow(carry, overflow);
         let no_rotate = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
         self.keep_flags_if(no_rotate, saved);
-        self.write(i, None, result);
+        self.write(i, ptr, result);
+    }
+
+    /// RCL/RCR by one: the carry rotates in and the bit leaving becomes CF.
+    fn rotate_through_carry(&mut self, i: &Instruction) {
+        let input = self.read(i, 0);
+        let ptr = self.destination(i);
+        let bits = (operand_size(i, 0) * 8) as i64;
+        let old_carry = self.flag(0);
+        let (result, carry) = if i.mnemonic() == M::Rcl {
+            let shifted = self.b.ins().ishl_imm(input, 1);
+            let result = self.b.ins().bor(shifted, old_carry);
+            let carry = self.b.ins().ushr_imm(input, bits - 1);
+            (result, self.b.ins().band_imm(carry, 1))
+        } else {
+            let shifted = self.b.ins().ushr_imm(input, 1);
+            let carry_in = self.b.ins().ishl_imm(old_carry, bits - 1);
+            let result = self.b.ins().bor(shifted, carry_in);
+            (result, self.b.ins().band_imm(input, 1))
+        };
+        let sign = self.b.ins().ushr_imm(result, bits - 1);
+        let sign = self.b.ins().band_imm(sign, 1);
+        let overflow = if i.mnemonic() == M::Rcl {
+            self.b.ins().bxor(sign, carry)
+        } else {
+            let next = self.b.ins().ushr_imm(result, bits - 2);
+            let next = self.b.ins().band_imm(next, 1);
+            self.b.ins().bxor(sign, next)
+        };
+        self.set_carry_overflow(carry, overflow);
+        self.write(i, ptr, result);
+    }
+
+    /// Flags of an ADD or SUB of the given width, as `narrow_alu` records them.
+    fn arithmetic_flags(&mut self, a: Value, b: Value, result: Value, size: usize, subtract: bool) {
+        let shift = (32 - size * 8) as i64;
+        let a = self.b.ins().ishl_imm(a, shift);
+        let b = self.b.ins().ishl_imm(b, shift);
+        let result = self.b.ins().ishl_imm(result, shift);
+        self.flags(a, b, result, subtract, false, false);
+        let kind = self.constant(if subtract { 2 } else { 1 } | (shift as u32) << 8);
+        self.b.def_var(self.lazy[3], kind);
+    }
+
+    /// XCHG r/m32, r32. Memory is always the first operand.
+    fn exchange(&mut self, i: &Instruction) {
+        let a = self.read(i, 0);
+        let b = self.read(i, 1);
+        let ptr = self.destination(i);
+        self.write(i, ptr, b);
+        self.write_register(i.op1_register(), a);
+    }
+
+    fn exchange_add(&mut self, i: &Instruction) {
+        let a = self.read(i, 0);
+        let b = self.read(i, 1);
+        let ptr = self.destination(i);
+        let sum = self.b.ins().iadd(a, b);
+        self.arithmetic_flags(a, b, sum, operand_size(i, 0), false);
+        // The destination wins when both operands name one register.
+        self.write_register(i.op1_register(), a);
+        self.write(i, ptr, sum);
+    }
+
+    /// CMPXCHG compares the accumulator with the destination. A memory
+    /// destination is written either way, as the processor does.
+    fn compare_exchange(&mut self, i: &Instruction) {
+        let value = self.read(i, 0);
+        let source = self.read(i, 1);
+        let ptr = self.destination(i);
+        let size = operand_size(i, 0);
+        let accumulator = match size {
+            1 => R::AL,
+            2 => R::AX,
+            _ => R::EAX,
+        };
+        let old = self.read_register(accumulator);
+        let difference = self.b.ins().isub(old, value);
+        self.arithmetic_flags(old, value, difference, size, true);
+        let equal = self.b.ins().icmp(IntCC::Equal, old, value);
+        let stored = self.b.ins().select(equal, source, value);
+        let loaded = self.b.ins().select(equal, old, value);
+        // Accumulator first: when it is also the destination, equality stores
+        // the source into it.
+        self.write_register(accumulator, loaded);
+        self.write(i, ptr, stored);
+    }
+
+    /// BT/BTS/BTR/BTC on a doubleword: only CF changes.
+    fn bit_test(&mut self, i: &Instruction) {
+        let value = self.read(i, 0);
+        let index = self.read(i, 1);
+        let ptr = if i.mnemonic() == M::Bt {
+            None
+        } else {
+            self.destination(i)
+        };
+        let index = self.b.ins().band_imm(index, 31);
+        let carry = self.b.ins().ushr(value, index);
+        let carry = self.b.ins().band_imm(carry, 1);
+        let overflow = self.flag(11);
+        self.set_carry_overflow(carry, overflow);
+        let one = self.constant(1);
+        let bit = self.b.ins().ishl(one, index);
+        let result = match i.mnemonic() {
+            M::Bt => return,
+            M::Bts => self.b.ins().bor(value, bit),
+            M::Btr => self.b.ins().band_not(value, bit),
+            M::Btc => self.b.ins().bxor(value, bit),
+            _ => unreachable!(),
+        };
+        self.write(i, ptr, result);
+    }
+
+    /// XLATB: AL = [EBX + AL].
+    fn translate(&mut self, i: &Instruction) {
+        let table = self.b.use_var(self.regs[3]);
+        let index = self.read_register(R::AL);
+        let mut address = self.b.ins().iadd(table, index);
+        if i.segment_prefix() == R::FS {
+            let fs = self.b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                self.state,
+                offset_of!(CpuState, fs_base) as i32,
+            );
+            address = self.b.ins().iadd(address, fs);
+        }
+        let value = self.direct_load(address, types::I8);
+        let value = self.b.ins().uextend(types::I32, value);
+        self.write_register(R::AL, value);
     }
 }

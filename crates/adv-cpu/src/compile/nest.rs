@@ -140,7 +140,12 @@ fn ordinary(i: &Instruction) -> bool {
 /// Existing integer lowering only. In particular no x87, MXCSR-changing SSE,
 /// alignment fault, division, implicit stack access, atomics or system state.
 fn inner_supported(i: &Instruction) -> bool {
+    // Shifts and rotates keep their original register-only shape here, which
+    // `defined_flags` sizes by.
+    let register_shift = !matches!(i.mnemonic(), M::Shl | M::Shr | M::Sar | M::Rol | M::Ror)
+        || i.op0_kind() == OpKind::Register && reg_index(i.op0_register()).is_some();
     ordinary(i)
+        && register_shift
         && (matches!(
             i.mnemonic(),
             M::Mov
