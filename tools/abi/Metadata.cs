@@ -312,6 +312,31 @@ public static class AbiMetadata
                 com.Add(name + "\t" + slot++ + "\t" + r.GetString(m.Name) + "\t" + sig.ReturnType.Kind + "\t" + sig.ReturnType.Name + "\tthis:" + name + "*:ptr:1" + (sig.ParameterTypes.Length == 0 ? "" : "|" + Parameters(r, m, sig)));
             }
         }
+        if (sdkSupplement != null)
+        {
+            var seen = new HashSet<string>(com.Skip(1).Select(row => string.Join('\t', row.Split('\t').Take(2))));
+            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0 };
+            foreach (var row in File.ReadLines(Path.Combine(Path.GetDirectoryName(sdkSupplement), "sdk-com-input.tsv"))
+                .Where(line => line.Length != 0 && !line.StartsWith('#')))
+            {
+                var f = row.Split('\t');
+                if (f.Length != 6 || !counts.ContainsKey(f[0]) || !int.TryParse(f[1], out int slot)
+                    || slot != counts[f[0]] || !new[] { "i32", "u32" }.Contains(f[3]))
+                    throw new InvalidDataException("Invalid scoped SDK COM signature: " + row);
+                foreach (var parameter in f[5].Split('|'))
+                {
+                    var p = parameter.Split(':');
+                    if (p.Length != 4 || !new[] { "ptr", "u32", "str16" }.Contains(p[2]) || p[3] != "1")
+                        throw new InvalidDataException("Invalid SDK COM parameter: " + parameter);
+                }
+                if (!seen.Add(f[0] + "\t" + f[1]))
+                    throw new InvalidDataException("Conflicting SDK COM slot: " + row);
+                counts[f[0]]++;
+                com.Add(row);
+            }
+            if (counts["IDxDiagProvider"] != 5 || counts["IDxDiagContainer"] != 9)
+                throw new InvalidDataException("Incomplete SDK DxDiag vtable declarations");
+        }
         File.WriteAllLines(Path.Combine(output, "com.tsv"), com, new UTF8Encoding(false));
         var constants = new SortedSet<string>(StringComparer.Ordinal);
         foreach (var h in types.Definitions)

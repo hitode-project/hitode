@@ -1,0 +1,12 @@
+{
+  "source": "Microsoft Windows SDK 10.0.26100.0",
+  "header": "um/dxdiag.h",
+  "sha256": "fb2e9b4d4aae8c728807d463c5f14ec8c0ace88d4a786bd517e4e7281f36ce5e",
+  "target": "x86 IUnknown-based stdcall vtables; DWORD/ULONG/pointers/HRESULT are 32 bits",
+  "input": "data/abi/sdk-com-input.tsv",
+  "output": "data/abi/com.tsv via tools/abi/Metadata.cs",
+  "interfaces": {"IDxDiagProvider": 5, "IDxDiagContainer": 9},
+  "documentation": [
+    "https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+  ]
+}

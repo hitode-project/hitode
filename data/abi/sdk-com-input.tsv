@@ -1,0 +1,15 @@
+# x86 COM declarations omitted by Win32Metadata; SDK dxdiag.h source/hash in sdk-com-source.json.
+IDxDiagProvider	0	QueryInterface	i32	HRESULT	this:IDxDiagProvider*:ptr:1|riid:GUID*:ptr:1|ppvObj:void**:ptr:1
+IDxDiagProvider	1	AddRef	u32	ULONG	this:IDxDiagProvider*:ptr:1
+IDxDiagProvider	2	Release	u32	ULONG	this:IDxDiagProvider*:ptr:1
+IDxDiagProvider	3	Initialize	i32	HRESULT	this:IDxDiagProvider*:ptr:1|pParams:DXDIAG_INIT_PARAMS*:ptr:1
+IDxDiagProvider	4	GetRootContainer	i32	HRESULT	this:IDxDiagProvider*:ptr:1|ppInstance:IDxDiagContainer**:ptr:1
+IDxDiagContainer	0	QueryInterface	i32	HRESULT	this:IDxDiagContainer*:ptr:1|riid:GUID*:ptr:1|ppvObj:void**:ptr:1
+IDxDiagContainer	1	AddRef	u32	ULONG	this:IDxDiagContainer*:ptr:1
+IDxDiagContainer	2	Release	u32	ULONG	this:IDxDiagContainer*:ptr:1
+IDxDiagContainer	3	GetNumberOfChildContainers	i32	HRESULT	this:IDxDiagContainer*:ptr:1|pdwCount:DWORD*:ptr:1
+IDxDiagContainer	4	EnumChildContainerNames	i32	HRESULT	this:IDxDiagContainer*:ptr:1|dwIndex:DWORD:u32:1|pwszContainer:LPWSTR:str16:1|cchContainer:DWORD:u32:1
+IDxDiagContainer	5	GetChildContainer	i32	HRESULT	this:IDxDiagContainer*:ptr:1|pwszContainer:LPCWSTR:str16:1|ppInstance:IDxDiagContainer**:ptr:1
+IDxDiagContainer	6	GetNumberOfProps	i32	HRESULT	this:IDxDiagContainer*:ptr:1|pdwCount:DWORD*:ptr:1
+IDxDiagContainer	7	EnumPropNames	i32	HRESULT	this:IDxDiagContainer*:ptr:1|dwIndex:DWORD:u32:1|pwszPropName:LPWSTR:str16:1|cchPropName:DWORD:u32:1
+IDxDiagContainer	8	GetProp	i32	HRESULT	this:IDxDiagContainer*:ptr:1|pwszPropName:LPCWSTR:str16:1|pvarProp:VARIANT*:ptr:1
