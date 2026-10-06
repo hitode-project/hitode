@@ -4,6 +4,7 @@ mod atom;
 mod environment;
 mod exception;
 pub(crate) use exception::install as install_exceptions;
+pub(crate) use exception::uncaught_query_blocker;
 mod file;
 pub(crate) mod file_mapping;
 mod handle;

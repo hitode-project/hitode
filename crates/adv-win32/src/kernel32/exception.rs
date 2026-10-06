@@ -1,6 +1,8 @@
 //! x86 Windows exception records and handler search. CPU stops and callback
 //! scheduling stay in adv-machine; all ABI layouts and dispositions live here.
 mod context;
+pub(super) mod phase;
+pub(crate) use phase::uncaught_query_blocker;
 
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{Backend, FaultKind, GuestExt, Prot, Reg};
@@ -188,6 +190,8 @@ struct Search {
     vectored: VecDeque<Identity<VectoredHandler>>,
     frame: Option<u32>,
     searched: usize,
+    // Survives vectored/frame callbacks, and expires on resume or nonlocal exit.
+    _phase: Rc<phase::Phase>,
 }
 
 fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcome {
@@ -232,6 +236,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
         return Outcome::Fail(error.to_string());
     }
     let vectored = env.ext.get_or_default::<Vectored>().order.clone();
+    let active = phase::enter(env, phase::Phase::Dispatch, record.code);
     search(
         env,
         Search {
@@ -241,6 +246,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
             vectored,
             frame: None,
             searched: 0,
+            _phase: active,
         },
     )
 }
