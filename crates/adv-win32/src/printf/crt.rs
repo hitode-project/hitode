@@ -4,6 +4,8 @@ use adv_abi::GuestPtr;
 use adv_cpu::backend::{Guest, MemFault};
 use adv_os::Codec;
 
+mod float;
+
 /// Output, format, string scans and numeric fields have the same explicit bound.
 pub(crate) const LIMIT: usize = 65536;
 #[derive(Debug)]
@@ -198,6 +200,7 @@ fn render<T: Unit>(
     cp: u32,
     fmt: &[T],
     pointer: u32,
+    float_unavailable: Option<&'static str>,
 ) -> Result<(Vec<T>, bool), Error> {
     if !matches!(cp, 0 | 932 | 936 | 1252) {
         return Err(Error::Unsupported(
@@ -301,13 +304,14 @@ fn render<T: Unit>(
         at += 1;
         // Classify before reading any conversion value: rejected formats never
         // probe invented argument slots or substitute placeholder strings.
-        if matches!(
-            conversion,
-            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A'
-        ) {
+        if matches!(conversion, b'F' | b'a' | b'A') {
             return Err(Error::Unsupported(
-                "floating-point CRT formatting is unavailable",
+                "hexadecimal/uppercase-F CRT floating formatting is outside the VC80 profile",
             ));
+        }
+        let floating = matches!(conversion, b'f' | b'e' | b'E' | b'g' | b'G');
+        if floating && let Some(reason) = float_unavailable {
+            return Err(Error::Unsupported(reason));
         }
         if conversion == b'n' {
             return Err(Error::Invalid("%n count-output is disabled"));
@@ -319,13 +323,28 @@ fn render<T: Unit>(
         }
         if !matches!(
             conversion,
-            b'd' | b'i' | b'u' | b'o' | b'x' | b'X' | b'p' | b's' | b'S' | b'c' | b'C'
+            b'd' | b'i'
+                | b'u'
+                | b'o'
+                | b'x'
+                | b'X'
+                | b'p'
+                | b's'
+                | b'S'
+                | b'c'
+                | b'C'
+                | b'f'
+                | b'e'
+                | b'E'
+                | b'g'
+                | b'G'
         ) {
             return Err(Error::Invalid(
                 "format conversion is not valid in the VC80/90 profile",
             ));
         }
-        if length == Length::Floating
+        if floating && !matches!(length, Length::Normal | Length::Long | Length::Floating)
+            || !floating && length == Length::Floating
             || length == Length::Wide && !matches!(conversion, b'c' | b'C' | b's' | b'S')
             || length == Length::Quad && matches!(conversion, b'c' | b'C' | b's' | b'S' | b'p')
         {
@@ -355,6 +374,20 @@ fn render<T: Unit>(
             ));
         }
         let body = match conversion {
+            b'f' | b'e' | b'E' | b'g' | b'G' => {
+                let value = f64::from_bits(args.value(true)?);
+                let digits = float::format(value, conversion, precision, alternate)?;
+                let prefix = if value.is_sign_negative() {
+                    "-"
+                } else if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                units(&pad_num(prefix, &digits, width, left, zero))
+            }
             b'c' | b'C' | b's' | b'S' => {
                 let wide = match length {
                     Length::Long | Length::Wide => true,
@@ -457,19 +490,57 @@ fn render<T: Unit>(
     }
     Ok((out, encoding_error))
 }
+// Retain the entry without a floating profile for existing integer/string callers.
+#[allow(dead_code)]
 pub(crate) fn narrow(
     cpu: &dyn Guest,
     cp: u32,
     fmt: &[u8],
     arguments: u32,
 ) -> Result<(Vec<u8>, bool), Error> {
-    render(cpu, cp, fmt, arguments)
+    render(
+        cpu,
+        cp,
+        fmt,
+        arguments,
+        Some("floating-point CRT formatting requires a verified numeric/control profile"),
+    )
 }
+#[allow(dead_code)]
 pub(crate) fn wide(
     cpu: &dyn Guest,
     cp: u32,
     fmt: &[u16],
     arguments: u32,
 ) -> Result<(Vec<u16>, bool), Error> {
-    render(cpu, cp, fmt, arguments)
+    render(
+        cpu,
+        cp,
+        fmt,
+        arguments,
+        Some("floating-point CRT formatting requires a verified numeric/control profile"),
+    )
+}
+
+/// The front verifies the module's decimal separator and guest rounding state.
+/// An unavailable profile rejects only actual floating conversions, preserving
+/// the existing integer/string contracts and immutable checked guest reader.
+pub(crate) fn narrow_with_float_profile(
+    cpu: &dyn Guest,
+    cp: u32,
+    fmt: &[u8],
+    arguments: u32,
+    float_unavailable: Option<&'static str>,
+) -> Result<(Vec<u8>, bool), Error> {
+    render(cpu, cp, fmt, arguments, float_unavailable)
+}
+
+pub(crate) fn wide_with_float_profile(
+    cpu: &dyn Guest,
+    cp: u32,
+    fmt: &[u16],
+    arguments: u32,
+    float_unavailable: Option<&'static str>,
+) -> Result<(Vec<u16>, bool), Error> {
+    render(cpu, cp, fmt, arguments, float_unavailable)
 }

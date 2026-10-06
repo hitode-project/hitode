@@ -1,4 +1,4 @@
-//! VC80/90 secure buffer and measurement fronts over one checked formatter.
+//! Legacy CRT buffer and measurement fronts over one checked formatter.
 use super::*;
 use crate::printf::crt::{self, Error};
 use adv_abi::{
@@ -9,6 +9,7 @@ use adv_cpu::backend::Prot;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
+    Unbounded,
     Secure,
     Bounded,
     Measure,
@@ -21,7 +22,21 @@ struct Front {
     mode: Mode,
     fixed: u8,
 }
-const FRONTS: [Front; 12] = [
+const FRONTS: [Front; 14] = [
+    Front {
+        name: "sprintf",
+        wide: false,
+        va_list: false,
+        mode: Mode::Unbounded,
+        fixed: 2,
+    },
+    Front {
+        name: "vsprintf",
+        wide: false,
+        va_list: true,
+        mode: Mode::Unbounded,
+        fixed: 3,
+    },
     Front {
         name: "sprintf_s",
         wide: false,
@@ -108,8 +123,11 @@ const FRONTS: [Front; 12] = [
     },
 ];
 pub(super) fn register(registry: &mut Registry) {
-    for module in ["msvcr80.dll", "msvcr90.dll"] {
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
         for front in FRONTS {
+            if module == "msvcrt.dll" && front.mode != Mode::Unbounded {
+                continue;
+            }
             registry.register(Api {
                 module,
                 name: front.name,
@@ -148,6 +166,28 @@ fn failure(
 ) -> Outcome {
     if let Error::Memory(error) = error {
         return memory_failure(error);
+    }
+    if front.mode == Mode::Unbounded {
+        // Native legacy %n invokes a callback after writing an unterminated
+        // prefix, and unknown/trailing conversions have permissive behavior.
+        // The staged checked formatter cannot reproduce those side effects;
+        // reject this boundary without fabricating a native invalid callback.
+        return match error {
+            Error::Invalid(_) => {
+                warning(
+                    env,
+                    front,
+                    "legacy format syntax/count-output callback ordering is unavailable",
+                );
+                set_errno(env, 40)
+            }
+            Error::Unsupported(reason) => {
+                warning(env, front, reason);
+                set_errno(env, 40)
+            }
+            Error::Encoding => set_errno(env, 42),
+            Error::Memory(_) => unreachable!(),
+        };
     }
     if let Err(error) = empty(env, front, destination, capacity) {
         return memory_failure(error);
@@ -198,6 +238,16 @@ fn finish(
     if front.mode == Mode::Measure {
         return Outcome::Return(length as u32);
     }
+    if front.mode == Mode::Unbounded {
+        // The ABI has no capacity argument. The shared formatter has already
+        // bounded its output; check exactly the bytes it produced plus NUL.
+        let mut output = bytes;
+        output.push(0);
+        if let Err(error) = write(env, destination, &output) {
+            return memory_failure(error);
+        }
+        return Outcome::Return(length as u32);
+    }
     let maximum = if front.mode == Mode::Bounded {
         count.min(capacity - 1)
     } else {
@@ -234,6 +284,8 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
         let mut arguments = Arguments::new(env.cpu);
         let (destination, capacity) = if front.mode == Mode::Measure {
             (0, 0)
+        } else if front.mode == Mode::Unbounded {
+            (arguments.next::<u32>()?, u32::MAX)
         } else {
             (arguments.next::<u32>()?, arguments.next::<u32>()?)
         };
@@ -271,6 +323,18 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
         return invalid_parameter_result(env, front.name, 22, u32::MAX);
     }
     let cp = locale::formatting_codepage(env);
+    // Integer/string conversions retain their existing transport even when a
+    // floating profile is unavailable. Only a floating conversion consumes
+    // this reason and reports the qualified API warning through failure().
+    let float_profile = if locale::scalar_float_profile(env).is_none() {
+        Some("LC_NUMERIC/LC_CTYPE floating formatting profile is unavailable")
+    } else {
+        match env.cpu.fpu_environment() {
+            Ok(control) if control.x87_control & 0xc00 == 0 && control.mxcsr & 0x6000 == 0 => None,
+            Ok(_) => Some("non-nearest floating rounding mode is unavailable"),
+            Err(_) => Some("guest floating control state is unavailable"),
+        }
+    };
     if front.wide {
         let format = match adv_abi::WideStr(GuestPtr::new(format)).read(env.cpu, crt::LIMIT + 1) {
             Ok(format) => format,
@@ -287,7 +351,7 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
                 return memory_failure(error);
             }
         };
-        match crt::wide(env.cpu, cp, &format, values) {
+        match crt::wide_with_float_profile(env.cpu, cp, &format, values, float_profile) {
             Ok((output, encoding_error)) => {
                 if encoding_error {
                     if let Err(outcome) = store_errno(env, 42) {
@@ -323,7 +387,7 @@ fn buffer(env: &mut Env<'_>) -> Outcome {
                 return memory_failure(error);
             }
         };
-        match crt::narrow(env.cpu, cp, &format, values) {
+        match crt::narrow_with_float_profile(env.cpu, cp, &format, values, float_profile) {
             Ok((output, encoding_error)) => {
                 if encoding_error {
                     if let Err(outcome) = store_errno(env, 42) {

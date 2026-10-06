@@ -185,6 +185,12 @@
     "behavior": "Native NORMAL attributes become _A_NORMAL=0. Creation/access/write times independently match three authored UTC-second values. No-match and EOF assign errno2; NULL pattern/output and next handle=-1 invoke the returning invalid handler with errno22. _findclose success is0, stale/-1 failure is-1 with errno22 and no invalid callback. All these failures retain prior DOS errno; success retains prior CRT errno. Shared VFS snapshots, rather than host filesystem bypasses, supply virtual rows.",
     "oracle_source_sha256": "aafb9efd45e94ed15fc67804ee8df2582681abe19de32452db8b4f652f179ef0"
   },
+  "buffer_float_profile": {
+    "target": "VC80 finite binary64 f/e/E/g/G, decimal-dot and nearest guest rounding; precision0-64. The existing bounded x86 formatter consumes two pointer-sized argument slots per promoted double and preserves integer/string fronts.",
+    "behavior": "Authored VC80 oracle39 cases confirm decimal ties away from zero, the legacy 17-significant-digit stage, three-digit exponent and g selection after rounding. Native NULL format/destination fails with returning invalid handler errno22 without a destination write; successful legacy sprintf/vsprintf writes only produced bytes plus NUL and preserves errno.",
+    "limitations": "Nonfinite, hexadecimal floating, capital F, extended precision, unknown numeric locale and non-nearest rounding remain explicit unsupported failures. Legacy count-output/prefix callback and permissive unknown/trailing syntax are rejected without a fabricated native invalid callback; no complete CRT/C99 equivalence is claimed.",
+    "oracle_source_sha256": "c0d739a468416bebb6b94629f2ba15f75a328c4fb632206cdcd33bb17b29a476"
+  },
   "strtod": {
     "header": "ucrt/stdlib.h:502-505",
     "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
