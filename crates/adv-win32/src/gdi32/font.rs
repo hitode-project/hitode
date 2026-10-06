@@ -17,6 +17,7 @@ mod paint;
 mod resource;
 mod widths;
 mod charset;
+mod logical;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -38,6 +39,7 @@ pub fn register(registry: &mut Registry) {
     rectangle::register(registry);
     widths::register(registry);
     charset::register(registry);
+    logical::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,
