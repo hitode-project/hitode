@@ -1481,6 +1481,8 @@ impl<B: Backend> Machine<B> {
             SliceResult::Complete(result) => result,
             SliceResult::Yielded => unreachable!("an unsliced run cannot soft-yield"),
         };
+        // The scheduler leaves the last per-run allowance in the backend.
+        self.cpu.set_execution_budget(hard_budget);
         if let Err(error) = self.collect_at_boundary() {
             return self.fail(error);
         }
