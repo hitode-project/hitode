@@ -408,7 +408,7 @@ def run(args: argparse.Namespace) -> None:
         if report_path.exists():
             try:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
-                for key in ("stop_reason", "guest_exit_code", "frames", "first_frame_seconds", "elapsed_seconds",
+                for key in ("stop_reason", "guest_exit_code", "frames", "first_frame_seconds", "elapsed_seconds", "host_calls",
                             "width", "height", "frame_fnv1a64", "missing_apis", "failure",
                             "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup"):
                     result[key] = report.get(key)
