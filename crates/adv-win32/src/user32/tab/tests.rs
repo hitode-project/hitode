@@ -510,6 +510,27 @@ fn tab_insert_parameter_selection_and_deletion_match_native_control() {
         send(&mut m, data, hwnd, 0x133d, 0, pointer),
         native_send(0x133d, 0, &mut n as *mut _ as isize)
     );
+    for (index, value) in [(0, 0), (0, 1), (0, 2), (0, 0x10000), (99, 1)] {
+        assert_eq!(
+            send(&mut m, data, hwnd, 0x1333, index, value),
+            native_send(0x1333, index, value as isize)
+        );
+        let mut n = NativeItem {
+            mask: 16,
+            state: 0,
+            state_mask: 3,
+            text: core::ptr::null_mut(),
+            capacity: 0,
+            image: 0,
+            parameter: 0,
+        };
+        put(&mut m, pointer, [16, 0, 3, 0, 0, 0, 0]);
+        assert_eq!(
+            send(&mut m, data, hwnd, 0x133c, 0, pointer),
+            native_send(0x133c, 0, &mut n as *mut _ as isize)
+        );
+        assert_eq!(m.cpu.read_u32(pointer + 4).unwrap(), n.state);
+    }
     for index in [2, -1, 999, 0] {
         assert_eq!(
             send(&mut m, data, hwnd, 0x130c, index, 0),

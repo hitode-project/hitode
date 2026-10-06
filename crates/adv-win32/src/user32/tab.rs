@@ -15,6 +15,7 @@ struct Item {
     text: Vec<u16>,
     image: i32,
     parameter: u32,
+    highlighted: bool,
 }
 impl Default for Item {
     fn default() -> Self {
@@ -22,6 +23,7 @@ impl Default for Item {
             text: Vec::new(),
             image: -1,
             parameter: 0,
+            highlighted: false,
         }
     }
 }
@@ -113,7 +115,9 @@ fn get(env: &mut Env<'_>, hwnd: u32, index: u32, pointer: u32, wide: bool) -> Ou
     if values[0] & 0x10 != 0 {
         writes.push((
             pointer + 4,
-            ((u32::from(state(env, hwnd).selected == index as i32)) & values[2])
+            ((u32::from(state(env, hwnd).selected == index as i32)
+                | (u32::from(item.highlighted) << 1))
+                & values[2])
                 .to_le_bytes()
                 .to_vec(),
         ));
@@ -227,6 +231,14 @@ fn proc(env: &mut Env<'_>) -> Outcome {
         }
         0x1328 => return adjust(env, hwnd, index != 0, pointer),
         0x132c => u32::from(!state(env, hwnd).items.is_empty()),
+        0x1333 => {
+            let Some(item) = state(env, hwnd).items.get_mut(index as usize) else {
+                return Outcome::Return(0);
+            };
+            let highlighted = pointer as u16 != 0;
+            let old = std::mem::replace(&mut item.highlighted, highlighted);
+            u32::from(old != highlighted)
+        }
         wm::PAINT => {
             validate(env, hwnd);
             0
