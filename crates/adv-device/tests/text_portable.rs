@@ -11,6 +11,73 @@ use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 const SINGLE: &[u8] = include_bytes!("fixtures/font-resource.ttf");
 const COLLECTION: &[u8] = include_bytes!("fixtures/font-resource.ttc");
+
+#[test]
+fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures() {
+    let mut declared = SINGLE.to_vec();
+    // The authored fixture's OS/2 v3 table starts at 400. Declare two code
+    // pages in this in-memory variant; discovery must use the metadata rather
+    // than guessing repertoire from an English family name.
+    let codepages = 1u32 | (1 << 17);
+    declared[478..482].copy_from_slice(&codepages.to_be_bytes());
+    let mut text = Text::with_font_directories(&[]);
+    text.add_resource(&declared).unwrap();
+    let entries = text
+        .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].font.encoding, Encoding::Latin);
+    assert_eq!(entries[1].font.encoding, Encoding::Japanese);
+    for (encoding, script) in [
+        (Encoding::Latin, "Western"),
+        (Encoding::Japanese, "Japanese"),
+    ] {
+        let entries = text
+            .enumerate(
+                Some("ADV Resource Fixture"),
+                FontEnumeration::FamiliesEx(encoding),
+            )
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.font.encoding, encoding);
+        assert_eq!(entry.metrics.encoding, encoding);
+        assert_eq!(entry.script, script);
+        assert_eq!(entry.signature.unwrap().codepages[0], codepages);
+        assert_eq!(entry.font.face, "ADV Resource Fixture");
+        assert!(
+            entry
+                .design
+                .as_ref()
+                .is_some_and(|design| design.em_units == 1000)
+        );
+    }
+    assert!(
+        text.enumerate(
+            None,
+            FontEnumeration::FamiliesEx(Encoding::SimplifiedChinese)
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        text.enumerate(
+            Some("missing authored font"),
+            FontEnumeration::FamiliesEx(Encoding::Japanese)
+        )
+        .unwrap()
+        .is_empty()
+    );
+    // Legacy discovery remains a single physical face, independent of its
+    // repertoire declarations.
+    assert_eq!(
+        text.enumerate(None, FontEnumeration::Families)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 fn font(face: &str) -> FontRequest {
     FontRequest {
         default: None,

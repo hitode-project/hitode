@@ -1001,8 +1001,19 @@ impl DirectDraw {
                 ) else {
                     return Ok(INVALID);
                 };
-                if a[4] & !0x01000000 != 0 || a[5] != 0 {
+                if a[4] & !0x01000000 != 0 {
                     return Ok(UNSUPPORTED);
+                }
+                // An optional DDBLTFX is legal even when no effect flag selects
+                // its fields. Native still validates its x86 size and readable
+                // structure, but ignores unrequested effects and color keys.
+                if a[5] != 0 {
+                    let Ok(fx) = m.read(a[5], 100) else {
+                        return Ok(INVALID);
+                    };
+                    if fx[..4] != 100u32.to_le_bytes() {
+                        return Ok(INVALID);
+                    }
                 }
                 if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);

@@ -60,22 +60,31 @@ fn families_ex_a(
     param: u32,
     _flags: u32,
 ) -> Outcome {
-    let face = if logfont.is_null() {
-        None
-    } else {
-        let mut face_bytes = [0u8; 32];
-        if env.cpu.read(logfont.addr() + 28, &mut face_bytes).is_ok() {
-            let len = face_bytes.iter().position(|&b| b == 0).unwrap_or(face_bytes.len());
-            if len == 0 {
-                None
-            } else {
-                Some(env.ext.get::<Win32>().codec.decode(&face_bytes[..len]))
-            }
-        } else {
+    let Ok(logical) = GuestPtr::<[u8; 60]>::new(logfont.addr()).read(env.cpu) else {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    };
+    let face = {
+        let face_bytes = &logical[28..];
+        let len = face_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(face_bytes.len());
+        if len == 0 {
             None
+        } else {
+            Some(env.ext.get::<Win32>().codec.decode(&face_bytes[..len]))
         }
     };
-    start(env, dc.0, face, callback.addr(), param, FontEnumeration::Families, false)
+    start(
+        env,
+        dc.0,
+        face,
+        callback.addr(),
+        param,
+        FontEnumeration::FamiliesEx(decode_encoding(logical[23])),
+        false,
+    )
 }
 #[win32(gdi32, name = "EnumFontFamiliesExW", level = implement)]
 fn families_ex_w(
@@ -86,27 +95,38 @@ fn families_ex_w(
     param: u32,
     _flags: u32,
 ) -> Outcome {
-    let face = if logfont.is_null() {
-        None
-    } else {
+    let Ok(logical) = GuestPtr::<[u8; 92]>::new(logfont.addr()).read(env.cpu) else {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    };
+    let face = {
         let mut units = [0u16; 32];
-        let mut bytes = [0u8; 64];
-        if env.cpu.read(logfont.addr() + 28, &mut bytes).is_ok() {
-            for i in 0..32 {
-                units[i] = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-            }
-            let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-            if len == 0 {
-                None
-            } else {
-                Some(String::from_utf16_lossy(&units[..len]))
-            }
-        } else {
+        let bytes = &logical[28..];
+        for i in 0..32 {
+            units[i] = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        }
+        let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        if len == 0 {
             None
+        } else {
+            let Ok(face) = String::from_utf16(&units[..len]) else {
+                set_last_error(env, 87);
+                return Outcome::Return(0);
+            };
+            Some(face)
         }
     };
-    start(env, dc.0, face, callback.addr(), param, FontEnumeration::Families, true)
+    start(
+        env,
+        dc.0,
+        face,
+        callback.addr(),
+        param,
+        FontEnumeration::FamiliesEx(decode_encoding(logical[23])),
+        true,
+    )
 }
+
 #[win32(gdi32, name = "EnumFontsA", level = implement)]
 fn fonts_a(
     env: &mut Env<'_>,
@@ -183,8 +203,8 @@ fn start_w(
     };
     start(env, dc, face, callback, param, mode, true)
 }
-const SCRATCH: u32 = 384;
-const METRICS_OFFSET: u32 = 288;
+const SCRATCH: u32 = 512;
+const METRICS_OFFSET: u32 = 352;
 struct Enumeration {
     fonts: VecDeque<EnumeratedFont>,
     callback: u32,
@@ -217,6 +237,8 @@ fn start(
                 (FontEnumeration::Families, true) => "gdi32.dll!EnumFontFamiliesW",
                 (FontEnumeration::Faces, false) => "gdi32.dll!EnumFontsA",
                 (FontEnumeration::Faces, true) => "gdi32.dll!EnumFontsW",
+                (FontEnumeration::FamiliesEx(_), false) => "gdi32.dll!EnumFontFamiliesExA",
+                (FontEnumeration::FamiliesEx(_), true) => "gdi32.dll!EnumFontFamiliesExW",
             };
             adv_abi::warn_unavailable(env, api, &error.to_string());
             set_last_error(
@@ -259,6 +281,7 @@ fn start(
         1,
     )
 }
+
 fn next(env: &mut Env<'_>, mut enumeration: Enumeration, previous: u32) -> Outcome {
     let Some(font) = enumeration.fonts.pop_front() else {
         return Outcome::Return(previous);
@@ -376,7 +399,7 @@ fn pack(
     let codec = env.ext.get::<Win32>().codec;
     let unit = if wide { 2 } else { 1 };
     put_string(codec, &mut bytes[28..28 + 32 * unit], &request.face, wide);
-    if mode == FontEnumeration::Families {
+    if mode != FontEnumeration::Faces {
         put_string(
             codec,
             &mut bytes[28 + 32 * unit..28 + 96 * unit],
@@ -389,6 +412,14 @@ fn pack(
             &font.style,
             wide,
         );
+        if matches!(mode, FontEnumeration::FamiliesEx(_)) {
+            put_string(
+                codec,
+                &mut bytes[28 + 128 * unit..28 + 160 * unit],
+                &font.script,
+                wide,
+            );
+        }
     }
     let metrics = METRICS_OFFSET as usize;
     let packed = pack_metrics(&font.metrics);
@@ -429,6 +460,19 @@ fn pack(
         ]
         .into_iter()
         .enumerate()
+        {
+            bytes[offset + i * 4..offset + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    if matches!(mode, FontEnumeration::FamiliesEx(_))
+        && let Some(signature) = font.signature
+    {
+        let offset = metrics + if wide { 76 } else { 72 };
+        for (i, value) in signature
+            .unicode
+            .into_iter()
+            .chain(signature.codepages)
+            .enumerate()
         {
             bytes[offset + i * 4..offset + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }

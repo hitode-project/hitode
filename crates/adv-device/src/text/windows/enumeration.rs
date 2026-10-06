@@ -123,8 +123,9 @@ unsafe extern "system" fn collect(
     } else {
         FontKind::Vector
     };
-    let (full_name, style, design) =
-        if collection.mode == FontEnumeration::Families && kind_value == FontKind::TrueType {
+    let extended = matches!(collection.mode, FontEnumeration::FamiliesEx(_));
+    let (mut full_name, mut style, design) =
+        if collection.mode != FontEnumeration::Faces && kind_value == FontKind::TrueType {
             // SAFETY: EnumFontFamiliesW supplies ENUMLOGFONTW, and TrueType font
             // metrics have NEWTEXTMETRICW's additional design fields.
             let extended = unsafe { &*font.cast::<gdi::ENUMLOGFONTW>() };
@@ -155,6 +156,24 @@ unsafe extern "system" fn collect(
         } else {
             (String::new(), String::new(), None)
         };
+    let (script, signature) = if extended {
+        // SAFETY: EnumFontFamiliesExW supplies ENUMLOGFONTEXW. Only TrueType
+        // callbacks promise NEWTEXTMETRICEXW and its repertoire signature.
+        let logical = unsafe { &*font.cast::<gdi::ENUMLOGFONTEXW>() };
+        full_name = string(&logical.elfFullName);
+        style = string(&logical.elfStyle);
+        let signature = (kind_value == FontKind::TrueType).then(|| {
+            let metric =
+                unsafe { &*metric.cast::<windows_sys::Win32::Globalization::NEWTEXTMETRICEXW>() };
+            FontSignature {
+                unicode: metric.ntmFontSig.fsUsb,
+                codepages: metric.ntmFontSig.fsCsb,
+            }
+        });
+        (string(&logical.elfScript), signature)
+    } else {
+        (String::new(), None)
+    };
     collection.fonts.push(EnumeratedFont {
         font: request(logical),
         metrics: metrics(m),
@@ -163,7 +182,9 @@ unsafe extern "system" fn collect(
         device: kind & gdi::DEVICE_FONTTYPE != 0,
         full_name,
         style,
+        script,
         design,
+        signature,
     });
     1
 }
@@ -196,6 +217,16 @@ pub(in crate::text) fn enumerate(
             }
             FontEnumeration::Faces => {
                 gdi::EnumFontsW(dc, pointer, Some(collect), &raw mut collection as isize)
+            }
+            FontEnumeration::FamiliesEx(encoding) => {
+                let mut query: gdi::LOGFONTW = std::mem::zeroed();
+                query.lfCharSet = super::encoding(encoding);
+                if let Some(face) = &face {
+                    for (destination, source) in query.lfFaceName.iter_mut().take(31).zip(face) {
+                        *destination = *source;
+                    }
+                }
+                gdi::EnumFontFamiliesExW(dc, &query, Some(collect), &raw mut collection as isize, 0)
             }
         };
         gdi::DeleteDC(dc);

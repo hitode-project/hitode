@@ -195,6 +195,7 @@ pub struct ControlState {
     pub base_units: (i32, i32),
     pub trackbar: Option<TrackbarState>,
     pub choices: Option<ChoiceState>,
+    pub(crate) tab: Option<super::tab::TabState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,6 +399,7 @@ pub struct SysProcs {
     pub edit: u32,
     pub combo: u32,
     pub trackbar: u32,
+    pub tab: u32,
 }
 
 pub struct User {
@@ -545,6 +547,7 @@ impl User {
         self.add_class_raw("Edit", 0, procs.edit, 0, 0);
         self.add_class_raw("ComboBox", 0, procs.combo, 0, 0);
         self.add_class_raw("msctls_trackbar32", 0, procs.trackbar, 0, 0);
+        self.add_class_raw("SysTabControl32", 0x400b, procs.tab, 4, 0);
         for c in ["ListBox", "ScrollBar", "msctls_progress32", "SysListView32"] {
             self.add_class_raw(c, 0, procs.def_window, 0, 0);
         }
