@@ -3,6 +3,10 @@ struct Parameters {
     alpha_op: u32,
     alpha_compare: u32,
     alpha_reference: f32,
+    address_flags: u32,
+    border_rgba: u32,
+    first_level: u32,
+    filter_flags: u32,
 }
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
@@ -45,6 +49,14 @@ fn compare_alpha(alpha: f32) -> bool {
 }
 @fragment fn fragment_main(input: Fragment) -> @location(0) vec4<f32> {
     var texel = textureSample(image, image_sampler, input.uv);
+    if (parameters.address_flags & 3u) != 0u {
+        let dimensions = vec2<f32>(textureDimensions(image, 0));
+        let dx = dpdx(input.uv) * dimensions;
+        let dy = dpdy(input.uv) * dimensions;
+        let lod = 0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-16));
+        texel = adv_border_sample(image, input.uv, lod, parameters.address_flags,
+            parameters.border_rgba, parameters.first_level, parameters.filter_flags);
+    }
     if (parameters.alpha_op & 0x80000000u) != 0u { texel.a = 1.0; }
     let color = combine(parameters.color_op, input.color, texel).rgb;
     let alpha = combine(parameters.alpha_op & 0x7fffffffu, input.color, texel).a;

@@ -50,6 +50,13 @@ def compare(baseline: list[dict], candidate: list[dict], tolerance: float) -> di
     frames = lambda results: [result.get("frames") or 0 for result in results]
     calls = lambda results: [result.get("host_calls") or 0 for result in results]
     reasons = []
+    def shader_warnings(results):
+        return {(warning.get("api", ""), warning.get("reason", ""))
+                for result in results for warning in (result.get("api") or {}).get("warnings", [])
+                if re.search(r"shader|declaration|programmable", warning.get("reason", ""), re.I)
+                or re.search(r"Create(?:Vertex|Pixel)Shader", warning.get("api", ""), re.I)}
+    for api, reason in sorted(shader_warnings(candidate) - shader_warnings(baseline)):
+        reasons.append(f"new shader/declaration warning: {api}: {reason}")
     if not candidate:
         reasons.append("no candidate run")
     for status, kind, site in sorted(after - before):

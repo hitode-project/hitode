@@ -40,6 +40,9 @@ pub(super) fn machine() -> Machine<JitCpu> {
             ("IDirect3DVertexBuffer9", 0),
             ("IDirect3DIndexBuffer9", 0),
             ("IDirect3DVertexDeclaration9", 0),
+            ("IDirect3DVertexShader9", 0),
+            ("IDirect3DPixelShader9", 0),
+            ("IDirect3DStateBlock9", 0),
         ]),
         gpu: None,
         provider,
@@ -48,6 +51,9 @@ pub(super) fn machine() -> Machine<JitCpu> {
         sender: None,
         wake: None,
         copy: true,
+        shader_caps: ShaderCaps::default(),
+        shader_stats: ShaderStats::default(),
+        shader_cache: None,
     });
     m
 }
@@ -77,6 +83,8 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             render_target: None,
             buffers: buffers::Bindings::default(),
             fixed: fixed::Fixed::new(16, 12),
+            shaders: shaders::Bindings::default(),
+            recording: None,
         })),
     )
     .unwrap();

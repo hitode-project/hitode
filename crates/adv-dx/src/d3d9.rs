@@ -22,6 +22,7 @@ mod format;
 mod memory;
 mod pacing;
 mod presentation;
+mod programmable;
 mod readback;
 mod stretch;
 mod targets;
@@ -71,6 +72,8 @@ enum Payload {
     Resource(Resource),
     Buffer(buffers::Buffer),
     Declaration(declaration::Declaration),
+    Shader(shaders::Shader),
+    StateBlock(Box<shaders::stateblocks::StateBlock>),
 }
 struct Device {
     pointer: u32,
@@ -91,6 +94,8 @@ struct Device {
     render_target: Option<Id>,
     buffers: buffers::Bindings,
     fixed: fixed::Fixed,
+    shaders: shaders::Bindings,
+    recording: Option<shaders::stateblocks::Snapshot>,
 }
 pub struct State {
     com: Com,
@@ -106,6 +111,37 @@ pub struct State {
     /// then needs vertex declarations), so a profile can withhold COPY when
     /// that path regresses an engine that has a working fallback.
     copy: bool,
+    shader_caps: ShaderCaps,
+    shader_stats: ShaderStats,
+    shader_cache: Option<std::path::PathBuf>,
+}
+/// Explicit milestone capability gates. Production leaves both disabled until
+/// the differential and engine matrix checks pass for the corresponding model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShaderCaps {
+    pub sm2: bool,
+    pub sm3: bool,
+}
+pub fn set_shader_caps(ext: &mut Ext, caps: ShaderCaps) {
+    ext.get_mut::<State>().shader_caps = caps;
+}
+/// Opt-in directory for derived WGSL. The frontend bounds and validates its
+/// cache; no guest shader token stream is written here.
+pub fn set_shader_cache(ext: &mut Ext, directory: Option<std::path::PathBuf>) {
+    let state = ext.get_mut::<State>();
+    if let Some(gpu) = &mut state.gpu {
+        gpu.set_pipeline_cache_directory(directory.as_deref());
+    }
+    state.shader_cache = directory;
+}
+/// Counts shader models without retaining or exporting guest shader contents.
+/// Array order: 1.1, 1.2, 1.3, 1.4, 2.0, 2.1, 3.0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShaderStats {
+    pub vertex: [u64; 7],
+    pub pixel: [u64; 7],
+    pub malformed: u64,
+    pub untranslated: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Diagnostics {
@@ -113,6 +149,7 @@ pub struct Diagnostics {
     pub pending_waits: usize,
     pub pending_readbacks: usize,
     pub gpu: Option<adv_device::gpu::Stats>,
+    pub shaders: ShaderStats,
 }
 pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
     let state = ext.get::<State>();
@@ -121,6 +158,7 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
         pending_waits: state.pending.len(),
         pending_readbacks: state.transfers.len(),
         gpu: state.gpu.as_ref().map(|g| g.stats()),
+        shaders: state.shader_stats,
     }
 }
 // Keep ordinary hot commands inline. Only a parked command requires allocation.
@@ -204,6 +242,8 @@ pub fn register(registry: &mut Registry) {
     memory::register(registry);
     cursor::register(registry);
     dirty::register(registry);
+    shaders::register(registry);
+    programmable::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -220,6 +260,9 @@ pub fn install<B: Backend>(
         "IDirect3DVertexBuffer9",
         "IDirect3DIndexBuffer9",
         "IDirect3DVertexDeclaration9",
+        "IDirect3DVertexShader9",
+        "IDirect3DPixelShader9",
+        "IDirect3DStateBlock9",
     ] {
         let signatures: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
@@ -258,14 +301,18 @@ pub fn install<B: Backend>(
         sender: None,
         wake: None,
         copy: true,
+        shader_caps: ShaderCaps::default(),
+        shader_stats: ShaderStats::default(),
+        shader_cache: None,
     });
     Ok(())
 }
-pub fn set_gpu(ext: &mut Ext, gpu: Gpu) -> Result<(), String> {
+pub fn set_gpu(ext: &mut Ext, mut gpu: Gpu) -> Result<(), String> {
     let state = ext.get_mut::<State>();
     if state.gpu.is_some() {
         return Err("D3D9 GPU already installed".into());
     }
+    gpu.set_pipeline_cache_directory(state.shader_cache.as_deref());
     state.gpu = Some(gpu);
     Ok(())
 }
@@ -325,6 +372,10 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         targets::release_binding(env, device.render_target);
         depth::release_binding(env, device.depth_stencil);
         buffers::release_bindings(env, device.buffers);
+        shaders::release_bindings(env, device.shaders);
+        if let Some(recording) = device.recording {
+            shaders::stateblocks::release_snapshot(env, recording);
+        }
         for binding in [device.texture, device.back_buffer].into_iter().flatten() {
             if let Some(Some(resource)) = com(env).release_internal(&mut env.sys.objects, binding) {
                 destroy(env, resource);
@@ -341,6 +392,8 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         resources::destroy(env, resource);
     } else if let Payload::Buffer(buffer) = destroyed.value {
         buffers::destroy(env, buffer);
+    } else if let Payload::StateBlock(block) = destroyed.value {
+        shaders::stateblocks::destroy(env, *block);
     }
     for pointer in destroyed.interfaces {
         free(env, pointer);
@@ -352,7 +405,8 @@ fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
     }
     let parent = resources::parent_on_last_public_release(env, pointer)
         .or_else(|| buffers::parent_on_last_public_release(env, pointer))
-        .or_else(|| declaration::parent_on_last_public_release(env, pointer));
+        .or_else(|| declaration::parent_on_last_public_release(env, pointer))
+        .or_else(|| shaders::parent_on_last_public_release(env, pointer));
     let Some(released) = com(env).release::<Payload>(&mut env.sys.objects, pointer) else {
         return 0;
     };
@@ -373,7 +427,8 @@ fn add_ref(env: &mut Env<'_>, pointer: u32) -> Option<u32> {
     }
     let parent = resources::parent_on_first_public_retain(env, pointer)
         .or_else(|| buffers::parent_on_first_public_retain(env, pointer))
-        .or_else(|| declaration::parent_on_first_public_retain(env, pointer));
+        .or_else(|| declaration::parent_on_first_public_retain(env, pointer))
+        .or_else(|| shaders::parent_on_first_public_retain(env, pointer));
     if let Some(parent) = parent {
         com(env).add_ref_identity(&mut env.sys.objects, parent)?;
     }
@@ -415,7 +470,8 @@ fn query(
     }
     let parent = resources::parent_on_first_public_retain(env, this.addr())
         .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()))
-        .or_else(|| declaration::parent_on_first_public_retain(env, this.addr()));
+        .or_else(|| declaration::parent_on_first_public_retain(env, this.addr()))
+        .or_else(|| shaders::parent_on_first_public_retain(env, this.addr()));
     if let Some(parent) = parent
         && com(env)
             .add_ref_identity(&mut env.sys.objects, parent)
@@ -467,6 +523,7 @@ mod buffers;
 mod declaration;
 mod depth;
 mod resources;
+mod shaders;
 unknown!(
     factory_query,
     factory_add_ref,
@@ -553,7 +610,7 @@ fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS, copy: bool) -> Op
         ("Flags", parameters.Flags, parameters.Flags & !3 == 0),
         (
             "AutoDepthStencilFormat",
-            parameters.AutoDepthStencilFormat as u32,
+            parameters.AutoDepthStencilFormat,
             parameters.EnableAutoDepthStencil == 0
                 || depth::format(parameters.AutoDepthStencilFormat).is_some(),
         ),
@@ -564,7 +621,7 @@ fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS, copy: bool) -> Op
         ),
         (
             "BackBufferFormat",
-            parameters.BackBufferFormat as u32,
+            parameters.BackBufferFormat,
             matches!(parameters.BackBufferFormat, 0 | 21 | 22),
         ),
     ] {
@@ -780,6 +837,8 @@ fn create_device(
         render_target: None,
         buffers: buffers::Bindings::default(),
         fixed,
+        shaders: shaders::Bindings::default(),
+        recording: None,
     };
     let Some((pointer, id)) = object(
         env,
@@ -906,7 +965,10 @@ fn reset(
     let outstanding_default = env.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace())
         .any(|(id,_)| matches!(com.get_identity(&env.sys.objects,id), Some(Payload::Resource(r))
             if r.device == device_id && r.desc.Pool == 0 && com.references(&env.sys.objects,id).is_some_and(|n| n != 0)));
-    if outstanding_default || buffers::has_outstanding_default(env, device_id) {
+    if outstanding_default
+        || buffers::has_outstanding_default(env, device_id)
+        || shaders::stateblocks::has_outstanding(env, device_id)
+    {
         if let Some(Payload::Device(d)) = com.get_identity_mut(&mut env.sys.objects, device_id) {
             d.needs_reset = true;
         }
@@ -995,6 +1057,7 @@ fn reset(
     depth::release_binding(env, old_depth);
     presentation::release(env, old_front);
     buffers::reset_bindings(env, device_id);
+    shaders::reset_bindings(env, device_id);
     targets::reset_binding(env, device_id);
     for binding in [old_texture, old_buffer].into_iter().flatten() {
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, binding) {
@@ -1081,14 +1144,19 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
                 }
                 Completion::Command
             }),
-        Operation::Draw(draw) => gpu
-            .draw(
-                &draw.target,
-                &draw.vertices,
-                draw.image.as_ref(),
-                draw.state,
-            )
-            .map(|()| Completion::Command),
+        Operation::Draw(draw) => {
+            let result = if let Some(program) = &draw.programmable {
+                gpu.draw_programmable(&draw.target, program, &draw.state)
+            } else {
+                gpu.draw(
+                    &draw.target,
+                    &draw.vertices,
+                    draw.image.as_ref(),
+                    draw.state,
+                )
+            };
+            result.map(|()| Completion::Command)
+        }
         Operation::Copy {
             source,
             rectangle,

@@ -34,7 +34,7 @@ pub(super) struct Stream {
     pub offset: u32,
     pub stride: u32,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Bindings {
     pub streams: [Stream; 16],
     pub indices: Option<Id>,
@@ -442,6 +442,15 @@ fn set_stream(
         }
         com(env).identity::<Payload>(&env.sys.objects, pointer.addr())
     };
+    let recorded = Stream {
+        buffer: new,
+        offset: if new.is_some() { offset } else { old.offset },
+        stride: if new.is_some() { stride } else { old.stride },
+    };
+    if let Some(result) = super::shaders::stateblocks::record_stream(env, device, stream, recorded)
+    {
+        return result;
+    }
     if new != old.buffer
         && new.is_some_and(|id| !com(env).retain_internal(&mut env.sys.objects, id))
     {
@@ -527,6 +536,9 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
         }
         com(env).identity::<Payload>(&env.sys.objects, pointer.addr())
     };
+    if let Some(result) = super::shaders::stateblocks::record_indices(env, device, new) {
+        return result;
+    }
     if new != old && new.is_some_and(|id| !com(env).retain_internal(&mut env.sys.objects, id)) {
         return OUT_OF_MEMORY;
     }
@@ -617,6 +629,13 @@ fn draw(env: &mut Env<'_>, this: GuestPtr<()>, kind: i32, start: u32, count: u32
             fixed::empty_draw(env, this.addr(), kind).map_or_else(|e| e, |()| 0),
         );
     }
+    if super::programmable::active(env, this.addr()) {
+        return match super::programmable::prepare(env, this.addr(), kind, count, None, None, start)
+        {
+            Ok(draw) => submit(env, this.addr(), draw, None),
+            Err(e) => Outcome::Return(e),
+        };
+    }
     let result = (|| {
         let (data, stride, len) = stream_data(env, this.addr())?;
         let size = fixed::vertex_size(env, this.addr())?;
@@ -702,7 +721,6 @@ fn draw_indexed(
         if kind == 1 {
             return Err(INVALID);
         }
-        let (data, stride, len) = stream_data(env, this.addr())?;
         let d = device(env, this.addr()).ok_or(INVALID)?;
         let Some(Payload::Buffer(b)) =
             com(env).get_identity(&env.sys.objects, d.buffers.indices.ok_or(INVALID)?)
@@ -731,6 +749,18 @@ fn draw_indexed(
             vertices,
             base,
         )?;
+        if super::programmable::active(env, this.addr()) {
+            return super::programmable::prepare(
+                env,
+                this.addr(),
+                kind,
+                count,
+                None,
+                Some(&indices),
+                0,
+            );
+        }
+        let (data, stride, len) = stream_data(env, this.addr())?;
         let size = fixed::vertex_size(env, this.addr())?;
         let last = indices.iter().copied().max().ok_or(INVALID)?;
         if last
@@ -781,7 +811,19 @@ fn draw_indexed_up(
         }
         let length = fixed::primitive_length(kind, count)?;
         let indices = decode_indices(env, indices.addr(), format, length, minimum, vertices, 0)?;
-        fixed::prepare(env, this.addr(), kind, count, data, stride, Some(&indices))
+        if super::programmable::active(env, this.addr()) {
+            super::programmable::prepare(
+                env,
+                this.addr(),
+                kind,
+                count,
+                Some((data, stride)),
+                Some(&indices),
+                0,
+            )
+        } else {
+            fixed::prepare(env, this.addr(), kind, count, data, stride, Some(&indices))
+        }
     })();
     match result {
         Ok(draw) => submit(env, this.addr(), draw, Some(true)),

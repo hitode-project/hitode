@@ -113,7 +113,8 @@ fn system_memory_cursor_request_fails_without_retaining_or_discarding_pixels() {
     assert_eq!(
         diagnostics.warnings.get(&(
             API.to_owned(),
-            "custom cursor presentation is unavailable".to_owned(),
+            "D3DERR_NOTAVAILABLE (HRESULT=0x8876086a): custom cursor presentation is unavailable"
+                .to_owned(),
         )),
         Some(&2)
     );

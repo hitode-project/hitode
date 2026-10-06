@@ -1,7 +1,9 @@
 //! Queries describe the implemented guest device, never the physical adapter's
 //! unrelated shader/texture capabilities. Keep unsupported paths discoverable.
 use super::*;
-use adv_abi::types::{D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDISPLAYMODE};
+use adv_abi::types::{
+    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDISPLAYMODE, D3DPSHADERCAPS2_0, D3DVSHADERCAPS2_0,
+};
 
 pub(super) fn register(registry: &mut Registry) {
     for api in [
@@ -173,12 +175,17 @@ fn check_format(
     }
     // Color surface/texture: sampled, dynamic or manual render-target mips.
     // Autogen, sRGB, depth textures, cubes and volumes remain unadvertised.
-    let supported = (matches!(check, 21 | 22)
-        && match resource {
-            1 => usage == 0 || usage == 1,
-            3 => matches!(usage, 0 | 1 | 0x200),
-            _ => false,
-        })
+    let vertex_texture_query = usage == 0x100000
+        && resource == 3
+        && matches!(check, 21 | 22)
+        && env.ext.get::<State>().shader_caps.sm3;
+    let supported = vertex_texture_query
+        || (matches!(check, 21 | 22)
+            && match resource {
+                1 => usage == 0 || usage == 1,
+                3 => matches!(usage, 0 | 1 | 0x200),
+                _ => false,
+            })
         || (check == 26
             && match resource {
                 1 => usage == 0,
@@ -272,6 +279,15 @@ fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         .limits()
         .max_texture_dimension_2d
         .min(2048);
+    let gates = env.ext.get::<State>().shader_caps;
+    let model = if gates.sm3 {
+        3
+    } else if gates.sm2 {
+        2
+    } else {
+        0
+    };
+    let shader = model != 0;
     Ok(D3DCAPS9 {
         DeviceType: 1,
         NumberOfAdaptersInGroup: 1,
@@ -288,7 +304,7 @@ fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         ShadeCaps: 0x8 | 0x4000,
         TextureCaps: 1 | 4 | 0x40 | 0x4000,
         TextureFilterCaps: 0x03000300 | 0x00030000,
-        TextureAddressCaps: 1 | 2 | 4 | 0x10,
+        TextureAddressCaps: 1 | 2 | 4 | 8 | 0x10,
         LineCaps: 1 | 4 | 8,
         MaxTextureWidth: texture_size,
         MaxTextureHeight: texture_size,
@@ -302,13 +318,35 @@ fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         TextureOpCaps: 1 | 2 | 4,
         MaxTextureBlendStages: 1,
         MaxSimultaneousTextures: 1,
-        MaxPointSize: 1.0,
+        MaxPointSize: if shader { 64.0 } else { 1.0 },
         MaxPrimitiveCount: 131072,
         MaxStreams: 16,
         MaxVertexIndex: 0x000f_ffff,
         MaxStreamStride: 2048,
         DevCaps2: 1, // STREAMOFFSET: SetStreamSource offsets are used by drawing.
         NumSimultaneousRTs: 1,
+        VertexShaderVersion: if shader { 0xfffe_0000 | model << 8 } else { 0 },
+        PixelShaderVersion: if shader { 0xffff_0000 | model << 8 } else { 0 },
+        MaxVertexShaderConst: if shader { 256 } else { 0 },
+        PixelShader1xMaxValue: if shader { 8.0 } else { 0.0 },
+        VS20Caps: D3DVSHADERCAPS2_0 {
+            Caps: u32::from(model == 3),
+            DynamicFlowControlDepth: if model == 3 { 24 } else { 0 },
+            NumTemps: if shader { 32 } else { 0 },
+            StaticFlowControlDepth: if shader { 4 } else { 0 },
+        },
+        PS20Caps: D3DPSHADERCAPS2_0 {
+            Caps: if model == 3 { 0x1f } else { 0 },
+            DynamicFlowControlDepth: if model == 3 { 24 } else { 0 },
+            NumTemps: if shader { 32 } else { 0 },
+            StaticFlowControlDepth: if model == 3 { 4 } else { 0 },
+            NumInstructionSlots: if shader { 512 } else { 0 },
+        },
+        MaxVShaderInstructionsExecuted: if shader { 65536 } else { 0 },
+        MaxPShaderInstructionsExecuted: if shader { 65536 } else { 0 },
+        MaxVertexShader30InstructionSlots: if model == 3 { 512 } else { 0 },
+        MaxPixelShader30InstructionSlots: if model == 3 { 512 } else { 0 },
+        VertexTextureFilterCaps: if model == 3 { 0x03030300 } else { 0 },
         ..D3DCAPS9::default()
     })
 }
@@ -334,7 +372,20 @@ fn device_caps(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DCAPS9>
         return INVALID;
     }
     match caps(env) {
-        Ok(c) => put(env, output, c),
+        Ok(mut c) => {
+            // Software VP has the same bounded 256-register file here. Its
+            // larger SM3 constant space is intentionally not advertised.
+            if device(env, this.addr()).is_some_and(|d| d.creation.software())
+                && c.VertexShaderVersion == 0xfffe_0300
+            {
+                c.VertexShaderVersion = 0xfffe_0200;
+                c.MaxVertexShader30InstructionSlots = 0;
+                c.VertexTextureFilterCaps = 0;
+                c.VS20Caps.Caps = 0;
+                c.VS20Caps.DynamicFlowControlDepth = 0;
+            }
+            put(env, output, c)
+        }
         Err(e) => e,
     }
 }
@@ -397,6 +448,75 @@ mod tests {
             (value.VertexShaderVersion, value.PixelShaderVersion),
             (0, 0)
         );
+        set_shader_caps(
+            env.ext,
+            ShaderCaps {
+                sm2: true,
+                sm3: false,
+            },
+        );
+        let sm2 = caps(&env).unwrap();
+        assert_eq!(
+            (sm2.VertexShaderVersion, sm2.PixelShaderVersion),
+            (0xfffe0200, 0xffff0200)
+        );
+        assert_eq!(sm2.MaxVertexShaderConst, 256);
+        assert_eq!(sm2.MaxPointSize, 64.0);
+        assert_eq!(sm2.MaxVertexShader30InstructionSlots, 0);
+        set_shader_caps(
+            env.ext,
+            ShaderCaps {
+                sm2: false,
+                sm3: true,
+            },
+        );
+        let sm3 = caps(&env).unwrap();
+        assert_eq!(
+            (sm3.VertexShaderVersion, sm3.PixelShaderVersion),
+            (0xfffe0300, 0xffff0300)
+        );
+        assert_eq!(sm3.MaxVertexShaderConst, 256);
+        assert!(sm3.MaxVertexShader30InstructionSlots >= 512);
+        assert_eq!(check_format(&mut env, this, 0, 1, 22, 0x100000, 3, 21), 0);
+        assert_eq!(check_format(&mut env, this, 0, 1, 22, 0x100000, 3, 22), 0);
+        assert_eq!(
+            check_format(&mut env, this, 0, 1, 22, 0x100000, 1, 21),
+            UNAVAILABLE
+        );
+        let (software, software_id, _, _) = super::super::tests::setup(&mut env);
+        let software_output =
+            GuestPtr::new(alloc(&mut env, std::mem::size_of::<D3DCAPS9>() as u32).unwrap());
+        assert_eq!(
+            device_caps(&mut env, GuestPtr::new(software), software_output),
+            0
+        );
+        let software_caps = software_output.read(env.cpu).unwrap();
+        assert_eq!(
+            (
+                software_caps.VertexShaderVersion,
+                software_caps.PixelShaderVersion
+            ),
+            (0xfffe0200, 0xffff0300)
+        );
+        assert_eq!(software_caps.VertexTextureFilterCaps, 0);
+        if let Some(Payload::Device(d)) =
+            com(&env).get_identity_mut(&mut env.sys.objects, software_id)
+        {
+            d.creation = creation::State::new(0, 1, 0, 0x42).unwrap();
+        }
+        assert_eq!(
+            device_caps(&mut env, GuestPtr::new(software), software_output),
+            0
+        );
+        assert_eq!(
+            software_output.read(env.cpu).unwrap().VertexShaderVersion,
+            0xfffe0300
+        );
+        set_shader_caps(env.ext, ShaderCaps::default());
+        assert_eq!(
+            check_format(&mut env, this, 0, 1, 22, 0x100000, 3, 21),
+            UNAVAILABLE
+        );
         assert_eq!(
             (value.CubeTextureFilterCaps, value.VolumeTextureFilterCaps,),
             (0, 0)
@@ -404,6 +524,11 @@ mod tests {
         assert_eq!(value.StencilCaps, 0x1ff);
         assert_eq!(value.ZCmpCaps, 0xff);
         assert_eq!(value.TextureCaps & 0x4000, 0x4000, "manual mip chains");
+        assert_eq!(
+            value.TextureAddressCaps & 8,
+            8,
+            "portable arbitrary border color"
+        );
         assert_eq!(
             value.TextureFilterCaps & 0x30000,
             0x30000,

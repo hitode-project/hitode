@@ -111,7 +111,9 @@ dependencies = [
  "bytemuck",
  "iced-x86",
  "log",
+ "naga",
  "pollster",
+ "sha2",
 ]
 
 [[package]]

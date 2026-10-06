@@ -221,6 +221,16 @@ impl<B: Backend> Runtime<B> {
     pub fn install_gpu(&mut self, gpu: adv_device::gpu::Gpu) -> Result<(), String> {
         adv_dx::d3d9::set_gpu(&mut self.machine.ext, gpu)
     }
+    /// Explicit capability gates for shader milestone validation. Disabled by
+    /// default; callers opt in independently before running guest code.
+    #[cfg(feature = "gpu")]
+    pub fn set_d3d9_shader_caps(&mut self, sm2: bool, sm3: bool) {
+        adv_dx::d3d9::set_shader_caps(&mut self.machine.ext, adv_dx::d3d9::ShaderCaps { sm2, sm3 });
+    }
+    #[cfg(feature = "gpu")]
+    pub fn set_d3d9_shader_cache(&mut self, directory: Option<std::path::PathBuf>) {
+        adv_dx::d3d9::set_shader_cache(&mut self.machine.ext, directory);
+    }
     #[cfg(feature = "gpu")]
     pub fn set_gpu_background(
         &mut self,
