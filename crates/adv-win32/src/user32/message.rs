@@ -1996,7 +1996,7 @@ pub fn validate(env: &mut Env<'_>, hwnd: u32) {
 
 fn call_window_proc_a(env: &mut Env<'_>) -> Outcome {
     let (proc, hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    call_proc(proc, hwnd, msg, wp, lp, |_, r| Outcome::Return(r))
+    window::call_window_proc(env, proc, hwnd, msg, wp, lp, false)
 }
 
 // ---- painting ----

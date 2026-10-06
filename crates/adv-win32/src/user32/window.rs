@@ -410,6 +410,11 @@ pub struct SysProcs {
 
 pub struct User {
     pub classes: Vec<Class>,
+    /// Process-lifetime encoding evidence for raw procedures returned by Get/Set.
+    /// It survives window destruction and does not pin guest code mappings;
+    /// address reuse can retain old evidence, so an opposite ABI is rejected.
+    /// Bits 1/2 mean A/W; an address legitimately used by both stays ambiguous.
+    saved_procedure_encodings: BTreeMap<u32, u8>,
     next_atom: u16,
     pub windows: Windows,
     /// Top-level windows in z-order (top first).
@@ -456,6 +461,7 @@ impl User {
     ) -> Option<Self> {
         let mut u = Self {
             classes: Vec::new(),
+            saved_procedure_encodings: BTreeMap::new(),
             next_atom: 0xc000,
             windows: Windows::new(objects)?,
             top: Vec::new(),
@@ -1960,13 +1966,74 @@ pub const GWL_ID: i32 = -12;
 pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
 pub const GWL_USERDATA: i32 = -21;
+const MAX_SAVED_PROCEDURE_ENCODINGS: usize = 4096;
+
+fn can_capture_procedures(u: &User, procedures: &[u32]) -> bool {
+    let mut missing = 0;
+    for (index, proc) in procedures.iter().enumerate() {
+        if !u.saved_procedure_encodings.contains_key(proc) && !procedures[..index].contains(proc) {
+            missing += 1;
+        }
+    }
+    u.saved_procedure_encodings.len() + missing <= MAX_SAVED_PROCEDURE_ENCODINGS
+}
 
 fn get_window_long_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, idx) = (env.arg(0), env.arg(1) as i32);
+    get_window_long(env, hwnd, idx, false)
+}
+
+#[win32(user32, name = "GetWindowLongW", level = state)]
+fn get_window_long_w(env: &mut Env<'_>, hwnd: AbiHandle, index: i32) -> Outcome {
+    get_window_long(env, hwnd.0, index, true)
+}
+
+fn procedure_encoding(env: &Env<'_>, proc: u32) -> Option<bool> {
+    let u = user(env);
+    // Shared host controls decode using the target USER window, not a global
+    // encoding attached to their common address. Captured A and W windows may
+    // therefore legitimately return this same procedure address.
+    if stock_procedure(u, proc) {
+        return None;
+    }
+    let mut mask = u.saved_procedure_encodings.get(&proc).copied().unwrap_or(0);
+    for class in &u.classes {
+        if class.proc == proc && !class.name.is_empty() {
+            if let Some(wide) = class.unicode {
+                mask |= if wide { 2 } else { 1 };
+            }
+        }
+    }
+    match mask {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+fn stock_procedure(u: &User, proc: u32) -> bool {
+    proc != 0 && [u.procs.def_window, u.procs.def_dlg, u.procs.button, u.procs.static_,
+        u.procs.edit, u.procs.combo, u.procs.trackbar, u.procs.tab].contains(&proc)
+}
+
+fn procedure_boundary(env: &mut Env<'_>, api: &str, reason: &str) -> Outcome {
+    adv_abi::warn_unavailable(env, api, reason);
+    set_last_error(env, 50);
+    Outcome::Return(0)
+}
+
+fn get_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, wide: bool) -> Outcome {
     let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         set_last_error(env, 1400);
         return Outcome::Return(0);
     };
+    if idx == GWL_WNDPROC && w.unicode != wide {
+        return procedure_boundary(
+            env,
+            if wide { "user32.dll!GetWindowLongW" } else { "user32.dll!GetWindowLongA" },
+            "cross-encoding GWL_WNDPROC query requires an unavailable procedure thunk",
+        );
+    }
     let v = match idx {
         GWL_WNDPROC => Some(w.proc),
         GWL_HINSTANCE => Some(w.instance),
@@ -1979,7 +2046,19 @@ fn get_window_long_a(env: &mut Env<'_>) -> Outcome {
         _ => None,
     };
     match v {
-        Some(v) => Outcome::Return(v),
+        Some(v) => {
+            if idx == GWL_WNDPROC {
+                if !can_capture_procedures(user(env), &[v]) {
+                    return procedure_boundary(
+                        env,
+                        if wide { "user32.dll!GetWindowLongW" } else { "user32.dll!GetWindowLongA" },
+                        "saved procedure encoding metadata reached its bounded capacity",
+                    );
+                }
+                *user_mut(env).saved_procedure_encodings.entry(v).or_default() |= if wide { 2 } else { 1 };
+            }
+            Outcome::Return(v)
+        }
         None => {
             set_last_error(env, 1413); // ERROR_INVALID_INDEX
             Outcome::Return(0)
@@ -1989,6 +2068,46 @@ fn get_window_long_a(env: &mut Env<'_>) -> Outcome {
 
 fn set_window_long_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, idx, v) = (env.arg(0), env.arg(1) as i32, env.arg(2));
+    set_window_long(env, hwnd, idx, v, false)
+}
+
+#[win32(user32, name = "SetWindowLongW", level = state)]
+fn set_window_long_w(env: &mut Env<'_>, hwnd: AbiHandle, index: i32, value: i32) -> Outcome {
+    set_window_long(env, hwnd.0, index, value as u32, true)
+}
+
+fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -> Outcome {
+    let Some(current) = user(env).windows.get(&env.sys.objects, &hwnd) else {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    };
+    if idx == GWL_HWNDPARENT {
+        return procedure_boundary(
+            env,
+            if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+            "GWL_HWNDPARENT reparent/owner lifecycle is unsupported",
+        );
+    }
+    if idx == GWL_WNDPROC {
+        if current.unicode != wide || procedure_encoding(env, v).is_some_and(|target| target != wide) {
+            return procedure_boundary(
+                env,
+                if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+                "cross-encoding GWL_WNDPROC replacement requires an unavailable procedure thunk",
+            );
+        }
+        if v == 0 {
+            set_last_error(env, 87);
+            return Outcome::Return(0);
+        }
+        if !can_capture_procedures(user(env), &[current.proc, v]) {
+            return procedure_boundary(
+                env,
+                if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+                "saved procedure encoding metadata reached its bounded capacity",
+            );
+        }
+    }
     let Some(w) = env
         .ext
         .get::<crate::Win32>()
@@ -2000,18 +2119,26 @@ fn set_window_long_a(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     };
     let old = match idx {
-        GWL_WNDPROC => Some(std::mem::replace(&mut w.proc, v)),
+        GWL_WNDPROC => {
+            w.unicode = wide;
+            Some(std::mem::replace(&mut w.proc, v))
+        }
         GWL_HINSTANCE => Some(std::mem::replace(&mut w.instance, v)),
         GWL_ID => Some(std::mem::replace(&mut w.id, v)),
         GWL_STYLE => Some(std::mem::replace(&mut w.style, v)),
         GWL_EXSTYLE => Some(std::mem::replace(&mut w.ex_style, v)),
         GWL_USERDATA => Some(std::mem::replace(&mut w.user_data, v)),
-        GWL_HWNDPARENT => Some(std::mem::replace(&mut w.owner, v)),
         i if i >= 0 => w.set_extra_u32(i as u32, v),
         _ => None,
     };
     match old {
         Some(o) => {
+            if idx == GWL_WNDPROC {
+                let bit = if wide { 2 } else { 1 };
+                let saved = &mut user_mut(env).saved_procedure_encodings;
+                *saved.entry(o).or_default() |= bit;
+                *saved.entry(v).or_default() |= bit;
+            }
             set_last_error(env, err::SUCCESS);
             Outcome::Return(o)
         }
@@ -2020,6 +2147,46 @@ fn set_window_long_a(env: &mut Env<'_>) -> Outcome {
             Outcome::Return(0)
         }
     }
+}
+
+/// Raw guest callbacks use the caller's declared ABI without HWND validation.
+/// Known opposite-encoding procedures need an opaque native-style conversion
+/// thunk, which this same-encoding profile explicitly does not manufacture.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn call_window_proc(
+    env: &mut Env<'_>,
+    proc: u32,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> Outcome {
+    let api = if wide { "user32.dll!CallWindowProcW" } else { "user32.dll!CallWindowProcA" };
+    if procedure_encoding(env, proc).is_some_and(|target| target != wide) {
+        return procedure_boundary(env, api, "saved/custom procedure A/W conversion thunk is unavailable");
+    }
+    let u = user(env);
+    let stock = stock_procedure(u, proc);
+    if stock && proc != 0
+        && !u.windows.get(&env.sys.objects, &hwnd).is_some_and(|w| w.unicode == wide)
+    {
+        return procedure_boundary(env, api, "shared built-in procedure requires a USER window with matching captured encoding");
+    }
+    // Call the saved procedure itself, never SendMessage/current w.proc.
+    super::message::call_proc(proc, hwnd, msg, wp, lp, |_, r| Outcome::Return(r))
+}
+
+#[win32(user32, name = "CallWindowProcW", level = implement)]
+fn call_window_proc_w(
+    env: &mut Env<'_>,
+    proc: GuestPtr<()>,
+    hwnd: AbiHandle,
+    msg: u32,
+    wp: u32,
+    lp: i32,
+) -> Outcome {
+    call_window_proc(env, proc.addr(), hwnd.0, msg, wp, lp as u32, true)
 }
 
 fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
@@ -2510,6 +2677,9 @@ pub fn register(reg: &mut Registry) {
     s(reg, "AdjustWindowRectEx", 4, adjust_window_rect_ex);
     s(reg, "GetWindowLongA", 2, get_window_long_a);
     s(reg, "SetWindowLongA", 3, set_window_long_a);
+    reg.register(get_window_long_w_ABI);
+    reg.register(set_window_long_w_ABI);
+    reg.register(call_window_proc_w_ABI);
     s(
         reg,
         "SetLayeredWindowAttributes",
@@ -2549,6 +2719,24 @@ pub fn register(reg: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_procedure_capacity_preflights_all_unique_entries() {
+        let mut objects = Objects::default();
+        let mut u = User::new(&mut objects, (800, 600), None).unwrap();
+        for proc in 0..MAX_SAVED_PROCEDURE_ENCODINGS as u32 - 1 {
+            u.saved_procedure_encodings.insert(proc, 1);
+        }
+        let before = u.saved_procedure_encodings.clone();
+        assert!(!can_capture_procedures(&u, &[0x9000, 0x9001]));
+        assert!(can_capture_procedures(&u, &[0x9000, 0x9000]));
+        assert!(can_capture_procedures(&u, &[1, 0x9000]));
+        assert_eq!(u.saved_procedure_encodings, before);
+        u.saved_procedure_encodings.insert(0x9000, 2);
+        assert!(!can_capture_procedures(&u, &[0x9001]));
+        assert!(can_capture_procedures(&u, &[1, 0x9000]));
+        assert_eq!(u.windows.get(&objects, &u.desktop).unwrap().proc, 0);
+    }
 
     #[test]
     fn insets_match_system_metrics() {

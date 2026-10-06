@@ -647,3 +647,6 @@ fn send_message_w_front_dispatches_opaque_parameters_unicode_text_and_real_guest
 
 #[path = "window_text/queue_w.rs"]
 mod queue_w;
+
+#[path = "window_text/window_long.rs"]
+mod window_long;
