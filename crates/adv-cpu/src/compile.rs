@@ -595,7 +595,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let versioned = fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let versioned = true;
-    let (plans, rejected) = if versioned {
+    let (mut plans, mut rejected) = if versioned {
         loops::survey(&instructions, &entries, |i| {
             supported(i)
                 && crate::strings::operation(i).is_none()
@@ -604,6 +604,22 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         (Vec::new(), Vec::new())
     };
+    // A memory bound is stable only while this guest thread owns execution.
+    // Another guest worker may change it even if this loop never does.
+    if snapshot.parallel {
+        plans.retain(|plan| {
+            if matches!(plan.bound, loops::Bound::Memory(_)) {
+                rejected.push(loops::Rejected {
+                    header: plan.header,
+                    latch: plan.latch,
+                    reason: "shared execution memory bound".into(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+    }
     // A kernel leaves at an access its windows reject; the region resumes
     // the loop's checked code there.
     for plan in &plans {
@@ -1899,6 +1915,33 @@ mod tests {
     }
 
     #[test]
+    fn memory_bound_kernels_require_single_guest_execution() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.inc(ecx).unwrap();
+        a.cmp(ecx, dword_ptr(ebp)).unwrap();
+        a.jb(top).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &bytes).unwrap();
+        let region = Region::new(0x10000, bytes.len());
+        let mut snapshot = Snapshot::capture(&region, &memory).unwrap();
+        let serial = compile_snapshot(&snapshot).unwrap();
+        assert_eq!(serial.versioned_loops, 1);
+        assert_eq!(serial.vectorized_loops, 0);
+        snapshot.parallel = true;
+        let parallel = compile_snapshot(&snapshot).unwrap();
+        assert_eq!(parallel.versioned_loops, 0);
+    }
+
+    #[test]
     fn loop_coverage_counts_iterations_by_outcome() {
         const CODE: u32 = 0x5_0000;
         const STOP: u32 = 0x5_1000;
@@ -3060,6 +3103,14 @@ impl Emitter<'_> {
         let bound = match bound {
             loops::Bound::Constant(value) => self.constant(value),
             loops::Bound::Register(register) => self.b.use_var(self.regs[register]),
+            loops::Bound::Memory(operand) => {
+                // enter_clone checked these exact bytes before the proof can
+                // read them. The proof excludes every loop write; kernel
+                // entry sees the same bound with no intervening guest call.
+                let address = self.bound_address(operand);
+                let address = self.proven_address(address);
+                self.b.ins().load(types::I32, MemFlags::new(), address, 0)
+            }
         };
         let distance = self.counter_distance(index, count, bound);
         let distance = self.b.ins().uextend(types::I64, distance);
@@ -3137,9 +3188,28 @@ impl Emitter<'_> {
         let prove = self.b.create_block();
         self.b.ins().brif(funded, prove, &[], checked, &[]);
         self.b.switch_to_block(prove);
-        let proven = self.loop_proof(index);
         let failed = self.b.create_block();
         self.b.set_cold_block(failed);
+        if let loops::Bound::Memory(operand) = self.plans[index].bound {
+            // Failure is a refusal to optimize, not an early guest fault.
+            // The checked loop must still commit its prefix before CMP faults.
+            let address = self.bound_address(operand);
+            let address = self.b.ins().uextend(types::I64, address);
+            let start = self.b.ins().iadd_imm(address, -i64::from(self.base));
+            let end = self.b.ins().iadd_imm(start, 4);
+            let len = self.b.ins().iconst(types::I64, self.len as i64);
+            let required = self.constant(u32::from(READ));
+            let forbidden = self.constant(u32::from(crate::memory::SHARED));
+            let call = self.b.ins().call(
+                self.range_ok_ref,
+                &[self.perms, start, end, len, required, forbidden],
+            );
+            let valid = self.b.inst_results(call)[0];
+            let readable = self.b.create_block();
+            self.b.ins().brif(valid, readable, &[], failed, &[]);
+            self.b.switch_to_block(readable);
+        }
+        let proven = self.loop_proof(index);
         let load = self.b.create_block();
         self.b.ins().brif(proven, load, &[], failed, &[]);
         self.b.switch_to_block(load);
@@ -3288,6 +3358,20 @@ impl Emitter<'_> {
         self.begin_lanes(index);
         self.resume_clone(index);
     }
+    /// The bound's exact x86 effective address, including 32-bit wrapping.
+    fn bound_address(&mut self, operand: loops::Operand) -> Value {
+        let mut address = self.constant(operand.displacement as u32);
+        if let Some(base) = operand.base {
+            let base = self.b.use_var(self.regs[base]);
+            address = self.b.ins().iadd(address, base);
+        }
+        if let Some((index, scale)) = operand.index {
+            let index = self.b.use_var(self.regs[index]);
+            let index = self.b.ins().imul_imm(index, i64::from(scale));
+            address = self.b.ins().iadd(address, index);
+        }
+        address
+    }
     /// Whether every group of loop `index` stays in ordinary memory for the
     /// iterations left when its latch branches back, at least one.
     fn loop_proof(&mut self, index: usize) -> Value {
@@ -3335,6 +3419,31 @@ impl Emitter<'_> {
             );
             let result = self.b.inst_results(call)[0];
             ok = self.b.ins().band(ok, result);
+        }
+        // A speculative trip count is valid only if ALL stores miss its
+        // bound, including stores forwarded through a promoted stack slot.
+        if let loops::Bound::Memory(operand) = self.plans[index].bound {
+            let address = self.bound_address(operand);
+            let start = self.b.ins().uextend(types::I64, address);
+            let end = self.b.ins().iadd_imm(start, 4);
+            let accesses = self.plans[index].accesses.clone();
+            for (_, access, _, write) in accesses {
+                if !write {
+                    continue;
+                }
+                let (write_start, write_end) = self.access_span(&access, more);
+                let below = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, write_end, start);
+                let above = self
+                    .b
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, end, write_start);
+                let apart = self.b.ins().bor(below, above);
+                let apart = self.b.ins().uextend(types::I32, apart);
+                ok = self.b.ins().band(ok, apart);
+            }
         }
         // Forwarded slots must lie outside every other proven write. Writes
         // through a slot's own base without an index are disjoint by plan.
@@ -3409,6 +3518,13 @@ impl Emitter<'_> {
         let operand = *plan.proven.get(&self.pc)?;
         if size as u32 > operand.width {
             return None;
+        }
+        if matches!(plan.bound, loops::Bound::Memory(bound) if bound == operand) {
+            // The dedicated precheck proves the fully wrapped address, not
+            // a signed displacement from an unwrapped host base. In
+            // particular absolute guest addresses above 2 GiB stay positive.
+            let address = self.bound_address(operand);
+            return Some((self.proven_address(address), 0));
         }
         if operand.index.is_none()
             && let Some(frame) = operand.base.and_then(|base| self.frames.get(&base))

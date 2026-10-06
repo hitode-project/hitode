@@ -28,7 +28,7 @@
 //! unproven accesses may call never change permissions, so a range proven at
 //! its latch stays proven for every remaining iteration.
 use super::*;
-use iced_x86::{CpuidFeature, InstructionInfoFactory, OpAccess};
+use iced_x86::{CodeSize, CpuidFeature, InstructionInfoFactory, OpAccess};
 
 /// Largest per-iteration pointer step considered; keeps range arithmetic in i64.
 const MAX_STEP: i64 = 1 << 16;
@@ -53,6 +53,9 @@ pub(super) enum Bound {
     Constant(u32),
     /// An invariant general register.
     Register(usize),
+    /// A doubleword whose immutable address is checked before loading the
+    /// bound; the loop proof also keeps every write away from these bytes.
+    Memory(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,20 +319,59 @@ fn plan(
     if counter_register.size() != 4 && !stepped {
         return Err("counter width".into());
     }
-    let (compared, bound) = if stepped {
-        (Compared::Step, Bound::Constant(0))
+    let (compared, bound, bound_pc) = if stepped {
+        (Compared::Step, Bound::Constant(0), None)
     } else {
         match (producer.mnemonic(), producer.op1_kind()) {
             (M::Cmp, OpKind::Immediate8to32 | OpKind::Immediate32) => (
                 Compared::Difference,
                 Bound::Constant(producer.immediate(1) as u32),
+                None,
             ),
             (M::Cmp, OpKind::Register) => {
-                let index = invariant_register(producer.op1_register()).ok_or("counter bound")?;
-                (Compared::Difference, Bound::Register(index))
+                let register = producer.op1_register();
+                if let Some(index) = invariant_register(register) {
+                    (Compared::Difference, Bound::Register(index), None)
+                } else {
+                    let index = reg_index(register)
+                        .filter(|&index| register.size() == 4 && index != counter)
+                        .ok_or("counter bound")?;
+                    // The last write dominates the comparison. Earlier narrow
+                    // or temporary values are irrelevant after this full load.
+                    let load = body
+                        .iter()
+                        .rev()
+                        .find(|i| {
+                            i.ip32() < producer.ip32() && write_sites[index].contains(&i.ip32())
+                        })
+                        .copied()
+                        .ok_or("counter bound")?;
+                    if load.mnemonic() != M::Mov
+                        || load.op0_kind() != OpKind::Register
+                        || load.op0_register() != register
+                        || load.op1_kind() != OpKind::Memory
+                        || !always(load.ip32())
+                    {
+                        return Err("counter bound".into());
+                    }
+                    let operand = memory_bound(load, &varies, &steps, factory)?;
+                    (
+                        Compared::Difference,
+                        Bound::Memory(operand),
+                        Some(load.ip32()),
+                    )
+                }
+            }
+            (M::Cmp, OpKind::Memory) => {
+                let operand = memory_bound(producer, &varies, &steps, factory)?;
+                (
+                    Compared::Difference,
+                    Bound::Memory(operand),
+                    Some(producer.ip32()),
+                )
             }
             (M::Test, OpKind::Register) if producer.op1_register() == counter_register => {
-                (Compared::Value, Bound::Constant(0))
+                (Compared::Value, Bound::Constant(0), None)
             }
             (_, OpKind::Memory) => return Err(format!("counter {} memory", name(producer))),
             _ => return Err(format!("counter {}", name(producer))),
@@ -444,7 +486,9 @@ fn plan(
             step += total(index) * i64::from(scale);
             offset += before_pc(index, pc) * i64::from(scale);
         }
-        if step.abs() > MAX_STEP || offset.abs() > MAX_STEP << 8 {
+        let prechecked_bound = bound_pc == Some(pc);
+        let large_offset = offset.abs() > MAX_STEP << 8;
+        if step.abs() > MAX_STEP || large_offset && !prechecked_bound {
             continue;
         }
         let index = index.map(|index| (index, scale));
@@ -481,6 +525,12 @@ fn plan(
             write,
             forwards_store(i),
         ));
+        // A bound's exact wrapped address has its own check before the
+        // speculative load. Large absolute displacements need no affine
+        // group, whose unwrapped signed offset would otherwise reject them.
+        if prechecked_bound && large_offset {
+            continue;
+        }
         if let Some(group) = groups.iter_mut().find(|g| {
             g.base == base
                 && g.index == index
@@ -519,6 +569,14 @@ fn plan(
                 )
             })
     });
+    if let Bound::Memory(operand) = bound {
+        if unproven_write {
+            return Err("counter bound write".into());
+        }
+        if bound_pc.and_then(|pc| proven.get(&pc)) != Some(&operand) {
+            return Err("counter bound proof".into());
+        }
+    }
     let mut slots = Vec::new();
     let mut promoted = BTreeMap::new();
     if !unproven_write {
@@ -634,6 +692,37 @@ fn plan(
         steps: totals,
         updates,
         accesses: listed,
+    })
+}
+
+/// A bound load through a full-width, immutable address. Its bytes are proved
+/// ordinary and disjoint from every loop write before the kernel uses it.
+fn memory_bound(
+    i: &Instruction,
+    varies: &[bool; 8],
+    steps: &[Vec<(u32, i64)>; 8],
+    factory: &mut InstructionInfoFactory,
+) -> Result<Operand, String> {
+    let [used] = factory.info(i).used_memory() else {
+        return Err("counter bound memory".into());
+    };
+    if i.memory_size().size() != 4 || used.address_size() != CodeSize::Code32 {
+        return Err("counter bound address".into());
+    }
+    let component = |register: R| -> Result<Option<usize>, String> {
+        if register == R::None {
+            return Ok(None);
+        }
+        let index = reg_index(register)
+            .filter(|&index| register.size() == 4 && !varies[index] && steps[index].is_empty())
+            .ok_or("counter bound")?;
+        Ok(Some(index))
+    };
+    Ok(Operand {
+        width: 4,
+        base: component(i.memory_base())?,
+        index: component(i.memory_index())?.map(|index| (index, i.memory_index_scale())),
+        displacement: i.memory_displacement32() as i32,
     })
 }
 
@@ -1018,7 +1107,17 @@ mod tests {
                     a.cmp(ebx, dword_ptr(ebp - 4)).unwrap();
                     a.jb(top).unwrap();
                 },
-                Err("counter cmp memory"),
+                Ok((
+                    3,
+                    1,
+                    Bound::Memory(Operand {
+                        width: 4,
+                        base: Some(5),
+                        index: None,
+                        displacement: -4,
+                    }),
+                    false,
+                )),
             ),
             (
                 |a, top| {
@@ -1059,6 +1158,94 @@ mod tests {
             let expected = expected.map_err(str::to_owned);
             assert_eq!(survey_one(close), expected, "case {n}");
         }
+    }
+
+    #[test]
+    fn memory_bounds_require_a_dominating_load_and_immutable_address() {
+        let build = |extra: fn(&mut CodeAssembler), address: AsmMemoryOperand| {
+            decode(|a| {
+                let mut top = a.create_label();
+                a.set_label(&mut top).unwrap();
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                extra(a);
+                a.mov(edx, address).unwrap();
+                a.inc(ebx).unwrap();
+                a.cmp(ebx, edx).unwrap();
+                a.jl(top).unwrap();
+                a.ret().unwrap();
+            })
+        };
+        // An earlier partial write cannot affect the full invariant load
+        // that supplies the comparison, even though EDX varies in the body.
+        let (instructions, entries) = build(
+            |a| a.mov(dx, word_ptr(edi)).unwrap(),
+            dword_ptr(ebp + ecx * 4 - 8),
+        );
+        let plan = &super::plans(&instructions, &entries, |_| true)[0];
+        assert_eq!(
+            plan.bound,
+            Bound::Memory(Operand {
+                width: 4,
+                base: Some(5),
+                index: Some((1, 4)),
+                displacement: -8,
+            })
+        );
+        for (extra, address, reason) in [
+            (
+                (|a: &mut CodeAssembler| a.add(ebp, 4).unwrap()) as fn(&mut CodeAssembler),
+                dword_ptr(ebp),
+                "counter bound",
+            ),
+            (
+                |a| a.inc(ecx).unwrap(),
+                dword_ptr(ebp + ecx * 4),
+                "counter bound",
+            ),
+            (
+                |a| a.mov(dword_ptr(edi + eax * 4), 9).unwrap(),
+                dword_ptr(ebp),
+                "counter bound write",
+            ),
+            (|_| {}, dword_ptr(bx + si), "counter bound address"),
+        ] {
+            let (instructions, entries) = build(extra, address);
+            let (plans, rejected) = survey(&instructions, &entries, |_| true);
+            assert!(plans.is_empty());
+            assert_eq!(rejected[0].reason, reason);
+        }
+        // The exact bound check covers an absolute address outside the
+        // affine groups' displacement limit, including the high half.
+        for address in [0x1234_0000u32, 0xf234_0000] {
+            let (instructions, entries) = build(|_| {}, dword_ptr(address as i32));
+            let plan = &super::plans(&instructions, &entries, |_| true)[0];
+            assert_eq!(
+                plan.bound,
+                Bound::Memory(Operand {
+                    width: 4,
+                    base: None,
+                    index: None,
+                    displacement: address as i32,
+                })
+            );
+            assert_eq!(plan.proven.len(), 2);
+            assert_eq!(plan.groups.len(), 1, "the source read only");
+        }
+        let (instructions, entries) = decode(|a| {
+            let mut top = a.create_label();
+            let mut skip = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.je(skip).unwrap();
+            a.mov(edx, dword_ptr(ebp)).unwrap();
+            a.set_label(&mut skip).unwrap();
+            a.inc(ebx).unwrap();
+            a.cmp(ebx, edx).unwrap();
+            a.jl(top).unwrap();
+            a.ret().unwrap();
+        });
+        assert!(super::plans(&instructions, &entries, |_| true).is_empty());
     }
 
     #[test]

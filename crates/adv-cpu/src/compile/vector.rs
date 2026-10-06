@@ -243,6 +243,11 @@ pub(super) fn batch(
     plan: &loops::Plan,
     instructions: &BTreeMap<u32, Instruction>,
 ) -> Result<Batch, String> {
+    // A bound reloaded into a vector temporary needs explicit lane/scalar
+    // comparison handling. Keep the proven scalar kernel until that exists.
+    if matches!(plan.bound, loops::Bound::Memory(_)) {
+        return Err("memory bound".into());
+    }
     if !plan.windows.is_empty() {
         return Err("windows".into());
     }
