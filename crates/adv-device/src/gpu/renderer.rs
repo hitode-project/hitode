@@ -7,6 +7,38 @@ use std::sync::{
 use super::*;
 
 static NEXT_RESOURCE: AtomicU64 = AtomicU64::new(1);
+
+/// The software adapter (WARP on Windows) has crashed the whole process when
+/// several of its devices render concurrently, so a process runs one software
+/// device at a time. One thread may hold several, as a fixture comparing two
+/// devices does; others wait. Hardware devices are not affected.
+struct SoftwareTurn;
+static SOFTWARE: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)> =
+    std::sync::Mutex::new((None, 0));
+static SOFTWARE_FREE: std::sync::Condvar = std::sync::Condvar::new();
+
+impl SoftwareTurn {
+    fn take() -> Self {
+        let me = std::thread::current().id();
+        let mut turn = SOFTWARE.lock().unwrap_or_else(|e| e.into_inner());
+        while turn.0.is_some_and(|owner| owner != me) {
+            turn = SOFTWARE_FREE.wait(turn).unwrap_or_else(|e| e.into_inner());
+        }
+        *turn = (Some(me), turn.1 + 1);
+        Self
+    }
+}
+
+impl Drop for SoftwareTurn {
+    fn drop(&mut self) {
+        let mut turn = SOFTWARE.lock().unwrap_or_else(|e| e.into_inner());
+        turn.1 -= 1;
+        if turn.1 == 0 {
+            turn.0 = None;
+            SOFTWARE_FREE.notify_all();
+        }
+    }
+}
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const MAX_PIPELINES: usize = 512;
 const MAX_UPLOAD: u64 = 16 * 1024 * 1024;
@@ -349,6 +381,7 @@ pub struct Gpu {
     frames: Vec<Image>,
     readbacks: Arc<AtomicUsize>,
     readback_limit: usize,
+    _software: Option<SoftwareTurn>,
 }
 
 impl Gpu {
@@ -375,6 +408,7 @@ impl Gpu {
         surface: Option<&wgpu::Surface<'_>>,
         fallback: bool,
     ) -> Result<Self, Error> {
+        let software = fallback.then(SoftwareTurn::take);
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -506,6 +540,7 @@ impl Gpu {
             frames: Vec::new(),
             readbacks: Arc::new(AtomicUsize::new(0)),
             readback_limit: MAX_READBACKS,
+            _software: software,
         })
     }
 
