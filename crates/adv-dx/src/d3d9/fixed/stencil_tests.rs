@@ -3,6 +3,77 @@
 struct StencilTarget(Target);
 
 #[test]
+fn typed_unknown_render_state_warns_once_and_counts_repeats_without_changing_result() {
+    use adv_cpu::backend::{Guest, Reg};
+    use std::{cell::RefCell, io::Write, rc::Rc};
+    #[derive(Clone, Default)]
+    struct Capture(Rc<RefCell<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut machine = super::super::tests::machine();
+    const STACK: u32 = 0x550000;
+    machine.cpu.map(STACK, 0x1000, Prot::RW).unwrap();
+    machine.cpu.set_reg(Reg::Esp, STACK);
+    let capture = Capture::default();
+    machine.sys.trace = adv_machine::trace::Trace::to_writer(Box::new(capture.clone()));
+    let mut env = Env {
+        context: 0,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    let (pointer, owner, _, _) = super::super::tests::setup(&mut env);
+    let count = env.sys.objects.object_count();
+    let refs = env.sys.objects.strong_count(owner);
+    for (offset, word) in [0x12345678, pointer, 0x7fffffff, 1].into_iter().enumerate() {
+        env.cpu.write_u32(STACK + offset as u32 * 4, word).unwrap();
+    }
+    for value in 0..151 {
+        env.cpu.write_u32(STACK + 12, value).unwrap();
+        assert!(matches!(
+            (set_render_ABI.handler)(&mut env),
+            Outcome::Return(UNAVAILABLE)
+        ));
+    }
+    env.cpu.write_u32(STACK + 8, 9).unwrap();
+    env.cpu.write_u32(STACK + 12, 2).unwrap();
+    assert!(matches!(
+        (set_render_ABI.handler)(&mut env),
+        Outcome::Return(0)
+    ));
+    env.cpu.write_u32(STACK + 8, 22).unwrap();
+    env.cpu.write_u32(STACK + 12, 0).unwrap();
+    assert!(matches!(
+        (set_render_ABI.handler)(&mut env),
+        Outcome::Return(INVALID)
+    ));
+    let diagnostics = env.ext.get::<adv_abi::ApiDiagnostics>();
+    assert_eq!(diagnostics.warnings.len(), 1);
+    let ((api, reason), repetitions) = diagnostics.warnings.first_key_value().unwrap();
+    assert_eq!(api, "d3d9.dll!IDirect3DDevice9::SetRenderState");
+    assert!(reason.contains("HRESULT=0x8876086a"));
+    assert!(reason.contains("State=0x7fffffff"));
+    assert_eq!(*repetitions, 151);
+    assert_eq!(diagnostics.stub_calls, 0);
+    assert!(diagnostics.acceptance_eligible(adv_abi::RunMode::Strict));
+    let trace = String::from_utf8(capture.0.borrow().clone()).unwrap();
+    assert_eq!(trace.lines().count(), 1);
+    assert!(
+        trace.starts_with("# warning\t0\t0\t12345678\td3d9.dll!IDirect3DDevice9::SetRenderState\t")
+    );
+    assert_eq!(env.sys.objects.object_count(), count);
+    assert_eq!(env.sys.objects.strong_count(owner), refs);
+}
+
+#[test]
 fn rejected_up_draw_records_the_exact_phase_without_changing_com_ownership() {
     let mut machine = super::super::tests::machine();
     let mut env = Env {

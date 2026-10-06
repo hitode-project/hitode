@@ -76,6 +76,26 @@ impl Trace {
         }
     }
 
+    /// A bounded diagnostic comment, independent of per-function trace flags.
+    /// Escaped text cannot introduce extra call records or raw control lines.
+    pub fn warning(
+        &mut self,
+        context: u32,
+        frame: u32,
+        caller: u32,
+        api: &str,
+        reason: &str,
+        sample: Option<&str>,
+    ) {
+        if let Some(w) = &mut self.sink {
+            let _ = writeln!(
+                w,
+                "# warning\t{context}\t{frame}\t{caller:08x}\t{api}\t{reason:?}\t{}",
+                sample.unwrap_or("")
+            );
+        }
+    }
+
     /// A comment preserves the five-column oracle format and makes truncation explicit.
     pub fn note_variadic(&mut self, module: &str, name: &str, fixed: u8) {
         if let Some(w) = &mut self.sink

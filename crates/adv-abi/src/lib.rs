@@ -18,6 +18,8 @@ use std::collections::HashMap;
 pub use adv_abi_macros::win32;
 pub use adv_machine::{Conv, Env, Handler, HostFn, Outcome};
 
+#[doc(hidden)]
+pub mod capability;
 pub mod code_signature;
 pub mod constants;
 pub mod guest;

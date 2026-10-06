@@ -110,7 +110,20 @@ fn bounded_text(text: String, characters: usize, truncated: &mut u64) -> String 
 /// This shares the existing per-machine diagnostics owner and bounds distinct
 /// reasons; repeated glyphs or capability probes do not flood stderr.
 pub fn warn_unavailable(env: &mut Env<'_>, api: &str, reason: &str) {
+    if crate::capability::defer_warning(env, api, reason) {
+        return;
+    }
     let caller = env.caller();
+    emit_warning(env, api, reason, caller, None);
+}
+
+pub(crate) fn emit_warning(
+    env: &mut Env<'_>,
+    api: &str,
+    reason: &str,
+    caller: u32,
+    sample: Option<&str>,
+) {
     let diagnostics = env.ext.get_or_default::<ApiDiagnostics>();
     let key = (api.to_owned(), reason.to_owned());
     if let Some(count) = diagnostics.warnings.get_mut(&key) {
@@ -120,11 +133,25 @@ pub fn warn_unavailable(env: &mut Env<'_>, api: &str, reason: &str) {
         eprintln!(
             "warning: {api}: {reason} (guest caller {caller:#010x}; repetitions counted in report)"
         );
+        if let Some(sample) = sample {
+            eprintln!("  first rejected call arguments: {sample}");
+        }
+        env.sys
+            .trace
+            .warning(env.context, env.sys.frame, caller, api, reason, sample);
     } else {
         diagnostics.unrecorded_warnings = diagnostics.unrecorded_warnings.saturating_add(1);
         if diagnostics.unrecorded_warnings == 1 {
             eprintln!(
                 "warning: additional distinct compatibility warnings omitted; see report count"
+            );
+            env.sys.trace.warning(
+                env.context,
+                env.sys.frame,
+                caller,
+                api,
+                "additional distinct compatibility warnings omitted; see report count",
+                None,
             );
         }
     }

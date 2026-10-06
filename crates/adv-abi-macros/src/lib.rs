@@ -168,6 +168,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
     let mut decode = Vec::new();
     let mut names = Vec::new();
     let mut stack_words: u16 = 0;
+    let mut selectors = Vec::new();
     for (i, (parameter, expected)) in sig.inputs.iter().skip(1).zip(metadata).enumerate() {
         let FnArg::Typed(parameter) = parameter else {
             return Err(syn::Error::new_spanned(
@@ -180,6 +181,25 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
         let words: u8 = expected[3]
             .parse()
             .map_err(|_| syn::Error::new_spanned(ty, "invalid generated stack width"))?;
+        if words == 1
+            && matches!(expected[2], "u32" | "i32")
+            && matches!(
+                expected[0],
+                "State"
+                    | "Type"
+                    | "Format"
+                    | "CheckFormat"
+                    | "Usage"
+                    | "Pool"
+                    | "Stage"
+                    | "Sampler"
+                    | "DeviceType"
+            )
+        {
+            let selector = expected[0];
+            let word = stack_words as u8;
+            selectors.push(quote!((#selector, #word)));
+        }
         stack_words += u16::from(words);
         let parameter_name = format_ident!("__win32_arg_{i}");
         let message = format!(
@@ -215,6 +235,17 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
     let descriptor = format_ident!("{ident}_ABI");
     let visibility = &function.vis;
     let return_message = format!("{module}!{name} has an incompatible guest return type");
+    let invoke = quote!(::adv_abi::GuestReturn::into_outcome(#ident(__win32_env, #(#names),*)));
+    let invoke = if module == "d3d9.dll" && fields[4] == "Windows.Win32.Foundation.HRESULT" {
+        let api = format!("{module}!{name}");
+        quote! {
+            ::adv_abi::capability::begin(__win32_env, #api, #stack_words, &[#(#selectors),*]);
+            let __win32_outcome = #invoke;
+            ::adv_abi::capability::finish(__win32_env, __win32_outcome)
+        }
+    } else {
+        invoke
+    };
     Ok(quote! {
         #function
         const _: () = {
@@ -226,7 +257,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
         fn #adapter(__win32_env: &mut ::adv_abi::Env<'_>) -> ::adv_abi::Outcome {
             let mut __win32_arguments = ::adv_abi::Arguments::new(__win32_env.cpu);
             #(#decode)*
-            ::adv_abi::GuestReturn::into_outcome(#ident(__win32_env, #(#names),*))
+            #invoke
         }
         #[allow(non_upper_case_globals)]
         #visibility const #descriptor: ::adv_abi::Api = ::adv_abi::Api {
