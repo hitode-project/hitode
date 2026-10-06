@@ -26,6 +26,12 @@ pub struct UserObjects {
 }
 
 impl UserObjects {
+    pub(super) fn contains(&self, objects: &Objects, handle: u32) -> bool {
+        self.index
+            .get(&handle)
+            .is_some_and(|&id| objects.owned(id).is_some())
+    }
+
     fn namespace(&mut self, objects: &mut Objects) -> Option<Namespace> {
         if self.namespace.is_none() {
             self.namespace = objects.new_namespace_in(0x0007_0000, 0x00ff_fffc);

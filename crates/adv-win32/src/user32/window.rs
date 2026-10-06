@@ -435,6 +435,7 @@ pub struct User {
     pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
     pub cursor_count: i32,
+    pub cursor_handle: u32,
     pub locked_window: Option<u32>,
 }
 
@@ -472,6 +473,7 @@ impl User {
             clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
             cursor_count: 0,
+            cursor_handle: 0,
             locked_window: None,
         };
         let desktop = u.add_class_raw("#32769", 0, 0, 0, 0);
