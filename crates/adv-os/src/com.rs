@@ -11,6 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use adv_machine::{Env, Identity, Namespace, Objects, Outcome};
 
+mod automation;
+pub use automation::{
+    AutomationStrings, MAX_BSTR_BYTES, alloc_bstr, copy_bstr, free_bstr, owns_bstr,
+};
+
 /// Bytes in the guest GUID's little-endian in-memory layout.
 pub type Iid = [u8; 16];
 pub const IUNKNOWN: Iid = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];

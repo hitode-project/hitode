@@ -5,24 +5,13 @@ use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::Heaps;
-use adv_os::com::TaskMemory;
+use adv_os::com::{MAX_BSTR_BYTES, TaskMemory, copy_bstr, free_bstr, owns_bstr};
 
 use crate::stdcall;
 
-const MAX_BSTR_BYTES: u32 = 16 * 1024 * 1024;
-#[derive(Default)]
-struct Memory {
-    strings: BTreeSet<u32>,
-}
 /// Task allocations are shared with other COM fronts (DirectShow media types).
 fn task<'a>(env: &'a mut Env<'_>) -> &'a mut BTreeSet<u32> {
     &mut env.ext.get_or_default::<TaskMemory>().allocations
-}
-fn state<'a>(env: &'a mut Env<'_>) -> &'a mut Memory {
-    if env.ext.try_get::<Memory>().is_none() {
-        env.ext.insert(Memory::default());
-    }
-    env.ext.get_mut::<Memory>()
 }
 fn allocate(env: &mut Env<'_>, size: u32) -> u32 {
     if size.checked_add(0xffff).is_none() {
@@ -103,36 +92,6 @@ fn text_length(env: &Env<'_>, pointer: u32) -> Option<u32> {
     }
     None
 }
-fn new_string(env: &mut Env<'_>, source: u32, bytes: u32) -> u32 {
-    if bytes > MAX_BSTR_BYTES || (source != 0 && !env.cpu.accessible(source, bytes, Prot::READ)) {
-        return 0;
-    }
-    let base = allocate(env, bytes + 6);
-    if base == 0 {
-        return 0;
-    }
-    let pointer = base + 4;
-    let mut buffer = [0u8; 4096];
-    let result = (|| {
-        env.cpu.write_u32(base, bytes).ok()?;
-        if source != 0 {
-            let mut at = 0;
-            while at < bytes {
-                let n = (bytes - at).min(buffer.len() as u32);
-                env.cpu.read(source + at, &mut buffer[..n as usize]).ok()?;
-                env.cpu.write(pointer + at, &buffer[..n as usize]).ok()?;
-                at += n;
-            }
-        }
-        env.cpu.write(pointer + bytes, &[0, 0]).ok()
-    })();
-    if result.is_none() {
-        free(env, base);
-        return 0;
-    }
-    state(env).strings.insert(pointer);
-    pointer
-}
 fn string_alloc(env: &mut Env<'_>, form: u8) -> Outcome {
     let source = env.arg(0);
     if form == 0 && source == 0 {
@@ -143,15 +102,12 @@ fn string_alloc(env: &mut Env<'_>, form: u8) -> Outcome {
         1 => env.arg(1).checked_mul(2),
         _ => Some(env.arg(1)),
     };
-    Outcome::Return(bytes.map_or(0, |bytes| new_string(env, source, bytes)))
+    Outcome::Return(bytes.map_or(0, |bytes| copy_bstr(env, source, bytes)))
 }
 fn string_free(env: &mut Env<'_>) -> Outcome {
     let pointer = env.arg(0);
-    if pointer != 0 {
-        if !state(env).strings.remove(&pointer) {
-            return Outcome::Fail(format!("SysFreeString: invalid BSTR {pointer:#x}"));
-        }
-        free(env, pointer - 4);
+    if !free_bstr(env, pointer) {
+        return Outcome::Fail(format!("SysFreeString: invalid BSTR {pointer:#x}"));
     }
     Outcome::Return(0)
 }
@@ -174,7 +130,7 @@ fn string_realloc(env: &mut Env<'_>, counted: bool) -> Outcome {
         return Outcome::Return(0);
     }
     let old = env.cpu.read_u32(output).unwrap();
-    if old != 0 && !state(env).strings.contains(&old) {
+    if old != 0 && !owns_bstr(env, old) {
         return Outcome::Fail(format!("SysReAllocString: invalid BSTR {old:#x}"));
     }
     let null = !counted && source == 0;
@@ -190,7 +146,7 @@ fn string_realloc(env: &mut Env<'_>, counted: bool) -> Outcome {
             return Outcome::Return(0);
         };
         // Allocate/copy before retiring old, including source aliases of old.
-        let pointer = new_string(env, source, bytes);
+        let pointer = copy_bstr(env, source, bytes);
         if pointer == 0 {
             return Outcome::Return(0);
         }
@@ -198,14 +154,12 @@ fn string_realloc(env: &mut Env<'_>, counted: bool) -> Outcome {
     };
     if let Err(error) = env.cpu.write_u32(output, pointer) {
         if pointer != 0 {
-            state(env).strings.remove(&pointer);
-            free(env, pointer - 4);
+            free_bstr(env, pointer);
         }
         return Outcome::Fail(error.to_string());
     }
     if old != 0 {
-        state(env).strings.remove(&old);
-        free(env, old - 4);
+        free_bstr(env, old);
     }
     Outcome::Return(1)
 }
@@ -227,8 +181,11 @@ fn variant_clear(env: &mut Env<'_>) -> Outcome {
             if vt == 8 {
                 if let Ok(bstr) = env.cpu.read_u32(p + 8) {
                     if bstr != 0 {
-                        state(env).strings.remove(&bstr);
-                        free(env, bstr.saturating_sub(4));
+                        if !free_bstr(env, bstr) {
+                            // Preserve VariantClear's existing best-effort
+                            // invalid-BSTR behavior while sharing valid ownership.
+                            free(env, bstr.saturating_sub(4));
+                        }
                     }
                 }
             }
