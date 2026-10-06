@@ -177,6 +177,10 @@ pub struct Class {
     pub cursor: u32,
     pub background: u32,
     pub menu_name: u32,
+    /// Registration-time menu resource text, independent of the caller's buffer.
+    pub menu_text: Option<String>,
+    /// USER-owned A/W query strings, retained until this class is unregistered.
+    pub menu_query_strings: [u32; 2],
     /// Built-in classes support both encodings; guest classes use their registered ABI.
     pub unicode: Option<bool>,
 }
@@ -522,6 +526,8 @@ impl User {
             cursor: 0,
             background: 0,
             menu_name: 0,
+            menu_text: None,
+            menu_query_strings: [0; 2],
             unicode: None,
         });
         self.classes.len() - 1
@@ -754,6 +760,15 @@ fn register_class_w(env: &mut Env<'_>, extended: bool) -> Outcome {
 }
 
 fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) -> Outcome {
+    let menu_text = if f[8] >= 0x1_0000 {
+        let Some(text) = super::message::read_text(env, f[8], wide) else {
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        };
+        Some(text)
+    } else {
+        None
+    };
     let key = if wide && f[9] >= 0x1_0000 {
         ClassKey::Name(String::from_utf16_lossy(&crate::util::wstr(env.cpu, f[9])))
     } else {
@@ -774,6 +789,7 @@ fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) ->
     let i = u.add_class_raw(&name, f[0], f[1], f[3], f[4]);
     let c = &mut u.classes[i];
     (c.cls_extra, c.icon, c.cursor, c.background, c.menu_name) = (f[2], f[5], f[6], f[7], f[8]);
+    c.menu_text = menu_text;
     c.unicode = Some(wide);
     let atom = c.atom;
     super::menu::class_menu(env, i, f[8], wide);
@@ -791,21 +807,72 @@ fn unregister_class_a(env: &mut Env<'_>) -> Outcome {
     if u.classes[i].instance == 0 || u.windows.values(&env.sys.objects).any(|w| w.class == i) {
         return Outcome::Return(0);
     }
-    // Keep indices stable: blank the slot.
+    let strings = std::mem::take(&mut u.classes[i].menu_query_strings);
+    // Keep indices stable: blank the slot and retire its owned query strings.
     u.classes[i].name.clear();
+    u.classes[i].menu_text = None;
+    for pointer in strings {
+        if pointer != 0 {
+            temp_free(env, pointer);
+        }
+    }
     Outcome::Return(1)
 }
 
 fn get_class_info_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name, out) = (env.arg(0), env.arg(1), env.arg(2));
-    let key = ClassKey::read(env, name);
-    let u = user(env);
-    let Some(i) = u.find_class(&key, inst) else {
+    get_class_info(env, inst, name, out, false)
+}
+
+#[win32(user32, name = "GetClassInfoW", level = state)]
+fn get_class_info_w(
+    env: &mut Env<'_>,
+    instance: AbiHandle,
+    name: WideStr,
+    out: GuestPtr<u8>,
+) -> Outcome {
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), true)
+}
+
+fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool) -> Outcome {
+    let api = if wide {
+        "user32.dll!GetClassInfoW"
+    } else {
+        "user32.dll!GetClassInfoA"
+    };
+    if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        adv_abi::warn_unavailable(env, api, "class query ANSI code page has no supported encoder");
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    let key = if name < 0x1_0000 {
+        ClassKey::Atom(name as u16)
+    } else {
+        let Some(text) = super::message::read_text(env, name, wide) else {
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        };
+        ClassKey::Name(text)
+    };
+    let Some(i) = user(env).find_class(&key, inst) else {
         set_last_error(env, 1411); // ERROR_CLASS_DOES_NOT_EXIST
         return Outcome::Return(0);
     };
+    let u = user(env);
     let c = &u.classes[i];
-    let f = [
+    if c.unicode.is_some_and(|registered_wide| registered_wide != wide) {
+        // Native returns an A/W procedure thunk for a custom class queried via
+        // the opposite encoding. A raw guest procedure is not that thunk.
+        adv_abi::warn_unavailable(env, api, "cross-encoding custom class procedure thunk is unavailable");
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    if adv_abi::guest::check_range(env.cpu, out, 40, adv_cpu::backend::Prot::WRITE).is_err() {
+        // The checked-pointer profile reports 998 rather than reproducing a native AV.
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    let mut f = [
         c.style,
         c.proc,
         c.cls_extra,
@@ -818,9 +885,30 @@ fn get_class_info_a(env: &mut Env<'_>) -> Outcome {
         name,
     ];
     let atom = c.atom;
-    for (i, v) in f.into_iter().enumerate() {
-        let _ = env.cpu.write_u32(out + 4 * i as u32, v);
+    let encoding = usize::from(wide);
+    let mut allocated = 0;
+    if let Some(text) = c.menu_text.clone() {
+        f[8] = c.menu_query_strings[encoding];
+        if f[8] == 0 {
+            allocated = super::message::guest_text(env, &text, wide);
+            if allocated == 0 {
+                set_last_error(env, 8);
+                return Outcome::Return(0);
+            }
+            f[8] = allocated;
+        }
     }
+    let bytes: Vec<_> = f.into_iter().flat_map(u32::to_le_bytes).collect();
+    if env.cpu.write(out, &bytes).is_err() {
+        temp_free(env, allocated);
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
+    if allocated != 0 {
+        user_mut(env).classes[i].menu_query_strings[encoding] = allocated;
+    }
+    // Native preserves LastError, returns the class atom as its nonzero BOOL,
+    // and copies the original name/atom argument into lpszClassName.
     Outcome::Return(u32::from(atom))
 }
 
@@ -2393,6 +2481,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "RegisterClassExA", 1, register_class_ex_a);
     s(reg, "UnregisterClassA", 2, unregister_class_a);
     s(reg, "GetClassInfoA", 3, get_class_info_a);
+    reg.register(get_class_info_w_ABI);
     s(reg, "GetClassNameA", 3, get_class_name_a);
     s(reg, "CreateWindowExA", 12, create_window_ex_a);
     reg.register(create_window_ex_w_ABI);
