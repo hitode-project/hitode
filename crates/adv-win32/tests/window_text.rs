@@ -95,6 +95,7 @@ impl<B: TestCpu> Fixture<B> {
             ("SetWindowTextW", 2),
             ("GetWindowTextW", 3),
             ("GetWindowTextLengthW", 1),
+            ("SendMessageW", 4),
         ] {
             assert_eq!(
                 registry.get("user32.dll", name).unwrap().conv,
@@ -186,6 +187,10 @@ impl<B: TestCpu> Fixture<B> {
             "DefWindowProcA"
         });
         let length = self.function("GetWindowTextLengthW");
+        on_message(&mut code, 0x8033, |code| {
+            value(code, 0xfedcba98);
+            code.ret_n(16);
+        });
         on_message(&mut code, wm::SETTEXT, |code| {
             if let Some((flag, result)) = reenter {
                 code.cmp_mem_imm8(flag, 1);
@@ -554,4 +559,85 @@ fn guards<B: TestCpu>(cpu: B, cp: u32) {
 fn window_text_guards_reject_bad_ranges_before_callbacks_and_preserve_unicode_without_ansi_codec() {
     guards(UnicornCpu::new(PARK_ADDR).unwrap(), 936);
     guards(JitCpu::new(PARK_ADDR, true).unwrap(), 437);
+}
+
+fn send_front<B: TestCpu>(cpu: B) {
+    let mut test = Fixture::new(cpu, 936);
+    let copied_a = test.alloc(64);
+    let copied_w = test.alloc(64);
+    let reenter = test.bytes(&1_u32.to_le_bytes());
+    let nested_result = test.alloc(4);
+    let proc_a = test.callback(false, copied_a, Some((reenter, nested_result)));
+    let proc_w = test.callback(true, copied_w, None);
+    let a = test.window(false, proc_a);
+    let w = test.window(true, proc_w);
+    let text = test.text("中A", true);
+    let first_a = test.call("SendMessageW", &[M(a), I(wm::SETTEXT), I(0), I(text)]);
+    let first_w = test.call("SendMessageW", &[M(w), I(wm::SETTEXT), I(0), I(text)]);
+    let length = test.call("SendMessageW", &[M(a), I(wm::GETTEXTLENGTH), I(0), I(0)]);
+    let output = test.alloc(32);
+    let get = test.call("SendMessageW", &[M(a), I(wm::GETTEXT), I(8), I(output)]);
+    // Ordinary nontext message arguments are opaque, including signed LPARAM
+    // and LRESULT bit patterns; no text marshaling may reinterpret them.
+    let ordinary = test.call(
+        "SendMessageW",
+        &[M(w), I(0x8033), I(0x12345678), I(0x87654321)],
+    );
+    let icon = test.call("SendMessageW", &[M(a), I(0x80), I(0), I(0x70000)]);
+    let broadcast_text = test.text("星B", true);
+    let broadcast = test.call(
+        "SendMessageW",
+        &[I(0xffff), I(wm::SETTEXT), I(0), I(broadcast_text)],
+    );
+    test.run();
+    assert_eq!((test.value(first_a), test.value(first_w)), (0x55, 0x55));
+    assert_eq!(test.value(nested_result), 3);
+    assert_eq!((test.value(length), test.value(get)), (2, 2));
+    assert_eq!(test.read(output, 6), utf16("中A"));
+    assert_eq!(test.value(ordinary), 0xfedcba98);
+    assert_eq!(
+        test.rows(test.value(w), 0x8033),
+        [[test.value(w), 0x8033, 0x12345678, 0x87654321]]
+    );
+    assert_eq!(
+        test.rows(test.value(a), 0x80),
+        [[test.value(a), 0x80, 0, 0x70000]]
+    );
+    assert_eq!(test.value(icon), 0); // Actual guest default-procedure return.
+    assert_eq!(test.value(broadcast), 1);
+    let mut ansi = test.machine.ext.get::<Win32>().codec.encode("星B");
+    ansi.push(0);
+    assert_eq!(test.read(copied_a, ansi.len()), ansi);
+    assert_eq!(test.read(copied_w, 6), utf16("星B"));
+    for hwnd in [test.value(a), test.value(w)] {
+        assert_eq!(
+            test.machine
+                .ext
+                .get::<Win32>()
+                .user
+                .windows
+                .get(&test.machine.sys.objects, &hwnd)
+                .unwrap()
+                .text,
+            "星B"
+        );
+    }
+    let sets_a = test.rows(test.value(a), wm::SETTEXT);
+    let sets_w = test.rows(test.value(w), wm::SETTEXT);
+    assert_eq!(sets_w[0][3], text);
+    assert_ne!(sets_a[0][3], text);
+    for row in sets_a {
+        assert_eq!(test.machine.ext.get::<adv_os::Heaps>().owner(row[3]), None);
+    }
+    assert_eq!(
+        test.machine.ext.get::<adv_abi::ApiDiagnostics>().stub_calls,
+        0
+    );
+}
+
+#[test]
+fn send_message_w_front_dispatches_opaque_parameters_unicode_text_and_real_guest_results() {
+    send_front(UnicornCpu::new(PARK_ADDR).unwrap());
+    send_front(JitCpu::new(PARK_ADDR, false).unwrap());
+    send_front(JitCpu::new(PARK_ADDR, true).unwrap());
 }

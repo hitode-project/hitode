@@ -1351,11 +1351,38 @@ pub fn post_quit(env: &mut Env<'_>, code: u32) {
 
 fn send_message_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    send_message(env, hwnd, msg, wp, lp, false)
+}
+
+#[win32(user32, name = "SendMessageW", level = implement)]
+fn send_message_w(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> Outcome {
+    send_message(env, hwnd.0, msg, wp, lp as u32, true)
+}
+
+fn send_message(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> Outcome {
     if hwnd == 0xffff {
-        let tops: VecDeque<[u32; 4]> = user(env).top.iter().map(|&t| [t, msg, wp, lp]).collect();
-        return send_all(env, tops, |_| Outcome::Return(1));
+        let tops = user(env).top.iter().copied().collect();
+        return broadcast_encoded(env, tops, msg, wp, lp, wide);
     }
-    send_encoded(env, hwnd, msg, wp, lp, false, |_, r| Outcome::Return(r))
+    send_encoded(env, hwnd, msg, wp, lp, wide, |_, r| Outcome::Return(r))
+}
+
+fn broadcast_encoded(
+    env: &mut Env<'_>,
+    mut windows: VecDeque<u32>,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> Outcome {
+    let Some(hwnd) = windows.pop_front() else {
+        return Outcome::Return(1);
+    };
+    // A broadcast can reach both class encodings. Each receiver uses the same
+    // conversion, callback and cross-thread send lifetime as an ordinary send.
+    send_encoded(env, hwnd, msg, wp, lp, wide, move |env, _| {
+        broadcast_encoded(env, windows, msg, wp, lp, wide)
+    })
 }
 
 fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
@@ -1795,6 +1822,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "PostThreadMessageA", 4, post_thread_message_a);
     s(reg, "PostQuitMessage", 1, post_quit_message);
     s(reg, "SendMessageA", 4, send_message_a);
+    reg.register(send_message_w_ABI);
     s(reg, "SendMessageTimeoutA", 7, send_message_timeout_a);
     s(reg, "InSendMessage", 0, sent::in_send);
     s(reg, "ReplyMessage", 1, sent::reply_message);
