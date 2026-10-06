@@ -864,6 +864,27 @@ fn validating_then_invalidating_paint_becomes_new_without_an_intervening_query()
 }
 
 #[test]
+fn invalidating_every_window_never_queues_a_desktop_paint() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let desktop = t.call(&mut a, "GetDesktopWindow", &[]);
+    t.call(&mut a, "InvalidateRect", &[I(0), I(0), I(0)]);
+    let status = t.call(&mut a, "GetQueueStatus", &[I(0x20)]);
+    let msg = t.alloc(28);
+    let peeked = t.call(
+        &mut a,
+        "PeekMessageA",
+        &[I(msg), I(0), I(wm::PAINT), I(wm::PAINT), I(1)],
+    );
+    // The desktop has no guest window procedure; the system paints it.
+    let updated = t.call(&mut a, "UpdateWindow", &[M(desktop)]);
+    t.run(a);
+    assert_eq!(t.u32(status), 0);
+    assert_eq!(t.u32(peeked), 0);
+    assert_eq!(t.u32(updated), 1);
+}
+
+#[test]
 fn create_visible_windows_notifies_parent_then_shows_and_activates() {
     let mut t = T::new();
     let mut a = Asm::new(CODE);

@@ -744,7 +744,7 @@ fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
     let paint = u
         .windows
         .values(&env.sys.objects)
-        .any(|w| w.thread == ctx && w.needs_paint && w.visible() && !w.destroying);
+        .any(|w| w.thread == ctx && u.paints(w));
     let q = u.queue(ctx);
     let generated = (u32::from(paint) * QS_PAINT)
         | (u32::from(q.timers.iter().any(|t| t.due_us <= now)) * QS_TIMER);
@@ -883,9 +883,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
     if f.range(wm::PAINT) {
         let paint = u.windows.values(&env.sys.objects).find(|w| {
             w.thread == ctx
-                && w.needs_paint
-                && w.visible()
-                && !w.destroying
+                && u.paints(w)
                 && (f.hwnd == 0
                     || w.hwnd == f.hwnd
                     || is_descendant(u, &env.sys.objects, w.hwnd, f.hwnd))
