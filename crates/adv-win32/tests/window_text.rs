@@ -650,3 +650,6 @@ mod queue_w;
 
 #[path = "window_text/window_long.rs"]
 mod window_long;
+
+#[path = "window_text/encoding.rs"]
+mod encoding;

@@ -109,11 +109,13 @@ impl Fixture {
             );
             assert!(registry.dynamic_available("user32.dll", api));
         }
-        assert_eq!(
-            registry.get("user32.dll", "LoadCursorW").unwrap().conv,
-            adv_abi::Conv::Stdcall { argc: 2 }
-        );
-        assert!(registry.dynamic_available("user32.dll", "LoadCursorW"));
+        for api in ["LoadCursorW", "LoadIconA", "LoadIconW"] {
+            assert_eq!(
+                registry.get("user32.dll", api).unwrap().conv,
+                adv_abi::Conv::Stdcall { argc: 2 }
+            );
+            assert!(registry.dynamic_available("user32.dll", api));
+        }
         assert!(registry.signature_conflicts().is_empty());
         let mut machine = Machine::new(
             JitCpu::new(PARK_ADDR, jit).unwrap(),
@@ -512,6 +514,7 @@ fn load_cursor_w_keeps_system_identity_and_shares_checked_unicode_resource_state
         let system_w = test.call("LoadCursorW", &[I(0), I(32512)]);
         let system_a = test.call("LoadCursorA", &[I(0), I(32512)]);
         let selected = test.call("SetCursor", &[M(system_w)]);
+        let current = test.call("GetCursor", &[]);
         test.call("DestroyCursor", &[M(system_w)]);
         let system_again = test.call("LoadCursorW", &[I(0), I(32512)]);
         let named_w = test.call("LoadCursorW", &[I(module), I(name_w)]);
@@ -533,7 +536,8 @@ fn load_cursor_w_keeps_system_identity_and_shares_checked_unicode_resource_state
         test.run();
         assert_ne!(test.value(system_w), 0);
         assert_eq!(test.value(system_w), test.value(system_a));
-        assert_eq!(test.value(system_w), test.value(selected));
+        assert_eq!(test.value(selected), 0); // SetCursor returns the previous cursor.
+        assert_eq!(test.value(system_w), test.value(current));
         assert_eq!(test.value(system_w), test.value(system_again));
         assert_ne!(test.value(named_w), 0);
         assert_eq!(test.value(named_w), test.value(named_a));
@@ -554,6 +558,114 @@ fn load_cursor_w_keeps_system_identity_and_shares_checked_unicode_resource_state
                 .keys()
                 .any(|key| key.0 == "user32.dll!LoadCursorW"
                     && key.1.contains("headless resource identity"))
+        );
+    }
+}
+
+#[test]
+fn load_icon_stock_shares_ansi_unicode_image_identity_without_aliasing_cursor_or_claiming_pixels() {
+    // Owned native LoadIcon/LoadImage probe: stock A/W identity survives
+    // DestroyIcon and is distinct from the same-numbered stock cursor.
+    for jit in [false, true] {
+        let mut test = Fixture::new(jit);
+        let baseline = test.machine.sys.objects.object_count();
+        test.call("kernel32.dll!SetLastError", &[I(0x12345678)]);
+        let wide = test.call("LoadIconW", &[I(0), I(32516)]); // Actual IDI_INFORMATION path.
+        let last_error = test.call("kernel32.dll!GetLastError", &[]);
+        let ansi = test.call("LoadIconA", &[I(0), I(32516)]);
+        let image = test.load(true, 0, 32516, 0, 0, DEFAULT_SIZE | SHARED);
+        let cursor = test.call("LoadCursorW", &[I(0), I(32516)]);
+        test.call("DestroyIcon", &[M(wide)]);
+        let again = test.call("LoadIconW", &[I(0), I(32516)]);
+        test.run();
+        let handle = test.value(wide);
+        assert_ne!(handle, 0);
+        for result in [ansi, image, again] {
+            assert_eq!(test.value(result), handle);
+        }
+        assert_eq!(test.value(last_error), 0x12345678);
+        let cursor = test.value(cursor);
+        assert_eq!(
+            cursor,
+            super::super::window::SYSTEM_OBJECT_BASE + (32516 & 0xfff) * 4
+        );
+        assert_ne!(handle, cursor);
+        let objects = &test.machine.ext.get::<Win32>().user.objects;
+        assert!(objects.contains(&test.machine.sys.objects, handle));
+        assert!(objects.contains(&test.machine.sys.objects, cursor));
+        assert!(objects.image(&test.machine.sys.objects, handle).is_none());
+        assert!(test.machine.sys.objects.get(handle).is_none());
+        assert_eq!(test.machine.sys.objects.object_count(), baseline + 3); // Two stocks and one thread.
+        let diagnostic = test.machine.ext.get::<adv_abi::ApiDiagnostics>();
+        assert_eq!(diagnostic.stub_calls, 0);
+        assert_eq!(diagnostic.warnings.len(), 3);
+        for api in ["LoadIconA", "LoadIconW", "LoadImageW"] {
+            assert!(diagnostic.warnings.keys().any(|key| {
+                key.0 == format!("user32.dll!{api}")
+                    && key.1.contains("stock pixel data is unavailable")
+            }));
+        }
+    }
+}
+
+#[test]
+fn load_icon_module_decodes_default_size_shares_resource_cache_and_checks_names_before_allocation()
+{
+    for jit in [false, true] {
+        let mut test = Fixture::new(jit);
+        let module = test.resource();
+        let name_a = test.text("図像", false);
+        let name_w = test.text("図像", true);
+        let ordinal = test.text("#101", true);
+        let missing = test.text("missing", true);
+        let malformed = test.bytes(&[0x00, 0xd8, 0, 0]);
+        test.machine.cpu.write(DATA + 4094, &[b'X', 0]).unwrap();
+        let baseline = test.machine.sys.objects.object_count();
+        let wide = test.call("LoadIconW", &[I(module), I(101)]);
+        let ansi = test.call("LoadIconA", &[I(module), I(101)]);
+        let id_string = test.call("LoadIconW", &[I(module), I(ordinal)]);
+        let image = test.load(true, module, 101, 16, 16, SHARED);
+        let named_a = test.call("LoadIconA", &[I(module), I(name_a)]);
+        let named_w = test.call("LoadIconW", &[I(module), I(name_w)]);
+        test.call("DestroyIcon", &[M(wide)]);
+        let again = test.call("LoadIconW", &[I(module), I(101)]);
+        let mut failures = Vec::new();
+        for (instance, name, error) in [
+            (module, 0xdead0000, 998),
+            (module, DATA + 4094, 998),
+            (module, malformed, 1113),
+            (module, missing, 1814),
+            (0xdead0000, 101, 126),
+            (0, 0, 1814),
+        ] {
+            let result = test.call("LoadIconW", &[I(instance), I(name)]);
+            let last_error = test.call("kernel32.dll!GetLastError", &[]);
+            failures.push((result, last_error, error));
+        }
+        test.run();
+        for result in [ansi, id_string, image, again] {
+            assert_eq!(test.value(result), test.value(wide));
+        }
+        assert_ne!(test.value(wide), test.value(named_w));
+        assert_eq!(test.value(named_a), test.value(named_w));
+        for result in [wide, named_a] {
+            let image = test.image(result);
+            // Guest SM_CXICON/SM_CYICON are 32; native host DPI is independent.
+            assert_eq!((image.width, image.height), (32, 32));
+            assert!(image.pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+            assert!(image.mask.iter().all(|&p| p == 0));
+        }
+        for (result, last_error, expected) in failures {
+            assert_eq!((test.value(result), test.value(last_error)), (0, expected));
+        }
+        assert_eq!(test.machine.sys.objects.object_count(), baseline + 3); // Two cached icons and one thread.
+        let diagnostic = test.machine.ext.get::<adv_abi::ApiDiagnostics>();
+        assert_eq!(diagnostic.stub_calls, 0);
+        assert_eq!(diagnostic.warnings.len(), 1);
+        assert!(
+            diagnostic.warnings.keys().any(|key| {
+                key.0 == "user32.dll!LoadIconW" && key.1.contains("unpaired UTF-16")
+            })
         );
     }
 }

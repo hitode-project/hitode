@@ -1,4 +1,4 @@
-//! LoadImage fronts share guest paths, module resources and ordinary USER owners.
+//! LoadImage/LoadIcon fronts share guest paths, module resources and USER owners.
 pub(crate) mod decode;
 
 use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, guest::check_range, win32};
@@ -28,12 +28,25 @@ fn unsupported(env: &mut Env<'_>, api: &str, reason: &str, error: u32) -> Handle
     fail(env, error)
 }
 
+fn name_failure(env: &mut Env<'_>, api: &str, error: u32) -> Handle {
+    if error == 1113 {
+        unsupported(
+            env,
+            api,
+            "image resource/path names containing unpaired UTF-16 surrogates are unsupported",
+            error,
+        )
+    } else {
+        fail(env, error)
+    }
+}
+
 fn name(env: &Env<'_>, pointer: u32, wide: bool) -> Result<String, u32> {
     if wide {
         WideStr(GuestPtr::new(pointer))
             .read(env.cpu, MAX_STR)
-            .map(|text| String::from_utf16_lossy(&text))
             .map_err(|_| 998)
+            .and_then(|text| String::from_utf16(&text).map_err(|_| 1113))
     } else {
         AnsiStr(GuestPtr::new(pointer))
             .read(env.cpu, MAX_STR)
@@ -72,7 +85,7 @@ pub(super) fn load_cursor(env: &mut Env<'_>, instance: u32, pointer: u32, wide: 
                 50,
             );
         }
-        Err(error) => return fail(env, error),
+        Err(error) => return name_failure(env, api, error),
     };
     if instance == 0 {
         let ResId::Id(id) = id else {
@@ -258,12 +271,8 @@ fn load(
     cy: i32,
     flags: u32,
     wide: bool,
+    api: &str,
 ) -> Handle {
-    let api = if wide {
-        "user32.dll!LoadImageW"
-    } else {
-        "user32.dll!LoadImageA"
-    };
     if cx < 0 || cy < 0 || ty > CURSOR {
         return fail(env, 87);
     }
@@ -323,7 +332,7 @@ fn load(
         }
         let path = match name(env, pointer, wide) {
             Ok(path) => path,
-            Err(error) => return fail(env, error),
+            Err(error) => return name_failure(env, api, error),
         };
         let bytes = match file_bytes(env, &path, api) {
             Ok(bytes) => bytes,
@@ -370,6 +379,13 @@ fn load(
         if !valid {
             return fail(env, 1814);
         }
+        if ty == ICON {
+            adv_abi::warn_unavailable(
+                env,
+                api,
+                "predefined icon retains shared headless identity; stock pixel data is unavailable",
+            );
+        }
         let adv_machine::Outcome::Return(handle) =
             super::load_user_object(env, if ty == ICON { "icon" } else { "cursor" }, 0, pointer)
         else {
@@ -386,7 +402,7 @@ fn load(
     };
     let id = match resource_id(env, pointer, wide) {
         Ok(id) => id,
-        Err(error) => return fail(env, error),
+        Err(error) => return name_failure(env, api, error),
     };
     if ty == CURSOR {
         return cursor_metadata(env, instance, &id, flags & SHARED != 0, api);
@@ -436,7 +452,17 @@ fn load_a(
     cy: i32,
     flags: u32,
 ) -> Handle {
-    load(env, instance.0, image.0.addr(), ty, cx, cy, flags, false)
+    load(
+        env,
+        instance.0,
+        image.0.addr(),
+        ty,
+        cx,
+        cy,
+        flags,
+        false,
+        "user32.dll!LoadImageA",
+    )
 }
 #[win32(user32, name = "LoadImageW", level = implement)]
 fn load_w(
@@ -448,11 +474,54 @@ fn load_w(
     cy: i32,
     flags: u32,
 ) -> Handle {
-    load(env, instance.0, image.0.addr(), ty, cx, cy, flags, true)
+    load(
+        env,
+        instance.0,
+        image.0.addr(),
+        ty,
+        cx,
+        cy,
+        flags,
+        true,
+        "user32.dll!LoadImageW",
+    )
 }
+
+#[win32(user32, name = "LoadIconA", level = implement)]
+fn load_icon_a(env: &mut Env<'_>, instance: Handle, icon: AnsiStr) -> Handle {
+    load(
+        env,
+        instance.0,
+        icon.0.addr(),
+        ICON,
+        0,
+        0,
+        DEFAULT_SIZE | SHARED,
+        false,
+        "user32.dll!LoadIconA",
+    )
+}
+
+#[win32(user32, name = "LoadIconW", level = implement)]
+fn load_icon_w(env: &mut Env<'_>, instance: Handle, icon: WideStr) -> Handle {
+    load(
+        env,
+        instance.0,
+        icon.0.addr(),
+        ICON,
+        0,
+        0,
+        DEFAULT_SIZE | SHARED,
+        true,
+        "user32.dll!LoadIconW",
+    )
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(load_a_ABI);
     registry.register(load_w_ABI);
+    registry.register(load_icon_a_ABI);
+    registry.register(load_icon_w_ABI);
 }
 
 #[cfg(test)]

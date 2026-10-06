@@ -9,6 +9,7 @@ pub mod controls;
 pub mod dialog;
 pub mod display;
 mod enumeration;
+mod encoding;
 mod formatting;
 pub(crate) mod hooks;
 pub mod host_input;
@@ -295,7 +296,13 @@ fn load_user_object(env: &mut Env<'_>, kind: &str, inst: u32, name: u32) -> Outc
         if name >= 0x1_0000 {
             return Outcome::Return(0);
         }
-        return stock_object(env, window::SYSTEM_OBJECT_BASE + (name & 0xfff) * 4);
+        // One USER owner, with separate fixed stock identity ranges. Preserve
+        // the existing cursor values (also used by cursor_handle defaults).
+        let kind_offset = if kind == "icon" { 0x4000 } else { 0 };
+        return stock_object(
+            env,
+            window::SYSTEM_OBJECT_BASE + kind_offset + (name & 0xfff) * 4,
+        );
     }
     let id = crate::kernel32::res_id(crate::kernel32::int_or_str(env, name, false));
     let key = format!("{kind} {inst:#x} {id:?}");
@@ -363,11 +370,6 @@ fn load_cursor_from_file_a(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     stock_object(env, window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
-}
-
-fn load_icon_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name) = (env.arg(0), env.arg(1));
-    load_user_object(env, "icon", inst, name)
 }
 
 fn create_icon_indirect(env: &mut Env<'_>) -> Outcome {
@@ -533,6 +535,7 @@ pub fn register(reg: &mut Registry) {
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
+    encoding::register(reg);
     placement::register(reg);
     message::register(reg);
     controls::register(reg);
@@ -584,7 +587,6 @@ pub fn register(reg: &mut Registry) {
     reg.register(load_cursor_w_ABI);
     s(reg, "LoadCursorFromFileA", 1, load_cursor_from_file_a);
     s(reg, "LoadCursorFromFileW", 1, load_cursor_from_file_a);
-    s(reg, "LoadIconA", 2, load_icon_a);
     s(reg, "CreateIconIndirect", 1, create_icon_indirect);
     s(reg, "DestroyIcon", 1, destroy_user_object);
     s(reg, "DestroyCursor", 1, destroy_user_object);
