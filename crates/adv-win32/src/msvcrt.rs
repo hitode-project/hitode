@@ -16,6 +16,7 @@ mod floating;
 mod heap;
 mod locale;
 mod onexit;
+mod random;
 mod scan;
 mod scalar_float;
 mod secure_memory;
@@ -27,6 +28,7 @@ mod wide_string;
 struct CrtState {
     errno: HashMap<(String, u32), u32>,
     tm_buffers: HashMap<(String, u32), u32>,
+    random_seeds: HashMap<(String, u32), u32>,
     locks: HashMap<(String, u32), u32>,
     globals: HashMap<(String, String), u32>,
     invalid_handlers: HashMap<String, u32>,
@@ -98,6 +100,7 @@ pub fn register(r: &mut Registry) {
     formatting::register(r);
     floating::register(r);
     time64::register(r);
+    random::register(r);
     scalar_float::register(r);
     onexit::register(r);
     startup::register(r);
@@ -287,12 +290,14 @@ pub fn register(r: &mut Registry) {
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
+    random::release(env, Some(env.context));
     time64::release(env, Some(env.context))?;
     release_errno(env, Some(env.context))
 }
 
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    random::release(env, None);
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
     locale::release_process_tables(env)?;

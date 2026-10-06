@@ -191,6 +191,12 @@
     "limitations": "Nonfinite, hexadecimal floating, capital F, extended precision, unknown numeric locale and non-nearest rounding remain explicit unsupported failures. Legacy count-output/prefix callback and permissive unknown/trailing syntax are rejected without a fabricated native invalid callback; no complete CRT/C99 equivalence is claimed.",
     "oracle_source_sha256": "c0d739a468416bebb6b94629f2ba15f75a328c4fb632206cdcd33bb17b29a476"
   },
+  "random": {
+    "header": "ucrt/stdlib.h:350-352",
+    "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+    "projection": "void __cdecl srand(unsigned int seed), one x86 scalar slot; int __cdecl rand(void), zero arguments and signed32 result. Only the existing MSVCRT/VC80/VC90 profiles.",
+    "profile": "Legacy noncryptographic random state belongs to the same CRT module/thread owner; no host random source or separate process-global generator."
+  },
   "time64": {
     "header": "ucrt/time.h:193-196,212-214,236-238,321-323",
     "sha256": "b775fe03a3288dfcd68a72caad43e8198283164eae94b665fdd3375a3baea44c",

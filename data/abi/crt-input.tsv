@@ -172,3 +172,9 @@ msvcr90.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
 msvcr90.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr90.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr90.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcrt.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcrt.dll	rand	cdecl	i32	int	
+msvcr80.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcr80.dll	rand	cdecl	i32	int	
+msvcr90.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcr90.dll	rand	cdecl	i32	int	
