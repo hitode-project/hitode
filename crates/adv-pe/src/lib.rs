@@ -289,13 +289,35 @@ impl Pe {
             .min(image.len());
         image[..hdr].copy_from_slice(&file[..hdr]);
         for s in &pe.sections {
+            // SEC_IMAGE preserves raw padding inside the section's final page.
+            // Extra raw pages do not enlarge a nonzero VirtualSize or overwrite
+            // the next section (some packed images have oversized raw data).
+            let mapped = if pe.section_alignment >= 0x1000 {
+                s.mem_size()
+                    .checked_add(0xfff)
+                    .map(|size| size & !0xfff)
+                    .ok_or_else(|| {
+                        PeError::Malformed(format!("section {} mapped size overflows", s.name))
+                    })?
+            } else {
+                s.mem_size()
+            };
+            if s.virtual_address
+                .checked_add(mapped)
+                .is_none_or(|end| end > pe.size_of_image)
+            {
+                return Err(PeError::Malformed(format!(
+                    "section {} exceeds SizeOfImage",
+                    s.name
+                )));
+            }
             // Windows rounds the raw pointer down to 512 when FileAlignment is at least that.
             let off = if pe.file_alignment >= 0x200 {
                 s.raw_offset & !0x1ff
             } else {
                 s.raw_offset
             } as usize;
-            let len = (s.raw_size.min(s.mem_size()) as usize).min(file.len().saturating_sub(off));
+            let len = (s.raw_size.min(mapped) as usize).min(file.len().saturating_sub(off));
             let va = s.virtual_address as usize;
             if va + len > image.len() {
                 return Err(PeError::Malformed(format!(
@@ -303,7 +325,9 @@ impl Pe {
                     s.name
                 )));
             }
-            image[va..va + len].copy_from_slice(&file[off..off + len]);
+            if len != 0 {
+                image[va..va + len].copy_from_slice(&file[off..off + len]);
+            }
         }
         pe.image = image;
         Ok(())
