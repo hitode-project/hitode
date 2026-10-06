@@ -8,5 +8,18 @@
   "documentation": [
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icinstall",
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icremove"
-  ]
+  ],
+  "legacy_d3dx_math": {
+    "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
+    "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",
+    "target": "x86 __stdcall, pointer return and 3/2/4/6 pointer arguments; matrix 64 bytes, vector 12 bytes; D3DVIEWPORT9 layout from pinned WinMD",
+    "native_abi_verification": "Authored x86 probe against installed Microsoft d3dx9_43.dll verifies pointer returns, stack convention, alias, row-vector and LH viewport conventions; no DLL or header is bundled",
+    "oracle_dll_sha256": "0b28546be22c71834501f7d7185ede5d79742457331c7ee09efc14490dd64f5f",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixmultiply",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixtranspose",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixlookatlh",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3project"
+    ]
+  }
 }

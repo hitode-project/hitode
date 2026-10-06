@@ -1,3 +1,7 @@
 # Scoped x86 declarations omitted by pinned Win32Metadata; source/hash in sdk-source.json.
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
+d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXMatrixTranspose	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXMatrixLookAtLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pEye:D3DXVECTOR3*:ptr:1|pAt:D3DXVECTOR3*:ptr:1|pUp:D3DXVECTOR3*:ptr:1
+d3dx9_43.dll	D3DXVec3Project	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV:D3DXVECTOR3*:ptr:1|pViewport:Windows.Win32.Graphics.Direct3D9.D3DVIEWPORT9*:ptr:1|pProjection:D3DXMATRIX*:ptr:1|pView:D3DXMATRIX*:ptr:1|pWorld:D3DXMATRIX*:ptr:1

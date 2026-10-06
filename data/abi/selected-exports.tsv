@@ -1,4 +1,4 @@
-# Exact existing legacy registrations outside modules.txt; sources are the same pinned Win32Metadata.
+# Exact selected registrations outside modules.txt; sources are the same pinned Win32Metadata.
 # destination DLL<TAB>export<TAB>source DLL<TAB>export<TAB>expected x86 stdcall stack words
 mpr.dll	WNetGetUniversalNameA	mpr.dll	WNetGetUniversalNameA	4
 mpr.dll	WNetGetUniversalNameW	mpr.dll	WNetGetUniversalNameW	4
@@ -6,3 +6,10 @@ ntdll.dll	RtlFreeUnicodeString	ntdll.dll	RtlFreeUnicodeString	1
 ntdll.dll	RtlInitUnicodeString	ntdll.dll	RtlInitUnicodeString	2
 shfolder.dll	SHGetFolderPathA	shell32.dll	SHGetFolderPathA	5
 shfolder.dll	SHGetFolderPathW	shell32.dll	SHGetFolderPathW	5
+# XInput 1.3 and 9.1.0 share these xinput.h declarations with the canonical 1.4 DLL.
+xinput1_3.dll	XInputGetState	xinput1_4.dll	XInputGetState	2
+xinput1_3.dll	XInputSetState	xinput1_4.dll	XInputSetState	2
+xinput1_3.dll	XInputGetCapabilities	xinput1_4.dll	XInputGetCapabilities	3
+xinput9_1_0.dll	XInputGetState	xinput1_4.dll	XInputGetState	2
+xinput9_1_0.dll	XInputSetState	xinput1_4.dll	XInputSetState	2
+xinput9_1_0.dll	XInputGetCapabilities	xinput1_4.dll	XInputGetCapabilities	3

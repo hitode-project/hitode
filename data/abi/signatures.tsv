@@ -861,6 +861,10 @@ d3d9.dll	Direct3DCreate9	stdcall	ptr	Windows.Win32.Graphics.Direct3D9.IDirect3D9
 d3d9.dll	Direct3DCreate9Ex	stdcall	i32	Windows.Win32.Foundation.HRESULT	SDKVersion:u32:u32:1|param1:Windows.Win32.Graphics.Direct3D9.IDirect3D9Ex*:ptr:1
 d3d9.dll	Direct3DCreate9On12	stdcall	ptr	Windows.Win32.Graphics.Direct3D9.IDirect3D9	SDKVersion:u32:u32:1|pOverrideList:Windows.Win32.Graphics.Direct3D9on12.D3D9ON12_ARGS*:ptr:1|NumOverrideEntries:u32:u32:1
 d3d9.dll	Direct3DCreate9On12Ex	stdcall	i32	Windows.Win32.Foundation.HRESULT	SDKVersion:u32:u32:1|pOverrideList:Windows.Win32.Graphics.Direct3D9on12.D3D9ON12_ARGS*:ptr:1|NumOverrideEntries:u32:u32:1|ppOutputInterface:Windows.Win32.Graphics.Direct3D9.IDirect3D9Ex*:ptr:1
+d3dx9_43.dll	D3DXMatrixLookAtLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pEye:D3DXVECTOR3*:ptr:1|pAt:D3DXVECTOR3*:ptr:1|pUp:D3DXVECTOR3*:ptr:1
+d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXMatrixTranspose	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXVec3Project	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV:D3DXVECTOR3*:ptr:1|pViewport:Windows.Win32.Graphics.Direct3D9.D3DVIEWPORT9*:ptr:1|pProjection:D3DXMATRIX*:ptr:1|pView:D3DXMATRIX*:ptr:1|pWorld:D3DXMATRIX*:ptr:1
 ddraw.dll	DirectDrawCreate	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGUID:System.Guid*:ptr:1|lplpDD:Windows.Win32.Graphics.DirectDraw.IDirectDraw*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateClipper	stdcall	i32	Windows.Win32.Foundation.HRESULT	dwFlags:u32:u32:1|lplpDDClipper:Windows.Win32.Graphics.DirectDraw.IDirectDrawClipper*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateEx	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGuid:System.Guid*:ptr:1|lplpDD:void**:ptr:1|iid:System.Guid*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
@@ -6792,3 +6796,12 @@ ws2_32.dll	sendto	stdcall	i32	i32	s:Windows.Win32.Networking.WinSock.SOCKET:u32:
 ws2_32.dll	setsockopt	stdcall	i32	i32	s:Windows.Win32.Networking.WinSock.SOCKET:u32:1|level:i32:i32:1|optname:i32:i32:1|optval:Windows.Win32.Foundation.PSTR:str8:1|optlen:i32:i32:1
 ws2_32.dll	shutdown	stdcall	i32	i32	s:Windows.Win32.Networking.WinSock.SOCKET:u32:1|how:Windows.Win32.Networking.WinSock.WINSOCK_SHUTDOWN_HOW:i32:1
 ws2_32.dll	socket	stdcall	u32	Windows.Win32.Networking.WinSock.SOCKET	af:i32:i32:1|type:Windows.Win32.Networking.WinSock.WINSOCK_SOCKET_TYPE:i32:1|protocol:i32:i32:1
+xinput1_3.dll	XInputGetCapabilities	stdcall	u32	u32	dwUserIndex:u32:u32:1|dwFlags:Windows.Win32.UI.Input.XboxController.XINPUT_FLAG:u32:1|pCapabilities:Windows.Win32.UI.Input.XboxController.XINPUT_CAPABILITIES*:ptr:1
+xinput1_3.dll	XInputGetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pState:Windows.Win32.UI.Input.XboxController.XINPUT_STATE*:ptr:1
+xinput1_3.dll	XInputSetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pVibration:Windows.Win32.UI.Input.XboxController.XINPUT_VIBRATION*:ptr:1
+xinput1_4.dll	XInputGetCapabilities	stdcall	u32	u32	dwUserIndex:u32:u32:1|dwFlags:Windows.Win32.UI.Input.XboxController.XINPUT_FLAG:u32:1|pCapabilities:Windows.Win32.UI.Input.XboxController.XINPUT_CAPABILITIES*:ptr:1
+xinput1_4.dll	XInputGetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pState:Windows.Win32.UI.Input.XboxController.XINPUT_STATE*:ptr:1
+xinput1_4.dll	XInputSetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pVibration:Windows.Win32.UI.Input.XboxController.XINPUT_VIBRATION*:ptr:1
+xinput9_1_0.dll	XInputGetCapabilities	stdcall	u32	u32	dwUserIndex:u32:u32:1|dwFlags:Windows.Win32.UI.Input.XboxController.XINPUT_FLAG:u32:1|pCapabilities:Windows.Win32.UI.Input.XboxController.XINPUT_CAPABILITIES*:ptr:1
+xinput9_1_0.dll	XInputGetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pState:Windows.Win32.UI.Input.XboxController.XINPUT_STATE*:ptr:1
+xinput9_1_0.dll	XInputSetState	stdcall	u32	u32	dwUserIndex:u32:u32:1|pVibration:Windows.Win32.UI.Input.XboxController.XINPUT_VIBRATION*:ptr:1

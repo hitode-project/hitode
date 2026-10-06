@@ -241,13 +241,21 @@ public static class AbiMetadata
         foreach (var row in File.ReadLines(sdkSupplement).Where(line => line.Length != 0 && !line.StartsWith('#')))
         {
             var f = row.Split('\t');
-            if (f.Length != 6 || f[0] != "msvfw32.dll" || !new[] { "ICInstall", "ICRemove" }.Contains(f[1])
-                || f[2] != "stdcall" || f[3] != "i32")
+            bool vcm = f.Length == 6 && f[0] == "msvfw32.dll" && new[] { "ICInstall", "ICRemove" }.Contains(f[1]) && f[3] == "i32";
+            bool d3dx = f.Length == 6 && f[0] == "d3dx9_43.dll"
+                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixLookAtLH", "D3DXVec3Project" }.Contains(f[1])
+                && f[3] == "ptr" && f[4] == (f[1] == "D3DXVec3Project" ? "D3DXVECTOR3*" : "D3DXMATRIX*");
+            if ((!vcm && !d3dx) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
+            if (d3dx) {
+                int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
+                if (f[5].Split('|', StringSplitOptions.RemoveEmptyEntries).Length != expected)
+                    throw new InvalidDataException("D3DX x86 stack contract changed: " + row);
+            }
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !new[] { "u32", "i32", "str8" }.Contains(p[2]) || p[3] != "1")
+                if (p.Length != 4 || !(d3dx ? p[2] == "ptr" : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

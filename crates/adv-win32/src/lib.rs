@@ -22,6 +22,7 @@ mod version;
 mod vfw;
 pub mod winmm;
 mod winsock;
+mod xinput;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -175,6 +176,7 @@ pub fn register(reg: &mut Registry) {
     vfw::register(reg);
     winsock::register(reg);
     winmm::register(reg);
+    xinput::register(reg);
     ntdll::register(reg);
 }
 

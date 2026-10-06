@@ -26,6 +26,7 @@ pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
     crate::compat::register(&mut registry);
     register_graphics(&mut registry);
     adv_dx::dsound::register(&mut registry);
+    adv_dx::d3dx9::register(&mut registry);
     adv_dx::dshow::register(&mut registry);
     adv_dx::dxdiag::register(&mut registry);
     adv_dx::dinput::register(&mut registry);
