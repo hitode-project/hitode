@@ -16,7 +16,7 @@ const REQUEST: u32 = DATA + 1024;
 const CALLBACK: u32 = CODE + 512;
 const MODULE: &str = "msvcr90.dll";
 
-fn machine<B: Backend>(cpu: B) -> Machine<B> {
+pub(super) fn machine<B: Backend>(cpu: B) -> Machine<B> {
     let mut registry = Registry::default();
     crate::register(&mut registry);
     super::super::register(&mut registry);
@@ -37,7 +37,7 @@ fn machine<B: Backend>(cpu: B) -> Machine<B> {
     machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
     machine
 }
-fn fixture() -> (Machine<JitCpu>, u32) {
+pub(super) fn fixture() -> (Machine<JitCpu>, u32) {
     let mut machine = machine(JitCpu::new(PARK_ADDR, false).unwrap());
     machine
         .spawn("locale owner", PARK_ADDR, &[], 65536)
@@ -45,7 +45,7 @@ fn fixture() -> (Machine<JitCpu>, u32) {
     let entry = machine.resolve_import(MODULE, "setlocale").unwrap();
     (machine, entry)
 }
-fn env<B: Backend>(machine: &mut Machine<B>, entry: u32) -> Env<'_> {
+pub(super) fn env<B: Backend>(machine: &mut Machine<B>, entry: u32) -> Env<'_> {
     Env {
         context: machine.sys.current,
         cpu: &mut machine.cpu,
@@ -54,7 +54,7 @@ fn env<B: Backend>(machine: &mut Machine<B>, entry: u32) -> Env<'_> {
         thunk: (entry - THUNK_BASE) / THUNK_STRIDE,
     }
 }
-fn call<B: Backend>(
+pub(super) fn call<B: Backend>(
     machine: &mut Machine<B>,
     entry: u32,
     category: i32,

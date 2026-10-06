@@ -66,6 +66,19 @@
       "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
     ]
   },
+  "native_close": {
+    "scope": "ntdll.dll!ZwClose only; no broader Nt/Zw export family is projected",
+    "source": "Microsoft Windows SDK 10.0.26100.0 um/winternl.h NtClose declaration, SDK Nt/Zw x86 ntdll.lib imports, and documented user-mode equivalence",
+    "header_sha256": "a43424486349c38f697c009512dfe4eb8fca733d7665afab42f50752170b9785",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS and one 32-bit HANDLE; SDK imports _NtClose@4 and _ZwClose@4; neither name exists in pinned WinMD",
+    "native_verification": "Authored x86 oracle checks file/event close, duplicate alias surviving original close, double/null/invalid/legacy stdio failures, pseudo-process/thread no-op success, unchanged LastError, and STATUS_HANDLE_NOT_CLOSABLE for protected native handles; no DLL or game bytes are bundled",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntclose",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwclose",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",

@@ -3,6 +3,8 @@
 use super::*;
 use adv_abi::{AnsiStr, GuestPtr, guest::memory_failure, win32};
 
+mod ctype;
+
 const CATEGORY_NAMES: [&str; 5] = [
     "LC_COLLATE",
     "LC_CTYPE",
@@ -56,11 +58,13 @@ impl Locale {
 pub(super) struct LocaleState {
     categories: [Locale; 5],
     buffer: u32,
+    ctype_tables: HashMap<u32, u32>,
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(setlocale_ABI);
     registry.register(lc_handles_ABI);
     registry.register(lc_codepage_ABI);
+    ctype::register(registry);
 }
 
 fn default_language(acp: u32) -> Language {
@@ -247,6 +251,7 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         LocaleState {
             categories,
             buffer: pointer,
+            ..state
         },
     );
     Outcome::Return(pointer)
@@ -283,6 +288,7 @@ fn lc_codepage(env: &mut Env<'_>) -> u32 {
 }
 
 pub(super) fn release_process_tables(env: &mut Env<'_>) -> Result<(), String> {
+    ctype::release_tables(env)?;
     let Some(state) = env.ext.try_get::<CrtState>() else {
         return Ok(());
     };

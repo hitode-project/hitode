@@ -9,6 +9,7 @@ mod file_mapping;
 mod handle;
 pub use file::open as open_file;
 pub(crate) use file::{open_with_share, read_coherent};
+pub(crate) use file_mapping::prune as prune_file_mappings;
 pub use handle::ProcessHandle;
 mod memory;
 mod module;

@@ -434,7 +434,16 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
         Some(ImplementationLevel::Implement)
     );
     assert!(registry.dynamic_available("ntdll.dll", "ZwReadFile"));
-    for name in ["NtCreateFile", "NtReadFile", "ZwClose"] {
+    assert_eq!(
+        registry.get("ntdll.dll", "ZwClose").unwrap().conv,
+        Conv::Stdcall { argc: 1 }
+    );
+    assert_eq!(
+        registry.level("ntdll.dll", "ZwClose"),
+        Some(ImplementationLevel::Implement)
+    );
+    assert!(registry.dynamic_available("ntdll.dll", "ZwClose"));
+    for name in ["NtCreateFile", "NtReadFile", "NtClose"] {
         assert!(!registry.dynamic_available("ntdll.dll", name));
     }
     assert!(registry.signature_conflicts().is_empty());
@@ -1049,4 +1058,165 @@ fn native_read_guards_preserve_cursor_and_reads_merge_actual_dirty_mapped_conten
         read_coherence_and_guards(cpu);
     }
     read_coherence_and_guards(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn close_call<B: Backend>(m: &mut Machine<B>, code: &mut Asm, handle: u32, result: u32) {
+    let set = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let close = m.resolve_import("ntdll.dll", "ZwClose").unwrap();
+    code.push_imm(MARKER)
+        .call(set)
+        .push_imm(handle)
+        .call(close)
+        .mov_mem_eax(result);
+    code.call(get).mov_mem_eax(result + 4);
+}
+
+fn close_lifecycle<B: Backend>(cpu: B) {
+    let (mut m, _) = fixture(cpu);
+    input(&mut m, DATA, SOURCE, r"\??\C:\Game\present.txt");
+    m.cpu.write(DATA + 0x1000, b"Close-mapping\0").unwrap();
+    let mapping = m
+        .resolve_import("kernel32.dll", "CreateFileMappingA")
+        .unwrap();
+    let map = m.resolve_import("kernel32.dll", "MapViewOfFile").unwrap();
+    let event = m.resolve_import("kernel32.dll", "CreateEventA").unwrap();
+    let mut code = Asm::new(CODE);
+    create(&mut m, &mut code, arguments(DATA), DATA + 16);
+    code.push_imm(DATA + 0x1000)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(2)
+        .push_imm(0)
+        .mov_eax_mem(DATA)
+        .push_eax()
+        .call(mapping)
+        .mov_mem_eax(DATA + 0x80);
+    code.push_imm(8)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(4)
+        .mov_eax_mem(DATA + 0x80)
+        .push_eax()
+        .call(map)
+        .mov_mem_eax(DATA + 0x84);
+    code.push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(0)
+        .call(event)
+        .mov_mem_eax(DATA + 0x88);
+    run(&mut m, code);
+    let file = m.cpu.read_u32(DATA).unwrap();
+    let alias = m.sys.objects.duplicate(file).unwrap();
+    let section = m.cpu.read_u32(DATA + 0x80).unwrap();
+    let section_alias = m.sys.objects.duplicate(section).unwrap();
+    let view = m.cpu.read_u32(DATA + 0x84).unwrap();
+    let event = m.cpu.read_u32(DATA + 0x88).unwrap();
+    assert_ne!(section, 0);
+    assert_ne!(view, 0);
+    assert_ne!(event, 0);
+    let mut code = Asm::new(CODE);
+    close_call(&mut m, &mut code, file, DATA + 0x100);
+    read_call(
+        &mut m,
+        &mut code,
+        [alias, 0, 0, 0, DATA + 0x200, DATA + 0x208, 2, 0, 0],
+        DATA + 0x220,
+    );
+    query(
+        &mut m,
+        &mut code,
+        [alias, DATA + 0x228, DATA + 0x230, 8, 14],
+        DATA + 0x238,
+    );
+    close_call(&mut m, &mut code, alias, DATA + 0x108);
+    close_call(&mut m, &mut code, section, DATA + 0x110);
+    // The duplicated section handle still owns its backing; views stay valid.
+    code.mov_eax_mem(view).mov_mem_eax(DATA + 0x240);
+    close_call(&mut m, &mut code, section_alias, DATA + 0x118);
+    code.mov_eax_mem(view).mov_mem_eax(DATA + 0x244);
+    close_call(&mut m, &mut code, event, DATA + 0x120);
+    for (index, handle) in [alias, 0, 0x13572468, 3, 7, 11, 0xffffffff, 0xfffffffe]
+        .into_iter()
+        .enumerate()
+    {
+        close_call(&mut m, &mut code, handle, DATA + 0x128 + index as u32 * 8);
+    }
+    run(&mut m, code);
+    for index in 0..5u32 {
+        assert_eq!(m.cpu.read_u32(DATA + 0x100 + index * 8).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(DATA + 0x104 + index * 8).unwrap(), MARKER);
+    }
+    for index in 0..8u32 {
+        assert_eq!(
+            m.cpu.read_u32(DATA + 0x128 + index * 8).unwrap(),
+            if index < 6 { 0xc0000008 } else { 0 }
+        );
+        assert_eq!(m.cpu.read_u32(DATA + 0x12c + index * 8).unwrap(), MARKER);
+    }
+    assert_eq!(m.cpu.read_u32(DATA + 0x220).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 0x204).unwrap(), 2);
+    let mut bytes = [0; 2];
+    m.cpu.read(DATA + 0x208, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"re");
+    assert_eq!(
+        m.cpu.read_u32(DATA + 0x230).unwrap(),
+        2,
+        "the surviving alias kept the shared stream cursor"
+    );
+    assert_eq!(
+        m.cpu.read_u32(DATA + 0x240).unwrap(),
+        u32::from_le_bytes(*b"repl")
+    );
+    assert_eq!(
+        m.cpu.read_u32(DATA + 0x244).unwrap(),
+        u32::from_le_bytes(*b"repl")
+    );
+    for handle in [file, alias, section, section_alias, event] {
+        assert!(m.sys.objects.get(handle).is_none());
+    }
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 0);
+    assert!(
+        m.cpu.accessible(view, 8, Prot::READ),
+        "closing a section never unmaps a retained view"
+    );
+    // Pruned names can be opened only while section handles exist. Unmapping
+    // the final view releases its owner and guest VM allocation independently.
+    let open = m
+        .resolve_import("kernel32.dll", "OpenFileMappingA")
+        .unwrap();
+    let get = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let unmap = m.resolve_import("kernel32.dll", "UnmapViewOfFile").unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(DATA + 0x1000)
+        .push_imm(0)
+        .push_imm(4)
+        .call(open)
+        .mov_mem_eax(DATA + 0x280);
+    code.call(get)
+        .mov_mem_eax(DATA + 0x284)
+        .push_imm(view)
+        .call(unmap)
+        .mov_mem_eax(DATA + 0x288);
+    run(&mut m, code);
+    assert_eq!(m.cpu.read_u32(DATA + 0x280).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 0x284).unwrap(), 2);
+    assert_eq!(m.cpu.read_u32(DATA + 0x288).unwrap(), 1);
+    assert!(!m.cpu.accessible(view, 8, Prot::READ));
+    assert!(
+        m.ext
+            .try_get::<ApiDiagnostics>()
+            .is_none_or(|d| d.warnings.is_empty())
+    );
+}
+
+#[test]
+fn nt_close_releases_real_aliases_preserves_last_error_and_retains_mapping_views() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        close_lifecycle(cpu);
+    }
+    close_lifecycle(UnicornCpu::new(PARK_ADDR).unwrap());
 }

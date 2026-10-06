@@ -27,6 +27,23 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(query_ABI);
     registry.register(set_ABI);
     registry.register(read_ABI);
+    registry.register(close_ABI);
+}
+
+#[win32(ntdll, name = "ZwClose", level = implement)]
+fn close(env: &mut Env<'_>, handle: Handle) -> i32 {
+    // Native pseudo-process/thread closes succeed without releasing an owned
+    // reference. This does not apply to Win32's legacy stdio constants.
+    if matches!(handle.0, 0xffff_ffff | 0xffff_fffe) {
+        return 0;
+    }
+    if env.sys.objects.close(handle.0).is_none() {
+        return INVALID_HANDLE;
+    }
+    // Closing just one alias retains its payload; the final close drops it
+    // before pruning weak mapping/synchronization names, as CloseHandle does.
+    crate::kernel32::prune_file_mappings(env);
+    0
 }
 
 fn completion(env: &mut Env<'_>, iosb: GuestPtr<()>, status: i32, count: u32) -> i32 {

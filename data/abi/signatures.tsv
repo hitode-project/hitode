@@ -3484,6 +3484,7 @@ msvcr90.dll	___lc_codepage_func	cdecl	u32	unsigned int
 msvcr90.dll	___lc_handle_func	cdecl	ptr	LCID*	
 msvcr90.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr90.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr90.dll	__pctype_func	cdecl	ptr	const unsigned short*	
 msvcr90.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	_acmdln	data	ptr	char*	
 msvcr90.dll	_calloc_crt	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
@@ -3525,6 +3526,7 @@ msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1
 ntdll.dll	RtlDosPathNameToNtPathName_U	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1
 ntdll.dll	RtlFreeUnicodeString	stdcall	void	void	UnicodeString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
 ntdll.dll	RtlInitUnicodeString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PWSTR:str16:1
+ntdll.dll	ZwClose	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	ZwCreateFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1
 ntdll.dll	ZwQueryInformationFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1
 ntdll.dll	ZwReadFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|Buffer:void*:ptr:1|Length:u32:u32:1|ByteOffset:LARGE_INTEGER*:ptr:1|Key:u32*:ptr:1

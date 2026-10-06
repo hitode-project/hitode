@@ -538,7 +538,7 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
 }
 
 /// Forget names whose objects are gone, after a handle closes.
-pub(super) fn prune(env: &mut Env<'_>) {
+pub(crate) fn prune(env: &mut Env<'_>) {
     if let Some(state) = env.ext.try_get_mut::<Mappings>() {
         state.prune(&env.sys.objects);
     }
