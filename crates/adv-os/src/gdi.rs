@@ -3,6 +3,8 @@
 //! one process object. Ids come from the surface store, which numbers surfaces and DCs together.
 use adv_machine::Objects;
 mod objects;
+mod clip;
+pub use clip::DcClip;
 pub use objects::{DcModes, DcState, Gdi, GdiObj, LogFont, stock_object};
 
 /// The window DC: always present, it draws into the primary surface.
@@ -92,6 +94,13 @@ impl DeviceContexts {
         match self.gdi.get(objects, dc) {
             Some(GdiObj::Dc { modes, .. }) => modes.stretch,
             _ => 1,
+        }
+    }
+
+    pub fn clip(&self, objects: &Objects, dc: u32) -> DcClip {
+        match self.gdi.get(objects, dc) {
+            Some(GdiObj::Dc { clip, .. }) => clip.clone(),
+            _ => DcClip::default(),
         }
     }
 

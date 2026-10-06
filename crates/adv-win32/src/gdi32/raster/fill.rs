@@ -7,6 +7,7 @@ use adv_os::gdi::{GdiObj, WINDOW_DC, stock_object};
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(fill_ABI);
+    registry.register(frame_ABI);
     registry.register(set_pixel_ABI);
     registry.register(set_pixel_v_ABI);
     registry.register(get_pixel_ABI);
@@ -18,25 +19,95 @@ fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
 }
 #[win32(user32,name="FillRect",level=implement)]
 fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle) -> Outcome {
+    if !matches!(
+        env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0),
+        Some(GdiObj::Dc { .. })
+    ) {
+        return fail(env, 6);
+    }
+    if adv_abi::guest::check_range(env.cpu, rectangle.addr(), 16, Prot::READ).is_err() {
+        return fail(env, 87);
+    }
+    let Ok(r) = rectangle.read(env.cpu) else {
+        return fail(env, 87);
+    };
+    paint_rectangles(
+        env,
+        dc,
+        brush,
+        &[[
+            i64::from(r.left),
+            i64::from(r.top),
+            i64::from(r.right),
+            i64::from(r.bottom),
+        ]],
+        "user32.dll!FillRect",
+    )
+}
+
+#[win32(user32,name="FrameRect",level=implement)]
+fn frame(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle) -> Outcome {
+    if !matches!(
+        env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0),
+        Some(GdiObj::Dc { .. })
+    ) {
+        return fail(env, 6);
+    }
+    if adv_abi::guest::check_range(env.cpu, rectangle.addr(), 16, Prot::READ).is_err() {
+        return fail(env, 87);
+    }
+    let Ok(r) = rectangle.read(env.cpu) else {
+        return fail(env, 87);
+    };
+    if r.right < r.left || r.bottom < r.top {
+        return Outcome::Return(0);
+    }
+    let [l, t, r, b] = [
+        i64::from(r.left),
+        i64::from(r.top),
+        i64::from(r.right),
+        i64::from(r.bottom),
+    ];
+    // USER draws four logical-unit PatBlt strips. Normalizing the side strip's
+    // negative height preserves native zero-width/height border pixels.
+    let top = (t + 1).min(b - 1);
+    let bottom = (t + 1).max(b - 1);
+    paint_rectangles(
+        env,
+        dc,
+        brush,
+        &[
+            [l, t, r, t + 1],
+            [l, b - 1, r, b],
+            [l, top, l + 1, bottom],
+            [r - 1, top, r, bottom],
+        ],
+        "user32.dll!FrameRect",
+    )
+}
+
+fn paint_rectangles(
+    env: &mut Env<'_>,
+    dc: Handle,
+    brush: Handle,
+    rectangles: &[[i64; 4]],
+    api: &str,
+) -> Outcome {
     let Some(GdiObj::Dc {
         selected,
         palette,
         modes,
+        clip,
         ..
     }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
     else {
         return fail(env, 6);
     };
     if modes.map != 1 {
-        return fail(env, 120);
+        adv_abi::warn_unavailable(env, api, "only MM_TEXT brush drawing is available");
+        return fail(env, 50);
     }
-    let (target, palette) = (selected[3], *palette);
-    if adv_abi::guest::check_range(env.cpu, rectangle.addr(), 16, Prot::READ).is_err() {
-        return fail(env, 87);
-    }
-    let Ok(rectangle) = rectangle.read(env.cpu) else {
-        return fail(env, 87);
-    };
+    let (target, palette, clip) = (selected[3], *palette, clip.clone());
     let stock = brush.0.checked_sub(stock_object(0));
     let color = match stock {
         Some(0) => 0xffffff,
@@ -44,7 +115,7 @@ fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle)
         Some(2) => 0x808080,
         Some(3) => 0x404040,
         Some(4) => 0,
-        Some(5) => return Outcome::Return(1), // NULL_BRUSH is a valid no-op.
+        Some(5) => return Outcome::Return(1),
         _ => match env.ext.get::<Win32>().gdi.get(&env.sys.objects, brush.0) {
             Some(GdiObj::Brush { color }) => *color,
             _ => return fail(env, 6),
@@ -54,57 +125,82 @@ fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle)
         0 => [color as u8, (color >> 8) as u8, (color >> 16) as u8],
         1 => {
             let Some(entry) = super::super::palette::entries(env, palette)
-                .and_then(|entries| entries.get((color & 0xffff) as usize))
+                .and_then(|e| e.get((color & 0xffff) as usize))
             else {
                 return fail(env, 87);
             };
             [entry[0], entry[1], entry[2]]
         }
-        _ => return fail(env, 120),
+        _ => {
+            adv_abi::warn_unavailable(env, api, "palette-relative brushes are unavailable");
+            return fail(env, 50);
+        }
     };
     let Some(provider) = super::front::provider(env.ext) else {
-        return fail(env, 120);
+        adv_abi::warn_unavailable(env, api, "the CPU raster provider is unavailable");
+        return fail(env, 50);
     };
-    let Some(store) = env.ext.try_get::<SurfaceStore>() else {
-        return fail(env, 120);
-    };
-    let Some(surface) = store.get(target) else {
+    let Some(surface) = env
+        .ext
+        .try_get::<SurfaceStore>()
+        .and_then(|s| s.get(target))
+        .cloned()
+    else {
         return fail(env, 6);
     };
     if surface.pixels == 0 {
-        return fail(env, 120);
+        adv_abi::warn_unavailable(env, api, "the selected bitmap has no CPU backing");
+        return fail(env, 50);
     }
-    let left = rectangle.left.max(0).min(surface.width as i32) as u32;
-    let top = rectangle.top.max(0).min(surface.height as i32) as u32;
-    let right = rectangle.right.max(0).min(surface.width as i32) as u32;
-    let bottom = rectangle.bottom.max(0).min(surface.height as i32) as u32;
-    if right <= left || bottom <= top {
+    let rectangles = rectangles
+        .iter()
+        .filter_map(|&[l, t, r, b]| {
+            let l = l.max(0).min(i64::from(surface.width)) as u32;
+            let t = t.max(0).min(i64::from(surface.height)) as u32;
+            let r = r.max(0).min(i64::from(surface.width)) as u32;
+            let b = b.max(0).min(i64::from(surface.height)) as u32;
+            (l < r && t < b).then(|| Rect {
+                x: l,
+                y: t,
+                w: r - l,
+                h: b - t,
+            })
+        })
+        .collect::<Vec<_>>();
+    if rectangles.is_empty() {
         return Outcome::Return(1);
     }
     let bytes = surface.format.bytes();
-    // Validate every touched row before the first mutation, including bottom-up
-    // DIBs and padding. No read permission or unrelated prefix is required.
-    for y in top..bottom {
-        let row = if surface.bottom_up {
-            surface.height - y - 1
-        } else {
-            y
-        };
-        let Some(address) = row
-            .checked_mul(surface.pitch)
-            .and_then(|offset| surface.pixels.checked_add(offset))
-            .and_then(|address| address.checked_add(left * bytes))
-        else {
-            return fail(env, 87);
-        };
-        if adv_abi::guest::check_range(env.cpu, address, (right - left) * bytes, Prot::WRITE)
-            .is_err()
-        {
-            return fail(env, 87);
+    {
+        let mut raw = (provider.memory)(env.cpu);
+        let memory = super::clip::ClippedMemory::new(&mut raw, surface.clone(), &clip);
+        // All visible border/fill ranges are checked before the first write.
+        for r in &rectangles {
+            for y in r.y..r.y + r.h {
+                let row = if surface.bottom_up {
+                    surface.height - y - 1
+                } else {
+                    y
+                };
+                let Some(address) = row
+                    .checked_mul(surface.pitch)
+                    .and_then(|o| surface.pixels.checked_add(o))
+                    .and_then(|a| a.checked_add(r.x * bytes))
+                else {
+                    return fail(env, 87);
+                };
+                if adv_device::surface::SurfaceMemory::writable(
+                    &memory,
+                    address,
+                    (r.w * bytes) as usize,
+                )
+                .is_err()
+                {
+                    return fail(env, 87);
+                }
+            }
         }
     }
-    // GDI converts COLORREF into 16-bit DIB channels by bit truncation. The
-    // neutral device conversion uses scaled channels for other frontends.
     let value = match surface.format {
         PixelFormat::Rgb555 => {
             u32::from(rgb[0] >> 3) << 10 | u32::from(rgb[1] >> 3) << 5 | u32::from(rgb[2] >> 3)
@@ -116,38 +212,34 @@ fn fill(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>, brush: Handle)
     };
     let result = {
         let store = env.ext.get_mut::<SurfaceStore>();
-        let mut memory = (provider.memory)(env.cpu);
-        store
-            .fill_raw(
-                target,
-                Rect {
-                    x: left,
-                    y: top,
-                    w: right - left,
-                    h: bottom - top,
-                },
-                value,
-                &mut memory,
-            )
-            .and_then(|()| {
-                if dc.0 == WINDOW_DC {
-                    store.present(target, &memory)
-                } else {
-                    Ok(())
-                }
-            })
+        let mut raw = (provider.memory)(env.cpu);
+        let mut memory = super::clip::ClippedMemory::new(&mut raw, surface, &clip);
+        let mut result = Ok(());
+        for r in rectangles {
+            if let Err(e) = store.fill_raw(target, r, value, &mut memory) {
+                result = Err(e);
+                break;
+            }
+        }
+        result.and_then(|()| {
+            if dc.0 == WINDOW_DC {
+                store.present(target, &memory)
+            } else {
+                Ok(())
+            }
+        })
     };
     match result {
         Ok(()) => {
             if dc.0 == WINDOW_DC {
                 let serial = env.ext.get::<SurfaceStore>().stats.presentations;
-                if let Some(outcome) = (provider.completed)(env, serial) {
-                    return outcome;
+                if let Some(o) = (provider.completed)(env, serial) {
+                    return o;
                 }
             }
             Outcome::Return(1)
         }
-        Err(error) => Outcome::Fail(format!("FillRect: {error}")),
+        Err(error) => Outcome::Fail(format!("{api}: {error}")),
     }
 }
 
@@ -165,6 +257,9 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
         return Outcome::Return(CLR_INVALID);
     };
     if modes.map != 1 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    if !super::clip::snapshot(env, dc.0).contains(x, y) {
         return Outcome::Return(CLR_INVALID);
     }
     let (target, palette) = (selected[3], *palette);
@@ -270,14 +365,15 @@ fn set_pixel_v(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Out
 #[win32(gdi32, name = "GetPixel", level = implement)]
 fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
     let Some(GdiObj::Dc {
-        selected,
-        modes,
-        ..
+        selected, modes, ..
     }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
     else {
         return Outcome::Return(CLR_INVALID);
     };
     if modes.map != 1 {
+        return Outcome::Return(CLR_INVALID);
+    }
+    if !super::clip::snapshot(env, dc.0).contains(x, y) {
         return Outcome::Return(CLR_INVALID);
     }
     let target = selected[3];
@@ -325,15 +421,7 @@ const BLACKNESS: u32 = 0x00000042;
 const WHITENESS: u32 = 0x00FF0062;
 
 #[win32(gdi32, name = "PatBlt", level = implement)]
-fn pat_blt(
-    env: &mut Env<'_>,
-    dc: Handle,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    rop: u32,
-) -> Outcome {
+fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u32) -> Outcome {
     if w <= 0 || h <= 0 {
         return Outcome::Return(1);
     }
@@ -353,7 +441,7 @@ fn pat_blt(
     let brush_handle = match rop {
         BLACKNESS => stock_object(4), // BLACK_BRUSH
         WHITENESS => stock_object(0), // WHITE_BRUSH
-        _ => selected[0],            // Selected brush in the DC
+        _ => selected[0],             // Selected brush in the DC
     };
     let stock = brush_handle.checked_sub(stock_object(0));
     let color = match stock {
@@ -363,7 +451,12 @@ fn pat_blt(
         Some(3) => 0x404040,
         Some(4) => 0,
         Some(5) => return Outcome::Return(1), // NULL_BRUSH is a valid no-op.
-        _ => match env.ext.get::<Win32>().gdi.get(&env.sys.objects, brush_handle) {
+        _ => match env
+            .ext
+            .get::<Win32>()
+            .gdi
+            .get(&env.sys.objects, brush_handle)
+        {
             Some(GdiObj::Brush { color }) => *color,
             _ => return fail(env, 6),
         },
@@ -399,6 +492,8 @@ fn pat_blt(
     if right <= left || bottom <= top {
         return Outcome::Return(1);
     }
+    let clip = super::clip::snapshot(env, dc.0);
+    let surface = surface.clone();
     let bytes = surface.format.bytes();
     for row_y in top..bottom {
         let row = if surface.bottom_up {
@@ -430,7 +525,8 @@ fn pat_blt(
     };
     let result = {
         let store = env.ext.get_mut::<SurfaceStore>();
-        let mut memory = (provider.memory)(env.cpu);
+        let mut raw = (provider.memory)(env.cpu);
+        let mut memory = super::clip::ClippedMemory::new(&mut raw, surface, &clip);
         store
             .fill_raw(
                 target,

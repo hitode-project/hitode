@@ -7,6 +7,8 @@ use adv_device::surface::{MemoryOperations, MemoryView, PixelFormat, Snapshot};
 use adv_machine::{Clock, Machine};
 use std::borrow::Cow;
 
+mod clip;
+
 fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
     MemoryView::new(
         cpu,

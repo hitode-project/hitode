@@ -226,6 +226,7 @@ fn output(
         );
     }
     let opaque_background = *bk_mode == 2;
+    let clip = super::super::raster::clip::snapshot(env, dc);
     let font = font_request(env, dc);
     if font.baseline_angle != 0 || font.glyph_angle != 0 || font.face.starts_with('@') {
         return unavailable(env, "rotated or vertical text is not supported");
@@ -287,7 +288,9 @@ fn output(
         {
             return fail(env, 87);
         }
-        let mut memory = (provider.memory)(env.cpu);
+        let surface = surface.clone();
+        let mut raw = (provider.memory)(env.cpu);
+        let mut memory = super::super::raster::clip::ClippedMemory::new(&mut raw, surface, &clip);
         let result = store.draw_text(target, &mut memory, &mut fonts.text, &font, paint);
         let before = store.stats.presentations;
         let result = result.and_then(|changed| {

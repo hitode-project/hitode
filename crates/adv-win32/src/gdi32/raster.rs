@@ -7,6 +7,7 @@ use adv_device::surface::{
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
 mod color_table;
+pub(crate) mod clip;
 mod dib;
 mod fill;
 pub mod front;
@@ -297,9 +298,12 @@ impl Raster {
                 y: top as u32,
                 ..sr
             };
-            surfaces.copy(src, sr, dst, dr, m)?;
+            let clip = dcs.clip(objects, destination_dc);
+            let surface = surfaces.get(dst).unwrap().clone();
+            let mut m = clip::ClippedMemory::new(m, surface, &clip);
+            surfaces.copy(src, sr, dst, dr, &mut m)?;
             if destination_dc == WINDOW_DC {
-                surfaces.present(dst, m)?;
+                surfaces.present(dst, &m)?;
             }
             1
         })
@@ -379,16 +383,19 @@ impl Raster {
                 _ => Sampling::AndColour,
             },
         };
+        let clip = dcs.clip(objects, destination_dc);
+        let surface = surfaces.get(dst).unwrap().clone();
+        let mut m = clip::ClippedMemory::new(m, surface, &clip);
         surfaces.blit_from(
             &source,
             transfer.source,
             dst,
             transfer.destination,
             options,
-            m,
+            &mut m,
         )?;
         if destination_dc == WINDOW_DC {
-            surfaces.present(dst, m)?;
+            surfaces.present(dst, &m)?;
         }
         Ok(transfer.scan_lines)
     }
@@ -471,9 +478,12 @@ impl Raster {
                     _ => Sampling::And,
                 },
             };
-            surfaces.blit(src, sr, dst, dr, options, m)?;
+            let clip = dcs.clip(objects, destination_dc);
+            let surface = surfaces.get(dst).unwrap().clone();
+            let mut m = clip::ClippedMemory::new(m, surface, &clip);
+            surfaces.blit(src, sr, dst, dr, options, &mut m)?;
             if destination_dc == WINDOW_DC {
-                surfaces.present(dst, m)?;
+                surfaces.present(dst, &m)?;
             }
             1
         })

@@ -1,0 +1,72 @@
+//! Bounded application clipping owned by the logical DC, including SaveDC.
+#[derive(Clone, Debug, Default)]
+pub struct DcClip {
+    excluded: Vec<[i32; 4]>,
+}
+impl DcClip {
+    pub const MAX_RECTANGLES: usize = 64;
+    pub fn exclude(&mut self, rect: [i32; 4]) -> bool {
+        let [l, t, r, b] = rect;
+        let rect = [l.min(r), t.min(b), l.max(r), t.max(b)];
+        if rect[0] == rect[2] || rect[1] == rect[3] || self.excluded.contains(&rect) {
+            return true;
+        }
+        if self.excluded.len() == Self::MAX_RECTANGLES {
+            return false;
+        }
+        self.excluded.push(rect);
+        true
+    }
+    pub fn is_default(&self) -> bool {
+        self.excluded.is_empty()
+    }
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        !self
+            .excluded
+            .iter()
+            .any(|&[l, t, r, b]| x >= l && x < r && y >= t && y < b)
+    }
+    /// Visible, disjoint spans in one surface row. Right/bottom are exclusive.
+    pub fn spans(&self, y: i32, width: u32) -> Vec<(u32, u32)> {
+        let mut spans = vec![(0, width)];
+        for &[l, t, r, b] in &self.excluded {
+            if y < t || y >= b {
+                continue;
+            }
+            let l = l.max(0) as u32;
+            let r = (r.max(0) as u32).min(width);
+            if l >= r {
+                continue;
+            }
+            let mut next = Vec::with_capacity(spans.len() + 1);
+            for (a, z) in spans {
+                if z <= l || a >= r {
+                    next.push((a, z));
+                } else {
+                    if a < l {
+                        next.push((a, l));
+                    }
+                    if z > r {
+                        next.push((r, z));
+                    }
+                }
+            }
+            spans = next;
+        }
+        spans
+    }
+    pub fn visible(&self, width: u32, height: u32) -> bool {
+        // Region topology changes only at rectangle boundaries, not every row.
+        if width == 0 || height == 0 {
+            return false;
+        }
+        if !self.spans(0, width).is_empty() {
+            return true;
+        }
+        self.excluded
+            .iter()
+            .flat_map(|r| [r[1], r[3]])
+            .filter(|&y| y >= 0 && (y as u32) < height)
+            .any(|y| !self.spans(y, width).is_empty())
+    }
+}

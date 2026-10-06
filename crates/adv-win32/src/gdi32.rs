@@ -106,6 +106,7 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
             bk_color: 0xff_ffff,
             bk_mode: 2,
             modes: adv_os::gdi::DcModes::default(),
+            clip: Default::default(),
             saved: Vec::new(),
         },
     )
@@ -548,6 +549,7 @@ fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
             bk_mode,
             modes,
             saved,
+            clip,
             ..
         }) => {
             saved.push(adv_os::gdi::DcState {
@@ -557,6 +559,7 @@ fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
                 bk_color: *bk_color,
                 bk_mode: *bk_mode,
                 modes: *modes,
+                clip: clip.clone(),
             });
             Outcome::Return(saved.len() as u32)
         }
@@ -599,6 +602,7 @@ fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
         bk_color,
         bk_mode,
         modes,
+        clip,
         ..
     }) = get_mut(env, dc.0)
     {
@@ -612,6 +616,7 @@ fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
         *bk_color = state.bk_color;
         *bk_mode = state.bk_mode;
         *modes = state.modes;
+        *clip = state.clip;
     }
     Outcome::Return(1)
 }
