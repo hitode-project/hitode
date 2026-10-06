@@ -149,6 +149,7 @@ public final class GameActivity extends Activity {
     }
     private void showLibrary() {
         if (destroyed) return;
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         LinearLayout layout = makeRoot();
         layout.addView(text("ADV 遊戲庫", 27, TEXT));
         layout.addView(text("匯入完整遊戲資料夾，開始你的故事。", 15, MUTED));
@@ -282,6 +283,7 @@ public final class GameActivity extends Activity {
         });
     }
     private void showGame() {
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         LinearLayout layout = makeRoot();
         LinearLayout top = new LinearLayout(this); top.setGravity(Gravity.CENTER_VERTICAL);
         Button back = button("‹ 遊戲庫", view -> confirmStop()); top.addView(back);
@@ -464,7 +466,8 @@ public final class GameActivity extends Activity {
         private boolean pointerDown;
         private int pointerId = -1, lastX, lastY;
         GameSurface() {
-            super(GameActivity.this); getHolder().addCallback(this); setBackgroundColor(Color.BLACK); setFocusable(true);
+            super(GameActivity.this); getHolder().addCallback(this); setFocusable(true);
+            // Paint letterboxing on the Surface canvas; a View background obscures the Surface below it.
             renderer = new Thread(this, "adv-frame-presenter"); renderer.start();
         }
         public void surfaceCreated(SurfaceHolder holder) { ready = true; wake(); }
