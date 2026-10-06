@@ -19,6 +19,7 @@ pub mod menu;
 pub mod message;
 mod monitor;
 mod placement;
+mod rectangle;
 mod resources;
 mod scroll;
 mod station;
@@ -537,6 +538,7 @@ pub fn register(reg: &mut Registry) {
     window::register(reg);
     encoding::register(reg);
     placement::register(reg);
+    rectangle::register(reg);
     message::register(reg);
     controls::register(reg);
     dialog::register(reg);
