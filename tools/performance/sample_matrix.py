@@ -7,6 +7,8 @@ audio is always muted. Reaching a frame is startup evidence, not playability.
 Imported but uncalled APIs are recorded separately from actual failure evidence.
 Optional manifest native_baseline evidence names exe_sha256, outcome, source,
 reviewer and note; codepage may be absent/unknown, otherwise it must match.
+--quick runs a regression gate of one sample per engine: the samples marked
+"quick": true, or else the first sample of each engine, 15 seconds each.
 """
 from __future__ import annotations
 
@@ -337,6 +339,17 @@ def milestones(report: dict, evidence: dict | None = None, report_hash: str | No
                              "note": "Frames alone do not establish a title screen, correct sound or chapter completion."}}
 
 
+def quick_samples(samples: list[dict]) -> set[str]:
+    """Ids of the quick gate: the marked samples, else the first of each engine."""
+    marked = {sample["id"] for sample in samples if sample.get("quick") is True}
+    if marked:
+        return marked
+    first = {}
+    for sample in samples:
+        first.setdefault(sample.get("engine", "unknown"), sample["id"])
+    return set(first.values())
+
+
 def run(args: argparse.Namespace) -> None:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
     samples = manifest["samples"] if isinstance(manifest, dict) else manifest
@@ -352,6 +365,10 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError(f"unsupported codepage for {name}")
     if selected - ids:
         raise ValueError(f"unknown sample ids: {sorted(selected - ids)}")
+    if getattr(args, "quick", False):
+        selected = (selected or ids) & quick_samples(samples)
+        if not selected:
+            raise ValueError("--only names no quick-gate samples")
     binary = args.binary.resolve(strict=True)
     output = args.output.resolve()
     # Never place diagnostic files or overlays in a source game's directory.
@@ -365,6 +382,7 @@ def run(args: argparse.Namespace) -> None:
     environment["ADV_AUDIO_MUTE_DEVICE"] = "1"
     metadata = {"binary": str(binary), "binary_sha256": digest(binary),
                 "manifest": str(args.manifest.resolve()), "seconds_per_sample": args.seconds,
+                "quick_gate": bool(getattr(args, "quick", False)),
                 "mode": args.mode, "api_mode": args.api_mode, "codec": args.codec, "hardware_muted": True,
                 "auto_dialog_ms": 50, "qualification": "startup probe, not playability or peak throughput",
                 "classification_schema_version": 1, "samples": []}
@@ -453,7 +471,9 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--only", nargs="+")
-    parser.add_argument("--seconds", type=float, default=20)
+    parser.add_argument("--seconds", type=float, help="per-sample limit (default 20, or 15 with --quick)")
+    parser.add_argument("--quick", action="store_true",
+                        help="one sample per engine: those marked \"quick\": true, else each engine's first")
     parser.add_argument("--timeout-grace", type=float, default=15)
     parser.add_argument("--mode", choices=("hidden", "headless"), default="hidden")
     parser.add_argument("--codec", choices=("native", "guest"), default="native")
@@ -463,6 +483,8 @@ if __name__ == "__main__":
     parser.add_argument("--runner-arg", action="append", default=[],
                         help="explicit candidate option, e.g. --runner-arg=--d3d9-sm2")
     options = parser.parse_args()
+    if options.seconds is None:
+        options.seconds = 15 if options.quick else 20
     if not math.isfinite(options.seconds) or not 0 < options.seconds <= 3600:
         parser.error("seconds must be finite and within 0..3600")
     if not math.isfinite(options.timeout_grace) or not 1 <= options.timeout_grace <= 120:

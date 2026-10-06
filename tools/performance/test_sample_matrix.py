@@ -7,10 +7,46 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from sample_matrix import analyze_report, diagnostic_completeness, milestones, run, validate_native_baseline
+from sample_matrix import (analyze_report, diagnostic_completeness, milestones, quick_samples, run,
+                           validate_native_baseline)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_quick_gate_prefers_marked_samples_then_each_engines_first(self):
+        samples = [{"id": "a1", "engine": "A"}, {"id": "a2", "engine": "A"},
+                   {"id": "b1", "engine": "B"}, {"id": "n1"}]
+        self.assertEqual(quick_samples(samples), {"a1", "b1", "n1"})
+        samples[1]["quick"] = True
+        self.assertEqual(quick_samples(samples), {"a2"})
+
+    def test_quick_run_launches_only_the_gate_and_records_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "game" / "fixture.exe"
+            game.parent.mkdir()
+            game.write_bytes(b"Not executed: subprocess is mocked")
+            manifest = root / "samples.json"
+            manifest.write_text(json.dumps({"samples": [
+                {"id": name, "exe": str(game), "engine": engine}
+                for name, engine in (("one", "A"), ("two", "A"), ("three", "B"))
+            ]}), encoding="utf-8")
+            launched = []
+
+            def launch(command, **kwargs):
+                launched.append(Path(command[command.index("--report") + 1]).parent.name)
+                return SimpleNamespace(wait=lambda timeout: 0)
+
+            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=game,
+                                      output=root / "output", seconds=1, timeout_grace=1, quick=True,
+                                      mode="hidden", api_mode="discovery", codec="native", trace=False)
+            with patch("sample_matrix.subprocess.Popen", side_effect=launch):
+                run(args)
+            self.assertEqual(launched, ["one", "three"])
+            self.assertTrue(json.loads((root / "output" / "results.json").read_text())["quick_gate"])
+            args.output, args.only = root / "other", ["two"]
+            with self.assertRaisesRegex(ValueError, "no quick-gate samples"):
+                run(args)
+
     def test_multiple_samples_keep_review_evidence_separate_from_failure_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
