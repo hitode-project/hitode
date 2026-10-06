@@ -36,7 +36,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsprintf-s-vsprintf-s-l-vswprintf-s-vswprintf-s-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsnprintf-s-vsnprintf-s-l-vsnwprintf-s-vsnwprintf-s-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/scprintf-scprintf-l-scwprintf-scwprintf-l",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localeconv"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -83,12 +84,20 @@
   "locale.h": {
     "header": "ucrt/locale.h",
     "sha256": "877aa49e1f22814dd5634e785d305210d3c7ac0a1274e8552ce4f687a91ac4cb",
-    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5. Also declares unsigned int __cdecl ___lc_codepage_func(void)."
+    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5. Also declares unsigned int __cdecl ___lc_codepage_func(void) and struct lconv* __cdecl localeconv(void). The modern SDK lconv wide tail is not projected as VC90 layout."
   },
   "legacy_locale_handle": {
     "declaration": "Microsoft Learn previous-versions ff730814(v=vs.120) declares LCID* ___lc_handle_func(void), indexed by locale.h categories. This legacy LCID-array getter is absent from modern UCRT headers; no modern header declaration is claimed.",
     "projection": "msvcr90 x86 CRT cdecl zero parameters, pointer to six 32-bit LCIDs (LC_ALL reserved zero, categories1..5). Authored x86 Microsoft SysWOW64/msvcrt.dll probe confirms C=0, Japanese=0x411, Simplified Chinese=0x804, English=0x409 and mixed category indices; this is a legacy MSVCRT semantic oracle, not a VC90 binary oracle.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
+  },
+  "legacy_localeconv": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "projection": "SDK locale.h supplies the zero-argument cdecl pointer-return declaration. Only the legacy 48-byte prefix (ten 32-bit ANSI pointers followed by eight char fields) is published; no modern wchar_t fields or thread-locale API is claimed.",
+    "oracle": "Authored x86 native probe verifies four supported locale profiles, mixed LC_NUMERIC/LC_MONETARY categories, and currency encoding snapshots across LC_CTYPE/code-page changes. Numeric and monetary categories provide independent data; changing LC_CTYPE alone or setting an unchanged LC_MONETARY locale leaves monetary strings unchanged. A changed monetary locale uses current non-C LC_CTYPE code page, or its own code page with C LC_CTYPE. CP932/936/1252 yen bytes are 5C/A3A4/A5. Results describe the existing virtual locale defaults, not arbitrary host regional customizations.",
+    "oracle_source_sha256": "a5091d642b3eb39d73c1a10e9652130d3ba49110c3f5ca416c2ff313c85be986",
+    "oracle_exe_sha256": "816ec88a86367e1ec7f360b150e3ebf3c7efb52b1148cb6bd1d48a2b10436d93"
   },
   "legacy_calloc_crt": {
     "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",

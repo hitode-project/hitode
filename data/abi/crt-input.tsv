@@ -130,3 +130,4 @@ msvcr90.dll	_scprintf	variadic	i32	int	format:const char*:str8:1
 msvcr90.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
 msvcr90.dll	_scwprintf	variadic	i32	int	format:const wchar_t*:str16:1
 msvcr90.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr90.dll	localeconv	cdecl	ptr	struct lconv*	

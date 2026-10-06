@@ -4,6 +4,7 @@ use super::*;
 use adv_abi::{AnsiStr, GuestPtr, guest::memory_failure, win32};
 
 mod ctype;
+mod conv;
 
 const CATEGORY_NAMES: [&str; 5] = [
     "LC_COLLATE",
@@ -15,7 +16,7 @@ const CATEGORY_NAMES: [&str; 5] = [
 const BUFFER_BYTES: u32 = 1024;
 const LCID_OFFSET: u32 = BUFFER_BYTES - 6 * 4;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Language {
     C,
     Japanese,
@@ -59,12 +60,15 @@ pub(super) struct LocaleState {
     categories: [Locale; 5],
     buffer: u32,
     ctype_tables: HashMap<u32, u32>,
+    monetary_codepage: u32,
+    conversions: HashMap<conv::Profile, u32>,
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(setlocale_ABI);
     registry.register(lc_handles_ABI);
     registry.register(lc_codepage_ABI);
     ctype::register(registry);
+    conv::register(registry);
 }
 
 /// Formatting observes the CRT module's LC_CTYPE, independently of Win32 ACP.
@@ -253,11 +257,13 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         }
         return memory_failure(error);
     }
+    let monetary_codepage = conv::updated_monetary_codepage(&state, &categories);
     env.ext.get_mut::<CrtState>().locales.insert(
         module,
         LocaleState {
             categories,
             buffer: pointer,
+            monetary_codepage,
             ..state
         },
     );
@@ -296,6 +302,7 @@ fn lc_codepage(env: &mut Env<'_>) -> u32 {
 
 pub(super) fn release_process_tables(env: &mut Env<'_>) -> Result<(), String> {
     ctype::release_tables(env)?;
+    conv::release_tables(env)?;
     let Some(state) = env.ext.try_get::<CrtState>() else {
         return Ok(());
     };
