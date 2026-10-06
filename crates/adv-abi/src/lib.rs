@@ -30,7 +30,10 @@ pub mod types;
 
 pub use guest::{AnsiStr, Arguments, GuestArg, GuestPtr, GuestReturn, Handle, WideStr};
 pub use signature::{AbiKind, Parameter, Signature};
-pub use stub::{ApiDiagnostics, RunMode, StubCall, warn_unavailable};
+pub use stub::{
+    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RunMode, StubCall,
+    warn_unavailable,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImplementationLevel {

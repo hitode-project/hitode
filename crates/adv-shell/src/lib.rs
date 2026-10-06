@@ -300,6 +300,54 @@ fn checksum(bytes: &[u8]) -> u64 {
     })
 }
 
+fn dynamic_lookup_json(failure: &adv_runtime::DynamicLookupFailure) -> String {
+    format!(
+        concat!(
+            "{{\"sequence\": {}, \"module\": {}, \"name\": {}, ",
+            "\"failure_module\": {}, \"failure_name\": {}, ",
+            "\"caller\": {}, \"context\": {}, \"kind\": {}, \"reason\": {}}}"
+        ),
+        failure.sequence,
+        json(&failure.module),
+        json(&failure.name),
+        failure
+            .failure_module
+            .as_deref()
+            .map_or_else(|| "null".into(), json),
+        failure
+            .failure_name
+            .as_deref()
+            .map_or_else(|| "null".into(), json),
+        failure.caller,
+        failure.context,
+        json(failure.kind.as_str()),
+        json(&failure.reason),
+    )
+}
+
+fn message_box_json(message: &adv_runtime::MessageBoxCall) -> String {
+    format!(
+        concat!(
+            "{{\"sequence\": {}, \"frame\": {}, \"api\": {}, \"caller\": {}, \"context\": {}, ",
+            "\"caption\": {}, \"text\": {}, \"style\": {}, \"result\": {}, ",
+            "\"preceding_lookup_failure\": {}}}"
+        ),
+        message.sequence,
+        message.frame,
+        json(&message.api),
+        message.caller,
+        message.context,
+        json(&message.caption),
+        json(&message.text),
+        message.style,
+        message.result,
+        message
+            .preceding_lookup_failure
+            .as_ref()
+            .map_or_else(|| "null".into(), dynamic_lookup_json),
+    )
+}
+
 fn api_report(runtime: &Runtime) -> String {
     let mode = match runtime.api_mode() {
         adv_runtime::RunMode::Strict => "strict",
@@ -356,12 +404,31 @@ fn api_report(runtime: &Runtime) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     });
+    let lookups = diagnostics.map_or_else(String::new, |d| {
+        d.dynamic_lookup_failures
+            .iter()
+            .map(dynamic_lookup_json)
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    let messages = diagnostics.map_or_else(String::new, |d| {
+        d.message_boxes
+            .iter()
+            .map(message_box_json)
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     format!(
         concat!(
             "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, ",
             "\"called_gaps\": {{{}}}, \"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
             "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}, ",
-            "\"warnings\": [{}], \"unrecorded_warnings\": {}}}"
+            "\"warnings\": [{}], \"unrecorded_warnings\": {}, ",
+            "\"discovery_diagnostics_version\": 1, ",
+            "\"dynamic_lookup_failures\": [{}], \"dynamic_lookup_failure_count\": {}, ",
+            "\"dropped_dynamic_lookup_failures\": {}, \"message_boxes\": [{}], ",
+            "\"message_box_count\": {}, \"dropped_message_boxes\": {}, ",
+            "\"truncated_diagnostic_fields\": {}}}"
         ),
         json(mode),
         runtime.api_acceptance_eligible(),
@@ -376,7 +443,14 @@ fn api_report(runtime: &Runtime) -> String {
         coverage.safe_fail,
         coverage.legacy,
         warnings,
-        diagnostics.map_or(0, |d| d.unrecorded_warnings)
+        diagnostics.map_or(0, |d| d.unrecorded_warnings),
+        lookups,
+        diagnostics.map_or(0, |d| d.dynamic_lookup_failure_count),
+        diagnostics.map_or(0, |d| d.dropped_dynamic_lookup_failures),
+        messages,
+        diagnostics.map_or(0, |d| d.message_box_count),
+        diagnostics.map_or(0, |d| d.dropped_message_boxes),
+        diagnostics.map_or(0, |d| d.truncated_diagnostic_fields),
     )
 }
 

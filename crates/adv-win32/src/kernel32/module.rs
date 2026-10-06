@@ -3,7 +3,10 @@
 
 use std::collections::VecDeque;
 
-use adv_abi::{AnsiStr, Handle, Registry, WideStr, win32};
+use adv_abi::{
+    AnsiStr, ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, Handle, Registry, WideStr,
+    win32,
+};
 use adv_cpu::backend::GuestExt;
 use adv_machine::outcome::DeferredContinuation;
 use adv_machine::{Env, InitCall, Object, Outcome, Wait};
@@ -453,10 +456,77 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
     locked(env, move |env| resolve_proc(env, h, sym, caller))
 }
 
+fn record_lookup_failure(
+    env: &mut Env<'_>,
+    module: String,
+    sym: &ImportName,
+    caller: u32,
+    kind: DynamicLookupKind,
+    reason: String,
+    target: Option<(String, String)>,
+) {
+    let (failure_module, failure_name) = match target {
+        Some((module, name)) => (Some(module), Some(name)),
+        None => (None, None),
+    };
+    let failure = DynamicLookupFailure {
+        sequence: 0,
+        module,
+        name: sym.to_string(),
+        failure_module,
+        failure_name,
+        caller,
+        context: env.context,
+        kind,
+        reason,
+    };
+    env.ext
+        .get_or_default::<ApiDiagnostics>()
+        .record_dynamic_lookup_failure(failure);
+}
+
+fn missing_lookup_kind(env: &Env<'_>, module: &str, name: &str) -> DynamicLookupKind {
+    // A shipped guest DLL may share a system DLL's name. Only an unambiguous
+    // live Host target proves this failure concerns our SDK capability, rather
+    // than a guest export or an unknown optional name. Pinned Host modules
+    // remain available after the loader rolls back a failed forwarder.
+    let mut host = false;
+    for (_, loaded) in adv_os::modules(env.ext).iter() {
+        if loaded.executable_visible() && loaded.name.eq_ignore_ascii_case(module) {
+            if loaded.kind != ModuleKind::Host {
+                return DynamicLookupKind::MissingExport;
+            }
+            host = true;
+        }
+    }
+    let registry = (env.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<Registry>();
+    if host && let Some(registry) = registry {
+        let canonical = registry.canonical_name(module, name).unwrap_or(name);
+        if adv_abi::signature::lookup(module, canonical).is_some()
+            && !registry.dynamic_available(module, name)
+        {
+            return DynamicLookupKind::Unimplemented;
+        }
+    }
+    DynamicLookupKind::MissingExport
+}
+
 fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outcome {
-    let Some(id) =
-        module_of(env, h).filter(|&id| adv_os::modules(env.ext).get(id).executable_visible())
+    let requested = module_of(env, h);
+    let Some(id) = requested.filter(|&id| adv_os::modules(env.ext).get(id).executable_visible())
     else {
+        let module = requested
+            .map(|id| adv_os::modules(env.ext).get(id).name.clone())
+            .unwrap_or_else(|| "<invalid-hmodule>".into());
+        record_lookup_failure(
+            env,
+            module,
+            &sym,
+            caller,
+            DynamicLookupKind::InvalidModule,
+            format!("HMODULE {h:#010x} is not an executable module"),
+            None,
+        );
         env.sys
             .trace
             .resolution(caller, "<invalid-hmodule>", &sym, 0);
@@ -487,6 +557,16 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
                     Outcome::Return(address)
                 }),
                 Box::new(move |env| {
+                    record_lookup_failure(
+                        env,
+                        name.clone(),
+                        &sym,
+                        caller,
+                        DynamicLookupKind::InitializationFailed,
+                        "a newly loaded forwarder dependency rejected process initialization"
+                            .into(),
+                        None,
+                    );
                     env.sys.trace.resolution(caller, &name, &sym, 0);
                     let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
                     match Loader::new(env.cpu, env.sys, modules, &w.vfs).abort_resolution(changes) {
@@ -497,6 +577,14 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
             )
         }
         Err(e) => {
+            let (kind, target) = match &e {
+                adv_os::LoadError::MissingExport { module, name } => (
+                    missing_lookup_kind(env, module, name),
+                    Some((module.clone(), name.clone())),
+                ),
+                _ => (DynamicLookupKind::ResolutionFailed, None),
+            };
+            record_lookup_failure(env, name.clone(), &sym, caller, kind, e.to_string(), target);
             log::info!("GetProcAddress: {e}");
             env.sys.trace.resolution(caller, &name, &sym, 0);
             set_last_error(env, err::PROC_NOT_FOUND);

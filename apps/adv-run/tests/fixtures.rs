@@ -43,6 +43,54 @@ fn number(report: &str, key: &str) -> f64 {
 }
 
 #[test]
+fn failed_dynamic_query_and_error_message_are_reported_without_tracing() {
+    let directory = fixtures();
+    for backend in ["jit", "interpreter"] {
+        let report_path = directory.join(format!("discovery-{backend}.json"));
+        let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
+            .arg(directory.join("fixture_discovery.exe"))
+            .args([
+                "--headless",
+                "--backend",
+                backend,
+                "--seconds",
+                "5",
+                "--report",
+            ])
+            .arg(&report_path)
+            .arg("--data-dir")
+            .arg(directory.join(format!("discovery-{backend}-overlay")))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{:?}", output);
+        // Parse the actual CLI report, including nested snapshots and escaped
+        // guest text. No --trace, host audio or logger is needed for capture.
+        let parsed = Command::new("python")
+            .args(["-c", concat!(
+                "import json,sys; r=json.load(open(sys.argv[1],encoding='utf-8')); a=r['api']; ",
+                "assert r['stop_reason']=='guest_exit' and r['guest_exit_code']==1 and r['frames']==0; ",
+                "assert a['discovery_diagnostics_version']==1 and a['stub_calls']==0 and a['called_gaps']=={}; ",
+                "assert a['dynamic_lookup_failure_count']==1 and a['message_box_count']==1; ",
+                "f=a['dynamic_lookup_failures'][0]; m=a['message_boxes'][0]; ",
+                "assert f['name']=='__adv_fixture_optional_export' and f['kind']=='missing_export'; ",
+                "assert m['preceding_lookup_failure']==f and m['sequence']>f['sequence']; ",
+                "assert m['context']==f['context'] and m['frame']==0 and m['style']==16 and m['result']==1; ",
+                "assert m['caption']=='Diagnostic '+chr(34)+'caption'+chr(34)+chr(10)+'second line'; ",
+                "assert chr(10) in m['text'] and chr(9) in m['text'] and chr(92) in m['text']; ",
+                "assert a['dropped_dynamic_lookup_failures']==0 and a['dropped_message_boxes']==0 and a['truncated_diagnostic_fields']==0"
+            )])
+            .arg(&report_path)
+            .output()
+            .unwrap();
+        assert!(
+            parsed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&parsed.stderr)
+        );
+    }
+}
+
+#[test]
 fn generated_stubs_stop_strict_and_report_the_discovery_chain() {
     let directory = fixtures();
     for backend in ["jit", "interpreter"] {

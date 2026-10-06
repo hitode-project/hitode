@@ -105,10 +105,26 @@ fn message_box_a(env: &mut Env<'_>) -> Outcome {
         env.caller()
     );
     // IDOK for OK-style boxes, IDYES for yes/no.
-    Outcome::Return(match ty & 0xf {
+    let result = match ty & 0xf {
         3 | 4 => 6,
         _ => 1,
-    })
+    };
+    let record = adv_abi::MessageBoxCall {
+        sequence: 0,
+        frame: env.sys.frame,
+        api: "user32.dll!MessageBoxA".into(),
+        caller: env.caller(),
+        context: env.context,
+        caption: cap,
+        text: t,
+        style: ty,
+        result,
+        preceding_lookup_failure: None,
+    };
+    env.ext
+        .get_or_default::<adv_abi::ApiDiagnostics>()
+        .record_message_box(record);
+    Outcome::Return(result)
 }
 
 /// A single-monitor desktop of the configured size.

@@ -21,6 +21,58 @@ pub struct StubCall {
     pub failure_value: Option<u32>,
 }
 
+/// A failed feature probe is an observation, not proof that the export was required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicLookupKind {
+    Unimplemented,
+    MissingExport,
+    InvalidModule,
+    InitializationFailed,
+    ResolutionFailed,
+}
+
+impl DynamicLookupKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unimplemented => "unimplemented",
+            Self::MissingExport => "missing_export",
+            Self::InvalidModule => "invalid_module",
+            Self::InitializationFailed => "initialization_failed",
+            Self::ResolutionFailed => "resolution_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicLookupFailure {
+    pub sequence: u64,
+    /// Requested DLL/export; a forwarded failure can have a different target.
+    pub module: String,
+    pub name: String,
+    pub failure_module: Option<String>,
+    pub failure_name: Option<String>,
+    pub caller: u32,
+    pub context: u32,
+    pub kind: DynamicLookupKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBoxCall {
+    pub sequence: u64,
+    /// Presentation serial at the call, to distinguish later recovered progress.
+    pub frame: u32,
+    pub api: String,
+    pub caller: u32,
+    pub context: u32,
+    pub caption: String,
+    pub text: String,
+    pub style: u32,
+    pub result: u32,
+    /// Chronological evidence only: optional probes can precede unrelated messages.
+    pub preceding_lookup_failure: Option<DynamicLookupFailure>,
+}
+
 #[derive(Debug, Default)]
 pub struct ApiDiagnostics {
     pub gaps: BTreeMap<String, u64>,
@@ -29,6 +81,29 @@ pub struct ApiDiagnostics {
     /// Explicit capability failures, not ordinary API errors such as missing files.
     pub warnings: BTreeMap<(String, String), u64>,
     pub unrecorded_warnings: u64,
+    pub dynamic_lookup_failures: VecDeque<DynamicLookupFailure>,
+    pub dynamic_lookup_failure_count: u64,
+    pub dropped_dynamic_lookup_failures: u64,
+    pub message_boxes: VecDeque<MessageBoxCall>,
+    pub message_box_count: u64,
+    pub dropped_message_boxes: u64,
+    pub truncated_diagnostic_fields: u64,
+    sequence: u64,
+}
+
+fn bounded_text(text: String, characters: usize, truncated: &mut u64) -> String {
+    if text.len() <= characters {
+        text
+    } else {
+        let mut chars = text.chars();
+        let bounded = chars.by_ref().take(characters).collect();
+        if chars.next().is_some() {
+            *truncated = truncated.saturating_add(1);
+            bounded
+        } else {
+            text
+        }
+    }
 }
 
 /// Keep failures visible even when the caller ignores their return values.
@@ -59,6 +134,58 @@ impl ApiDiagnostics {
     pub fn acceptance_eligible(&self, mode: RunMode) -> bool {
         mode == RunMode::Strict && self.stub_calls == 0
     }
+
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence = self.sequence.saturating_add(1);
+        self.sequence
+    }
+
+    /// Record only failed dynamic lookups, without changing the API's result or
+    /// making an optional probe into a called stub. Counters expose truncation.
+    pub fn record_dynamic_lookup_failure(&mut self, mut failure: DynamicLookupFailure) {
+        failure.sequence = self.next_sequence();
+        let truncated = &mut self.truncated_diagnostic_fields;
+        failure.module = bounded_text(failure.module, 256, truncated);
+        failure.name = bounded_text(failure.name, 256, truncated);
+        failure.failure_module = failure
+            .failure_module
+            .map(|name| bounded_text(name, 256, truncated));
+        failure.failure_name = failure
+            .failure_name
+            .map(|name| bounded_text(name, 256, truncated));
+        failure.reason = bounded_text(failure.reason, 1024, truncated);
+        self.dynamic_lookup_failure_count = self.dynamic_lookup_failure_count.saturating_add(1);
+        if self.dynamic_lookup_failures.len() == 64 {
+            self.dynamic_lookup_failures.pop_front();
+            self.dropped_dynamic_lookup_failures =
+                self.dropped_dynamic_lookup_failures.saturating_add(1);
+        }
+        self.dynamic_lookup_failures.push_back(failure);
+    }
+
+    /// Capture the decoded message even if no host logger is installed. The
+    /// same-thread preceding lookup remains available after later probes evict
+    /// the lookup ring; consumers must independently establish any attribution.
+    pub fn record_message_box(&mut self, mut message: MessageBoxCall) {
+        message.sequence = self.next_sequence();
+        let truncated = &mut self.truncated_diagnostic_fields;
+        message.api = bounded_text(message.api, 256, truncated);
+        message.caption = bounded_text(message.caption, 256, truncated);
+        message.text = bounded_text(message.text, 4096, truncated);
+        message.preceding_lookup_failure = self
+            .dynamic_lookup_failures
+            .iter()
+            .rev()
+            .find(|failure| failure.context == message.context)
+            .cloned();
+        self.message_box_count = self.message_box_count.saturating_add(1);
+        if self.message_boxes.len() == 32 {
+            self.message_boxes.pop_front();
+            self.dropped_message_boxes = self.dropped_message_boxes.saturating_add(1);
+        }
+        self.message_boxes.push_back(message);
+    }
+
     fn record(&mut self, call: StubCall) {
         *self
             .gaps

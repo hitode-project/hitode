@@ -134,6 +134,33 @@ impl<B: Backend> Runtime<B> {
                     call.arguments.join(", ")
                 ));
             }
+            report.push_str(&format!(
+                "\nFailed dynamic queries: {}; captured messages: {}; dropped queries/messages: {}/{}; truncated fields: {}",
+                diagnostics.dynamic_lookup_failure_count,
+                diagnostics.message_box_count,
+                diagnostics.dropped_dynamic_lookup_failures,
+                diagnostics.dropped_message_boxes,
+                diagnostics.truncated_diagnostic_fields,
+            ));
+            for failure in &diagnostics.dynamic_lookup_failures {
+                report.push_str(&format!(
+                    "\n  lookup #{} {}!{} from {:#010x}, context {}, {}: {}",
+                    failure.sequence,
+                    failure.module,
+                    failure.name,
+                    failure.caller,
+                    failure.context,
+                    failure.kind.as_str(),
+                    failure.reason,
+                ));
+            }
+            for message in &diagnostics.message_boxes {
+                report.push_str(&format!(
+                    "\n  message #{} at frame {} {} from {:#010x}, context {}, style {:#x}, result {}: {:?}: {:?}",
+                    message.sequence, message.frame, message.api, message.caller, message.context,
+                    message.style, message.result, message.caption, message.text,
+                ));
+            }
         }
         report.push_str(&format!(
             "\nActive CPU context {}:",
