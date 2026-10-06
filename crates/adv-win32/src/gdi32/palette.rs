@@ -1,6 +1,6 @@
 //! Logical palettes on the provider's 32-bit true-colour display. Entries are
 //! real shared GDI objects; selecting a palette does not copy its contents.
-use adv_abi::Registry;
+use adv_abi::{Handle, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
@@ -30,6 +30,29 @@ const DEFAULT: [[u8; 4]; 20] = [
     [0, 255, 255, 0],
     [255, 255, 255, 0],
 ];
+
+#[win32(gdi32, name = "CreateHalftonePalette", level = implement)]
+fn create_halftone(env: &mut Env<'_>, _dc: Handle) -> Handle {
+    // This true-colour provider uses a device-independent 256-entry palette.
+    // Interior ordering is device-specific; the static system colours occupy
+    // the first and last ten slots, with a colour cube and greys between them.
+    // Native Windows also accepts NULL/stale DCs for this independent palette.
+    let mut entries = Vec::with_capacity(256);
+    entries.extend_from_slice(&DEFAULT[..10]);
+    for blue in 0..6 {
+        for green in 0..6 {
+            for red in 0..6 {
+                entries.push([red * 51, green * 51, blue * 51, 4]);
+            }
+        }
+    }
+    for shade in 1..=20 {
+        let value = (shade * 255 / 21) as u8;
+        entries.push([value, value, value, 4]);
+    }
+    entries.extend_from_slice(&DEFAULT[10..]);
+    Handle(add(env, GdiObj::Palette { entries }))
+}
 pub(super) fn entries<'a>(env: &'a Env<'_>, palette: u32) -> Option<&'a [[u8; 4]]> {
     if palette == stock_object(15) {
         return Some(&DEFAULT);
@@ -206,6 +229,7 @@ fn current_object(env: &mut Env<'_>) -> Outcome {
     })
 }
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(create_halftone_ABI);
     for (name, argc, handler) in [
         ("CreatePalette", 1, create as adv_machine::Handler),
         ("SelectPalette", 3, select),
@@ -217,5 +241,99 @@ pub(super) fn register(reg: &mut Registry) {
         ("GetCurrentObject", 2, current_object),
     ] {
         stdcall(reg, GDI32, name, argc, handler);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, Reg},
+    };
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateHalftonePalette(dc: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn GetPaletteEntries(
+            palette: *mut core::ffi::c_void,
+            start: u32,
+            count: u32,
+            output: *mut u8,
+        ) -> u32;
+        fn DeleteObject(object: *mut core::ffi::c_void) -> i32;
+    }
+
+    #[test]
+    fn halftone_palette_has_native_static_colours_and_shared_object_lifetime() {
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        assert!(registry.signature_conflicts().is_empty());
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/halftone-tests");
+        crate::Win32::install(
+            &mut machine,
+            crate::Win32Config::new(&root, "authored.exe", &root),
+        )
+        .unwrap();
+        machine.cpu.map(0x410000, 4096, Prot::RW).unwrap();
+        machine.cpu.set_reg(Reg::Esp, 0x410000);
+        let mut env = Env {
+            context: machine.sys.current,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        for dc in [0, 0xdeadbeef] {
+            // SAFETY: Windows accepts these DC values; the returned palette is
+            // inspected in a 256-entry buffer and released before leaving.
+            let native = unsafe { CreateHalftonePalette(dc as usize as *mut _) };
+            assert!(!native.is_null());
+            let mut native_entries = [[0u8; 4]; 256];
+            assert_eq!(
+                unsafe { GetPaletteEntries(native, 0, 256, native_entries.as_mut_ptr().cast()) },
+                256
+            );
+            let palette = create_halftone(&mut env, Handle(dc));
+            let actual = entries(&env, palette.0).unwrap();
+            assert_eq!(actual.len(), 256);
+            assert_eq!(&actual[..10], &native_entries[..10]);
+            assert_eq!(&actual[246..], &native_entries[246..]);
+            assert_eq!(unsafe { DeleteObject(native) }, 1);
+            let other = create_halftone(&mut env, Handle(dc));
+            assert_ne!(palette.0, other.0);
+            let private_dc = super::super::window_dc(&mut env, 0);
+            for (index, argument) in [private_dc, palette.0, 0].into_iter().enumerate() {
+                env.cpu
+                    .write_u32(0x410004 + index as u32 * 4, argument)
+                    .unwrap();
+            }
+            assert!(
+                matches!(select(&mut env), Outcome::Return(value) if value == stock_object(15))
+            );
+            env.cpu.write_u32(0x410004, palette.0).unwrap();
+            assert!(matches!(
+                super::super::delete_object_value(&mut env, palette.0),
+                Outcome::Return(0)
+            ));
+            env.cpu.write_u32(0x410004, private_dc).unwrap();
+            env.cpu.write_u32(0x410008, stock_object(15)).unwrap();
+            assert!(matches!(select(&mut env), Outcome::Return(value) if value == palette.0));
+            env.cpu.write_u32(0x410004, palette.0).unwrap();
+            assert!(matches!(
+                super::super::delete_object_value(&mut env, palette.0),
+                Outcome::Return(1)
+            ));
+            assert!(entries(&env, palette.0).is_none());
+            assert!(entries(&env, other.0).is_some());
+        }
     }
 }
