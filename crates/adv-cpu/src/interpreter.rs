@@ -1206,7 +1206,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
         }
         M::Bswap => {
             let reg = Reg::decode(i.op0_register())?;
-            if reg.width != 4 {
+            if !matches!(reg.width, 2 | 4) {
                 return None;
             }
             Action::Bswap(reg)
@@ -1700,7 +1700,16 @@ impl Transaction {
                 }
             }
             Action::Bswap(reg) => {
-                let value = reg.read(&self.regs).swap_bytes();
+                // 66 0F C8+r has an architecturally undefined result, not a
+                // specified 16-bit byte swap. Our guest compatibility policy
+                // follows observed Intel execution: clear the low word,
+                // preserve the upper word and all flags. Do not delegate this
+                // undefined host instruction on x64 or invent REV16 on ARM.
+                let value = if reg.width == 2 {
+                    0
+                } else {
+                    reg.read(&self.regs).swap_bytes()
+                };
                 reg.write(&mut self.regs, value);
             }
             Action::Xchg(a, b) => {
