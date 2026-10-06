@@ -3,7 +3,7 @@
 
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
-use adv_abi::Registry;
+use adv_abi::{AnsiStr, Registry, WideStr, win32};
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Object, Outcome, Resume, Wait, WakeReason};
 
@@ -327,6 +327,16 @@ fn create_mutex(env: &mut Env<'_>) -> Outcome {
     )
 }
 
+#[win32(kernel32, name = "OpenMutexA", level = implement)]
+fn open_mutex_a(env: &mut Env<'_>, _access: u32, _inherit: i32, name: AnsiStr) -> Outcome {
+    super::file_mapping::open_mutex(env, name.0.addr(), false)
+}
+
+#[win32(kernel32, name = "OpenMutexW", level = implement)]
+fn open_mutex_w(env: &mut Env<'_>, _access: u32, _inherit: i32, name: WideStr) -> Outcome {
+    super::file_mapping::open_mutex(env, name.0.addr(), true)
+}
+
 fn release_mutex(env: &mut Env<'_>) -> Outcome {
     let h = env.arg(0);
     let cur = env.context;
@@ -617,6 +627,8 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "ReleaseSemaphore", 3, release_semaphore);
     stdcall(reg, K32, "CreateMutexA", 3, create_mutex);
     stdcall(reg, K32, "CreateMutexW", 3, create_mutex);
+    reg.register(open_mutex_a_ABI);
+    reg.register(open_mutex_w_ABI);
     stdcall(reg, K32, "ReleaseMutex", 1, release_mutex);
     stdcall(reg, K32, "CreateWaitableTimerA", 3, create_waitable_timer);
     stdcall(reg, K32, "CreateWaitableTimerW", 3, create_waitable_timer);
