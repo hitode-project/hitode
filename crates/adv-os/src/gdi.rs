@@ -3,7 +3,7 @@
 //! one process object. Ids come from the surface store, which numbers surfaces and DCs together.
 use adv_machine::Objects;
 mod objects;
-pub use objects::{DcModes, Gdi, GdiObj, LogFont, stock_object};
+pub use objects::{DcModes, DcState, Gdi, GdiObj, LogFont, stock_object};
 
 /// The window DC: always present, it draws into the primary surface.
 pub const WINDOW_DC: u32 = 1;
