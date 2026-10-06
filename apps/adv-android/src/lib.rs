@@ -2,11 +2,12 @@
 #[cfg(feature = "gpu")]
 mod gpu;
 mod protocol;
+mod scheduling;
 mod worker;
 
 use adv_sync::{WakeEvent, input::KeyState};
 use jni::JNIEnv;
-use jni::objects::{GlobalRef, JClass, JObject, JString};
+use jni::objects::{GlobalRef, JClass, JLongArray, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
 use serde_json::json;
 use std::path::PathBuf;
@@ -377,6 +378,32 @@ unsafe extern "C" {
     ) -> i32;
     fn AndroidBitmap_unlockPixels(env: *mut jni::sys::JNIEnv, bitmap: jni::sys::jobject) -> i32;
 }
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_advhost_player_GameActivity_nativeFrameInfo(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    output: JLongArray<'_>,
+) {
+    let result = (|| -> Result<(), String> {
+        if env.get_array_length(&output).map_err(|error| error.to_string())? != 3 {
+            return Err("frameInfo requires a three-element long array".into());
+        }
+        let session = session(handle)?;
+        let metadata = {
+            let frame = session.frame.lock().unwrap_or_else(|error| error.into_inner());
+            frame.as_ref().map_or([-1, 0, 0], |frame| {
+                [frame.serial as jlong, frame.width as jlong, frame.height as jlong]
+            })
+        };
+        env.set_long_array_region(&output, 0, &metadata)
+            .map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        throw(&mut env, error);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCopyFrame(
     mut env: JNIEnv<'_>,

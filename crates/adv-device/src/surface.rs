@@ -759,6 +759,39 @@ impl<P: Presenter> Surfaces<P> {
         Ok(true)
     }
 
+    /// Materialize a retained immutable source after a later presentation.
+    /// Its own dimensions and serial remain authoritative; completed captures
+    /// cannot replace a snapshot which is already newer.
+    #[cfg(feature = "gpu")]
+    pub fn capture_native_snapshot_pixels(
+        &mut self,
+        source: &crate::gpu::NativeFrame,
+        bgra: &[u8],
+    ) -> Result<bool, String> {
+        let width = source.image.width();
+        let height = source.image.height();
+        let length = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("native capture dimensions overflow")?;
+        if bgra.len() != length {
+            return Err("native capture dimensions or byte length mismatch".into());
+        }
+        if source.serial <= self.captured_serial || source.serial > self.stats.presentations {
+            return Ok(false);
+        }
+        self.presenter.present(FrameView {
+            width,
+            height,
+            pitch: width * 4,
+            bgra,
+            serial: source.serial,
+        })?;
+        self.captured_serial = source.serial;
+        self.stats.host_captures += 1;
+        Ok(true)
+    }
+
     /// Materialize the newest complete frame once, including after the guest stops
     /// producing frames. Raw pixels are owned, so later guest writes or surface
     /// release cannot turn this into a partially drawn frame.

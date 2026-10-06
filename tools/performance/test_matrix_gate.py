@@ -16,6 +16,15 @@ WILD = ("blocked", "cpu_access_violation", "context 0 at 0x7FFE0010: memory faul
 
 
 class GateTests(unittest.TestCase):
+    def test_new_shader_diagnostics_regress_even_when_frames_continue(self):
+        candidate = result()
+        candidate["api"] = {"warnings": [{"api": "IDirect3DDevice9::DrawPrimitive",
+                                         "reason": "programmable declaration unavailable"}]}
+        verdict = gate({"one": [result()]}, {"one": [candidate]}, 0.25)["one"]
+        self.assertEqual(verdict["verdict"], "regressed")
+        self.assertIn("new shader/declaration warning", verdict["reasons"][0])
+        self.assertEqual(gate({"one": [candidate]}, {"one": [candidate]}, 0.25)["one"]["verdict"], "same")
+
     def test_outcome_names_the_failure_address_of_cpu_failures_only(self):
         self.assertEqual(outcome(result(status=SEH[0], kind=SEH[1], failure=SEH[2])),
                          ("blocked", "seh_dispatch", "0x00574916"))

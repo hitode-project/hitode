@@ -833,10 +833,14 @@ fn set_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, texture: Guest
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    if stage != 0 {
+    let Some(slot) = super::programmable::sampler_slot(stage) else {
         return INVALID;
-    }
-    let old = d.texture;
+    };
+    let old = if slot == 0 {
+        d.texture
+    } else {
+        d.shaders.textures[slot]
+    };
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
@@ -855,6 +859,11 @@ fn set_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, texture: Guest
                 .unwrap(),
         )
     };
+    if let Some(result) =
+        super::shaders::stateblocks::record_texture_slot(env, device_id, slot, new)
+    {
+        return result;
+    }
     if old == new {
         return 0;
     }
@@ -865,7 +874,11 @@ fn set_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, texture: Guest
     }
     if let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     {
-        d.texture = new;
+        if slot == 0 {
+            d.texture = new;
+        } else {
+            d.shaders.textures[slot] = new;
+        }
     }
     if let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -887,10 +900,14 @@ fn get_texture(
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if stage != 0 {
+    let Some(slot) = super::programmable::sampler_slot(stage) else {
         return Outcome::Return(INVALID);
-    }
-    let Some(id) = d.texture else {
+    };
+    let Some(id) = (if slot == 0 {
+        d.texture
+    } else {
+        d.shaders.textures[slot]
+    }) else {
         return Outcome::Return(0);
     };
     let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {

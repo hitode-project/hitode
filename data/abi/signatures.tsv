@@ -861,6 +861,8 @@ d3d9.dll	Direct3DCreate9	stdcall	ptr	Windows.Win32.Graphics.Direct3D9.IDirect3D9
 d3d9.dll	Direct3DCreate9Ex	stdcall	i32	Windows.Win32.Foundation.HRESULT	SDKVersion:u32:u32:1|param1:Windows.Win32.Graphics.Direct3D9.IDirect3D9Ex*:ptr:1
 d3d9.dll	Direct3DCreate9On12	stdcall	ptr	Windows.Win32.Graphics.Direct3D9.IDirect3D9	SDKVersion:u32:u32:1|pOverrideList:Windows.Win32.Graphics.Direct3D9on12.D3D9ON12_ARGS*:ptr:1|NumOverrideEntries:u32:u32:1
 d3d9.dll	Direct3DCreate9On12Ex	stdcall	i32	Windows.Win32.Foundation.HRESULT	SDKVersion:u32:u32:1|pOverrideList:Windows.Win32.Graphics.Direct3D9on12.D3D9ON12_ARGS*:ptr:1|NumOverrideEntries:u32:u32:1|ppOutputInterface:Windows.Win32.Graphics.Direct3D9.IDirect3D9Ex*:ptr:1
+d3dx9_43.dll	D3DXCreateEffect	stdcall	i32	HRESULT	pDevice:IDirect3DDevice9*:ptr:1|pSrcData:void*:ptr:1|SrcDataLen:UINT:u32:1|pDefines:D3DXMACRO*:ptr:1|pInclude:ID3DXInclude*:ptr:1|Flags:DWORD:u32:1|pPool:ID3DXEffectPool*:ptr:1|ppEffect:ID3DXEffect**:ptr:1|ppCompilationErrors:ID3DXBuffer**:ptr:1
+d3dx9_43.dll	D3DXGetShaderOutputSemantics	stdcall	i32	HRESULT	pFunction:DWORD*:ptr:1|pSemantics:D3DXSEMANTIC*:ptr:1|pCount:UINT*:ptr:1
 d3dx9_43.dll	D3DXMatrixLookAtLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pEye:D3DXVECTOR3*:ptr:1|pAt:D3DXVECTOR3*:ptr:1|pUp:D3DXVECTOR3*:ptr:1
 d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXMatrixTranspose	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM:D3DXMATRIX*:ptr:1

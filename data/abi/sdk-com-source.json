@@ -5,8 +5,20 @@
   "target": "x86 IUnknown-based stdcall vtables; DWORD/ULONG/pointers/HRESULT are 32 bits",
   "input": "data/abi/sdk-com-input.tsv",
   "output": "data/abi/com.tsv via tools/abi/Metadata.cs",
-  "interfaces": {"IDxDiagProvider": 5, "IDxDiagContainer": 9},
+  "interfaces": {
+    "IDxDiagProvider": 5,
+    "IDxDiagContainer": 9
+  },
   "documentation": [
     "https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
-  ]
+  ],
+  "legacy_d3dx_effect": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
+    "url": "https://www.nuget.org/packages/Microsoft.DXSDK.D3DX/9.29.952.8",
+    "package_sha256": "ead0906ae8a26c18a7525da7490127a2110f7c58f18293738283e30e97c6ea4b",
+    "header": "build/native/include/d3dx9effect.h",
+    "header_sha256": "72d6665d54c425b8a99fe0716518b2711f7cece6a3b2f8e7c6fc307e0a3fae26",
+    "scope": "ID3DXEffect 79 x86 slots, including inherited ID3DXBaseEffect/IUnknown methods; metadata only, no header or DLL bundled",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxeffect"
+  }
 }

@@ -17,6 +17,47 @@ pub struct Runtime<B: Backend = JitCpu> {
     pub machine: Machine<B>,
 }
 
+/// One immutable presentation and its owned asynchronous pixel transfer.
+/// The source stays pinned even when the guest presents a newer frame.
+#[cfg(feature = "gpu")]
+pub struct NativeCapture {
+    source: adv_device::gpu::NativeFrame,
+    readback: adv_device::gpu::Readback,
+    completed: bool,
+}
+#[cfg(feature = "gpu")]
+impl NativeCapture {
+    pub fn serial(&self) -> u64 {
+        self.source.serial
+    }
+    pub fn width(&self) -> u32 {
+        self.source.image.width()
+    }
+    pub fn height(&self) -> u32 {
+        self.source.image.height()
+    }
+    pub fn take_completion_job(&mut self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        self.readback.take_completion_job()
+    }
+    pub fn poll(&mut self) -> Option<Result<Vec<u8>, adv_device::gpu::Error>> {
+        let result = self.readback.poll();
+        self.completed |= result.is_some();
+        result
+    }
+    pub fn cancel(&mut self) {
+        if !self.completed {
+            self.readback.cancel();
+            self.completed = true;
+        }
+    }
+}
+#[cfg(feature = "gpu")]
+impl Drop for NativeCapture {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Assemble API descriptors without loading guest code or opening host devices.
 /// The same registry drives loading, signature audits and diagnostic tools.
 pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
@@ -221,6 +262,16 @@ impl<B: Backend> Runtime<B> {
     pub fn install_gpu(&mut self, gpu: adv_device::gpu::Gpu) -> Result<(), String> {
         adv_dx::d3d9::set_gpu(&mut self.machine.ext, gpu)
     }
+    /// Explicit capability gates for shader milestone validation. Disabled by
+    /// default; callers opt in independently before running guest code.
+    #[cfg(feature = "gpu")]
+    pub fn set_d3d9_shader_caps(&mut self, sm2: bool, sm3: bool) {
+        adv_dx::d3d9::set_shader_caps(&mut self.machine.ext, adv_dx::d3d9::ShaderCaps { sm2, sm3 });
+    }
+    #[cfg(feature = "gpu")]
+    pub fn set_d3d9_shader_cache(&mut self, directory: Option<std::path::PathBuf>) {
+        adv_dx::d3d9::set_shader_cache(&mut self.machine.ext, directory);
+    }
     #[cfg(feature = "gpu")]
     pub fn set_gpu_background(
         &mut self,
@@ -399,6 +450,47 @@ impl<B: Backend> Runtime<B> {
             .get::<Graphics<Snapshot>>()
             .latest_native_frame()
             .is_some()
+    }
+    #[cfg(feature = "gpu")]
+    pub fn native_frame_serial(&self) -> Option<u64> {
+        self.machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .latest_native_frame()
+            .map(|frame| frame.serial)
+    }
+    /// Frontend readback which may finish after a newer presentation. The token
+    /// retains its immutable source, independently of the latest-frame mailbox.
+    #[cfg(feature = "gpu")]
+    pub fn begin_native_frame_capture(
+        &mut self,
+    ) -> Result<Option<NativeCapture>, adv_device::gpu::Error> {
+        let Some(source) = self
+            .machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .latest_native_frame()
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let readback = adv_dx::d3d9::readback_image(&mut self.machine.ext, &source.image)?;
+        Ok(Some(NativeCapture {
+            source,
+            readback,
+            completed: false,
+        }))
+    }
+    #[cfg(feature = "gpu")]
+    pub fn finish_native_frame_capture(
+        &mut self,
+        capture: &NativeCapture,
+        bgra: &[u8],
+    ) -> Result<bool, String> {
+        self.machine
+            .ext
+            .get_mut::<Graphics<Snapshot>>()
+            .capture_native_snapshot_pixels(&capture.source, bgra)
     }
     /// Explicit export/diagnostic capture. Callers enqueue its fence job on the
     /// existing background service and consume the typed completion separately.

@@ -89,6 +89,8 @@ impl Pool {
             thread::Builder::new()
                 .name(format!("adv-jit-{index}"))
                 .spawn(move || {
+                    #[cfg(target_os = "android")]
+                    configure_android_compile_priority();
                     loop {
                         // Hold the lock only to take one job.
                         let job = queue
@@ -106,6 +108,31 @@ impl Pool {
             results,
             deliver,
         })
+    }
+}
+
+#[cfg(target_os = "android")]
+fn configure_android_compile_priority() {
+    // New threads inherit nice from the execution owner. Compilation remains
+    // ordinary work even if that owner prefers foreground latency. Preserve
+    // an already lower priority instead of trying to boost it back to normal.
+    // SAFETY: pid 0 with PRIO_PROCESS addresses only the calling Linux thread;
+    // bionic errno is thread-local, and zero or the inherited nice is in range.
+    let result = unsafe {
+        *libc::__errno() = 0;
+        let inherited = libc::getpriority(libc::PRIO_PROCESS, 0);
+        let priority = if *libc::__errno() == 0 {
+            inherited.max(0)
+        } else {
+            0
+        };
+        libc::setpriority(libc::PRIO_PROCESS, 0, priority)
+    };
+    if result != 0 {
+        eprintln!(
+            "adv-jit: could not reset inherited Android thread priority: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
