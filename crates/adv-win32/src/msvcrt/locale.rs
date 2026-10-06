@@ -67,6 +67,13 @@ pub(super) fn register(registry: &mut Registry) {
     ctype::register(registry);
 }
 
+/// Formatting observes the CRT module's LC_CTYPE, independently of Win32 ACP.
+pub(super) fn formatting_codepage(env: &Env<'_>) -> u32 {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    env.ext.try_get::<CrtState>().and_then(|state| state.locales.get(module))
+        .map_or(0, |state| state.categories[1].codepage)
+}
+
 fn default_language(acp: u32) -> Language {
     // Match kernel32's existing virtual GetUserDefaultLCID profile, not the
     // machine running the host: CP936 is zh-CN, otherwise the profile is ja-JP.

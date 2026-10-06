@@ -8,6 +8,7 @@ mod convert;
 mod cpp_alloc;
 mod data;
 mod exceptions;
+mod formatting;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
@@ -79,6 +80,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 pub fn register(r: &mut Registry) {
     data::register(r);
     exceptions::register(r);
+    formatting::register(r);
     floating::register(r);
     onexit::register(r);
     startup::register(r);

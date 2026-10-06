@@ -30,7 +30,13 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/calloc",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-func",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-pwctype-wctype-mbctype-mbcasemap",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/uncaught-exception"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/uncaught-exception",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/sprintf-s-sprintf-s-l-swprintf-s-swprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/snprintf-s-snprintf-s-l-snwprintf-s-snwprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsprintf-s-vsprintf-s-l-vswprintf-s-vswprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsnprintf-s-vsnprintf-s-l-vsnwprintf-s-vsnwprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/scprintf-scprintf-l-scwprintf-scwprintf-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -99,7 +105,12 @@
     "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
     "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
     "behavior": "Authored activation-context VC90 probe reads the EOF slot at pointer[-1] and all256 byte slots. C is distinct from localized tables. Japanese/Chinese/English LC_CTYPE names crossed with CP932/936/1252 produce identical classification for each codepage, so the supported four profiles are keyed by CP0/932/936/1252 independently of language and host ACP. Compact classification data is derived from observed tables, not copied from SDK implementation headers.",
-    "fnv1a64_514_bytes": { "C": "48cabdc90fcb0865", "932": "44eb5be34d5b7579", "936": "e33c618c172b2971", "1252": "006150ad6479dba0" }
+    "fnv1a64_514_bytes": {
+      "C": "48cabdc90fcb0865",
+      "932": "44eb5be34d5b7579",
+      "936": "e33c618c172b2971",
+      "1252": "006150ad6479dba0"
+    }
   },
   "eh.h": {
     "source": "Microsoft Visual C++ Build Tools 14.44.35207",
@@ -115,5 +126,15 @@
   "process.h": {
     "header": "ucrt/process.h",
     "sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490"
+  },
+  "stdio.h": {
+    "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "header": "ucrt/stdio.h",
+    "projection": "x86 cdecl fixed va_list and variadic mandatory parameters for six paired buffer/count families, limited to VC80/90 export profiles"
+  },
+  "corecrt_wstdio.h": {
+    "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515",
+    "header": "ucrt/corecrt_wstdio.h",
+    "projection": "wchar_t pointer parameters and character capacities remain UTF-16; va_list is an x86 pointer, variadic functions retain only mandatory parameter slots"
   }
 }

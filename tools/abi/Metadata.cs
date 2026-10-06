@@ -221,7 +221,10 @@ public static class AbiMetadata
         foreach (var row in File.ReadLines(supplement).Where(line => line.Length != 0 && !line.StartsWith('#')))
         {
             var f = row.Split('\t');
-            if (f.Length != 6 || !new[] { "cdecl", "data" }.Contains(f[2]) || !new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3])
+            bool crtVariadic = f.Length == 6 && new[] { "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "sprintf_s", "_snprintf_s", "swprintf_s", "_snwprintf_s", "_scprintf", "_scwprintf" }.Contains(f[1])
+                && f[2] == "variadic" && f[3] == "i32" && f[4] == "int";
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic) || !new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3])
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))

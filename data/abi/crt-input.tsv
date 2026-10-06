@@ -106,3 +106,27 @@ msvcr80.dll	_acmdln	data	ptr	char*
 msvcr80.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr90.dll	_acmdln	data	ptr	char*	
 msvcr90.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr80.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
+msvcr80.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	_snprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1
+msvcr80.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	swprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr80.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr80.dll	_snwprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr80.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr80.dll	_scprintf	variadic	i32	int	format:const char*:str8:1
+msvcr80.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	_scwprintf	variadic	i32	int	format:const wchar_t*:str16:1
+msvcr80.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr90.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
+msvcr90.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	_snprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1
+msvcr90.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	swprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr90.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr90.dll	_snwprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr90.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr90.dll	_scprintf	variadic	i32	int	format:const char*:str8:1
+msvcr90.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	_scwprintf	variadic	i32	int	format:const wchar_t*:str16:1
+msvcr90.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
