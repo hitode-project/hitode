@@ -470,12 +470,14 @@ impl Sys {
 
     /// Non-blocking check of a waitable object (consumes an auto-reset signal).
     pub fn try_acquire(&mut self, h: Handle) -> bool {
+        self.wake();
         let cur = self.current;
         sched::poll_object(&mut self.objects, &self.contexts, h, cur, true)
     }
 
     /// Acquire a wait set without partially consuming an unsatisfied WaitAll.
     pub fn try_acquire_objects(&mut self, handles: &[Handle], all: bool) -> Option<WakeReason> {
+        self.wake();
         sched::poll_objects(
             &mut self.objects,
             &self.contexts,
@@ -532,6 +534,7 @@ impl Sys {
     /// Wake every blocked context whose wait is satisfied, in context order.
     fn wake(&mut self) {
         let now = self.clock.now_us();
+        self.objects.expire_timers(now);
         for i in 0..self.contexts.len() {
             let reason = self.poll_wait(i, now);
             if let Some(reason) = reason {
@@ -624,7 +627,25 @@ impl Sys {
                 } => *deadline,
                 _ => None,
             })
+            .chain(self.objects.next_timer_deadline())
             .min()
+    }
+
+    /// Arm a neutral waitable timer against the one guest clock. Set clears
+    /// its signal, but cannot revoke a grant already made to a blocked waiter.
+    pub fn arm_timer(&mut self, handle: Handle, deadline: u64, period_us: u64) -> bool {
+        self.wake();
+        if !self.objects.arm_timer(handle, deadline, period_us) {
+            return false;
+        }
+        self.wake();
+        true
+    }
+
+    /// Cancel future expirations without clearing an already available signal.
+    pub fn cancel_timer(&mut self, handle: Handle) -> bool {
+        self.wake();
+        self.objects.cancel_timer(handle)
     }
 }
 

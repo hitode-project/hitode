@@ -8,11 +8,12 @@
 //! separately, so releasing a borrowed token cannot destroy an open alias.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sched::{Handle, Object};
+mod timers;
 
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(1);
 
@@ -122,6 +123,8 @@ pub struct Objects {
     entries: HashMap<u64, Entry>,
     targets: HashMap<(u32, u32), u64>,
     kernel_identities: HashMap<Handle, u64>,
+    /// Armed timer entries, indexed by deadline and stable payload identity.
+    timer_deadlines: BTreeSet<(u64, u64)>,
     namespaces: HashMap<u32, NamespaceState>,
     next_object: u64,
     next_namespace: u32,
@@ -144,6 +147,7 @@ impl Objects {
             entries: HashMap::new(),
             targets: HashMap::new(),
             kernel_identities: HashMap::new(),
+            timer_deadlines: BTreeSet::new(),
             namespaces: HashMap::from([(0, NamespaceState::default())]),
             next_object: 0,
             next_namespace: 0,
@@ -268,6 +272,13 @@ impl Objects {
             return None;
         }
         let entry = self.entries.remove(&id).unwrap();
+        if let Object::Timer {
+            deadline: Some(deadline),
+            ..
+        } = &entry.value
+        {
+            self.timer_deadlines.remove(&(*deadline, id));
+        }
         if let Some(kernel_identity) = entry.kernel_identity {
             self.kernel_identities.remove(&kernel_identity);
         }

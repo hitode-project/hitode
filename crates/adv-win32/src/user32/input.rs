@@ -2,7 +2,49 @@
 use super::{user, user_mut};
 use crate::util::set_last_error;
 use adv_abi::{AnsiStr, Env, GuestPtr, Handle, Registry, WideStr, win32};
-use adv_cpu::backend::Prot;
+use adv_cpu::backend::{GuestExt, Prot};
+
+#[win32(user32, name = "GetCursorInfo", level = state)]
+fn get_cursor_info(env: &mut Env<'_>, out: GuestPtr<u8>) -> i32 {
+    // Win32 CURSORINFO is 20 bytes: DWORD, DWORD, HCURSOR, POINT. Keep
+    // the ABI independent of the host pointer width and validate before writing.
+    let pointer = out.addr();
+    if adv_abi::guest::check_range(env.cpu, pointer, 4, Prot::READ).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    let size = env.cpu.read_u32(pointer).unwrap_or(0);
+    if size != 20 {
+        set_last_error(env, 87);
+        return 0;
+    }
+    if adv_abi::guest::check_range(env.cpu, pointer, 20, Prot::WRITE).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    let state = user(env);
+    let words = [
+        20,
+        u32::from(state.cursor_handle != 0 && state.cursor_count >= 0),
+        state.cursor_handle,
+        state.cursor_pos.0 as u32,
+        state.cursor_pos.1 as u32,
+    ];
+    let mut bytes = [0; 20];
+    for (word, output) in words.into_iter().zip(bytes.chunks_exact_mut(4)) {
+        output.copy_from_slice(&word.to_le_bytes());
+    }
+    if env.cpu.write(pointer, &bytes).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    1
+}
+
+#[win32(user32, name = "GetCursor", level = state)]
+fn get_cursor(env: &mut Env<'_>) -> Handle {
+    Handle(user(env).cursor_handle)
+}
 
 pub(super) fn layout_for_codepage(codepage: u32) -> u32 {
     match codepage {
@@ -79,6 +121,8 @@ fn swap_mouse_button(env: &mut Env<'_>, swap: i32) -> u32 {
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
+        get_cursor_info_ABI,
+        get_cursor_ABI,
         get_keyboard_layout_ABI,
         get_keyboard_layout_list_ABI,
         get_keyboard_layout_name_a_ABI,
@@ -98,6 +142,74 @@ mod tests {
         backend::{Guest, GuestExt, Reg},
     };
     use adv_machine::{Clock, Machine, Outcome};
+    #[test]
+    fn cursor_info_tracks_shape_visibility_position_and_rejects_bad_outputs() {
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        let cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+        let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+        crate::Win32::install(
+            &mut m,
+            crate::Win32Config::new(".", "cursor.exe", "target/cursor-tests"),
+        )
+        .unwrap();
+        m.spawn("cursor", adv_machine::layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        let page = m.sys.vm.alloc(&mut m.cpu, 8192, Prot::RW).unwrap();
+        m.cpu.set_reg(Reg::Esp, page);
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        env.cpu.write_u32(page + 4, 0).unwrap();
+        env.cpu.write_u32(page + 8, 32512).unwrap();
+        let Outcome::Return(cursor) = super::super::load_cursor_a(&mut env) else {
+            panic!()
+        };
+        assert_ne!(cursor, 0);
+        env.cpu.write_u32(page + 4, cursor).unwrap();
+        assert!(matches!(
+            super::super::set_cursor(&mut env),
+            Outcome::Return(0)
+        ));
+        assert_eq!(get_cursor(&mut env), Handle(cursor));
+        user_mut(&mut env).cursor_pos = (-20, 100);
+        let output = page + 64;
+        env.cpu.write_u32(output, 20).unwrap();
+        assert_eq!(get_cursor_info(&mut env, GuestPtr::new(output)), 1);
+        let read = |env: &Env<'_>| {
+            (0..5)
+                .map(|i| env.cpu.read_u32(output + i * 4).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(&env), [20, 1, cursor, (-20i32) as u32, 100]);
+        env.cpu.write_u32(page + 4, 0).unwrap();
+        assert!(matches!(
+            super::super::show_cursor(&mut env),
+            Outcome::Return(u32::MAX)
+        ));
+        assert_eq!(get_cursor_info(&mut env, GuestPtr::new(output)), 1);
+        assert_eq!(read(&env)[1], 0);
+        assert!(
+            matches!(super::super::set_cursor(&mut env), Outcome::Return(value) if value == cursor)
+        );
+        assert_eq!(get_cursor(&mut env), Handle(0));
+        env.cpu.write_u32(output, 19).unwrap();
+        let unchanged = read(&env);
+        assert_eq!(get_cursor_info(&mut env, GuestPtr::new(output)), 0);
+        assert_eq!(read(&env), unchanged);
+        // The size is readable, but the output would cross a read-only page.
+        let edge = page + 4092;
+        env.cpu.write(edge, &[0x5a; 20]).unwrap();
+        env.cpu.write_u32(edge, 20).unwrap();
+        env.cpu.protect(page + 4096, 4096, Prot::READ).unwrap();
+        assert_eq!(get_cursor_info(&mut env, GuestPtr::new(edge)), 0);
+        assert_eq!(env.cpu.read_u32(edge + 4).unwrap(), 0x5a5a5a5a);
+        assert_eq!(get_cursor_info(&mut env, GuestPtr::new(0)), 0);
+    }
     #[test]
     fn host_inverse_then_guest_mapping_is_once_and_preserves_ctrl_wheel_and_extra_buttons() {
         for host in [false, true] {

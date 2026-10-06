@@ -183,6 +183,7 @@ fn message_wait(
             e.sys.objects.get(h),
             Some(
                 Object::Event { .. }
+                    | Object::Timer { .. }
                     | Object::Mutex { .. }
                     | Object::Semaphore { .. }
                     | Object::Thread { .. }

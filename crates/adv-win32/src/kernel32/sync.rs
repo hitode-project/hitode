@@ -191,6 +191,7 @@ fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
         env.sys.objects.get(h),
         Some(
             Object::Event { .. }
+                | Object::Timer { .. }
                 | Object::Mutex { .. }
                 | Object::Semaphore { .. }
                 | Object::Thread { .. }
@@ -243,6 +244,7 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
             env.sys.objects.get(h),
             Some(
                 Object::Event { .. }
+                    | Object::Timer { .. }
                     | Object::Mutex { .. }
                     | Object::Semaphore { .. }
                     | Object::Thread { .. }
@@ -357,48 +359,6 @@ fn release_mutex(env: &mut Env<'_>) -> Outcome {
         env.sys.signal_waiters(h);
     }
     result
-}
-
-fn create_waitable_timer(env: &mut Env<'_>) -> Outcome {
-    let manual = env.arg(1) != 0;
-    let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
-    super::file_mapping::sync_created(
-        env,
-        Object::Event {
-            manual_reset: manual,
-            signaled: false,
-        },
-        env.arg(2),
-        wide,
-    )
-}
-
-fn set_waitable_timer(env: &mut Env<'_>) -> Outcome {
-    let h = env.arg(0);
-    if let Some(Object::Event { signaled, .. }) = env.sys.objects.get_mut(h) {
-        *signaled = true;
-        env.sys.signal_waiters(h);
-        Outcome::Return(1)
-    } else {
-        set_last_error(env, err::INVALID_HANDLE);
-        Outcome::Return(0)
-    }
-}
-
-fn cancel_waitable_timer(env: &mut Env<'_>) -> Outcome {
-    let h = env.arg(0);
-    if let Some(Object::Event { signaled, .. }) = env.sys.objects.get_mut(h) {
-        *signaled = false;
-        Outcome::Return(1)
-    } else {
-        set_last_error(env, err::INVALID_HANDLE);
-        Outcome::Return(0)
-    }
-}
-
-fn open_waitable_timer(env: &mut Env<'_>) -> Outcome {
-    set_last_error(env, 2); // ERROR_FILE_NOT_FOUND
-    Outcome::Return(0)
 }
 
 /// SLIST_HEADER (x86): `Next`, then `Depth` and `Sequence` u16s. The interlocked
@@ -630,12 +590,6 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(open_mutex_a_ABI);
     reg.register(open_mutex_w_ABI);
     stdcall(reg, K32, "ReleaseMutex", 1, release_mutex);
-    stdcall(reg, K32, "CreateWaitableTimerA", 3, create_waitable_timer);
-    stdcall(reg, K32, "CreateWaitableTimerW", 3, create_waitable_timer);
-    stdcall(reg, K32, "SetWaitableTimer", 6, set_waitable_timer);
-    stdcall(reg, K32, "CancelWaitableTimer", 1, cancel_waitable_timer);
-    stdcall(reg, K32, "OpenWaitableTimerA", 3, open_waitable_timer);
-    stdcall(reg, K32, "OpenWaitableTimerW", 3, open_waitable_timer);
     stdcall(reg, K32, "WaitForSingleObject", 2, |e| {
         let (h, ms) = (e.arg(0), e.arg(1));
         wait_one(e, h, ms)
