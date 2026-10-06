@@ -52,7 +52,12 @@ pub(super) fn supported(i: &Instruction) -> bool {
             };
     }
     match i.mnemonic() {
-        M::Clc | M::Stc | M::Cmc => i.op_count() == 0,
+        M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Lahf | M::Sahf => i.op_count() == 0,
+        M::Bswap => i.code() == Code::Bswap_r32,
+        M::Pushf | M::Pushfd | M::Popf | M::Popfd => matches!(
+            i.code(),
+            Code::Pushfw | Code::Pushfd | Code::Popfw | Code::Popfd
+        ),
         M::Cdq => i.code() == Code::Cdq,
         M::Leave => i.code() == Code::Leaved,
         M::Adc | M::Sbb => {
@@ -175,6 +180,17 @@ impl Emitter<'_> {
         }
     }
 
+    /// Make `flags` the whole EFLAGS, with no lazily derived bits.
+    pub(super) fn set_raw_flags(&mut self, flags: Value) {
+        self.b.def_var(self.flags, flags);
+        let zero = self.constant(0);
+        for var in self.lazy {
+            self.b.def_var(var, zero);
+        }
+        let carry = self.b.ins().band_imm(flags, 1);
+        self.b.def_var(self.lazy[4], carry);
+    }
+
     fn flags_state(&mut self) -> [Value; 8] {
         let mut state = [self.b.use_var(self.flags); 8];
         for (value, var) in state[1..].iter_mut().zip(self.lazy) {
@@ -211,6 +227,89 @@ impl Emitter<'_> {
             for (var, value) in self.lazy[4..].iter().zip([carry, zero, zero]) {
                 self.b.def_var(*var, value);
             }
+            return;
+        }
+        if matches!(i.mnemonic(), M::Cld | M::Std) {
+            let flags = self.b.use_var(self.flags);
+            let flags = if i.mnemonic() == M::Std {
+                self.b.ins().bor_imm(flags, 0x400)
+            } else {
+                self.b.ins().band_imm(flags, !0x400_i64)
+            };
+            self.b.def_var(self.flags, flags);
+            return;
+        }
+        if i.mnemonic() == M::Lahf {
+            let flags = self.materialize_flags();
+            let flags = self.b.ins().band_imm(flags, 0xd5);
+            let flags = self.b.ins().bor_imm(flags, 2);
+            let high = self.b.ins().ishl_imm(flags, 8);
+            let eax = self.b.use_var(self.regs[0]);
+            let eax = self.b.ins().band_imm(eax, !0xff00_i64);
+            let eax = self.b.ins().bor(eax, high);
+            self.b.def_var(self.regs[0], eax);
+            return;
+        }
+        if i.mnemonic() == M::Sahf {
+            // SF, ZF, AF, PF and CF come from AH; OF is kept.
+            let overflow = self.flag(11);
+            let overflow = self.b.ins().ishl_imm(overflow, 11);
+            let eax = self.b.use_var(self.regs[0]);
+            let high = self.b.ins().ushr_imm(eax, 8);
+            let loaded = self.b.ins().band_imm(high, 0xd5);
+            let flags = self.b.use_var(self.flags);
+            let flags = self.b.ins().band_imm(flags, !0x8d5_i64);
+            let flags = self.b.ins().bor(flags, loaded);
+            let flags = self.b.ins().bor(flags, overflow);
+            self.set_raw_flags(flags);
+            return;
+        }
+        if i.mnemonic() == M::Bswap {
+            let index = reg_index(i.op0_register()).unwrap();
+            let value = self.b.use_var(self.regs[index]);
+            let value = self.b.ins().bswap(value);
+            self.b.def_var(self.regs[index], value);
+            return;
+        }
+        if matches!(i.code(), Code::Pushfw | Code::Pushfd) {
+            let width = if i.code() == Code::Pushfw { 2 } else { 4 };
+            // PUSHF stores VM and RF clear.
+            let flags = self.materialize_flags();
+            let flags = self.b.ins().band_imm(flags, !0x30000_i64);
+            let sp = self.b.use_var(self.regs[4]);
+            let sp = self.b.ins().iadd_imm(sp, -(width as i64));
+            let ptr = self.pointer(sp, width);
+            let value = if width == 2 {
+                self.b.ins().ireduce(types::I16, flags)
+            } else {
+                flags
+            };
+            self.store_memory(ptr, value);
+            self.b.def_var(self.regs[4], sp);
+            return;
+        }
+        if matches!(i.code(), Code::Popfw | Code::Popfd) {
+            let width: i64 = if i.code() == Code::Popfw { 2 } else { 4 };
+            let sp = self.b.use_var(self.regs[4]);
+            let value = if width == 2 {
+                let word = self.direct_load(sp, types::I16);
+                self.b.ins().uextend(types::I32, word)
+            } else {
+                self.direct_load(sp, types::I32)
+            };
+            // Setting TF single-steps the next instruction: the interpreter does that.
+            let trap = self.b.ins().band_imm(value, 0x100);
+            self.guard(trap, Exit::Fallback, None);
+            // At CPL3, POPF cannot change IF or IOPL.
+            let writable = 0x24_4dd5 & if width == 2 { 0xffff } else { -1 };
+            let kept = self.b.use_var(self.flags);
+            let kept = self.b.ins().band_imm(kept, !writable);
+            let loaded = self.b.ins().band_imm(value, writable);
+            let flags = self.b.ins().bor(kept, loaded);
+            let flags = self.b.ins().bor_imm(flags, 2);
+            self.set_raw_flags(flags);
+            let sp = self.b.ins().iadd_imm(sp, width);
+            self.b.def_var(self.regs[4], sp);
             return;
         }
         if i.code() == Code::Cdq {

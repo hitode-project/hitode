@@ -325,3 +325,79 @@ fn byte_and_word_compare_test_flags_and_branches_match_unicorn() {
         }
     }
 }
+
+#[test]
+fn flag_transfers_direction_and_byte_swap_match_unicorn() {
+    let values = [0, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x1234_d5c7];
+    // EFLAGS images without TF, which would single-step.
+    let images = [0, 0xffff_feff, 0x0000_0ed7, 0x0024_4cd5, 0x8d5];
+    for form in 0..9 {
+        let bytes = assemble(|a| {
+            // A lazy producer first, so each form must see derived flags.
+            a.add(eax, ebx).unwrap();
+            match form {
+                0 => a.lahf().unwrap(),
+                1 => {
+                    a.mov(eax, edx).unwrap();
+                    a.sahf().unwrap();
+                }
+                2 => {
+                    a.pushfd().unwrap();
+                    a.pop(ecx).unwrap();
+                }
+                3 => {
+                    a.pushf().unwrap();
+                    a.movzx(ecx, word_ptr(esp)).unwrap();
+                    a.add(esp, 2).unwrap();
+                }
+                4 => {
+                    a.push(edx).unwrap();
+                    a.popfd().unwrap();
+                }
+                5 => {
+                    a.push(dx).unwrap();
+                    a.popf().unwrap();
+                }
+                6 => {
+                    a.std().unwrap();
+                    a.pushfd().unwrap();
+                    a.pop(ecx).unwrap();
+                    a.cld().unwrap();
+                }
+                7 => a.bswap(eax).unwrap(),
+                _ => {
+                    a.mov(eax, edx).unwrap();
+                    a.sahf().unwrap();
+                    a.seto(cl).unwrap();
+                    a.setc(ch).unwrap();
+                }
+            }
+            a.ret().unwrap();
+        });
+        let mut jit = machine(&bytes, true);
+        let mut uc = machine(&bytes, false);
+        for &left in &values {
+            for &right in &values {
+                for &image in &images {
+                    let context = format!("form {form}, {left:#x} + {right:#x}, image {image:#x}");
+                    let regs = [left, 0, image, right, 0, 0, 0, 0];
+                    reset(&mut jit, regs, 0x202);
+                    assert_eq!(jit.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+                    // Unicorn for the results; the interpreter for EFLAGS, which
+                    // Unicorn reports stale after PUSHFD.
+                    reset(&mut uc, regs, 0x202);
+                    assert_eq!(
+                        uc.run_unicorn(STOP, 10000).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    assert_eq!(jit.state.regs, uc.state.regs, "{context}");
+                    reset(&mut uc, regs, 0x202);
+                    assert_eq!(uc.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(jit.state.regs, uc.state.regs, "{context}");
+                    assert_eq!(jit.state.eflags, uc.state.eflags, "{context}");
+                }
+            }
+        }
+        assert_eq!(jit.stats.interpreter_entries, 0, "form {form}");
+    }
+}

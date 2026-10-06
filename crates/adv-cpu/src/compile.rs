@@ -27,6 +27,7 @@ mod register_liveness;
 mod scalar;
 mod shadow;
 mod simd;
+mod sse;
 mod vector;
 mod write_summary;
 pub(crate) mod x87;
@@ -2196,7 +2197,10 @@ pub(crate) fn supported(i: &Instruction) -> bool {
             | M::Jnp
             | M::Loop
     ) {
-        return simd::supported(i) || scalar::supported(i) || mmx::supported(i);
+        return simd::supported(i)
+            || scalar::supported(i)
+            || mmx::supported(i)
+            || sse::supported(i);
     }
     let narrow = matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx)
         || narrow_alu(i.mnemonic())
@@ -4826,6 +4830,10 @@ impl Emitter<'_> {
         }
         if simd::supported(i) {
             self.simd_instruction(i);
+            return false;
+        }
+        if sse::supported(i) {
+            self.sse_instruction(i);
             return false;
         }
         match i.mnemonic() {

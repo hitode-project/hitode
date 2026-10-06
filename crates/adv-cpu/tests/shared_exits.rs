@@ -27,11 +27,11 @@ fn machine(bytes: &[u8], strategy: Option<CompileStrategy>) -> Executor {
     if let Some(strategy) = strategy {
         let mut region = Region::new(CODE, bytes.len());
         region.compile_strategy = strategy;
-        // The native island after BSWAP observes the saved partial/vector state.
+        // The native island after XADD observes the saved partial/vector state.
         region.entries.extend(
             Decoder::with_ip(32, bytes, u64::from(CODE), DecoderOptions::NONE)
                 .into_iter()
-                .filter(|i| i.mnemonic() == Mnemonic::Bswap)
+                .filter(|i| i.mnemonic() == Mnemonic::Xadd)
                 .map(|i| i.next_ip32()),
         );
         m.add_region(region).unwrap();
@@ -218,19 +218,19 @@ fn cold_exit_saves_each_predecessor_before_the_interpreted_instruction_runs() {
         a.test(ecx, ecx).unwrap();
         a.jnz(subtract).unwrap();
         prefix(a, false);
-        a.bswap(edx).unwrap();
+        a.xadd(edx, eax).unwrap();
         a.setb(dl).unwrap();
         a.ret().unwrap();
         a.set_label(&mut subtract).unwrap();
         prefix(a, true);
-        a.bswap(edx).unwrap();
+        a.xadd(edx, eax).unwrap();
         a.setb(dl).unwrap();
         a.ret().unwrap();
     });
     let interpreted_pcs: Vec<_> =
         Decoder::with_ip(32, &bytes, u64::from(CODE), DecoderOptions::NONE)
             .into_iter()
-            .filter(|i| i.mnemonic() == Mnemonic::Bswap)
+            .filter(|i| i.mnemonic() == Mnemonic::Xadd)
             .map(|i| i.ip32())
             .collect();
     for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
@@ -248,18 +248,17 @@ fn cold_exit_saves_each_predecessor_before_the_interpreted_instruction_runs() {
                 assert_eq!(jit.state.eip, pc);
                 assert_eq!(jit.state.fuel, 0);
                 assert_eq!(jit.state.fault_addr, INITIAL_FAULT_ADDRESS);
-                // Exhausting the native budget before BSWAP does not execute
+                // Exhausting the native budget before XADD does not execute
                 // or count an interpreter instruction.
                 assert_eq!(jit.stats.interpreter_entries, interpreter_entries);
                 assert_eq!(jit.stats.interpreter_instructions, interpreter_instructions);
                 equal_state(&mut jit, &mut uc);
-                assert_eq!(jit.state.regs[2], 0x89ab_cdef, "BSWAP has not executed yet");
+                assert_eq!(jit.state.regs[2], 0x89ab_cdef, "XADD has not executed yet");
                 assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
                 assert!(jit.stats.interpreter_entries > interpreter_entries);
                 assert!(jit.stats.interpreter_instructions > interpreter_instructions);
                 assert_eq!(uc.run_unicorn(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
                 equal_state(&mut jit, &mut uc);
-                assert_eq!(jit.state.regs[2] & !255, 0xefcd_ab00);
             }
         }
     }
