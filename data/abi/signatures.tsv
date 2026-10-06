@@ -3478,6 +3478,7 @@ msvcr80.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u
 msvcr80.dll	_errno	cdecl	ptr	i32*	
 msvcr80.dll	_exit	cdecl	void	void	status:i32:i32:1
 msvcr80.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcr80.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcr80.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
 msvcr80.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr80.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
@@ -3496,6 +3497,7 @@ msvcr80.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:
 msvcr80.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr80.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcr80.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr80.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
 msvcr80.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
@@ -3530,6 +3532,7 @@ msvcr90.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u
 msvcr90.dll	_errno	cdecl	ptr	i32*	
 msvcr90.dll	_exit	cdecl	void	void	status:i32:i32:1
 msvcr90.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcr90.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcr90.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
 msvcr90.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcr90.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
@@ -3548,6 +3551,7 @@ msvcr90.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:
 msvcr90.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr90.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcr90.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr90.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
 msvcr90.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
@@ -3579,6 +3583,7 @@ msvcrt.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u6
 msvcrt.dll	_errno	cdecl	ptr	i32*	
 msvcrt.dll	_exit	cdecl	void	void	status:i32:i32:1
 msvcrt.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcrt.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcrt.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcrt.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
 msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
@@ -3587,6 +3592,7 @@ msvcrt.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
 msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcrt.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcrt.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
 msvcrt.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1

@@ -178,3 +178,9 @@ msvcr80.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
 msvcr80.dll	rand	cdecl	i32	int	
 msvcr90.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
 msvcr90.dll	rand	cdecl	i32	int	
+msvcrt.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
+msvcrt.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
+msvcr80.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
+msvcr80.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
+msvcr90.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
+msvcr90.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1

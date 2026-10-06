@@ -213,5 +213,19 @@
     "projection": "double __cdecl strtod(char const* _String, char** _EndPtr), two x86 pointer slots and an IEEE binary64 x87 ST0 return. Only the existing MSVCRT/VC80/VC90 export profiles; no locale-object or C99 conversion family is projected.",
     "behavior": "Authored x86 VC80 8.0.50727.9680 oracle: decimal prefix with incomplete exponent rollback; hex stops after initial decimal zero, inf/nan do not convert. Overflow and nonzero mantissa rounding to zero assign errno34; nonzero subnormal retains errno. NULL source zeros endptr and calls returning invalid handler with errno22. Existing supported C/JP/CN/EN numeric categories use decimal dot; byte-space classification follows module LC_CTYPE, including CP1252 A0.",
     "oracle_source_sha256": "f2000268d660b2b42b987a9db6bc26aad7d8d4b47bee059edef18ffaa3f75fa7"
+  },
+  "shared_open": {
+    "headers": [
+      {
+        "header": "ucrt/stdio.h:255-259",
+        "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6"
+      },
+      {
+        "header": "ucrt/corecrt_wstdio.h:162-166",
+        "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515"
+      }
+    ],
+    "projection": "FILE* __cdecl _fsopen/_wfsopen(filename, mode, int share), three x86 slots; legacy CRT aliases only.",
+    "profile": "Use the existing CRT stream and VFS owner; unsupported sharing modes must fail with qualified warning rather than fabricated success."
   }
 }
