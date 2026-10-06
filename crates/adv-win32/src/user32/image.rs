@@ -42,6 +42,93 @@ fn name(env: &Env<'_>, pointer: u32, wide: bool) -> Result<String, u32> {
     }
 }
 
+pub(super) fn resource_id(env: &Env<'_>, pointer: u32, wide: bool) -> Result<ResId, u32> {
+    if pointer < 0x10000 {
+        return Ok(ResId::Id(pointer as u16));
+    }
+    if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        return Err(50);
+    }
+    let text = name(env, pointer, wide)?;
+    Ok(text
+        .strip_prefix('#')
+        .and_then(|n| n.parse::<u16>().ok())
+        .map_or_else(|| ResId::Name(text), ResId::Id))
+}
+
+pub(super) fn load_cursor(env: &mut Env<'_>, instance: u32, pointer: u32, wide: bool) -> Handle {
+    let api = if wide {
+        "user32.dll!LoadCursorW"
+    } else {
+        "user32.dll!LoadCursorA"
+    };
+    let id = match resource_id(env, pointer, wide) {
+        Ok(id) => id,
+        Err(50) => {
+            return unsupported(
+                env,
+                api,
+                "ANSI cursor resource name code page has no supported decoder",
+                50,
+            );
+        }
+        Err(error) => return fail(env, error),
+    };
+    if instance == 0 {
+        let ResId::Id(id) = id else {
+            return fail(env, 1814);
+        };
+        if !system_cursor(u32::from(id)) {
+            return fail(env, 1814);
+        }
+        let adv_machine::Outcome::Return(handle) =
+            super::load_user_object(env, "cursor", 0, u32::from(id))
+        else {
+            unreachable!()
+        };
+        return Handle(handle);
+    }
+    cursor_metadata(env, instance, &id, false, api)
+}
+
+fn system_cursor(id: u32) -> bool {
+    matches!(id, 32512..=32516 | 32640..=32646 | 32648..=32651)
+}
+
+fn cursor_metadata(
+    env: &mut Env<'_>,
+    instance: u32,
+    id: &ResId,
+    shared: bool,
+    api: &str,
+) -> Handle {
+    // Preserve the original cursor resource identity, without claiming pixel
+    // decoding. LoadCursor and LoadImage use one common USER metadata owner.
+    if let Err(error) = resource_bytes(env, instance, 12, id, decode::MAX_CANDIDATE_BYTES) {
+        return fail(env, error);
+    }
+    adv_abi::warn_unavailable(
+        env,
+        api,
+        "module cursor retains the headless resource identity; pixel decoding/resizing is unsupported",
+    );
+    let key = if shared {
+        format!("cursor shared {instance:#x} {id:?}")
+    } else {
+        format!("cursor {instance:#x} {id:?}")
+    };
+    if let Some(handle) = user(env).objects.find(&env.sys.objects, &key) {
+        return Handle(handle);
+    }
+    let handle =
+        env.ext
+            .get_mut::<Win32>()
+            .user
+            .objects
+            .create_metadata(&mut env.sys.objects, key, shared);
+    handle.map_or_else(|| fail(env, 8), Handle)
+}
+
 fn file_bytes(env: &mut Env<'_>, path: &str, api: &str) -> Result<Vec<u8>, u32> {
     // The temporary owner participates in ordinary guest sharing checks and
     // coherent mapped-file reads; every successful open is closed on all paths.
@@ -278,7 +365,7 @@ fn load(
         let valid = if ty == ICON {
             (32512..=32518).contains(&pointer)
         } else {
-            matches!(pointer, 32512..=32516 | 32640..=32646 | 32648..=32651)
+            system_cursor(pointer)
         };
         if !valid {
             return fail(env, 1814);
@@ -297,43 +384,12 @@ fn load(
     else {
         return fail(env, 126);
     };
-    let id = if pointer < 0x10000 {
-        ResId::Id(pointer as u16)
-    } else {
-        let text = match name(env, pointer, wide) {
-            Ok(text) => text,
-            Err(error) => return fail(env, error),
-        };
-        text.strip_prefix('#')
-            .and_then(|n| n.parse::<u16>().ok())
-            .map_or_else(|| ResId::Name(text), ResId::Id)
+    let id = match resource_id(env, pointer, wide) {
+        Ok(id) => id,
+        Err(error) => return fail(env, error),
     };
     if ty == CURSOR {
-        // Preserve the pre-existing LoadImageA/LoadCursor resource identity
-        // used by the headless cursor state. This is not a decoded pixel image.
-        if let Err(error) = resource_bytes(env, instance, 12, &id, decode::MAX_CANDIDATE_BYTES) {
-            return fail(env, error);
-        }
-        adv_abi::warn_unavailable(
-            env,
-            api,
-            "module cursor retains the headless resource identity; pixel decoding/resizing is unsupported",
-        );
-        let shared = flags & SHARED != 0;
-        let key = if shared {
-            format!("cursor shared {instance:#x} {id:?}")
-        } else {
-            format!("cursor {instance:#x} {id:?}")
-        };
-        if let Some(handle) = user(env).objects.find(&env.sys.objects, &key) {
-            return Handle(handle);
-        }
-        let handle = env.ext.get_mut::<Win32>().user.objects.create_metadata(
-            &mut env.sys.objects,
-            key,
-            shared,
-        );
-        return handle.map_or_else(|| fail(env, 8), Handle);
+        return cursor_metadata(env, instance, &id, flags & SHARED != 0, api);
     }
     let cache_id = match &id {
         ResId::Id(id) => format!("#{id}"),

@@ -109,6 +109,11 @@ impl Fixture {
             );
             assert!(registry.dynamic_available("user32.dll", api));
         }
+        assert_eq!(
+            registry.get("user32.dll", "LoadCursorW").unwrap().conv,
+            adv_abi::Conv::Stdcall { argc: 2 }
+        );
+        assert!(registry.dynamic_available("user32.dll", "LoadCursorW"));
         assert!(registry.signature_conflicts().is_empty());
         let mut machine = Machine::new(
             JitCpu::new(PARK_ADDR, jit).unwrap(),
@@ -272,6 +277,8 @@ impl Fixture {
         put32(&mut cursor_group, 14, 1128);
         put16(&mut cursor_group, 18, 203);
         let cursor_entry = entry(ResId::Id(301), cursor_group, 0x7000);
+        let mut cursor_name = cursor_entry.clone();
+        cursor_name.id = ResId::Name("図像".into());
         let mut named = group_entry.clone();
         named.id = ResId::Name("図像".into());
         let resources = ResourceDir {
@@ -279,7 +286,7 @@ impl Fixture {
                 ResourceEntry {
                     id: ResId::Id(12),
                     node: ResourceNode::Dir(ResourceDir {
-                        entries: vec![cursor_entry],
+                        entries: vec![cursor_entry, cursor_name],
                     }),
                 },
                 ResourceEntry {
@@ -490,4 +497,63 @@ fn image_failures_have_checked_names_native_file_errors_and_explicit_unsupported
             .keys()
             .all(|key| key.0 == "user32.dll!LoadImageW")
     );
+}
+
+#[test]
+fn load_cursor_w_keeps_system_identity_and_shares_checked_unicode_resource_state_with_ansi() {
+    for jit in [false, true] {
+        let mut test = Fixture::new(jit);
+        let module = test.resource();
+        let name_a = test.text("図像", false);
+        let name_w = test.text("図像", true);
+        let ordinal = test.text("#301", true);
+        let missing = test.text("missing", true);
+        let baseline = test.machine.sys.objects.object_count();
+        let system_w = test.call("LoadCursorW", &[I(0), I(32512)]);
+        let system_a = test.call("LoadCursorA", &[I(0), I(32512)]);
+        let selected = test.call("SetCursor", &[M(system_w)]);
+        test.call("DestroyCursor", &[M(system_w)]);
+        let system_again = test.call("LoadCursorW", &[I(0), I(32512)]);
+        let named_w = test.call("LoadCursorW", &[I(module), I(name_w)]);
+        let named_a = test.call("LoadCursorA", &[I(module), I(name_a)]);
+        let named_image = test.call(
+            "LoadImageW",
+            &[I(module), I(name_w), I(2), I(0), I(0), I(0)],
+        );
+        let id = test.call("LoadCursorW", &[I(module), I(301)]);
+        let string_id = test.call("LoadCursorW", &[I(module), I(ordinal)]);
+        let bad = test.call("LoadCursorW", &[I(module), I(0xdead0000)]);
+        let bad_error = test.call("kernel32.dll!GetLastError", &[]);
+        let absent = test.call("LoadCursorW", &[I(module), I(missing)]);
+        let absent_error = test.call("kernel32.dll!GetLastError", &[]);
+        let invalid_system = test.call("LoadCursorW", &[I(0), I(0)]);
+        let invalid_system_error = test.call("kernel32.dll!GetLastError", &[]);
+        test.call("DestroyCursor", &[M(named_w)]);
+        test.call("DestroyCursor", &[M(id)]);
+        test.run();
+        assert_ne!(test.value(system_w), 0);
+        assert_eq!(test.value(system_w), test.value(system_a));
+        assert_eq!(test.value(system_w), test.value(selected));
+        assert_eq!(test.value(system_w), test.value(system_again));
+        assert_ne!(test.value(named_w), 0);
+        assert_eq!(test.value(named_w), test.value(named_a));
+        assert_eq!(test.value(named_w), test.value(named_image));
+        assert_eq!(test.value(id), test.value(string_id));
+        assert_eq!((test.value(bad), test.value(bad_error)), (0, 998));
+        assert_eq!((test.value(absent), test.value(absent_error)), (0, 1814));
+        assert_eq!(
+            (test.value(invalid_system), test.value(invalid_system_error)),
+            (0, 1814)
+        );
+        assert_eq!(test.machine.sys.objects.object_count(), baseline + 2); // Retained stock cursor and guest thread.
+        let diagnostic = test.machine.ext.get::<adv_abi::ApiDiagnostics>();
+        assert_eq!(diagnostic.stub_calls, 0);
+        assert!(
+            diagnostic
+                .warnings
+                .keys()
+                .any(|key| key.0 == "user32.dll!LoadCursorW"
+                    && key.1.contains("headless resource identity"))
+        );
+    }
 }
