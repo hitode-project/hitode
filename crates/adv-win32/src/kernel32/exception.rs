@@ -138,7 +138,7 @@ fn raise(
     )
 }
 
-fn cpu_exception(env: &mut Env<'_>, event: Exception, checkpoint: Checkpoint) -> Outcome {
+fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) -> Outcome {
     let record = match mapping::map(env.cpu, &event, &checkpoint.state) {
         Ok(record) => record,
         Err(reason) => {
@@ -146,6 +146,7 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, checkpoint: Checkpoint) ->
             return Outcome::Fail(reason);
         }
     };
+    mapping::normalize_context(&record, &mut checkpoint.state);
     dispatch(env, checkpoint, record)
 }
 

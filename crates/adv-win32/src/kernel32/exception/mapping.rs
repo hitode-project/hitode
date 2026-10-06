@@ -1,5 +1,6 @@
-//! Win32 codes for precise x86 CPU stops. Records retain the stopped PC;
-//! continuing execution always requires the guest handler's disposition.
+//! Win32 codes for precise x86 CPU stops. Faults retain the stopped PC;
+//! breakpoint addresses/CONTEXT follow native x86's one-byte PC adjustment.
+//! Continuing execution always requires the guest handler's disposition.
 //! Codes follow SDK ntstatus.h and Microsoft Learn's GetExceptionCode table.
 //! An authored x86 Windows oracle (target/exception-arithmetic-native/probe.c)
 //! verifies DIV zero -> 0xc0000094, nonzero unsigned/signed quotient overflow
@@ -14,8 +15,29 @@ const ACCESS_VIOLATION: u32 = 0xc000_0005;
 const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
 const INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
 const INTEGER_OVERFLOW: u32 = 0xc000_0095;
+const BREAKPOINT: u32 = 0x8000_0003;
 
 pub(super) fn map(
+    cpu: &dyn Guest,
+    event: &Exception,
+    state: &ArchitecturalState,
+) -> Result<Record, String> {
+    let pc = match event {
+        Exception::Fault(fault) => fault.pc,
+        Exception::Trap { pc, .. } => *pc,
+    };
+    map_stop(cpu, event, state).map_err(|reason| {
+        // Mapping failure is fatal: retain the original CPU stop rather than
+        // losing it to the later exception-dispatch thunk PC. The existing
+        // warning recorder still bounds distinct reasons and repetitions.
+        format!(
+            "{reason}; original CPU PC {pc:#010x}, captured EIP {:#010x}",
+            state.eip
+        )
+    })
+}
+
+fn map_stop(
     cpu: &dyn Guest,
     event: &Exception,
     state: &ArchitecturalState,
@@ -60,11 +82,46 @@ pub(super) fn map(
             }
         }
         Exception::Trap { vector: 6, .. } => ILLEGAL_INSTRUCTION,
+        Exception::Trap { vector: 3, .. } => {
+            record.address = breakpoint_address(cpu, pc)?;
+            record.count = 1; // Owned x86 native CC/CD03 oracle: Information[0]=0.
+            BREAKPOINT
+        }
         Exception::Trap { vector, .. } => {
             return Err(format!("unmapped x86 CPU exception vector {vector}"));
         }
     };
     Ok(record)
+}
+
+pub(super) fn normalize_context(record: &Record, state: &mut ArchitecturalState) {
+    if record.code == BREAKPOINT {
+        // CPU INT traps report the retired PC. Native Win32 x86 backs it up
+        // exactly one byte for both CC and CD03: CD03 therefore points at03.
+        // The handler must explicitly advance/edit this saved EIP to continue;
+        // returning unchanged repeats CC just as on the owned native oracle.
+        state.eip = record.address;
+    }
+}
+
+fn breakpoint_address(cpu: &dyn Guest, pc: u32) -> Result<u32, String> {
+    let last = pc
+        .checked_sub(1)
+        .ok_or_else(|| "x86 breakpoint PC underflow".to_owned())?;
+    let byte = |address| {
+        if cpu.accessible(address, 1, Prot::EXEC) {
+            cpu.read_u8(address).ok()
+        } else {
+            None
+        }
+    };
+    match byte(last) {
+        Some(0xcc) => Ok(last),
+        Some(0x03) if last.checked_sub(1).and_then(byte) == Some(0xcd) => Ok(last),
+        _ => {
+            Err("x86 breakpoint classification requires an executed CC or CD03 instruction".into())
+        }
+    }
 }
 
 fn register(state: &ArchitecturalState, register: Register) -> Option<u64> {
@@ -144,5 +201,7 @@ fn divisor(cpu: &dyn Guest, state: &ArchitecturalState) -> Result<u32, String> {
     }
 }
 
+#[cfg(test)]
+mod breakpoint_tests;
 #[cfg(test)]
 mod tests;
