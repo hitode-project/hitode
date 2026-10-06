@@ -130,9 +130,13 @@ fn private_native_global_local_locks_flags_mix_and_reallocation_match_three_cpus
             .zip(reference.as_chunks::<4>().0)
             .enumerate()
         {
+            // GlobalFlags of a fixed block that GMEM_MODIFY made moveable:
+            // native reports GMEM_DDESHARE or not depending on its heap
+            // layout, which even the size of the environment block changes.
+            let ignored = if i == 411 { 0x2000 } else { 0 };
             assert_eq!(
-                u32::from_le_bytes(*a),
-                u32::from_le_bytes(*b),
+                u32::from_le_bytes(*a) & !ignored,
+                u32::from_le_bytes(*b) & !ignored,
                 "{backend}: global native word {i}"
             );
         }
