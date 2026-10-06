@@ -13,6 +13,7 @@ mod formatting;
 pub(crate) mod hooks;
 pub mod host_input;
 mod input;
+pub(crate) mod image;
 pub mod menu;
 pub mod message;
 mod monitor;
@@ -364,18 +365,6 @@ fn load_icon_a(env: &mut Env<'_>) -> Outcome {
     load_user_object(env, "icon", inst, name)
 }
 
-fn load_image_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name, ty) = (env.arg(0), env.arg(1), env.arg(2));
-    match ty {
-        1 => load_user_object(env, "icon", inst, name),
-        2 => load_user_object(env, "cursor", inst, name),
-        _ => {
-            log::warn!("LoadImageA type {ty}: bitmaps not supported yet");
-            Outcome::Return(0)
-        }
-    }
-}
-
 fn create_icon_indirect(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     let r = |i: u32| env.cpu.read_u32(p + 4 * i).unwrap_or(0);
@@ -543,6 +532,7 @@ pub fn register(reg: &mut Registry) {
     enumeration::register(reg);
     menu::register(reg);
     input::register(reg);
+    image::register(reg);
     clipboard::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "MessageBoxA", 4, message_box_a);
@@ -584,7 +574,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "LoadCursorFromFileA", 1, load_cursor_from_file_a);
     s(reg, "LoadCursorFromFileW", 1, load_cursor_from_file_a);
     s(reg, "LoadIconA", 2, load_icon_a);
-    s(reg, "LoadImageA", 6, load_image_a);
     s(reg, "CreateIconIndirect", 1, create_icon_indirect);
     s(reg, "DestroyIcon", 1, destroy_user_object);
     s(reg, "DestroyCursor", 1, destroy_user_object);

@@ -40,12 +40,21 @@ impl UserObjects {
     }
 
     pub(super) fn create(&mut self, objects: &mut Objects, description: String) -> Option<u32> {
+        self.create_metadata(objects, description, false)
+    }
+
+    pub(super) fn create_metadata(
+        &mut self,
+        objects: &mut Objects,
+        description: String,
+        shared: bool,
+    ) -> Option<u32> {
         let namespace = self.namespace(objects)?;
         let handle = objects.insert_host_in(
             namespace,
             UserObject {
                 description,
-                stock: false,
+                stock: shared,
                 _image: None,
             },
         )?;
@@ -60,6 +69,16 @@ impl UserObjects {
         description: String,
         image: IconImage,
     ) -> Option<u32> {
+        self.create_image(objects, description, image, false)
+    }
+
+    pub(super) fn create_image(
+        &mut self,
+        objects: &mut Objects,
+        description: String,
+        image: IconImage,
+        shared: bool,
+    ) -> Option<u32> {
         let pixels = image.width.checked_mul(image.height)? as usize;
         if pixels == 0 || image.pixels.len() != pixels.checked_mul(4)? || image.mask.len() != pixels
         {
@@ -70,7 +89,7 @@ impl UserObjects {
             namespace,
             UserObject {
                 description,
-                stock: false,
+                stock: shared,
                 _image: Some(image),
             },
         )?;
@@ -81,6 +100,11 @@ impl UserObjects {
 
     pub(crate) fn destroy_icon(&mut self, objects: &mut Objects, handle: u32) {
         self.remove(objects, handle);
+    }
+
+    #[cfg(test)]
+    pub(super) fn image<'a>(&self, objects: &'a Objects, handle: u32) -> Option<&'a IconImage> {
+        objects.owned(*self.index.get(&handle)?)?._image.as_ref()
     }
 
     pub(super) fn stock(&mut self, objects: &mut Objects, handle: u32) -> Option<u32> {
