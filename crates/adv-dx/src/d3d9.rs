@@ -144,8 +144,8 @@ enum Operation {
         source: adv_device::gpu::Image,
         rectangle: adv_device::surface::Rect,
         destination: adv_device::gpu::Image,
-        x: u32,
-        y: u32,
+        region: adv_device::surface::Rect,
+        filter: adv_device::gpu::Filter,
         resources: [Id; 2],
     },
     Draw(fixed::Draw),
@@ -1079,11 +1079,11 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
             source,
             rectangle,
             destination,
-            x,
-            y,
+            region,
+            filter,
             ..
         } => gpu
-            .copy(source, *rectangle, destination, *x, *y)
+            .blit(source, *rectangle, destination, *region, *filter)
             .map(|()| Completion::Command),
     };
     env.ext.get_mut::<State>().gpu = Some(gpu);
