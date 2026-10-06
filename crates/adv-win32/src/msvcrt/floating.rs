@@ -171,7 +171,10 @@ pub(super) fn errno_address(env: &mut Env<'_>) -> GuestPtr<i32> {
     let address = if let Some(&address) = env.ext.get::<CrtState>().errno.get(&key) {
         address
     } else {
-        let address = allocate(env, 4, true);
+        // One existing module/thread owner holds errno and its adjacent DWORD
+        // DOS error. The published _errno pointer remains the first int32 cell;
+        // the ordinary thread/process detach path frees this same allocation.
+        let address = allocate(env, 8, true);
         if address != 0 {
             env.ext.get_mut::<CrtState>().errno.insert(key, address);
         }

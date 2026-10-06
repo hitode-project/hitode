@@ -772,12 +772,27 @@ pub(super) fn copy_file(
 }
 
 pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
-    let w = env.ext.get::<Win32>();
-    if w.vfs.lookup(&path).is_some() {
-        set_last_error(env, err::ALREADY_EXISTS);
-        return Outcome::Return(0);
+    match create_directory_path(env, &path) {
+        Ok(()) => Outcome::Return(1),
+        Err(code) => {
+            set_last_error(env, code);
+            Outcome::Return(0)
+        }
     }
-    let full = w.vfs.normalize(&path);
+}
+
+/// Kernel32 and CRT directory fronts share this checked, single-component VFS
+/// mutation. write_path may mirror already-existing guest parents in an overlay;
+/// it cannot make an absent guest parent valid for this operation.
+pub(crate) fn create_directory_path(env: &Env<'_>, path: &str) -> Result<(), u32> {
+    if path.is_empty() {
+        return Err(err::PATH_NOT_FOUND);
+    }
+    let w = env.ext.get::<Win32>();
+    if w.vfs.lookup(path).is_some() {
+        return Err(err::ALREADY_EXISTS);
+    }
+    let full = w.vfs.normalize(path);
     let parent = full.trim_end_matches('\\').rsplit_once('\\').map(|(p, _)| {
         if p.len() == 2 {
             format!("{p}\\")
@@ -786,16 +801,18 @@ pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
         }
     });
     if !parent.is_some_and(|p| w.vfs.is_dir(&p)) {
-        set_last_error(env, err::PATH_NOT_FOUND);
-        return Outcome::Return(0);
+        return Err(err::PATH_NOT_FOUND);
     }
-    match w.vfs.write_path(&path).map(std::fs::create_dir) {
-        Some(Ok(())) => Outcome::Return(1),
-        _ => {
-            set_last_error(env, err::PATH_NOT_FOUND);
-            Outcome::Return(0)
-        }
-    }
+    let destination = w.vfs.write_path(path).ok_or(err::PATH_NOT_FOUND)?;
+    std::fs::create_dir(destination).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => err::ALREADY_EXISTS,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => err::PATH_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => err::ACCESS_DENIED,
+        std::io::ErrorKind::InvalidInput => 123, // ERROR_INVALID_NAME
+        std::io::ErrorKind::OutOfMemory => err::NOT_ENOUGH_MEMORY,
+        std::io::ErrorKind::StorageFull => 112, // ERROR_DISK_FULL
+        _ => io_code(&error),
+    })
 }
 
 /// WIN32_FIND_DATAA/W: attrs, 3 FILETIMEs, size hi/lo, 2 reserved, name[260], alt[14]

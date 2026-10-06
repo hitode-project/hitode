@@ -7,6 +7,7 @@ use std::collections::HashMap;
 mod convert;
 mod cpp_alloc;
 mod data;
+mod directory;
 mod exceptions;
 mod formatting;
 pub(crate) use data::initialize as initialize_data;
@@ -80,6 +81,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 
 pub fn register(r: &mut Registry) {
     data::register(r);
+    directory::register(r);
     exceptions::register(r);
     formatting::register(r);
     floating::register(r);
