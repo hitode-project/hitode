@@ -294,6 +294,67 @@ fn driver_details_queries_sizes_encoding_and_protected_outputs() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 920);
 }
 
+#[test]
+fn driver_metrics_match_catalog_and_distinguish_null_from_stale_ids() {
+    let mut m = fixture(false);
+    ensure(&mut env(&mut m));
+    let id = m
+        .ext
+        .get_mut::<Acm>()
+        .drivers
+        .id(&mut m.sys.objects)
+        .unwrap();
+    for index in (1..=6).chain(20..=24) {
+        assert_eq!(metric(&mut env(&mut m), 0, index, DATA), Ok(()));
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), u32::from(index <= 3));
+        assert_eq!(
+            metric(&mut env(&mut m), id, index, DATA),
+            Err(INVALID_HANDLE)
+        );
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+    }
+    for (object, index, expected) in [(0, 50, 50), (id, 50, 50), (id, 100, SUPPORT), (id, 101, 1)] {
+        assert_eq!(metric(&mut env(&mut m), object, index, DATA), Ok(()));
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), expected);
+    }
+    for (object, index, expected, output) in [
+        (0, 100, INVALID_HANDLE, 0),
+        (id + 4, 101, INVALID_HANDLE, 0xfedcba98),
+        (id + 4, 50, INVALID_HANDLE, 0xfedcba98),
+        (id, 30, INVALID_HANDLE, u32::MAX),
+        (id, 31, INVALID_HANDLE, u32::MAX),
+        (id, 51, NOT_POSSIBLE, 0),
+    ] {
+        m.cpu.write_u32(DATA, 0xfedcba98).unwrap();
+        assert_eq!(metric(&mut env(&mut m), object, index, DATA), Err(expected));
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), output);
+    }
+    assert_eq!(metric(&mut env(&mut m), id, 101, 0), Err(INVALID_PARAMETER));
+    m.cpu.write_u32(DATA, 0xfedcba98).unwrap();
+    m.cpu.protect(DATA, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        metric(&mut env(&mut m), id, 101, DATA),
+        Err(INVALID_PARAMETER)
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xfedcba98);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_driver_metrics_distinguish_null_from_unknown_ids() {
+    #[link(name = "msacm32")]
+    unsafe extern "system" {
+        fn acmMetrics(object: usize, index: u32, output: *mut u32) -> u32;
+    }
+    unsafe {
+        for (object, index) in [(0, 101), (0x1234, 101), (0x1234, 50)] {
+            let mut value = 0xfedcba98;
+            assert_eq!(acmMetrics(object, index, &mut value), INVALID_HANDLE);
+            assert_eq!(value, if object == 0 { 0 } else { 0xfedcba98 });
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn native_driver_details_allow_partial_and_clamp_extended_structures() {

@@ -102,6 +102,60 @@ fn details_w(e: &mut Env<'_>, id: Handle, output: GuestPtr<()>, flags: u32) -> u
         .unwrap_or(0)
 }
 
+fn metric(e: &mut Env<'_>, object: u32, index: u32, output: u32) -> Result<(), u32> {
+    if output == 0 || !e.cpu.accessible(output, 4, Prot::WRITE) {
+        return Err(INVALID_PARAMETER);
+    }
+    ensure(e);
+    let catalog = &e.ext.get::<Acm>().drivers;
+    // Unknown non-null handles fail before initializing the result. NULL is a
+    // valid ACM-wide selector, so each metric initializes its own default first.
+    if object != 0 {
+        catalog.get(&e.sys.objects, object).ok_or(INVALID_HANDLE)?;
+    }
+    if matches!(index, 1..=6 | 20..=24 | 50 | 51 | 100 | 101) {
+        e.cpu.write_u32(output, 0).map_err(|_| INVALID_PARAMETER)?;
+    }
+    let value = match index {
+        // Counts describe the same global catalog that enumeration traverses.
+        1..=6 | 20..=24 => {
+            if object != 0 {
+                return Err(INVALID_HANDLE);
+            }
+            u32::from(matches!(index, 1..=3))
+        }
+        50 => {
+            // MS ADPCM's standard coefficient table is the largest format.
+            18 + 32
+        }
+        51 => return Err(NOT_POSSIBLE), // No filter formats are installed.
+        100 | 101 => {
+            if object == 0 {
+                return Err(INVALID_HANDLE);
+            }
+            if index == 100 { SUPPORT } else { 1 }
+        }
+        30 | 31 => {
+            e.cpu
+                .write_u32(output, u32::MAX)
+                .map_err(|_| INVALID_PARAMETER)?;
+            return Err(INVALID_HANDLE); // No hardware wave device association.
+        }
+        _ => {
+            adv_abi::warn_unavailable(e, "acmMetrics", "requested ACM metric is unavailable");
+            return Err(NOT_SUPPORTED);
+        }
+    };
+    e.cpu
+        .write_u32(output, value)
+        .map_err(|_| INVALID_PARAMETER)
+}
+
+#[win32(msacm32, name = "acmMetrics", level = state)]
+fn metrics(e: &mut Env<'_>, object: Handle, index: u32, output: GuestPtr<()>) -> u32 {
+    metric(e, object.0, index, output.addr()).err().unwrap_or(0)
+}
+
 #[win32(msacm32, name = "acmDriverEnum", level = state)]
 fn enumerate(e: &mut Env<'_>, callback: GuestPtr<()>, instance: u32, flags: u32) -> Outcome {
     if flags & !ENUM_FLAGS != 0 {
@@ -128,6 +182,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(enumerate_ABI);
     registry.register(details_a_ABI);
     registry.register(details_w_ABI);
+    registry.register(metrics_ABI);
 }
 
 #[cfg(test)]
