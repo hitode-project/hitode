@@ -8,6 +8,7 @@ use adv_cpu::backend::{Backend, Guest};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine};
 use adv_os::gdi::Gdi;
+mod enumeration;
 #[derive(Clone, Copy)]
 pub struct WindowGeometry {
     pub width: u32,
@@ -32,6 +33,7 @@ impl State {
 }
 
 pub fn register(registry: &mut Registry) {
+    enumeration::register(registry);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
