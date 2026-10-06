@@ -39,7 +39,10 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localeconv",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memchr-wmemchr",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkdir-wmkdir"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkdir-wmkdir",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findfirst-functions",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findnext-functions",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findclose"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -163,5 +166,22 @@
     "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515",
     "header": "ucrt/corecrt_wstdio.h",
     "projection": "wchar_t pointer parameters and character capacities remain UTF-16; va_list is an x86 pointer, variadic functions retain only mandatory parameter slots"
+  },
+  "corecrt_io.h": {
+    "header": "ucrt/corecrt_io.h",
+    "sha256": "0ea13520ed2078b7db3dedaccc882ae61dd517dbd3af831b8e76fae5cca3c830",
+    "projection": "int __cdecl _findclose(intptr_t _FindHandle); x86 intptr_t is signed 32-bit. Only the three existing MSVCRT/VC80/VC90 profiles are declared."
+  },
+  "corecrt_wio.h": {
+    "header": "ucrt/corecrt_wio.h",
+    "sha256": "e6a08ad4c75ef96fd5fafcff334048c4cc610f990f39c15e07c03af14d607197",
+    "projection": "intptr_t __cdecl _wfindfirst64i32(wchar_t const*, struct _wfinddata64i32_t*) and int __cdecl _wfindnext64i32(intptr_t, struct _wfinddata64i32_t*). wchar_t input remains str16, output is a pointer; no ANSI or other time/size-width find family is declared."
+  },
+  "legacy_find64i32": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "layout": "Authored x86 probe corroborates SDK _wfinddata64i32_t: sizeof560, unsigned attrib at0, signed time64 at8/16/24, unsigned size32 at32 and UTF16 name[260] at36. Alignment padding at4 and556 are not overwritten; no unrelated modern find_t layout is projected.",
+    "behavior": "Native NORMAL attributes become _A_NORMAL=0. Creation/access/write times independently match three authored UTC-second values. No-match and EOF assign errno2; NULL pattern/output and next handle=-1 invoke the returning invalid handler with errno22. _findclose success is0, stale/-1 failure is-1 with errno22 and no invalid callback. All these failures retain prior DOS errno; success retains prior CRT errno. Shared VFS snapshots, rather than host filesystem bypasses, supply virtual rows.",
+    "oracle_source_sha256": "aafb9efd45e94ed15fc67804ee8df2582681abe19de32452db8b4f652f179ef0"
   }
 }

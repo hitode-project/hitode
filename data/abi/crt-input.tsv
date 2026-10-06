@@ -142,3 +142,12 @@ msvcr80.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr80.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr90.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr90.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcrt.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcrt.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcr80.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr80.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr80.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcr90.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr90.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr90.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1

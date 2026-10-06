@@ -3476,6 +3476,7 @@ msvcr80.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_errno	cdecl	ptr	i32*	
 msvcr80.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcr80.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
 msvcr80.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr80.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
@@ -3489,6 +3490,8 @@ msvcr80.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va
 msvcr80.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
 msvcr80.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr80.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr80.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr80.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcr80.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
@@ -3516,6 +3519,7 @@ msvcr90.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_errno	cdecl	ptr	i32*	
 msvcr90.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcr90.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcr90.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
 msvcr90.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr90.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
@@ -3529,6 +3533,8 @@ msvcr90.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va
 msvcr90.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
 msvcr90.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr90.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr90.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcr90.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
@@ -3553,9 +3559,12 @@ msvcrt.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcrt.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 msvcrt.dll	_errno	cdecl	ptr	i32*	
 msvcrt.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
 msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
+msvcrt.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcrt.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcrt.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1
