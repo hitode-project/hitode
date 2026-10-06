@@ -11,6 +11,7 @@ use adv_machine::Machine;
 use std::borrow::Cow;
 
 mod enumeration;
+mod rectangle;
 mod paint;
 mod resource;
 mod widths;
@@ -31,6 +32,7 @@ pub fn register(registry: &mut Registry) {
     paint::register(registry);
     resource::register(registry);
     enumeration::register(registry);
+    rectangle::register(registry);
     widths::register(registry);
     for api in [
         glyph_a_ABI,
