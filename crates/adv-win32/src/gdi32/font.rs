@@ -41,6 +41,8 @@ pub fn register(registry: &mut Registry) {
         get_map_mode_ABI,
         set_poly_fill_ABI,
         get_poly_fill_ABI,
+        set_rop2_ABI,
+        get_rop2_ABI,
         extent_a_ABI,
         extent_w_ABI,
     ] {
@@ -128,6 +130,23 @@ fn get_poly_fill(env: &mut Env<'_>, dc: Handle) -> i32 {
         return 0;
     }
     modes(env, dc.0).poly_fill
+}
+
+#[win32(gdi32, name = "SetROP2", level = state)]
+fn set_rop2(env: &mut Env<'_>, dc: Handle, mode: i32) -> i32 {
+    if reject_dc(env, dc.0) {
+        return 0;
+    }
+    // Native GDI stores the low byte, including values outside the documented
+    // R2_BLACK..R2_WHITE range; state queries must preserve that normalization.
+    std::mem::replace(&mut modes(env, dc.0).rop2, i32::from(mode as u8))
+}
+#[win32(gdi32, name = "GetROP2", level = state)]
+fn get_rop2(env: &mut Env<'_>, dc: Handle) -> i32 {
+    if reject_dc(env, dc.0) {
+        return 0;
+    }
+    modes(env, dc.0).rop2
 }
 
 fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {

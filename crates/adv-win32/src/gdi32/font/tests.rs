@@ -666,6 +666,59 @@ fn software_dc_preserves_font_and_mapping_state() {
     assert_eq!(invoke(&mut machine, data, "DeleteDC", &[dc]), 1);
     assert_eq!(invoke(&mut machine, data, "GetMapMode", &[dc]), 0);
 }
+
+#[test]
+fn software_dc_preserves_rop2_per_context_and_normalizes_the_native_byte() {
+    let (mut machine, data, dc) = fixture();
+    let other = invoke(&mut machine, data, "CreateCompatibleDC", &[0]);
+    assert_ne!(other, 0);
+    assert_eq!(invoke(&mut machine, data, "GetROP2", &[dc]), 13);
+    let mut previous = 13;
+    for mode in 1..=16 {
+        assert_eq!(invoke(&mut machine, data, "SetROP2", &[dc, mode]), previous);
+        assert_eq!(invoke(&mut machine, data, "GetROP2", &[dc]), mode);
+        assert_eq!(invoke(&mut machine, data, "GetROP2", &[other]), 13);
+        previous = mode;
+    }
+    for (input, actual) in [(0, 0), (17, 17), (u32::MAX, 255), (256, 0), (0x100000d, 13)] {
+        assert_eq!(invoke(&mut machine, data, "SetROP2", &[dc, input]), previous);
+        assert_eq!(invoke(&mut machine, data, "GetROP2", &[dc]), actual);
+        assert_eq!(invoke(&mut machine, data, "GetROP2", &[other]), 13);
+        previous = actual;
+    }
+    assert_eq!(invoke(&mut machine, data, "DeleteDC", &[other]), 1);
+    assert_eq!(invoke(&mut machine, data, "GetROP2", &[other]), 0);
+    assert_eq!(invoke(&mut machine, data, "SetROP2", &[other, 13]), 0);
+    assert_eq!(invoke(&mut machine, data, "GetROP2", &[0xdeadbeef]), 0);
+}
+
+#[test]
+#[cfg(windows)]
+fn rop2_state_matches_native_memory_dc() {
+    use core::ffi::c_void;
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateCompatibleDC(source: *mut c_void) -> *mut c_void;
+        fn DeleteDC(dc: *mut c_void) -> i32;
+        fn GetROP2(dc: *mut c_void) -> i32;
+        fn SetROP2(dc: *mut c_void, mode: i32) -> i32;
+    }
+    let (mut machine, data, dc) = fixture();
+    // SAFETY: the native DC is owned by this test and retired after comparison.
+    let native = unsafe { CreateCompatibleDC(core::ptr::null_mut()) };
+    assert!(!native.is_null());
+    for mode in [13, 7, 1, 16, 0, 17, -1, 2, 256, i32::MIN, i32::MAX] {
+        assert_eq!(
+            invoke(&mut machine, data, "SetROP2", &[dc, mode as u32]),
+            unsafe { SetROP2(native, mode) } as u32
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "GetROP2", &[dc]),
+            unsafe { GetROP2(native) } as u32
+        );
+    }
+    assert_eq!(unsafe { DeleteDC(native) }, 1);
+}
 #[test]
 #[cfg(windows)]
 fn glyph_metrics_bitmap_gray8_and_index_use_real_font_pixels() {

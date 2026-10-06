@@ -408,3 +408,141 @@ fn invalid_strings_and_unsupported_devices_do_not_publish_dcs_or_mutate_guest_in
     assert_eq!(error(&mut machine), 50);
     assert_eq!(machine.sys.objects.object_count(), baseline);
 }
+
+#[test]
+fn information_contexts_share_device_queries_and_retire_without_a_raster_canvas() {
+    let (mut machine, data) = fixture();
+    let baseline = machine.sys.objects.object_count();
+    let contexts = [
+        invoke(
+            &mut machine,
+            data,
+            "gdi32.dll",
+            "CreateICA",
+            &[data + 256, 0, 0xdead0000, 0],
+        ),
+        invoke(
+            &mut machine,
+            data,
+            "gdi32.dll",
+            "CreateICW",
+            &[data + 288, data + 320, 0, 0],
+        ),
+    ];
+    assert_ne!(contexts[0], 0);
+    assert_ne!(contexts[1], 0);
+    assert_ne!(contexts[0], contexts[1]);
+    assert!(machine.ext.get::<SurfaceStore>().primary_id().is_none());
+    for dc in contexts {
+        assert_ne!(
+            invoke(&mut machine, data, "gdi32.dll", "GetCurrentObject", &[dc, 6]),
+            0
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "GetDeviceCaps", &[dc, 8]),
+            8
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "GetDeviceCaps", &[dc, 12]),
+            32
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "GetDeviceCaps", &[dc, 90]),
+            96
+        );
+        assert!(
+            !machine
+                .ext
+                .get::<State>()
+                .dcs
+                .contains(&machine.sys.objects, dc)
+        );
+    }
+    // Selecting and querying fonts uses the same logical object as other DCs.
+    machine.cpu.write(data + 1024, &[0; 60]).unwrap();
+    machine.cpu.write_u32(data + 1024, 18).unwrap();
+    machine.cpu.write_u32(data + 1040, 400).unwrap();
+    machine.cpu.write(data + 1052, b"Arial\0").unwrap();
+    let font = invoke(
+        &mut machine,
+        data,
+        "gdi32.dll",
+        "CreateFontIndirectA",
+        &[data + 1024],
+    );
+    assert_ne!(font, 0);
+    assert_ne!(
+        invoke(
+            &mut machine,
+            data,
+            "gdi32.dll",
+            "SelectObject",
+            &[contexts[0], font]
+        ),
+        0
+    );
+    assert_eq!(
+        invoke(
+            &mut machine,
+            data,
+            "gdi32.dll",
+            "GetCurrentObject",
+            &[contexts[0], 6]
+        ),
+        font
+    );
+    machine.cpu.write(data + 2048, b"Hello").unwrap();
+    assert_eq!(
+        invoke(
+            &mut machine,
+            data,
+            "gdi32.dll",
+            "GetTextExtentPoint32A",
+            &[contexts[0], data + 2048, 5, data + 2304]
+        ),
+        1
+    );
+    assert!(machine.cpu.read_u32(data + 2304).unwrap() > 0);
+    assert_eq!(
+        invoke(&mut machine, data, "gdi32.dll", "DeleteObject", &[font]),
+        0
+    );
+    for dc in contexts {
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "DeleteDC", &[dc]),
+            1
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "DeleteDC", &[dc]),
+            0
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "GetCurrentObject", &[dc, 6]),
+            0
+        );
+        assert_eq!(
+            invoke(&mut machine, data, "gdi32.dll", "GetDeviceCaps", &[dc, 8]),
+            0
+        );
+    }
+    assert_eq!(
+        invoke(&mut machine, data, "gdi32.dll", "DeleteObject", &[font]),
+        1
+    );
+    // An information context does not require a raster frontend at all.
+    machine.ext.get_mut::<State>().provider = None;
+    let dc = invoke(
+        &mut machine,
+        data,
+        "gdi32.dll",
+        "CreateICW",
+        &[0, data + 320, 0, 0],
+    );
+    assert_ne!(dc, 0);
+    assert_eq!(
+        invoke(&mut machine, data, "gdi32.dll", "DeleteDC", &[dc]),
+        1
+    );
+    assert_eq!(machine.sys.objects.object_count(), baseline);
+    assert!(machine.ext.get::<SurfaceStore>().primary_id().is_none());
+}
