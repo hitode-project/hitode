@@ -1329,3 +1329,38 @@ fn popfd_in_user_mode_preserves_privileged_bits_and_defers_new_tf_until_next_ins
     );
     assert_eq!(initial.eip, CODE + 2);
 }
+
+#[test]
+fn bswap_word_uses_explicit_compatibility_semantics_without_changing_flags() {
+    // SDM leaves the word form undefined. Expected word results follow the
+    // chosen guest policy, verified with native 32-bit/64-bit host probes;
+    // Unicorn is not an architectural oracle for this encoding.
+    for register in 0..8 {
+        for word in [false, true] {
+            let bytes = if word {
+                vec![0x66, 0x0f, 0xc8 + register as u8]
+            } else {
+                vec![0x0f, 0xc8 + register as u8]
+            };
+            let mut mem = memory(&bytes);
+            let mut interpreter = Interpreter::new();
+            for value in [0u32, 0x1234_5678, 0xffff_0000, 0x0000_ffff, 0x89ab_cdef] {
+                for flags in [0x202, 0xad7] {
+                    let mut cpu = state();
+                    cpu.regs[register] = value;
+                    cpu.eflags = flags;
+                    let mut expected = cpu.regs;
+                    expected[register] = if word {
+                        value & 0xffff_0000
+                    } else {
+                        value.swap_bytes()
+                    };
+                    assert_eq!(interpreter.step(&mut cpu, &mut mem), Step::Executed);
+                    assert_eq!(cpu.regs, expected);
+                    assert_eq!(cpu.eflags, flags);
+                    assert_eq!(cpu.eip, CODE + bytes.len() as u32);
+                }
+            }
+        }
+    }
+}
