@@ -55,6 +55,9 @@ impl Fixture {
             adv_dx::d3d9::install(
                 &mut machine,
                 adv_dx::d3d9::SurfaceProvider {
+                    acquire_dc: |_, _, _, _, _| panic!("DxDiag never borrows DCs"),
+                    writeback_dc: |_, _, _, _| panic!("DxDiag never borrows DCs"),
+                    release_dc: |_, _| panic!("DxDiag never borrows DCs"),
                     insert: |_, _| panic!("DxDiag never creates surfaces"),
                     target: |_, _| None,
                     remove: |_, _, _| panic!("DxDiag never removes surfaces"),

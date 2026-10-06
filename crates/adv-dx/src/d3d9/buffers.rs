@@ -38,6 +38,7 @@ pub(super) struct Stream {
 pub(super) struct Bindings {
     pub streams: [Stream; 16],
     pub indices: Option<Id>,
+    pub declaration: Option<Id>,
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
@@ -111,6 +112,7 @@ pub(super) fn release_bindings(env: &mut Env<'_>, bindings: Bindings) {
         .into_iter()
         .filter_map(|s| s.buffer)
         .chain(bindings.indices)
+        .chain(bindings.declaration)
     {
         if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
             super::destroy(env, dead);

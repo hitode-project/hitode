@@ -54,6 +54,7 @@ static LONG CALLBACK observer(EXCEPTION_POINTERS *p) {
 
 static LONG CALLBACK resolver(EXCEPTION_POINTERS *p) {
     record(0x200 + phase);
+    if (phase == 10) return EXCEPTION_CONTINUE_SEARCH;
     if (phase == 5) {
         __asm__ volatile("movl %0,%%fs:0" : : "r"(repaired_seh_head) : "memory");
         return EXCEPTION_CONTINUE_SEARCH;
@@ -97,6 +98,28 @@ static LONG __cdecl stack_handler(EXCEPTION_RECORD *exception, void *frame, CONT
     context->Eip = resume_pc;
     context->Eax = 0xaabbccdd;
     return 0; // ExceptionContinueExecution for a frame-based handler.
+}
+
+// Phase 10 resumes like an MSVC `__except` block: the outer frame handler
+// unwinds the inner frame, then continues on the establisher's stack instead
+// of returning to the dispatcher.
+static DWORD establisher_esp, establisher_ebp, continuation;
+static LONG __cdecl inner_handler(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
+    (void)frame; (void)context; (void)dispatcher;
+    record(0x600 + phase);
+    record(exception->ExceptionFlags);
+    return 1; // ExceptionContinueSearch, also during unwind.
+}
+static LONG __cdecl execute_handler(EXCEPTION_RECORD *exception, void *frame, CONTEXT *context, void *dispatcher) {
+    (void)context; (void)dispatcher;
+    if (exception->ExceptionFlags & 6) return 1;
+    record(0x700 + phase);
+    record(exception->ExceptionFlags);
+    record(frame == expected_frame);
+    RtlUnwind(frame, NULL, exception, NULL);
+    __asm__ volatile("movl %0,%%esp\n\tmovl %1,%%ebp\n\tjmpl *%2"
+        : : "m"(establisher_esp), "m"(establisher_ebp), "m"(continuation) : "memory");
+    __builtin_unreachable();
 }
 
 static void read_fault(void) {
@@ -158,6 +181,28 @@ void mainCRTStartup(void) {
         __asm__ volatile("fnstcw %0" : "=m"(after_cw));
         record(after_cw);
     }
+    phase = 10;
+    Registration frames[2]; // The inner registration lies below the outer one.
+    frames[0].handler = inner_handler;
+    frames[0].previous = &frames[1];
+    frames[1].handler = execute_handler;
+    expected_frame = &frames[1];
+    __asm__ volatile("movl %%fs:0,%0" : "=r"(frames[1].previous) : : "memory");
+    __asm__ volatile("movl %0,%%fs:0" : : "r"(&frames[0]) : "memory");
+    DWORD result, address = (DWORD)page, head;
+    __asm__ volatile(
+        "movl %%esp,%2\n\tmovl %%ebp,%3\n\tmovl $2f,%4\n\tmovl $1f,%5\n\t"
+        "movl $0x12345678,%%eax\n\t1: movl (%%ecx),%%eax\n\tmovl $1,%%eax\n\tjmp 3f\n\t"
+        "2: xorl %%eax,%%eax\n\t3:"
+        : "=a"(result), "+c"(address), "=m"(establisher_esp), "=m"(establisher_ebp),
+          "=m"(continuation), "=m"(fault_pc)
+        : : "memory", "ebx", "edx", "esi", "edi");
+    record(result);
+    __asm__ volatile("movl %%fs:0,%0" : "=r"(head) : : "memory");
+    record(head == (DWORD)&frames[1]);
+    __asm__ volatile("movl %0,%%fs:0" : : "r"(frames[1].previous) : "memory");
+    phase = 11; // A later fault must not see the abandoned dispatch as live.
+    read_fault();
     record(RemoveVectoredExceptionHandler(first));
     record(RemoveVectoredExceptionHandler(second));
     fail_if(!VirtualProtect((void *)page, 4096, PAGE_READWRITE, &protection), 13);

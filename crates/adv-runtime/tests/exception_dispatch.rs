@@ -69,7 +69,7 @@ fn vectored_and_stack_handlers_resume_full_context_after_yield_like_native() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let expected = std::fs::read(output).unwrap();
-    assert_eq!(expected.len(), 154 * 4);
+    assert_eq!(expected.len(), 184 * 4);
     for backend in ["interpreter", "jit", "unicorn"] {
         let profile = directory.join(backend);
         let output = profile.join("overlay/exception-dispatch.bin");

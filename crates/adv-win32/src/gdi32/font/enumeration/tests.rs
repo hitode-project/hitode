@@ -83,6 +83,7 @@ fn callback_layout_parameter_stop_and_final_result_follow_guest_returns() {
                 args,
                 stack,
                 then,
+                ..
             } => {
                 assert_eq!(target, adv_machine::layout::PARK_ADDR);
                 assert_eq!(args[3], 0x51c0ffee);

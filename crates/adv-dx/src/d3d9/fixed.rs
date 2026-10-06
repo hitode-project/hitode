@@ -16,6 +16,41 @@ pub(super) struct Fixed {
     scissor: RECT,
     transforms: [[f32; 16]; 3],
 }
+/// Byte offsets of the fixed-function inputs inside one vertex, from either
+/// an FVF code or a vertex declaration on stream 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Layout {
+    pub transformed: bool,
+    pub position: u32,
+    pub color: Option<u32>,
+    pub uv: Option<u32>,
+    /// Bytes from the vertex start through the end of the last input.
+    pub size: u32,
+}
+impl Layout {
+    pub(super) fn from_fvf(fvf: u32) -> Option<Self> {
+        if !valid_fvf(fvf) {
+            return None;
+        }
+        let transformed = fvf & 0x0e == 4;
+        let mut size = if transformed { 16 } else { 12 };
+        let mut field = |present: bool, bytes: u32| {
+            present.then(|| {
+                size += bytes;
+                size - bytes
+            })
+        };
+        let color = field(fvf & 0x40 != 0, 4);
+        let uv = field(fvf & 0x100 != 0, 8);
+        Some(Self {
+            transformed,
+            position: 0,
+            color,
+            uv,
+            size,
+        })
+    }
+}
 pub(super) struct Draw {
     pub target: Target,
     pub image: Option<Image>,
@@ -69,6 +104,9 @@ impl Fixed {
             w: right - left,
             h: bottom - top,
         }
+    }
+    pub(super) fn clear_fvf(&mut self) {
+        self.fvf = 0;
     }
     pub(super) fn auto_depth(&mut self, enabled: bool) {
         self.render.insert(7, u32::from(enabled));
@@ -208,7 +246,7 @@ fn valid_fvf(fvf: u32) -> bool {
     matches!(fvf & 0x0e, 2 | 4) && fvf & !(0x0e | 0x40 | 0x100) == 0
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetFVF",level=state)]
-fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
+pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
@@ -216,10 +254,34 @@ fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
         return UNAVAILABLE;
     }
     f.fvf = fvf;
+    let device = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .unwrap();
+    if device_declaration(env, this.addr()).is_some() {
+        // Unbinding a declaration clears the FVF it replaced; restore ours.
+        let code = super::declaration::bind(env, device, None);
+        if code != 0 {
+            return code;
+        }
+        mutable(env, this.addr()).unwrap().fvf = fvf;
+    }
     0
 }
+fn device_declaration(env: &Env<'_>, pointer: u32) -> Option<Id> {
+    device(env, pointer)?.buffers.declaration
+}
+fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
+    let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
+    match d.buffers.declaration {
+        Some(id) => {
+            super::declaration::layout(env, id).map_err(|reason| rejected(UNAVAILABLE, reason))
+        }
+        None => Layout::from_fvf(d.fixed.fvf)
+            .ok_or_else(|| rejected(INVALID, "no supported FVF is set")),
+    }
+}
 #[win32(d3d9,name="IDirect3DDevice9::GetFVF",level=implement)]
-fn get_fvf(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
+pub(super) fn get_fvf(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
     };
@@ -605,12 +667,9 @@ fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
     std::array::from_fn(|column| (0..4).map(|i| vector[i] * matrix[i * 4 + column]).sum())
 }
 pub(super) fn vertex_size(env: &Env<'_>, pointer: u32) -> Result<u32, u32> {
-    let f = current(env, pointer).ok_or(INVALID)?;
-    if !valid_fvf(f.fvf) {
-        return Err(INVALID);
-    }
-    let position = if f.fvf & 0x0e == 4 { 4 } else { 3 };
-    Ok((position + u32::from(f.fvf & 0x40 != 0) + 2 * u32::from(f.fvf & 0x100 != 0)) * 4)
+    layout(env, pointer)
+        .map(|layout| layout.size)
+        .map_err(|error| error.code)
 }
 pub(super) fn primitive_length(kind: i32, count: u32) -> Result<u32, u32> {
     if count == 0 || count > 131_072 {
@@ -636,7 +695,7 @@ pub(super) fn empty_draw(env: &Env<'_>, pointer: u32, kind: i32) -> Result<(), u
     Ok(())
 }
 pub(super) fn prepare(
-    env: &Env<'_>,
+    env: &mut Env<'_>,
     pointer: u32,
     kind: i32,
     count: u32,
@@ -644,7 +703,27 @@ pub(super) fn prepare(
     stride: u32,
     indices: Option<&[u32]>,
 ) -> Result<Draw, u32> {
-    prepare_checked(env, pointer, kind, count, data, stride, indices).map_err(|error| error.code)
+    prepare_checked(env, pointer, kind, count, data, stride, indices).map_err(|error| {
+        // Unsupported (not invalid) inputs name the missing capability.
+        if error.code == UNAVAILABLE {
+            let api = if indices.is_some() {
+                "IDirect3DDevice9::DrawIndexedPrimitive"
+            } else {
+                "IDirect3DDevice9::DrawPrimitive"
+            };
+            warn_rejected(
+                env,
+                api,
+                pointer,
+                kind,
+                data,
+                stride,
+                error.code,
+                error.reason,
+            );
+        }
+        error.code
+    })
 }
 fn prepare_checked(
     env: &Env<'_>,
@@ -660,17 +739,14 @@ fn prepare_checked(
     if !d.scene {
         return Err(rejected(INVALID, "draw outside BeginScene/EndScene"));
     }
-    if !valid_fvf(f.fvf) {
-        return Err(rejected(INVALID, "no supported FVF is set"));
-    }
-    let position = if f.fvf & 0x0e == 4 { 4 } else { 3 };
-    if position == 3 && f.render[&137] != 0 {
+    let layout = layout(env, pointer)?;
+    if !layout.transformed && f.render[&137] != 0 {
         return Err(rejected(
             UNAVAILABLE,
             "untransformed vertices require unsupported lighting",
         ));
     }
-    let minimum = vertex_size(env, pointer)?;
+    let minimum = layout.size;
     if stride < minimum || stride > 2048 || data.is_null() {
         return Err(rejected(INVALID, "vertex pointer or stride is invalid"));
     }
@@ -703,17 +779,18 @@ fn prepare_checked(
     adv_abi::guest::check_range(env.cpu, span, bytes, Prot::READ)
         .map_err(|_| rejected(INVALID, "vertex span is not readable"))?;
     let mut vertices = Vec::with_capacity(length as usize);
+    let mut raw = vec![0; minimum as usize];
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
-        let mut raw = [0; 28];
         env.cpu
-            .read(data.addr() + index * stride, &mut raw[..minimum as usize])
+            .read(data.addr() + index * stride, &mut raw)
             .map_err(|_| rejected(INVALID, "vertex read failed"))?;
-        let float =
-            |word: usize| f32::from_le_bytes(raw[word * 4..word * 4 + 4].try_into().unwrap());
-        let mut p = [float(0), float(1), float(2), 1.];
-        if position == 4 {
-            let rhw = float(3);
+        let word = |at: u32| -> [u8; 4] { raw[at as usize..at as usize + 4].try_into().unwrap() };
+        let float = |at: u32| f32::from_le_bytes(word(at));
+        let at = layout.position;
+        let mut p = [float(at), float(at + 4), float(at + 8), 1.];
+        if layout.transformed {
+            let rhw = float(at + 12);
             if rhw == 0. || !rhw.is_finite() {
                 return Err(rejected(INVALID, "vertex RHW is zero or not finite"));
             }
@@ -735,23 +812,17 @@ fn prepare_checked(
                 "transformed vertex position is not finite",
             ));
         }
-        let mut at = position as usize;
         let mut color = [1.; 4];
-        if f.fvf & 0x40 != 0 {
-            let argb = u32::from_le_bytes(raw[at * 4..at * 4 + 4].try_into().unwrap());
+        if let Some(at) = layout.color {
+            let argb = u32::from_le_bytes(word(at));
             color = [
                 ((argb >> 16) & 255) as f32 / 255.,
                 ((argb >> 8) & 255) as f32 / 255.,
                 (argb & 255) as f32 / 255.,
                 (argb >> 24) as f32 / 255.,
             ];
-            at += 1;
         }
-        let uv = if f.fvf & 0x100 != 0 {
-            [float(at), float(at + 1)]
-        } else {
-            [0.; 2]
-        };
+        let uv = layout.uv.map_or([0.; 2], |at| [float(at), float(at + 4)]);
         if uv.iter().any(|v| !v.is_finite()) {
             return Err(rejected(
                 INVALID,
@@ -994,12 +1065,29 @@ fn warn_draw_rejected(
     code: u32,
     reason: &str,
 ) {
+    let api = "IDirect3DDevice9::DrawPrimitiveUP";
+    warn_rejected(env, api, pointer, kind, data, stride, code, reason);
+}
+fn warn_rejected(
+    env: &mut Env<'_>,
+    api: &str,
+    pointer: u32,
+    kind: i32,
+    data: GuestPtr<u8>,
+    stride: u32,
+    code: u32,
+    reason: &str,
+) {
     let state = device(env, pointer).map_or_else(
         || "device unavailable".to_owned(),
         |d| {
             let v = d.fixed.viewport;
+            let declaration = d
+                .buffers
+                .declaration
+                .map_or_else(|| "none".into(), |id| super::declaration::describe(env, id));
             format!(
-                "FVF={:#x}, scene={}, viewport=({},{} {}x{},{}..{}), z_enable={}, stencil_enable={}, stencil_attachment={}",
+                "FVF={:#x}, declaration={declaration}, scene={}, viewport=({},{} {}x{},{}..{}), z_enable={}, stencil_enable={}, stencil_attachment={}",
                 d.fixed.fvf, d.scene, v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ,
                 d.fixed.render[&7], d.fixed.render[&52], super::depth::has_stencil(env, pointer),
             )
@@ -1009,7 +1097,7 @@ fn warn_draw_rejected(
     // repeated failed batches share one bounded diagnostic and a repeat count.
     adv_abi::warn_unavailable(
         env,
-        "IDirect3DDevice9::DrawPrimitiveUP",
+        api,
         &format!(
             "{reason}; HRESULT={code:#x}, primitive={kind}, data={:#x}, stride={stride}; {state}",
             data.addr(),

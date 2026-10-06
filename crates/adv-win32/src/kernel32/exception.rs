@@ -261,7 +261,8 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
                     Outcome::Fail(format!("invalid vectored exception disposition {value:#x}"))
                 }
             },
-        );
+        )
+        .unwindable();
     }
     // A vectored handler can repair the live registration head before declining.
     let frame = match search.frame {
@@ -323,6 +324,9 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
             }
         },
     )
+    // An `__except` or catch target resumes on the establisher's stack and
+    // never returns here; dropping this continuation also ends the phase.
+    .unwindable()
 }
 
 fn resume(env: &mut Env<'_>, mut search: Search) -> Outcome {
