@@ -18,6 +18,7 @@ mod osversion;
 mod process;
 pub(crate) use environment::entries as environment_entries;
 pub(crate) use process::{command_line, configure_codepage};
+pub(crate) use process::install_parameters;
 mod string;
 mod sync;
 mod time;
