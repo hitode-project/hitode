@@ -626,6 +626,7 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
         Object::Event { .. } => 1,
         Object::Mutex { .. } => 2,
         Object::Semaphore { .. } => 3,
+        Object::Timer { .. } => 4,
         _ => unreachable!(),
     };
     if let Some(name) = &name {
@@ -672,6 +673,16 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
 
 /// Open an existing process-owned mutex through the same namespace as Create.
 pub(super) fn open_mutex(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
+    open_sync(env, pointer, wide, 2, 0x001f0001)
+}
+
+pub(super) fn open_sync(
+    env: &mut Env<'_>,
+    pointer: u32,
+    wide: bool,
+    kind: u32,
+    full_access: u32,
+) -> Outcome {
     if pointer == 0 {
         return fail(env, 87);
     }
@@ -683,13 +694,27 @@ pub(super) fn open_mutex(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome
     };
     prune(env);
     let identity = match state(env).names.get(&name) {
-        Some(Named::Sync { identity, kind: 2 }) => *identity,
+        Some(Named::Sync {
+            identity,
+            kind: existing,
+        }) if *existing == kind => *identity,
         Some(_) => return fail(env, 6),
         None => return fail(env, 2),
     };
     // Kernel aliases currently carry full access and do not implement process
     // inheritance. Do not silently broaden a restricted access request.
-    if !matches!(env.arg(0), 0x001f0001 | 0x10000000) || env.arg(1) != 0 {
+    if (env.arg(0) != full_access && env.arg(0) != 0x10000000) || env.arg(1) != 0 {
+        if kind == 4 {
+            adv_abi::warn_unavailable(
+                env,
+                if wide {
+                    "OpenWaitableTimerW"
+                } else {
+                    "OpenWaitableTimerA"
+                },
+                "restricted access and inherited timer handles are not modeled",
+            );
+        }
         return fail(env, 50);
     }
     match env.sys.objects.alias_identity(identity) {
