@@ -22,6 +22,53 @@ const WS_GROUP: u32 = 0x0002_0000;
 const APP: u32 = 0x8000;
 
 #[test]
+fn drag_accept_files_updates_the_existing_window_style() {
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let class = t.text("Static");
+    let window = t.window(&mut a, class, WS_POPUP, I(0), 0);
+    t.call(
+        &mut a,
+        "SetWindowLongA",
+        &[M(window), I((-20i32) as u32), I(WS_EX_CLIENTEDGE)],
+    );
+    let mut results = Vec::new();
+    for (accept, expected) in [
+        (1, WS_EX_CLIENTEDGE | 0x10),
+        (7, WS_EX_CLIENTEDGE | 0x10),
+        (0, WS_EX_CLIENTEDGE),
+    ] {
+        t.call(
+            &mut a,
+            "shell32.dll!DragAcceptFiles",
+            &[M(window), I(accept)],
+        );
+        let style = t.call(&mut a, "GetWindowLongA", &[M(window), I((-20i32) as u32)]);
+        results.push((style, expected));
+    }
+    t.call(
+        &mut a,
+        "shell32.dll!DragAcceptFiles",
+        &[I(0xdeadbeef), I(1)],
+    );
+    let error = t.call(&mut a, "kernel32.dll!GetLastError", &[]);
+    t.run(a);
+    assert_ne!(t.u32(window), 0);
+    for (style, expected) in results {
+        assert_eq!(t.u32(style), expected);
+    }
+    assert_eq!(t.u32(error), 1400);
+    let state =
+        t.m.ext
+            .get::<Win32>()
+            .user
+            .windows
+            .get(&t.m.sys.objects, &t.u32(window))
+            .unwrap();
+    assert_eq!(state.ex_style, WS_EX_CLIENTEDGE);
+}
+
+#[test]
 fn dialog_projection_owns_state_and_validates_control_input() {
     use adv_win32::user32::dialog::{self, DialogEvent};
     use adv_win32::user32::window::WS_DISABLED;
