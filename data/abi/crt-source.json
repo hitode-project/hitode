@@ -23,7 +23,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memcpy-s-wmemcpy-s",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memmove-s-wmemmove-s",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setlocale-wsetlocale"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -66,6 +67,11 @@
     "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
     "adjust_fdiv": "Existing x86 MSVCRT compatibility data cell, int32 zero initial value. The installed Microsoft SysWOW64/msvcrt.dll PE exports _adjust_fdiv from its writable, non-executable .data virtual tail, not a code entry. No modern SDK header declaration is claimed.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
+  },
+  "locale.h": {
+    "header": "ucrt/locale.h",
+    "sha256": "877aa49e1f22814dd5634e785d305210d3c7ac0a1274e8552ce4f687a91ac4cb",
+    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5"
   },
   "process.h": {
     "header": "ucrt/process.h",

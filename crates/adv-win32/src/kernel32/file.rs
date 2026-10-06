@@ -148,7 +148,7 @@ pub fn open(env: &mut Env<'_>, path: &str, access: u32, disposition: u32) -> u32
     open_with_share(env, path, access, disposition, 7)
 }
 
-fn open_with_share(
+pub(crate) fn open_with_share(
     env: &mut Env<'_>,
     path: &str,
     access: u32,

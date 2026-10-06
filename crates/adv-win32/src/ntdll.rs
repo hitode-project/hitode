@@ -1,5 +1,6 @@
 //! Minimal ntdll RTL functions for registry paths and unicode strings.
 mod path;
+mod file;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -81,6 +82,7 @@ fn rtl_init_unicode_string(env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     path::register(reg);
+    file::register(reg);
     stdcall(reg, NTDLL, "RtlFormatCurrentUserKeyPath", 1, rtl_format_current_user_key_path);
     stdcall(reg, NTDLL, "RtlFreeUnicodeString", 1, rtl_free_unicode_string);
     stdcall(reg, NTDLL, "RtlInitUnicodeString", 2, rtl_init_unicode_string);

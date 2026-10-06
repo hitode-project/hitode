@@ -227,7 +227,7 @@ public static class AbiMetadata
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !new[] { "u32", "i32", "ptr", "str16" }.Contains(p[2]) || p[3] != "1")
+                if (p.Length != 4 || !new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1")
                     throw new InvalidDataException("Invalid supplemental x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];
@@ -252,7 +252,13 @@ public static class AbiMetadata
             bool ntPath = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "RtlDosPathNameToNtPathName_U"
                 && f[3] == "u32" && f[4] == "Windows.Win32.Foundation.BOOLEAN"
                 && f[5] == "DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1";
-            if ((!vcm && !d3dx && !ntPath) || f[2] != "stdcall")
+            // User-mode Nt/Zw share one native service. This sole alias uses
+            // the SDK winternl.h NtCreateFile declaration and both SDK x86
+            // import symbols @44, without projecting other native services.
+            bool ntCreate = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwCreateFile"
+                && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
+                && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1";
+            if ((!vcm && !d3dx && !ntPath && !ntCreate) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
@@ -262,7 +268,7 @@ public static class AbiMetadata
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : d3dx ? p[2] == "ptr" : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dx ? p[2] == "ptr" : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

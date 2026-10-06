@@ -1,6 +1,7 @@
 # Supplemental x86 declarations from Microsoft SDK 10.0.26100.0 ucrt/float.h.
 # Authoritative input merged by Metadata.cs into the sole signatures.tsv output.
 # Declaration source/hash and official docs are in crt-source.json; no SDK header is copied.
+msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
 msvcrt.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcrt.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 msvcrt.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1

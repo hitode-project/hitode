@@ -19,6 +19,18 @@
     "native_abi_verification": "RVA 0x6a5a0 U wrapper calls the same path conversion as WithStatus, returns setns AL or xor AL,AL, and pops 16 bytes. Authored x86 oracle checks BOOLEAN, descriptor byte lengths, FilePart/RelativeName aliasing, empty failure, and RtlFreeUnicodeString allocation ownership. No DLL bytes are bundled.",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/devnotes/rtldospathnametontpathname_u_withstatus"
   },
+  "native_create_file": {
+    "scope": "ntdll.dll!ZwCreateFile only; no other Nt/Zw exports are projected",
+    "source": "Microsoft Windows SDK 10.0.26100.0 um/winternl.h NtCreateFile declaration; Microsoft documents identical Nt/Zw user-mode behavior",
+    "header_sha256": "a43424486349c38f697c009512dfe4eb8fca733d7665afab42f50752170b9785",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS and eleven 32-bit arguments; SDK ntdll.lib declares both _NtCreateFile@44 and _ZwCreateFile@44",
+    "native_verification": "Authored x86 ZwCreateFile oracle opens its own target file and checks FILE_OPENED, failure HANDLE/IO_STATUS_BLOCK output preservation, and LastError; no host DLL bytes or game data are bundled",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwcreatefile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",

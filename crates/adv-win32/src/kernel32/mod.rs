@@ -8,6 +8,7 @@ mod file;
 mod file_mapping;
 mod handle;
 pub use file::open as open_file;
+pub(crate) use file::open_with_share;
 pub use handle::ProcessHandle;
 mod memory;
 mod module;

@@ -10,6 +10,7 @@ mod data;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
+mod locale;
 mod onexit;
 mod secure_memory;
 mod startup;
@@ -22,6 +23,7 @@ struct CrtState {
     globals: HashMap<(String, String), u32>,
     invalid_handlers: HashMap<String, u32>,
     files: HashMap<u32, std::fs::File>,
+    locales: HashMap<String, locale::LocaleState>,
 }
 
 // API-set imports and their UCRT exports share the same CRT state owner.
@@ -34,6 +36,15 @@ fn crt_module(module: &str) -> &str {
 }
 
 fn invalid_parameter(env: &mut Env<'_>, function: &str, error: i32) -> Outcome {
+    invalid_parameter_result(env, function, error, error as u32)
+}
+
+fn invalid_parameter_result(
+    env: &mut Env<'_>,
+    function: &str,
+    error: i32,
+    result: u32,
+) -> Outcome {
     let errno = floating::errno_address(env);
     if errno.is_null() || errno.write(env.cpu, error).is_err() {
         return Outcome::Fail("CRT errno allocation/write failed".into());
@@ -53,7 +64,7 @@ fn invalid_parameter(env: &mut Env<'_>, function: &str, error: i32) -> Outcome {
     // Release UCRT passes no diagnostic strings. errno is assigned before the
     // callback, and a returning callback may change it or wait via the Machine.
     Outcome::call(handler, [0, 0, 0, 0, 0], move |_, _| {
-        Outcome::Return(error as u32)
+        Outcome::Return(result)
     })
 }
 
@@ -73,6 +84,7 @@ pub fn register(r: &mut Registry) {
     cpp_alloc::register(r);
     secure_memory::register(r);
     heap::register(r);
+    locale::register(r);
     wide_string::register(r);
     for (name, argc) in [
         ("malloc", 1),
@@ -260,6 +272,7 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
+    locale::release_process_tables(env)?;
     release_errno(env, None)
 }
 
