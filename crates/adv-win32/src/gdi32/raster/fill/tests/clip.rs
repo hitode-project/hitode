@@ -384,3 +384,116 @@ fn rect_visible_matches_native_normalization_degenerate_axes_and_saved_clip_with
             .any(|(api, _)| api == "gdi32.dll!RectVisible")
     );
 }
+
+#[test]
+fn window_origin_query_reads_shared_modes_and_atomically_preserves_errors_and_lifetime() {
+    let (mut m, data, dc, pixels) = fixture(8, 8, PixelFormat::Bgra32, false);
+    let count = m.sys.objects.object_count();
+    m.cpu.write(pixels, &[0xa5; 256]).unwrap();
+    let point = data + 128;
+    let value = |m: &Machine<JitCpu>| {
+        [
+            m.cpu.read_u32(point).unwrap() as i32,
+            m.cpu.read_u32(point + 4).unwrap() as i32,
+        ]
+    };
+    m.cpu.write(point - 4, &[0xa5; 16]).unwrap();
+    crate::util::set_last_error(&mut env(&mut m), 0x12345678);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, point]),
+        1
+    );
+    assert_eq!(value(&m), [0, 0]);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
+    assert_eq!(m.cpu.read_u32(point - 4).unwrap(), 0xa5a5a5a5);
+    assert_eq!(m.cpu.read_u32(point + 8).unwrap(), 0xa5a5a5a5);
+    let mut gdi = m.ext.get::<Win32>().gdi.clone();
+    // Seed the common owner's modes, not an exported, unimplemented setter.
+    let set_origin = |m: &mut Machine<JitCpu>, origin| {
+        let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) else {
+            panic!("DC owner")
+        };
+        modes.window_origin = origin;
+    };
+    set_origin(&mut m, [11, -7]);
+    assert_eq!(call(&mut m, data, "gdi32.dll!SaveDC", &[dc]), 1);
+    set_origin(&mut m, [-2, 5]);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, point]),
+        1
+    );
+    assert_eq!(value(&m), [-2, 5]);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!RestoreDC", &[dc, u32::MAX]),
+        1
+    );
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, point]),
+        1
+    );
+    assert_eq!(value(&m), [11, -7]);
+    let short = m.sys.vm.alloc(&mut m.cpu, 8192, Prot::RW).unwrap();
+    m.cpu.write_u32(short + 4092, 0xdeadbeef).unwrap();
+    m.cpu.protect(short + 4096, 4096, Prot(0)).unwrap();
+    for output in [0, 0xfffffffc, short + 4092] {
+        assert_eq!(
+            call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, output]),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+    }
+    assert_eq!(m.cpu.read_u32(short + 4092).unwrap(), 0xdeadbeef);
+    m.cpu.protect(short, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, short]),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+    crate::util::set_last_error(&mut env(&mut m), 0x12345678);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[0, point]),
+        0
+    );
+    assert_eq!(value(&m), [11, -7]);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 2;
+    }
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, point]),
+        0
+    );
+    assert_eq!(value(&m), [11, -7]);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 1;
+    }
+    // This logical getter remains available without raster pixels/provider.
+    m.cpu.protect(pixels, 4096, Prot(0)).unwrap();
+    super::super::super::front::install(&mut m);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, point]),
+        1
+    );
+    assert_eq!(value(&m), [11, -7]);
+    m.cpu.protect(pixels, 4096, Prot::RW).unwrap();
+    let mut raw = [0; 256];
+    m.cpu.read(pixels, &mut raw).unwrap();
+    assert_eq!(raw, [0xa5; 256]);
+    assert_eq!(m.sys.objects.object_count(), count);
+    assert!(
+        m.ext
+            .get::<adv_abi::ApiDiagnostics>()
+            .warnings
+            .keys()
+            .any(|(api, _)| api == "gdi32.dll!GetWindowOrgEx")
+    );
+    assert!(gdi.remove_external_dc(&mut m.sys.objects, dc));
+    crate::util::set_last_error(&mut env(&mut m), 0x12345678);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, point]),
+        0
+    );
+    assert_eq!(value(&m), [11, -7]);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
+}

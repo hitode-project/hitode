@@ -1,6 +1,10 @@
 //! Application clipping borrows the existing DC and CPU surface; no pixel owner.
 use crate::{Win32, util::set_last_error};
-use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, types::RECT, win32};
+use adv_abi::{
+    Env, GuestPtr, Handle, Outcome, Registry,
+    types::{POINT, RECT},
+    win32,
+};
 use adv_cpu::backend::Prot;
 use adv_device::surface::{Surface, SurfaceMemory, SurfaceStore};
 use adv_os::gdi::{DcClip, GdiObj};
@@ -9,6 +13,7 @@ use std::borrow::Cow;
 pub(super) fn register(reg: &mut Registry) {
     reg.register(exclude_ABI);
     reg.register(rect_visible_ABI);
+    reg.register(window_origin_ABI);
 }
 fn unsupported(env: &mut Env<'_>, reason: &str) -> Outcome {
     adv_abi::warn_unavailable(env, "gdi32.dll!ExcludeClipRect", reason);
@@ -63,6 +68,32 @@ pub(crate) fn snapshot(env: &Env<'_>, dc: u32) -> DcClip {
         Some(GdiObj::Dc { clip, .. }) => clip.clone(),
         _ => DcClip::default(),
     }
+}
+
+#[win32(gdi32, name="GetWindowOrgEx", level=state)]
+fn window_origin(env: &mut Env<'_>, dc: Handle, output: GuestPtr<POINT>) -> Outcome {
+    let Some(GdiObj::Dc { modes, .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
+    else {
+        // Native invalid-HDC query leaves both the POINT and LastError alone.
+        return Outcome::Return(0);
+    };
+    if modes.map != 1 {
+        adv_abi::warn_unavailable(
+            env,
+            "gdi32.dll!GetWindowOrgEx",
+            "only MM_TEXT window origins are available",
+        );
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    let [x, y] = modes.window_origin;
+    if adv_abi::guest::check_range(env.cpu, output.addr(), 8, Prot::WRITE).is_err()
+        || output.write(env.cpu, POINT { x, y }).is_err()
+    {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    Outcome::Return(1)
 }
 
 #[win32(gdi32, name="RectVisible", level=state)]

@@ -11,6 +11,8 @@ pub struct DcModes {
     pub rop2: i32,
     pub stretch: u32,
     pub text_align: u32,
+    /// Logical window origin. Initial MM_TEXT DCs start at (0, 0).
+    pub window_origin: [i32; 2],
 }
 impl Default for DcModes {
     fn default() -> Self {
@@ -20,6 +22,7 @@ impl Default for DcModes {
             rop2: 13, // R2_COPYPEN
             stretch: 1,
             text_align: 0,
+            window_origin: [0, 0],
         }
     }
 }
