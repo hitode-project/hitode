@@ -14,6 +14,7 @@ pub mod menu;
 pub mod message;
 mod placement;
 mod resources;
+mod station;
 pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
@@ -102,8 +103,18 @@ fn message_box_a(env: &mut Env<'_>) -> Outcome {
         c.decode(&cstr(env.cpu, text)),
         c.decode(&cstr(env.cpu, caption)),
     );
+    message_box(env, t, cap, ty, "MessageBoxA")
+}
+
+fn message_box_w(env: &mut Env<'_>) -> Outcome {
+    let t = String::from_utf16_lossy(&crate::util::wstr(env.cpu, env.arg(1)));
+    let cap = String::from_utf16_lossy(&crate::util::wstr(env.cpu, env.arg(2)));
+    message_box(env, t, cap, env.arg(3), "MessageBoxW")
+}
+
+fn message_box(env: &mut Env<'_>, t: String, cap: String, ty: u32, api: &str) -> Outcome {
     log::warn!(
-        "MessageBoxA [{cap}] {t} (type {ty:#x}) from {:#010x}",
+        "{api} [{cap}] {t} (type {ty:#x}) from {:#010x}",
         env.caller()
     );
     // IDOK for OK-style boxes, IDYES for yes/no.
@@ -114,7 +125,7 @@ fn message_box_a(env: &mut Env<'_>) -> Outcome {
     let record = adv_abi::MessageBoxCall {
         sequence: 0,
         frame: env.sys.frame,
-        api: "user32.dll!MessageBoxA".into(),
+        api: format!("user32.dll!{api}"),
         caller: env.caller(),
         context: env.context,
         caption: cap,
@@ -562,6 +573,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     accelerator::register(reg);
+    station::register(reg);
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
@@ -583,6 +595,7 @@ pub fn register(reg: &mut Registry) {
     );
     s(reg, "wvsprintfA", 3, wvsprintf_a);
     s(reg, "MessageBoxA", 4, message_box_a);
+    s(reg, "MessageBoxW", 4, message_box_w);
     s(reg, "MessageBeep", 1, |_| Outcome::Return(1));
     s(reg, "GetSystemMetrics", 1, get_system_metrics);
     // The guest has one standard enhanced keyboard, independent of the host
