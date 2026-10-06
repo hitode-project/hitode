@@ -42,7 +42,8 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkdir-wmkdir",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findfirst-functions",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findnext-functions",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findclose"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findclose",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtod-strtod-l-wcstod-wcstod-l"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -183,5 +184,12 @@
     "layout": "Authored x86 probe corroborates SDK _wfinddata64i32_t: sizeof560, unsigned attrib at0, signed time64 at8/16/24, unsigned size32 at32 and UTF16 name[260] at36. Alignment padding at4 and556 are not overwritten; no unrelated modern find_t layout is projected.",
     "behavior": "Native NORMAL attributes become _A_NORMAL=0. Creation/access/write times independently match three authored UTC-second values. No-match and EOF assign errno2; NULL pattern/output and next handle=-1 invoke the returning invalid handler with errno22. _findclose success is0, stale/-1 failure is-1 with errno22 and no invalid callback. All these failures retain prior DOS errno; success retains prior CRT errno. Shared VFS snapshots, rather than host filesystem bypasses, supply virtual rows.",
     "oracle_source_sha256": "aafb9efd45e94ed15fc67804ee8df2582681abe19de32452db8b4f652f179ef0"
+  },
+  "strtod": {
+    "header": "ucrt/stdlib.h:502-505",
+    "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+    "projection": "double __cdecl strtod(char const* _String, char** _EndPtr), two x86 pointer slots and an IEEE binary64 x87 ST0 return. Only the existing MSVCRT/VC80/VC90 export profiles; no locale-object or C99 conversion family is projected.",
+    "behavior": "Authored x86 VC80 8.0.50727.9680 oracle: decimal prefix with incomplete exponent rollback; hex stops after initial decimal zero, inf/nan do not convert. Overflow and nonzero mantissa rounding to zero assign errno34; nonzero subnormal retains errno. NULL source zeros endptr and calls returning invalid handler with errno22. Existing supported C/JP/CN/EN numeric categories use decimal dot; byte-space classification follows module LC_CTYPE, including CP1252 A0.",
+    "oracle_source_sha256": "f2000268d660b2b42b987a9db6bc26aad7d8d4b47bee059edef18ffaa3f75fa7"
   }
 }
