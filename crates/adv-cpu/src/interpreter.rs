@@ -1148,7 +1148,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
             }
             Action::Unary(i.mnemonic(), dst)
         }
-        M::Shl | M::Shr | M::Sar | M::Rol | M::Ror | M::Rcl | M::Rcr => {
+        M::Sal | M::Shl | M::Shr | M::Sar | M::Rol | M::Ror | M::Rcl | M::Rcr => {
             let (dst, count) = (op(0)?, op(1)?);
             if !dst.writable()
                 || !(count.width().is_none()
@@ -1163,7 +1163,14 @@ fn predecode(i: &Instruction) -> Option<Action> {
             {
                 return None;
             }
-            Action::Shift(i.mnemonic(), dst, count)
+            // Iced distinguishes the group-2 /6 SAL encoding from /4 SHL.
+            // They share the same widths, count masking and flag semantics.
+            let kind = if i.mnemonic() == M::Sal {
+                M::Shl
+            } else {
+                i.mnemonic()
+            };
+            Action::Shift(kind, dst, count)
         }
         M::Xchg => {
             let (a, b) = pair()?;

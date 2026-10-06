@@ -1364,3 +1364,46 @@ fn bswap_word_uses_explicit_compatibility_semantics_without_changing_flags() {
         }
     }
 }
+
+#[test]
+fn sal_alias_encodings_match_shl_for_all_widths_and_count_forms() {
+    for width in [1, 2, 4] {
+        for opcode in if width == 1 {
+            [0xd0, 0xd2, 0xc0]
+        } else {
+            [0xd1, 0xd3, 0xc1]
+        } {
+            for indirect in [false, true] {
+                for count in [0u8, 1, 7, 16, 31, 32, 255] {
+                    let encode = |group: u8| {
+                        let mut bytes = Vec::new();
+                        if width == 2 {
+                            bytes.push(0x66);
+                        }
+                        bytes.extend([opcode, if indirect { 0x06 } else { 0xc0 } | group << 3]);
+                        if opcode == 0xc0 || opcode == 0xc1 {
+                            bytes.push(count);
+                        }
+                        bytes
+                    };
+                    let mut left = memory(&encode(6));
+                    let mut right = memory(&encode(4));
+                    left.write(DATA + 32, &0x8123_4567u32.to_le_bytes())
+                        .unwrap();
+                    right
+                        .write(DATA + 32, &0x8123_4567u32.to_le_bytes())
+                        .unwrap();
+                    let mut a = state();
+                    a.regs[1] = u32::from(count);
+                    let mut b = a.clone();
+                    assert_eq!(Interpreter::new().step(&mut a, &mut left), Step::Executed);
+                    assert_eq!(Interpreter::new().step(&mut b, &mut right), Step::Executed);
+                    assert_eq!(a.regs, b.regs);
+                    assert_eq!(a.eflags, b.eflags);
+                    assert_eq!(a.eip, b.eip);
+                    assert_eq!(left.read(DATA + 32, 4), right.read(DATA + 32, 4));
+                }
+            }
+        }
+    }
+}
