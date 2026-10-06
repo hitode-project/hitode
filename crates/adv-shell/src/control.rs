@@ -26,6 +26,8 @@ pub enum Command {
     Report(PathBuf),
     Memory(u32, u32),
     ResetMetrics,
+    AwaitFrame(FrameGateSpec),
+    Resume,
     Close,
     Error(String),
 }
@@ -120,12 +122,279 @@ impl Command {
                 })
             }
             "close" if rest.is_empty() => Ok(Self::Close),
+            "resume" if rest.is_empty() => Ok(Self::Resume),
+            "await-frame" => Ok(Self::AwaitFrame(FrameGateSpec::parse(rest)?)),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click/move X Y, key/key-down/key-up VK, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics or close"
+                "expected click/move X Y, key/key-down/key-up VK, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
                     .into(),
             ),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PixelProbe {
+    pub x: u32,
+    pub y: u32,
+    pub bgra: [u8; 4],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FrameGateSpec {
+    pub hash: u64,
+    pub timeout: Duration,
+    pub hold: Option<u32>,
+    pub release: Option<u32>,
+    pub current: bool,
+    pub probes: Vec<PixelProbe>,
+}
+impl FrameGateSpec {
+    fn parse(rest: &str) -> Result<Self, String> {
+        let mut words = rest.split_whitespace();
+        let hash = words.next().ok_or("await-frame requires HASH TIMEOUT_MS")?;
+        if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("await-frame hash must have exactly 16 hexadecimal digits".into());
+        }
+        let hash = u64::from_str_radix(hash, 16).map_err(|_| "invalid frame hash")?;
+        let timeout: u64 = words
+            .next()
+            .ok_or("await-frame requires TIMEOUT_MS")?
+            .parse()
+            .map_err(|_| "invalid frame timeout")?;
+        if !(1..=600_000).contains(&timeout) {
+            return Err("frame timeout must be in 1..=600000 milliseconds".into());
+        }
+        let mut spec = Self {
+            hash,
+            timeout: Duration::from_millis(timeout),
+            hold: None,
+            release: None,
+            current: false,
+            probes: Vec::new(),
+        };
+        while let Some(option) = words.next() {
+            match option {
+                "hold" | "release" => {
+                    let key: u32 = words
+                        .next()
+                        .ok_or("hold/release requires a decimal key")?
+                        .parse()
+                        .map_err(|_| "invalid hold/release key")?;
+                    if key > 255 {
+                        return Err("virtual key must be in 0..=255".into());
+                    }
+                    let target = if option == "hold" {
+                        &mut spec.hold
+                    } else {
+                        &mut spec.release
+                    };
+                    if target.replace(key).is_some() {
+                        return Err("duplicate hold/release option".into());
+                    }
+                }
+                "current" if !spec.current => spec.current = true,
+                "probes" if spec.probes.is_empty() => {
+                    let probes = words.next().ok_or("probes requires X,Y,B,G,R,A;...")?;
+                    for probe in probes.split(';') {
+                        let values: Vec<u32> = probe
+                            .split(',')
+                            .map(str::parse)
+                            .collect::<Result<_, _>>()
+                            .map_err(|_| "invalid pixel probe")?;
+                        if values.len() != 6
+                            || values[0] >= 8192
+                            || values[1] >= 8192
+                            || values[2..].iter().any(|&v| v > 255)
+                            || spec.probes.len() >= 16
+                        {
+                            return Err("probes requires 1..=16 bounded X,Y,B,G,R,A pixels".into());
+                        }
+                        spec.probes.push(PixelProbe {
+                            x: values[0],
+                            y: values[1],
+                            bgra: [
+                                values[2] as u8,
+                                values[3] as u8,
+                                values[4] as u8,
+                                values[5] as u8,
+                            ],
+                        });
+                    }
+                }
+                _ => return Err("invalid or duplicate await-frame option".into()),
+            }
+        }
+        if spec.hold.is_some() && spec.current {
+            return Err(
+                "current cannot be combined with hold: an input must reach a new frame".into(),
+            );
+        }
+        if let Some(hold) = spec.hold {
+            if spec.release.is_some_and(|release| release != hold) {
+                return Err("held key must be released by the same gate".into());
+            }
+            spec.release = Some(hold);
+        }
+        Ok(spec)
+    }
+}
+
+struct ArmedGate {
+    spec: FrameGateSpec,
+    start_frame: u64,
+    observed_frame: Option<u64>,
+    deadline: Instant,
+}
+pub struct GateCompletion {
+    pub release: Option<u32>,
+    pub result: Result<String, String>,
+}
+/// Opt-in frame diagnostics. No guest work runs between a latch and its evidence.
+#[derive(Default)]
+pub struct SceneGate {
+    pending: Option<ArmedGate>,
+    frozen_since: Option<Instant>,
+    frozen_wall: Duration,
+    pub failure: Option<String>,
+    arms: u64,
+    matches: u64,
+    checks: u64,
+    hashes: u64,
+    check_time: Duration,
+    hash_time: Duration,
+    hash_max: Duration,
+}
+impl SceneGate {
+    pub fn arm(&mut self, spec: FrameGateSpec, frame: u64, now: Instant) -> Result<(), String> {
+        if self.pending.is_some() || self.failure.is_some() {
+            return Err("cannot arm a pending or failed scene gate".into());
+        }
+        self.resume(now)?;
+        self.arms += 1;
+        self.pending = Some(ArmedGate {
+            deadline: now + spec.timeout,
+            spec,
+            start_frame: frame,
+            observed_frame: None,
+        });
+        Ok(())
+    }
+    pub fn resume(&mut self, now: Instant) -> Result<(), String> {
+        if self.failure.is_some() {
+            return Err("failed scene gate remains frozen".into());
+        }
+        if let Some(since) = self.frozen_since.take() {
+            self.frozen_wall += now.saturating_duration_since(since);
+        }
+        Ok(())
+    }
+    pub fn close(&mut self, now: Instant) {
+        if let Some(since) = self.frozen_since.take() {
+            self.frozen_wall += now.saturating_duration_since(since);
+        }
+    }
+    pub fn frozen(&self) -> bool {
+        self.frozen_since.is_some()
+    }
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.pending
+            .as_ref()
+            .map(|gate| gate.deadline.saturating_duration_since(now))
+    }
+    pub fn abort(&mut self, reason: &str, frame: u64, now: Instant) -> Option<GateCompletion> {
+        let gate = self.pending.take()?;
+        let error = format!(
+            "await-frame {reason} target={:016x} frame={frame} start_frame={} frozen=true",
+            gate.spec.hash, gate.start_frame
+        );
+        self.failure = Some(error.clone());
+        self.frozen_since = Some(now);
+        Some(GateCompletion {
+            release: gate.spec.release,
+            result: Err(error),
+        })
+    }
+    pub fn observe(
+        &mut self,
+        frame: u64,
+        width: u32,
+        pixels: &[u8],
+        now: Instant,
+    ) -> Option<GateCompletion> {
+        let gate = self.pending.as_mut()?;
+        if now >= gate.deadline {
+            return self.abort("timeout", frame, now);
+        }
+        if frame == 0
+            || gate.observed_frame == Some(frame)
+            || (!gate.spec.current && frame <= gate.start_frame)
+        {
+            return None;
+        }
+        gate.observed_frame = Some(frame);
+        let started = Instant::now();
+        self.checks += 1;
+        let probes_match = gate.spec.probes.iter().all(|p| {
+            if p.x >= width {
+                return false;
+            }
+            let offset = ((u64::from(p.y) * u64::from(width) + u64::from(p.x)) * 4) as usize;
+            pixels.get(offset..offset.saturating_add(4)) == Some(p.bgra.as_slice())
+        });
+        let matched = if probes_match {
+            let hash_started = Instant::now();
+            let hash = pixels.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+            let elapsed = hash_started.elapsed();
+            self.hashes += 1;
+            self.hash_time += elapsed;
+            self.hash_max = self.hash_max.max(elapsed);
+            hash == gate.spec.hash
+        } else {
+            false
+        };
+        self.check_time += started.elapsed();
+        if !matched {
+            return None;
+        }
+        let gate = self.pending.take().unwrap();
+        self.matches += 1;
+        self.frozen_since = Some(Instant::now());
+        Some(GateCompletion {
+            release: gate.spec.release,
+            result: Ok(format!(
+                "await-frame hash={:016x} frame={frame} start_frame={} frozen=true",
+                gate.spec.hash, gate.start_frame
+            )),
+        })
+    }
+    pub fn json(&self) -> String {
+        let frozen = self.frozen_wall
+            + self
+                .frozen_since
+                .map_or(Duration::ZERO, |since| since.elapsed());
+        format!(
+            concat!(
+                "{{\"arms\":{},\"matches\":{},\"pending\":{},\"frozen\":{},",
+                "\"frame_checks\":{},\"full_hash_checks\":{},\"check_seconds\":{:.9},",
+                "\"hash_seconds\":{:.9},\"hash_max_seconds\":{:.9},\"frozen_observation_seconds\":{:.9}}}"
+            ),
+            self.arms,
+            self.matches,
+            self.pending(),
+            self.frozen(),
+            self.checks,
+            self.hashes,
+            self.check_time.as_secs_f64(),
+            self.hash_time.as_secs_f64(),
+            self.hash_max.as_secs_f64(),
+            frozen.as_secs_f64()
+        )
     }
 }
 
@@ -299,6 +568,9 @@ impl Control {
         })
     }
     pub fn drain(&mut self) -> Vec<Command> {
+        self.drain_frozen(false)
+    }
+    pub fn drain_frozen(&mut self, frozen: bool) -> Vec<Command> {
         self.receiver.fill();
         if let Some(reader) = &self.reader {
             reader.unpark();
@@ -306,7 +578,7 @@ impl Control {
         // An interrupt can produce a slice with no guest progress, or stop a
         // partial message dispatch. Keep diagnostics behind a normal guest
         // boundary after input, while new input and close remain responsive.
-        let command = if self.awaiting_guest_boundary {
+        let command = if self.awaiting_guest_boundary && !frozen {
             let input = self.receiver.pop_input();
             if input.is_some() {
                 input
@@ -422,6 +694,7 @@ mod tests {
         );
         assert_eq!(Command::parse("dialog-close"), Ok(Command::DialogClose));
         assert_eq!(Command::parse("reset-metrics"), Ok(Command::ResetMetrics));
+        assert_eq!(Command::parse("resume"), Ok(Command::Resume));
         assert_eq!(
             Command::parse("memory 0x400000 16"),
             Ok(Command::Memory(0x400000, 16))
@@ -449,9 +722,85 @@ mod tests {
             "dialog-track 1002",
             "dialog-track 1002 0 extra",
             "garbage",
+            "await-frame abc 100",
+            "await-frame 0000000000000001 0",
+            "await-frame 0000000000000001 600001",
+            "await-frame 0000000000000001 100 hold 256",
+            "await-frame 0000000000000001 100 hold 17 current",
+            "await-frame 0000000000000001 100 hold 17 release 13",
+            "await-frame 0000000000000001 100 probes 0,0,256,0,0,0",
         ] {
             assert!(Command::parse(line).is_err(), "{line}");
         }
+    }
+    #[test]
+    fn frame_gate_requires_a_new_frame_and_freezes_before_acknowledging() {
+        let pixels: [u8; 4] = [1, 2, 3, 255];
+        let hash = pixels.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+        let spec = FrameGateSpec::parse(&format!("{hash:016x} 100 hold 17")).unwrap();
+        assert_eq!(spec.release, Some(17));
+        let now = Instant::now();
+        let mut gate = SceneGate::default();
+        gate.arm(spec, 5, now).unwrap();
+        assert!(gate.observe(5, 1, &pixels, now).is_none());
+        let latch = gate.observe(6, 1, &pixels, now).unwrap();
+        assert_eq!(latch.release, Some(17));
+        assert!(
+            latch
+                .result
+                .unwrap()
+                .contains("frame=6 start_frame=5 frozen=true")
+        );
+        assert!(gate.frozen());
+        assert_eq!(gate.hashes, 1);
+        gate.resume(now).unwrap();
+        assert!(!gate.frozen());
+    }
+    #[test]
+    fn pixel_prefilter_cannot_accept_a_full_hash_mismatch_or_rehash_a_frame() {
+        let now = Instant::now();
+        let mut gate = SceneGate::default();
+        let spec = FrameGateSpec::parse("0000000000000001 100 probes 0,0,1,2,3,4").unwrap();
+        gate.arm(spec, 0, now).unwrap();
+        assert!(gate.observe(1, 1, &[0, 0, 0, 0], now).is_none());
+        assert_eq!(gate.hashes, 0);
+        assert!(gate.observe(2, 1, &[1, 2, 3, 4], now).is_none());
+        assert!(gate.observe(2, 1, &[1, 2, 3, 4], now).is_none());
+        assert_eq!(gate.hashes, 1);
+        assert!(!gate.frozen());
+        let latch = gate
+            .observe(2, 1, &[1, 2, 3, 4], now + Duration::from_millis(101))
+            .unwrap();
+        assert!(latch.result.unwrap_err().contains("timeout"));
+        assert!(gate.frozen());
+        assert!(gate.failure.is_some());
+        assert!(gate.resume(now).is_err());
+    }
+    #[test]
+    fn frozen_inputs_do_not_deadlock_the_next_gate_or_its_diagnostics() {
+        let (mut sender, receiver) = channel();
+        let mut control = Control {
+            receiver,
+            reader: None,
+            alive: Arc::new(AtomicBool::new(true)),
+            awaiting_guest_boundary: false,
+            input_receipt: 0,
+            awaiting_until: None,
+        };
+        sender.send(Command::Key(13)).unwrap();
+        sender.send(Command::Report("frozen.json".into())).unwrap();
+        sender.send(Command::Resume).unwrap();
+        assert_eq!(control.drain_frozen(true), [Command::Key(13)]);
+        assert_eq!(
+            control.drain_frozen(true),
+            [Command::Report("frozen.json".into())]
+        );
+        assert_eq!(control.drain_frozen(true), [Command::Resume]);
+        assert!(control.drain().is_empty());
+        control.after_guest_step(true);
+        assert_eq!(control.awaited_input_receipt(), None);
     }
     #[test]
     fn only_input_and_close_commands_request_guest_preemption() {

@@ -36,6 +36,16 @@ windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Fou
 # instead of reusing the older windows crate required by the WASAPI backend.
 windows = { version = "=0.62.2", optional = true }
 
+[target.'cfg(not(windows))'.dependencies]
+# One portable outline/raster stack. Font discovery needs no native fontconfig
+# library or unsafe mapping, including on Android.
+skrifa = "0.44"
+zeno = "0.3.3"
+fontdb = { version = "0.24", default-features = false, features = ["fs"] }
+encoding_rs.workspace = true
+serde_json = "1"
+sha2 = "0.10"
+
 [lints]
 workspace = true
 

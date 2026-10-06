@@ -1,0 +1,73 @@
+{
+  "schema": "adv-scene-v1",
+  "description": "Minimal ARM scene: title to choice, then first choice and five-second functional observation; final observation is not a fixed-work gate.",
+  "timeout_seconds": 90,
+  "steps": [
+    {
+      "delay_ms": 4000
+    },
+    {
+      "checkpoint": "title",
+      "await": {
+        "frame_fnv1a64": "59d66396fce144f3",
+        "timeout_ms": 90000,
+        "probes": [
+          {
+            "x": 638,
+            "y": 506,
+            "bgra": [
+              246,
+              218,
+              204,
+              255
+            ]
+          },
+          {
+            "x": 80,
+            "y": 538,
+            "bgra": [
+              253,
+              253,
+              253,
+              255
+            ]
+          },
+          {
+            "x": 111,
+            "y": 538,
+            "bgra": [
+              201,
+              166,
+              243,
+              255
+            ]
+          }
+        ],
+        "hold_key": 17
+      },
+      "reset_metrics": true
+    },
+    {
+      "command": "click 650 410"
+    },
+    {
+      "checkpoint": "choice",
+      "await": {
+        "frame_fnv1a64": "94a2292ec5312c1a",
+        "timeout_ms": 45000,
+        "probes": [],
+        "hold_key": 17
+      },
+      "reset_metrics": true
+    },
+    {
+      "command": "click 400 333"
+    },
+    {
+      "delay_ms": 5000
+    },
+    {
+      "command": "close"
+    }
+  ]
+}

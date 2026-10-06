@@ -1,0 +1,175 @@
+{
+  "schema": "adv-scene-v1",
+  "description": "Minimal ARM scene: loaded save to Cero chapter; no later normal-advance acceptance.",
+  "timeout_seconds": 360,
+  "steps": [
+    {
+      "delay_ms": 8000
+    },
+    {
+      "command": "menu 40010"
+    },
+    {
+      "delay_ms": 1200
+    },
+    {
+      "command": "click 560 110"
+    },
+    {
+      "delay_ms": 800
+    },
+    {
+      "command": "click 560 110"
+    },
+    {
+      "delay_ms": 800
+    },
+    {
+      "command": "click 400 264"
+    },
+    {
+      "delay_ms": 300
+    },
+    {
+      "command": "click 400 264"
+    },
+    {
+      "checkpoint": "loaded",
+      "await": {
+        "frame_fnv1a64": "f0e2585e03b7e63d",
+        "timeout_ms": 90000,
+        "probes": [
+          {
+            "x": 483,
+            "y": 498,
+            "bgra": [
+              163,
+              163,
+              163,
+              0
+            ]
+          },
+          {
+            "x": 545,
+            "y": 498,
+            "bgra": [
+              192,
+              192,
+              192,
+              0
+            ]
+          },
+          {
+            "x": 80,
+            "y": 530,
+            "bgra": [
+              188,
+              188,
+              188,
+              0
+            ]
+          },
+          {
+            "x": 328,
+            "y": 530,
+            "bgra": [
+              255,
+              255,
+              255,
+              0
+            ]
+          },
+          {
+            "x": 297,
+            "y": 538,
+            "bgra": [
+              255,
+              255,
+              255,
+              0
+            ]
+          },
+          {
+            "x": 80,
+            "y": 546,
+            "bgra": [
+              189,
+              189,
+              189,
+              0
+            ]
+          },
+          {
+            "x": 111,
+            "y": 546,
+            "bgra": [
+              246,
+              246,
+              246,
+              0
+            ]
+          },
+          {
+            "x": 266,
+            "y": 546,
+            "bgra": [
+              214,
+              214,
+              214,
+              0
+            ]
+          },
+          {
+            "x": 297,
+            "y": 546,
+            "bgra": [
+              255,
+              255,
+              255,
+              0
+            ]
+          }
+        ],
+        "current": true
+      },
+      "reset_metrics": true
+    },
+    {
+      "command": "menu 40005"
+    },
+    {
+      "delay_ms": 300
+    },
+    {
+      "command": "dialog-track 1001 0"
+    },
+    {
+      "command": "dialog-track 1002 0"
+    },
+    {
+      "command": "dialog 1004"
+    },
+    {
+      "command": "dialog 1"
+    },
+    {
+      "delay_ms": 100
+    },
+    {
+      "command": "reset-metrics"
+    },
+    {
+      "checkpoint": "after-skip",
+      "await": {
+        "frame_fnv1a64": "a6968230ebfbf74d",
+        "timeout_ms": 90000,
+        "probes": [],
+        "hold_key": 17
+      },
+      "reset_metrics": true
+    },
+    {
+      "command": "close"
+    }
+  ]
+}

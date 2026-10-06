@@ -1,11 +1,14 @@
 //! Font matching, immutable glyph results and a bounded raster cache. Requests
 //! contain text and rendering attributes, never guest pointers or DC handles.
-//! The current backend uses owned Windows fonts; other hosts report unavailable.
+//! Windows uses owned GDI fonts; other hosts use system or guest supplied OpenType
+//! fonts through skrifa and zeno, with fontdb providing discovery.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod spacing;
 
+#[cfg(not(windows))]
+mod portable;
 #[cfg(windows)]
 mod windows;
 
@@ -222,7 +225,8 @@ pub enum GlyphFormat {
     Gray4,
     Gray8,
 }
-/// Signed 16.16 fixed point, in row-major order. This retains the exact caller
+/// Signed 16.16 fixed point in row-major order, applied to glyph coordinates as
+/// row vectors (x' = x*xx + y*yx, y' = x*xy + y*yy). This retains the exact caller
 /// transform without float round trips or backend-specific structure layouts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Transform {
@@ -278,7 +282,6 @@ pub enum GlyphData {
     Outline(Vec<Contour>),
 }
 impl GlyphData {
-    #[cfg(windows)]
     fn cache_bytes(&self) -> usize {
         match self {
             Self::None => 0,
@@ -352,6 +355,24 @@ pub struct TextExtent {
     pub width: i32,
     pub height: i32,
 }
+/// The actual portable face and rendering size, for reproducible references.
+/// This reports the selected bytes, including a registered guest resource.
+#[cfg(not(windows))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontResolution {
+    pub family: String,
+    pub source: String,
+    pub face_index: u32,
+    pub sha256: String,
+    pub font_bytes: usize,
+    pub glyph_index: u32,
+    pub default_glyph: bool,
+    pub em_pixels: f32,
+    pub cell_pixels: i32,
+    pub horizontal_scale: f32,
+    pub profile_sha256: Option<String>,
+    pub backend: &'static str,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub fonts: usize,
@@ -368,9 +389,7 @@ pub enum TextError {
 impl std::fmt::Display for TextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable => {
-                f.write_str("Font metrics and glyphs require a Windows GDI backend on this host")
-            }
+            Self::Unavailable => f.write_str("No font backend is available on this host"),
             Self::Font(message) | Self::Glyph(message) => f.write_str(message),
         }
     }
@@ -380,6 +399,10 @@ impl std::fmt::Display for TextError {
 pub struct Text {
     #[cfg(windows)]
     fonts: BTreeMap<FontRequest, windows::Font>,
+    #[cfg(not(windows))]
+    fonts: BTreeMap<FontRequest, portable::Font>,
+    #[cfg(not(windows))]
+    backend: portable::Backend,
     #[cfg(windows)]
     canvas: Option<windows::Canvas>,
     glyphs: BTreeMap<(FontRequest, GlyphRequest), Arc<Glyph>>,
@@ -415,8 +438,7 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = (face, mode);
-            Err(TextError::Unavailable)
+            self.backend.enumerate(face, mode)
         }
     }
     /// Install owned backend font data. Successful resource changes invalidate
@@ -445,8 +467,9 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = bytes;
-            Err(TextError::Unavailable)
+            let result = self.backend.add_resource(bytes)?;
+            self.invalidate_fonts();
+            Ok(result)
         }
     }
 
@@ -466,8 +489,11 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = id;
-            Err(TextError::Unavailable)
+            let removed = self.backend.remove_resource(id);
+            if removed {
+                self.invalidate_fonts();
+            }
+            Ok(removed)
         }
     }
     pub fn resource_stats(&self) -> (usize, usize) {
@@ -477,13 +503,12 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            (0, 0)
+            self.backend.resource_stats()
         }
     }
     /// Refresh font matching after a resource reference changes without a new
     /// backend registration (for example a personality's repeated add/remove).
     pub fn invalidate_fonts(&mut self) {
-        #[cfg(windows)]
         self.fonts.clear();
         self.glyphs.clear();
         self.bytes = 0;
@@ -536,8 +561,7 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = (request, paint, pixels);
-            Err(TextError::Unavailable)
+            portable::paint(self, request, paint, pixels)
         }
     }
     pub fn stats(&self) -> CacheStats {
@@ -549,14 +573,7 @@ impl Text {
         }
     }
     fn font_count(&self) -> usize {
-        #[cfg(windows)]
-        {
-            self.fonts.len()
-        }
-        #[cfg(not(windows))]
-        {
-            0
-        }
+        self.fonts.len()
     }
     #[cfg(windows)]
     fn font(&mut self, request: &FontRequest) -> Result<&windows::Font, TextError> {
@@ -569,6 +586,49 @@ impl Text {
         }
         Ok(&self.fonts[request])
     }
+    #[cfg(not(windows))]
+    fn font(&mut self, request: &FontRequest) -> Result<&portable::Font, TextError> {
+        if !self.fonts.contains_key(request) {
+            let font = self.backend.font(request)?;
+            if self.fonts.len() >= FONT_CACHE_CAPACITY {
+                self.fonts.clear();
+            }
+            self.fonts.insert(request.clone(), font);
+        }
+        Ok(&self.fonts[request])
+    }
+    /// Use only these discovery directories on portable hosts. This provides a
+    /// deterministic font environment for comparisons; guest resources still
+    /// take precedence. Default construction discovers system fonts and the
+    /// additional directories in ADV_FONT_DIR (the host's path-list syntax).
+    #[cfg(not(windows))]
+    pub fn with_font_directories(directories: &[std::path::PathBuf]) -> Self {
+        let mut text = Self::default();
+        text.backend = portable::Backend::with_directories(directories);
+        text
+    }
+    /// Load a pinned, isolated portable font profile and validate all files,
+    /// SHA-256 hashes, collection indices and family names before returning.
+    /// Production default construction uses the same profile when
+    /// ADV_FONT_PROFILE is set. Guest fonts retain exact-family precedence.
+    #[cfg(not(windows))]
+    pub fn with_font_profile(path: &std::path::Path) -> Result<Self, TextError> {
+        let backend = portable::Backend::with_profile(path)?;
+        let mut text = Self::default();
+        text.backend = backend;
+        Ok(text)
+    }
+    /// Resolve a Unicode character using the same primary/coverage/default
+    /// selection as metrics, extent and raster queries. This is diagnostic data,
+    /// never a font handle or a guest pointer.
+    #[cfg(not(windows))]
+    pub fn resolved_character(
+        &mut self,
+        request: &FontRequest,
+        code: u32,
+    ) -> Result<FontResolution, TextError> {
+        self.font(request)?.resolved_character(code)
+    }
     pub fn metrics(&mut self, request: &FontRequest) -> Result<TextMetrics, TextError> {
         #[cfg(windows)]
         {
@@ -576,8 +636,7 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = request;
-            Err(TextError::Unavailable)
+            Ok(self.font(request)?.metrics())
         }
     }
     /// Measure the entire run with the same owned font used for glyph requests.
@@ -593,8 +652,7 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let _ = (request, input);
-            Err(TextError::Unavailable)
+            self.font(request)?.extent(input)
         }
     }
     pub fn glyph(
@@ -607,13 +665,18 @@ impl Text {
             self.hits += 1;
             return Ok(Arc::clone(glyph));
         }
-        #[cfg(windows)]
-        let glyph = Arc::new(self.font(font)?.glyph(request)?);
-        #[cfg(not(windows))]
-        {
-            return Err(TextError::Unavailable);
-        }
-        #[cfg(windows)]
+        let result = self.font(font).and_then(|font| font.glyph(request));
+        let glyph = match result {
+            Ok(glyph) => Arc::new(glyph),
+            Err(error) => {
+                if std::env::var_os("ADV_TEXT_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "adv-text glyph failure: font={font:?} request={request:?} error={error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
         {
             const CACHE_BYTES: usize = 8 * 1024 * 1024;
             let bytes = glyph.data.cache_bytes();

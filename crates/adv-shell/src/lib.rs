@@ -514,6 +514,7 @@ struct ReportContext<'a> {
     screenshot_error: Option<&'a str>,
     performance: &'a performance::Performance,
     audio: &'a audio::AudioOutput,
+    scene_gate: &'a control::SceneGate,
 }
 
 fn build_report(context: ReportContext<'_>) -> String {
@@ -531,6 +532,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         screenshot_error,
         performance,
         audio,
+        scene_gate,
     } = context;
     let frame = runtime.frame();
     let arena = runtime
@@ -645,7 +647,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"runtime\": {}\n}}\n"
+            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {}\n}}\n"
         ),
         json(&options.exe.to_string_lossy()),
         json(if options.jit { "jit" } else { "interpreter" }),
@@ -714,6 +716,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         codec_kernels,
         gpu_diagnostics,
         graphics_memory,
+        scene_gate.json(),
         json(&runtime.report_with_profile(&runtime.machine.cpu.profile()))
     )
 }
@@ -732,6 +735,42 @@ fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> 
     }
     let _ = wake;
     runtime.capture_latest_frame().map(|_| ())
+}
+
+fn acknowledge_scene_gate(
+    completion: control::GateCompletion,
+    runtime: &mut Runtime,
+    keys: &adv_sync::input::KeyState,
+    inputs: &mut u64,
+    failure: &mut Option<String>,
+) {
+    let release = completion.release.map(|key| {
+        keys.set(key, false);
+        let posted = runtime.post_input(0x101, key, 0xc0000001);
+        *inputs += u64::from(posted);
+        (key, posted)
+    });
+    let result = match (completion.result, release) {
+        (Ok(message), Some((key, true))) => Ok(format!(
+            "{message} release={key} release_posted=true receipt={}",
+            runtime.latest_input_receipt()
+        )),
+        (Ok(message), None) => Ok(format!("{message} release=none")),
+        (Ok(message), Some((key, false))) => Err(format!(
+            "{message} release={key} release_posted=false: no guest target window"
+        )),
+        (Err(message), release) => Err(format!(
+            "{message} release={} release_posted={}",
+            release.map_or_else(|| "none".into(), |(key, _)| key.to_string()),
+            release.is_some_and(|(_, posted)| posted)
+        )),
+    };
+    if let Err(error) = &result {
+        *failure = Some(error.clone());
+    }
+    // The physical key was released at this frame boundary. Its queued guest
+    // message is explicitly reported; a frozen guest has not dispatched it yet.
+    control::acknowledge(result);
 }
 
 #[cfg(all(windows, feature = "gpu"))]
@@ -1045,6 +1084,7 @@ fn run_execution(
     let mut idle_waits = 0u64;
     let mut wait_time = Duration::ZERO;
     let mut performance = performance::Performance::default();
+    let mut scene_gate = control::SceneGate::default();
     let mut inputs = 0u64;
     let mut injected = false;
     let mut first_frame_seconds = None;
@@ -1083,7 +1123,12 @@ fn run_execution(
             }
         }
         if let Some(controller) = control.as_mut() {
-            for command in controller.drain() {
+            let commands = if scene_gate.frozen() {
+                controller.drain_frozen(true)
+            } else {
+                controller.drain()
+            };
+            for command in commands {
                 let receipt_before = runtime.latest_input_receipt();
                 let result = match command {
                     control::Command::Dialogs => runtime
@@ -1273,10 +1318,11 @@ fn run_execution(
                             idle_waits,
                             wait_time,
                             inputs,
-                            failure: None,
+                            failure: failure.as_deref(),
                             screenshot_error: None,
                             performance: &performance,
                             audio: &audio,
+                            scene_gate: &scene_gate,
                         });
                         write_report(&path, &snapshot).map(|_| format!("report {}", path.display()))
                     }
@@ -1286,7 +1332,59 @@ fn run_execution(
                         performance.reset(serial);
                         Ok(format!("reset-metrics start_frame={serial}"))
                     }
+                    control::Command::AwaitFrame(spec) => {
+                        if !options.headless || options.guest_workers != 1 {
+                            Err(
+                                "await-frame requires headless execution with one guest worker"
+                                    .into(),
+                            )
+                        } else {
+                            let hold = spec.hold;
+                            if hold.is_some() && runtime.guest_window_count() == 0 {
+                                Err("await-frame hold has no guest target window".into())
+                            } else {
+                                match scene_gate.arm(
+                                    spec,
+                                    runtime.presented_frames(),
+                                    Instant::now(),
+                                ) {
+                                    Err(error) => Err(error),
+                                    Ok(()) => {
+                                        // Arm before publishing the physical held state. Guest
+                                        // execution resumes only after this command returns.
+                                        if let Some(key) = hold {
+                                            keys.set(key, true);
+                                            let posted = runtime.post_input(0x100, key, 1);
+                                            inputs += u64::from(posted);
+                                            if !posted
+                                                && let Some(completion) = scene_gate.abort(
+                                                    "hold has no guest target window",
+                                                    runtime.presented_frames(),
+                                                    Instant::now(),
+                                                )
+                                            {
+                                                acknowledge_scene_gate(
+                                                    completion,
+                                                    &mut runtime,
+                                                    &keys,
+                                                    &mut inputs,
+                                                    &mut failure,
+                                                );
+                                            }
+                                            controller
+                                                .note_input_receipt(runtime.latest_input_receipt());
+                                        }
+                                        continue; // Deferred ACK belongs to the actual latch/timeout.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    control::Command::Resume => {
+                        scene_gate.resume(Instant::now()).map(|_| "resume".into())
+                    }
                     control::Command::Close => {
+                        scene_gate.close(Instant::now());
                         runtime.post_input(0x10, 0, 0);
                         close_at.get_or_insert_with(Instant::now);
                         if let Some(window) = window.as_mut() {
@@ -1305,16 +1403,40 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
+        if let Some(completion) = scene_gate.observe(
+            runtime.presented_frames(),
+            runtime.frame().width,
+            &runtime.frame().bgra,
+            Instant::now(),
+        ) {
+            acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
+        }
         if options
             .seconds
             .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
         {
+            if let Some(completion) = scene_gate.abort(
+                "session time limit",
+                runtime.presented_frames(),
+                Instant::now(),
+            ) {
+                acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
+            }
             stop_reason = "time_limit";
             break;
         }
         if close_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(2)) {
             stop_reason = "host_window_closed";
             break;
+        }
+        if scene_gate.frozen() {
+            // Input is queued while frozen. Diagnostics share the same retained
+            // wake event and remain responsive without running another guest frame.
+            if !control.as_ref().is_some_and(control::Control::has_pending) {
+                wake.wait(Some(Duration::from_millis(50)))
+                    .map_err(|e| e.to_string())?;
+            }
+            continue;
         }
         let time_remaining = options
             .seconds
@@ -1359,10 +1481,30 @@ fn run_execution(
         audio.update();
         let presented = runtime.presented_frames();
         performance.step(step_elapsed, presented);
+        if matches!(
+            &outcome,
+            SliceResult::Complete(RunResult::Exited(_) | RunResult::Failed(_))
+        ) && let Some(completion) =
+            scene_gate.abort("guest stopped before target", presented, Instant::now())
+        {
+            acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
+        }
+        if let Some(completion) = scene_gate.observe(
+            presented,
+            runtime.frame().width,
+            &runtime.frame().bgra,
+            Instant::now(),
+        ) {
+            acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
+        }
         if first_frame_seconds.is_none() && presented > 0 {
             first_frame_seconds = runtime
                 .first_frame_time()
                 .map(|at| at.saturating_duration_since(started).as_secs_f64());
+        }
+        if scene_gate.frozen() && matches!(&outcome, SliceResult::Complete(RunResult::Idle { .. }))
+        {
+            continue;
         }
         let outcome = match outcome {
             SliceResult::Yielded => {
@@ -1440,6 +1582,9 @@ fn run_execution(
                     let remaining = Duration::from_secs(2).saturating_sub(at.elapsed());
                     delay = Some(delay.map_or(remaining, |d| d.min(remaining)));
                 }
+                if let Some(remaining) = scene_gate.remaining(Instant::now()) {
+                    delay = Some(delay.map_or(remaining, |d| d.min(remaining)));
+                }
                 delay = audio.wait_duration(delay);
                 let wait_started = Instant::now();
                 // Every producer signals this same retained event. No UI/frame or
@@ -1501,6 +1646,7 @@ fn run_execution(
         screenshot_error: screenshot_error.as_deref(),
         performance: &performance,
         audio: &audio,
+        scene_gate: &scene_gate,
     });
     if let Some(path) = &options.report {
         write_report(path, &report)?;
