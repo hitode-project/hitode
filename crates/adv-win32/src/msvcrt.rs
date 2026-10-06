@@ -20,6 +20,7 @@ mod random;
 mod scan;
 mod scalar_float;
 mod secure_memory;
+mod shared_file;
 mod startup;
 mod time64;
 mod wide_string;
@@ -108,6 +109,7 @@ pub fn register(r: &mut Registry) {
     cpp_alloc::register(r);
     scan::register(r);
     secure_memory::register(r);
+    shared_file::register(r);
     heap::register(r);
     locale::register(r);
     wide_string::register(r);
@@ -432,21 +434,31 @@ fn file_open_options(mode: &str) -> Option<std::fs::OpenOptions> {
 
 fn crt_open_file(e: &mut Env<'_>, name: &str, mode: &str) -> Option<u32> {
     let opts = file_open_options(mode)?;
+    crt_open_file_options(e, name, mode, opts).ok()
+}
+
+fn crt_open_file_options(
+    e: &mut Env<'_>,
+    name: &str,
+    mode: &str,
+    opts: std::fs::OpenOptions,
+) -> std::io::Result<u32> {
+    let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
     let host_path = if mode.starts_with('w') || mode.starts_with('a') {
-        e.ext.try_get::<crate::Win32>()?.vfs.write_path(name)?
+        e.ext.try_get::<crate::Win32>().ok_or_else(missing)?.vfs.write_path(name).ok_or_else(missing)?
     } else {
-        e.ext.try_get::<crate::Win32>()?.vfs.lookup(name)?
+        e.ext.try_get::<crate::Win32>().ok_or_else(missing)?.vfs.lookup(name).ok_or_else(missing)?
     };
-    let file = opts.open(&host_path).ok()?;
+    let file = opts.open(&host_path)?;
     let ptr = allocate(e, 32, true);
     if ptr == 0 {
-        return None;
+        return Err(std::io::ErrorKind::OutOfMemory.into());
     }
     if e.ext.try_get::<CrtState>().is_none() {
         e.ext.insert(CrtState::default());
     }
     e.ext.get_mut::<CrtState>().files.insert(ptr, file);
-    Some(ptr)
+    Ok(ptr)
 }
 
 fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> Outcome {
