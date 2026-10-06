@@ -3,9 +3,14 @@ use super::{user, window};
 use adv_abi::{Env, GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::Prot;
 
+mod enumeration;
+
+const PRIMARY_DEVICE_NAME: &str = r"\\.\DISPLAY1";
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(info_a_ABI);
     registry.register(info_w_ABI);
+    enumeration::register(registry);
 }
 fn fail(env: &mut Env<'_>, error: u32) -> i32 {
     crate::util::set_last_error(env, error);
@@ -47,7 +52,7 @@ fn info(env: &mut Env<'_>, monitor: Handle, output: GuestPtr<()>, wide: bool) ->
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
     if size == extended {
-        let name = br"\\.\DISPLAY1";
+        let name = PRIMARY_DEVICE_NAME.as_bytes();
         if wide {
             for (index, &character) in name.iter().enumerate() {
                 bytes[40 + index * 2..42 + index * 2]
