@@ -2409,7 +2409,9 @@ impl Emitter<'_> {
         }
         self.flush_mmx_effects();
         self.settle_fuel(pc);
-        if let Some(pc) = self.known(pc) {
+        if let Some(pc) = self.known(pc)
+            && !self.copy_kernel()
+        {
             self.forget_dead_flags(pc);
             // Exceptions show every register; resuming exits carry live ones.
             if matches!(reason, Exit::Dispatch | Exit::Budget | Exit::Interrupted) {
@@ -2792,8 +2794,10 @@ impl Emitter<'_> {
         self.b.ins().brif(funded, next, &[], refill, &[]);
         // The checked header resumes the loop; dead values need not reach it.
         self.b.switch_to_block(refill);
-        self.forget_dead_flags(header);
-        self.forget_dead_registers(header);
+        if !self.copy_kernel() {
+            self.forget_dead_flags(header);
+            self.forget_dead_registers(header);
+        }
         self.b.ins().jump(checked, &[]);
         self.b.switch_to_block(next);
         let target = self.constant(header);

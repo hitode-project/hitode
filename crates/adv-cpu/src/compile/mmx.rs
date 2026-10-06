@@ -515,10 +515,16 @@ impl Emitter<'_> {
         // Compose the effect at compile time. Emitting AND/OR for every packed
         // instruction produces a long dependency chain in pixel loops because
         // Cranelift does not combine the alternating operations.
+        self.mmx_written(register(i.op0_register()));
+    }
+
+    /// Record a committed MMX instruction without imposing work on a native
+    /// copy loop's backedge. Its last MOVD value is materialized at the exit.
+    pub(super) fn mmx_written(&mut self, register: Option<usize>) {
         let effects = self.mmx_effects.as_mut().unwrap();
         effects.and_mask &= !2;
         effects.or_mask &= !2;
-        let written = register(i.op0_register()).map_or(0, |slot| 1 << (8 + slot));
+        let written = register.map_or(0, |slot| 1 << (8 + slot));
         effects.or_mask |= 5 | written;
     }
 }

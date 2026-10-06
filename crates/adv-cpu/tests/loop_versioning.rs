@@ -645,3 +645,130 @@ fn batched_loop_interrupts_and_resumes_exactly() {
     assert_eq!(m.run(STOP, 1 << 20).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[2], completed + 11);
 }
+
+#[test]
+fn compact_copies_cover_four_lane_aliases_tails_and_observable_budget_state() {
+    for packed in [false, true] {
+        let bytes = counted(true, |a| {
+            if packed {
+                a.movd(mm0, dword_ptr(esi)).unwrap();
+                a.movd(dword_ptr(edi), mm0).unwrap();
+            } else {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            }
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+        });
+        for count in [3, 4, 5, 8, 9, 129] {
+            // +/-8 and +/-12 distinguish a four-lane alias proof from V=2.
+            for destination in [
+                DST,
+                SRC,
+                SRC + 8,
+                SRC + 12,
+                SRC - 8,
+                SRC - 12,
+                SRC + 15,
+                SRC - 15,
+                SRC + 16,
+                SRC - 16,
+            ] {
+                differential(
+                    "compact-copy",
+                    &bytes,
+                    regs(0x2345_0000 | count, SRC, destination),
+                    |_| {},
+                    37,
+                );
+            }
+        }
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            for fuel in [6, 7, 8, 9, 10, 11, 13, 17, 33, 34, 35] {
+                let mut jit = machine(&bytes, Some(strategy));
+                let mut uc = machine(&bytes, None);
+                for m in [&mut jit, &mut uc] {
+                    m.state.regs = regs(0x2345_0000 | 200, SRC, DST);
+                }
+                assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
+                let done = (jit.state.regs[6] - SRC) / 4;
+                assert!(done > 0 && done < 200);
+                // One prologue instruction, six per complete iteration.
+                assert_eq!(
+                    uc.run_unicorn(STOP, 1 + 6 * done as usize).unwrap(),
+                    RunOutcome::Budget
+                );
+                assert_eq!(jit.state.eip, uc.state.eip);
+                assert_eq!(jit.state.regs, uc.state.regs, "packed={packed} fuel={fuel}");
+                assert_eq!(jit.state.mmx, uc.state.mmx);
+                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+                assert_eq!(
+                    jit.memory().read(DST, 804).unwrap(),
+                    uc.memory().read(DST, 804).unwrap()
+                );
+                // Fault before the next MOV/MOVD overwrites its result: the
+                // last completed element and flags must remain observable.
+                for m in [&mut jit, &mut uc] {
+                    m.protect(SRC, 4096, 0).unwrap();
+                }
+                let expected = uc.run_unicorn(STOP, 100).unwrap();
+                assert_eq!(jit.run(STOP, 100).unwrap(), expected);
+                assert_eq!(jit.state.regs, uc.state.regs);
+                assert_eq!(jit.state.mmx, uc.state.mmx);
+                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_copy_interrupt_publishes_progress_and_resumes() {
+    let bytes = counted(false, |a| {
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+    });
+    // A sufficiently long in-place copy allows an asynchronous interrupt;
+    // one zero-filled allocation, without a second large oracle allocation.
+    const COUNT: u32 = 16_000_000;
+    let mut m = adv_cpu::Executor::new(CODE, 0x4200000).unwrap();
+    m.protect(CODE, 0x4200000, READ | WRITE).unwrap();
+    m.write(CODE, &bytes).unwrap();
+    m.protect(CODE, 4096, READ | EXEC).unwrap();
+    m.protect(STOP, 4096, READ | EXEC).unwrap();
+    m.add_region(Region::new(CODE, bytes.len())).unwrap();
+    m.write(STACK, &STOP.to_le_bytes()).unwrap();
+    m.state.regs = regs(COUNT, SRC, SRC);
+    m.state.eip = CODE;
+    // Finish compilation before starting the interrupt producer.
+    assert_eq!(m.run(STOP, 64).unwrap(), RunOutcome::Budget);
+    m.state.regs = regs(COUNT, SRC, SRC);
+    m.state.eip = CODE;
+    let flag = Arc::new(AtomicBool::new(false));
+    m.set_host_interrupt_flag(flag.clone());
+    let notify = flag.clone();
+    let producer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(2));
+        notify.store(true, Ordering::Release);
+    });
+    let budget = 1 << 40;
+    let outcome = m.run(STOP, budget).unwrap();
+    producer.join().unwrap();
+    assert_eq!(outcome, RunOutcome::Interrupted);
+    let done = COUNT - m.state.regs[1];
+    assert!(
+        done >= 5 && done < COUNT,
+        "must interrupt after a packed batch"
+    );
+    assert_eq!(m.state.regs[6], SRC + done * 4);
+    assert_eq!(m.state.regs[7], SRC + done * 4);
+    assert_eq!(m.state.mmx[0], 0);
+    assert_eq!(budget - m.state.fuel, u64::from(done) + 1);
+    assert_eq!(m.stats.interpreter_instructions, 0);
+    flag.store(false, Ordering::Release);
+    m.state.regs[1] = 11;
+    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(m.state.regs[6], SRC + (done + 11) * 4);
+    assert_eq!(m.state.regs[7], m.state.regs[6]);
+}

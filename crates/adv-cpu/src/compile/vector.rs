@@ -1,4 +1,4 @@
-//! Integer vectorization of versioned loops. A kernel runs `LANES`
+//! Integer vectorization of versioned loops. A general kernel runs `LANES`
 //! consecutive iterations of a qualifying loop as one batch: the values the
 //! iterations compute live in host vector lanes, one lane per iteration,
 //! while the pointers and the counter stay scalar with the first lane's
@@ -17,6 +17,9 @@
 //! register written on one path keeps its value on the other, which a batch
 //! whose lanes agree on the path preserves in its last lane: the last lane
 //! is the state after the batch.
+//!
+//! Bit-preserving DWORD copies pack four iterations densely and reconstruct
+//! their scalar state at the batch-loop exit using the same admission proofs.
 use super::*;
 use iced_x86::{InstructionInfoFactory, OpAccess, RflagsBits};
 
@@ -25,8 +28,20 @@ use iced_x86::{InstructionInfoFactory, OpAccess, RflagsBits};
 /// of an `I32X4`, which `movd` to and from MMX keeps in place.
 pub(super) const LANES: i64 = 2;
 
+/// A bit-preserving DWORD load/store pair. Its four packed lanes have no
+/// per-lane arithmetic or branches; the last scalar value is rebuilt on exit.
+#[derive(Debug, Clone, Copy)]
+struct CopyBatch {
+    load: u32,
+    store: u32,
+    register: R,
+}
+
+const COPY_LANES: i64 = 4;
+
 #[derive(Debug, Clone)]
 pub(super) struct Batch {
+    copy: Option<CopyBatch>,
     /// General and MMX registers the iterations compute.
     pub general: u8,
     pub mmx: u8,
@@ -42,6 +57,62 @@ pub(super) struct Batch {
     /// Operand groups through different registers, one of them written,
     /// whose lanes the kernel keeps apart when it starts.
     pub checks: Vec<(loops::Group, loops::Group)>,
+}
+
+impl Batch {
+    fn width(&self) -> i64 {
+        if self.copy.is_some() {
+            COPY_LANES
+        } else {
+            LANES
+        }
+    }
+}
+
+fn copy_batch(plan: &loops::Plan, body: &[&Instruction], tail: u32) -> Option<CopyBatch> {
+    let operations: Vec<_> = body
+        .iter()
+        .copied()
+        .filter(|i| i.ip32() < tail && i.mnemonic() != M::Nop)
+        .collect();
+    let [load, store] = operations.as_slice() else {
+        return None;
+    };
+    let register = load.op0_register();
+    let plain = load.mnemonic() == M::Mov && register.is_gpr32();
+    let packed = load.mnemonic() == M::Movd && mmx::register(register).is_some();
+    if !(plain || packed)
+        || load.op0_kind() != OpKind::Register
+        || load.op1_kind() != OpKind::Memory
+        || store.mnemonic() != load.mnemonic()
+        || store.op0_kind() != OpKind::Memory
+        || store.op1_kind() != OpKind::Register
+        || store.op1_register() != register
+        || load.memory_size().size() != 4
+        || store.memory_size().size() != 4
+    {
+        return None;
+    }
+    for pc in [load.ip32(), store.ip32()] {
+        let (_, access, _, _) = plan.accesses.iter().find(|(at, ..)| *at == pc)?;
+        if access.step != 4 {
+            return None;
+        }
+    }
+    // Cleanup replays ONLY the register-only affine tail's last iteration.
+    // No hidden memory effects or control flow may be deferred there.
+    if body.iter().filter(|i| i.ip32() >= tail).any(|i| {
+        !plan.updates.contains(&i.ip32())
+            || i.flow_control() != FlowControl::Next
+            || i.op0_kind() != OpKind::Register
+    }) {
+        return None;
+    }
+    Some(CopyBatch {
+        load: load.ip32(),
+        store: store.ip32(),
+        register,
+    })
 }
 
 /// A kernel's batch blocks and lane values while it is emitted.
@@ -342,10 +413,12 @@ pub(super) fn batch(
         return None;
     }
 
+    let copy = copy_batch(plan, &body, tail);
+    let width = if copy.is_some() { COPY_LANES } else { LANES };
     // Lanes of operands through the same registers keep fixed distances.
     let meets = |a: &loops::Access, b: &loops::Access| {
-        (0..LANES).any(|x| {
-            (0..LANES).any(|y| {
+        (0..width).any(|x| {
+            (0..width).any(|y| {
                 x != y
                     && a.low + x * a.step < b.high + y * b.step
                     && b.low + y * b.step < a.high + x * a.step
@@ -374,6 +447,7 @@ pub(super) fn batch(
         }
     }
     Some(Batch {
+        copy,
         general,
         mmx,
         tail,
@@ -384,6 +458,17 @@ pub(super) fn batch(
 }
 
 impl Emitter<'_> {
+    /// This kernel can reconstruct all state cheaply at its exits. In
+    /// particular, a future overwrite does not hide a register from a fault
+    /// or debugger immediately after a budget/interrupt boundary.
+    pub(super) fn copy_kernel(&self) -> bool {
+        self.kernel.is_some_and(|(index, ..)| {
+            self.batches[index]
+                .as_ref()
+                .is_some_and(|batch| batch.copy.is_some())
+        })
+    }
+
     pub(super) fn lanes_active(&self) -> bool {
         self.lanes.as_ref().is_some_and(|lanes| lanes.active)
     }
@@ -455,6 +540,8 @@ impl Emitter<'_> {
     /// the kernel may run. Groups stepping alike keep their distance.
     fn lanes_apart(&mut self, index: usize, checks: &[(loops::Group, loops::Group)]) -> Value {
         let plan = &self.plans[index];
+        let width = self.batches[index].as_ref().unwrap().width();
+        let copy = self.batches[index].as_ref().unwrap().copy.is_some();
         let (counter, counter_size) = (plan.counter, plan.counter_size);
         let count = self.b.use_var(self.regs[counter]);
         let count = self.counter_value(counter_size, count);
@@ -464,10 +551,26 @@ impl Emitter<'_> {
         for (a, b) in checks {
             let origin_a = self.group_origin(a);
             let origin_b = self.group_origin(b);
-            let apart = if a.step == b.step {
+            let apart = if copy {
+                // Four contiguous DWORDs conflict across lanes precisely
+                // when their byte distance is nonzero and less than 16.
+                // Equal addresses and a whole-batch distance are safe, even
+                // if later batches read bytes earlier batches wrote.
+                let origin_a = self.b.ins().iadd_imm(origin_a, a.low);
+                let origin_b = self.b.ins().iadd_imm(origin_b, b.low);
+                let distance = self.b.ins().isub(origin_b, origin_a);
+                let same = self.b.ins().icmp_imm(IntCC::Equal, distance, 0);
+                let shifted = self.b.ins().iadd_imm(distance, width * 4 - 1);
+                let far = self.b.ins().icmp_imm(
+                    IntCC::UnsignedGreaterThanOrEqual,
+                    shifted,
+                    width * 8 - 1,
+                );
+                self.b.ins().bor(same, far)
+            } else if a.step == b.step {
                 let distance = self.b.ins().isub(origin_b, origin_a);
                 let mut apart = self.b.ins().iconst(types::I8, 1);
-                for lanes in (1 - LANES)..LANES {
+                for lanes in (1 - width)..width {
                     if lanes == 0 {
                         continue;
                     }
@@ -533,7 +636,8 @@ impl Emitter<'_> {
     /// Whether the counter has a whole batch left before its stop value,
     /// and the scalar iteration after it unless the batch has exact flags.
     fn batch_room(&mut self, index: usize) -> Value {
-        let exact = self.batches[index].as_ref().unwrap().exact;
+        let batch = self.batches[index].as_ref().unwrap();
+        let (exact, width) = (batch.exact, batch.width());
         let counter = self.plans[index].counter;
         let (_, stop, _) = self.kernel.expect("batches run in kernels");
         let count = self.b.use_var(self.regs[counter]);
@@ -542,7 +646,7 @@ impl Emitter<'_> {
         self.b.ins().icmp_imm(
             IntCC::UnsignedGreaterThanOrEqual,
             left,
-            LANES + i64::from(!exact),
+            width + i64::from(!exact),
         )
     }
     /// Continues loop `index` at its header: as a batch when one fits, else
@@ -584,6 +688,10 @@ impl Emitter<'_> {
 
     /// Emits the batch body of kernel `index`, after its scalar clone.
     pub(super) fn emit_lanes(&mut self, index: usize, instructions: &BTreeMap<u32, Instruction>) {
+        if let Some(copy) = self.batches[index].as_ref().and_then(|batch| batch.copy) {
+            self.emit_copy_batch(index, copy, instructions);
+            return;
+        }
         let Some(lanes) = &self.lanes else {
             return;
         };
@@ -695,6 +803,117 @@ impl Emitter<'_> {
         self.lanes().active = false;
         let fast = self.fast_blocks[index][&header];
         self.b.ins().jump(fast, &[]);
+    }
+
+    /// A copy uses the same admission/range/alias proofs as arithmetic batches,
+    /// but keeps only native pointers and a funded batch counter on its backedge.
+    /// Scalar tail semantics, flags and the last MOV/MOVD value are reconstructed
+    /// on the common exit, before either an interrupt or scalar continuation.
+    fn emit_copy_batch(
+        &mut self,
+        index: usize,
+        copy: CopyBatch,
+        instructions: &BTreeMap<u32, Instruction>,
+    ) {
+        let entry = self.lanes.as_ref().unwrap().entry;
+        let plan = &self.plans[index];
+        let (header, latch, counter, inductions, steps) = (
+            plan.header,
+            plan.latch,
+            plan.counter,
+            plan.inductions,
+            plan.steps,
+        );
+        let tail = self.batches[index].as_ref().unwrap().tail;
+        self.fast = Some(index);
+        self.b.switch_to_block(entry);
+        self.lanes().active = false;
+        self.mmx_effects = None;
+        self.at(copy.load);
+        let (source, offset) = self.proven(4).unwrap();
+        let source = self.b.ins().iadd_imm(source, i64::from(offset));
+        self.at(copy.store);
+        let (destination, offset) = self.proven(4).unwrap();
+        let destination = self.b.ins().iadd_imm(destination, i64::from(offset));
+        let count = self.b.use_var(self.regs[counter]);
+        let (_, stop, _) = self.kernel.unwrap();
+        let stop = self.b.use_var(stop);
+        let available = self.b.ins().isub(count, stop);
+        let batches = self.b.ins().ushr_imm(available, 2);
+        let body = self.b.create_block();
+        self.b.append_block_param(body, self.ptr_ty);
+        self.b.append_block_param(body, self.ptr_ty);
+        self.b.append_block_param(body, types::I32);
+        let cleanup = self.b.create_block();
+        self.b.append_block_param(cleanup, types::I8);
+        self.b.set_cold_block(cleanup);
+        self.b
+            .ins()
+            .jump(body, &[source.into(), destination.into(), batches.into()]);
+        self.b.switch_to_block(body);
+        let source = self.b.block_params(body)[0];
+        let destination = self.b.block_params(body)[1];
+        let remaining = self.b.block_params(body)[2];
+        let value = self.b.ins().load(types::I32X4, MemFlags::new(), source, 0);
+        self.b.ins().store(MemFlags::new(), value, destination, 0);
+        let remaining = self.b.ins().iadd_imm(remaining, -1);
+        let again = self.b.create_block();
+        let no_interrupt = self.b.ins().iconst(types::I8, 0);
+        self.b
+            .ins()
+            .brif(remaining, again, &[], cleanup, &[no_interrupt.into()]);
+        self.b.switch_to_block(again);
+        let pending = self
+            .b
+            .ins()
+            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
+        let advance = self.b.create_block();
+        self.b
+            .ins()
+            .brif(pending, cleanup, &[pending.into()], advance, &[]);
+        self.b.switch_to_block(advance);
+        let source = self.b.ins().iadd_imm(source, COPY_LANES * 4);
+        let destination = self.b.ins().iadd_imm(destination, COPY_LANES * 4);
+        self.b
+            .ins()
+            .jump(body, &[source.into(), destination.into(), remaining.into()]);
+
+        self.b.switch_to_block(cleanup);
+        let pending = self.b.block_params(cleanup)[0];
+        let completed = self.b.ins().isub(batches, remaining);
+        let completed = self.b.ins().ishl_imm(completed, 2);
+        let preceding = self.b.ins().iadd_imm(completed, -1);
+        for register in bits(inductions) {
+            let original = self.b.use_var(self.regs[register]);
+            let delta = self.b.ins().imul_imm(preceding, steps[register]);
+            let last = self.b.ins().iadd(original, delta);
+            self.b.def_var(self.regs[register], last);
+        }
+        self.begin_mmx_block();
+        let last = self.b.ins().extractlane(value, (COPY_LANES - 1) as u8);
+        if let Some(register) = mmx::register(copy.register) {
+            let last = self.b.ins().uextend(types::I64, last);
+            let last = self.b.ins().scalar_to_vector(types::I64X2, last);
+            let last = self.mmx_cast(last, types::I8X16);
+            self.b.def_var(self.mmx[register].unwrap(), last);
+            self.mmx_written(Some(register));
+        } else {
+            self.b
+                .def_var(self.regs[reg_index(copy.register).unwrap()], last);
+        }
+        for (&pc, instruction) in instructions.range(tail..latch) {
+            self.at(pc);
+            self.instruction(instruction);
+        }
+        let interrupted = self.b.create_block();
+        self.b.set_cold_block(interrupted);
+        let finished = self.b.create_block();
+        self.b.ins().brif(pending, interrupted, &[], finished, &[]);
+        self.b.switch_to_block(interrupted);
+        self.exit_const(Exit::Interrupted, header);
+        self.b.switch_to_block(finished);
+        self.at(latch);
+        self.instruction(&instructions[&latch]);
     }
 
     /// The batch's back edge: another batch while one fits, else the scalar
