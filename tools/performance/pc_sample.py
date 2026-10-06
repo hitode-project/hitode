@@ -129,6 +129,10 @@ def busiest_thread(pid):
         CloseHandle(snapshot)
     if not candidates:
         raise SystemExit(f"no accessible thread in process {pid}")
+    # Rank by recent CPU time: a compile thread busy during startup can have
+    # more total time than the guest thread that is busy now.
+    time.sleep(0.5)
+    candidates = [(cpu_time(handle) - start, tid, handle) for start, tid, handle in candidates]
     candidates.sort(reverse=True)
     for _, _, handle in candidates[1:]:
         CloseHandle(handle)

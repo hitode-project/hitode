@@ -13,6 +13,8 @@ use iced_x86::{
 
 use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -87,6 +89,9 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    pub(crate) fn profile(&self) -> Option<&Profile> {
+        self.input.profile.as_deref()
+    }
     pub(crate) fn parallel_entry(&self) -> crate::parallel::Entry {
         assert!(!self.input.shadow_returns);
         self.entry
@@ -219,6 +224,35 @@ impl Compiled {
     }
 }
 
+/// Counters written by Fast code that may be recompiled: executed blocks,
+/// including those entered through region links, and the latest target of
+/// each indirect call site. Plain racy stores; only a hint for tier-up.
+#[derive(Debug, Default)]
+pub(crate) struct Profile {
+    heat: AtomicU64,
+    calls: [AtomicU32; CALL_SITES],
+}
+
+const CALL_SITES: usize = 8;
+
+impl Profile {
+    pub(crate) fn heat(&self) -> u64 {
+        self.heat.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn call_targets(&self) -> Vec<u32> {
+        let mut targets: Vec<u32> = self
+            .calls
+            .iter()
+            .map(|cell| cell.load(Ordering::Relaxed))
+            .filter(|&target| target != 0)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+}
+
 /// An immutable, Send compilation input. No guest allocation is borrowed or
 /// retained: only bounded instruction bytes and their page stamps are copied.
 #[derive(Clone, Debug)]
@@ -227,12 +261,16 @@ pub(crate) struct Snapshot {
     pub region: Box<Region>,
     base: u32,
     len: usize,
+    /// Guest address of `bytes[0]`: the region start, or a callee below it.
+    origin: u32,
     bytes: Vec<u8>,
     pages: Vec<PageStamp>,
     // Published reachable regions compare only their decoded instruction bytes.
     // A pending snapshot still stamps the full bounded window conservatively.
     covered: Option<Vec<(usize, usize)>>,
     pub(crate) shadow_returns: bool,
+    /// Present for Fast code that may tier up; owned by the compiled result.
+    pub(crate) profile: Option<Arc<Profile>>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     native_fault_reads: bool,
 }
@@ -250,12 +288,16 @@ impl Snapshot {
         &self.bytes
     }
 
+    pub(crate) fn origin(&self) -> u32 {
+        self.origin
+    }
+
     /// Slice an immutable input without consulting active guest memory. Keep
     /// tail/negative-page stamps and the optional hardware-read proof capability.
     pub(crate) fn fragment(&self, region: Region) -> Result<Self, String> {
         let offset = region
             .start
-            .checked_sub(self.region.start)
+            .checked_sub(self.origin)
             .ok_or("fragment starts before its snapshot")? as usize;
         if region.len == 0 || offset + region.len > self.bytes.len() {
             return Err("fragment extends beyond its snapshot".into());
@@ -263,9 +305,10 @@ impl Snapshot {
         let end =
             (offset + region.len + if region.complete_tail { 14 } else { 0 }).min(self.bytes.len());
         let first = (region.start - self.base) as usize / 4096;
-        let last = ((self.region.start - self.base) as usize + end) / 4096;
+        let last = ((self.origin - self.base) as usize + end) / 4096;
         Ok(Self {
             parallel: self.parallel,
+            origin: region.start,
             region: Box::new(region),
             base: self.base,
             len: self.len,
@@ -278,6 +321,7 @@ impl Snapshot {
                 .collect(),
             covered: None,
             shadow_returns: self.shadow_returns,
+            profile: None,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             native_fault_reads: self.native_fault_reads,
         })
@@ -288,13 +332,17 @@ impl Snapshot {
         {
             return Err("region must contain 1..16384 executable bytes".into());
         }
-        let mut bytes = memory.read_data(region.start, region.len)?.to_vec();
-        let first = (region.start - memory.base) as usize / 4096;
+        let mut region = region.clone();
+        let origin = callee_origin(&mut region, memory);
+        let mut bytes = memory
+            .read_data(origin, (region.start - origin) as usize + region.len)?
+            .to_vec();
+        let first = (origin - memory.base) as usize / 4096;
         let last = ((region.start - memory.base) as usize + region.len - 1) / 4096;
         let mut pages: BTreeSet<usize> = (first..=last).collect();
         if region.complete_tail {
-            for offset in region.len..region.len + 14 {
-                let Some(address) = u64::from(region.start)
+            for offset in bytes.len()..bytes.len() + 14 {
+                let Some(address) = u64::from(origin)
                     .checked_add(offset as u64)
                     .and_then(|address| u32::try_from(address).ok())
                 else {
@@ -310,7 +358,7 @@ impl Snapshot {
                 }
                 bytes.push(memory.read_data(address, 1)?[0]);
             }
-            if let Some(address) = u64::from(region.start)
+            if let Some(address) = u64::from(origin)
                 .checked_add(bytes.len() as u64)
                 .and_then(|address| u32::try_from(address).ok())
                 && let Ok(range) = memory.range(address, 1)
@@ -320,12 +368,14 @@ impl Snapshot {
         }
         Ok(Self {
             parallel: memory.is_parallel(),
-            region: Box::new(region.clone()),
+            region: Box::new(region),
+            origin,
             base: memory.base,
             len: memory.len,
             bytes,
             covered: None,
             shadow_returns: false,
+            profile: None,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             native_fault_reads: memory.native_fault_reads_available(),
             pages: pages
@@ -361,13 +411,13 @@ impl Snapshot {
             && self.covered.as_ref().map_or_else(
                 || {
                     memory
-                        .read_data(self.region.start, self.bytes.len())
+                        .read_data(self.origin, self.bytes.len())
                         .is_ok_and(|bytes| bytes == self.bytes)
                 },
                 |ranges| {
                     ranges.iter().all(|&(offset, len)| {
                         memory
-                            .read_data(self.region.start + offset as u32, len)
+                            .read_data(self.origin + offset as u32, len)
                             .is_ok_and(|bytes| bytes == &self.bytes[offset..offset + len])
                     })
                 },
@@ -386,7 +436,7 @@ impl Snapshot {
                     .values()
                     .map(|instruction| {
                         (
-                            (instruction.ip32() - self.region.start) as usize,
+                            (instruction.ip32() - self.origin) as usize,
                             instruction.len(),
                         )
                     })
@@ -395,6 +445,43 @@ impl Snapshot {
             input.pages.retain(|stamp| pages.contains(&stamp.page));
         }
         input
+    }
+
+    /// Straight-line code of each captured callee through its return. Any
+    /// other transfer, or undecodable bytes, stays a transfer out of the unit.
+    pub(crate) fn callee_code(&self, decoded: &BTreeMap<u32, Instruction>) -> Vec<Instruction> {
+        const LIMIT: usize = 64;
+        let mut code = BTreeMap::new();
+        for &callee in &self.region.callees {
+            let Some(offset) = callee.checked_sub(self.origin) else {
+                continue;
+            };
+            let Some(bytes) = self.bytes.get(offset as usize..) else {
+                continue;
+            };
+            let mut decoder = Decoder::with_ip(32, bytes, u64::from(callee), DecoderOptions::NONE);
+            for _ in 0..LIMIT {
+                let pc = decoder.ip() as u32;
+                if !decoder.can_decode()
+                    || decoded.contains_key(&pc)
+                    || code.contains_key(&pc)
+                    || self.region.frontier.contains(&pc)
+                {
+                    break;
+                }
+                let i = decoder.decode();
+                if i.is_invalid()
+                    || !matches!(i.flow_control(), FlowControl::Next | FlowControl::Return)
+                {
+                    break;
+                }
+                code.insert(pc, i);
+                if i.flow_control() == FlowControl::Return {
+                    break;
+                }
+            }
+        }
+        code.into_values().collect()
     }
 
     fn page_index(&self, address: u32) -> Option<usize> {
@@ -411,6 +498,32 @@ impl Snapshot {
     }
 }
 
+/// Keep the callees that share one bounded executable window with the region,
+/// nearest first, and return the window's lowest address.
+fn callee_origin(region: &mut Region, memory: &Memory) -> u32 {
+    const WINDOW: u64 = 16 * 1024;
+    let start = region.start;
+    let end = u64::from(start) + region.len as u64;
+    let mut origin = start;
+    if !region.reachable {
+        region.callees.clear();
+    }
+    region.callees.sort_unstable_by(|a, b| b.cmp(a));
+    region.callees.dedup();
+    region.callees.retain(|&callee| {
+        if callee >= start {
+            return u64::from(callee) < end;
+        }
+        let low = origin.min(callee);
+        let fits = end - u64::from(low) <= WINDOW && memory.executable(low, (start - low) as usize);
+        if fits {
+            origin = low;
+        }
+        fits
+    });
+    origin
+}
+
 fn record_tail_dependencies(
     region: &Region,
     snapshot: &Snapshot,
@@ -420,7 +533,7 @@ fn record_tail_dependencies(
     instruction: &Instruction,
     pages: &mut BTreeSet<usize>,
 ) {
-    let start = (region.start - snapshot.base) as usize;
+    let start = (snapshot.origin - snapshot.base) as usize;
     let read_start = (instruction.ip32() - snapshot.base) as usize;
     let read_end = start + offset + decoder.position();
     pages.extend(read_start / 4096..=(read_end - 1) / 4096);
@@ -428,7 +541,7 @@ fn record_tail_dependencies(
         // The next page's mapping/EXEC permission can make a previously
         // truncated instruction compilable, even if none of its bytes
         // could be read. Keep that negative dependency in the cache.
-        if let Some(address) = u64::from(region.start)
+        if let Some(address) = u64::from(snapshot.origin)
             .checked_add(bytes.len() as u64)
             .and_then(|address| u32::try_from(address).ok())
             && let Some(page) = snapshot.page_index(address)
@@ -500,6 +613,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         else {
             continue;
         };
+        let offset = offset + (region.start - snapshot.origin) as usize;
         let mut decoder = Decoder::with_ip(
             32,
             &bytes[offset..],
@@ -531,14 +645,21 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         }
     }
+    let mut callee_code = BTreeSet::new();
+    for i in snapshot.callee_code(&instructions) {
+        callee_code.insert(i.ip32());
+        let first = (i.ip32() - snapshot.base) as usize / 4096;
+        let last = (i.ip32() - snapshot.base) as usize + i.len() - 1;
+        pages.extend(first..=last / 4096);
+        instructions.insert(i.ip32(), i);
+    }
     // x87 stays in the region: guarded scalar lowering handles the exact subset,
     // and the remaining cases call the interpreter's transaction in place.
     let x87: Box<[crate::floating::NativeX87]> = instructions
         .values()
         .filter(|i| !supported(i) && crate::floating::native_x87(i))
         .map(|i| {
-            // The snapshot bytes begin at the region start.
-            let start = (i.ip32() - region.start) as usize;
+            let start = (i.ip32() - snapshot.origin) as usize;
             // Same FOP derivation as the interpreter's decoded entry.
             let opcode = bytes[start..start + i.len()]
                 .windows(2)
@@ -567,6 +688,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             entries.insert(instruction.near_branch32());
         }
     }
+    // A matching indirect call dispatches to a decoded callee internally.
+    entries.extend(region.callees.iter().copied());
     for &entry in &region.entries {
         if !instructions.contains_key(&entry) {
             return Err(format!("entry {entry:#x} is not an instruction boundary"));
@@ -1186,6 +1309,21 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             x87_cold: None,
             x87_cold_reads: 0,
             parallel: snapshot.parallel,
+            heat: snapshot
+                .profile
+                .as_ref()
+                .map(|profile| &profile.heat as *const _ as usize),
+            call_sites: snapshot
+                .profile
+                .as_ref()
+                .map_or_else(BTreeMap::new, |profile| {
+                    instructions
+                        .values()
+                        .filter(|i| i.flow_control() == FlowControl::IndirectCall)
+                        .zip(&profile.calls)
+                        .map(|(i, cell)| (i.ip32(), cell as *const _ as usize))
+                        .collect()
+                }),
             lane: None,
             x87: x87
                 .iter()
@@ -1296,6 +1434,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 e.guard(zero, Exit::Budget, None);
                 let remaining = e.b.ins().iadd_imm(budget, -1);
                 e.b.def_var(e.fuel, remaining);
+                if let Some(heat) = e.heat {
+                    let cell = e.b.ins().iconst(ptr_ty, heat as i64);
+                    let count = e.b.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                    let count = e.b.ins().iadd_imm(count, 1);
+                    e.b.ins().store(MemFlags::trusted(), count, cell, 0);
+                }
             }
             let mut pc = start;
             loop {
@@ -1708,8 +1852,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
+    // Callee code stays owned by its own unit; only calls from here reach it.
     entries.retain(|pc| {
-        supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc)
+        !callee_code.contains(pc)
+            && (supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc))
     });
     let input = snapshot.with_coverage(&instructions, &pages);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2376,6 +2522,10 @@ struct Emitter<'a> {
     x87_cold_reads: u8,
     /// Other guest threads may run native code at the same time.
     parallel: bool,
+    /// Address of the profile's block counter, for Fast code that may tier up.
+    heat: Option<usize>,
+    /// Indirect call site -> address of its profile target cell.
+    call_sites: BTreeMap<u32, usize>,
     /// Inside a resident x87 lane, every guard and shared/file access path of an
     /// integer instruction branches here before the instruction commits; the
     /// lane then materializes its prefix and re-executes canonically.
@@ -4995,6 +5145,10 @@ impl Emitter<'_> {
                         self.direct(i.near_branch32());
                     } else {
                         self.record_indirect(v, crate::IndirectBranchKind::Call);
+                        if let Some(&cell) = self.call_sites.get(&self.pc) {
+                            let cell = self.b.ins().iconst(self.ptr_ty, cell as i64);
+                            self.b.ins().store(MemFlags::trusted(), v, cell, 0);
+                        }
                         self.indirect(v);
                     }
                     return true;
