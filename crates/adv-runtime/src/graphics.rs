@@ -194,6 +194,17 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
             ext.get_mut::<Graphics<Snapshot>>()
                 .present_native_rotating(id, gpu)
         },
+        present_copy: |ext, id, gpu| {
+            use adv_device::gpu::Error;
+            let graphics = ext.get_mut::<Graphics<Snapshot>>();
+            let target = graphics
+                .native_target(id)
+                .ok_or_else(|| Error::Invalid("COPY front surface no longer exists".into()))?;
+            let frame = gpu.present(&target.image, 0)?;
+            graphics
+                .publish_native_frame(id, frame)
+                .map_err(Error::Invalid)
+        },
         window: |ext, objects, hwnd| {
             let window = ext.get::<Win32>().user.windows.get(objects, &hwnd)?;
             let (width, height) = window.client_size();

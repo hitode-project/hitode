@@ -33,6 +33,16 @@ fn packet<T: bytemuck::Pod>(env: &mut Env<'_>, value: T) -> GuestPtr<T> {
     pointer.write(env.cpu, value).unwrap();
     pointer
 }
+fn validate(
+    env: &mut Env<'_>,
+    parameters: D3DPRESENT_PARAMETERS,
+    source: GuestPtr<RECT>,
+    destination: GuestPtr<RECT>,
+    window: u32,
+    dirty: GuestPtr<()>,
+) -> Result<(), u32> {
+    super::validate(env, parameters, source, destination, window, dirty).map(|_| ())
+}
 
 #[test]
 fn copy_parameters_preserve_effect_and_reject_multibuffer_or_multisample() {
@@ -166,7 +176,7 @@ fn unavailable_creation_reports_requested_fields_and_absent_gpu_without_publicat
 }
 
 #[test]
-fn copy_full_rectangles_and_dirty_hints_validate_permissions_and_reject_partial_composition() {
+fn copy_rectangles_and_dirty_hints_validate_permissions_and_reject_stretch_or_another_window() {
     let mut machine = super::super::tests::machine();
     machine.cpu.map(0x550000, 8192, Prot::RW).unwrap();
     machine.cpu.protect(0x551000, 4096, Prot::READ).unwrap();
@@ -271,6 +281,120 @@ fn copy_full_rectangles_and_dirty_hints_validate_permissions_and_reject_partial_
     );
 }
 
+#[test]
+fn equal_rectangles_clip_source_and_destination_together_without_shifting_pixels() {
+    let mut machine = super::super::tests::machine();
+    let mut env = env(&mut machine);
+    for (source, destination, transfer) in [
+        (
+            RECT {
+                left: -2,
+                top: -1,
+                right: 5,
+                bottom: 4,
+            },
+            RECT {
+                left: 11,
+                top: 8,
+                right: 18,
+                bottom: 13,
+            },
+            Some(Transfer {
+                source: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 3,
+                    h: 3,
+                },
+                x: 13,
+                y: 9,
+            }),
+        ),
+        (
+            RECT {
+                left: 3,
+                top: 2,
+                right: 7,
+                bottom: 6,
+            },
+            RECT {
+                left: -1,
+                top: -2,
+                right: 3,
+                bottom: 2,
+            },
+            Some(Transfer {
+                source: Rect {
+                    x: 4,
+                    y: 4,
+                    w: 3,
+                    h: 2,
+                },
+                x: 0,
+                y: 0,
+            }),
+        ),
+        (
+            RECT {
+                left: 40,
+                top: 40,
+                right: 44,
+                bottom: 44,
+            },
+            RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            },
+            None,
+        ),
+        (
+            RECT {
+                left: i32::MIN,
+                top: i32::MIN,
+                right: i32::MAX,
+                bottom: i32::MAX,
+            },
+            RECT {
+                left: i32::MIN,
+                top: i32::MIN,
+                right: i32::MAX,
+                bottom: i32::MAX,
+            },
+            Some(Transfer {
+                source: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 12,
+                },
+                x: 0,
+                y: 0,
+            }),
+        ),
+    ] {
+        let source = packet(&mut env, source);
+        let destination = packet(&mut env, destination);
+        assert_eq!(
+            super::validate(
+                &mut env,
+                parameters(),
+                source,
+                destination,
+                0,
+                GuestPtr::new(0)
+            ),
+            Ok(Some(Copy {
+                width: 16,
+                height: 12,
+                transfer
+            }))
+        );
+    }
+    assert!(env.ext.try_get::<ApiDiagnostics>().is_none());
+}
+
 #[derive(Default)]
 struct Surfaces {
     next: u32,
@@ -290,11 +414,8 @@ fn pixels(env: &mut Env<'_>, image: &Image) -> Vec<u8> {
     transfer.poll().unwrap().unwrap()
 }
 
-#[test]
-fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
-    let mut machine = super::super::tests::machine();
+fn install_surfaces(env: &mut Env<'_>) {
     let gpu = pollster::block_on(Gpu::request(true)).expect("software COPY GPU fixture");
-    let mut env = env(&mut machine);
     env.ext.insert(Surfaces::default());
     let state = env.ext.get_mut::<State>();
     state.gpu = Some(gpu);
@@ -320,6 +441,14 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
         surfaces.frames.push(frame);
         Ok(serial)
     };
+    state.provider.present_copy = state.provider.present;
+}
+
+#[test]
+fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
+    let mut machine = super::super::tests::machine();
+    let mut env = env(&mut machine);
+    install_surfaces(&mut env);
     let (factory, _) = object(&mut env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
     let aliases = env.sys.objects.alias_count(com(&env).namespace());
     let input = packet(&mut env, parameters());
@@ -378,6 +507,9 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
     assert_eq!(pixels(&mut env, &target.image), expected);
     let snapshot = env.ext.get::<Surfaces>().frames[0].image.clone();
     assert_eq!(pixels(&mut env, &snapshot), expected);
+    let front = device(&env, pointer).unwrap().front.unwrap();
+    assert_ne!(front, surface);
+    assert_eq!(env.ext.get::<Surfaces>().targets.len(), 2);
     // Rendering after Present changes the original target but not its frame snapshot.
     env.ext
         .get_mut::<State>()
@@ -437,12 +569,30 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
         BackBufferHeight: 6,
         ..parameters()
     };
+    input
+        .write(
+            env.cpu,
+            D3DPRESENT_PARAMETERS {
+                BackBufferCount: 2,
+                ..replacement
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        reset(&mut env, GuestPtr::new(pointer), input),
+        Outcome::Return(INVALID)
+    ));
+    assert_eq!(device(&env, pointer).unwrap().front, Some(front));
+    let front_target = env.ext.get::<Surfaces>().targets[&front].clone();
+    assert_eq!(pixels(&mut env, &front_target.image), green);
     input.write(env.cpu, replacement).unwrap();
     assert!(matches!(
         reset(&mut env, GuestPtr::new(pointer), input),
         Outcome::Return(0)
     ));
     assert_eq!(device(&env, pointer).unwrap().parameters, replacement);
+    assert_eq!(device(&env, pointer).unwrap().front, None);
+    assert!(!env.ext.get::<Surfaces>().targets.contains_key(&front));
     assert_eq!(input.read(env.cpu).unwrap(), replacement);
     let replacement_target = env.ext.get::<Surfaces>().targets[&surface].clone();
     assert_eq!(
@@ -463,7 +613,7 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
         Outcome::Return(INVALID)
     ));
     assert_eq!(device(&env, pointer).unwrap().parameters, replacement);
-    assert_eq!(release(&mut env, pointer), 0);
+    assert_eq!(super::super::release(&mut env, pointer), 0);
     assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), aliases);
     assert!(env.ext.get::<Surfaces>().targets.is_empty());
     assert_eq!(
@@ -478,4 +628,202 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
     );
     assert!(env.ext.get::<State>().pending.is_empty());
     assert!(env.ext.get::<State>().transfers.is_empty());
+}
+
+#[test]
+fn partial_copy_preserves_front_pixels_back_buffer_and_prior_snapshots() {
+    let mut machine = super::super::tests::machine();
+    let mut env = env(&mut machine);
+    install_surfaces(&mut env);
+    let (factory, _) = object(&mut env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
+    let input = packet(&mut env, parameters());
+    let output = packet(&mut env, 0u32);
+    assert!(matches!(
+        create_device(
+            &mut env,
+            GuestPtr::new(factory),
+            0,
+            1,
+            Handle(0x7788),
+            0x24,
+            input,
+            output
+        ),
+        Outcome::Return(0)
+    ));
+    let pointer = output.read(env.cpu).unwrap();
+    let back = device(&env, pointer).unwrap().surface;
+    let target = env.ext.get::<Surfaces>().targets[&back].clone();
+    let original = (0..16 * 12)
+        .flat_map(|i| [i as u8, (i * 7) as u8, (i * 13) as u8, 255])
+        .collect::<Vec<_>>();
+    env.ext
+        .get_mut::<State>()
+        .gpu
+        .as_mut()
+        .unwrap()
+        .upload(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 12,
+            },
+            64,
+            &original,
+        )
+        .unwrap();
+    assert!(matches!(
+        present(
+            &mut env,
+            GuestPtr::new(pointer),
+            GuestPtr::new(0),
+            GuestPtr::new(0),
+            Handle(0),
+            GuestPtr::new(0)
+        ),
+        Outcome::Return(0)
+    ));
+    let front = device(&env, pointer).unwrap().front.unwrap();
+    let front_target = env.ext.get::<Surfaces>().targets[&front].clone();
+    let first_snapshot = env.ext.get::<Surfaces>().frames[0].image.clone();
+
+    env.ext
+        .get_mut::<State>()
+        .gpu
+        .as_mut()
+        .unwrap()
+        .clear(&target, Some([0.0, 1.0, 0.0, 1.0]), None)
+        .unwrap();
+    let top = packet(
+        &mut env,
+        RECT {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 8,
+        },
+    );
+    assert!(matches!(
+        present(
+            &mut env,
+            GuestPtr::new(pointer),
+            top,
+            top,
+            Handle(0),
+            GuestPtr::new(0)
+        ),
+        Outcome::Return(0)
+    ));
+    let mut expected = original.clone();
+    expected[..16 * 8 * 4].copy_from_slice(&[0u8, 255, 0, 255].repeat(16 * 8));
+    assert_eq!(pixels(&mut env, &front_target.image), expected);
+    let second_snapshot = env.ext.get::<Surfaces>().frames[1].image.clone();
+    assert_eq!(pixels(&mut env, &second_snapshot), expected);
+    assert_eq!(pixels(&mut env, &first_snapshot), original);
+    assert_eq!(
+        pixels(&mut env, &target.image),
+        [0u8, 255, 0, 255].repeat(16 * 12)
+    );
+
+    let changed = (0..16 * 12)
+        .flat_map(|i| [(i * 11) as u8, 23, (255 - i) as u8, 255])
+        .collect::<Vec<_>>();
+    env.ext
+        .get_mut::<State>()
+        .gpu
+        .as_mut()
+        .unwrap()
+        .upload(
+            &target.image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 12,
+            },
+            64,
+            &changed,
+        )
+        .unwrap();
+    let source = packet(
+        &mut env,
+        RECT {
+            left: -2,
+            top: -1,
+            right: 5,
+            bottom: 4,
+        },
+    );
+    let destination = packet(
+        &mut env,
+        RECT {
+            left: 11,
+            top: 8,
+            right: 18,
+            bottom: 13,
+        },
+    );
+    assert!(matches!(
+        present(
+            &mut env,
+            GuestPtr::new(pointer),
+            source,
+            destination,
+            Handle(0),
+            GuestPtr::new(0)
+        ),
+        Outcome::Return(0)
+    ));
+    for y in 0..3 {
+        let src = y * 16 * 4;
+        let dst = ((y + 9) * 16 + 13) * 4;
+        expected[dst..dst + 3 * 4].copy_from_slice(&changed[src..src + 3 * 4]);
+    }
+    assert_eq!(pixels(&mut env, &front_target.image), expected);
+    assert_eq!(pixels(&mut env, &target.image), changed);
+    assert_eq!(pixels(&mut env, &first_snapshot), original);
+    assert_eq!(
+        &pixels(&mut env, &second_snapshot)[16 * 8 * 4..],
+        &original[16 * 8 * 4..]
+    );
+
+    let outside = packet(
+        &mut env,
+        RECT {
+            left: 40,
+            top: 40,
+            right: 44,
+            bottom: 44,
+        },
+    );
+    let small = packet(
+        &mut env,
+        RECT {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        },
+    );
+    assert!(matches!(
+        present(
+            &mut env,
+            GuestPtr::new(pointer),
+            outside,
+            small,
+            Handle(0),
+            GuestPtr::new(0)
+        ),
+        Outcome::Return(0)
+    ));
+    assert_eq!(pixels(&mut env, &front_target.image), expected);
+    assert_eq!(env.ext.get::<Surfaces>().frames.len(), 4);
+    assert_eq!(device(&env, pointer).unwrap().front, Some(front));
+    assert_eq!(env.ext.get::<Surfaces>().targets.len(), 2);
+    assert!(env.ext.try_get::<ApiDiagnostics>().is_none());
+    assert_eq!(super::super::release(&mut env, pointer), 0);
+    assert!(env.ext.get::<Surfaces>().targets.is_empty());
+    assert_eq!(pixels(&mut env, &first_snapshot), original);
 }

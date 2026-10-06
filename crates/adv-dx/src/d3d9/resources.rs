@@ -44,6 +44,8 @@ pub(super) struct Level {
     pub surface: Option<u32>,
     pub interface: Option<Id>,
     pub lock: Option<Lock>,
+    /// Pending CPU-to-GPU synchronization, conservatively expanded to a level.
+    pub dirty: bool,
 }
 impl Resource {
     pub(super) fn new_depth(
@@ -612,6 +614,7 @@ fn level_layout(desc: D3DSURFACE_DESC, count: u32) -> Option<(Vec<Level>, u32)> 
             surface: None,
             interface: None,
             lock: None,
+            dirty: true,
         });
     }
     Some((levels, length))
@@ -761,6 +764,15 @@ pub(super) fn texture_lock(
             flags,
             ready: true,
         });
+        if flags & 0x10 == 0 && (flags & 0x8000 == 0 || r.desc.Pool == 0) {
+            if level == 0 {
+                for selected in &mut r.levels {
+                    selected.dirty = true;
+                }
+            } else {
+                r.levels[level as usize].dirty = true;
+            }
+        }
     }
     0
 }
@@ -775,50 +787,17 @@ pub(super) fn texture_unlock(env: &mut Env<'_>, this: GuestPtr<()>, level: u32) 
     let Some(lock) = selected.lock else {
         // The authored native oracle confirms repeated UnlockRect on a valid
         // texture level succeeds. Invalid interfaces/levels still fail above.
-        return Outcome::Return(0);
+        return dirty::flush(env, this.addr());
     };
-    if lock.flags & 0x10 != 0 || r.desc.Pool >= 2 {
-        if let Some(Payload::Resource(r)) =
-            com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-        {
-            r.levels[level as usize].lock = None;
-        }
-        return Outcome::Return(0);
-    }
-    let provider = env.ext.get::<State>().provider;
-    let Some(target) = selected.surface.and_then(|s| (provider.target)(env.ext, s)) else {
-        return Outcome::Return(INVALID);
-    };
-    let pitch = selected.desc.Width * 4;
-    let size = (lock.rectangle.h - 1) * pitch + lock.rectangle.w * 4;
-    let address = r.storage + selected.offset + lock.rectangle.y * pitch + lock.rectangle.x * 4;
-    let format = r.desc.Format;
-    let mut pixels = vec![0; size as usize];
-    if env.cpu.read(address, &mut pixels).is_err() {
+    if !lock.ready {
         return Outcome::Return(INVALID);
     }
-    if format == 22 {
-        for y in 0..lock.rectangle.h as usize {
-            for x in 0..lock.rectangle.w as usize {
-                pixels[y * pitch as usize + x * 4 + 3] = 255;
-            }
-        }
+    if let Some(Payload::Resource(r)) =
+        com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    {
+        r.levels[level as usize].lock = None;
     }
-    let id = com(env)
-        .identity::<Payload>(&env.sys.objects, this.addr())
-        .unwrap();
-    dispatch(
-        env,
-        id,
-        Operation::Upload {
-            resource: id,
-            level: Some(level),
-            target,
-            pixels,
-            pitch,
-            rectangle: lock.rectangle,
-        },
-    )
+    dirty::flush(env, this.addr())
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetTexture",level=state)]
 fn set_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, texture: GuestPtr<()>) -> u32 {

@@ -22,6 +22,21 @@ pub(super) struct Draw {
     pub vertices: Vec<Vertex>,
     pub state: DrawState,
 }
+struct Rejected {
+    code: u32,
+    reason: &'static str,
+}
+impl From<u32> for Rejected {
+    fn from(code: u32) -> Self {
+        Self {
+            code,
+            reason: "invalid or unsupported fixed-function state value",
+        }
+    }
+}
+fn rejected(code: u32, reason: &'static str) -> Rejected {
+    Rejected { code, reason }
+}
 impl Fixed {
     pub(super) fn viewport_rect(&self) -> Rect {
         Rect {
@@ -561,18 +576,35 @@ pub(super) fn prepare(
     stride: u32,
     indices: Option<&[u32]>,
 ) -> Result<Draw, u32> {
-    let d = device(env, pointer).ok_or(INVALID)?;
+    prepare_checked(env, pointer, kind, count, data, stride, indices).map_err(|error| error.code)
+}
+fn prepare_checked(
+    env: &Env<'_>,
+    pointer: u32,
+    kind: i32,
+    count: u32,
+    data: GuestPtr<u8>,
+    stride: u32,
+    indices: Option<&[u32]>,
+) -> Result<Draw, Rejected> {
+    let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
     let f = &d.fixed;
-    if !d.scene || !valid_fvf(f.fvf) {
-        return Err(INVALID);
+    if !d.scene {
+        return Err(rejected(INVALID, "draw outside BeginScene/EndScene"));
+    }
+    if !valid_fvf(f.fvf) {
+        return Err(rejected(INVALID, "no supported FVF is set"));
     }
     let position = if f.fvf & 0x0e == 4 { 4 } else { 3 };
     if position == 3 && f.render[&137] != 0 {
-        return Err(UNAVAILABLE);
+        return Err(rejected(
+            UNAVAILABLE,
+            "untransformed vertices require unsupported lighting",
+        ));
     }
     let minimum = vertex_size(env, pointer)?;
     if stride < minimum || stride > 2048 || data.is_null() {
-        return Err(INVALID);
+        return Err(rejected(INVALID, "vertex pointer or stride is invalid"));
     }
     let topology = match kind {
         1 => Topology::Points,
@@ -580,11 +612,15 @@ pub(super) fn prepare(
         3 => Topology::LineStrip,
         4 | 6 => Topology::Triangles,
         5 => Topology::TriangleStrip,
-        _ => return Err(INVALID),
+        _ => return Err(rejected(INVALID, "invalid primitive topology")),
     };
-    let length = primitive_length(kind, count)?;
+    let length = primitive_length(kind, count)
+        .map_err(|code| rejected(code, "invalid or excessive primitive count"))?;
     if indices.is_some_and(|v| v.len() != length as usize) {
-        return Err(INVALID);
+        return Err(rejected(
+            INVALID,
+            "index count does not match primitive count",
+        ));
     }
     let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
     let last = indices
@@ -596,21 +632,22 @@ pub(super) fn prepare(
         .and_then(|n| n.checked_add(minimum))
         .ok_or(INVALID)?;
     let span = data.addr().checked_add(offset).ok_or(INVALID)?;
-    adv_abi::guest::check_range(env.cpu, span, bytes, Prot::READ).map_err(|_| INVALID)?;
+    adv_abi::guest::check_range(env.cpu, span, bytes, Prot::READ)
+        .map_err(|_| rejected(INVALID, "vertex span is not readable"))?;
     let mut vertices = Vec::with_capacity(length as usize);
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         let mut raw = [0; 28];
         env.cpu
             .read(data.addr() + index * stride, &mut raw[..minimum as usize])
-            .map_err(|_| INVALID)?;
+            .map_err(|_| rejected(INVALID, "vertex read failed"))?;
         let float =
             |word: usize| f32::from_le_bytes(raw[word * 4..word * 4 + 4].try_into().unwrap());
         let mut p = [float(0), float(1), float(2), 1.];
         if position == 4 {
             let rhw = float(3);
             if rhw == 0. || !rhw.is_finite() {
-                return Err(INVALID);
+                return Err(rejected(INVALID, "vertex RHW is zero or not finite"));
             }
             let w = 1. / rhw;
             p = [
@@ -625,7 +662,10 @@ pub(super) fn prepare(
             }
         }
         if p.iter().any(|v| !v.is_finite()) {
-            return Err(INVALID);
+            return Err(rejected(
+                INVALID,
+                "transformed vertex position is not finite",
+            ));
         }
         let mut at = position as usize;
         let mut color = [1.; 4];
@@ -645,7 +685,10 @@ pub(super) fn prepare(
             [0.; 2]
         };
         if uv.iter().any(|v| !v.is_finite()) {
-            return Err(INVALID);
+            return Err(rejected(
+                INVALID,
+                "vertex texture coordinates are not finite",
+            ));
         }
         vertices.push(Vertex {
             position: p,
@@ -661,24 +704,34 @@ pub(super) fn prepare(
         vertices = fan;
     }
     let provider = env.ext.get::<State>().provider;
-    let target = super::targets::draw_target(env, pointer)?;
+    let target = super::targets::draw_target(env, pointer)
+        .map_err(|code| rejected(code, "render target is missing, locked or unavailable"))?;
     let target = if f.render[&7] != 0 || f.render[&52] != 0 {
-        super::depth::attach(env, pointer, target)?
+        super::depth::attach(env, pointer, target)
+            .map_err(|code| rejected(code, "depth attachment is invalid or incompatible"))?
     } else {
         target
     };
     let (image, lod) = if let Some(id) = d.texture {
         let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
-            return Err(INVALID);
+            return Err(rejected(
+                INVALID,
+                "bound texture no longer has a resource owner",
+            ));
         };
         if resources::locked(env, r) {
-            return Err(INVALID);
+            return Err(rejected(INVALID, "bound texture is locked"));
         }
         (
             Some(
-                (provider.target)(env.ext, r.surface.ok_or(INVALID)?)
-                    .ok_or(INVALID)?
-                    .image,
+                (provider.target)(
+                    env.ext,
+                    r.surface.ok_or_else(|| {
+                        rejected(INVALID, "bound texture has no sampleable surface")
+                    })?,
+                )
+                .ok_or_else(|| rejected(INVALID, "bound texture surface is unavailable"))?
+                .image,
             ),
             r.lod,
         )
@@ -697,10 +750,10 @@ pub(super) fn prepare(
             state.depth = Some(compare(f.render[&23]).ok_or(INVALID)?);
             state.depth_write = f.render[&14] != 0;
         }
-        if f.render[&52] != 0 {
-            if !super::depth::has_stencil(env, pointer) {
-                return Err(INVALID);
-            }
+        // Native D3D9 ignores stencil state when the bound depth format has
+        // no stencil component (D16/D24X8), even STENCILFUNC=NEVER. Keep the
+        // requested state observable and preserve the independent depth test.
+        if f.render[&52] != 0 && super::depth::has_stencil(env, pointer) {
             let front = StencilFace {
                 compare: compare(f.render[&56]).ok_or(INVALID)?,
                 fail: stencil_op(f.render[&53]).ok_or(INVALID)?,
@@ -762,7 +815,10 @@ pub(super) fn prepare(
         let right = (r.right as u32).min(target.image.width());
         let bottom = (r.bottom as u32).min(target.image.height());
         if right <= r.left as u32 || bottom <= r.top as u32 {
-            return Err(INVALID);
+            return Err(rejected(
+                INVALID,
+                "scissor rectangle is empty outside render target",
+            ));
         }
         state.scissor = Some(Rect {
             x: r.left as u32,
@@ -824,20 +880,78 @@ fn draw_up(
         super::buffers::clear_up_bindings(env, this.addr(), false);
         return Outcome::Return(0);
     }
-    let draw = match prepare(env, this.addr(), kind, count, data, stride, None) {
+    let draw = match prepare_checked(env, this.addr(), kind, count, data, stride, None) {
         Ok(d) => d,
-        Err(e) => return Outcome::Return(e),
+        Err(error) => {
+            warn_draw_rejected(
+                env,
+                this.addr(),
+                kind,
+                data,
+                stride,
+                error.code,
+                error.reason,
+            );
+            return Outcome::Return(error.code);
+        }
     };
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
     super::buffers::clear_up_bindings(env, this.addr(), false);
-    dispatch(env, id, Operation::Draw(draw))
+    let outcome = dispatch(env, id, Operation::Draw(draw));
+    if let Outcome::Return(error) = &outcome
+        && *error != 0
+    {
+        warn_draw_rejected(
+            env,
+            this.addr(),
+            kind,
+            data,
+            stride,
+            *error,
+            "GPU command rejected after fixed-function input validation",
+        );
+    }
+    outcome
+}
+
+fn warn_draw_rejected(
+    env: &mut Env<'_>,
+    pointer: u32,
+    kind: i32,
+    data: GuestPtr<u8>,
+    stride: u32,
+    code: u32,
+    reason: &str,
+) {
+    let state = device(env, pointer).map_or_else(
+        || "device unavailable".to_owned(),
+        |d| {
+            let v = d.fixed.viewport;
+            format!(
+                "FVF={:#x}, scene={}, viewport=({},{} {}x{},{}..{}), z_enable={}, stencil_enable={}, stencil_attachment={}",
+                d.fixed.fvf, d.scene, v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ,
+                d.fixed.render[&7], d.fixed.render[&52], super::depth::has_stencil(env, pointer),
+            )
+        },
+    );
+    // Do not include primitive count or vertex contents in the warning key:
+    // repeated failed batches share one bounded diagnostic and a repeat count.
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3DDevice9::DrawPrimitiveUP",
+        &format!(
+            "{reason}; HRESULT={code:#x}, primitive={kind}, data={:#x}, stride={stride}; {state}",
+            data.addr(),
+        ),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("fixed/stencil_tests.rs");
 
     #[test]
     fn no_specular_fvf_profile_exposes_bool_state_without_accepting_specular_inputs() {

@@ -16,6 +16,7 @@ use resources::Resource;
 mod capabilities;
 mod creation;
 mod cursor;
+mod dirty;
 mod fixed;
 mod memory;
 mod pacing;
@@ -48,6 +49,8 @@ pub struct SurfaceProvider {
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
     pub replace: fn(&mut Ext, u32, Target) -> Result<(), String>,
     pub present: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
+    /// Snapshot a preserved COPY front without rotating its writable target.
+    pub present_copy: fn(&mut Ext, u32, &mut Gpu) -> Result<u64, Error>,
     pub window: fn(&Ext, &Objects, u32) -> Option<(u32, u32)>,
     pub visible: fn(&Ext, &Objects, u32) -> Option<bool>,
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
@@ -70,6 +73,8 @@ struct Device {
     pointer: u32,
     factory: Id,
     surface: u32,
+    /// Shared surface-store identity, owned exclusively by this device.
+    front: Option<u32>,
     parameters: D3DPRESENT_PARAMETERS,
     creator: u32,
     preserve_fpu: bool,
@@ -123,6 +128,7 @@ enum Operation {
     Present {
         surface: u32,
         deadline: Option<u64>,
+        copy: Option<(Id, presentation::Copy)>,
     },
     Upload {
         resource: Id,
@@ -177,6 +183,7 @@ pub fn register(registry: &mut Registry) {
     depth::register(registry);
     memory::register(registry);
     cursor::register(registry);
+    dirty::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -302,6 +309,7 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
             }
         }
         let _ = (provider.remove)(env.ext, env.cpu, device.surface);
+        presentation::release(env, device.front);
         if let Some(released) = com(env).release_identity(&mut env.sys.objects, device.factory)
             && let Some(factory) = released.destroyed
         {
@@ -732,6 +740,7 @@ fn create_device(
         pointer: 0,
         factory,
         surface,
+        front: None,
         parameters: normalized,
         creator: env.context,
         preserve_fpu: flags & 2 != 0,
@@ -862,6 +871,7 @@ fn reset(
     let old_buffer = d.back_buffer;
     let old_depth = d.depth_stencil;
     let old_texture = d.texture;
+    let old_front = d.front;
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
@@ -946,6 +956,7 @@ fn reset(
     }
     if let Some(Payload::Device(d)) = com.get_identity_mut(&mut env.sys.objects, device_id) {
         d.parameters = normalized;
+        d.front = None;
         d.back_buffer = Some(new_buffer);
         d.depth_stencil = new_depth;
         d.texture = None;
@@ -955,6 +966,7 @@ fn reset(
         d.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     }
     depth::release_binding(env, old_depth);
+    presentation::release(env, old_front);
     buffers::reset_bindings(env, device_id);
     targets::reset_binding(env, device_id);
     for binding in [old_texture, old_buffer].into_iter().flatten() {
@@ -1009,8 +1021,18 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
         } => gpu
             .clear_region(target, *rectangle, *color, *depth, *stencil)
             .map(|()| Completion::Command),
-        Operation::Present { surface, deadline } => (provider.present)(env.ext, *surface, &mut gpu)
-            .map(|serial| Completion::Presented(serial, *deadline)),
+        Operation::Present {
+            surface,
+            deadline,
+            copy,
+        } => {
+            let result = if let Some((device, copy)) = copy {
+                presentation::execute(env, &mut gpu, *device, *surface, *copy)
+            } else {
+                (provider.present)(env.ext, *surface, &mut gpu)
+            };
+            result.map(|serial| Completion::Presented(serial, *deadline))
+        }
         Operation::Upload {
             resource,
             level,
@@ -1268,7 +1290,7 @@ fn present(
         return Outcome::Return(INVALID);
     }
     let parameters = d.parameters;
-    if let Err(error) = presentation::validate(
+    let copy = match presentation::validate(
         env,
         parameters,
         source,
@@ -1276,8 +1298,9 @@ fn present(
         override_window.0,
         dirty,
     ) {
-        return Outcome::Return(error);
-    }
+        Ok(copy) => copy,
+        Err(error) => return Outcome::Return(error),
+    };
     let d = device(env, this.addr()).unwrap();
     if d.back_buffer.is_some_and(|id| {
         matches!(com(env).get_identity(&env.sys.objects, id),
@@ -1301,5 +1324,13 @@ fn present(
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
-    dispatch(env, id, Operation::Present { surface, deadline })
+    dispatch(
+        env,
+        id,
+        Operation::Present {
+            surface,
+            deadline,
+            copy: copy.map(|copy| (id, copy)),
+        },
+    )
 }

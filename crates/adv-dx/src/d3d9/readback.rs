@@ -332,14 +332,21 @@ fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
 /// for retry; cancellation of its guest continuation releases the reservation.
 pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled: bool) {
     if let Operation::Upload {
-        resource,
-        level: None,
-        ..
+        resource, level, ..
     } = operation
         && let Some(Payload::Resource(r)) =
             com(env).get_identity_mut(&mut env.sys.objects, *resource)
     {
-        if cancelled {
+        if let Some(level) = level {
+            if let Some(selected) = r.levels.get_mut(*level as usize) {
+                selected.dirty = true;
+                if cancelled {
+                    selected.lock = None;
+                } else if let Some(lock) = &mut selected.lock {
+                    lock.ready = true;
+                }
+            }
+        } else if cancelled {
             r.lock = None;
         } else if let Some(lock) = &mut r.lock {
             lock.ready = true;
