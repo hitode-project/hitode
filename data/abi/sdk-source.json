@@ -91,5 +91,17 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixlookatlh",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3project"
     ]
+  },
+  "legacy_d3dx_effect": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
+    "scope": "D3DXCreateEffect and D3DXGetShaderOutputSemantics x86 __stdcall declarations only",
+    "headers": {
+      "d3dx9effect.h": "72d6665d54c425b8a99fe0716518b2711f7cece6a3b2f8e7c6fc307e0a3fae26",
+      "d3dx9shader.h": "235bf935a1381c68d0847cfb8d5422f33cdd92d33acee5a59befeef6afad78d4"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreateeffect",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetshaderoutputsemantics"
+    ]
   }
 }

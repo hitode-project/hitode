@@ -220,7 +220,7 @@ fn typed_legacy_math_exports_and_x86_stack_are_exact_without_gpu() {
     }
     assert!(registry.signature_conflicts().is_empty());
     assert!(!registry.dynamic_available("d3dx9_42.dll", "D3DXMatrixMultiply"));
-    assert!(!registry.dynamic_available("d3dx9_43.dll", "D3DXCreateEffect"));
+    assert!(registry.dynamic_available("d3dx9_43.dll", "D3DXCreateEffect"));
 }
 
 #[test]

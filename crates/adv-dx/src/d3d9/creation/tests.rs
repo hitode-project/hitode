@@ -1,3 +1,4 @@
+use super::super::shaders::{get_pixel, get_vertex, set_pixel, set_vertex};
 use super::*;
 use adv_cpu::backend::Guest;
 

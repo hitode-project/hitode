@@ -1,8 +1,11 @@
-//! The four legacy D3DX9 math contracts used by guest rendering libraries.
-//! This is finite matrix/vector API arithmetic, not another rendering backend.
+//! Legacy D3DX9 matrix/vector contracts and native binary Effect execution.
+//! Effect shader objects feed the shared D3D9 programmable drawing frontend.
 //! Authoritative prototypes and the scoped ABI input are in data/abi/sdk-source.json.
 use adv_abi::{GuestPtr, Registry, types::D3DVIEWPORT9, win32};
 use adv_machine::Env;
+mod binary;
+mod effect;
+mod preshader;
 
 type Matrix = [f32; 16];
 type Vector = [f32; 3];
@@ -11,6 +14,7 @@ pub fn register(registry: &mut Registry) {
     for api in [multiply_ABI, transpose_ABI, look_at_ABI, project_ABI] {
         registry.register(api);
     }
+    effect::register(registry);
 }
 
 fn product(left: Matrix, right: Matrix) -> Matrix {

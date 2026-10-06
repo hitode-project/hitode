@@ -253,6 +253,12 @@ fn declaration_elements(
 /// Bind a declaration (or none) with an internal reference. Either binding
 /// replaces the FVF: GetFVF reports 0 until SetFVF selects one again.
 pub(super) fn bind(env: &mut Env<'_>, device: Id, new: Option<Id>) -> u32 {
+    let Some(Payload::Device(_)) = com(env).get_identity(&env.sys.objects, device) else {
+        return INVALID;
+    };
+    if let Some(result) = super::shaders::stateblocks::record_declaration(env, device, new) {
+        return result;
+    }
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, device) else {
         return INVALID;
     };

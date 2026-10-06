@@ -383,6 +383,7 @@ def run(args: argparse.Namespace) -> None:
                    "--screenshot", str(folder / "frame.png")]
         if args.trace:
             command += ["--trace", str(folder / "api.log")]
+        command += getattr(args, "runner_arg", [])
         result = dict(sample, command=command, guest_exe_sha256=digest(game))
         validate_native_baseline(result)
         result["report_available"] = False
@@ -410,7 +411,7 @@ def run(args: argparse.Namespace) -> None:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
                 for key in ("stop_reason", "guest_exit_code", "frames", "first_frame_seconds", "elapsed_seconds", "host_calls",
                             "width", "height", "frame_fnv1a64", "missing_apis", "failure",
-                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup"):
+                            "screenshot_error", "audio", "pcm", "codec", "performance", "api", "startup", "gpu"):
                     result[key] = report.get(key)
                 result["report_available"] = True
                 result["report_sha256"] = digest(report_path)
@@ -459,6 +460,8 @@ if __name__ == "__main__":
     parser.add_argument("--api-mode", choices=("strict", "discovery"), default="strict")
     parser.add_argument("--evidence", type=Path, help="reviewed S1-S4 evidence keyed by sample id, tied to report SHA-256")
     parser.add_argument("--trace", action="store_true", help="diagnostic API trace, not a performance measurement")
+    parser.add_argument("--runner-arg", action="append", default=[],
+                        help="explicit candidate option, e.g. --runner-arg=--d3d9-sm2")
     options = parser.parse_args()
     if not math.isfinite(options.seconds) or not 0 < options.seconds <= 3600:
         parser.error("seconds must be finite and within 0..3600")

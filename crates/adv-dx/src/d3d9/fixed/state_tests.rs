@@ -99,11 +99,15 @@ mod state_tests {
             );
             assert_eq!(render(&mut env, pointer, state), value);
         }
-        for state in [16, 161] {
+        for state in [16, 28, 161] {
             for value in [0, 1, 0] {
                 assert_eq!(call(&mut env, set_render_ABI, &[pointer, state, value]), 0);
                 assert_eq!(render(&mut env, pointer, state as i32), value);
             }
+        }
+        for value in [0, 1, 0x3f, 0] {
+            assert_eq!(call(&mut env, set_render_ABI, &[pointer, 152, value]), 0);
+            assert_eq!(render(&mut env, pointer, 152), value);
         }
         for state in 145..=148 {
             for value in 0..=2 {
@@ -150,7 +154,6 @@ mod state_tests {
             (8, 2, UNAVAILABLE),
             (8, 0, INVALID),
             (8, 4, INVALID),
-            (28, 1, UNAVAILABLE),
             (28, 2, INVALID),
             (136, 0, UNAVAILABLE),
             (136, 2, INVALID),
@@ -162,9 +165,9 @@ mod state_tests {
             (151, 4, INVALID),
             (151, 254, INVALID),
             (151, 257, INVALID),
-            (152, 1, UNAVAILABLE),
-            (152, 0x80, UNAVAILABLE),
-            (152, u32::MAX, UNAVAILABLE),
+            (152, 0x40, INVALID),
+            (152, 0x80, INVALID),
+            (152, u32::MAX, INVALID),
             (167, 1, UNAVAILABLE),
             (167, 2, INVALID),
             (16, 2, INVALID),
@@ -238,12 +241,12 @@ mod state_tests {
         }
         defaults(&mut env, pointer);
         let diagnostics = env.ext.get::<ApiDiagnostics>();
-        assert_eq!(diagnostics.warnings.len(), 8);
+        assert_eq!(diagnostics.warnings.len(), 6);
         assert_eq!(diagnostics.warnings.values().sum::<u64>(), unavailable);
         assert_eq!(diagnostics.stub_calls, 0);
         assert!(diagnostics.acceptance_eligible(RunMode::Strict));
         let trace = String::from_utf8(capture.0.borrow().clone()).unwrap();
-        assert_eq!(trace.lines().count(), 8);
+        assert_eq!(trace.lines().count(), 6);
         assert!(
             trace
                 .lines()
