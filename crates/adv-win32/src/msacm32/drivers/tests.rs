@@ -339,6 +339,116 @@ fn driver_metrics_match_catalog_and_distinguish_null_from_stale_ids() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xfedcba98);
 }
 
+#[test]
+fn driver_priority_and_enable_state_reach_enumeration_details_and_stream_selection() {
+    let mut m = fixture(false);
+    ensure(&mut env(&mut m));
+    let id = m
+        .ext
+        .get_mut::<Acm>()
+        .drivers
+        .id(&mut m.sys.objects)
+        .unwrap();
+    for position in [0, 1, 2, u32::MAX] {
+        assert_eq!(priority_impl(&mut env(&mut m), id, position, 0), Ok(()));
+        assert_eq!(metric(&mut env(&mut m), id, 101, DATA), Ok(()));
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 1);
+    }
+    assert_eq!(
+        priority_impl(&mut env(&mut m), id + 4, 1, 0),
+        Err(INVALID_HANDLE)
+    );
+    for flags in [3, 4, 0x30000, 0x10001] {
+        assert_eq!(
+            priority_impl(&mut env(&mut m), id, 1, flags),
+            Err(INVALID_FLAG)
+        );
+    }
+    let format = Format {
+        tag: 1,
+        channels: 1,
+        rate: 22050,
+        block: 2,
+        bits: 16,
+        frames_per_block: 1,
+    };
+    m.cpu.write(DATA + 1024, &format.pcm_bytes()).unwrap();
+    for enabled in [false, false, true, true] {
+        assert_eq!(
+            priority_impl(&mut env(&mut m), id, 0, if enabled { 1 } else { 2 }),
+            Ok(())
+        );
+        for (index, expected) in [
+            (1, u32::from(enabled)),
+            (2, u32::from(enabled)),
+            (3, u32::from(enabled)),
+            (5, u32::from(!enabled)),
+            (100, SUPPORT | if enabled { 0 } else { 0x8000_0000 }),
+        ] {
+            assert_eq!(
+                metric(
+                    &mut env(&mut m),
+                    if index == 100 { id } else { 0 },
+                    index,
+                    DATA
+                ),
+                Ok(())
+            );
+            assert_eq!(m.cpu.read_u32(DATA).unwrap(), expected);
+        }
+        m.cpu.write_u32(DATA, 920).unwrap();
+        assert_eq!(details(&mut env(&mut m), id, DATA, 0, false), Ok(()));
+        let expected_support = SUPPORT | if enabled { 0 } else { 0x8000_0000 };
+        assert_eq!(m.cpu.read_u32(DATA + 24).unwrap(), expected_support);
+        for flags in [0, ENUM_FLAGS] {
+            let outcome = enumerate(&mut env(&mut m), GuestPtr::new(CODE), 0, flags);
+            if enabled || flags & 0x8000_0000 != 0 {
+                let Outcome::Call { args, .. } = outcome else {
+                    panic!("installed driver")
+                };
+                assert_eq!(args, [id, 0, expected_support]);
+            } else {
+                assert!(matches!(outcome, Outcome::Return(0)));
+            }
+        }
+        // The existing automatic stream query must not select a disabled driver.
+        m.cpu.set_reg(Reg::Esp, DATA + 2048);
+        for (i, arg) in [0, 0, DATA + 1024, DATA + 1024, 0, 0, 0, 1]
+            .iter()
+            .enumerate()
+        {
+            m.cpu.write_u32(DATA + 2052 + i as u32 * 4, *arg).unwrap();
+        }
+        assert_eq!(
+            super::super::open(&mut env(&mut m)),
+            if enabled { Ok(()) } else { Err(NOT_POSSIBLE) }
+        );
+        for (i, arg) in [0, DATA + 1024, DATA + 1100, 18, 0].iter().enumerate() {
+            m.cpu.write_u32(DATA + 2052 + i as u32 * 4, *arg).unwrap();
+        }
+        assert_eq!(
+            super::super::suggest(&mut env(&mut m)),
+            if enabled { Ok(()) } else { Err(NOT_POSSIBLE) }
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_driver_priority_rejects_unknown_ids_and_invalid_flags() {
+    #[link(name = "msacm32")]
+    unsafe extern "system" {
+        fn acmDriverPriority(id: usize, priority: u32, flags: u32) -> u32;
+    }
+    unsafe {
+        // Only failure paths: never reorder or disable the host's installed codecs.
+        assert_eq!(acmDriverPriority(0x1234, 1, 0), INVALID_HANDLE);
+        assert_eq!(acmDriverPriority(0, 1, 0), INVALID_FLAG);
+        assert_eq!(acmDriverPriority(0x1234, 1, 4), INVALID_FLAG);
+        assert_eq!(acmDriverPriority(0x1234, 1, 3), INVALID_HANDLE);
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn native_driver_metrics_distinguish_null_from_unknown_ids() {

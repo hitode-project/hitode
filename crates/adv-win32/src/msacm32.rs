@@ -254,6 +254,10 @@ fn suggest(e: &mut Env<'_>) -> Result<(), u32> {
     if e.arg(0) != 0 {
         return Err(INVALID_HANDLE);
     }
+    ensure(e);
+    if !e.ext.get::<Acm>().drivers.enabled(&e.sys.objects) {
+        return Err(NOT_POSSIBLE);
+    }
     let source = Format::read(e.cpu, e.arg(1))?;
     let address = e.arg(2);
     let available = e.arg(3);
@@ -310,6 +314,10 @@ fn open(e: &mut Env<'_>) -> Result<(), u32> {
     }
     if e.arg(1) != 0 {
         return Err(INVALID_HANDLE);
+    }
+    ensure(e);
+    if !e.ext.get::<Acm>().drivers.enabled(&e.sys.objects) {
+        return Err(NOT_POSSIBLE);
     }
     if flags & 2 != 0 || e.arg(4) != 0 {
         return Err(NOT_SUPPORTED);
