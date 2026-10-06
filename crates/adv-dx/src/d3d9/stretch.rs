@@ -1,5 +1,5 @@
-//! Equal-size color blits use the same GPU copy and COM owners as presentation.
-//! Scaling, texture-source profiles and depth/MSAA copies remain unavailable.
+//! Color copies and full-source LINEAR scaling share the GPU and COM owners.
+//! Cropped scaling, texture profiles and depth/MSAA remain unavailable.
 use super::*;
 use adv_device::surface::Rect;
 
@@ -33,11 +33,6 @@ fn rectangle(env: &Env<'_>, pointer: GuestPtr<RECT>, width: u32, height: u32) ->
         w: (value.right - value.left) as u32,
         h: (value.bottom - value.top) as u32,
     })
-}
-
-fn unavailable(env: &mut Env<'_>, reason: &str) -> Outcome {
-    adv_abi::warn_unavailable(env, "IDirect3DDevice9::StretchRect", reason);
-    Outcome::Return(UNAVAILABLE)
 }
 
 #[win32(d3d9, name = "IDirect3DDevice9::StretchRect", level = implement)]
@@ -74,6 +69,42 @@ fn stretch(
     {
         return Outcome::Return(INVALID);
     }
+    let from = match rectangle(env, source_rect, src.desc.Width, src.desc.Height) {
+        Ok(rect) => rect,
+        Err(error) => return Outcome::Return(error),
+    };
+    let to = match rectangle(env, destination_rect, dst.desc.Width, dst.desc.Height) {
+        Ok(rect) => rect,
+        Err(error) => return Outcome::Return(error),
+    };
+    let source_description = src.desc;
+    let destination_description = dst.desc;
+    let unavailable = |env: &mut Env<'_>, reason: &str| {
+        // Actual requested rectangles belong in the bounded warning evidence.
+        // Equal-size hot calls avoid allocating this diagnostic string.
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::StretchRect",
+            &format!(
+                "{reason}: source={}x{} format={} rect=({},{},{},{}); destination={}x{} format={} rect=({},{},{},{}); filter={filter}",
+                source_description.Width,
+                source_description.Height,
+                source_description.Format,
+                from.x,
+                from.y,
+                from.x + from.w,
+                from.y + from.h,
+                destination_description.Width,
+                destination_description.Height,
+                destination_description.Format,
+                to.x,
+                to.y,
+                to.x + to.w,
+                to.y + to.h,
+            ),
+        );
+        Outcome::Return(UNAVAILABLE)
+    };
     if src.depth.is_some()
         || dst.depth.is_some()
         || src.desc.MultiSampleType != 0
@@ -106,19 +137,16 @@ fn stretch(
             "render-target to offscreen-plain blits are unavailable",
         );
     }
-    let from = match rectangle(env, source_rect, src.desc.Width, src.desc.Height) {
-        Ok(rect) => rect,
-        Err(error) => return Outcome::Return(error),
-    };
-    let to = match rectangle(env, destination_rect, dst.desc.Width, dst.desc.Height) {
-        Ok(rect) => rect,
-        Err(error) => return Outcome::Return(error),
-    };
     if (from.w, from.h) != (to.w, to.h) {
-        return unavailable(
-            env,
-            "rectangle dimensions differ; StretchRect scaling is unavailable",
-        );
+        if from.x != 0 || from.y != 0 || from.w != src.desc.Width || from.h != src.desc.Height {
+            return unavailable(env, "cropped-source scaling is unavailable");
+        }
+        if dst.desc.Usage & 1 == 0 {
+            return unavailable(env, "scaled blits require a render-target destination");
+        }
+        if filter != 2 {
+            return unavailable(env, "scaling currently requires LINEAR filtering");
+        }
     }
     let source_id = com(env)
         .identity::<Payload>(&env.sys.objects, source.addr())
@@ -144,9 +172,8 @@ fn stretch(
     else {
         return unavailable(env, "destination surface has no shared GPU image");
     };
-    // Integer, equal-size rectangles map texel centers exactly. NONE, POINT
-    // and LINEAR are equivalent here, as confirmed by the authored native
-    // color oracle both inside and outside BeginScene. No blend/state is used.
+    // Equal-size copies stay exact. Scaled copies use the isolated neutral
+    // scaling state; guest scene/blend/alpha/depth state is not involved.
     dispatch(
         env,
         owner,
@@ -154,8 +181,12 @@ fn stretch(
             source,
             rectangle: from,
             destination,
-            x: to.x,
-            y: to.y,
+            region: to,
+            filter: if filter == 2 {
+                adv_device::gpu::Filter::Linear
+            } else {
+                adv_device::gpu::Filter::Nearest
+            },
             resources: [source_id, destination_id],
         },
     )

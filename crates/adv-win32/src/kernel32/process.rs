@@ -9,6 +9,8 @@ use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod processor;
+mod parameters;
+pub(crate) use parameters::install as install_parameters;
 
 fn exit_process(env: &mut Env<'_>) -> Outcome {
     super::module::exit_process(env, env.arg(0))

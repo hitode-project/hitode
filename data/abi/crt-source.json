@@ -23,7 +23,13 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memcpy-s-wmemcpy-s",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memmove-s-wmemmove-s",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setlocale-wsetlocale",
+    "https://learn.microsoft.com/en-us/previous-versions/ff730814(v=vs.120)",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/lc-codepage-func",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/calloc",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-func",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-pwctype-wctype-mbctype-mbcasemap"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -66,6 +72,33 @@
     "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
     "adjust_fdiv": "Existing x86 MSVCRT compatibility data cell, int32 zero initial value. The installed Microsoft SysWOW64/msvcrt.dll PE exports _adjust_fdiv from its writable, non-executable .data virtual tail, not a code entry. No modern SDK header declaration is claimed.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
+  },
+  "locale.h": {
+    "header": "ucrt/locale.h",
+    "sha256": "877aa49e1f22814dd5634e785d305210d3c7ac0a1274e8552ce4f687a91ac4cb",
+    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5. Also declares unsigned int __cdecl ___lc_codepage_func(void)."
+  },
+  "legacy_locale_handle": {
+    "declaration": "Microsoft Learn previous-versions ff730814(v=vs.120) declares LCID* ___lc_handle_func(void), indexed by locale.h categories. This legacy LCID-array getter is absent from modern UCRT headers; no modern header declaration is claimed.",
+    "projection": "msvcr90 x86 CRT cdecl zero parameters, pointer to six 32-bit LCIDs (LC_ALL reserved zero, categories1..5). Authored x86 Microsoft SysWOW64/msvcrt.dll probe confirms C=0, Japanese=0x411, Simplified Chinese=0x804, English=0x409 and mixed category indices; this is a legacy MSVCRT semantic oracle, not a VC90 binary oracle.",
+    "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
+  },
+  "legacy_calloc_crt": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "declaration": "Modern SDK corecrt_malloc.h declares public void* __cdecl calloc(size_t,size_t); it does not declare this legacy internal export. The VC90 PE export _calloc_crt RVA0x63797 reads stack count/size and returns with RET, and the actual x86 guest call removes both arguments. This is a VC90 binary-backed declaration, not a claimed modern SDK declaration.",
+    "behavior": "Authored x86 activation-context VC90 oracle confirms zero-filled allocation and non-NULL freeable zero-count/size blocks; successful allocation preserves errno. Product beyond 0xffffffe0 sets ENOMEM(12), calls the installed invalid-parameter handler with five NULL arguments and returns NULL. Valid-size allocation failure preserves prior errno and sets LastError8, sampled immediately on return. The internal entry explicitly disables new-handler invocation even with native newmode1/handler installed; only its default zero allocation-retry-delay profile is supported."
+  },
+  "corecrt_wctype.h": {
+    "header": "ucrt/corecrt_wctype.h",
+    "sha256": "b622b24cbda842a1736987f38c9deb5076e51af018630842a127bebd9104076e",
+    "declaration": "const unsigned short* __cdecl __pctype_func(void), with CRT _UPPER/_LOWER/_DIGIT/_SPACE/_PUNCT/_CONTROL/_BLANK/_HEX/_ALPHA/_LEADBYTE masks."
+  },
+  "legacy_pctype": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "behavior": "Authored activation-context VC90 probe reads the EOF slot at pointer[-1] and all256 byte slots. C is distinct from localized tables. Japanese/Chinese/English LC_CTYPE names crossed with CP932/936/1252 produce identical classification for each codepage, so the supported four profiles are keyed by CP0/932/936/1252 independently of language and host ACP. Compact classification data is derived from observed tables, not copied from SDK implementation headers.",
+    "fnv1a64_514_bytes": { "C": "48cabdc90fcb0865", "932": "44eb5be34d5b7579", "936": "e33c618c172b2971", "1252": "006150ad6479dba0" }
   },
   "process.h": {
     "header": "ucrt/process.h",

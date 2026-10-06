@@ -75,5 +75,6 @@ pub mod teb {
 /// PEB field offsets (x86).
 pub mod peb {
     pub const IMAGE_BASE: u32 = 0x08;
+    pub const PROCESS_PARAMETERS: u32 = 0x10;
     pub const PROCESS_HEAP: u32 = 0x18;
 }

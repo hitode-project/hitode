@@ -1088,6 +1088,98 @@ impl Gpu {
         submission
     }
 
+    /// Color blit over the shared drawing pipeline. Equal-size rectangles use
+    /// an exact GPU copy; full-source LINEAR scaling uses a measured D3D9 HAL
+    /// profile: texel centers for minification, (src-1)/(dst-1) for magnification.
+    /// No guest blend, depth, viewport or alpha-test state enters this operation.
+    pub fn blit(
+        &mut self,
+        source: &Image,
+        rectangle: Rect,
+        destination: &Image,
+        region: Rect,
+        filter: Filter,
+    ) -> Result<(), Error> {
+        self.own(source)?;
+        self.own(destination)?;
+        rectangle_in(source, rectangle)?;
+        rectangle_in(destination, region)?;
+        if source.shares_storage(destination) {
+            return Err(invalid("image cannot blit onto itself"));
+        }
+        if source.alpha == AlphaMode::Opaque && destination.alpha == AlphaMode::Stored {
+            return Err(Error::Unavailable(
+                "opaque-to-stored color conversion is unavailable".into(),
+            ));
+        }
+        if (rectangle.w, rectangle.h) == (region.w, region.h) {
+            return self.copy(source, rectangle, destination, region.x, region.y);
+        }
+        if rectangle.x != 0
+            || rectangle.y != 0
+            || rectangle.w != source.width
+            || rectangle.h != source.height
+            || filter != Filter::Linear
+        {
+            return Err(Error::Unavailable(
+                "scaled blits require full-source LINEAR filtering".into(),
+            ));
+        }
+        // Neutral clip coordinates put the rectangle on pixel-cell edges.
+        // WGPU samples destination centers (x+0.5,y+0.5). A minified axis uses
+        // (x+0.5)*src/dst-0.5 in source texels. The authored native HAL oracle
+        // uses (x+0.5)*(src-1)/(dst-1)-0.5 for a magnified axis; UVs therefore
+        // start at zero, with the far edge below one. A one-texel source axis
+        // always samples its center. REF rejects this filtered profile; see
+        // tools/fixtures/d3d9-stretch-native.md for the measured contract.
+        let coordinates = |src: u32, dst: u32| {
+            if dst <= src {
+                (0., 1.)
+            } else if src == 1 {
+                (0.5, 0.5)
+            } else {
+                (
+                    0.,
+                    dst as f32 * (src - 1) as f32 / (src as f32 * (dst - 1) as f32),
+                )
+            }
+        };
+        let (u0, u1) = coordinates(rectangle.w, region.w);
+        let (v0, v1) = coordinates(rectangle.h, region.h);
+        let x0 = region.x as f32 * 2. / destination.width as f32 - 1.;
+        let x1 = (region.x + region.w) as f32 * 2. / destination.width as f32 - 1.;
+        let y0 = 1. - region.y as f32 * 2. / destination.height as f32;
+        let y1 = 1. - (region.y + region.h) as f32 * 2. / destination.height as f32;
+        let vertex = |x, y, u, v| Vertex {
+            position: [x, y, 0., 1.],
+            color: [1.; 4],
+            uv: [u, v],
+        };
+        let vertices = [
+            vertex(x0, y0, u0, v0),
+            vertex(x1, y0, u1, v0),
+            vertex(x1, y1, u1, v1),
+            vertex(x0, y0, u0, v0),
+            vertex(x1, y1, u1, v1),
+            vertex(x0, y1, u0, v1),
+        ];
+        let mut state = DrawState::new(destination.width, destination.height);
+        state.sampler.min = Filter::Linear;
+        state.sampler.mag = Filter::Linear;
+        state.texture_op = TextureOp::Texture;
+        state.alpha_texture_op = TextureOp::Texture;
+        state.scissor = Some(region);
+        self.draw(
+            &Target {
+                image: destination.clone(),
+                depth: None,
+            },
+            &vertices,
+            Some(source),
+            state,
+        )
+    }
+
     pub fn copy(
         &mut self,
         source: &Image,

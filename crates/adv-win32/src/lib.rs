@@ -127,6 +127,7 @@ impl Win32 {
         gdi32::font::install(m);
         user32::install(m)?;
         msvcrt::initialize_data(m)?;
+        kernel32::install_parameters(m)?;
         Ok(())
     }
 

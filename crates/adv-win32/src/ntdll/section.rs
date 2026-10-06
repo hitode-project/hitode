@@ -175,9 +175,7 @@ fn unmap(env: &mut Env<'_>) -> Outcome {
 }
 fn close(env: &mut Env<'_>) -> Outcome {
     let handle = env.arg(0);
-    let closed = env.sys.objects.close(handle).is_some();
-    file_mapping::prune(env);
-    Outcome::Return(if closed { 0 } else { 0xc0000008 })
+    Outcome::Return(super::file::close(env, adv_abi::Handle(handle)) as u32)
 }
 fn protect(env: &mut Env<'_>) -> Outcome {
     let (process, base, size, protection, old) =
@@ -222,9 +220,8 @@ pub(super) fn register(reg: &mut Registry) {
     for name in ["NtUnmapViewOfSection", "ZwUnmapViewOfSection"] {
         crate::stdcall(reg, "ntdll.dll", name, 2, unmap);
     }
-    for name in ["NtClose", "ZwClose"] {
-        crate::stdcall(reg, "ntdll.dll", name, 1, close);
-    }
+    // ZwClose is registered by the typed file front; both names use its core.
+    crate::stdcall(reg, "ntdll.dll", "NtClose", 1, close);
     for name in ["NtProtectVirtualMemory", "ZwProtectVirtualMemory"] {
         crate::stdcall(reg, "ntdll.dll", name, 5, protect);
     }

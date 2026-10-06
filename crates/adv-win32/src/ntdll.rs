@@ -8,6 +8,7 @@ use adv_os::Heaps;
 
 use crate::stdcall;
 mod file;
+mod open;
 mod section;
 
 const NTDLL: &str = "ntdll.dll";
@@ -238,6 +239,7 @@ pub fn register(reg: &mut Registry) {
         query_system_information,
     );
     file::register(reg);
+    open::register(reg);
     section::register(reg);
     stdcall(
         reg,

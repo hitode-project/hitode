@@ -19,6 +19,66 @@
     "native_abi_verification": "RVA 0x6a5a0 U wrapper calls the same path conversion as WithStatus, returns setns AL or xor AL,AL, and pops 16 bytes. Authored x86 oracle checks BOOLEAN, descriptor byte lengths, FilePart/RelativeName aliasing, empty failure, and RtlFreeUnicodeString allocation ownership. No DLL bytes are bundled.",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/devnotes/rtldospathnametontpathname_u_withstatus"
   },
+  "native_create_file": {
+    "scope": "ntdll.dll!ZwCreateFile only; no other Nt/Zw exports are projected",
+    "source": "Microsoft Windows SDK 10.0.26100.0 um/winternl.h NtCreateFile declaration; Microsoft documents identical Nt/Zw user-mode behavior",
+    "header_sha256": "a43424486349c38f697c009512dfe4eb8fca733d7665afab42f50752170b9785",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS and eleven 32-bit arguments; SDK ntdll.lib declares both _NtCreateFile@44 and _ZwCreateFile@44",
+    "native_verification": "Authored x86 ZwCreateFile oracle opens its own target file and checks FILE_OPENED, failure HANDLE/IO_STATUS_BLOCK output preservation, and LastError; no host DLL bytes or game data are bundled",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwcreatefile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
+  "native_query_file": {
+    "scope": "ntdll.dll!ZwQueryInformationFile only; the personality implements FilePositionInformation (14), with other classes explicitly unavailable",
+    "source": "Microsoft Learn wdm.h ZwQueryInformationFile declaration; this declaration is absent from the installed user-mode winternl.h and pinned WinMD",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS, HANDLE and pointers, ULONG length and signed 32-bit FILE_INFORMATION_CLASS; SDK ntdll.lib declares both _NtQueryInformationFile@20 and _ZwQueryInformationFile@20",
+    "native_verification": "Authored x86 ZwQueryInformationFile probe verifies 8-byte CurrentByteOffset, 64-bit seek/read cursor, IOSB byte count, error-output/LastError preservation, and attributes-only/overlapped native handles; no DLL or game bytes are bundled",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwqueryinformationfile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_position_information",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
+  "native_set_file": {
+    "scope": "ntdll.dll!ZwSetInformationFile only; the actual initial call sets FilePositionInformation (14) to zero",
+    "source": "Microsoft Learn wdm.h ZwSetInformationFile declaration; absent from installed user-mode winternl.h and pinned WinMD",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS, HANDLE and pointers, ULONG length and signed 32-bit FILE_INFORMATION_CLASS; SDK ntdll.lib declares both _NtSetInformationFile@20 and _ZwSetInformationFile@20",
+    "native_verification": "Authored x86 probe verifies 64-bit position, success IOSB (STATUS_SUCCESS, 0), preserved input/LastError, negative/short/NULL failures, and mapped readonly IOSB completion failure after the seek; attributes-only and overlapped handles also accept this setter",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwsetinformationfile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_position_information",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
+  "native_read_file": {
+    "scope": "ntdll.dll!ZwReadFile only; synchronous current-position or explicit-offset reads through the shared file owner",
+    "source": "Microsoft Learn WDM ZwReadFile nine-parameter declaration and user-mode Nt/Zw equivalence; absent from installed user-mode winternl.h and pinned WinMD",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS and nine 32-bit stack words; SDK ntdll.lib declares both _NtReadFile@36 and _ZwReadFile@36; PIO_APC_ROUTINE pointer type from SDK winternl.h",
+    "native_verification": "Authored x86 read oracle verifies current/explicit/-2 sentinel positions, partial and complete EOF, zero length, failed explicit EOF preserving the cursor, read-access checks, and writable IOSB/buffer preflight before any data or cursor changes; LastError remains unchanged",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwreadfile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
+  "native_close": {
+    "scope": "ntdll.dll!ZwClose only; no broader Nt/Zw export family is projected",
+    "source": "Microsoft Windows SDK 10.0.26100.0 um/winternl.h NtClose declaration, SDK Nt/Zw x86 ntdll.lib imports, and documented user-mode equivalence",
+    "header_sha256": "a43424486349c38f697c009512dfe4eb8fca733d7665afab42f50752170b9785",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS and one 32-bit HANDLE; SDK imports _NtClose@4 and _ZwClose@4; neither name exists in pinned WinMD",
+    "native_verification": "Authored x86 oracle checks file/event close, duplicate alias surviving original close, double/null/invalid/legacy stdio failures, pseudo-process/thread no-op success, unchanged LastError, and STATUS_HANDLE_NOT_CLOSABLE for protected native handles; no DLL or game bytes are bundled",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntclose",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwclose",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",
