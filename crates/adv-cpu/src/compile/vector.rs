@@ -379,7 +379,6 @@ pub(super) fn batch(
             return None;
         }
         let info = factory.info(i);
-        let mut state = state;
         if !info.used_memory().is_empty() && !matches!(i.mnemonic(), M::Lea | M::Nop) {
             state.stored |= *accesses.get(&pc)?;
         }

@@ -19,6 +19,8 @@ mod host_fault;
 pub mod interpreter;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod jit_memory;
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+mod jit_memory_android;
 mod linking;
 mod memory;
 mod parallel;

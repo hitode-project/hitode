@@ -14,7 +14,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
     println!("cargo:rerun-if-env-changed=ANDROID_NDK_ROOT");
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if os != "android" || env::var_os("CARGO_FEATURE_UNICORN").is_none() {
+    // This dedicated reference crate always links Unicorn. The former CPU
+    // feature gate no longer exists after the runtime/reference split.
+    if os != "android" {
         return;
     }
     let target = env::var("TARGET").unwrap();

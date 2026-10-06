@@ -1,4 +1,9 @@
-#![cfg(windows)]
+#![cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+))]
 use adv_cpu::JitCpu;
 use adv_cpu::backend::{Guest, Prot, SharedRegion};
 use adv_cpu::{Region, RunOutcome};
@@ -70,6 +75,63 @@ fn alias_survives_protect_partial_unmap_address_reuse_and_machine_destruction() 
     drop(cpu);
     assert_eq!(new.read_alias.load_u8(0), 0xaa);
     assert_eq!(old.read_alias.load_u8(4096), 0x56);
+}
+
+#[test]
+fn pcm_in_a_partial_host_page_preserves_ordinary_neighbours_and_permissions() {
+    let mut cpu = JitCpu::new(STOP, false).unwrap();
+    // All four guest pages share one host page on a 16 KiB host. PCM remains
+    // an overlay there, so mapping/reusing it cannot relax or destroy neighbours.
+    cpu.map(DATA, 16384, Prot::RW).unwrap();
+    let pattern: Vec<_> = (0..16384).map(|i| (i / 4096 + 0x31) as u8).collect();
+    cpu.write(DATA, &pattern).unwrap();
+    cpu.protect(DATA, 4096, Prot::RX).unwrap();
+    cpu.protect(DATA + 8192, 4096, Prot::READ).unwrap();
+    cpu.protect(DATA + 12288, 4096, Prot(0)).unwrap();
+    cpu.unmap(DATA + 4096, 4096).unwrap();
+
+    assert!(cpu.map_shared_audio(DATA + 4096, 0).is_err());
+    assert!(cpu.map_shared_audio(DATA + 4097, 4096).is_err());
+    assert!(cpu.map_shared_audio(DATA + 4096, 4095).is_err());
+    assert!(cpu.map_shared_audio(DATA + 4096, 8192).is_err());
+    let old = cpu.map_shared_audio(DATA + 4096, 4096).unwrap();
+    assert!(cpu.shared_bytes(DATA + 4096, 1).is_none());
+    assert_eq!(old.read_alias.len(), 4096);
+    assert_eq!(old.read_alias.load_u8(0), 0);
+    assert_eq!(old.read_alias.load_u8(4095), 0);
+    cpu.write(DATA + 4096, &[0x91]).unwrap();
+    cpu.write(DATA + 8191, &[0x37]).unwrap();
+    cpu.protect(DATA + 4096, 4096, Prot(0)).unwrap();
+    assert!(!cpu.accessible(DATA + 4096, 1, Prot::READ));
+    assert_eq!(old.read_alias.load_u8(0), 0x91);
+
+    cpu.unmap(DATA + 4096, 4096).unwrap();
+    let new = cpu.map_shared_audio(DATA + 4096, 4096).unwrap();
+    assert_eq!(new.read_alias.load_u8(0), 0);
+    cpu.write(DATA + 4096, &[0xa5]).unwrap();
+    assert_eq!(old.read_alias.load_u8(0), 0x91);
+    cpu.unmap(DATA + 4096, 4096).unwrap();
+    cpu.map(DATA + 4096, 4096, Prot::RW).unwrap();
+    let mut zeroed = [0xa5; 4096];
+    cpu.read(DATA + 4096, &mut zeroed).unwrap();
+    assert_eq!(zeroed, [0; 4096]);
+    cpu.write(DATA + 4096, &[0xee; 4096]).unwrap();
+
+    for page in [0, 2, 3] {
+        let mut actual = [0; 4096];
+        cpu.read(DATA + page * 4096, &mut actual).unwrap();
+        assert_eq!(actual, [page as u8 + 0x31; 4096]);
+    }
+    assert!(cpu.accessible(DATA, 4096, Prot::RX));
+    assert!(!cpu.accessible(DATA, 4096, Prot::WRITE));
+    assert!(cpu.accessible(DATA + 8192, 4096, Prot::READ));
+    assert!(!cpu.accessible(DATA + 8192, 4096, Prot::WRITE));
+    assert!(!cpu.accessible(DATA + 12288, 4096, Prot::READ));
+    assert!(!cpu.accessible(DATA + 12288, 4096, Prot::WRITE));
+    drop(cpu);
+    assert_eq!(old.read_alias.load_u8(0), 0x91);
+    assert_eq!(old.read_alias.load_u8(4095), 0x37);
+    assert_eq!(new.read_alias.load_u8(0), 0xa5);
 }
 
 #[test]

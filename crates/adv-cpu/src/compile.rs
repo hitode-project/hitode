@@ -633,6 +633,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_x87", x87::helper_address());
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
@@ -783,6 +785,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // Builds the region function, or with `kernel` the separate function for
     // that versioned loop's clone. `kernels` holds each loop's finalized kernel
     // address for the region to call.
+    // Windows fault-recovery metadata is the closure's only mutable capture.
+    #[cfg_attr(
+        not(all(windows, target_arch = "x86_64", target_env = "msvc")),
+        allow(unused_mut)
+    )]
     let mut emit = |module: &mut JITModule,
                     func: &mut ir::Function,
                     fb_ctx: &mut FunctionBuilderContext,

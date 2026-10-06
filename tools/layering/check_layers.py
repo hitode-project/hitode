@@ -27,13 +27,15 @@ RULES: dict[str, set[str]] = {
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync"},
     "adv-run": {"adv-shell"},
+    # Standalone Android CPU acceptance app, outside the game runtime graph.
+    "adv-android-probe": {"adv-cpu"},
     "adv-tune": {"adv-abi", "adv-device"},
     # Test support: reachable only from dev-dependencies.
     "adv-unicorn": {"adv-cpu"},
     "adv-samples": {"adv-pe"},
 }
 ALIASES: dict[str, str] = {}
-TEST_ONLY = {"adv-unicorn", "adv-samples"}
+TEST_ONLY = {"adv-unicorn", "adv-samples", "adv-android-probe"}
 TRANSITIONAL: dict[tuple[str, str], str] = {}
 
 
