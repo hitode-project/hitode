@@ -52,6 +52,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
             };
     }
     match i.mnemonic() {
+        M::Clc | M::Stc | M::Cmc => i.op_count() == 0,
         M::Cdq => i.code() == Code::Cdq,
         M::Leave => i.code() == Code::Leaved,
         M::Adc | M::Sbb => {
@@ -194,6 +195,24 @@ impl Emitter<'_> {
     }
 
     pub(super) fn scalar_instruction(&mut self, i: &Instruction) {
+        if matches!(i.mnemonic(), M::Clc | M::Stc | M::Cmc) {
+            let carry = match i.mnemonic() {
+                M::Clc => self.constant(0),
+                M::Stc => self.constant(1),
+                M::Cmc => {
+                    let carry = self.flag(0);
+                    self.b.ins().bxor_imm(carry, 1)
+                }
+                _ => unreachable!(),
+            };
+            // Only CF changes. Keep the arithmetic producer and raw EFLAGS
+            // intact, including any lazily carried OF from a rotate/MUL.
+            let zero = self.constant(0);
+            for (var, value) in self.lazy[4..].iter().zip([carry, zero, zero]) {
+                self.b.def_var(*var, value);
+            }
+            return;
+        }
         if i.code() == Code::Cdq {
             let value = self.b.use_var(self.regs[0]);
             let sign = self.b.ins().sshr_imm(value, 31);

@@ -443,7 +443,12 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
         Some(ImplementationLevel::Implement)
     );
     assert!(registry.dynamic_available("ntdll.dll", "ZwClose"));
-    for name in ["NtCreateFile", "NtReadFile", "NtClose"] {
+    assert_eq!(
+        registry.get("ntdll.dll", "NtClose").unwrap().conv,
+        Conv::Stdcall { argc: 1 }
+    );
+    assert!(registry.dynamic_available("ntdll.dll", "NtClose"));
+    for name in ["NtCreateFile", "NtReadFile"] {
         assert!(!registry.dynamic_available("ntdll.dll", name));
     }
     assert!(registry.signature_conflicts().is_empty());

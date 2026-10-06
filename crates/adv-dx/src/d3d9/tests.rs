@@ -17,6 +17,9 @@ pub(super) fn machine() -> Machine<JitCpu> {
     m.ext.insert(heaps);
     let com = Com::new(&mut m.sys.objects).unwrap();
     let provider = SurfaceProvider {
+        acquire_dc: |_, _, _, _, _| Err("ownership-only fixture".into()),
+        writeback_dc: |_, _, _, _| Err("ownership-only fixture".into()),
+        release_dc: |_, _| {},
         insert: |_, _| unreachable!("ownership-only fixture"),
         target: |_, _| None,
         remove: |_, _, _| Ok(()),
@@ -39,13 +42,16 @@ pub(super) fn machine() -> Machine<JitCpu> {
             ("IDirect3DSurface9", 0),
             ("IDirect3DVertexBuffer9", 0),
             ("IDirect3DIndexBuffer9", 0),
+            ("IDirect3DVertexDeclaration9", 0),
         ]),
         gpu: None,
         provider,
         pending: Vec::new(),
         transfers: Vec::new(),
+        dcs: Vec::new(),
         sender: None,
         wake: None,
+        copy: true,
     });
     m
 }

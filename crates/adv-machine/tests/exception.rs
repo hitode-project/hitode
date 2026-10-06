@@ -152,6 +152,49 @@ fn lower_callback_stack_cannot_escape_into_reserved_scratch_or_consume_another_r
 }
 
 #[test]
+fn unwindable_callback_is_abandoned_when_the_guest_resumes_above_its_stack() {
+    for api_call in [false, true] {
+        let mut registry = Registry::default();
+        registry.add("test", "outer", Conv::Stdcall { argc: 0 }, |env| {
+            let original = env.cpu.reg(Reg::Esp);
+            env.cpu.write_u32(SEEN, original).unwrap();
+            Outcome::call_on_stack(HANDLER, [1, 2], original - 0x100, |_, _| {
+                panic!("abandoned callback must not consume its continuation")
+            })
+            .unwindable()
+        });
+        registry.add("test", "side_effect", Conv::Stdcall { argc: 0 }, |env| {
+            env.cpu.write_u32(SEEN + 4, 1).unwrap();
+            Outcome::Return(0)
+        });
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, true).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.cpu.map(CODE, 4096, Prot::RWX).unwrap();
+        machine.cpu.map(SEEN, 4096, Prot::RW).unwrap();
+        let outer = machine.resolve_import("test", "outer").unwrap();
+        let side_effect = machine.resolve_import("test", "side_effect").unwrap();
+        // Like an `__except` target: drop the dispatcher's frame and return
+        // from the outer API on its caller's stack.
+        let mut handler = Asm::new(HANDLER);
+        handler.bytes.extend([0x8b, 0x25]); // mov esp,[SEEN].
+        handler.bytes.extend(SEEN.to_le_bytes());
+        if api_call {
+            handler.call(side_effect);
+        }
+        handler.ret();
+        machine.cpu.write(HANDLER, &handler.bytes).unwrap();
+        machine.spawn("main", outer, &[], 0x10000).unwrap();
+        let result = machine.run_virtual(100000);
+        assert!(matches!(result, RunResult::Exited(_)), "{result:?}");
+        assert_eq!(machine.cpu.read_u32(SEEN + 4).unwrap(), u32::from(api_call));
+    }
+}
+
+#[test]
 fn first_fetch_fault_keeps_original_branch_and_stack_after_exception_handler_returns() {
     use adv_cpu::{
         IndirectBranch, IndirectBranchKind,

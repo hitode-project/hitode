@@ -749,6 +749,7 @@ fn apply(
             args,
             then,
             stack,
+            unwindable,
         } => {
             let stack = stack.unwrap_or(origin.esp);
             let Some(bytes) = args
@@ -794,6 +795,7 @@ fn apply(
                 id,
                 stack,
                 return_floor: bottom + 4,
+                unwindable,
                 then,
                 origin,
             });
@@ -882,11 +884,38 @@ pub fn guess_backtrace(cpu: &dyn Guest, images: &Images, esp: u32) -> Vec<u32> {
 }
 
 impl Dispatch<'_> {
+    /// Drop callback frames the guest has left by nonlocal unwind. A native
+    /// exception dispatcher never regains control from a handler that resumes
+    /// in an `__except` block or catch continuation, so frames declared
+    /// unwindable are abandoned and their continuations dropped. Escaping any
+    /// other frame still fails, naming the host call that frame belongs to.
+    fn unwind_escaped(
+        &mut self,
+        escaped: impl Fn(&Frame) -> bool,
+        what: &str,
+    ) -> Result<(), Parked> {
+        let frames = &mut self.sys.contexts[self.sys.current as usize].frames;
+        while let Some(frame) = frames.last().filter(|frame| escaped(frame)) {
+            if !frame.unwindable {
+                let host = self.sys.thunks.get(frame.origin.thunk);
+                return Err(Parked::Fail(format!(
+                    "guest {what} escaped its continuation stack; nonlocal unwind is unsupported \
+                     across {}!{}",
+                    host.module, host.name
+                )));
+            }
+            frames.pop();
+        }
+        Ok(())
+    }
+
     fn exception(
         &mut self,
         cpu: &mut dyn Guest,
         event: exception::Exception,
     ) -> Result<(), Parked> {
+        let esp = cpu.reg(Reg::Esp);
+        self.unwind_escaped(|frame| esp >= frame.stack, "exception")?;
         if let exception::Exception::Fault(fault) = &event {
             let snapshot = exception::CpuFaultSnapshot::capture(cpu, self.sys.current, fault);
             self.sys
@@ -923,18 +952,7 @@ impl Dispatch<'_> {
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
         let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
-        if self
-            .sys
-            .current_context()
-            .frames
-            .last()
-            .is_some_and(|frame| esp >= frame.stack)
-        {
-            return Err(Parked::Fail(
-                "guest callback escaped its continuation stack; nonlocal unwind is unsupported"
-                    .into(),
-            ));
-        }
+        self.unwind_escaped(|frame| esp >= frame.stack, "callback")?;
         let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all)).then(|| {
             (0..u32::from(f.conv.argc()))
                 .map(|i| cpu.arg(i).unwrap_or(0))
@@ -980,6 +998,7 @@ impl Dispatch<'_> {
     fn guest_return(&mut self, cpu: &mut dyn Guest) -> Result<(), Parked> {
         let eax = cpu.reg(Reg::Eax);
         let returned_sp = cpu.reg(Reg::Esp);
+        self.unwind_escaped(|frame| returned_sp > frame.stack, "return")?;
         if self
             .sys
             .current_context()

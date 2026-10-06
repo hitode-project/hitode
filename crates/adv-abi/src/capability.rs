@@ -124,12 +124,14 @@ fn observe(env: &mut Env<'_>, mut scope: Scope, outcome: Outcome) -> Outcome {
             args,
             then,
             stack,
+            unwindable,
         } => {
             scope.arguments = Some(arguments(env, &scope));
             Outcome::Call {
                 target,
                 args,
                 stack,
+                unwindable,
                 then: Box::new(move |env, resume| {
                     push(env, scope);
                     let outcome = then(env, resume);

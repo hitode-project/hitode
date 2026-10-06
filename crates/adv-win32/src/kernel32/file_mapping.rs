@@ -35,6 +35,22 @@ struct SectionHandle {
     section: Rc<Section>,
     access: u32,
 }
+
+pub(crate) fn restrict_section_access(env: &mut Env<'_>, handle: u32, access: u32) {
+    if let Some(handle) = env.sys.objects.host_mut::<SectionHandle>(handle) {
+        handle.access = access & (READ | WRITE);
+    }
+}
+
+pub(crate) fn view_extent(env: &Env<'_>, address: u32) -> Option<(u32, u32)> {
+    let (&base, view) = env
+        .ext
+        .try_get::<Mappings>()?
+        .views
+        .range(..=address)
+        .next_back()?;
+    (address - base < view.len).then_some((base, view.len))
+}
 impl SectionHandle {
     fn new(section: Rc<Section>, access: u32) -> Self {
         section.handles.set(section.handles.get() + 1);
@@ -265,6 +281,17 @@ fn create(env: &mut Env<'_>, wide: bool) -> Outcome {
         Ok(name) => name,
         Err(e) => return fail(env, e),
     };
+    create_section(env, file, attributes, protection, maximum, name)
+}
+
+pub(crate) fn create_section(
+    env: &mut Env<'_>,
+    file: u32,
+    attributes: u32,
+    protection: u32,
+    maximum: u64,
+    name: Option<Vec<u16>>,
+) -> Outcome {
     if protection & !(0x08000000 | 0xff) != 0 || protection & 0xff >= 0x10 {
         return fail(env, 50);
     }
@@ -401,6 +428,17 @@ fn map(env: &mut Env<'_>, requested: bool) -> Outcome {
     let offset = (u64::from(env.arg(2)) << 32) | u64::from(env.arg(3));
     let count = u64::from(env.arg(4));
     let base = if requested { env.arg(5) } else { 0 };
+    map_section(env, handle, access, offset, count, base)
+}
+
+pub(crate) fn map_section(
+    env: &mut Env<'_>,
+    handle: u32,
+    access: u32,
+    offset: u64,
+    count: u64,
+    base: u32,
+) -> Outcome {
     let Some(handle) = env.sys.objects.host::<SectionHandle>(handle) else {
         return fail(env, 6);
     };
@@ -515,6 +553,10 @@ fn flush(env: &mut Env<'_>) -> Outcome {
 
 fn unmap(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
+    unmap_section(env, address)
+}
+
+pub(crate) fn unmap_section(env: &mut Env<'_>, address: u32) -> Outcome {
     let Some(view) = state(env).views.get(&address) else {
         return fail(env, 487);
     };
@@ -595,6 +637,37 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
     }
     set_last_error(env, 0);
     Outcome::Return(handle)
+}
+
+/// Open an existing process-owned mutex through the same namespace as Create.
+pub(super) fn open_mutex(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
+    if pointer == 0 {
+        return fail(env, 87);
+    }
+    let name = match name(env, pointer, wide) {
+        Ok(Some(name)) => name,
+        Ok(None) => return fail(env, 6),
+        Err(123) => return fail(env, 3),
+        Err(error) => return fail(env, error),
+    };
+    prune(env);
+    let identity = match state(env).names.get(&name) {
+        Some(Named::Sync { identity, kind: 2 }) => *identity,
+        Some(_) => return fail(env, 6),
+        None => return fail(env, 2),
+    };
+    // Kernel aliases currently carry full access and do not implement process
+    // inheritance. Do not silently broaden a restricted access request.
+    if !matches!(env.arg(0), 0x001f0001 | 0x10000000) || env.arg(1) != 0 {
+        return fail(env, 50);
+    }
+    match env.sys.objects.alias_identity(identity) {
+        Some(handle) => {
+            set_last_error(env, 0);
+            Outcome::Return(handle)
+        }
+        None => fail(env, 8),
+    }
 }
 
 fn page_protection(env: &Env<'_>, view: &View, base: u32, page: u32) -> u32 {
@@ -701,4 +774,135 @@ pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, K32, "MapViewOfFileEx", 6, |env| map(env, true));
     stdcall(registry, K32, "FlushViewOfFile", 2, flush);
     stdcall(registry, K32, "UnmapViewOfFile", 1, unmap);
+}
+
+#[cfg(test)]
+mod mutex_tests {
+    use super::*;
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, Reg},
+    };
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+
+    fn returned(outcome: Outcome) -> u32 {
+        match outcome {
+            Outcome::Return(value) => value,
+            _ => panic!("mutex operation must return"),
+        }
+    }
+
+    #[test]
+    fn open_mutex_uses_shared_named_identity_and_last_alias_lifetime() {
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        assert!(registry.signature_conflicts().is_empty());
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/open-mutex-tests");
+        crate::Win32::install(
+            &mut machine,
+            crate::Win32Config::new(&root, "authored.exe", &root),
+        )
+        .unwrap();
+        machine.spawn("owner", PARK_ADDR, &[], 65536).unwrap();
+        machine.cpu.map(0x410000, 4096, Prot::RW).unwrap();
+        machine.cpu.set_reg(Reg::Esp, 0x410000);
+        let mut env = Env {
+            context: machine.sys.current,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        for (offset, text) in [
+            (0x100, "authored-mutex"),
+            (0x200, "Local\\authored-mutex"),
+            (0x300, "Global\\authored-mutex"),
+            (0x400, "Authored-mutex"),
+            (0x500, "bad\\name"),
+        ] {
+            env.cpu
+                .write(0x410000 + offset, &[text.as_bytes(), &[0]].concat())
+                .unwrap();
+        }
+        let wide: Vec<_> = "authored-mutex"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        env.cpu.write(0x410600, &wide).unwrap();
+        env.cpu.write_u32(0x410004, 0x1f0001).unwrap();
+        env.cpu.write_u32(0x410008, 0).unwrap();
+        assert_eq!(returned(open_mutex(&mut env, 0x410100, false)), 0);
+        assert_eq!(crate::util::last_error(&env), 2);
+        let original = returned(sync_created(
+            &mut env,
+            Object::Mutex {
+                owner: Some(0),
+                recursion: 1,
+            },
+            0x410100,
+            false,
+        ));
+        assert_ne!(original, 0);
+        let local = returned(open_mutex(&mut env, 0x410200, false));
+        let unicode = returned(open_mutex(&mut env, 0x410600, true));
+        assert_ne!(local, original);
+        assert!(env.sys.objects.same_object(original, local));
+        assert!(env.sys.objects.same_object(original, unicode));
+        assert!(matches!(
+            env.sys.objects.get(local),
+            Some(Object::Mutex {
+                owner: Some(0),
+                recursion: 1
+            })
+        ));
+        for (pointer, error) in [
+            (0, 87),
+            (0x410400, 2),
+            (0x410500, 3),
+            (0x410300, 2),
+            (0x410700, 6),
+        ] {
+            assert_eq!(returned(open_mutex(&mut env, pointer, false)), 0);
+            assert_eq!(crate::util::last_error(&env), error);
+        }
+        let global = returned(sync_created(
+            &mut env,
+            Object::Event {
+                manual_reset: true,
+                signaled: false,
+            },
+            0x410300,
+            false,
+        ));
+        assert_ne!(global, 0);
+        assert_eq!(returned(open_mutex(&mut env, 0x410300, false)), 0);
+        assert_eq!(crate::util::last_error(&env), 6);
+        // Unsupported restrictions fail explicitly rather than producing an
+        // unrestricted or inheritable alias.
+        env.cpu.write_u32(0x410004, 0x100000).unwrap();
+        assert_eq!(returned(open_mutex(&mut env, 0x410100, false)), 0);
+        assert_eq!(crate::util::last_error(&env), 50);
+        env.cpu.write_u32(0x410004, 0x1f0001).unwrap();
+        env.cpu.write_u32(0x410008, 1).unwrap();
+        assert_eq!(returned(open_mutex(&mut env, 0x410100, false)), 0);
+        assert_eq!(crate::util::last_error(&env), 50);
+        env.cpu.write_u32(0x410008, 0).unwrap();
+        env.sys.objects.close(original).unwrap();
+        env.sys.objects.close(local).unwrap();
+        prune(&mut env);
+        let reopened = returned(open_mutex(&mut env, 0x410100, false));
+        assert!(env.sys.objects.same_object(unicode, reopened));
+        env.sys.objects.close(unicode).unwrap();
+        env.sys.objects.close(reopened).unwrap();
+        assert_eq!(returned(open_mutex(&mut env, 0x410100, false)), 0);
+        assert_eq!(crate::util::last_error(&env), 2);
+    }
 }

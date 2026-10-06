@@ -92,6 +92,119 @@ macro_rules! setcc {
     };
 }
 
+fn carry_control(a: &mut CodeAssembler, form: usize) {
+    match form {
+        0 => a.clc(),
+        1 => a.stc(),
+        _ => a.cmc(),
+    }
+    .unwrap();
+}
+
+#[test]
+fn carry_controls_preserve_other_flags_and_feed_branches_and_setcc() {
+    for producer in 0..7 {
+        for carry in 0..3 {
+            let bytes = assemble(|a| {
+                match producer {
+                    0 => Ok(()),
+                    1 => a.add(eax, ecx),
+                    2 => a.cmp(eax, ecx),
+                    3 => a.add(al, cl),
+                    4 => a.cmp(ax, cx),
+                    5 => a.inc(eax),
+                    _ => a.xor(eax, ecx),
+                }
+                .unwrap();
+                carry_control(a, carry);
+                let mut carried = a.create_label();
+                let mut joined = a.create_label();
+                a.jb(carried).unwrap();
+                a.mov(esi, 1).unwrap();
+                a.jmp(joined).unwrap();
+                a.set_label(&mut carried).unwrap();
+                a.mov(esi, 2).unwrap();
+                a.set_label(&mut joined).unwrap();
+                for condition in 0..16 {
+                    setcc!(a, condition, byte_ptr(DATA as i32 + condition));
+                }
+                a.ret().unwrap();
+            });
+            let cases: Vec<_> = if producer == 0 {
+                (0..64)
+                    .map(|bits| {
+                        let mut flags = 0x602;
+                        for (index, bit) in [0, 2, 4, 6, 7, 11].into_iter().enumerate() {
+                            flags |= ((bits >> index) & 1) << bit;
+                        }
+                        (0xa5a5_a5a5, 0x5a5a_5a5a, flags)
+                    })
+                    .collect()
+            } else {
+                [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX]
+                    .into_iter()
+                    .flat_map(|left| VALUES.map(|right| (left, right, 0xed7)))
+                    .collect()
+            };
+            for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+                let mut jit = machine(&bytes, Some(strategy));
+                let mut reference = machine(&bytes, None);
+                for &(left, right, flags) in &cases {
+                    for m in [&mut jit, &mut reference] {
+                        reset(m, left, right, flags, DATA + 64);
+                    }
+                    compare(&mut jit, &mut reference);
+                    assert_eq!(
+                        jit.memory().read(DATA, 16).unwrap(),
+                        reference.memory().read(DATA, 16).unwrap(),
+                        "{strategy:?}, producer={producer}, carry={carry}, {left:#x}, {right:#x}"
+                    );
+                }
+                assert_eq!(jit.stats.interpreter_entries, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn carry_controls_chain_through_inc_dec_adc_sbb_and_a_loop_merge() {
+    let bytes = assemble(|a| {
+        a.cmp(edx, ebx).unwrap();
+        a.cmc().unwrap();
+        a.inc(esi).unwrap();
+        a.dec(ebp).unwrap();
+        a.adc(eax, ecx).unwrap();
+        a.stc().unwrap();
+        a.sbb(esi, ebx).unwrap();
+        a.clc().unwrap();
+        a.mov(edi, 5).unwrap();
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.adc(eax, ecx).unwrap();
+        a.cmc().unwrap();
+        a.inc(esi).unwrap();
+        a.dec(edi).unwrap();
+        a.jnz(top).unwrap();
+        a.cmc().unwrap();
+        a.ret().unwrap();
+    });
+    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+        let mut jit = machine(&bytes, Some(strategy));
+        let mut reference = machine(&bytes, None);
+        for left in VALUES {
+            for right in VALUES {
+                for flags in [0x202, 0xed7] {
+                    for m in [&mut jit, &mut reference] {
+                        reset(m, left, right, flags, DATA + 64);
+                    }
+                    compare(&mut jit, &mut reference);
+                }
+            }
+        }
+        assert_eq!(jit.stats.interpreter_entries, 0);
+    }
+}
+
 #[test]
 fn sbb_forms_match_results_all_flags_and_live_conditions_at_borrow_boundaries() {
     carry_forms_match(true);

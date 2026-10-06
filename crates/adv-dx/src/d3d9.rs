@@ -16,6 +16,7 @@ use resources::Resource;
 mod capabilities;
 mod creation;
 mod cursor;
+mod dc;
 mod dirty;
 mod fixed;
 mod format;
@@ -46,6 +47,11 @@ const IID_DEVICE: Iid = [
 /// Thin assembly operations; no higher-layer payload is owned by this frontend.
 #[derive(Clone, Copy)]
 pub struct SurfaceProvider {
+    /// Explicit CPU/GDI access, assembled by the runtime without a frontend
+    /// dependency. The borrowed canvas is owned until `release_dc`.
+    pub acquire_dc: fn(&mut Env<'_>, u32, u32, u32, u32) -> Result<u32, String>,
+    pub writeback_dc: fn(&mut Env<'_>, u32, u32, u32) -> Result<(), String>,
+    pub release_dc: fn(&mut Env<'_>, u32),
     pub insert: fn(&mut Ext, Target) -> Result<u32, String>,
     pub target: fn(&Ext, u32) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
@@ -70,6 +76,7 @@ enum Payload {
     Device(Box<Device>),
     Resource(Resource),
     Buffer(buffers::Buffer),
+    Declaration(declaration::Declaration),
 }
 struct Device {
     pointer: u32,
@@ -98,8 +105,14 @@ pub struct State {
     provider: SurfaceProvider,
     pending: Vec<Pending>,
     transfers: Vec<readback::PendingTransfer>,
+    dcs: Vec<dc::Lease>,
     sender: Option<adv_sync::background::LocalSender>,
     wake: Option<std::sync::Arc<adv_sync::WakeEvent>>,
+    /// Whether creation offers COPY presentation. Accepting a swap effect
+    /// moves every engine that requests it onto its Direct3D path (SoftPAL
+    /// then needs vertex declarations), so a profile can withhold COPY when
+    /// that path regresses an engine that has a working fallback.
+    copy: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Diagnostics {
@@ -192,11 +205,13 @@ pub fn register(registry: &mut Registry) {
     capabilities::register(registry);
     targets::register(registry);
     buffers::register(registry);
+    declaration::register(registry);
     creation::register(registry);
     depth::register(registry);
     memory::register(registry);
     cursor::register(registry);
     dirty::register(registry);
+    dc::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -212,6 +227,7 @@ pub fn install<B: Backend>(
         "IDirect3DSurface9",
         "IDirect3DVertexBuffer9",
         "IDirect3DIndexBuffer9",
+        "IDirect3DVertexDeclaration9",
     ] {
         let signatures: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
@@ -247,8 +263,10 @@ pub fn install<B: Backend>(
         provider,
         pending: Vec::new(),
         transfers: Vec::new(),
+        dcs: Vec::new(),
         sender: None,
         wake: None,
+        copy: true,
     });
     Ok(())
 }
@@ -342,7 +360,8 @@ fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
         return release(env, parent);
     }
     let parent = resources::parent_on_last_public_release(env, pointer)
-        .or_else(|| buffers::parent_on_last_public_release(env, pointer));
+        .or_else(|| buffers::parent_on_last_public_release(env, pointer))
+        .or_else(|| declaration::parent_on_last_public_release(env, pointer));
     let Some(released) = com(env).release::<Payload>(&mut env.sys.objects, pointer) else {
         return 0;
     };
@@ -362,7 +381,8 @@ fn add_ref(env: &mut Env<'_>, pointer: u32) -> Option<u32> {
         return add_ref(env, parent);
     }
     let parent = resources::parent_on_first_public_retain(env, pointer)
-        .or_else(|| buffers::parent_on_first_public_retain(env, pointer));
+        .or_else(|| buffers::parent_on_first_public_retain(env, pointer))
+        .or_else(|| declaration::parent_on_first_public_retain(env, pointer));
     if let Some(parent) = parent {
         com(env).add_ref_identity(&mut env.sys.objects, parent)?;
     }
@@ -403,7 +423,8 @@ fn query(
         return Outcome::Return(0);
     }
     let parent = resources::parent_on_first_public_retain(env, this.addr())
-        .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()));
+        .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()))
+        .or_else(|| declaration::parent_on_first_public_retain(env, this.addr()));
     if let Some(parent) = parent
         && com(env)
             .add_ref_identity(&mut env.sys.objects, parent)
@@ -452,6 +473,7 @@ macro_rules! unknown {
     };
 }
 mod buffers;
+mod declaration;
 mod depth;
 mod resources;
 unknown!(
@@ -514,7 +536,7 @@ fn get_direct3d(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) ->
     }
     0
 }
-fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS) -> Option<String> {
+fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS, copy: bool) -> Option<String> {
     let mut reasons = Vec::new();
     for (name, value, supported) in [
         (
@@ -530,7 +552,7 @@ fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS) -> Option<String>
         (
             "SwapEffect",
             parameters.SwapEffect as u32,
-            matches!(parameters.SwapEffect, 1 | 3),
+            parameters.SwapEffect == 1 || copy && parameters.SwapEffect == 3,
         ),
         (
             "BackBufferCount",
@@ -602,7 +624,7 @@ fn normalize(
     {
         return Err(INVALID);
     }
-    if presentation_unavailable(parameters).is_some() {
+    if presentation_unavailable(parameters, env.ext.get::<State>().copy).is_some() {
         return Err(UNAVAILABLE);
     }
     if parameters.hDeviceWindow == 0 {
@@ -675,7 +697,8 @@ fn create_device(
         Ok(p) => p,
         Err(e) => {
             if e == UNAVAILABLE {
-                let reason = presentation_unavailable(input).unwrap();
+                let copy = env.ext.get::<State>().copy;
+                let reason = presentation_unavailable(input, copy).unwrap();
                 warn_create_unavailable(env, adapter, kind, focus.0, flags, Some(input), &reason);
             }
             return Outcome::Return(e);
@@ -1241,7 +1264,9 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
         ext: &mut machine.ext,
         thunk: 0,
     };
-    Ok(readback::pump(&mut env) || progress)
+    let readback = readback::pump(&mut env);
+    dc::reap_cancelled(&mut env);
+    Ok(readback || progress)
 }
 /// Process stop cancels map ownership and closes internal wait handles. Accepted
 /// fence tasks still finish on the one service before the host window is destroyed.
@@ -1262,6 +1287,7 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
         release_pending_owners(&mut env, wait.owner, wait.resources);
     }
     readback::cancel_pending(&mut env);
+    dc::cancel_all(&mut env);
 }
 #[win32(d3d9, name = "IDirect3DDevice9::Clear", level = implement)]
 fn clear(

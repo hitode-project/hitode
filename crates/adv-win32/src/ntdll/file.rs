@@ -31,7 +31,7 @@ pub(super) fn register(registry: &mut Registry) {
 }
 
 #[win32(ntdll, name = "ZwClose", level = implement)]
-fn close(env: &mut Env<'_>, handle: Handle) -> i32 {
+pub(super) fn close(env: &mut Env<'_>, handle: Handle) -> i32 {
     // Native pseudo-process/thread closes succeed without releasing an owned
     // reference. This does not apply to Win32's legacy stdio constants.
     if matches!(handle.0, 0xffff_ffff | 0xffff_fffe) {

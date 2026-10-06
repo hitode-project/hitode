@@ -82,7 +82,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --schedule-profile PATH opt-in scheduling and lock boundary TSV\n\
   --auto-dialog-ms N      explicitly auto-select dialog defaults after N guest ms\n\
   --self-test-input       post A key and left-click after the first idle\n\
-  --profile               collect execution timings by guest address\n\
+  --profile               collect execution timings; with --report writes .cpu.tsv (disables region links)\n\
   --control-stdin         explicitly enable line-based diagnostic commands\n\
   --help                  show this help\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
@@ -1629,6 +1629,39 @@ fn run_execution(
         }
     }
     runtime.machine.sys.trace.flush();
+    if options.profile {
+        let mut entries: Vec<_> = runtime.machine.cpu.profile().into_iter().collect();
+        entries.sort_unstable_by_key(|(_, sample)| {
+            std::cmp::Reverse(sample.native_ns.saturating_add(sample.interpreter_ns))
+        });
+        if let Some(report) = &options.report {
+            use std::io::Write;
+            let path = report.with_extension("cpu.tsv");
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut output = std::io::BufWriter::new(
+                std::fs::File::create(&path).map_err(|e| e.to_string())?,
+            );
+            writeln!(output, "pc\tnative_entries\tnative_ns\tinterpreter_entries\tinterpreter_instructions\tinterpreter_ns")
+                .map_err(|e| e.to_string())?;
+            for (pc, sample) in &entries {
+                writeln!(output, "{pc:#010x}\t{}\t{}\t{}\t{}\t{}",
+                    sample.native_entries, sample.native_ns, sample.interpreter_entries,
+                    sample.interpreter_instructions, sample.interpreter_ns,
+                ).map_err(|e| e.to_string())?;
+            }
+            output.flush().map_err(|e| e.to_string())?;
+            eprintln!("CPU execution profile: {} (region linking is disabled while profiling)",
+                path.display());
+        } else {
+            for (pc, sample) in entries.iter().take(20) {
+                eprintln!("CPU {pc:#010x}: native {} ns / {} entries; interpreter {} ns / {} instructions",
+                    sample.native_ns, sample.native_entries, sample.interpreter_ns,
+                    sample.interpreter_instructions);
+            }
+        }
+    }
     #[cfg(all(windows, feature = "gpu"))]
     let native_frame = runtime.has_native_frame();
     #[cfg(not(all(windows, feature = "gpu")))]

@@ -107,6 +107,66 @@ fn budget_and_memory_faults_publish_flags_before_a_future_full_writer() {
 }
 
 struct NotifyAtTrap(Arc<AtomicBool>);
+
+#[test]
+fn carry_controls_publish_exact_flags_at_budget_and_fault_boundaries() {
+    for carry in 0..3 {
+        let bytes = code(|a| {
+            a.cmp(eax, ebx).unwrap();
+            match carry {
+                0 => a.clc(),
+                1 => a.stc(),
+                _ => a.cmc(),
+            }
+            .unwrap();
+            let mut boundary = a.create_label();
+            a.jmp(boundary).unwrap();
+            a.set_label(&mut boundary).unwrap();
+            a.mov(esi, dword_ptr(edx)).unwrap();
+            // A later complete flag writer cannot hide the carry edit at
+            // either observable boundary before this instruction executes.
+            a.add(edi, 1).unwrap();
+            a.ret().unwrap();
+        });
+        let boundary = Decoder::with_ip(32, &bytes, u64::from(CODE), DecoderOptions::NONE)
+            .into_iter()
+            .find(|i| i.mnemonic() == Mnemonic::Jmp)
+            .unwrap()
+            .near_branch32();
+        for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
+            let mut jit = machine(&bytes, Some(strategy));
+            let mut reference = machine(&bytes, None);
+            assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
+            assert_eq!(
+                reference.run_unicorn(boundary, 100).unwrap(),
+                RunOutcome::ReachedStop
+            );
+            assert_eq!(jit.state.eip, boundary);
+            assert_eq!(jit.state.regs, reference.state.regs);
+            assert_eq!(jit.state.eflags, reference.state.eflags);
+            assert_eq!(jit.state.eflags, if carry == 1 { 0x297 } else { 0x296 });
+            for m in [&mut jit, &mut reference] {
+                m.protect(BAD, 4096, 0).unwrap();
+            }
+            let fault = RunOutcome::ReadFault {
+                pc: boundary,
+                address: BAD,
+            };
+            assert_eq!(reference.run_unicorn(STOP, 100).unwrap(), fault);
+            assert_eq!(jit.run(STOP, 100).unwrap(), fault);
+            assert_eq!(jit.state.regs, reference.state.regs);
+            assert_eq!(jit.state.eflags, reference.state.eflags);
+
+            let mut fresh = machine(&bytes, Some(strategy));
+            fresh.protect(BAD, 4096, 0).unwrap();
+            assert_eq!(fresh.run(STOP, 100).unwrap(), fault);
+            assert_eq!(fresh.state.regs, reference.state.regs);
+            assert_eq!(fresh.state.eflags, reference.state.eflags);
+            assert_eq!(fresh.stats.interpreter_instructions, 0);
+        }
+    }
+}
+
 impl ExecutionTrap for NotifyAtTrap {
     fn call(
         &mut self,

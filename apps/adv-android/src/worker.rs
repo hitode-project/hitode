@@ -197,7 +197,9 @@ fn audio_info(output: &adv_device::Output) -> Value {
         "device_sample_rate":metrics.device_sample_rate.load(Ordering::Relaxed),
         "device_channels":metrics.device_channels.load(Ordering::Relaxed),
         "output_frames":metrics.output_frames.load(Ordering::Relaxed),
-        "native_clock_callbacks":metrics.native_clock_callbacks.load(Ordering::Relaxed)})
+        "native_clock_callbacks":metrics.native_clock_callbacks.load(Ordering::Relaxed),
+        "device_consumed_frames":metrics.device_consumed_frames.load(Ordering::Relaxed),
+        "device_queued_frames":metrics.device_queued_frames.load(Ordering::Relaxed)})
 }
 fn snapshot(
     runtime: &Runtime,

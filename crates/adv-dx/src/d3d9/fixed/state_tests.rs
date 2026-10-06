@@ -362,8 +362,16 @@ mod state_tests {
                         call(&mut env, set_render_ABI, &[pointer, 161, last_pixel]),
                         0
                     );
-                    let draw = prepare(&env, pointer, 2, 1, GuestPtr::new(vertices), stride, None)
-                        .unwrap();
+                    let draw = prepare(
+                        &mut env,
+                        pointer,
+                        2,
+                        1,
+                        GuestPtr::new(vertices),
+                        stride,
+                        None,
+                    )
+                    .unwrap();
                     assert_eq!(draw.state.last_pixel, last_pixel != 0);
                     for vertex in draw.vertices {
                         assert_eq!(vertex.color, [128. / 255., 64. / 255., 32. / 255., 1.]);
@@ -392,5 +400,102 @@ mod state_tests {
         assert_eq!(release(&mut env, factory), 0);
         assert_eq!(env.sys.objects.object_count(), 0);
         assert!(env.ext.get::<Surfaces>().targets.is_empty());
+    }
+
+    #[test]
+    fn permuted_declaration_decodes_like_its_fvf_and_reset_unbinds_it() {
+        use super::super::super::declaration;
+        let mut machine = machine();
+        let mut env = env(&mut machine);
+        gpu(&mut env);
+        let (factory, _) = object(&mut env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
+        let parameters = GuestPtr::new(DATA + 0x100);
+        let present = D3DPRESENT_PARAMETERS {
+            BackBufferWidth: 16,
+            BackBufferHeight: 12,
+            BackBufferFormat: 22,
+            BackBufferCount: 1,
+            SwapEffect: 1,
+            hDeviceWindow: 0x7788,
+            Windowed: 1,
+            ..Default::default()
+        };
+        parameters.write(env.cpu, present).unwrap();
+        assert_eq!(
+            call(
+                &mut env,
+                create_device_ABI,
+                &[factory, 0, 1, 0x7788, 0x24, parameters.addr(), DATA]
+            ),
+            0
+        );
+        let pointer = env.cpu.read_u32(DATA).unwrap();
+        let this = GuestPtr::new(pointer);
+        // TEXCOORD0 FLOAT2 @0, COLOR0 D3DCOLOR @8, POSITIONT FLOAT4 @12.
+        let elements = DATA + 0x200;
+        let mut bytes = Vec::new();
+        for (offset, kind, usage) in [(0u16, 1u8, 5u8), (8, 4, 10), (12, 3, 9)] {
+            bytes.extend([0, 0]);
+            bytes.extend(offset.to_le_bytes());
+            bytes.extend([kind, 0, usage, 0]);
+        }
+        bytes.extend([0xff, 0, 0, 0, 17, 0, 0, 0]);
+        env.cpu.write(elements, &bytes).unwrap();
+        let output = GuestPtr::<u32>::new(DATA + 0x300);
+        assert_eq!(
+            declaration::create(&mut env, this, GuestPtr::new(elements), output),
+            0
+        );
+        let decl = output.read(env.cpu).unwrap();
+        let corners = [(1.5f32, 1.5f32), (12.5, 1.5), (1.5, 8.5)];
+        let vertex = |x: f32, y: f32, permuted: bool| {
+            let position = [x.to_bits(), y.to_bits(), 0.5f32.to_bits(), 1f32.to_bits()];
+            let rest = [0.25f32.to_bits(), 0.75f32.to_bits()];
+            let words: Vec<u32> = if permuted {
+                rest.into_iter()
+                    .chain([0xff804020])
+                    .chain(position)
+                    .collect()
+            } else {
+                position
+                    .into_iter()
+                    .chain([0xff804020])
+                    .chain(rest)
+                    .collect()
+            };
+            words
+        };
+        assert_eq!(call(&mut env, begin_scene_ABI, &[pointer]), 0);
+        let mut decoded = Vec::new();
+        for permuted in [false, true] {
+            let words: Vec<u8> = corners
+                .iter()
+                .flat_map(|&(x, y)| vertex(x, y, permuted))
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let vertices = DATA + 0x400;
+            env.cpu.write(vertices, &words).unwrap();
+            if permuted {
+                assert_eq!(declaration::set(&mut env, this, GuestPtr::new(decl)), 0);
+            } else {
+                assert_eq!(call(&mut env, set_fvf_ABI, &[pointer, 0x144]), 0);
+            }
+            let draw = prepare(&mut env, pointer, 4, 1, GuestPtr::new(vertices), 28, None).unwrap();
+            decoded.push(draw.vertices);
+        }
+        let fields = |v: &[adv_device::gpu::Vertex]| -> Vec<_> {
+            v.iter().map(|v| (v.position, v.color, v.uv)).collect()
+        };
+        assert_eq!(fields(&decoded[0]), fields(&decoded[1]));
+        assert_eq!(decoded[0][0].uv, [0.25, 0.75]);
+        assert_eq!(call(&mut env, end_scene_ABI, &[pointer]), 0);
+        // Reset restores the default (no declaration) and drops the binding.
+        assert_eq!(release(&mut env, decl), 0);
+        assert_eq!(call(&mut env, reset_ABI, &[pointer, parameters.addr()]), 0);
+        assert_eq!(declaration::get(&mut env, this, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 0);
+        assert_eq!(release(&mut env, pointer), 0);
+        assert_eq!(release(&mut env, factory), 0);
+        assert_eq!(env.sys.objects.object_count(), 0);
     }
 }

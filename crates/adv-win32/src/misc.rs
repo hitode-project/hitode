@@ -11,6 +11,7 @@ mod ole_memory;
 mod property_sheet;
 mod shell_execute;
 mod shell_icon;
+mod shell_drop;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
@@ -301,6 +302,7 @@ pub fn register(reg: &mut Registry) {
     internet::register(reg);
     shell_execute::register(reg);
     shell_icon::register(reg);
+    shell_drop::register(reg);
     property_sheet::register(reg);
     stdcall(
         reg,

@@ -234,6 +234,7 @@ fn block_call_and_defer_keep_results_wait_flags_and_original_call_sample() {
         args,
         then,
         stack,
+        ..
     } = then(&mut env, Resume::Woke(WakeReason::Timeout))
     else {
         panic!("call preserved")

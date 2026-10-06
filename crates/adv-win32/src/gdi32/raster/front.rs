@@ -8,6 +8,7 @@ use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine, Objects};
 
 mod display;
+pub mod surface_dc;
 
 #[derive(Clone, Copy)]
 pub struct DrawingProvider {
@@ -18,6 +19,8 @@ pub struct State {
     raster: Raster,
     dcs: DeviceContexts,
     provider: Option<DrawingProvider>,
+    /// Canvas bitmaps lent to another frontend, retired only by that owner.
+    surface_dcs: std::collections::BTreeMap<u32, u32>,
 }
 pub fn install<B: Backend>(machine: &mut Machine<B>) {
     let gdi = machine.ext.get::<Win32>().gdi.clone();
@@ -25,6 +28,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) {
         raster: Raster::default(),
         dcs: DeviceContexts::new(gdi),
         provider: None,
+        surface_dcs: Default::default(),
     });
 }
 pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
@@ -318,6 +322,14 @@ fn create_dib(
 }
 #[win32(gdi32, name = "SelectObject", level = implement)]
 fn select_object(env: &mut Env<'_>, dc: Handle, object: Handle) -> Outcome {
+    if env
+        .ext
+        .try_get::<State>()
+        .is_some_and(|s| s.surface_dcs.contains_key(&dc.0))
+        && (object.0 == STOCK_BITMAP || env.ext.get::<SurfaceStore>().contains(object.0))
+    {
+        return fail(env, 87);
+    }
     if available(env)
         && (object.0 == STOCK_BITMAP || env.ext.get::<SurfaceStore>().contains(object.0))
     {
@@ -329,6 +341,13 @@ fn select_object(env: &mut Env<'_>, dc: Handle, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteObject", level = implement)]
 fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
+    if env
+        .ext
+        .try_get::<State>()
+        .is_some_and(|s| s.surface_dcs.values().any(|&bitmap| bitmap == object.0))
+    {
+        return Outcome::Return(0);
+    }
     if matches!(
         env.ext.get::<Win32>().gdi.get(&env.sys.objects, object.0),
         Some(adv_os::gdi::GdiObj::Dc { .. })
@@ -350,7 +369,9 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteDC", level = implement)]
 fn delete_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
-    if available(env) && dc.0 == WINDOW_DC {
+    if available(env)
+        && (dc.0 == WINDOW_DC || env.ext.get::<State>().surface_dcs.contains_key(&dc.0))
+    {
         return Outcome::Return(0); // GetDC lends this DC; ReleaseDC returns it.
     }
     if available(env)
