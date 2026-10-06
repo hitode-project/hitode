@@ -7,6 +7,7 @@ use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 mod internet;
+pub(crate) mod imm;
 mod image_list;
 mod ole_memory;
 mod property_sheet;
@@ -23,7 +24,6 @@ use crate::{Win32, stdcall};
 const SHLWAPI: &str = "shlwapi.dll";
 const SHELL32: &str = "shell32.dll";
 const SHFOLDER: &str = "shfolder.dll";
-const IMM32: &str = "imm32.dll";
 const COMDLG32: &str = "comdlg32.dll";
 const SENSAPI: &str = "sensapi.dll";
 const COMCTL32: &str = "comctl32.dll";
@@ -377,13 +377,7 @@ pub fn register(reg: &mut Registry) {
         set_last_error(e, 0);
         Outcome::Return(0)
     });
-    stdcall(reg, IMM32, "ImmReleaseContext", 2, |_| Outcome::Return(1));
-    stdcall(reg, IMM32, "ImmSetOpenStatus", 2, |_| Outcome::Return(1));
-    stdcall(reg, IMM32, "ImmGetOpenStatus", 1, |_| Outcome::Return(0));
-    stdcall(reg, IMM32, "ImmSetConversionStatus", 3, |_| {
-        Outcome::Return(1)
-    });
-    stdcall(reg, IMM32, "ImmAssociateContext", 2, |_| Outcome::Return(0));
+    imm::register(reg);
     stdcall(reg, "mpr.dll", "WNetGetUniversalNameA", 4, |_| {
         Outcome::Return(2250) // ERROR_NOT_CONNECTED
     });
