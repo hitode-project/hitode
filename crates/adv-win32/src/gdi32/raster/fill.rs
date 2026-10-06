@@ -107,7 +107,7 @@ fn paint_rectangles(
         adv_abi::warn_unavailable(env, api, "only MM_TEXT brush drawing is available");
         return fail(env, 50);
     }
-    let (target, palette, clip) = (selected[3], *palette, clip.clone());
+    let (target, palette, clip, modes) = (selected[3], *palette, clip.clone(), *modes);
     let stock = brush.0.checked_sub(stock_object(0));
     let color = match stock {
         Some(0) => 0xffffff,
@@ -155,6 +155,8 @@ fn paint_rectangles(
     let rectangles = rectangles
         .iter()
         .filter_map(|&[l, t, r, b]| {
+            let [l, t] = modes.to_device(l, t);
+            let [r, b] = modes.to_device(r, b);
             let l = l.max(0).min(i64::from(surface.width)) as u32;
             let t = t.max(0).min(i64::from(surface.height)) as u32;
             let r = r.max(0).min(i64::from(surface.width)) as u32;
@@ -259,6 +261,9 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
     if modes.map != 1 {
         return Outcome::Return(CLR_INVALID);
     }
+    let Some([x, y]) = modes.device_point(x, y) else {
+        return Outcome::Return(CLR_INVALID);
+    };
     if !super::clip::snapshot(env, dc.0).contains(x, y) {
         return Outcome::Return(CLR_INVALID);
     }
@@ -373,6 +378,9 @@ fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
     if modes.map != 1 {
         return Outcome::Return(CLR_INVALID);
     }
+    let Some([x, y]) = modes.device_point(x, y) else {
+        return Outcome::Return(CLR_INVALID);
+    };
     if !super::clip::snapshot(env, dc.0).contains(x, y) {
         return Outcome::Return(CLR_INVALID);
     }
@@ -438,6 +446,7 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
         return fail(env, 120);
     }
     let (target, palette) = (selected[3], *palette);
+    let [x, y] = modes.to_device(i64::from(x), i64::from(y));
     let brush_handle = match rop {
         BLACKNESS => stock_object(4), // BLACK_BRUSH
         WHITENESS => stock_object(0), // WHITE_BRUSH
@@ -485,10 +494,10 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
     if surface.pixels == 0 {
         return fail(env, 120);
     }
-    let left = x.max(0).min(surface.width as i32) as u32;
-    let top = y.max(0).min(surface.height as i32) as u32;
-    let right = (x.saturating_add(w)).max(0).min(surface.width as i32) as u32;
-    let bottom = (y.saturating_add(h)).max(0).min(surface.height as i32) as u32;
+    let left = x.max(0).min(i64::from(surface.width)) as u32;
+    let top = y.max(0).min(i64::from(surface.height)) as u32;
+    let right = (x + i64::from(w)).max(0).min(i64::from(surface.width)) as u32;
+    let bottom = (y + i64::from(h)).max(0).min(i64::from(surface.height)) as u32;
     if right <= left || bottom <= top {
         return Outcome::Return(1);
     }

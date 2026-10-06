@@ -13,6 +13,8 @@ pub struct DcModes {
     pub text_align: u32,
     /// Logical window origin. Initial MM_TEXT DCs start at (0, 0).
     pub window_origin: [i32; 2],
+    /// Device viewport origin. MM_TEXT uses translation without scaling.
+    pub viewport_origin: [i32; 2],
 }
 impl Default for DcModes {
     fn default() -> Self {
@@ -23,7 +25,21 @@ impl Default for DcModes {
             stretch: 1,
             text_align: 0,
             window_origin: [0, 0],
+            viewport_origin: [0, 0],
         }
+    }
+}
+
+impl DcModes {
+    pub fn to_device(&self, x: i64, y: i64) -> [i64; 2] {
+        [
+            x - i64::from(self.window_origin[0]) + i64::from(self.viewport_origin[0]),
+            y - i64::from(self.window_origin[1]) + i64::from(self.viewport_origin[1]),
+        ]
+    }
+    pub fn device_point(&self, x: i32, y: i32) -> Option<[i32; 2]> {
+        let [x, y] = self.to_device(i64::from(x), i64::from(y));
+        Some([i32::try_from(x).ok()?, i32::try_from(y).ok()?])
     }
 }
 

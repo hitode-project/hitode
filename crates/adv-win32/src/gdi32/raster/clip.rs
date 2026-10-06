@@ -14,6 +14,8 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(exclude_ABI);
     reg.register(rect_visible_ABI);
     reg.register(window_origin_ABI);
+    reg.register(set_window_origin_ABI);
+    reg.register(set_viewport_origin_ABI);
 }
 fn unsupported(env: &mut Env<'_>, reason: &str) -> Outcome {
     adv_abi::warn_unavailable(env, "gdi32.dll!ExcludeClipRect", reason);
@@ -47,6 +49,15 @@ fn exclude(env: &mut Env<'_>, dc: Handle, left: i32, top: i32, right: i32, botto
         return unsupported(env, "the DC has no CPU raster provider");
     }
     let (w, h) = (surface.width, surface.height);
+    let (Some([left, top]), Some([right, bottom])) = (
+        modes.device_point(left, top),
+        modes.device_point(right, bottom),
+    ) else {
+        return unsupported(
+            env,
+            "the translated clipping coordinates exceed the supported device range",
+        );
+    };
     let mut next = clip.clone();
     if !next.exclude([left, top, right, bottom]) {
         return unsupported(
@@ -96,6 +107,73 @@ fn window_origin(env: &mut Env<'_>, dc: Handle, output: GuestPtr<POINT>) -> Outc
     Outcome::Return(1)
 }
 
+#[win32(gdi32,name="SetWindowOrgEx",level=state)]
+fn set_window_origin(
+    env: &mut Env<'_>,
+    dc: Handle,
+    x: i32,
+    y: i32,
+    old: GuestPtr<POINT>,
+) -> Outcome {
+    set_origin(env, dc, [x, y], old, false)
+}
+#[win32(gdi32,name="SetViewportOrgEx",level=state)]
+fn set_viewport_origin(
+    env: &mut Env<'_>,
+    dc: Handle,
+    x: i32,
+    y: i32,
+    old: GuestPtr<POINT>,
+) -> Outcome {
+    set_origin(env, dc, [x, y], old, true)
+}
+fn set_origin(
+    env: &mut Env<'_>,
+    dc: Handle,
+    next: [i32; 2],
+    output: GuestPtr<POINT>,
+    viewport: bool,
+) -> Outcome {
+    let api = if viewport {
+        "gdi32.dll!SetViewportOrgEx"
+    } else {
+        "gdi32.dll!SetWindowOrgEx"
+    };
+    let gdi = env.ext.get::<Win32>().gdi.clone();
+    let Some(GdiObj::Dc { modes, .. }) = gdi.get(&env.sys.objects, dc.0) else {
+        set_last_error(env, 6);
+        return Outcome::Return(0);
+    };
+    if modes.map != 1 {
+        adv_abi::warn_unavailable(env, api, "only MM_TEXT origin translation is available");
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    let [x, y] = if viewport {
+        modes.viewport_origin
+    } else {
+        modes.window_origin
+    };
+    // Optional previous POINT is completely preflighted before either output or
+    // DC state changes. The origins never relocate the already stored device clip.
+    if !output.is_null()
+        && (adv_abi::guest::check_range(env.cpu, output.addr(), 8, Prot::WRITE).is_err()
+            || output.write(env.cpu, POINT { x, y }).is_err())
+    {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut env.sys.objects, dc.0) else {
+        unreachable!("checked DC")
+    };
+    if viewport {
+        modes.viewport_origin = next;
+    } else {
+        modes.window_origin = next;
+    }
+    Outcome::Return(1)
+}
+
 #[win32(gdi32, name="RectVisible", level=state)]
 fn rect_visible(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>) -> Outcome {
     let Some(GdiObj::Dc {
@@ -117,7 +195,7 @@ fn rect_visible(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>) -> Out
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
-    let (target, clip) = (selected[3], clip.clone());
+    let (target, clip, modes) = (selected[3], clip.clone(), *modes);
     if adv_abi::guest::check_range(env.cpu, rectangle.addr(), 16, Prot::READ).is_err() {
         set_last_error(env, 87);
         return Outcome::Return(0);
@@ -140,8 +218,10 @@ fn rect_visible(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>) -> Out
         return Outcome::Return(0);
     };
     // This query needs owned geometry, not CPU pixel access or host window state.
-    Outcome::Return(u32::from(clip.intersects(
-        [r.left, r.top, r.right, r.bottom],
+    let [left, top] = modes.to_device(i64::from(r.left), i64::from(r.top));
+    let [right, bottom] = modes.to_device(i64::from(r.right), i64::from(r.bottom));
+    Outcome::Return(u32::from(clip.intersects_device(
+        [left, top, right, bottom],
         surface.width,
         surface.height,
     )))

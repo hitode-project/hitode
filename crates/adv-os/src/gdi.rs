@@ -104,6 +104,13 @@ impl DeviceContexts {
         }
     }
 
+    pub fn modes(&self, objects: &Objects, dc: u32) -> Option<DcModes> {
+        match self.gdi.get(objects, dc) {
+            Some(GdiObj::Dc { modes, .. }) => Some(*modes),
+            _ => None,
+        }
+    }
+
     pub fn set_stretch_mode(&mut self, objects: &mut Objects, dc: u32, mode: u32) -> Option<u32> {
         if dc == WINDOW_DC && !self.gdi.register_external_dc(objects, dc, 0) {
             return None;

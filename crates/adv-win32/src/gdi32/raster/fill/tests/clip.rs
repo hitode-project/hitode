@@ -497,3 +497,258 @@ fn window_origin_query_reads_shared_modes_and_atomically_preserves_errors_and_li
     assert_eq!(value(&m), [11, -7]);
     assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
 }
+
+#[test]
+fn mm_text_origins_translate_pixels_and_each_transfer_owner_without_relocating_device_clip() {
+    let (mut m, data, dc, pixels) = fixture(8, 8, PixelFormat::Bgra32, false);
+    let count = m.sys.objects.object_count();
+    let old = data + 128;
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!ExcludeClipRect", &[dc, 2, 2, 5, 5]),
+        3
+    );
+    assert_eq!(call(&mut m, data, "gdi32.dll!SaveDC", &[dc]), 1);
+    crate::util::set_last_error(&mut env(&mut m), 0x12345678);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!SetWindowOrgEx",
+            &[dc, (-1_i32) as u32, (-1_i32) as u32, old]
+        ),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(old).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(old + 4).unwrap(), 0);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetViewportOrgEx", &[dc, 1, 0, old]),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(old).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(old + 4).unwrap(), 0);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
+    rect(&mut m, data, [0, 0, 5, 5]);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "user32.dll!FillRect",
+            &[dc, data, stock_object(0)]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 124, 96, 96, 96, 124, 0, 0]);
+    rect(&mut m, data, [0, 1, 3, 4]);
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 0);
+    rect(&mut m, data, [3, 1, 4, 2]);
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 1);
+    // New clipping coordinates translate now; the old hole remains device [2,2,5,5].
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!ExcludeClipRect",
+            &[dc, (-2_i32) as u32, (-1_i32) as u32, u32::MAX, 0]
+        ),
+        3
+    );
+    let clip = super::super::super::clip::snapshot(&env(&mut m), dc);
+    assert!(!clip.contains(0, 0));
+    assert!(!clip.contains(3, 3));
+    assert!(clip.contains(5, 3));
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetPixel", &[dc, 0, 1, 0xffffff]),
+        u32::MAX
+    );
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetPixel", &[dc, 0, 0, 0xffffff]),
+        0xffffff
+    );
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 2) * 4).unwrap(), 0xffffff);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetPixel", &[dc, 0, 0]),
+        0xffffff
+    );
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    rect(&mut m, data, [0, 0, 5, 5]);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "user32.dll!FrameRect",
+            &[dc, data, stock_object(0)]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 124, 64, 64, 64, 124, 0, 0]);
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!PatBlt",
+            &[dc, 3, 2, 2, 2, 0xff0062]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 0, 0, 96, 96, 0, 0, 0]);
+    // Source and destination DCs have distinct origins; source clip is not applied.
+    let mut contexts = adv_os::gdi::DeviceContexts::new(m.ext.get::<Win32>().gdi.clone());
+    let (src, src_dc, src_pixels) = {
+        let store = m.ext.get_mut::<SurfaceStore>();
+        let src = store
+            .create(8, 8, false, PixelFormat::Bgra32, &mut memory(&mut m.cpu))
+            .unwrap();
+        let src_dc = store.new_id();
+        (src, src_dc, store.get(src).unwrap().pixels)
+    };
+    assert!(contexts.create(&mut m.sys.objects, src_dc, src));
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetWindowOrgEx", &[src_dc, 1, 0, 0]),
+        1
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!SetViewportOrgEx",
+            &[src_dc, 3, 0, 0]
+        ),
+        1
+    );
+    for x in 0..8 {
+        m.cpu.write_u32(src_pixels + x * 4, 0x10 + x).unwrap();
+    }
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!BitBlt",
+            &[dc, 1, 0, 2, 1, src_dc, 0, 0, 0xcc0020]
+        ),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 3) * 4).unwrap(), 0x12);
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 4) * 4).unwrap(), 0x13);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetStretchBltMode", &[dc, 3]),
+        1
+    );
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!StretchBlt",
+            &[dc, 0, 0, 2, 1, src_dc, 0, 0, 4, 1, 0xcc0020]
+        ),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 2) * 4).unwrap(), 0x12);
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 3) * 4).unwrap(), 0x14);
+    // DIB input coordinates are bitmap pixels, not an imaginary source DC origin.
+    let info = data + 1024;
+    let bits = data + 1100;
+    let mut header = [0; 40];
+    for (at, value) in [(0, 40_u32), (4, 2), (8, u32::MAX), (12, 0x0020_0001)] {
+        header[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    m.cpu.write(info, &header).unwrap();
+    m.cpu.write_u32(bits, 0x21).unwrap();
+    m.cpu.write_u32(bits + 4, 0x22).unwrap();
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!StretchDIBits",
+            &[dc, 0, 0, 2, 1, 0, 0, 2, 1, bits, info, 0, 0xcc0020]
+        ),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 2) * 4).unwrap(), 0x21);
+    assert_eq!(m.cpu.read_u32(pixels + (8 + 3) * 4).unwrap(), 0x22);
+    // Count-zero opaque text checks the same translated rectangle + fixed clip,
+    // without a host-dependent glyph shape expectation.
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    rect(&mut m, data, [0, 0, 2, 2]);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!ExtTextOutW",
+            &[dc, 0, 0, 2, data, 0, 0, 0]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 12, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(call(&mut m, data, "gdi32.dll!DeleteDC", &[src_dc]), 1);
+    assert_eq!(call(&mut m, data, "gdi32.dll!DeleteObject", &[src]), 1);
+    // Failed optional previous POINT must change neither half-output nor origins.
+    let guarded = m.sys.vm.alloc(&mut m.cpu, 8192, Prot::RW).unwrap();
+    m.cpu.write_u32(guarded + 4092, 0xdeadbeef).unwrap();
+    m.cpu.protect(guarded + 4096, 4096, Prot(0)).unwrap();
+    let gdi = m.ext.get::<Win32>().gdi.clone();
+    let modes = |m: &Machine<JitCpu>| {
+        let Some(GdiObj::Dc { modes, .. }) = gdi.get(&m.sys.objects, dc) else {
+            panic!("DC")
+        };
+        (modes.window_origin, modes.viewport_origin)
+    };
+    for api in ["gdi32.dll!SetWindowOrgEx", "gdi32.dll!SetViewportOrgEx"] {
+        assert_eq!(call(&mut m, data, api, &[dc, 123, 456, guarded + 4092]), 0);
+        assert_eq!(modes(&m), ([-1, -1], [1, 0]));
+        assert_eq!(m.cpu.read_u32(guarded + 4092).unwrap(), 0xdeadbeef);
+        assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+        assert_eq!(call(&mut m, data, api, &[dc, 123, 456, 0xfffffffc]), 0);
+        assert_eq!(modes(&m), ([-1, -1], [1, 0]));
+    }
+    m.cpu.protect(guarded, 4096, Prot::READ).unwrap();
+    for api in ["gdi32.dll!SetWindowOrgEx", "gdi32.dll!SetViewportOrgEx"] {
+        assert_eq!(call(&mut m, data, api, &[dc, 1, 2, guarded]), 0);
+        assert_eq!(modes(&m), ([-1, -1], [1, 0]));
+        assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+        assert_eq!(call(&mut m, data, api, &[0, 1, 2, old]), 0);
+        assert_eq!(crate::util::last_error(&env(&mut m)), 6);
+    }
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 2;
+    }
+    for api in ["gdi32.dll!SetWindowOrgEx", "gdi32.dll!SetViewportOrgEx"] {
+        assert_eq!(call(&mut m, data, api, &[dc, 1, 2, old]), 0);
+        assert_eq!(modes(&m), ([-1, -1], [1, 0]));
+        assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+        assert!(
+            m.ext
+                .get::<adv_abi::ApiDiagnostics>()
+                .warnings
+                .keys()
+                .any(|(name, _)| name == api)
+        );
+    }
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!RestoreDC", &[dc, u32::MAX]),
+        1
+    );
+    assert_eq!(modes(&m), ([0, 0], [0, 0]));
+    assert!(super::super::super::clip::snapshot(&env(&mut m), dc).contains(0, 0));
+    // The actual request and nullable output use the same state, not a facade.
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!SetWindowOrgEx",
+            &[dc, (-452_i32) as u32, (-18_i32) as u32, 0]
+        ),
+        1
+    );
+    assert_eq!(modes(&m), ([-452, -18], [0, 0]));
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!GetWindowOrgEx", &[dc, old]),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(old).unwrap() as i32, -452);
+    assert_eq!(m.cpu.read_u32(old + 4).unwrap() as i32, -18);
+    assert_eq!(m.sys.objects.object_count(), count);
+}

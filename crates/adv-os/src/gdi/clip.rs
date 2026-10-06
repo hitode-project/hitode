@@ -74,7 +74,12 @@ impl DcClip {
     /// Native normalizes reversed coordinates and gives zero-length axes one
     /// logical unit, including a point rectangle. Use i64 for the i32::MAX edge.
     pub fn intersects(&self, rect: [i32; 4], width: u32, height: u32) -> bool {
-        let [l, t, r, b] = rect.map(i64::from);
+        self.intersects_device(rect.map(i64::from), width, height)
+    }
+
+    /// Input has already been translated into the fixed device clipping space.
+    pub fn intersects_device(&self, rect: [i64; 4], width: u32, height: u32) -> bool {
+        let [l, t, r, b] = rect;
         let (l, t, r, b) = (l.min(r), t.min(b), l.max(r), t.max(b));
         let r = if r == l { r + 1 } else { r };
         let b = if b == t { b + 1 } else { b };

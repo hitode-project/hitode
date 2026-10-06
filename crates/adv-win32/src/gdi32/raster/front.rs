@@ -85,6 +85,19 @@ fn raster_call(
         &mut dyn SurfaceMemory,
     ) -> Result<u32, String>,
 ) -> Outcome {
+    raster_call_named(env, None, call)
+}
+fn raster_call_named(
+    env: &mut Env<'_>,
+    api: Option<&str>,
+    call: impl FnOnce(
+        &mut Raster,
+        &mut SurfaceStore,
+        &mut DeviceContexts,
+        &mut Objects,
+        &mut dyn SurfaceMemory,
+    ) -> Result<u32, String>,
+) -> Outcome {
     let Some(provider) = env.ext.get::<State>().provider else {
         return Outcome::Fail("raster memory provider is not installed".into());
     };
@@ -113,7 +126,18 @@ fn raster_call(
         return outcome;
     }
     match result {
-        Ok(0) if error != 0 => fail(env, error),
+        Ok(0) if error != 0 => {
+            if error == 50
+                && let Some(api) = api
+            {
+                adv_abi::warn_unavailable(
+                    env,
+                    api,
+                    "the coordinate mapping or translated device range is unavailable",
+                );
+            }
+            fail(env, error)
+        }
         Ok(value) => Outcome::Return(value),
         Err(error) => Outcome::Fail(format!("GDI raster: {error}")),
     }
@@ -405,7 +429,7 @@ fn bit_blt(
     if !available(env) {
         return fail(env, 6);
     }
-    raster_call(env, |r, s, d, o, m| {
+    raster_call_named(env, Some("gdi32.dll!BitBlt"), |r, s, d, o, m| {
         r.bit_blt(
             s,
             d,
@@ -441,7 +465,7 @@ fn stretch_blt(
     if !available(env) {
         return fail(env, 6);
     }
-    raster_call(env, |r, s, d, o, m| {
+    raster_call_named(env, Some("gdi32.dll!StretchBlt"), |r, s, d, o, m| {
         r.stretch_blt(
             s,
             d,
@@ -484,7 +508,7 @@ fn stretch_dib(
     if adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err() {
         return fail(env, 87);
     }
-    raster_call(env, |r, s, d, o, m| {
+    raster_call_named(env, Some("gdi32.dll!StretchDIBits"), |r, s, d, o, m| {
         r.stretch_dib(
             s,
             d,

@@ -226,6 +226,33 @@ fn output(
         );
     }
     let opaque_background = *bk_mode == 2;
+    let modes = *modes;
+    let Some([x, y]) = modes.device_point(x, y) else {
+        return unavailable(
+            env,
+            "translated text coordinates exceed the supported device range",
+        );
+    };
+    let r = match r {
+        Some(r) => {
+            let (Some([left, top]), Some([right, bottom])) = (
+                modes.device_point(r.left, r.top),
+                modes.device_point(r.right, r.bottom),
+            ) else {
+                return unavailable(
+                    env,
+                    "translated text rectangle exceeds the supported device range",
+                );
+            };
+            Some(TextBox {
+                left,
+                top,
+                right,
+                bottom,
+            })
+        }
+        None => None,
+    };
     let clip = super::super::raster::clip::snapshot(env, dc);
     let font = font_request(env, dc);
     if font.baseline_angle != 0 || font.glyph_angle != 0 || font.face.starts_with('@') {
