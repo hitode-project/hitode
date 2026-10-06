@@ -56,6 +56,7 @@ pub struct Stats {
     pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
+    pub memo: crate::MemoStats,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -157,6 +158,8 @@ pub struct Executor {
     deferred_fallback: Option<u32>,
     interpreter_profile: Option<Box<interpreter_profile::Profile>>,
     timestamp: crate::timestamp::Counter,
+    /// Guest function result reuse; None unless enabled.
+    memo: Option<Box<crate::memo::Memo>>,
     pub state: CpuState,
     pub stats: Stats,
 }
@@ -233,8 +236,15 @@ impl Executor {
             deadline: self.deadline,
             bulk_calls: 0,
             bulk_bytes: 0,
+            memo: std::ptr::null_mut(),
+            recorder: std::ptr::null_mut(),
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
+        // A recording covers one uninterrupted execution of its function.
+        self.memo_abort(crate::memo::Abort::Context);
+        if let Some(memo) = &self.memo {
+            self.stats.memo = memo.stats();
+        }
         if self.parallel.is_some() {
             if self.stats.interpreter_entries != interpreted_before {
                 self.admission.cold();
@@ -313,6 +323,7 @@ impl Executor {
             deferred_fallback: None,
             interpreter_profile: interpreter_profile::Profile::from_env(),
             timestamp: crate::timestamp::Counter::default(),
+            memo: crate::memo::Memo::from_env(),
             state: CpuState::default(),
             stats: Stats::default(),
         })
@@ -418,7 +429,7 @@ impl Executor {
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
         let start = Instant::now();
-        let compiled = compile::compile(&region, &self.memory, self.shadow_returns.is_some())?;
+        let compiled = compile::compile_snapshot(&self.capture(&region)?)?;
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
         self.pending_regions.remove(&region.start);
@@ -428,6 +439,139 @@ impl Executor {
         self.automatic_regions.remove(&region.start);
         self.publish(region, compiled);
         Ok(())
+    }
+
+    fn capture(&self, region: &Region) -> Result<compile::Snapshot, String> {
+        let mut snapshot = compile::Snapshot::capture(region, &self.memory)?;
+        snapshot.shadow_returns = self.shadow_returns.is_some();
+        if let Some(memo) = &self.memo {
+            // Room for a completed final instruction.
+            snapshot.memo_hooks = memo.hooks_in(region.start, region.len + 16);
+        }
+        Ok(snapshot)
+    }
+
+    /// Enables guest function result reuse with these options, or disables it.
+    pub fn set_memo(&mut self, options: Option<crate::MemoOptions>) {
+        self.memo_abort(crate::memo::Abort::Context);
+        self.memo = options.map(|options| Box::new(crate::memo::Memo::new(options)));
+    }
+
+    /// Hooks a guest function entry for result reuse.
+    pub fn memo_hook(&mut self, pc: u32) {
+        if let Some(memo) = &mut self.memo {
+            memo.hook(pc);
+        }
+        self.memo_rehook();
+    }
+
+    pub fn memo_stats(&self) -> Option<crate::MemoStats> {
+        self.memo.as_ref().map(|memo| memo.stats())
+    }
+
+    /// Recompiles published owners of functions whose hook changed.
+    fn memo_rehook(&mut self) {
+        let Some(memo) = self.memo.as_deref_mut() else {
+            return;
+        };
+        if memo.changed.is_empty() {
+            return;
+        }
+        let changed = std::mem::take(&mut memo.changed);
+        let owners: Vec<u32> = self
+            .code
+            .compiled
+            .iter()
+            .filter(|(_, compiled)| changed.iter().any(|pc| compiled.entries.contains(pc)))
+            .map(|(&owner, _)| owner)
+            .collect();
+        for owner in owners {
+            let Some(region) = self.code.regions.get(&owner).cloned() else {
+                continue;
+            };
+            let Ok(snapshot) = self.capture(&region) else {
+                continue;
+            };
+            if let Ok(compiled) = compile::compile_snapshot(&snapshot) {
+                self.stats.compilations += 1;
+                self.publish(region, compiled);
+            }
+        }
+    }
+
+    /// Starts, completes or bounds the current recording at an executor
+    /// boundary. True while a recording continues.
+    fn memo_progress(&mut self) -> bool {
+        let Some(memo) = self.memo.as_deref_mut() else {
+            return false;
+        };
+        let Some(recorder) = memo.recording.as_deref_mut() else {
+            return false;
+        };
+        if !recorder.armed {
+            recorder.armed = true;
+            recorder.saved_fuel = self.state.fuel;
+            self.state.fuel = crate::memo::RECORD_FUEL;
+            memo.prune_code(&self.memory);
+            return true;
+        }
+        let blocks = crate::memo::RECORD_FUEL.saturating_sub(self.state.fuel);
+        if self.state.eip == recorder.ret && self.state.regs[4] > recorder.entry_esp {
+            let recorder = memo.recording.take().unwrap();
+            self.state.fuel = recorder.saved_fuel;
+            memo.finish(recorder, &self.state, &self.memory, blocks);
+            return false;
+        }
+        if blocks > crate::memo::RECORD_LIMIT {
+            self.memo_abort(crate::memo::Abort::Limit);
+            return false;
+        }
+        true
+    }
+
+    fn memo_abort(&mut self, reason: crate::memo::Abort) {
+        let Some(memo) = self.memo.as_deref_mut() else {
+            return;
+        };
+        let Some(recorder) = memo.recording.take() else {
+            return;
+        };
+        if recorder.armed {
+            self.state.fuel = recorder.saved_fuel;
+        }
+        memo.abort(recorder, reason);
+    }
+
+    fn recording(&self) -> bool {
+        self.memo
+            .as_ref()
+            .is_some_and(|memo| memo.recording.is_some())
+    }
+
+    /// The record-mode variant of `owner` for the current PC.
+    fn memo_code(&mut self, owner: u32) -> bool {
+        let pc = self.state.eip;
+        let Some(memo) = self.memo.as_deref_mut() else {
+            return false;
+        };
+        if memo
+            .code
+            .get(&owner)
+            .is_some_and(|code| code.entries.contains(&pc) && code.valid(&self.memory))
+        {
+            return true;
+        }
+        let input = self.code.compiled[&owner].input().for_recording();
+        if !input.valid(&self.memory) {
+            return false;
+        }
+        match compile::compile_snapshot(&input) {
+            Ok(code) if code.entries.contains(&pc) => {
+                memo.add_code(owner, code);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn publish(&mut self, region: Region, compiled: Compiled) {
@@ -614,8 +758,7 @@ impl Executor {
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
             return Ok(false);
         }
-        let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
-        snapshot.shadow_returns = self.shadow_returns.is_some();
+        let snapshot = self.capture(&region)?;
         let fragments = if let Some(limit) = limit {
             match crate::compile_budget::plan(snapshot, limit) {
                 Ok(fragments) => fragments,
@@ -1199,6 +1342,8 @@ impl Executor {
             self.validate_stop(stop)?;
         }
         loop {
+            // A recording finishes its function before the slice may end.
+            let recording = self.memo_progress();
             if bridge.parked {
                 return Ok(RunOutcome::Parked);
             }
@@ -1206,13 +1351,13 @@ impl Executor {
                 return Ok(RunOutcome::ReachedStop);
             }
             let now = self.deadline.map(|_| Instant::now());
-            if self.deadline.zip(now).is_some_and(|(t, now)| now >= t) {
+            if !recording && self.deadline.zip(now).is_some_and(|(t, now)| now >= t) {
                 return Ok(RunOutcome::Budget);
             }
             if self.state.fuel == 0 {
                 return Ok(RunOutcome::Budget);
             }
-            if self.host_interrupts && self.interrupt.load(Ordering::Acquire) {
+            if !recording && self.host_interrupts && self.interrupt.load(Ordering::Acquire) {
                 return Ok(RunOutcome::Interrupted);
             }
             if self
@@ -1253,7 +1398,12 @@ impl Executor {
                     && self.deferred_fallback != Some(self.state.eip)
             });
             let native = native.map(|(owner, _)| owner);
+            if recording && !native.is_some_and(|owner| self.memo_code(owner)) {
+                self.memo_abort(crate::memo::Abort::Impure);
+            }
+            let recording = self.recording();
             if native.is_some()
+                && !recording
                 && self.parallel.is_some()
                 && self.parallel_demand
                 && self.admission.ready()
@@ -1275,7 +1425,11 @@ impl Executor {
                 // At the measured rate, the allowance covers about half the time
                 // left, so hot loops rarely leave native code early.
                 const SAFEPOINT: u64 = 256;
-                let timed = self.deadline.zip(now);
+                let timed = if recording {
+                    None
+                } else {
+                    self.deadline.zip(now)
+                };
                 let allowance = timed.map_or(u64::MAX, |(deadline, now)| {
                     let left = deadline.saturating_duration_since(now).as_micros() as u64;
                     (left / 2).saturating_mul(self.native_rate).max(SAFEPOINT)
@@ -1285,21 +1439,57 @@ impl Executor {
                 let before = self.state.fuel;
                 let pc = self.state.eip;
                 let timer = self.profiling.then(Instant::now);
-                let (result, linked) = native.run(
-                    &mut self.state,
-                    &mut self.memory,
-                    bridge,
-                    compile::NativeRun {
-                        links: (self.region_linking && !self.profiling).then_some(&self.code.links),
-                        stop,
-                        interrupt: if self.host_interrupts {
-                            self.interrupt.as_ref()
-                        } else {
-                            &self.inactive_interrupt
+                let (result, linked) = if let Some(memo) = self.memo.as_deref_mut()
+                    && recording
+                {
+                    // Record-mode variants link only to one another and leave
+                    // native code when execution returns to the caller.
+                    let crate::memo::Memo {
+                        code,
+                        links,
+                        recording: recorder,
+                        ..
+                    } = memo;
+                    let recorder = recorder.as_deref_mut().unwrap();
+                    let ret = recorder.ret;
+                    bridge.recorder = recorder;
+                    let result = code[&owner].run(
+                        &mut self.state,
+                        &mut self.memory,
+                        bridge,
+                        compile::NativeRun {
+                            links: Some(links),
+                            stop: ret,
+                            interrupt: &self.inactive_interrupt,
+                            shadow: None,
                         },
-                        shadow: self.shadow_returns.as_deref_mut(),
-                    },
-                );
+                    );
+                    bridge.recorder = std::ptr::null_mut();
+                    result
+                } else {
+                    bridge.memo = self
+                        .memo
+                        .as_deref_mut()
+                        .map_or(std::ptr::null_mut(), |memo| memo as *mut _);
+                    let result = native.run(
+                        &mut self.state,
+                        &mut self.memory,
+                        bridge,
+                        compile::NativeRun {
+                            links: (self.region_linking && !self.profiling)
+                                .then_some(&self.code.links),
+                            stop,
+                            interrupt: if self.host_interrupts {
+                                self.interrupt.as_ref()
+                            } else {
+                                &self.inactive_interrupt
+                            },
+                            shadow: self.shadow_returns.as_deref_mut(),
+                        },
+                    );
+                    bridge.memo = std::ptr::null_mut();
+                    result
+                };
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
                     p.native_entries += 1;
@@ -1328,7 +1518,19 @@ impl Executor {
                 }
                 self.state.fuel += reserved;
                 self.stats.native_blocks += completed;
-                self.record_native_work(owner, completed);
+                if recording {
+                    if result == Exit::Budget as u32 || result == Exit::Interrupted as u32 {
+                        self.memo_abort(crate::memo::Abort::Context);
+                    } else if result != Exit::Dispatch as u32 {
+                        self.memo_abort(crate::memo::Abort::Impure);
+                    }
+                } else {
+                    self.record_native_work(owner, completed);
+                    if let Some(memo) = self.memo.as_deref_mut() {
+                        memo.sample(&self.state, &self.memory);
+                        self.memo_rehook();
+                    }
+                }
                 match result {
                     n if n == Exit::Trap as u32 => {
                         if let Some(error) = bridge.error.take() {
@@ -1377,6 +1579,8 @@ impl Executor {
                     _ => return Err(format!("invalid native exit {result}")),
                 }
             }
+            // Interpreted instructions are not recorded.
+            self.memo_abort(crate::memo::Abort::Impure);
             use crate::interpreter::Step;
             // The interpreter owns its decode cache and this CPU state. Ordinary
             // scalar memory operations use the same foreign-memory accessors as
