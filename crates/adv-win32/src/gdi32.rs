@@ -106,6 +106,7 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
             bk_color: 0xff_ffff,
             bk_mode: 2,
             modes: adv_os::gdi::DcModes::default(),
+            saved: Vec::new(),
         },
     )
 }
@@ -524,6 +525,91 @@ fn set_bk_mode(env: &mut Env<'_>, dc: Handle, mode: i32) -> Outcome {
     dc_field(env, dc.0, |_, _, m| std::mem::replace(m, mode as u32))
 }
 
+#[win32(gdi32, name = "SaveDC", level = implement)]
+fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
+    if dc.0 == adv_os::gdi::WINDOW_DC {
+        env.ext
+            .get_mut::<Win32>()
+            .gdi
+            .register_external_dc(&mut env.sys.objects, dc.0, 0);
+    }
+    match get_mut(env, dc.0) {
+        Some(GdiObj::Dc {
+            selected,
+            palette,
+            text_color,
+            bk_color,
+            bk_mode,
+            modes,
+            saved,
+            ..
+        }) => {
+            saved.push(adv_os::gdi::DcState {
+                selected: *selected,
+                palette: *palette,
+                text_color: *text_color,
+                bk_color: *bk_color,
+                bk_mode: *bk_mode,
+                modes: *modes,
+            });
+            Outcome::Return(saved.len() as u32)
+        }
+        _ => Outcome::Return(0),
+    }
+}
+
+/// A positive level restores the state that SaveDC numbered so; a negative one counts back
+/// from the newest. Either way the restored state and every newer one leave the stack.
+#[win32(gdi32, name = "RestoreDC", level = implement)]
+fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
+    let (state, raster, bitmap) = match get_mut(env, dc.0) {
+        Some(GdiObj::Dc {
+            saved,
+            raster,
+            selected,
+            ..
+        }) => {
+            let depth = saved.len() as i64;
+            let index = if level > 0 {
+                i64::from(level) - 1
+            } else {
+                depth + i64::from(level)
+            };
+            if level == 0 || !(0..depth).contains(&index) {
+                return Outcome::Return(0);
+            }
+            saved.truncate(index as usize + 1);
+            (saved.pop().unwrap(), *raster, selected[3])
+        }
+        _ => return Outcome::Return(0),
+    };
+    if raster && state.selected[3] != bitmap {
+        raster::front::reselect_bitmap(env, dc.0, state.selected[3]);
+    }
+    if let Some(GdiObj::Dc {
+        selected,
+        palette,
+        text_color,
+        bk_color,
+        bk_mode,
+        modes,
+        ..
+    }) = get_mut(env, dc.0)
+    {
+        let kept = selected[3];
+        *selected = state.selected;
+        if raster {
+            selected[3] = kept;
+        }
+        *palette = state.palette;
+        *text_color = state.text_color;
+        *bk_color = state.bk_color;
+        *bk_mode = state.bk_mode;
+        *modes = state.modes;
+    }
+    Outcome::Return(1)
+}
+
 #[win32(gdi32, name = "MoveToEx", level = implement)]
 fn move_to_ex(
     env: &mut Env<'_>,
@@ -827,6 +913,8 @@ pub fn register(reg: &mut Registry) {
         set_text_color_ABI,
         set_bk_color_ABI,
         set_bk_mode_ABI,
+        save_dc_ABI,
+        restore_dc_ABI,
         move_to_ex_ABI,
         line_to_ABI,
         get_current_position_ex_ABI,

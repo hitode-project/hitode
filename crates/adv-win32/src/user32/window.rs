@@ -254,6 +254,8 @@ pub struct Window {
     pub control: ControlState,
     /// Headless dialog policy: auto clicks done so far.
     pub auto_clicks: u32,
+    /// ShowOwnedPopups(FALSE) hid this popup; ShowOwnedPopups(TRUE) brings it back.
+    pub hidden_popup: bool,
 }
 
 /// Typed aliases and a non-owning traversal index over the common object table.
@@ -700,6 +702,7 @@ impl Window {
             destroying: false,
             control: ControlState::default(),
             auto_clicks: 0,
+            hidden_popup: false,
         }
     }
 }
@@ -1309,6 +1312,58 @@ fn animate_window(env: &mut Env<'_>) -> Outcome {
     show_window(env, hwnd, cmd, |_, _| Outcome::Return(1))
 }
 
+const SW_PARENTCLOSING: u32 = 1;
+const SW_PARENTOPENING: u32 = 3;
+
+/// The owner tells its popups through WM_SHOWWINDOW; DefWindowProc does the hiding and
+/// showing, so a popup procedure that swallows the message keeps its state.
+fn show_owned_popups(env: &mut Env<'_>) -> Outcome {
+    let (owner, show) = (env.arg(0), env.arg(1) != 0);
+    let u = &mut env.ext.get_mut::<crate::Win32>().user;
+    if !u
+        .windows
+        .get(&env.sys.objects, &owner)
+        .is_some_and(|w| !w.destroying)
+    {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
+    let mut msgs = VecDeque::new();
+    for &top in &u.top {
+        let Some(w) = u.windows.get_mut(&mut env.sys.objects, &top) else {
+            continue;
+        };
+        if w.owner != owner || w.destroying {
+            continue;
+        }
+        if show && w.hidden_popup {
+            msgs.push_back([top, wm::SHOWWINDOW, 1, SW_PARENTOPENING]);
+        } else if !show && w.visible() {
+            w.hidden_popup = true;
+            msgs.push_back([top, wm::SHOWWINDOW, 0, SW_PARENTCLOSING]);
+        }
+    }
+    send_all(env, msgs, |_| Outcome::Return(1))
+}
+
+/// DefWindowProc's WM_SHOWWINDOW: an owner-driven show or hide applies to popups only.
+pub(super) fn parent_show(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    show: bool,
+    reason: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
+        return then(env, 0);
+    };
+    if reason == 0 || w.style & WS_POPUP == 0 || w.visible() == show {
+        return then(env, 0);
+    }
+    let cmd = if show { SW_SHOWNOACTIVATE } else { SW_HIDE };
+    show_window(env, hwnd, cmd, |env, _| then(env, 0))
+}
+
 fn set_layered_window_attributes(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     if !user(env)
@@ -1349,6 +1404,7 @@ pub fn show_window(
         w.style &= !WS_VISIBLE;
         msgs.push([hwnd, wm::SHOWWINDOW, 0, 0]);
     } else {
+        w.hidden_popup = false;
         if !was {
             w.style |= WS_VISIBLE;
             w.needs_paint = true;
@@ -2135,6 +2191,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "DestroyWindow", 1, destroy_window_api);
     s(reg, "ShowWindow", 2, show_window_api);
     s(reg, "AnimateWindow", 3, animate_window);
+    s(reg, "ShowOwnedPopups", 2, show_owned_popups);
     s(reg, "UpdateWindow", 1, update_window);
     s(reg, "LockWindowUpdate", 1, lock_window_update);
     s(reg, "SetWindowPos", 7, set_window_pos_api);

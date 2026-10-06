@@ -24,6 +24,17 @@ impl Default for DcModes {
     }
 }
 
+/// What SaveDC records and RestoreDC brings back.
+#[derive(Clone, Copy, Debug)]
+pub struct DcState {
+    pub selected: [u32; 4],
+    pub palette: u32,
+    pub text_color: u32,
+    pub bk_color: u32,
+    pub bk_mode: u32,
+    pub modes: DcModes,
+}
+
 #[derive(Clone, Debug)]
 pub struct LogFont {
     pub height: i32,
@@ -73,6 +84,8 @@ pub enum GdiObj {
         bk_color: u32,
         bk_mode: u32,
         modes: DcModes,
+        /// The SaveDC stack, oldest first.
+        saved: Vec<DcState>,
     },
     Region,
 }
@@ -151,6 +164,7 @@ impl Gdi {
                 bk_color: 0xff_ffff,
                 bk_mode: 2,
                 modes: DcModes::default(),
+                saved: Vec::new(),
             },
         )
     }

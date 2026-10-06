@@ -1576,6 +1576,7 @@ pub(super) fn def_window_proc_encoded(
     let r = match msg {
         wm::NCCREATE => 1,
         wm::CLOSE => return destroy_window(env, hwnd, move |env, _| then(env, 0)),
+        wm::SHOWWINDOW => return window::parent_show(env, hwnd, wp != 0, lp, then),
         wm::SETTEXT => {
             let Some(text) = read_text(env, lp, wide) else {
                 crate::util::set_last_error(env, 87);

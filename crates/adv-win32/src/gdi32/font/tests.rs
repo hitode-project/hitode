@@ -667,6 +667,49 @@ fn software_dc_preserves_font_and_mapping_state() {
     assert_eq!(invoke(&mut machine, data, "GetMapMode", &[dc]), 0);
 }
 
+#[test]
+fn restore_dc_returns_selections_colors_and_the_bitmap_by_level() {
+    let (mut machine, data, dc) = fixture();
+    let font = selected_font(&machine, dc);
+    let bitmap = invoke(&mut machine, data, "CreateCompatibleBitmap", &[dc, 4, 4]);
+    assert_ne!(bitmap, 0);
+    invoke(&mut machine, data, "SetTextColor", &[dc, 0x11]);
+    assert_eq!(invoke(&mut machine, data, "SaveDC", &[dc]), 1);
+    let stock_bitmap = invoke(&mut machine, data, "SelectObject", &[dc, bitmap]);
+    invoke(&mut machine, data, "SelectObject", &[dc, STOCK_FONT]);
+    invoke(&mut machine, data, "SetTextColor", &[dc, 0x22]);
+    invoke(&mut machine, data, "SetBkMode", &[dc, 1]);
+    assert_eq!(invoke(&mut machine, data, "SaveDC", &[dc]), 2);
+    invoke(&mut machine, data, "SetTextColor", &[dc, 0x33]);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 0]), 0);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 3]), 0);
+    assert_eq!(
+        invoke(&mut machine, data, "RestoreDC", &[dc, (-3i32) as u32]),
+        0
+    );
+    // -1 brings back the newest state and pops it.
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, u32::MAX]), 1);
+    assert_eq!(
+        invoke(&mut machine, data, "SetTextColor", &[dc, 0x22]),
+        0x22
+    );
+    assert_eq!(invoke(&mut machine, data, "SetBkMode", &[dc, 1]), 1);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 2]), 0);
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, 1]), 1);
+    assert_eq!(
+        invoke(&mut machine, data, "SetTextColor", &[dc, 0x11]),
+        0x11
+    );
+    assert_eq!(invoke(&mut machine, data, "SetBkMode", &[dc, 2]), 2);
+    assert_eq!(selected_font(&machine, dc), font);
+    assert_eq!(
+        invoke(&mut machine, data, "SelectObject", &[dc, stock_bitmap]),
+        stock_bitmap
+    );
+    assert_eq!(invoke(&mut machine, data, "RestoreDC", &[dc, u32::MAX]), 0);
+    assert_eq!(invoke(&mut machine, data, "SaveDC", &[0x1234]), 0);
+}
+
 fn invoke_draw_text(machine: &mut Machine<JitCpu>, data: u32, wide: bool, args: &[u32]) -> u32 {
     let address = machine
         .resolve_import("user32.dll", if wide { "DrawTextW" } else { "DrawTextA" })
