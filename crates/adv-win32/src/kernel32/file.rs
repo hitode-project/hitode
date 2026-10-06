@@ -14,6 +14,7 @@ use crate::util::{
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
 mod path;
+mod profile;
 #[cfg(test)]
 mod tests;
 
@@ -940,14 +941,6 @@ impl Ini {
         }
     }
 
-    fn sections(&self) -> Vec<Vec<u8>> {
-        self.lines
-            .iter()
-            .filter_map(|l| section_name(l))
-            .map(<[u8]>::to_vec)
-            .collect()
-    }
-
     /// Line range of a section's body.
     fn section(&self, name: &[u8]) -> Option<(usize, usize)> {
         let start = self
@@ -991,51 +984,6 @@ impl Ini {
     }
 }
 
-/// Copy a double-NUL-terminated list into `buf`, truncating like the API does.
-fn put_list(env: &mut Env<'_>, buf: u32, cap: u32, items: &[Vec<u8>]) -> u32 {
-    if cap < 2 {
-        return 0;
-    }
-    let mut out = Vec::new();
-    for it in items {
-        out.extend_from_slice(it);
-        out.push(0);
-    }
-    if out.len() + 1 > cap as usize {
-        out.truncate(cap as usize - 2);
-        out.extend_from_slice(&[0, 0]);
-        let _ = env.cpu.write(buf, &out);
-        return cap - 2;
-    }
-    out.push(0);
-    let _ = env.cpu.write(buf, &out);
-    out.len() as u32 - 1
-}
-
-fn get_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
-    let (sec_p, key_p, def_p, buf, cap) =
-        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let file = profile_path(env, env.arg(5));
-    let ini = Ini::load(env, &file);
-    if sec_p == 0 {
-        let secs = ini.sections();
-        return Outcome::Return(put_list(env, buf, cap, &secs));
-    }
-    let sec = cstr(env.cpu, sec_p);
-    if key_p == 0 {
-        let keys: Vec<Vec<u8>> = ini.entries(&sec).into_iter().map(|(_, k, _)| k).collect();
-        return Outcome::Return(put_list(env, buf, cap, &keys));
-    }
-    let key = cstr(env.cpu, key_p);
-    let v = ini
-        .get(&sec, &key)
-        .unwrap_or_else(|| trim(&cstr(env.cpu, def_p)).to_vec());
-    Outcome::Return(match put_cstr(env.cpu, buf, cap, &v) {
-        Some(n) => n,
-        None => cap.saturating_sub(1),
-    })
-}
-
 fn get_private_profile_int_a(env: &mut Env<'_>) -> Outcome {
     let (sec, key, def) = (
         cstr(env.cpu, env.arg(0)),
@@ -1058,6 +1006,11 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     let (sec_p, key_p, val_p) = (env.arg(0), env.arg(1), env.arg(2));
     let file = profile_path(env, env.arg(3));
     let mut ini = match read_contents(env, &file) {
+        Ok(bytes) if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) => {
+            adv_abi::warn_unavailable(env, "kernel32.dll!WritePrivateProfileStringA", "Unicode profile-file writes are unavailable; preserving the existing encoded file");
+            set_last_error(env, 50);
+            return Outcome::Return(0);
+        }
         Ok(bytes) => Ini::from_bytes(&bytes),
         Err(error) => {
             io_error(env, &error);
@@ -1402,13 +1355,8 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(u32::from(find))
     });
     path::register(reg);
-    stdcall(
-        reg,
-        K32,
-        "GetPrivateProfileStringA",
-        6,
-        get_private_profile_string_a,
-    );
+    profile::register(reg);
+
     stdcall(
         reg,
         K32,
