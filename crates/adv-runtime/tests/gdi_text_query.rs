@@ -58,6 +58,13 @@ fn runtime(directory: &Path, executable: &str, backend: &str, suffix: &str) -> R
     )
     .unwrap();
     runtime.set_api_mode(RunMode::Strict);
+    // Native ANSI strings decode in the host ACP; the guest must share it.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetACP() -> u32;
+    }
+    // SAFETY: GetACP has no parameters or memory access preconditions.
+    runtime.set_codepage(unsafe { GetACP() }).unwrap();
     runtime.machine.sys.clock = Clock::virtual_time();
     runtime
         .machine
