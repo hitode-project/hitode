@@ -204,3 +204,156 @@ fn native_driver_enumeration_callback_stop_flags_and_instance() {
         assert!(p.calls >= 1);
     }
 }
+
+#[test]
+fn driver_details_queries_sizes_encoding_and_protected_outputs() {
+    let mut m = fixture(false);
+    ensure(&mut env(&mut m));
+    let id = m
+        .ext
+        .get_mut::<Acm>()
+        .drivers
+        .id(&mut m.sys.objects)
+        .unwrap();
+    for wide in [false, true] {
+        let full: u32 = if wide { 1800 } else { 920 };
+        for size in [0, 3, 4, 8, 40, full - 1, full, full + 20] {
+            let mut sentinel = vec![0xa5; full as usize + 32];
+            sentinel[..4].copy_from_slice(&size.to_le_bytes());
+            m.cpu.write(DATA, &sentinel).unwrap();
+            assert_eq!(
+                details(&mut env(&mut m), id, DATA, 0, wide),
+                if size < 4 {
+                    Err(INVALID_PARAMETER)
+                } else {
+                    Ok(())
+                }
+            );
+            let mut actual = sentinel.clone();
+            m.cpu.read(DATA, &mut actual).unwrap();
+            if size < 4 {
+                assert_eq!(actual, sentinel);
+            } else {
+                let written = size.min(full) as usize;
+                assert_eq!(m.cpu.read_u32(DATA).unwrap(), written as u32);
+                assert_eq!(actual[written..], sentinel[written..]);
+                if written >= 40 {
+                    assert_eq!(&actual[4..8], b"audc");
+                    assert_eq!(m.cpu.read_u32(DATA + 24).unwrap(), SUPPORT);
+                    assert_eq!(m.cpu.read_u32(DATA + 28).unwrap(), 3);
+                    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0);
+                }
+                if written >= full as usize {
+                    let name = if wide {
+                        actual[40..104]
+                            .chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .take_while(|u| *u != 0)
+                            .map(|u| char::from_u32(u32::from(u)).unwrap())
+                            .collect::<String>()
+                    } else {
+                        String::from_utf8(
+                            actual[40..72]
+                                .iter()
+                                .copied()
+                                .take_while(|b| *b != 0)
+                                .collect(),
+                        )
+                        .unwrap()
+                    };
+                    assert_eq!(name, "Symphonia");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        details(&mut env(&mut m), id, DATA, 1, false),
+        Err(INVALID_FLAG)
+    );
+    assert_eq!(
+        details(&mut env(&mut m), id + 4, DATA, 0, false),
+        Err(INVALID_HANDLE)
+    );
+    assert_eq!(
+        details(&mut env(&mut m), id, 0, 0, false),
+        Err(INVALID_PARAMETER)
+    );
+    // A trailing inaccessible page is rejected before any partial writes.
+    m.cpu.write_u32(DATA + 4096 - 40, 920).unwrap();
+    assert_eq!(
+        details(&mut env(&mut m), id, DATA + 4096 - 40, 0, false),
+        Err(INVALID_PARAMETER)
+    );
+    assert_eq!(m.cpu.read_u32(DATA + 4096 - 40).unwrap(), 920);
+    m.cpu.write_u32(DATA, 920).unwrap();
+    m.cpu.protect(DATA, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        details(&mut env(&mut m), id, DATA, 0, false),
+        Err(INVALID_PARAMETER)
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 920);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_driver_details_allow_partial_and_clamp_extended_structures() {
+    type Callback = unsafe extern "system" fn(usize, usize, u32) -> i32;
+    #[link(name = "msacm32")]
+    unsafe extern "system" {
+        fn acmDriverEnum(callback: Option<Callback>, instance: usize, flags: u32) -> u32;
+        fn acmDriverDetailsA(id: usize, output: *mut u8, flags: u32) -> u32;
+        fn acmDriverDetailsW(id: usize, output: *mut u8, flags: u32) -> u32;
+    }
+    unsafe extern "system" fn callback(id: usize, instance: usize, _: u32) -> i32 {
+        unsafe {
+            *(instance as *mut usize) = id;
+        }
+        0
+    }
+    unsafe {
+        let mut id = 0;
+        assert_eq!(
+            acmDriverEnum(Some(callback), (&mut id as *mut usize) as usize, 0),
+            0
+        );
+        assert_ne!(id, 0);
+        for (query, full) in [
+            (
+                acmDriverDetailsA as unsafe extern "system" fn(usize, *mut u8, u32) -> u32,
+                916 + std::mem::size_of::<usize>(),
+            ),
+            (acmDriverDetailsW, 1796 + std::mem::size_of::<usize>()),
+        ] {
+            for size in [0, 3, 4, 8, 40, full - 1, full, full + 20] {
+                // Native W's ANSI adapter inspects fields beyond a short
+                // cbStruct. Initialize the supplied structure as normal callers
+                // do; A has no such dependency on untouched fields.
+                let mut bytes = vec![if full > 1000 { 0 } else { 0xa5 }; full + 32];
+                bytes[..4].copy_from_slice(&(size as u32).to_le_bytes());
+                let before = bytes.clone();
+                assert_eq!(
+                    query(id, bytes.as_mut_ptr(), 0),
+                    if size < 4 { INVALID_PARAMETER } else { 0 }
+                );
+                if size < 4 {
+                    assert_eq!(bytes, before);
+                } else {
+                    let written = size.min(full);
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                        written as u32
+                    );
+                    assert_eq!(bytes[written..], before[written..]);
+                    if written >= 8 {
+                        assert_eq!(&bytes[4..8], b"audc");
+                    }
+                }
+            }
+            let mut bytes = vec![0xa5; full];
+            bytes[..4].copy_from_slice(&(full as u32).to_le_bytes());
+            assert_eq!(query(id, bytes.as_mut_ptr(), 1), INVALID_FLAG);
+            assert_eq!(query(0, bytes.as_mut_ptr(), 0), INVALID_HANDLE);
+            assert_eq!(query(id, std::ptr::null_mut(), 0), INVALID_PARAMETER);
+        }
+    }
+}
