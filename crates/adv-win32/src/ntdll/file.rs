@@ -1,4 +1,6 @@
 //! Native synchronous FILE_OPEN shares the Win32 VFS and FileObj owner.
+use std::io::{Seek, SeekFrom};
+
 use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, warn_unavailable, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::Env;
@@ -23,6 +25,75 @@ const READ_ACCESS: u32 = GENERIC_READ | SYNCHRONIZE | 0x0002_0000 | 0x89;
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_ABI);
     registry.register(query_ABI);
+    registry.register(set_ABI);
+}
+
+#[win32(ntdll, name = "ZwSetInformationFile", level = implement)]
+fn set(
+    env: &mut Env<'_>,
+    handle: Handle,
+    iosb: GuestPtr<()>,
+    input: GuestPtr<()>,
+    length: u32,
+    class: i32,
+) -> i32 {
+    if class != 14 {
+        warn_unavailable(
+            env,
+            "ntdll.dll!ZwSetInformationFile",
+            "only FilePositionInformation is implemented",
+        );
+        return if class == 0 {
+            0xc000_0002u32 as i32
+        } else {
+            NOT_SUPPORTED
+        };
+    }
+    if length < 8 {
+        return 0xc000_0004u32 as i32; // STATUS_INFO_LENGTH_MISMATCH
+    }
+    if check_range(env.cpu, input.addr(), length, Prot::READ).is_err()
+        || check_range(env.cpu, iosb.addr(), 8, Prot::READ).is_err()
+    {
+        return ACCESS_VIOLATION;
+    }
+    let mut bytes = [0; 8];
+    if env.cpu.read(input.addr(), &mut bytes).is_err() {
+        return ACCESS_VIOLATION;
+    }
+    let position = i64::from_le_bytes(bytes);
+    if position < 0 {
+        return INVALID_PARAMETER;
+    }
+    let Some(file) = env.sys.objects.host_mut::<FileObj>(handle.0) else {
+        return if env.sys.objects.get(handle.0).is_some()
+            || matches!(handle.0, 0xffff_ffff | 0xffff_fffe)
+        {
+            0xc000_0024u32 as i32 // STATUS_OBJECT_TYPE_MISMATCH
+        } else {
+            INVALID_HANDLE
+        };
+    };
+    // Read-only file contents do not prevent seeking. The native position
+    // setter also accepts attributes-only/overlapped handles. Every alias
+    // shares the same FileStream position; no file data or length is changed.
+    if let Err(error) = file.file.seek(SeekFrom::Start(position as u64)) {
+        log::warn!("ZwSetInformationFile position update failed: {error}");
+        return match error.kind() {
+            std::io::ErrorKind::InvalidInput => INVALID_PARAMETER,
+            std::io::ErrorKind::PermissionDenied => ACCESS_DENIED,
+            _ => 0xc000_0001u32 as i32, // STATUS_UNSUCCESSFUL
+        };
+    }
+    // Native completes the seek before reporting a write fault on a mapped
+    // read-only IOSB. Preserve those bytes and report AV without bypassing
+    // guest page protection. NULL/unmapped IOSB was rejected before seeking.
+    if check_range(env.cpu, iosb.addr(), 8, Prot::WRITE).is_err()
+        || env.cpu.write(iosb.addr(), &[0; 8]).is_err()
+    {
+        return ACCESS_VIOLATION;
+    }
+    0
 }
 
 /// The file position belongs to the shared file object, including duplicate

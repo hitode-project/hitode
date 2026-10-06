@@ -389,7 +389,7 @@ fn incompatible_sharing_fails_until_the_shared_file_object_is_closed() {
 }
 
 #[test]
-fn only_the_actual_called_nt_alias_is_projected_with_its_sdk_stack_contract() {
+fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts() {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
     assert_eq!(
@@ -413,6 +413,18 @@ fn only_the_actual_called_nt_alias_is_projected_with_its_sdk_stack_contract() {
         Some(ImplementationLevel::Implement)
     );
     assert!(registry.dynamic_available("ntdll.dll", "ZwQueryInformationFile"));
+    assert_eq!(
+        registry
+            .get("ntdll.dll", "ZwSetInformationFile")
+            .unwrap()
+            .conv,
+        Conv::Stdcall { argc: 5 }
+    );
+    assert_eq!(
+        registry.level("ntdll.dll", "ZwSetInformationFile"),
+        Some(ImplementationLevel::Implement)
+    );
+    assert!(registry.dynamic_available("ntdll.dll", "ZwSetInformationFile"));
     for name in ["NtCreateFile", "ZwReadFile", "ZwClose"] {
         assert!(!registry.dynamic_available("ntdll.dll", name));
     }
@@ -644,4 +656,128 @@ fn failed_queries_preserve_all_outputs_last_error_and_the_shared_file_cursor() {
         query_failures(cpu);
     }
     query_failures(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn set_position<B: Backend>(cpu: B) {
+    let (mut m, root) = fixture(cpu);
+    input(&mut m, DATA, SOURCE, r"\??\C:\Game\present.txt");
+    let mut code = Asm::new(CODE);
+    create(&mut m, &mut code, arguments(DATA), DATA + 16);
+    run(&mut m, code);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0);
+    let handle = m.cpu.read_u32(DATA).unwrap();
+    let alias = m.sys.objects.duplicate(handle).unwrap();
+    let setter = m
+        .resolve_import("ntdll.dll", "ZwSetInformationFile")
+        .unwrap();
+    let set_error = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get_error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let close = m.resolve_import("kernel32.dll", "CloseHandle").unwrap();
+    let cases = [
+        ("actual zero", 0i64, 0u32, 0u64),
+        ("duplicate 64-bit", 0x100000003, 0, 0x100000003),
+        ("negative", -1, 0xc000000d, 0x100000003),
+        ("short", 7, 0xc0000004, 0x100000003),
+        ("null IOSB", 7, 0xc0000005, 0x100000003),
+        ("input overrun", 7, 0xc0000005, 0x100000003),
+        ("readonly input", 9, 0, 9),
+        ("readonly IOSB", 7, 0xc0000005, 7),
+        ("invalid handle", 0, 0xc0000008, 7),
+    ];
+    let mut readonly = [0x77; 32];
+    readonly[..8].copy_from_slice(&9i64.to_le_bytes());
+    m.cpu.write(READ_ONLY, &readonly).unwrap();
+    let mut code = Asm::new(CODE);
+    for (index, (label, value, _, _)) in cases.iter().enumerate() {
+        let base = DATA + 0x100 + index as u32 * 128;
+        m.cpu.write(base, &[0xcd; 128]).unwrap();
+        m.cpu.write(base + 8, &value.to_le_bytes()).unwrap();
+        let mut args = [handle, base, base + 8, 8, 14];
+        match *label {
+            "duplicate 64-bit" => {
+                args[0] = alias;
+                args[3] = 12;
+            }
+            "short" => args[3] = 7,
+            "null IOSB" => args[1] = 0,
+            "input overrun" => args[2] = SOURCE + 0xffff,
+            "readonly input" => args[2] = READ_ONLY,
+            "readonly IOSB" => args[1] = READ_ONLY + 16,
+            "invalid handle" => args[0] = 0x13572468,
+            _ => {}
+        }
+        code.push_imm(MARKER).call(set_error);
+        for value in args.into_iter().rev() {
+            code.push_imm(value);
+        }
+        code.call(setter).mov_mem_eax(base + 24);
+        code.call(get_error).mov_mem_eax(base + 28);
+        // Query through the original alias observes the setter's shared seek,
+        // including native completion failure after a mapped readonly IOSB.
+        query(
+            &mut m,
+            &mut code,
+            [handle, base + 40, base + 48, 8, 14],
+            base + 32,
+        );
+    }
+    code.push_imm(alias)
+        .call(close)
+        .push_imm(handle)
+        .call(close);
+    run(&mut m, code);
+    for (index, (label, value, status, position)) in cases.into_iter().enumerate() {
+        let base = DATA + 0x100 + index as u32 * 128;
+        assert_eq!(m.cpu.read_u32(base + 24).unwrap(), status, "{label}");
+        assert_eq!(
+            m.cpu.read_u32(base + 28).unwrap(),
+            MARKER,
+            "setter LastError: {label}"
+        );
+        let mut bytes = [0; 8];
+        m.cpu.read(base + 8, &mut bytes).unwrap();
+        assert_eq!(bytes, value.to_le_bytes(), "input unchanged: {label}");
+        m.cpu.read(base, &mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            if status == 0 { [0; 8] } else { [0xcd; 8] },
+            "IOSB: {label}"
+        );
+        assert_eq!(
+            m.cpu.read_u32(base + 32).unwrap(),
+            0,
+            "position query: {label}"
+        );
+        m.cpu.read(base + 48, &mut bytes).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(bytes),
+            position,
+            "shared cursor: {label}"
+        );
+    }
+    let mut bytes = [0; 32];
+    m.cpu.read(READ_ONLY, &mut bytes).unwrap();
+    assert_eq!(
+        bytes, readonly,
+        "neither input nor readonly completion storage is written"
+    );
+    assert_eq!(m.sys.objects.hosts::<FileObj>().count(), 0);
+    assert_eq!(
+        std::fs::read(root.join("resources/present.txt")).unwrap(),
+        b"replacement!"
+    );
+    assert!(
+        !root.join("data/overlay").exists(),
+        "seeking never creates or extends files"
+    );
+}
+
+#[test]
+fn position_setter_shares_alias_cursor_and_preserves_native_failure_ordering() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        set_position(cpu);
+    }
+    set_position(UnicornCpu::new(PARK_ADDR).unwrap());
 }
