@@ -69,4 +69,38 @@ impl DcClip {
             .filter(|&y| y >= 0 && (y as u32) < height)
             .any(|y| !self.spans(y, width).is_empty())
     }
+
+    /// RectVisible's MM_TEXT query over the selected surface's visible bounds.
+    /// Native normalizes reversed coordinates and gives zero-length axes one
+    /// logical unit, including a point rectangle. Use i64 for the i32::MAX edge.
+    pub fn intersects(&self, rect: [i32; 4], width: u32, height: u32) -> bool {
+        let [l, t, r, b] = rect.map(i64::from);
+        let (l, t, r, b) = (l.min(r), t.min(b), l.max(r), t.max(b));
+        let r = if r == l { r + 1 } else { r };
+        let b = if b == t { b + 1 } else { b };
+        let (l, t, r, b) = (
+            l.max(0),
+            t.max(0),
+            r.min(i64::from(width)),
+            b.min(i64::from(height)),
+        );
+        if l >= r || t >= b {
+            return false;
+        }
+        let visible = |y| {
+            self.spans(y, width)
+                .into_iter()
+                .any(|(a, z)| i64::from(a) < r && i64::from(z) > l)
+        };
+        if visible(t as i32) {
+            return true;
+        }
+        // The row topology is constant between exclusion edges: no pixel-height
+        // loop and at most two event rows per bounded exclusion rectangle.
+        self.excluded
+            .iter()
+            .flat_map(|e| [e[1], e[3]])
+            .filter(|&y| i64::from(y) >= t && i64::from(y) < b)
+            .any(visible)
+    }
 }

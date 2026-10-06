@@ -286,3 +286,101 @@ fn frame_guards_clip_capacity_and_provider_fail_without_partial_pixels_or_state(
     );
     assert_eq!(crate::util::last_error(&env(&mut m)), 6);
 }
+
+#[test]
+fn rect_visible_matches_native_normalization_degenerate_axes_and_saved_clip_without_writes() {
+    let (mut m, data, dc, pixels) = fixture(8, 8, PixelFormat::Bgra32, false);
+    let count = m.sys.objects.object_count();
+    m.cpu.write(pixels, &[0xa5; 256]).unwrap();
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!ExcludeClipRect", &[dc, 2, 2, 5, 5]),
+        3
+    );
+    for (r, expected) in [
+        ([0, 0, 8, 8], 1),
+        ([2, 2, 5, 5], 0),
+        ([5, 2, 6, 3], 1),
+        ([1, 3, 3, 4], 1),
+        ([20, 20, 30, 30], 0),
+        ([6, 6, 1, 1], 1),
+        ([5, 5, 2, 2], 0),
+        ([1, 1, 1, 5], 1),
+        ([1, 1, 5, 1], 1),
+        ([8, 0, 9, 1], 0),
+        ([1, 1, 1, 1], 1),
+        ([3, 3, 3, 3], 0),
+        ([8, 1, 8, 1], 0),
+        ([i32::MAX, i32::MAX, i32::MAX, i32::MAX], 0),
+    ] {
+        rect(&mut m, data, r);
+        crate::util::set_last_error(&mut env(&mut m), 0x12345678);
+        assert_eq!(
+            call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]),
+            expected,
+            "{r:?}"
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
+    }
+    assert_eq!(call(&mut m, data, "gdi32.dll!SaveDC", &[dc]), 1);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!ExcludeClipRect", &[dc, 0, 0, 8, 8]),
+        1
+    );
+    rect(&mut m, data, [0, 0, 8, 8]);
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 0);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!RestoreDC", &[dc, u32::MAX]),
+        1
+    );
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 1);
+    // A band begins in the hole but a later exclusion boundary becomes visible.
+    rect(&mut m, data, [2, 2, 5, 6]);
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 1);
+    let guarded = m.sys.vm.alloc(&mut m.cpu, 8192, Prot::RW).unwrap();
+    rect(&mut m, guarded, [1, 1, 1, 1]);
+    m.cpu.protect(guarded, 4096, Prot::READ).unwrap();
+    m.cpu.protect(guarded + 4096, 4096, Prot(0)).unwrap();
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!RectVisible", &[dc, guarded]),
+        1
+    );
+    for pointer in [0, 0xfffffff8, guarded + 4096 - 8] {
+        assert_eq!(
+            call(&mut m, data, "gdi32.dll!RectVisible", &[dc, pointer]),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m)), 87);
+    }
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[0, 0]), 0);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 6);
+    let gdi = m.ext.get::<Win32>().gdi.clone();
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 2;
+    }
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 0);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 1;
+    }
+    // Geometric visibility does not require permission to read/write the pixels.
+    m.cpu.protect(pixels, 4096, Prot(0)).unwrap();
+    super::super::super::front::install(&mut m);
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 1);
+    m.cpu.protect(pixels, 4096, Prot::RW).unwrap();
+    let mut raw = [0; 256];
+    m.cpu.read(pixels, &mut raw).unwrap();
+    assert_eq!(raw, [0xa5; 256]);
+    assert_eq!(m.sys.objects.object_count(), count);
+    assert!(super::super::super::clip::snapshot(&env(&mut m), dc).contains(0, 0));
+    assert!(!super::super::super::clip::snapshot(&env(&mut m), dc).contains(3, 3));
+    assert!(m.ext.get_mut::<SurfaceStore>().delete(16));
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 0);
+    assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+    assert!(
+        m.ext
+            .get::<adv_abi::ApiDiagnostics>()
+            .warnings
+            .keys()
+            .any(|(api, _)| api == "gdi32.dll!RectVisible")
+    );
+}

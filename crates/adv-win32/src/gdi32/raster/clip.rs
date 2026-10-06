@@ -1,12 +1,14 @@
 //! Application clipping borrows the existing DC and CPU surface; no pixel owner.
 use crate::{Win32, util::set_last_error};
-use adv_abi::{Env, Handle, Outcome, Registry, win32};
+use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, types::RECT, win32};
+use adv_cpu::backend::Prot;
 use adv_device::surface::{Surface, SurfaceMemory, SurfaceStore};
 use adv_os::gdi::{DcClip, GdiObj};
 use std::borrow::Cow;
 
 pub(super) fn register(reg: &mut Registry) {
     reg.register(exclude_ABI);
+    reg.register(rect_visible_ABI);
 }
 fn unsupported(env: &mut Env<'_>, reason: &str) -> Outcome {
     adv_abi::warn_unavailable(env, "gdi32.dll!ExcludeClipRect", reason);
@@ -61,6 +63,57 @@ pub(crate) fn snapshot(env: &Env<'_>, dc: u32) -> DcClip {
         Some(GdiObj::Dc { clip, .. }) => clip.clone(),
         _ => DcClip::default(),
     }
+}
+
+#[win32(gdi32, name="RectVisible", level=state)]
+fn rect_visible(env: &mut Env<'_>, dc: Handle, rectangle: GuestPtr<RECT>) -> Outcome {
+    let Some(GdiObj::Dc {
+        selected,
+        modes,
+        clip,
+        ..
+    }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
+    else {
+        set_last_error(env, 6);
+        return Outcome::Return(0);
+    };
+    if modes.map != 1 {
+        adv_abi::warn_unavailable(
+            env,
+            "gdi32.dll!RectVisible",
+            "only MM_TEXT visibility queries are available",
+        );
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    let (target, clip) = (selected[3], clip.clone());
+    if adv_abi::guest::check_range(env.cpu, rectangle.addr(), 16, Prot::READ).is_err() {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    let Ok(r) = rectangle.read(env.cpu) else {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    };
+    let Some(surface) = env
+        .ext
+        .try_get::<SurfaceStore>()
+        .and_then(|s| s.get(target))
+    else {
+        adv_abi::warn_unavailable(
+            env,
+            "gdi32.dll!RectVisible",
+            "the DC has no shared surface geometry",
+        );
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    };
+    // This query needs owned geometry, not CPU pixel access or host window state.
+    Outcome::Return(u32::from(clip.intersects(
+        [r.left, r.top, r.right, r.bottom],
+        surface.width,
+        surface.height,
+    )))
 }
 
 /// Filter destination writes only. Reads retain the original transfer sampling
