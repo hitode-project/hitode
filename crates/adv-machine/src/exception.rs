@@ -2,7 +2,9 @@
 //! Personalities own exception records, handler search and context layouts.
 
 use crate::{Env, Outcome, Sys, sched::CtxId};
-use adv_cpu::backend::{ArchitecturalState, Fault, Guest, StateError};
+use adv_cpu::backend::{
+    ArchitecturalState, Fault, FaultKind, Guest, GuestExt, Prot, Reg, StateError,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Exception {
@@ -11,6 +13,83 @@ pub enum Exception {
 }
 
 pub type ExceptionHandler = fn(&mut Env<'_>, Exception, Checkpoint) -> Outcome;
+
+/// Original backend fault evidence, retained before any guest exception handler
+/// can replace registers, stack contents or the last indirect transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuFaultSnapshot {
+    pub context: CtxId,
+    pub fault: Fault,
+    pub last_indirect_branch: Option<adv_cpu::IndirectBranch>,
+    pub registers: [(Reg, u32); 9],
+    pub stack_address: u32,
+    /// At most 16 consecutive readable DWORDs; an unreadable word ends capture.
+    pub stack: Vec<u32>,
+}
+
+impl CpuFaultSnapshot {
+    pub fn kind_name(&self) -> &'static str {
+        match self.fault.kind {
+            FaultKind::Read(_) => "read",
+            FaultKind::Write(_) => "write",
+            FaultKind::Fetch(_) => "fetch",
+            FaultKind::InvalidInstruction => "invalid_instruction",
+            FaultKind::Other(_) => "other",
+        }
+    }
+
+    pub fn access(&self) -> Option<(&'static str, u32)> {
+        match self.fault.kind {
+            FaultKind::Read(address) => Some(("read", address)),
+            FaultKind::Write(address) => Some(("write", address)),
+            FaultKind::Fetch(address) => Some(("execute", address)),
+            _ => None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match &self.fault.kind {
+            FaultKind::Other(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn capture(cpu: &dyn Guest, context: CtxId, fault: &Fault) -> Self {
+        let stack_address = cpu.reg(Reg::Esp);
+        let mut stack = Vec::with_capacity(16);
+        for index in 0..16 {
+            let Some(address) = stack_address.checked_add(index * 4) else {
+                break;
+            };
+            if !cpu.accessible(address, 4, Prot::READ) {
+                break;
+            }
+            let Ok(value) = cpu.read_u32(address) else {
+                break;
+            };
+            stack.push(value);
+        }
+        Self {
+            context,
+            fault: fault.clone(),
+            last_indirect_branch: cpu.last_indirect_branch(),
+            registers: [
+                Reg::Eip,
+                Reg::Esp,
+                Reg::Ebp,
+                Reg::Eax,
+                Reg::Ebx,
+                Reg::Ecx,
+                Reg::Edx,
+                Reg::Esi,
+                Reg::Edi,
+            ]
+            .map(|register| (register, cpu.reg(register))),
+            stack_address,
+            stack,
+        }
+    }
+}
 
 /// One-use architectural image tied to a context and its live host-call ancestry.
 /// No scheduler, clock, fuel, cache or interrupt state belongs in this image.

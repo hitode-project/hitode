@@ -12,6 +12,12 @@ impl<B: Backend> Runtime<B> {
     pub fn last_indirect_branch(&self) -> Option<adv_cpu::IndirectBranch> {
         self.machine.cpu.last_indirect_branch()
     }
+    pub fn first_cpu_fault(&self) -> Option<&adv_machine::exception::CpuFaultSnapshot> {
+        self.machine.sys.first_cpu_fault.as_ref()
+    }
+    pub fn latest_cpu_fault(&self) -> Option<&adv_machine::exception::CpuFaultSnapshot> {
+        self.machine.sys.latest_cpu_fault.as_ref()
+    }
     fn api_registry(&self) -> &adv_abi::Registry {
         (self.machine.sys.thunks.resolver() as &dyn std::any::Any)
             .downcast_ref()
@@ -160,6 +166,35 @@ impl<B: Backend> Runtime<B> {
                     message.sequence, message.frame, message.api, message.caller, message.context,
                     message.style, message.result, message.caption, message.text,
                 ));
+            }
+        }
+        for (label, fault) in [
+            ("First", self.first_cpu_fault()),
+            ("Latest", self.latest_cpu_fault()),
+        ] {
+            let Some(fault) = fault else {
+                continue;
+            };
+            report.push_str(&format!(
+                "\n{label} CPU fault: context {} at {:#010x}: {:?};",
+                fault.context, fault.fault.pc, fault.fault.kind
+            ));
+            if let Some(branch) = fault.last_indirect_branch {
+                report.push_str(&format!(
+                    " last indirect {:?} {:#010x} -> {:#010x};",
+                    branch.kind, branch.source, branch.target
+                ));
+            }
+            for (register, value) in fault.registers {
+                report.push_str(&format!(" {register:?}={value:#010x}"));
+            }
+            report.push_str(&format!(
+                "\n{label} fault stack at {:#010x} ({} of at most 16 readable words):",
+                fault.stack_address,
+                fault.stack.len()
+            ));
+            for word in &fault.stack {
+                report.push_str(&format!(" {word:08x}"));
             }
         }
         report.push_str(&format!(

@@ -348,6 +348,52 @@ fn message_box_json(message: &adv_runtime::MessageBoxCall) -> String {
     )
 }
 
+fn cpu_fault_json(fault: Option<&adv_machine::exception::CpuFaultSnapshot>) -> String {
+    let Some(fault) = fault else {
+        return "null".into();
+    };
+    let access = fault.access();
+    let branch = fault.last_indirect_branch.map_or_else(
+        || "null".into(),
+        |branch| {
+            format!(
+                "{{\"source\": {}, \"target\": {}, \"kind\": {}}}",
+                branch.source,
+                branch.target,
+                json(&format!("{:?}", branch.kind))
+            )
+        },
+    );
+    let registers = fault
+        .registers
+        .iter()
+        .map(|(register, value)| format!("{}: {value}", json(&format!("{register:?}"))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stack = fault
+        .stack
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        concat!(
+            "{{\"context\": {}, \"pc\": {}, \"kind\": {}, \"access\": {}, \"address\": {}, \"reason\": {}, ",
+            "\"last_indirect_branch\": {}, \"registers\": {{{}}}, \"stack_address\": {}, \"stack\": [{}]}}"
+        ),
+        fault.context,
+        fault.fault.pc,
+        json(fault.kind_name()),
+        access.map_or_else(|| "null".into(), |(access, _)| json(access)),
+        access.map_or_else(|| "null".into(), |(_, address)| address.to_string()),
+        fault.reason().map_or_else(|| "null".into(), json),
+        branch,
+        registers,
+        fault.stack_address,
+        stack,
+    )
+}
+
 fn api_report(runtime: &Runtime) -> String {
     let mode = match runtime.api_mode() {
         adv_runtime::RunMode::Strict => "strict",
@@ -596,7 +642,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
-            "  \"api\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
+            "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"runtime\": {}\n}}\n"
@@ -645,6 +691,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         runtime.machine.sys.tls_images.len(),
         modules,
         api_report(runtime),
+        cpu_fault_json(runtime.first_cpu_fault()),
+        cpu_fault_json(runtime.latest_cpu_fault()),
         runtime.guest_window_count(),
         options.time_skip,
         runtime.machine.sys.scheduling.active_time_skips,

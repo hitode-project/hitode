@@ -98,6 +98,10 @@ pub struct Sys {
     pub process_return: Option<fn(&mut Env<'_>, u32) -> Outcome>,
     /// Personality-supplied interpretation of precise CPU stops.
     pub exception_handler: Option<exception::ExceptionHandler>,
+    /// First backend fault, retained across guest SEH execution and later slices.
+    pub first_cpu_fault: Option<exception::CpuFaultSnapshot>,
+    /// Most recent backend fault; recoverable faults do not hide later evidence.
+    pub latest_cpu_fault: Option<exception::CpuFaultSnapshot>,
     checkpoint_identity: std::sync::Arc<()>,
     next_frame_id: u64,
     /// The last host calls, for failure reports.
@@ -883,6 +887,13 @@ impl Dispatch<'_> {
         cpu: &mut dyn Guest,
         event: exception::Exception,
     ) -> Result<(), Parked> {
+        if let exception::Exception::Fault(fault) = &event {
+            let snapshot = exception::CpuFaultSnapshot::capture(cpu, self.sys.current, fault);
+            self.sys
+                .first_cpu_fault
+                .get_or_insert_with(|| snapshot.clone());
+            self.sys.latest_cpu_fault = Some(snapshot);
+        }
         let Some(handler) = self.sys.exception_handler else {
             return Err(Parked::Fail(format!("unhandled CPU stop: {event:?}")));
         };
@@ -1176,6 +1187,8 @@ impl<B: Backend> Machine<B> {
             process_ready: Vec::new(),
             process_return: None,
             exception_handler: None,
+            first_cpu_fault: None,
+            latest_cpu_fault: None,
             checkpoint_identity: std::sync::Arc::new(()),
             next_frame_id: 0,
             recent: RecentCalls::new(32),
