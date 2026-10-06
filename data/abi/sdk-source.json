@@ -81,7 +81,7 @@
   },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations; Scaling/Translation additionally verified in Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package (not present in pinned WinMD or installed modern SDK)",
-    "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixScaling, D3DXMatrixTranslation, D3DXMatrixLookAtLH, D3DXVec3Project only",
+    "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixScaling, D3DXMatrixTranslation, D3DXMatrixLookAtLH, D3DXVec3Project, D3DXMatrixRotationYawPitchRoll, D3DXMatrixRotationY, D3DXMatrixPerspectiveFovLH, D3DXVec4Transform only",
     "target": "x86 __stdcall and pointer return. Existing helpers have 3/2/4/6 pointer arguments; Scaling/Translation have one matrix pointer and three 32-bit FLOAT stack values. Matrix 64 bytes, vector 12 bytes; D3DVIEWPORT9 layout from pinned WinMD",
     "headers": {
       "d3dx9math.h": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9"
@@ -94,8 +94,14 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixscaling",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixtranslation",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixlookatlh",
-      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3project"
-    ]
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3project",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixrotationyawpitchroll",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixrotationy",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixperspectivefovlh",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec4transform"
+    ],
+    "pose_projection": "Same official d3dx9math.h header hash: WINAPI x86 stdcall; RotationYawPitchRoll ptr+3FLOAT (4 words), RotationY ptr+FLOAT(2), PerspectiveFovLH ptr+4FLOAT(5), Vec4Transform3pointers(3). Matrix64 bytes, vector4 16 bytes; pure CPU row-vector arithmetic, no shader/effect/capability change.",
+    "pose_oracle_source_sha256": "da63e284798101e1970e2fcc7c34a34875c6335eb730bf85e3e237bc5c99d5d7"
   },
   "legacy_d3dx_effect": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",

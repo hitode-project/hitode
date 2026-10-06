@@ -16,3 +16,7 @@ ntdll.dll	ZwReadFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Wi
 ntdll.dll	ZwClose	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1
 d3dx9_43.dll	D3DXCreateEffect	stdcall	i32	HRESULT	pDevice:IDirect3DDevice9*:ptr:1|pSrcData:void*:ptr:1|SrcDataLen:UINT:u32:1|pDefines:D3DXMACRO*:ptr:1|pInclude:ID3DXInclude*:ptr:1|Flags:DWORD:u32:1|pPool:ID3DXEffectPool*:ptr:1|ppEffect:ID3DXEffect**:ptr:1|ppCompilationErrors:ID3DXBuffer**:ptr:1
 d3dx9_43.dll	D3DXGetShaderOutputSemantics	stdcall	i32	HRESULT	pFunction:DWORD*:ptr:1|pSemantics:D3DXSEMANTIC*:ptr:1|pCount:UINT*:ptr:1
+d3dx9_43.dll	D3DXMatrixRotationYawPitchRoll	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixRotationY	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|Angle:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixPerspectiveFovLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1
+d3dx9_43.dll	D3DXVec4Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1

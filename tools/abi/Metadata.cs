@@ -257,9 +257,9 @@ public static class AbiMetadata
             var f = row.Split('\t');
             bool vcm = f.Length == 6 && f[0] == "msvfw32.dll" && new[] { "ICInstall", "ICRemove" }.Contains(f[1]) && f[3] == "i32";
             bool d3dx = f.Length == 6 && f[0] == "d3dx9_43.dll"
-                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project" }.Contains(f[1])
-                && f[3] == "ptr" && f[4] == (f[1] == "D3DXVec3Project" ? "D3DXVECTOR3*" : "D3DXMATRIX*");
-            bool d3dxScalars = d3dx && new[] { "D3DXMatrixScaling", "D3DXMatrixTranslation" }.Contains(f[1]);
+                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixPerspectiveFovLH", "D3DXVec4Transform" }.Contains(f[1])
+                && f[3] == "ptr" && f[4] == (f[1] switch { "D3DXVec3Project" => "D3DXVECTOR3*", "D3DXVec4Transform" => "D3DXVECTOR4*", _ => "D3DXMATRIX*" });
+            bool d3dxScalars = d3dx && new[] { "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixPerspectiveFovLH" }.Contains(f[1]);
             bool d3dxEffect = f.Length == 6 && f[0] == "d3dx9_43.dll"
                 && new[] { "D3DXCreateEffect", "D3DXGetShaderOutputSemantics" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "HRESULT";
@@ -297,13 +297,21 @@ public static class AbiMetadata
             if ((!vcm && !d3dx && !d3dxEffect && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
-                int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" => 4, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
+                int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
                 if (f[5].Split('|', StringSplitOptions.RemoveEmptyEntries).Length != expected)
                     throw new InvalidDataException("D3DX x86 stack contract changed: " + row);
-                if (d3dxScalars && f[5] != (f[1] == "D3DXMatrixScaling"
-                    ? "pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1"
-                    : "pOut:D3DXMATRIX*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1"))
+                string scalarDeclaration = f[1] switch {
+                    "D3DXMatrixScaling" => "pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1",
+                    "D3DXMatrixTranslation" => "pOut:D3DXMATRIX*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1",
+                    "D3DXMatrixRotationYawPitchRoll" => "pOut:D3DXMATRIX*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1",
+                    "D3DXMatrixRotationY" => "pOut:D3DXMATRIX*:ptr:1|Angle:FLOAT:f32:1",
+                    "D3DXMatrixPerspectiveFovLH" => "pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1",
+                    _ => null
+                };
+                if (d3dxScalars && f[5] != scalarDeclaration)
                     throw new InvalidDataException("D3DX scalar matrix declaration changed: " + row);
+                if (f[1] == "D3DXVec4Transform" && f[5] != "pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1")
+                    throw new InvalidDataException("D3DX vector4 declaration changed: " + row);
             }
             if (d3dxEffect && f[5].Split('|').Length != (f[1] == "D3DXCreateEffect" ? 9 : 3))
                 throw new InvalidDataException("D3DX Effect x86 stack contract changed: " + row);

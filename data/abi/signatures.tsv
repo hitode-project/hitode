@@ -866,10 +866,14 @@ d3dx9_43.dll	D3DXCreateEffect	stdcall	i32	HRESULT	pDevice:IDirect3DDevice9*:ptr:
 d3dx9_43.dll	D3DXGetShaderOutputSemantics	stdcall	i32	HRESULT	pFunction:DWORD*:ptr:1|pSemantics:D3DXSEMANTIC*:ptr:1|pCount:UINT*:ptr:1
 d3dx9_43.dll	D3DXMatrixLookAtLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pEye:D3DXVECTOR3*:ptr:1|pAt:D3DXVECTOR3*:ptr:1|pUp:D3DXVECTOR3*:ptr:1
 d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXMatrixPerspectiveFovLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixRotationY	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|Angle:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixRotationYawPitchRoll	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
 d3dx9_43.dll	D3DXMatrixScaling	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1
 d3dx9_43.dll	D3DXMatrixTranslation	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
 d3dx9_43.dll	D3DXMatrixTranspose	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM:D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXVec3Project	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV:D3DXVECTOR3*:ptr:1|pViewport:Windows.Win32.Graphics.Direct3D9.D3DVIEWPORT9*:ptr:1|pProjection:D3DXMATRIX*:ptr:1|pView:D3DXMATRIX*:ptr:1|pWorld:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXVec4Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 ddraw.dll	DirectDrawCreate	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGUID:System.Guid*:ptr:1|lplpDD:Windows.Win32.Graphics.DirectDraw.IDirectDraw*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateClipper	stdcall	i32	Windows.Win32.Foundation.HRESULT	dwFlags:u32:u32:1|lplpDDClipper:Windows.Win32.Graphics.DirectDraw.IDirectDrawClipper*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateEx	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGuid:System.Guid*:ptr:1|lplpDD:void**:ptr:1|iid:System.Guid*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
