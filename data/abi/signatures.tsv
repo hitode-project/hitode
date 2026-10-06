@@ -3466,6 +3466,10 @@ msacm32.dll	acmStreamSize	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTRE
 msacm32.dll	acmStreamUnprepareHeader	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTREAM:handle:1|pash:Windows.Win32.Media.Audio.ACMSTREAMHEADER*:ptr:1|fdwUnprepare:u32:u32:1
 msvcr80.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr80.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr80.dll	_CIcos	cdecl	void	void	
+msvcr80.dll	_CIsin	cdecl	void	void	
+msvcr80.dll	_CIsqrt	cdecl	void	void	
+msvcr80.dll	_CItan	cdecl	void	void	
 msvcr80.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
@@ -3517,6 +3521,10 @@ msvcr80.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|f
 msvcr80.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr90.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr90.dll	_CIcos	cdecl	void	void	
+msvcr90.dll	_CIsin	cdecl	void	void	
+msvcr90.dll	_CIsqrt	cdecl	void	void	
+msvcr90.dll	_CItan	cdecl	void	void	
 msvcr90.dll	___lc_codepage_func	cdecl	u32	unsigned int	
 msvcr90.dll	___lc_handle_func	cdecl	ptr	LCID*	
 msvcr90.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
@@ -3575,6 +3583,10 @@ msvcr90.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|f
 msvcr90.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcrt.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcrt.dll	_CIcos	cdecl	void	void	
+msvcrt.dll	_CIsin	cdecl	void	void	
+msvcrt.dll	_CIsqrt	cdecl	void	void	
+msvcrt.dll	_CItan	cdecl	void	void	
 msvcrt.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	_acmdln	data	ptr	char*	

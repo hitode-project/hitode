@@ -190,3 +190,15 @@ msvcr80.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
 msvcr80.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcr90.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
 msvcr90.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
+msvcrt.dll	_CItan	cdecl	void	void	
+msvcrt.dll	_CIsin	cdecl	void	void	
+msvcrt.dll	_CIcos	cdecl	void	void	
+msvcrt.dll	_CIsqrt	cdecl	void	void	
+msvcr80.dll	_CItan	cdecl	void	void	
+msvcr80.dll	_CIsin	cdecl	void	void	
+msvcr80.dll	_CIcos	cdecl	void	void	
+msvcr80.dll	_CIsqrt	cdecl	void	void	
+msvcr90.dll	_CItan	cdecl	void	void	
+msvcr90.dll	_CIsin	cdecl	void	void	
+msvcr90.dll	_CIcos	cdecl	void	void	
+msvcr90.dll	_CIsqrt	cdecl	void	void	

@@ -233,5 +233,16 @@
     "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
     "projection": "int __cdecl fgetpos(FILE*, fpos_t*) and fsetpos(FILE*, const fpos_t*), two x86 pointer slots; fpos_t typedef signed __int64, 8-byte guest position; legacy CRT aliases only.",
     "profile": "Use the existing CRT stream cursor; bounded atomic guest position accesses, no separate stream or host pathname owner."
+  },
+  "x87_intrinsic_math": {
+    "source": "Microsoft Learn x86 CRT intrinsic declarations, 2026-10-07 read",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/citan",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisin",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cicos",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisqrt"
+    ],
+    "projection": "void __cdecl _CItan/_CIsin/_CIcos/_CIsqrt(void); zero integer-stack parameter slots, specialized x87 input/result in ST0. Result must replace the operand while preserving lower x87 stack and guest ESP; not a two-slot cdecl double input.",
+    "profile": "Only legacy CRT aliases. Reuse guest FPU owner, measured finite nearest/masked inputs; unavailable exceptional/control profiles must warn and fail rather than claim complete CRT math compatibility."
   }
 }
