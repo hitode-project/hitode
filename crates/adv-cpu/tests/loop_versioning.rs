@@ -382,6 +382,225 @@ fn loops_leaving_through_a_side_exit_resume_after_it() {
     }
 }
 
+/// A loop around `body` that `close` steps and tests.
+fn closed(
+    body: impl FnOnce(&mut CodeAssembler),
+    close: impl FnOnce(&mut CodeAssembler, CodeLabel),
+) -> Vec<u8> {
+    code(|a| {
+        let mut top = a.create_label();
+        a.pxor(mm0, mm0).unwrap();
+        a.mov(eax, 0x0060_00a0).unwrap();
+        a.movd(mm5, eax).unwrap();
+        a.punpckldq(mm5, mm5).unwrap();
+        a.set_label(&mut top).unwrap();
+        body(a);
+        close(a, top);
+        a.emms().unwrap();
+        a.ret().unwrap();
+    })
+}
+
+#[test]
+fn stores_between_the_counter_step_and_the_latch_match_unicorn() {
+    let all = |_: &mut Executor| {};
+    // Batched bodies whose decrement precedes a store: of a lane value, of
+    // the counter itself, and to a slot the next iteration reads.
+    let lane = counted_store(|a| a.mov(dword_ptr(edi - 4), eax).unwrap());
+    let counter = counted_store(|a| a.mov(dword_ptr(edi - 4), ecx).unwrap());
+    let slot = counted_store(|a| a.mov(dword_ptr(ebp), eax).unwrap());
+    for (name, bytes) in [("lane", &lane), ("counter", &counter), ("slot", &slot)] {
+        for count in [1u32, 2, 3, 4, 5, 3000] {
+            let mut r = regs(count, SRC, DST);
+            r[5] = END - 0x100;
+            differential(name, bytes, r, all, 1 << 30);
+            differential(name, bytes, r, all, 37);
+        }
+    }
+}
+
+/// A rotate-and-mix body stepping its pointers, then `dec ecx`, `store`, `jne`.
+fn counted_store(store: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
+    code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(edx, dword_ptr(esi + 4)).unwrap();
+        a.mov(ebx, eax).unwrap();
+        a.ror(ebx, 7).unwrap();
+        a.xor(eax, ebx).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        store(a);
+        a.jne(top).unwrap();
+        a.ret().unwrap();
+    })
+}
+
+#[test]
+fn compare_latched_and_signed_counters_match_unicorn() {
+    let all = |_: &mut Executor| {};
+    let copy = |a: &mut CodeAssembler| {
+        a.mov(eax, dword_ptr(esi + ebx * 4)).unwrap();
+        a.mov(dword_ptr(edi + ebx * 4), eax).unwrap();
+    };
+    // Up to a register bound, exclusive and inclusive, and to a constant.
+    let below = closed(copy, |a, top| {
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, edx).unwrap();
+        a.jb(top).unwrap();
+    });
+    let through = closed(copy, |a, top| {
+        a.add(ebx, 1).unwrap();
+        a.cmp(ebx, edx).unwrap();
+        a.jle(top).unwrap();
+    });
+    let constant = closed(copy, |a, top| {
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, 2500).unwrap();
+        a.jne(top).unwrap();
+    });
+    for (name, bytes) in [
+        ("below", &below),
+        ("through", &through),
+        ("constant", &constant),
+    ] {
+        for (first, bound) in [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (5, 3000),
+            (2499, 2500),
+            (-3i32 as u32, 7),
+        ] {
+            if name == "below" && first > bound || name == "constant" && first >= 2500 {
+                continue;
+            }
+            let mut r = regs(0, SRC + 12, DST + 12);
+            (r[3], r[2]) = (first, bound);
+            differential(name, bytes, r, all, 1 << 30);
+            differential(name, bytes, r, all, 37);
+        }
+    }
+    // Down to an inclusive register bound, the destination read-only midway.
+    let down = closed(copy, |a, top| {
+        a.dec(ebx).unwrap();
+        a.cmp(ebx, ebp).unwrap();
+        a.jge(top).unwrap();
+    });
+    let mut r = regs(0, SRC, DST);
+    (r[3], r[5]) = (3000, 7);
+    differential("down", &down, r, all, 1 << 30);
+    differential("down-sliced", &down, r, all, 41);
+    let readonly = |m: &mut Executor| m.protect(DST + 0x1000, 4096, READ).unwrap();
+    differential("down-fault", &down, r, readonly, 1 << 30);
+    // Pointer bounds: an end pointer met exactly, and one stepped past,
+    // which runs on until the source ends.
+    let pointers = closed(
+        |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        },
+        |a, top| {
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.cmp(esi, edx).unwrap();
+            a.jne(top).unwrap();
+        },
+    );
+    for (name, end) in [
+        ("end", SRC + 4 * 3001),
+        ("end-one", SRC + 4),
+        ("end-missed", SRC + 4 * 3001 + 2),
+    ] {
+        let mut r = regs(0, SRC, DST + 0x8000);
+        r[2] = end;
+        differential(name, &pointers, r, all, 1 << 30);
+        differential(name, &pointers, r, all, 43);
+    }
+    // A negative index stepping up to zero, and a positive one down past it:
+    // an MMX scale with the counter as the address index.
+    let negative = closed(copy, |a, top| {
+        a.add(ebx, 1).unwrap();
+        a.jne(top).unwrap();
+    });
+    for count in [1u32, 2, 3, 3000] {
+        let r = regs(0, SRC + 0x4000, DST + 0x4000);
+        let mut r = r;
+        r[3] = count.wrapping_neg();
+        differential("negative", &negative, r, all, 1 << 30);
+        differential("negative-sliced", &negative, r, all, 31);
+    }
+    let scale = closed(
+        |a| {
+            a.movd(mm1, dword_ptr(esi + ecx)).unwrap();
+            a.punpcklbw(mm1, mm0).unwrap();
+            a.pmullw(mm1, mm5).unwrap();
+            a.psrlw(mm1, 8).unwrap();
+            a.packuswb(mm1, mm0).unwrap();
+            a.movd(dword_ptr(edi + ecx), mm1).unwrap();
+        },
+        |a, top| {
+            a.sub(ecx, 4).unwrap();
+            a.jns(top).unwrap();
+        },
+    );
+    for count in [1u32, 2, 3, 4, 3000] {
+        let r = regs(4 * (count - 1), SRC, DST);
+        differential("scale", &scale, r, all, 1 << 30);
+        differential("scale-sliced", &scale, r, all, 29);
+    }
+    let r = regs(4 * 2999, SRC, DST);
+    differential("scale-fault", &scale, r, readonly, 1 << 30);
+    // A signed bound with a side exit, counting from below zero, and a
+    // decrement whose flags the latch tests after a store and through TEST.
+    let search = code(|a| {
+        let mut top = a.create_label();
+        let mut found = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi + ebx * 4 + 0x400)).unwrap();
+        a.cmp(eax, 0x5555_5555).unwrap();
+        a.je(found).unwrap();
+        a.mov(dword_ptr(edi + ebx * 4 + 0x400), eax).unwrap();
+        a.inc(ebx).unwrap();
+        a.cmp(ebx, edx).unwrap();
+        a.jl(top).unwrap();
+        a.set_label(&mut found).unwrap();
+        a.ret().unwrap();
+    });
+    let marker = |m: &mut Executor| {
+        m.write(SRC + 0x400 + 4 * 1000, &0x5555_5555u32.to_le_bytes())
+            .unwrap()
+    };
+    for bound in [-200i32, 40, 3000] {
+        let mut r = regs(0, SRC, DST);
+        (r[3], r[2]) = (-250i32 as u32, bound as u32);
+        differential("search", &search, r, marker, 1 << 30);
+        differential("search-sliced", &search, r, marker, 23);
+    }
+    let late = closed(
+        |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(esi, 4).unwrap();
+        },
+        |a, top| {
+            a.dec(ecx).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.lea(edi, dword_ptr(edi + 4)).unwrap();
+            a.test(ecx, ecx).unwrap();
+            a.jg(top).unwrap();
+        },
+    );
+    for count in [1u32, 2, 3000] {
+        let r = regs(count, SRC, DST);
+        differential("late", &late, r, all, 1 << 30);
+        differential("late-sliced", &late, r, all, 19);
+    }
+}
+
 /// The blend loop of a sprite renderer: skip transparent pixels, otherwise
 /// mix source and destination by the source alpha and a global factor.
 fn blend() -> Vec<u8> {

@@ -13,6 +13,7 @@ use iced_x86::{
 
 use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
+pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
@@ -585,14 +586,14 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let versioned = fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let versioned = true;
-    let plans = if versioned {
-        loops::plans(&instructions, &entries, |i| {
+    let (plans, rejected) = if versioned {
+        loops::survey(&instructions, &entries, |i| {
             supported(i)
                 && crate::strings::operation(i).is_none()
                 && !matches!(i.mnemonic(), M::Int | M::Rdtsc)
         })
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     // A kernel leaves at an access its windows reject; the region resumes
     // the loop's checked code there.
@@ -600,10 +601,19 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         entries.extend(plan.windows.iter().map(|&(pc, _)| pc));
     }
     let dead_flags = flag_liveness::dead_on_entry(&instructions);
-    let batches: Vec<_> = plans
+    let analyzed: Vec<_> = plans
         .iter()
         .map(|plan| vector::batch(plan, &instructions, &dead_flags))
         .collect();
+    let batches: Vec<_> = analyzed
+        .iter()
+        .map(|batch| batch.as_ref().ok().cloned())
+        .collect();
+    let coverage = if coverage::enabled() {
+        coverage::record(region.start, &instructions, &plans, &rejected, &analyzed)
+    } else {
+        BTreeMap::new()
+    };
     #[cfg(test)]
     let vectorized_loops = batches.iter().flatten().count();
     #[cfg(test)]
@@ -1056,6 +1066,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             kernels: kernels.to_vec(),
             batches: batches.clone(),
             lanes: None,
+            coverage: coverage.clone(),
             range_ok_ref,
             site: None,
             unchanged: 0,
@@ -1748,6 +1759,80 @@ mod tests {
     }
 
     #[test]
+    fn loop_coverage_counts_iterations_by_outcome() {
+        const CODE: u32 = 0x5_0000;
+        const STOP: u32 = 0x5_1000;
+        const STACK: u32 = 0x5_2f00;
+        const SRC: u32 = 0x6_0000;
+        const DST: u32 = 0x7_0000;
+        coverage::testing::FORCE.set(true);
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut copy = a.create_label();
+        let mut count = a.create_label();
+        a.mov(ecx, 100).unwrap();
+        a.set_label(&mut copy).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(copy).unwrap();
+        a.xor(edx, edx).unwrap();
+        a.set_label(&mut count).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, 50).unwrap();
+        a.jl(count).unwrap();
+        // Halves 200 pixels from the last down, stepping the index past zero.
+        let mut scale = a.create_label();
+        a.pxor(mm0, mm0).unwrap();
+        a.mov(ecx, 4 * 199).unwrap();
+        a.set_label(&mut scale).unwrap();
+        a.movd(mm1, dword_ptr(esi + ecx)).unwrap();
+        a.punpcklbw(mm1, mm0).unwrap();
+        a.psrlw(mm1, 1).unwrap();
+        a.packuswb(mm1, mm0).unwrap();
+        a.movd(dword_ptr(edi + ecx), mm1).unwrap();
+        a.sub(ecx, 4).unwrap();
+        a.jns(scale).unwrap();
+        a.emms().unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(u64::from(CODE)).unwrap();
+        let mut machine = crate::Executor::new(CODE, 0x3_0000).unwrap();
+        machine.protect(CODE, 0x3_0000, READ | WRITE).unwrap();
+        machine.write(CODE, &bytes).unwrap();
+        machine.protect(CODE, 4096, READ | EXEC).unwrap();
+        machine.protect(STOP, 4096, READ | EXEC).unwrap();
+        machine.write(STACK, &STOP.to_le_bytes()).unwrap();
+        machine.add_region(Region::new(CODE, bytes.len())).unwrap();
+        machine.state.eip = CODE;
+        machine.state.regs[4] = STACK;
+        machine.state.regs[6] = SRC;
+        machine.state.regs[7] = DST;
+        assert_eq!(
+            machine.run(STOP, 1 << 30).unwrap(),
+            crate::RunOutcome::ReachedStop
+        );
+        let report = coverage::report().unwrap();
+        coverage::testing::FORCE.set(false);
+        let row = |outcome: &str| -> Vec<u64> {
+            let line = report
+                .lines()
+                .find(|line| line.starts_with("0x00050000") && line.contains(outcome))
+                .unwrap_or_else(|| panic!("{outcome} in {report}"));
+            let fields: Vec<&str> = line.split('\t').collect();
+            fields[6..10].iter().map(|n| n.parse().unwrap()).collect()
+        };
+        // One checked back edge proves the copy; its kernel runs the rest.
+        let copied = row("\tkernel copy\t");
+        assert_eq!(copied[0] + copied[1], 100, "{report}");
+        assert_eq!(copied[2], 1);
+        assert_eq!(row("\trejected: nothing proven\t"), [49, 0, 0, 0]);
+        let scaled = row("\tkernel batch\t");
+        assert_eq!(scaled[0] + scaled[1], 200, "{report}");
+        assert_eq!(scaled[2], 1);
+    }
+
+    #[test]
     fn divide_uses_distinct_host_widths_without_a_second_remainder_division() {
         for clear_high in [true, false] {
             let mut a = CodeAssembler::new(32).unwrap();
@@ -2023,6 +2108,8 @@ struct Emitter<'a> {
     /// Each loop's batch form, and in its kernel the batch being emitted.
     batches: Vec<Option<vector::Batch>>,
     lanes: Option<vector::Lanes>,
+    /// With loop coverage on, each loop's counters by header and latch.
+    coverage: BTreeMap<(u32, u32), usize>,
     range_ok_ref: ir::FuncRef,
     /// The current instruction's operand address and size once a kernel
     /// validated its windows (`precheck`).
@@ -2747,6 +2834,11 @@ impl Emitter<'_> {
             if pc <= self.pc {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
+                if self.kernel.is_none()
+                    && let Some(&counters) = self.coverage.get(&(pc, self.pc))
+                {
+                    self.count_one(counters, offset_of!(coverage::Counters, checked));
+                }
             }
             self.flush_mmx_effects();
             let versioned = self
@@ -2829,7 +2921,7 @@ impl Emitter<'_> {
         let (index, ..) = self.kernel?;
         self.fast?;
         let plan = &self.plans[index];
-        (plan.counter_size == 2 && i.next_ip32() == plan.latch).then_some(plan.counter)
+        (plan.counter_size == 2 && i.ip32() == plan.counter_step).then_some(plan.counter)
     }
     /// The iteration count in a counter register's value of `size` bytes.
     fn counter_value(&mut self, size: u32, value: Value) -> Value {
@@ -2837,6 +2929,49 @@ impl Emitter<'_> {
             self.b.ins().band_imm(value, 0xffff)
         } else {
             value
+        }
+    }
+    /// How far loop `index`'s counter moves from `from` to reach `to`.
+    pub(super) fn counter_distance(&mut self, index: usize, from: Value, to: Value) -> Value {
+        let plan = &self.plans[index];
+        let (size, step) = (plan.counter_size, plan.steps[plan.counter]);
+        let distance = if step > 0 {
+            self.b.ins().isub(to, from)
+        } else {
+            self.b.ins().isub(from, to)
+        };
+        self.counter_value(size, distance)
+    }
+    /// The counter steps from `from` to `to`, a value it reaches by them.
+    pub(super) fn counter_steps(&mut self, index: usize, from: Value, to: Value) -> Value {
+        let magnitude = self.plans[index].steps[self.plans[index].counter].abs();
+        let distance = self.counter_distance(index, from, to);
+        if magnitude == 1 {
+            distance
+        } else {
+            self.b.ins().udiv_imm(distance, magnitude)
+        }
+    }
+    /// The iterations loop `index` has left, as an `I64`, when its latch
+    /// branches back: the counter's steps to its bound, rounded up, and one
+    /// more for an inclusive bound.
+    pub(super) fn remaining(&mut self, index: usize) -> Value {
+        let plan = &self.plans[index];
+        let (counter, bound, inclusive) = (plan.counter, plan.bound, plan.inclusive);
+        let magnitude = plan.steps[counter].abs();
+        let count = self.b.use_var(self.regs[counter]);
+        let bound = match bound {
+            loops::Bound::Constant(value) => self.constant(value),
+            loops::Bound::Register(register) => self.b.use_var(self.regs[register]),
+        };
+        let distance = self.counter_distance(index, count, bound);
+        let distance = self.b.ins().uextend(types::I64, distance);
+        let bias = if inclusive { magnitude } else { magnitude - 1 };
+        let distance = self.b.ins().iadd_imm(distance, bias);
+        if magnitude == 1 {
+            distance
+        } else {
+            self.b.ins().udiv_imm(distance, magnitude)
         }
     }
     /// A kernel's fuel when it leaves at `pc`: every iteration its counter
@@ -2847,19 +2982,18 @@ impl Emitter<'_> {
             return;
         };
         let plan = &self.plans[index];
-        let (header, latch) = (plan.header, plan.latch);
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let (header, step) = (plan.header, plan.counter_step);
+        let counter = plan.counter;
         let blocks = plan.starts.len() as i64;
         let fuel = self.b.ins().stack_load(types::I64, entry, 0);
         let first = self.b.ins().stack_load(types::I32, entry, 8);
         let count = self.b.use_var(self.regs[counter]);
-        let done = self.b.ins().isub(first, count);
-        let done = self.counter_value(counter_size, done);
+        let done = self.counter_steps(index, first, count);
         let mut done = self.b.ins().uextend(types::I64, done);
-        // Before the counter's decrement, right ahead of the latch.
+        // Inside an iteration, up to the counter's step.
         match self.known(pc) {
             Some(pc) => {
-                if header < pc && pc < latch {
+                if header < pc && pc <= step {
                     done = self.b.ins().iadd_imm(done, 1);
                 }
             }
@@ -2868,11 +3002,14 @@ impl Emitter<'_> {
                 let inside = self.b.ins().icmp_imm(
                     IntCC::UnsignedLessThan,
                     relative,
-                    i64::from(latch - header - 1),
+                    i64::from(step - header),
                 );
                 let inside = self.b.ins().uextend(types::I64, inside);
                 done = self.b.ins().iadd(done, inside);
             }
+        }
+        if let Some(counters) = self.plan_counters(index) {
+            self.count(counters, offset_of!(coverage::Counters, kernel), done);
         }
         let charge = self.b.ins().imul_imm(done, blocks);
         let fuel = self.b.ins().isub(fuel, charge);
@@ -2912,6 +3049,9 @@ impl Emitter<'_> {
         self.b.seal_block(load);
         self.call_kernel(index);
         self.b.switch_to_block(failed);
+        if let Some(counters) = self.plan_counters(index) {
+            self.count_one(counters, offset_of!(coverage::Counters, failures));
+        }
         let wait = self.constant(COOLDOWN);
         self.b.def_var(cooldown, wait);
         self.b.ins().jump(checked, &[]);
@@ -2920,6 +3060,9 @@ impl Emitter<'_> {
     /// returns `Dispatch` to resume here at the saved PC; any other exit has
     /// already saved the state and leaves the region with the same reason.
     fn call_kernel(&mut self, index: usize) {
+        if let Some(counters) = self.plan_counters(index) {
+            self.count_one(counters, offset_of!(coverage::Counters, calls));
+        }
         let header = self.constant(self.plans[index].header);
         self.save_state(header);
         let address = self.b.ins().iconst(self.ptr_ty, self.kernels[index] as i64);
@@ -2978,7 +3121,7 @@ impl Emitter<'_> {
     /// its header. Forwarded slots start from memory; windows start empty.
     fn enter_kernel(&mut self, index: usize) {
         let plan = &self.plans[index];
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let (counter, step) = (plan.counter, plan.steps[plan.counter]);
         let blocks = plan.starts.len() as i64;
         // The fuel pays for whole iterations: the loop stops early when the
         // counter reaches `stop` and charges what ran when it leaves.
@@ -2991,17 +3134,19 @@ impl Emitter<'_> {
         ));
         self.b.ins().stack_store(fuel, entry, 0);
         self.b.ins().stack_store(first, entry, 8);
-        let count = self.counter_value(counter_size, first);
-        let count = self.b.ins().uextend(types::I64, count);
+        let count = self.remaining(index);
         let affordable = self.b.ins().udiv_imm(fuel, blocks);
         let limit = self.b.ins().umin(affordable, count);
-        let stop = self.b.ins().isub(count, limit);
-        let mut stop = self.b.ins().ireduce(types::I32, stop);
-        if counter_size == 2 {
-            // The high half never changes (`counting`): compare whole registers.
-            let high = self.b.ins().band_imm(first, 0xffff_0000);
-            stop = self.b.ins().bor(high, stop);
-        }
+        // Fewer steps than wrap the counter: it meets `stop` only there. A
+        // 16-bit counter's high half never changes (`counting`).
+        let most = self
+            .b
+            .ins()
+            .iconst(types::I64, u32::MAX as i64 / step.abs());
+        let limit = self.b.ins().umin(limit, most);
+        let limit = self.b.ins().ireduce(types::I32, limit);
+        let advance = self.b.ins().imul_imm(limit, step);
+        let stop = self.b.ins().iadd(first, advance);
         let stop_var = self.b.declare_var(types::I32);
         self.b.def_var(stop_var, stop);
         self.kernel = Some((index, stop_var, entry));
@@ -3032,22 +3177,14 @@ impl Emitter<'_> {
         self.resume_clone(index);
     }
     /// Whether every group of loop `index` stays in ordinary memory for the
-    /// iterations left when its latch branches back: the counter, already
-    /// decremented and nonzero, is that count.
+    /// iterations left when its latch branches back, at least one.
     fn loop_proof(&mut self, index: usize) -> Value {
-        let plan = &self.plans[index];
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
-        let groups = plan.groups.clone();
-        let count = self.b.use_var(self.regs[counter]);
-        let count = if counter_size == 2 {
-            self.b.ins().band_imm(count, 0xffff)
-        } else {
-            count
-        };
-        let count = self.b.ins().uextend(types::I64, count);
+        let groups = self.plans[index].groups.clone();
+        let count = self.remaining(index);
         let more = self.b.ins().iadd_imm(count, -1);
         let len = self.b.ins().iconst(types::I64, self.len as i64);
-        let mut ok = self.constant(1);
+        let some = self.b.ins().icmp_imm(IntCC::NotEqual, count, 0);
+        let mut ok = self.b.ins().uextend(types::I32, some);
         for group in groups {
             let mut address = self.constant(0);
             if let Some(base) = group.base {

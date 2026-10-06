@@ -60,6 +60,9 @@ pub(super) struct Batch {
 }
 
 impl Batch {
+    pub(super) fn copies(&self) -> bool {
+        self.copy.is_some()
+    }
     fn width(&self) -> i64 {
         if self.copy.is_some() {
             COPY_LANES
@@ -240,15 +243,18 @@ pub(super) fn batch(
     plan: &loops::Plan,
     instructions: &BTreeMap<u32, Instruction>,
     dead_flags: &BTreeSet<u32>,
-) -> Option<Batch> {
-    if !plan.windows.is_empty() || !plan.slots.is_empty() {
-        return None;
+) -> Result<Batch, String> {
+    if !plan.windows.is_empty() {
+        return Err("windows".into());
+    }
+    if !plan.slots.is_empty() {
+        return Err("slots".into());
     }
     let body: Vec<&Instruction> = instructions
         .range(plan.header..plan.latch)
         .map(|(_, i)| i)
         .collect();
-    let end = instructions.get(&plan.latch)?.next_ip32();
+    let end = instructions.get(&plan.latch).ok_or("latch")?.next_ip32();
     let mut tail = plan.latch;
     for i in body.iter().rev() {
         if !plan.updates.contains(&i.ip32()) {
@@ -282,12 +288,12 @@ pub(super) fn batch(
             } else if let Some(index) = mmx::register(register) {
                 mmx |= u8::from(write) << index;
             } else if !register.is_segment_register() {
-                return None;
+                return Err(format!("register {register:?}").to_lowercase());
             }
         }
     }
     if general & (plan.inductions | 1 << 4) != 0 {
-        return None;
+        return Err("induction written".into());
     }
     // The tail runs with the last lane's pointers, so its flags are the
     // batch's, unless the body sets flags the tail keeps.
@@ -335,7 +341,7 @@ pub(super) fn batch(
         let pc = i.ip32();
         let state = match (current, incoming.remove(&pc)) {
             (Some(a), Some(b)) => meet(a, b),
-            (a, b) => a.or(b)?,
+            (a, b) => a.or(b).ok_or("unreachable")?,
         };
         let mut merge = |target: u32, state: State| {
             let merged = incoming
@@ -352,17 +358,20 @@ pub(super) fn batch(
         match i.flow_control() {
             FlowControl::Next => {}
             FlowControl::ConditionalBranch => {
-                let first = *starts.range(..=pc).next_back()?;
-                if !matches!(i.mnemonic(), M::Je | M::Jne)
-                    || state.stored
-                    || !zero_source(&body, n, first, &plan.updates)
-                {
-                    return None;
+                let first = *starts.range(..=pc).next_back().ok_or("block")?;
+                if !matches!(i.mnemonic(), M::Je | M::Jne) {
+                    return Err(format!("branch {}", loops::name(i)));
+                }
+                if state.stored {
+                    return Err("branch after store".into());
+                }
+                if !zero_source(&body, n, first, &plan.updates) {
+                    return Err("branch flags".into());
                 }
                 if i.near_branch32() < end {
                     merge(i.near_branch32(), state);
                 } else if !leaves(state) {
-                    return None;
+                    return Err("exit flags".into());
                 }
                 continue;
             }
@@ -371,15 +380,15 @@ pub(super) fn batch(
                 current = None;
                 continue;
             }
-            _ => return None,
+            _ => return Err(format!("flow {}", loops::name(i))),
         }
         if !general_supported(i) && !mmx_supported(i) {
-            return None;
+            return Err(format!("instruction {}", loops::name(i)));
         }
         let info = factory.info(i);
         let mut state = state;
         if !info.used_memory().is_empty() && !matches!(i.mnemonic(), M::Lea | M::Nop) {
-            state.stored |= *accesses.get(&pc)?;
+            state.stored |= *accesses.get(&pc).ok_or("unproven access")?;
         }
         let mut written = (0u8, 0u8);
         for used in info.used_registers() {
@@ -389,18 +398,18 @@ pub(super) fn batch(
                 OpAccess::Write => (false, true),
                 OpAccess::ReadWrite => (true, true),
                 _ if register.is_segment_register() => continue,
-                _ => return None,
+                _ => return Err("conditional access".into()),
             };
             if let Some(index) = reg_index(register.full_register32()) {
                 // A narrow write keeps the rest of the register.
                 let read = read || write && register.size() < 4;
                 if read && general & !state.general & 1 << index != 0 {
-                    return None;
+                    return Err(format!("carried {:?}", register.full_register32()).to_lowercase());
                 }
                 written.0 |= u8::from(write) << index;
             } else if let Some(index) = mmx::register(register) {
                 if read && mmx & !state.mmx & 1 << index != 0 {
-                    return None;
+                    return Err(format!("carried {register:?}").to_lowercase());
                 }
                 written.1 |= u8::from(write) << index;
             }
@@ -409,8 +418,8 @@ pub(super) fn batch(
         state.mmx |= written.1;
         current = Some(state);
     }
-    if !leaves(current?) {
-        return None;
+    if !leaves(current.ok_or("unreachable")?) {
+        return Err("exit flags".into());
     }
 
     let copy = copy_batch(plan, &body, tail);
@@ -434,7 +443,7 @@ pub(super) fn batch(
                 *write || *other_write
             };
             if conflict && a.base == b.base && a.index == b.index && meets(a, b) {
-                return None;
+                return Err("lane overlap".into());
             }
         }
     }
@@ -446,7 +455,7 @@ pub(super) fn batch(
             }
         }
     }
-    Some(Batch {
+    Ok(Batch {
         copy,
         general,
         mmx,
@@ -539,13 +548,9 @@ impl Emitter<'_> {
     /// bytes of a group through different registers, over the iterations
     /// the kernel may run. Groups stepping alike keep their distance.
     fn lanes_apart(&mut self, index: usize, checks: &[(loops::Group, loops::Group)]) -> Value {
-        let plan = &self.plans[index];
         let width = self.batches[index].as_ref().unwrap().width();
         let copy = self.batches[index].as_ref().unwrap().copy.is_some();
-        let (counter, counter_size) = (plan.counter, plan.counter_size);
-        let count = self.b.use_var(self.regs[counter]);
-        let count = self.counter_value(counter_size, count);
-        let count = self.b.ins().uextend(types::I64, count);
+        let count = self.remaining(index);
         let more = self.b.ins().iadd_imm(count, -1);
         let mut ok = self.b.ins().iconst(types::I8, 1);
         for (a, b) in checks {
@@ -638,15 +643,17 @@ impl Emitter<'_> {
     fn batch_room(&mut self, index: usize) -> Value {
         let batch = self.batches[index].as_ref().unwrap();
         let (exact, width) = (batch.exact, batch.width());
-        let counter = self.plans[index].counter;
+        let plan = &self.plans[index];
+        let (counter, magnitude) = (plan.counter, plan.steps[plan.counter].abs());
         let (_, stop, _) = self.kernel.expect("batches run in kernels");
         let count = self.b.use_var(self.regs[counter]);
         let stop = self.b.use_var(stop);
-        let left = self.b.ins().isub(count, stop);
+        // The distance is a whole number of steps.
+        let left = self.counter_distance(index, count, stop);
         self.b.ins().icmp_imm(
             IntCC::UnsignedGreaterThanOrEqual,
             left,
-            width + i64::from(!exact),
+            (width + i64::from(!exact)) * magnitude,
         )
     }
     /// Continues loop `index` at its header: as a batch when one fits, else
@@ -838,7 +845,7 @@ impl Emitter<'_> {
         let count = self.b.use_var(self.regs[counter]);
         let (_, stop, _) = self.kernel.unwrap();
         let stop = self.b.use_var(stop);
-        let available = self.b.ins().isub(count, stop);
+        let available = self.counter_steps(index, count, stop);
         let batches = self.b.ins().ushr_imm(available, 2);
         let body = self.b.create_block();
         self.b.append_block_param(body, self.ptr_ty);
