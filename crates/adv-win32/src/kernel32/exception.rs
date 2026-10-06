@@ -19,15 +19,25 @@ struct Vectored {
     namespace: Option<Namespace>,
     order: VecDeque<Identity<VectoredHandler>>,
 }
-/// Borrowed phase observations only. The existing callback continuation owns
-/// each marker; returning or dropping that continuation releases the phase.
+/// Frame handlers running per context, innermost last. Borrowed observations
+/// only: the callback continuation owns each marker, so returning or dropping
+/// (unwinding) it ends that handler's call.
 #[derive(Default)]
-struct FrameDispatch(BTreeMap<adv_machine::CtxId, Weak<()>>);
+struct FrameDispatch(BTreeMap<adv_machine::CtxId, Vec<Active>>);
+struct Active {
+    marker: Weak<()>,
+    /// Where native code would hold the dispatcher's own registration: the
+    /// handler runs on the stack below this dispatch's scratch records.
+    scratch: u32,
+    establisher: u32,
+}
 const LIMIT: usize = 1024;
+const EXCEPTION_NESTED_CALL: u32 = 0x10;
 const CONTEXT: u32 = 0x50;
 const POINTERS: u32 = 0x320;
 const DISPATCHER: u32 = 0x330;
-const SCRATCH: u32 = 0x340;
+const HANDLER_FRAME: u32 = 0x340;
+const SCRATCH: u32 = 0x360;
 
 pub(crate) fn install<B: Backend>(machine: &mut Machine<B>) {
     machine.sys.exception_handler = Some(cpu_exception);
@@ -188,18 +198,23 @@ struct Search {
     vectored: VecDeque<Identity<VectoredHandler>>,
     frame: Option<u32>,
     searched: usize,
+    /// (scratch, establisher) of interrupted frame handlers, innermost first.
+    outer: VecDeque<(u32, u32)>,
+    /// Native NestedFrame: the highest establisher whose handler was running.
+    nested: Option<u32>,
 }
 
 fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcome {
-    if env
+    let mut outer: Vec<_> = env
         .ext
         .try_get::<FrameDispatch>()
         .and_then(|state| state.0.get(&env.context))
-        .and_then(Weak::upgrade)
-        .is_some()
-    {
-        return Outcome::Fail("nested frame-based exception dispatch is not implemented".into());
-    }
+        .into_iter()
+        .flatten()
+        .filter(|active| active.marker.strong_count() != 0)
+        .map(|active| (active.scratch, active.establisher))
+        .collect();
+    outer.sort_unstable();
     // Guest stack owns the transient records. Callback frames live below them;
     // cancellation/exit needs no side heap allocation or cleanup continuation.
     let Some(scratch) = env
@@ -241,8 +256,54 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
             vectored,
             frame: None,
             searched: 0,
+            outer: outer.into(),
+            nested: None,
         },
     )
+}
+
+/// Bytes of the frame `handler_frame` writes.
+pub(super) const HANDLER_FRAME_SIZE: u32 = 28;
+
+/// Lay out ntdll's ExecuteHandler2 frame at `at` and point EBP at it before a
+/// frame-based handler runs: saved EBP, return slot, then the handler's four
+/// arguments and the handler. Borland's handler entry reads its arguments as
+/// `[ebp+8..+0x14]` without setting up a frame of its own.
+pub(super) fn handler_frame(
+    env: &mut Env<'_>,
+    at: u32,
+    args: [u32; 4],
+    handler: u32,
+) -> Result<(), String> {
+    let mut bytes = [0; HANDLER_FRAME_SIZE as usize];
+    let words = [
+        env.cpu.reg(Reg::Ebp),
+        0,
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        handler,
+    ];
+    for (slot, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *slot = word.to_le_bytes();
+    }
+    env.cpu.write(at, &bytes).map_err(|e| e.to_string())?;
+    env.cpu.set_reg(Reg::Ebp, at);
+    Ok(())
+}
+
+/// Native ExceptionFlags live in the guest record, which handlers may edit.
+fn nested_flag(env: &mut Env<'_>, search: &mut Search, set: bool) -> Result<(), String> {
+    let address = search.scratch + 4;
+    let flags = env.cpu.read_u32(address).map_err(|e| e.to_string())?;
+    let flags = if set {
+        flags | EXCEPTION_NESTED_CALL
+    } else {
+        flags & !EXCEPTION_NESTED_CALL
+    };
+    search.record.flags = flags;
+    env.cpu.write_u32(address, flags).map_err(|e| e.to_string())
 }
 
 fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
@@ -272,6 +333,18 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
             Err(error) => return Outcome::Fail(format!("SEH head read failed: {error}")),
         },
     };
+    // Passing an interrupted handler's dispatcher registration: native
+    // RtlpExceptionHandler answers ExceptionNestedException with that
+    // handler's establisher frame.
+    while let Some(&(scratch, establisher)) = search.outer.front()
+        && frame > scratch
+    {
+        search.outer.pop_front();
+        if let Err(error) = nested_flag(env, &mut search, true) {
+            return Outcome::Fail(format!("nested exception record write failed: {error}"));
+        }
+        search.nested = Some(search.nested.map_or(establisher, |n| n.max(establisher)));
+    }
     if frame == u32::MAX {
         return Outcome::Fail(format!(
             "unhandled Windows exception {:#010x} at {:#010x}",
@@ -302,28 +375,41 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
     search.frame = Some(next);
     search.searched += 1;
     let active = Rc::new(());
-    env.ext
+    let running = env
+        .ext
         .get_or_default::<FrameDispatch>()
         .0
-        .insert(env.context, Rc::downgrade(&active));
-    Outcome::call_on_stack(
-        handler,
-        [
-            search.scratch,
-            frame,
-            search.scratch + CONTEXT,
-            search.scratch + DISPATCHER,
-        ],
+        .entry(env.context)
+        .or_default();
+    running.retain(|active| active.marker.strong_count() != 0);
+    running.push(Active {
+        marker: Rc::downgrade(&active),
+        scratch: search.scratch,
+        establisher: frame,
+    });
+    let args = [
         search.scratch,
-        move |env, result| {
-            drop(active);
-            match result.value() {
-                0 => resume(env, search),
-                1 => self::search(env, search),
-                value => Outcome::Fail(format!("unsupported SEH disposition {value:#x}")),
+        frame,
+        search.scratch + CONTEXT,
+        search.scratch + DISPATCHER,
+    ];
+    if let Err(error) = handler_frame(env, search.scratch + HANDLER_FRAME, args, handler) {
+        return Outcome::Fail(format!("SEH handler frame write failed: {error}"));
+    }
+    Outcome::call_on_stack(handler, args, search.scratch, move |env, result| {
+        drop(active);
+        if search.nested == Some(frame) {
+            search.nested = None;
+            if let Err(error) = nested_flag(env, &mut search, false) {
+                return Outcome::Fail(format!("nested exception record write failed: {error}"));
             }
-        },
-    )
+        }
+        match result.value() {
+            0 => resume(env, search),
+            1 => self::search(env, search),
+            value => Outcome::Fail(format!("unsupported SEH disposition {value:#x}")),
+        }
+    })
     // An `__except` or catch target resumes on the establisher's stack and
     // never returns here; dropping this continuation also ends the phase.
     .unwindable()

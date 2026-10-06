@@ -162,7 +162,8 @@ const STATUS_UNWIND: u32 = 0xc000_0027;
 const RECORD: u32 = 0;
 const CONTEXT: u32 = 0x50;
 const DISPATCHER: u32 = 0x320;
-const SCRATCH: u32 = 0x330;
+const HANDLER_FRAME: u32 = 0x330;
+const SCRATCH: u32 = HANDLER_FRAME + super::exception::HANDLER_FRAME_SIZE;
 
 struct Unwind {
     target: u32,
@@ -260,6 +261,10 @@ fn unwind_step(env: &mut Env<'_>, u: Unwind) -> Outcome {
         return Outcome::Fail(format!("RtlUnwind: unreadable registration {frame:#010x}"));
     };
     let args = [u.record, frame, u.scratch + CONTEXT, u.scratch + DISPATCHER];
+    let at = u.scratch + HANDLER_FRAME;
+    if let Err(error) = super::exception::handler_frame(env, at, args, handler) {
+        return Outcome::Fail(format!("RtlUnwind: handler frame write failed: {error}"));
+    }
     Outcome::call(handler, args, move |env, r| {
         if r.value() != 1 {
             log::warn!(
