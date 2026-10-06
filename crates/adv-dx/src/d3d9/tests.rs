@@ -39,6 +39,7 @@ pub(super) fn machine() -> Machine<JitCpu> {
             ("IDirect3DSurface9", 0),
             ("IDirect3DVertexBuffer9", 0),
             ("IDirect3DIndexBuffer9", 0),
+            ("IDirect3DVertexDeclaration9", 0),
         ]),
         gpu: None,
         provider,

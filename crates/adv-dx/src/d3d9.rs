@@ -70,6 +70,7 @@ enum Payload {
     Device(Box<Device>),
     Resource(Resource),
     Buffer(buffers::Buffer),
+    Declaration(declaration::Declaration),
 }
 struct Device {
     pointer: u32,
@@ -101,10 +102,9 @@ pub struct State {
     sender: Option<adv_sync::background::LocalSender>,
     wake: Option<std::sync::Arc<adv_sync::WakeEvent>>,
     /// Whether creation offers COPY presentation. Accepting a swap effect
-    /// moves every engine that requests it onto its Direct3D path, so the
-    /// production profile withholds COPY until vertex declarations exist;
-    /// otherwise SoftPAL leaves its working fallback for an unimplemented
-    /// declaration. The COPY implementation itself stays tested.
+    /// moves every engine that requests it onto its Direct3D path (SoftPAL
+    /// then needs vertex declarations), so a profile can withhold COPY when
+    /// that path regresses an engine that has a working fallback.
     copy: bool,
 }
 #[derive(Clone, Copy, Debug)]
@@ -198,6 +198,7 @@ pub fn register(registry: &mut Registry) {
     capabilities::register(registry);
     targets::register(registry);
     buffers::register(registry);
+    declaration::register(registry);
     creation::register(registry);
     depth::register(registry);
     memory::register(registry);
@@ -218,6 +219,7 @@ pub fn install<B: Backend>(
         "IDirect3DSurface9",
         "IDirect3DVertexBuffer9",
         "IDirect3DIndexBuffer9",
+        "IDirect3DVertexDeclaration9",
     ] {
         let signatures: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
@@ -255,7 +257,7 @@ pub fn install<B: Backend>(
         transfers: Vec::new(),
         sender: None,
         wake: None,
-        copy: false,
+        copy: true,
     });
     Ok(())
 }
@@ -349,7 +351,8 @@ fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
         return release(env, parent);
     }
     let parent = resources::parent_on_last_public_release(env, pointer)
-        .or_else(|| buffers::parent_on_last_public_release(env, pointer));
+        .or_else(|| buffers::parent_on_last_public_release(env, pointer))
+        .or_else(|| declaration::parent_on_last_public_release(env, pointer));
     let Some(released) = com(env).release::<Payload>(&mut env.sys.objects, pointer) else {
         return 0;
     };
@@ -369,7 +372,8 @@ fn add_ref(env: &mut Env<'_>, pointer: u32) -> Option<u32> {
         return add_ref(env, parent);
     }
     let parent = resources::parent_on_first_public_retain(env, pointer)
-        .or_else(|| buffers::parent_on_first_public_retain(env, pointer));
+        .or_else(|| buffers::parent_on_first_public_retain(env, pointer))
+        .or_else(|| declaration::parent_on_first_public_retain(env, pointer));
     if let Some(parent) = parent {
         com(env).add_ref_identity(&mut env.sys.objects, parent)?;
     }
@@ -410,7 +414,8 @@ fn query(
         return Outcome::Return(0);
     }
     let parent = resources::parent_on_first_public_retain(env, this.addr())
-        .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()));
+        .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()))
+        .or_else(|| declaration::parent_on_first_public_retain(env, this.addr()));
     if let Some(parent) = parent
         && com(env)
             .add_ref_identity(&mut env.sys.objects, parent)
@@ -459,6 +464,7 @@ macro_rules! unknown {
     };
 }
 mod buffers;
+mod declaration;
 mod depth;
 mod resources;
 unknown!(

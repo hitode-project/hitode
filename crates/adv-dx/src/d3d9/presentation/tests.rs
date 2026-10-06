@@ -88,11 +88,12 @@ fn copy_parameters_preserve_effect_and_reject_multibuffer_or_multisample() {
 }
 
 #[test]
-fn production_profile_withholds_copy_but_keeps_discard() {
+fn profile_can_withhold_copy_but_keeps_discard() {
     let mut machine = super::super::tests::machine();
     let provider = machine.ext.get::<State>().provider;
     install(&mut machine, provider).unwrap();
-    assert!(!machine.ext.get::<State>().copy);
+    assert!(machine.ext.get::<State>().copy);
+    machine.ext.get_mut::<State>().copy = false;
     let env = env(&mut machine);
     assert_eq!(normalize(&env, parameters(), 0), Err(UNAVAILABLE));
     let discard = D3DPRESENT_PARAMETERS {
