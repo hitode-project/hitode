@@ -11,7 +11,14 @@ type Matrix = [f32; 16];
 type Vector = [f32; 3];
 
 pub fn register(registry: &mut Registry) {
-    for api in [multiply_ABI, transpose_ABI, look_at_ABI, project_ABI] {
+    for api in [
+        multiply_ABI,
+        transpose_ABI,
+        scaling_ABI,
+        translation_ABI,
+        look_at_ABI,
+        project_ABI,
+    ] {
         registry.register(api);
     }
     effect::register(registry);
@@ -25,6 +32,43 @@ fn product(left: Matrix, right: Matrix) -> Matrix {
             .map(|k| left[row * 4 + k] * right[k * 4 + column])
             .sum()
     })
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixScaling", level = implement)]
+fn scaling(
+    env: &mut Env<'_>,
+    output: GuestPtr<Matrix>,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+) -> GuestPtr<Matrix> {
+    // Scalar assignments retain their IEEE bits, including negative zero and
+    // NaN payloads. Every other coefficient is explicitly initialized.
+    let value = [
+        sx, 0., 0., 0., 0., sy, 0., 0., 0., 0., sz, 0., 0., 0., 0., 1.,
+    ];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXMatrixTranslation", level = implement)]
+fn translation(
+    env: &mut Env<'_>,
+    output: GuestPtr<Matrix>,
+    x: f32,
+    y: f32,
+    z: f32,
+) -> GuestPtr<Matrix> {
+    // D3DX uses row vectors: the translation occupies the fourth matrix row.
+    let value = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, z, 1.];
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
 }
 
 #[win32(d3dx9_43, name = "D3DXMatrixMultiply", level = implement)]

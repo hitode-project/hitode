@@ -246,8 +246,9 @@ public static class AbiMetadata
             var f = row.Split('\t');
             bool vcm = f.Length == 6 && f[0] == "msvfw32.dll" && new[] { "ICInstall", "ICRemove" }.Contains(f[1]) && f[3] == "i32";
             bool d3dx = f.Length == 6 && f[0] == "d3dx9_43.dll"
-                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixLookAtLH", "D3DXVec3Project" }.Contains(f[1])
+                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project" }.Contains(f[1])
                 && f[3] == "ptr" && f[4] == (f[1] == "D3DXVec3Project" ? "D3DXVECTOR3*" : "D3DXMATRIX*");
+            bool d3dxScalars = d3dx && new[] { "D3DXMatrixScaling", "D3DXMatrixTranslation" }.Contains(f[1]);
             bool d3dxEffect = f.Length == 6 && f[0] == "d3dx9_43.dll"
                 && new[] { "D3DXCreateEffect", "D3DXGetShaderOutputSemantics" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "HRESULT";
@@ -281,16 +282,20 @@ public static class AbiMetadata
             if ((!vcm && !d3dx && !d3dxEffect && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
-                int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
+                int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" => 4, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
                 if (f[5].Split('|', StringSplitOptions.RemoveEmptyEntries).Length != expected)
                     throw new InvalidDataException("D3DX x86 stack contract changed: " + row);
+                if (d3dxScalars && f[5] != (f[1] == "D3DXMatrixScaling"
+                    ? "pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1"
+                    : "pOut:D3DXMATRIX*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1"))
+                    throw new InvalidDataException("D3DX scalar matrix declaration changed: " + row);
             }
             if (d3dxEffect && f[5].Split('|').Length != (f[1] == "D3DXCreateEffect" ? 9 : 3))
                 throw new InvalidDataException("D3DX Effect x86 stack contract changed: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? p[2] == "ptr" : d3dxEffect ? new[] { "ptr", "u32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect ? new[] { "ptr", "u32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

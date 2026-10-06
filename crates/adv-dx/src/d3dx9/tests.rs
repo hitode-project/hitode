@@ -153,6 +153,8 @@ fn typed_legacy_math_exports_and_x86_stack_are_exact_without_gpu() {
     let contracts = [
         (multiply_ABI, vec![OUTPUT, LEFT, RIGHT]),
         (transpose_ABI, vec![OUTPUT, LEFT]),
+        (scaling_ABI, vec![OUTPUT, 0x3acccccd, 0x3b360b61, 0]),
+        (translation_ABI, vec![OUTPUT, 0xbf800000, 0xbf800000, 0]),
         (
             look_at_ABI,
             vec![OUTPUT, VECTOR, VECTOR + 0x10, VECTOR + 0x20],
@@ -184,12 +186,18 @@ fn typed_legacy_math_exports_and_x86_stack_are_exact_without_gpu() {
         let declared = signature::lookup(api.module, api.name).unwrap();
         assert_eq!(declared.return_kind, AbiKind::Pointer);
         assert_eq!(declared.stack_words(), args.len() as u16);
-        assert!(
-            declared
-                .parameters
-                .iter()
-                .all(|p| p.kind == AbiKind::Pointer)
-        );
+        for (index, parameter) in declared.parameters.iter().enumerate() {
+            let scalar =
+                matches!(api.name, "D3DXMatrixScaling" | "D3DXMatrixTranslation") && index != 0;
+            assert_eq!(
+                parameter.kind,
+                if scalar {
+                    AbiKind::F32
+                } else {
+                    AbiKind::Pointer
+                }
+            );
+        }
         assert_eq!(
             registry.level(api.module, api.name),
             Some(ImplementationLevel::Implement)
@@ -215,12 +223,85 @@ fn typed_legacy_math_exports_and_x86_stack_are_exact_without_gpu() {
         m.cpu.read_u32(DATA + 0x700).unwrap(),
         m.cpu.read_u32(DATA + 0x704).unwrap()
     );
-    for index in 0..4 {
+    for index in 0..contracts.len() as u32 {
         assert_eq!(m.cpu.read_u32(DATA + 0x710 + index * 4).unwrap(), OUTPUT);
     }
     assert!(registry.signature_conflicts().is_empty());
     assert!(!registry.dynamic_available("d3dx9_42.dll", "D3DXMatrixMultiply"));
     assert!(registry.dynamic_available("d3dx9_43.dll", "D3DXCreateEffect"));
+}
+
+#[test]
+fn scaling_and_row_vector_translation_assign_native_scalar_bits_without_reading_output() {
+    // Four authored native calls (finite/negative/special values) are preserved
+    // in target/engine-loop/20261007-resume/d3dx-affine-native/native.jsonl.
+    let mut f = Fixture::new();
+    for (api, scalars, expected) in [
+        (
+            scaling_ABI,
+            [0x3acccccd, 0x3b360b61, 0],
+            [
+                0x3acccccd, 0, 0, 0, 0, 0x3b360b61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x3f800000,
+            ],
+        ),
+        (
+            translation_ABI,
+            [0xbf800000, 0xbf800000, 0],
+            [
+                0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0xbf800000,
+                0xbf800000, 0, 0x3f800000,
+            ],
+        ),
+        (
+            scaling_ABI,
+            [0x80000000, 0x7f800000, 0x7fc12345],
+            [
+                0x80000000, 0, 0, 0, 0, 0x7f800000, 0, 0, 0, 0, 0x7fc12345, 0, 0, 0, 0, 0x3f800000,
+            ],
+        ),
+        (
+            translation_ABI,
+            [0x80000000, 0x7f800000, 0x7fc12345],
+            [
+                0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0x80000000,
+                0x7f800000, 0x7fc12345, 0x3f800000,
+            ],
+        ),
+    ] {
+        for output in [OUTPUT, OUTPUT + 4, WRITE_ONLY, STACK + 4] {
+            // This may overlap the argument slots themselves: typed Arguments
+            // snapshots all three FLOAT values before publishing the matrix.
+            f.0.cpu.write(output, &[0xcd; 64]).unwrap();
+            assert_eq!(
+                f.call(api, &[output, scalars[0], scalars[1], scalars[2]]),
+                output
+            );
+            assert_eq!(f.get::<16>(output).map(f32::to_bits), expected);
+        }
+    }
+    // Confirm the two constructors compose in the existing row-vector product:
+    // scaling followed by translation keeps the offset in row 4.
+    assert_eq!(
+        f.call(
+            scaling_ABI,
+            &[LEFT, 2f32.to_bits(), 3f32.to_bits(), 4f32.to_bits()]
+        ),
+        LEFT
+    );
+    assert_eq!(
+        f.call(
+            translation_ABI,
+            &[RIGHT, (-1f32).to_bits(), 5f32.to_bits(), 0]
+        ),
+        RIGHT
+    );
+    assert_eq!(f.call(multiply_ABI, &[OUTPUT, LEFT, RIGHT]), OUTPUT);
+    assert_eq!(
+        f.get::<16>(OUTPUT),
+        [
+            2., 0., 0., 0., 0., 3., 0., 0., 0., 0., 4., 0., -1., 5., 0., 1.
+        ]
+    );
 }
 
 #[test]
@@ -353,6 +434,8 @@ fn unreadable_inputs_and_unwritable_outputs_fail_without_partial_writes() {
     let contracts = [
         (multiply_ABI, vec![OUTPUT, LEFT, RIGHT], 64),
         (transpose_ABI, vec![OUTPUT, LEFT], 64),
+        (scaling_ABI, vec![OUTPUT, 0x3acccccd, 0x3b360b61, 0], 64),
+        (translation_ABI, vec![OUTPUT, 0xbf800000, 0xbf800000, 0], 64),
         (
             look_at_ABI,
             vec![OUTPUT, VECTOR, VECTOR + 0x10, VECTOR + 0x20],
@@ -366,6 +449,11 @@ fn unreadable_inputs_and_unwritable_outputs_fail_without_partial_writes() {
     ];
     for (api, args, size) in contracts {
         for index in 1..args.len() {
+            if signature::lookup(api.module, api.name).unwrap().parameters[index].kind
+                != AbiKind::Pointer
+            {
+                continue;
+            }
             for bad in [0, UNMAPPED, WRITE_ONLY, DATA + 4090, u32::MAX - 8] {
                 f.0.cpu.write(OUTPUT, &[0xcd; 64]).unwrap();
                 let mut args = args.clone();
