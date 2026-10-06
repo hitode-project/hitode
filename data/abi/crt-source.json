@@ -151,7 +151,7 @@
   "stdio.h": {
     "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
     "header": "ucrt/stdio.h",
-    "projection": "x86 cdecl fixed va_list and variadic mandatory parameters for six paired buffer/count families, limited to VC80/90 export profiles"
+    "projection": "x86 cdecl fixed va_list and variadic mandatory parameters for six paired secure buffer/count families in VC80/90 profiles; sprintf at1764-1767 and vsprintf at1465-1469 add the two/three mandatory x86 pointer slots without a capacity parameter in the existing MSVCRT/VC80/VC90 profiles"
   },
   "direct.h": {
     "header": "ucrt/direct.h",
