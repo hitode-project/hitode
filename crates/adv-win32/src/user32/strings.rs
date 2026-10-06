@@ -1,11 +1,32 @@
-//! In-place USER32 case conversion, with ACP and DBCS character boundaries.
-use adv_abi::{AnsiStr, Registry, win32};
-use adv_cpu::backend::{GuestExt, MemFault, Prot};
+//! USER32 string traversal and case conversion, with ACP and DBCS boundaries.
+use adv_abi::{AnsiStr, GuestPtr, Registry, win32};
+use adv_cpu::backend::{Guest, GuestExt, MemFault, Prot};
 use adv_machine::{Env, Outcome};
 use adv_os::Codec;
 use adv_os::nls::{CP_ACP, CP_OEMCP, unit_case};
 
 use crate::{Win32, stdcall};
+
+fn next_ansi(cpu: &dyn Guest, codec: Codec, address: u32) -> Result<u32, MemFault> {
+    let byte = cpu.read_u8(address)?;
+    if byte == 0 {
+        return Ok(address);
+    }
+    let next = address.wrapping_add(1);
+    // A dangling lead byte advances to the terminator, never past it. Only
+    // DBCS leads require reading a second byte (including at a page boundary).
+    if codec.is_lead_byte(CP_ACP, byte) && cpu.read_u8(next)? != 0 {
+        Ok(next.wrapping_add(1))
+    } else {
+        Ok(next)
+    }
+}
+
+#[win32(user32, name = "CharNextA", level = implement)]
+fn char_next(env: &mut Env<'_>, text: AnsiStr) -> Result<AnsiStr, MemFault> {
+    next_ansi(env.cpu, env.ext.get::<Win32>().codec, text.0.addr())
+        .map(|address| AnsiStr(GuestPtr::new(address)))
+}
 
 fn ansi_case(bytes: &mut [u8], codec: Codec, upper: bool) {
     let mut i = 0;
@@ -150,6 +171,7 @@ fn convert(env: &mut Env<'_>, wide: bool, upper: bool) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(char_next_ABI);
     reg.register(char_upper_ABI);
     reg.register(char_lower_ABI);
     reg.register(oem_to_char_ABI);
@@ -179,6 +201,7 @@ pub(super) fn register(reg: &mut Registry) {
 mod tests {
     #[link(name = "user32")]
     unsafe extern "system" {
+        fn CharNextExA(codepage: u16, text: *const u8, flags: u32) -> *mut u8;
         fn CharUpperA(text: *mut u8) -> *mut u8;
         fn CharLowerA(text: *mut u8) -> *mut u8;
         fn CharUpperBuffW(text: *mut u16, len: u32) -> u32;
@@ -188,6 +211,46 @@ mod tests {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetACP() -> u32;
+    }
+
+    #[test]
+    fn ansi_next_matches_windows_dbcs_and_terminator_boundaries() {
+        use adv_cpu::{JitCpu, backend::Guest};
+
+        let mut cpu = JitCpu::new(0x400000, false).unwrap();
+        cpu.map(0x410000, 4096, super::Prot::RW).unwrap();
+        for codepage in [932, 936, 1252] {
+            let codec = super::Codec::new(codepage);
+            for first in 0..=u8::MAX {
+                for second in [0, 0x20, 0x40, 0x81, 0xff] {
+                    let bytes = [first, second, 0];
+                    cpu.write(0x410000, &bytes).unwrap();
+                    // SAFETY: the input is a readable, null-terminated buffer.
+                    let expected = unsafe {
+                        CharNextExA(codepage as u16, bytes.as_ptr(), 0).offset_from(bytes.as_ptr())
+                    } as u32;
+                    assert_eq!(
+                        super::next_ansi(&cpu, codec, 0x410000).unwrap() - 0x410000,
+                        expected,
+                        "CP={codepage} bytes={bytes:02x?}"
+                    );
+                }
+            }
+        }
+        let end = 0x410fff;
+        cpu.write(end, b"a").unwrap();
+        assert_eq!(
+            super::next_ansi(&cpu, super::Codec::new(932), end).unwrap(),
+            end + 1
+        );
+        cpu.write(end, &[0]).unwrap();
+        assert_eq!(
+            super::next_ansi(&cpu, super::Codec::new(932), end).unwrap(),
+            end
+        );
+        cpu.write(end, &[0x82]).unwrap();
+        assert!(super::next_ansi(&cpu, super::Codec::new(932), end).is_err());
+        assert!(super::next_ansi(&cpu, super::Codec::new(932), 0).is_err());
     }
 
     #[test]

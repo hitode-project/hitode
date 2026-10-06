@@ -318,6 +318,18 @@ impl<T> GuestReturn for GuestPtr<T> {
         Outcome::Return(self.addr())
     }
 }
+impl GuestReturn for AnsiStr {
+    const KIND: AbiKind = AbiKind::AnsiString;
+    fn into_outcome(self) -> Outcome {
+        Outcome::Return(self.0.addr())
+    }
+}
+impl GuestReturn for WideStr {
+    const KIND: AbiKind = AbiKind::WideString;
+    fn into_outcome(self) -> Outcome {
+        Outcome::Return(self.0.addr())
+    }
+}
 impl<T: GuestReturn> GuestReturn for Result<T, MemFault> {
     const KIND: AbiKind = T::KIND;
     fn into_outcome(self) -> Outcome {
