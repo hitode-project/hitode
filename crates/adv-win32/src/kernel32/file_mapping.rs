@@ -525,6 +525,37 @@ pub(crate) fn map_section(
     Outcome::Return(address)
 }
 
+/// DIBs use DWORD offsets inside a private view of the same shared section.
+/// The mapping owner already retains the section after its handle is closed.
+pub(crate) fn map_dib_section(
+    env: &mut Env<'_>,
+    handle: u32,
+    offset: u32,
+    bytes: u32,
+) -> Result<(u32, u32), u32> {
+    if offset & 3 != 0 || bytes == 0 {
+        return Err(87);
+    }
+    let protection = env
+        .sys
+        .objects
+        .host::<SectionHandle>(handle)
+        .ok_or(6u32)?
+        .section
+        .protection;
+    let access = match protection {
+        4 => WRITE,
+        8 => COPY,
+        _ => return Err(87),
+    };
+    let aligned = u64::from(offset) / GRANULE * GRANULE;
+    let delta = u64::from(offset) - aligned;
+    match map_section(env, handle, access, aligned, u64::from(bytes) + delta, 0) {
+        Outcome::Return(0) => Err(crate::util::last_error(env)),
+        Outcome::Return(base) => Ok((base, base + delta as u32)),
+        _ => unreachable!("mapping a data section is synchronous"),
+    }
+}
 fn flush(env: &mut Env<'_>) -> Outcome {
     let (address, count) = (env.arg(0), env.arg(1));
     let Some((&base, view)) = state(env).views.range(..=address).next_back() else {

@@ -397,6 +397,7 @@ fn new_bitmap(env: &mut Env<'_>, width: i32, height: i32, bpp: u16) -> Option<(u
             bits,
             stride,
             owned: true,
+            mapping_view: None,
             dib_colors: 0,
         },
     );

@@ -69,6 +69,7 @@ pub fn acquire(
             bits,
             stride: row,
             owned: false,
+            mapping_view: None,
             dib_colors: 0,
         },
     ) {

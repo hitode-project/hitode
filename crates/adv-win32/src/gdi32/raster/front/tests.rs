@@ -4,7 +4,7 @@ use adv_device::surface::{MemoryOperations, Snapshot};
 use adv_machine::{Clock, layout};
 use std::borrow::Cow;
 
-fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
+pub(super) fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
     MemoryView::new(
         cpu,
         MemoryOperations {
@@ -25,7 +25,7 @@ fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
         },
     )
 }
-fn invoke(m: &mut Machine<JitCpu>, data: u32, api: adv_abi::Api, args: &[u32]) -> u32 {
+pub(super) fn invoke<B: Backend>(m: &mut Machine<B>, data: u32, api: adv_abi::Api, args: &[u32]) -> u32 {
     for (i, &arg) in args.iter().enumerate() {
         m.cpu.write_u32(data + 4 * (i as u32 + 1), arg).unwrap();
     }

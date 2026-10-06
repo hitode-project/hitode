@@ -137,6 +137,7 @@ impl Raster {
                 bits,
                 stride: surface.pitch,
                 owned: false,
+                mapping_view: None,
                 dib_colors: dib.palette_count,
             };
             if !dcs.register_bitmap(objects, bitmap, metadata) {

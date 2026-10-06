@@ -452,6 +452,13 @@ pub struct ArenaUsage {
     pub live_surfaces: usize,
 }
 impl Arena {
+    fn contains(&self, address: u32, bytes: u32) -> bool {
+        address.checked_add(bytes).is_some_and(|end| {
+            self.regions
+                .iter()
+                .any(|&(base, len)| address >= base && end <= base + len)
+        })
+    }
     fn new(start: u32, len: u32) -> Result<Self, String> {
         start.checked_add(len).ok_or("arena overflow")?;
         if !start.is_multiple_of(16) || len == 0 {
@@ -688,7 +695,11 @@ impl<P: Presenter> Surfaces<P> {
         if self.native_surfaces.remove(&id).is_some() {
             return true;
         }
-        self.arena.release(s.pixels, s.pitch * s.height);
+        // Imported guest storage is retired by its frontend owner, not returned
+        // to the surface allocator's free list.
+        if self.arena.contains(s.pixels, s.pitch * s.height) {
+            self.arena.release(s.pixels, s.pitch * s.height);
+        }
         true
     }
 
@@ -887,6 +898,42 @@ impl<P: Presenter> Surfaces<P> {
         self.surfaces.insert(primary, surface);
         self.arena.release(old.pixels, old.pitch * old.height);
         Ok(())
+    }
+    /// Register existing writable guest pixels without copying or clearing them.
+    /// The caller keeps that memory alive until it deletes the surface. Imported
+    /// memory must lie outside the arena, so deletion never transfers it there.
+    pub fn import_guest(
+        &mut self,
+        surface: Surface,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<u32, String> {
+        size(surface.width, surface.height)?;
+        let row = surface
+            .width
+            .checked_mul(surface.format.bytes())
+            .ok_or("surface overflow")?;
+        let bytes = surface
+            .pitch
+            .checked_mul(surface.height)
+            .ok_or("surface overflow")?;
+        let end = surface
+            .pixels
+            .checked_add(bytes)
+            .ok_or("surface overflow")?;
+        if surface.pixels == 0
+            || surface.pitch < row
+            || self
+                .arena
+                .regions
+                .iter()
+                .any(|&(base, len)| surface.pixels < base + len && base < end)
+        {
+            return Err("invalid external surface storage".into());
+        }
+        m.writable(surface.pixels, bytes as usize)?;
+        let id = self.new_id();
+        self.surfaces.insert(id, surface);
+        Ok(id)
     }
     /// A zeroed surface; returns its id.
     pub fn create(
