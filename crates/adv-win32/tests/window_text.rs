@@ -656,3 +656,6 @@ mod encoding;
 
 #[path = "window_text/call_proc.rs"]
 mod call_proc;
+
+#[path = "window_text/paint_leases.rs"]
+mod paint_leases;

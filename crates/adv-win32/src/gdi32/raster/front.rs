@@ -3,7 +3,7 @@
 use super::*;
 use crate::{Win32, util::set_last_error};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
-use adv_cpu::backend::{Backend, Guest, Prot};
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine, Objects};
 
@@ -22,6 +22,22 @@ pub struct State {
     provider: Option<DrawingProvider>,
     /// Canvas bitmaps lent to another frontend, retired only by that owner.
     surface_dcs: std::collections::BTreeMap<u32, u32>,
+    /// Balanced USER acquisitions over the existing GDI/surface owner. Paint
+    /// leases belong to their PAINTSTRUCT, not to arbitrary guest HDC values.
+    window_leases: Vec<WindowDcLease>,
+}
+const MAX_WINDOW_LEASES: usize = 4096;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowDcUse {
+    Get,
+    Paint(u32),
+}
+#[derive(Clone, Copy)]
+struct WindowDcLease {
+    context: u32,
+    hwnd: u32,
+    dc: u32,
+    usage: WindowDcUse,
 }
 pub fn install<B: Backend>(machine: &mut Machine<B>) {
     let gdi = machine.ext.get::<Win32>().gdi.clone();
@@ -30,6 +46,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) {
         dcs: DeviceContexts::new(gdi),
         provider: None,
         surface_dcs: Default::default(),
+        window_leases: Vec::new(),
     });
 }
 pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
@@ -143,10 +160,7 @@ fn raster_call_named(
     }
 }
 
-pub(super) fn get_dc_value(env: &mut Env<'_>, hwnd: u32) -> Outcome {
-    if !available(env) {
-        return Outcome::Return(super::super::window_dc(env, hwnd));
-    }
+fn acquire_window_dc(env: &mut Env<'_>, hwnd: u32, usage: WindowDcUse, api: &str) -> Outcome {
     let size = if hwnd == 0 {
         Some(env.ext.get::<Win32>().user.screen)
     } else {
@@ -160,6 +174,55 @@ pub(super) fn get_dc_value(env: &mut Env<'_>, hwnd: u32) -> Outcome {
     let Some((width, height)) = size else {
         return fail(env, 1400);
     };
+    let raster = available(env);
+    let state = env.ext.get_mut::<State>();
+    if state.window_leases.len() == MAX_WINDOW_LEASES {
+        adv_abi::warn_unavailable(env, api, "window DC acquisition capacity is exhausted");
+        return fail(env, 50);
+    }
+    // The single display canvas cannot be rebound while another window or
+    // thread still owns it. Same-window reentry retains its GDI state instead.
+    if raster
+        && state.window_leases.iter().any(|lease| {
+            lease.dc == WINDOW_DC && (lease.hwnd != hwnd || lease.context != env.context)
+        })
+    {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "simultaneous display DC acquisitions for different windows or threads are unavailable",
+        );
+        return fail(env, 50);
+    }
+    if state.window_leases.try_reserve(1).is_err() {
+        return fail(env, 8);
+    }
+    let dc = match acquire_window_dc_owner(env, hwnd, width, height, raster) {
+        Outcome::Return(0) => return Outcome::Return(0),
+        Outcome::Return(dc) => dc,
+        result => return result,
+    };
+    env.ext
+        .get_mut::<State>()
+        .window_leases
+        .push(WindowDcLease {
+            context: env.context,
+            hwnd,
+            dc,
+            usage,
+        });
+    Outcome::Return(dc)
+}
+fn acquire_window_dc_owner(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    width: i32,
+    height: i32,
+    raster: bool,
+) -> Outcome {
+    if !raster {
+        return Outcome::Return(super::super::window_dc(env, hwnd));
+    }
     let provider = env.ext.get::<State>().provider.unwrap();
     let primary = {
         let store = env.ext.get_mut::<SurfaceStore>();
@@ -182,30 +245,37 @@ pub(super) fn get_dc_value(env: &mut Env<'_>, hwnd: u32) -> Outcome {
     gdi.set_external_bitmap(&mut env.sys.objects, WINDOW_DC, primary);
     Outcome::Return(WINDOW_DC)
 }
+fn release_window_dc(env: &mut Env<'_>, hwnd: u32, dc: u32, usage: WindowDcUse) -> bool {
+    let state = env.ext.get_mut::<State>();
+    let Some(index) = state.window_leases.iter().rposition(|lease| {
+        lease.context == env.context && lease.hwnd == hwnd && lease.dc == dc && lease.usage == usage
+    }) else {
+        return false;
+    };
+    state.window_leases.remove(index);
+    if !state.window_leases.iter().any(|lease| lease.dc == dc) {
+        super::super::release_dc(env, dc);
+    }
+    true
+}
 #[win32(user32, name = "GetDC", level = implement)]
 fn get_dc(env: &mut Env<'_>, hwnd: Handle) -> Outcome {
-    get_dc_value(env, hwnd.0)
+    acquire_window_dc(env, hwnd.0, WindowDcUse::Get, "user32.dll!GetDC")
 }
 #[win32(user32, name = "GetWindowDC", level = implement)]
 fn get_window_dc(env: &mut Env<'_>, hwnd: Handle) -> Outcome {
     // The renderer currently models client pixels for both DC accessors.
-    get_dc_value(env, hwnd.0)
+    acquire_window_dc(env, hwnd.0, WindowDcUse::Get, "user32.dll!GetWindowDC")
 }
 
 #[win32(user32, name = "ReleaseDC", level = implement)]
-fn release_dc(env: &mut Env<'_>, _hwnd: Handle, dc: Handle) -> Outcome {
-    if available(env) {
-        if dc.0 != WINDOW_DC {
-            return Outcome::Return(0);
-        }
-        env.ext
-            .get_mut::<Win32>()
-            .gdi
-            .remove_external_dc(&mut env.sys.objects, dc.0);
-        Outcome::Return(1)
-    } else {
-        Outcome::Return(u32::from(super::super::release_dc(env, dc.0)))
-    }
+fn release_dc(env: &mut Env<'_>, hwnd: Handle, dc: Handle) -> Outcome {
+    Outcome::Return(u32::from(release_window_dc(
+        env,
+        hwnd.0,
+        dc.0,
+        WindowDcUse::Get,
+    )))
 }
 #[win32(user32, name = "BeginPaint", level = implement)]
 fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Outcome {
@@ -222,7 +292,12 @@ fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Ou
     if let Err(error) = adv_abi::guest::check_range(env.cpu, paint.addr(), 64, Prot::WRITE) {
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
-    let dc = match get_dc_value(env, hwnd.0) {
+    let dc = match acquire_window_dc(
+        env,
+        hwnd.0,
+        WindowDcUse::Paint(paint.addr()),
+        "user32.dll!BeginPaint",
+    ) {
         Outcome::Return(0) => return Outcome::Return(0),
         Outcome::Return(dc) => dc,
         other => return other,
@@ -232,14 +307,24 @@ fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Ou
     bytes[16..20].copy_from_slice(&width.to_le_bytes());
     bytes[20..24].copy_from_slice(&height.to_le_bytes());
     if let Err(error) = paint.write(env.cpu, bytes) {
-        env.ext
-            .get_mut::<Win32>()
-            .gdi
-            .remove_external_dc(&mut env.sys.objects, dc);
+        release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
     crate::user32::message::validate(env, hwnd.0);
     Outcome::Return(dc)
+}
+/// End only the acquisition represented by this PAINTSTRUCT. The documented
+/// EndPaint return is always nonzero; an unmatched structure cannot retire a DC.
+pub(crate) fn end_paint_value(env: &mut Env<'_>, hwnd: u32, paint: u32) -> Outcome {
+    if let Err(error) = adv_abi::guest::check_range(env.cpu, paint, 64, Prot::READ) {
+        return Outcome::Fail(format!("EndPaint: {error}"));
+    }
+    let dc = match env.cpu.read_u32(paint) {
+        Ok(dc) => dc,
+        Err(error) => return Outcome::Fail(format!("EndPaint: {error}")),
+    };
+    release_window_dc(env, hwnd, dc, WindowDcUse::Paint(paint));
+    Outcome::Return(1)
 }
 #[win32(gdi32, name = "CreateCompatibleDC", level = implement)]
 fn create_dc(env: &mut Env<'_>, source: Handle) -> Outcome {
@@ -401,6 +486,15 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteDC", level = implement)]
 fn delete_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
+    if env
+        .ext
+        .get::<State>()
+        .window_leases
+        .iter()
+        .any(|lease| lease.dc == dc.0)
+    {
+        return Outcome::Return(0); // USER leases are balanced by their accessors.
+    }
     if available(env)
         && (dc.0 == WINDOW_DC || env.ext.get::<State>().surface_dcs.contains_key(&dc.0))
     {

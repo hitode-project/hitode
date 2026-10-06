@@ -2091,10 +2091,7 @@ fn validate_rect(env: &mut Env<'_>) -> Outcome {
 }
 
 fn end_paint(env: &mut Env<'_>) -> Outcome {
-    let ps = env.arg(1);
-    let hdc = env.cpu.read_u32(ps).unwrap_or(0);
-    crate::gdi32::release_dc(env, hdc);
-    Outcome::Return(1)
+    crate::gdi32::raster::front::end_paint_value(env, env.arg(0), env.arg(1))
 }
 
 fn redraw_window(env: &mut Env<'_>) -> Outcome {
