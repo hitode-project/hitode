@@ -97,9 +97,11 @@ impl Fixed {
             fvf: 0,
             render: BTreeMap::from([
                 (7, 0),
+                (8, 3), // FILLMODE: only solid rasterization is implemented.
                 (9, 2), // SHADEMODE: the shared shader interpolates vertex colors.
                 (14, 1),
                 (15, 0),
+                (16, 1), // LASTPIXEL: consumed by the shared line rasterizer.
                 (19, 2),
                 (20, 1),
                 (22, 3),
@@ -107,6 +109,7 @@ impl Fixed {
                 (24, 0),
                 (25, 8),
                 (27, 0),
+                (28, 0), // FOGENABLE: no fog contribution.
                 (29, 0), // SPECULARENABLE: supported FVFs supply zero specular RGB.
                 (52, 0),
                 (53, 1),
@@ -116,7 +119,16 @@ impl Fixed {
                 (57, 0),
                 (58, u32::MAX),
                 (59, u32::MAX),
+                (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
                 (137, 1),
+                (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
+                (146, 2),
+                (147, 0),
+                (148, 0),
+                (151, 0), // VERTEXBLEND: one world matrix without blending.
+                (152, 0), // CLIPPLANEENABLE: no user clipping planes.
+                (161, 1), // Inert on the supported single-sample render targets.
+                (167, 0), // INDEXEDVERTEXBLENDENABLE: no matrix indices.
                 (168, 15),
                 (171, 1),
                 (174, 0),
@@ -130,7 +142,16 @@ impl Fixed {
                 (208, 1),
                 (209, 1),
             ]),
-            stage: BTreeMap::from([(1, 4), (2, 2), (3, 1), (4, 2), (5, 2), (6, 1)]),
+            stage: BTreeMap::from([
+                (1, 4),
+                (2, 2),
+                (3, 1),
+                (4, 2),
+                (5, 2),
+                (6, 1),
+                (11, 0), // TEXCOORDINDEX: pass through the first FVF coordinate set.
+                (24, 0), // TEXTURETRANSFORMFLAGS: no texture coordinate transform.
+            ]),
             sampler: BTreeMap::from([(1, 1), (2, 1), (5, 1), (6, 1), (7, 0), (9, 0)]),
             viewport: D3DVIEWPORT9 {
                 X: 0,
@@ -267,12 +288,43 @@ fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> 
         return INVALID;
     };
     let valid = match state {
+        8 => match value {
+            3 => true,
+            1 | 2 => return UNAVAILABLE,
+            _ => false,
+        },
         9 => match value {
             2 => true, // GOURAUD is the existing neutral renderer's shading mode.
             1 | 3 => return UNAVAILABLE,
             _ => false,
         },
-        7 | 14 | 15 | 27 | 29 | 52 | 137 | 174 | 185 | 206 => value <= 1,
+        7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 161 | 174 | 185 | 206 => value <= 1,
+        28 | 167 => match value {
+            0 => true,
+            1 => return UNAVAILABLE,
+            _ => false,
+        },
+        136 => match value {
+            1 => true,
+            0 => return UNAVAILABLE,
+            _ => false,
+        },
+        // Material sources only affect lighting. Supported prelit and
+        // lighting-off draws use vertex colors; lit draws still fail explicitly.
+        145..=148 => value <= 2,
+        151 => match value {
+            0 => true,
+            1..=3 | 255 | 256 => return UNAVAILABLE,
+            _ => false,
+        },
+        // Every DWORD is a clipping-plane enable mask. Nonzero masks require
+        // user clip-plane equations, which the current renderer does not have.
+        152 => {
+            if value != 0 {
+                return UNAVAILABLE;
+            }
+            true
+        }
         19 | 20 | 207 | 208 => factor(value).is_some(),
         22 => (1..=3).contains(&value),
         23 | 25 | 56 | 189 => compare(value).is_some(),
@@ -313,6 +365,22 @@ fn set_stage(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, kind: i32, value
     let valid = match kind {
         1 | 4 => matches!(value, 1 | 2 | 3 | 4 | 7 | 10),
         2 | 3 | 5 | 6 => value <= 2,
+        11 => {
+            // Up to eight FVF coordinate sets and the SDK's four automatic
+            // generation modes are legal; this decoder supplies set zero only.
+            if value & 0xffff > 7 || value >> 16 > 4 {
+                false
+            } else if value != 0 {
+                return UNAVAILABLE;
+            } else {
+                true
+            }
+        }
+        24 => match value {
+            0 => true,
+            1..=4 | 256..=260 => return UNAVAILABLE,
+            _ => false,
+        },
         _ => return UNAVAILABLE,
     };
     if !valid {
@@ -739,6 +807,7 @@ fn prepare_checked(
         (None, 0)
     };
     let mut state = DrawState::new(target.image.width(), target.image.height());
+    state.last_pixel = f.render[&16] != 0;
     state.topology = topology;
     state.cull = match f.render[&22] {
         1 => Cull::None,
@@ -952,6 +1021,7 @@ fn warn_draw_rejected(
 mod tests {
     use super::*;
     include!("fixed/stencil_tests.rs");
+    include!("fixed/state_tests.rs");
 
     #[test]
     fn no_specular_fvf_profile_exposes_bool_state_without_accepting_specular_inputs() {

@@ -3,6 +3,7 @@
 use crate::surface::Rect;
 mod clear;
 mod depth;
+mod line;
 mod renderer;
 mod submission;
 pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
@@ -120,6 +121,8 @@ pub struct Viewport {
 #[derive(Clone, Copy, Debug)]
 pub struct DrawState {
     pub topology: Topology,
+    /// Include the terminal pixel of aliased line segments. Other topologies ignore it.
+    pub last_pixel: bool,
     pub cull: Cull,
     pub blend: Option<Blend>,
     /// None uses the color blend component for alpha too.
@@ -142,6 +145,7 @@ impl DrawState {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             topology: Topology::Triangles,
+            last_pixel: true,
             cull: Cull::None,
             blend: None,
             alpha_blend: None,

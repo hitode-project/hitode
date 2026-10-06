@@ -660,7 +660,14 @@ impl Gpu {
             });
         let view = texture.create_view(&Default::default());
         self.check()?;
-        Ok(Depth::new(texture, view, self.context.id, width, height, format))
+        Ok(Depth::new(
+            texture,
+            view,
+            self.context.id,
+            width,
+            height,
+            format,
+        ))
     }
 
     /// Upload a checked BGRA rectangle. Row padding stays outside the GPU image.
@@ -773,11 +780,13 @@ impl Gpu {
                             load: depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: attachment.format().has_stencil().then_some(wgpu::Operations {
-                            load: stencil
-                                .map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(v & 255)),
-                            store: wgpu::StoreOp::Store,
-                        }),
+                        stencil_ops: attachment.format().has_stencil().then_some(
+                            wgpu::Operations {
+                                load: stencil
+                                    .map_or(wgpu::LoadOp::Load, |v| wgpu::LoadOp::Clear(v & 255)),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        ),
                     }
                 }),
                 ..Default::default()
@@ -882,6 +891,7 @@ impl Gpu {
             }
         }
         validate(target, vertices, &state)?;
+        let inclusive = line::prepare(vertices, image, &state)?;
         if state.stencil.is_some()
             && target
                 .depth
@@ -935,6 +945,15 @@ impl Gpu {
             color_write: state.color_write,
         };
         let pipeline = self.pipeline(key)?;
+        let endpoint_pipeline = inclusive
+            .as_ref()
+            .map(|_| {
+                self.pipeline(PipelineKey {
+                    topology: Topology::Points,
+                    ..key
+                })
+            })
+            .transpose()?;
         let image_levels = image.map_or(1, Image::mip_levels);
         let sampler = self.sampler(Sampler {
             first_level: state.sampler.first_level.min(image_levels - 1),
@@ -999,10 +1018,12 @@ impl Gpu {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: attachment.format().has_stencil().then_some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
+                        stencil_ops: attachment.format().has_stencil().then_some(
+                            wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        ),
                     }
                 }),
                 ..Default::default()
@@ -1025,7 +1046,31 @@ impl Gpu {
                 pass.set_scissor_rect(r.x, r.y, r.w, r.h);
             }
             pass.set_vertex_buffer(0, self.upload.slice(0..size));
-            pass.draw(0..vertices.len() as u32, 0..1);
+            match inclusive {
+                None => pass.draw(0..vertices.len() as u32, 0..1),
+                Some(line::Inclusive::Strip { terminal }) => {
+                    // A strip includes shared joins only once. Its terminal
+                    // point follows the last real segment, never a clipped end.
+                    pass.draw(0..vertices.len() as u32, 0..1);
+                    if terminal {
+                        pass.set_pipeline(endpoint_pipeline.as_ref().unwrap());
+                        pass.draw(vertices.len() as u32 - 1..vertices.len() as u32, 0..1);
+                    }
+                }
+                Some(line::Inclusive::List) => {
+                    // Keep endpoint blending/depth/stencil in each segment's
+                    // original order, including intersections with later lines.
+                    for (index, pair) in vertices.chunks_exact(2).enumerate() {
+                        let first = index as u32 * 2;
+                        pass.set_pipeline(&pipeline);
+                        pass.draw(first..first + 2, 0..1);
+                        if !line::degenerate(&pair[0], &pair[1], state.viewport) {
+                            pass.set_pipeline(endpoint_pipeline.as_ref().unwrap());
+                            pass.draw(first + 1..first + 2, 0..1);
+                        }
+                    }
+                }
+            }
         }
         self.submit(encoder, &submission);
         self.stats.draws += 1;
