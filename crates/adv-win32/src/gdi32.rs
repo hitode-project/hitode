@@ -11,6 +11,7 @@ use crate::Win32;
 pub mod font;
 mod palette;
 mod pen;
+mod readback;
 pub mod raster;
 
 #[cfg(test)]
@@ -808,6 +809,7 @@ fn create_di_bitmap(
 pub fn register(reg: &mut Registry) {
     palette::register(reg);
     pen::register(reg);
+    readback::register(reg);
     for api in [
         get_stock_object_ABI,
         create_font_indirect_a_ABI,
