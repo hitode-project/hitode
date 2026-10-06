@@ -25,6 +25,7 @@ use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
 
 pub use placement::PlacementState;
+pub(crate) use resources::IconImage;
 pub use window::User;
 
 use crate::printf::{StackArgs, format};

@@ -6,6 +6,16 @@ use std::collections::BTreeMap;
 struct UserObject {
     description: String,
     stock: bool,
+    _image: Option<IconImage>,
+}
+
+/// Extracted icon pixels remain owned by the same USER object DestroyIcon closes.
+/// The AND mask is retained separately so monochrome XOR pixels are not lost.
+pub(crate) struct IconImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub mask: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -36,11 +46,41 @@ impl UserObjects {
             UserObject {
                 description,
                 stock: false,
+                _image: None,
             },
         )?;
         self.index
             .insert(handle, objects.lookup_alias(namespace, handle)?);
         Some(handle)
+    }
+
+    pub(crate) fn create_icon(
+        &mut self,
+        objects: &mut Objects,
+        description: String,
+        image: IconImage,
+    ) -> Option<u32> {
+        let pixels = image.width.checked_mul(image.height)? as usize;
+        if pixels == 0 || image.pixels.len() != pixels.checked_mul(4)? || image.mask.len() != pixels
+        {
+            return None;
+        }
+        let namespace = self.namespace(objects)?;
+        let handle = objects.insert_host_in(
+            namespace,
+            UserObject {
+                description,
+                stock: false,
+                _image: Some(image),
+            },
+        )?;
+        self.index
+            .insert(handle, objects.lookup_alias(namespace, handle)?);
+        Some(handle)
+    }
+
+    pub(crate) fn destroy_icon(&mut self, objects: &mut Objects, handle: u32) {
+        self.remove(objects, handle);
     }
 
     pub(super) fn stock(&mut self, objects: &mut Objects, handle: u32) -> Option<u32> {
@@ -58,6 +98,7 @@ impl UserObjects {
             UserObject {
                 description: format!("system resource {handle:#x}"),
                 stock: true,
+                _image: None,
             },
         ) {
             return None;

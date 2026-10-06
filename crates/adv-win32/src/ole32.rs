@@ -8,6 +8,7 @@ pub fn register(registry: &mut Registry) {
         initialize_ex_ABI,
         uninitialize_ABI,
         create_instance_ABI,
+        free_unused_ABI,
     ] {
         registry.register(api);
     }
@@ -23,6 +24,11 @@ fn initialize_ex(_env: &mut Env<'_>, _reserved: GuestPtr<()>, _flags: u32) -> i3
 }
 #[win32(ole32, name = "CoUninitialize", level = state)]
 fn uninitialize(_env: &mut Env<'_>) {}
+#[win32(ole32, name = "CoFreeUnusedLibraries", level = state)]
+fn free_unused(_env: &mut Env<'_>) {
+    // Activation uses installed personality factories. None owns a dynamically
+    // loaded guest COM server with a DllCanUnloadNow/unload contract.
+}
 #[win32(ole32, name = "CoCreateInstance", level = implement)]
 fn create_instance(
     env: &mut Env<'_>,

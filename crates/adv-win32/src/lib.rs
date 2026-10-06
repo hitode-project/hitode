@@ -19,6 +19,7 @@ pub mod printf;
 pub mod user32;
 pub mod util;
 mod version;
+mod vfw;
 pub mod winmm;
 mod winsock;
 
@@ -169,7 +170,9 @@ pub fn register(reg: &mut Registry) {
     gdi32::register(reg);
     advapi32::register(reg);
     misc::register(reg);
+    imm32::register(reg);
     version::register(reg);
+    vfw::register(reg);
     winsock::register(reg);
     winmm::register(reg);
     ntdll::register(reg);

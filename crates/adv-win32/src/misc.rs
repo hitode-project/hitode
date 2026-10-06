@@ -8,6 +8,9 @@ use adv_machine::{Env, Outcome};
 
 mod internet;
 mod ole_memory;
+mod property_sheet;
+mod shell_execute;
+mod shell_icon;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
@@ -294,24 +297,11 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
     })
 }
 
-fn shell_execute_a(env: &mut Env<'_>) -> Outcome {
-    let c = codec(env);
-    let (op, file, params) = (
-        cstr(env.cpu, env.arg(1)),
-        cstr(env.cpu, env.arg(2)),
-        cstr(env.cpu, env.arg(3)),
-    );
-    log::info!(
-        "ShellExecuteA({:?}, {:?}, {:?}): not launched",
-        c.decode(&op),
-        c.decode(&file),
-        c.decode(&params)
-    );
-    Outcome::Return(42)
-}
-
 pub fn register(reg: &mut Registry) {
     internet::register(reg);
+    shell_execute::register(reg);
+    shell_icon::register(reg);
+    property_sheet::register(reg);
     stdcall(
         reg,
         SHLWAPI,
@@ -361,7 +351,6 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHELL32, "SHGetFolderPathW", 5, sh_get_folder_path_w);
     stdcall(reg, SHFOLDER, "SHGetFolderPathA", 5, sh_get_folder_path_a);
     stdcall(reg, SHFOLDER, "SHGetFolderPathW", 5, sh_get_folder_path_w);
-    stdcall(reg, SHELL32, "ShellExecuteA", 6, shell_execute_a);
     // File and folder pickers: the user cancels (CommDlgExtendedError stays 0).
     stdcall(reg, COMDLG32, "GetOpenFileNameA", 1, |_| Outcome::Return(0));
     stdcall(reg, COMDLG32, "GetSaveFileNameA", 1, |_| Outcome::Return(0));
@@ -383,9 +372,6 @@ pub fn register(reg: &mut Registry) {
         set_last_error(e, 0);
         Outcome::Return(0)
     });
-    stdcall(reg, IMM32, "ImmGetContext", 1, |_| {
-        Outcome::Return(0x0001_0001)
-    });
     stdcall(reg, IMM32, "ImmReleaseContext", 2, |_| Outcome::Return(1));
     stdcall(reg, IMM32, "ImmSetOpenStatus", 2, |_| Outcome::Return(1));
     stdcall(reg, IMM32, "ImmGetOpenStatus", 1, |_| Outcome::Return(0));
@@ -406,14 +392,22 @@ pub fn register(reg: &mut Registry) {
         }
         Outcome::Return(0)
     });
-    stdcall(reg, "gdiplus.dll", "GdiplusShutdown", 1, |_| Outcome::Return(0));
-    stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| Outcome::Return(0));
-    stdcall(reg, COMCTL32, "InitCommonControlsEx", 1, |_| Outcome::Return(1));
+    stdcall(reg, "gdiplus.dll", "GdiplusShutdown", 1, |_| {
+        Outcome::Return(0)
+    });
+    stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| {
+        Outcome::Return(0)
+    });
+    stdcall(reg, COMCTL32, "InitCommonControlsEx", 1, |_| {
+        Outcome::Return(1)
+    });
     stdcall(reg, COMCTL32, "ImageList_Read", 1, |e| {
         let pstm = e.arg(0);
         Outcome::Return(if pstm != 0 { 0x0002_0001 } else { 0 })
     });
-    stdcall(reg, COMCTL32, "ImageList_Destroy", 1, |_| Outcome::Return(1));
+    stdcall(reg, COMCTL32, "ImageList_Destroy", 1, |_| {
+        Outcome::Return(1)
+    });
     stdcall(reg, COMCTL32, "ImageList_Create", 5, |_| {
         Outcome::Return(0x0002_0001)
     });

@@ -1,0 +1,12 @@
+{
+  "source": "Microsoft Windows SDK 10.0.26100.0",
+  "header": "um/vfw.h",
+  "sha256": "14b6d9f7999e2a2480a287d841de7460e29d73ea5204422c23b78d52084b9459",
+  "target": "x86 VFWAPI (__stdcall), DWORD/UINT/LPARAM/BOOL and pointers are 32 bits",
+  "input": "data/abi/sdk-input.tsv",
+  "output": "data/abi/signatures.tsv via tools/abi/Metadata.cs",
+  "documentation": [
+    "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icinstall",
+    "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icremove"
+  ]
+}

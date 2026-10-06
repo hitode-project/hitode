@@ -107,13 +107,15 @@ fn joystick_failure_is_a_typed_implementation_and_dynamic_capability() {
     );
     assert!(registry.dynamic_available("winmm.dll", "joyGetPos"));
     assert!(registry.signature_conflicts().is_empty());
-    // Signature metadata alone does not claim the rest of the family works.
     for name in [
         "joyGetNumDevs",
         "joyGetDevCapsA",
         "joyGetDevCapsW",
         "joyGetPosEx",
+        "joySetCapture",
+        "joyReleaseCapture",
     ] {
-        assert!(!registry.is_implemented("winmm.dll", name));
+        assert!(registry.is_implemented("winmm.dll", name));
+        assert!(registry.dynamic_available("winmm.dll", name));
     }
 }
