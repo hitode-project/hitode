@@ -16,12 +16,16 @@ pub fn cstr(cpu: &dyn Guest, p: u32) -> Vec<u8> {
 
 /// NUL-terminated UTF-16 string at `p` (empty for NULL).
 pub fn wstr(cpu: &dyn Guest, p: u32) -> Vec<u16> {
+    wstr_up_to(cpu, p, MAX_STR)
+}
+
+fn wstr_up_to(cpu: &dyn Guest, p: u32, max: usize) -> Vec<u16> {
     let mut out = Vec::new();
     if p == 0 {
         return out;
     }
     let mut a = p;
-    while out.len() < MAX_STR {
+    while out.len() < max {
         match cpu.read_u16(a) {
             Ok(0) | Err(_) => break,
             Ok(c) => out.push(c),
@@ -32,9 +36,15 @@ pub fn wstr(cpu: &dyn Guest, p: u32) -> Vec<u16> {
 }
 
 /// `len` bytes at `p`, or up to the NUL if `len` is -1 (terminator excluded).
+/// Unlike names, a -1 conversion source has no length cap: Kirikiri passes
+/// whole decompressed scripts this way.
 pub fn bytes_or_cstr(cpu: &dyn Guest, p: u32, len: i32) -> Vec<u8> {
     if len < 0 {
-        return cstr(cpu, p);
+        if p == 0 {
+            return Vec::new();
+        }
+        let rest = (u32::MAX - p) as usize + 1;
+        return cpu.read_cstr(p, rest).unwrap_or_default();
     }
     let mut v = vec![0; len as usize];
     let _ = cpu.read(p, &mut v);
@@ -44,7 +54,7 @@ pub fn bytes_or_cstr(cpu: &dyn Guest, p: u32, len: i32) -> Vec<u8> {
 /// `len` units at `p`, or up to the NUL if `len` is -1 (terminator excluded).
 pub fn units_or_wstr(cpu: &dyn Guest, p: u32, len: i32) -> Vec<u16> {
     if len < 0 {
-        return wstr(cpu, p);
+        return wstr_up_to(cpu, p, (u32::MAX - p) as usize / 2 + 1);
     }
     let mut v = vec![0u8; len as usize * 2];
     let _ = cpu.read(p, &mut v);
@@ -133,3 +143,22 @@ pub mod err {
 }
 
 pub const INVALID_HANDLE_VALUE: u32 = u32::MAX;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::backend::Prot;
+
+    #[test]
+    fn terminated_conversion_sources_are_not_capped() {
+        let mut cpu = adv_cpu::JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+        cpu.map(0x400000, 0x30000, Prot::RW).unwrap();
+        let len = MAX_STR + 0x1234;
+        cpu.write(0x400000, &vec![b'a'; len]).unwrap();
+        assert_eq!(bytes_or_cstr(&cpu, 0x400000, -1).len(), len);
+        assert_eq!(cstr(&cpu, 0x400000).len(), MAX_STR);
+        let units = len / 2 - 7;
+        cpu.write(0x400000 + units as u32 * 2, &[0, 0]).unwrap();
+        assert_eq!(units_or_wstr(&cpu, 0x400000, -1).len(), units);
+    }
+}
