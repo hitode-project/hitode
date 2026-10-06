@@ -23,6 +23,7 @@ mod memory;
 mod pacing;
 mod presentation;
 mod readback;
+mod stretch;
 mod targets;
 #[cfg(test)]
 mod tests;
@@ -139,12 +140,22 @@ enum Operation {
         pitch: u32,
         rectangle: adv_device::surface::Rect,
     },
+    Copy {
+        source: adv_device::gpu::Image,
+        rectangle: adv_device::surface::Rect,
+        destination: adv_device::gpu::Image,
+        x: u32,
+        y: u32,
+        resources: [Id; 2],
+    },
     Draw(fixed::Draw),
 }
 struct Pending {
     context: u32,
     event: u32,
     owner: Id,
+    /// At most the two controlling surface identities of a pending blit.
+    resources: [Option<Id>; 2],
     operation: Option<Box<Operation>>,
     result: Option<Result<Completion, Error>>,
 }
@@ -177,6 +188,7 @@ pub fn register(registry: &mut Registry) {
     resources::register(registry);
     fixed::register(registry);
     readback::register(registry);
+    stretch::register(registry);
     capabilities::register(registry);
     targets::register(registry);
     buffers::register(registry);
@@ -1063,6 +1075,16 @@ fn execute(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error
                 draw.state,
             )
             .map(|()| Completion::Command),
+        Operation::Copy {
+            source,
+            rectangle,
+            destination,
+            x,
+            y,
+            ..
+        } => gpu
+            .copy(source, *rectangle, destination, *x, *y)
+            .map(|()| Completion::Command),
     };
     env.ext.get_mut::<State>().gpu = Some(gpu);
     result
@@ -1096,12 +1118,26 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                 readback::upload_failed(env, &operation, false);
                 return Outcome::Return(OUT_OF_MEMORY);
             }
+            let resources = match &operation {
+                Operation::Copy { resources, .. } => resources.map(Some),
+                _ => [None; 2],
+            };
+            let mut retained = [None; 2];
+            for (index, resource) in resources.into_iter().enumerate() {
+                if let Some(resource) = resource {
+                    if !com(env).retain_internal(&mut env.sys.objects, resource) {
+                        release_pending_owners(env, owner, retained);
+                        return Outcome::Return(OUT_OF_MEMORY);
+                    }
+                    retained[index] = Some(resource);
+                }
+            }
             let event = env.sys.objects.insert(Object::Event {
                 manual_reset: true,
                 signaled: false,
             });
             if event == 0 {
-                let _ = com(env).release_internal(&mut env.sys.objects, owner);
+                release_pending_owners(env, owner, retained);
                 readback::upload_failed(env, &operation, false);
                 return Outcome::Return(OUT_OF_MEMORY);
             }
@@ -1109,6 +1145,7 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                 context: env.context,
                 event,
                 owner,
+                resources: retained,
                 operation: Some(Box::new(operation)),
                 result: None,
             });
@@ -1127,11 +1164,7 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                         .expect("owned GPU wait");
                     let pending = env.ext.get_mut::<State>().pending.swap_remove(index);
                     env.sys.objects.close(event);
-                    if let Some(Some(dead)) =
-                        com(env).release_internal(&mut env.sys.objects, pending.owner)
-                    {
-                        destroy(env, dead);
-                    }
+                    release_pending_owners(env, pending.owner, pending.resources);
                     match pending
                         .result
                         .expect("GPU wait only signaled after completion")
@@ -1145,6 +1178,17 @@ fn dispatch(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
         Err(error) => {
             readback::upload_failed(env, &operation, false);
             gpu_error(error)
+        }
+    }
+}
+fn release_pending_owners(env: &mut Env<'_>, owner: Id, resources: [Option<Id>; 2]) {
+    for id in resources
+        .into_iter()
+        .flatten()
+        .chain(std::iter::once(owner))
+    {
+        if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
+            destroy(env, dead);
         }
     }
 }
@@ -1171,9 +1215,7 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
                 readback::upload_failed(&mut env, operation, true);
             }
             env.sys.objects.close(wait.event);
-            if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, wait.owner) {
-                destroy(&mut env, dead);
-            }
+            release_pending_owners(&mut env, wait.owner, wait.resources);
             continue;
         }
         if let Some(operation) = &wait.operation {
@@ -1217,9 +1259,7 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
             readback::upload_failed(&mut env, operation, true);
         }
         env.sys.objects.close(wait.event);
-        if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, wait.owner) {
-            destroy(&mut env, dead);
-        }
+        release_pending_owners(&mut env, wait.owner, wait.resources);
     }
     readback::cancel_pending(&mut env);
 }

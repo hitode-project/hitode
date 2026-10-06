@@ -45,11 +45,17 @@ fn create_offscreen(
     if device(env, this.addr()).is_none() {
         return Outcome::Return(INVALID);
     }
-    if !matches!(pool, 2 | 3) || format::bytes(format).is_none() || !shared.is_null() {
+    if !matches!(pool, 0 | 2 | 3)
+        || format::bytes(format).is_none()
+        || (pool == 0 && !matches!(format, 21 | 22))
+        || !shared.is_null()
+    {
         let reason = if format::bytes(format).is_none() {
             "pixel format is unsupported (supported: 21/22/26)"
+        } else if pool == 0 && !matches!(format, 21 | 22) {
+            "DEFAULT offscreen GPU surfaces support formats 21/22"
         } else {
-            "pool or shared-handle combination is unsupported (supported: SYSTEMMEM/SCRATCH)"
+            "pool or shared-handle combination is unsupported (supported: DEFAULT/SYSTEMMEM/SCRATCH)"
         };
         adv_abi::warn_unavailable(
             env,
@@ -61,7 +67,37 @@ fn create_offscreen(
     let Some(length) = format::length(format, width, height) else {
         return Outcome::Return(INVALID);
     };
+    // DEFAULT plain surfaces have one GPU image owned by this Resource. Its
+    // guest storage is a reusable lock mapping, synchronized at lock/unlock.
+    // SYSTEMMEM/SCRATCH remain CPU storage without a parallel GPU copy.
+    let surface = if pool == 0 {
+        let target = match env.ext.get::<State>().gpu.as_ref() {
+            Some(gpu) => match gpu.target(width, height, false) {
+                Ok(target) => target.with_alpha_mode(targets::alpha_mode(format)),
+                Err(error) => return gpu_error(error),
+            },
+            None => {
+                adv_abi::warn_unavailable(
+                    env,
+                    "IDirect3DDevice9::CreateOffscreenPlainSurface",
+                    "DEFAULT offscreen surface requires the shared GPU backend",
+                );
+                return Outcome::Return(UNAVAILABLE);
+            }
+        };
+        let provider = env.ext.get::<State>().provider;
+        match (provider.insert)(env.ext, target) {
+            Ok(surface) => Some(surface),
+            Err(_) => return Outcome::Return(OUT_OF_MEMORY),
+        }
+    } else {
+        None
+    };
     let Some(storage) = alloc(env, length) else {
+        if let Some(surface) = surface {
+            let provider = env.ext.get::<State>().provider;
+            let _ = (provider.remove)(env.ext, env.cpu, surface);
+        }
         return Outcome::Return(OUT_OF_MEMORY);
     };
     let owner = com(env)
@@ -84,9 +120,9 @@ fn create_offscreen(
                 Height: height,
             },
             depth: None,
-            surface: None,
+            surface,
             storage,
-            owns_surface: false,
+            owns_surface: surface.is_some(),
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -124,13 +160,14 @@ fn lock(
         return Outcome::Return(INVALID);
     };
     let back_buffer = lockable_back_buffer(env, this.addr(), r);
+    let gpu_lock = back_buffer || default_offscreen(r);
     // DONOTWAIT needs a genuinely nonblocking readiness protocol. Until that
     // exists it is rejected, never silently turned into a Machine wait.
     let allowed_flags = if back_buffer { 0x810 | 0x8000 } else { 0x10 };
     if r.kind != Kind::Surface || r.lock.is_some() || flags & !allowed_flags != 0 {
         return Outcome::Return(INVALID);
     }
-    if !back_buffer && (r.desc.Pool < 2 || r.storage == 0) {
+    if !gpu_lock && (r.desc.Pool < 2 || r.storage == 0) {
         return Outcome::Return(INVALID);
     }
     let rectangle = match lock_rectangle(env, r.desc.Width, r.desc.Height, rect) {
@@ -146,9 +183,9 @@ fn lock(
     let selected = Lock {
         rectangle,
         flags,
-        ready: !back_buffer,
+        ready: !gpu_lock,
     };
-    if !back_buffer {
+    if !gpu_lock {
         let value = locked_rect(r, rectangle);
         if output.write(env.cpu, value).is_err() {
             return Outcome::Return(INVALID);
@@ -211,6 +248,17 @@ fn lock(
             lock_output: Some(output),
         },
     )
+}
+
+/// An explicit DEFAULT plain surface, not a texture level or render target.
+pub(super) fn default_offscreen(r: &Resource) -> bool {
+    r.kind == Kind::Surface
+        && r.container.is_none()
+        && r.desc.Pool == 0
+        && r.desc.Usage == 0
+        && r.depth.is_none()
+        && r.owns_surface
+        && r.surface.is_some()
 }
 
 pub(super) fn lockable_back_buffer(env: &Env<'_>, pointer: u32, r: &Resource) -> bool {
@@ -286,7 +334,7 @@ fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
         set_lock(env, id, None);
         return Outcome::Return(0);
     }
-    if !lockable_back_buffer(env, this.addr(), r) {
+    if !lockable_back_buffer(env, this.addr(), r) && !default_offscreen(r) {
         return Outcome::Return(INVALID);
     }
     let provider = env.ext.get::<State>().provider;
