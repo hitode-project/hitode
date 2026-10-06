@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 
+mod enumeration;
+
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
 const NO_INTERFACE: u32 = 0x80004002;
@@ -321,6 +323,7 @@ impl Sound {
     }
 }
 pub fn register(reg: &mut Registry) {
+    enumeration::register(reg, true);
     for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
         reg.add("dsound.dll", name, Conv::Stdcall { argc: 3 }, call);
     }
@@ -343,6 +346,7 @@ pub fn register(reg: &mut Registry) {
 /// The same no-driver failure used before the device personality is installed.
 /// Kept in the DirectSound front; runtime compatibility assembly owns no API behavior.
 pub fn register_unavailable(registry: &mut Registry) {
+    enumeration::register(registry, false);
     registry.register(unavailable_create_ABI);
     registry.register(unavailable_create8_ABI);
     registry.add(
