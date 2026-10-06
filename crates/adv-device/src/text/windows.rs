@@ -181,6 +181,23 @@ fn decode_family(value: u8) -> Family {
     }
 }
 impl Font {
+    pub(super) fn character_widths(&self, first: u16, last: u16) -> Result<Vec<i32>, TextError> {
+        let mut widths = vec![0; usize::from(last) - usize::from(first) + 1];
+        // SAFETY: private selected font/DC, and a writable allocation covering
+        // the entire inclusive Unicode range. No guest address reaches GDI.
+        if unsafe {
+            gdi::GetCharWidth32W(
+                self.dc,
+                u32::from(first),
+                u32::from(last),
+                widths.as_mut_ptr(),
+            )
+        } == 0
+        {
+            return Err(TextError::Font("character width query failed".into()));
+        }
+        Ok(widths)
+    }
     pub(super) fn paint(
         &self,
         canvas: &mut Canvas,

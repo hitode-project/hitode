@@ -34,6 +34,22 @@ pub struct Raster {
 }
 
 impl Raster {
+    pub fn create_display_dc<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        dcs: &mut DeviceContexts,
+        objects: &mut adv_machine::Objects,
+        memory: &mut dyn SurfaceMemory,
+    ) -> Result<u32, String> {
+        // Creating a device-name DC does not change the display mode or resize
+        // an existing client canvas. All DCs borrow the current shared pixels.
+        let primary = surfaces.primary(memory)?;
+        let dc = surfaces.new_id();
+        if !dcs.create(objects, dc, primary) {
+            return Ok(self.fail(8));
+        }
+        Ok(dc)
+    }
     /// Last failing raster operation, for diagnostics; ABI handlers update the TEB.
     pub fn last_error(&self) -> u32 {
         self.last_error
@@ -148,6 +164,11 @@ impl Raster {
             if !dcs.contains(objects, dc) || (bitmap != STOCK_BITMAP && !surfaces.contains(bitmap))
             {
                 return Ok(self.fail(6));
+            }
+            if dcs.get(objects, dc) == surfaces.primary_id() {
+                // A display DC draws into the display. Bitmap selection belongs
+                // to a memory DC and must not replace the display's target.
+                return Ok(self.fail(87));
             }
             if bitmap != STOCK_BITMAP && dcs.selects(objects, bitmap, Some(dc)) {
                 return Ok(self.fail(87));

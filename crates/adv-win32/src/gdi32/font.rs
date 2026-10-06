@@ -13,6 +13,7 @@ use std::borrow::Cow;
 mod enumeration;
 mod paint;
 mod resource;
+mod widths;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -30,6 +31,7 @@ pub fn register(registry: &mut Registry) {
     paint::register(registry);
     resource::register(registry);
     enumeration::register(registry);
+    widths::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,

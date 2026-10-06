@@ -1,4 +1,6 @@
 use super::*;
+#[path = "tests/widths.rs"]
+mod widths;
 use crate as adv_win32;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};

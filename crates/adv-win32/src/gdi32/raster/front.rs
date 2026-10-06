@@ -7,6 +7,8 @@ use adv_cpu::backend::{Backend, Guest, Prot};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine, Objects};
 
+mod display;
+
 #[derive(Clone, Copy)]
 pub struct DrawingProvider {
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
@@ -47,6 +49,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::FLUSH, flush_ABI),
 ];
 pub fn register(registry: &mut Registry) {
+    display::register(registry);
     super::fill::register(registry);
     super::color_table::register(registry);
     for &(_, api) in BINDINGS {
@@ -326,6 +329,12 @@ fn select_object(env: &mut Env<'_>, dc: Handle, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteObject", level = implement)]
 fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
+    if matches!(
+        env.ext.get::<Win32>().gdi.get(&env.sys.objects, object.0),
+        Some(adv_os::gdi::GdiObj::Dc { .. })
+    ) {
+        return Outcome::Return(0); // DCs are retired with DeleteDC/ReleaseDC.
+    }
     if available(env) && env.ext.get::<SurfaceStore>().contains(object.0) {
         return raster_call(env, |r, s, d, o, m| r.delete_bitmap(s, d, o, m, object.0));
     }
@@ -341,6 +350,9 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteDC", level = implement)]
 fn delete_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
+    if available(env) && dc.0 == WINDOW_DC {
+        return Outcome::Return(0); // GetDC lends this DC; ReleaseDC returns it.
+    }
     if available(env)
         && (dc.0 == WINDOW_DC || env.ext.get::<State>().dcs.contains(&env.sys.objects, dc.0))
     {
