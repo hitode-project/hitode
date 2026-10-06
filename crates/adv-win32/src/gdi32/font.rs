@@ -157,6 +157,11 @@ fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
         Some(GdiObj::Dc { selected, .. }) => selected[2],
         _ => STOCK_FONT,
     };
+    request_for_handle(env, font)
+}
+
+fn request_for_handle(env: &Env<'_>, font: u32) -> FontRequest {
+    let gdi = &env.ext.get::<Win32>().gdi;
     if let Some(GdiObj::Font(font)) = gdi.get(&env.sys.objects, font) {
         from_font(font)
     } else {
@@ -193,6 +198,15 @@ fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
             family: Family::Default,
         }
     }
+}
+
+/// USER control geometry measures the same logical font without creating a DC.
+pub(crate) fn metrics_for_logical_font(
+    env: &mut Env<'_>,
+    font: u32,
+) -> Result<text::TextMetrics, TextError> {
+    let request = request_for_handle(env, font);
+    env.ext.get_mut::<Fonts>().text.metrics(&request)
 }
 
 /// ANSI/default text belongs to the guest locale, never the host process ACP.

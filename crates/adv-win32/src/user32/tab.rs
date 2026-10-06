@@ -225,6 +225,8 @@ fn proc(env: &mut Env<'_>) -> Outcome {
             tabs.selected = -1;
             1
         }
+        0x1328 => return adjust(env, hwnd, index != 0, pointer),
+        0x132c => u32::from(!state(env, hwnd).items.is_empty()),
         wm::PAINT => {
             validate(env, hwnd);
             0
@@ -241,6 +243,54 @@ fn proc(env: &mut Env<'_>) -> Outcome {
         }
     };
     Outcome::Return(result)
+}
+
+fn adjust(env: &mut Env<'_>, hwnd: u32, grow: bool, pointer: u32) -> Outcome {
+    let window = user(env).windows.get(&env.sys.objects, &hwnd).unwrap();
+    // The virtual 96-DPI profile currently supports top, single-row tabs.
+    if window.style & 0x382 != 0 {
+        return Outcome::Fail(
+            "SysTabControl32: non-top, button or multiline tab geometry is not implemented".into(),
+        );
+    }
+    let font = if window.font == 0 {
+        crate::gdi32::stock_object(13) // Existing virtual USER/GDI system-font profile.
+    } else {
+        window.font
+    };
+    let rect = GuestPtr::<[i32; 4]>::new(pointer);
+    let Ok([left, top, right, bottom]) = rect.read(env.cpu) else {
+        return Outcome::Return(0);
+    };
+    if adv_abi::guest::check_range(env.cpu, pointer, 16, Prot::WRITE).is_err() {
+        return Outcome::Return(0);
+    }
+    let row = if state(env, hwnd).items.is_empty() {
+        0
+    } else {
+        match crate::gdi32::font::metrics_for_logical_font(env, font) {
+            Ok(metrics) => i64::from(metrics.height) + 5,
+            Err(error) => return Outcome::Fail(format!("SysTabControl32 font metrics: {error}")),
+        }
+    };
+    // Native classic tabs at 96 DPI have a four-pixel display inset. The tab
+    // row adds the measured font height and five pixels, excluding external leading.
+    let sign = if grow { -1 } else { 1 };
+    let values = [
+        i64::from(left) + sign * 4,
+        i64::from(top) + sign * (4 + row),
+        i64::from(right) - sign * 4,
+        i64::from(bottom) - sign * 4,
+    ];
+    let Ok(values) = values
+        .into_iter()
+        .map(i32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return Outcome::Return(0);
+    };
+    let _ = rect.write(env.cpu, values.try_into().unwrap());
+    Outcome::Return(0) // TCM_ADJUSTRECT has no defined return value.
 }
 pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, USER32, PROC, 4, proc);

@@ -205,6 +205,190 @@ fn tab_saved_system_proc_is_reachable_from_guest_subclass_after_waits() {
 }
 
 #[test]
+fn tab_adjust_rect_validates_the_whole_rectangle_and_preserves_round_trip() {
+    let (mut m, data, hwnd, _) = fixture();
+    let pointer = data + 768;
+    let rect = [3i32, 4, 503, 204];
+    GuestPtr::new(pointer).write(&mut m.cpu, rect).unwrap();
+    assert_eq!(send(&mut m, data, hwnd, 0x1328, 0, pointer), 0);
+    assert_eq!(
+        GuestPtr::<[i32; 4]>::new(pointer).read(&m.cpu).unwrap(),
+        [7, 8, 499, 200]
+    );
+    assert_eq!(send(&mut m, data, hwnd, 0x1328, 1, pointer), 0);
+    assert_eq!(
+        GuestPtr::<[i32; 4]>::new(pointer).read(&m.cpu).unwrap(),
+        rect
+    );
+    GuestPtr::new(data + 4096).write(&mut m.cpu, rect).unwrap();
+    m.cpu.protect(data + 4096, 4096, Prot::READ).unwrap();
+    send(&mut m, data, hwnd, 0x1328, 0, data + 4096);
+    assert_eq!(
+        GuestPtr::<[i32; 4]>::new(data + 4096).read(&m.cpu).unwrap(),
+        rect
+    );
+    GuestPtr::new(pointer)
+        .write(&mut m.cpu, [i32::MIN, 0, 100, 100])
+        .unwrap();
+    send(&mut m, data, hwnd, 0x1328, 1, pointer);
+    assert_eq!(m.cpu.read_u32(pointer).unwrap(), i32::MIN as u32);
+}
+
+#[test]
+#[cfg(windows)]
+fn tab_adjust_rect_matches_native_font_height_and_single_row_profile() {
+    use core::ffi::c_void;
+    #[repr(C)]
+    struct NativeItem {
+        mask: u32,
+        state: u32,
+        state_mask: u32,
+        text: *mut u16,
+        capacity: i32,
+        image: i32,
+        parameter: isize,
+    }
+    #[link(name = "comctl32")]
+    unsafe extern "system" {
+        fn InitCommonControls();
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn CreateWindowExW(
+            ex: u32,
+            class: *const u16,
+            title: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: *mut c_void,
+            menu: *mut c_void,
+            instance: *mut c_void,
+            param: *mut c_void,
+        ) -> *mut c_void;
+        fn SendMessageW(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
+        fn DestroyWindow(hwnd: *mut c_void) -> i32;
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateFontIndirectA(logfont: *const u8) -> *mut c_void;
+        fn DeleteObject(font: *mut c_void) -> i32;
+        fn GetStockObject(index: i32) -> *mut c_void;
+    }
+    let class = "SysTabControl32"
+        .encode_utf16()
+        .chain([0])
+        .collect::<Vec<_>>();
+    // SAFETY: hidden authored control and fonts are owned by the fixture; each
+    // native send receives a complete aligned structure and returns synchronously.
+    unsafe {
+        InitCommonControls();
+    }
+    for height in [None, Some(-8i32), Some(-24), Some(-40)] {
+        let native = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                [0u16].as_ptr(),
+                0,
+                0,
+                0,
+                500,
+                200,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert!(!native.is_null());
+        let (mut m, data, hwnd, _) = fixture();
+        let pointer = data + 768;
+        let mut native_font = core::ptr::null_mut();
+        if let Some(height) = height {
+            let mut logfont = [0; 60];
+            logfont[..4].copy_from_slice(&height.to_le_bytes());
+            logfont[16..20].copy_from_slice(&400i32.to_le_bytes());
+            logfont[28..34].copy_from_slice(b"Arial\0");
+            native_font = unsafe { CreateFontIndirectA(logfont.as_ptr()) };
+            assert!(!native_font.is_null());
+            unsafe {
+                SendMessageW(native, wm::SETFONT, native_font as usize, 0);
+            }
+            m.cpu.write(data + 1024, &logfont).unwrap();
+            m.cpu.write_u32(data + 260, data + 1024).unwrap();
+            let address = m
+                .resolve_import("gdi32.dll", "CreateFontIndirectA")
+                .unwrap();
+            let index =
+                (address - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+            let handler = m.sys.thunks.get(index).f.handler;
+            let Outcome::Return(font) = handler(&mut env(&mut m)) else {
+                panic!("font creation")
+            };
+            assert_ne!(font, 0);
+            send(&mut m, data, hwnd, wm::SETFONT, font as i32, 0);
+        } else {
+            // Match the virtual profile explicitly. Native controls may pick
+            // the host message font, which varies with theme and process DPI.
+            unsafe {
+                SendMessageW(native, wm::SETFONT, GetStockObject(13) as usize, 0);
+            }
+        }
+        for count in 0..3 {
+            if count > 0 {
+                let mut entry = NativeItem {
+                    mask: 0,
+                    state: 0,
+                    state_mask: 0,
+                    text: core::ptr::null_mut(),
+                    capacity: 0,
+                    image: 0,
+                    parameter: 0,
+                };
+                unsafe {
+                    SendMessageW(
+                        native,
+                        0x133e,
+                        (count - 1) as usize,
+                        &mut entry as *mut _ as isize,
+                    );
+                }
+                put(&mut m, data + 512, [0; 7]);
+                assert_eq!(
+                    send(&mut m, data, hwnd, 0x133e, count - 1, data + 512),
+                    count - 1
+                );
+            }
+            assert_eq!(send(&mut m, data, hwnd, 0x132c, 0, 0), unsafe {
+                SendMessageW(native, 0x132c, 0, 0)
+            } as i32);
+            for grow in [0, 1] {
+                let mut rect = [3i32, 4, 503, 204];
+                unsafe {
+                    SendMessageW(native, 0x1328, grow as usize, rect.as_mut_ptr() as isize);
+                }
+                GuestPtr::new(pointer)
+                    .write(&mut m.cpu, [3i32, 4, 503, 204])
+                    .unwrap();
+                send(&mut m, data, hwnd, 0x1328, grow, pointer);
+                assert_eq!(
+                    GuestPtr::<[i32; 4]>::new(pointer).read(&m.cpu).unwrap(),
+                    rect,
+                    "font={height:?} count={count} grow={grow}"
+                );
+            }
+        }
+        assert_eq!(unsafe { DestroyWindow(native) }, 1);
+        if !native_font.is_null() {
+            assert_eq!(unsafe { DeleteObject(native_font) }, 1);
+        }
+    }
+}
+
+#[test]
 #[cfg(windows)]
 fn tab_insert_parameter_selection_and_deletion_match_native_control() {
     use core::ffi::c_void;
