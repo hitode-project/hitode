@@ -752,3 +752,255 @@ fn mm_text_origins_translate_pixels_and_each_transfer_owner_without_relocating_d
     assert_eq!(m.cpu.read_u32(old + 4).unwrap() as i32, -18);
     assert_eq!(m.sys.objects.object_count(), count);
 }
+
+#[test]
+fn intersect_clip_rect_native_masks_and_device_origin_save_restore_failures_share_one_owner() {
+    let (mut m, data, dc, pixels) = fixture(8, 8, PixelFormat::Bgra32, false);
+    let count = m.sys.objects.object_count();
+    for (r, expected, visible) in [
+        ([2, 2, 5, 5], [0, 0, 28, 28, 28, 0, 0, 0], 1),
+        ([20, 20, 30, 30], [0; 8], 0),
+        ([0, 0, 8, 8], [255; 8], 1),
+        ([5, 5, 2, 2], [0, 0, 28, 28, 28, 0, 0, 0], 1),
+        ([2, 2, 2, 5], [0; 8], 0),
+    ] {
+        assert_eq!(call(&mut m, data, "gdi32.dll!SaveDC", &[dc]), 1);
+        m.cpu.write(pixels, &[0; 256]).unwrap();
+        crate::util::set_last_error(&mut env(&mut m), 0x12345678);
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "gdi32.dll!IntersectClipRect",
+                &[dc, r[0] as u32, r[1] as u32, r[2] as u32, r[3] as u32]
+            ),
+            3
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m)), 0x12345678);
+        rect(&mut m, data, [0, 0, 8, 8]);
+        assert_eq!(
+            call(
+                &mut m,
+                data,
+                "user32.dll!FillRect",
+                &[dc, data, stock_object(0)]
+            ),
+            1
+        );
+        assert_eq!(masks(&m, pixels), expected);
+        assert_eq!(
+            call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]),
+            visible
+        );
+        assert_eq!(
+            call(&mut m, data, "gdi32.dll!RestoreDC", &[dc, u32::MAX]),
+            1
+        );
+        assert!(super::super::super::clip::snapshot(&env(&mut m), dc).is_default());
+    }
+    assert_eq!(call(&mut m, data, "gdi32.dll!SaveDC", &[dc]), 1);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!ExcludeClipRect", &[dc, 3, 3, 5, 5]),
+        3
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 1, 1, 7, 7]
+        ),
+        3
+    );
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    rect(&mut m, data, [0, 0, 8, 8]);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "user32.dll!FillRect",
+            &[dc, data, stock_object(0)]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 126, 126, 102, 102, 126, 126, 0]);
+    // Intersecting entirely with an excluded hole empties the real mask, while
+    // this tested memory-DC API still reports its observed success value 3.
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 3, 3, 5, 5]
+        ),
+        3
+    );
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 0);
+    let before = masks(&m, pixels);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "user32.dll!FillRect",
+            &[dc, data, stock_object(4)]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), before);
+    // A later, larger intersection never resurrects an empty clipping region.
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 0, 0, 8, 8]
+        ),
+        3
+    );
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 0);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!RestoreDC", &[dc, u32::MAX]),
+        1
+    );
+    assert_eq!(call(&mut m, data, "gdi32.dll!SaveDC", &[dc]), 1);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!SetWindowOrgEx",
+            &[dc, u32::MAX, u32::MAX, 0]
+        ),
+        1
+    );
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetViewportOrgEx", &[dc, 1, 0, 0]),
+        1
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 0, 0, 3, 4]
+        ),
+        3
+    );
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    rect(&mut m, data, [0, 0, 8, 8]);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "user32.dll!FillRect",
+            &[dc, data, stock_object(0)]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 28, 28, 28, 28, 0, 0, 0]);
+    let clip = super::super::super::clip::snapshot(&env(&mut m), dc);
+    assert!(clip.visible(8, 8)); // Requires the intersection top-band event.
+    assert!(!clip.contains(2, 0));
+    assert!(clip.contains(2, 1));
+    assert!(!clip.contains(5, 1));
+    assert!(!clip.contains(2, 5));
+    // Origins move logical inputs, not the stored device intersection.
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!SetWindowOrgEx", &[dc, 0, 0, 0]),
+        1
+    );
+    assert_eq!(call(&mut m, data, "gdi32.dll!RectVisible", &[dc, data]), 1);
+    m.cpu.write(pixels, &[0; 256]).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "user32.dll!FillRect",
+            &[dc, data, stock_object(0)]
+        ),
+        1
+    );
+    assert_eq!(masks(&m, pixels), [0, 28, 28, 28, 28, 0, 0, 0]);
+    assert_eq!(
+        call(&mut m, data, "gdi32.dll!RestoreDC", &[dc, u32::MAX]),
+        1
+    );
+    let gdi = m.ext.get::<Win32>().gdi.clone();
+    let snapshot = |m: &mut Machine<JitCpu>| super::super::super::clip::snapshot(&env(m), dc);
+    let expected = snapshot(&mut m).spans(0, 8);
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 2;
+    }
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 0, 0, 1, 1]
+        ),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+    assert_eq!(snapshot(&mut m).spans(0, 8), expected);
+    if let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut m.sys.objects, dc) {
+        modes.map = 1;
+    }
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!SetWindowOrgEx",
+            &[dc, i32::MIN as u32, 0, 0]
+        ),
+        1
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!SetViewportOrgEx",
+            &[dc, i32::MAX as u32, 0, 0]
+        ),
+        1
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 1, 0, 2, 1]
+        ),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+    assert!(snapshot(&mut m).is_default());
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[0, 0, 0, 1, 1]
+        ),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m)), 6);
+    super::super::super::front::install(&mut m);
+    assert_eq!(
+        call(
+            &mut m,
+            data,
+            "gdi32.dll!IntersectClipRect",
+            &[dc, 0, 0, 1, 1]
+        ),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m)), 50);
+    assert!(snapshot(&mut m).is_default());
+    assert_eq!(m.sys.objects.object_count(), count);
+    assert!(
+        m.ext
+            .get::<adv_abi::ApiDiagnostics>()
+            .warnings
+            .keys()
+            .any(|(name, _)| name == "gdi32.dll!IntersectClipRect")
+    );
+}

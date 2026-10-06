@@ -2,6 +2,8 @@
 #[derive(Clone, Debug, Default)]
 pub struct DcClip {
     excluded: Vec<[i32; 4]>,
+    /// Intersection limit in device units; origin changes never relocate it.
+    intersection: Option<[i32; 4]>,
 }
 impl DcClip {
     pub const MAX_RECTANGLES: usize = 64;
@@ -18,17 +20,46 @@ impl DcClip {
         true
     }
     pub fn is_default(&self) -> bool {
-        self.excluded.is_empty()
+        self.excluded.is_empty() && self.intersection.is_none()
+    }
+    pub fn intersect(&mut self, rect: [i32; 4]) {
+        let [l, t, r, b] = rect;
+        let mut rect = [l.min(r), t.min(b), l.max(r), t.max(b)];
+        if let Some([l, t, r, b]) = self.intersection {
+            rect = [
+                rect[0].max(l),
+                rect[1].max(t),
+                rect[2].min(r),
+                rect[3].min(b),
+            ];
+        }
+        if rect[0] >= rect[2] || rect[1] >= rect[3] {
+            rect = [0; 4];
+        }
+        self.intersection = Some(rect);
     }
     pub fn contains(&self, x: i32, y: i32) -> bool {
-        !self
-            .excluded
-            .iter()
-            .any(|&[l, t, r, b]| x >= l && x < r && y >= t && y < b)
+        self.intersection
+            .is_none_or(|[l, t, r, b]| x >= l && x < r && y >= t && y < b)
+            && !self
+                .excluded
+                .iter()
+                .any(|&[l, t, r, b]| x >= l && x < r && y >= t && y < b)
     }
     /// Visible, disjoint spans in one surface row. Right/bottom are exclusive.
     pub fn spans(&self, y: i32, width: u32) -> Vec<(u32, u32)> {
-        let mut spans = vec![(0, width)];
+        let (l, r) = if let Some([l, t, r, b]) = self.intersection {
+            if y < t || y >= b {
+                return Vec::new();
+            }
+            ((l.max(0) as u32).min(width), (r.max(0) as u32).min(width))
+        } else {
+            (0, width)
+        };
+        if l >= r {
+            return Vec::new();
+        }
+        let mut spans = vec![(l, r)];
         for &[l, t, r, b] in &self.excluded {
             if y < t || y >= b {
                 continue;
@@ -63,9 +94,7 @@ impl DcClip {
         if !self.spans(0, width).is_empty() {
             return true;
         }
-        self.excluded
-            .iter()
-            .flat_map(|r| [r[1], r[3]])
+        self.edges()
             .filter(|&y| y >= 0 && (y as u32) < height)
             .any(|y| !self.spans(y, width).is_empty())
     }
@@ -102,10 +131,15 @@ impl DcClip {
         }
         // The row topology is constant between exclusion edges: no pixel-height
         // loop and at most two event rows per bounded exclusion rectangle.
-        self.excluded
-            .iter()
-            .flat_map(|e| [e[1], e[3]])
+        self.edges()
             .filter(|&y| i64::from(y) >= t && i64::from(y) < b)
             .any(visible)
+    }
+
+    fn edges(&self) -> impl Iterator<Item = i32> + '_ {
+        self.excluded
+            .iter()
+            .flat_map(|r| [r[1], r[3]])
+            .chain(self.intersection.into_iter().flat_map(|r| [r[1], r[3]]))
     }
 }

@@ -12,6 +12,7 @@ use std::borrow::Cow;
 
 pub(super) fn register(reg: &mut Registry) {
     reg.register(exclude_ABI);
+    reg.register(intersect_ABI);
     reg.register(rect_visible_ABI);
     reg.register(window_origin_ABI);
     reg.register(set_window_origin_ABI);
@@ -79,6 +80,65 @@ pub(crate) fn snapshot(env: &Env<'_>, dc: u32) -> DcClip {
         Some(GdiObj::Dc { clip, .. }) => clip.clone(),
         _ => DcClip::default(),
     }
+}
+
+#[win32(gdi32,name="IntersectClipRect",level=state)]
+fn intersect(
+    env: &mut Env<'_>,
+    dc: Handle,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> Outcome {
+    let unavailable = |env: &mut Env<'_>, reason: &str| {
+        adv_abi::warn_unavailable(env, "gdi32.dll!IntersectClipRect", reason);
+        set_last_error(env, 50);
+        Outcome::Return(0)
+    };
+    let gdi = env.ext.get::<Win32>().gdi.clone();
+    let Some(GdiObj::Dc {
+        selected,
+        modes,
+        clip,
+        ..
+    }) = gdi.get(&env.sys.objects, dc.0)
+    else {
+        set_last_error(env, 6);
+        return Outcome::Return(0);
+    };
+    if modes.map != 1 {
+        return unavailable(env, "only MM_TEXT clipping is available");
+    }
+    let Some(surface) = env
+        .ext
+        .try_get::<SurfaceStore>()
+        .and_then(|s| s.get(selected[3]))
+    else {
+        return unavailable(env, "the DC has no shared raster surface");
+    };
+    if super::front::provider(env.ext).is_none() || surface.pixels == 0 {
+        return unavailable(env, "the DC has no CPU raster provider");
+    }
+    let (Some([left, top]), Some([right, bottom])) = (
+        modes.device_point(left, top),
+        modes.device_point(right, bottom),
+    ) else {
+        return unavailable(
+            env,
+            "the translated clipping coordinates exceed the supported device range",
+        );
+    };
+    let mut next = clip.clone();
+    next.intersect([left, top, right, bottom]);
+    let Some(GdiObj::Dc { clip, .. }) = gdi.get_mut(&mut env.sys.objects, dc.0) else {
+        unreachable!("checked DC")
+    };
+    *clip = next;
+    // The tested Windows memory-DC profile returns COMPLEXREGION here even for
+    // simple/empty visible intersections. GetClipBox's result is distinct;
+    // actual visibility and pixel writes always use the real updated mask.
+    Outcome::Return(3)
 }
 
 #[win32(gdi32, name="GetWindowOrgEx", level=state)]
