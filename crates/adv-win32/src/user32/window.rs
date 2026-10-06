@@ -485,6 +485,13 @@ impl User {
         Some(u)
     }
 
+    /// Whether `window` is owed a WM_PAINT. The system paints the desktop; its
+    /// thread field names no guest thread, so invalidating every window (as
+    /// InvalidateRect(NULL) does) must not queue it to context 0.
+    pub fn paints(&self, window: &Window) -> bool {
+        window.needs_paint && window.visible() && !window.destroying && window.hwnd != self.desktop
+    }
+
     fn alloc_hwnd(&mut self) -> Option<u32> {
         let h = self.next_hwnd;
         self.next_hwnd = self.next_hwnd.checked_add(HWND_STEP)?;
@@ -1599,10 +1606,11 @@ fn move_window(env: &mut Env<'_>) -> Outcome {
 
 fn update_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    let paint = user(env)
+    let u = user(env);
+    let paint = u
         .windows
         .get(&env.sys.objects, &hwnd)
-        .is_some_and(|w| w.needs_paint && w.visible());
+        .is_some_and(|w| u.paints(w));
     if !paint {
         return Outcome::Return(u32::from(
             user(env).windows.contains_key(&env.sys.objects, &hwnd),
