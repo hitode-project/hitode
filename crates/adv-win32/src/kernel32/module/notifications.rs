@@ -53,7 +53,7 @@ pub(super) fn startup_enter(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     };
     if env.sys.try_acquire_objects(&[handle], false).is_some() {
-        return Outcome::Return(1);
+        return startup_system_modules(env, handle);
     }
     Outcome::block(
         Wait::Objects {
@@ -62,8 +62,34 @@ pub(super) fn startup_enter(env: &mut Env<'_>) -> Outcome {
             deadline: None,
             notification: None,
         },
-        |_, _| Outcome::Return(1),
+        move |env, _| startup_system_modules(env, handle),
     )
+}
+
+/// Win32 process infrastructure is resident before any guest initializer,
+/// even when the executable has no import descriptor naming these DLLs.
+/// Keep this in the personality startup gate, not GetModuleHandle: queries
+/// must never implicitly load arbitrary modules or change reference counts.
+fn startup_system_modules(env: &mut Env<'_>, handle: u32) -> Outcome {
+    let result = (|| -> Result<(), String> {
+        let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
+        for name in ["ntdll.dll", "kernel32.dll"] {
+            if modules.by_name(name).is_some() {
+                continue;
+            }
+            let mut loader = Loader::new(env.cpu, env.sys, modules, &win32.vfs);
+            loader
+                .load(&format!("C:\\Windows\\System32\\{name}"))
+                .map_err(|error| format!("Win32 startup {name}: {error}"))?;
+            // Synthetic system images have no guest TLS/DllMain callbacks.
+            debug_assert!(loader.inits.is_empty());
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Outcome::Return(1),
+        Err(error) => release_lock(env, handle, Outcome::Fail(error)),
+    }
 }
 
 pub(super) fn startup_leave(env: &mut Env<'_>) -> Outcome {

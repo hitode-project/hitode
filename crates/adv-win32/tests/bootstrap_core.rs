@@ -279,3 +279,72 @@ fn malformed_version_outputs_and_vcm_installation_have_explicit_failures() {
         assert_eq!(m.cpu.read_u32(OUTPUT + 24).unwrap(), 120);
     }
 }
+
+#[test]
+fn debugger_query_reports_the_guest_process_and_validates_outputs() {
+    for jit in [false, true] {
+        let mut m = machine(jit, "debugger-query");
+        m.cpu.write_u32(DATA, 0xdeadbeef).unwrap();
+        m.cpu.write_u32(DATA + 4, 0x12345678).unwrap();
+        let mut code = Asm::new(CODE);
+        call(
+            &mut m,
+            &mut code,
+            "kernel32.dll",
+            "SetLastError",
+            &[0x55],
+            0,
+        );
+        call(
+            &mut m,
+            &mut code,
+            "kernel32.dll",
+            "CheckRemoteDebuggerPresent",
+            &[u32::MAX, DATA],
+            4,
+        );
+        call(&mut m, &mut code, "kernel32.dll", "GetLastError", &[], 8);
+        call(
+            &mut m,
+            &mut code,
+            "kernel32.dll",
+            "CheckRemoteDebuggerPresent",
+            &[0, DATA + 4],
+            12,
+        );
+        call(&mut m, &mut code, "kernel32.dll", "GetLastError", &[], 16);
+        call(
+            &mut m,
+            &mut code,
+            "kernel32.dll",
+            "CheckRemoteDebuggerPresent",
+            &[u32::MAX, 0],
+            20,
+        );
+        call(&mut m, &mut code, "kernel32.dll", "GetLastError", &[], 24);
+        call(
+            &mut m,
+            &mut code,
+            "kernel32.dll",
+            "CheckRemoteDebuggerPresent",
+            &[u32::MAX, DATA + 0x4000],
+            28,
+        );
+        call(&mut m, &mut code, "kernel32.dll", "GetLastError", &[], 32);
+        run(&mut m, code);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), 0x12345678);
+        for (offset, expected) in [
+            (4, 1),
+            (8, 0x55),
+            (12, 0),
+            (16, 6),
+            (20, 0),
+            (24, 87),
+            (28, 0),
+            (32, 998),
+        ] {
+            assert_eq!(m.cpu.read_u32(OUTPUT + offset).unwrap(), expected);
+        }
+    }
+}
