@@ -14,6 +14,7 @@ mod formatting;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
+mod intrinsic_math;
 mod locale;
 mod onexit;
 mod random;
@@ -101,6 +102,7 @@ pub fn register(r: &mut Registry) {
     find::register(r);
     formatting::register(r);
     floating::register(r);
+    intrinsic_math::register(r);
     time64::register(r);
     random::register(r);
     scalar_float::register(r);
