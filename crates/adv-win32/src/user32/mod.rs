@@ -22,6 +22,7 @@ mod station;
 pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
+mod tab;
 pub mod window;
 
 use adv_abi::{Conv, Registry};
@@ -57,6 +58,7 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
         edit: proc(controls::EDIT_PROC)?,
         combo: proc(controls::COMBO_PROC)?,
         trackbar: proc(controls::TRACKBAR_PROC)?,
+        tab: proc(tab::PROC)?,
     };
     let win32 = m.ext.get_mut::<Win32>();
     win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);

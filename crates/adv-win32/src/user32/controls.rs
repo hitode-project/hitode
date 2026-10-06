@@ -505,6 +505,7 @@ fn def_dlg_default(
 }
 
 pub fn register(reg: &mut Registry) {
+    super::tab::register(reg);
     reg.register(def_dlg_proc_w_ABI);
     stdcall(reg, USER32, DIALOG_PROC, 4, dialog_proc);
     stdcall(reg, USER32, BUTTON_PROC, 4, button_proc);
