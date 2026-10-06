@@ -8,6 +8,7 @@ pub mod compat;
 pub mod controls;
 pub mod dialog;
 pub mod display;
+mod enumeration;
 mod formatting;
 pub(crate) mod hooks;
 pub mod host_input;
@@ -539,6 +540,7 @@ pub fn register(reg: &mut Registry) {
     dialog::register(reg);
     strings::register(reg);
     scroll::register(reg);
+    enumeration::register(reg);
     menu::register(reg);
     input::register(reg);
     clipboard::register(reg);
