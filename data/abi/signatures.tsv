@@ -972,6 +972,7 @@ gdi32.dll	DeleteObject	stdcall	i32	Windows.Win32.Foundation.BOOL	ho:Windows.Win3
 gdi32.dll	DescribePixelFormat	stdcall	i32	i32	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1|iPixelFormat:i32:i32:1|nBytes:u32:u32:1|ppfd:Windows.Win32.Graphics.OpenGL.PIXELFORMATDESCRIPTOR*:ptr:1
 gdi32.dll	DrawEscape	stdcall	i32	i32	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1|iEscape:i32:i32:1|cjIn:i32:i32:1|lpIn:Windows.Win32.Foundation.PSTR:str8:1
 gdi32.dll	Ellipse	stdcall	i32	Windows.Win32.Foundation.BOOL	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1|left:i32:i32:1|top:i32:i32:1|right:i32:i32:1|bottom:i32:i32:1
+gdi32.dll	EnableEUDC	stdcall	i32	Windows.Win32.Foundation.BOOL	fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1
 gdi32.dll	EndDoc	stdcall	i32	i32	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1
 gdi32.dll	EndPage	stdcall	i32	i32	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1
 gdi32.dll	EndPath	stdcall	i32	Windows.Win32.Foundation.BOOL	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1

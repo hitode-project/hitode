@@ -11,6 +11,7 @@ use adv_machine::Machine;
 use std::borrow::Cow;
 
 mod enumeration;
+mod eudc;
 mod rectangle;
 mod paint;
 mod resource;
@@ -29,6 +30,7 @@ struct Fonts {
 }
 
 pub fn register(registry: &mut Registry) {
+    eudc::register(registry);
     paint::register(registry);
     resource::register(registry);
     enumeration::register(registry);
