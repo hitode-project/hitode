@@ -100,6 +100,12 @@ pub struct State {
     transfers: Vec<readback::PendingTransfer>,
     sender: Option<adv_sync::background::LocalSender>,
     wake: Option<std::sync::Arc<adv_sync::WakeEvent>>,
+    /// Whether creation offers COPY presentation. Accepting a swap effect
+    /// moves every engine that requests it onto its Direct3D path, so the
+    /// production profile withholds COPY until vertex declarations exist;
+    /// otherwise SoftPAL leaves its working fallback for an unimplemented
+    /// declaration. The COPY implementation itself stays tested.
+    copy: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Diagnostics {
@@ -249,6 +255,7 @@ pub fn install<B: Backend>(
         transfers: Vec::new(),
         sender: None,
         wake: None,
+        copy: false,
     });
     Ok(())
 }
@@ -514,7 +521,7 @@ fn get_direct3d(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) ->
     }
     0
 }
-fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS) -> Option<String> {
+fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS, copy: bool) -> Option<String> {
     let mut reasons = Vec::new();
     for (name, value, supported) in [
         (
@@ -530,7 +537,7 @@ fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS) -> Option<String>
         (
             "SwapEffect",
             parameters.SwapEffect as u32,
-            matches!(parameters.SwapEffect, 1 | 3),
+            parameters.SwapEffect == 1 || copy && parameters.SwapEffect == 3,
         ),
         (
             "BackBufferCount",
@@ -602,7 +609,7 @@ fn normalize(
     {
         return Err(INVALID);
     }
-    if presentation_unavailable(parameters).is_some() {
+    if presentation_unavailable(parameters, env.ext.get::<State>().copy).is_some() {
         return Err(UNAVAILABLE);
     }
     if parameters.hDeviceWindow == 0 {
@@ -675,7 +682,8 @@ fn create_device(
         Ok(p) => p,
         Err(e) => {
             if e == UNAVAILABLE {
-                let reason = presentation_unavailable(input).unwrap();
+                let copy = env.ext.get::<State>().copy;
+                let reason = presentation_unavailable(input, copy).unwrap();
                 warn_create_unavailable(env, adapter, kind, focus.0, flags, Some(input), &reason);
             }
             return Outcome::Return(e);

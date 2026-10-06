@@ -88,6 +88,23 @@ fn copy_parameters_preserve_effect_and_reject_multibuffer_or_multisample() {
 }
 
 #[test]
+fn production_profile_withholds_copy_but_keeps_discard() {
+    let mut machine = super::super::tests::machine();
+    let provider = machine.ext.get::<State>().provider;
+    install(&mut machine, provider).unwrap();
+    assert!(!machine.ext.get::<State>().copy);
+    let env = env(&mut machine);
+    assert_eq!(normalize(&env, parameters(), 0), Err(UNAVAILABLE));
+    let discard = D3DPRESENT_PARAMETERS {
+        SwapEffect: 1,
+        ..parameters()
+    };
+    assert_eq!(normalize(&env, discard, 0).unwrap().SwapEffect, 1);
+    let reason = presentation_unavailable(parameters(), false).unwrap();
+    assert!(reason.contains("SwapEffect=0x3 (3)"), "{reason}");
+}
+
+#[test]
 fn unavailable_creation_reports_requested_fields_and_absent_gpu_without_publication() {
     let mut machine = super::super::tests::machine();
     let mut env = env(&mut machine);

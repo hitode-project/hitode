@@ -46,6 +46,7 @@ pub(super) fn machine() -> Machine<JitCpu> {
         transfers: Vec::new(),
         sender: None,
         wake: None,
+        copy: true,
     });
     m
 }
