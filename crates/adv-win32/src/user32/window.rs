@@ -2152,8 +2152,8 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
 }
 
 /// Raw guest callbacks use the caller's declared ABI without HWND validation.
-/// Known opposite-encoding procedures need an opaque native-style conversion
-/// thunk, which this same-encoding profile explicitly does not manufacture.
+/// Shared USER procedures use the captured window encoding for supported text
+/// conversion; known opposite-encoding guest procedures still require a thunk.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn call_window_proc(
     env: &mut Env<'_>,
@@ -2170,10 +2170,30 @@ pub(super) fn call_window_proc(
     }
     let u = user(env);
     let stock = stock_procedure(u, proc);
-    if stock && proc != 0
-        && !u.windows.get(&env.sys.objects, &hwnd).is_some_and(|w| w.unicode == wide)
-    {
-        return procedure_boundary(env, api, "shared built-in procedure requires a USER window with matching captured encoding");
+    if stock {
+        let Some(target) = u.windows.get(&env.sys.objects, &hwnd) else {
+            return procedure_boundary(env, api, "shared built-in procedure requires a captured USER window");
+        };
+        if target.unicode != wide {
+            if matches!(msg, wm::SETTEXT | wm::GETTEXT | wm::GETTEXTLENGTH) {
+                return super::message::call_proc_encoded(env, proc, hwnd, msg, wp, lp, wide);
+            }
+            // Ordinary controls delegate these messages to our default handler:
+            // CREATE/NCCREATE do not read CREATESTRUCT strings, and destruction
+            // has no encoding-sensitive payload. DialogWndProc instead invokes
+            // an application DLGPROC first, so it cannot use this exception.
+            let creation_metadata = matches!(msg, wm::CREATE | wm::NCCREATE | wm::DESTROY | wm::NCDESTROY)
+                && [u.procs.def_window, u.procs.button, u.procs.static_, u.procs.edit,
+                    u.procs.combo, u.procs.trackbar, u.procs.tab].contains(&proc);
+            let numeric = matches!(msg, 0 | wm::MOVE | wm::SIZE | wm::SETFONT | wm::GETFONT
+                | wm::ENABLE | 0x000b /* WM_SETREDRAW */ | wm::PAINT | wm::ERASEBKGND
+                | wm::SETFOCUS | wm::KILLFOCUS | wm::GETDLGCODE
+                | wm::WINDOWPOSCHANGING | wm::WINDOWPOSCHANGED
+                | wm::KEYDOWN | wm::KEYUP | wm::SYSKEYDOWN | 0x0105 /* WM_SYSKEYUP */);
+            if !creation_metadata && !numeric {
+                return procedure_boundary(env, api, "saved built-in message needs an unavailable A/W structure or character conversion");
+            }
+        }
     }
     // Call the saved procedure itself, never SendMessage/current w.proc.
     super::message::call_proc(proc, hwnd, msg, wp, lp, |_, r| Outcome::Return(r))

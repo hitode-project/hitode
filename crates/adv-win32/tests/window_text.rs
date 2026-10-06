@@ -653,3 +653,6 @@ mod window_long;
 
 #[path = "window_text/encoding.rs"]
 mod encoding;
+
+#[path = "window_text/call_proc.rs"]
+mod call_proc;

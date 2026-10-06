@@ -422,6 +422,69 @@ pub(super) fn send_encoded(
     wide: bool,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
+    encoded_to(env, None, hwnd, msg, wp, lp, wide, then)
+}
+
+/// Share bounded text conversion while calling an immutable saved procedure.
+/// This deliberately bypasses SendMessage/current-procedure/thread dispatch.
+pub(super) fn call_proc_encoded(
+    env: &mut Env<'_>,
+    proc: u32,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> Outcome {
+    let api = if wide { "user32.dll!CallWindowProcW" } else { "user32.dll!CallWindowProcA" };
+    if !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        adv_abi::warn_unavailable(env, api, "saved-procedure ANSI text conversion requires guest ACP 932/936/1252/65001");
+        crate::util::set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    if msg == wm::GETTEXT && wp != 0 {
+        let size = wp.checked_mul(if wide { 2 } else { 1 });
+        if wp as usize > crate::util::MAX_STR || size.is_none() {
+            adv_abi::warn_unavailable(env, api, "saved-procedure text capacity exceeds the bounded buffer profile");
+            crate::util::set_last_error(env, 87);
+            return Outcome::Return(0);
+        }
+        if adv_abi::guest::check_range(env.cpu, lp, size.unwrap(), adv_cpu::backend::Prot::WRITE).is_err() {
+            crate::util::set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
+    }
+    encoded_to(env, Some(proc), hwnd, msg, wp, lp, wide, |_, r| Outcome::Return(r))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_encoded(
+    env: &mut Env<'_>,
+    proc: Option<u32>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    if let Some(proc) = proc {
+        call_proc(proc, hwnd, msg, wp, lp, then)
+    } else {
+        send(env, hwnd, msg, wp, lp, then)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoded_to(
+    env: &mut Env<'_>,
+    proc: Option<u32>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     let Some(target_wide) = user(env)
         .windows
         .get(&env.sys.objects, &hwnd)
@@ -430,7 +493,7 @@ pub(super) fn send_encoded(
         return then(env, 0);
     };
     if wide == target_wide {
-        return send(env, hwnd, msg, wp, lp, then);
+        return dispatch_encoded(env, proc, hwnd, msg, wp, lp, then);
     }
     let combo = user(env)
         .windows
@@ -442,7 +505,7 @@ pub(super) fn send_encoded(
         });
     if msg == wm::SETTEXT || (combo && matches!(msg, 0x143 | 0x14a | 0x14c | 0x14d | 0x158)) {
         if msg == wm::SETTEXT && lp == 0 {
-            return send(env, hwnd, msg, wp, 0, then);
+            return dispatch_encoded(env, proc, hwnd, msg, wp, 0, then);
         }
         let Some(text) = read_text(env, lp, wide) else {
             crate::util::set_last_error(env, 87);
@@ -453,7 +516,7 @@ pub(super) fn send_encoded(
             crate::util::set_last_error(env, 8);
             return then(env, 0);
         }
-        return send(env, hwnd, msg, wp, pointer, move |env, result| {
+        return dispatch_encoded(env, proc, hwnd, msg, wp, pointer, move |env, result| {
             window::temp_free(env, pointer);
             then(env, result)
         });
@@ -476,7 +539,7 @@ pub(super) fn send_encoded(
             crate::util::set_last_error(env, 87);
             return then(env, 0);
         };
-        return converted_text(env, hwnd, msg, capacity, 0, lp, wp, wide, target_wide, then);
+        return converted_text(env, proc, hwnd, msg, capacity, 0, lp, wp, wide, target_wide, then);
     }
     if msg == wm::GETTEXTLENGTH || (combo && matches!(msg, 0x148 | 0x149)) {
         let query = if combo && msg != wm::GETTEXTLENGTH {
@@ -484,7 +547,7 @@ pub(super) fn send_encoded(
         } else {
             wm::GETTEXTLENGTH
         };
-        return send(env, hwnd, query, wp, 0, move |env, length| {
+        return dispatch_encoded(env, proc, hwnd, query, wp, 0, move |env, length| {
             if length == u32::MAX {
                 return then(env, length);
             }
@@ -493,6 +556,7 @@ pub(super) fn send_encoded(
             };
             converted_text(
                 env,
+                proc,
                 hwnd,
                 if query == 0x149 { 0x148 } else { wm::GETTEXT },
                 capacity,
@@ -505,12 +569,13 @@ pub(super) fn send_encoded(
             )
         });
     }
-    send(env, hwnd, msg, wp, lp, then)
+    dispatch_encoded(env, proc, hwnd, msg, wp, lp, then)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn converted_text(
     env: &mut Env<'_>,
+    proc: Option<u32>,
     hwnd: u32,
     msg: u32,
     capacity: u32,
@@ -540,8 +605,9 @@ fn converted_text(
         crate::util::set_last_error(env, 8);
         return then(env, 0);
     }
-    send(
+    dispatch_encoded(
         env,
+        proc,
         hwnd,
         msg,
         if msg == wm::GETTEXT { capacity } else { index },
