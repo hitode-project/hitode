@@ -36,6 +36,9 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.FrameLayout;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -69,7 +72,9 @@ public final class GameActivity extends Activity {
     private volatile boolean resumed, destroyed;
     private GameLibrary library;
     private Throwable libraryError, nativeError;
-    private LinearLayout root;
+    private View root;
+    private View gameChrome;
+    private Button chromeToggle;
     private TextView status, importStatus;
     private AlertDialog importDialog, guestDialog;
     private int shownDialog = -1;
@@ -153,6 +158,8 @@ public final class GameActivity extends Activity {
     }
     private void showLibrary() {
         if (destroyed) return;
+        gameChrome = null; chromeToggle = null;
+        applyImmersiveMode(false);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         LinearLayout layout = makeRoot();
         layout.addView(text("ADV 遊戲庫", 27, TEXT));
@@ -288,16 +295,23 @@ public final class GameActivity extends Activity {
     }
     private void showGame() {
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
-        LinearLayout layout = makeRoot();
+        FrameLayout layout = new FrameLayout(this);
+        layout.setBackgroundColor(Color.BLACK);
+        setContentView(layout); root = layout;
+        gameSurface = new GameSurface();
+        layout.addView(gameSurface, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout overlay = new FrameLayout(this);
+        layout.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        gameChrome = overlay;
         LinearLayout top = new LinearLayout(this); top.setGravity(Gravity.CENTER_VERTICAL);
+        top.setBackgroundColor(0xdd10141c);
         Button back = button("‹ 遊戲庫", view -> confirmStop()); top.addView(back);
         status = text(currentTitle, 13, MUTED); status.setMaxLines(2); status.setPadding(dp(12), 0, dp(8), 0);
         top.addView(status, new LinearLayout.LayoutParams(0, -2, 1));
         menuButton = button("選單", view -> showMenus(menus, "遊戲選單")); menuButton.setEnabled(false); top.addView(menuButton);
-        layout.addView(top);
-        gameSurface = new GameSurface();
-        layout.addView(gameSurface, new LinearLayout.LayoutParams(-1, 0, 1));
+        overlay.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
         LinearLayout controls = new LinearLayout(this); controls.setGravity(Gravity.CENTER);
+        controls.setBackgroundColor(0xdd10141c);
         controls.addView(button("確認", view -> tapKey(13)), new LinearLayout.LayoutParams(0, -2, 1));
         controls.addView(button("右鍵", view -> { if (gameSurface != null) gameSurface.rightClick(); }), new LinearLayout.LayoutParams(0, -2, 1));
         controls.addView(button("Esc", view -> tapKey(27)), new LinearLayout.LayoutParams(0, -2, 1));
@@ -310,7 +324,57 @@ public final class GameActivity extends Activity {
             return true;
         });
         controls.addView(fastButton, new LinearLayout.LayoutParams(0, -2, 1));
-        layout.addView(controls);
+        overlay.addView(controls, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        chromeToggle = button("☰", view -> setChromeVisible(gameChrome.getVisibility() != View.VISIBLE));
+        chromeToggle.setContentDescription("顯示或隱藏遊戲控制列");
+        chromeToggle.setAlpha(0.65f);
+        layout.addView(chromeToggle, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.END | Gravity.CENTER_VERTICAL));
+        final Button edgeToggle = chromeToggle;
+        layout.setOnApplyWindowInsetsListener((view, insets) -> {
+            int left, right, topInset, bottom;
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets safe = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                left = safe.left; right = safe.right; topInset = safe.top; bottom = safe.bottom;
+            } else {
+                left = insets.getSystemWindowInsetLeft(); right = insets.getSystemWindowInsetRight();
+                topInset = insets.getSystemWindowInsetTop(); bottom = insets.getSystemWindowInsetBottom();
+                if (insets.getDisplayCutout() != null) {
+                    left = Math.max(left, insets.getDisplayCutout().getSafeInsetLeft());
+                    right = Math.max(right, insets.getDisplayCutout().getSafeInsetRight());
+                }
+            }
+            overlay.setPadding(left, topInset, right, bottom);
+            FrameLayout.LayoutParams toggle = (FrameLayout.LayoutParams)edgeToggle.getLayoutParams();
+            toggle.rightMargin = right + dp(4); edgeToggle.setLayoutParams(toggle);
+            return insets;
+        });
+        setChromeVisible(false); applyImmersiveMode(true); layout.requestApplyInsets();
+    }
+    private void setChromeVisible(boolean visible) {
+        releaseInputs();
+        if (gameChrome != null) gameChrome.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (chromeToggle != null) chromeToggle.setText(visible ? "×" : "☰");
+    }
+    private void applyImmersiveMode(boolean enabled) {
+        // The initial library calls this before setContentView creates the decor.
+        getWindow().getDecorView();
+        WindowManager.LayoutParams params = getWindow().getAttributes();
+        params.layoutInDisplayCutoutMode = enabled
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+        getWindow().setAttributes(params);
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().setDecorFitsSystemWindows(!enabled);
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                if (enabled) controller.hide(WindowInsets.Type.systemBars());
+                else controller.show(WindowInsets.Type.systemBars());
+            }
+        } else getWindow().getDecorView().setSystemUiVisibility(enabled
+            ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            : View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
     }
     private void confirmStop() {
         releaseInputs();
@@ -722,8 +786,8 @@ public final class GameActivity extends Activity {
             case KeyEvent.KEYCODE_CTRL_LEFT: case KeyEvent.KEYCODE_CTRL_RIGHT: return 17; case KeyEvent.KEYCODE_SPACE: return 32;
             case KeyEvent.KEYCODE_DPAD_LEFT: return 37; case KeyEvent.KEYCODE_DPAD_UP: return 38; case KeyEvent.KEYCODE_DPAD_RIGHT: return 39; case KeyEvent.KEYCODE_DPAD_DOWN: return 40; default: return 0; }
     }
-    @Override public void onBackPressed() { if (session != 0 || gameSurface != null) confirmStop(); else super.onBackPressed(); }
-    @Override public void onWindowFocusChanged(boolean focused) { super.onWindowFocusChanged(focused); if (!focused) { releaseInputs(); for (int key : new int[]{13, 17, 27, 32, 37, 38, 39, 40}) command(object("type", "key", "key", key, "pressed", false)); } }
+    @Override public void onBackPressed() { if (gameChrome != null) setChromeVisible(gameChrome.getVisibility() != View.VISIBLE); else super.onBackPressed(); }
+    @Override public void onWindowFocusChanged(boolean focused) { super.onWindowFocusChanged(focused); if (focused && gameSurface != null) applyImmersiveMode(true); if (!focused) { releaseInputs(); for (int key : new int[]{13, 17, 27, 32, 37, 38, 39, 40}) command(object("type", "key", "key", key, "pressed", false)); } }
     @Override protected void onPause() { resumed = false; if (gameSurface != null) gameSurface.wake(); releaseInputs(); command(object("type", "pause")); command(object("type", "audio_focus", "active", false)); abandonAudioFocus(); super.onPause(); }
     @Override protected void onResume() { super.onResume(); resumed = true; if (session != 0) { requestAudioFocus(); command(object("type", "audio_focus", "active", audioFocused)); command(object("type", "resume")); if (gameSurface != null) gameSurface.wake(); } }
     @Override public void onConfigurationChanged(Configuration configuration) { super.onConfigurationChanged(configuration); releaseInputs(); if (root != null) root.requestApplyInsets(); }
