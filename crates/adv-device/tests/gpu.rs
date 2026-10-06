@@ -48,6 +48,76 @@ fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_los
     assert_eq!(read(&mut gpu, &target.image), [0, 0, 255, 255].repeat(4));
 }
 
+#[test]
+fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() {
+    use adv_device::surface::{Snapshot, Surfaces};
+    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    let mut surfaces = Surfaces::new(2, 2, 0x1000, 0x10000, Snapshot::default()).unwrap();
+    surfaces.set_deferred_presentation(true).unwrap();
+    let first = surfaces.create_native(&gpu, 2, 2, false).unwrap();
+    let second = surfaces.create_native(&gpu, 3, 1, false).unwrap();
+    gpu.clear(
+        surfaces.native_target(first).unwrap(),
+        Some([1., 0., 0., 1.]),
+        None,
+    )
+    .unwrap();
+    surfaces.present_native(first, &mut gpu).unwrap();
+    let source = surfaces.latest_native_frame().unwrap().clone();
+    let mut transfer = gpu.readback(&source.image, None).unwrap();
+    let completion = transfer.take_completion_job().unwrap();
+
+    // Advance and resize before delivering the original transfer completion.
+    gpu.clear(
+        surfaces.native_target(second).unwrap(),
+        Some([0., 0., 1., 1.]),
+        None,
+    )
+    .unwrap();
+    surfaces.present_native(second, &mut gpu).unwrap();
+    completion();
+    let pixels = transfer.poll().unwrap().unwrap();
+    assert_eq!(pixels, [0, 0, 255, 255].repeat(4));
+    assert!(!surfaces.capture_native_pixels(1, 2, 2, &pixels).unwrap());
+    assert!(
+        surfaces
+            .capture_native_snapshot_pixels(&source, &pixels)
+            .unwrap()
+    );
+    assert_eq!(surfaces.presenter.frames, 1);
+    assert_eq!(
+        (surfaces.presenter.width, surfaces.presenter.height),
+        (2, 2)
+    );
+    assert_eq!(surfaces.presenter.bgra, pixels);
+    assert!(surfaces.has_pending_frame());
+    assert!(
+        surfaces
+            .capture_native_snapshot_pixels(&source, &pixels[..12])
+            .is_err()
+    );
+
+    let latest = surfaces.latest_native_frame().unwrap().clone();
+    let latest_pixels = read(&mut gpu, &latest.image);
+    assert!(
+        surfaces
+            .capture_native_pixels(2, 3, 1, &latest_pixels)
+            .unwrap()
+    );
+    assert!(
+        !surfaces
+            .capture_native_snapshot_pixels(&source, &pixels)
+            .unwrap()
+    );
+    assert_eq!(surfaces.presenter.frames, 2);
+    assert_eq!(
+        (surfaces.presenter.width, surfaces.presenter.height),
+        (3, 1)
+    );
+    assert_eq!(surfaces.presenter.bgra, [255, 0, 0, 255].repeat(3));
+    assert!(!surfaces.has_pending_frame());
+}
+
 fn pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let at = ((y * width + x) * 4) as usize;
     bytes[at..at + 4].try_into().unwrap()

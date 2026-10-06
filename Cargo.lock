@@ -39,6 +39,7 @@ dependencies = [
  "adv-runtime",
  "adv-sync",
  "jni",
+ "libc",
  "ndk-context",
  "pollster",
  "serde_json",

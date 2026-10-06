@@ -17,6 +17,15 @@ pub fn frame_info(session: &Session) -> Value {
         |frame| json!({"serial":frame.serial,"width":frame.width,"height":frame.height}),
     )
 }
+fn store_frame(session: &Session, frame_serial: &mut u64, frame: Frame) {
+    if frame.serial > *frame_serial {
+        *frame_serial = frame.serial;
+        *session
+            .frame
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(frame));
+    }
+}
 fn find_menu(items: &[MenuItem], id: u32, found: &mut Vec<adv_runtime::MenuCommand>) {
     for item in items {
         if item.children.is_empty()
@@ -205,6 +214,7 @@ fn snapshot(
     runtime: &Runtime,
     session: &Session,
     output: &adv_device::Output,
+    scheduling: &Value,
     status: &str,
     paused: bool,
     command_error: &Option<String>,
@@ -234,7 +244,7 @@ fn snapshot(
             "pcm":{"playback_starts":pcm.playback_starts,"missing_stream_frames":pcm.missing_stream_frames,
                 "missing_output_frames":pcm.missing_output_frames},
             "build":option_env!("ADV_ANDROID_SHELL_BUILD").unwrap_or("unrecorded"),
-            "guest_workers":1,"backend":"jit","gpu_enabled":cfg!(feature="gpu"),
+            "guest_workers":1,"backend":"jit","gpu_enabled":cfg!(feature="gpu"),"scheduling":scheduling,
             "graphics":if cfg!(feature="gpu") {"existing GPU with Bitmap readback"} else {"software GDI/DirectDraw"}
         }),
     )
@@ -374,10 +384,15 @@ pub fn run(
     let mut frame_serial = 0;
     let mut input_epoch = session.input_epoch.load(Ordering::Acquire);
     let mut input_fence: Option<(u64, Instant)> = None;
+    #[cfg(feature = "gpu")]
+    let mut capture = crate::gpu::Capture::new();
+    let scheduling = crate::scheduling::configure_execution_thread();
     let status;
     loop {
         session.wake.take_interrupt();
         if session.stop.load(Ordering::Acquire) && closing.is_none() {
+            #[cfg(feature = "gpu")]
+            capture.cancel();
             session.keys.release_all();
             runtime.release_input();
             output.suspend();
@@ -393,6 +408,8 @@ pub fn run(
                 || !session.audio_focus.load(Ordering::Acquire));
         if requested_pause != paused {
             if requested_pause {
+                #[cfg(feature = "gpu")]
+                capture.cancel();
                 runtime.release_input();
                 buttons = 0;
                 output.suspend();
@@ -411,6 +428,7 @@ pub fn run(
                 &runtime,
                 session,
                 &output,
+                &scheduling,
                 if paused { "paused" } else { "running" },
                 paused,
                 &command_error,
@@ -497,25 +515,23 @@ pub fn run(
         if !paused && closing.is_none() {
             output.update();
         }
-        if !paused {
-            #[cfg(feature = "gpu")]
-            crate::gpu::capture(&mut runtime, session)?;
-            #[cfg(not(feature = "gpu"))]
-            runtime.capture_latest_frame()?;
-        }
-        let frame = runtime.frame();
-        if frame.frames > frame_serial {
-            frame_serial = frame.frames;
-            let latest = Arc::new(Frame {
+        #[cfg(feature = "gpu")]
+        let latest = capture.update(&mut runtime, session)?;
+        #[cfg(not(feature = "gpu"))]
+        let latest = {
+            if !paused {
+                runtime.capture_latest_frame()?;
+            }
+            let frame = runtime.frame();
+            (frame.frames > frame_serial).then(|| Frame {
                 serial: frame.frames,
                 width: frame.width,
                 height: frame.height,
                 bgra: frame.bgra.clone(),
-            });
-            *session
-                .frame
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(latest);
+            })
+        };
+        if let Some(latest) = latest {
+            store_frame(session, &mut frame_serial, latest);
         }
         match &outcome {
             Some(SliceResult::Complete(RunResult::Exited(code))) => {
@@ -543,13 +559,14 @@ pub fn run(
             }
             _ => {}
         }
-        if last_publish.elapsed() >= Duration::from_millis(50) {
+        if last_publish.elapsed() >= Duration::from_millis(100) {
             publish(
                 session,
                 snapshot(
                     &runtime,
                     session,
                     &output,
+                    &scheduling,
                     if paused {
                         "paused"
                     } else if closing.is_some() {
@@ -580,11 +597,53 @@ pub fn run(
             let delay = output.next_wake().map_or(delay, |wake| {
                 delay.min(wake.saturating_duration_since(Instant::now()))
             });
+            #[cfg(feature = "gpu")]
+            let delay = if !paused && closing.is_none() {
+                delay.min(
+                    capture
+                        .next_wake()
+                        .saturating_duration_since(Instant::now()),
+                )
+            } else {
+                delay
+            };
             session
                 .wake
                 .wait(Some(delay))
                 .map_err(|error| error.to_string())?;
         }
+    }
+    #[cfg(feature = "gpu")]
+    {
+        // The guest is finished. Preserve the final report's complete snapshot
+        // through the same asynchronous transfer; lifecycle/stop cancels it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.has_pending_frame()
+            && !session.stop.load(Ordering::Acquire)
+            && !session.lifecycle_paused.load(Ordering::Acquire)
+            && session.audio_focus.load(Ordering::Acquire)
+        {
+            if let Some(latest) = capture.update(&mut runtime, session)? {
+                store_frame(session, &mut frame_serial, latest);
+            }
+            if !runtime.has_pending_frame() {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                capture.cancel();
+                return Err("final GPU capture timed out".into());
+            }
+            let delay = capture
+                .next_wake()
+                .saturating_duration_since(Instant::now())
+                .min(remaining);
+            session
+                .wake
+                .wait(Some(delay))
+                .map_err(|error| error.to_string())?;
+        }
+        capture.cancel();
     }
     session.keys.release_all();
     runtime.release_input();
@@ -593,6 +652,7 @@ pub fn run(
         &runtime,
         session,
         &output,
+        &scheduling,
         status,
         paused,
         &command_error,

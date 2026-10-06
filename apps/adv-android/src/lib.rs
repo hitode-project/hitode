@@ -2,6 +2,7 @@
 #[cfg(feature = "gpu")]
 mod gpu;
 mod protocol;
+mod scheduling;
 mod worker;
 
 use adv_sync::{WakeEvent, input::KeyState};
