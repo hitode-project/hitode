@@ -142,7 +142,7 @@ fn cursor_metadata(
     handle.map_or_else(|| fail(env, 8), Handle)
 }
 
-fn file_bytes(env: &mut Env<'_>, path: &str, api: &str) -> Result<Vec<u8>, u32> {
+pub(crate) fn file_bytes(env: &mut Env<'_>, path: &str, api: &str) -> Result<Vec<u8>, u32> {
     // The temporary owner participates in ordinary guest sharing checks and
     // coherent mapped-file reads; every successful open is closed on all paths.
     let handle = crate::kernel32::open_with_share(env, path, 0x80000000, 3, 7);
@@ -155,7 +155,9 @@ fn file_bytes(env: &mut Env<'_>, path: &str, api: &str) -> Result<Vec<u8>, u32> 
         if size > MAX_FILE {
             return Err(8);
         }
-        let mut bytes = vec![0; size as usize];
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size as usize).map_err(|_| 8_u32)?;
+        bytes.resize(size as usize, 0);
         let got =
             crate::kernel32::read_coherent(file, &env.ext.get::<Win32>().vfs.sections, &mut bytes)
                 .map_err(|_| 5_u32)?;

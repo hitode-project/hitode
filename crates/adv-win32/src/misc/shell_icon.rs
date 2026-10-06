@@ -1,18 +1,19 @@
-//! ExtractIconEx reads guest files and creates ordinary, owned USER icon objects.
+//! Shell extraction reads guest files and creates ordinary, owned USER icons.
 //! PE group resources and classic ICO DIBs share the same checked pixel decoder.
 use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::Env;
 use adv_pe::ResId;
-use std::io::Read;
 
 use crate::{
     Win32,
-    user32::image::decode::{ico_groups, image, pe_groups},
-    util::{MAX_STR, set_last_error},
+    user32::image::{
+        decode::{ico_groups, image, pe_groups},
+        file_bytes,
+    },
+    util::{MAX_STR, last_error, set_last_error},
 };
 
-const MAX_FILE: u64 = 128 * 1024 * 1024;
 const ERROR_NOACCESS: u32 = 998;
 
 fn fail(env: &mut Env<'_>, error: u32) -> u32 {
@@ -27,6 +28,7 @@ fn extract(
     large: u32,
     small: u32,
     count: u32,
+    api: &str,
 ) -> u32 {
     let query = index == -1 && large == 0 && small == 0;
     // Native rejects a zero extraction count without altering caller outputs or
@@ -38,36 +40,19 @@ fn extract(
         Ok(path) => path,
         Err(error) => return fail(env, error),
     };
-    let Some(host) = env.ext.get::<Win32>().vfs.lookup(&path) else {
-        set_last_error(env, 2);
-        return if query { 0 } else { u32::MAX };
-    };
-    let file = std::fs::File::open(host);
-    let mut file = match file {
-        Ok(file) => file,
-        Err(error) => {
-            return fail(
-                env,
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    2
-                } else {
-                    5
-                },
-            );
+    // LoadImage and shell extraction use one temporary FileObj, including guest
+    // sharing checks and dirty mapped-file content. Its open must not reset the
+    // extraction front's otherwise unspecified success LastError.
+    let saved_error = last_error(env);
+    let bytes = match file_bytes(env, &path, api) {
+        Ok(bytes) => bytes,
+        Err(2) if query => {
+            set_last_error(env, 2);
+            return 0;
         }
+        Err(error) => return fail(env, error),
     };
-    let mut bytes = Vec::new();
-    if file
-        .by_ref()
-        .take(MAX_FILE + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return fail(env, 5);
-    }
-    if bytes.len() as u64 > MAX_FILE {
-        return fail(env, 8);
-    }
+    set_last_error(env, saved_error);
     let portable_executable = bytes.starts_with(b"MZ");
     let groups = if portable_executable {
         pe_groups(&bytes)
@@ -205,7 +190,15 @@ fn extract_a(
         .read(env.cpu, MAX_STR)
         .map(|bytes| env.ext.get::<Win32>().codec.decode(&bytes))
         .map_err(|_| ERROR_NOACCESS);
-    extract(env, path, index, large.addr(), small.addr(), count)
+    extract(
+        env,
+        path,
+        index,
+        large.addr(),
+        small.addr(),
+        count,
+        "shell32.dll!ExtractIconExA",
+    )
 }
 #[win32(shell32, name = "ExtractIconExW", level = implement)]
 fn extract_w(
@@ -220,18 +213,173 @@ fn extract_w(
         .read(env.cpu, MAX_STR)
         .map(|units| String::from_utf16_lossy(&units))
         .map_err(|_| ERROR_NOACCESS);
-    extract(env, path, index, large.addr(), small.addr(), count)
+    extract(
+        env,
+        path,
+        index,
+        large.addr(),
+        small.addr(),
+        count,
+        "shell32.dll!ExtractIconExW",
+    )
+}
+
+fn associated_fail(env: &mut Env<'_>, error: u32) -> Handle {
+    set_last_error(env, error);
+    Handle(0)
+}
+
+fn associated_unavailable(env: &mut Env<'_>, api: &str, reason: &str, error: u32) -> Handle {
+    adv_abi::warn_unavailable(env, api, reason);
+    associated_fail(env, error)
+}
+
+fn associated(env: &mut Env<'_>, path: u32, index: GuestPtr<u16>, wide: bool) -> Handle {
+    let api = if wide {
+        "shell32.dll!ExtractAssociatedIconW"
+    } else {
+        "shell32.dll!ExtractAssociatedIconA"
+    };
+    if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        return associated_unavailable(
+            env,
+            api,
+            "ANSI icon path code page has no supported decoder",
+            50,
+        );
+    }
+    let decoded = if wide {
+        WideStr(GuestPtr::new(path))
+            .read(env.cpu, MAX_STR)
+            .map_err(|_| ERROR_NOACCESS)
+            .and_then(|units| {
+                let bytes = (units.len() as u32 + 1) * 2;
+                String::from_utf16(&units)
+                    .map(|text| (text, bytes))
+                    .map_err(|_| 1113)
+            })
+    } else {
+        AnsiStr(GuestPtr::new(path))
+            .read(env.cpu, MAX_STR)
+            .map(|bytes| {
+                (
+                    env.ext.get::<Win32>().codec.decode(&bytes),
+                    bytes.len() as u32 + 1,
+                )
+            })
+            .map_err(|_| ERROR_NOACCESS)
+    };
+    let (text, length) = match decoded {
+        Ok(decoded) => decoded,
+        Err(1113) => {
+            return associated_unavailable(
+                env,
+                api,
+                "icon path contains unpaired UTF-16 surrogates",
+                1113,
+            );
+        }
+        Err(error) => return associated_fail(env, error),
+    };
+    // This direct-source profile preserves the original path (including relative
+    // spelling) and WORD ordinal, as native PE/ICO extraction does. Validate both
+    // inout spans before creating an icon; no MAX_PATH-sized write is invented.
+    if check_range(env.cpu, path, length, Prot::WRITE).is_err()
+        || check_range(env.cpu, index.addr(), 2, Prot::RW).is_err()
+    {
+        return associated_fail(env, ERROR_NOACCESS);
+    }
+    let ordinal = match env.cpu.read_u16(index.addr()) {
+        Ok(ordinal) => usize::from(ordinal),
+        Err(_) => return associated_fail(env, ERROR_NOACCESS),
+    };
+    let saved_error = last_error(env);
+    let bytes = match file_bytes(env, &text, api) {
+        Ok(bytes) => bytes,
+        Err(error) => return associated_fail(env, error),
+    };
+    let portable_executable = bytes.starts_with(b"MZ");
+    let groups = if portable_executable {
+        pe_groups(&bytes)
+    } else {
+        ico_groups(&bytes)
+    };
+    let Some(groups) = groups else {
+        return associated_unavailable(
+            env,
+            api,
+            "direct icon source is unsupported or malformed; shell file associations are unavailable",
+            50,
+        );
+    };
+    // A PE WORD selects the zero-based group ordinal, not RT_GROUP_ICON's ID.
+    // An ICO has one logical icon with several sizes, independent of its WORD.
+    let group = if portable_executable {
+        groups.get(ordinal)
+    } else {
+        groups.first()
+    };
+    let Some(group) = group else {
+        return associated_unavailable(
+            env,
+            api,
+            "requested file icon is absent; shell file associations are unavailable",
+            50,
+        );
+    };
+    let Some(image) = image(group, 32) else {
+        return associated_unavailable(
+            env,
+            api,
+            "direct icon has no decodable classic DIB pixels; shell file associations are unavailable",
+            50,
+        );
+    };
+    let description = format!("associated icon extracted {text} {:?} 32x32", group.id);
+    let Some(handle) = env.ext.get_mut::<Win32>().user.objects.create_icon(
+        &mut env.sys.objects,
+        description,
+        image,
+    ) else {
+        return associated_fail(env, 8);
+    };
+    // Success LastError is unspecified; never reproduce incidental host loader
+    // errors (native PE and ICO extraction leave different internal values).
+    set_last_error(env, saved_error);
+    Handle(handle)
+}
+
+#[win32(shell32, name = "ExtractAssociatedIconA", level = implement)]
+fn associated_a(
+    env: &mut Env<'_>,
+    _instance: Handle,
+    path: AnsiStr,
+    index: GuestPtr<u16>,
+) -> Handle {
+    associated(env, path.0.addr(), index, false)
+}
+
+#[win32(shell32, name = "ExtractAssociatedIconW", level = implement)]
+fn associated_w(
+    env: &mut Env<'_>,
+    _instance: Handle,
+    path: WideStr,
+    index: GuestPtr<u16>,
+) -> Handle {
+    associated(env, path.0.addr(), index, true)
 }
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(extract_a_ABI);
     registry.register(extract_w_ABI);
+    registry.register(associated_a_ABI);
+    registry.register(associated_w_ABI);
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::user32::image::decode::{Candidate, Group, bitmap};
     use super::*;
+    use crate::user32::image::decode::{Candidate, Group, bitmap};
 
     fn color_dib(size: u32, color: [u8; 4]) -> Vec<u8> {
         let mask_stride = (size + 31) / 32 * 4;
