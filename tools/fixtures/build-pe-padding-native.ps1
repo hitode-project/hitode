@@ -20,6 +20,19 @@ if ($Run) {
     for ($nativeIndex = 0; $nativeIndex -lt $nativeRows.Count; ++$nativeIndex) {
         if ($nativeRows[$nativeIndex].seq -ne $nativeIndex + 1) { throw 'PE padding native sequence mismatch' }
     }
+    $expectedLoads = @{
+        'same-page.dll' = 1; 'cross-gap.dll' = 0; 'cross-adjacent.dll' = 1
+        'zero-vsize.dll' = 1; 'zero-fill.dll' = 1; 'raw-outside-image.dll' = 1
+        'virtual-outside-image.dll' = 0
+    }
+    foreach ($nativeCase in $expectedLoads.Keys) {
+        $nativeLoad = @($nativeRows | Where-Object { $_.op -eq 'load' -and $_.case -eq $nativeCase })
+        if ($nativeLoad.Count -ne 1 -or $nativeLoad[0].loaded -ne $expectedLoads[$nativeCase]) {
+            throw "Unexpected native image load result: $nativeCase"
+        }
+    }
+    $nativeExecutions = @($nativeRows | Where-Object { $_.executed -eq 0x11223344 })
+    if ($nativeExecutions.Count -ne 6) { throw 'Native padding entrypoints did not execute six times' }
     $nativeRows | Where-Object { $_.op -eq 'load' } | Format-Table -AutoSize
     "PE padding native oracle: $($nativeRows.Count) valid JSONL records"
 }

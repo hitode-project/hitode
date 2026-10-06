@@ -12,7 +12,8 @@ static void probe(const char *name, BYTE *base, DWORD offset) {
     MEMORY_BASIC_INFORMATION information; DWORD value = 0, executed = 0, written;
     SIZE_T read = 0; BYTE code[6]; char text[512];
     DWORD queried = VirtualQuery(base + offset, &information, sizeof(information));
-    BOOL readable = ReadProcessMemory(GetCurrentProcess(), base + offset, &value, sizeof(value), &read) && read == sizeof(value);
+    BOOL readable = queried && information.AllocationBase == base && information.State == MEM_COMMIT &&
+        ReadProcessMemory(GetCurrentProcess(), base + offset, &value, sizeof(value), &read) && read == sizeof(value);
     if (!queried) { information.State = 0; information.Protect = 0; }
     if (queried && information.AllocationBase == base && information.State == MEM_COMMIT &&
         (information.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
