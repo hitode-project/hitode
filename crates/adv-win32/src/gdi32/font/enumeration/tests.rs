@@ -58,6 +58,218 @@ fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
 
 #[test]
 #[cfg(windows)]
+fn extended_fonts_match_native_charset_script_and_signature_in_a_and_w_callbacks() {
+    use core::ffi::c_void;
+    struct NativeFont {
+        logical: [u8; 348],
+        metrics: [u8; 100],
+        kind: u32,
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateCompatibleDC(dc: *mut c_void) -> *mut c_void;
+        fn DeleteDC(dc: *mut c_void) -> i32;
+        fn EnumFontFamiliesExW(
+            dc: *mut c_void,
+            query: *const u8,
+            callback: unsafe extern "system" fn(*const u8, *const u8, u32, isize) -> i32,
+            parameter: isize,
+            flags: u32,
+        ) -> i32;
+    }
+    unsafe extern "system" fn collect(
+        font: *const u8,
+        metrics: *const u8,
+        kind: u32,
+        parameter: isize,
+    ) -> i32 {
+        let records = unsafe { &mut *(parameter as *mut Vec<NativeFont>) };
+        let mut record = NativeFont {
+            logical: [0; 348],
+            metrics: [0; 100],
+            kind,
+        };
+        // TrueType promises the full extended metrics; raster callbacks only
+        // promise TEXTMETRIC. ENUMLOGFONTEX is supplied by this API for both.
+        unsafe {
+            core::ptr::copy_nonoverlapping(font, record.logical.as_mut_ptr(), 348);
+            core::ptr::copy_nonoverlapping(
+                metrics,
+                record.metrics.as_mut_ptr(),
+                if kind & 4 != 0 { 100 } else { 60 },
+            );
+        }
+        records.push(record);
+        1
+    }
+    let native = |charset: u8, face: Option<&str>| {
+        let mut query = [0; 92];
+        query[23] = charset;
+        if let Some(face) = face {
+            for (dst, unit) in query[28..].chunks_exact_mut(2).zip(face.encode_utf16()) {
+                dst.copy_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let mut records = Vec::<NativeFont>::new();
+        unsafe {
+            let dc = CreateCompatibleDC(core::ptr::null_mut());
+            assert!(!dc.is_null());
+            assert_ne!(
+                EnumFontFamiliesExW(
+                    dc,
+                    query.as_ptr(),
+                    collect,
+                    &mut records as *mut _ as isize,
+                    0
+                ),
+                0
+            );
+            assert_ne!(DeleteDC(dc), 0);
+        }
+        records
+    };
+    let string = |bytes: &[u8]| {
+        String::from_utf16_lossy(
+            &bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .take_while(|&u| u != 0)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (mut machine, dc) = fixture();
+    let pointer = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 4096, Prot::RW)
+        .unwrap();
+    let japanese = native(128, None);
+    assert!(!japanese.is_empty()); // This test host has an installed Japanese font.
+    let face = string(&japanese[0].logical[28..92]);
+    for (charset, filter) in [(0, None), (128, None), (1, Some(face.as_str()))] {
+        let expected = native(charset, filter);
+        assert!(!expected.is_empty());
+        for wide in [false, true] {
+            let mut logical = vec![0; if wide { 92 } else { 60 }];
+            logical[23] = charset;
+            if let Some(face) = filter {
+                if wide {
+                    for (destination, unit) in
+                        logical[28..].chunks_exact_mut(2).zip(face.encode_utf16())
+                    {
+                        destination.copy_from_slice(&unit.to_le_bytes());
+                    }
+                } else {
+                    let encoded = machine.ext.get::<Win32>().codec.encode(face);
+                    if encoded.contains(&b'?') {
+                        continue;
+                    } // Host-only face unavailable in guest ACP.
+                    let length = encoded.len().min(31);
+                    logical[28..28 + length].copy_from_slice(&encoded[..length]);
+                }
+            }
+            machine.cpu.write(pointer, &logical).unwrap();
+            let mut outcome = if wide {
+                families_ex_w(
+                    &mut env(&mut machine),
+                    Handle(dc),
+                    GuestPtr::new(pointer),
+                    GuestPtr::new(adv_machine::layout::PARK_ADDR),
+                    0xfeedface,
+                    0,
+                )
+            } else {
+                families_ex_a(
+                    &mut env(&mut machine),
+                    Handle(dc),
+                    GuestPtr::new(pointer),
+                    GuestPtr::new(adv_machine::layout::PARK_ADDR),
+                    0xfeedface,
+                    0,
+                )
+            };
+            let mut count = 0;
+            loop {
+                outcome = match outcome {
+                    Outcome::Call { args, then, .. } => {
+                        let record = &expected[count];
+                        assert_eq!(args[2], record.kind);
+                        assert_eq!(args[3], 0xfeedface);
+                        let mut output = [0; 348];
+                        machine.cpu.read(args[0], &mut output).unwrap();
+                        let mut expected_logical = record.logical[..28].to_vec();
+                        // Neutral device requests canonicalize logical BOOLs;
+                        // native raster fonts sometimes use 0xff for true.
+                        for flag in &mut expected_logical[20..23] {
+                            *flag = u8::from(*flag != 0);
+                        }
+                        assert_eq!(&output[..28], &expected_logical);
+                        let codec = machine.ext.get::<Win32>().codec;
+                        for (offset, length) in [(28, 32), (92, 64), (220, 32), (284, 32)] {
+                            let expected_text =
+                                string(&record.logical[offset..offset + length * 2]);
+                            let actual_offset = 28 + (offset - 28) / if wide { 1 } else { 2 };
+                            let mut expected_bytes = vec![0; length * if wide { 2 } else { 1 }];
+                            put_string(codec, &mut expected_bytes, &expected_text, wide);
+                            assert_eq!(
+                                &output[actual_offset..actual_offset + expected_bytes.len()],
+                                &expected_bytes
+                            );
+                        }
+                        if record.kind & 4 != 0 {
+                            let mut signature = [0; 24];
+                            machine
+                                .cpu
+                                .read(args[1] + if wide { 76 } else { 72 }, &mut signature)
+                                .unwrap();
+                            assert_eq!(&signature, &record.metrics[76..100]);
+                        }
+                        count += 1;
+                        then(&mut env(&mut machine), Resume::Returned(7))
+                    }
+                    Outcome::Return(value) => {
+                        assert_eq!(value, 7);
+                        break;
+                    }
+                    _ => panic!("extended font callback"),
+                };
+            }
+            assert_eq!(count, expected.len());
+        }
+    }
+}
+
+#[test]
+fn extended_font_logfont_rejects_unreadable_and_wrapping_input() {
+    let (mut machine, dc) = fixture();
+    for pointer in [0, 0xdeadbeef, u32::MAX - 24] {
+        assert!(matches!(
+            families_ex_a(
+                &mut env(&mut machine),
+                Handle(dc),
+                GuestPtr::new(pointer),
+                GuestPtr::new(adv_machine::layout::PARK_ADDR),
+                0,
+                0
+            ),
+            Outcome::Return(0)
+        ));
+        assert!(matches!(
+            families_ex_w(
+                &mut env(&mut machine),
+                Handle(dc),
+                GuestPtr::new(pointer),
+                GuestPtr::new(adv_machine::layout::PARK_ADDR),
+                0,
+                0
+            ),
+            Outcome::Return(0)
+        ));
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn callback_layout_parameter_stop_and_final_result_follow_guest_returns() {
     let (mut machine, dc) = fixture();
     let mut outcome = families_a(

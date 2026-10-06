@@ -31,7 +31,7 @@ bytemuck = { version = "1.23", optional = true, features = ["derive"] }
 pollster = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Foundation"] }
+windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Foundation", "Win32_Globalization"] }
 # The broad gpu-allocator windows range must select wgpu-hal's ABI version,
 # instead of reusing the older windows crate required by the WASAPI backend.
 windows = { version = "=0.62.2", optional = true }

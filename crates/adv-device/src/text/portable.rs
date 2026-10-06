@@ -15,6 +15,7 @@ use std::{
 };
 use zeno::{Command, Vector};
 
+mod enumeration;
 mod profile;
 
 type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
@@ -265,6 +266,23 @@ impl Backend {
                 .with_face_data(info.id, |bytes, index| {
                     let font = FontRef::from_index(bytes, index).map_err(font_error)?;
                     let request = enumeration_request(info, name);
+                    let signature = matches!(mode, FontEnumeration::FamiliesEx(_)).then(|| {
+                        font.os2()
+                            .ok()
+                            .map(|os2| FontSignature {
+                                unicode: [
+                                    os2.ul_unicode_range_1(),
+                                    os2.ul_unicode_range_2(),
+                                    os2.ul_unicode_range_3(),
+                                    os2.ul_unicode_range_4(),
+                                ],
+                                codepages: [
+                                    os2.ul_code_page_range_1().unwrap_or(0),
+                                    os2.ul_code_page_range_2().unwrap_or(0),
+                                ],
+                            })
+                            .unwrap_or_default()
+                    });
                     let (em, xscale, metrics) = font_metrics(&font, &request)?;
                     let _ = (em, xscale);
                     let unscaled = font.metrics(Size::unscaled(), LocationRef::default());
@@ -294,7 +312,9 @@ impl Backend {
                         device: false,
                         full_name: string(skrifa::string::StringId::FULL_NAME),
                         style: string(skrifa::string::StringId::SUBFAMILY_NAME),
-                        design: (mode == FontEnumeration::Families).then_some(FontDesign {
+                        script: String::new(),
+                        signature,
+                        design: (mode != FontEnumeration::Faces).then_some(FontDesign {
                             italic: info.style != Style::Normal,
                             bold: info.weight.0 >= 700,
                             regular: info.style == Style::Normal && info.weight.0 < 700,
@@ -312,7 +332,16 @@ impl Backend {
                     })
                 })
                 .ok_or_else(|| TextError::Font("font discovery file became unreadable".into()))??;
-            output.push(result);
+            if let FontEnumeration::FamiliesEx(encoding) = mode {
+                for font in enumeration::repertoires(result, encoding) {
+                    if output.len() >= 8192 {
+                        return Err(TextError::Font("font enumeration budget exceeded".into()));
+                    }
+                    output.push(font);
+                }
+            } else {
+                output.push(result);
+            }
         }
         Ok(output)
     }
