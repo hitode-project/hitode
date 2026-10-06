@@ -314,6 +314,69 @@ fn library_exit<B: Backend>(cpu: B, pending: bool, capacity: usize) {
 }
 
 #[test]
+fn startup_gate_makes_system_modules_resident_without_loading_module_queries() {
+    let mut machine = machine(JitCpu::new(PARK, false).unwrap(), 16);
+    machine.spawn("startup contract", CODE, &[], 65536).unwrap();
+    let enter = machine
+        .resolve_import(super::INTERNAL, "startup_enter")
+        .unwrap();
+    assert_eq!(machine.sys.process_init.front().unwrap().target, enter);
+    assert!(adv_os::modules(&machine.ext).by_name("ntdll.dll").is_none());
+    let mut references = None;
+    let mut env = adv_machine::Env {
+        context: 0,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    for _ in 0..2 {
+        assert!(matches!(super::startup_enter(&mut env), Outcome::Return(1)));
+        // The gate runs before guest initializers, so their ordinary module
+        // queries can already observe readable, pinned system PE images.
+        let current = ["ntdll.dll", "kernel32.dll"].map(|name| {
+            let modules = adv_os::modules(env.ext);
+            let module = modules.get(modules.by_name(name).unwrap());
+            assert!(module.lifetime.pinned);
+            assert!(env.cpu.accessible(module.base, 2, Prot::READ));
+            assert_eq!(env.cpu.read_u32(module.base).unwrap() & 0xffff, 0x5a4d);
+            let (base, refs) = (module.base, module.lifetime.external_refs);
+            assert!(matches!(
+                super::super::get_module_handle(&mut env, Some(name.into())),
+                Outcome::Return(handle) if handle == base
+            ));
+            (base, refs)
+        });
+        if let Some(expected) = references {
+            assert_eq!(
+                current, expected,
+                "startup must not retain resident images again"
+            );
+        } else {
+            references = Some(current);
+        }
+        assert!(matches!(
+            super::super::get_module_handle(&mut env, Some("unrelated-not-loaded.dll".into())),
+            Outcome::Return(0)
+        ));
+        assert!(
+            adv_os::modules(env.ext)
+                .by_name("unrelated-not-loaded.dll")
+                .is_none()
+        );
+        assert!(matches!(super::startup_leave(&mut env), Outcome::Return(1)));
+        let lock = env.ext.get::<Win32>().loader_lock.unwrap();
+        assert!(matches!(
+            env.sys.objects.get(lock),
+            Some(Object::Mutex {
+                owner: None,
+                recursion: 0
+            })
+        ));
+    }
+}
+
+#[test]
 fn both_terminal_apis_need_no_new_lock_without_notifications_even_at_capacity() {
     for thread in [false, true] {
         for jit in [false, true] {

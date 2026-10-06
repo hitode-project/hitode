@@ -313,7 +313,9 @@ fn create_thread(env: &mut Env<'_>) -> Outcome {
         Ok(id) => {
             let c = env.sys.context(id);
             let (tid, h) = (c.tid, c.thread_handle);
-            log::info!("CreateThread: context {id} ({name}) at {start:#010x}({param:#x}) flags={flags:#x}");
+            log::info!(
+                "CreateThread: context {id} ({name}) at {start:#010x}({param:#x}) flags={flags:#x}"
+            );
             out_u32(env.cpu, tid_out, tid);
             Outcome::Return(h)
         }
@@ -489,6 +491,27 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(e.ext.get::<Win32>().codec.acp)
     });
     stdcall(reg, K32, "IsDebuggerPresent", 0, |_| Outcome::Return(0));
+    stdcall(reg, K32, "CheckRemoteDebuggerPresent", 2, |e| {
+        // This personality exposes its own process through the same pseudo
+        // handle returned by GetCurrentProcess and OpenProcess. A host
+        // debugger of the emulator is not a debugger of the virtual process.
+        if e.arg(0) != u32::MAX {
+            set_last_error(e, err::INVALID_HANDLE);
+            return Outcome::Return(0);
+        }
+        let out = e.arg(1);
+        if out == 0 {
+            set_last_error(e, err::INVALID_PARAMETER);
+            return Outcome::Return(0);
+        }
+        if adv_abi::guest::check_range(e.cpu, out, 4, adv_cpu::backend::Prot::WRITE).is_err()
+            || e.cpu.write_u32(out, 0).is_err()
+        {
+            set_last_error(e, 998); // ERROR_NOACCESS
+            return Outcome::Return(0);
+        }
+        Outcome::Return(1)
+    });
     stdcall(
         reg,
         K32,
