@@ -127,6 +127,18 @@ impl Guest for View<'_> {
     fn quiesce_memory(&mut self) {
         self.memory.quiesce_workers();
     }
+    fn lock_pages(&mut self, addr: u32, len: u32) -> Result<(), super::PageLockError> {
+        self.memory.lock_pages(addr, len)
+    }
+    fn unlock_pages(&mut self, addr: u32, len: u32) -> Result<(), super::PageLockError> {
+        self.memory.unlock_pages(addr, len)
+    }
+    fn has_locked_pages(&self, addr: u32, len: u32) -> bool {
+        self.memory.has_locked_pages(addr, len)
+    }
+    fn retire_locked_pages(&mut self) -> Result<(), super::PageLockError> {
+        self.memory.retire_locked_pages()
+    }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         Ok(self.state.capture_architecture())
     }
@@ -258,6 +270,18 @@ impl Guest for View<'_> {
 impl Guest for JitCpu {
     fn quiesce_memory(&mut self) {
         self.inner.memory.quiesce_workers();
+    }
+    fn lock_pages(&mut self, addr: u32, len: u32) -> Result<(), super::PageLockError> {
+        self.view(|guest| guest.lock_pages(addr, len))
+    }
+    fn unlock_pages(&mut self, addr: u32, len: u32) -> Result<(), super::PageLockError> {
+        self.view(|guest| guest.unlock_pages(addr, len))
+    }
+    fn has_locked_pages(&self, addr: u32, len: u32) -> bool {
+        self.inner.memory.has_locked_pages(addr, len)
+    }
+    fn retire_locked_pages(&mut self) -> Result<(), super::PageLockError> {
+        self.view(|guest| guest.retire_locked_pages())
     }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         self.view(|g| g.capture_architecture())

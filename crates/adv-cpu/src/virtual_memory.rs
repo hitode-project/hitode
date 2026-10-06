@@ -34,6 +34,8 @@ mod os {
         fn VirtualProtect(address: *mut c_void, size: usize, protection: u32, old: *mut u32)
         -> i32;
         fn VirtualQuery(address: *const c_void, info: *mut c_void, size: usize) -> usize;
+        pub(super) fn VirtualLock(address: *mut c_void, size: usize) -> i32;
+        pub(super) fn VirtualUnlock(address: *mut c_void, size: usize) -> i32;
     }
     #[repr(C)]
     #[derive(Default)]
@@ -478,6 +480,28 @@ impl Reservation {
 
 #[cfg(windows)]
 impl Reservation {
+    /// Lock only an offset within this owned reservation, never a caller's host pointer.
+    pub(crate) fn lock_pages(&self, offset: usize, len: usize) -> Result<(), u32> {
+        self.bounds(offset, len).map_err(|_| 87u32)?;
+        // SAFETY: bounds retain the complete host address range in this owner.
+        if unsafe { os::VirtualLock(self.ptr.as_ptr().add(offset).cast(), len) } == 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(50) as u32)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn unlock_pages(&self, offset: usize, len: usize) -> Result<(), u32> {
+        self.bounds(offset, len).map_err(|_| 87u32)?;
+        // VirtualUnlock accepts reserved/unlocked pages and reports NOT_LOCKED.
+        // It does not dereference an inaccessible page in the host process.
+        if unsafe { os::VirtualUnlock(self.ptr.as_ptr().add(offset).cast(), len) } == 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(50) as u32)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Temporarily grant/restrict host access without altering guest permission
     /// metadata. No production memory policy is changed by adding this primitive.
     ///
@@ -827,6 +851,24 @@ impl Reservation {
             );
         }
         Ok(())
+    }
+
+    /// Committed neighbours in these private regions are rebuilt by promotion,
+    /// even when only an uncommitted hole will receive the new section view.
+    pub(crate) fn section_promotion_ranges(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<std::ops::Range<usize>>, String> {
+        let end = self.bounds(offset, len)?;
+        let regions = self.regions.borrow();
+        Ok(Self::spans(&regions, offset, end)
+            .into_iter()
+            .filter_map(|(base, _, _)| {
+                matches!(regions[&base].kind, Kind::Private(_))
+                    .then_some(base..base + regions[&base].len)
+            })
+            .collect())
     }
 
     /// Add page-sized section views into the reserved linear guest addresses.

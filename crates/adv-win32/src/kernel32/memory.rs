@@ -10,6 +10,7 @@ use crate::stdcall;
 use crate::util::{err, set_last_error};
 use adv_os::Heaps;
 mod global;
+mod locks;
 
 const HEAP_ZERO_MEMORY: u32 = 0x8;
 const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
@@ -192,7 +193,7 @@ fn find_region(env: &Env<'_>, addr: u32) -> Option<(u32, u32)> {
 }
 
 fn virtual_free(env: &mut Env<'_>) -> Outcome {
-    let (addr, _size, ty) = (env.arg(0), env.arg(1), env.arg(2));
+    let (addr, size, ty) = (env.arg(0), env.arg(1), env.arg(2));
     if adv_os::try_modules(env.ext)
         .and_then(|modules| modules.data_file_containing(addr))
         .is_some()
@@ -206,7 +207,35 @@ fn virtual_free(env: &mut Env<'_>) -> Outcome {
     }
     if ty & 0x8000 != 0 {
         // MEM_RELEASE
-        return Outcome::Return(u32::from(env.sys.vm.free(env.cpu, addr).is_ok()));
+        let allocation = env.sys.vm.region(addr);
+        let released = env.sys.vm.free(env.cpu, addr).is_ok();
+        if !released && allocation.is_some_and(|length| env.cpu.has_locked_pages(addr, length)) {
+            adv_abi::warn_unavailable(
+                env,
+                "kernel32.dll!VirtualFree",
+                "MEM_RELEASE could not retire physical page pins; the allocation remains reserved",
+            );
+            set_last_error(env, 50);
+        }
+        return Outcome::Return(u32::from(released));
+    }
+    if ty & 0x4000 != 0 {
+        let size = if size == 0 {
+            find_region(env, addr).map_or(0, |(_, length)| length)
+        } else {
+            size
+        };
+        if let Some((page, length)) = page_span(addr, size)
+            && env.cpu.has_locked_pages(page, length)
+        {
+            adv_abi::warn_unavailable(
+                env,
+                "kernel32.dll!VirtualFree",
+                "MEM_DECOMMIT of pinned pages is unavailable in the current keep-mapped VM profile; unlock or release the allocation instead",
+            );
+            set_last_error(env, 50);
+            return Outcome::Return(0);
+        }
     }
     Outcome::Return(1) // MEM_DECOMMIT: keep it mapped
 }
@@ -463,6 +492,7 @@ fn write_process_memory(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     global::register(reg);
+    locks::register(reg);
     stdcall(reg, K32, "HeapCreate", 3, heap_create);
     stdcall(reg, K32, "HeapDestroy", 1, heap_destroy);
     stdcall(reg, K32, "HeapAlloc", 3, heap_alloc);

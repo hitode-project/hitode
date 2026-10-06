@@ -1420,6 +1420,19 @@ impl<B: Backend> Machine<B> {
         })
     }
 
+    fn complete_process_exit(&mut self, code: u32) -> RunResult {
+        // Reports retain guest memory after exit, but physical pins must end
+        // with the guest process rather than wait for the executor's Drop.
+        match self.cpu.retire_locked_pages() {
+            Ok(()) => RunResult::Exited(code),
+            Err(error) => {
+                let message = format!("process exit could not release locked pages: {error:?}");
+                log::warn!("{message}");
+                self.fail(message)
+            }
+        }
+    }
+
     /// Record why the current context parked. `Some` ends the run.
     fn park(&mut self, p: Parked) -> Option<RunResult> {
         let id = self.sys.current;
@@ -1480,7 +1493,7 @@ impl<B: Backend> Machine<B> {
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
                 if self.sys.contexts.iter().all(Context::is_done) {
-                    return Some(RunResult::Exited(code));
+                    return Some(self.complete_process_exit(code));
                 }
             }
             Parked::ExitProcess(code) => {
@@ -1488,7 +1501,7 @@ impl<B: Backend> Machine<B> {
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
                 self.sys.terminate_other_contexts(code);
-                return Some(RunResult::Exited(code));
+                return Some(self.complete_process_exit(code));
             }
             Parked::Fail(msg) => return Some(self.fail(msg)),
             Parked::Exception(v) => {

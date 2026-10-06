@@ -6,6 +6,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+mod locks;
+
 pub const PAGE_SIZE: usize = 4096;
 pub const READ: u8 = 1;
 pub const WRITE: u8 = 2;
@@ -110,6 +112,7 @@ impl WorkerLayout {
             reservation: None,
             shared_pages: BTreeMap::new(),
             resident: BTreeMap::new(),
+            locked_pages: BTreeSet::new(),
             #[cfg(windows)]
             native_protection: false,
             #[cfg(windows)]
@@ -133,6 +136,8 @@ pub struct Memory {
     shared_pages: BTreeMap<usize, SharedPage>,
     /// File pages whose bytes live in this window's committed pages.
     resident: BTreeMap<usize, std::rc::Rc<crate::backend::FilePage>>,
+    /// Real host pins owned by this window; repeated locks do not add a count.
+    locked_pages: BTreeSet<usize>,
     #[cfg(windows)]
     native_protection: bool,
     #[cfg(windows)]
@@ -379,6 +384,7 @@ impl Memory {
             reservation: None,
             shared_pages: BTreeMap::new(),
             resident: BTreeMap::new(),
+            locked_pages: BTreeSet::new(),
             #[cfg(windows)]
             native_protection: false,
             #[cfg(windows)]
@@ -419,6 +425,7 @@ impl Memory {
             reservation: Some(reservation),
             shared_pages: BTreeMap::new(),
             resident: BTreeMap::new(),
+            locked_pages: BTreeSet::new(),
             #[cfg(windows)]
             native_protection: false,
             #[cfg(windows)]
@@ -476,6 +483,10 @@ impl Memory {
         self.quiesce_workers();
         let pages = self.pages(addr, len)?;
         self.committed(addr, len)?;
+        // Retire pins while their original committed host addresses still exist.
+        // Failure keeps the remaining ledger and mapping, so reuse cannot inherit it.
+        self.retire_page_locks(pages.clone())
+            .map_err(|error| format!("unpin before unmapping: {error:?}"))?;
         let reservation = self
             .reservation
             .as_ref()
@@ -768,6 +779,27 @@ impl Memory {
         let pages = self.pages(addr, len)?;
         if self.mapped[pages.clone()].iter().any(|&mapped| mapped) {
             return Err("overlapping shared audio mapping".into());
+        }
+        #[cfg(windows)]
+        for range in self
+            .reservation
+            .as_ref()
+            .unwrap()
+            .section_promotion_ranges(pages.start * PAGE_SIZE, len)?
+        {
+            if self
+                .locked_pages
+                .range(range.start / PAGE_SIZE..range.end / PAGE_SIZE)
+                .next()
+                .is_some()
+            {
+                log::warn!(
+                    "unsupported PCM mapping at guest {addr:#x} (+{len}): private host region {}..{} contains neighbouring physical page pins that promotion would retire",
+                    range.start,
+                    range.end,
+                );
+                return Err("PCM section promotion would replace neighbouring physically pinned private pages".into());
+            }
         }
         let storage = SharedAllocation::new(len)?;
         #[cfg(windows)]
@@ -1130,27 +1162,46 @@ impl Memory {
         {
             return Err("executable file views are not supported".into());
         }
+        // Native NOACCESS removes pages from the working set and ends their pin.
+        // Do the same when host protection is disabled; restore prior pins if the
+        // subsequent protection transaction fails.
+        let retired = if perms == 0 {
+            self.retire_page_locks(range.start / PAGE_SIZE..range.end / PAGE_SIZE)
+                .map_err(|error| format!("unpin before NOACCESS: {error:?}"))?
+        } else {
+            Vec::new()
+        };
         #[cfg(windows)]
-        if self.native_protection {
-            let reservation = self.reservation.as_ref().unwrap();
-            let pages = range.start / PAGE_SIZE..range.end / PAGE_SIZE;
-            let mut scopes = Vec::new();
-            for page in pages.clone() {
-                if self.perms[page] & SHARED != 0 && self.perms[page] & AUDIO == 0 {
-                    continue;
+        let host_result = (|| {
+            if self.native_protection {
+                let reservation = self.reservation.as_ref().unwrap();
+                let pages = range.start / PAGE_SIZE..range.end / PAGE_SIZE;
+                let mut scopes = Vec::new();
+                for page in pages.clone() {
+                    if self.perms[page] & SHARED != 0 && self.perms[page] & AUDIO == 0 {
+                        continue;
+                    }
+                    scopes.push(unsafe {
+                        reservation.temporary_protection(
+                            page * PAGE_SIZE,
+                            PAGE_SIZE,
+                            Self::native_permission(perms),
+                        )
+                    }?);
                 }
-                scopes.push(unsafe {
-                    reservation.temporary_protection(
-                        page * PAGE_SIZE,
-                        PAGE_SIZE,
-                        Self::native_permission(perms),
-                    )
-                }?);
+                for scope in scopes {
+                    scope.retain();
+                }
             }
-            for scope in scopes {
-                scope.retain();
-            }
+            Ok::<(), String>(())
+        })();
+        #[cfg(windows)]
+        if let Err(error) = host_result {
+            let restoration = self.restore_page_locks(&retired);
+            return Err(format!("{error}; pin restoration: {restoration:?}"));
         }
+        #[cfg(not(windows))]
+        let _ = retired;
         for page in
             &mut Arc::make_mut(&mut self.perms)[range.start / PAGE_SIZE..range.end / PAGE_SIZE]
         {
@@ -1183,6 +1234,9 @@ impl Drop for Memory {
         if let Some(fence) = &self.parallel {
             fence.quiesce();
         }
+        // The Reservation release also retires any pin whose host unlock failed.
+        // Worker views and heap-backed test windows can never acquire a pin.
+        let _ = self.retire_page_locks(0..self.len / PAGE_SIZE);
         // Sections outlive their views; give them their bytes back.
         for file in std::mem::take(&mut self.resident).into_values() {
             file.evict();

@@ -131,12 +131,18 @@ impl Vm {
 
     /// Unmap and release the region starting at `addr`. Unmapped pages (guards) are skipped.
     pub fn free(&mut self, cpu: &mut dyn Guest, addr: u32) -> Result<(), MemFault> {
-        let size = self.used.remove(&addr).ok_or(MemFault { addr, len: 0 })?;
+        let size = self.used.get(&addr).copied().ok_or(MemFault { addr, len: 0 })?;
         if cpu.unmap(addr, size).is_err() {
-            for p in (addr..addr + size).step_by(PAGE as usize) {
-                let _ = cpu.unmap(p, PAGE);
+            for offset in (0..size).step_by(PAGE as usize) {
+                let _ = cpu.unmap(addr + offset, PAGE);
+            }
+            // The guard-page fallback must not hide a failed physical unpin or
+            // make an allocation available for reuse while its pins still live.
+            if cpu.has_locked_pages(addr, size) {
+                return Err(MemFault { addr, len: size });
             }
         }
+        self.used.remove(&addr);
         Ok(())
     }
 }
@@ -149,6 +155,7 @@ mod tests {
     #[derive(Default)]
     struct MappingGuest {
         fail_next: bool,
+        locked: bool,
         requests: Vec<(u32, u32)>,
     }
     impl Guest for MappingGuest {
@@ -179,9 +186,32 @@ mod tests {
         fn protect(&mut self, _: u32, _: u32, _: Prot) -> Result<(), MemFault> {
             Ok(())
         }
-        fn unmap(&mut self, _: u32, _: u32) -> Result<(), MemFault> {
-            Ok(())
+        fn unmap(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+            if self.locked {
+                Err(MemFault { addr, len })
+            } else {
+                Ok(())
+            }
         }
+        fn has_locked_pages(&self, _: u32, _: u32) -> bool {
+            self.locked
+        }
+    }
+
+    #[test]
+    fn failed_unpin_keeps_the_allocation_owned_until_release_can_finish() {
+        let mut vm = Vm::new();
+        let mut guest = MappingGuest::default();
+        let address = vm.alloc(&mut guest, PAGE, Prot::RW).unwrap();
+        guest.locked = true;
+        assert!(vm.free(&mut guest, address).is_err());
+        assert_eq!(vm.region(address), Some(GRANULE));
+        assert!(!vm.reserve_at(address, GRANULE));
+
+        guest.locked = false;
+        vm.free(&mut guest, address).unwrap();
+        assert_eq!(vm.region(address), None);
+        assert_eq!(vm.reserve(GRANULE), Some(address));
     }
 
     #[test]
