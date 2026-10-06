@@ -15,6 +15,7 @@ use adv_os::{
 use resources::Resource;
 mod capabilities;
 mod creation;
+mod cursor;
 mod fixed;
 mod memory;
 mod pacing;
@@ -175,6 +176,7 @@ pub fn register(registry: &mut Registry) {
     creation::register(registry);
     depth::register(registry);
     memory::register(registry);
+    cursor::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
