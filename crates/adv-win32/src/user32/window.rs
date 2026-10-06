@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use adv_abi::Registry;
+use adv_abi::{AnsiStr, Handle as AbiHandle, Registry, WideStr, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{CtxId, Env, Handle, Identity, Namespace, Objects, Outcome};
 use adv_os::Heaps;
@@ -2067,26 +2067,165 @@ fn find_window_w(env: &mut Env<'_>) -> Outcome {
 
 fn set_window_text_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, text) = (env.arg(0), env.arg(1));
-    super::message::send_encoded(env, hwnd, wm::SETTEXT, 0, text, false, |_, r| {
-        Outcome::Return(r)
-    })
+    window_text(
+        env,
+        hwnd,
+        wm::SETTEXT,
+        0,
+        text,
+        false,
+        "user32.dll!SetWindowTextA",
+    )
 }
 
 fn get_window_text_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, buf, cap) = (env.arg(0), env.arg(1), env.arg(2));
-    if cap == 0 {
-        return Outcome::Return(0);
-    }
-    super::message::send_encoded(env, hwnd, wm::GETTEXT, cap, buf, false, |_, r| {
-        Outcome::Return(r)
-    })
+    window_text(
+        env,
+        hwnd,
+        wm::GETTEXT,
+        cap as i32,
+        buf,
+        false,
+        "user32.dll!GetWindowTextA",
+    )
 }
 
 fn get_window_text_length_a(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    super::message::send_encoded(env, hwnd, wm::GETTEXTLENGTH, 0, 0, false, |_, r| {
-        Outcome::Return(r)
-    })
+    window_text(
+        env,
+        hwnd,
+        wm::GETTEXTLENGTH,
+        0,
+        0,
+        false,
+        "user32.dll!GetWindowTextLengthA",
+    )
+}
+
+#[win32(user32, name = "SetWindowTextW", level = implement)]
+fn set_window_text_w(env: &mut Env<'_>, hwnd: AbiHandle, text: WideStr) -> Outcome {
+    window_text(
+        env,
+        hwnd.0,
+        wm::SETTEXT,
+        0,
+        text.0.addr(),
+        true,
+        "user32.dll!SetWindowTextW",
+    )
+}
+
+#[win32(user32, name = "GetWindowTextW", level = implement)]
+fn get_window_text_w(env: &mut Env<'_>, hwnd: AbiHandle, text: WideStr, capacity: i32) -> Outcome {
+    window_text(
+        env,
+        hwnd.0,
+        wm::GETTEXT,
+        capacity,
+        text.0.addr(),
+        true,
+        "user32.dll!GetWindowTextW",
+    )
+}
+
+#[win32(user32, name = "GetWindowTextLengthW", level = implement)]
+fn get_window_text_length_w(env: &mut Env<'_>, hwnd: AbiHandle) -> Outcome {
+    window_text(
+        env,
+        hwnd.0,
+        wm::GETTEXTLENGTH,
+        0,
+        0,
+        true,
+        "user32.dll!GetWindowTextLengthW",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_text(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    msg: u32,
+    capacity: i32,
+    pointer: u32,
+    wide: bool,
+    api: &str,
+) -> Outcome {
+    use adv_abi::guest::check_range;
+    use adv_cpu::backend::Prot;
+    // Native performs these no-work checks before HWND validation/dispatch.
+    if msg == wm::GETTEXT && (capacity == 0 || pointer == 0) {
+        return Outcome::Return(0);
+    }
+    let Some(target_wide) = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map(|w| w.unicode)
+    else {
+        if msg == wm::GETTEXT && capacity > 0 {
+            // A valid output receives an empty string for an invalid HWND.
+            let _ = super::message::write_text(env, pointer, 1, "", wide);
+        }
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    };
+    if (!wide || !target_wide)
+        && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001)
+    {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "window text ANSI code page has no supported encoder",
+        );
+        set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    if msg == wm::GETTEXT {
+        // Negative native counts behave as unsigned capacities. The guarded
+        // profile refuses unbounded buffers, rather than handing them to a
+        // guest procedure or allowing native A/W thunk truncation overruns.
+        if capacity < 0 || capacity as usize > crate::util::MAX_STR {
+            adv_abi::warn_unavailable(
+                env,
+                api,
+                "window text capacity exceeds the supported bounded buffer profile",
+            );
+            set_last_error(env, 87);
+            return Outcome::Return(0);
+        }
+        let bytes = capacity as u32 * if wide { 2 } else { 1 };
+        if check_range(env.cpu, pointer, bytes, Prot::WRITE).is_err() {
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
+    } else if msg == wm::SETTEXT && pointer != 0 {
+        let valid = if wide {
+            WideStr(adv_abi::GuestPtr::new(pointer))
+                .read(env.cpu, crate::util::MAX_STR)
+                .is_ok()
+        } else {
+            AnsiStr(adv_abi::GuestPtr::new(pointer))
+                .read(env.cpu, crate::util::MAX_STR)
+                .is_ok()
+        };
+        if !valid {
+            // Checked-pointer failure deliberately does not reproduce native
+            // bad-pointer WM_SETTEXT success/access-violation side effects.
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
+    }
+    super::message::send_encoded(
+        env,
+        hwnd,
+        msg,
+        capacity as u32,
+        pointer,
+        wide,
+        |_, result| Outcome::Return(result),
+    )
 }
 
 // ---- capture ----
@@ -2171,6 +2310,9 @@ pub fn register(reg: &mut Registry) {
     s(reg, "SetWindowTextA", 2, set_window_text_a);
     s(reg, "GetWindowTextA", 3, get_window_text_a);
     s(reg, "GetWindowTextLengthA", 1, get_window_text_length_a);
+    reg.register(set_window_text_w_ABI);
+    reg.register(get_window_text_w_ABI);
+    reg.register(get_window_text_length_w_ABI);
     s(reg, "SetCapture", 1, set_capture);
     s(reg, "ReleaseCapture", 0, release_capture);
     s(reg, "GetCapture", 0, get_capture);

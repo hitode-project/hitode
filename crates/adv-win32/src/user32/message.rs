@@ -18,7 +18,6 @@ use adv_machine::{Env, Object, Outcome, Wait};
 
 use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
-use crate::util::put_cstr;
 use crate::{Win32, stdcall};
 pub(crate) mod sent;
 
@@ -26,17 +25,21 @@ pub(crate) mod sent;
 pub const DEFAULT_PROC: &str = "<DefaultWndProc>";
 
 pub(super) fn read_text(env: &Env<'_>, pointer: u32, wide: bool) -> Option<String> {
+    read_text_limit(env, pointer, wide, crate::util::MAX_STR)
+}
+
+fn read_text_limit(env: &Env<'_>, pointer: u32, wide: bool, limit: usize) -> Option<String> {
     if pointer == 0 {
         return Some(String::new());
     }
     if wide {
         WideStr(GuestPtr::new(pointer))
-            .read(env.cpu, crate::util::MAX_STR)
+            .read(env.cpu, limit)
             .ok()
             .map(|units| String::from_utf16_lossy(&units))
     } else {
         AnsiStr(GuestPtr::new(pointer))
-            .read(env.cpu, crate::util::MAX_STR)
+            .read(env.cpu, limit)
             .ok()
             .map(|bytes| env.ext.get::<Win32>().codec.decode(&bytes))
     }
@@ -60,20 +63,55 @@ pub(super) fn write_text(
     if capacity == 0 {
         return Some(0);
     }
-    let length = text_length(env, text, wide).min(capacity - 1);
-    let bytes = (length + 1).checked_mul(if wide { 2 } else { 1 })?;
-    adv_abi::guest::check_range(env.cpu, pointer, bytes, adv_cpu::backend::Prot::WRITE).ok()?;
-    if wide {
-        crate::util::put_wstr(
-            env.cpu,
-            pointer,
-            capacity,
-            &text.encode_utf16().collect::<Vec<_>>(),
-        );
+    let (length, bytes) = if wide {
+        let units: Vec<_> = text.encode_utf16().take(capacity as usize - 1).collect();
+        let count = units.len() as u32;
+        (
+            count,
+            units
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .chain([0, 0])
+                .collect::<Vec<_>>(),
+        )
     } else {
-        let bytes = env.ext.get::<Win32>().codec.encode(text);
-        put_cstr(env.cpu, pointer, capacity, &bytes);
-    }
+        let codec = env.ext.get::<Win32>().codec;
+        let mut bytes = codec.encode(text);
+        let limit = bytes.len().min(capacity as usize - 1);
+        let mut end = 0;
+        if codec.acp == 65001 {
+            end = limit;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+        } else {
+            // DefWindowProcA truncates complete DBCS characters, not a lead
+            // byte followed by NUL. The returned count remains an ACP byte count.
+            while end < limit {
+                let next = end
+                    + if codec.is_lead_byte(0, bytes[end]) {
+                        2
+                    } else {
+                        1
+                    };
+                if next > limit {
+                    break;
+                }
+                end = next;
+            }
+        }
+        bytes.truncate(end);
+        bytes.push(0);
+        (end as u32, bytes)
+    };
+    adv_abi::guest::check_range(
+        env.cpu,
+        pointer,
+        bytes.len() as u32,
+        adv_cpu::backend::Prot::WRITE,
+    )
+    .ok()?;
+    env.cpu.write(pointer, &bytes).ok()?;
     Some(length)
 }
 
@@ -403,6 +441,9 @@ pub(super) fn send_encoded(
                 .eq_ignore_ascii_case("ComboBox")
         });
     if msg == wm::SETTEXT || (combo && matches!(msg, 0x143 | 0x14a | 0x14c | 0x14d | 0x158)) {
+        if msg == wm::SETTEXT && lp == 0 {
+            return send(env, hwnd, msg, wp, 0, then);
+        }
         let Some(text) = read_text(env, lp, wide) else {
             crate::util::set_last_error(env, 87);
             return then(env, 0);
@@ -421,8 +462,17 @@ pub(super) fn send_encoded(
         if wp == 0 {
             return then(env, 0);
         }
-        // An ANSI procedure may need several bytes per UTF-16 unit.
-        let Some(capacity) = wp.checked_mul(if target_wide { 1 } else { 4 }) else {
+        // ACP936 native W->A sends wp*2 bytes. Follow the shared GetCPInfo
+        // profile for other guest encoders, not the host's active code page.
+        let cp = env.ext.get::<Win32>().codec.acp;
+        let max_char_size = if cp == 65001 {
+            4
+        } else if adv_os::nls::lead_byte_ranges(cp).is_empty() {
+            1
+        } else {
+            2
+        };
+        let Some(capacity) = wp.checked_mul(if target_wide { 1 } else { max_char_size }) else {
             crate::util::set_last_error(env, 87);
             return then(env, 0);
         };
@@ -477,6 +527,11 @@ fn converted_text(
         .checked_mul(if target_wide { 2 } else { 1 })
         .filter(|size| *size <= crate::util::MAX_STR as u32 * 4)
     else {
+        adv_abi::warn_unavailable(
+            env,
+            "user32.dll!A/W text conversion",
+            "temporary text capacity exceeds the supported bounded buffer profile",
+        );
         crate::util::set_last_error(env, 87);
         return then(env, 0);
     };
@@ -492,7 +547,7 @@ fn converted_text(
         if msg == wm::GETTEXT { capacity } else { index },
         pointer,
         move |env, result| {
-            let text = read_text(env, pointer, target_wide);
+            let text = read_text_limit(env, pointer, target_wide, capacity as usize);
             window::temp_free(env, pointer);
             if result == u32::MAX {
                 return then(env, result);
