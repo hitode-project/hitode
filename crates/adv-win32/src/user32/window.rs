@@ -177,6 +177,8 @@ pub struct Class {
     pub cursor: u32,
     pub background: u32,
     pub menu_name: u32,
+    /// Built-in classes support both encodings; guest classes use their registered ABI.
+    pub unicode: Option<bool>,
 }
 
 /// Per-window state of built-in controls and dialogs.
@@ -221,6 +223,8 @@ pub struct Window {
     pub hwnd: u32,
     pub class: usize,
     pub proc: u32,
+    /// Encoding of string messages and CREATESTRUCT pointers seen by the procedure.
+    pub unicode: bool,
     pub style: u32,
     pub ex_style: u32,
     /// 0 for top-level windows.
@@ -231,6 +235,8 @@ pub struct Window {
     pub instance: u32,
     /// Screen coordinates for top-level windows, parent-client coordinates for children.
     pub rect: Rect,
+    /// Restore geometry and show history belong to this same USER object.
+    pub placement: super::placement::PlacementState,
     pub text: String,
     pub extra: Vec<u8>,
     pub user_data: u32,
@@ -504,6 +510,7 @@ impl User {
             cursor: 0,
             background: 0,
             menu_name: 0,
+            unicode: None,
         });
         self.classes.len() - 1
     }
@@ -524,6 +531,7 @@ impl User {
         let i = self.add_class_raw(name, style, proc, wnd_extra, instance);
         let c = &mut self.classes[i];
         (c.icon, c.cursor, c.background) = (icon, cursor, background);
+        c.unicode = Some(false);
         c.atom
     }
 
@@ -660,6 +668,7 @@ impl Window {
             hwnd,
             class,
             proc,
+            unicode: false,
             style,
             ex_style,
             parent,
@@ -667,6 +676,7 @@ impl Window {
             id: 0,
             instance: 0,
             rect,
+            placement: super::placement::PlacementState::new(rect),
             text: String::new(),
             extra: Vec::new(),
             user_data: 0,
@@ -750,6 +760,7 @@ fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) ->
     let i = u.add_class_raw(&name, f[0], f[1], f[3], f[4]);
     let c = &mut u.classes[i];
     (c.cls_extra, c.icon, c.cursor, c.background, c.menu_name) = (f[2], f[5], f[6], f[7], f[8]);
+    c.unicode = Some(wide);
     let atom = c.atom;
     super::menu::class_menu(env, i, f[8], wide);
     log::debug!("RegisterClass({name}) proc {:#010x} extra {}", f[1], f[3]);
@@ -867,6 +878,55 @@ pub fn create_window(
     p: CreateParams,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
+    create_window_encoded(env, p, false, then)
+}
+
+/// A/W creation shares one lifecycle. Registered guest classes retain their ABI;
+/// dual-encoding built-in classes inherit the caller's encoding.
+pub(super) fn create_window_encoded(
+    env: &mut Env<'_>,
+    mut p: CreateParams,
+    wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let unicode = user(env)
+        .find_class(&p.class, p.instance)
+        .and_then(|index| user(env).classes[index].unicode)
+        .unwrap_or(wide);
+    let mut scratch = Vec::new();
+    if unicode != wide {
+        if p.class_ptr >= 0x1_0000
+            && let ClassKey::Name(name) = &p.class
+        {
+            p.class_ptr = super::message::guest_text(env, name, unicode);
+            scratch.push(p.class_ptr);
+        }
+        if p.name_ptr >= 0x1_0000 {
+            p.name_ptr = super::message::guest_text(env, &p.text, unicode);
+            scratch.push(p.name_ptr);
+        }
+        if scratch.contains(&0) {
+            for pointer in scratch {
+                temp_free(env, pointer);
+            }
+            set_last_error(env, 8);
+            return then(env, 0);
+        }
+    }
+    create_window_inner(env, p, unicode, move |env, hwnd| {
+        for pointer in scratch {
+            temp_free(env, pointer);
+        }
+        then(env, hwnd)
+    })
+}
+
+fn create_window_inner(
+    env: &mut Env<'_>,
+    p: CreateParams,
+    unicode: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     let ctx = env.context;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
@@ -928,6 +988,7 @@ pub fn create_window(
     };
     win.id = if child { p.menu } else { 0 };
     win.instance = p.instance;
+    win.unicode = unicode;
     win.text = p.text;
     win.extra = vec![0; wnd_extra as usize];
     win.created_us = now;
@@ -1259,6 +1320,11 @@ pub fn show_window(
 ) -> Outcome {
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let (sw, sh) = u.screen;
+    let minimize_area = u
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .and_then(|window| u.windows.get(&env.sys.objects, &window.parent))
+        .map_or((sw, sh - 40), Window::client_size);
     let Some(w) = u.windows.get_mut(&mut env.sys.objects, &hwnd) else {
         return then(env, false);
     };
@@ -1277,30 +1343,14 @@ pub fn show_window(
             w.needs_paint = true;
             msgs.push([hwnd, wm::SHOWWINDOW, 1, 0]);
         }
-        match cmd {
-            SW_MAXIMIZE if w.style & WS_MAXIMIZE == 0 => {
-                w.style = (w.style | WS_MAXIMIZE) & !WS_MINIMIZE;
-                w.rect = Rect::new(0, 0, sw, sh - 40);
+        if let Some(kind) = super::placement::show_state(w, cmd, (sw, sh), minimize_area) {
+            let size = if kind == 1 {
+                0
+            } else {
                 let (cw, ch) = w.client_size();
-                msgs.push([hwnd, wm::SIZE, 2, make_long(cw, ch)]); // SIZE_MAXIMIZED
-            }
-            SW_MINIMIZE | SW_SHOWMINIMIZED | SW_SHOWMINNOACTIVE => {
-                w.style = (w.style | WS_MINIMIZE) & !WS_MAXIMIZE;
-                msgs.push([hwnd, wm::SIZE, 1, 0]); // SIZE_MINIMIZED
-            }
-            SW_RESTORE | SW_SHOWNORMAL if w.style & (WS_MINIMIZE | WS_MAXIMIZE) != 0 => {
-                w.style &= !(WS_MINIMIZE | WS_MAXIMIZE);
-                let (cw, ch) = w.client_size();
-                msgs.push([hwnd, wm::SIZE, 0, make_long(cw, ch)]);
-            }
-            SW_SHOWNOACTIVATE if w.style & WS_MINIMIZE != 0 => {
-                // Unlike SW_SHOWNA, native SHOWNOACTIVATE restores a minimized
-                // window. Keep the existing no-activation path below.
-                w.style &= !WS_MINIMIZE;
-                let (cw, ch) = w.client_size();
-                msgs.push([hwnd, wm::SIZE, 0, make_long(cw, ch)]);
-            }
-            _ => {}
+                make_long(cw, ch)
+            };
+            msgs.push([hwnd, wm::SIZE, kind, size]);
         }
         if !w.initial_geometry_reported {
             w.initial_geometry_reported = true;
@@ -1442,6 +1492,7 @@ pub fn set_window_pos(
         let u = &mut env.ext.get_mut::<crate::Win32>().user;
         if let Some(w) = u.windows.get_mut(&mut env.sys.objects, &hwnd) {
             w.rect = Rect::new(x, y, cx, cy);
+            super::placement::position_changed(w);
             if flags & SWP_NOSIZE == 0 {
                 w.needs_paint = true;
             }
@@ -1973,7 +2024,9 @@ fn find_window_w(env: &mut Env<'_>) -> Outcome {
         let mut u16_chars = Vec::new();
         let mut p = class;
         while let Ok(u) = env.cpu.read_u16(p) {
-            if u == 0 { break; }
+            if u == 0 {
+                break;
+            }
             u16_chars.push(u);
             p += 2;
         }
@@ -1987,7 +2040,9 @@ fn find_window_w(env: &mut Env<'_>) -> Outcome {
         let mut u16_chars = Vec::new();
         let mut p = title;
         while let Ok(u) = env.cpu.read_u16(p) {
-            if u == 0 { break; }
+            if u == 0 {
+                break;
+            }
             u16_chars.push(u);
             p += 2;
         }
@@ -2011,7 +2066,9 @@ fn find_window_w(env: &mut Env<'_>) -> Outcome {
 
 fn set_window_text_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, text) = (env.arg(0), env.arg(1));
-    send(env, hwnd, wm::SETTEXT, 0, text, |_, r| Outcome::Return(r))
+    super::message::send_encoded(env, hwnd, wm::SETTEXT, 0, text, false, |_, r| {
+        Outcome::Return(r)
+    })
 }
 
 fn get_window_text_a(env: &mut Env<'_>) -> Outcome {
@@ -2019,12 +2076,14 @@ fn get_window_text_a(env: &mut Env<'_>) -> Outcome {
     if cap == 0 {
         return Outcome::Return(0);
     }
-    send(env, hwnd, wm::GETTEXT, cap, buf, |_, r| Outcome::Return(r))
+    super::message::send_encoded(env, hwnd, wm::GETTEXT, cap, buf, false, |_, r| {
+        Outcome::Return(r)
+    })
 }
 
 fn get_window_text_length_a(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
-    send(env, hwnd, wm::GETTEXTLENGTH, 0, 0, |_, r| {
+    super::message::send_encoded(env, hwnd, wm::GETTEXTLENGTH, 0, 0, false, |_, r| {
         Outcome::Return(r)
     })
 }
@@ -2083,7 +2142,12 @@ pub fn register(reg: &mut Registry) {
     s(reg, "AdjustWindowRectEx", 4, adjust_window_rect_ex);
     s(reg, "GetWindowLongA", 2, get_window_long_a);
     s(reg, "SetWindowLongA", 3, set_window_long_a);
-    s(reg, "SetLayeredWindowAttributes", 4, set_layered_window_attributes);
+    s(
+        reg,
+        "SetLayeredWindowAttributes",
+        4,
+        set_layered_window_attributes,
+    );
     s(reg, "GetClassLongA", 2, get_class_long_a);
     s(reg, "SetClassLongA", 3, set_class_long_a);
     s(reg, "GetParent", 1, get_parent);

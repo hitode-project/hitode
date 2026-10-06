@@ -27,6 +27,7 @@ pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
     register_graphics(&mut registry);
     adv_dx::dsound::register(&mut registry);
     adv_dx::dinput::register(&mut registry);
+    adv_dx::dshow::register(&mut registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(&mut registry);
     crate::vorbis::register(&mut registry, codec);
@@ -133,6 +134,7 @@ impl<B: Backend> Runtime<B> {
         #[cfg(feature = "gpu")]
         adv_dx::d3d9::install(&mut machine, crate::graphics::d3d9_provider())?;
         adv_dx::dsound::install(&mut machine)?;
+        adv_dx::dshow::install(&mut machine)?;
         machine.start_process(exe).map_err(|e| e.to_string())?;
         Ok(Self { machine })
     }
@@ -638,6 +640,7 @@ mod tests {
             hwnd,
             class: 0,
             proc: 0,
+            unicode: false,
             style: WS_VISIBLE | if parent == 0 { WS_POPUP } else { WS_CHILD },
             ex_style: 0,
             parent,
@@ -645,6 +648,7 @@ mod tests {
             id: 0,
             instance: 0,
             rect,
+            placement: adv_win32::user32::PlacementState::new(rect),
             text: String::new(),
             extra: Vec::new(),
             user_data: 0,

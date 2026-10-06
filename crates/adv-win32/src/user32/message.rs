@@ -12,15 +12,80 @@
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 
-use adv_abi::Registry;
+use adv_abi::{AnsiStr, GuestPtr, Handle as AbiHandle, Registry, WideStr, win32};
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Object, Outcome, Wait};
 
 use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
-use crate::util::{cstr, put_cstr};
+use crate::util::put_cstr;
 use crate::{Win32, stdcall};
 pub(crate) mod sent;
+
+/// Internal procedure for built-in classes, whose encoding follows the window.
+pub const DEFAULT_PROC: &str = "<DefaultWndProc>";
+
+pub(super) fn read_text(env: &Env<'_>, pointer: u32, wide: bool) -> Option<String> {
+    if pointer == 0 {
+        return Some(String::new());
+    }
+    if wide {
+        WideStr(GuestPtr::new(pointer))
+            .read(env.cpu, crate::util::MAX_STR)
+            .ok()
+            .map(|units| String::from_utf16_lossy(&units))
+    } else {
+        AnsiStr(GuestPtr::new(pointer))
+            .read(env.cpu, crate::util::MAX_STR)
+            .ok()
+            .map(|bytes| env.ext.get::<Win32>().codec.decode(&bytes))
+    }
+}
+
+pub(super) fn text_length(env: &Env<'_>, text: &str, wide: bool) -> u32 {
+    if wide {
+        text.encode_utf16().count() as u32
+    } else {
+        env.ext.get::<Win32>().codec.encode(text).len() as u32
+    }
+}
+
+pub(super) fn write_text(
+    env: &mut Env<'_>,
+    pointer: u32,
+    capacity: u32,
+    text: &str,
+    wide: bool,
+) -> Option<u32> {
+    if capacity == 0 {
+        return Some(0);
+    }
+    let length = text_length(env, text, wide).min(capacity - 1);
+    let bytes = (length + 1).checked_mul(if wide { 2 } else { 1 })?;
+    adv_abi::guest::check_range(env.cpu, pointer, bytes, adv_cpu::backend::Prot::WRITE).ok()?;
+    if wide {
+        crate::util::put_wstr(
+            env.cpu,
+            pointer,
+            capacity,
+            &text.encode_utf16().collect::<Vec<_>>(),
+        );
+    } else {
+        let bytes = env.ext.get::<Win32>().codec.encode(text);
+        put_cstr(env.cpu, pointer, capacity, &bytes);
+    }
+    Some(length)
+}
+
+pub(super) fn guest_text(env: &mut Env<'_>, text: &str, wide: bool) -> u32 {
+    let length = text_length(env, text, wide) + 1;
+    let pointer = window::temp_alloc(env, length * if wide { 2 } else { 1 });
+    if pointer != 0 && write_text(env, pointer, length, text, wide).is_none() {
+        window::temp_free(env, pointer);
+        return 0;
+    }
+    pointer
+}
 
 #[cfg(test)]
 mod dwm_tests;
@@ -306,6 +371,149 @@ pub fn send(
             },
         )
     }
+}
+
+/// Send a public A/W message, converting supported text messages to the receiving
+/// procedure's encoding. The callback and its result still use the common send path.
+pub(super) fn send_encoded(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let Some(target_wide) = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .map(|w| w.unicode)
+    else {
+        return then(env, 0);
+    };
+    if wide == target_wide {
+        return send(env, hwnd, msg, wp, lp, then);
+    }
+    let combo = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| {
+            user(env).classes[w.class]
+                .name
+                .eq_ignore_ascii_case("ComboBox")
+        });
+    if msg == wm::SETTEXT || (combo && matches!(msg, 0x143 | 0x14a | 0x14c | 0x14d | 0x158)) {
+        let Some(text) = read_text(env, lp, wide) else {
+            crate::util::set_last_error(env, 87);
+            return then(env, 0);
+        };
+        let pointer = guest_text(env, &text, target_wide);
+        if pointer == 0 {
+            crate::util::set_last_error(env, 8);
+            return then(env, 0);
+        }
+        return send(env, hwnd, msg, wp, pointer, move |env, result| {
+            window::temp_free(env, pointer);
+            then(env, result)
+        });
+    }
+    if msg == wm::GETTEXT {
+        if wp == 0 {
+            return then(env, 0);
+        }
+        // An ANSI procedure may need several bytes per UTF-16 unit.
+        let Some(capacity) = wp.checked_mul(if target_wide { 1 } else { 4 }) else {
+            crate::util::set_last_error(env, 87);
+            return then(env, 0);
+        };
+        return converted_text(env, hwnd, msg, capacity, 0, lp, wp, wide, target_wide, then);
+    }
+    if msg == wm::GETTEXTLENGTH || (combo && matches!(msg, 0x148 | 0x149)) {
+        let query = if combo && msg != wm::GETTEXTLENGTH {
+            0x149
+        } else {
+            wm::GETTEXTLENGTH
+        };
+        return send(env, hwnd, query, wp, 0, move |env, length| {
+            if length == u32::MAX {
+                return then(env, length);
+            }
+            let Some(capacity) = length.checked_add(1) else {
+                return then(env, 0);
+            };
+            converted_text(
+                env,
+                hwnd,
+                if query == 0x149 { 0x148 } else { wm::GETTEXT },
+                capacity,
+                wp,
+                lp,
+                if msg == 0x148 { u32::MAX } else { 0 },
+                wide,
+                target_wide,
+                then,
+            )
+        });
+    }
+    send(env, hwnd, msg, wp, lp, then)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn converted_text(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    msg: u32,
+    capacity: u32,
+    index: u32,
+    output: u32,
+    output_capacity: u32,
+    wide: bool,
+    target_wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    // Bound temporary guest allocation even if an untrusted procedure reports a
+    // bogus text length. Normal text uses the same limit as string marshalling.
+    let Some(size) = capacity
+        .checked_mul(if target_wide { 2 } else { 1 })
+        .filter(|size| *size <= crate::util::MAX_STR as u32 * 4)
+    else {
+        crate::util::set_last_error(env, 87);
+        return then(env, 0);
+    };
+    let pointer = window::temp_alloc(env, size);
+    if pointer == 0 {
+        crate::util::set_last_error(env, 8);
+        return then(env, 0);
+    }
+    send(
+        env,
+        hwnd,
+        msg,
+        if msg == wm::GETTEXT { capacity } else { index },
+        pointer,
+        move |env, result| {
+            let text = read_text(env, pointer, target_wide);
+            window::temp_free(env, pointer);
+            if result == u32::MAX {
+                return then(env, result);
+            }
+            let Some(text) = text else {
+                crate::util::set_last_error(env, 87);
+                return then(env, 0);
+            };
+            let length = text_length(env, &text, wide);
+            if output_capacity == 0 {
+                return then(env, length);
+            }
+            let Some(length) =
+                write_text(env, output, output_capacity.min(length + 1), &text, wide)
+            else {
+                crate::util::set_last_error(env, 87);
+                return then(env, 0);
+            };
+            then(env, length)
+        },
+    )
 }
 
 pub fn call_proc(
@@ -1073,7 +1281,7 @@ fn send_message_a(env: &mut Env<'_>) -> Outcome {
         let tops: VecDeque<[u32; 4]> = user(env).top.iter().map(|&t| [t, msg, wp, lp]).collect();
         return send_all(env, tops, |_| Outcome::Return(1));
     }
-    send(env, hwnd, msg, wp, lp, |_, r| Outcome::Return(r))
+    send_encoded(env, hwnd, msg, wp, lp, false, |_, r| Outcome::Return(r))
 }
 
 fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
@@ -1306,6 +1514,18 @@ fn kill_timer(env: &mut Env<'_>) -> Outcome {
 
 fn def_window_proc_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    def_window_proc_encoded(env, hwnd, msg, wp, lp, false, |_, r| Outcome::Return(r))
+}
+
+#[win32(user32, name="DefWindowProcW", level=state)]
+fn def_window_proc_w(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> Outcome {
+    def_window_proc_encoded(env, hwnd.0, msg, wp, lp as u32, true, |_, r| {
+        Outcome::Return(r)
+    })
+}
+
+fn default_proc(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     def_window_proc(env, hwnd, msg, wp, lp, |_, r| Outcome::Return(r))
 }
 
@@ -1317,14 +1537,30 @@ pub fn def_window_proc(
     lp: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
+    let wide = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| w.unicode);
+    def_window_proc_encoded(env, hwnd, msg, wp, lp, wide, then)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn def_window_proc_encoded(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     let r = match msg {
         wm::NCCREATE => 1,
         wm::CLOSE => return destroy_window(env, hwnd, move |env, _| then(env, 0)),
         wm::SETTEXT => {
-            let text = if lp == 0 {
-                String::new()
-            } else {
-                env.ext.get::<Win32>().codec.decode(&cstr(env.cpu, lp))
+            let Some(text) = read_text(env, lp, wide) else {
+                crate::util::set_last_error(env, 87);
+                return then(env, 0);
             };
             if let Some(w) = env
                 .ext
@@ -1342,18 +1578,17 @@ pub fn def_window_proc(
             let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
                 return then(env, 0);
             };
-            let bytes = env.ext.get::<Win32>().codec.encode(&w.text);
-            if wp == 0 {
+            let text = w.text.clone();
+            write_text(env, lp, wp, &text, wide).unwrap_or_else(|| {
+                crate::util::set_last_error(env, 87);
                 0
-            } else {
-                put_cstr(env.cpu, lp, wp, &bytes).unwrap_or(wp - 1)
-            }
+            })
         }
         wm::GETTEXTLENGTH => {
             let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
                 return then(env, 0);
             };
-            env.ext.get::<Win32>().codec.encode(&w.text).len() as u32
+            text_length(env, &w.text, wide)
         }
         wm::SETFONT => {
             if let Some(w) = env
@@ -1474,6 +1709,8 @@ fn redraw_window(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    reg.register(def_window_proc_w_ABI);
+    stdcall(reg, USER32, DEFAULT_PROC, 4, default_proc);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "PeekMessageA", 5, peek_message_a);
     s(reg, "GetMessageA", 4, get_message_a);

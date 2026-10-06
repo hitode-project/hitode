@@ -11,6 +11,7 @@ pub mod host_input;
 mod input;
 pub mod menu;
 pub mod message;
+mod placement;
 mod resources;
 pub(crate) mod strings;
 pub(crate) mod system_colors;
@@ -22,6 +23,7 @@ use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
 
+pub use placement::PlacementState;
 pub use window::User;
 
 use crate::printf::{StackArgs, format};
@@ -44,8 +46,8 @@ pub fn user_mut<'a>(env: &'a mut Env<'_>) -> &'a mut User {
 pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
     let mut proc = |name: &str| m.sys.thunks.resolve(&mut m.cpu, USER32, name);
     let procs = window::SysProcs {
-        def_window: proc("DefWindowProcA")?,
-        def_dlg: proc("DefDlgProcA")?,
+        def_window: proc(message::DEFAULT_PROC)?,
+        def_dlg: proc(controls::DIALOG_PROC)?,
         button: proc(controls::BUTTON_PROC)?,
         static_: proc(controls::STATIC_PROC)?,
         edit: proc(controls::EDIT_PROC)?,
@@ -544,6 +546,7 @@ pub fn register(reg: &mut Registry) {
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
+    placement::register(reg);
     message::register(reg);
     controls::register(reg);
     dialog::register(reg);

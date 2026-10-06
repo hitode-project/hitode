@@ -30,6 +30,7 @@ fn fixture() -> Machine<JitCpu> {
         hwnd: 0x10020,
         class: 0,
         proc: procedure,
+        unicode: false,
         style: WS_CAPTION | WS_THICKFRAME | WS_VISIBLE,
         ex_style: window::WS_EX_CLIENTEDGE,
         parent: 0,
@@ -37,6 +38,7 @@ fn fixture() -> Machine<JitCpu> {
         id: 0,
         instance: 0,
         rect: Rect::new(560, 240, 820, 643),
+        placement: super::super::placement::PlacementState::new(Rect::new(560, 240, 820, 643)),
         text: String::new(),
         extra: Vec::new(),
         user_data: 0,
@@ -181,6 +183,29 @@ fn fullscreen_resizes_do_not_replace_saved_window_and_final_release_restores_it(
     assert_geometry(&machine, (1920, 1080), (570, 273), (800, 600));
     assert!(machine.ext.get::<Modes>().owners.is_empty());
     release(&mut env(&mut machine), 1);
+    assert_geometry(&machine, (1920, 1080), (570, 273), (800, 600));
+}
+
+#[test]
+fn fullscreen_preserves_maximized_windows_normal_restore_rectangle() {
+    let mut machine = fixture();
+    let outcome = window::show_window(
+        &mut env(&mut machine),
+        0x10020,
+        window::SW_MAXIMIZE,
+        |_, _| Outcome::Return(0),
+    );
+    assert_eq!(finish(&mut machine, outcome), 0);
+    enter(&mut machine, 800, 600);
+    let outcome = windowed(&mut env(&mut machine), 1);
+    assert_eq!(finish(&mut machine, outcome), 0);
+    let outcome = window::show_window(
+        &mut env(&mut machine),
+        0x10020,
+        window::SW_RESTORE,
+        |_, _| Outcome::Return(0),
+    );
+    assert_eq!(finish(&mut machine, outcome), 0);
     assert_geometry(&machine, (1920, 1080), (570, 273), (800, 600));
 }
 

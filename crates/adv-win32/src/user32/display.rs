@@ -15,6 +15,7 @@ struct SavedWindow {
     rect: Rect,
     style: u32,
     ex_style: u32,
+    placement: super::PlacementState,
 }
 struct Fullscreen {
     saved: SavedWindow,
@@ -91,6 +92,7 @@ fn restore_style(env: &mut Env<'_>, saved: SavedWindow) -> bool {
     };
     window.style = saved.style;
     window.ex_style = saved.ex_style;
+    window.placement = saved.placement;
     true
 }
 
@@ -119,6 +121,7 @@ pub fn fullscreen(env: &mut Env<'_>, owner: u32, hwnd: u32, width: u32, height: 
         rect: window.rect,
         style: window.style,
         ex_style: window.ex_style,
+        placement: window.placement,
     };
     let desktop = env.ext.get::<Win32>().user.screen;
     let modes = env.ext.get_or_default::<Modes>();

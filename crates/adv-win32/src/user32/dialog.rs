@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use adv_abi::Registry;
+use adv_abi::{GuestPtr, Handle, Registry, WideStr, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 use adv_machine::{Env, Outcome};
 use adv_pe::ResId;
@@ -12,10 +12,10 @@ use adv_pe::ResId;
 use super::message::{dispatch, next_any, send, wait_for_message};
 use super::window::{
     self, ClassKey, CreateParams, DWL_DLGPROC, Rect, SW_HIDE, SW_SHOWNORMAL, User, WS_CHILD,
-    WS_VISIBLE, create_window, destroy_window, nc_insets, show_window, wm,
+    WS_VISIBLE, create_window_encoded, destroy_window, nc_insets, show_window, wm,
 };
 use super::{USER32, user, user_mut};
-use crate::{Win32, stdcall};
+use crate::stdcall;
 
 mod presentation;
 pub use presentation::{
@@ -26,6 +26,7 @@ pub use presentation::{
 const RT_DIALOG: u16 = 5;
 const DS_ABSALIGN: u32 = 0x1;
 const DS_SETFONT: u32 = 0x40;
+const DS_NOFAILCREATE: u32 = 0x10;
 const DS_CENTER: u32 = 0x800;
 const DS_SHELLFONT: u32 = 0x48;
 
@@ -221,14 +222,6 @@ fn predefined_class(ord: u16) -> &'static str {
     }
 }
 
-/// Guest string for a CREATESTRUCT (freed by the caller).
-fn guest_cstr(env: &mut Env<'_>, s: &str) -> u32 {
-    let bytes = env.ext.get::<Win32>().codec.encode(s);
-    let p = window::temp_alloc(env, bytes.len() as u32 + 1);
-    let _ = env.cpu.write(p, &bytes);
-    p
-}
-
 #[allow(clippy::too_many_arguments)]
 /// CreateDialogIndirectParam: create the dialog and its controls, send WM_INITDIALOG,
 /// show it if the template (or `force_visible`) says so. `then` gets the HWND or 0.
@@ -242,6 +235,35 @@ pub fn create_dialog(
     force_visible: bool,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
+    create_dialog_encoded(
+        env,
+        instance,
+        t,
+        owner,
+        dlgproc,
+        param,
+        force_visible,
+        false,
+        then,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_dialog_encoded(
+    env: &mut Env<'_>,
+    instance: u32,
+    t: Template,
+    owner: u32,
+    dlgproc: u32,
+    param: u32,
+    force_visible: bool,
+    wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    if owner != 0 && !user(env).is_window(&env.sys.objects, owner) {
+        crate::util::set_last_error(env, 1400);
+        return then(env, 0);
+    }
     let (bx, by) = base_units(t.font.as_ref());
     let px = |v: i16| i32::from(v) * bx / 4;
     let py = |v: i16| i32::from(v) * by / 8;
@@ -271,11 +293,25 @@ pub fn create_dialog(
         SzOrOrd::None => "#32770".into(),
     };
     let visible = t.style & WS_VISIBLE != 0 || force_visible;
-    let class_ptr = guest_cstr(env, &class_name);
-    let title_ptr = guest_cstr(env, &t.title);
+    let class_ptr = match t.class {
+        SzOrOrd::Ord(ordinal) => u32::from(ordinal),
+        _ => super::message::guest_text(env, &class_name, wide),
+    };
+    let title_ptr = super::message::guest_text(env, &t.title, wide);
+    if class_ptr == 0 || title_ptr == 0 {
+        if class_ptr >= 0x1_0000 {
+            window::temp_free(env, class_ptr);
+        }
+        window::temp_free(env, title_ptr);
+        crate::util::set_last_error(env, 8);
+        return then(env, 0);
+    }
     let p = CreateParams {
         ex_style: t.ex_style,
-        class: ClassKey::Name(class_name),
+        class: match t.class {
+            SzOrOrd::Ord(ordinal) => ClassKey::Atom(ordinal),
+            _ => ClassKey::Name(class_name),
+        },
         class_ptr,
         name_ptr: title_ptr,
         text: t.title.clone(),
@@ -289,8 +325,10 @@ pub fn create_dialog(
         instance,
         param,
     };
-    create_window(env, p, move |env, dlg| {
-        window::temp_free(env, class_ptr);
+    create_window_encoded(env, p, wide, move |env, dlg| {
+        if class_ptr >= 0x1_0000 {
+            window::temp_free(env, class_ptr);
+        }
         window::temp_free(env, title_ptr);
         if dlg == 0 {
             return then(env, 0);
@@ -311,30 +349,48 @@ pub fn create_dialog(
             crate::gdi32::create_font(env, -(i32::from(*pt) * 4 / 3), face)
         });
         let items: VecDeque<Item> = t.items.into_iter().collect();
+        let allow_failed_controls = t.style & DS_NOFAILCREATE != 0;
         let after_font = move |env: &mut Env<'_>| {
-            create_items(env, dlg, instance, items, (bx, by), font, move |env| {
-                let focus = first_tab_stop(user(env), &env.sys.objects, dlg);
-                send(env, dlg, wm::INITDIALOG, focus, param, move |env, r| {
-                    // EndDialog during INITDIALOG ends creation before showing or focusing.
-                    if user(env)
-                        .windows
-                        .get(&env.sys.objects, &dlg)
-                        .is_some_and(|w| w.control.dialog_end.is_some())
-                    {
-                        return then(env, dlg);
+            create_items(
+                env,
+                dlg,
+                instance,
+                items,
+                (bx, by),
+                font,
+                wide,
+                allow_failed_controls,
+                move |env, complete| {
+                    if !complete {
+                        return destroy_window(env, dlg, move |env, _| then(env, 0));
                     }
-                    let show = move |env: &mut Env<'_>| {
-                        if !visible {
+                    let focus = first_tab_stop(user(env), &env.sys.objects, dlg);
+                    send(env, dlg, wm::INITDIALOG, focus, param, move |env, r| {
+                        // A modeless callback may destroy the dialog during initialization.
+                        if !user(env).is_window(&env.sys.objects, dlg) {
+                            return then(env, 0);
+                        }
+                        // EndDialog during INITDIALOG ends creation before showing or focusing.
+                        if user(env)
+                            .windows
+                            .get(&env.sys.objects, &dlg)
+                            .is_some_and(|w| w.control.dialog_end.is_some())
+                        {
                             return then(env, dlg);
                         }
-                        show_window(env, dlg, SW_SHOWNORMAL, move |env, _| then(env, dlg))
-                    };
-                    if r != 0 && focus != 0 {
-                        return window::set_focus(env, focus, move |env, _| show(env));
-                    }
-                    show(env)
-                })
-            })
+                        let show = move |env: &mut Env<'_>| {
+                            if !visible {
+                                return then(env, dlg);
+                            }
+                            show_window(env, dlg, SW_SHOWNORMAL, move |env, _| then(env, dlg))
+                        };
+                        if r != 0 && focus != 0 {
+                            return window::set_focus(env, focus, move |env, _| show(env));
+                        }
+                        show(env)
+                    })
+                },
+            )
         };
         if font != 0 {
             return send(env, dlg, wm::SETFONT, font, 0, move |env, _| {
@@ -345,6 +401,7 @@ pub fn create_dialog(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_items(
     env: &mut Env<'_>,
     dlg: u32,
@@ -352,10 +409,12 @@ fn create_items(
     mut items: VecDeque<Item>,
     (bx, by): (i32, i32),
     font: u32,
-    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+    wide: bool,
+    allow_failed_controls: bool,
+    then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
 ) -> Outcome {
     let Some(it) = items.pop_front() else {
-        return then(env);
+        return then(env, true);
     };
     let class_name = match &it.class {
         SzOrOrd::Ord(o) => predefined_class(*o).to_owned(),
@@ -366,8 +425,19 @@ fn create_items(
         SzOrOrd::Str(s) => s.clone(),
         _ => String::new(),
     };
-    let class_ptr = guest_cstr(env, &class_name);
-    let title_ptr = guest_cstr(env, &title);
+    let class_ptr = super::message::guest_text(env, &class_name, wide);
+    let title_ptr = match it.title {
+        SzOrOrd::Ord(ordinal) => u32::from(ordinal),
+        _ => super::message::guest_text(env, &title, wide),
+    };
+    if class_ptr == 0 || title_ptr == 0 {
+        window::temp_free(env, class_ptr);
+        if title_ptr >= 0x1_0000 {
+            window::temp_free(env, title_ptr);
+        }
+        crate::util::set_last_error(env, 8);
+        return then(env, false);
+    }
     let p = CreateParams {
         ex_style: it.ex_style,
         class: ClassKey::Name(class_name),
@@ -384,9 +454,11 @@ fn create_items(
         instance,
         param: it.data.unwrap_or(0),
     };
-    create_window(env, p, move |env, ctl| {
+    create_window_encoded(env, p, wide, move |env, ctl| {
         window::temp_free(env, class_ptr);
-        window::temp_free(env, title_ptr);
+        if title_ptr >= 0x1_0000 {
+            window::temp_free(env, title_ptr);
+        }
         if ctl == 0 {
             log::warn!("dialog control {} could not be created", it.id);
             adv_abi::warn_unavailable(
@@ -394,6 +466,9 @@ fn create_items(
                 "user32.dll!CreateDialog",
                 &format!("dialog control {} could not be created", it.id),
             );
+            if !allow_failed_controls {
+                return then(env, false);
+            }
         } else {
             let u = user(env);
             let w = u.windows.get(&env.sys.objects, &ctl).unwrap();
@@ -406,8 +481,19 @@ fn create_items(
                 adv_abi::warn_unavailable(env, "user32.dll!CreateDialog", &reason);
             }
         }
-        let next =
-            move |env: &mut Env<'_>| create_items(env, dlg, instance, items, (bx, by), font, then);
+        let next = move |env: &mut Env<'_>| {
+            create_items(
+                env,
+                dlg,
+                instance,
+                items,
+                (bx, by),
+                font,
+                wide,
+                allow_failed_controls,
+                then,
+            )
+        };
         if ctl != 0 && font != 0 {
             return send(env, ctl, wm::SETFONT, font, 0, move |env, _| next(env));
         }
@@ -441,11 +527,31 @@ pub fn item(u: &User, objects: &adv_machine::Objects, dlg: u32, id: u32) -> u32 
         .unwrap_or(0)
 }
 
-fn template_resource(env: &mut Env<'_>, instance: u32, name: u32) -> Option<u32> {
-    let id = crate::kernel32::res_id(crate::kernel32::int_or_str(env, name, false));
+fn template_resource(env: &mut Env<'_>, instance: u32, name: u32, wide: bool) -> Option<u32> {
+    let id = crate::kernel32::res_id(crate::kernel32::int_or_str(env, name, wide));
     let found = crate::kernel32::find_resource_data(env, instance, &ResId::Id(RT_DIALOG), &id);
     if found.is_none() {
         log::warn!("dialog template {id:?} not found");
+        let handle = if instance == 0 {
+            env.cpu
+                .read_u32(adv_machine::layout::PEB_ADDR + adv_machine::layout::peb::IMAGE_BASE)
+                .unwrap_or(0)
+        } else {
+            instance
+        };
+        let modules = adv_os::modules(env.ext);
+        let error = modules.by_handle(handle).map_or(1812, |index| {
+            let module = modules.get(index);
+            if module.data_file.is_some() {
+                return 1814;
+            }
+            match &module.resources {
+                None => 1812, // ERROR_RESOURCE_DATA_NOT_FOUND
+                Some(resources) if resources.get(&ResId::Id(RT_DIALOG)).is_none() => 1813,
+                Some(_) => 1814, // ERROR_RESOURCE_NAME_NOT_FOUND
+            }
+        });
+        crate::util::set_last_error(env, error);
     }
     found.map(|(addr, _)| addr)
 }
@@ -453,8 +559,7 @@ fn template_resource(env: &mut Env<'_>, instance: u32, name: u32) -> Option<u32>
 fn create_dialog_param_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name, owner, proc, param) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let Some(t) = template_resource(env, inst, name).and_then(|a| parse_template(env.cpu, a))
-    else {
+    let Some(t) = resource_template(env, inst, name, false) else {
         return Outcome::Return(0);
     };
     create_dialog(env, inst, t, owner, proc, param, false, |_, h| {
@@ -466,6 +571,7 @@ fn create_dialog_indirect_param_a(env: &mut Env<'_>) -> Outcome {
     let (inst, tpl, owner, proc, param) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let Some(t) = parse_template(env.cpu, tpl) else {
+        crate::util::set_last_error(env, 87);
         return Outcome::Return(0);
     };
     create_dialog(env, inst, t, owner, proc, param, false, |_, h| {
@@ -476,24 +582,131 @@ fn create_dialog_indirect_param_a(env: &mut Env<'_>) -> Outcome {
 fn dialog_box_param_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name, owner, proc, param) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let Some(t) = template_resource(env, inst, name).and_then(|a| parse_template(env.cpu, a))
-    else {
+    let Some(t) = resource_template(env, inst, name, false) else {
         return Outcome::Return(u32::MAX);
     };
-    dialog_box(env, inst, t, owner, proc, param)
+    dialog_box(env, inst, t, owner, proc, param, false)
 }
 
 fn dialog_box_indirect_param_a(env: &mut Env<'_>) -> Outcome {
     let (inst, tpl, owner, proc, param) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let Some(t) = parse_template(env.cpu, tpl) else {
+        crate::util::set_last_error(env, 87);
         return Outcome::Return(u32::MAX);
     };
-    dialog_box(env, inst, t, owner, proc, param)
+    dialog_box(env, inst, t, owner, proc, param, false)
+}
+
+fn resource_template(env: &mut Env<'_>, instance: u32, name: u32, wide: bool) -> Option<Template> {
+    let address = template_resource(env, instance, name, wide)?;
+    parse_template(env.cpu, address).or_else(|| {
+        crate::util::set_last_error(env, 87);
+        None
+    })
+}
+
+#[win32(user32, name="CreateDialogParamW", level=state)]
+fn create_dialog_param_w(
+    env: &mut Env<'_>,
+    instance: Handle,
+    name: WideStr,
+    owner: Handle,
+    proc: GuestPtr<()>,
+    param: i32,
+) -> Outcome {
+    let Some(template) = resource_template(env, instance.0, name.0.addr(), true) else {
+        return Outcome::Return(0);
+    };
+    create_dialog_encoded(
+        env,
+        instance.0,
+        template,
+        owner.0,
+        proc.addr(),
+        param as u32,
+        false,
+        true,
+        |_, hwnd| Outcome::Return(hwnd),
+    )
+}
+
+#[win32(user32, name="CreateDialogIndirectParamW", level=state)]
+fn create_dialog_indirect_param_w(
+    env: &mut Env<'_>,
+    instance: Handle,
+    template: GuestPtr<()>,
+    owner: Handle,
+    proc: GuestPtr<()>,
+    param: i32,
+) -> Outcome {
+    let Some(template) = parse_template(env.cpu, template.addr()) else {
+        crate::util::set_last_error(env, 87);
+        return Outcome::Return(0);
+    };
+    create_dialog_encoded(
+        env,
+        instance.0,
+        template,
+        owner.0,
+        proc.addr(),
+        param as u32,
+        false,
+        true,
+        |_, hwnd| Outcome::Return(hwnd),
+    )
+}
+
+#[win32(user32, name="DialogBoxParamW", level=state)]
+fn dialog_box_param_w(
+    env: &mut Env<'_>,
+    instance: Handle,
+    name: WideStr,
+    owner: Handle,
+    proc: GuestPtr<()>,
+    param: i32,
+) -> Outcome {
+    let Some(template) = resource_template(env, instance.0, name.0.addr(), true) else {
+        return Outcome::Return(u32::MAX);
+    };
+    dialog_box(
+        env,
+        instance.0,
+        template,
+        owner.0,
+        proc.addr(),
+        param as u32,
+        true,
+    )
+}
+
+#[win32(user32, name="DialogBoxIndirectParamW", level=state)]
+fn dialog_box_indirect_param_w(
+    env: &mut Env<'_>,
+    instance: Handle,
+    template: GuestPtr<()>,
+    owner: Handle,
+    proc: GuestPtr<()>,
+    param: i32,
+) -> Outcome {
+    let Some(template) = parse_template(env.cpu, template.addr()) else {
+        crate::util::set_last_error(env, 87);
+        return Outcome::Return(u32::MAX);
+    };
+    dialog_box(
+        env,
+        instance.0,
+        template,
+        owner.0,
+        proc.addr(),
+        param as u32,
+        true,
+    )
 }
 
 /// DialogBoxIndirectParam: disable the owner, create the dialog, run a modal loop until
 /// EndDialog, destroy it, re-enable the owner.
+#[allow(clippy::too_many_arguments)]
 fn dialog_box(
     env: &mut Env<'_>,
     inst: u32,
@@ -501,7 +714,12 @@ fn dialog_box(
     owner: u32,
     proc: u32,
     param: u32,
+    wide: bool,
 ) -> Outcome {
+    if owner != 0 && !user(env).is_window(&env.sys.objects, owner) {
+        crate::util::set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
     let owner = user(env).root(&env.sys.objects, owner);
     let owner_was_enabled = user(env)
         .windows
@@ -517,22 +735,32 @@ fn dialog_box(
     {
         w.style |= window::WS_DISABLED;
     }
-    create_dialog(env, inst, t, owner, proc, param, true, move |env, dlg| {
-        if dlg == 0 {
-            restore_owner(env, owner, owner_was_enabled);
-            return Outcome::Return(u32::MAX);
-        }
-        if let Some(w) = env
-            .ext
-            .get::<crate::Win32>()
-            .user
-            .windows
-            .get_mut(&mut env.sys.objects, &dlg)
-        {
-            w.control.modal = true;
-        }
-        modal_loop(env, dlg, owner, owner_was_enabled)
-    })
+    create_dialog_encoded(
+        env,
+        inst,
+        t,
+        owner,
+        proc,
+        param,
+        true,
+        wide,
+        move |env, dlg| {
+            if dlg == 0 {
+                restore_owner(env, owner, owner_was_enabled);
+                return Outcome::Return(u32::MAX);
+            }
+            if let Some(w) = env
+                .ext
+                .get::<crate::Win32>()
+                .user
+                .windows
+                .get_mut(&mut env.sys.objects, &dlg)
+            {
+                w.control.modal = true;
+            }
+            modal_loop(env, dlg, owner, owner_was_enabled)
+        },
+    )
 }
 
 fn restore_owner(env: &mut Env<'_>, owner: u32, was_enabled: bool) {
@@ -569,7 +797,7 @@ fn modal_loop_inner(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool
         })
     };
     match state {
-        None | Some((_, true)) => return Outcome::Return(0),
+        None | Some((_, true)) => return finish(env, 0),
         Some((Some(r), _)) => return finish(env, r),
         _ => {}
     }
@@ -620,13 +848,15 @@ fn get_dlg_ctrl_id(env: &mut Env<'_>) -> Outcome {
 fn send_dlg_item_message_a(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let h = item(user(env), &env.sys.objects, dlg, id);
-    send(env, h, msg, wp, lp, |_, r| Outcome::Return(r))
+    super::message::send_encoded(env, h, msg, wp, lp, false, |_, r| Outcome::Return(r))
 }
 
 fn set_dlg_item_text_a(env: &mut Env<'_>) -> Outcome {
     let (dlg, id, text) = (env.arg(0), env.arg(1), env.arg(2));
     let h = item(user(env), &env.sys.objects, dlg, id);
-    send(env, h, wm::SETTEXT, 0, text, |_, r| Outcome::Return(r))
+    super::message::send_encoded(env, h, wm::SETTEXT, 0, text, false, |_, r| {
+        Outcome::Return(r)
+    })
 }
 
 fn get_dlg_item_text_a(env: &mut Env<'_>) -> Outcome {
@@ -638,7 +868,59 @@ fn get_dlg_item_text_a(env: &mut Env<'_>) -> Outcome {
         }
         return Outcome::Return(0);
     }
-    send(env, h, wm::GETTEXT, cap, buf, |_, r| Outcome::Return(r))
+    super::message::send_encoded(env, h, wm::GETTEXT, cap, buf, false, |_, r| {
+        Outcome::Return(r)
+    })
+}
+
+#[win32(user32, name="SendDlgItemMessageW", level=state)]
+fn send_dlg_item_message_w(
+    env: &mut Env<'_>,
+    dlg: Handle,
+    id: i32,
+    msg: u32,
+    wp: u32,
+    lp: i32,
+) -> Outcome {
+    let hwnd = item(user(env), &env.sys.objects, dlg.0, id as u32);
+    super::message::send_encoded(env, hwnd, msg, wp, lp as u32, true, |_, r| {
+        Outcome::Return(r)
+    })
+}
+
+#[win32(user32, name="SetDlgItemTextW", level=state)]
+fn set_dlg_item_text_w(env: &mut Env<'_>, dlg: Handle, id: i32, text: WideStr) -> Outcome {
+    let hwnd = item(user(env), &env.sys.objects, dlg.0, id as u32);
+    super::message::send_encoded(env, hwnd, wm::SETTEXT, 0, text.0.addr(), true, |_, r| {
+        Outcome::Return(r)
+    })
+}
+
+#[win32(user32, name="GetDlgItemTextW", level=state)]
+fn get_dlg_item_text_w(
+    env: &mut Env<'_>,
+    dlg: Handle,
+    id: i32,
+    text: WideStr,
+    capacity: i32,
+) -> Outcome {
+    if capacity <= 0 {
+        return Outcome::Return(0);
+    }
+    let hwnd = item(user(env), &env.sys.objects, dlg.0, id as u32);
+    if hwnd == 0 {
+        let _ = super::message::write_text(env, text.0.addr(), capacity as u32, "", true);
+        return Outcome::Return(0);
+    }
+    super::message::send_encoded(
+        env,
+        hwnd,
+        wm::GETTEXT,
+        capacity as u32,
+        text.0.addr(),
+        true,
+        |_, r| Outcome::Return(r),
+    )
 }
 
 fn set_dlg_item_int(env: &mut Env<'_>) -> Outcome {
@@ -648,8 +930,16 @@ fn set_dlg_item_int(env: &mut Env<'_>) -> Outcome {
     } else {
         v.to_string()
     };
-    let p = guest_cstr(env, &s);
     let h = item(user(env), &env.sys.objects, dlg, id);
+    let wide = user(env)
+        .windows
+        .get(&env.sys.objects, &h)
+        .is_some_and(|w| w.unicode);
+    let p = super::message::guest_text(env, &s, wide);
+    if p == 0 {
+        crate::util::set_last_error(env, 8);
+        return Outcome::Return(0);
+    }
     send(env, h, wm::SETTEXT, 0, p, move |env, r| {
         window::temp_free(env, p);
         Outcome::Return(r)
@@ -733,6 +1023,15 @@ fn is_dialog_message_a(env: &mut Env<'_>) -> Outcome {
     // Keyboard navigation (Tab, Enter, Esc) is not emulated: the caller dispatches the
     // message itself. Enter/Esc still reach the dialog as WM_COMMAND IDOK/IDCANCEL.
     let (dlg, msg) = (env.arg(0), env.arg(1));
+    is_dialog_message(env, dlg, msg)
+}
+
+#[win32(user32, name="IsDialogMessageW", level=state)]
+fn is_dialog_message_w(env: &mut Env<'_>, dlg: Handle, msg: GuestPtr<()>) -> Outcome {
+    is_dialog_message(env, dlg.0, msg.addr())
+}
+
+fn is_dialog_message(env: &mut Env<'_>, dlg: u32, msg: u32) -> Outcome {
     let m = super::message::Msg {
         hwnd: env.cpu.read_u32(msg).unwrap_or(0),
         msg: env.cpu.read_u32(msg + 4).unwrap_or(0),
@@ -753,6 +1052,18 @@ fn is_dialog_message_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    for api in [
+        create_dialog_param_w_ABI,
+        create_dialog_indirect_param_w_ABI,
+        dialog_box_param_w_ABI,
+        dialog_box_indirect_param_w_ABI,
+        send_dlg_item_message_w_ABI,
+        set_dlg_item_text_w_ABI,
+        get_dlg_item_text_w_ABI,
+        is_dialog_message_w_ABI,
+    ] {
+        reg.register(api);
+    }
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "CreateDialogParamA", 5, create_dialog_param_a);
     s(

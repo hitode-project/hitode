@@ -4468,6 +4468,8 @@ Windows.Win32.Media.Audio.SND_FLAGS	SND_RESOURCE	40004	flags
 Windows.Win32.Media.Audio.SND_FLAGS	SND_SENTRY	80000	flags
 Windows.Win32.Media.Audio.SND_FLAGS	SND_SYNC	0	flags
 Windows.Win32.Media.Audio.SND_FLAGS	SND_SYSTEM	200000	flags
+Windows.Win32.NetworkManagement.WNet.UNC_INFO_LEVEL	REMOTE_NAME_INFO_LEVEL	2	enum
+Windows.Win32.NetworkManagement.WNet.UNC_INFO_LEVEL	UNIVERSAL_NAME_INFO_LEVEL	1	enum
 Windows.Win32.Networking.WinHttp.WIN_HTTP_CREATE_URL_FLAGS	ICU_DECODE	10000000	enum
 Windows.Win32.Networking.WinHttp.WIN_HTTP_CREATE_URL_FLAGS	ICU_ESCAPE	80000000	enum
 Windows.Win32.Networking.WinHttp.WIN_HTTP_CREATE_URL_FLAGS	ICU_REJECT_USERPWD	4000	enum
