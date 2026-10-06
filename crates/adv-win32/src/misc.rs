@@ -7,6 +7,7 @@ use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 mod internet;
+mod image_list;
 mod ole_memory;
 mod property_sheet;
 mod shell_execute;
@@ -405,27 +406,7 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, COMCTL32, "InitCommonControlsEx", 1, |_| {
         Outcome::Return(1)
     });
-    stdcall(reg, COMCTL32, "ImageList_Read", 1, |e| {
-        let pstm = e.arg(0);
-        Outcome::Return(if pstm != 0 { 0x0002_0001 } else { 0 })
-    });
-    stdcall(reg, COMCTL32, "ImageList_Destroy", 1, |_| {
-        Outcome::Return(1)
-    });
-    stdcall(reg, COMCTL32, "ImageList_Create", 5, |_| {
-        Outcome::Return(0x0002_0001)
-    });
-    stdcall(reg, COMCTL32, "ImageList_GetIconSize", 3, |e| {
-        let cx = e.arg(1);
-        let cy = e.arg(2);
-        if cx != 0 {
-            let _ = e.cpu.write_u32(cx, 16);
-        }
-        if cy != 0 {
-            let _ = e.cpu.write_u32(cy, 16);
-        }
-        Outcome::Return(1)
-    });
+    image_list::register(reg);
 }
 
 #[cfg(test)]

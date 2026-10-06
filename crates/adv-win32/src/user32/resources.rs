@@ -26,7 +26,7 @@ pub struct UserObjects {
 }
 
 impl UserObjects {
-    pub(super) fn contains(&self, objects: &Objects, handle: u32) -> bool {
+    pub(crate) fn contains(&self, objects: &Objects, handle: u32) -> bool {
         self.index
             .get(&handle)
             .is_some_and(|&id| objects.owned(id).is_some())
@@ -108,8 +108,7 @@ impl UserObjects {
         self.remove(objects, handle);
     }
 
-    #[cfg(test)]
-    pub(super) fn image<'a>(&self, objects: &'a Objects, handle: u32) -> Option<&'a IconImage> {
+    pub(crate) fn image<'a>(&self, objects: &'a Objects, handle: u32) -> Option<&'a IconImage> {
         objects.owned(*self.index.get(&handle)?)?._image.as_ref()
     }
 
