@@ -41,6 +41,8 @@ pub enum GdiObj {
         color: u32,
     },
     Pen {
+        style: u32,
+        width: u32,
         color: u32,
     },
     Bitmap {
