@@ -61,6 +61,46 @@ pub(super) fn machine() -> Machine<JitCpu> {
     });
     m
 }
+
+#[test]
+fn child_frontend_inherits_host_policy_without_parent_guest_objects() {
+    let mut parent = machine();
+    let mut child = machine();
+    parent.ext.get_mut::<State>().copy = false;
+    set_shader_caps(
+        &mut parent.ext,
+        ShaderCaps {
+            sm2: true,
+            sm3: true,
+        },
+    );
+    set_shader_cache(
+        &mut parent.ext,
+        Some(std::path::PathBuf::from("child-policy-cache")),
+    );
+    parent.ext.get_mut::<State>().shader_stats.vertex[4] = 9;
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    parent.ext.get_mut::<State>().wake = Some(std::sync::Arc::new(wake));
+    let child_com = child.ext.get::<State>().com.namespace();
+    fork_host_state(&parent.ext, &mut child.ext).unwrap();
+    let source = parent.ext.get::<State>();
+    let destination = child.ext.get::<State>();
+    assert!(!destination.copy);
+    assert_eq!(destination.shader_caps, source.shader_caps);
+    assert_eq!(destination.shader_cache, source.shader_cache);
+    assert!(std::sync::Arc::ptr_eq(
+        source.wake.as_ref().unwrap(),
+        destination.wake.as_ref().unwrap()
+    ));
+    assert_eq!(destination.com.namespace(), child_com);
+    assert_eq!(destination.shader_stats.vertex, [0; 7]);
+    assert_eq!(destination.shader_stats.pixel, [0; 7]);
+    assert!(
+        destination.pending.is_empty()
+            && destination.transfers.is_empty()
+            && destination.dcs.is_empty()
+    );
+}
 pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     let (_, factory) = object(env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
     com(env)

@@ -6,6 +6,8 @@ pub mod boot;
 pub mod compat;
 pub use adv_win32::msvcrt as crt;
 mod font;
+mod family;
+pub use family::ProcessStatus;
 mod graphics;
 pub use adv_win32::winmm::mmio;
 mod report;

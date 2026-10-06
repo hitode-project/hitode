@@ -1,6 +1,7 @@
 //! kernel32.dll.
 
 mod atom;
+pub(crate) mod child_process;
 mod environment;
 mod exception;
 pub(crate) use exception::install as install_exceptions;
@@ -34,6 +35,7 @@ pub(crate) const K32: &str = "kernel32.dll";
 
 pub fn register(reg: &mut Registry) {
     atom::register(reg);
+    child_process::register(reg);
     environment::register(reg);
     exception::register(reg);
     file::register(reg);
@@ -49,4 +51,3 @@ pub fn register(reg: &mut Registry) {
     time::register(reg);
     toolhelp::register(reg);
 }
-pub mod unsupported_process;

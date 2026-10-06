@@ -299,16 +299,10 @@ pub(crate) fn create_section(
     if !matches!(protection, 2 | 4 | 8) {
         return fail(env, 87);
     }
-    if attributes != 0 {
-        if !env.cpu.accessible(attributes, 12, Prot::READ)
-            || env.cpu.read_u32(attributes).unwrap_or(0) != 12
-        {
-            return fail(env, 87);
-        }
-        if env.cpu.read_u32(attributes + 4).unwrap_or(1) != 0 {
-            return fail(env, 50);
-        }
-    }
+    let inherit = match super::handle::security_inherit(env, attributes) {
+        Ok(inherit) => inherit,
+        Err(code) => return fail(env, code),
+    };
     let existing = if let Some(name) = &name {
         match state(env).names.get(name) {
             Some(Named::Mapping(section)) => section
@@ -334,6 +328,7 @@ pub(crate) fn create_section(
         if handle == 0 {
             return fail(env, 8);
         }
+        super::handle::set_inherit(env, handle, inherit);
         set_last_error(env, 183);
         return Outcome::Return(handle);
     }
@@ -383,11 +378,13 @@ pub(crate) fn create_section(
         .sys
         .objects
         .insert_host(SectionHandle::new(section, ALL));
+    super::handle::set_inherit(env, handle, inherit);
     set_last_error(env, 0);
     Outcome::Return(handle)
 }
 
 fn open(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let inherit = env.arg(1) != 0;
     let access = if env.arg(0) == COPY { READ } else { env.arg(0) };
     let name = match name(env, env.arg(2), wide) {
         Ok(Some(name)) => name,
@@ -420,6 +417,7 @@ fn open(env: &mut Env<'_>, wide: bool) -> Outcome {
     if handle == 0 {
         return fail(env, 8);
     }
+    super::handle::set_inherit(env, handle, inherit);
     Outcome::Return(handle)
 }
 
@@ -677,13 +675,6 @@ fn page_protection(env: &Env<'_>, view: &View, base: u32, page: u32) -> u32 {
     } else {
         value
     }
-}
-
-pub(super) fn contains(env: &Env<'_>, addr: u32) -> bool {
-    env.ext
-        .try_get::<Mappings>()
-        .and_then(|state| state.views.range(..=addr).next_back())
-        .is_some_and(|(&base, view)| addr - base < view.len)
 }
 
 pub(super) fn query(env: &Env<'_>, addr: u32) -> Option<[u32; 7]> {

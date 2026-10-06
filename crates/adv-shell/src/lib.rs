@@ -495,6 +495,12 @@ fn api_report(runtime: &Runtime) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     });
+    let processes = runtime.process_statuses().iter().map(|process| format!(
+        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}}}",
+        process.pid, process.parent.map_or_else(|| "null".into(), |v| v.to_string()), json(&process.image),
+        process.exit_code.map_or_else(|| "null".into(), |v| v.to_string()),
+        process.failure.as_deref().map_or_else(|| "null".into(), json)
+    )).collect::<Vec<_>>().join(", ");
     format!(
         concat!(
             "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, ",
@@ -505,7 +511,7 @@ fn api_report(runtime: &Runtime) -> String {
             "\"dynamic_lookup_failures\": [{}], \"dynamic_lookup_failure_count\": {}, ",
             "\"dropped_dynamic_lookup_failures\": {}, \"message_boxes\": [{}], ",
             "\"message_box_count\": {}, \"dropped_message_boxes\": {}, ",
-            "\"truncated_diagnostic_fields\": {}}}"
+            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}]}}"
         ),
         json(mode),
         runtime.api_acceptance_eligible(),
@@ -528,6 +534,7 @@ fn api_report(runtime: &Runtime) -> String {
         diagnostics.map_or(0, |d| d.message_box_count),
         diagnostics.map_or(0, |d| d.dropped_message_boxes),
         diagnostics.map_or(0, |d| d.truncated_diagnostic_fields),
+        processes,
     )
 }
 
@@ -1575,6 +1582,7 @@ fn run_execution(
             SliceResult::Complete(outcome) => outcome,
         };
         match outcome {
+            RunResult::HostRequest => unreachable!("runtime services process requests internally"),
             RunResult::Exited(code) => {
                 if options.frames.is_some_and(|limit| presented >= limit) {
                     stop_reason = "frame_limit";

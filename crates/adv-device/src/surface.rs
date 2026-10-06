@@ -850,6 +850,31 @@ impl<P: Presenter> Surfaces<P> {
         self.frame_mailbox = Some((mailbox, wake));
         self.deferred_presentation = true;
     }
+    /// Move the shell's single producer to the next foreground process. The
+    /// receiving process continues the sequence observed by the same consumer.
+    /// Without a mailbox, carry the capture policy and sequence instead.
+    /// Both stores must be between execution leases during this handoff.
+    pub fn transfer_frame_mailbox_to(&mut self, destination: &mut Self) -> Result<bool, String> {
+        if destination.frame_mailbox.is_some() {
+            return Err("destination already owns a frame mailbox".into());
+        }
+        let endpoint = self.frame_mailbox.take();
+        let transferred = endpoint.is_some();
+        let serial = self
+            .stats
+            .presentations
+            .max(destination.stats.presentations);
+        destination.stats.presentations = serial;
+        // A process-local pending frame may carry a smaller sequence. Clear it
+        // before adopting the shared output so delayed captures cannot regress.
+        destination.pending_frame = None;
+        destination.captured_serial = serial;
+        destination.frame_mailbox = endpoint;
+        destination.deferred_presentation = self.deferred_presentation;
+        // The former foreground can keep producing its local pending frame.
+        self.deferred_presentation = true;
+        Ok(transferred)
+    }
     /// Resize the display; an existing primary surface keeps its overlapping pixels.
     pub fn configure_window(
         &mut self,

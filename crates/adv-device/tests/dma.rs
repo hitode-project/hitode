@@ -91,6 +91,80 @@ impl SharedReadView for View {
         self.0.get(index).map_or(0, |v| v.load(Ordering::Relaxed))
     }
 }
+
+#[test]
+fn shared_process_audio_keeps_notices_and_retires_only_the_exiting_owner() {
+    use adv_device::{AudioEvent, mixer::PcmBlock};
+    let parent = AudioControl::new(false);
+    let child = parent.clone();
+    let parent_id = (0x1000_u64 << 32) | 1;
+    let child_id = (0x2000_u64 << 32) | 1;
+    let parent_view = sine(44100, 440.0, 4410);
+    let child_view = sine(44100, 220.0, 4410);
+    add(
+        &parent,
+        parent_id,
+        parent_view.clone(),
+        44100,
+        vec![(0, 77)],
+    );
+    add(&child, child_id, child_view.clone(), 44100, vec![(0, 77)]);
+    assert!(parent.play_ring(parent_id, true, 1));
+    assert!(child.play_ring(child_id, true, 1));
+    let mut reader = parent.stream().device_reader(44100, 2).unwrap();
+    reader.read(&mut [0.0; 512], 0);
+    let parent_events = parent.take_events_for_owner(0x1000);
+    assert!(parent_events.iter().any(|event| matches!(event,
+        AudioEvent::Notification { source, event: 77, .. } if *source == parent_id)));
+    let child_events = child.take_events_for_owner(0x2000);
+    assert!(child_events.iter().any(|event| matches!(event,
+        AudioEvent::Notification { source, event: 77, .. } if *source == child_id)));
+    assert!(parent_events.iter().all(|event| event.owner() == 0x1000));
+    assert!(child_events.iter().all(|event| event.owner() == 0x2000));
+    // Movie PCM uses the same namespace and must be retired with ring voices.
+    let movie_id = (0x1000_u64 << 32) | 2;
+    assert!(
+        parent
+            .push_pcm(PcmBlock {
+                stream_id: movie_id,
+                guest_pts_us: 0,
+                sample_rate: 44100,
+                channels: 1,
+                samples: vec![0.25; 4410],
+            })
+            .is_ok()
+    );
+    assert!(parent.remove_owner(0x1000));
+    no_alloc(|| {
+        reader.read(&mut [0.0; 512], 0);
+    });
+    child.maintain();
+    assert_eq!(Arc::strong_count(&parent_view), 1);
+    assert!(Arc::strong_count(&child_view) > 1);
+    assert!(child.active());
+    assert!(parent.take_events_for_owner(0x1000).is_empty());
+    assert!(
+        parent
+            .push_pcm(PcmBlock {
+                stream_id: movie_id,
+                guest_pts_us: 0,
+                sample_rate: 44100,
+                channels: 1,
+                samples: vec![0.25; 441],
+            })
+            .is_err()
+    );
+    assert!(child.remove_pcm(child_id));
+    reader.read(&mut [0.0; 512], 0);
+    assert!(parent.take_events_for_owner(0x1000).is_empty());
+    assert!(
+        child
+            .take_events_for_owner(0x2000)
+            .iter()
+            .any(|event| matches!(event,
+        AudioEvent::Released { source } if *source == child_id))
+    );
+}
 #[test]
 fn direct_ring_equal_rate_is_continuous() {
     let control = AudioControl::new(false);

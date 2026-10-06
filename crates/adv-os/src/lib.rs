@@ -20,6 +20,7 @@ pub mod loader;
 pub mod module;
 pub mod nls;
 pub mod processor;
+pub mod processes;
 pub mod registry;
 pub mod synthetic;
 pub mod system_files;
@@ -73,7 +74,11 @@ impl OsConfig {
 
     /// Guest path of the exe.
     pub fn exe_path(&self) -> String {
-        format!("{}\\{}", self.guest_root, self.exe_name)
+        if self.exe_name.as_bytes().get(1) == Some(&b':') || self.exe_name.starts_with("\\\\") {
+            self.exe_name.clone()
+        } else {
+            format!("{}\\{}", self.guest_root, self.exe_name)
+        }
     }
 }
 

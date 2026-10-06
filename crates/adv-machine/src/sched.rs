@@ -104,6 +104,8 @@ pub(crate) enum State {
 }
 
 pub struct Context {
+    pub suspend_count: u32,
+    pub completion: std::sync::Arc<crate::process::Completion>,
     pub id: CtxId,
     pub name: String,
     pub tid: u32,
@@ -175,7 +177,7 @@ impl Context {
     }
     /// Observe readiness without changing scheduler state or selecting a context.
     pub fn is_ready(&self) -> bool {
-        matches!(self.state, State::Ready { .. })
+        self.suspend_count == 0 && matches!(self.state, State::Ready { .. })
     }
 
     pub fn exit_code(&self) -> Option<u32> {
@@ -190,6 +192,8 @@ impl Context {
 /// keeps behind a handle (files, enumerations, sections, ...) is a [`Object::Host`] payload,
 /// dropped when its last handle closes.
 pub enum Object {
+    Process { identity: std::sync::Arc<crate::process::ProcessIdentity>, access: u32 },
+    RemoteThread { identity: crate::process::ThreadIdentity, access: u32 },
     Event {
         manual_reset: bool,
         signaled: bool,
@@ -212,6 +216,8 @@ pub enum Object {
 impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Process { identity, access } => f.debug_tuple("Process").field(&identity.pid).field(access).finish(),
+            Self::RemoteThread { identity, access } => f.debug_tuple("RemoteThread").field(&identity.tid).field(access).finish(),
             Self::Event {
                 manual_reset,
                 signaled,
@@ -246,6 +252,8 @@ pub(crate) fn poll_object(
     consume: bool,
 ) -> bool {
     match objects.get_mut(handle) {
+        Some(Object::Process { identity, .. }) => identity.completion.exit_code().is_some(),
+        Some(Object::RemoteThread { identity, .. }) => identity.completion.exit_code().is_some(),
         Some(Object::Semaphore { count, .. }) => {
             let s = *count > 0;
             if s && consume {

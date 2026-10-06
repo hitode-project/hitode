@@ -275,6 +275,7 @@ fn run() -> Result<(), String> {
             std::io::stdout().flush().map_err(|e| e.to_string())?;
         }
         let sleep = match r.step_for(Duration::from_millis(8)) {
+            SliceResult::Complete(RunResult::HostRequest) => unreachable!("runtime services process requests internally"),
             SliceResult::Complete(RunResult::Failed(e)) => {
                 r.machine.sys.trace.flush();
                 dump_failed_stacks(&r, &args[3]);

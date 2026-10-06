@@ -129,6 +129,12 @@ impl Vm {
             .filter(|&(b, s)| addr - b < s)
     }
 
+    /// Next reserved boundary; callers can describe a free interval without
+    /// scanning hundreds of thousands of unmapped pages.
+    pub fn next_region(&self, address: u32) -> Option<u32> {
+        self.used.range(address..).next().map(|(&base, _)| base)
+    }
+
     /// Unmap and release the region starting at `addr`. Unmapped pages (guards) are skipped.
     pub fn free(&mut self, cpu: &mut dyn Guest, addr: u32) -> Result<(), MemFault> {
         let size = self.used.remove(&addr).ok_or(MemFault { addr, len: 0 })?;

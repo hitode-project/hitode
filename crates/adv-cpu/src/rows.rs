@@ -137,6 +137,12 @@ pub(crate) struct RowPool {
 }
 
 impl RowPool {
+    pub(crate) fn fork_empty(&self) -> Result<Self, String> {
+        let mut child = Self::new(self.workers.len())?;
+        child.threshold = self.threshold;
+        Ok(child)
+    }
+
     pub fn default_workers() -> usize {
         thread::available_parallelism()
             .map_or(1, usize::from)

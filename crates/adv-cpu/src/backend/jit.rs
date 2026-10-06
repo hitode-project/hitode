@@ -363,6 +363,15 @@ impl crate::ExecutionTrap for Raw<'_> {
 }
 
 impl Backend for JitCpu {
+    fn new_process(&mut self) -> Result<Self, String> {
+        let mut child = Self::new(self.park, self.jit)?;
+        child.budget = self.budget;
+        let sender = self.background_sender()?;
+        child.inner.inherit_process_policy(&self.inner)?;
+        child.set_background_sender(sender)?;
+        Ok(child)
+    }
+
     type Context = Option<ExecutionContext>;
     fn guest_workers(&self) -> usize {
         self.inner.guest_workers()

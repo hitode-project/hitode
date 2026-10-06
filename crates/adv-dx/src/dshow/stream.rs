@@ -94,7 +94,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
         .then(|| env.ext.try_get_mut::<Sound>())
         .flatten()
         .filter(|sound| sound.enabled)
-        .map(Sound::allocate_audio_id);
+        .and_then(Sound::allocate_audio_id);
     let wake = env.sys.objects.insert(Object::Event {
         manual_reset: false,
         signaled: false,

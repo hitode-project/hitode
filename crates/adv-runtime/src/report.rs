@@ -51,7 +51,7 @@ impl<B: Backend> Runtime<B> {
     }
 
     /// Necessary ABI conditions only; this does not certify graphics, audio or playability.
-    pub fn api_acceptance_eligible(&self) -> bool {
+    pub(crate) fn selected_api_acceptance_eligible(&self) -> bool {
         self.api_mode() == adv_abi::RunMode::Strict
             && self.api_diagnostics().is_none_or(|d| d.stub_calls == 0)
             && self.api_signature_conflicts().is_empty()
@@ -63,6 +63,30 @@ impl<B: Backend> Runtime<B> {
                 .all(|(_, thunk, _)| self.machine.sys.thunks.get(*thunk).implemented)
     }
 
+    pub fn api_acceptance_eligible(&self) -> bool {
+        self.selected_api_acceptance_eligible()
+            && self.family.records.iter().all(|p| p.acceptance_eligible && p.failure.is_none())
+            && self.family.parked.values().all(|machine| {
+                let registry = (machine.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<adv_abi::Registry>().unwrap();
+                registry.mode() == adv_abi::RunMode::Strict
+                    && registry.signature_conflicts().is_empty()
+                    && machine.ext.try_get::<adv_abi::ApiDiagnostics>().is_none_or(|d| d.stub_calls == 0)
+                    && machine.sys.recent.iter().all(|(_, thunk, _)| machine.sys.thunks.get(*thunk).implemented)
+            })
+    }
+
+    pub fn missing_apis(&self) -> Vec<String> {
+        let mut missing: std::collections::BTreeSet<_> = self.selected_missing_apis().into_iter().collect();
+        for record in &self.family.records { missing.extend(record.missing_apis.iter().cloned()); }
+        for machine in self.family.parked.values() {
+            let called: std::collections::BTreeSet<_> = machine.sys.recent.iter().map(|(_, thunk, _)| *thunk).collect();
+            missing.extend(machine.sys.thunks.iter()
+                .filter(|(index, t)| !t.implemented && (t.requested || called.contains(index)))
+                .map(|(_, t)| format!("{}!{}", t.module, t.name)));
+        }
+        missing.into_iter().collect()
+    }
+
     pub fn guest_window_count(&self) -> usize {
         let user = &self.machine.ext.get::<Win32>().user;
         user.windows
@@ -72,7 +96,7 @@ impl<B: Backend> Runtime<B> {
     }
 
     /// Imports with no handler; resolved probes are included even if never called.
-    pub fn missing_apis(&self) -> Vec<String> {
+    pub(crate) fn selected_missing_apis(&self) -> Vec<String> {
         let called: std::collections::BTreeSet<_> = self
             .machine
             .sys
@@ -100,6 +124,10 @@ impl<B: Backend> Runtime<B> {
             std::any::type_name::<B>(),
             self.missing_apis().join(", ")
         );
+        for process in self.process_statuses() {
+            report.push_str(&format!("\nProcess {} parent {:?}: {}; exit {:?}; failure {:?}",
+                process.pid, process.parent, process.image, process.exit_code, process.failure));
+        }
         let user = &self.machine.ext.get::<Win32>().user;
         report.push_str(&format!(
             "\nGuest input: cursor {:?}; display {:?}",

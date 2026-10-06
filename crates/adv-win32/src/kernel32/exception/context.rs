@@ -2,7 +2,7 @@
 use adv_cpu::backend::ArchitecturalState;
 use adv_cpu::{X87Register, X87State};
 
-pub(super) const SIZE: usize = 716;
+pub(crate) const SIZE: usize = 716;
 const FLAGS: u32 = 0x0001_002f; // control, integer, segments, x87, extended; no debug registers.
 fn put(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -14,7 +14,7 @@ fn word(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
-pub(super) fn encode(state: &ArchitecturalState) -> [u8; SIZE] {
+pub(crate) fn encode(state: &ArchitecturalState) -> [u8; SIZE] {
     let mut bytes = [0; SIZE];
     put(&mut bytes, 0, FLAGS);
     for (offset, index) in [
@@ -110,7 +110,7 @@ fn extended(bytes: &[u8]) -> X87State {
     state
 }
 
-pub(super) fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), String> {
+pub(crate) fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), String> {
     let flags = get(bytes, 0);
     // This dispatch contract returns a full supported image. Partial CONTEXT
     // restores and debug registers need a separate native-verified API contract;

@@ -58,6 +58,87 @@ fn store() -> Surfaces<Snapshot> {
 }
 
 #[test]
+fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
+    let mut parent = store();
+    let mut child = store();
+    let mut parent_memory = Memory::new(false);
+    let mut child_memory = Memory::new(false);
+    let parent_surface = parent
+        .create(1, 1, false, PixelFormat::Bgra32, &mut parent_memory)
+        .unwrap();
+    let child_surface = child
+        .create(1, 1, false, PixelFormat::Bgra32, &mut child_memory)
+        .unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    parent.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    parent_memory
+        .write(parent[parent_surface].pixels, &[1, 2, 3, 4])
+        .unwrap();
+    child_memory
+        .write(child[child_surface].pixels, &[5, 6, 7, 8])
+        .unwrap();
+    for _ in 0..3 {
+        parent.present(parent_surface, &parent_memory).unwrap();
+    }
+    assert!(parent.transfer_frame_mailbox_to(&mut child).unwrap());
+    assert!(!parent.transfer_frame_mailbox_to(&mut store()).unwrap());
+    child.present(child_surface, &child_memory).unwrap();
+    assert!(consumer.update());
+    let mut snapshot = Snapshot::default();
+    consumer.current().snapshot(&mut snapshot).unwrap();
+    assert_eq!(
+        (snapshot.frames, snapshot.bgra.as_slice()),
+        (4, &[5, 6, 7, 8][..])
+    );
+    // Background output stays local and cannot overwrite the foreground child.
+    parent.present(parent_surface, &parent_memory).unwrap();
+    assert!(!consumer.update());
+    assert!(child.transfer_frame_mailbox_to(&mut parent).unwrap());
+    parent.present(parent_surface, &parent_memory).unwrap();
+    assert!(consumer.update());
+    consumer.current().snapshot(&mut snapshot).unwrap();
+    assert_eq!(
+        (snapshot.frames, snapshot.bgra.as_slice()),
+        (5, &[1, 2, 3, 4][..])
+    );
+}
+
+#[test]
+fn mailbox_handoff_rejects_an_owned_destination_without_losing_the_source() {
+    let mut parent = store();
+    let mut child = store();
+    let (parent_producer, _) = frame_mailbox();
+    let (child_producer, _) = frame_mailbox();
+    parent.set_frame_mailbox(parent_producer, adv_sync::WakeEvent::new().unwrap());
+    child.set_frame_mailbox(child_producer, adv_sync::WakeEvent::new().unwrap());
+    assert!(parent.transfer_frame_mailbox_to(&mut child).is_err());
+    assert!(parent.transfer_frame_mailbox_to(&mut store()).unwrap());
+}
+
+#[test]
+fn headless_foreground_handoff_keeps_deferred_capture_and_frame_sequence() {
+    let mut parent = store();
+    let mut child = store();
+    let mut parent_memory = Memory::new(false);
+    let mut child_memory = Memory::new(false);
+    parent.set_deferred_presentation(true).unwrap();
+    let parent_surface = parent
+        .create(1, 1, false, PixelFormat::Bgra32, &mut parent_memory)
+        .unwrap();
+    let child_surface = child
+        .create(1, 1, false, PixelFormat::Bgra32, &mut child_memory)
+        .unwrap();
+    for _ in 0..3 {
+        parent.present(parent_surface, &parent_memory).unwrap();
+    }
+    assert!(!parent.transfer_frame_mailbox_to(&mut child).unwrap());
+    child.present(child_surface, &child_memory).unwrap();
+    assert_eq!(child.presenter.frames, 0);
+    assert!(child.capture_latest().unwrap());
+    assert_eq!(child.presenter.frames, 4);
+}
+
+#[test]
 fn segmented_storage_reuses_deleted_blocks_and_rolls_back_initialization_failure() {
     struct FailedWrite<'a>(&'a mut Memory);
     impl SurfaceMemory for FailedWrite<'_> {

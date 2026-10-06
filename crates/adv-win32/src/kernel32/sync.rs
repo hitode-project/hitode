@@ -187,6 +187,13 @@ fn wait_result(r: Resume) -> Outcome {
 }
 
 fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
+    if let Some(Object::Process { access, .. } | Object::RemoteThread { access, .. }) =
+        env.sys.objects.get(h)
+        && access & 0x10_0000 == 0
+    {
+        set_last_error(env, err::ACCESS_DENIED);
+        return Outcome::Return(WAIT_FAILED);
+    }
     if !matches!(
         env.sys.objects.get(h),
         Some(
@@ -194,6 +201,8 @@ fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
                 | Object::Mutex { .. }
                 | Object::Semaphore { .. }
                 | Object::Thread { .. }
+                | Object::Process { .. }
+                | Object::RemoteThread { .. }
         )
     ) {
         log::warn!("wait on unknown handle {h:#x} from {:#010x}", env.caller());
@@ -239,6 +248,13 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
             set_last_error(env, err::INVALID_PARAMETER);
             return Outcome::Return(WAIT_FAILED);
         }
+        if let Some(Object::Process { access, .. } | Object::RemoteThread { access, .. }) =
+            env.sys.objects.get(h)
+            && access & 0x10_0000 == 0
+        {
+            set_last_error(env, err::ACCESS_DENIED);
+            return Outcome::Return(WAIT_FAILED);
+        }
         if !matches!(
             env.sys.objects.get(h),
             Some(
@@ -246,6 +262,8 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
                     | Object::Mutex { .. }
                     | Object::Semaphore { .. }
                     | Object::Thread { .. }
+                    | Object::Process { .. }
+                    | Object::RemoteThread { .. }
             )
         ) {
             set_last_error(env, err::INVALID_HANDLE);
@@ -272,13 +290,24 @@ fn wait_multiple(env: &mut Env<'_>) -> Outcome {
 }
 
 fn created(env: &mut Env<'_>, o: Object) -> Outcome {
+    let inherit = match super::handle::security_inherit(env, env.arg(0)) {
+        Ok(inherit) => inherit,
+        Err(code) => {
+            set_last_error(env, code);
+            return Outcome::Return(0);
+        }
+    };
     let index = if matches!(o, Object::Mutex { .. }) {
         2
     } else {
         3
     };
     let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
-    super::file_mapping::sync_created(env, o, env.arg(index), wide)
+    let result = super::file_mapping::sync_created(env, o, env.arg(index), wide);
+    if let Outcome::Return(handle) = &result {
+        super::handle::set_inherit(env, *handle, inherit);
+    }
+    result
 }
 
 fn create_event(env: &mut Env<'_>) -> Outcome {
@@ -360,9 +389,16 @@ fn release_mutex(env: &mut Env<'_>) -> Outcome {
 }
 
 fn create_waitable_timer(env: &mut Env<'_>) -> Outcome {
+    let inherit = match super::handle::security_inherit(env, env.arg(0)) {
+        Ok(inherit) => inherit,
+        Err(code) => {
+            set_last_error(env, code);
+            return Outcome::Return(0);
+        }
+    };
     let manual = env.arg(1) != 0;
     let wide = env.sys.thunks.get(env.thunk).name.ends_with('W');
-    super::file_mapping::sync_created(
+    let result = super::file_mapping::sync_created(
         env,
         Object::Event {
             manual_reset: manual,
@@ -370,7 +406,11 @@ fn create_waitable_timer(env: &mut Env<'_>) -> Outcome {
         },
         env.arg(2),
         wide,
-    )
+    );
+    if let Outcome::Return(handle) = &result {
+        super::handle::set_inherit(env, *handle, inherit);
+    }
+    result
 }
 
 fn set_waitable_timer(env: &mut Env<'_>) -> Outcome {

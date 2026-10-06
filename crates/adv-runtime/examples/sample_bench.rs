@@ -128,6 +128,7 @@ fn run() -> Result<(), String> {
                     runtime.frame().frames
                 ));
             }
+            RunResult::HostRequest => return Err("process requests require the runtime family scheduler".into()),
             RunResult::Failed(error) => return Err(format!("{error}\n{}", runtime.report())),
         }
         if runtime.machine.sys.clock.now_us() - clock_start > 120_000_000 {

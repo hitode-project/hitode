@@ -122,6 +122,9 @@ pub struct Objects {
     entries: HashMap<u64, Entry>,
     targets: HashMap<(u32, u32), u64>,
     kernel_identities: HashMap<Handle, u64>,
+    /// Kernel alias metadata. Each duplicate begins with independent flags;
+    /// payload identities and nonkernel namespaces have no handle properties.
+    handle_flags: BTreeMap<Handle, u32>,
     namespaces: HashMap<u32, NamespaceState>,
     next_object: u64,
     next_namespace: u32,
@@ -144,6 +147,7 @@ impl Objects {
             entries: HashMap::new(),
             targets: HashMap::new(),
             kernel_identities: HashMap::new(),
+            handle_flags: BTreeMap::new(),
             namespaces: HashMap::from([(0, NamespaceState::default())]),
             next_object: 0,
             next_namespace: 0,
@@ -414,6 +418,9 @@ impl Objects {
     pub fn close_alias(&mut self, ns: Namespace, alias: u32) -> Option<Option<Object>> {
         let ns = self.namespace_id(ns)?;
         let id = self.targets.remove(&(ns, alias))?;
+        if ns == 0 {
+            self.handle_flags.remove(&alias);
+        }
         self.namespaces.get_mut(&ns).unwrap().aliases -= 1;
         let entry = self.entries.get_mut(&id).unwrap();
         entry.aliases -= 1;
@@ -511,6 +518,39 @@ impl Objects {
         self.insert_aliased(0, object).unwrap_or(0)
     }
 
+    /// Insert a transferred kernel object at the inherited numeric handle.
+    /// Existing aliases/identities are never replaced on collision.
+    pub fn insert_handle_at(&mut self, handle: Handle, object: Object) -> bool {
+        self.insert_at(0, handle, object).is_some()
+    }
+
+    /// Properties belong to the live kernel alias, rather than its payload.
+    pub fn handle_flags(&self, handle: Handle) -> Option<u32> {
+        self.targets.get(&(0, handle))?;
+        Some(self.handle_flags.get(&handle).copied().unwrap_or(0))
+    }
+
+    pub fn set_handle_flags(&mut self, handle: Handle, mask: u32, flags: u32) -> bool {
+        let Some(previous) = self.handle_flags(handle) else {
+            return false;
+        };
+        let flags = (previous & !mask) | (flags & mask);
+        if flags == 0 {
+            self.handle_flags.remove(&handle);
+        } else {
+            self.handle_flags.insert(handle, flags);
+        }
+        true
+    }
+
+    /// Sorted live kernel aliases carrying the inheritance flag. Enumeration is
+    /// bounded by the existing alias limit and excludes anonymous identities.
+    pub fn inheritable_handles(&self) -> impl Iterator<Item = Handle> + '_ {
+        self.handle_flags
+            .iter()
+            .filter_map(|(&handle, &flags)| (flags & 1 != 0).then_some(handle))
+    }
+
     pub fn insert_host<T: Any>(&mut self, value: T) -> Handle {
         self.insert(Object::Host(Box::new(value)))
     }
@@ -595,6 +635,46 @@ impl Objects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_alias_flags_are_independent_masked_and_removed_with_the_alias() {
+        let mut objects = Objects::default();
+        let first = objects.insert_host(7_u32);
+        assert_eq!(objects.handle_flags(first), Some(0));
+        assert!(objects.set_handle_flags(first, 3, 3));
+        let alias = objects.duplicate(first).unwrap();
+        assert_eq!(objects.handle_flags(alias), Some(0));
+        assert_eq!(objects.inheritable_handles().collect::<Vec<_>>(), [first]);
+        assert!(objects.set_handle_flags(alias, 1, 1));
+        assert!(objects.set_handle_flags(first, 1, 0));
+        assert_eq!(objects.handle_flags(first), Some(2));
+        assert_eq!(objects.inheritable_handles().collect::<Vec<_>>(), [alias]);
+        assert!(objects.same_object(first, alias));
+        // Internal ownership cleanup remains independent of API close flags.
+        assert!(objects.close(first).is_some());
+        assert_eq!(objects.handle_flags(first), None);
+        assert!(objects.host::<u32>(alias).is_some());
+        assert!(objects.close(alias).is_some());
+        assert!(objects.inheritable_handles().next().is_none());
+        assert!(!objects.set_handle_flags(alias, 3, 3));
+        assert_eq!(objects.handle_flags(0), None);
+    }
+
+    #[test]
+    fn inherited_numeric_aliases_refuse_collisions_and_do_not_mark_other_namespaces() {
+        let mut objects = Objects::default();
+        assert!(objects.insert_handle_at(0x204, Object::Host(Box::new(7_u32))));
+        assert!(!objects.insert_handle_at(0x204, Object::Host(Box::new(8_u32))));
+        assert_eq!(objects.host::<u32>(0x204), Some(&7));
+        assert!(!objects.insert_handle_at(0, Object::Host(Box::new(8_u32))));
+        let ns = objects.new_namespace().unwrap();
+        assert!(objects.insert_host_at(ns, 0x204, 9_u32));
+        assert!(objects.set_handle_flags(0x204, 1, 1));
+        assert!(objects.close(0x204).is_some());
+        assert_eq!(objects.handle_flags(0x204), None);
+        assert!(objects.inheritable_handles().next().is_none());
+        assert!(objects.lookup_alias::<u32>(ns, 0x204).is_some());
+    }
 
     #[test]
     fn counter_and_reference_overflow_refuse_without_mutation() {
