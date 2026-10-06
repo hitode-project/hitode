@@ -258,7 +258,12 @@ public static class AbiMetadata
             bool ntCreate = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwCreateFile"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1";
-            if ((!vcm && !d3dx && !ntPath && !ntCreate) || f[2] != "stdcall")
+            // Microsoft Learn's WDM declaration and both SDK ntdll.lib @20
+            // symbols supply this one observed native query, absent in WinMD.
+            bool ntQuery = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "ZwQueryInformationFile"
+                && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
+                && f[5] == "FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1";
+            if ((!vcm && !d3dx && !ntPath && !ntCreate && !ntQuery) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
@@ -268,7 +273,7 @@ public static class AbiMetadata
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dx ? p[2] == "ptr" : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : d3dx ? p[2] == "ptr" : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

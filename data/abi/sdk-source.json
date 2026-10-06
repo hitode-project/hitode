@@ -31,6 +31,18 @@
       "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
     ]
   },
+  "native_query_file": {
+    "scope": "ntdll.dll!ZwQueryInformationFile only; FilePositionInformation (14) is the observed operation",
+    "source": "Microsoft Learn wdm.h ZwQueryInformationFile declaration; this declaration is absent from the installed user-mode winternl.h and pinned WinMD",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS, HANDLE and pointers, ULONG length and signed 32-bit FILE_INFORMATION_CLASS; SDK ntdll.lib declares both _NtQueryInformationFile@20 and _ZwQueryInformationFile@20",
+    "native_verification": "Authored x86 ZwQueryInformationFile probe verifies 8-byte CurrentByteOffset, 64-bit seek/read cursor, IOSB byte count, error-output/LastError preservation, and attributes-only/overlapped native handles; no DLL or game bytes are bundled",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwqueryinformationfile",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_position_information",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",

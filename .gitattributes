@@ -1,0 +1,2 @@
+# Zero-argument ABI declarations retain an empty final TSV parameter column.
+/data/abi/*.tsv whitespace=-blank-at-eol

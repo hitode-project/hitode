@@ -24,7 +24,9 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memmove-s-wmemmove-s",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/acmdln-tcmdln-wcmdln",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/internal-crt-globals-and-functions",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setlocale-wsetlocale"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setlocale-wsetlocale",
+    "https://learn.microsoft.com/en-us/previous-versions/ff730814(v=vs.120)",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/lc-codepage-func"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -71,7 +73,12 @@
   "locale.h": {
     "header": "ucrt/locale.h",
     "sha256": "877aa49e1f22814dd5634e785d305210d3c7ac0a1274e8552ce4f687a91ac4cb",
-    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5"
+    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5. Also declares unsigned int __cdecl ___lc_codepage_func(void)."
+  },
+  "legacy_locale_handle": {
+    "declaration": "Microsoft Learn previous-versions ff730814(v=vs.120) declares LCID* ___lc_handle_func(void), indexed by locale.h categories. This legacy LCID-array getter is absent from modern UCRT headers; no modern header declaration is claimed.",
+    "projection": "msvcr90 x86 CRT cdecl zero parameters, pointer to six 32-bit LCIDs (LC_ALL reserved zero, categories1..5). Authored x86 Microsoft SysWOW64/msvcrt.dll probe confirms C=0, Japanese=0x411, Simplified Chinese=0x804, English=0x409 and mixed category indices; this is a legacy MSVCRT semantic oracle, not a VC90 binary oracle.",
+    "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
   },
   "process.h": {
     "header": "ucrt/process.h",

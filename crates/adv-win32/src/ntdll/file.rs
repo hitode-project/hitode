@@ -1,5 +1,5 @@
 //! Native synchronous FILE_OPEN shares the Win32 VFS and FileObj owner.
-use adv_abi::{GuestPtr, Registry, guest::check_range, warn_unavailable, win32};
+use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, warn_unavailable, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::Env;
 
@@ -22,6 +22,73 @@ const READ_ACCESS: u32 = GENERIC_READ | SYNCHRONIZE | 0x0002_0000 | 0x89;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(create_ABI);
+    registry.register(query_ABI);
+}
+
+/// The file position belongs to the shared file object, including duplicate
+/// Win32 handles and virtual System32 streams. Querying never moves it.
+#[win32(ntdll, name = "ZwQueryInformationFile", level = implement)]
+fn query(
+    env: &mut Env<'_>,
+    handle: Handle,
+    iosb: GuestPtr<()>,
+    output: GuestPtr<()>,
+    length: u32,
+    class: i32,
+) -> i32 {
+    if class != 14 {
+        warn_unavailable(
+            env,
+            "ntdll.dll!ZwQueryInformationFile",
+            "only FilePositionInformation is implemented",
+        );
+        return if class == 0 {
+            0xc000_0002u32 as i32
+        } else {
+            NOT_SUPPORTED
+        };
+    }
+    if length < 8 {
+        return 0xc000_0004u32 as i32; // STATUS_INFO_LENGTH_MISMATCH
+    }
+    if check_range(env.cpu, iosb.addr(), 8, Prot::WRITE).is_err()
+        || check_range(env.cpu, output.addr(), length, Prot::WRITE).is_err()
+    {
+        return ACCESS_VIOLATION;
+    }
+    let Some(file) = env.sys.objects.host::<FileObj>(handle.0) else {
+        return if env.sys.objects.get(handle.0).is_some()
+            || matches!(handle.0, 0xffff_ffff | 0xffff_fffe)
+        {
+            0xc000_0024u32 as i32 // STATUS_OBJECT_TYPE_MISMATCH
+        } else {
+            INVALID_HANDLE
+        };
+    };
+    // Native also accepts attributes-only and overlapped handles for this
+    // query. Do not manufacture a second per-front position or mode table.
+    let position = match file.file.stream_position() {
+        Ok(position) => position,
+        Err(error) => {
+            log::warn!("ZwQueryInformationFile position query failed: {error}");
+            return if error.kind() == std::io::ErrorKind::PermissionDenied {
+                ACCESS_DENIED
+            } else {
+                0xc000_0001u32 as i32 // STATUS_UNSUCCESSFUL
+            };
+        }
+    };
+    let mut completion = [0; 8];
+    completion[4..].copy_from_slice(&8u32.to_le_bytes());
+    if env
+        .cpu
+        .write(output.addr(), &position.to_le_bytes())
+        .and_then(|()| env.cpu.write(iosb.addr(), &completion))
+        .is_err()
+    {
+        return ACCESS_VIOLATION;
+    }
+    0
 }
 
 fn unavailable(env: &mut Env<'_>, reason: &str) -> i32 {

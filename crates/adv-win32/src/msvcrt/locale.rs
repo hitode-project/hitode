@@ -1,7 +1,7 @@
 //! CRT locale categories and returned strings belong to their CRT module.
 //! They do not change Win32's ACP or the independent multibyte code page.
 use super::*;
-use adv_abi::{AnsiStr, guest::memory_failure, win32};
+use adv_abi::{AnsiStr, GuestPtr, guest::memory_failure, win32};
 
 const CATEGORY_NAMES: [&str; 5] = [
     "LC_COLLATE",
@@ -11,6 +11,7 @@ const CATEGORY_NAMES: [&str; 5] = [
     "LC_TIME",
 ];
 const BUFFER_BYTES: u32 = 1024;
+const LCID_OFFSET: u32 = BUFFER_BYTES - 6 * 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Language {
@@ -33,6 +34,14 @@ impl Default for Locale {
     }
 }
 impl Locale {
+    fn lcid(self) -> u32 {
+        match self.language {
+            Language::C => 0,
+            Language::Japanese => 0x411,
+            Language::Chinese => 0x804,
+            Language::English => 0x409,
+        }
+    }
     fn name(self) -> String {
         let language = match self.language {
             Language::C => return "C".to_owned(),
@@ -50,6 +59,8 @@ pub(super) struct LocaleState {
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(setlocale_ABI);
+    registry.register(lc_handles_ABI);
+    registry.register(lc_codepage_ABI);
 }
 
 fn default_language(acp: u32) -> Language {
@@ -195,9 +206,16 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         };
         categories
     };
-    let mut bytes = name(&categories, category as usize).into_bytes();
-    bytes.push(0);
-    debug_assert!(bytes.len() <= BUFFER_BYTES as usize);
+    // The category names and LCID array share one module-owned process block.
+    // Publish them together so no successful set exposes stale category IDs.
+    let label = name(&categories, category as usize);
+    debug_assert!(label.len() < LCID_OFFSET as usize);
+    let mut bytes = [0u8; BUFFER_BYTES as usize];
+    bytes[..label.len()].copy_from_slice(label.as_bytes());
+    for (index, locale) in categories.iter().enumerate() {
+        let at = LCID_OFFSET as usize + (index + 1) * 4;
+        bytes[at..at + 4].copy_from_slice(&locale.lcid().to_le_bytes());
+    }
     let fresh = state.buffer == 0;
     let pointer = if fresh {
         allocate(env, BUFFER_BYTES, true)
@@ -232,6 +250,36 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         },
     );
     Outcome::Return(pointer)
+}
+
+#[win32(msvcr90, name = "___lc_handle_func", level = state)]
+fn lc_handles(env: &mut Env<'_>) -> Outcome {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    if let Some(state) = env
+        .ext
+        .try_get::<CrtState>()
+        .and_then(|s| s.locales.get(module))
+        && state.buffer != 0
+    {
+        // Already-published data stays readable even if the guest made its
+        // allocation read-only. A getter does not rewrite category storage.
+        return Outcome::Return(state.buffer + LCID_OFFSET);
+    }
+    // Before any setlocale call, all categories are C. Initializing the shared
+    // return block also gives this pointer a real owner and detach lifecycle.
+    match setlocale(env, 0, AnsiStr(GuestPtr::new(0))) {
+        Outcome::Return(pointer) if pointer != 0 => Outcome::Return(pointer + LCID_OFFSET),
+        other => other,
+    }
+}
+
+#[win32(msvcr90, name = "___lc_codepage_func", level = state)]
+fn lc_codepage(env: &mut Env<'_>) -> u32 {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    env.ext
+        .try_get::<CrtState>()
+        .and_then(|state| state.locales.get(module))
+        .map_or(0, |state| state.categories[1].codepage)
 }
 
 pub(super) fn release_process_tables(env: &mut Env<'_>) -> Result<(), String> {

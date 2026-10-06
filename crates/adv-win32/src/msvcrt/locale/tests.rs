@@ -265,3 +265,160 @@ fn actual_cdecl_query_and_invalid_category_callback_run_in_interpreter_and_jit()
     guest_roundtrip(UnicornCpu::new(PARK_ADDR).unwrap());
     guest_roundtrip(JitCpu::new(PARK_ADDR, false).unwrap());
 }
+
+fn handles<B: Backend>(machine: &mut Machine<B>, entry: u32) -> u32 {
+    match lc_handles(&mut env(machine, entry)) {
+        Outcome::Return(pointer) => pointer,
+        _ => panic!("LCID getter must return its owned array"),
+    }
+}
+fn ids<B: Backend>(machine: &Machine<B>, pointer: u32) -> [u32; 6] {
+    let mut bytes = [0; 24];
+    machine.cpu.read(pointer, &mut bytes).unwrap();
+    core::array::from_fn(|index| {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    })
+}
+
+#[test]
+fn getter_arrays_follow_real_categories_codepage_module_owner_and_atomic_set_publication() {
+    let (mut machine, set_entry) = fixture();
+    let entry = machine.resolve_import(MODULE, "___lc_handle_func").unwrap();
+    let cp_entry = machine
+        .resolve_import(MODULE, "___lc_codepage_func")
+        .unwrap();
+    assert_eq!(lc_codepage(&mut env(&mut machine, cp_entry)), 0);
+    let pointer = handles(&mut machine, entry);
+    assert_ne!(pointer, 0);
+    let allocation = pointer - LCID_OFFSET;
+    assert!(machine.ext.get::<Heaps>().owner(allocation).is_some());
+    assert_eq!(ids(&machine, pointer), [0; 6]);
+    let errno = floating::errno_address(&mut env(&mut machine, entry));
+    errno.write(&mut machine.cpu, 79).unwrap();
+    crate::util::set_last_error(&mut env(&mut machine, entry), 0x12345678);
+    for (requested, expected, cp) in [
+        ("C", [0; 6], 0),
+        ("Japanese", [0, 0x411, 0x411, 0x411, 0x411, 0x411], 932),
+        (
+            "Chinese (Simplified)",
+            [0, 0x804, 0x804, 0x804, 0x804, 0x804],
+            936,
+        ),
+        ("English", [0, 0x409, 0x409, 0x409, 0x409, 0x409], 1252),
+        (
+            "LC_COLLATE=Japanese;LC_CTYPE=Chinese (Simplified);LC_TIME=English",
+            [0, 0x411, 0x804, 0x409, 0x409, 0x409],
+            936,
+        ),
+        ("C", [0; 6], 0),
+    ] {
+        assert_eq!(
+            call(&mut machine, set_entry, 0, Some(requested)),
+            allocation
+        );
+        // A previously returned array observes successful category changes.
+        assert_eq!(ids(&machine, pointer), expected);
+        assert_eq!(handles(&mut machine, entry), pointer);
+        assert_eq!(lc_codepage(&mut env(&mut machine, cp_entry)), cp);
+        assert_eq!(errno.read(&machine.cpu).unwrap(), 79);
+        assert_eq!(
+            crate::util::last_error(&env(&mut machine, entry)),
+            0x12345678
+        );
+        assert_eq!(machine.ext.get::<crate::Win32>().codec.acp, 932);
+    }
+    let other = machine.resolve_import("msvcr80.dll", "_errno").unwrap();
+    let other_pointer = handles(&mut machine, other);
+    assert_ne!(other_pointer, pointer);
+    call(&mut machine, set_entry, 2, Some("Chinese (Simplified)"));
+    assert_eq!(ids(&machine, pointer), [0, 0, 0x804, 0, 0, 0]);
+    assert_eq!(ids(&machine, other_pointer), [0; 6]);
+    assert_eq!(lc_codepage(&mut env(&mut machine, other)), 0);
+    assert_eq!(call(&mut machine, set_entry, 0, Some("unsupported")), 0);
+    assert_eq!(ids(&machine, pointer), [0, 0, 0x804, 0, 0, 0]);
+    machine
+        .cpu
+        .protect(allocation & !4095, 4096, Prot::READ)
+        .unwrap();
+    assert_eq!(handles(&mut machine, entry), pointer);
+    assert_eq!(lc_codepage(&mut env(&mut machine, cp_entry)), 936);
+    machine.cpu.write(REQUEST, b"C\0").unwrap();
+    let Outcome::Fail(_) = setlocale(
+        &mut env(&mut machine, set_entry),
+        0,
+        AnsiStr(GuestPtr::new(REQUEST)),
+    ) else {
+        panic!("set overwrote protected locale data")
+    };
+    assert_eq!(ids(&machine, pointer), [0, 0, 0x804, 0, 0, 0]);
+    assert_eq!(lc_codepage(&mut env(&mut machine, cp_entry)), 936);
+    machine
+        .cpu
+        .protect(allocation & !4095, 4096, Prot::RW)
+        .unwrap();
+    super::super::detach_process(&mut env(&mut machine, entry)).unwrap();
+    assert!(machine.ext.get::<Heaps>().owner(allocation).is_none());
+    assert!(
+        machine
+            .ext
+            .get::<Heaps>()
+            .owner(other_pointer - LCID_OFFSET)
+            .is_none()
+    );
+}
+
+fn guest_getters<B: Backend>(cpu: B) {
+    let mut machine = machine(cpu);
+    let handle = machine.resolve_import(MODULE, "___lc_handle_func").unwrap();
+    let cp = machine
+        .resolve_import(MODULE, "___lc_codepage_func")
+        .unwrap();
+    let locale = machine.resolve_import(MODULE, "setlocale").unwrap();
+    let set_error = machine
+        .resolve_import("kernel32.dll", "SetLastError")
+        .unwrap();
+    let get_error = machine
+        .resolve_import("kernel32.dll", "GetLastError")
+        .unwrap();
+    let get_acp = machine.resolve_import("kernel32.dll", "GetACP").unwrap();
+    machine
+        .cpu
+        .write(REQUEST, b"Chinese (Simplified)\0")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(0x12345678).call(set_error);
+    code.call(cp).mov_mem_eax(DATA + 4);
+    code.call(handle).mov_mem_eax(DATA);
+    code.mov_eax_ptr_eax().mov_mem_eax(DATA + 8);
+    code.mov_eax_mem(DATA);
+    code.bytes.extend_from_slice(&[0x8b, 0x40, 0x04]); // Actual caller: mov eax,[eax+4].
+    code.mov_mem_eax(DATA + 12);
+    code.push_imm(REQUEST).push_imm(2).call(locale).add_esp(8);
+    code.mov_eax_mem(DATA);
+    code.bytes.extend_from_slice(&[0x8b, 0x40, 0x08]); // Previously published LC_CTYPE.
+    code.mov_mem_eax(DATA + 16);
+    code.call(cp).mov_mem_eax(DATA + 20);
+    code.call(get_acp).mov_mem_eax(DATA + 24);
+    code.call(get_error).mov_mem_eax(DATA + 28);
+    code.bytes.extend_from_slice(&[0x31, 0xc0]);
+    code.ret();
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine
+        .spawn("CRT locale zero-argument getters", CODE, &[], 65536)
+        .unwrap();
+    let result = machine.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    assert_ne!(machine.cpu.read_u32(DATA).unwrap(), 0);
+    for offset in [4, 8, 12] {
+        assert_eq!(machine.cpu.read_u32(DATA + offset).unwrap(), 0);
+    }
+    assert_eq!(machine.cpu.read_u32(DATA + 16).unwrap(), 0x804);
+    assert_eq!(machine.cpu.read_u32(DATA + 20).unwrap(), 936);
+    assert_eq!(machine.cpu.read_u32(DATA + 24).unwrap(), 932);
+    assert_eq!(machine.cpu.read_u32(DATA + 28).unwrap(), 0x12345678);
+}
+#[test]
+fn getter_actual_zero_argument_cdecl_array_reads_run_in_interpreter_and_jit() {
+    guest_getters(UnicornCpu::new(PARK_ADDR).unwrap());
+    guest_getters(JitCpu::new(PARK_ADDR, false).unwrap());
+}

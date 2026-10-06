@@ -1,4 +1,4 @@
-//! Authored native FILE_OPEN regressions; the x86 oracle lives under target.
+//! Authored native FILE_OPEN and position queries; x86 oracles live under target.
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU32, Ordering},
@@ -401,8 +401,247 @@ fn only_the_actual_called_nt_alias_is_projected_with_its_sdk_stack_contract() {
         Some(ImplementationLevel::Implement)
     );
     assert!(registry.dynamic_available("ntdll.dll", "ZwCreateFile"));
+    assert_eq!(
+        registry
+            .get("ntdll.dll", "ZwQueryInformationFile")
+            .unwrap()
+            .conv,
+        Conv::Stdcall { argc: 5 }
+    );
+    assert_eq!(
+        registry.level("ntdll.dll", "ZwQueryInformationFile"),
+        Some(ImplementationLevel::Implement)
+    );
+    assert!(registry.dynamic_available("ntdll.dll", "ZwQueryInformationFile"));
     for name in ["NtCreateFile", "ZwReadFile", "ZwClose"] {
         assert!(!registry.dynamic_available("ntdll.dll", name));
     }
     assert!(registry.signature_conflicts().is_empty());
+}
+
+fn query<B: Backend>(m: &mut Machine<B>, code: &mut Asm, args: [u32; 5], result: u32) {
+    let set = m.resolve_import("kernel32.dll", "SetLastError").unwrap();
+    let get = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+    let query = m
+        .resolve_import("ntdll.dll", "ZwQueryInformationFile")
+        .unwrap();
+    code.push_imm(MARKER).call(set);
+    for value in args.into_iter().rev() {
+        code.push_imm(value);
+    }
+    code.call(query).mov_mem_eax(result);
+    code.call(get).mov_mem_eax(result + 4);
+}
+
+fn query_position<B: Backend>(cpu: B) {
+    let (mut m, _) = fixture(cpu);
+    input(&mut m, DATA, SOURCE, r"\??\C:\Game\present.txt");
+    let mut code = Asm::new(CODE);
+    create(&mut m, &mut code, arguments(DATA), DATA + 16);
+    run(&mut m, code);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0);
+    let handle = m.cpu.read_u32(DATA).unwrap();
+    let alias = m.sys.objects.duplicate(handle).unwrap();
+    // The shared synthetic-file owner is also seekable. A query does not
+    // require FILE_READ_DATA access on native Windows, checked by the oracle.
+    let memory = m.sys.objects.insert_host(FileObj {
+        file: adv_os::vfs::FileStream::read_only(std::sync::Arc::from(*b"memory")),
+        guest_path: r"C:\Windows\fixture.dll".into(),
+        access: 0x80,
+        share: 7,
+    });
+    let read = m.resolve_import("kernel32.dll", "ReadFile").unwrap();
+    let seek = m
+        .resolve_import("kernel32.dll", "SetFilePointerEx")
+        .unwrap();
+    let close = m.resolve_import("kernel32.dll", "CloseHandle").unwrap();
+    let mut code = Asm::new(CODE);
+    for index in 0..7u32 {
+        m.cpu.write(DATA + 0x100 + index * 64, &[0xcd; 64]).unwrap();
+    }
+    for (index, queried) in [handle, handle, alias, handle, alias, memory, alias]
+        .into_iter()
+        .enumerate()
+    {
+        match index {
+            1 => {
+                code.push_imm(0)
+                    .push_imm(DATA + 0x700)
+                    .push_imm(5)
+                    .push_imm(DATA + 0x710)
+                    .push_imm(handle)
+                    .call(read);
+            }
+            3 => {
+                code.push_imm(0)
+                    .push_imm(DATA + 0x730)
+                    .push_imm(1)
+                    .push_imm(3)
+                    .push_imm(handle)
+                    .call(seek);
+            }
+            5 => {
+                code.push_imm(0)
+                    .push_imm(DATA + 0x730)
+                    .push_imm(1)
+                    .push_imm(4)
+                    .push_imm(memory)
+                    .call(seek);
+            }
+            6 => {
+                code.push_imm(handle).call(close);
+            }
+            _ => {}
+        }
+        let base = DATA + 0x100 + index as u32 * 64;
+        query(
+            &mut m,
+            &mut code,
+            [queried, base, base + 8, 12, 14],
+            base + 24,
+        );
+    }
+    code.push_imm(alias)
+        .call(close)
+        .push_imm(memory)
+        .call(close);
+    run(&mut m, code);
+    for (index, expected) in [
+        0u64,
+        5,
+        5,
+        0x100000003,
+        0x100000003,
+        0x100000004,
+        0x100000003,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let base = DATA + 0x100 + index as u32 * 64;
+        assert_eq!(m.cpu.read_u32(base).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(base + 4).unwrap(), 8);
+        let mut position = [0; 8];
+        m.cpu.read(base + 8, &mut position).unwrap();
+        assert_eq!(u64::from_le_bytes(position), expected);
+        assert_eq!(
+            m.cpu.read_u32(base + 16).unwrap(),
+            0xcdcdcdcd,
+            "oversized buffer tail stays untouched"
+        );
+        assert_eq!(m.cpu.read_u32(base + 24).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(base + 28).unwrap(), MARKER);
+    }
+    assert_eq!(
+        m.sys.objects.hosts::<FileObj>().count(),
+        0,
+        "all shared aliases and memory streams released"
+    );
+}
+
+#[test]
+fn native_position_queries_follow_reads_seeks_duplicate_handles_and_virtual_streams() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        query_position(cpu);
+    }
+    query_position(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn query_failures<B: Backend>(cpu: B) {
+    let (mut m, _) = fixture(cpu);
+    let file = m.sys.objects.insert_host(FileObj {
+        file: adv_os::vfs::FileStream::read_only(std::sync::Arc::from(*b"memory")),
+        guest_path: r"C:\Game\fixture.dat".into(),
+        access: 0x80000000,
+        share: 7,
+    });
+    let other = m.sys.objects.insert_host(String::from("non-file object"));
+    let closed = m.sys.objects.duplicate(file).unwrap();
+    m.sys.objects.close(closed).unwrap();
+    m.cpu.write(READ_ONLY, &[0x77; 32]).unwrap();
+    let cases = [
+        ("short", 0xc0000004),
+        ("invalid", 0xc0000008),
+        ("non-file", 0xc0000024),
+        ("process", 0xc0000024),
+        ("closed", 0xc0000008),
+        ("class zero", 0xc0000002),
+        ("other class", 0xc00000bb),
+        ("null IOSB", 0xc0000005),
+        ("null output", 0xc0000005),
+        ("read-only IOSB", 0xc0000005),
+        ("read-only output", 0xc0000005),
+        ("address overflow", 0xc0000005),
+        ("length overflow", 0xc0000005),
+    ];
+    let mut code = Asm::new(CODE);
+    for (index, (label, _)) in cases.iter().enumerate() {
+        let base = DATA + index as u32 * 64;
+        m.cpu.write(base, &[0xcd; 64]).unwrap();
+        let mut args = [file, base, base + 8, 8, 14];
+        match *label {
+            "short" => args[3] = 7,
+            "invalid" => args[0] = 0x13572468,
+            "non-file" => args[0] = other,
+            "process" => args[0] = 0xffffffff,
+            "closed" => args[0] = closed,
+            "class zero" => args[4] = 0,
+            "other class" => args[4] = 5,
+            "null IOSB" => args[1] = 0,
+            "null output" => args[2] = 0,
+            "read-only IOSB" => args[1] = READ_ONLY,
+            "read-only output" => args[2] = READ_ONLY,
+            "address overflow" => args[2] = 0xfffffffc,
+            "length overflow" => args[3] = 0xffffffff,
+            _ => unreachable!(),
+        }
+        query(&mut m, &mut code, args, base + 24);
+    }
+    run(&mut m, code);
+    for (index, (label, expected)) in cases.into_iter().enumerate() {
+        let base = DATA + index as u32 * 64;
+        assert_eq!(m.cpu.read_u32(base + 24).unwrap(), expected, "{label}");
+        assert_eq!(
+            m.cpu.read_u32(base + 28).unwrap(),
+            MARKER,
+            "LastError: {label}"
+        );
+        let mut bytes = [0; 24];
+        m.cpu.read(base, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xcd; 24], "outputs: {label}");
+    }
+    let mut bytes = [0; 32];
+    m.cpu.read(READ_ONLY, &mut bytes).unwrap();
+    assert_eq!(bytes, [0x77; 32]);
+    assert_eq!(
+        m.sys
+            .objects
+            .host::<FileObj>(file)
+            .unwrap()
+            .file
+            .stream_position()
+            .unwrap(),
+        0
+    );
+    assert!(
+        m.ext
+            .get::<ApiDiagnostics>()
+            .warnings
+            .keys()
+            .any(|(api, _)| api.ends_with("ZwQueryInformationFile"))
+    );
+    m.sys.objects.close(file);
+    m.sys.objects.close(other);
+}
+
+#[test]
+fn failed_queries_preserve_all_outputs_last_error_and_the_shared_file_cursor() {
+    for jit in [false, true] {
+        let mut cpu = JitCpu::new(PARK_ADDR, jit).unwrap();
+        cpu.set_async_compilation(false);
+        query_failures(cpu);
+    }
+    query_failures(UnicornCpu::new(PARK_ADDR).unwrap());
 }
