@@ -621,9 +621,10 @@ mod tests {
     #[test]
     fn runtime_explicit_budget_still_fails_across_soft_slices() {
         let mut runtime = looping_executable_runtime();
+        // Many 2 ms slices fit the budget even after a slow first (debug) compile.
         runtime
             .machine
-            .set_execution_budget(Some(Duration::from_millis(12)));
+            .set_execution_budget(Some(Duration::from_millis(200)));
         let started = Instant::now();
         let mut yielded = false;
         loop {

@@ -34,9 +34,32 @@ fn omission_reason(name: &str) -> &'static str {
         // SDK 10.0.26100.0 um/x86/ntdll.lib independently records
         // _RtlFormatCurrentUserKeyPath@4. Do not invent a full metadata signature.
         "documented legacy RTL export absent from pinned WinMD"
+    } else if module == "ntdll.dll" && native_argc(export).is_some() {
+        "NT native API (WDK, outside the Win32 WinMD)"
     } else {
         "uncategorized metadata gap"
     }
+}
+
+/// x86 stdcall argument counts of the NT native APIs, from the decorated
+/// `_Name@bytes` imports in SDK 10.0.26100.0 um/x86/ntdll.lib. Zw aliases share them.
+fn native_argc(export: &str) -> Option<u8> {
+    let name = export
+        .strip_prefix("Nt")
+        .or_else(|| export.strip_prefix("Zw"))?;
+    let bytes = match name {
+        "Close" => 4,
+        "CreateSection" => 28,
+        "MapViewOfSection" => 40,
+        "OpenFile" => 24,
+        "ProtectVirtualMemory" => 20,
+        "QueryInformationProcess" => 20,
+        "QuerySystemInformation" => 16,
+        "SetInformationThread" => 16,
+        "UnmapViewOfSection" => 8,
+        _ => return None,
+    };
+    Some(bytes / 4)
 }
 
 #[test]
@@ -78,6 +101,16 @@ fn all_fronts_signature_audit() {
                 reason, "uncategorized metadata gap",
                 "new omission needs investigation: {name}"
             );
+            if let Some(argc) = native_argc(name.trim_start_matches("ntdll.dll!")) {
+                assert_eq!(
+                    registry
+                        .get("ntdll.dll", &name["ntdll.dll!".len()..])
+                        .unwrap()
+                        .conv,
+                    adv_abi::Conv::Stdcall { argc },
+                    "{name}"
+                );
+            }
             *categories.entry(reason).or_insert(0usize) += 1;
             report.push(format!("{policy:?}\t{name}\t{reason}"));
         }

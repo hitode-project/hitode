@@ -71,11 +71,24 @@ pub(super) fn register(registry: &mut Registry) {
     }
 }
 #[win32(d3d9, name = "IDirect3DDevice9::SetDialogBoxMode", level = implement)]
-fn set_dialogs(env: &mut Env<'_>, this: GuestPtr<()>, _enable_dialogs: i32) -> u32 {
+fn set_dialogs(env: &mut Env<'_>, this: GuestPtr<()>, enable_dialogs: i32) -> u32 {
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
     if d.scene {
+        return INVALID;
+    }
+    // Windowed devices ignore the mode. Fullscreen dialogs need a lockable,
+    // single-sampled DISCARD back buffer in a GDI format (X8R8G8B8, X1R5G5B5
+    // or R5G6B5). Dialogs are ordinary USER windows here, so nothing else changes.
+    let p = &d.parameters;
+    if p.Windowed == 0
+        && enable_dialogs != 0
+        && (p.Flags & 1 == 0
+            || p.MultiSampleType != 0
+            || p.SwapEffect != 1
+            || !matches!(p.BackBufferFormat, 22 | 24 | 23))
+    {
         return INVALID;
     }
     0
