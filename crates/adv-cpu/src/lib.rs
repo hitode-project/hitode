@@ -136,6 +136,10 @@ pub struct Region {
     /// regions enable this; explicit regions retain their strict byte boundary.
     pub complete_tail: bool,
     pub compile_strategy: CompileStrategy,
+    /// Observed indirect call targets at or below this region. Their
+    /// straight-line code is decoded into this unit so a call and its return
+    /// dispatch internally. They are not entries of this unit.
+    pub callees: Vec<u32>,
 }
 
 impl Region {
@@ -148,6 +152,7 @@ impl Region {
             reachable: false,
             complete_tail: false,
             compile_strategy: CompileStrategy::Speed,
+            callees: Vec::new(),
         }
     }
 }

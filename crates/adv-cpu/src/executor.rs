@@ -100,6 +100,11 @@ pub enum RunOutcome {
     Parked,
 }
 
+/// Executed blocks after which an automatic Fast unit is recompiled for Speed.
+const HOT_BLOCKS: u64 = 16_384;
+/// Native blocks between scans of the profiled Fast units.
+const SCAN_BLOCKS: u64 = 1 << 18;
+
 /// Owns the guest CPU, decoded instructions and native cache. Both executors
 /// access the same state and address space; only this owner publishes links.
 pub struct Executor {
@@ -119,6 +124,10 @@ pub struct Executor {
     tiered_compilation: bool,
     native_heat: HashMap<u32, u64>,
     tier_attempted: BTreeSet<u32>,
+    /// Indirect call targets already offered to each unit's recompilation.
+    callee_attempts: HashMap<u32, BTreeSet<u32>>,
+    /// `stats.native_blocks` at the last `scan_profiles`.
+    scanned_blocks: u64,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
     background_sender: Option<adv_sync::background::LocalSender>,
@@ -317,6 +326,8 @@ impl Executor {
             tiered_compilation: true,
             native_heat: HashMap::new(),
             tier_attempted: BTreeSet::new(),
+            callee_attempts: HashMap::new(),
+            scanned_blocks: 0,
             async_compilation: false,
             compiler: None,
             background_sender: None,
@@ -442,6 +453,7 @@ impl Executor {
         self.stats.deferred_compilations = 0;
         self.automatic_regions.clear();
         self.native_heat.clear();
+        self.callee_attempts.clear();
         self.tier_attempted.clear();
         self.hits.clear();
         self.demand.clear();
@@ -652,7 +664,7 @@ impl Executor {
         }
         let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
-        let fragments = if let Some(limit) = limit {
+        let mut fragments = if let Some(limit) = limit {
             match crate::compile_budget::plan(snapshot, limit) {
                 Ok(fragments) => fragments,
                 Err(error) => {
@@ -676,6 +688,13 @@ impl Executor {
             return Ok(false);
         }
         self.stats.compile_slices += fragments.len().saturating_sub(1) as u64;
+        if self.tiered_compilation && self.parallel.is_none() {
+            for fragment in &mut fragments {
+                if fragment.region.compile_strategy == CompileStrategy::Fast {
+                    fragment.profile = Some(Arc::default());
+                }
+            }
+        }
         for fragment in fragments {
             if !self.pending_regions.contains_key(&fragment.region.start) {
                 self.deferred_sequence += 1;
@@ -1049,43 +1068,95 @@ impl Executor {
         self.host_interrupts = enabled;
     }
 
-    fn record_native_work(&mut self, owner: u32, blocks: u64) {
-        const HOT_BLOCKS: u64 = 16_384;
-        if !self.auto_jit || !self.async_compilation || !self.tiered_compilation || blocks == 0 {
-            return;
-        }
-        if !self.code.fast_regions.contains(&owner)
-            || self.tier_attempted.contains(&owner)
-            || !self.automatic_regions.contains(&owner)
+    fn may_tier_up(&self, owner: u32) -> bool {
+        self.auto_jit
+            && self.async_compilation
+            && self.tiered_compilation
+            && self.code.fast_regions.contains(&owner)
+            && !self.tier_attempted.contains(&owner)
+            && self.automatic_regions.contains(&owner)
             // Reserve at least half the bounded queue for cold discoveries.
-            || self.pending_regions.len() >= crate::compiler::CAPACITY / 2
-            || self.pending_regions.contains_key(&owner)
-        {
-            return;
-        }
-        let Some(region) = self.code.regions.get(&owner) else {
-            return;
-        };
-        if region.compile_strategy != CompileStrategy::Fast
-            || !self
-                .code
-                .compiled
-                .get(&owner)
-                .is_some_and(|c| c.valid(&self.memory))
-        {
+            && self.pending_regions.len() < crate::compiler::CAPACITY / 2
+            && !self.pending_regions.contains_key(&owner)
+    }
+
+    fn record_native_work(&mut self, owner: u32, blocks: u64) {
+        if blocks == 0 || !self.may_tier_up(owner) {
             return;
         }
         // Native chains are sampled at their Rust entry, not timed per guest
-        // instruction. This intentionally approximates heat without perturbing
-        // generated code or attributing wall time to a background compiler.
+        // instruction. Units entered through region links count their own
+        // blocks in their profile instead (`scan_profiles`).
         let heat = self.native_heat.entry(owner).or_default();
         *heat = heat.saturating_add(blocks);
-        if *heat < HOT_BLOCKS {
+        if *heat >= HOT_BLOCKS {
+            self.request_tier_up(owner);
+        }
+    }
+
+    /// Tier up the hottest profiled Fast unit, including one that only runs
+    /// behind region links and never returns to Rust itself. Cold code waiting
+    /// for its first compilation keeps the background compiler first.
+    fn scan_profiles(&mut self) {
+        if !self.deferred_compilations.is_empty() {
+            return;
+        }
+        let hottest = self
+            .code
+            .fast_regions
+            .iter()
+            .filter(|&&owner| self.may_tier_up(owner))
+            .filter_map(|&owner| {
+                let heat = self.code.compiled.get(&owner)?.profile()?.heat();
+                (heat >= HOT_BLOCKS).then_some((heat, owner))
+            })
+            .max();
+        if let Some((_, owner)) = hottest {
+            self.request_tier_up(owner);
+        }
+    }
+
+    fn request_tier_up(&mut self, owner: u32) {
+        const CALLEES: usize = 8;
+        let Some(region) = self.code.regions.get(&owner) else {
+            return;
+        };
+        let Some(compiled) = self
+            .code
+            .compiled
+            .get(&owner)
+            .filter(|c| c.valid(&self.memory))
+        else {
+            return;
+        };
+        if region.compile_strategy != CompileStrategy::Fast {
             return;
         }
         let old_region = region.clone();
         let mut optimized = old_region.clone();
         optimized.compile_strategy = CompileStrategy::Speed;
+        // Observed indirect call targets join the unit, so the calls and their
+        // returns dispatch inside it. Each target is offered once per unit.
+        let tried = self.callee_attempts.entry(owner).or_default();
+        let observed = compiled
+            .profile()
+            .map(|p| p.call_targets())
+            .unwrap_or_default();
+        let fresh: Vec<u32> = observed
+            .into_iter()
+            .filter(|target| !tried.contains(target))
+            .collect();
+        if !old_region.callees.is_empty() && fresh.is_empty() {
+            // Already whole with its callees, since Speed did not fit. Later
+            // scans look for targets the guest selects afterwards.
+            return;
+        }
+        for target in fresh {
+            if optimized.callees.len() < CALLEES && !optimized.callees.contains(&target) {
+                optimized.callees.push(target);
+            }
+            tried.insert(target);
+        }
         match self.queue_region(optimized) {
             Ok(true) => {
                 // Keep Fast code AND its published metadata live while Speed is
@@ -1370,6 +1441,12 @@ impl Executor {
                 self.state.fuel += reserved;
                 self.stats.native_blocks += completed;
                 self.record_native_work(owner, completed);
+                // A scan visits every Fast unit; pace it by native work so
+                // short native runs between interpreted code stay cheap.
+                if self.stats.native_blocks - self.scanned_blocks >= SCAN_BLOCKS {
+                    self.scanned_blocks = self.stats.native_blocks;
+                    self.scan_profiles();
+                }
                 match result {
                     n if n == Exit::Trap as u32 => {
                         if let Some(error) = bridge.error.take() {
@@ -2605,6 +2682,49 @@ mod tiering_tests {
         m.automatic_regions.clear();
         m.record_native_work(0x1000, 100_000);
         assert_eq!(m.stats.tier_up_requests, 0);
+    }
+
+    #[test]
+    fn profiled_units_tier_up_with_their_observed_indirect_callees() {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
+            .unwrap();
+        // inc ebx; ret
+        m.write(0x1000, &[0x43, 0xc3]).unwrap();
+        // top: call esi; dec ecx; jnz top; ret
+        m.write(0x1100, &[0xff, 0xd6, 0x49, 0x75, 0xfb, 0xc3])
+            .unwrap();
+        m.write(0x4f00, &0x3000u32.to_le_bytes()).unwrap();
+        m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
+        m.enable_auto_jit(true);
+        m.set_auto_compile_strategy(CompileStrategy::Fast);
+        m.set_async_compilation(true);
+        m.state.eip = 0x1100;
+        m.state.regs[1] = 100_000;
+        m.state.regs[4] = 0x4f00;
+        m.state.regs[6] = 0x1000;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !m
+            .code
+            .compiled
+            .get(&0x1100)
+            .and_then(Compiled::profile)
+            .is_some_and(|profile| profile.heat() >= HOT_BLOCKS)
+        {
+            assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
+            assert!(Instant::now() < deadline);
+        }
+        m.scan_profiles();
+        collect(&mut m);
+        let region = &m.code.regions[&0x1100];
+        assert_eq!(region.callees, [0x1000]);
+        assert_eq!(region.compile_strategy, CompileStrategy::Speed);
+        // The call and its return no longer leave the unit.
+        let entries = m.stats.native_entries;
+        assert_eq!(m.run(0x3000, 3000).unwrap(), RunOutcome::Budget);
+        assert!(m.stats.native_entries - entries <= 2);
+        assert_eq!(m.run(0x3000, u64::MAX).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[3], 100_000);
     }
 
     #[test]

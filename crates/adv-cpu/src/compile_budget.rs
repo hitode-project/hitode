@@ -69,6 +69,7 @@ fn decoded(input: &Snapshot) -> BTreeMap<u32, Instruction> {
         else {
             continue;
         };
+        let offset = offset + (region.start - input.origin()) as usize;
         let mut decoder = Decoder::with_ip(
             32,
             &bytes[offset..],
@@ -99,6 +100,8 @@ fn decoded(input: &Snapshot) -> BTreeMap<u32, Instruction> {
             }
         }
     }
+    // Callee code is bounded by `Snapshot::callee_code` and not budgeted:
+    // adding it must neither split nor refuse the unit that observed it.
     instructions
 }
 
@@ -266,9 +269,23 @@ fn plan_within(input: Snapshot, limit: usize, loops: usize) -> Result<Vec<Snapsh
         return Ok(vec![input]);
     }
     if input.region.compile_strategy == CompileStrategy::Speed {
+        // Keeping a hot unit whole with its callees saves more than Speed.
+        if !input.region.callees.is_empty()
+            && total(&instructions, CompileStrategy::Fast, input.shadow_returns) <= whole
+        {
+            let mut input = input;
+            input.region.compile_strategy = CompileStrategy::Fast;
+            return Ok(vec![input]);
+        }
         return Err(format!(
             "Speed work {amount} exceeds background budget {whole}"
         ));
+    }
+    // Fragments start their own windows; they do not keep callees.
+    if !input.region.callees.is_empty() {
+        let mut input = input;
+        input.region.callees.clear();
+        return plan_within(input, limit, loops);
     }
     let mut groups: Vec<BTreeSet<u32>> = Vec::new();
     let mut current = BTreeSet::new();
@@ -378,6 +395,21 @@ mod tests {
         let mut original = input(&[0x8b, 0x00, 0x8b, 0x00]);
         original.region.compile_strategy = CompileStrategy::Speed;
         assert!(plan(original, 32).is_err());
+    }
+    #[test]
+    fn callees_keep_a_hot_unit_whole_when_speed_does_not_fit() {
+        let mut original = input(&[0x8b, 0x00, 0x8b, 0x00]);
+        original.region.compile_strategy = CompileStrategy::Speed;
+        original.region.callees = vec![0x10000];
+        let fragments = plan(original.clone(), 32).unwrap();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].region.compile_strategy, CompileStrategy::Fast);
+        assert_eq!(fragments[0].region.callees, [0x10000]);
+        // Splitting still bounds Fast work; fragments do not keep callees.
+        original.region.compile_strategy = CompileStrategy::Fast;
+        let fragments = plan(original, 8).unwrap();
+        assert_eq!(fragments.len(), 2);
+        assert!(fragments.iter().all(|f| f.region.callees.is_empty()));
     }
     #[test]
     fn shadow_metadata_is_budgeted_and_preserved_in_every_fragment() {
