@@ -16,7 +16,9 @@ use resources::Resource;
 mod capabilities;
 mod creation;
 mod fixed;
+mod memory;
 mod pacing;
+mod presentation;
 mod readback;
 mod targets;
 #[cfg(test)]
@@ -172,6 +174,7 @@ pub fn register(registry: &mut Registry) {
     buffers::register(registry);
     creation::register(registry);
     depth::register(registry);
+    memory::register(registry);
 }
 
 /// Install hookable, guest-resident vtables from generated COM slot metadata.
@@ -488,21 +491,95 @@ fn get_direct3d(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) ->
     }
     0
 }
+fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS) -> Option<String> {
+    let mut reasons = Vec::new();
+    for (name, value, supported) in [
+        (
+            "MultiSampleType",
+            parameters.MultiSampleType as u32,
+            parameters.MultiSampleType == 0,
+        ),
+        (
+            "MultiSampleQuality",
+            parameters.MultiSampleQuality,
+            parameters.MultiSampleQuality == 0,
+        ),
+        (
+            "SwapEffect",
+            parameters.SwapEffect as u32,
+            matches!(parameters.SwapEffect, 1 | 3),
+        ),
+        (
+            "BackBufferCount",
+            parameters.BackBufferCount,
+            parameters.BackBufferCount <= 1,
+        ),
+        ("Flags", parameters.Flags, parameters.Flags & !3 == 0),
+        (
+            "AutoDepthStencilFormat",
+            parameters.AutoDepthStencilFormat as u32,
+            parameters.EnableAutoDepthStencil == 0
+                || depth::format(parameters.AutoDepthStencilFormat).is_some(),
+        ),
+        (
+            "PresentationInterval",
+            parameters.PresentationInterval,
+            matches!(parameters.PresentationInterval, 0 | 1 | 0x80000000),
+        ),
+        (
+            "BackBufferFormat",
+            parameters.BackBufferFormat as u32,
+            matches!(parameters.BackBufferFormat, 0 | 21 | 22),
+        ),
+    ] {
+        if !supported {
+            reasons.push(format!("{name}={value:#x} ({value})"));
+        }
+    }
+    (!reasons.is_empty()).then(|| {
+        format!(
+            "unsupported presentation parameters: {}",
+            reasons.join(", ")
+        )
+    })
+}
+fn warn_create_unavailable(
+    env: &mut Env<'_>,
+    adapter: u32,
+    kind: i32,
+    focus: u32,
+    flags: u32,
+    input: Option<D3DPRESENT_PARAMETERS>,
+    reason: &str,
+) {
+    let parameters = input.map_or_else(|| "parameters not read".into(), |p| format!(
+        "requested BackBufferWidth={}, BackBufferHeight={}, BackBufferFormat={}, BackBufferCount={}, MultiSampleType={}, MultiSampleQuality={}, SwapEffect={}, hDeviceWindow={:#x}, Windowed={}, EnableAutoDepthStencil={}, AutoDepthStencilFormat={}, Flags={:#x}, FullScreen_RefreshRateInHz={}, PresentationInterval={:#x}",
+        p.BackBufferWidth, p.BackBufferHeight, p.BackBufferFormat, p.BackBufferCount,
+        p.MultiSampleType, p.MultiSampleQuality, p.SwapEffect, p.hDeviceWindow,
+        p.Windowed, p.EnableAutoDepthStencil, p.AutoDepthStencilFormat, p.Flags,
+        p.FullScreen_RefreshRateInHz, p.PresentationInterval,
+    ));
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3D9::CreateDevice",
+        &format!(
+            "{reason}; adapter={adapter}, device_type={kind}, focus={focus:#x}, behavior_flags={flags:#x}; {parameters}"
+        ),
+    );
+}
 fn normalize(
     env: &Env<'_>,
     mut parameters: D3DPRESENT_PARAMETERS,
     focus: u32,
 ) -> Result<D3DPRESENT_PARAMETERS, u32> {
-    if parameters.MultiSampleType != 0
-        || parameters.MultiSampleQuality != 0
-        || parameters.SwapEffect != 1
-        || parameters.BackBufferCount > 1
-        || parameters.Flags & !3 != 0
-        || (parameters.EnableAutoDepthStencil != 0
-            && depth::format(parameters.AutoDepthStencilFormat).is_none())
-        || !matches!(parameters.PresentationInterval, 0 | 1 | 0x80000000)
-        || !matches!(parameters.BackBufferFormat, 0 | 21 | 22)
+    // COPY has one preserved back buffer and cannot use multisampling. Zero
+    // count is the SDK spelling for one, normalized below for both swap effects.
+    if parameters.SwapEffect == 3
+        && (parameters.BackBufferCount > 1 || parameters.MultiSampleType != 0)
     {
+        return Err(INVALID);
+    }
+    if presentation_unavailable(parameters).is_some() {
         return Err(UNAVAILABLE);
     }
     if parameters.hDeviceWindow == 0 {
@@ -553,14 +630,33 @@ fn create_device(
     }
     let creation = match creation::State::new(adapter, kind, focus.0, flags) {
         Ok(creation) => creation,
-        Err(error) => return Outcome::Return(error),
+        Err(error) => {
+            if error == UNAVAILABLE {
+                warn_create_unavailable(
+                    env,
+                    adapter,
+                    kind,
+                    focus.0,
+                    flags,
+                    None,
+                    "requested device creation behavior policy is unavailable",
+                );
+            }
+            return Outcome::Return(error);
+        }
     };
     let Ok(input) = parameters.read(env.cpu) else {
         return Outcome::Return(INVALID);
     };
     let normalized = match normalize(env, input, focus.0) {
         Ok(p) => p,
-        Err(e) => return Outcome::Return(e),
+        Err(e) => {
+            if e == UNAVAILABLE {
+                let reason = presentation_unavailable(input).unwrap();
+                warn_create_unavailable(env, adapter, kind, focus.0, flags, Some(input), &reason);
+            }
+            return Outcome::Return(e);
+        }
     };
     if adv_abi::guest::check_range(
         env.cpu,
@@ -574,7 +670,18 @@ fn create_device(
     }
     let environment = match creation_environment(env.cpu, flags & 2 != 0) {
         Ok(environment) => environment,
-        Err(_) => return Outcome::Return(UNAVAILABLE),
+        Err(error) => {
+            warn_create_unavailable(
+                env,
+                adapter,
+                kind,
+                focus.0,
+                flags,
+                Some(input),
+                &format!("CPU floating-point creation environment is unavailable: {error}"),
+            );
+            return Outcome::Return(UNAVAILABLE);
+        }
     };
     let target = match env.ext.get::<State>().gpu.as_ref() {
         Some(gpu) => gpu.target(
@@ -582,7 +689,18 @@ fn create_device(
             normalized.BackBufferHeight,
             false,
         ),
-        None => return Outcome::Return(UNAVAILABLE),
+        None => {
+            warn_create_unavailable(
+                env,
+                adapter,
+                kind,
+                focus.0,
+                flags,
+                Some(input),
+                "GPU backend is not installed",
+            );
+            return Outcome::Return(UNAVAILABLE);
+        }
     };
     let target = match target {
         Ok(t) => t,
@@ -650,6 +768,17 @@ fn create_device(
         Ok(value) => value,
         Err(error) => {
             release(env, pointer);
+            if error == UNAVAILABLE {
+                warn_create_unavailable(
+                    env,
+                    adapter,
+                    kind,
+                    focus.0,
+                    flags,
+                    Some(input),
+                    "automatic depth-stencil backend is unavailable",
+                );
+            }
             return Outcome::Return(error);
         }
     };
@@ -657,9 +786,18 @@ fn create_device(
         device.depth_stencil = depth;
     }
     if let Some(environment) = environment
-        && env.cpu.set_fpu_environment(environment).is_err()
+        && let Err(error) = env.cpu.set_fpu_environment(environment)
     {
         release(env, pointer);
+        warn_create_unavailable(
+            env,
+            adapter,
+            kind,
+            focus.0,
+            flags,
+            Some(input),
+            &format!("CPU floating-point creation environment could not be applied: {error}"),
+        );
         return Outcome::Return(UNAVAILABLE);
     }
     if parameters.write(env.cpu, normalized).is_err() || output.write(env.cpu, pointer).is_err() {
@@ -1124,14 +1262,21 @@ fn present(
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if d.scene
-        || !source.is_null()
-        || !destination.is_null()
-        || override_window.0 != 0
-        || !dirty.is_null()
-    {
+    if d.scene {
         return Outcome::Return(INVALID);
     }
+    let parameters = d.parameters;
+    if let Err(error) = presentation::validate(
+        env,
+        parameters,
+        source,
+        destination,
+        override_window.0,
+        dirty,
+    ) {
+        return Outcome::Return(error);
+    }
+    let d = device(env, this.addr()).unwrap();
     if d.back_buffer.is_some_and(|id| {
         matches!(com(env).get_identity(&env.sys.objects, id),
             Some(Payload::Resource(r)) if resources::locked(env, r))
