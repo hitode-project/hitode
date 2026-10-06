@@ -30,6 +30,7 @@ mod time;
 mod timer;
 mod toolhelp;
 pub use time::filetime_now;
+pub(crate) use time::{civil_from_days, days_from_civil};
 
 use adv_abi::Registry;
 

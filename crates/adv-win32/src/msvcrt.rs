@@ -20,11 +20,13 @@ mod scan;
 mod scalar_float;
 mod secure_memory;
 mod startup;
+mod time64;
 mod wide_string;
 
 #[derive(Default)]
 struct CrtState {
     errno: HashMap<(String, u32), u32>,
+    tm_buffers: HashMap<(String, u32), u32>,
     locks: HashMap<(String, u32), u32>,
     globals: HashMap<(String, String), u32>,
     invalid_handlers: HashMap<String, u32>,
@@ -95,6 +97,7 @@ pub fn register(r: &mut Registry) {
     find::register(r);
     formatting::register(r);
     floating::register(r);
+    time64::register(r);
     scalar_float::register(r);
     onexit::register(r);
     startup::register(r);
@@ -284,6 +287,7 @@ pub fn register(r: &mut Registry) {
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
+    time64::release(env, Some(env.context))?;
     release_errno(env, Some(env.context))
 }
 
@@ -292,6 +296,7 @@ pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
     locale::release_process_tables(env)?;
+    time64::release(env, None)?;
     release_errno(env, None)
 }
 
