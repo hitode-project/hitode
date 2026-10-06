@@ -84,8 +84,16 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     else {
         return Outcome::Return(INVALID);
     };
-    let pitch = selected.desc.Width * 4;
-    let size = pitch * selected.desc.Height;
+    let Some(pitch) = format::pitch(selected.desc.Format, selected.desc.Width) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(size) = format::length(
+        selected.desc.Format,
+        selected.desc.Width,
+        selected.desc.Height,
+    ) else {
+        return Outcome::Return(INVALID);
+    };
     let Some(address) = r
         .storage
         .checked_add(selected.offset)
@@ -100,11 +108,15 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     if env.cpu.read(address, &mut pixels).is_err() {
         return Outcome::Return(INVALID);
     }
-    if r.desc.Format == 22 {
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
-    }
+    let Some((pixels, pitch)) = format::upload(
+        selected.desc.Format,
+        pixels,
+        pitch,
+        selected.desc.Width,
+        selected.desc.Height,
+    ) else {
+        return Outcome::Return(INVALID);
+    };
     let rectangle = Rect {
         x: 0,
         y: 0,

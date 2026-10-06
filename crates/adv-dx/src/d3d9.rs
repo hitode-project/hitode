@@ -18,6 +18,7 @@ mod creation;
 mod cursor;
 mod dirty;
 mod fixed;
+mod format;
 mod memory;
 mod pacing;
 mod presentation;

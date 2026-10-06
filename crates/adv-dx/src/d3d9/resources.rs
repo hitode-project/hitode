@@ -497,12 +497,25 @@ fn create_texture(
         return Outcome::Return(INVALID);
     }
     if !shared.is_null()
-        || !matches!(format, 21 | 22)
+        || format::bytes(format).is_none()
         || !(0..=3).contains(&pool)
         || usage & !(1 | 0x200) != 0
         || (pool != 0 && usage != 0)
         || (usage & 1 != 0 && usage & 0x200 != 0)
+        || (format == 26 && usage & 1 != 0)
     {
+        let reason = if format::bytes(format).is_none() {
+            "pixel format is unsupported (supported: 21/22/26)"
+        } else if format == 26 && usage & 1 != 0 {
+            "packed 26 render targets are unavailable; 26 supports sampled textures"
+        } else {
+            "usage/pool or shared-handle combination is unsupported"
+        };
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::CreateTexture",
+            &format!("{reason}: format={format}, usage={usage:#x}, pool={pool}"),
+        );
         return Outcome::Return(UNAVAILABLE);
     }
     let desc = D3DSURFACE_DESC {
@@ -600,10 +613,7 @@ fn level_layout(desc: D3DSURFACE_DESC, count: u32) -> Option<(Vec<Level>, u32)> 
         let mut level_desc = desc;
         level_desc.Width = (desc.Width >> index).max(1);
         level_desc.Height = (desc.Height >> index).max(1);
-        let bytes = level_desc
-            .Width
-            .checked_mul(level_desc.Height)?
-            .checked_mul(4)?;
+        let bytes = format::length(level_desc.Format, level_desc.Width, level_desc.Height)?;
         let offset = length;
         length = length
             .checked_add(bytes)
@@ -742,8 +752,11 @@ pub(super) fn texture_lock(
             h: (rect.bottom - rect.top) as u32,
         }
     };
-    let pitch = selected.desc.Width * 4;
-    let bits = r.storage + selected.offset + rect.y * pitch + rect.x * 4;
+    let Some(pitch) = format::pitch(selected.desc.Format, selected.desc.Width) else {
+        return INVALID;
+    };
+    let bytes = format::bytes(selected.desc.Format).unwrap();
+    let bits = r.storage + selected.offset + rect.y * pitch + rect.x * bytes;
     if output
         .write(
             env.cpu,
@@ -885,6 +898,7 @@ mod tests {
     #[test]
     fn mip_layout_bounds_the_complete_chain_and_halves_rectangular_npot_dimensions() {
         let desc = D3DSURFACE_DESC {
+            Format: 21,
             Width: 3,
             Height: 5,
             ..D3DSURFACE_DESC::default()

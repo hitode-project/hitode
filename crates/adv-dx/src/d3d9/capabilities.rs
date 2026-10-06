@@ -179,6 +179,12 @@ fn check_format(
             3 => matches!(usage, 0 | 1 | 0x200),
             _ => false,
         })
+        || (check == 26
+            && match resource {
+                1 => usage == 0,
+                3 => matches!(usage, 0 | 0x200),
+                _ => false,
+            })
         || (resource == 1 && usage == 2 && depth::format(check).is_some());
     if available(env) && format == 22 && supported {
         0
@@ -413,6 +419,9 @@ mod tests {
         assert!(u64::from(value.MaxPrimitiveCount) * 3 * 40 <= 16 * 1024 * 1024);
         for (usage, kind, format) in [
             (0, 3, 21),
+            (0, 3, 26),
+            (0x200, 3, 26),
+            (0, 1, 26),
             (0x200, 3, 22),
             (0, 1, 21),
             (1, 3, 21),
@@ -428,6 +437,8 @@ mod tests {
         }
         for (usage, kind, format) in [
             (2, 3, 75),
+            (1, 3, 26),
+            (1, 1, 26),
             (2, 1, 70),
             (0x400, 3, 21),
             (0, 4, 21),
@@ -441,13 +452,20 @@ mod tests {
         assert_eq!(check_depth(&mut env, this, 0, 1, 22, 21, 75), 0);
         assert_eq!(check_type(&mut env, this, 0, 1, 22, 21, 0), 0);
         assert_eq!(check_type(&mut env, this, 0, 1, 99, 21, 0), UNAVAILABLE);
+        assert_eq!(check_type(&mut env, this, 0, 1, 22, 26, 1), UNAVAILABLE);
         assert_eq!(
             check_multisample(&mut env, this, 0, 1, 21, 1, 2, GuestPtr::new(0)),
             UNAVAILABLE
         );
-        assert_eq!(adapter_monitor(&mut env, this, 0), adv_abi::Handle(HMONITOR_PRIMARY));
+        assert_eq!(
+            adapter_monitor(&mut env, this, 0),
+            adv_abi::Handle(HMONITOR_PRIMARY)
+        );
         assert_eq!(adapter_monitor(&mut env, this, 1), adv_abi::Handle(0));
-        assert_eq!(adapter_monitor(&mut env, GuestPtr::new(0), 0), adv_abi::Handle(0));
+        assert_eq!(
+            adapter_monitor(&mut env, GuestPtr::new(0), 0),
+            adv_abi::Handle(0)
+        );
         let at = alloc(&mut env, 4096).unwrap();
         assert_eq!(factory_caps(&mut env, this, 0, 1, GuestPtr::new(at)), 0);
         assert_eq!(GuestPtr::<D3DCAPS9>::new(at).read(env.cpu).unwrap(), value);

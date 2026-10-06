@@ -17,6 +17,7 @@ pub(super) struct PendingTransfer {
     image: Image,
     storage: u32,
     length: u32,
+    format: u32,
     ticket: Option<Readback>,
     job: Option<Task>,
     result: Option<u32>,
@@ -44,14 +45,20 @@ fn create_offscreen(
     if device(env, this.addr()).is_none() {
         return Outcome::Return(INVALID);
     }
-    if !matches!(pool, 2 | 3) || !matches!(format, 21 | 22) || !shared.is_null() {
+    if !matches!(pool, 2 | 3) || format::bytes(format).is_none() || !shared.is_null() {
+        let reason = if format::bytes(format).is_none() {
+            "pixel format is unsupported (supported: 21/22/26)"
+        } else {
+            "pool or shared-handle combination is unsupported (supported: SYSTEMMEM/SCRATCH)"
+        };
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::CreateOffscreenPlainSurface",
+            &format!("{reason}: format={format}, pool={pool}"),
+        );
         return Outcome::Return(UNAVAILABLE);
     }
-    let Some(length) = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n > 0 && n <= 64 * 1024 * 1024)
-    else {
+    let Some(length) = format::length(format, width, height) else {
         return Outcome::Return(INVALID);
     };
     let Some(storage) = alloc(env, length) else {
@@ -150,6 +157,7 @@ fn lock(
         return Outcome::Return(0);
     }
     let owner = r.device;
+    let format = r.desc.Format;
     let state = env.ext.get::<State>();
     if state.sender.is_none() || state.wake.is_none() {
         return Outcome::Return(UNAVAILABLE);
@@ -161,13 +169,7 @@ fn lock(
     else {
         return Outcome::Return(INVALID);
     };
-    let Some(length) = r
-        .desc
-        .Width
-        .checked_mul(r.desc.Height)
-        .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n > 0 && n <= 64 * 1024 * 1024)
-    else {
+    let Some(length) = format::length(format, r.desc.Width, r.desc.Height) else {
         return Outcome::Return(INVALID);
     };
     let storage = r.storage;
@@ -202,6 +204,7 @@ fn lock(
             image,
             storage,
             length,
+            format,
             ticket: None,
             job: None,
             result: None,
@@ -250,10 +253,11 @@ fn lock_rectangle(
     })
 }
 fn locked_rect(r: &Resource, rectangle: Rect) -> D3DLOCKED_RECT {
-    let pitch = r.desc.Width * 4;
+    let pitch = format::pitch(r.desc.Format, r.desc.Width).unwrap();
+    let bytes = format::bytes(r.desc.Format).unwrap();
     D3DLOCKED_RECT {
         Pitch: pitch as i32,
-        pBits: r.storage + rectangle.y * pitch + rectangle.x * 4,
+        pBits: r.storage + rectangle.y * pitch + rectangle.x * bytes,
     }
 }
 fn set_lock(env: &mut Env<'_>, resource: Id, lock: Option<Lock>) {
@@ -289,8 +293,9 @@ fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     let Some(target) = r.surface.and_then(|s| (provider.target)(env.ext, s)) else {
         return Outcome::Return(INVALID);
     };
-    let pitch = r.desc.Width * 4;
-    let size = (lock.rectangle.h - 1) * pitch + lock.rectangle.w * 4;
+    let pitch = format::pitch(r.desc.Format, r.desc.Width).unwrap();
+    let row = format::pitch(r.desc.Format, lock.rectangle.w).unwrap();
+    let size = (lock.rectangle.h - 1) * pitch + row;
     let address = locked_rect(r, lock.rectangle).pBits;
     let format = r.desc.Format;
     let mut pixels = vec![0; size as usize];
@@ -299,13 +304,11 @@ fn unlock(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     {
         return Outcome::Return(INVALID);
     }
-    if format == 22 {
-        for y in 0..lock.rectangle.h as usize {
-            for x in 0..lock.rectangle.w as usize {
-                pixels[y * pitch as usize + x * 4 + 3] = 255;
-            }
-        }
-    }
+    let Some((pixels, pitch)) =
+        format::upload(format, pixels, pitch, lock.rectangle.w, lock.rectangle.h)
+    else {
+        return Outcome::Return(INVALID);
+    };
     set_lock(
         env,
         id,
@@ -400,7 +403,10 @@ pub(super) fn transfer(
     let Some(storage) = resources::storage(env, dst) else {
         return Outcome::Return(INVALID);
     };
-    let length = dst.desc.Width * dst.desc.Height * 4;
+    let format = dst.desc.Format;
+    let Some(length) = format::length(format, dst.desc.Width, dst.desc.Height) else {
+        return Outcome::Return(INVALID);
+    };
     if adv_abi::guest::check_range(env.cpu, storage, length, Prot::WRITE).is_err() {
         return Outcome::Return(INVALID);
     }
@@ -422,6 +428,7 @@ pub(super) fn transfer(
             image,
             storage,
             length,
+            format,
             ticket: None,
             job: None,
             result: None,
@@ -600,22 +607,34 @@ pub(super) fn pump(env: &mut Env<'_>) -> bool {
                 && let Some(result) = ticket.poll()
             {
                 transfer.result = Some(match result {
-                    Ok(pixels) if pixels.len() == transfer.length as usize => {
-                        // A different guest thread can change protection while
-                        // this thread is blocked. Revalidate the complete span
-                        // before committing any bytes on every backend.
-                        if adv_abi::guest::check_range(
-                            env.cpu,
-                            transfer.storage,
-                            transfer.length,
-                            Prot::WRITE,
-                        )
-                        .is_ok()
-                            && env.cpu.write(transfer.storage, &pixels).is_ok()
+                    Ok(pixels)
+                        if pixels.len()
+                            == transfer.image.width() as usize
+                                * transfer.image.height() as usize
+                                * 4 =>
+                    {
+                        match format::readback(transfer.format, pixels)
+                            .filter(|pixels| pixels.len() == transfer.length as usize)
                         {
-                            0
-                        } else {
-                            INVALID
+                            Some(pixels) => {
+                                // A different guest thread can change protection while
+                                // this thread is blocked. Revalidate the complete span
+                                // before committing any bytes on every backend.
+                                if adv_abi::guest::check_range(
+                                    env.cpu,
+                                    transfer.storage,
+                                    transfer.length,
+                                    Prot::WRITE,
+                                )
+                                .is_ok()
+                                    && env.cpu.write(transfer.storage, &pixels).is_ok()
+                                {
+                                    0
+                                } else {
+                                    INVALID
+                                }
+                            }
+                            None => DEVICE_LOST,
                         }
                     }
                     _ => DEVICE_LOST,

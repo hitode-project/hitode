@@ -403,7 +403,7 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
 #[test]
 fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaque() {
     use adv_device::gpu::AlphaMode;
-    for format in [21, 22] {
+    for format in [21, 22, 26] {
         let (mut m, device_pointer) = machine(true);
         let output = packet(&mut m, 0u32);
         okay(call(
@@ -415,21 +415,28 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
         let source = image(&mut m, texture, 0);
         assert_eq!(
             source.alpha_mode(),
-            if format == 21 {
+            if format != 22 {
                 AlphaMode::Stored
             } else {
                 AlphaMode::Opaque
             }
         );
         let locked = lock(&mut m, texture, 0, 0, 0x8000);
+        let coverage = if format == 26 { 136 } else { 128 };
         let row = [
-            255u8, 255, 255, 0, 255, 255, 255, 128, 255, 255, 255, 255, 0, 0, 0, 0,
+            255u8, 255, 255, 0, 255, 255, 255, coverage, 255, 255, 255, 255, 0, 0, 0, 0,
         ];
-        let data = row.repeat(4);
+        let data = if format == 26 {
+            assert_eq!(locked.Pitch, 8);
+            [0xff, 0x0f, 0xff, 0x8f, 0xff, 0xff, 0, 0].repeat(4)
+        } else {
+            assert_eq!(locked.Pitch, 16);
+            row.repeat(4)
+        };
         m.cpu.write(locked.pBits, &data).unwrap();
         okay(add_rect(&mut m, texture, 0));
         okay(unlock(&mut m, texture, 0));
-        let mut expected_upload = data.clone();
+        let mut expected_upload = row.repeat(4);
         if format == 22 {
             for pixel in expected_upload.chunks_exact_mut(4) {
                 pixel[3] = 255;
@@ -501,6 +508,12 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
                 &[device_pointer, state, value],
             ));
         }
+        // The observed font path modulates both channels against white diffuse.
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::SetTextureStageState",
+            &[device_pointer, 0, 4, 4],
+        ));
         let mut vertices = [0u32; 28];
         for (index, (x, y, u, v)) in [
             (-0.5f32, -0.5f32, 0f32, 0f32),
@@ -539,14 +552,14 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
         ));
         let drawn = pixels(&mut m, &target.image);
         for row in drawn.chunks_exact(16) {
-            if format == 21 {
+            if format != 22 {
                 assert_eq!(
                     &row[..3],
                     &[255, 0, 0],
                     "transparent white must preserve blue background"
                 );
                 assert_eq!(row[4], 255);
-                assert!(row[5].abs_diff(128) <= 1 && row[6].abs_diff(128) <= 1);
+                assert!(row[5].abs_diff(coverage) <= 1 && row[6].abs_diff(coverage) <= 1);
                 assert_eq!(&row[8..11], &[255; 3]);
                 assert_eq!(&row[12..15], &[255, 0, 0]);
             } else {
@@ -563,4 +576,159 @@ fn argb_font_coverage_survives_managed_upload_and_typed_draw_while_rgbx_is_opaqu
         ));
         assert_eq!(release(&mut env(&mut m), texture), 0);
     }
+}
+
+#[test]
+fn packed_argb_mip_and_surface_alias_locks_share_two_byte_storage_and_deferred_uploads() {
+    let (mut m, device) = machine(true);
+    let output = packet(&mut m, 0u32);
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::CreateTexture",
+        &[device, 4, 4, 3, 0, 26, 1, output, 0],
+    ));
+    let texture = m.cpu.read_u32(output).unwrap();
+    let levels = resources::resource(&env(&mut m), texture)
+        .unwrap()
+        .levels
+        .clone();
+    assert_eq!(
+        levels.iter().map(|level| level.offset).collect::<Vec<_>>(),
+        [0, 32, 40]
+    );
+    let mut locks = Vec::new();
+    for (level, width) in [4u32, 2, 1].into_iter().enumerate() {
+        let locked = lock(&mut m, texture, level as u32, 0, 0x8000);
+        assert_eq!(locked.Pitch, (width * 2) as i32);
+        assert_eq!(
+            locked.pBits,
+            resources::resource(&env(&mut m), texture).unwrap().storage + levels[level].offset
+        );
+        m.cpu
+            .write(locked.pBits, &[0x23, 0x81].repeat((width * width) as usize))
+            .unwrap();
+        locks.push(locked);
+    }
+    let submitted = submissions(&m);
+    okay(add_rect(&mut m, texture, 0));
+    okay(unlock(&mut m, texture, 0));
+    okay(unlock(&mut m, texture, 1));
+    assert_eq!(
+        submissions(&m),
+        submitted,
+        "a remaining mip lock prevents upload"
+    );
+    okay(unlock(&mut m, texture, 2));
+    for (level, width) in [4u32, 2, 1].into_iter().enumerate() {
+        let image = image(&mut m, texture, level);
+        assert_eq!(
+            pixels(&mut m, &image),
+            [51, 34, 17, 136].repeat((width * width) as usize)
+        );
+    }
+    okay(call(
+        &mut m,
+        "IDirect3DTexture9::GetSurfaceLevel",
+        &[texture, 0, output],
+    ));
+    let alias = m.cpu.read_u32(output).unwrap();
+    let rect = packet(
+        &mut m,
+        RECT {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 3,
+        },
+    );
+    let locked_output = packet(&mut m, D3DLOCKED_RECT::default());
+    okay(call(
+        &mut m,
+        "IDirect3DSurface9::LockRect",
+        &[alias, locked_output, rect, 0x8000],
+    ));
+    let locked: D3DLOCKED_RECT = GuestPtr::new(locked_output).read(&m.cpu).unwrap();
+    assert_eq!((locked.Pitch, locked.pBits), (8, locks[0].pBits + 10));
+    assert!(matches!(
+        call(
+            &mut m,
+            "IDirect3DTexture9::LockRect",
+            &[texture, 0, locked_output, 0, 0]
+        ),
+        Outcome::Return(INVALID)
+    ));
+    m.cpu.write(locked.pBits, &[0x00, 0xff]).unwrap();
+    let submitted = submissions(&m);
+    okay(add_rect(&mut m, texture, rect));
+    assert_eq!(submissions(&m), submitted);
+    okay(call(&mut m, "IDirect3DSurface9::UnlockRect", &[alias]));
+    let image = image(&mut m, texture, 0);
+    let actual = pixels(&mut m, &image);
+    assert_eq!(&actual[20..24], &[0, 0, 255, 255]);
+    assert_eq!(&actual[..4], &[51, 34, 17, 136]);
+    let desc_output = packet(&mut m, adv_abi::types::D3DSURFACE_DESC::default());
+    okay(call(
+        &mut m,
+        "IDirect3DSurface9::GetDesc",
+        &[alias, desc_output],
+    ));
+    let desc: adv_abi::types::D3DSURFACE_DESC = GuestPtr::new(desc_output).read(&m.cpu).unwrap();
+    assert_eq!((desc.Format, desc.Width, desc.Height), (26, 4, 4));
+    assert_eq!(release(&mut env(&mut m), alias), 1);
+    assert_eq!(release(&mut env(&mut m), texture), 0);
+}
+
+#[test]
+fn packed_argb_rejects_render_targets_and_keeps_offscreen_guest_locks_packed() {
+    let (mut m, device) = machine(false);
+    let output = packet(&mut m, 0xdeadbeefu32);
+    assert!(matches!(
+        call(
+            &mut m,
+            "IDirect3DDevice9::CreateTexture",
+            &[device, 4, 4, 1, 1, 26, 0, output, 0]
+        ),
+        Outcome::Return(UNAVAILABLE)
+    ));
+    assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::CreateOffscreenPlainSurface",
+        &[device, 3, 2, 26, 2, output, 0],
+    ));
+    let surface = m.cpu.read_u32(output).unwrap();
+    let rect = packet(
+        &mut m,
+        RECT {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 2,
+        },
+    );
+    let locked_output = packet(&mut m, D3DLOCKED_RECT::default());
+    let storage = resources::resource(&env(&mut m), surface).unwrap().storage;
+    okay(call(
+        &mut m,
+        "IDirect3DSurface9::LockRect",
+        &[surface, locked_output, rect, 0],
+    ));
+    let locked: D3DLOCKED_RECT = GuestPtr::new(locked_output).read(&m.cpu).unwrap();
+    assert_eq!((locked.Pitch, locked.pBits), (6, storage + 8));
+    m.cpu
+        .write(locked.pBits, &[0x23, 0x81, 0xff, 0x0f])
+        .unwrap();
+    okay(call(&mut m, "IDirect3DSurface9::UnlockRect", &[surface]));
+    okay(call(
+        &mut m,
+        "IDirect3DSurface9::LockRect",
+        &[surface, locked_output, rect, 0x10],
+    ));
+    let mut actual = [0u8; 4];
+    m.cpu.read(locked.pBits, &mut actual).unwrap();
+    assert_eq!(actual, [0x23, 0x81, 0xff, 0x0f]);
+    okay(call(&mut m, "IDirect3DSurface9::UnlockRect", &[surface]));
+    assert!(m.ext.get::<State>().pending.is_empty());
+    assert!(m.ext.get::<State>().transfers.is_empty());
+    assert_eq!(release(&mut env(&mut m), surface), 0);
 }
