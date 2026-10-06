@@ -24,6 +24,7 @@ fn store_frame(session: &Session, frame_serial: &mut u64, frame: Frame) {
             .frame
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(frame));
+        crate::notify_changed(session);
     }
 }
 fn find_menu(items: &[MenuItem], id: u32, found: &mut Vec<adv_runtime::MenuCommand>) {
@@ -215,6 +216,7 @@ fn snapshot(
     session: &Session,
     output: &adv_device::Output,
     scheduling: &Value,
+    frame_output: (u64, u64),
     status: &str,
     paused: bool,
     command_error: &Option<String>,
@@ -245,6 +247,7 @@ fn snapshot(
                 "missing_output_frames":pcm.missing_output_frames},
             "build":option_env!("ADV_ANDROID_SHELL_BUILD").unwrap_or("unrecorded"),
             "guest_workers":1,"backend":"jit","gpu_enabled":cfg!(feature="gpu"),"scheduling":scheduling,
+            "frame_output":{"published":frame_output.0,"duplicates":frame_output.1},
             "graphics":if cfg!(feature="gpu") {"existing GPU with Bitmap readback"} else {"software GDI/DirectDraw"}
         }),
     )
@@ -386,6 +389,10 @@ pub fn run(
     let mut input_fence: Option<(u64, Instant)> = None;
     #[cfg(feature = "gpu")]
     let mut capture = crate::gpu::Capture::new();
+    #[cfg(feature = "gpu")]
+    let mut frame_output = (0, 0);
+    #[cfg(not(feature = "gpu"))]
+    let frame_output = (0, 0);
     let scheduling = crate::scheduling::configure_execution_thread();
     let status;
     loop {
@@ -429,6 +436,7 @@ pub fn run(
                 session,
                 &output,
                 &scheduling,
+                frame_output,
                 if paused { "paused" } else { "running" },
                 paused,
                 &command_error,
@@ -517,6 +525,10 @@ pub fn run(
         }
         #[cfg(feature = "gpu")]
         let latest = capture.update(&mut runtime, session)?;
+        #[cfg(feature = "gpu")]
+        {
+            frame_output = capture.metrics();
+        }
         #[cfg(not(feature = "gpu"))]
         let latest = {
             if !paused {
@@ -567,6 +579,7 @@ pub fn run(
                     session,
                     &output,
                     &scheduling,
+                    frame_output,
                     if paused {
                         "paused"
                     } else if closing.is_some() {
@@ -599,11 +612,11 @@ pub fn run(
             });
             #[cfg(feature = "gpu")]
             let delay = if !paused && closing.is_none() {
-                delay.min(
-                    capture
-                        .next_wake()
-                        .saturating_duration_since(Instant::now()),
-                )
+                capture
+                    .next_wake(runtime.has_pending_frame())
+                    .map_or(delay, |wake| {
+                        delay.min(wake.saturating_duration_since(Instant::now()))
+                    })
             } else {
                 delay
             };
@@ -626,6 +639,7 @@ pub fn run(
             if let Some(latest) = capture.update(&mut runtime, session)? {
                 store_frame(session, &mut frame_serial, latest);
             }
+            frame_output = capture.metrics();
             if !runtime.has_pending_frame() {
                 break;
             }
@@ -635,9 +649,11 @@ pub fn run(
                 return Err("final GPU capture timed out".into());
             }
             let delay = capture
-                .next_wake()
-                .saturating_duration_since(Instant::now())
-                .min(remaining);
+                .next_wake(runtime.has_pending_frame())
+                .map_or(remaining, |wake| {
+                    wake.saturating_duration_since(Instant::now())
+                        .min(remaining)
+                });
             session
                 .wake
                 .wait(Some(delay))
@@ -653,6 +669,7 @@ pub fn run(
         session,
         &output,
         &scheduling,
+        frame_output,
         status,
         paused,
         &command_error,

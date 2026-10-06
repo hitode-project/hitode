@@ -45,6 +45,7 @@ import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Locale;
@@ -64,7 +65,14 @@ public final class GameActivity extends Activity {
     private static final int TEXT = Color.rgb(235, 240, 247);
     private static final int MUTED = Color.rgb(166, 180, 199);
     private static final int ACCENT = Color.rgb(119, 192, 255);
+    private static final int FRAME_CHANGED = 1, STATE_CHANGED = 2;
+    private static volatile WeakReference<GameActivity> currentActivity = new WeakReference<>(null);
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Object nativeUpdateLock = new Object();
+    private final Runnable deliverNativeUpdate = this::deliverNativeUpdate;
+    private long nativeUpdateHandle;
+    private int nativeUpdateFlags;
+    private boolean nativeUpdateQueued;
     private final ExecutorService work = Executors.newSingleThreadExecutor();
     private final AtomicInteger generation = new AtomicInteger();
     private final AtomicBoolean importCancelled = new AtomicBoolean();
@@ -99,8 +107,33 @@ public final class GameActivity extends Activity {
     private static native long nativeCopyFrame(long session, Bitmap target);
     private static native void nativeStop(long session);
 
+    // Called by the native worker. Keep both queues bounded while it publishes updates.
+    private static void onNativeUpdate(long handle, int flags) {
+        GameActivity activity = currentActivity.get();
+        if (activity == null || activity.destroyed || activity.session != handle) return;
+        synchronized (activity.nativeUpdateLock) {
+            if (activity.destroyed || activity.session != handle) return;
+            if (activity.nativeUpdateHandle != handle) activity.nativeUpdateFlags = 0;
+            activity.nativeUpdateHandle = handle;
+            activity.nativeUpdateFlags |= flags & (FRAME_CHANGED | STATE_CHANGED);
+            if (activity.nativeUpdateQueued || activity.nativeUpdateFlags == 0) return;
+            activity.nativeUpdateQueued = true;
+            activity.main.post(activity.deliverNativeUpdate);
+        }
+    }
+    private void deliverNativeUpdate() {
+        final long handle;
+        final int flags;
+        synchronized (nativeUpdateLock) {
+            handle = nativeUpdateHandle; flags = nativeUpdateFlags;
+            nativeUpdateFlags = 0; nativeUpdateQueued = false;
+        }
+        if (!destroyed && session == handle && gameSurface != null) gameSurface.nativeChanged(flags);
+    }
+
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        currentActivity = new WeakReference<>(this);
         getWindow().setStatusBarColor(BACKGROUND);
         getWindow().setNavigationBarColor(BACKGROUND);
         audioManager = (AudioManager)getSystemService(AUDIO_SERVICE);
@@ -533,13 +566,17 @@ public final class GameActivity extends Activity {
         private final HandlerThread renderer;
         private final Handler renderHandler;
         private final long[] frameInfo = new long[3];
+        private final AtomicInteger pendingChanges = new AtomicInteger();
+        private final AtomicBoolean changeQueued = new AtomicBoolean();
         private final Runnable synchronizeState = this::synchronizeState;
+        private final Runnable consumeNativeChanges = this::consumeNativeChanges;
         private final Runnable pollState = this::pollState;
+        private final Runnable fixtureReport = this::fixtureReport;
         // These fields and the Bitmap belong to the render looper.
         private Choreographer choreographer;
         private Bitmap bitmap;
-        private boolean frameScheduled, stateScheduled, redraw = true, disposed;
-        private long copied = -1, presented = -1, observedHandle, lastFixtureReport;
+        private boolean frameScheduled, stateScheduled, fixtureScheduled, redraw = true, disposed, copyRetry;
+        private long copied = -1, presented = -1, observedHandle;
         private long canvasPosts, frameCopies, statePolls, vsyncCallbacks;
         private boolean hardwareCanvas;
         private volatile RectF destination = new RectF();
@@ -561,6 +598,26 @@ public final class GameActivity extends Activity {
             releasePointer(); wake();
         }
         void wake() { if (open) renderHandler.post(synchronizeState); }
+        void nativeChanged(int flags) {
+            if (!open) return;
+            pendingChanges.getAndAccumulate(flags, (pending, update) -> pending | update);
+            queueNativeChanges();
+        }
+        private void queueNativeChanges() {
+            if (open && pendingChanges.get() != 0 && changeQueued.compareAndSet(false, true)) {
+                if (!renderHandler.post(consumeNativeChanges)) changeQueued.set(false);
+            }
+        }
+        private void consumeNativeChanges() {
+            int flags = pendingChanges.getAndSet(0);
+            changeQueued.set(false);
+            // An update between the atomic drain and clearing the guard needs its own handoff.
+            queueNativeChanges();
+            if (disposed) return;
+            if (!open || destroyed) { dispose(); return; }
+            if ((flags & STATE_CHANGED) != 0) requestState();
+            if ((flags & FRAME_CHANGED) != 0) { copyRetry = false; scheduleFrame(); }
+        }
         void close() {
             synchronized (surfaceLock) { open = false; ready = false; }
             renderHandler.post(this::dispose);
@@ -572,12 +629,21 @@ public final class GameActivity extends Activity {
             if (!open || destroyed) { dispose(); return; }
             redraw = true;
             if (canPoll()) {
-                if (!stateScheduled) { stateScheduled = true; renderHandler.post(pollState); }
+                requestState();
+                if (activeFixture && !fixtureScheduled) {
+                    fixtureScheduled = true; renderHandler.postDelayed(fixtureReport, 500);
+                }
             } else {
                 renderHandler.removeCallbacks(pollState); stateScheduled = false;
+                renderHandler.removeCallbacks(fixtureReport); fixtureScheduled = false;
             }
-            if (canPresent()) scheduleFrame();
+            if (canPresent()) { copyRetry = false; scheduleFrame(); }
             else if (frameScheduled) { choreographer.removeFrameCallback(this); frameScheduled = false; }
+        }
+        private void requestState() {
+            if (!disposed && canPoll() && !stateScheduled) {
+                stateScheduled = true; renderHandler.post(pollState);
+            }
         }
         private void scheduleFrame() {
             if (!disposed && canPresent() && !frameScheduled) {
@@ -587,13 +653,15 @@ public final class GameActivity extends Activity {
         @Override public void doFrame(long frameTimeNanos) {
             frameScheduled = false; ++vsyncCallbacks;
             if (disposed || !canPresent()) return;
+            boolean allowRetry = !copyRetry;
+            copyRetry = false;
             long handle = session;
             try {
                 if (handle != observedHandle) {
                     observedHandle = handle; copied = presented = -1; redraw = true;
                     frameWidth = frameHeight = 0; destination = new RectF();
                 }
-                // Reuse primitive metadata; JSON menus/dialogs are polled separately at 10 Hz.
+                // A native update requests one vsync; unchanged scenes leave the presenter idle.
                 nativeFrameInfo(handle, frameInfo);
                 long serial = frameInfo[0], width = frameInfo[1], height = frameInfo[2];
                 if (serial >= 0 && width > 0 && height > 0 && width <= 4096 && height <= 4096 && width * height <= 16777216) {
@@ -605,16 +673,18 @@ public final class GameActivity extends Activity {
                             if (bitmap != null) bitmap.recycle();
                             bitmap = next; copied = complete; redraw = true;
                             frameWidth = (int)width; frameHeight = (int)height;
-                        } else next.recycle();
+                        } else { next.recycle(); copyRetry = allowRetry; }
                     } else if (serial != copied) {
                         ++frameCopies;
                         long complete = nativeCopyFrame(handle, bitmap);
                         if (complete >= 0) { copied = complete; frameWidth = (int)width; frameHeight = (int)height; }
+                        else copyRetry = allowRetry;
                     }
                 }
                 if (redraw || copied != presented) present(handle);
             } catch (Throwable error) { presentationFailed(handle, error); }
-            scheduleFrame();
+            // Metadata and copy can observe opposite sides of a resize. Retry once next vsync.
+            if (copyRetry) scheduleFrame();
         }
         private void present(long handle) {
             synchronized (surfaceLock) {
@@ -641,17 +711,34 @@ public final class GameActivity extends Activity {
             try {
                 ++statePolls;
                 JSONObject snapshot = new JSONObject(nativePoll(handle));
-                long now = android.os.SystemClock.uptimeMillis();
-                if (activeFixture && now - lastFixtureReport >= 500) {
-                    lastFixtureReport = now;
-                    snapshot.put("presented_serial", presented).put("canvas_posts", canvasPosts)
-                        .put("frame_copies", frameCopies).put("state_polls", statePolls)
-                        .put("vsync_callbacks", vsyncCallbacks).put("hardware_canvas", hardwareCanvas);
-                    writeFixtureReport(snapshot);
-                }
                 main.post(() -> updateState(handle, snapshot));
             } catch (Throwable error) { presentationFailed(handle, error); }
-            if (!disposed && canPoll()) { stateScheduled = true; renderHandler.postDelayed(pollState, 100); }
+        }
+        private JSONObject diagnosticSnapshot(long handle) throws Exception {
+            ++statePolls;
+            return new JSONObject(nativePoll(handle)).put("presented_serial", presented)
+                .put("canvas_posts", canvasPosts).put("frame_copies", frameCopies)
+                .put("state_polls", statePolls).put("vsync_callbacks", vsyncCallbacks)
+                .put("hardware_canvas", hardwareCanvas);
+        }
+        private void fixtureReport() {
+            fixtureScheduled = false;
+            if (disposed || !activeFixture || !canPoll()) return;
+            long handle = session;
+            try { writeFixtureReport(diagnosticSnapshot(handle)); }
+            catch (Throwable error) { presentationFailed(handle, error); }
+            if (!disposed && activeFixture && canPoll()) {
+                fixtureScheduled = true; renderHandler.postDelayed(fixtureReport, 500);
+            }
+        }
+        void snapshot() {
+            long handle = session;
+            if (!open || handle == 0) return;
+            renderHandler.post(() -> {
+                if (disposed || !open || destroyed || session != handle) return;
+                try { writeReport("player-state.json", diagnosticSnapshot(handle)); }
+                catch (Throwable error) { Log.w(TAG, "Player snapshot", error); }
+            });
         }
         private void presentationFailed(long handle, Throwable error) {
             Log.e(TAG, "Presentation", error);
@@ -664,7 +751,9 @@ public final class GameActivity extends Activity {
             disposed = true;
             if (choreographer != null) choreographer.removeFrameCallback(this);
             renderHandler.removeCallbacks(pollState); renderHandler.removeCallbacks(synchronizeState);
-            frameScheduled = stateScheduled = false;
+            renderHandler.removeCallbacks(consumeNativeChanges); renderHandler.removeCallbacks(fixtureReport);
+            pendingChanges.set(0); changeQueued.set(false);
+            frameScheduled = stateScheduled = fixtureScheduled = false;
             if (bitmap != null) { bitmap.recycle(); bitmap = null; }
             frameWidth = frameHeight = 0; destination = new RectF();
             renderer.quitSafely();
@@ -701,13 +790,18 @@ public final class GameActivity extends Activity {
         }
     }
 
-    // Debug-only, fixed private fixture. No intent supplies an executable path or native JSON.
+    // Debug-only diagnostics and a fixed private fixture. Intents supply no executable path or native JSON.
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) == 0) return;
         String action = intent.getStringExtra("probe_action");
         if (action == null) {
             if (session == 0 && gameSurface == null && "shell-probe".equals(intent.getStringExtra("fixture"))) launchFixture();
+            return;
+        }
+        if (action.equals("snapshot")) {
+            if (session != 0 && gameSurface != null) gameSurface.snapshot();
+            else Log.w(TAG, "Rejected snapshot without an active game");
             return;
         }
         if (!activeFixture || session == 0 || gameSurface == null) { Log.w(TAG, "Rejected fixture action outside fixture"); return; }
@@ -763,7 +857,10 @@ public final class GameActivity extends Activity {
         return false;
     }
     private void writeFixtureReport(JSONObject snapshot) {
-        android.util.AtomicFile report = new android.util.AtomicFile(new File(getFilesDir(), "shell-state.json"));
+        writeReport("shell-state.json", snapshot);
+    }
+    private void writeReport(String filename, JSONObject snapshot) {
+        android.util.AtomicFile report = new android.util.AtomicFile(new File(getFilesDir(), filename));
         java.io.FileOutputStream output = null;
         try { output = report.startWrite(); output.write(snapshot.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); report.finishWrite(output); }
         catch (Exception error) { if (output != null) report.failWrite(output); Log.w(TAG, "Fixture report", error); }
@@ -792,7 +889,9 @@ public final class GameActivity extends Activity {
     @Override protected void onResume() { super.onResume(); resumed = true; if (session != 0) { requestAudioFocus(); command(object("type", "audio_focus", "active", audioFocused)); command(object("type", "resume")); if (gameSurface != null) gameSurface.wake(); } }
     @Override public void onConfigurationChanged(Configuration configuration) { super.onConfigurationChanged(configuration); releaseInputs(); if (root != null) root.requestApplyInsets(); }
     @Override protected void onDestroy() {
+        if (currentActivity.get() == this) currentActivity = new WeakReference<>(null);
         destroyed = true; generation.incrementAndGet(); importCancelled.set(true); if (importing && library != null) new Thread(() -> library.cancelImport(), "adv-import-cancel").start(); releaseInputs();
+        main.removeCallbacks(deliverNativeUpdate);
         long handle = session; session = 0; if (gameSurface != null) gameSurface.close(); if (handle != 0) nativeStop(handle);
         if (pendingImport != null) {
             GameLibrary.Imported pending = pendingImport; pendingImport = null;

@@ -22,10 +22,31 @@ struct Flight {
     pixels: Option<Vec<u8>>,
 }
 
+fn software_frame(
+    snapshot: &adv_device::surface::Snapshot,
+    previous: Option<&Frame>,
+) -> Option<Frame> {
+    if previous.is_some_and(|previous| {
+        previous.width == snapshot.width
+            && previous.height == snapshot.height
+            && previous.bgra == snapshot.bgra
+    }) {
+        return None;
+    }
+    Some(Frame {
+        serial: snapshot.frames,
+        width: snapshot.width,
+        height: snapshot.height,
+        bgra: snapshot.bgra.clone(),
+    })
+}
+
 pub struct Capture {
     flight: Option<Flight>,
     next_request: Instant,
     next_output: Instant,
+    published_frames: u64,
+    duplicate_frames: u64,
 }
 impl Capture {
     pub fn new() -> Self {
@@ -34,6 +55,8 @@ impl Capture {
             flight: None,
             next_request: now,
             next_output: now,
+            published_frames: 0,
+            duplicate_frames: 0,
         }
     }
 
@@ -45,15 +68,20 @@ impl Capture {
 
     /// Fold this into the ordinary idle wait. Map completion also signals the
     /// worker's wake event, so a submitted transfer needs no periodic fence poll.
-    pub fn next_wake(&self) -> Instant {
+    pub fn next_wake(&self, pending_frame: bool) -> Option<Instant> {
         match &self.flight {
-            Some(flight) if flight.pixels.is_some() => self.next_output,
+            Some(flight) if flight.pixels.is_some() => Some(self.next_output),
             Some(flight) if flight.task.is_some() => {
-                (Instant::now() + Duration::from_millis(1)).min(flight.deadline)
+                Some((Instant::now() + Duration::from_millis(1)).min(flight.deadline))
             }
-            Some(flight) => flight.deadline,
-            None => self.next_request,
+            Some(flight) => Some(flight.deadline),
+            None if pending_frame => Some(self.next_request),
+            None => None,
         }
+    }
+
+    pub fn metrics(&self) -> (u64, u64) {
+        (self.published_frames, self.duplicate_frames)
     }
 
     fn submit(&mut self, runtime: &mut Runtime) -> Result<(), String> {
@@ -116,10 +144,14 @@ impl Capture {
                     bgra: pixels,
                 });
                 self.next_output = now + FRAME_INTERVAL;
+                self.published_frames = self.published_frames.saturating_add(1);
             }
         }
         if self.flight.is_some() {
             self.submit(runtime)?;
+            return Ok(ready);
+        }
+        if !runtime.has_pending_frame() {
             return Ok(ready);
         }
         if now < self.next_request {
@@ -150,16 +182,78 @@ impl Capture {
             });
             self.submit(runtime)?;
         } else if ready.is_none() && now >= self.next_output && runtime.capture_latest_frame()? {
-            let frame = runtime.frame();
-            ready = Some(Frame {
-                serial: frame.frames,
-                width: frame.width,
-                height: frame.height,
-                bgra: frame.bgra.clone(),
-            });
+            // Source capture accounting still advances for every presentation.
+            // Keep the last distinct snapshot's serial as the Bitmap identity.
+            let previous = session
+                .frame
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            ready = software_frame(runtime.frame(), previous.as_deref());
+            if ready.is_some() {
+                self.published_frames = self.published_frames.saturating_add(1);
+            } else {
+                self.duplicate_frames = self.duplicate_frames.saturating_add(1);
+            }
             self.next_output = now + FRAME_INTERVAL;
         }
         Ok(ready)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_device::surface::Snapshot;
+
+    #[test]
+    fn identical_software_pixels_do_not_publish_a_new_bitmap() {
+        let previous = Frame {
+            serial: 1,
+            width: 2,
+            height: 1,
+            bgra: vec![0, 0, 255, 255, 0, 255, 0, 255],
+        };
+        let mut snapshot = Snapshot {
+            frames: 99,
+            width: 2,
+            height: 1,
+            bgra: previous.bgra.clone(),
+        };
+        assert!(software_frame(&snapshot, Some(&previous)).is_none());
+        assert_eq!(snapshot.frames, 99, "source accounting remains current");
+
+        snapshot.bgra[4] = 1;
+        let changed = software_frame(&snapshot, Some(&previous)).unwrap();
+        assert_eq!(changed.serial, 99);
+        assert_eq!(changed.bgra, snapshot.bgra);
+    }
+
+    #[test]
+    fn software_dimensions_and_first_frame_are_always_published() {
+        let previous = Frame {
+            serial: 1,
+            width: 2,
+            height: 1,
+            bgra: vec![0; 8],
+        };
+        let snapshot = Snapshot {
+            frames: 2,
+            width: 1,
+            height: 2,
+            bgra: previous.bgra.clone(),
+        };
+        let changed = software_frame(&snapshot, Some(&previous)).unwrap();
+        assert_eq!((changed.width, changed.height, changed.serial), (1, 2, 2));
+        assert!(software_frame(&snapshot, None).is_some());
+    }
+
+    #[test]
+    fn no_frame_has_no_capture_timer_even_after_previous_deadline_expires() {
+        let mut capture = Capture::new();
+        capture.next_request = Instant::now() - FRAME_INTERVAL;
+        assert!(capture.next_wake(false).is_none());
+        assert_eq!(capture.next_wake(true), Some(capture.next_request));
     }
 }
 impl Drop for Capture {

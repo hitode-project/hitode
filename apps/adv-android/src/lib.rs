@@ -9,6 +9,8 @@ use adv_sync::{WakeEvent, input::KeyState};
 use jni::JNIEnv;
 use jni::objects::{GlobalRef, JClass, JLongArray, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
+#[cfg(target_os = "android")]
+use jni::{JavaVM, objects::JValue};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +35,7 @@ struct Session {
     input_epoch: AtomicU64,
     input_lock: Mutex<()>,
     poll: Mutex<Arc<String>>,
+    ui_state: Mutex<Option<serde_json::Value>>,
     frame: Mutex<Option<Arc<Frame>>>,
 }
 struct Packet {
@@ -136,6 +139,10 @@ fn rgba_row(source: &[u8], target: &mut [u8]) {
     }
 }
 static APPLICATION: OnceLock<GlobalRef> = OnceLock::new();
+#[cfg(target_os = "android")]
+static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+#[cfg(target_os = "android")]
+static PLAYER_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 static INITIALIZING: Mutex<()> = Mutex::new(());
 static SESSION: Mutex<Option<Arc<Session>>> = Mutex::new(None);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -149,11 +156,69 @@ fn session(handle: jlong) -> Result<Arc<Session>, String> {
         .ok_or_else(|| "invalid or stale Android session handle".into())
 }
 fn publish(session: &Session, value: serde_json::Value) {
+    let changed = {
+        let mut previous = session
+            .ui_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let changed = ui_changed(previous.as_ref(), &value);
+        if changed {
+            *previous = Some(value.clone());
+        }
+        changed
+    };
     let text = Arc::new(value.to_string());
     *session
         .poll
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = text;
+    if changed {
+        notify_java(session, 2);
+    }
+}
+fn ui_changed(previous: Option<&serde_json::Value>, next: &serde_json::Value) -> bool {
+    previous.is_none_or(|previous| {
+        [
+            "status",
+            "error",
+            "menus",
+            "dialogs",
+            "menu_enabled",
+            "command_error",
+        ]
+        .iter()
+        .any(|key| previous.get(*key) != next.get(*key))
+    })
+}
+/// Frame publication precedes this notification; Java coalesces work at vsync.
+pub(crate) fn notify_changed(session: &Session) {
+    notify_java(session, 1);
+}
+fn notify_java(session: &Session, flags: i32) {
+    #[cfg(target_os = "android")]
+    {
+        let (Some(vm), Some(class)) = (JAVA_VM.get(), PLAYER_CLASS.get()) else {
+            return;
+        };
+        // The native worker attaches once and stays attached until thread exit.
+        // Callbacks enqueue Java looper work only; no UI or guest work runs here.
+        if let Ok(mut env) = vm.attach_current_thread_as_daemon() {
+            let class: &JClass<'_> = class.as_obj().into();
+            if env
+                .call_static_method(
+                    class,
+                    "onNativeUpdate",
+                    "(JI)V",
+                    &[JValue::Long(session.id as jlong), JValue::Int(flags)],
+                )
+                .is_err()
+            {
+                let _ = env.exception_clear();
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = (session, flags);
 }
 fn throw(env: &mut JNIEnv<'_>, error: impl AsRef<str>) {
     let _ = env.throw_new("java/lang/IllegalStateException", error.as_ref());
@@ -186,6 +251,9 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeInit(
         #[cfg(target_os = "android")]
         {
             let vm = env.get_java_vm().map_err(|error| error.to_string())?;
+            let class = env
+                .new_global_ref(&_class)
+                .map_err(|error| error.to_string())?;
             // The JVM and application GlobalRef remain valid for process lifetime.
             // This serialized initialization happens before any AAudio worker exists.
             unsafe {
@@ -194,6 +262,12 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeInit(
                     reference.as_obj().as_raw().cast(),
                 );
             }
+            JAVA_VM
+                .set(vm)
+                .map_err(|_| "Android JVM was already initialized")?;
+            PLAYER_CLASS
+                .set(class)
+                .map_err(|_| "Android player class was already initialized")?;
         }
         APPLICATION
             .set(reference)
@@ -251,6 +325,7 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeStart(
             input_epoch: AtomicU64::new(1),
             input_lock: Mutex::new(()),
             frame: Mutex::new(None),
+            ui_state: Mutex::new(None),
             poll: Mutex::new(Arc::new(
                 json!({"session":id,"status":"starting","startup_stage":"spawned","error":null,
                 "frame":{"serial":0,"width":0,"height":0},"menus":[],"dialogs":[]})
@@ -386,14 +461,25 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeFrameInfo(
     output: JLongArray<'_>,
 ) {
     let result = (|| -> Result<(), String> {
-        if env.get_array_length(&output).map_err(|error| error.to_string())? != 3 {
+        if env
+            .get_array_length(&output)
+            .map_err(|error| error.to_string())?
+            != 3
+        {
             return Err("frameInfo requires a three-element long array".into());
         }
         let session = session(handle)?;
         let metadata = {
-            let frame = session.frame.lock().unwrap_or_else(|error| error.into_inner());
+            let frame = session
+                .frame
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             frame.as_ref().map_or([-1, 0, 0], |frame| {
-                [frame.serial as jlong, frame.width as jlong, frame.height as jlong]
+                [
+                    frame.serial as jlong,
+                    frame.width as jlong,
+                    frame.height as jlong,
+                ]
             })
         };
         env.set_long_array_region(&output, 0, &metadata)
@@ -489,6 +575,28 @@ pub extern "system" fn Java_org_advhost_player_GameActivity_nativeCopyFrame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ui_notifications_ignore_telemetry_but_preserve_controls_and_errors() {
+        let initial = json!({"status":"running", "menus":[], "dialogs":[],
+            "menu_enabled":false, "error":null, "frames":1});
+        assert!(ui_changed(None, &initial));
+        let mut next = initial.clone();
+        next["frames"] = json!(500);
+        next["audio"] = json!({"callbacks":600});
+        assert!(!ui_changed(Some(&initial), &next));
+        for key in [
+            "status",
+            "menus",
+            "dialogs",
+            "menu_enabled",
+            "error",
+            "command_error",
+        ] {
+            let mut changed = next.clone();
+            changed[key] = json!("changed");
+            assert!(ui_changed(Some(&initial), &changed), "{key}");
+        }
+    }
     fn fixture(capacity: usize) -> (Session, mpsc::Receiver<Packet>) {
         let (commands, receiver) = mpsc::sync_channel(capacity);
         (
@@ -505,6 +613,7 @@ mod tests {
                 input_epoch: AtomicU64::new(1),
                 input_lock: Mutex::new(()),
                 poll: Mutex::new(Arc::new("{}".into())),
+                ui_state: Mutex::new(None),
                 frame: Mutex::new(None),
             },
             receiver,
