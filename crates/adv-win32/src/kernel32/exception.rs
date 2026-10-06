@@ -157,9 +157,9 @@ fn cpu_exception(env: &mut Env<'_>, event: Exception, checkpoint: Checkpoint) ->
         },
         Exception::Trap { vector: 6, .. } => (0xc000_001d, 0),
         other => {
-            return Outcome::Fail(format!(
-                "Windows exception mapping not implemented for {other:?}"
-            ));
+            let reason = format!("Windows exception mapping not implemented for {other:?}");
+            adv_abi::warn_unavailable(env, "Win32 exception mapping", &reason);
+            return Outcome::Fail(reason);
         }
     };
     let address = checkpoint.state.eip;
