@@ -4287,6 +4287,20 @@ impl Emitter<'_> {
             }
             // ADD and INC: SF ^ OF is the sign of the exact sum.
             1 if self.computes(result, ir::Opcode::Iadd, a, b) => {
+                // For signed i32 operands, a + b < 0 iff a <= -b - 1.
+                // -b - 1 is exactly !b, including b == i32::MIN. Keep this
+                // comparison at i32 width instead of sign-extending both
+                // operands to compute an i64 sum. Testing the wrapped result
+                // itself would lose x86 overflow semantics.
+                if matches!(m, M::Jl | M::Jge) {
+                    let bound = self.b.ins().bnot(b);
+                    let cc = if m == M::Jl {
+                        IntCC::SignedLessThanOrEqual
+                    } else {
+                        IntCC::SignedGreaterThan
+                    };
+                    return Some(self.b.ins().icmp(cc, a, bound));
+                }
                 let cc = signed(m)?;
                 let a = self.b.ins().sextend(types::I64, a);
                 let b = self.b.ins().sextend(types::I64, b);
