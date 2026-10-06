@@ -2,6 +2,7 @@
 //! ([`controls`]) and dialogs ([`dialog`]), plus resources, input state, monitors and the
 //! formatting/message-box helpers Game.exe uses.
 
+mod accelerator;
 pub(crate) mod clipboard;
 pub mod compat;
 pub mod controls;
@@ -559,6 +560,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    accelerator::register(reg);
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
@@ -602,8 +604,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "OffsetRect", 3, offset_rect);
     s(reg, "IntersectRect", 3, intersect_rect);
     s(reg, "UnionRect", 3, union_rect);
-    s(reg, "TranslateAcceleratorA", 3, |_| Outcome::Return(0));
-    s(reg, "TranslateAcceleratorW", 3, |_| Outcome::Return(0));
     s(reg, "AttachThreadInput", 3, |_| Outcome::Return(1));
     s(reg, "WindowFromPoint", 2, |_| Outcome::Return(0));
     s(reg, "EnumWindows", 2, |_| Outcome::Return(1));

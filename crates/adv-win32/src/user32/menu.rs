@@ -377,6 +377,10 @@ pub(super) fn attach_creation(
 
 fn get_system_menu(env: &mut Env<'_>) -> Outcome {
     let (hwnd, revert) = (env.arg(0), env.arg(1) != 0);
+    system_menu(env, hwnd, revert)
+}
+
+fn system_menu(env: &mut Env<'_>, hwnd: u32, revert: bool) -> Outcome {
     let Some(window) = user(env).windows.get(&env.sys.objects, &hwnd) else {
         set_last_error(env, 1400);
         return Outcome::Return(0);
@@ -441,6 +445,70 @@ fn get_system_menu(env: &mut Env<'_>) -> Outcome {
     u.menus.owners.insert(hwnd, menu);
     *u.menus.get_mut(&mut env.sys.objects, menu).unwrap() = items;
     Outcome::Return(menu)
+}
+
+/// Snapshot the sole menu tree for accelerator routing. Callers re-query after
+/// WM_INITMENU/WM_INITMENUPOPUP because those callbacks may alter or destroy it.
+#[derive(Clone, Copy)]
+pub(super) struct AcceleratorMenu {
+    pub root: u32,
+    pub popup: Option<(u32, u16)>,
+    pub system: bool,
+    pub enabled: bool,
+}
+
+pub(super) fn accelerator_lookup(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    command: u16,
+) -> Option<AcceleratorMenu> {
+    if !user(env).is_window(&env.sys.objects, hwnd) {
+        return None;
+    }
+    // The window already owns this lazy system-menu model; translation must see
+    // its default commands even before an application calls GetSystemMenu.
+    if command >= 0xf000 {
+        system_menu(env, hwnd, false);
+    }
+    let menus = &user(env).menus;
+    for (root, system) in [
+        (menus.owners.get(&hwnd).copied(), true),
+        (menus.attached.get(&hwnd).copied(), false),
+    ] {
+        let Some(root) = root else { continue };
+        let mut pending = vec![(root, 0, system.then_some((root, 0)), true)];
+        let mut visited = BTreeSet::new();
+        while let Some((menu, start, popup, ancestors_enabled)) = pending.pop() {
+            if start == 0 && !visited.insert(menu) {
+                continue;
+            }
+            let Some(items) = menus.get(&env.sys.objects, menu) else {
+                continue;
+            };
+            for (position, item) in items.iter().enumerate().skip(start) {
+                let enabled = ancestors_enabled && item.flags & (3 | 0x800) == 0;
+                if item.submenu == 0 && item.id == u32::from(command) {
+                    return Some(AcceleratorMenu {
+                        root,
+                        popup,
+                        system,
+                        enabled,
+                    });
+                }
+                if item.submenu != 0 {
+                    pending.push((menu, position + 1, popup, ancestors_enabled));
+                    pending.push((
+                        item.submenu,
+                        0,
+                        Some((item.submenu, position as u16)),
+                        enabled,
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    None
 }
 
 fn edit(env: &mut Env<'_>, mode: u8) -> Outcome {
