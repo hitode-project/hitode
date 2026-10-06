@@ -123,17 +123,37 @@ pub(crate) struct Recorder {
     /// with the same state apart soonest.
     order: Vec<usize>,
     poisoned: bool,
+    /// Diagnostic: the access that poisoned this recording.
+    why: String,
     pub(crate) armed: bool,
     pub(crate) saved_fuel: u64,
+    /// x87 last-instruction fields (see `x87_pointers`) some interpreted
+    /// instruction changed.
+    pub(crate) x87_written: u8,
+    /// Physical x87 registers some interpreted instruction loaded or changed.
+    pub(crate) x87_touched: u8,
+    /// Set when an instruction could observe empty x87 registers: MMX
+    /// aliases, environment stores and restores.
+    pub(crate) x87_opaque: bool,
+    /// Set when an instruction could read, clear or unmask the x87
+    /// exception flags.
+    pub(crate) x87_status: bool,
+    /// x87 condition code bits some interpreted instruction changed.
+    pub(crate) x87_conditions: u16,
 }
 
 impl Recorder {
-    fn access(&mut self, memory: &Memory, addr: u32, len: u32, write: bool) {
+    fn poison(&mut self, why: String) {
+        self.poisoned = true;
+        self.why = why;
+    }
+
+    pub(crate) fn access(&mut self, memory: &Memory, addr: u32, len: u32, write: bool) {
         if self.poisoned {
             return;
         }
         let Ok(range) = memory.range(addr, len as usize) else {
-            self.poisoned = true;
+            self.poison(format!("outside {addr:#x}"));
             return;
         };
         let need = if write { WRITE } else { READ };
@@ -144,11 +164,11 @@ impl Recorder {
             let permission = memory.perms[page];
             if permission & need == 0 || permission & SHARED != 0 || !memory.mapped[page] {
                 // The access itself faults or needs a helper; either aborts.
-                self.poisoned = true;
+                self.poison(format!("{addr:#x} perms {permission:#x} write={write}"));
                 return;
             }
             if self.pages.len() >= RECORD_PAGES && !self.pages.contains_key(&page) {
-                self.poisoned = true;
+                self.poison("too many pages".into());
                 return;
             }
             let record = self.pages.entry(page).or_insert_with(|| {
@@ -199,6 +219,20 @@ struct Entry {
     reads: Runs,
     writes: Runs,
     code: Vec<(usize, u64)>,
+    /// x87 pointer fields the result passes through; `key` holds only these.
+    x87_inputs: u8,
+    /// Physical registers empty on entry whose stale contents nothing
+    /// observed; `key` omits them.
+    x87_free: u8,
+    /// The free registers the function left alone; a hit keeps the caller's.
+    x87_kept: u8,
+    /// When nothing observed the x87 exception flags: those set on entry.
+    /// The function only adds flags, so any caller with at least these ends
+    /// with its own flags plus the recorded result's.
+    sticky: Option<u16>,
+    /// x87 status bits outside the key: unobserved sticky flags and
+    /// condition codes the function overwrites.
+    status_free: u16,
     out: Box<CpuState>,
     /// Memory epoch at which permissions and code versions last matched.
     epoch: u64,
@@ -209,6 +243,53 @@ struct Entry {
 impl Entry {
     fn bytes(&self) -> usize {
         self.reads.data.len() + self.writes.data.len() + 2 * std::mem::size_of::<CpuState>()
+    }
+
+    /// Diagnostic: input runs that differ now, as (guest address, length).
+    fn differences(&self, memory: &Memory) -> (usize, Vec<(u32, usize)>) {
+        let mut at = 0;
+        let mut total = 0;
+        let mut runs = Vec::new();
+        for &(offset, len) in &self.reads.runs {
+            let live = unsafe { std::slice::from_raw_parts(memory.ptr.as_ptr().add(offset), len) };
+            let old = &self.reads.data[at..at + len];
+            let mut index = 0;
+            while index < len {
+                if live[index] == old[index] {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < len && live[index] != old[index] {
+                    index += 1;
+                }
+                total += index - start;
+                if runs.len() < 6 {
+                    runs.push((memory.base + (offset + start) as u32, index - start));
+                }
+            }
+            at += len;
+        }
+        (total, runs)
+    }
+
+    /// Whether `probe`, the canonical entry state, equals the key once
+    /// pointer fields this entry overwrites are cleared.
+    fn same_key(&self, hash: u64, key: &CpuState, probe: &mut CpuState) -> bool {
+        if self.hash != hash {
+            return false;
+        }
+        if let Some(sticky) = self.sticky
+            && key.x87.status & sticky != sticky
+        {
+            return false;
+        }
+        set_x87_pointers(probe, x87_pointers(key));
+        probe.x87.regs = key.x87.regs;
+        probe.mmx = key.mmx;
+        probe.x87.status = key.x87.status;
+        mask_key(probe, self.x87_inputs, self.x87_free, self.status_free);
+        *self.key == *probe
     }
 
     fn matches(&mut self, memory: &Memory) -> bool {
@@ -258,7 +339,19 @@ impl Entry {
         }
         let fuel = state.fuel;
         let fault_addr = state.fault_addr;
+        state.refresh_mmx();
+        let regs = state.x87.regs;
+        let status = state.x87.status;
         state.clone_from(&self.out);
+        if self.sticky.is_some() {
+            state.x87.status |= status & STICKY;
+        }
+        for slot in 0..8 {
+            if self.x87_kept & 1 << slot != 0 {
+                state.x87.regs[slot] = regs[slot];
+                state.mmx[slot] = regs[slot].significand();
+            }
+        }
         state.fuel = fuel;
         state.fault_addr = fault_addr;
         state.rep = None;
@@ -328,6 +421,70 @@ fn canonical(state: &CpuState) -> Box<CpuState> {
     key
 }
 
+/// The x87 last-instruction opcode and pointers. Only environment stores
+/// observe them; a recording either overwrites a field or passes it through,
+/// and only a passed-through field is an input.
+pub(crate) fn x87_pointers(state: &CpuState) -> [u32; 5] {
+    let x87 = &state.x87;
+    [
+        u32::from(x87.opcode),
+        x87.ip,
+        x87.dp,
+        u32::from(x87.cs),
+        u32::from(x87.ds),
+    ]
+}
+
+fn set_x87_pointers(state: &mut CpuState, pointers: [u32; 5]) {
+    let x87 = &mut state.x87;
+    x87.opcode = pointers[0] as u16;
+    x87.ip = pointers[1];
+    x87.dp = pointers[2];
+    x87.cs = pointers[3] as u16;
+    x87.ds = pointers[4] as u16;
+}
+
+/// `state` with the x87 pointer fields outside `inputs` cleared.
+fn mask_x87_pointers(state: &mut CpuState, inputs: u8) {
+    let mut pointers = x87_pointers(state);
+    for (index, pointer) in pointers.iter_mut().enumerate() {
+        if inputs & 1 << index == 0 {
+            *pointer = 0;
+        }
+    }
+    set_x87_pointers(state, pointers);
+}
+
+/// Physical x87 registers tagged empty.
+pub(crate) fn x87_empty(state: &CpuState) -> u8 {
+    (0..8).fold(0, |empty, slot| {
+        if state.x87.tag >> (2 * slot) & 3 == 3 {
+            empty | 1 << slot
+        } else {
+            empty
+        }
+    })
+}
+
+/// Sticky x87 exception and stack fault flags.
+const STICKY: u16 = 0x7f;
+/// x87 condition codes C0–C3.
+pub(crate) const CONDITIONS: u16 = 0x4700;
+
+/// Clears what the key of an entry does not depend on: x87 pointer fields
+/// outside `pointers`, the contents of the physical registers in `free` and
+/// the x87 status bits in `status`.
+fn mask_key(state: &mut CpuState, pointers: u8, free: u8, status: u16) {
+    mask_x87_pointers(state, pointers);
+    state.x87.status &= !status;
+    for slot in 0..8 {
+        if free & 1 << slot != 0 {
+            state.x87.regs[slot] = Default::default();
+            state.mmx[slot] = 0;
+        }
+    }
+}
+
 fn hash(state: &CpuState) -> u64 {
     let mut hash = 0u64;
     let mut mix = |value: u64| {
@@ -341,10 +498,15 @@ fn hash(state: &CpuState) -> u64 {
         mix(u64::from_le_bytes(xmm[..8].try_into().unwrap()));
         mix(u64::from_le_bytes(xmm[8..].try_into().unwrap()));
     }
-    for value in state.mmx {
-        mix(value);
+    // Stale contents of empty registers are inputs only to some entries.
+    let empty = x87_empty(state);
+    for (slot, value) in state.mmx.into_iter().enumerate() {
+        if empty & 1 << slot == 0 {
+            mix(value);
+        }
     }
-    mix(u64::from(state.x87.status) | u64::from(state.x87.control) << 16);
+    let status = state.x87.status & !(STICKY | CONDITIONS);
+    mix(u64::from(status) | u64::from(state.x87.control) << 16);
     hash
 }
 
@@ -397,6 +559,23 @@ pub(crate) struct Memo {
     sampler: Sampler,
     pub(crate) stats: MemoStats,
     log: Option<Instant>,
+    diag: HashMap<u32, Diag>,
+}
+
+/// Per-function diagnostics printed with ADV_MEMO_LOG.
+#[derive(Default)]
+struct Diag {
+    calls: u64,
+    hits: u64,
+    key_misses: u64,
+    data_misses: u64,
+    recordings: u64,
+    aborts: u64,
+    unprofitable: u64,
+    last_key: String,
+    last_data: String,
+    last_cost: String,
+    last_abort: String,
 }
 
 impl Memo {
@@ -414,6 +593,7 @@ impl Memo {
             sampler: Sampler::default(),
             stats: MemoStats::default(),
             log: std::env::var_os("ADV_MEMO_LOG").map(|_| Instant::now()),
+            diag: HashMap::new(),
         }
     }
 
@@ -498,9 +678,10 @@ impl Memo {
         function.window_calls += 1;
         let key = canonical(state);
         let hash = hash(&key);
+        let mut probe = key.clone();
         let mut variants = 0;
         for entry in &mut function.entries {
-            if entry.hash != hash || entry.key != key {
+            if !entry.same_key(hash, &key, &mut probe) {
                 continue;
             }
             if entry.matches(memory) {
@@ -510,12 +691,63 @@ impl Memo {
                 function.window_hits += 1;
                 function.gap = Duration::ZERO;
                 self.stats.hits += 1;
+                if self.log.is_some() {
+                    let diag = self.diag.entry(pc).or_default();
+                    diag.calls += 1;
+                    diag.hits += 1;
+                }
                 return 1;
             }
             variants += 1;
         }
         if variants != 0 {
             self.stats.misses += 1;
+        }
+        if self.log.is_some() {
+            let diag = self.diag.entry(pc).or_default();
+            diag.calls += 1;
+            let latest = function
+                .entries
+                .iter()
+                .filter(|entry| entry.same_key(hash, &key, &mut probe))
+                .max_by_key(|entry| entry.used);
+            if let Some(entry) = latest {
+                diag.data_misses += 1;
+                let (bytes, runs) = entry.differences(memory);
+                diag.last_data = format!(
+                    "{bytes}/{} bytes differ: {}",
+                    entry.reads.data.len(),
+                    runs.iter()
+                        .map(|(addr, len)| format!("{addr:#x}+{len}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            } else if let Some(entry) = function.entries.iter().max_by_key(|entry| entry.used) {
+                diag.key_misses += 1;
+                let (a, b) = (&*entry.key, &*key);
+                let mut fields = Vec::new();
+                for index in 0..8 {
+                    if a.regs[index] != b.regs[index] {
+                        fields.push(format!("r{index}:{:x}->{:x}", a.regs[index], b.regs[index]));
+                    }
+                }
+                if a.eflags != b.eflags {
+                    fields.push(format!("fl:{:x}->{:x}", a.eflags, b.eflags));
+                }
+                if a.xmm != b.xmm {
+                    fields.push("xmm".into());
+                }
+                if a.mmx != b.mmx {
+                    fields.push("mmx".into());
+                }
+                if a.x87 != b.x87 {
+                    fields.push("x87".into());
+                }
+                if a.mxcsr != b.mxcsr || a.segments != b.segments || a.fs_base != b.fs_base {
+                    fields.push("other".into());
+                }
+                diag.last_key = fields.join(" ");
+            }
         }
         let now = Instant::now();
         if function.window_calls >= WINDOW {
@@ -541,6 +773,9 @@ impl Memo {
         };
         function.next_record = Some(now + function.gap);
         self.last_record = Some(now);
+        if self.log.is_some() {
+            self.diag.entry(pc).or_default().recordings += 1;
+        }
         self.recording = Some(Box::new(Recorder {
             function: pc,
             key,
@@ -550,8 +785,14 @@ impl Memo {
             pages: HashMap::new(),
             order: Vec::new(),
             poisoned: false,
+            why: String::new(),
             armed: false,
             saved_fuel: 0,
+            x87_written: 0,
+            x87_touched: 0,
+            x87_opaque: false,
+            x87_status: false,
+            x87_conditions: 0,
         }));
         2
     }
@@ -568,6 +809,11 @@ impl Memo {
         let now = Instant::now();
         if recorder.poisoned {
             self.stats.aborts += 1;
+            if self.log.is_some() {
+                let diag = self.diag.entry(recorder.function).or_default();
+                diag.aborts += 1;
+                diag.last_abort = format!("poisoned {}", recorder.why);
+            }
             self.fail(recorder.function, now);
             return;
         }
@@ -595,6 +841,11 @@ impl Memo {
         let moved = (reads.data.len() + writes.data.len()) as u64;
         if blocks < 32 || blocks * 32 < moved {
             self.stats.unprofitable += 1;
+            if self.log.is_some() {
+                let diag = self.diag.entry(recorder.function).or_default();
+                diag.unprofitable += 1;
+                diag.last_cost = format!("blocks={blocks} bytes={moved}");
+            }
             self.fail(recorder.function, now);
             return;
         }
@@ -609,9 +860,39 @@ impl Memo {
         out.refresh_mmx();
         out.fuel = 0;
         out.rep = None;
+        let (before, after) = (x87_pointers(&recorder.key), x87_pointers(&out));
+        let mut x87_inputs = 0;
+        for index in 0..5 {
+            if recorder.x87_written & 1 << index == 0 && before[index] == after[index] {
+                x87_inputs |= 1 << index;
+            }
+        }
+        let empty = x87_empty(&recorder.key);
+        let free = if recorder.x87_opaque { 0 } else { empty };
+        let mut touched = recorder.x87_touched;
+        for slot in 0..8 {
+            if out.x87.regs[slot] != recorder.key.x87.regs[slot] {
+                touched |= 1 << slot;
+            }
+        }
+        let sticky = (!recorder.x87_status && recorder.key.x87.control & 0x3f == 0x3f)
+            .then_some(recorder.key.x87.status & STICKY);
+        // Unchanged condition codes pass through, as for pointer fields.
+        let mut status_free = if sticky.is_some() { STICKY } else { 0 };
+        if !recorder.x87_status {
+            status_free |=
+                (recorder.x87_conditions | (out.x87.status ^ recorder.key.x87.status)) & CONDITIONS;
+        }
+        let mut key = recorder.key;
+        mask_key(&mut key, x87_inputs, free, status_free);
         self.clock += 1;
         let entry = Entry {
-            key: recorder.key,
+            key,
+            x87_inputs,
+            x87_free: free,
+            x87_kept: free & !touched,
+            sticky,
+            status_free,
             hash: recorder.hash,
             reads,
             writes,
@@ -626,7 +907,14 @@ impl Memo {
         let Some(function) = self.functions.get_mut(&recorder.function) else {
             return;
         };
-        let same = |old: &Entry| old.hash == entry.hash && old.key == entry.key;
+        let same = |old: &Entry| {
+            old.hash == entry.hash
+                && old.x87_inputs == entry.x87_inputs
+                && old.x87_free == entry.x87_free
+                && old.sticky == entry.sticky
+                && old.status_free == entry.status_free
+                && old.key == entry.key
+        };
         let victim = if function.entries.iter().filter(|old| same(old)).count() >= VARIANTS {
             (0..function.entries.len())
                 .filter(|&index| same(&function.entries[index]))
@@ -674,8 +962,17 @@ impl Memo {
         true
     }
 
-    pub(crate) fn abort(&mut self, recorder: Box<Recorder>, reason: Abort) {
+    pub(crate) fn logging(&self) -> bool {
+        self.log.is_some()
+    }
+
+    pub(crate) fn abort(&mut self, recorder: Box<Recorder>, reason: Abort, detail: String) {
         self.stats.aborts += 1;
+        if self.log.is_some() {
+            let diag = self.diag.entry(recorder.function).or_default();
+            diag.aborts += 1;
+            diag.last_abort = format!("{reason:?} {detail}");
+        }
         let now = Instant::now();
         match reason {
             Abort::Impure => self.fail(recorder.function, now),
@@ -795,6 +1092,29 @@ impl Memo {
             stats.unprofitable,
             stats.bytes,
         );
+        let mut rows: Vec<_> = self.diag.iter().collect();
+        rows.sort_unstable_by_key(|(_, diag)| std::cmp::Reverse(diag.calls));
+        for (pc, diag) in rows.into_iter().take(12) {
+            let state = match self.functions.get(pc).and_then(|f| f.off.as_ref()) {
+                None => "on",
+                Some(Off::Until(_)) => "wait",
+                Some(Off::Forever) => "off",
+            };
+            eprintln!(
+                "  {pc:08x} {state} calls={} hits={} keymiss={} datamiss={} rec={} abort={} unprof={} | key[{}] data[{}] cost[{}] abort[{}]",
+                diag.calls,
+                diag.hits,
+                diag.key_misses,
+                diag.data_misses,
+                diag.recordings,
+                diag.aborts,
+                diag.unprofitable,
+                diag.last_key,
+                diag.last_data,
+                diag.last_cost,
+                diag.last_abort,
+            );
+        }
     }
 
     pub(crate) fn stats(&self) -> MemoStats {

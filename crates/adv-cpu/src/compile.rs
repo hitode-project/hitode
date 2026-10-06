@@ -1214,9 +1214,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     break;
                 };
                 e.at(pc);
+                // The executor interprets these while recording: it records
+                // their footprint and which x87 state they observe.
                 if e.record
                     && (crate::strings::operation(instruction).is_some()
-                        || matches!(instruction.mnemonic(), M::Int | M::Rdtsc))
+                        || matches!(instruction.mnemonic(), M::Int | M::Rdtsc | M::Emms)
+                        || (0..instruction.op_count()).any(|operand| {
+                            instruction.op_kind(operand) == OpKind::Register
+                                && instruction.op_register(operand).is_mm()
+                        }))
                 {
                     e.exit_const(Exit::Fallback, pc);
                     break;

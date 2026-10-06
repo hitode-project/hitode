@@ -97,15 +97,7 @@ fn differential(main: &[u8], func: &[u8]) -> MemoStats {
             "memory at {at:#x}"
         );
     }
-    let stats = stats.unwrap();
-    // Only an abandoned recording leaves its instruction to the interpreter.
-    if stats.aborts == 0 {
-        assert_eq!(
-            memo.stats.interpreter_entries,
-            plain.stats.interpreter_entries
-        );
-    }
-    stats
+    stats.unwrap()
 }
 
 fn pure_sum() -> Vec<u8> {
@@ -249,4 +241,188 @@ fn rewritten_code_is_not_answered_from_old_recordings() {
         m.memory().read_data(DST, 4).unwrap(),
         plain.memory().read_data(DST, 4).unwrap()
     );
+}
+
+#[test]
+fn x87_memory_operands_are_recorded_by_the_interpreter() {
+    let main = driver(|a| a.xor(eax, eax).unwrap());
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.fld(dword_ptr(SRC + 16)).unwrap();
+        a.fadd(dword_ptr(SRC + 20)).unwrap();
+        a.fstp(qword_ptr(DST + 8)).unwrap();
+        a.fild(dword_ptr(SRC + 24)).unwrap();
+        a.fistp(dword_ptr(DST + 16)).unwrap();
+        a.mov(dword_ptr(DST), eax).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    assert_eq!(stats.aborts, 0);
+    assert_eq!(stats.recordings, 1);
+    assert_eq!(stats.hits, 9);
+}
+
+#[test]
+fn x87_inputs_select_a_new_recording() {
+    let main = driver(|a| {
+        let mut skip = a.create_label();
+        a.cmp(dword_ptr(COUNTER), 4).unwrap();
+        a.jne(skip).unwrap();
+        a.add(byte_ptr(SRC + 517), 1).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.xor(eax, eax).unwrap();
+    });
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.fld(dword_ptr(SRC + 516)).unwrap();
+        a.fstp(dword_ptr(DST + 8)).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    assert_eq!(stats.recordings, 2);
+    assert_eq!(stats.hits, 8);
+}
+
+/// A REP copy fully overwrites its destination, which is no input.
+#[test]
+fn rep_strings_record_each_element() {
+    let main = driver(|a| {
+        a.add(byte_ptr(DST + 0x100), 1).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.xor(ecx, ecx).unwrap();
+    });
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.push(edi).unwrap();
+        a.mov(edi, DST + 0x100).unwrap();
+        a.mov(ecx, 16).unwrap();
+        a.rep().movsd().unwrap();
+        a.mov(ecx, 0).unwrap();
+        a.rep().movsd().unwrap();
+        a.mov(ecx, 8).unwrap();
+        a.rep().stosd().unwrap();
+        a.mov(esi, SRC).unwrap();
+        a.mov(edi, SRC + 4).unwrap();
+        a.mov(ecx, 4).unwrap();
+        a.repe().cmpsd().unwrap();
+        a.pop(edi).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    assert_eq!(stats.aborts, 0);
+    assert_eq!(stats.recordings, 1);
+    assert_eq!(stats.hits, 9);
+}
+
+/// Callers leave different stale contents in empty x87 registers.
+fn stale_x87(a: &mut CodeAssembler) {
+    a.xor(eax, eax).unwrap();
+    a.fild(dword_ptr(COUNTER)).unwrap();
+    a.fild(dword_ptr(COUNTER)).unwrap();
+    a.fmulp(st1, st0).unwrap();
+    a.fstp(dword_ptr(DST + 0x200)).unwrap();
+}
+
+#[test]
+fn stale_x87_registers_are_kept_unless_observed() {
+    let main = code(CODE, |a| {
+        a.mov(dword_ptr(COUNTER), 10).unwrap();
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        stale_x87(a);
+        a.call(u64::from(FUNC)).unwrap();
+        // The physical registers below TOP still hold the caller's values.
+        a.movq(qword_ptr(DST + 0x300), mm7).unwrap();
+        a.movq(qword_ptr(DST + 0x308), mm6).unwrap();
+        a.emms().unwrap();
+        a.mov(eax, dword_ptr(COUNTER)).unwrap();
+        a.movq(qword_ptr(eax * 8 + (DST + 0x400)), mm7).unwrap();
+        a.emms().unwrap();
+        a.dec(dword_ptr(COUNTER)).unwrap();
+        a.jnz(top).unwrap();
+        a.ret().unwrap();
+    });
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.fld(dword_ptr(SRC + 16)).unwrap();
+        a.fstp(dword_ptr(DST + 8)).unwrap();
+        a.mov(dword_ptr(DST), eax).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    assert_eq!(stats.recordings, 1);
+    assert_eq!(stats.hits, 9);
+}
+
+#[test]
+fn stale_x87_registers_read_through_mmx_are_inputs() {
+    let main = driver(stale_x87);
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.movq(qword_ptr(DST + 8), mm6).unwrap();
+        a.emms().unwrap();
+        a.mov(dword_ptr(DST), eax).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    assert_eq!(stats.hits, 0);
+}
+
+#[test]
+fn observed_x87_exception_flags_are_inputs() {
+    let main = driver(|a| {
+        let mut skip = a.create_label();
+        a.test(dword_ptr(COUNTER), 1).unwrap();
+        a.jz(skip).unwrap();
+        a.fnclex().unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.xor(eax, eax).unwrap();
+    });
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.fstsw(word_ptr(DST + 8)).unwrap();
+        a.fld(dword_ptr(SRC + 16)).unwrap();
+        a.fdiv(dword_ptr(SRC + 20)).unwrap();
+        a.fstp(dword_ptr(DST + 12)).unwrap();
+        a.mov(dword_ptr(DST), eax).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    // The first status is clear; later ones alternate in the inexact flag.
+    assert_eq!(stats.recordings, 3);
+    assert_eq!(stats.hits, 7);
+}
+
+#[test]
+fn unobserved_x87_exception_flags_accumulate() {
+    let main = driver(|a| {
+        let mut skip = a.create_label();
+        a.cmp(dword_ptr(COUNTER), 3).unwrap();
+        a.jne(skip).unwrap();
+        a.fnclex().unwrap();
+        a.fld1().unwrap();
+        a.fldz().unwrap();
+        a.fdivp(st1, st0).unwrap();
+        a.fstp(st0).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.xor(eax, eax).unwrap();
+    });
+    let func = code(FUNC, |a| {
+        sum(a, |a| a.mov(esi, SRC).unwrap());
+        a.fld(dword_ptr(SRC + 16)).unwrap();
+        a.fdiv(dword_ptr(SRC + 20)).unwrap();
+        a.fstp(dword_ptr(DST + 12)).unwrap();
+        a.mov(dword_ptr(DST), eax).unwrap();
+        a.pop(esi).unwrap();
+        a.ret().unwrap();
+    });
+    let stats = differential(&main, &func);
+    assert_eq!(stats.recordings, 1);
+    assert_eq!(stats.hits, 9);
 }

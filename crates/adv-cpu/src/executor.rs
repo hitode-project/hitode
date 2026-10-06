@@ -539,7 +539,199 @@ impl Executor {
         if recorder.armed {
             self.state.fuel = recorder.saved_fuel;
         }
-        memo.abort(recorder, reason);
+        let detail = if memo.logging() {
+            let pc = self.state.eip;
+            let instruction = self.memory.read_data(pc, 15).ok().map(|bytes| {
+                iced_x86::Decoder::with_ip(
+                    32,
+                    &bytes,
+                    u64::from(pc),
+                    iced_x86::DecoderOptions::NONE,
+                )
+                .decode()
+                .code()
+            });
+            format!("at {pc:#x} {instruction:?}")
+        } else {
+            String::new()
+        };
+        memo.abort(recorder, reason, detail);
+    }
+
+    /// Interprets one instruction or REP element of the current recording
+    /// after recording the memory it may access. Any step other than Executed
+    /// abandons the recording and is handled as usual.
+    fn memo_step(&mut self) -> crate::interpreter::Execution {
+        use iced_x86::{Mnemonic, OpAccess, OpKind, Register};
+        let pc = self.state.eip;
+        let mut bytes = [0; 15];
+        let len = (1..=15)
+            .rev()
+            .find(|&len| self.memory.read_into(pc, &mut bytes[..len]).is_ok())
+            .unwrap_or(0);
+        let instruction = iced_x86::Decoder::with_ip(
+            32,
+            &bytes[..len],
+            u64::from(pc),
+            iced_x86::DecoderOptions::NONE,
+        )
+        .decode();
+        let state = &self.state;
+        // REP elements access exactly their operands; an exhausted count
+        // accesses nothing.
+        let string = instruction.op_kinds().find(|kind| {
+            matches!(
+                kind,
+                OpKind::MemorySegSI
+                    | OpKind::MemorySegESI
+                    | OpKind::MemorySegDI
+                    | OpKind::MemorySegEDI
+                    | OpKind::MemoryESDI
+                    | OpKind::MemoryESEDI
+            )
+        });
+        let repeated =
+            string.is_some() && (instruction.has_rep_prefix() || instruction.has_repne_prefix());
+        let narrow = matches!(
+            string,
+            Some(OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI)
+        );
+        let count = state.regs[1] & if narrow { 0xffff } else { u32::MAX };
+        let mut footprint = Vec::new();
+        let mut known = !instruction.is_invalid();
+        if known && !(repeated && count == 0) {
+            let info = iced_x86::InstructionInfoFactory::new()
+                .info(&instruction)
+                .used_memory()
+                .to_vec();
+            for used in info {
+                let (read, write) = match used.access() {
+                    OpAccess::NoMemAccess => continue,
+                    OpAccess::Read => (true, false),
+                    OpAccess::CondRead => (!repeated, false),
+                    OpAccess::Write => (false, true),
+                    // A write that may not happen keeps the old bytes, which
+                    // makes them an input unless a REP count guarantees it.
+                    OpAccess::CondWrite => (!repeated, true),
+                    _ => (true, true),
+                };
+                let address = used.virtual_address(0, |register, _, _| {
+                    if register.is_segment_register() {
+                        return Some(if register == Register::FS {
+                            u64::from(state.fs_base)
+                        } else {
+                            0
+                        });
+                    }
+                    let index = (register.full_register32() as usize)
+                        .checked_sub(Register::EAX as usize)
+                        .filter(|&index| index < 8)?;
+                    let value = state.regs[index];
+                    Some(u64::from(match register.size() {
+                        1 if register >= Register::AH && register <= Register::BH => {
+                            value >> 8 & 0xff
+                        }
+                        1 => value & 0xff,
+                        2 => value & 0xffff,
+                        _ => value,
+                    }))
+                });
+                // A REP access spans the remaining elements; one step does one.
+                let size = if repeated {
+                    instruction.memory_size().size()
+                } else {
+                    used.memory_size().size()
+                } as u32;
+                match address {
+                    Some(address) if size != 0 => {
+                        footprint.push((address as u32, size, read, write))
+                    }
+                    _ => known = false,
+                }
+            }
+        }
+        let recorder = self
+            .memo
+            .as_deref_mut()
+            .and_then(|memo| memo.recording.as_deref_mut())
+            .expect("recording");
+        for &(address, size, read, write) in &footprint {
+            if read {
+                recorder.access(&self.memory, address, size, false);
+            }
+            if write {
+                recorder.access(&self.memory, address, size, true);
+            }
+        }
+        // Environment stores read x87 pointer fields the recording may not
+        // have overwritten yet.
+        let environment = matches!(
+            instruction.mnemonic(),
+            Mnemonic::Fnstenv
+                | Mnemonic::Fstenv
+                | Mnemonic::Fnsave
+                | Mnemonic::Fsave
+                | Mnemonic::Fxsave
+                | Mnemonic::Fxsave64
+        );
+        // These observe or reload the contents of empty x87 registers.
+        let opaque = environment
+            || matches!(
+                instruction.mnemonic(),
+                Mnemonic::Emms
+                    | Mnemonic::Femms
+                    | Mnemonic::Fldenv
+                    | Mnemonic::Frstor
+                    | Mnemonic::Fxrstor
+                    | Mnemonic::Fxrstor64
+            )
+            || (0..instruction.op_count()).any(|operand| {
+                instruction.op_kind(operand) == OpKind::Register
+                    && instruction.op_register(operand).is_mm()
+            });
+        recorder.x87_opaque |= opaque;
+        recorder.x87_status |= opaque
+            || matches!(
+                instruction.mnemonic(),
+                Mnemonic::Fnstsw
+                    | Mnemonic::Fstsw
+                    | Mnemonic::Fnclex
+                    | Mnemonic::Fclex
+                    | Mnemonic::Fninit
+                    | Mnemonic::Finit
+                    | Mnemonic::Fldcw
+            );
+        if !known || environment && recorder.x87_written != 0x1f {
+            self.memo_abort(crate::memo::Abort::Impure);
+            return self
+                .interpreter
+                .run_chunk(&mut self.state, &mut self.memory, 1);
+        }
+        let before = crate::memo::x87_pointers(&self.state);
+        let (regs, empty) = (self.state.x87.regs, crate::memo::x87_empty(&self.state));
+        let status = self.state.x87.status;
+        let execution = self
+            .interpreter
+            .run_chunk(&mut self.state, &mut self.memory, 1);
+        let after = crate::memo::x87_pointers(&self.state);
+        for index in 0..5 {
+            if before[index] != after[index] {
+                recorder.x87_written |= 1 << index;
+            }
+        }
+        recorder.x87_conditions |= (status ^ self.state.x87.status) & crate::memo::CONDITIONS;
+        // A register is loaded when it stops being empty, even with the
+        // value it already held.
+        recorder.x87_touched |= empty & !crate::memo::x87_empty(&self.state);
+        for slot in 0..8 {
+            if regs[slot] != self.state.x87.regs[slot] {
+                recorder.x87_touched |= 1 << slot;
+            }
+        }
+        if execution.step != crate::interpreter::Step::Executed {
+            self.memo_abort(crate::memo::Abort::Impure);
+        }
+        execution
     }
 
     fn recording(&self) -> bool {
@@ -1398,10 +1590,12 @@ impl Executor {
                     && self.deferred_fallback != Some(self.state.eip)
             });
             let native = native.map(|(owner, _)| owner);
-            if recording && !native.is_some_and(|owner| self.memo_code(owner)) {
-                self.memo_abort(crate::memo::Abort::Impure);
-            }
-            let recording = self.recording();
+            // Without a record-mode variant, a recording interprets the instruction.
+            let native = if recording {
+                native.filter(|&owner| self.memo_code(owner))
+            } else {
+                native
+            };
             if native.is_some()
                 && !recording
                 && self.parallel.is_some()
@@ -1521,7 +1715,7 @@ impl Executor {
                 if recording {
                     if result == Exit::Budget as u32 || result == Exit::Interrupted as u32 {
                         self.memo_abort(crate::memo::Abort::Context);
-                    } else if result != Exit::Dispatch as u32 {
+                    } else if result != Exit::Dispatch as u32 && result != Exit::Fallback as u32 {
                         self.memo_abort(crate::memo::Abort::Impure);
                     }
                 } else {
@@ -1579,8 +1773,6 @@ impl Executor {
                     _ => return Err(format!("invalid native exit {result}")),
                 }
             }
-            // Interpreted instructions are not recorded.
-            self.memo_abort(crate::memo::Abort::Impure);
             use crate::interpreter::Step;
             // The interpreter owns its decode cache and this CPU state. Ordinary
             // scalar memory operations use the same foreign-memory accessors as
@@ -1592,7 +1784,10 @@ impl Executor {
             // decoded block. Transfers, exceptions, SMC and REP return here; native
             // publications change the revision used to build fallthrough boundaries.
             let units = self.state.fuel.min(256) as u32;
-            let (execution, last_units) = if self.profiling || single_step {
+            let (execution, last_units) = if self.recording() {
+                let execution = self.memo_step();
+                (execution, execution.units)
+            } else if self.profiling || single_step {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1634,7 +1829,8 @@ impl Executor {
                 }
                 *self.demand.entry(pc).or_default() += 1;
             }
-            self.state.fuel -= u64::from(execution.units);
+            // An abandoned recording has restored the caller's fuel.
+            self.state.fuel = self.state.fuel.saturating_sub(u64::from(execution.units));
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
                 p.interpreter_entries += 1;
