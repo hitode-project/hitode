@@ -415,3 +415,131 @@ fn mci_no_device_errors_have_checked_bounded_text_and_no_notifications() {
     mci_boundary(JitCpu::new(PARK_ADDR, true).unwrap());
     mci_boundary(UnicornCpu::new(PARK_ADDR).unwrap());
 }
+
+fn midi_boundary<B: Backend>(cpu: B) {
+    let mut m = machine(cpu);
+    let mut code = start();
+    m.cpu.write(DATA, &[0x77; 512]).unwrap();
+    m.cpu.write(READ_ONLY, &[0x66; 32]).unwrap();
+    m.cpu.write_u32(DATA + 128, 0).unwrap();
+    m.cpu.write_u32(DATA + 132, u32::MAX).unwrap();
+    m.cpu.write_u32(DATA + 136, 0x1234).unwrap();
+    m.cpu.write_u32(DATA + 140, 0x1234).unwrap();
+    call(&mut m, &mut code, "midiOutGetNumDevs", &[], 0);
+    call(
+        &mut m,
+        &mut code,
+        "midiOutGetDevCapsA",
+        &[0, DATA + 256, 52],
+        1,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "midiOutGetDevCapsA",
+        &[u32::MAX, DATA + 256, 52],
+        2,
+    );
+    call(&mut m, &mut code, "midiOutGetDevCapsA", &[0, 0, 0], 3);
+    call(
+        &mut m,
+        &mut code,
+        "midiOutGetDevCapsA",
+        &[0, READ_ONLY, 52],
+        4,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "midiStreamOpen",
+        &[DATA, DATA + 128, 1, CALLBACK, MARKER, 0x30000],
+        5,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "midiStreamOpen",
+        &[DATA + 4, DATA + 132, 1, 0, 0, 0],
+        6,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "midiStreamOpen",
+        &[DATA + 8, DATA + 136, 0, 0, 0, 0],
+        7,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "midiStreamOpen",
+        &[READ_ONLY, DATA + 140, 1, 0, 0, 0],
+        8,
+    );
+    call(
+        &mut m,
+        &mut code,
+        "midiStreamOpen",
+        &[DATA + 12, READ_ONLY, 1, 0, 0, 0],
+        9,
+    );
+    run(&mut m, code);
+    for (index, error) in [0, 2, 6, 0, 11, 2, 6, 11, 11, 11].into_iter().enumerate() {
+        result(&m, index as u32, error);
+    }
+    for offset in [0, 4, 8, 12] {
+        assert_eq!(m.cpu.read_u32(DATA + offset).unwrap(), 0);
+    }
+    assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0x8000_0000);
+    assert_eq!(m.cpu.read_u32(DATA + 132).unwrap(), u32::MAX);
+    assert_eq!(m.cpu.read_u32(DATA + 136).unwrap(), 0x1234);
+    assert_eq!(m.cpu.read_u32(DATA + 140).unwrap(), 0x1234);
+    assert_eq!(bytes(&m, DATA + 256, 52), vec![0x77; 52]);
+    assert_eq!(bytes(&m, READ_ONLY, 32), vec![0x66; 32]);
+    assert_eq!(
+        registry().level("winmm.dll", "midiStreamOpen"),
+        Some(ImplementationLevel::SafeFail)
+    );
+    assert!(
+        m.ext
+            .get::<ApiDiagnostics>()
+            .warnings
+            .keys()
+            .any(|(api, _)| api == "midiStreamOpen")
+    );
+}
+
+#[test]
+fn midi_absent_device_count_caps_and_stream_errors_preserve_buffers_and_callbacks() {
+    midi_boundary(JitCpu::new(PARK_ADDR, false).unwrap());
+    midi_boundary(JitCpu::new(PARK_ADDR, true).unwrap());
+    midi_boundary(UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn midi_native_stream_failure_clears_handle_and_tags_device_after_count_validation() {
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn midiStreamOpen(
+            output: *mut usize,
+            device: *mut u32,
+            count: u32,
+            callback: usize,
+            instance: usize,
+            flags: u32,
+        ) -> u32;
+    }
+    unsafe {
+        for (count, expected) in [(0, 11), (2, 11), (1, 2)] {
+            let mut output = 0xfedcba98;
+            let mut device = 0x7ffffffe;
+            assert_eq!(
+                midiStreamOpen(&mut output, &mut device, count, 0, 0, 0),
+                expected
+            );
+            assert_eq!(output, 0);
+            assert_eq!(device, if count == 1 { 0xfffffffe } else { 0x7ffffffe });
+        }
+    }
+}
