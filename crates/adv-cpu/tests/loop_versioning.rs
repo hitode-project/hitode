@@ -495,7 +495,9 @@ fn interleaved_pointer_steps_and_a_store_after_the_decrement_match_unicorn() {
     // A delayed recurrence: update the address between loads, then decrement
     // a separate counter before storing a result that later iterations read.
     // The two-lane batch is legal, since its reads and writes stay apart.
-    for displacement in [4, 12] {
+    // The latch reads the first lane's flags, so a batch is never exact,
+    // even when the code after the loop overwrites every flag.
+    for (displacement, clobber) in [(4, false), (12, false), (4, true)] {
         let bytes = code(|a| {
             let mut top = a.create_label();
             a.set_label(&mut top).unwrap();
@@ -509,6 +511,9 @@ fn interleaved_pointer_steps_and_a_store_after_the_decrement_match_unicorn() {
             a.dec(esi).unwrap();
             a.mov(dword_ptr(eax + displacement), edx).unwrap();
             a.jne(top).unwrap();
+            if clobber {
+                a.xor(ecx, ecx).unwrap();
+            }
             a.ret().unwrap();
         });
         for count in [1, 2, 3, 4, 5, 8, 9, 3000] {
