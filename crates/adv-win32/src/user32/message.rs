@@ -1050,6 +1050,21 @@ fn write_message(env: &mut Env<'_>, message: Msg, out: u32, removed: bool) {
     }
 }
 
+fn finish_hooked_message(env: &mut Env<'_>, mut original: Msg, out: u32, removed: bool) -> Msg {
+    let changed = Msg::read(env.cpu, out);
+    original.hwnd = changed.hwnd;
+    original.msg = changed.msg;
+    original.wparam = changed.wparam;
+    original.lparam = changed.lparam;
+    original.time = changed.time;
+    original.pt = changed.pt;
+    let ctx = env.context;
+    if let Some(tracking) = &mut user_mut(env).input_tracking {
+        tracking.remember(ctx, out, original, removed);
+    }
+    original
+}
+
 fn peek_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max, flags) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let f = Filter { hwnd, min, max };
@@ -1068,7 +1083,10 @@ fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool) -> Outcome
             .flatten()
     }) {
         write_message(env, m, out, remove);
-        return Outcome::Return(1);
+        return super::hooks::retrieved(env, out, remove, move |env| {
+            finish_hooked_message(env, m, out, remove);
+            Outcome::Return(1)
+        });
     }
     // Nothing: let other contexts run (the caller is a polling loop).
     Outcome::block_then_return(Wait::Yield, 0)
@@ -1086,7 +1104,10 @@ fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
 fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
     if let Some(m) = next_message(env, f, true) {
         write_message(env, m, out, true);
-        return Outcome::Return(u32::from(m.msg != wm::QUIT));
+        return super::hooks::retrieved(env, out, true, move |env| {
+            let message = finish_hooked_message(env, m, out, true);
+            Outcome::Return(u32::from(message.msg != wm::QUIT))
+        });
     }
     if headless_idle(env) {
         return get_message(env, out, f);

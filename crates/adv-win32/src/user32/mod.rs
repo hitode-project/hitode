@@ -8,10 +8,13 @@ pub mod compat;
 pub mod controls;
 pub mod dialog;
 pub mod display;
+mod formatting;
+pub(crate) mod hooks;
 pub mod host_input;
 mod input;
 pub mod menu;
 pub mod message;
+mod monitor;
 mod placement;
 mod resources;
 mod station;
@@ -29,13 +32,10 @@ pub use placement::PlacementState;
 pub(crate) use resources::IconImage;
 pub use window::User;
 
-use crate::printf::{StackArgs, format};
 use crate::util::{cstr, put_cstr};
 use crate::{Win32, stdcall};
 
 pub const USER32: &str = "user32.dll";
-/// wsprintf's documented output limit.
-const WSPRINTF_MAX: u32 = 1024;
 
 pub fn user<'a>(env: &'a Env<'_>) -> &'a User {
     &env.ext.get::<Win32>().user
@@ -61,39 +61,6 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
     win32.user.keyboard_layout = input::layout_for_codepage(win32.codec.acp);
     win32.user.add_system_classes(procs);
     Ok(())
-}
-
-fn wsprintf_a(env: &mut Env<'_>) -> Outcome {
-    let (buf, fmt) = (env.arg(0), env.arg(1));
-    let f = cstr(env.cpu, fmt);
-    let esp = env.cpu.reg(adv_cpu::backend::Reg::Esp);
-    let codec = env.ext.get::<Win32>().codec;
-    let out = format(
-        env.cpu,
-        &codec,
-        &f,
-        &mut StackArgs {
-            cpu: env.cpu,
-            addr: esp + 12,
-        },
-    );
-    Outcome::Return(put_cstr(env.cpu, buf, WSPRINTF_MAX, &out).unwrap_or(WSPRINTF_MAX - 1))
-}
-
-fn wvsprintf_a(env: &mut Env<'_>) -> Outcome {
-    let (buf, fmt, va) = (env.arg(0), env.arg(1), env.arg(2));
-    let f = cstr(env.cpu, fmt);
-    let codec = env.ext.get::<Win32>().codec;
-    let out = format(
-        env.cpu,
-        &codec,
-        &f,
-        &mut StackArgs {
-            cpu: env.cpu,
-            addr: va,
-        },
-    );
-    Outcome::Return(put_cstr(env.cpu, buf, WSPRINTF_MAX, &out).unwrap_or(WSPRINTF_MAX - 1))
 }
 
 fn message_box_a(env: &mut Env<'_>) -> Outcome {
@@ -539,23 +506,6 @@ fn monitor_from(_env: &mut Env<'_>) -> Outcome {
     Outcome::Return(window::HMONITOR_PRIMARY)
 }
 
-fn get_monitor_info_a(env: &mut Env<'_>) -> Outcome {
-    let (hmon, p) = (env.arg(0), env.arg(1));
-    if hmon != window::HMONITOR_PRIMARY {
-        return Outcome::Return(0);
-    }
-    let size = env.cpu.read_u32(p).unwrap_or(0);
-    let (w, h) = user(env).screen;
-    window::Rect::new(0, 0, w, h).write(env.cpu, p + 4);
-    window::Rect::new(0, 0, w, h - 40).write(env.cpu, p + 20);
-    let _ = env.cpu.write_u32(p + 36, 1); // MONITORINFOF_PRIMARY
-    if size >= 72 {
-        // MONITORINFOEXA::szDevice
-        let _ = put_cstr(env.cpu, p + 40, 32, br"\\.\DISPLAY1");
-    }
-    Outcome::Return(1)
-}
-
 fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
     let (hdc, proc, data) = (env.arg(0), env.arg(2), env.arg(3));
     let (w, h) = user(env).screen;
@@ -572,6 +522,9 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    formatting::register(reg);
+    hooks::register(reg);
+    monitor::register(reg);
     accelerator::register(reg);
     station::register(reg);
     system_colors::register(reg);
@@ -586,14 +539,6 @@ pub fn register(reg: &mut Registry) {
     input::register(reg);
     clipboard::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
-    // WINAPIV is cdecl with a two-argument mandatory prefix, not a fixed signature.
-    reg.add(
-        USER32,
-        "wsprintfA",
-        Conv::CdeclVariadic { fixed: 2 },
-        wsprintf_a,
-    );
-    s(reg, "wvsprintfA", 3, wvsprintf_a);
     s(reg, "MessageBoxA", 4, message_box_a);
     s(reg, "MessageBoxW", 4, message_box_w);
     s(reg, "MessageBeep", 1, |_| Outcome::Return(1));
@@ -659,7 +604,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "MonitorFromPoint", 3, monitor_from);
     s(reg, "MonitorFromWindow", 2, monitor_from);
     s(reg, "MonitorFromRect", 2, monitor_from);
-    s(reg, "GetMonitorInfoA", 2, get_monitor_info_a);
     s(reg, "EnumDisplayMonitors", 4, enum_display_monitors);
     s(reg, "DdeInitializeA", 4, |e| {
         let p = e.arg(0);

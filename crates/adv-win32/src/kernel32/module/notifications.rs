@@ -267,6 +267,7 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
                     return Outcome::Fail(error);
                 }
                 crate::user32::message::sent::exit_thread(env);
+                crate::user32::hooks::exit_thread(env);
                 if env
                     .sys
                     .contexts
@@ -289,6 +290,7 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     // DLL detach callbacks must not race a native lease belonging to a thread
     // that Windows has already terminated as part of process shutdown.
     env.cpu.quiesce_memory();
+    crate::user32::hooks::exit_process(env);
     env.sys.terminate_other_contexts(code);
     terminal_notifications(
         env,
