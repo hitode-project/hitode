@@ -454,7 +454,10 @@ fn create_compatible_bitmap(env: &mut Env<'_>, _dc: Handle, w: i32, h: i32) -> O
     Outcome::Return(new_bitmap(env, w, h, 32).map_or(0, |(h, _)| h))
 }
 #[win32(gdi32, name = "GetDeviceCaps", level = state)]
-fn get_device_caps(env: &mut Env<'_>, _dc: Handle, index: i32) -> Outcome {
+fn get_device_caps(env: &mut Env<'_>, dc: Handle, index: i32) -> Outcome {
+    if !matches!(get(env, dc.0), Some(GdiObj::Dc { .. })) {
+        return Outcome::Return(0);
+    }
     let (w, h) = env.ext.get::<Win32>().user.screen;
     Outcome::Return(match index {
         8 => w as u32,
