@@ -1120,21 +1120,161 @@ fn finish_hooked_message(env: &mut Env<'_>, mut original: Msg, out: u32, removed
 
 fn peek_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max, flags) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    peek_message_front(env, out, hwnd, min, max, flags, false)
+}
+
+#[win32(user32, name = "PeekMessageW", level = implement)]
+fn peek_message_w(
+    env: &mut Env<'_>,
+    out: GuestPtr<()>,
+    hwnd: AbiHandle,
+    min: u32,
+    max: u32,
+    flags: u32,
+) -> Outcome {
+    peek_message_front(env, out.addr(), hwnd.0, min, max, flags, true)
+}
+
+fn peek_message_front(
+    env: &mut Env<'_>,
+    out: u32,
+    hwnd: u32,
+    min: u32,
+    max: u32,
+    flags: u32,
+    wide: bool,
+) -> Outcome {
     let f = Filter { hwnd, min, max };
     let remove = flags & PM_REMOVE != 0;
     if flags >> 16 == 0 || flags & (sent::QS_SEND << 16) != 0 {
-        sent::drain(env, move |env| peek_message(env, out, f, remove))
+        sent::drain(env, move |env| peek_message(env, out, f, remove, wide))
     } else {
-        peek_message(env, out, f, remove)
+        peek_message(env, out, f, remove, wide)
     }
 }
 
-fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool) -> Outcome {
-    if let Some(m) = next_message(env, f, remove).or_else(|| {
-        headless_idle(env)
-            .then(|| next_message(env, f, remove))
-            .flatten()
-    }) {
+// Public retrieval owns a checked 28-byte x86 MSG. Recheck after draining sent
+// callbacks or waking a blocked GetMessage: guest code can change mappings.
+fn retrieval_output(env: &mut Env<'_>, out: u32, f: Filter) -> bool {
+    if f.hwnd != 0
+        && f.hwnd != u32::MAX
+        && !user(env)
+            .windows
+            .get(&env.sys.objects, &f.hwnd)
+            .is_some_and(|window| window.thread == env.context)
+    {
+        crate::util::set_last_error(env, 1400);
+        return false;
+    }
+    if adv_abi::guest::check_range(env.cpu, out, 28, adv_cpu::backend::Prot::WRITE).is_err() {
+        crate::util::set_last_error(env, 998);
+        return false;
+    }
+    true
+}
+
+fn character_message(message: u32) -> bool {
+    matches!(message, wm::CHAR | wm::SYSCHAR | 0x103 | 0x107)
+}
+
+/// Queue producers currently supply either ANSI PostMessageA characters or
+/// UTF-16 host input. TranslateMessage generates ASCII, common to both. A/W
+/// thunks support whole single-byte characters; DBCS/UTF-8 split-message state
+/// and IME composition are not implemented, so they must not be guessed.
+fn character_param(
+    env: &Env<'_>,
+    parameter: u32,
+    source_wide: bool,
+    target_wide: bool,
+) -> Result<u32, &'static str> {
+    if source_wide == target_wide {
+        return Ok(parameter);
+    }
+    if parameter < 0x80 {
+        return Ok(parameter);
+    }
+    let codec = &env.ext.get::<Win32>().codec;
+    if !matches!(codec.acp, 932 | 936 | 1252 | 65001) {
+        return Err("character conversion requires a supported guest ANSI encoder");
+    }
+    if source_wide {
+        let unit = u16::try_from(parameter)
+            .ok()
+            .filter(|unit| !(0xd800..=0xdfff).contains(unit))
+            .ok_or("cross-encoding UTF-16 surrogate character messages are unsupported")?;
+        let (bytes, _) = codec.from_utf16(0, &[unit]);
+        if bytes.len() != 1 {
+            return Err(
+                "multibyte character dispatch requires unsupported split-message conversion",
+            );
+        }
+        Ok(u32::from(bytes[0]))
+    } else {
+        let byte = u8::try_from(parameter)
+            .map_err(|_| "packed or split multibyte character retrieval is unsupported")?;
+        let (units, invalid) = codec.to_utf16_checked(0, &[byte]);
+        if invalid || units.len() != 1 {
+            return Err(
+                "multibyte character retrieval requires unsupported split-message conversion",
+            );
+        }
+        Ok(u32::from(units[0]))
+    }
+}
+
+fn next_public_message(
+    env: &mut Env<'_>,
+    filter: Filter,
+    remove: bool,
+    wide: bool,
+) -> Result<Option<Msg>, &'static str> {
+    let Some(mut message) = next_message(env, filter, false) else {
+        return Ok(None);
+    };
+    let parameter = if character_message(message.msg) {
+        character_param(env, message.wparam, message.input, wide)?
+    } else {
+        message.wparam
+    };
+    // No guest callback or scheduling occurs between these observations. Only
+    // remove after conversion succeeds, retaining unsupported queued input.
+    if remove {
+        message = next_message(env, filter, true).expect("peeked message remains queued");
+    }
+    message.wparam = parameter;
+    Ok(Some(message))
+}
+
+fn character_failure(env: &mut Env<'_>, api: &str, reason: &str, result: u32) -> Outcome {
+    adv_abi::warn_unavailable(env, api, reason);
+    crate::util::set_last_error(env, 50);
+    Outcome::Return(result)
+}
+
+fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool, wide: bool) -> Outcome {
+    if !retrieval_output(env, out, f) {
+        return Outcome::Return(0);
+    }
+    let mut next = next_public_message(env, f, remove, wide);
+    if matches!(next, Ok(None)) && headless_idle(env) {
+        next = next_public_message(env, f, remove, wide);
+    }
+    let m = match next {
+        Ok(message) => message,
+        Err(reason) => {
+            return character_failure(
+                env,
+                if wide {
+                    "user32.dll!PeekMessageW"
+                } else {
+                    "user32.dll!PeekMessageA"
+                },
+                reason,
+                0,
+            );
+        }
+    };
+    if let Some(m) = m {
         write_message(env, m, out, remove);
         return super::hooks::retrieved(env, out, remove, move |env| {
             finish_hooked_message(env, m, out, remove);
@@ -1147,15 +1287,53 @@ fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool) -> Outcome
 
 fn get_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    get_message(env, out, Filter { hwnd, min, max })
+    get_message(env, out, Filter { hwnd, min, max }, false)
 }
 
-fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
-    sent::drain(env, move |env| get_message_inner(env, out, f))
+#[win32(user32, name = "GetMessageW", level = implement)]
+fn get_message_w(
+    env: &mut Env<'_>,
+    out: GuestPtr<()>,
+    hwnd: AbiHandle,
+    min: u32,
+    max: u32,
+) -> Outcome {
+    get_message(
+        env,
+        out.addr(),
+        Filter {
+            hwnd: hwnd.0,
+            min,
+            max,
+        },
+        true,
+    )
 }
 
-fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
-    if let Some(m) = next_message(env, f, true) {
+fn get_message(env: &mut Env<'_>, out: u32, f: Filter, wide: bool) -> Outcome {
+    sent::drain(env, move |env| get_message_inner(env, out, f, wide))
+}
+
+fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter, wide: bool) -> Outcome {
+    if !retrieval_output(env, out, f) {
+        return Outcome::Return(u32::MAX);
+    }
+    let next = match next_public_message(env, f, true, wide) {
+        Ok(message) => message,
+        Err(reason) => {
+            return character_failure(
+                env,
+                if wide {
+                    "user32.dll!GetMessageW"
+                } else {
+                    "user32.dll!GetMessageA"
+                },
+                reason,
+                u32::MAX,
+            );
+        }
+    };
+    if let Some(m) = next {
         write_message(env, m, out, true);
         return super::hooks::retrieved(env, out, true, move |env| {
             let message = finish_hooked_message(env, m, out, true);
@@ -1163,7 +1341,7 @@ fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
         });
     }
     if headless_idle(env) {
-        return get_message(env, out, f);
+        return get_message(env, out, f, wide);
     }
     let event = queue_event(env);
     if event == 0 {
@@ -1176,7 +1354,7 @@ fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
             handle: event,
             deadline,
         },
-        move |env, _| get_message(env, out, f),
+        move |env, _| get_message(env, out, f, wide),
     )
 }
 
@@ -1482,19 +1660,72 @@ fn timeout_to(
 
 fn dispatch_message_a(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
+    dispatch_message(env, address, false)
+}
+
+#[win32(user32, name = "DispatchMessageW", level = implement)]
+fn dispatch_message_w(env: &mut Env<'_>, message: GuestPtr<()>) -> Outcome {
+    dispatch_message(env, message.addr(), true)
+}
+
+fn dispatch_message(env: &mut Env<'_>, address: u32, wide: bool) -> Outcome {
+    if adv_abi::guest::check_range(env.cpu, address, 28, adv_cpu::backend::Prot::READ).is_err() {
+        crate::util::set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
     let m = Msg::read(env.cpu, address);
+    let target_wide = user(env)
+        .windows
+        .get(&env.sys.objects, &m.hwnd)
+        .map(|w| w.unicode);
+    let parameter = if character_message(m.msg)
+        && let Some(target) = target_wide
+    {
+        match character_param(env, m.wparam, wide, target) {
+            Ok(parameter) => parameter,
+            Err(reason) => {
+                return character_failure(
+                    env,
+                    if wide {
+                        "user32.dll!DispatchMessageW"
+                    } else {
+                        "user32.dll!DispatchMessageA"
+                    },
+                    reason,
+                    0,
+                );
+            }
+        }
+    } else {
+        m.wparam
+    };
     let ctx = env.context;
-    let m = user_mut(env)
+    let mut m = user_mut(env)
         .input_tracking
         .as_mut()
         .map_or(m, |tracking| tracking.take(ctx, address, m));
-    dispatch(env, m, |_, r| Outcome::Return(r))
+    m.wparam = parameter;
+    let encoding = if character_message(m.msg) {
+        target_wide.unwrap_or(wide)
+    } else {
+        wide
+    };
+    dispatch_common(env, m, Some(encoding), |_, r| Outcome::Return(r))
 }
 
 /// DispatchMessage: timer callbacks, else the window procedure.
 pub fn dispatch(
     env: &mut Env<'_>,
     m: Msg,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    dispatch_common(env, m, None, then)
+}
+
+fn dispatch_common(
+    env: &mut Env<'_>,
+    m: Msg,
+    wide: Option<bool>,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
     if m.input_receipt != 0
@@ -1516,7 +1747,11 @@ pub fn dispatch(
     if m.hwnd == 0 {
         return then(env, 0);
     }
-    send(env, m.hwnd, m.msg, m.wparam, m.lparam, then)
+    if let Some(wide) = wide {
+        send_encoded(env, m.hwnd, m.msg, m.wparam, m.lparam, wide, then)
+    } else {
+        send(env, m.hwnd, m.msg, m.wparam, m.lparam, then)
+    }
 }
 
 fn translate_message(env: &mut Env<'_>) -> Outcome {
@@ -1815,7 +2050,9 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, USER32, DEFAULT_PROC, 4, default_proc);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "PeekMessageA", 5, peek_message_a);
+    reg.register(peek_message_w_ABI);
     s(reg, "GetMessageA", 4, get_message_a);
+    reg.register(get_message_w_ABI);
     s(reg, "WaitMessage", 0, wait_message);
     s(reg, "GetQueueStatus", 1, get_queue_status);
     s(reg, "PostMessageA", 4, post_message_a);
@@ -1827,6 +2064,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "InSendMessage", 0, sent::in_send);
     s(reg, "ReplyMessage", 1, sent::reply_message);
     s(reg, "DispatchMessageA", 1, dispatch_message_a);
+    reg.register(dispatch_message_w_ABI);
     s(reg, "TranslateMessage", 1, translate_message);
     s(reg, "GetMessageTime", 0, get_message_time);
     s(reg, "GetMessagePos", 0, get_message_pos);

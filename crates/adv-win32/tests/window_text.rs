@@ -96,6 +96,9 @@ impl<B: TestCpu> Fixture<B> {
             ("GetWindowTextW", 3),
             ("GetWindowTextLengthW", 1),
             ("SendMessageW", 4),
+            ("PeekMessageW", 5),
+            ("GetMessageW", 4),
+            ("DispatchMessageW", 1),
         ] {
             assert_eq!(
                 registry.get("user32.dll", name).unwrap().conv,
@@ -641,3 +644,6 @@ fn send_message_w_front_dispatches_opaque_parameters_unicode_text_and_real_guest
     send_front(JitCpu::new(PARK_ADDR, false).unwrap());
     send_front(JitCpu::new(PARK_ADDR, true).unwrap());
 }
+
+#[path = "window_text/queue_w.rs"]
+mod queue_w;
