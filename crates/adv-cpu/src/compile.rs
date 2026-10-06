@@ -18,6 +18,7 @@ mod diagnostics;
 mod fault;
 mod flag_liveness;
 mod loops;
+mod memo_probe;
 mod mmx;
 mod scalar;
 mod shadow;
@@ -632,6 +633,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         crate::atomic_memory::load_vector as *const u8,
     );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
+    builder.symbol("adv_memo_probe", memo_probe::record as *const u8);
     builder.symbol(
         "adv_read_timestamp",
         crate::trap::read_timestamp as *const u8,
@@ -751,6 +753,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .declare_function("adv_read_timestamp", Linkage::Import, &timestamp_signature)
         .map_err(|e| e.to_string())?;
     let timestamp_ref = module.declare_func_in_func(timestamp_id, &mut ctx.func);
+    let memo_probe_ref = if memo_probe::pcs().is_empty() {
+        None
+    } else {
+        let mut signature = module.make_signature();
+        signature.params.push(AbiParam::new(ptr_ty));
+        signature.params.extend([AbiParam::new(types::I32); 11]);
+        let id = module
+            .declare_function("adv_memo_probe", Linkage::Import, &signature)
+            .map_err(|e| e.to_string())?;
+        Some(module.declare_func_in_func(id, &mut ctx.func))
+    };
     let mut range_signature = module.make_signature();
     range_signature.params.push(AbiParam::new(ptr_ty));
     range_signature.params.extend([AbiParam::new(types::I64); 3]);
@@ -1048,6 +1061,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
+            memo_probe_ref,
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -1835,6 +1849,7 @@ struct Emitter<'a> {
     file_prepare_ref: ir::FuncRef,
     file_prepared_ref: ir::FuncRef,
     timestamp_ref: ir::FuncRef,
+    memo_probe_ref: Option<ir::FuncRef>,
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
     source_map: bool,
@@ -2424,6 +2439,18 @@ impl Emitter<'_> {
     fn at(&mut self, pc: u32) {
         self.pc = pc;
         self.mark(diagnostics::Part::Body);
+        if let Some(probe) = self.memo_probe_ref
+            && memo_probe::pcs().contains(&pc)
+        {
+            let mut args = vec![self.mem];
+            for value in [self.base, self.len as u32, pc] {
+                args.push(self.constant(value));
+            }
+            for reg in 0..8 {
+                args.push(self.b.use_var(self.regs[reg]));
+            }
+            self.b.ins().call(probe, &args);
+        }
     }
     fn mark(&mut self, part: diagnostics::Part) {
         let offset = self.pc.wrapping_sub(self.source_origin);
