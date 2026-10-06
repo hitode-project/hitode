@@ -7,6 +7,8 @@ use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_device::codec::{Codec, Decoder, DecoderConfig, PcmEncoding};
 use adv_machine::{Conv, Env, Namespace, Objects, Outcome};
 
+mod drivers;
+
 const INVALID_HANDLE: u32 = 5;
 const NO_MEMORY: u32 = 7;
 const NOT_SUPPORTED: u32 = 8;
@@ -198,6 +200,7 @@ struct Stream {
 #[derive(Default)]
 struct Acm {
     namespace: Option<Namespace>,
+    drivers: drivers::Catalog,
 }
 
 impl Acm {
@@ -250,6 +253,10 @@ fn suggest(e: &mut Env<'_>) -> Result<(), u32> {
     }
     if e.arg(0) != 0 {
         return Err(INVALID_HANDLE);
+    }
+    ensure(e);
+    if !e.ext.get::<Acm>().drivers.enabled(&e.sys.objects) {
+        return Err(NOT_POSSIBLE);
     }
     let source = Format::read(e.cpu, e.arg(1))?;
     let address = e.arg(2);
@@ -307,6 +314,10 @@ fn open(e: &mut Env<'_>) -> Result<(), u32> {
     }
     if e.arg(1) != 0 {
         return Err(INVALID_HANDLE);
+    }
+    ensure(e);
+    if !e.ext.get::<Acm>().drivers.enabled(&e.sys.objects) {
+        return Err(NOT_POSSIBLE);
     }
     if flags & 2 != 0 || e.arg(4) != 0 {
         return Err(NOT_SUPPORTED);
@@ -518,6 +529,7 @@ fn close_impl(e: &mut Env<'_>, handle: u32, flags: u32) -> Result<(), u32> {
 }
 
 pub fn register(registry: &mut Registry) {
+    drivers::register(registry);
     macro_rules! add {
         ($name:literal, $argc:literal, $handler:ident) => {
             registry.add("msacm32.dll", $name, Conv::Stdcall { argc: $argc }, |env| {
