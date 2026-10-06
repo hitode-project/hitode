@@ -9,6 +9,7 @@ use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine};
 use adv_os::gdi::Gdi;
 mod enumeration;
+mod modes;
 #[derive(Clone, Copy)]
 pub struct WindowGeometry {
     pub width: u32,
@@ -177,6 +178,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::DISPLAY_MODE_OLD, display_mode_old_ABI),
     (api::RESTORE_MODE, restore_mode_ABI),
     (api::GET_DISPLAY_MODE, get_display_mode_ABI),
+    (api::ENUM_MODES, modes::enum_modes_ABI),
     (api::GET_CAPS, get_caps_ABI),
     (api::BLT_FAST, blt_fast_ABI),
     (api::FLIP, flip_ABI),

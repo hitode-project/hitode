@@ -45,6 +45,7 @@ pub mod api {
     pub const CLIPPER_GET_HWND: u32 = 227;
     pub const SET_CLIPPER: u32 = 228;
     pub const CLIPPER_INITIALIZE: u32 = 229;
+    pub const ENUM_MODES: u32 = 230;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -280,6 +281,7 @@ impl DirectDraw {
             methods.extend([
                 (4, api::CREATE_CLIPPER),
                 (6, api::CREATE_SURFACE),
+                (8, api::ENUM_MODES),
                 (11, api::GET_CAPS),
                 (12, api::GET_DISPLAY_MODE),
                 (19, api::RESTORE_MODE),
