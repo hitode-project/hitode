@@ -313,3 +313,71 @@ fn forwarded_stack_slots_match_unicorn_and_respect_aliasing_writes() {
     });
     differential("slots-mixed", &mixed, r, frame, 1 << 30);
 }
+
+#[test]
+fn windowed_gathers_and_scatters_match_unicorn() {
+    // Offsets loaded from the source address a table at EBX: each access
+    // depends on data, so the clone checks it against a validated window.
+    let gather = counted(false, |a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.and(eax, 0x3ffc).unwrap();
+        a.mov(edx, dword_ptr(ebx + eax)).unwrap();
+        a.mov(dword_ptr(edi), edx).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+    });
+    let mut r = regs(3000, SRC, DST);
+    r[3] = SRC + 0x8000;
+    let all = |_: &mut Executor| {};
+    differential("gather", &gather, r, all, 1 << 30);
+    differential("gather-sliced", &gather, r, all, 29);
+    let hole = |m: &mut Executor| m.protect(SRC + 0x9000, 4096, 0).unwrap();
+    differential("gather-fault", &gather, r, hole, 1 << 30);
+    // Unaligned table reads straddle pages.
+    r[3] = SRC + 0x8002;
+    differential("gather-straddle", &gather, r, all, 1 << 30);
+    differential("gather-straddle-fault", &gather, r, hole, 1 << 30);
+    // The same addressing as a store, into read-only and executable pages.
+    let scatter = counted(false, |a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.and(eax, 0x3ffc).unwrap();
+        a.mov(dword_ptr(ebx + eax), ecx).unwrap();
+        a.add(esi, 4).unwrap();
+    });
+    r[3] = DST;
+    differential("scatter", &scatter, r, all, 1 << 30);
+    differential("scatter-sliced", &scatter, r, all, 31);
+    let readonly = |m: &mut Executor| m.protect(DST + 0x2000, 4096, READ).unwrap();
+    differential("scatter-readonly", &scatter, r, readonly, 1 << 30);
+    let executable = |m: &mut Executor| m.protect(DST + 0x1000, 4096, READ | WRITE | EXEC).unwrap();
+    differential("scatter-executable", &scatter, r, executable, 1 << 30);
+}
+
+#[test]
+fn loops_leaving_through_a_side_exit_resume_after_it() {
+    // Copies until a marker word, then finishes outside the loop.
+    let bytes = code(|a| {
+        let mut top = a.create_label();
+        let mut found = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.cmp(eax, 0x5555_5555).unwrap();
+        a.je(found).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.set_label(&mut found).unwrap();
+        a.lea(ebx, dword_ptr(ecx + 7)).unwrap();
+        a.ret().unwrap();
+    });
+    for at in [0u32, 1, 100, 2999] {
+        let marker = move |m: &mut Executor| {
+            m.write(SRC + at * 4, &0x5555_5555u32.to_le_bytes())
+                .unwrap()
+        };
+        differential("side", &bytes, regs(3000, SRC, DST), marker, 1 << 30);
+        differential("side-sliced", &bytes, regs(3000, SRC, DST), marker, 43);
+    }
+}

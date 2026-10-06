@@ -19,6 +19,7 @@ mod fault;
 mod flag_liveness;
 mod loops;
 mod mmx;
+mod register_liveness;
 mod scalar;
 mod shadow;
 mod simd;
@@ -590,6 +591,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         Vec::new()
     };
+    // A kernel leaves at an access its windows reject; the region resumes
+    // the loop's checked code there.
+    for plan in &plans {
+        entries.extend(plan.windows.iter().map(|&(pc, _)| pc));
+    }
     #[cfg(test)]
     let versioned_loops = plans.len();
     let return_hint = if returns.len() == 1 {
@@ -673,7 +679,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let host_id = module
         .declare_function("adv_trap_call", Linkage::Import, &trap_signature)
         .map_err(|e| e.to_string())?;
-    let trap_ref = module.declare_func_in_func(host_id, &mut ctx.func);
     let mut repeat_signature = module.make_signature();
     repeat_signature.params.extend([AbiParam::new(ptr_ty); 2]);
     repeat_signature.returns.push(AbiParam::new(types::I32));
@@ -681,14 +686,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let repeat_id = module
         .declare_function("adv_repeat", Linkage::Import, &repeat_signature)
         .map_err(|e| e.to_string())?;
-    let repeat_ref = module.declare_func_in_func(repeat_id, &mut ctx.func);
     let mut x87_signature = module.make_signature();
     x87_signature.params.extend([AbiParam::new(ptr_ty); 3]);
     x87_signature.returns.push(AbiParam::new(types::I32));
     let x87_id = module
         .declare_function("adv_x87", Linkage::Import, &x87_signature)
         .map_err(|e| e.to_string())?;
-    let x87_ref = module.declare_func_in_func(x87_id, &mut ctx.func);
     let mut atomic_store_signature = module.make_signature();
     atomic_store_signature.params.extend([
         AbiParam::new(ptr_ty),
@@ -699,7 +702,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let atomic_store_id = module
         .declare_function("adv_atomic_store", Linkage::Import, &atomic_store_signature)
         .map_err(|e| e.to_string())?;
-    let atomic_store_ref = module.declare_func_in_func(atomic_store_id, &mut ctx.func);
     let mut atomic_load_signature = module.make_signature();
     atomic_load_signature
         .params
@@ -711,7 +713,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             &atomic_load_signature,
         )
         .map_err(|e| e.to_string())?;
-    let atomic_load_ref = module.declare_func_in_func(atomic_load_id, &mut ctx.func);
     let mut file_signature = module.make_signature();
     file_signature.params.extend([
         AbiParam::new(ptr_ty),
@@ -723,16 +724,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let file_read_id = module
         .declare_function("adv_file_read", Linkage::Import, &file_signature)
         .map_err(|e| e.to_string())?;
-    let file_read_ref = module.declare_func_in_func(file_read_id, &mut ctx.func);
     let file_write_id = module
         .declare_function("adv_file_write", Linkage::Import, &file_signature)
         .map_err(|e| e.to_string())?;
-    let file_write_ref = module.declare_func_in_func(file_write_id, &mut ctx.func);
     file_signature.returns.clear();
     let file_prepared_id = module
         .declare_function("adv_file_write_prepared", Linkage::Import, &file_signature)
         .map_err(|e| e.to_string())?;
-    let file_prepared_ref = module.declare_func_in_func(file_prepared_id, &mut ctx.func);
     let mut prepare_signature = module.make_signature();
     prepare_signature.params.extend([
         AbiParam::new(ptr_ty),
@@ -743,14 +741,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let prepare_id = module
         .declare_function("adv_file_prepare", Linkage::Import, &prepare_signature)
         .map_err(|e| e.to_string())?;
-    let file_prepare_ref = module.declare_func_in_func(prepare_id, &mut ctx.func);
     let mut timestamp_signature = module.make_signature();
     timestamp_signature.params.push(AbiParam::new(ptr_ty));
     timestamp_signature.returns.push(AbiParam::new(types::I64));
     let timestamp_id = module
         .declare_function("adv_read_timestamp", Linkage::Import, &timestamp_signature)
         .map_err(|e| e.to_string())?;
-    let timestamp_ref = module.declare_func_in_func(timestamp_id, &mut ctx.func);
     let mut range_signature = module.make_signature();
     range_signature.params.push(AbiParam::new(ptr_ty));
     range_signature.params.extend([AbiParam::new(types::I64); 3]);
@@ -759,7 +755,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let range_id = module
         .declare_function("adv_range_ok", Linkage::Import, &range_signature)
         .map_err(|e| e.to_string())?;
-    let range_ok_ref = module.declare_func_in_func(range_id, &mut ctx.func);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let mut fault_draft = None;
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -771,8 +766,35 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let source_map = diagnostics::instruction_map_enabled();
-    {
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+    // Builds the region function, or with `kernel` the separate function for
+    // that versioned loop's clone. `kernels` holds each loop's finalized kernel
+    // address for the region to call.
+    let mut emit = |module: &mut JITModule,
+                    func: &mut ir::Function,
+                    fb_ctx: &mut FunctionBuilderContext,
+                    kernel: Option<usize>,
+                    kernels: &[usize]| {
+        let trap_ref = module.declare_func_in_func(host_id, func);
+        let repeat_ref = module.declare_func_in_func(repeat_id, func);
+        let x87_ref = module.declare_func_in_func(x87_id, func);
+        let atomic_store_ref = module.declare_func_in_func(atomic_store_id, func);
+        let atomic_load_ref = module.declare_func_in_func(atomic_load_id, func);
+        let file_read_ref = module.declare_func_in_func(file_read_id, func);
+        let file_write_ref = module.declare_func_in_func(file_write_id, func);
+        let file_prepared_ref = module.declare_func_in_func(file_prepared_id, func);
+        let file_prepare_ref = module.declare_func_in_func(prepare_id, func);
+        let timestamp_ref = module.declare_func_in_func(timestamp_id, func);
+        let range_ok_ref = module.declare_func_in_func(range_id, func);
+        let shadow_ref = if kernel.is_some() { None } else { shadow_ref };
+        // A kernel loads and stores only the state its loop can touch.
+        let scope: Vec<&Instruction> = match kernel {
+            Some(index) => instructions
+                .range(plans[index].header..=plans[index].latch)
+                .map(|(_, i)| i)
+                .collect(),
+            None => instructions.values().collect(),
+        };
+        let mut b = FunctionBuilder::new(func, fb_ctx);
         let prologue = b.create_block();
         b.append_block_params_for_function_params(prologue);
         b.switch_to_block(prologue);
@@ -806,7 +828,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             params[0],
             offset_of!(NativeContext, interrupt) as i32,
         );
-        let tail_ref = b.import_signature(tail_signature);
+        let tail_ref = b.import_signature(tail_signature.clone());
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let fault_mode = fault_pc.map(|_| {
             let variable = b.declare_var(types::I8);
@@ -821,7 +843,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         });
         let regs: [Variable; 8] = std::array::from_fn(|_| b.declare_var(types::I32));
         let mut xmm = [None; 8];
-        for instruction in instructions.values().filter(|i| supported(i)) {
+        for instruction in scope.iter().filter(|i| supported(i)) {
             for operand in 0..instruction.op_count() {
                 if let Some(index) = simd::register(instruction.op_register(operand))
                     && xmm[index].is_none()
@@ -839,13 +861,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
         }
         let mut mmx = [None; 8];
-        let has_mmx = instructions
-            .values()
-            .any(|i| supported(i) && mmx::supported(i));
-        for instruction in instructions
-            .values()
-            .filter(|i| supported(i) && mmx::supported(i))
-        {
+        let has_mmx = scope.iter().any(|i| supported(i) && mmx::supported(i));
+        for instruction in scope.iter().filter(|i| supported(i) && mmx::supported(i)) {
             for operand in 0..instruction.op_count() {
                 if let Some(index) = mmx::register(instruction.op_register(operand))
                     && mmx[index].is_none()
@@ -940,6 +957,21 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     .collect()
             })
             .collect();
+        let windows: Vec<BTreeMap<(u32, bool), (Variable, Variable)>> = plans
+            .iter()
+            .map(|plan| {
+                plan.windows
+                    .iter()
+                    .map(|&site| {
+                        let low = b.declare_var(types::I32);
+                        let span = b.declare_var(types::I32);
+                        b.def_var(low, zero);
+                        b.def_var(span, zero);
+                        (site, (low, span))
+                    })
+                    .collect()
+            })
+            .collect();
         let dispatch = b.create_block();
         b.append_block_param(dispatch, types::I32);
         if shadow_ref.is_some() {
@@ -958,8 +990,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             b.append_block_param(hot_dispatch, ptr_ty);
         }
         let write_summary = write_summary::Summary::for_region(&instructions);
-        let hot_exits = write_summary.is_some() && write_summary::crosses_regions(&instructions);
-        if !hot_exits {
+        let hot_exits = kernel.is_none()
+            && write_summary.is_some()
+            && write_summary::crosses_regions(&instructions);
+        if !hot_exits && kernel.is_none() {
             if shadow_ref.is_some() {
                 let absent = b.ins().iconst(ptr_ty, 0);
                 b.ins().jump(dispatch, &[pc.into(), absent.into()]);
@@ -1003,12 +1037,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             base: snapshot.base,
             len: snapshot.len,
             blocks,
-            plans,
+            plans: plans.clone(),
             fast_blocks,
             cooldowns,
             slot_vars,
+            windows,
             fast: None,
+            kernels: kernels.to_vec(),
             range_ok_ref,
+            site: None,
+            unchanged: 0,
+            frames: BTreeMap::new(),
+            kernel: None,
             dispatch,
             shared_exit,
             pc: region.start,
@@ -1028,6 +1068,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             direct_footers: BTreeMap::new(),
             write_summary,
             dead_flags: flag_liveness::dead_on_entry(&instructions),
+            live_registers: register_liveness::live_on_entry(&instructions),
             hot_exits,
             bridge,
             trap_ref,
@@ -1085,9 +1126,14 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             let reason = e.constant(Exit::Dispatch as u32);
             e.b.ins().return_(&[reason]);
         }
-        // Versioned loop clones follow the ordinary blocks and share their body.
+        // A kernel runs its clone from the entry; every ordinary block becomes
+        // a transfer back to the region.
+        if let Some(index) = kernel {
+            e.enter_kernel(index);
+        }
         let mut work: Vec<_> = e.blocks.iter().map(|(&pc, &block)| (pc, block, None)).collect();
-        for (index, blocks) in e.fast_blocks.iter().enumerate() {
+        if let Some(index) = kernel {
+            let blocks = &e.fast_blocks[index];
             work.extend(blocks.iter().map(|(&pc, &block)| (pc, block, Some(index))));
         }
         for (start, block, fast) in work {
@@ -1097,6 +1143,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             e.b.switch_to_block(block);
             e.pc = start;
+            if kernel.is_some() && fast.is_none() {
+                e.begin_mmx_block();
+                e.exit_const(Exit::Dispatch, start);
+                continue;
+            }
             e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Budget));
             e.begin_mmx_block();
             let budget = e.b.use_var(e.fuel);
@@ -1120,16 +1171,20 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     ));
                 }
             }
-            // Entering a clone iteration paid for all of its blocks.
+            // A kernel charges its blocks when it leaves (`settle_fuel`).
             if fast.is_none() {
                 let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
                 e.guard(zero, Exit::Budget, None);
+                let remaining = e.b.ins().iadd_imm(budget, -1);
+                e.b.def_var(e.fuel, remaining);
             }
-            let remaining = e.b.ins().iadd_imm(budget, -1);
-            e.b.def_var(e.fuel, remaining);
             let mut pc = start;
             loop {
-                if pc != start && e.blocks.contains_key(&pc) {
+                let boundary = match fast {
+                    Some(index) => e.fast_blocks[index].contains_key(&pc),
+                    None => e.blocks.contains_key(&pc),
+                };
+                if pc != start && boundary {
                     e.mark_source(diagnostics::overhead_source(
                         diagnostics::Overhead::Transfer,
                     ));
@@ -1158,7 +1213,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     // normal success lane bypasses these cold helper blocks.
                     e.canonical_x87_instruction(instruction);
                     break;
-                } else if e.instruction(instruction) {
+                }
+                e.precheck(instruction);
+                if e.instruction(instruction) {
                     break;
                 }
                 pc = instruction.next_ip32();
@@ -1200,7 +1257,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let reason = e.b.block_params(shared_exit)[0];
         let pc = e.b.block_params(shared_exit)[1];
         e.save_state(pc);
-        if hot_exits {
+        if hot_exits || kernel.is_some() {
             e.b.ins().return_(&[reason]);
         } else {
             let prediction = shadow_ref.map(|_| e.b.block_params(shared_exit)[2]);
@@ -1263,22 +1320,73 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
         e.b.seal_all_blocks();
         e.b.finalize();
-    }
-    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
-    module
-        .define_function(id, &mut ctx)
-        .map_err(|e| format!("{e:?}"))?;
-    if let Some(directory) = dump_dir {
-        let directory = std::path::PathBuf::from(directory);
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        if let Some(code) = ctx.compiled_code().and_then(|code| code.vcode.as_ref()) {
+    };
+    // Kernels are finalized first: the region calls their absolute addresses,
+    // since JIT allocations need not stay within a rel32 reach of each other.
+    let mut kernel_functions = Vec::new();
+    for index in 0..plans.len() {
+        let mut kernel_ctx = module.make_context();
+        if dump_dir.is_some() {
+            kernel_ctx.set_disasm(true);
+        }
+        kernel_ctx.func.signature = tail_signature.clone();
+        emit(
+            &mut module,
+            &mut kernel_ctx.func,
+            &mut fb_ctx,
+            Some(index),
+            &[],
+        );
+        let kernel_id = module
+            .declare_function(
+                &format!("guest_kernel_{index}"),
+                Linkage::Local,
+                &tail_signature,
+            )
+            .map_err(|e| e.to_string())?;
+        #[cfg(feature = "cross-dump")]
+        let cross = dump_dir.as_ref().map(|_| kernel_ctx.func.clone());
+        module
+            .define_function(kernel_id, &mut kernel_ctx)
+            .map_err(|e| format!("{e:?}"))?;
+        let name = format!("region-{:08x}.kernel-{index}", region.start);
+        dump(&dump_dir, &name, &kernel_ctx)?;
+        #[cfg(feature = "cross-dump")]
+        if let (Some(directory), Some(function)) = (&dump_dir, cross) {
+            let code = aarch64_vcode(function, opt_level)?;
             std::fs::write(
-                directory.join(format!("region-{:08x}.vcode", region.start)),
+                std::path::Path::new(directory).join(format!("{name}.aarch64.vcode")),
                 code,
             )
             .map_err(|e| e.to_string())?;
         }
+        kernel_functions.push((kernel_id, kernel_ctx));
+    }
+    if !kernel_functions.is_empty() {
+        module.finalize_definitions().map_err(|e| e.to_string())?;
+    }
+    let kernels: Vec<usize> = kernel_functions
+        .iter()
+        .map(|&(id, _)| module.get_finalized_function(id) as usize)
+        .collect();
+    emit(&mut module, &mut ctx.func, &mut fb_ctx, None, &kernels);
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
+    #[cfg(feature = "cross-dump")]
+    let cross = dump_dir.as_ref().map(|_| ctx.func.clone());
+    module
+        .define_function(id, &mut ctx)
+        .map_err(|e| format!("{e:?}"))?;
+    let name = format!("region-{:08x}", region.start);
+    dump(&dump_dir, &name, &ctx)?;
+    #[cfg(feature = "cross-dump")]
+    if let (Some(directory), Some(function)) = (&dump_dir, cross) {
+        let code = aarch64_vcode(function, opt_level)?;
+        std::fs::write(
+            std::path::Path::new(directory).join(format!("{name}.aarch64.vcode")),
+            code,
+        )
+        .map_err(|e| e.to_string())?;
     }
     let source_ranges = diagnostics::instruction_map_enabled().then(|| {
         ctx.compiled_code().map_or_else(Vec::new, |code| {
@@ -1315,6 +1423,23 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         diagnostics::record_body(region, opt_level, tail_entry, code_size, instructions.len());
     if let Some(ranges) = source_ranges {
         diagnostics::record_instructions(region, recorded, tail_entry, ranges, &instructions);
+    }
+    for (id, kernel_ctx) in &kernel_functions {
+        let base = module.get_finalized_function(*id) as usize;
+        let Some(code) = kernel_ctx.compiled_code() else {
+            continue;
+        };
+        let size = code.code_buffer().len();
+        code_size += size;
+        let recorded = diagnostics::record_body(region, "kernel", base, size, 0);
+        if diagnostics::instruction_map_enabled() {
+            let ranges = code
+                .buffer
+                .get_srclocs_sorted()
+                .iter()
+                .map(|range| (range.start, range.end, range.loc));
+            diagnostics::record_instructions(region, recorded, base, ranges, &instructions);
+        }
     }
     let mut wrapper = module.make_context();
     wrapper.func.signature = module.make_signature();
@@ -1408,6 +1533,25 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         (Vec::new(), Vec::new())
     };
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    if unwind.len() == 2 {
+        for (id, kernel_ctx) in &kernel_functions {
+            let code = kernel_ctx.compiled_code().unwrap();
+            let Some(cranelift_codegen::isa::unwind::UnwindInfo::WindowsX64(info)) = code
+                .create_unwind_info(module.isa())
+                .map_err(|e| e.to_string())?
+            else {
+                return Err("missing Windows kernel unwind".into());
+            };
+            let address = module.get_finalized_function(*id) as usize;
+            let length = code.code_buffer().len();
+            if let Ok(registration) =
+                unsafe { crate::host_fault::UnwindRegistration::new(address, length, &info) }
+            {
+                unwind.push(registration);
+            }
+        }
+    }
     Ok(Compiled {
         module: Some(module),
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -1619,6 +1763,56 @@ mod tests {
     }
 }
 
+/// Writes the vcode of a compiled function when dumping is enabled.
+fn dump(
+    directory: &Option<std::ffi::OsString>,
+    name: &str,
+    context: &cranelift_codegen::Context,
+) -> Result<(), String> {
+    let Some(directory) = directory else {
+        return Ok(());
+    };
+    let directory = std::path::Path::new(directory);
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    if let Some(code) = context.compiled_code().and_then(|code| code.vcode.as_ref()) {
+        std::fs::write(directory.join(format!("{name}.vcode")), code).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The AArch64 lowering of a region function, for comparing the code the
+/// final target would run. Host helper signatures use the AArch64 C ABI.
+#[cfg(feature = "cross-dump")]
+fn aarch64_vcode(mut function: ir::Function, opt_level: &str) -> Result<String, String> {
+    use cranelift_codegen::settings::{self, Configurable};
+    for signature in function.dfg.signatures.values_mut() {
+        if signature.call_conv == cranelift_codegen::isa::CallConv::WindowsFastcall {
+            signature.call_conv = cranelift_codegen::isa::CallConv::SystemV;
+        }
+    }
+    let mut flags = settings::builder();
+    flags
+        .set("opt_level", opt_level)
+        .map_err(|e| e.to_string())?;
+    flags
+        .set("preserve_frame_pointers", "true")
+        .map_err(|e| e.to_string())?;
+    let isa = cranelift_codegen::isa::lookup_by_name("aarch64")
+        .map_err(|e| e.to_string())?
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| e.to_string())?;
+    let mut context = cranelift_codegen::Context::for_function(function);
+    context.set_disasm(true);
+    let code = context
+        .compile(&*isa, &mut Default::default())
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(code.vcode.clone().unwrap_or_default())
+}
+
+/// Checked iterations a versioned loop runs after a failed proof, or after
+/// its kernel stopped inside it, before the region calls the kernel again.
+const COOLDOWN: u32 = 63;
+
 fn reg_index(reg: R) -> Option<usize> {
     Some(match reg {
         R::EAX => 0,
@@ -1766,6 +1960,8 @@ pub(crate) fn supported(i: &Instruction) -> bool {
 #[derive(Clone, Copy)]
 struct GuestPointer {
     address: Value,
+    /// Byte offset from `address` for ordinary stores; zero unless proven.
+    offset: i32,
     guest: Value,
     shared: Value,
     file: Value,
@@ -1800,8 +1996,24 @@ struct Emitter<'a> {
     cooldowns: Vec<Variable>,
     /// Forwarded slot values of each loop, valid inside its clone.
     slot_vars: Vec<Vec<Variable>>,
+    /// Each loop's validated windows as `(low, span)`: an access at `addr`
+    /// fits when `addr - low < span`. Empty when its kernel starts.
+    windows: Vec<BTreeMap<(u32, bool), (Variable, Variable)>>,
     fast: Option<usize>,
+    /// Finalized kernel addresses, one per plan, for the region to call.
+    kernels: Vec<usize>,
     range_ok_ref: ir::FuncRef,
+    /// The current instruction's operand address and size once a kernel
+    /// validated its windows (`precheck`).
+    site: Option<(u32, Value, u32)>,
+    /// In a kernel, the registers its loop never writes: `CpuState` already
+    /// holds them at every exit.
+    unchanged: u8,
+    /// In a kernel, the host address of each unchanged base register.
+    frames: BTreeMap<usize, Variable>,
+    /// In a kernel: its loop, the counter value that ends the iterations its
+    /// fuel pays for, and the fuel and counter it started with.
+    kernel: Option<(usize, Variable, ir::StackSlot)>,
     dispatch: ir::Block,
     shared_exit: ir::Block,
     pc: u32,
@@ -1815,6 +2027,8 @@ struct Emitter<'a> {
     write_summary: Option<write_summary::Summary>,
     /// Exit PCs that need no lazy-flag materialization.
     dead_flags: BTreeSet<u32>,
+    /// General registers live on entry to each PC (register_liveness).
+    live_registers: BTreeMap<u32, u8>,
     bridge: Value,
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
@@ -2170,20 +2384,13 @@ impl Emitter<'_> {
     }
     fn exit_predicted(&mut self, reason: Exit, pc: Value, prediction: Option<Value>) {
         self.flush_mmx_effects();
-        // No guest instruction can observe the arithmetic flags at this PC:
-        // exit with the last canonical EFLAGS instead of keeping the lazy
-        // values alive. That is still exact when nothing changed them since.
-        if self
-            .known(pc)
-            .is_some_and(|pc| self.dead_flags.contains(&pc))
-        {
-            let zero = self.constant(0);
-            for var in self.lazy {
-                self.b.def_var(var, zero);
+        self.settle_fuel(pc);
+        if let Some(pc) = self.known(pc) {
+            self.forget_dead_flags(pc);
+            // Exceptions show every register; resuming exits carry live ones.
+            if matches!(reason, Exit::Dispatch | Exit::Budget | Exit::Interrupted) {
+                self.forget_dead_registers(pc);
             }
-            let flags = self.b.use_var(self.flags);
-            let carry = self.b.ins().band_imm(flags, 1);
-            self.b.def_var(self.lazy[4], carry);
         }
         if reason == Exit::Dispatch && self.hot_exits {
             if self.shadow_ref.is_some() {
@@ -2207,6 +2414,41 @@ impl Emitter<'_> {
             self.b
                 .ins()
                 .jump(self.shared_exit, &[reason.into(), pc.into()]);
+        }
+    }
+    /// No guest instruction can observe the arithmetic flags at `pc`: leave
+    /// with the last canonical EFLAGS instead of keeping the lazy values
+    /// alive. That is still exact when nothing changed them since.
+    fn forget_dead_flags(&mut self, pc: u32) {
+        if self.dead_flags.contains(&pc) {
+            let zero = self.constant(0);
+            for var in self.lazy {
+                self.b.def_var(var, zero);
+            }
+            let flags = self.b.use_var(self.flags);
+            let carry = self.b.ins().band_imm(flags, 1);
+            self.b.def_var(self.lazy[4], carry);
+        }
+    }
+    /// Before resuming the guest at `pc`, registers that every path from there
+    /// overwrites before reading take their values in `CpuState`, so the
+    /// current values need not stay live up to this transfer.
+    fn forget_dead_registers(&mut self, pc: u32) {
+        let live = self
+            .live_registers
+            .get(&pc)
+            .copied()
+            .unwrap_or(register_liveness::ALL);
+        for index in 0..8 {
+            if live & (1 << index) == 0 {
+                let value = self.b.ins().load(
+                    types::I32,
+                    MemFlags::trusted(),
+                    self.state,
+                    (index * 4) as i32,
+                );
+                self.b.def_var(self.regs[index], value);
+            }
         }
     }
     fn save_state(&mut self, pc: Value) {
@@ -2249,6 +2491,9 @@ impl Emitter<'_> {
             }
         }
         for (i, reg) in self.regs.iter().enumerate() {
+            if self.unchanged & 1 << i != 0 {
+                continue;
+            }
             let v = self.b.use_var(*reg);
             self.b
                 .ins()
@@ -2423,6 +2668,7 @@ impl Emitter<'_> {
     /// Starts guest instruction `pc`. Source tags are sampler metadata only.
     fn at(&mut self, pc: u32) {
         self.pc = pc;
+        self.site = None;
         self.mark(diagnostics::Part::Body);
     }
     fn mark(&mut self, part: diagnostics::Part) {
@@ -2497,7 +2743,7 @@ impl Emitter<'_> {
         }
     }
     /// Whether the fuel pays for every block of one more iteration of loop
-    /// `index`; clone blocks charge fuel without their own guards.
+    /// `index`, which its kernel charges as a whole.
     fn funded(&mut self, index: usize) -> Value {
         let blocks = self.plans[index].starts.len() as i64;
         let fuel = self.b.use_var(self.fuel);
@@ -2505,27 +2751,113 @@ impl Emitter<'_> {
             .ins()
             .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, fuel, blocks)
     }
-    /// A clone's back edge stays in the clone while the fuel pays for the next
-    /// iteration; otherwise the checked header takes the budget exit.
+    /// A kernel's back edge stays in the clone until the counter reaches the
+    /// value its fuel pays for; the region's checked header then resumes.
     fn continue_clone(&mut self, index: usize) {
         let header = self.plans[index].header;
         let checked = self.blocks[&header];
         let fast = self.fast_blocks[index][&header];
         self.flush_mmx_effects();
-        let funded = self.funded(index);
+        let counter = self.plans[index].counter;
+        let (_, stop, _) = self.kernel.expect("clones run in kernels");
+        let count = self.b.use_var(self.regs[counter]);
+        let stop = self.b.use_var(stop);
+        let funded = self.b.ins().icmp(IntCC::NotEqual, count, stop);
         let next = self.b.create_block();
-        self.b.ins().brif(funded, next, &[], checked, &[]);
+        let refill = self.b.create_block();
+        self.b.set_cold_block(refill);
+        self.b.ins().brif(funded, next, &[], refill, &[]);
+        // The checked header resumes the loop; dead values need not reach it.
+        self.b.switch_to_block(refill);
+        self.forget_dead_flags(header);
+        self.forget_dead_registers(header);
+        self.b.ins().jump(checked, &[]);
         self.b.switch_to_block(next);
         let target = self.constant(header);
         self.interrupt_at(target, false);
+        // Redefining each frame pointer here keeps it a block parameter, which
+        // instruction selection cannot split back into base, extended
+        // register and displacement: a frame access stays one instruction.
+        let frames: Vec<_> = self.frames.iter().map(|(&b, &v)| (b, v)).collect();
+        for (base, frame) in frames {
+            let address = self.frame(base);
+            self.b.def_var(frame, address);
+        }
+        // Likewise the stop value stays one register the latch compares
+        // with, instead of being folded into the counter every iteration.
+        let (_, stop, _) = self.kernel.expect("clones run in kernels");
+        let value = self.b.use_var(stop);
+        let value = self.b.ins().iadd_imm(value, 0);
+        self.b.def_var(stop, value);
         self.b.ins().jump(fast, &[]);
+    }
+    /// In a kernel, the register of a 16-bit loop counter that `i`
+    /// decrements. The clone runs only while the counter is at least one
+    /// before it, so the decrement never borrows from the high half.
+    fn counting(&self, i: &Instruction) -> Option<usize> {
+        let (index, ..) = self.kernel?;
+        self.fast?;
+        let plan = &self.plans[index];
+        (plan.counter_size == 2 && i.next_ip32() == plan.latch).then_some(plan.counter)
+    }
+    /// The iteration count in a counter register's value of `size` bytes.
+    fn counter_value(&mut self, size: u32, value: Value) -> Value {
+        if size == 2 {
+            self.b.ins().band_imm(value, 0xffff)
+        } else {
+            value
+        }
+    }
+    /// A kernel's fuel when it leaves at `pc`: every iteration its counter
+    /// shows as begun pays for all of the loop's blocks, an exit inside an
+    /// iteration included. The region charges the blocks it then runs again.
+    fn settle_fuel(&mut self, pc: Value) {
+        let Some((index, _, entry)) = self.kernel else {
+            return;
+        };
+        let plan = &self.plans[index];
+        let (header, latch) = (plan.header, plan.latch);
+        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let blocks = plan.starts.len() as i64;
+        let fuel = self.b.ins().stack_load(types::I64, entry, 0);
+        let first = self.b.ins().stack_load(types::I32, entry, 8);
+        let count = self.b.use_var(self.regs[counter]);
+        let done = self.b.ins().isub(first, count);
+        let done = self.counter_value(counter_size, done);
+        let mut done = self.b.ins().uextend(types::I64, done);
+        // Before the counter's decrement, right ahead of the latch.
+        match self.known(pc) {
+            Some(pc) => {
+                if header < pc && pc < latch {
+                    done = self.b.ins().iadd_imm(done, 1);
+                }
+            }
+            None => {
+                let relative = self.b.ins().iadd_imm(pc, -i64::from(header) - 1);
+                let inside = self.b.ins().icmp_imm(
+                    IntCC::UnsignedLessThan,
+                    relative,
+                    i64::from(latch - header - 1),
+                );
+                let inside = self.b.ins().uextend(types::I64, inside);
+                done = self.b.ins().iadd(done, inside);
+            }
+        }
+        let charge = self.b.ins().imul_imm(done, blocks);
+        let fuel = self.b.ins().isub(fuel, charge);
+        self.b.def_var(self.fuel, fuel);
+    }
+    /// The host address of guest register `base`'s value.
+    fn frame(&mut self, base: usize) -> Value {
+        let value = self.b.use_var(self.regs[base]);
+        let biased = self.b.ins().iadd_imm(self.mem, -i64::from(self.base));
+        let offset = self.b.ins().uextend(self.ptr_ty, value);
+        self.b.ins().iadd(biased, offset)
     }
     /// A checked back edge enters the clone once the remaining iterations'
     /// operand ranges are proven. A failed proof waits `COOLDOWN` iterations
     /// before the next attempt, so unprovable loops stay cheap.
     fn enter_clone(&mut self, index: usize, checked: ir::Block) {
-        const COOLDOWN: i64 = 63;
-        let fast = self.fast_blocks[index][&self.plans[index].header];
         let cooldown = self.cooldowns[index];
         let wait = self.b.use_var(cooldown);
         let attempt = self.b.create_block();
@@ -2547,6 +2879,116 @@ impl Emitter<'_> {
         self.b.ins().brif(proven, load, &[], failed, &[]);
         self.b.switch_to_block(load);
         self.b.seal_block(load);
+        self.call_kernel(index);
+        self.b.switch_to_block(failed);
+        let wait = self.constant(COOLDOWN);
+        self.b.def_var(cooldown, wait);
+        self.b.ins().jump(checked, &[]);
+    }
+    /// Runs loop `index` in its kernel with the state at its header. The kernel
+    /// returns `Dispatch` to resume here at the saved PC; any other exit has
+    /// already saved the state and leaves the region with the same reason.
+    fn call_kernel(&mut self, index: usize) {
+        let header = self.constant(self.plans[index].header);
+        self.save_state(header);
+        let address = self.b.ins().iconst(self.ptr_ty, self.kernels[index] as i64);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        let reason = self.b.inst_results(call)[0];
+        let resume = self.b.create_block();
+        let leave = self.b.create_block();
+        self.b.set_cold_block(leave);
+        let dispatch = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
+        self.b.ins().brif(dispatch, resume, &[], leave, &[]);
+        self.b.switch_to_block(leave);
+        self.b.seal_block(leave);
+        self.b.ins().return_(&[reason]);
+        self.b.switch_to_block(resume);
+        self.b.seal_block(resume);
+        // The resumed path leaves through the dispatcher; other edges of the
+        // current guest block keep composing the MMX prefix they had.
+        let effects = self.mmx_effects.take();
+        self.reload_state();
+        let pc = self.b.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            self.state,
+            offset_of!(CpuState, eip) as i32,
+        );
+        // A kernel that stopped inside its loop met memory its windows
+        // reject; the checked loop runs a while before the next call.
+        let (first, last) = (self.plans[index].header, self.plans[index].latch);
+        let inside = self.b.ins().iadd_imm(pc, -i64::from(first) - 1);
+        let inside =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::UnsignedLessThan, inside, i64::from(last - first));
+        let cooldown = self.cooldowns[index];
+        let wait = self.b.use_var(cooldown);
+        let rest = self.constant(COOLDOWN);
+        let wait = self.b.ins().select(inside, rest, wait);
+        self.b.def_var(cooldown, wait);
+        if self.shadow_ref.is_some() {
+            let absent = self.b.ins().iconst(self.ptr_ty, 0);
+            self.b
+                .ins()
+                .jump(self.dispatch, &[pc.into(), absent.into()]);
+        } else {
+            self.b.ins().jump(self.dispatch, &[pc.into()]);
+        }
+        self.mmx_effects = effects;
+    }
+    /// A kernel's entry: the region proved the loop and saved the state at
+    /// its header. Forwarded slots start from memory; windows start empty.
+    fn enter_kernel(&mut self, index: usize) {
+        let plan = &self.plans[index];
+        let (counter, counter_size) = (plan.counter, plan.counter_size);
+        let blocks = plan.starts.len() as i64;
+        // The fuel pays for whole iterations: the loop stops early when the
+        // counter reaches `stop` and charges what ran when it leaves.
+        let fuel = self.b.use_var(self.fuel);
+        let first = self.b.use_var(self.regs[counter]);
+        let entry = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            3,
+        ));
+        self.b.ins().stack_store(fuel, entry, 0);
+        self.b.ins().stack_store(first, entry, 8);
+        let count = self.counter_value(counter_size, first);
+        let count = self.b.ins().uextend(types::I64, count);
+        let affordable = self.b.ins().udiv_imm(fuel, blocks);
+        let limit = self.b.ins().umin(affordable, count);
+        let stop = self.b.ins().isub(count, limit);
+        let mut stop = self.b.ins().ireduce(types::I32, stop);
+        if counter_size == 2 {
+            // The high half never changes (`counting`): compare whole registers.
+            let high = self.b.ins().band_imm(first, 0xffff_0000);
+            stop = self.b.ins().bor(high, stop);
+        }
+        let stop_var = self.b.declare_var(types::I32);
+        self.b.def_var(stop_var, stop);
+        self.kernel = Some((index, stop_var, entry));
+        let plan = &self.plans[index];
+        self.unchanged = plan.invariant;
+        let bases: BTreeSet<usize> = plan
+            .proven
+            .values()
+            .filter(|operand| operand.index.is_none())
+            .filter_map(|operand| operand.base)
+            .filter(|&base| plan.invariant & 1 << base != 0)
+            .collect();
+        for base in bases {
+            let frame = self.b.declare_var(self.ptr_ty);
+            let address = self.frame(base);
+            self.b.def_var(frame, address);
+            self.frames.insert(base, frame);
+        }
         let slots = self.plans[index].slots.clone();
         for (slot, (base, displacement)) in slots.into_iter().enumerate() {
             let address = self.b.use_var(self.regs[base]);
@@ -2555,11 +2997,8 @@ impl Emitter<'_> {
             let value = self.b.ins().load(types::I32, MemFlags::new(), address, 0);
             self.b.def_var(self.slot_vars[index][slot], value);
         }
+        let fast = self.fast_blocks[index][&self.plans[index].header];
         self.b.ins().jump(fast, &[]);
-        self.b.switch_to_block(failed);
-        let wait = self.constant(COOLDOWN as u32);
-        self.b.def_var(cooldown, wait);
-        self.b.ins().jump(checked, &[]);
     }
     /// Whether every group of loop `index` stays in ordinary memory for the
     /// iterations left when its latch branches back: the counter, already
@@ -2677,17 +3116,44 @@ impl Emitter<'_> {
         let slot = *self.plans[index].promoted.get(&self.pc)?;
         (ty == types::I32).then(|| self.slot_vars[index][slot])
     }
-    /// The host address of an operand the current loop clone has proven.
-    fn proven(&mut self, addr: Value, size: usize) -> Option<Value> {
+    /// The host address of an operand the current loop clone has proven, as a
+    /// base and a constant offset. The proof keeps `base + index * scale +
+    /// displacement` from wrapping, so the displacement can stay an immediate
+    /// of the host access: loop-invariant bases then share one hoisted value
+    /// instead of one per displacement.
+    fn proven(&mut self, size: usize) -> Option<(Value, i32)> {
         let plan = &self.plans[self.fast?];
-        if plan
-            .proven
-            .get(&self.pc)
-            .is_none_or(|&width| size as u32 > width)
-        {
+        let operand = *plan.proven.get(&self.pc)?;
+        if size as u32 > operand.width {
             return None;
         }
-        Some(self.proven_address(addr))
+        if operand.index.is_none()
+            && let Some(frame) = operand.base.and_then(|base| self.frames.get(&base))
+        {
+            let frame = *frame;
+            return Some((self.b.use_var(frame), operand.displacement));
+        }
+        let mut sum = None;
+        if let Some(base) = operand.base {
+            sum = Some(self.b.use_var(self.regs[base]));
+        }
+        if let Some((index, scale)) = operand.index {
+            let value = self.b.use_var(self.regs[index]);
+            let scaled = self.b.ins().imul_imm(value, i64::from(scale));
+            sum = Some(match sum {
+                Some(sum) => self.b.ins().iadd(sum, scaled),
+                None => scaled,
+            });
+        }
+        let biased = self.b.ins().iadd_imm(self.mem, -i64::from(self.base));
+        let address = match sum {
+            Some(sum) => {
+                let sum = self.b.ins().uextend(self.ptr_ty, sum);
+                self.b.ins().iadd(biased, sum)
+            }
+            None => biased,
+        };
+        Some((address, operand.displacement))
     }
     fn proven_address(&mut self, addr: Value) -> Value {
         let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
@@ -2755,6 +3221,11 @@ impl Emitter<'_> {
         self.b.switch_to_block(continued);
     }
     fn address(&mut self, i: &Instruction) -> Value {
+        if let Some((pc, addr, _)) = self.site
+            && pc == self.pc
+        {
+            return addr;
+        }
         let mut addr = self.constant(i.memory_displacement32());
         if let Some(reg) = reg_index(i.memory_base()) {
             let value = self.b.use_var(self.regs[reg]);
@@ -2852,10 +3323,22 @@ impl Emitter<'_> {
             .icmp_imm(IntCC::NotEqual, mask, i64::from(permission))
     }
     fn pointer(&mut self, addr: Value, size: usize) -> GuestPointer {
-        if let Some(address) = self.proven(addr, size) {
+        if let Some((address, offset)) = self.proven(size) {
             let ordinary = self.b.ins().iconst(types::I8, 0);
             return GuestPointer {
                 address,
+                offset,
+                guest: addr,
+                shared: ordinary,
+                file: ordinary,
+            };
+        }
+        if self.validated(addr, size, false) && self.validated(addr, size, true) {
+            let address = self.window_address(addr);
+            let ordinary = self.b.ins().iconst(types::I8, 0);
+            return GuestPointer {
+                address,
+                offset: 0,
                 guest: addr,
                 shared: ordinary,
                 file: ordinary,
@@ -2889,6 +3372,7 @@ impl Emitter<'_> {
             let address = self.b.ins().iadd(self.mem, host_offset);
             return GuestPointer {
                 address,
+                offset: 0,
                 guest: addr,
                 shared: no_file,
                 file: no_file,
@@ -2956,6 +3440,7 @@ impl Emitter<'_> {
         let address = self.b.ins().iadd(self.mem, host_offset);
         GuestPointer {
             address,
+            offset: 0,
             guest: addr,
             shared,
             file,
@@ -2975,7 +3460,17 @@ impl Emitter<'_> {
                 Some(value) => self.b.def_var(slot, value),
             }
         }
-        if let Some(address) = self.proven(addr, size) {
+        if let Some((address, offset)) = self.proven(size) {
+            return match value {
+                Some(value) => {
+                    self.b.ins().store(MemFlags::new(), value, address, offset);
+                    None
+                }
+                None => Some(self.b.ins().load(ty, MemFlags::new(), address, offset)),
+            };
+        }
+        if self.validated(addr, size, write) {
+            let address = self.window_address(addr);
             return match value {
                 Some(value) => {
                     self.b.ins().store(MemFlags::new(), value, address, 0);
@@ -2984,6 +3479,206 @@ impl Emitter<'_> {
                 None => Some(self.b.ins().load(ty, MemFlags::new(), address, 0)),
             };
         }
+        self.checked_memory(addr, ty, value)
+    }
+    /// In a kernel, validates the windows of the instruction's memory operand
+    /// before any of its effects. An access outside ordinary memory leaves
+    /// the kernel at the instruction, which the region's checked block then
+    /// performs. The loop body thus calls nothing, so its values can stay in
+    /// caller-saved registers.
+    fn precheck(&mut self, i: &Instruction) {
+        let Some(index) = self.fast else {
+            return;
+        };
+        if self.lane.is_some() {
+            return;
+        }
+        let sites: Vec<_> = [false, true]
+            .into_iter()
+            .filter_map(|write| {
+                let window = self.windows[index].get(&(self.pc, write))?;
+                Some((write, *window))
+            })
+            .collect();
+        if sites.is_empty() {
+            return;
+        }
+        let addr = self.address(i);
+        let size = i.memory_size().size() as u32;
+        for (write, (low_var, span_var)) in sites {
+            self.mark(diagnostics::Part::Check);
+            let low = self.b.use_var(low_var);
+            let span = self.b.use_var(span_var);
+            let relative = self.b.ins().isub(addr, low);
+            let hit = self.b.ins().icmp(IntCC::UnsignedLessThan, relative, span);
+            let refill = self.b.create_block();
+            self.b.set_cold_block(refill);
+            let next = self.b.create_block();
+            self.b.ins().brif(hit, next, &[], refill, &[]);
+            self.b.switch_to_block(refill);
+            self.b.seal_block(refill);
+            self.mark(diagnostics::Part::Slow);
+            let (low, span) = self.refill_window(addr, size, write);
+            self.b.def_var(low_var, low);
+            self.b.def_var(span_var, span);
+            self.b.ins().jump(next, &[]);
+            self.b.switch_to_block(next);
+            self.b.seal_block(next);
+        }
+        self.mark(diagnostics::Part::Body);
+        self.site = Some((self.pc, addr, size));
+    }
+    /// The window around an access of `size` bytes at `addr` that missed its
+    /// window: the adjacent pages, up to `WINDOW_PAGES` on each side, that
+    /// all grant the access and have no forbidden bit. Leaves the kernel at
+    /// the instruction when the access itself is not ordinary memory.
+    fn refill_window(&mut self, addr: Value, size: u32, write: bool) -> (Value, Value) {
+        let (required, forbidden) = if write {
+            (WRITE, crate::memory::SHARED | EXEC)
+        } else {
+            (READ, crate::memory::SHARED)
+        };
+        let (mask, required) = (i64::from(required | forbidden), i64::from(required));
+        let page = crate::memory::PAGE_SIZE as i64;
+        let len = self.len as i64;
+        let reach = loops::WINDOW_PAGES;
+        let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
+        let start = self.b.ins().uextend(types::I64, offset);
+        let end = self.b.ins().iadd_imm(start, i64::from(size));
+        let outside = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, end, len);
+        let blocks: [ir::Block; 7] = std::array::from_fn(|_| self.b.create_block());
+        let [deopt, inside, down, probe_down, up, probe_up, finish] = blocks;
+        for block in blocks {
+            self.b.set_cold_block(block);
+        }
+        self.b.append_block_param(down, types::I64);
+        for block in [up, finish] {
+            self.b.append_block_param(block, types::I64);
+            self.b.append_block_param(block, types::I64);
+        }
+        self.b.ins().brif(outside, deopt, &[], inside, &[]);
+        // The access's own pages, then the limits of the scan around them.
+        self.b.switch_to_block(inside);
+        self.b.seal_block(inside);
+        let first = self.b.ins().ushr_imm(start, 12);
+        let last = self.b.ins().iadd_imm(end, -1);
+        let last = self.b.ins().ushr_imm(last, 12);
+        let first_ok = self.page_grants(first, mask, required);
+        let last_ok = self.page_grants(last, mask, required);
+        let ok = self.b.ins().band(first_ok, last_ok);
+        let near = self.b.ins().icmp_imm(IntCC::UnsignedLessThan, first, reach);
+        let zero = self.b.ins().iconst(types::I64, 0);
+        let below = self.b.ins().iadd_imm(first, -reach);
+        let floor = self.b.ins().select(near, zero, below);
+        let above = self.b.ins().iadd_imm(last, reach);
+        let top = self.b.ins().iconst(types::I64, (len + page - 1) / page - 1);
+        let ceiling = self.b.ins().umin(above, top);
+        self.b.ins().brif(ok, down, &[first.into()], deopt, &[]);
+        self.b.switch_to_block(deopt);
+        self.b.seal_block(deopt);
+        self.deopt();
+        // Extend downwards while the page below grants the access.
+        self.b.switch_to_block(down);
+        let low = self.b.block_params(down)[0];
+        let at_floor = self.b.ins().icmp(IntCC::Equal, low, floor);
+        self.b
+            .ins()
+            .brif(at_floor, up, &[low.into(), last.into()], probe_down, &[]);
+        self.b.switch_to_block(probe_down);
+        self.b.seal_block(probe_down);
+        let lower = self.b.ins().iadd_imm(low, -1);
+        let granted = self.page_grants(lower, mask, required);
+        self.b.ins().brif(
+            granted,
+            down,
+            &[lower.into()],
+            up,
+            &[low.into(), last.into()],
+        );
+        self.b.seal_block(down);
+        // Then upwards.
+        self.b.switch_to_block(up);
+        let low = self.b.block_params(up)[0];
+        let high = self.b.block_params(up)[1];
+        let at_ceiling = self.b.ins().icmp(IntCC::Equal, high, ceiling);
+        self.b.ins().brif(
+            at_ceiling,
+            finish,
+            &[low.into(), high.into()],
+            probe_up,
+            &[],
+        );
+        self.b.switch_to_block(probe_up);
+        self.b.seal_block(probe_up);
+        let higher = self.b.ins().iadd_imm(high, 1);
+        let granted = self.page_grants(higher, mask, required);
+        self.b.ins().brif(
+            granted,
+            up,
+            &[low.into(), higher.into()],
+            finish,
+            &[low.into(), high.into()],
+        );
+        self.b.seal_block(up);
+        self.b.switch_to_block(finish);
+        self.b.seal_block(finish);
+        let low = self.b.block_params(finish)[0];
+        let high = self.b.block_params(finish)[1];
+        let low = self.b.ins().ishl_imm(low, 12);
+        let high = self.b.ins().iadd_imm(high, 1);
+        let high = self.b.ins().ishl_imm(high, 12);
+        let len = self.b.ins().iconst(types::I64, len);
+        let high = self.b.ins().umin(high, len);
+        let span = self.b.ins().isub(high, low);
+        let span = self.b.ins().iadd_imm(span, 1 - i64::from(size));
+        let span = self.b.ins().ireduce(types::I32, span);
+        let low = self.b.ins().ireduce(types::I32, low);
+        let low = self.b.ins().iadd_imm(low, i64::from(self.base));
+        (low, span)
+    }
+    /// Leaves a kernel for the region to perform the current instruction,
+    /// which may raise: unlike other resuming exits, every register and flag
+    /// stays exact.
+    fn deopt(&mut self) {
+        debug_assert!(!self.hot_exits && self.shadow_ref.is_none());
+        self.flush_mmx_effects();
+        let reason = self.constant(Exit::Dispatch as u32);
+        let pc = self.constant(self.pc);
+        self.settle_fuel(pc);
+        self.b
+            .ins()
+            .jump(self.shared_exit, &[reason.into(), pc.into()]);
+    }
+    /// Whether permission page `page` (an I64 index) has exactly `required`
+    /// among the bits of `mask`.
+    fn page_grants(&mut self, page: Value, mask: i64, required: i64) -> Value {
+        let at = self.b.ins().iadd(self.perms, page);
+        let flags = MemFlags::trusted().with_readonly();
+        let bits = self.b.ins().uload8(types::I32, flags, at, 0);
+        let bits = self.b.ins().band_imm(bits, mask);
+        self.b.ins().icmp_imm(IntCC::Equal, bits, required)
+    }
+    /// Whether `precheck` validated this access of `size` bytes at `addr`
+    /// for `write`: the current instruction's operand inside its window.
+    fn validated(&self, addr: Value, size: usize, write: bool) -> bool {
+        let (Some(index), Some((pc, site, width))) = (self.fast, self.site) else {
+            return false;
+        };
+        self.lane.is_none()
+            && pc == self.pc
+            && site == addr
+            && size as u32 <= width
+            && self.windows[index].contains_key(&(pc, write))
+    }
+    fn window_address(&mut self, addr: Value) -> Value {
+        let biased = self.b.ins().iadd_imm(self.mem, -i64::from(self.base));
+        let offset = self.b.ins().uextend(self.ptr_ty, addr);
+        self.b.ins().iadd(biased, offset)
+    }
+    /// An unproven access through the page table.
+    fn checked_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
+        let write = value.is_some();
+        let size = ty.bytes() as usize;
         self.mark(diagnostics::Part::Check);
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         let hardware = if !write
@@ -3268,7 +3963,7 @@ impl Emitter<'_> {
         if self.known(pointer.shared) == Some(0) {
             self.b
                 .ins()
-                .store(MemFlags::new(), value, pointer.address, 0);
+                .store(MemFlags::new(), value, pointer.address, pointer.offset);
             return;
         }
         let ordinary = self.b.create_block();
@@ -3281,7 +3976,7 @@ impl Emitter<'_> {
         self.b.switch_to_block(ordinary);
         self.b
             .ins()
-            .store(MemFlags::new(), value, pointer.address, 0);
+            .store(MemFlags::new(), value, pointer.address, pointer.offset);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(atomic);
         let overlay = self.b.create_block();

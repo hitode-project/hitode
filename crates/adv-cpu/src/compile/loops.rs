@@ -3,11 +3,14 @@
 //! iteration ends. Checking that range once lets a clone of the loop access
 //! those operands without per-access guards.
 //!
-//! A clone also forwards loop-invariant stack slots, such as `[ebp-8]`, through
-//! SSA values. Stores still write memory, so every exit sees current memory;
-//! loads read the value instead. That needs every write that could reach a
-//! slot to update its value: the loop may contain no unproven write, and the
-//! proof also checks that the other proven writes miss every slot.
+//! A clone also forwards stack slots that the loop writes, such as an
+//! accumulator at `[ebp-8]`, through SSA values. Stores still write memory, so
+//! every exit sees current memory; loads read the value instead. That needs
+//! every write that could reach a slot to update its value: the loop may
+//! contain no unproven write, and the proof also checks that the other proven
+//! writes miss every slot. Slots the loop only reads stay in memory, as in the
+//! original code: forwarding them would keep one host register (or spill slot)
+//! per slot live across the loop for loads that cost no more.
 //!
 //! The permission table is read-only for one native invocation: every change
 //! advances the memory epoch and a trap that observes a new epoch leaves native
@@ -15,7 +18,7 @@
 //! unproven accesses may call never change permissions, so a range proven at
 //! its latch stays proven for every remaining iteration.
 use super::*;
-use iced_x86::{InstructionInfoFactory, OpAccess};
+use iced_x86::{CpuidFeature, InstructionInfoFactory, OpAccess};
 
 /// Largest per-iteration pointer step considered; keeps range arithmetic in i64.
 const MAX_STEP: i64 = 1 << 16;
@@ -44,15 +47,31 @@ pub(super) struct Plan {
     /// Guest block starts inside the loop, each cloned once.
     pub starts: BTreeSet<u32>,
     pub groups: Vec<Group>,
-    /// Instructions whose single memory operand is covered by a group, with
-    /// the operand width in bytes.
-    pub proven: BTreeMap<u32, u32>,
+    /// Instructions whose single memory operand is covered by a group.
+    pub proven: BTreeMap<u32, Operand>,
     /// Forwarded doubleword slots: invariant base register and displacement.
     pub slots: Vec<(usize, i64)>,
     /// Instructions whose memory operand is exactly a slot, and its index.
     pub promoted: BTreeMap<u32, usize>,
     /// Proven writes outside the slots, which the proof must keep off them.
     pub writes: Vec<Access>,
+    /// Unproven operands, as (pc, write), that a kernel checks against a
+    /// validated window of its own instead of the page table, before the
+    /// instruction's effects. Each instruction here starts a checked block,
+    /// where the kernel leaves when its access is not ordinary memory.
+    pub windows: Vec<(u32, bool)>,
+    /// General registers the loop never writes, as a mask by index.
+    pub invariant: u8,
+}
+
+/// The form of a proven memory operand: `base + index * scale + displacement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Operand {
+    /// Width in bytes.
+    pub width: u32,
+    pub base: Option<usize>,
+    pub index: Option<(usize, u32)>,
+    pub displacement: i32,
 }
 
 /// One proven memory operand: like a [`Group`] of a single instruction.
@@ -264,7 +283,15 @@ fn plan(
             continue;
         }
         let index = index.map(|index| (index, scale));
-        proven.insert(pc, size as u32);
+        proven.insert(
+            pc,
+            Operand {
+                width: size as u32,
+                base,
+                index,
+                displacement: i.memory_displacement32() as i32,
+            },
+        );
         accesses.push((
             pc,
             Access {
@@ -336,9 +363,11 @@ fn plan(
                     && other.low < access.high
                     && access.low < other.high
             });
-            if overlapping.clone().all(|(_, other, write, forwards)| {
-                other.low == access.low && other.high == access.high && (!write || *forwards)
-            }) {
+            if overlapping.clone().any(|(_, _, write, _)| *write)
+                && overlapping.clone().all(|(_, other, write, forwards)| {
+                    other.low == access.low && other.high == access.high && (!write || *forwards)
+                })
+            {
                 for (pc, ..) in overlapping {
                     promoted.insert(*pc, slots.len());
                 }
@@ -351,6 +380,45 @@ fn plan(
         .filter(|(pc, _, write, _)| *write && !promoted.contains_key(pc))
         .map(|(_, access, ..)| access)
         .collect();
+    let mut windows = Vec::new();
+    for i in &body {
+        if proven.contains_key(&i.ip32()) || matches!(i.mnemonic(), M::Lea | M::Nop) {
+            continue;
+        }
+        // The check precedes the instruction: its operand must be the
+        // entry registers' address, and its bytes at most two pages.
+        if matches!(
+            i.mnemonic(),
+            M::Pop | M::Push | M::Bt | M::Bts | M::Btr | M::Btc
+        ) || i.flow_control() != FlowControl::Next
+            || !(1..=64).contains(&i.memory_size().size())
+            || i.cpuid_features().contains(&CpuidFeature::FPU)
+        {
+            continue;
+        }
+        let info = factory.info(i);
+        let [used] = info.used_memory() else {
+            continue;
+        };
+        if (0..i.op_count()).all(|n| i.op_kind(n) != OpKind::Memory) {
+            continue;
+        }
+        let (read, write) = match used.access() {
+            OpAccess::Read | OpAccess::CondRead => (true, false),
+            OpAccess::Write | OpAccess::CondWrite => (false, true),
+            OpAccess::ReadWrite | OpAccess::ReadCondWrite => (true, true),
+            _ => continue,
+        };
+        if read {
+            windows.push((i.ip32(), false));
+        }
+        if write {
+            windows.push((i.ip32(), true));
+        }
+    }
+    let invariant = (0..8)
+        .filter(|&index| !varies[index] && steps[index].is_empty())
+        .fold(0, |mask, index| mask | 1 << index);
     Some(Plan {
         header,
         latch: latch.ip32(),
@@ -362,6 +430,8 @@ fn plan(
         slots,
         promoted,
         writes,
+        windows,
+        invariant,
     })
 }
 
@@ -439,6 +509,9 @@ pub(crate) extern "C" fn range_ok(
     }
     1
 }
+
+/// Pages a window may extend over on each side of the access that fills it.
+pub(super) const WINDOW_PAGES: i64 = 256;
 
 #[cfg(test)]
 mod tests {
@@ -560,14 +633,24 @@ mod tests {
         };
         let (instructions, entries) = decode(|a| body(a, |_| {}));
         let plan = &super::plans(&instructions, &entries, |_| true)[0];
-        assert_eq!(plan.slots, [(5, 8), (5, -4)]);
-        assert_eq!(plan.promoted.len(), 2);
-        assert_eq!(plan.writes.len(), 1, "the [edi] store");
-        // A narrow store overlapping [ebp+8] keeps that slot in memory.
-        let (instructions, entries) =
-            decode(|a| body(a, |a| a.mov(byte_ptr(ebp + 10), al).unwrap()));
-        let plan = &super::plans(&instructions, &entries, |_| true)[0];
+        // [ebp+8] is only read and stays in memory.
         assert_eq!(plan.slots, [(5, -4)]);
+        assert_eq!(plan.promoted.len(), 1);
+        assert_eq!(plan.writes.len(), 1, "the [edi] store");
+        assert_eq!(
+            plan.proven.values().next(),
+            Some(&Operand {
+                width: 4,
+                base: Some(5),
+                index: None,
+                displacement: 8,
+            })
+        );
+        // A narrow store overlapping [ebp-4] keeps that slot in memory.
+        let (instructions, entries) =
+            decode(|a| body(a, |a| a.mov(byte_ptr(ebp - 2), al).unwrap()));
+        let plan = &super::plans(&instructions, &entries, |_| true)[0];
+        assert!(plan.slots.is_empty());
         // An unproven indexed store could reach any slot.
         let (instructions, entries) =
             decode(|a| body(a, |a| a.mov(dword_ptr(esi + eax * 4), eax).unwrap()));
