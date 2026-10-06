@@ -664,3 +664,201 @@ fn rotation_projection_and_vec4_native_math_aliases_and_x86_float_contracts() {
         assert_eq!(fixture.bytes(OUTPUT, 16), vec![0xcd; 16]);
     }
 }
+
+#[test]
+fn vec3_transforms_and_catmull_rom_match_native_with_aliases_and_atomic_bounds() {
+    // Six-row authored native probe, source SHA256
+    // 18377D6CA6258329B2011CB4C95D41AE93E094802826D6F79E529E765B6EE2BB.
+    let matrix: Matrix = [
+        2., 0., 0., 0., 0., 3., 0., 0., 0., 0., 4., 0.5, 5., 7., 11., 1.,
+    ];
+    let vector: Vector = [2., -3., 4.];
+    let points: [Vector; 4] = [[1., 2., 3.], [2., -1., 4.], [-3., 5., 0.], [4., 1., -2.]];
+    let control: [u32; 4] = std::array::from_fn(|i| VECTOR + i as u32 * 0x20);
+    let coord = native([0x403fffff, 0xbf2aaaaa, 0x410fffff]);
+    let contracts = [
+        (transform3_ABI, vec![OUTPUT, VECTOR, LEFT]),
+        (transform_coord_ABI, vec![OUTPUT, VECTOR, LEFT]),
+        (
+            catmull_rom_ABI,
+            vec![
+                OUTPUT,
+                control[0],
+                control[1],
+                control[2],
+                control[3],
+                0.25f32.to_bits(),
+            ],
+        ),
+    ];
+    let mut registry = Registry::default();
+    register(&mut registry);
+    let mut machine = machine();
+    machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
+    machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
+    machine
+        .cpu
+        .write(LEFT, bytemuck::bytes_of(&matrix))
+        .unwrap();
+    for (address, value) in control.into_iter().zip(points) {
+        machine
+            .cpu
+            .write(address, bytemuck::bytes_of(&value))
+            .unwrap();
+    }
+    let mut code = Asm::new(CODE);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 0x700);
+    for (index, (api, arguments)) in contracts.iter().enumerate() {
+        let declared = signature::lookup(api.module, api.name).unwrap();
+        assert_eq!(declared.return_kind, AbiKind::Pointer);
+        assert_eq!(declared.stack_words(), arguments.len() as u16);
+        assert_eq!(
+            registry.level(api.module, api.name),
+            Some(ImplementationLevel::Implement)
+        );
+        assert!(registry.dynamic_available(api.module, api.name));
+        for (slot, parameter) in declared.parameters.iter().enumerate() {
+            assert_eq!(
+                parameter.kind,
+                if api.name == "D3DXVec3CatmullRom" && slot == 5 {
+                    AbiKind::F32
+                } else {
+                    AbiKind::Pointer
+                }
+            );
+        }
+        let entry = machine.resolve_import(api.module, api.name).unwrap();
+        for argument in arguments.iter().rev() {
+            code.push_imm(*argument);
+        }
+        code.call(entry)
+            .mov_mem_eax(DATA + 0x710 + index as u32 * 4);
+    }
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 0x704);
+    code.bytes.extend_from_slice(&[0x31, 0xc0]);
+    code.ret();
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine
+        .spawn("authored D3DX Vec3", CODE, &[], 65536)
+        .unwrap();
+    let result = machine.run_virtual(1_000_000);
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    assert_eq!(
+        machine.cpu.read_u32(DATA + 0x700).unwrap(),
+        machine.cpu.read_u32(DATA + 0x704).unwrap()
+    );
+    for index in 0..3 {
+        assert_eq!(
+            machine.cpu.read_u32(DATA + 0x710 + index * 4).unwrap(),
+            OUTPUT
+        );
+    }
+    assert!(registry.signature_conflicts().is_empty());
+
+    let mut fixture = Fixture::new();
+    for output in [OUTPUT, VECTOR, VECTOR + 4, LEFT, LEFT + 4, WRITE_ONLY] {
+        fixture.put(LEFT, matrix);
+        fixture.put(VECTOR, vector);
+        assert_eq!(
+            fixture.call(transform3_ABI, &[output, VECTOR, LEFT]),
+            output
+        );
+        assert_eq!(fixture.get::<4>(output), [9., -2., 27., 3.]);
+        fixture.put(LEFT, matrix);
+        fixture.put(VECTOR, vector);
+        assert_eq!(
+            fixture.call(transform_coord_ABI, &[output, VECTOR, LEFT]),
+            output
+        );
+        close(fixture.get::<3>(output), coord);
+    }
+    let mut zero_w = matrix;
+    zero_w[11] = 0.;
+    zero_w[15] = 0.;
+    fixture.put(LEFT, zero_w);
+    fixture.put(VECTOR, vector);
+    assert_eq!(
+        fixture.call(transform_coord_ABI, &[OUTPUT, VECTOR, LEFT]),
+        OUTPUT
+    );
+    assert_eq!(fixture.get::<3>(OUTPUT).map(f32::to_bits), [0xffc00000; 3]);
+    for (s, expected) in [
+        (0.25f32, native([0x3f640000, 0x3dd00000, 0x40538000])),
+        (-0.5, native([0xbf900000, 0x403c0000, 0x40340000])),
+        (1.5, native([0x40180000, 0x3f300000, 0x3d800000])),
+        (0., points[1]),
+        (1., points[2]),
+    ] {
+        for output in [
+            OUTPUT,
+            control[0],
+            control[1] + 4,
+            control[2],
+            control[3],
+            WRITE_ONLY,
+            STACK + 4,
+        ] {
+            for (address, point) in control.into_iter().zip(points) {
+                fixture.put(address, point);
+            }
+            assert_eq!(
+                fixture.call(
+                    catmull_rom_ABI,
+                    &[
+                        output,
+                        control[0],
+                        control[1],
+                        control[2],
+                        control[3],
+                        s.to_bits()
+                    ]
+                ),
+                output
+            );
+            close(fixture.get::<3>(output), expected);
+        }
+    }
+    // A Vec3 ends at its third DWORD. Do not read an implicit fourth DWORD;
+    // Coord writes twelve bytes, whereas Transform requires sixteen bytes.
+    let exact_vec3 = DATA + 4096 - 12;
+    fixture.put(LEFT, matrix);
+    fixture.put(exact_vec3, vector);
+    assert_eq!(
+        fixture.call(transform3_ABI, &[OUTPUT, exact_vec3, LEFT]),
+        OUTPUT
+    );
+    assert_eq!(fixture.get::<4>(OUTPUT), [9., -2., 27., 3.]);
+    fixture.put(VECTOR, vector);
+    assert_eq!(
+        fixture.call(transform_coord_ABI, &[exact_vec3, VECTOR, LEFT]),
+        exact_vec3
+    );
+    let before = fixture.bytes(exact_vec3, 12);
+    assert_eq!(fixture.call(transform3_ABI, &[exact_vec3, VECTOR, LEFT]), 0);
+    assert_eq!(fixture.bytes(exact_vec3, 12), before);
+    for (api, arguments) in contracts {
+        for slot in 1..arguments.len() {
+            if signature::lookup(api.module, api.name).unwrap().parameters[slot].kind
+                != AbiKind::Pointer
+            {
+                continue;
+            }
+            fixture.0.cpu.write(OUTPUT, &[0xcd; 16]).unwrap();
+            let mut arguments = arguments.clone();
+            arguments[slot] = DATA + 4090;
+            assert_eq!(fixture.call(api, &arguments), 0);
+            assert_eq!(fixture.bytes(OUTPUT, 16), vec![0xcd; 16]);
+        }
+        for output in [0, READ_ONLY, DATA + 4088, u32::MAX - 8] {
+            fixture.0.cpu.write(READ_ONLY, &[0x77; 16]).unwrap();
+            fixture.0.cpu.write(DATA + 4088, &[0x66; 8]).unwrap();
+            let mut arguments = arguments.clone();
+            arguments[0] = output;
+            assert_eq!(fixture.call(api, &arguments), 0);
+            assert_eq!(fixture.bytes(READ_ONLY, 16), vec![0x77; 16]);
+            assert_eq!(fixture.bytes(DATA + 4088, 8), vec![0x66; 8]);
+        }
+    }
+}

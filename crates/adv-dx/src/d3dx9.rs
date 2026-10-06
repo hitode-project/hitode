@@ -21,6 +21,9 @@ pub fn register(registry: &mut Registry) {
         rotation_y_ABI,
         perspective_fov_lh_ABI,
         transform4_ABI,
+        transform3_ABI,
+        transform_coord_ABI,
+        catmull_rom_ABI,
         look_at_ABI,
         project_ABI,
     ] {
@@ -35,6 +38,14 @@ fn product(left: Matrix, right: Matrix) -> Matrix {
         let column = at % 4;
         (0..4)
             .map(|k| left[row * 4 + k] * right[k * 4 + column])
+            .sum()
+    })
+}
+
+fn transform_value(vector: Vector4, matrix: Matrix) -> Vector4 {
+    std::array::from_fn(|column| {
+        (0..4)
+            .map(|row| vector[row] * matrix[row * 4 + column])
             .sum()
     })
 }
@@ -179,11 +190,86 @@ fn transform4(
     };
     // Both full inputs are snapshots, including a partially overlapping
     // destination. This is homogeneous multiplication, without a W divide.
-    let value = std::array::from_fn(|column| {
-        (0..4)
-            .map(|row| vector[row] * matrix[row * 4 + column])
-            .sum()
-    });
+    let value = transform_value(vector, matrix);
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXVec3Transform", level = implement)]
+fn transform3(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector4>,
+    vector: GuestPtr<Vector>,
+    matrix: GuestPtr<Matrix>,
+) -> GuestPtr<Vector4> {
+    let (Ok(vector), Ok(matrix)) = (vector.read(env.cpu), matrix.read(env.cpu)) else {
+        return GuestPtr::default();
+    };
+    // The source is exactly three FLOATs; W is supplied rather than read from
+    // the following guest DWORD. The output is four FLOATs without a W divide.
+    let value = transform_value([vector[0], vector[1], vector[2], 1.], matrix);
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXVec3TransformCoord", level = implement)]
+fn transform_coord(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector>,
+    vector: GuestPtr<Vector>,
+    matrix: GuestPtr<Matrix>,
+) -> GuestPtr<Vector> {
+    let (Ok(vector), Ok(matrix)) = (vector.read(env.cpu), matrix.read(env.cpu)) else {
+        return GuestPtr::default();
+    };
+    let clip = transform_value([vector[0], vector[1], vector[2], 1.], matrix);
+    // The native D3DX reciprocal refinement at W=0 yields an indefinite NaN
+    // for all three coordinates, including nonzero homogeneous numerators.
+    let value = if clip[3] == 0. {
+        [f32::from_bits(0xffc00000); 3]
+    } else {
+        std::array::from_fn(|i| clip[i] / clip[3])
+    };
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+#[win32(d3dx9_43, name = "D3DXVec3CatmullRom", level = implement)]
+fn catmull_rom(
+    env: &mut Env<'_>,
+    output: GuestPtr<Vector>,
+    v0: GuestPtr<Vector>,
+    v1: GuestPtr<Vector>,
+    v2: GuestPtr<Vector>,
+    v3: GuestPtr<Vector>,
+    s: f32,
+) -> GuestPtr<Vector> {
+    let (Ok(v0), Ok(v1), Ok(v2), Ok(v3)) = (
+        v0.read(env.cpu),
+        v1.read(env.cpu),
+        v2.read(env.cpu),
+        v3.read(env.cpu),
+    ) else {
+        return GuestPtr::default();
+    };
+    // SDK cubic coefficients are evaluated for the supplied s, without
+    // clamping. Snapshot all four sources before publishing any destination.
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let c0 = -s3 + 2. * s2 - s;
+    let c1 = 3. * s3 - 5. * s2 + 2.;
+    let c2 = -3. * s3 + 4. * s2 + s;
+    let c3 = s3 - s2;
+    let value = std::array::from_fn(|i| (c0 * v0[i] + c1 * v1[i] + c2 * v2[i] + c3 * v3[i]) * 0.5);
     if output.write(env.cpu, value).is_ok() {
         output
     } else {
