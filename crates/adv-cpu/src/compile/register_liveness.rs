@@ -116,7 +116,6 @@ mod tests {
     const EAX: u8 = 1;
     const ECX: u8 = 2;
     const EDX: u8 = 4;
-    const EBX: u8 = 8;
     const EBP: u8 = 32;
     const ESI: u8 = 64;
     const EDI: u8 = 128;

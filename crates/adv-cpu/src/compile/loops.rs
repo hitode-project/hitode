@@ -62,6 +62,13 @@ pub(super) struct Plan {
     pub windows: Vec<(u32, bool)>,
     /// General registers the loop never writes, as a mask by index.
     pub invariant: u8,
+    /// Registers changed only by the constant steps in `updates`, the
+    /// counter included, and each one's total step per iteration.
+    pub inductions: u8,
+    pub steps: [i64; 8],
+    pub updates: BTreeSet<u32>,
+    /// Every proven operand as (pc, range, read, write).
+    pub accesses: Vec<(u32, Access, bool, bool)>,
 }
 
 /// The form of a proven memory operand: `base + index * scale + displacement`.
@@ -232,6 +239,7 @@ fn plan(
     };
     let mut groups: Vec<Group> = Vec::new();
     let mut proven = BTreeMap::new();
+    let mut listed = Vec::new();
     // (pc, access, writes, writer forwards its store) for each proven operand.
     let mut accesses = Vec::new();
     for i in &body {
@@ -283,6 +291,18 @@ fn plan(
             continue;
         }
         let index = index.map(|index| (index, scale));
+        listed.push((
+            pc,
+            Access {
+                base,
+                index,
+                step,
+                low: offset,
+                high: offset + size,
+            },
+            read,
+            write,
+        ));
         proven.insert(
             pc,
             Operand {
@@ -419,6 +439,20 @@ fn plan(
     let invariant = (0..8)
         .filter(|&index| !varies[index] && steps[index].is_empty())
         .fold(0, |mask, index| mask | 1 << index);
+    // A 16-bit counter varies as an address component, yet still steps by
+    // one through its decrement.
+    let inductions = (0..8)
+        .filter(|&index| !varies[index] && !steps[index].is_empty())
+        .fold(1 << counter, |mask, index| mask | 1 << index);
+    let mut totals = [0; 8];
+    let mut updates = BTreeSet::from([before.ip32()]);
+    for index in 0..8 {
+        if inductions & 1 << index != 0 {
+            totals[index] = total(index);
+            updates.extend(steps[index].iter().map(|&(pc, _)| pc));
+        }
+    }
+    totals[counter] = -1;
     Some(Plan {
         header,
         latch: latch.ip32(),
@@ -432,6 +466,10 @@ fn plan(
         writes,
         windows,
         invariant,
+        inductions,
+        steps: totals,
+        updates,
+        accesses: listed,
     })
 }
 

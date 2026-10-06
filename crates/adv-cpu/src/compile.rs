@@ -23,6 +23,7 @@ mod register_liveness;
 mod scalar;
 mod shadow;
 mod simd;
+mod vector;
 mod write_summary;
 pub(crate) mod x87;
 
@@ -64,6 +65,8 @@ pub(crate) struct Compiled {
     disasm: String,
     #[cfg(test)]
     versioned_loops: usize,
+    #[cfg(test)]
+    vectorized_loops: usize,
 }
 
 impl Drop for Compiled {
@@ -596,6 +599,13 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     for plan in &plans {
         entries.extend(plan.windows.iter().map(|&(pc, _)| pc));
     }
+    let dead_flags = flag_liveness::dead_on_entry(&instructions);
+    let batches: Vec<_> = plans
+        .iter()
+        .map(|plan| vector::batch(plan, &instructions, &dead_flags))
+        .collect();
+    #[cfg(test)]
+    let vectorized_loops = batches.iter().flatten().count();
     #[cfg(test)]
     let versioned_loops = plans.len();
     let return_hint = if returns.len() == 1 {
@@ -1044,6 +1054,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             windows,
             fast: None,
             kernels: kernels.to_vec(),
+            batches: batches.clone(),
+            lanes: None,
             range_ok_ref,
             site: None,
             unchanged: 0,
@@ -1067,7 +1079,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             hot_dispatch,
             direct_footers: BTreeMap::new(),
             write_summary,
-            dead_flags: flag_liveness::dead_on_entry(&instructions),
+            dead_flags: dead_flags.clone(),
             live_registers: register_liveness::live_on_entry(&instructions),
             hot_exits,
             bridge,
@@ -1220,6 +1232,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 }
                 pc = instruction.next_ip32();
             }
+        }
+        if let Some(index) = kernel {
+            e.emit_lanes(index, &instructions);
         }
         e.fast = None;
         e.emit_canonical_x87_recovery();
@@ -1579,6 +1594,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         disasm,
         #[cfg(test)]
         versioned_loops,
+        #[cfg(test)]
+        vectorized_loops,
     })
 }
 
@@ -1727,6 +1744,7 @@ mod tests {
         let region = Region::new(0x10000, bytes.len());
         let compiled = compile(&region, machine.memory(), false).unwrap();
         assert_eq!(compiled.versioned_loops, 1);
+        assert_eq!(compiled.vectorized_loops, 1);
     }
 
     #[test]
@@ -2002,6 +2020,9 @@ struct Emitter<'a> {
     fast: Option<usize>,
     /// Finalized kernel addresses, one per plan, for the region to call.
     kernels: Vec<usize>,
+    /// Each loop's batch form, and in its kernel the batch being emitted.
+    batches: Vec<Option<vector::Batch>>,
+    lanes: Option<vector::Lanes>,
     range_ok_ref: ir::FuncRef,
     /// The current instruction's operand address and size once a kernel
     /// validated its windows (`precheck`).
@@ -2383,6 +2404,9 @@ impl Emitter<'_> {
         self.exit_predicted(reason, pc, None);
     }
     fn exit_predicted(&mut self, reason: Exit, pc: Value, prediction: Option<Value>) {
+        if self.lanes_active() {
+            self.materialize_lanes();
+        }
         self.flush_mmx_effects();
         self.settle_fuel(pc);
         if let Some(pc) = self.known(pc) {
@@ -2756,7 +2780,6 @@ impl Emitter<'_> {
     fn continue_clone(&mut self, index: usize) {
         let header = self.plans[index].header;
         let checked = self.blocks[&header];
-        let fast = self.fast_blocks[index][&header];
         self.flush_mmx_effects();
         let counter = self.plans[index].counter;
         let (_, stop, _) = self.kernel.expect("clones run in kernels");
@@ -2775,6 +2798,11 @@ impl Emitter<'_> {
         self.b.switch_to_block(next);
         let target = self.constant(header);
         self.interrupt_at(target, false);
+        self.refresh_clone();
+        self.resume_clone(index);
+    }
+    /// On a kernel's back edge, before it reaches the loop header again.
+    fn refresh_clone(&mut self) {
         // Redefining each frame pointer here keeps it a block parameter, which
         // instruction selection cannot split back into base, extended
         // register and displacement: a frame access stays one instruction.
@@ -2789,7 +2817,6 @@ impl Emitter<'_> {
         let value = self.b.use_var(stop);
         let value = self.b.ins().iadd_imm(value, 0);
         self.b.def_var(stop, value);
-        self.b.ins().jump(fast, &[]);
     }
     /// In a kernel, the register of a 16-bit loop counter that `i`
     /// decrements. The clone runs only while the counter is at least one
@@ -2997,8 +3024,8 @@ impl Emitter<'_> {
             let value = self.b.ins().load(types::I32, MemFlags::new(), address, 0);
             self.b.def_var(self.slot_vars[index][slot], value);
         }
-        let fast = self.fast_blocks[index][&self.plans[index].header];
-        self.b.ins().jump(fast, &[]);
+        self.begin_lanes(index);
+        self.resume_clone(index);
     }
     /// Whether every group of loop `index` stays in ordinary memory for the
     /// iterations left when its latch branches back: the counter, already

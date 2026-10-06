@@ -128,7 +128,7 @@ impl Emitter<'_> {
         // need the same prefix, while the successful path can keep composing.
     }
 
-    fn mmx_cast(&mut self, value: Value, ty: ir::Type) -> Value {
+    pub(super) fn mmx_cast(&mut self, value: Value, ty: ir::Type) -> Value {
         if self.b.func.dfg.value_type(value) == ty {
             value
         } else {
@@ -139,7 +139,17 @@ impl Emitter<'_> {
             )
         }
     }
+    /// An operand's value; inside a batch, every lane's in its own half.
     fn mmx_read(&mut self, i: &Instruction, n: u32) -> Value {
+        if self.lanes_active() {
+            return if i.op_kind(n) == OpKind::Memory {
+                let value = self.lane_load(8);
+                self.mmx_cast(value, types::I8X16)
+            } else {
+                let var = self.lane_mmx(register(i.op_register(n)).unwrap());
+                self.b.use_var(var)
+            };
+        }
         if i.op_kind(n) == OpKind::Memory {
             let addr = self.address(i);
             let bits = self.direct_load(addr, types::I64);
@@ -152,7 +162,7 @@ impl Emitter<'_> {
     }
     /// Masks name all 16 lanes. Upper MMX lanes are don't-care, but choosing
     /// them to match an SSE pattern lets the backend emit a single instruction.
-    fn mmx_shuffle(&mut self, a: Value, b: Value, mask: Vec<u8>) -> Value {
+    pub(super) fn mmx_shuffle(&mut self, a: Value, b: Value, mask: Vec<u8>) -> Value {
         debug_assert_eq!(mask.len(), 16);
         let imm = self
             .b
@@ -164,17 +174,36 @@ impl Emitter<'_> {
     }
     fn set_mmx(&mut self, i: &Instruction, value: Value) {
         let value = self.mmx_cast(value, types::I8X16);
-        self.b.def_var(
-            self.mmx[register(i.op0_register()).unwrap()].unwrap(),
-            value,
-        );
+        let index = register(i.op0_register()).unwrap();
+        let var = if self.lanes_active() {
+            self.lane_mmx(index)
+        } else {
+            self.mmx[index].unwrap()
+        };
+        self.b.def_var(var, value);
     }
     pub(super) fn mmx_instruction(&mut self, i: &Instruction) {
         if i.mnemonic() == M::Emms {
             self.mmx_effects.as_mut().unwrap().or_mask |= 2;
             return;
         }
-        if i.mnemonic() == M::Movd {
+        let lanes = self.lanes_active();
+        if i.mnemonic() == M::Movd && lanes {
+            if register(i.op0_register()).is_some() {
+                let value = if i.op1_kind() == OpKind::Memory {
+                    self.lane_load(4)
+                } else {
+                    let value = self.lane_register(i.op1_register());
+                    let low = self.lane_vector([u32::MAX, 0, u32::MAX, 0]);
+                    self.b.ins().band(value, low)
+                };
+                self.set_mmx(i, value);
+            } else {
+                let value = self.mmx_read(i, 1);
+                let value = self.mmx_cast(value, types::I32X4);
+                self.lane_write(i, value, 4);
+            }
+        } else if i.mnemonic() == M::Movd {
             if register(i.op0_register()).is_some() {
                 let bits = self.read(i, 1);
                 let bits = self.b.ins().uextend(types::I64, bits);
@@ -193,7 +222,9 @@ impl Emitter<'_> {
             }
         } else if matches!(i.mnemonic(), M::Movq | M::Movntq) {
             let value = self.mmx_read(i, 1);
-            if i.op0_kind() == OpKind::Memory {
+            if i.op0_kind() == OpKind::Memory && lanes {
+                self.lane_store(8, value);
+            } else if i.op0_kind() == OpKind::Memory {
                 let addr = self.address(i);
                 let value = self.mmx_cast(value, types::I64X2);
                 let bits = self.b.ins().extractlane(value, 0);
@@ -222,12 +253,15 @@ impl Emitter<'_> {
         } else if i.mnemonic() == M::Pshufw {
             let b = self.mmx_read(i, 1);
             let order = i.immediate8();
-            let mask = (0..4)
-                .flat_map(|lane| {
-                    let word = (order >> (lane * 2)) & 3;
-                    [word * 2, word * 2 + 1]
+            let halves = if lanes { 2 } else { 1 };
+            let mask = (0..halves)
+                .flat_map(|half| {
+                    (0..4).flat_map(move |lane| {
+                        let word = (order >> (lane * 2)) & 3;
+                        [8 * half + word * 2, 8 * half + word * 2 + 1]
+                    })
                 })
-                .chain(8..16)
+                .chain(8 * halves..16)
                 .collect();
             let value = self.mmx_shuffle(b, b, mask);
             self.set_mmx(i, value);
@@ -338,6 +372,36 @@ impl Emitter<'_> {
                 M::Pmaxub => self.b.ins().umax(a, b),
                 M::Pminub => self.b.ins().umin(a, b),
                 M::Pmullw => self.b.ins().imul(a, b),
+                // Each half's four words widen on their own.
+                M::Pmulhw | M::Pmulhuw | M::Pmaddwd if lanes => {
+                    let signed = i.mnemonic() != M::Pmulhuw;
+                    let mut products = [a; 2];
+                    for (half, product) in products.iter_mut().enumerate() {
+                        let (a, b) = match (signed, half) {
+                            (true, 0) => (self.b.ins().swiden_low(a), self.b.ins().swiden_low(b)),
+                            (true, _) => (self.b.ins().swiden_high(a), self.b.ins().swiden_high(b)),
+                            (false, 0) => (self.b.ins().uwiden_low(a), self.b.ins().uwiden_low(b)),
+                            (false, _) => {
+                                (self.b.ins().uwiden_high(a), self.b.ins().uwiden_high(b))
+                            }
+                        };
+                        *product = self.b.ins().imul(a, b);
+                    }
+                    let [low, high] = products;
+                    match i.mnemonic() {
+                        M::Pmulhw => {
+                            let low = self.b.ins().sshr_imm(low, 16);
+                            let high = self.b.ins().sshr_imm(high, 16);
+                            self.b.ins().snarrow(low, high)
+                        }
+                        M::Pmulhuw => {
+                            let low = self.b.ins().ushr_imm(low, 16);
+                            let high = self.b.ins().ushr_imm(high, 16);
+                            self.b.ins().unarrow(low, high)
+                        }
+                        _ => self.b.ins().iadd_pairwise(low, high),
+                    }
+                }
                 // Only the low four words are architectural, so one widening suffices.
                 M::Pmulhw => {
                     let a = self.b.ins().swiden_low(a);
@@ -386,12 +450,20 @@ impl Emitter<'_> {
                         self.mmx_cast(a, types::I8X16),
                         self.mmx_cast(b, types::I8X16),
                     );
+                    // With lanes, the high halves join likewise and pack
+                    // into the high half.
                     let joined = self.mmx_shuffle(a8, b8, (0..8).chain(16..24).collect());
                     let joined = self.mmx_cast(joined, ty);
-                    if i.mnemonic() == M::Packuswb {
-                        self.b.ins().unarrow(joined, joined)
+                    let high = if lanes {
+                        let high = self.mmx_shuffle(a8, b8, (8..16).chain(24..32).collect());
+                        self.mmx_cast(high, ty)
                     } else {
-                        self.b.ins().snarrow(joined, joined)
+                        joined
+                    };
+                    if i.mnemonic() == M::Packuswb {
+                        self.b.ins().unarrow(joined, high)
+                    } else {
+                        self.b.ins().snarrow(joined, high)
                     }
                 }
                 M::Punpcklbw
@@ -405,6 +477,21 @@ impl Emitter<'_> {
                         M::Punpckldq | M::Punpckhdq => 4,
                         _ => 1,
                     };
+                    let high = matches!(i.mnemonic(), M::Punpckhbw | M::Punpckhwd | M::Punpckhdq);
+                    // With lanes, each half's unpacked doubleword first moves
+                    // to its lane of the low quadword: the even or odd
+                    // doublewords, one AArch64 UZP.
+                    let (a, b) = if lanes {
+                        let pick = if high { 4 } else { 0 };
+                        let compact: Vec<u8> = [pick, 8 + pick, 16 + pick, 24 + pick]
+                            .iter()
+                            .flat_map(|&start| start..start + 4)
+                            .collect();
+                        let a = self.mmx_shuffle(a, a, compact.clone());
+                        (a, self.mmx_shuffle(b, b, compact))
+                    } else {
+                        (a, b)
+                    };
                     // The SSE low unpack of both quadwords; its upper half is the
                     // MMX high unpack.
                     let mask = (0..8 / width)
@@ -415,7 +502,7 @@ impl Emitter<'_> {
                         })
                         .collect();
                     let low = self.mmx_shuffle(a, b, mask);
-                    if matches!(i.mnemonic(), M::Punpckhbw | M::Punpckhwd | M::Punpckhdq) {
+                    if high && !lanes {
                         self.mmx_shuffle(low, low, (8..16).chain(8..16).collect())
                     } else {
                         low
