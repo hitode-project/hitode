@@ -23,6 +23,25 @@ enum PageState {
     Lazy(Initializer),
     Loading,
     Ready(Box<UnsafeCell<Bytes>>),
+    /// The bytes live in one guest window page, where native code accesses
+    /// them as ordinary memory, until `evict` moves them back. Native stores
+    /// are untracked, so `clean` keeps the bytes as of the last clean state.
+    Resident {
+        window: *mut u8,
+        clean: Box<UnsafeCell<Bytes>>,
+    },
+}
+
+/// Whether a resident window differs from its clean copy.
+///
+/// # Safety
+/// `window` must be a live resident window of the same worker.
+unsafe fn changed(window: *const u8, clean: &UnsafeCell<Bytes>) -> bool {
+    // SAFETY: both are page sized; no store can run during the comparison.
+    unsafe {
+        std::slice::from_raw_parts(window, FILE_PAGE_SIZE)
+            != std::slice::from_raw_parts((*clean.get()).0.as_ptr(), FILE_PAGE_SIZE)
+    }
 }
 
 impl FilePage {
@@ -45,7 +64,49 @@ impl FilePage {
     }
 
     pub fn initialized(&self) -> bool {
-        matches!(*self.state.borrow(), PageState::Ready(_))
+        matches!(
+            *self.state.borrow(),
+            PageState::Ready(_) | PageState::Resident { .. }
+        )
+    }
+
+    pub(crate) fn resident(&self) -> bool {
+        matches!(*self.state.borrow(), PageState::Resident { .. })
+    }
+
+    /// Moves the page's bytes into `window`, which stores them until `evict`.
+    ///
+    /// # Safety
+    /// `window` must stay valid and writable for `FILE_PAGE_SIZE` bytes until
+    /// `evict`, and be accessed only on this page's execution worker.
+    pub(crate) unsafe fn make_resident(&self, window: *mut u8) -> Result<(), String> {
+        let source = self.pointer()?;
+        let PageState::Ready(clean) = self.state.replace(PageState::Loading) else {
+            unreachable!("initialized pages are ready or resident")
+        };
+        // SAFETY: both ranges are page sized; the caller owns the window.
+        unsafe { std::ptr::copy_nonoverlapping(source, window, FILE_PAGE_SIZE) };
+        self.state.replace(PageState::Resident { window, clean });
+        Ok(())
+    }
+
+    /// Moves a resident page's bytes back out of its window.
+    pub(crate) fn evict(&self) {
+        if !self.resident() {
+            return;
+        }
+        let PageState::Resident { window, mut clean } = self.state.replace(PageState::Loading)
+        else {
+            unreachable!()
+        };
+        // SAFETY: `make_resident` keeps the window valid until this call.
+        unsafe {
+            if changed(window, &clean) {
+                self.dirty.set(true);
+            }
+            std::ptr::copy_nonoverlapping(window, clean.get_mut().0.as_mut_ptr(), FILE_PAGE_SIZE)
+        };
+        self.state.replace(PageState::Ready(clean));
     }
 
     /// Resolve first-touch I/O before a transactional write changes any bytes.
@@ -77,12 +138,28 @@ impl FilePage {
 
     pub fn dirty(&self) -> bool {
         self.dirty.get()
+            || match &*self.state.borrow() {
+                // SAFETY: a resident window stays live until `evict`.
+                PageState::Resident { window, clean } => unsafe { changed(*window, clean) },
+                _ => false,
+            }
     }
     pub fn mark_dirty(&self) {
         self.dirty.set(true);
     }
     pub fn clear_dirty(&self) {
         self.dirty.set(false);
+        if let PageState::Resident { window, clean } = &*self.state.borrow() {
+            // SAFETY: a resident window stays live until `evict`, and the
+            // clean copy has no outstanding references.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    *window,
+                    (*clean.get()).0.as_mut_ptr(),
+                    FILE_PAGE_SIZE,
+                )
+            };
+        }
     }
 
     fn pointer(&self) -> Result<*mut u8, String> {
@@ -92,6 +169,7 @@ impl FilePage {
                 // reference to bytes that the worker/foreign engine can write.
                 return Ok(unsafe { std::ptr::addr_of_mut!((*bytes.get()).0).cast() });
             }
+            PageState::Resident { window, .. } => return Ok(*window),
             PageState::Loading => return Err("recursive file page initialization".into()),
             PageState::Lazy(_) => {}
         }

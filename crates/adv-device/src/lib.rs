@@ -10,6 +10,7 @@ pub mod codec_kernel;
 mod device;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod media;
 pub mod mixer;
 mod owned;
 mod resample;

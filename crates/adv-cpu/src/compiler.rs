@@ -189,7 +189,7 @@ impl Worker {
             return Err(SubmitError::Closed);
         }
         let work = if let Some(limit) = self.sender.borrow().work_policy().background_limit() {
-            let work = crate::compile_budget::work(&input);
+            let (work, limit) = crate::compile_budget::work_and_allowance(&input, limit);
             if work > limit {
                 return Err(SubmitError::WorkLimit { work, limit });
             }

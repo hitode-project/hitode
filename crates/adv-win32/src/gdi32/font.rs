@@ -184,13 +184,24 @@ fn ansi_codepage(env: &Env<'_>, request: &FontRequest) -> Option<u32> {
     })
 }
 
-fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<u16>> {
+fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<(Vec<u16>, bool)> {
     Some(
         env.ext
             .get::<Win32>()
             .codec
-            .to_utf16(ansi_codepage(env, request)?, bytes),
+            .to_utf16_checked(ansi_codepage(env, request)?, bytes),
     )
+}
+
+/// A counted ANSI string for text output and extents.
+fn ansi_text(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<u16>> {
+    // Native GDI decodes a string of one byte in an ANSI_CHARSET font as
+    // cp1252, even where the ACP is a DBCS code page; longer strings use the
+    // ACP. Text drawn a byte at a time therefore shows Latin-1 glyphs.
+    if matches!(request.encoding, Encoding::Latin) && bytes.len() == 1 {
+        return Some(env.ext.get::<Win32>().codec.to_utf16(1252, bytes));
+    }
+    ansi_units(env, request, bytes).map(|(units, _)| units)
 }
 
 fn ansi_character(env: &Env<'_>, font: &FontRequest, character: u32) -> Character {
@@ -216,10 +227,10 @@ fn ansi_character(env: &Env<'_>, font: &FontRequest, character: u32) -> Characte
     } else {
         &bytes[1..]
     };
-    match ansi_units(env, font, bytes).as_deref() {
+    match ansi_units(env, font, bytes) {
         // A replacement produced by the codec is not a decoded ANSI character.
         // Keep the backend's native invalid-sequence behavior in that case.
-        Some([unit]) if *unit != 0xfffd => Character::Unicode(u32::from(*unit)),
+        Some((units, false)) if units.len() == 1 => Character::Unicode(u32::from(units[0])),
         _ => Character::Encoded(character),
     }
 }
@@ -350,7 +361,7 @@ fn extent(
         return Outcome::Return(0);
     }
     let request = font_request(env, dc);
-    let ansi = ansi.then(|| ansi_units(env, &request, &bytes));
+    let ansi = ansi.then(|| ansi_text(env, &request, &bytes));
     let units;
     let input = if let Some(converted) = &ansi {
         match converted {

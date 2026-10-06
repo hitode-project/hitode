@@ -50,10 +50,50 @@ impl Codec {
         }
     }
 
-    /// Bytes in code page `cp` to UTF-16.
+    /// Bytes in code page `cp` to UTF-16, as MultiByteToWideChar without
+    /// MB_ERR_INVALID_CHARS converts them.
     pub fn to_utf16(&self, cp: u32, bytes: &[u8]) -> Vec<u16> {
-        let (s, _) = self.encoding(cp).decode_without_bom_handling(bytes);
-        s.encode_utf16().collect()
+        self.to_utf16_checked(cp, bytes).0
+    }
+
+    /// [`Self::to_utf16`], also returning whether any sequence was invalid
+    /// and became the code page's default character.
+    pub fn to_utf16_checked(&self, cp: u32, bytes: &[u8]) -> (Vec<u16>, bool) {
+        let cp = self.resolve(cp);
+        let Some(default) = dbcs_default(cp) else {
+            let (s, replaced) = self.encoding(cp).decode_without_bom_handling(bytes);
+            return (s.encode_utf16().collect(), replaced);
+        };
+        // WHATWG Shift_JIS and GBK differ from the Windows tables at their
+        // edges: a lead byte always consumes the next byte, an undefined pair
+        // or a lone final lead byte is one default character, a few single
+        // bytes map to private use, and cp936 has no GB18030 four-byte form.
+        let encoding = self.encoding(cp);
+        let (mut units, mut replaced) = (Vec::with_capacity(bytes.len()), false);
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if byte < 0x80 {
+                units.push(u16::from(byte));
+                i += 1;
+                continue;
+            }
+            if !self.is_lead_byte(cp, byte) {
+                units.push(match (cp, byte) {
+                    (932, 0xa0) => 0xf8f0,
+                    (932, 0xfd..=0xff) => 0xf8f1 + u16::from(byte - 0xfd),
+                    (936, 0xff) => 0xf8f5,
+                    _ => single(encoding, &[byte]).unwrap_or(default),
+                });
+                i += 1;
+                continue;
+            }
+            let decoded = bytes.get(i..i + 2).and_then(|pair| single(encoding, pair));
+            replaced |= decoded.is_none();
+            units.push(decoded.unwrap_or(default));
+            i += 2;
+        }
+        (units, replaced)
     }
 
     /// UTF-16 to code page `cp`; unmappable characters become `?`. Returns whether any did.
@@ -79,10 +119,7 @@ impl Codec {
 
     /// Guest ANSI bytes (ACP) to a Rust string, for paths and logs.
     pub fn decode(&self, bytes: &[u8]) -> String {
-        self.encoding(CP_ACP)
-            .decode_without_bom_handling(bytes)
-            .0
-            .into_owned()
+        String::from_utf16_lossy(&self.to_utf16(CP_ACP, bytes))
     }
 
     /// Rust string to guest ANSI bytes (ACP).
@@ -96,6 +133,28 @@ impl Codec {
             .iter()
             .any(|&(lo, hi)| (lo..=hi).contains(&b))
     }
+}
+
+/// The character MultiByteToWideChar substitutes for an invalid sequence in
+/// a DBCS code page.
+fn dbcs_default(cp: u32) -> Option<u16> {
+    match cp {
+        932 => Some(0x30fb),
+        936 => Some(u16::from(b'?')),
+        _ => None,
+    }
+}
+
+/// One complete sequence that decodes to exactly one BMP character.
+fn single(encoding: &'static Encoding, bytes: &[u8]) -> Option<u16> {
+    let mut out = [0; 4];
+    let (result, read, written) = encoding
+        .new_decoder_without_bom_handling()
+        .decode_to_utf16_without_replacement(bytes, &mut out, true);
+    (matches!(result, encoding_rs::DecoderResult::InputEmpty)
+        && read == bytes.len()
+        && written == 1)
+        .then_some(out[0])
 }
 
 /// CT_CTYPE1 classification of a UTF-16 unit.
@@ -188,6 +247,42 @@ mod tests {
         // U+00E9 has no Shift_JIS mapping.
         assert_eq!(c.from_utf16(932, &[0xe9, 0x41]), (b"?A".to_vec(), true));
         assert!(c.is_lead_byte(CP_ACP, 0x82) && !c.is_lead_byte(CP_ACP, 0x41));
+    }
+
+    #[test]
+    fn invalid_dbcs_sequences_follow_multi_byte_to_wide_char() {
+        // Native MultiByteToWideChar(cp, 0, ...) results.
+        let sjis = Codec::new(932);
+        for (bytes, units) in [
+            (&b"\x82"[..], &[0x30fb][..]),
+            (b"A\x82", &[0x41, 0x30fb]),
+            (b"\x82A", &[0x30fb]),
+            (b"\x82\x7f", &[0x30fb]),
+            (b"\x85\x40", &[0x30fb]),
+            (b"\x80", &[0x80]),
+            (b"\xa0\xfd\xfe\xff", &[0xf8f0, 0xf8f1, 0xf8f2, 0xf8f3]),
+            (b"\xf0\x40", &[0xe000]),
+            (b"\xfa\x40", &[0x2170]),
+            (b"\xa1\x40", &[0xff61, 0x40]),
+        ] {
+            assert_eq!(sjis.to_utf16(CP_ACP, bytes), units, "932 {bytes:x?}");
+        }
+        let gbk = Codec::new(936);
+        for (bytes, units) in [
+            (&b"\x82"[..], &[0x3f][..]),
+            (b"\x82A", &[0x4fab]),
+            (b"\x82\x7f", &[0x3f]),
+            (b"\x82\x20", &[0x3f]),
+            (b"\x81\x30\x81\x30", &[0x3f, 0x3f]),
+            (b"\x80", &[0x20ac]),
+            (b"\xa0", &[0x3f]),
+            (b"\xff", &[0xf8f5]),
+            (b"\xaa\xa1", &[0xe000]),
+        ] {
+            assert_eq!(gbk.to_utf16(CP_ACP, bytes), units, "936 {bytes:x?}");
+        }
+        assert_eq!(gbk.to_utf16_checked(CP_ACP, b"\x82"), (vec![0x3f], true));
+        assert_eq!(gbk.to_utf16_checked(CP_ACP, b"?"), (vec![0x3f], false));
     }
 
     #[test]

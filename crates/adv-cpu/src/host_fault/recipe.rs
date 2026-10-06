@@ -155,7 +155,7 @@ impl Recipe {
         }
         let output = |index: usize| values[self.outputs[index] as usize];
         let lazy: [u32; 7] = std::array::from_fn(|index| output(index + 9) as u32);
-        if lazy[3] & 0xff > 3 || !matches!(lazy[3] >> 8, 0 | 16 | 24) || lazy[6] > 1 {
+        if lazy[3] & 0xff > 7 || !matches!(lazy[3] >> 8, 0 | 16 | 24) || lazy[6] > 1 {
             return None;
         }
         Some(Recovered {
@@ -167,8 +167,9 @@ impl Recipe {
     }
 }
 
-// Identical raw/add/sub/logic and separately preserved carry representation used
-// by the integer emitter. This runs only after a verified hardware exception.
+// Identical raw/add/sub/logic (plus carried AF/OF) and separately preserved
+// carry representation used by the integer emitter. This runs only after a
+// verified hardware exception.
 fn flags(old: u32, lazy: [u32; 7]) -> u32 {
     let [
         left,
@@ -188,18 +189,23 @@ fn flags(old: u32, lazy: [u32; 7]) -> u32 {
     // Narrow operations keep operands shifted to bit 31; the high byte is the shift.
     let shift = kind >> 8;
     let kind = kind & 0xff;
+    // Bit 4: a CF/OF writer moved OF into right and folded the old right into
+    // left, keeping AF's left ^ right ^ result.
+    let base = kind & 3;
     for bit in [2, 4, 6, 7, 11] {
-        let value = if kind == 0 {
+        let value = if bit == 11 && kind & 4 != 0 {
+            right & 1
+        } else if kind == 0 || bit != 11 && base == 0 {
             (old >> bit) & 1
         } else {
             match bit {
                 2 => (((result >> shift) as u8).count_ones() ^ 1) & 1,
-                4 if kind != 3 => ((left ^ right ^ result) >> shift >> 4) & 1,
+                4 if base != 3 => ((left ^ right ^ result) >> shift >> 4) & 1,
                 6 => u32::from(result == 0),
                 7 => result >> 31,
-                11 if kind != 3 => {
+                11 if base != 3 => {
                     let lr = left ^ right;
-                    let first = if kind == 1 { !lr } else { lr };
+                    let first = if base == 1 { !lr } else { lr };
                     (first & (left ^ result)) >> 31
                 }
                 _ => 0,

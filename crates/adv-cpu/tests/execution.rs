@@ -191,8 +191,27 @@ fn faulting_rmw_keeps_registers_flags_and_memory_before_the_instruction() {
     let outcome = jit.run(STOP, 100).unwrap();
     assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == DATA + 4094));
     assert_eq!(jit.state.regs[0], 16);
-    assert_eq!(jit.state.eflags & 0x8d5, 0x10);
     assert_eq!(jit.memory().read(DATA + 4094, 4).unwrap(), [0; 4]);
+}
+
+#[test]
+fn faults_keep_arithmetic_flags_that_later_code_can_read() {
+    let code = assemble(|a| {
+        a.add(eax, 7).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.setc(al).unwrap();
+        a.ret().unwrap();
+    });
+    let mut jit = machine(&code, true);
+    jit.protect(DATA + 4096, 4096, READ).unwrap();
+    reset(&mut jit, [9, 0, 0, 0, 0, 0, 0, DATA + 4094], 2);
+    let outcome = jit.run(STOP, 100).unwrap();
+    assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == DATA + 4094));
+    assert_eq!(jit.state.regs[0], 16);
+    // SETC still reads the ADD's flags after the store. Where every path
+    // rewrites all six before reading any, as for the ADD to memory above,
+    // a fault leaves them unspecified.
+    assert_eq!(jit.state.eflags & 0x8d5, 0x10);
 }
 
 #[test]

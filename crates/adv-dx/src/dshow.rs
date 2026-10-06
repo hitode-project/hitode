@@ -1,737 +1,817 @@
-//! DirectShow's empty filter graph, over the common COM/object owner.
+//! DirectShow (quartz) front: the filter graph manager, the system filters a game
+//! can name by CLSID, and the pin, allocator and sample protocol shared with filters
+//! the game implements itself. Graph semantics live here; demuxing and decoding are
+//! adv-device's `media` decoder, and audio output is the DirectSound mixer.
 //!
-//! Graph activation, identity, enumeration, stop/state and event configuration
-//! are available without a media backend. Filter installation, decoding and
-//! rendering deliberately fail: this front neither decodes media nor invents
-//! playback/completion. A future device backend belongs in adv-device.
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+//! Every interface pointer handed to the guest is a guest-memory vtable of host
+//! thunks. Pointers the guest hands back are called through their own vtables, so
+//! host and guest objects are interchangeable on either side of a connection.
+use std::collections::{BTreeMap, VecDeque};
 
-use adv_abi::{Api, Arguments, GuestPtr, ImplementationLevel, Registry, Signature, WideStr};
-use adv_cpu::backend::{Backend, GuestExt, Prot};
-use adv_machine::{Env, Machine, Object, Outcome, Wait};
-use adv_os::{
-    Heaps,
-    com::{ClassFactories, Com, Iid, QueryError},
-};
+use adv_abi::Registry;
+use adv_cpu::backend::{GuestExt, MemFault, Prot};
+use adv_machine::{Conv, Env, Outcome};
+use adv_os::Heaps;
+use adv_os::com::{Com, Iid, QueryError};
 
-const E_POINTER: u32 = 0x80004003;
-const E_INVALIDARG: u32 = 0x80070057;
-const E_NOTIMPL: u32 = 0x80004001;
-const E_NOINTERFACE: u32 = 0x80004002;
-const E_OUTOFMEMORY: u32 = 0x8007000e;
-const E_ABORT: u32 = 0x80004004;
-const CLASS_E_NOAGGREGATION: u32 = 0x80040110;
-const VFW_E_NOT_CONNECTED: u32 = 0x80040209;
-const VFW_E_NOT_FOUND: u32 = 0x80040216;
-const VFW_E_CANNOT_CONNECT: u32 = 0x80040217;
-const VFW_E_CANNOT_RENDER: u32 = 0x80040218;
+mod filter;
+mod graph;
+mod sample;
+mod stream;
 
-// SDK 10.0.26100.0: shared/uuids.h, um/strmif.h, um/control.h.
-pub const CLSID_FILTERGRAPH: Iid = [
-    0xb3, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0, 0x20, 0xaf, 0x0b, 0xa7, 0x70,
-];
-const fn graph_iid(first: u8) -> Iid {
+pub(crate) const S_OK: u32 = 0;
+pub(crate) const S_FALSE: u32 = 1;
+pub(crate) const E_NOTIMPL: u32 = 0x8000_4001;
+pub(crate) const E_NOINTERFACE: u32 = 0x8000_4002;
+pub(crate) const E_POINTER: u32 = 0x8000_4003;
+pub(crate) const E_UNEXPECTED: u32 = 0x8000_ffff;
+pub(crate) const E_OUTOFMEMORY: u32 = 0x8007_000e;
+pub(crate) const E_INVALIDARG: u32 = 0x8007_0057;
+pub(crate) const CLASS_E_NOAGGREGATION: u32 = 0x8004_0110;
+pub(crate) const VFW_E_NOT_CONNECTED: u32 = 0x8004_0209;
+pub(crate) const VFW_E_NO_ALLOCATOR: u32 = 0x8004_020a;
+pub(crate) const VFW_E_ALREADY_CONNECTED: u32 = 0x8004_0204;
+pub(crate) const VFW_E_NO_ACCEPTABLE_TYPES: u32 = 0x8004_0207;
+pub(crate) const VFW_E_INVALID_DIRECTION: u32 = 0x8004_0208;
+pub(crate) const VFW_E_TYPE_NOT_ACCEPTED: u32 = 0x8004_022a;
+pub(crate) const VFW_E_NOT_COMMITTED: u32 = 0x8004_0211;
+pub(crate) const VFW_E_WRONG_STATE: u32 = 0x8004_0227;
+pub(crate) const VFW_E_NOT_FOUND: u32 = 0x8004_0216;
+pub(crate) const VFW_E_UNSUPPORTED_STREAM: u32 = 0x8004_0265;
+
+/// A GUID in its in-memory (little-endian first three fields) byte order.
+pub(crate) const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> Iid {
+    let a = d1.to_le_bytes();
+    let b = d2.to_le_bytes();
+    let c = d3.to_le_bytes();
     [
-        first, 0x68, 0xa8, 0x56, 0xd4, 0x0a, 0xce, 0x11, 0xb0, 0x3a, 0, 0x20, 0xaf, 0x0b, 0xa7,
-        0x70,
+        a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d4[0], d4[1], d4[2], d4[3], d4[4], d4[5],
+        d4[6], d4[7],
     ]
 }
-const IID_GRAPH: Iid = graph_iid(0xa9);
-const IID_FILTER_GRAPH: Iid = graph_iid(0x9f);
-const IID_CONTROL: Iid = graph_iid(0xb1);
-const IID_EVENT: Iid = graph_iid(0xb6);
-const IID_EVENT_EX: Iid = graph_iid(0xc0);
-const IID_AUDIO: Iid = graph_iid(0xb3);
-const IID_WINDOW: Iid = graph_iid(0xb4);
-const IID_ENUM: Iid = graph_iid(0x93);
-const IID_SEEKING: Iid = [
-    0x80, 0x38, 0xb7, 0x36, 0xc8, 0xc2, 0xcf, 0x11, 0x8b, 0x46, 0, 0x80, 0x5f, 0x6c, 0xef, 0x60,
-];
-const IID_DISPATCH: Iid = [0, 4, 2, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
-const GRAPH_INTERFACES: [(&str, Iid); 6] = [
-    ("IGraphBuilder", IID_GRAPH),
-    ("IMediaControl", IID_CONTROL),
-    ("IMediaEventEx", IID_EVENT_EX),
-    ("IMediaSeeking", IID_SEEKING),
-    ("IBasicAudio", IID_AUDIO),
-    ("IVideoWindow", IID_WINDOW),
+const fn quartz(d1: u32) -> Iid {
+    guid(
+        d1,
+        0x0ad4,
+        0x11ce,
+        [0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70],
+    )
+}
+const fn amovie(d1: u32) -> Iid {
+    guid(
+        d1,
+        0x524f,
+        0x11ce,
+        [0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70],
+    )
+}
+const fn fourcc_type(d1: u32) -> Iid {
+    guid(
+        d1,
+        0x0000,
+        0x0010,
+        [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    )
+}
+
+pub(crate) const IID_IPERSIST: Iid = guid(0x0000_010c, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+pub(crate) const IID_IFILTERGRAPH: Iid = quartz(0x56a8_689f);
+pub(crate) const IID_IGRAPHBUILDER: Iid = quartz(0x56a8_68a9);
+pub(crate) const IID_IFILTERGRAPH2: Iid = guid(
+    0x36b7_3882,
+    0xc2c8,
+    0x11cf,
+    [0x8b, 0x46, 0x00, 0x80, 0x5f, 0x6c, 0xef, 0x60],
+);
+pub(crate) const IID_IMEDIACONTROL: Iid = quartz(0x56a8_68b1);
+pub(crate) const IID_IMEDIAEVENT: Iid = quartz(0x56a8_68b6);
+pub(crate) const IID_IMEDIAEVENTEX: Iid = quartz(0x56a8_68c0);
+pub(crate) const IID_IMEDIAEVENTSINK: Iid = quartz(0x56a8_68a2);
+pub(crate) const IID_IMEDIASEEKING: Iid = guid(
+    0x36b7_3880,
+    0xc2c8,
+    0x11cf,
+    [0x8b, 0x46, 0x00, 0x80, 0x5f, 0x6c, 0xef, 0x60],
+);
+pub(crate) const IID_IMEDIAPOSITION: Iid = quartz(0x56a8_68b2);
+pub(crate) const IID_IBASICAUDIO: Iid = quartz(0x56a8_68b3);
+pub(crate) const IID_IVIDEOWINDOW: Iid = quartz(0x56a8_68b4);
+pub(crate) const IID_IBASICVIDEO: Iid = quartz(0x56a8_68b5);
+pub(crate) const IID_IMEDIAFILTER: Iid = quartz(0x56a8_6899);
+pub(crate) const IID_IBASEFILTER: Iid = quartz(0x56a8_6895);
+pub(crate) const IID_IENUMFILTERS: Iid = quartz(0x56a8_6893);
+pub(crate) const IID_IENUMPINS: Iid = quartz(0x56a8_6892);
+pub(crate) const IID_IPIN: Iid = quartz(0x56a8_6891);
+pub(crate) const IID_IENUMMEDIATYPES: Iid = guid(
+    0x89c3_1040,
+    0x846b,
+    0x11ce,
+    [0x97, 0xd3, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a],
+);
+pub(crate) const IID_IMEMINPUTPIN: Iid = quartz(0x56a8_689d);
+pub(crate) const IID_IMEMALLOCATOR: Iid = quartz(0x56a8_689c);
+pub(crate) const IID_IMEDIASAMPLE: Iid = quartz(0x56a8_689a);
+pub(crate) const IID_IASYNCREADER: Iid = quartz(0x56a8_68aa);
+pub(crate) const IID_IFILESOURCEFILTER: Iid = quartz(0x56a8_68a6);
+
+pub(crate) const MEDIATYPE_VIDEO: Iid = fourcc_type(0x7364_6976);
+pub(crate) const MEDIATYPE_AUDIO: Iid = fourcc_type(0x7364_7561);
+pub(crate) const MEDIATYPE_STREAM: Iid = amovie(0xe436_eb83);
+pub(crate) const MEDIASUBTYPE_MPEG1SYSTEM: Iid = amovie(0xe436_eb84);
+pub(crate) const MEDIASUBTYPE_MPEG1PAYLOAD: Iid = amovie(0xe436_eb81);
+pub(crate) const MEDIASUBTYPE_MPEG1AUDIOPAYLOAD: Iid = fourcc_type(0x0000_0050);
+pub(crate) const MEDIASUBTYPE_RGB565: Iid = amovie(0xe436_eb7b);
+pub(crate) const MEDIASUBTYPE_RGB555: Iid = amovie(0xe436_eb7c);
+pub(crate) const MEDIASUBTYPE_RGB24: Iid = amovie(0xe436_eb7d);
+pub(crate) const MEDIASUBTYPE_RGB32: Iid = amovie(0xe436_eb7e);
+pub(crate) const MEDIASUBTYPE_PCM: Iid = fourcc_type(0x0000_0001);
+pub(crate) const FORMAT_VIDEOINFO: Iid = guid(
+    0x0558_9f80,
+    0xc356,
+    0x11ce,
+    [0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a],
+);
+pub(crate) const FORMAT_WAVEFORMATEX: Iid = guid(
+    0x0558_9f81,
+    0xc356,
+    0x11ce,
+    [0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a],
+);
+pub(crate) const GUID_NULL: Iid = [0; 16];
+
+const CLSID_FILTERGRAPH: Iid = amovie(0xe436_ebb3);
+const CLSID_FILTERGRAPH_NO_THREAD: Iid = amovie(0xe436_ebb8);
+const CLSID_MPEG1_SPLITTER: Iid = guid(
+    0x3364_75d0,
+    0x942a,
+    0x11ce,
+    [0xa8, 0x70, 0x00, 0xaa, 0x00, 0x2f, 0xea, 0xb5],
+);
+const CLSID_MPEG_VIDEO_CODEC: Iid = guid(
+    0xfeb5_0740,
+    0x7bef,
+    0x11ce,
+    [0x9b, 0xd9, 0x00, 0x00, 0xe2, 0x02, 0x59, 0x9c],
+);
+const CLSID_MPEG_AUDIO_CODEC: Iid = guid(
+    0x4a22_86e0,
+    0x7bef,
+    0x11ce,
+    [0x9b, 0xd9, 0x00, 0x00, 0xe2, 0x02, 0x59, 0x9c],
+);
+const CLSID_DSOUND_RENDER: Iid = guid(
+    0x7937_6820,
+    0x07d0,
+    0x11cf,
+    [0xa2, 0x4d, 0x00, 0x20, 0xaf, 0xd7, 0x97, 0x67],
+);
+const CLSID_AUDIO_RENDER: Iid = guid(
+    0xe306_29d1,
+    0x27e5,
+    0x11ce,
+    [0x87, 0x5d, 0x00, 0x60, 0x8c, 0xb7, 0x80, 0x66],
+);
+
+/// One guest-visible vtable layout. The generated COM table supplies slots and
+/// stack widths; a face may answer for every IID its vtable is a superset of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Face {
+    FilterGraph,
+    MediaControl,
+    MediaEvent,
+    MediaEventSink,
+    MediaSeeking,
+    MediaPosition,
+    BasicAudio,
+    BasicVideo,
+    VideoWindow,
+    MediaFilter,
+    BaseFilter,
+    FileSource,
+    EnumFilters,
+    EnumPins,
+    Pin,
+    MemInputPin,
+    EnumMediaTypes,
+    MemAllocator,
+    MediaSample,
+}
+
+const FACES: [(Face, &str); 19] = [
+    (Face::FilterGraph, "IFilterGraph2"),
+    (Face::MediaControl, "IMediaControl"),
+    (Face::MediaEvent, "IMediaEventEx"),
+    (Face::MediaEventSink, "IMediaEventSink"),
+    (Face::MediaSeeking, "IMediaSeeking"),
+    (Face::MediaPosition, "IMediaPosition"),
+    (Face::BasicAudio, "IBasicAudio"),
+    (Face::BasicVideo, "IBasicVideo"),
+    (Face::VideoWindow, "IVideoWindow"),
+    (Face::MediaFilter, "IMediaFilter"),
+    (Face::BaseFilter, "IBaseFilter"),
+    (Face::FileSource, "IFileSourceFilter"),
+    (Face::EnumFilters, "IEnumFilters"),
+    (Face::EnumPins, "IEnumPins"),
+    (Face::Pin, "IPin"),
+    (Face::MemInputPin, "IMemInputPin"),
+    (Face::EnumMediaTypes, "IEnumMediaTypes"),
+    (Face::MemAllocator, "IMemAllocator"),
+    (Face::MediaSample, "IMediaSample"),
 ];
 
-#[derive(Default)]
-struct Graph {
-    event: u32,
-    notify: [u32; 3],
-    notify_flags: u32,
-    canceled_events: BTreeSet<u32>,
-    aborted: bool,
+impl Face {
+    fn interface(self) -> &'static str {
+        FACES[self as usize].1
+    }
+    /// The IIDs this vtable answers for, besides IUnknown.
+    fn iids(self) -> &'static [Iid] {
+        match self {
+            Face::FilterGraph => &[IID_IFILTERGRAPH, IID_IGRAPHBUILDER, IID_IFILTERGRAPH2],
+            Face::MediaControl => &[IID_IMEDIACONTROL],
+            Face::MediaEvent => &[IID_IMEDIAEVENT, IID_IMEDIAEVENTEX],
+            Face::MediaEventSink => &[IID_IMEDIAEVENTSINK],
+            Face::MediaSeeking => &[IID_IMEDIASEEKING],
+            Face::MediaPosition => &[IID_IMEDIAPOSITION],
+            Face::BasicAudio => &[IID_IBASICAUDIO],
+            Face::BasicVideo => &[IID_IBASICVIDEO],
+            Face::VideoWindow => &[IID_IVIDEOWINDOW],
+            Face::MediaFilter => &[IID_IMEDIAFILTER, IID_IPERSIST],
+            Face::BaseFilter => &[IID_IBASEFILTER, IID_IMEDIAFILTER, IID_IPERSIST],
+            Face::FileSource => &[IID_IFILESOURCEFILTER],
+            Face::EnumFilters => &[IID_IENUMFILTERS],
+            Face::EnumPins => &[IID_IENUMPINS],
+            Face::Pin => &[IID_IPIN],
+            Face::MemInputPin => &[IID_IMEMINPUTPIN],
+            Face::EnumMediaTypes => &[IID_IENUMMEDIATYPES],
+            Face::MemAllocator => &[IID_IMEMALLOCATOR],
+            Face::MediaSample => &[IID_IMEDIASAMPLE],
+        }
+    }
 }
-enum Payload {
-    Graph(Graph),
-    EmptyEnumerator,
+
+/// COM payload. Larger state lives in [`State`] maps keyed by the canonical pointer.
+pub(crate) enum Obj {
+    Graph,
+    Filter,
+    Pin,
+    EnumFilters {
+        list: Vec<u32>,
+        position: usize,
+    },
+    EnumPins {
+        filter: u32,
+        position: usize,
+    },
+    EnumTypes {
+        types: Vec<MediaType>,
+        position: usize,
+    },
+    Allocator,
+    Sample,
 }
-struct State {
+
+pub(crate) struct State {
     com: Com,
-    tables: BTreeMap<&'static str, u32>,
-}
-struct Binding {
-    signature: &'static Signature,
-    name: &'static str,
+    tables: BTreeMap<Face, u32>,
+    pub(crate) graphs: BTreeMap<u32, graph::Graph>,
+    pub(crate) filters: BTreeMap<u32, filter::Filter>,
+    pub(crate) pins: BTreeMap<u32, filter::Pin>,
+    pub(crate) allocators: BTreeMap<u32, sample::Allocator>,
+    pub(crate) samples: BTreeMap<u32, sample::Sample>,
+    pub(crate) sessions: BTreeMap<u32, stream::Session>,
+    pub(crate) next_session: u32,
+    /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
+    pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
 }
 
-/// All stack widths and slots come from the pinned Win32Metadata projection.
-/// One data-driven adapter also covers inherited methods and explicit failures.
-fn bindings() -> &'static [Binding] {
-    static BINDINGS: OnceLock<Vec<Binding>> = OnceLock::new();
-    BINDINGS.get_or_init(|| {
-        adv_abi::signature::com_signatures()
-            .iter()
-            .filter(|s| {
-                GRAPH_INTERFACES.iter().any(|(name, _)| *name == s.module)
-                    || s.module == "IEnumFilters"
-            })
-            .map(|signature| Binding {
-                name: Box::leak(
-                    format!("{}::{}", signature.module, signature.name).into_boxed_str(),
-                ),
-                signature,
-            })
-            .collect()
-    })
+/// Dispatch data: face index and slot, bound once per thunk.
+fn data(face: Face, slot: u16) -> u64 {
+    ((face as u64) << 16) | u64::from(slot)
 }
-fn level(signature: &Signature) -> ImplementationLevel {
-    use ImplementationLevel::{Implement, SafeFail, State};
-    match signature.name {
-        "QueryInterface" | "AddRef" | "Release" | "EnumFilters" | "FindFilterByName"
-        | "RemoveFilter" | "Next" | "Skip" | "Reset" | "Clone" | "GetEventHandle" | "GetEvent"
-        | "WaitForCompletion" | "FreeEventParams" => Implement,
-        "GetTypeInfoCount"
-        | "Stop"
-        | "StopWhenReady"
-        | "GetState"
-        | "SetDefaultSyncSource"
-        | "Abort"
-        | "ShouldOperationContinue"
-        | "SetNotifyWindow"
-        | "SetNotifyFlags"
-        | "GetNotifyFlags"
-        | "CancelDefaultHandling"
-        | "RestoreDefaultHandling"
-        | "GetCapabilities"
-        | "CheckCapabilities" => State,
-        _ => SafeFail,
-    }
-}
+
 pub fn register(registry: &mut Registry) {
-    for (index, binding) in bindings().iter().enumerate() {
-        registry.register_with_data(
-            Api {
-                module: "quartz.dll",
-                name: binding.name,
-                conv: binding
-                    .signature
-                    .conv
-                    .expect("projected DirectShow stdcall"),
-                handler: dispatch,
-                level: level(binding.signature),
-            },
-            index as u64,
-        );
+    for (face, interface) in FACES {
+        for signature in adv_abi::signature::com_signatures()
+            .iter()
+            .filter(|signature| signature.module == interface)
+        {
+            let (Some(conv), Some(slot)) = (signature.conv, signature.com_slot) else {
+                continue;
+            };
+            registry.add_with_data(
+                "quartz.dll",
+                &format!("{interface}::{}", signature.name),
+                conv,
+                dispatch,
+                data(face, slot),
+            );
+        }
     }
+    registry.add(
+        "quartz.dll",
+        stream::THREAD_ENTRY,
+        Conv::Stdcall { argc: 1 },
+        stream::thread_entry,
+    );
 }
-/// Assembly only registers the in-process class. Guest storage is created lazily.
-pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
-    machine
-        .ext
-        .get_or_default::<ClassFactories>()
-        .register(CLSID_FILTERGRAPH, create_graph);
+
+/// Register the classes; vtables are built on first activation.
+pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
+    let classes = m.ext.get_or_default::<adv_os::com::ClassFactories>();
+    classes.register(CLSID_FILTERGRAPH, graph::create);
+    classes.register(CLSID_FILTERGRAPH_NO_THREAD, graph::create);
+    classes.register(CLSID_MPEG1_SPLITTER, filter::create_splitter);
+    classes.register(CLSID_MPEG_VIDEO_CODEC, filter::create_video_decoder);
+    classes.register(CLSID_MPEG_AUDIO_CODEC, filter::create_audio_decoder);
+    classes.register(CLSID_DSOUND_RENDER, filter::create_audio_renderer);
+    classes.register(CLSID_AUDIO_RENDER, filter::create_audio_renderer);
+}
+
+fn initialize(env: &mut Env<'_>) -> Result<(), String> {
+    if env.ext.try_get::<State>().is_some() {
+        return Ok(());
+    }
+    let mut tables = BTreeMap::new();
+    for (face, interface) in FACES {
+        let methods: Vec<_> = adv_abi::signature::com_signatures()
+            .iter()
+            .filter(|signature| signature.module == interface)
+            .collect();
+        let table = alloc(env, methods.len() as u32 * 4).ok_or("DirectShow vtable allocation")?;
+        for signature in methods {
+            let slot = u32::from(signature.com_slot.ok_or("COM slot")?);
+            let name = format!("{interface}::{}", signature.name);
+            let method = env
+                .sys
+                .thunks
+                .publish(env.cpu, "quartz.dll", &name)
+                .map_err(|e| e.to_string())?;
+            env.cpu
+                .write_u32(table + slot * 4, method)
+                .map_err(|e| e.to_string())?;
+        }
+        tables.insert(face, table);
+    }
+    let com = Com::new(&mut env.sys.objects).ok_or("COM namespace exhausted")?;
+    env.ext.insert(State {
+        com,
+        tables,
+        graphs: BTreeMap::new(),
+        filters: BTreeMap::new(),
+        pins: BTreeMap::new(),
+        allocators: BTreeMap::new(),
+        samples: BTreeMap::new(),
+        sessions: BTreeMap::new(),
+        next_session: 1,
+        pending_posts: Vec::new(),
+    });
     Ok(())
 }
-fn alloc(env: &mut Env<'_>, size: u32) -> Option<u32> {
-    let heaps = env.ext.get_mut::<Heaps>();
-    heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, size, true)
+
+pub(crate) fn state<'a>(env: &'a mut Env<'_>) -> &'a mut State {
+    env.ext.get_mut::<State>()
 }
-fn free(env: &mut Env<'_>, pointer: u32) {
+
+pub(crate) fn alloc(env: &mut Env<'_>, len: u32) -> Option<u32> {
+    let heaps = env.ext.get_mut::<Heaps>();
+    heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, len, true)
+}
+
+pub(crate) fn free(env: &mut Env<'_>, pointer: u32) {
     let heaps = env.ext.get_mut::<Heaps>();
     heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
 }
-fn initialize(env: &mut Env<'_>) -> bool {
-    if env.ext.try_get::<State>().is_some() {
-        return true;
-    }
-    let mut tables = BTreeMap::new();
-    let result = (|| {
-        for (interface, count) in [
-            ("IGraphBuilder", 18),
-            ("IMediaControl", 16),
-            ("IMediaEventEx", 16),
-            ("IMediaSeeking", 20),
-            ("IBasicAudio", 11),
-            ("IVideoWindow", 46),
-            ("IEnumFilters", 7),
-        ] {
-            let methods: Vec<_> = bindings()
-                .iter()
-                .filter(|b| b.signature.module == interface)
-                .collect();
-            if methods.len() != count {
-                return None;
-            }
-            let table = alloc(env, count as u32 * 4)?;
-            tables.insert(interface, table);
-            for (slot, method) in methods.iter().enumerate() {
-                if method.signature.com_slot != Some(slot as u16) {
-                    return None;
-                }
-                let thunk = env
-                    .sys
-                    .thunks
-                    .publish(env.cpu, "quartz.dll", method.name)
-                    .ok()?;
-                env.cpu.write_u32(table + slot as u32 * 4, thunk).ok()?;
-            }
-        }
-        let com = Com::new(&mut env.sys.objects)?;
-        env.ext.insert(State {
-            com,
-            tables: tables.clone(),
-        });
-        Some(())
-    })();
-    if result.is_none() {
-        for &table in tables.values() {
-            free(env, table);
+
+/// Publish a host object with one vtable pointer per face. Returns the face
+/// pointers in order; the first is canonical. The caller stores its own state
+/// under that pointer before handing any of them to the guest.
+pub(crate) fn create(env: &mut Env<'_>, faces: &[Face], value: Obj) -> Result<Vec<u32>, u32> {
+    initialize(env).map_err(|error| {
+        log::warn!("DirectShow: {error}");
+        E_OUTOFMEMORY
+    })?;
+    let block = alloc(env, faces.len() as u32 * 4).ok_or(E_OUTOFMEMORY)?;
+    let pointers: Vec<u32> = (0..faces.len() as u32).map(|i| block + i * 4).collect();
+    for (&face, &pointer) in faces.iter().zip(&pointers) {
+        let table = state(env).tables[&face];
+        if env.cpu.write_u32(pointer, table).is_err() {
+            free(env, block);
+            return Err(E_OUTOFMEMORY);
         }
     }
-    result.is_some()
+    let com = state(env).com;
+    let Some(id) = com.create(&mut env.sys.objects, block, faces[0].iids()[0], value) else {
+        free(env, block);
+        return Err(E_OUTOFMEMORY);
+    };
+    for (&face, &pointer) in faces.iter().zip(&pointers) {
+        for &iid in face.iids() {
+            if !com.register_interface(&mut env.sys.objects, id, iid, pointer) {
+                release(env, block);
+                return Err(E_OUTOFMEMORY);
+            }
+        }
+    }
+    Ok(pointers)
 }
-fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
-    let Some(com) = env.ext.try_get::<State>().map(|s| s.com) else {
+
+/// Canonical (IUnknown) pointer of a host object, given any of its faces.
+pub(crate) fn canonical(env: &Env<'_>, pointer: u32) -> Option<u32> {
+    let state = env.ext.try_get::<State>()?;
+    let id = state.com.identity::<Obj>(&env.sys.objects, pointer)?;
+    state.com.canonical(&env.sys.objects, id)
+}
+
+pub(crate) fn payload<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Obj> {
+    let state = env.ext.try_get::<State>()?;
+    state.com.get::<Obj>(&env.sys.objects, pointer)
+}
+
+pub(crate) fn payload_mut<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<&'a mut Obj> {
+    let com = env.ext.try_get::<State>()?.com;
+    com.get_mut::<Obj>(&mut env.sys.objects, pointer)
+}
+
+pub(crate) fn add_ref(env: &mut Env<'_>, pointer: u32) -> u32 {
+    let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
-    let Some(released) = com.release::<Payload>(&mut env.sys.objects, pointer) else {
+    state
+        .com
+        .add_ref::<Obj>(&mut env.sys.objects, pointer)
+        .unwrap_or(0)
+}
+
+/// Host-side Release; samples return to their allocator instead of being destroyed.
+pub(crate) fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
+    let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
+    let com = state.com;
+    let canonical = canonical(env, pointer);
+    let Some(released) = com.release::<Obj>(&mut env.sys.objects, pointer) else {
+        return 0;
+    };
+    if released.references == 0
+        && let Some(canonical) = canonical
+    {
+        sample::returned(env, canonical);
+    }
     if let Some(destroyed) = released.destroyed {
-        if let Payload::Graph(graph) = destroyed.value
-            && graph.event != 0
-        {
-            env.sys.objects.close(graph.event);
+        if let Some(canonical) = canonical {
+            destroyed_object(env, canonical, &destroyed.value);
         }
-        for pointer in destroyed.interfaces {
-            free(env, pointer);
+        // All faces share one block, which starts at the canonical pointer.
+        if let Some(&first) = destroyed.interfaces.iter().min() {
+            free(env, first);
         }
     }
     released.references
 }
-fn interface(env: &mut Env<'_>, name: &str) -> Option<u32> {
-    let table = *env.ext.get::<State>().tables.get(name)?;
-    let pointer = alloc(env, 4)?;
-    if env.cpu.write_u32(pointer, table).is_err() {
-        free(env, pointer);
-        return None;
-    }
-    Some(pointer)
-}
-fn new_graph(env: &mut Env<'_>) -> Option<u32> {
-    if !initialize(env) {
-        return None;
-    }
-    let com = env.ext.get::<State>().com;
-    let pointer = interface(env, "IGraphBuilder")?;
-    let Some(id) = com.create(
-        &mut env.sys.objects,
-        pointer,
-        IID_GRAPH,
-        Payload::Graph(Graph::default()),
-    ) else {
-        free(env, pointer);
-        return None;
-    };
-    for (name, iid) in GRAPH_INTERFACES.into_iter().skip(1) {
-        let Some(other) = interface(env, name) else {
-            release(env, pointer);
-            return None;
-        };
-        if !com.register_interface(&mut env.sys.objects, id, iid, other) {
-            free(env, other);
-            release(env, pointer);
-            return None;
+
+fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
+    let state = state(env);
+    match value {
+        Obj::Graph => {
+            state.graphs.remove(&canonical);
         }
-        let base = match name {
-            "IMediaControl" => Some(IID_DISPATCH),
-            "IMediaEventEx" => Some(IID_EVENT),
-            _ => None,
-        };
-        if let Some(base) = base
-            && !com.register_interface(&mut env.sys.objects, id, base, other)
-        {
-            release(env, pointer);
-            return None;
+        Obj::Filter => {
+            state.filters.remove(&canonical);
         }
+        Obj::Pin => {
+            state.pins.remove(&canonical);
+        }
+        Obj::Allocator => {
+            state.allocators.remove(&canonical);
+        }
+        Obj::Sample => {
+            state.samples.remove(&canonical);
+        }
+        Obj::EnumFilters { .. } | Obj::EnumPins { .. } | Obj::EnumTypes { .. } => {}
     }
-    if !com.register_interface(&mut env.sys.objects, id, IID_FILTER_GRAPH, pointer) {
-        release(env, pointer);
-        return None;
-    }
-    Some(pointer)
 }
-fn empty_enumerator(env: &mut Env<'_>, output: u32) -> u32 {
-    if !clear(env, output, 4) {
-        return E_POINTER;
-    }
-    let Some(pointer) = interface(env, "IEnumFilters") else {
-        return E_OUTOFMEMORY;
-    };
-    let com = env.ext.get::<State>().com;
-    if com
-        .create(
-            &mut env.sys.objects,
-            pointer,
-            IID_ENUM,
-            Payload::EmptyEnumerator,
-        )
-        .is_none()
-    {
-        free(env, pointer);
-        return E_OUTOFMEMORY;
-    }
-    if GuestPtr::<u32>::new(output)
-        .write(env.cpu, pointer)
-        .is_err()
-    {
-        release(env, pointer);
-        return E_POINTER;
-    }
-    0
-}
-fn create_graph(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
-    if !clear(env, output, 4) {
-        return Outcome::Return(E_POINTER);
-    }
-    if outer != 0 {
-        return Outcome::Return(CLASS_E_NOAGGREGATION);
-    }
-    if !GRAPH_INTERFACES.iter().any(|(_, known)| *known == iid)
-        && ![
-            adv_os::com::IUNKNOWN,
-            IID_FILTER_GRAPH,
-            IID_DISPATCH,
-            IID_EVENT,
-        ]
-        .contains(&iid)
-    {
-        adv_abi::warn_unavailable(
-            env,
-            "ole32.dll!CoCreateInstance",
-            &format!("FilterGraph does not support IID bytes {iid:02x?}"),
-        );
-        return Outcome::Return(E_NOINTERFACE);
-    }
-    let Some(pointer) = new_graph(env) else {
-        return Outcome::Return(E_OUTOFMEMORY);
-    };
-    let com = env.ext.get::<State>().com;
-    let target = com
-        .resolve_interface::<Payload>(&mut env.sys.objects, pointer, iid)
-        .unwrap();
-    if GuestPtr::<u32>::new(output).write(env.cpu, target).is_err() {
-        release(env, pointer);
-        return Outcome::Return(E_POINTER);
-    }
-    Outcome::Return(0)
-}
-fn clear(env: &mut Env<'_>, pointer: u32, size: u32) -> bool {
-    if adv_abi::guest::check_range(env.cpu, pointer, size, Prot::WRITE).is_err() {
+
+/// Keep a host object alive without a guest-visible reference.
+pub(crate) fn retain_internal(env: &mut Env<'_>, pointer: u32) -> bool {
+    let com = state(env).com;
+    let Some(id) = com.identity::<Obj>(&env.sys.objects, pointer) else {
         return false;
-    }
-    // All uses are fixed SDK scalar/GUID outputs, at most sixteen bytes.
-    size <= 16 && env.cpu.write(pointer, &[0; 16][..size as usize]).is_ok()
-}
-fn readable(env: &Env<'_>, pointer: u32, size: u32) -> bool {
-    adv_abi::guest::check_range(env.cpu, pointer, size, Prot::READ).is_ok()
-}
-fn wide(env: &Env<'_>, pointer: u32) -> bool {
-    WideStr(GuestPtr::new(pointer)).read(env.cpu, 32768).is_ok()
-}
-fn query(env: &mut Env<'_>, this: u32, requested: u32, output: u32) -> u32 {
-    if !clear(env, output, 4) || !readable(env, requested, 16) {
-        return E_POINTER;
-    }
-    let Ok(iid) = GuestPtr::<Iid>::new(requested).read(env.cpu) else {
-        return E_POINTER;
     };
-    let com = env.ext.get::<State>().com;
-    match com.query::<Payload>(&mut env.sys.objects, this, iid) {
-        Ok(target) => {
-            if GuestPtr::<u32>::new(output).write(env.cpu, target).is_ok() {
-                0
-            } else {
-                release(env, target);
-                E_POINTER
-            }
-        }
-        Err(QueryError::NoInterface) => {
-            adv_abi::warn_unavailable(
-                env,
-                "quartz.dll!IUnknown::QueryInterface",
-                &format!("DirectShow object does not support IID bytes {iid:02x?}"),
-            );
-            E_NOINTERFACE
-        }
-        Err(QueryError::ReferenceLimit) => E_OUTOFMEMORY,
-        Err(QueryError::InvalidObject) => E_INVALIDARG,
-    }
+    com.retain_internal(&mut env.sys.objects, id)
 }
-fn unavailable(env: &mut Env<'_>, binding: &Binding, reason: &str, error: u32) -> u32 {
-    adv_abi::warn_unavailable(env, &format!("quartz.dll!{}", binding.name), reason);
-    error
-}
-fn graph_mut<'a>(env: &'a mut Env<'_>, this: u32) -> Option<&'a mut Graph> {
-    let com = env.ext.get::<State>().com;
-    match com.get_mut::<Payload>(&mut env.sys.objects, this)? {
-        Payload::Graph(graph) => Some(graph),
-        _ => None,
+
+fn dispatch(env: &mut Env<'_>) -> Outcome {
+    let data = env.sys.thunks.get(env.thunk).f.data;
+    let face = FACES[(data >> 16) as usize].0;
+    let slot = data as u16;
+    let this = env.arg(0);
+    let method = env.sys.thunks.get(env.thunk).name.clone();
+    let method = method.rsplit("::").next().unwrap_or("").to_owned();
+    if env.ext.try_get::<State>().is_none() {
+        return Outcome::Return(E_UNEXPECTED);
     }
-}
-fn event_handle(env: &mut Env<'_>, this: u32) -> Option<u32> {
-    let existing = graph_mut(env, this)?.event;
-    if existing != 0 {
-        return Some(existing);
+    if payload(env, this).is_none() {
+        log::warn!(
+            "DirectShow {}::{method}: unknown this {this:#x}",
+            face.interface()
+        );
+        return Outcome::Return(E_POINTER);
     }
-    let handle = env.sys.objects.insert(Object::Event {
-        manual_reset: true,
-        signaled: false,
-    });
-    if handle == 0 {
-        return None;
+    match slot {
+        0 => return Outcome::Return(query_interface(env, this, env.arg(1), env.arg(2))),
+        1 => return Outcome::Return(add_ref(env, this)),
+        2 => return graph::release_method(env, this),
+        _ => {}
     }
-    graph_mut(env, this)?.event = handle;
-    Some(handle)
-}
-fn event_timeout(env: &mut Env<'_>, this: u32, timeout: i32) -> Outcome {
-    if timeout == 0 {
-        return Outcome::Return(E_ABORT);
-    }
-    if timeout < -1 {
-        return Outcome::Return(E_INVALIDARG);
-    }
-    let Some(handle) = event_handle(env, this) else {
-        return Outcome::Return(E_OUTOFMEMORY);
+    let outcome = match face {
+        Face::FilterGraph
+        | Face::MediaControl
+        | Face::MediaEvent
+        | Face::MediaEventSink
+        | Face::MediaSeeking
+        | Face::MediaPosition
+        | Face::BasicAudio
+        | Face::BasicVideo
+        | Face::VideoWindow
+        | Face::MediaFilter => graph::call(env, face, &method, this),
+        Face::BaseFilter
+        | Face::FileSource
+        | Face::EnumFilters
+        | Face::EnumPins
+        | Face::Pin
+        | Face::MemInputPin
+        | Face::EnumMediaTypes => filter::call(env, face, &method, this),
+        Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
     };
-    let deadline =
-        (timeout >= 0).then(|| env.sys.clock.now_us().saturating_add(timeout as u64 * 1000));
-    // No producer exists for this empty graph. Real scheduler waits still honor
-    // the requested timeout; the event is never signaled as fake EC_COMPLETE.
-    Outcome::block(Wait::Object { handle, deadline }, |_, _| {
-        Outcome::Return(E_ABORT)
+    outcome.unwrap_or_else(|| {
+        log::debug!("DirectShow {}::{method}: not implemented", face.interface());
+        Outcome::Return(E_NOTIMPL)
     })
 }
-fn dispatch(env: &mut Env<'_>) -> Outcome {
-    let index = env.sys.thunks.get(env.thunk).f.data as usize;
-    let binding = &bindings()[index];
-    let mut cursor = Arguments::new(env.cpu);
-    let mut args = Vec::with_capacity(binding.signature.stack_words() as usize);
-    for _ in 0..binding.signature.stack_words() {
-        match cursor.next::<u32>() {
-            Ok(word) => args.push(word),
-            Err(fault) => return adv_abi::guest::memory_failure(fault),
-        }
-    }
-    call(env, binding, &args)
-}
-fn call(env: &mut Env<'_>, binding: &Binding, a: &[u32]) -> Outcome {
-    let method = binding.signature.name;
-    let Some(com) = env.ext.try_get::<State>().map(|state| state.com) else {
-        return Outcome::Return(E_INVALIDARG);
-    };
-    let Some(payload) = com.get::<Payload>(&env.sys.objects, a[0]) else {
-        return Outcome::Return(E_INVALIDARG);
-    };
-    let enumerator = matches!(payload, Payload::EmptyEnumerator);
-    if (binding.signature.module == "IEnumFilters") != enumerator {
-        return Outcome::Return(E_NOINTERFACE);
-    }
-    let value = match method {
-        "QueryInterface" => query(env, a[0], a[1], a[2]),
-        "AddRef" => com
-            .add_ref::<Payload>(&mut env.sys.objects, a[0])
-            .unwrap_or(0),
-        "Release" => release(env, a[0]),
-        _ if enumerator => match method {
-            "Next" => {
-                if (a[1] != 1 && a[3] == 0)
-                    || (a[1] != 0 && !clear(env, a[2], 4))
-                    || (a[3] != 0 && !clear(env, a[3], 4))
-                {
-                    E_POINTER
-                } else {
-                    u32::from(a[1] != 0)
-                }
-            }
-            "Skip" => {
-                if a[1] == 0 {
-                    0
-                } else {
-                    E_INVALIDARG
-                }
-            }
-            "Reset" => 0,
-            "Clone" => empty_enumerator(env, a[1]),
-            _ => unreachable!("projected IEnumFilters method"),
-        },
-        "GetTypeInfoCount" => {
-            if clear(env, a[1], 4) {
-                0
-            } else {
-                E_POINTER
-            }
-        }
-        "GetTypeInfo" => {
-            if !clear(env, a[3], 4) {
-                E_POINTER
-            } else {
-                unavailable(
-                    env,
-                    binding,
-                    "DirectShow automation type information is unavailable",
-                    E_NOTIMPL,
-                )
-            }
-        }
-        "GetIDsOfNames" | "Invoke" => unavailable(
-            env,
-            binding,
-            "DirectShow IDispatch invocation is unavailable; direct vtable methods are supported",
-            E_NOTIMPL,
-        ),
-        _ => match binding.signature.module {
-            "IGraphBuilder" => graph_call(env, binding, a),
-            "IMediaControl" => match method {
-                "Stop" | "StopWhenReady" => 0,
-                "GetState" => {
-                    if clear(env, a[2], 4) {
-                        0
-                    } else {
-                        E_POINTER
-                    }
-                } // State_Stopped
-                "Run" | "Pause" => unavailable(
-                    env,
-                    binding,
-                    "the graph has no connected media; playback is unavailable",
-                    VFW_E_NOT_CONNECTED,
-                ),
-                "RenderFile" => render_file(env, binding, a[1], 0),
-                "AddSourceFilter" | "get_FilterCollection" | "get_RegFilterCollection" => {
-                    let output = if method == "AddSourceFilter" {
-                        a[2]
-                    } else {
-                        a[1]
-                    };
-                    if !clear(env, output, 4) {
-                        E_POINTER
-                    } else {
-                        unavailable(
-                            env,
-                            binding,
-                            "DirectShow source filters and automation collections are unavailable",
-                            E_NOTIMPL,
-                        )
-                    }
-                }
-                _ => unreachable!("projected IMediaControl method"),
-            },
-            "IMediaEventEx" => return event_call(env, binding, a),
-            "IMediaSeeking" => seeking_call(env, binding, a),
-            "IBasicAudio" | "IVideoWindow" => unavailable(
-                env,
-                binding,
-                "the empty graph has no renderer to supply this interface's media properties",
-                VFW_E_NOT_CONNECTED,
-            ),
-            _ => unreachable!("selected DirectShow interface"),
-        },
-    };
-    Outcome::Return(value)
-}
-fn render_file(env: &mut Env<'_>, binding: &Binding, file: u32, playlist: u32) -> u32 {
-    if !wide(env, file) || (playlist != 0 && !wide(env, playlist)) {
+
+pub(crate) fn query_interface(env: &mut Env<'_>, this: u32, iid: u32, output: u32) -> u32 {
+    if output == 0 || iid == 0 {
         return E_POINTER;
     }
-    unavailable(
-        env,
-        binding,
-        "no DirectShow media decoder or renderer backend is installed",
-        VFW_E_CANNOT_RENDER,
-    )
-}
-fn graph_call(env: &mut Env<'_>, binding: &Binding, a: &[u32]) -> u32 {
-    match binding.signature.name {
-        "EnumFilters" => empty_enumerator(env, a[1]),
-        "FindFilterByName" => {
-            if !clear(env, a[2], 4) || !wide(env, a[1]) {
-                E_POINTER
-            } else {
-                VFW_E_NOT_FOUND
-            }
+    let _ = env.cpu.write_u32(output, 0);
+    let Ok(requested) = read_guid(env, iid) else {
+        return E_POINTER;
+    };
+    let com = state(env).com;
+    match com.query::<Obj>(&mut env.sys.objects, this, requested) {
+        Ok(pointer) => {
+            let _ = env.cpu.write_u32(output, pointer);
+            S_OK
         }
-        "RemoveFilter" => {
-            if readable(env, a[1], 4) {
-                VFW_E_NOT_FOUND
-            } else {
-                E_POINTER
-            }
-        }
-        "AddFilter" => {
-            if !readable(env, a[1], 4) || (a[2] != 0 && !wide(env, a[2])) {
-                E_POINTER
-            } else {
-                unavailable(
-                    env,
-                    binding,
-                    "guest DirectShow filters cannot be attached without a media graph backend",
-                    E_NOTIMPL,
-                )
-            }
-        }
-        "ConnectDirect" | "Connect" | "Reconnect" | "Disconnect" | "Render" => {
-            if !readable(env, a[1], 4)
-                || (["ConnectDirect", "Connect"].contains(&binding.signature.name)
-                    && !readable(env, a[2], 4))
-            {
-                E_POINTER
-            } else {
-                unavailable(
-                    env,
-                    binding,
-                    "DirectShow pin connection and media rendering are unavailable",
-                    VFW_E_CANNOT_CONNECT,
-                )
-            }
-        }
-        "RenderFile" => render_file(env, binding, a[1], a[2]),
-        "AddSourceFilter" => {
-            if !clear(env, a[3], 4) || !wide(env, a[1]) {
-                E_POINTER
-            } else {
-                unavailable(
-                    env,
-                    binding,
-                    "no DirectShow source-filter backend is installed",
-                    VFW_E_CANNOT_RENDER,
-                )
-            }
-        }
-        "SetDefaultSyncSource" => 0, // There are no filters requiring a clock.
-        "SetLogFile" => unavailable(
-            env,
-            binding,
-            "DirectShow graph logging to a guest handle is unavailable",
-            E_NOTIMPL,
-        ),
-        "Abort" => {
-            graph_mut(env, a[0]).unwrap().aborted = true;
-            0
-        }
-        "ShouldOperationContinue" => {
-            if graph_mut(env, a[0]).unwrap().aborted {
-                E_ABORT
-            } else {
-                0
-            }
-        }
-        _ => unreachable!("projected IGraphBuilder method"),
+        Err(QueryError::NoInterface) => E_NOINTERFACE,
+        Err(QueryError::ReferenceLimit) => E_OUTOFMEMORY,
+        Err(QueryError::InvalidObject) => E_POINTER,
     }
 }
-fn event_call(env: &mut Env<'_>, binding: &Binding, a: &[u32]) -> Outcome {
-    let value = match binding.signature.name {
-        "GetEventHandle" => {
-            if !clear(env, a[1], 4) {
-                E_POINTER
-            } else if let Some(event) = event_handle(env, a[0]) {
-                GuestPtr::<u32>::new(a[1])
-                    .write(env.cpu, event)
-                    .map_or(E_POINTER, |_| 0)
-            } else {
-                E_OUTOFMEMORY
-            }
-        }
-        "GetEvent" => {
-            if ![a[1], a[2], a[3]]
-                .iter()
-                .all(|&output| clear(env, output, 4))
-            {
-                E_POINTER
-            } else {
-                return event_timeout(env, a[0], a[4] as i32);
-            }
-        }
-        "WaitForCompletion" => {
-            if !clear(env, a[2], 4) {
-                E_POINTER
-            } else {
-                return event_timeout(env, a[0], a[1] as i32);
-            }
-        }
-        "SetNotifyWindow" => {
-            graph_mut(env, a[0]).unwrap().notify = [a[1], a[2], a[3]];
-            0
-        }
-        "SetNotifyFlags" => {
-            if a[1] & !1 != 0 {
-                E_INVALIDARG
-            } else {
-                graph_mut(env, a[0]).unwrap().notify_flags = a[1];
-                0
-            }
-        }
-        "GetNotifyFlags" => {
-            let flags = graph_mut(env, a[0]).unwrap().notify_flags;
-            GuestPtr::<u32>::new(a[1])
-                .write(env.cpu, flags)
-                .map_or(E_POINTER, |_| 0)
-        }
-        "CancelDefaultHandling" | "RestoreDefaultHandling" => {
-            if binding.signature.name == "CancelDefaultHandling" {
-                graph_mut(env, a[0]).unwrap().canceled_events.insert(a[1]);
-            } else {
-                graph_mut(env, a[0]).unwrap().canceled_events.remove(&a[1]);
-            }
-            0
-        }
-        "FreeEventParams" => 0, // No event parameters were ever allocated.
-        _ => unreachable!("projected IMediaEventEx method"),
-    };
-    Outcome::Return(value)
+
+pub(crate) fn read_guid(env: &Env<'_>, pointer: u32) -> Result<Iid, MemFault> {
+    let mut bytes = [0; 16];
+    env.cpu.read(pointer, &mut bytes)?;
+    Ok(bytes)
 }
-fn seeking_call(env: &mut Env<'_>, binding: &Binding, a: &[u32]) -> u32 {
-    match binding.signature.name {
-        "GetCapabilities" => {
-            if clear(env, a[1], 4) {
-                0
-            } else {
-                E_POINTER
+
+pub(crate) fn write_guid(env: &mut Env<'_>, pointer: u32, value: &Iid) -> Result<(), MemFault> {
+    env.cpu.write(pointer, value)
+}
+
+pub(crate) fn write_i64(env: &mut Env<'_>, pointer: u32, value: i64) -> bool {
+    pointer != 0 && env.cpu.write(pointer, &value.to_le_bytes()).is_ok()
+}
+
+pub(crate) fn read_i64(env: &Env<'_>, pointer: u32) -> Option<i64> {
+    let mut bytes = [0; 8];
+    (pointer != 0 && env.cpu.read(pointer, &mut bytes).is_ok()).then(|| i64::from_le_bytes(bytes))
+}
+
+/// The i64 argument occupying stack words `index` and `index + 1`.
+pub(crate) fn arg_i64(env: &Env<'_>, index: u32) -> i64 {
+    (u64::from(env.arg(index)) | (u64::from(env.arg(index + 1)) << 32)) as i64
+}
+
+pub(crate) fn arg_f64(env: &Env<'_>, index: u32) -> f64 {
+    f64::from_bits(u64::from(env.arg(index)) | (u64::from(env.arg(index + 1)) << 32))
+}
+
+pub(crate) fn read_wide(env: &Env<'_>, pointer: u32, max: usize) -> Vec<u16> {
+    let mut text = Vec::new();
+    if pointer == 0 {
+        return text;
+    }
+    while text.len() < max {
+        match env.cpu.read_u16(pointer + text.len() as u32 * 2) {
+            Ok(0) | Err(_) => break,
+            Ok(c) => text.push(c),
+        }
+    }
+    text
+}
+
+/// Call method `slot` of any COM pointer, host or guest, through its vtable.
+pub(crate) fn guest_call(
+    env: &mut Env<'_>,
+    this: u32,
+    slot: u32,
+    args: Vec<u32>,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let target = env
+        .cpu
+        .read_u32(this)
+        .and_then(|table| env.cpu.read_u32(table + slot * 4));
+    match target {
+        Ok(target) if this != 0 && target != 0 => {
+            let mut all = Vec::with_capacity(args.len() + 1);
+            all.push(this);
+            all.extend(args);
+            Outcome::call(target, all, move |env, resume| then(env, resume.value()))
+        }
+        _ => then(env, E_POINTER),
+    }
+}
+
+pub(crate) type Then = Box<dyn FnOnce(&mut Env<'_>, Vec<u32>) -> Outcome>;
+
+/// One queued guest COM call: `this`, slot, arguments after `this`.
+pub(crate) struct Call(pub u32, pub u32, pub Vec<u32>);
+
+/// Run guest calls in order, then `then` with every result.
+pub(crate) fn chain(
+    env: &mut Env<'_>,
+    mut calls: VecDeque<Call>,
+    mut results: Vec<u32>,
+    then: Then,
+) -> Outcome {
+    let Some(Call(this, slot, args)) = calls.pop_front() else {
+        return then(env, results);
+    };
+    guest_call(env, this, slot, args, move |env, value| {
+        results.push(value);
+        chain(env, calls, results, then)
+    })
+}
+
+/// AM_MEDIA_TYPE without its pUnk (always null here).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MediaType {
+    pub major: Iid,
+    pub sub: Iid,
+    pub fixed_size: bool,
+    pub temporal: bool,
+    pub sample_size: u32,
+    pub format_type: Iid,
+    pub format: Vec<u8>,
+}
+
+pub(crate) const MEDIA_TYPE_SIZE: u32 = 72;
+
+impl MediaType {
+    pub fn read(env: &Env<'_>, pointer: u32) -> Result<Self, MemFault> {
+        let mut raw = [0u8; MEDIA_TYPE_SIZE as usize];
+        env.cpu.read(pointer, &mut raw)?;
+        let word = |at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+        let (size, data) = (word(64), word(68));
+        let mut format = vec![0; size.min(0x10000) as usize];
+        if !format.is_empty() && data != 0 {
+            env.cpu.read(data, &mut format)?;
+        } else {
+            format.clear();
+        }
+        Ok(Self {
+            major: raw[0..16].try_into().unwrap(),
+            sub: raw[16..32].try_into().unwrap(),
+            fixed_size: word(32) != 0,
+            temporal: word(36) != 0,
+            sample_size: word(40),
+            format_type: raw[44..60].try_into().unwrap(),
+            format,
+        })
+    }
+
+    /// Fill a guest AM_MEDIA_TYPE; the format block is CoTaskMemAlloc'd so the
+    /// receiver may free it with DeleteMediaType / FreeMediaType.
+    pub fn write(&self, env: &mut Env<'_>, pointer: u32) -> Result<(), u32> {
+        if pointer == 0 || !env.cpu.accessible(pointer, MEDIA_TYPE_SIZE, Prot::WRITE) {
+            return Err(E_POINTER);
+        }
+        let data = if self.format.is_empty() {
+            0
+        } else {
+            let data = adv_os::com::task_alloc(env, self.format.len() as u32);
+            if data == 0 {
+                return Err(E_OUTOFMEMORY);
+            }
+            if env.cpu.write(data, &self.format).is_err() {
+                adv_os::com::task_free(env, data);
+                return Err(E_POINTER);
+            }
+            data
+        };
+        let mut raw = [0u8; MEDIA_TYPE_SIZE as usize];
+        raw[0..16].copy_from_slice(&self.major);
+        raw[16..32].copy_from_slice(&self.sub);
+        raw[32..36].copy_from_slice(&u32::from(self.fixed_size).to_le_bytes());
+        raw[36..40].copy_from_slice(&u32::from(self.temporal).to_le_bytes());
+        raw[40..44].copy_from_slice(&self.sample_size.to_le_bytes());
+        raw[44..60].copy_from_slice(&self.format_type);
+        raw[64..68].copy_from_slice(&(self.format.len() as u32).to_le_bytes());
+        raw[68..72].copy_from_slice(&data.to_le_bytes());
+        if env.cpu.write(pointer, &raw).is_err() {
+            if data != 0 {
+                adv_os::com::task_free(env, data);
+            }
+            return Err(E_POINTER);
+        }
+        Ok(())
+    }
+
+    /// A new task-memory AM_MEDIA_TYPE, as CreateMediaType returns.
+    pub fn create(&self, env: &mut Env<'_>) -> Result<u32, u32> {
+        let pointer = adv_os::com::task_alloc(env, MEDIA_TYPE_SIZE);
+        if pointer == 0 {
+            return Err(E_OUTOFMEMORY);
+        }
+        if let Err(error) = self.write(env, pointer) {
+            adv_os::com::task_free(env, pointer);
+            return Err(error);
+        }
+        Ok(pointer)
+    }
+
+    pub fn video_rgb(sub: Iid, width: u32, height: u32, frame_100ns: i64) -> Self {
+        let bits: u16 = match sub {
+            s if s == MEDIASUBTYPE_RGB32 => 32,
+            s if s == MEDIASUBTYPE_RGB24 => 24,
+            _ => 16,
+        };
+        let stride = (width * u32::from(bits) / 8 + 3) & !3;
+        let image = stride * height;
+        let masks = sub == MEDIASUBTYPE_RGB565;
+        let mut format = vec![0u8; 88 + if masks { 12 } else { 0 }];
+        // rcSource / rcTarget stay empty: the whole image.
+        let bit_rate = (u64::from(image) * 8 * 10_000_000 / frame_100ns.max(1) as u64) as u32;
+        format[32..36].copy_from_slice(&bit_rate.to_le_bytes());
+        format[40..48].copy_from_slice(&frame_100ns.to_le_bytes());
+        let header = &mut format[48..88];
+        header[0..4].copy_from_slice(&40u32.to_le_bytes());
+        header[4..8].copy_from_slice(&width.to_le_bytes());
+        header[8..12].copy_from_slice(&height.to_le_bytes());
+        header[12..14].copy_from_slice(&1u16.to_le_bytes());
+        header[14..16].copy_from_slice(&bits.to_le_bytes());
+        // BI_BITFIELDS for 565; BI_RGB otherwise.
+        header[16..20].copy_from_slice(&(if masks { 3u32 } else { 0 }).to_le_bytes());
+        header[20..24].copy_from_slice(&image.to_le_bytes());
+        if masks {
+            for (i, mask) in [0xf800u32, 0x07e0, 0x001f].into_iter().enumerate() {
+                format[88 + i * 4..92 + i * 4].copy_from_slice(&mask.to_le_bytes());
             }
         }
-        "CheckCapabilities" => {
-            let Ok(requested) = GuestPtr::<u32>::new(a[1]).read(env.cpu) else {
-                return E_POINTER;
-            };
-            if !clear(env, a[1], 4) {
-                E_POINTER
-            } else if requested == 0 {
-                0
-            } else {
-                0x80004005
-            }
+        Self {
+            major: MEDIATYPE_VIDEO,
+            sub,
+            fixed_size: true,
+            temporal: false,
+            sample_size: image,
+            format_type: FORMAT_VIDEOINFO,
+            format,
         }
-        _ => unavailable(
-            env,
-            binding,
-            "the empty graph has no media duration, time format or seek provider",
-            E_NOTIMPL,
-        ),
+    }
+
+    pub fn audio_pcm(rate: u32, channels: u16) -> Self {
+        let align = channels * 2;
+        let mut format = vec![0u8; 18];
+        format[0..2].copy_from_slice(&1u16.to_le_bytes());
+        format[2..4].copy_from_slice(&channels.to_le_bytes());
+        format[4..8].copy_from_slice(&rate.to_le_bytes());
+        format[8..12].copy_from_slice(&(rate * u32::from(align)).to_le_bytes());
+        format[12..14].copy_from_slice(&align.to_le_bytes());
+        format[14..16].copy_from_slice(&16u16.to_le_bytes());
+        Self {
+            major: MEDIATYPE_AUDIO,
+            sub: MEDIASUBTYPE_PCM,
+            fixed_size: true,
+            temporal: false,
+            sample_size: u32::from(align),
+            format_type: FORMAT_WAVEFORMATEX,
+            format,
+        }
+    }
+
+    /// Image geometry of a VIDEOINFOHEADER type: width, signed height, bit depth.
+    pub fn video_geometry(&self) -> Option<(u32, i32, u16)> {
+        if self.format_type != FORMAT_VIDEOINFO || self.format.len() < 88 {
+            return None;
+        }
+        let h = &self.format[48..88];
+        Some((
+            u32::from_le_bytes(h[4..8].try_into().unwrap()),
+            i32::from_le_bytes(h[8..12].try_into().unwrap()),
+            u16::from_le_bytes(h[14..16].try_into().unwrap()),
+        ))
     }
 }
 

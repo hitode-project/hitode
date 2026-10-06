@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use super::Executor;
 use crate::{CompileStrategy, Region};
 
-const MAGIC: &[u8; 8] = b"ADVWARM1";
+/// Version 2 drops profiles recorded while pending regions could fragment loops.
+const MAGIC: &[u8; 8] = b"ADVWARM2";
 /// Bounded by the deferred queue so one import cannot crowd out discovery.
 const LIMIT: usize = 2048;
 /// Modules mapped later than this after import are left to normal discovery.

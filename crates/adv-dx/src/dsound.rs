@@ -289,6 +289,13 @@ pub struct Sound {
     playback_clock: Arc<adv_device::clock::PlaybackClock>,
 }
 impl Sound {
+    /// A mixer stream id for another front's owned PCM (movie audio).
+    pub(crate) fn allocate_audio_id(&mut self) -> u64 {
+        let id = self.next_audio_id;
+        self.next_audio_id += 1;
+        id
+    }
+
     fn buffer<'a>(&self, objects: &'a Objects, pointer: u32) -> Option<&'a Buffer> {
         self.com.get::<Object>(objects, pointer)?.buffer.as_ref()
     }

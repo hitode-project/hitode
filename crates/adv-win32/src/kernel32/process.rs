@@ -333,6 +333,24 @@ fn resume_thread(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
+fn terminate_thread(env: &mut Env<'_>) -> Outcome {
+    let (h, code) = (env.arg(0), env.arg(1));
+    let target = match env.sys.objects.get(h) {
+        Some(adv_machine::Object::Thread { ctx }) => *ctx,
+        _ if h == u32::MAX - 1 => env.context,
+        _ => {
+            set_last_error(env, err::INVALID_HANDLE);
+            return Outcome::Return(0);
+        }
+    };
+    if target == env.context {
+        return Outcome::ExitThread(code);
+    }
+    // Already finished threads keep their exit code; TerminateThread still succeeds.
+    env.sys.terminate_context(target, code);
+    Outcome::Return(1)
+}
+
 fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
     let (h, out) = (env.arg(0), env.arg(1));
     let code = match env.sys.objects.get(h) {
@@ -445,6 +463,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "ExitThread", 1, |e| {
         super::module::exit_thread(e, e.arg(0))
     });
+    stdcall(reg, K32, "TerminateThread", 2, terminate_thread);
     stdcall(reg, K32, "CreateThread", 6, create_thread);
     stdcall(reg, K32, "SuspendThread", 1, suspend_thread);
     stdcall(reg, K32, "ResumeThread", 1, resume_thread);
