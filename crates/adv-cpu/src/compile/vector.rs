@@ -721,6 +721,7 @@ impl Emitter<'_> {
             if start == header {
                 let mut vars: Vec<Variable> = self.lazy.to_vec();
                 vars.push(self.flags);
+                vars.extend(self.written);
                 vars.extend(self.mmx_mode);
                 vars.extend(bits(inductions).map(|register| self.regs[register]));
                 let lanes = self.lanes();
@@ -731,6 +732,14 @@ impl Emitter<'_> {
                     .map(|var| (var, self.b.use_var(var)))
                     .collect();
                 self.lanes().start = start;
+            }
+            if self.written.is_some() {
+                let mask = nest_emit::block_writes(
+                    instructions,
+                    start,
+                    &self.batches[index].as_ref().unwrap().starts,
+                );
+                self.record_writes(mask);
             }
             if start == tail {
                 // The tail steps from the last lane's values.
@@ -870,6 +879,12 @@ impl Emitter<'_> {
             .jump(body, &[source.into(), destination.into(), remaining.into()]);
 
         self.b.switch_to_block(cleanup);
+        if self.written.is_some() {
+            let mask = instructions
+                .range(header..=latch)
+                .fold(0, |mask, (_, i)| mask | nest::written(i));
+            self.record_writes(mask);
+        }
         let pending = self.b.block_params(cleanup)[0];
         let completed = self.b.ins().isub(batches, remaining);
         let completed = self.b.ins().ishl_imm(completed, 2);

@@ -21,6 +21,18 @@ impl JitCpu {
         }
         self.inner.set_guest_workers(count)
     }
+    pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
+        self.inner.set_row_workers(count)
+    }
+    pub fn disable_row_batching(&mut self) {
+        self.inner.disable_row_batching();
+    }
+    pub fn set_row_threshold(&mut self, work: u64) {
+        self.inner.set_row_threshold(work);
+    }
+    pub fn row_parallel_stats(&self) -> crate::RowStats {
+        self.inner.row_parallel_stats()
+    }
     pub fn parallel_stats(&self) -> crate::ParallelStats {
         self.inner.parallel_stats()
     }

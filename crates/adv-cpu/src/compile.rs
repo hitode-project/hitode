@@ -18,6 +18,8 @@ mod diagnostics;
 mod fault;
 mod loops;
 mod mmx;
+mod nest;
+mod nest_emit;
 // Retain the analysis tests; observable exits cannot discard guest state.
 #[cfg(test)]
 mod register_liveness;
@@ -32,6 +34,7 @@ type Entry = unsafe extern "C" fn(*mut NativeContext, *mut u8) -> u32;
 
 /// Borrowed controls for one bounded native entry and its linked regions.
 pub(crate) struct NativeRun<'a> {
+    pub rows: Option<&'a crate::rows::RowPool>,
     pub links: Option<&'a Table>,
     pub stop: u32,
     pub interrupt: &'a std::sync::atomic::AtomicBool,
@@ -59,6 +62,7 @@ pub(crate) struct Compiled {
     pub code_size: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
+    _nests: Box<[crate::rows::Descriptor]>,
     /// Owner-side recency sampled at Rust entries, never read by generated code.
     // Controller-only metadata; native descriptors never reference this cell.
     pub cache_stamp: std::cell::Cell<u64>,
@@ -130,6 +134,10 @@ impl Compiled {
         let (slots, mask) = controls.links.map_or((std::ptr::null(), 0), Table::parts);
         let mut context = NativeContext {
             state,
+            rows: controls
+                .rows
+                .map_or(std::ptr::null(), |pool| pool as *const _),
+            written: 0,
             perms: memory.perms.as_ptr(),
             bridge: (bridge as *mut crate::trap::Bridge<'_>).cast(),
             interrupt: controls.interrupt,
@@ -600,6 +608,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     for plan in &plans {
         entries.extend(plan.windows.iter().map(|&(pc, _)| pc));
     }
+    let nests = if snapshot.parallel || plans.is_empty() {
+        Vec::new()
+    } else {
+        nest::nests(&instructions, &entries, &plans)
+    };
     let batches: Vec<_> = plans
         .iter()
         .map(|plan| vector::batch(plan, &instructions))
@@ -648,6 +661,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         crate::atomic_memory::load_vector as *const u8,
     );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
+    builder.symbol("adv_nest_run", crate::rows::run as *const u8);
     builder.symbol(
         "adv_read_timestamp",
         crate::trap::read_timestamp as *const u8,
@@ -780,6 +794,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
     let source_map = diagnostics::instruction_map_enabled();
+    let mut nest_signature = module.make_signature();
+    nest_signature.params.extend([AbiParam::new(ptr_ty); 4]);
+    nest_signature.returns.push(AbiParam::new(types::I32));
+    let nest_id = module
+        .declare_function("adv_nest_run", Linkage::Import, &nest_signature)
+        .map_err(|e| e.to_string())?;
     // Builds the region function, or with `kernel` the separate function for
     // that versioned loop's clone. `kernels` holds each loop's finalized kernel
     // address for the region to call.
@@ -787,7 +807,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     func: &mut ir::Function,
                     fb_ctx: &mut FunctionBuilderContext,
                     kernel: Option<usize>,
-                    kernels: &[usize]| {
+                    kernels: &[usize],
+                    track_writes: bool,
+                    descriptors: &[usize]| {
+        let nest_ref = module.declare_func_in_func(nest_id, func);
         let trap_ref = module.declare_func_in_func(host_id, func);
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
         let x87_ref = module.declare_func_in_func(x87_id, func);
@@ -916,6 +939,34 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         for var in lazy {
             b.def_var(var, zero);
         }
+        let written = track_writes.then(|| {
+            let var = b.declare_var(types::I32);
+            b.def_var(var, zero);
+            var
+        });
+        let row_hooks = if kernel.is_none() {
+            nests
+                .iter()
+                .zip(descriptors)
+                .map(|(nest, &descriptor)| {
+                    let valid = b.declare_var(types::I32);
+                    b.def_var(valid, zero);
+                    let previous = std::array::from_fn(|_| {
+                        let var = b.declare_var(types::I32);
+                        b.def_var(var, zero);
+                        var
+                    });
+                    nest_emit::Hook {
+                        nest: nest.clone(),
+                        descriptor,
+                        valid,
+                        previous,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let fuel = b.declare_var(types::I64);
         for (i, reg) in regs.iter().enumerate() {
             let v = b
@@ -1038,6 +1089,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         });
         let mut e = Emitter {
             b,
+            row_hooks,
+            nest_ref,
+            written,
             regs,
             xmm,
             mmx,
@@ -1173,6 +1227,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Budget));
             e.begin_mmx_block();
+            if e.written.is_some()
+                && let Some(index) = fast
+            {
+                let mask = nest_emit::block_writes(&instructions, start, &e.plans[index].starts);
+                e.record_writes(mask);
+            }
             let budget = e.b.use_var(e.fuel);
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             if start == region.start && fast.is_none() && fault_pc.is_some() {
@@ -1256,6 +1316,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // individual guest block's recipe dominates this block.
         e.mmx_effects = None;
         e.b.switch_to_block(dispatch);
+        e.reset_rows();
         let target = e.b.block_params(dispatch)[0];
         let prediction = shadow_ref.map(|_| e.b.block_params(dispatch)[1]);
         // Atomic rather than readonly/trusted ordinary data: this flag can
@@ -1283,6 +1344,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let reason = e.b.block_params(shared_exit)[0];
         let pc = e.b.block_params(shared_exit)[1];
         e.save_state(pc);
+        if let Some(written) = e.written {
+            let value = e.b.use_var(written);
+            e.b.ins().store(
+                MemFlags::trusted(),
+                value,
+                e.context,
+                offset_of!(NativeContext, written) as i32,
+            );
+        }
         if hot_exits || kernel.is_some() {
             e.b.ins().return_(&[reason]);
         } else {
@@ -1350,7 +1420,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // Kernels are finalized first: the region calls their absolute addresses,
     // since JIT allocations need not stay within a rel32 reach of each other.
     let mut kernel_functions = Vec::new();
-    for index in 0..plans.len() {
+    let mut kernel_locations = Vec::new();
+    let jobs: Vec<_> = (0..plans.len())
+        .flat_map(|index| {
+            std::iter::once((index, false)).chain(
+                nests
+                    .iter()
+                    .any(|nest| nest.inner == index)
+                    .then_some((index, true)),
+            )
+        })
+        .collect();
+    for (index, row) in jobs {
         let mut kernel_ctx = module.make_context();
         if dump_dir.is_some() {
             kernel_ctx.set_disasm(true);
@@ -1362,10 +1443,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             &mut fb_ctx,
             Some(index),
             &[],
+            row,
+            &[],
         );
         let kernel_id = module
             .declare_function(
-                &format!("guest_kernel_{index}"),
+                &format!("guest_kernel_{index}_row_{row}"),
                 Linkage::Local,
                 &tail_signature,
             )
@@ -1375,7 +1458,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         module
             .define_function(kernel_id, &mut kernel_ctx)
             .map_err(|e| format!("{e:?}"))?;
-        let name = format!("region-{:08x}.kernel-{index}", region.start);
+        let name = if row {
+            format!("region-{:08x}.row-kernel-{index}", region.start)
+        } else {
+            format!("region-{:08x}.kernel-{index}", region.start)
+        };
         dump(&dump_dir, &name, &kernel_ctx)?;
         #[cfg(feature = "cross-dump")]
         if let (Some(directory), Some(function)) = (&dump_dir, cross) {
@@ -1387,15 +1474,56 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .map_err(|e| e.to_string())?;
         }
         kernel_functions.push((kernel_id, kernel_ctx));
+        kernel_locations.push((index, row));
     }
+    let row_thunk = if nests.is_empty() {
+        None
+    } else {
+        let result = nest_emit::thunk(&mut module, &mut fb_ctx, &tail_signature)?;
+        let id = result.0;
+        kernel_functions.push(result);
+        Some(id)
+    };
     if !kernel_functions.is_empty() {
         module.finalize_definitions().map_err(|e| e.to_string())?;
     }
-    let kernels: Vec<usize> = kernel_functions
+    let mut kernels = vec![0; plans.len()];
+    let mut row_kernels = vec![0; plans.len()];
+    for (&(index, row), &(id, _)) in kernel_locations.iter().zip(&kernel_functions) {
+        let address = module.get_finalized_function(id) as usize;
+        if row {
+            row_kernels[index] = address;
+        } else {
+            kernels[index] = address;
+        }
+    }
+    let thunk = row_thunk.map_or(0, |id| module.get_finalized_function(id) as usize);
+    let descriptors: Box<[_]> = nests
         .iter()
-        .map(|&(id, _)| module.get_finalized_function(id) as usize)
+        .map(|nest| {
+            nest_emit::descriptor(
+                nest,
+                &plans[nest.inner],
+                snapshot.base,
+                snapshot.len,
+                thunk,
+                row_kernels[nest.inner],
+            )
+        })
         .collect();
-    emit(&mut module, &mut ctx.func, &mut fb_ctx, None, &kernels);
+    let addresses: Vec<_> = descriptors
+        .iter()
+        .map(|desc| desc as *const _ as usize)
+        .collect();
+    emit(
+        &mut module,
+        &mut ctx.func,
+        &mut fb_ctx,
+        None,
+        &kernels,
+        false,
+        &addresses,
+    );
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
     #[cfg(feature = "cross-dump")]
@@ -1600,6 +1728,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         entries,
         code_size,
         _x87: x87,
+        _nests: descriptors,
         cache_stamp: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
@@ -1997,6 +2126,9 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
+    row_hooks: Vec<nest_emit::Hook>,
+    nest_ref: ir::FuncRef,
+    written: Option<Variable>,
     b: FunctionBuilder<'a>,
     regs: [Variable; 8],
     xmm: [Option<Variable>; 8],
@@ -2699,6 +2831,9 @@ impl Emitter<'_> {
         self.b.seal_block(ok);
     }
     fn direct(&mut self, pc: u32) {
+        if self.row_edge(pc) {
+            return;
+        }
         if let Some(index) = self.fast
             && self.plans[index].header == pc
             && self.plans[index].latch == self.pc
@@ -2915,6 +3050,19 @@ impl Emitter<'_> {
         );
         // A kernel that stopped inside its loop met memory its windows
         // reject; the checked loop runs a while before the next call.
+        if let Some(exit) = self
+            .row_hooks
+            .iter()
+            .find(|hook| hook.nest.inner == index)
+            .map(|hook| hook.nest.exit)
+        {
+            if let Some(&block) = self.blocks.get(&exit) {
+                let same = self.b.ins().icmp_imm(IntCC::Equal, pc, i64::from(exit));
+                let other = self.b.create_block();
+                self.b.ins().brif(same, block, &[], other, &[]);
+                self.b.switch_to_block(other);
+            }
+        }
         let (first, last) = (self.plans[index].header, self.plans[index].latch);
         let inside = self.b.ins().iadd_imm(pc, -i64::from(first) - 1);
         let inside =

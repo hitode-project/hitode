@@ -784,6 +784,7 @@ pub(crate) mod testing {
                 &mut bridge,
                 NativeRun {
                     links: None,
+                    rows: None,
                     stop: 0,
                     interrupt: &interrupt,
                     shadow: None,

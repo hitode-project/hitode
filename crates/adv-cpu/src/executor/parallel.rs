@@ -32,6 +32,7 @@ impl Executor {
         self.memory.parallel = Some(pool.fence.clone());
         self.timestamp.share(tsc);
         self.parallel = Some(pool);
+        self.rows = None;
         // Parallel code has an explicit unoptimized memory-order contract until
         // Speed's memory transformations are independently audited.
         self.tiered_compilation = false;
