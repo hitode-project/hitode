@@ -184,6 +184,7 @@ pub struct Class {
 /// Per-window state of built-in controls and dialogs.
 #[derive(Default)]
 pub struct ControlState {
+    pub(crate) scrolls: Option<[super::scroll::ScrollState; 2]>,
     /// Button check state (BST_*), and BST_PUSHED while the mouse is down.
     pub button: u32,
     /// Dialog: EndDialog result once called.

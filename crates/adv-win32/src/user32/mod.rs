@@ -17,6 +17,7 @@ pub mod message;
 mod monitor;
 mod placement;
 mod resources;
+mod scroll;
 mod station;
 pub(crate) mod strings;
 pub(crate) mod system_colors;
@@ -535,6 +536,7 @@ pub fn register(reg: &mut Registry) {
     controls::register(reg);
     dialog::register(reg);
     strings::register(reg);
+    scroll::register(reg);
     menu::register(reg);
     input::register(reg);
     clipboard::register(reg);
@@ -594,8 +596,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "GetPropW", 2, |_| Outcome::Return(0));
     s(reg, "SetPropW", 3, |_| Outcome::Return(1));
     s(reg, "RemovePropW", 2, |_| Outcome::Return(0));
-    s(reg, "SetScrollInfo", 4, |_| Outcome::Return(0));
-    s(reg, "GetScrollInfo", 3, |_| Outcome::Return(0));
     s(reg, "EnableScrollBar", 3, |_| Outcome::Return(1));
     s(reg, "ShowScrollBar", 3, |_| Outcome::Return(1));
     s(reg, "GetAsyncKeyState", 1, get_async_key_state);
