@@ -13,6 +13,7 @@ pub(crate) const PAUSED: u32 = 1;
 pub(crate) const RUNNING: u32 = 2;
 
 const EC_COMPLETE: u32 = 1;
+const AM_MEDIAEVENT_NONOTIFY: u32 = 1;
 const EC_USERABORT: u32 = 2;
 const EC_ERRORABORT: u32 = 3;
 const E_ABORT: u32 = 0x8000_4004;
@@ -33,13 +34,15 @@ pub(crate) struct Member {
 
 pub(crate) struct Graph {
     /// IFilterGraph2, IMediaControl, IMediaEventEx, IMediaSeeking, IMediaPosition,
-    /// IBasicAudio, IMediaEventSink, IMediaFilter.
+    /// IBasicAudio, IMediaEventSink, IMediaFilter, IBasicVideo, IVideoWindow.
     pub faces: Vec<u32>,
     pub members: Vec<Member>,
     pub state: u32,
     events: VecDeque<(u32, u32, u32)>,
     event: Handle,
     notify: Option<(u32, u32, u32)>,
+    /// AM_MEDIAEVENT_NONOTIFY: events are neither queued, signaled nor posted.
+    no_notify: bool,
     default_complete: bool,
     time_format: Iid,
     /// Media position at `origin`, or the frozen position when not running.
@@ -73,7 +76,7 @@ impl Graph {
     }
 }
 
-const GRAPH_FACES: [Face; 8] = [
+const GRAPH_FACES: [Face; 10] = [
     Face::FilterGraph,
     Face::MediaControl,
     Face::MediaEvent,
@@ -82,6 +85,8 @@ const GRAPH_FACES: [Face; 8] = [
     Face::BasicAudio,
     Face::MediaEventSink,
     Face::MediaFilter,
+    Face::BasicVideo,
+    Face::VideoWindow,
 ];
 
 pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
@@ -106,6 +111,7 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
             events: VecDeque::new(),
             event,
             notify: None,
+            no_notify: false,
             default_complete: true,
             time_format: TIME_FORMAT_MEDIA_TIME,
             position: 0,
@@ -284,6 +290,10 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         (Face::MediaSeeking, method) => seeking(env, graph, method),
         (Face::MediaPosition, method) => position_method(env, graph, method),
         (Face::BasicAudio, method) => audio_method(env, graph, method),
+        // Like quartz's plug-in distributor, the graph always answers these
+        // interfaces; with no video renderer of its own every call reports
+        // that no filter supports it.
+        (Face::BasicVideo | Face::VideoWindow, _) => r(super::E_NOINTERFACE),
         _ => None,
     }
 }
@@ -556,6 +566,9 @@ pub(crate) fn notify(env: &mut Env<'_>, graph: u32, code: u32, p1: u32, p2: u32)
 fn queue_event(env: &mut Env<'_>, graph: u32, code: u32, p1: u32, p2: u32) {
     log::info!("DirectShow: graph {graph:#x} event {code:#x}");
     let graph_state = g(env, graph);
+    if graph_state.no_notify {
+        return;
+    }
     graph_state.events.push_back((code, p1, p2));
     let (event, notify) = (graph_state.event, graph_state.notify);
     env.sys.set_event(event);
@@ -632,10 +645,24 @@ fn event_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> 
             g(env, graph).notify = Some((window, message, instance));
             r(S_OK)
         }
-        "SetNotifyFlags" => r(S_OK),
+        "SetNotifyFlags" => match env.arg(1) {
+            flags @ (0 | AM_MEDIAEVENT_NONOTIFY) => {
+                g(env, graph).no_notify = flags != 0;
+                r(S_OK)
+            }
+            _ => r(E_INVALIDARG),
+        },
         "GetNotifyFlags" => {
-            let _ = env.cpu.write_u32(env.arg(1), 0);
-            r(S_OK)
+            let flags = if g(env, graph).no_notify {
+                AM_MEDIAEVENT_NONOTIFY
+            } else {
+                0
+            };
+            r(if env.cpu.write_u32(env.arg(1), flags).is_ok() {
+                S_OK
+            } else {
+                E_POINTER
+            })
         }
         _ => None,
     }

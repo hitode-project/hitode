@@ -8,5 +8,6 @@
   "metadata_license": "MIT",
   "generator": "tools/abi/Metadata.cs using Microsoft System.Reflection.Metadata",
   "target": "x86 (SupportedArchitecture mask 1), little endian, 32-bit native pointers",
-  "scope": "data/abi/modules.txt"
+  "scope": "data/abi/modules.txt",
+  "selected_exports": "data/abi/selected-exports.tsv"
 }

@@ -300,6 +300,15 @@ fn wide(bytes: &mut Vec<u8>, value: &str) {
 
 /// Hand-built, DWORD-aligned standard/extended templates, including font and item data.
 fn dialog_template(extended: bool, custom_class: Option<&str>) -> Vec<u8> {
+    named_dialog_template(extended, custom_class, "Guest dialog", "First")
+}
+
+fn named_dialog_template(
+    extended: bool,
+    custom_class: Option<&str>,
+    title: &str,
+    control: &str,
+) -> Vec<u8> {
     let mut b = Vec::new();
     let style = WS_POPUP | 0x40; // DS_SETFONT
     if extended {
@@ -316,7 +325,7 @@ fn dialog_template(extended: bool, custom_class: Option<&str>) -> Vec<u8> {
         // count, x, y, cx, cy, menu, class
         word(&mut b, v);
     }
-    wide(&mut b, "Guest dialog");
+    wide(&mut b, title);
     word(&mut b, 9);
     if extended {
         word(&mut b, 400);
@@ -348,7 +357,7 @@ fn dialog_template(extended: bool, custom_class: Option<&str>) -> Vec<u8> {
             word(&mut b, 0xffff);
             word(&mut b, 0x80); // BUTTON ordinal
         }
-        wide(&mut b, if i == 0 { "First" } else { "OK" });
+        wide(&mut b, if i == 0 { control } else { "OK" });
         if i == 0 && custom_class.is_some() {
             // Native USER32 counts bytes following the size word in both formats,
             // and passes a pointer to the size word as CREATESTRUCT.lpCreateParams.
@@ -474,6 +483,85 @@ impl T {
 
     fn text(&mut self, text: &str) -> u32 {
         self.bytes(&[text.as_bytes(), &[0]].concat())
+    }
+
+    fn wtext(&mut self, text: &str) -> u32 {
+        let mut bytes = Vec::new();
+        wide(&mut bytes, text);
+        self.bytes(&bytes)
+    }
+
+    fn read_wtext(&self, pointer: u32) -> Vec<u16> {
+        let mut units = Vec::new();
+        for address in (pointer..pointer + 1024).step_by(2) {
+            let unit = self.m.cpu.read_u16(address).unwrap();
+            if unit == 0 {
+                return units;
+            }
+            units.push(unit);
+        }
+        panic!("unterminated output")
+    }
+
+    fn dialog_resources(&mut self, template: &[u8], name: &str) -> u32 {
+        use adv_os::module::{Lifetime, Module, ModuleKind, Modules};
+        use adv_pe::{ResId, ResourceData, ResourceDir, ResourceEntry, ResourceNode};
+        const BASE: u32 = 0x0060_0000;
+        self.m.cpu.map(BASE, 0x10000, Prot::READ).unwrap();
+        self.m.cpu.write(BASE + 0x2000, template).unwrap();
+        self.m.cpu.write_u32(BASE + 0x1000, 0x2000).unwrap();
+        self.m
+            .cpu
+            .write_u32(BASE + 0x1004, template.len() as u32)
+            .unwrap();
+        let data = ResourceData {
+            entry_rva: 0x1000,
+            rva: 0x2000,
+            size: template.len() as u32,
+            codepage: 0,
+        };
+        let language = ResourceNode::Dir(ResourceDir {
+            entries: vec![ResourceEntry {
+                id: ResId::Id(0x409),
+                node: ResourceNode::Data(data),
+            }],
+        });
+        let resources = ResourceDir {
+            entries: vec![ResourceEntry {
+                id: ResId::Id(5),
+                node: ResourceNode::Dir(ResourceDir {
+                    entries: vec![
+                        ResourceEntry {
+                            id: ResId::Id(0x66),
+                            node: language.clone(),
+                        },
+                        ResourceEntry {
+                            id: ResId::Name(name.to_owned()),
+                            node: language,
+                        },
+                    ],
+                }),
+            }],
+        };
+        self.m.ext.get_mut::<Modules>().add(Module {
+            name: "dialog-resource-test.dll".into(),
+            path: "dialog-resource-test.dll".into(),
+            kind: ModuleKind::Image,
+            base: BASE,
+            size: 0x10000,
+            is_dll: true,
+            entry: 0,
+            stack_reserve: 0,
+            exports_by_name: Default::default(),
+            exports_by_ordinal: Default::default(),
+            resources: Some(resources),
+            data_file: None,
+            load_count: 1,
+            ldr_entry: 0,
+            ldr_size: 0,
+            lifetime: Lifetime::default(),
+        });
+        BASE
     }
 
     fn f(&mut self, name: &str) -> u32 {
@@ -1330,7 +1418,7 @@ fn bm_click_completes_checkbox_and_parent_notification_synchronously() {
 
 #[test]
 fn dialog_templates_preserve_creation_data_and_extended_control_ids() {
-    for extended in [false, true] {
+    for (extended, unicode) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut t = T::new();
         let data = t.alloc(4);
         let control = t.wndproc(|a| {
@@ -1352,7 +1440,11 @@ fn dialog_templates_preserve_creation_data_and_extended_control_ids() {
         ));
         let dlg = t.call(
             &mut a,
-            "CreateDialogIndirectParamA",
+            if unicode {
+                "CreateDialogIndirectParamW"
+            } else {
+                "CreateDialogIndirectParamA"
+            },
             &[I(CODE), I(template), I(0), I(proc), I(0x1234)],
         );
         let base = if extended { 0x1_0000 } else { 0 };
@@ -1387,7 +1479,7 @@ fn dialog_templates_preserve_creation_data_and_extended_control_ids() {
 
 #[test]
 fn modal_dialog_waits_for_timer_and_restores_its_owner_after_end_dialog() {
-    for extended in [false, true] {
+    for (extended, unicode) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut t = T::new();
         let owner_proc = t.wndproc(|_| {});
         let mut a = Asm::new(CODE);
@@ -1423,7 +1515,11 @@ fn modal_dialog_waits_for_timer_and_restores_its_owner_after_end_dialog() {
         let template = t.bytes(&dialog_template(extended, None));
         let result = t.call(
             &mut a,
-            "DialogBoxIndirectParamA",
+            if unicode {
+                "DialogBoxIndirectParamW"
+            } else {
+                "DialogBoxIndirectParamA"
+            },
             &[I(CODE), I(template), M(owner), I(proc), I(123)],
         );
         let enabled_after = t.call(&mut a, "IsWindowEnabled", &[M(owner)]);
@@ -1451,7 +1547,7 @@ fn modal_dialog_waits_for_timer_and_restores_its_owner_after_end_dialog() {
 
 #[test]
 fn end_dialog_during_initialization_returns_without_showing_or_activating() {
-    for extended in [false, true] {
+    for (extended, unicode) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut t = T::new();
         let dlg = t.alloc(4);
         let end = t.f("EndDialog");
@@ -1470,7 +1566,11 @@ fn end_dialog_during_initialization_returns_without_showing_or_activating() {
         let mut a = Asm::new(CODE);
         let result = t.call(
             &mut a,
-            "DialogBoxIndirectParamA",
+            if unicode {
+                "DialogBoxIndirectParamW"
+            } else {
+                "DialogBoxIndirectParamA"
+            },
             &[I(CODE), I(template), I(0), I(proc), I(0x77)],
         );
         let alive = t.call(&mut a, "IsWindow", &[M(dlg)]);
@@ -1487,7 +1587,7 @@ fn end_dialog_during_initialization_returns_without_showing_or_activating() {
 
 #[test]
 fn auto_dialog_clicks_the_default_button_after_its_virtual_deadline() {
-    for extended in [false, true] {
+    for (extended, unicode) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut t = T::with_auto_dialog(Some(25));
         let dlg = t.alloc(4);
         let button = t.alloc(4);
@@ -1512,7 +1612,11 @@ fn auto_dialog_clicks_the_default_button_after_its_virtual_deadline() {
         let mut a = Asm::new(CODE);
         let result = t.call(
             &mut a,
-            "DialogBoxIndirectParamA",
+            if unicode {
+                "DialogBoxIndirectParamW"
+            } else {
+                "DialogBoxIndirectParamA"
+            },
             &[I(CODE), I(template), I(0), I(proc), I(0)],
         );
         let before = t.m.sys.clock.now_us();
@@ -1530,6 +1634,445 @@ fn auto_dialog_clicks_the_default_button_after_its_virtual_deadline() {
             .collect();
         assert_eq!(commands, [[t.u32(dlg), wm::COMMAND, 42, t.u32(button)]]);
         assert_eq!(t.m.sys.clock.now_us(), before + 25_000);
+    }
+}
+
+#[test]
+fn unicode_dialog_named_and_integer_resources_preserve_callback_parameters() {
+    for extended in [false, true] {
+        let mut t = T::new();
+        let template = named_dialog_template(extended, None, "設定🌸", "日本語😀");
+        let module = t.dialog_resources(&template, "対話🌸");
+        let name = t.wtext("対話🌸");
+        let dlg = t.alloc(4);
+        let end = t.f("EndDialog");
+        let proc = t.wndproc(|a| {
+            on_message(a, wm::INITDIALOG, |a| {
+                a.mov_eax_esp(4);
+                store(a, dlg);
+                invoke(a, end, &[S(4), S(16)]);
+            });
+            value(a, 0);
+            a.ret_n(16);
+        });
+        let mut main = Asm::new(CODE);
+        let named = t.call(
+            &mut main,
+            "DialogBoxParamW",
+            &[I(module), I(name), I(0), I(proc), I(0xffff_ffd6)],
+        );
+        let integer = t.call(
+            &mut main,
+            "DialogBoxParamW",
+            &[I(module), I(0x66), I(0), I(proc), I(0x8765_4321)],
+        );
+        let modeless = t.call(
+            &mut main,
+            "CreateDialogParamW",
+            &[I(module), I(name), I(0), I(0), I(123)],
+        );
+        let first = t.call(
+            &mut main,
+            "GetDlgItem",
+            &[M(modeless), I(if extended { 0x1_0029 } else { 41 })],
+        );
+        let output = t.alloc(64);
+        let text_length = t.call(
+            &mut main,
+            "GetDlgItemTextW",
+            &[
+                M(modeless),
+                I(if extended { 0x1_0029 } else { 41 }),
+                I(output),
+                I(32),
+            ],
+        );
+        t.run(main);
+        assert_eq!(t.u32(named), 0xffff_ffd6);
+        assert_eq!(t.u32(integer), 0x8765_4321);
+        assert_eq!(t.u32(text_length), 5);
+        assert_eq!(
+            t.read_wtext(output),
+            "日本語😀".encode_utf16().collect::<Vec<_>>()
+        );
+        let user = &t.m.ext.get::<Win32>().user;
+        let window = user
+            .windows
+            .get(&t.m.sys.objects, &t.u32(modeless))
+            .unwrap();
+        assert!(window.unicode);
+        assert_eq!(window.text, "設定🌸");
+        assert!(
+            user.windows
+                .get(&t.m.sys.objects, &t.u32(first))
+                .unwrap()
+                .unicode
+        );
+        let init: Vec<_> = t
+            .log()
+            .into_iter()
+            .filter(|m| m[1] == wm::INITDIALOG)
+            .collect();
+        assert_eq!(init.len(), 2);
+        assert_eq!(init[0][3], 0xffff_ffd6);
+        assert_eq!(init[1][3], 0x8765_4321);
+        assert_ne!(init[0][2], 0);
+        assert!(
+            (t.m.sys.thunks.resolver() as &dyn std::any::Any)
+                .downcast_ref::<Registry>()
+                .unwrap()
+                .signature_conflicts()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn unicode_dialog_text_helpers_deliver_unicode_callbacks_and_count_utf16_units() {
+    let mut t = T::new();
+    let copied_title = t.alloc(128);
+    let copied_class = t.alloc(128);
+    let copied_set = t.alloc(128);
+    let control = t.proc;
+    let copy = t.f("kernel32.dll!lstrcpyW");
+    let mut callback = Asm::new(control);
+    record(&mut callback);
+    on_message(&mut callback, wm::CREATE, |a| {
+        a.mov_eax_esp(16);
+        a.bytes.extend_from_slice(&[0x8b, 0x40, 36]); // CREATESTRUCTW.lpszName
+        a.push_eax().push_imm(copied_title).call(copy);
+        a.mov_eax_esp(16);
+        a.bytes.extend_from_slice(&[0x8b, 0x40, 40]); // CREATESTRUCTW.lpszClass
+        a.push_eax().push_imm(copied_class).call(copy);
+    });
+    on_message(&mut callback, wm::SETTEXT, |a| {
+        invoke(a, copy, &[I(copied_set), S(16)]);
+    });
+    callback.jmp(t.f("DefWindowProcW"));
+    t.m.cpu.write(control, &callback.bytes).unwrap();
+    t.proc = callback.here().next_multiple_of(16);
+    let class_name = "自作🌸";
+    let class = t.wtext(class_name);
+    let fields = [0, control, 0, 0, CODE, 0, 0, 0, 0, class];
+    let wc = t.bytes(
+        &fields
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let template = t.bytes(&named_dialog_template(
+        false,
+        Some(class_name),
+        "設定🌸",
+        "漢字😀",
+    ));
+    let initial = t.alloc(64);
+    let output = t.alloc(64);
+    let truncated = t.alloc(8);
+    let zero = t.bytes(&[0xcc; 8]);
+    let missing = t.bytes(&[0xcc; 8]);
+    let text = t.wtext("雪😀猫");
+    let mut main = Asm::new(CODE);
+    t.call(&mut main, "RegisterClassW", &[I(wc)]);
+    let dlg = t.call(
+        &mut main,
+        "CreateDialogIndirectParamW",
+        &[I(CODE), I(template), I(0), I(0), I(0)],
+    );
+    let first = t.call(
+        &mut main,
+        "GetDlgItemTextW",
+        &[M(dlg), I(41), I(initial), I(32)],
+    );
+    let set = t.call(&mut main, "SetDlgItemTextW", &[M(dlg), I(41), I(text)]);
+    let read = t.call(
+        &mut main,
+        "SendDlgItemMessageW",
+        &[M(dlg), I(41), I(wm::GETTEXT), I(32), I(output)],
+    );
+    let short = t.call(
+        &mut main,
+        "GetDlgItemTextW",
+        &[M(dlg), I(41), I(truncated), I(3)],
+    );
+    let no_capacity = t.call(
+        &mut main,
+        "GetDlgItemTextW",
+        &[M(dlg), I(41), I(zero), I(0)],
+    );
+    let absent = t.call(
+        &mut main,
+        "GetDlgItemTextW",
+        &[M(dlg), I(999), I(missing), I(4)],
+    );
+    let invalid = t.call(
+        &mut main,
+        "SetDlgItemTextW",
+        &[M(dlg), I(42), I(0xdead_0000)],
+    );
+    let invalid_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+    t.run(main);
+    assert_eq!(
+        t.read_wtext(copied_title),
+        "漢字😀".encode_utf16().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        t.read_wtext(copied_class),
+        class_name.encode_utf16().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        t.read_wtext(copied_set),
+        "雪😀猫".encode_utf16().collect::<Vec<_>>()
+    );
+    assert_eq!(t.u32(first), 4);
+    assert_eq!(
+        t.read_wtext(initial),
+        "漢字😀".encode_utf16().collect::<Vec<_>>()
+    );
+    assert_eq!(t.u32(set), 1);
+    assert_eq!(t.u32(read), 4);
+    assert_eq!(
+        t.read_wtext(output),
+        "雪😀猫".encode_utf16().collect::<Vec<_>>()
+    );
+    assert_eq!(t.u32(short), 2);
+    assert_eq!(t.read_wtext(truncated), [0x96ea, 0xd83d]);
+    assert_eq!(t.u32(no_capacity), 0);
+    assert_eq!(t.u32(zero), 0xcccc_cccc);
+    assert_eq!(t.u32(absent), 0);
+    assert_eq!(t.m.cpu.read_u16(missing).unwrap(), 0);
+    assert_eq!(t.m.cpu.read_u16(missing + 2).unwrap(), 0xcccc);
+    assert_eq!(t.u32(invalid), 0);
+    assert_eq!(t.u32(invalid_error), 87);
+}
+
+#[test]
+fn unicode_dialog_failure_and_direct_destruction_restore_owner_without_partial_windows() {
+    let mut t = T::new();
+    let mut main = Asm::new(CODE);
+    let class = t.text("Static");
+    let owner = t.window(&mut main, class, WS_POPUP, I(0), 0);
+    let baseline = t.m.ext.get::<Win32>().user.windows.len() + 1;
+    let broken = t.bytes(&dialog_template(false, Some("MissingControlClass")));
+    let invalid_owner = t.bytes(&dialog_template(false, None));
+    let failed = t.call(
+        &mut main,
+        "DialogBoxIndirectParamW",
+        &[I(CODE), I(broken), M(owner), I(0), I(0)],
+    );
+    let enabled = t.call(&mut main, "IsWindowEnabled", &[M(owner)]);
+    let wrong_owner = t.call(
+        &mut main,
+        "DialogBoxIndirectParamW",
+        &[I(CODE), I(invalid_owner), I(0xbad), I(0), I(0)],
+    );
+    let wrong_owner_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+    let malformed = t.call(
+        &mut main,
+        "CreateDialogIndirectParamW",
+        &[I(CODE), I(0xdead_0000), I(0), I(0), I(0)],
+    );
+    let malformed_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+    let missing = t.call(
+        &mut main,
+        "DialogBoxParamW",
+        &[I(CODE), I(0x99), I(0), I(0), I(0)],
+    );
+    let missing_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+    let destroy = t.f("DestroyWindow");
+    let proc = t.wndproc(|a| {
+        on_message(a, wm::INITDIALOG, |a| {
+            invoke(a, destroy, &[S(4)]);
+        });
+        value(a, 0);
+        a.ret_n(16);
+    });
+    let destroyed = t.call(
+        &mut main,
+        "DialogBoxIndirectParamW",
+        &[I(CODE), I(invalid_owner), M(owner), I(proc), I(0)],
+    );
+    let restored = t.call(&mut main, "IsWindowEnabled", &[M(owner)]);
+    let destroyed_modeless = t.call(
+        &mut main,
+        "CreateDialogIndirectParamW",
+        &[I(CODE), I(invalid_owner), M(owner), I(proc), I(0)],
+    );
+    t.run(main);
+    assert_eq!(t.u32(failed), u32::MAX);
+    assert_eq!(t.u32(enabled), 1);
+    assert_eq!(t.u32(wrong_owner), 0);
+    assert_eq!(t.u32(wrong_owner_error), 1400);
+    assert_eq!(t.u32(malformed), 0);
+    assert_eq!(t.u32(malformed_error), 87);
+    assert_eq!(t.u32(missing), u32::MAX);
+    assert_eq!(t.u32(missing_error), 1812);
+    assert_eq!(t.u32(destroyed), u32::MAX);
+    assert_eq!(t.u32(restored), 1);
+    assert_eq!(t.u32(destroyed_modeless), 0);
+    assert_eq!(t.m.ext.get::<Win32>().user.windows.len(), baseline);
+    assert!(
+        t.m.ext
+            .get::<Win32>()
+            .user
+            .windows
+            .values(&t.m.sys.objects)
+            .all(|w| !w.control.modal)
+    );
+}
+
+#[test]
+fn unicode_dialog_helpers_convert_text_at_the_registered_control_abi() {
+    for ansi_control in [false, true] {
+        let mut t = T::new();
+        let mut main = Asm::new(CODE);
+        let proc = t.wndproc(|_| {});
+        let class_name = if ansi_control {
+            t.class(&mut main, proc);
+            format!("User32Test{proc:x}")
+        } else {
+            "ComboBox".to_owned()
+        };
+        let template = t.bytes(&named_dialog_template(
+            false,
+            Some(&class_name),
+            "Unicode",
+            "日本語",
+        ));
+        let dlg = t.call(
+            &mut main,
+            "CreateDialogIndirectParamW",
+            &[I(CODE), I(template), I(0), I(0), I(0)],
+        );
+        let first = t.call(&mut main, "GetDlgItem", &[M(dlg), I(41)]);
+        let replacement = "漢字";
+        let expected_ansi = t.m.ext.get::<Win32>().codec.encode(replacement);
+        assert_eq!(
+            t.m.ext.get::<Win32>().codec.decode(&expected_ansi),
+            replacement
+        );
+        let wide = t.wtext(replacement);
+        let ansi = t.bytes(&[expected_ansi.as_slice(), &[0]].concat());
+        let set = t.call(&mut main, "SetDlgItemTextW", &[M(dlg), I(41), I(wide)]);
+        let wide_output = t.alloc(64);
+        let ansi_output = t.alloc(64);
+        let wide_length = t.call(
+            &mut main,
+            "GetDlgItemTextW",
+            &[M(dlg), I(41), I(wide_output), I(32)],
+        );
+        let ansi_length = t.call(
+            &mut main,
+            "GetDlgItemTextA",
+            &[M(dlg), I(41), I(ansi_output), I(64)],
+        );
+        t.call(&mut main, "SetDlgItemTextA", &[M(dlg), I(41), I(ansi)]);
+        let integer = t.call(
+            &mut main,
+            "SetDlgItemInt",
+            &[M(dlg), I(41), I(0xffff_ff85), I(1)],
+        );
+        let integer_output = t.alloc(64);
+        let integer_length = t.call(
+            &mut main,
+            "GetDlgItemTextW",
+            &[M(dlg), I(41), I(integer_output), I(32)],
+        );
+        let combo_ansi = t.alloc(64);
+        let mut combo = None;
+        if !ansi_control {
+            let add = t.call(
+                &mut main,
+                "SendDlgItemMessageW",
+                &[M(dlg), I(41), I(0x143), I(0), I(wide)],
+            );
+            let wide_len = t.call(
+                &mut main,
+                "SendDlgItemMessageW",
+                &[M(dlg), I(41), I(0x149), I(0), I(0)],
+            );
+            let ansi_len = t.call(
+                &mut main,
+                "SendDlgItemMessageA",
+                &[M(dlg), I(41), I(0x149), I(0), I(0)],
+            );
+            let text_len = t.call(
+                &mut main,
+                "SendDlgItemMessageA",
+                &[M(dlg), I(41), I(0x148), I(0), I(combo_ansi)],
+            );
+            combo = Some((add, wide_len, ansi_len, text_len));
+        }
+        t.run(main);
+        assert_eq!(t.u32(set), 1);
+        assert_eq!(t.u32(wide_length), 2);
+        assert_eq!(
+            t.read_wtext(wide_output),
+            replacement.encode_utf16().collect::<Vec<_>>()
+        );
+        assert_eq!(t.u32(ansi_length), expected_ansi.len() as u32);
+        assert_eq!(t.m.cpu.read_cstr(ansi_output, 64).unwrap(), expected_ansi);
+        assert_eq!(t.u32(integer), 1);
+        assert_eq!(t.u32(integer_length), 4);
+        assert_eq!(
+            t.read_wtext(integer_output),
+            "-123".encode_utf16().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            t.m.ext
+                .get::<Win32>()
+                .user
+                .windows
+                .get(&t.m.sys.objects, &t.u32(first))
+                .unwrap()
+                .unicode,
+            !ansi_control
+        );
+        if let Some((add, wide_len, ansi_len, text_len)) = combo {
+            assert_eq!(t.u32(add), 0);
+            assert_eq!(t.u32(wide_len), 2);
+            assert_eq!(t.u32(ansi_len), expected_ansi.len() as u32);
+            assert_eq!(t.u32(text_len), expected_ansi.len() as u32);
+            assert_eq!(t.m.cpu.read_cstr(combo_ansi, 64).unwrap(), expected_ansi);
+        }
+    }
+}
+
+#[test]
+fn unicode_dialog_resource_errors_distinguish_data_type_and_name() {
+    for expected in [1812, 1813, 1814] {
+        let mut t = T::new();
+        let module = t.dialog_resources(&dialog_template(false, None), "設定🌸");
+        let modules = t.m.ext.get_mut::<adv_os::Modules>();
+        let index = modules.by_handle(module).unwrap();
+        match expected {
+            1812 => modules.get_mut(index).resources = None,
+            1813 => {
+                modules.get_mut(index).resources.as_mut().unwrap().entries[0].id =
+                    adv_pe::ResId::Id(6)
+            }
+            _ => {}
+        }
+        let before = t.m.ext.get::<Win32>().user.windows.len();
+        let mut main = Asm::new(CODE);
+        let modal = t.call(
+            &mut main,
+            "DialogBoxParamW",
+            &[I(module), I(0x99), I(0), I(0), I(0)],
+        );
+        let modal_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+        let modeless = t.call(
+            &mut main,
+            "CreateDialogParamW",
+            &[I(module), I(0x99), I(0), I(0), I(0)],
+        );
+        let modeless_error = t.call(&mut main, "kernel32.dll!GetLastError", &[]);
+        t.run(main);
+        assert_eq!(t.u32(modal), u32::MAX);
+        assert_eq!(t.u32(modal_error), expected);
+        assert_eq!(t.u32(modeless), 0);
+        assert_eq!(t.u32(modeless_error), expected);
+        assert_eq!(t.m.ext.get::<Win32>().user.windows.len(), before);
     }
 }
 

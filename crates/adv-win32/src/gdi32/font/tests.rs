@@ -595,6 +595,48 @@ fn bitmap_source_and_palette_outputs_obey_permissions_and_never_wrap_or_leak() {
         0
     );
 }
+
+#[test]
+fn set_di_bits_copies_rows_to_bitmap() {
+    let (mut machine, data, _dc) = fixture();
+    let hbm = invoke(&mut machine, data, "CreateBitmap", &[2, 2, 1, 32, 0]);
+    assert_ne!(hbm, 0);
+
+    let info = machine.sys.vm.alloc(&mut machine.cpu, 4096, Prot::RW).unwrap();
+    let mut header = [0u8; 40];
+    header[0..4].copy_from_slice(&40u32.to_le_bytes());
+    header[4..8].copy_from_slice(&2i32.to_le_bytes());
+    header[8..12].copy_from_slice(&2i32.to_le_bytes()); // biHeight positive = bottom-up
+    header[12..14].copy_from_slice(&1u16.to_le_bytes());
+    header[14..16].copy_from_slice(&24u16.to_le_bytes()); // 24 bpp
+    machine.cpu.write(info, &header).unwrap();
+
+    let bits = machine.sys.vm.alloc(&mut machine.cpu, 4096, Prot::RW).unwrap();
+    let dib_data = [
+        0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, // bottom row (Red, Green, 2 pad)
+        0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0x00, 0x00, // top row (Blue, White, 2 pad)
+    ];
+    machine.cpu.write(bits, &dib_data).unwrap();
+
+    let result = invoke(&mut machine, data, "SetDIBits", &[0, hbm, 0, 2, bits, info, 0]);
+    assert_eq!(result, 2);
+
+    let Some(GdiObj::Bitmap { bits: dst_bits, stride, .. }) = machine.ext.get::<Win32>().gdi.get(&machine.sys.objects, hbm) else {
+        panic!("bitmap missing");
+    };
+    let mut top_row = [0u8; 8];
+    machine.cpu.read(*dst_bits, &mut top_row).unwrap();
+    assert_eq!(&top_row[0..4], &[0xff, 0x00, 0x00, 0xff]); // Blue
+    assert_eq!(&top_row[4..8], &[0xff, 0xff, 0xff, 0xff]); // White
+
+    let mut bottom_row = [0u8; 8];
+    machine.cpu.read(*dst_bits + stride, &mut bottom_row).unwrap();
+    assert_eq!(&bottom_row[0..4], &[0x00, 0x00, 0xff, 0xff]); // Red
+    assert_eq!(&bottom_row[4..8], &[0x00, 0xff, 0x00, 0xff]); // Green
+
+    assert_eq!(invoke(&mut machine, data, "DeleteObject", &[hbm]), 1);
+}
+
 #[test]
 fn software_dc_preserves_font_and_mapping_state() {
     let (mut machine, data, dc) = fixture();
@@ -773,6 +815,84 @@ fn glyph_cache_shares_decoded_characters_and_separates_transform_and_font() {
 
 #[test]
 #[cfg(windows)]
+fn explicit_dbcs_charsets_share_unicode_glyphs_across_guest_codepages() {
+    for (charset, guest_codepage, face, characters) in [
+        (
+            128,
+            936,
+            "MS Gothic",
+            vec![(0x82a0, 'あ'), (0xad, 'ｭ'), (0x1234, '4')],
+        ),
+        (
+            134,
+            932,
+            "SimSun",
+            vec![(0xd6d0, '中'), (0xcec4, '文'), (0x1234, '4')],
+        ),
+    ] {
+        let (mut machine, data, dc) = fixture();
+        machine.ext.get_mut::<Win32>().codec = adv_os::Codec::new(guest_codepage);
+        let mut raw = [0u8; 60];
+        raw[..4].copy_from_slice(&(-24i32).to_le_bytes());
+        raw[16..20].copy_from_slice(&400i32.to_le_bytes());
+        raw[23] = charset;
+        raw[28..28 + face.len()].copy_from_slice(face.as_bytes());
+        machine.cpu.write(data, &raw).unwrap();
+        let font = invoke(&mut machine, data, "CreateFontIndirectA", &[data]);
+        assert_ne!(font, 0);
+        invoke(&mut machine, data, "SelectObject", &[dc, font]);
+        let matrix = data + 128;
+        let metrics = data + 160;
+        let buffer = data + 256;
+        let mut identity = [0u8; 16];
+        identity[2..4].copy_from_slice(&1i16.to_le_bytes());
+        identity[14..16].copy_from_slice(&1i16.to_le_bytes());
+        machine.cpu.write(matrix, &identity).unwrap();
+        for (packed, character) in characters {
+            let mut outputs = Vec::new();
+            let before = machine.ext.get::<Fonts>().text.stats();
+            for (api, code) in [
+                ("GetGlyphOutlineA", packed),
+                ("GetGlyphOutlineW", character as u32),
+            ] {
+                let size = invoke(
+                    &mut machine,
+                    data,
+                    api,
+                    &[dc, code, 6, metrics, 0, 0, matrix],
+                );
+                assert_ne!(size, GDI_ERROR);
+                assert!(size > 0);
+                assert_eq!(
+                    invoke(
+                        &mut machine,
+                        data,
+                        api,
+                        &[dc, code, 6, metrics, size, buffer, matrix]
+                    ),
+                    size
+                );
+                let mut pixels = vec![0; size as usize];
+                let mut layout = [0; 20];
+                machine.cpu.read(buffer, &mut pixels).unwrap();
+                machine.cpu.read(metrics, &mut layout).unwrap();
+                outputs.push((layout, pixels));
+            }
+            assert_eq!(
+                outputs[0], outputs[1],
+                "charset={charset} packed={packed:04x}"
+            );
+            assert_eq!(
+                machine.ext.get::<Fonts>().text.stats().glyphs,
+                before.glyphs + 1,
+                "ANSI and Unicode must identify the same cached glyph"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn gbk_packed_characters_match_unicode_glyph_pixels() {
     let (mut machine, data, dc) = fixture();
     let win32 = machine.ext.get_mut::<Win32>();
@@ -919,7 +1039,7 @@ fn selected_charset_and_metrics_match_native_gdi_across_process_acp() {
     identity[2..4].copy_from_slice(&1i16.to_le_bytes());
     identity[14..16].copy_from_slice(&1i16.to_le_bytes());
     machine.cpu.write(matrix, &identity).unwrap();
-    for character in [0xad, 0x82a0, 0x00ff_ecff] {
+    for character in [0xad, 0x82a0, 0xecff, 0x00ff_ecff, 0xffff_82a0] {
         let size = invoke(
             &mut machine,
             data,
@@ -946,7 +1066,7 @@ fn selected_charset_and_metrics_match_native_gdi_across_process_acp() {
                 &transform,
             )
         };
-        assert_eq!(size, expected);
+        assert_eq!(size, expected, "packed character={character:08x}");
         assert_eq!(
             machine.cpu.read_u32(metrics).unwrap(),
             native_metrics.gmBlackBoxX

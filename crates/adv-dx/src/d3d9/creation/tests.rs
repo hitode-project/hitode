@@ -156,6 +156,85 @@ fn fixed_modes_reject_changes_and_mixed_normalizes_bool_without_changing_creatio
 }
 
 #[test]
+fn successful_reset_applies_mode_and_rejected_reset_keeps_previous_mode() {
+    #[derive(Default)]
+    struct Observed {
+        modes: Vec<(u32, i32, u32, u32)>,
+        released: Vec<u32>,
+    }
+    let mut m = super::super::tests::machine();
+    let gpu = pollster::block_on(Gpu::request(true)).unwrap();
+    let mut env = Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (pointer, _, _, resource) = super::super::tests::setup(&mut env);
+    let state = env.ext.get_mut::<super::super::State>();
+    state.gpu = Some(gpu);
+    state.provider.replace = |_, _, _| Ok(());
+    state.provider.mode_changed = |env, owner, parameters| {
+        env.ext.get_or_default::<Observed>().modes.push((
+            owner,
+            parameters.Windowed,
+            parameters.BackBufferWidth,
+            parameters.BackBufferHeight,
+        ));
+        Outcome::Return(0)
+    };
+    state.provider.device_released =
+        |env, owner| env.ext.get_or_default::<Observed>().released.push(owner);
+    let packet = GuestPtr::new(
+        alloc(
+            &mut env,
+            std::mem::size_of::<D3DPRESENT_PARAMETERS>() as u32,
+        )
+        .unwrap(),
+    );
+    let mut parameters = D3DPRESENT_PARAMETERS {
+        BackBufferWidth: 16,
+        BackBufferHeight: 12,
+        BackBufferFormat: 21,
+        BackBufferCount: 1,
+        SwapEffect: 1,
+        hDeviceWindow: 0x7788,
+        Windowed: 0,
+        ..D3DPRESENT_PARAMETERS::default()
+    };
+    packet.write(env.cpu, parameters).unwrap();
+    assert!(matches!(
+        reset(&mut env, GuestPtr::new(pointer), packet),
+        Outcome::Return(0)
+    ));
+    assert_eq!(env.ext.get::<Observed>().modes, [(pointer, 0, 16, 12)]);
+    assert_eq!(begin_scene(&mut env, GuestPtr::new(pointer)), 0);
+    parameters.Windowed = 1;
+    parameters.BackBufferWidth = 32;
+    packet.write(env.cpu, parameters).unwrap();
+    assert!(matches!(
+        reset(&mut env, GuestPtr::new(pointer), packet),
+        Outcome::Return(INVALID)
+    ));
+    assert_eq!(env.ext.get::<Observed>().modes, [(pointer, 0, 16, 12)]);
+    assert_eq!(end_scene(&mut env, GuestPtr::new(pointer)), 0);
+    assert!(matches!(
+        reset(&mut env, GuestPtr::new(pointer), packet),
+        Outcome::Return(0)
+    ));
+    assert_eq!(
+        env.ext.get::<Observed>().modes,
+        [(pointer, 0, 16, 12), (pointer, 1, 32, 12)]
+    );
+    if let Some(Some(dead)) = com(&env).release_internal(&mut env.sys.objects, resource) {
+        destroy(&mut env, dead);
+    }
+    assert_eq!(release(&mut env, pointer), 0);
+    assert_eq!(env.ext.get::<Observed>().released, [pointer]);
+}
+
+#[test]
 fn rejected_reset_keeps_mixed_mode_and_does_not_replace_creation_identity() {
     let mut m = super::super::tests::machine();
     let mut env = Env {

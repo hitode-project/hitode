@@ -26,6 +26,14 @@ fn omission_reason(name: &str) -> &'static str {
         .contains(&export)
     {
         "SDK intrinsic absent from PInvoke metadata"
+    } else if module == "ntdll.dll" && export == "RtlFormatCurrentUserKeyPath" {
+        // This one legacy export is absent from the pinned WinMD. Microsoft's
+        // historical Ntrtl.h documentation specifies NTSTATUS WINAPI and one
+        // CurrentUserKeyPath argument:
+        // https://learn.microsoft.com/en-us/previous-versions/ff899322(v=vs.85)
+        // SDK 10.0.26100.0 um/x86/ntdll.lib independently records
+        // _RtlFormatCurrentUserKeyPath@4. Do not invent a full metadata signature.
+        "documented legacy RTL export absent from pinned WinMD"
     } else {
         "uncategorized metadata gap"
     }
@@ -53,6 +61,14 @@ fn all_fronts_signature_audit() {
         assert!(
             conflicts.is_empty(),
             "real x86 signature conflicts must be fixed, never suppressed: {conflicts:?}"
+        );
+        // The exact omission above still has an independently checked x86 ABI.
+        assert_eq!(
+            registry
+                .get("ntdll.dll", "RtlFormatCurrentUserKeyPath")
+                .unwrap()
+                .conv,
+            adv_abi::Conv::Stdcall { argc: 1 }
         );
         let unknown = registry.missing_signatures();
         let mut categories = std::collections::BTreeMap::new();

@@ -2,7 +2,7 @@
 //! They are host functions reached through thunks, like any window procedure, so guest
 //! subclassing (SetWindowLong(GWL_WNDPROC) + CallWindowProc) works on them.
 
-use adv_abi::Registry;
+use adv_abi::{Handle, Registry, win32};
 use adv_machine::{Env, Outcome};
 
 use super::message::{call_proc, def_window_proc, post, send, validate};
@@ -15,6 +15,7 @@ pub const STATIC_PROC: &str = "<StaticWndProc>";
 pub const EDIT_PROC: &str = "<EditWndProc>";
 pub const COMBO_PROC: &str = "<ComboWndProc>";
 pub const TRACKBAR_PROC: &str = "<TrackbarWndProc>";
+pub const DIALOG_PROC: &str = "<DialogWndProc>";
 
 const BM_GETCHECK: u32 = 0xf0;
 const BM_SETCHECK: u32 = 0xf1;
@@ -283,16 +284,35 @@ fn combo_proc(env: &mut Env<'_>) -> Outcome {
     if !(0x140..=0x164).contains(&msg) {
         return def_window_proc(env, hwnd, msg, wp, lp, |_, r| Outcome::Return(r));
     }
+    let wide = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| w.unicode);
     let source_text = if matches!(msg, 0x143 | 0x14a | 0x14c | 0x14d | 0x158) {
-        Some(
-            env.ext
-                .get::<crate::Win32>()
-                .codec
-                .decode(&crate::util::cstr(env.cpu, lp)),
-        )
+        let Some(text) = super::message::read_text(env, lp, wide) else {
+            crate::util::set_last_error(env, 87);
+            return Outcome::Return(u32::MAX);
+        };
+        Some(text)
     } else {
         None
     };
+    if matches!(msg, 0x148 | 0x149) {
+        let Some(text) = user(env)
+            .windows
+            .get(&env.sys.objects, &hwnd)
+            .and_then(|window| window.control.choices.as_ref())
+            .and_then(|choices| choices.items.get(wp as usize))
+            .cloned()
+        else {
+            return Outcome::Return(u32::MAX);
+        };
+        let length = super::message::text_length(env, &text, wide);
+        if msg == 0x148 && super::message::write_text(env, lp, length + 1, &text, wide).is_none() {
+            return Outcome::Return(u32::MAX);
+        }
+        return Outcome::Return(length);
+    }
     let Some(window) = env
         .ext
         .get::<crate::Win32>()
@@ -347,18 +367,6 @@ fn combo_proc(env: &mut Env<'_>) -> Outcome {
         }
         0x146 => choices.items.len() as u32,
         0x147 => choices.selected.map_or(u32::MAX, |i| i as u32),
-        0x148 | 0x149 => {
-            let Some(text) = choices.items.get(wp as usize) else {
-                return Outcome::Return(u32::MAX);
-            };
-            let bytes = env.ext.get::<crate::Win32>().codec.encode(text);
-            if msg == 0x148
-                && crate::util::put_cstr(env.cpu, lp, bytes.len() as u32 + 1, &bytes).is_none()
-            {
-                return Outcome::Return(u32::MAX);
-            }
-            bytes.len() as u32
-        }
         0x14b => {
             choices.items.clear();
             choices.data.clear();
@@ -433,12 +441,30 @@ fn returns_directly(msg: u32) -> bool {
 
 fn def_dlg_proc_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = args(env);
+    def_dlg_proc(env, hwnd, msg, wp, lp, false)
+}
+
+#[win32(user32, name="DefDlgProcW", level=state)]
+fn def_dlg_proc_w(env: &mut Env<'_>, hwnd: Handle, msg: u32, wp: u32, lp: i32) -> Outcome {
+    def_dlg_proc(env, hwnd.0, msg, wp, lp as u32, true)
+}
+
+fn dialog_proc(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, msg, wp, lp) = args(env);
+    let wide = user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd)
+        .is_some_and(|w| w.unicode);
+    def_dlg_proc(env, hwnd, msg, wp, lp, wide)
+}
+
+fn def_dlg_proc(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> Outcome {
     let dlgproc = user(env)
         .windows
         .get(&env.sys.objects, &hwnd)
         .map_or(0, |w| w.dlgproc());
     if dlgproc == 0 {
-        return def_dlg_default(env, hwnd, msg, wp, lp);
+        return def_dlg_default(env, hwnd, msg, wp, lp, wide);
     }
     call_proc(dlgproc, hwnd, msg, wp, lp, move |env, r| {
         if r & 0xff != 0 && user(env).windows.contains_key(&env.sys.objects, &hwnd) {
@@ -452,11 +478,18 @@ fn def_dlg_proc_a(env: &mut Env<'_>) -> Outcome {
                 .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
             return Outcome::Return(res);
         }
-        def_dlg_default(env, hwnd, msg, wp, lp)
+        def_dlg_default(env, hwnd, msg, wp, lp, wide)
     })
 }
 
-fn def_dlg_default(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32) -> Outcome {
+fn def_dlg_default(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> Outcome {
     match msg {
         // Closing a dialog is cancelling it.
         wm::CLOSE => {
@@ -465,11 +498,15 @@ fn def_dlg_default(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32) -> 
             Outcome::Return(0)
         }
         wm::INITDIALOG => Outcome::Return(0),
-        _ => def_window_proc(env, hwnd, msg, wp, lp, |_, r| Outcome::Return(r)),
+        _ => super::message::def_window_proc_encoded(env, hwnd, msg, wp, lp, wide, |_, r| {
+            Outcome::Return(r)
+        }),
     }
 }
 
 pub fn register(reg: &mut Registry) {
+    reg.register(def_dlg_proc_w_ABI);
+    stdcall(reg, USER32, DIALOG_PROC, 4, dialog_proc);
     stdcall(reg, USER32, BUTTON_PROC, 4, button_proc);
     stdcall(reg, USER32, STATIC_PROC, 4, static_proc);
     stdcall(reg, USER32, EDIT_PROC, 4, edit_proc);

@@ -336,7 +336,9 @@ fn headless_limit_wakes_an_indefinite_event_wait() {
             "interpreter",
             "--headless",
             "--seconds",
-            "0.15",
+            // The limit includes GPU initialization in GPU-enabled builds.
+            // Leave time for the authored guest to enter its indefinite wait.
+            "1",
         ])
         .arg("--report")
         .arg(&report_path)
@@ -399,7 +401,7 @@ fn close_grace_interrupts_a_guest_close_handler_that_never_returns() {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
     };
     struct Search {
         process: u32,
@@ -412,8 +414,16 @@ fn close_grace_interrupts_a_guest_close_handler_that_never_returns() {
             let mut process = 0;
             GetWindowThreadProcessId(hwnd, &mut process);
             if process == search.process {
-                search.window = hwnd;
-                return 0;
+                // A GPU driver may create another top-level helper HWND in
+                // this process. Close the shell window owned by the fixture.
+                let mut class = [0u16; 256];
+                let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+                if length > 0
+                    && String::from_utf16_lossy(&class[..length as usize]) == "AdvGuestHost"
+                {
+                    search.window = hwnd;
+                    return 0;
+                }
             }
         }
         1

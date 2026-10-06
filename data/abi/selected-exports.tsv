@@ -1,0 +1,8 @@
+# Exact existing legacy registrations outside modules.txt; sources are the same pinned Win32Metadata.
+# destination DLL<TAB>export<TAB>source DLL<TAB>export<TAB>expected x86 stdcall stack words
+mpr.dll	WNetGetUniversalNameA	mpr.dll	WNetGetUniversalNameA	4
+mpr.dll	WNetGetUniversalNameW	mpr.dll	WNetGetUniversalNameW	4
+ntdll.dll	RtlFreeUnicodeString	ntdll.dll	RtlFreeUnicodeString	1
+ntdll.dll	RtlInitUnicodeString	ntdll.dll	RtlInitUnicodeString	2
+shfolder.dll	SHGetFolderPathA	shell32.dll	SHGetFolderPathA	5
+shfolder.dll	SHGetFolderPathW	shell32.dll	SHGetFolderPathW	5

@@ -20,6 +20,7 @@ const SHFOLDER: &str = "shfolder.dll";
 const IMM32: &str = "imm32.dll";
 const COMDLG32: &str = "comdlg32.dll";
 const SENSAPI: &str = "sensapi.dll";
+const COMCTL32: &str = "comctl32.dll";
 const MAX_PATH: u32 = 260;
 
 /// Byte offsets of each character start (DBCS-aware: a trail byte may be 0x5C `\`).
@@ -406,6 +407,27 @@ pub fn register(reg: &mut Registry) {
         Outcome::Return(0)
     });
     stdcall(reg, "gdiplus.dll", "GdiplusShutdown", 1, |_| Outcome::Return(0));
+    stdcall(reg, COMCTL32, "InitCommonControls", 0, |_| Outcome::Return(0));
+    stdcall(reg, COMCTL32, "InitCommonControlsEx", 1, |_| Outcome::Return(1));
+    stdcall(reg, COMCTL32, "ImageList_Read", 1, |e| {
+        let pstm = e.arg(0);
+        Outcome::Return(if pstm != 0 { 0x0002_0001 } else { 0 })
+    });
+    stdcall(reg, COMCTL32, "ImageList_Destroy", 1, |_| Outcome::Return(1));
+    stdcall(reg, COMCTL32, "ImageList_Create", 5, |_| {
+        Outcome::Return(0x0002_0001)
+    });
+    stdcall(reg, COMCTL32, "ImageList_GetIconSize", 3, |e| {
+        let cx = e.arg(1);
+        let cy = e.arg(2);
+        if cx != 0 {
+            let _ = e.cpu.write_u32(cx, 16);
+        }
+        if cy != 0 {
+            let _ = e.cpu.write_u32(cy, 16);
+        }
+        Outcome::Return(1)
+    });
 }
 
 #[cfg(test)]
@@ -420,5 +442,14 @@ mod tests {
         assert_eq!(last_sep(&c, &s), Some(2));
         let s = [b'a', 0x95, 0x5c, b'.', b't', b'x', b't'];
         assert_eq!(ext_dot(&c, &s), Some(3));
+    }
+
+    #[test]
+    fn common_controls_registered() {
+        let mut reg = Registry::default();
+        register(&mut reg);
+        assert!(reg.get("comctl32.dll", "InitCommonControls").is_some());
+        assert!(reg.get("comctl32.dll", "InitCommonControlsEx").is_some());
+        assert!(reg.get("comctl32.dll", "ImageList_Read").is_some());
     }
 }

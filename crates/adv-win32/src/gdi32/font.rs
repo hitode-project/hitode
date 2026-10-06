@@ -175,36 +175,51 @@ fn font_request(env: &Env<'_>, dc: u32) -> FontRequest {
 /// ANSI/default text belongs to the guest locale, never the host process ACP.
 /// Explicit supported DBCS repertoires also remain independent of host locale.
 /// Symbol and other explicit repertoires retain their existing backend mapping.
-fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<u16>> {
-    let codec = env.ext.get::<Win32>().codec;
-    let codepage = match request.encoding {
-        Encoding::Automatic | Encoding::Latin | Encoding::Oem => codec.acp,
+fn ansi_codepage(env: &Env<'_>, request: &FontRequest) -> Option<u32> {
+    Some(match request.encoding {
+        Encoding::Automatic | Encoding::Latin | Encoding::Oem => env.ext.get::<Win32>().codec.acp,
         Encoding::Japanese => 932,
         Encoding::SimplifiedChinese => 936,
         _ => return None,
-    };
-    Some(codec.to_utf16(codepage, bytes))
+    })
+}
+
+fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<u16>> {
+    Some(
+        env.ext
+            .get::<Win32>()
+            .codec
+            .to_utf16(ansi_codepage(env, request)?, bytes),
+    )
 }
 
 fn ansi_character(env: &Env<'_>, font: &FontRequest, character: u32) -> Character {
-    if !matches!(
-        font.encoding,
-        Encoding::Automatic | Encoding::Latin | Encoding::Oem
-    ) {
+    // Preserve native handling of values outside the packed ANSI low word.
+    if character > u32::from(u16::MAX) {
         return Character::Encoded(character);
     }
+    let Some(codepage) = ansi_codepage(env, font) else {
+        return Character::Encoded(character);
+    };
     // GGO packs a DBCS lead byte in the high byte, unlike a counted A string.
     // Resolve the guest repertoire before entering a host font backend, whose
     // default charset may have been selected under a different system locale.
     let packed = character as u16;
     let bytes = packed.to_be_bytes();
-    let bytes = if packed <= 0xff {
-        &bytes[1..]
-    } else {
+    let bytes = if env
+        .ext
+        .get::<Win32>()
+        .codec
+        .is_lead_byte(codepage, bytes[0])
+    {
         &bytes[..]
+    } else {
+        &bytes[1..]
     };
     match ansi_units(env, font, bytes).as_deref() {
-        Some([unit]) => Character::Unicode(u32::from(*unit)),
+        // A replacement produced by the codec is not a decoded ANSI character.
+        // Keep the backend's native invalid-sequence behavior in that case.
+        Some([unit]) if *unit != 0xfffd => Character::Unicode(u32::from(*unit)),
         _ => Character::Encoded(character),
     }
 }

@@ -96,6 +96,24 @@ impl<B: Backend> Runtime<B> {
         );
         let user = &self.machine.ext.get::<Win32>().user;
         report.push_str(&format!(
+            "\nGuest input: cursor {:?}; display {:?}",
+            user.cursor_pos, user.screen
+        ));
+        for window in user
+            .windows
+            .values(&self.machine.sys.objects)
+            .filter(|window| window.hwnd != user.desktop)
+        {
+            report.push_str(&format!(
+                "\n  window {:#x}: style {:#x}; rect {:?}; client {:?}; origin {:?}",
+                window.hwnd,
+                window.style,
+                user.screen_rect(&self.machine.sys.objects, window.hwnd),
+                window.client_size(),
+                user.client_origin(&self.machine.sys.objects, window.hwnd)
+            ));
+        }
+        report.push_str(&format!(
             "\nAPI mode: {:?}; ABI acceptance eligible: {}; signature conflicts: {:?}",
             self.api_mode(),
             self.api_acceptance_eligible(),

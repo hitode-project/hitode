@@ -335,10 +335,14 @@ impl<'a> Loader<'a> {
             }
             return self.load_image(key, &resolved, bytes, retain);
         }
-        // Anything the game doesn't ship is a system DLL: the host provides it, and calls
-        // into unimplemented functions fail by name.
-        log::info!("{path}: not in the game files, treating as a system module");
-        self.load_host(key, path, retain)
+        // Anything the game doesn't ship that is a system PE extension (.dll, .drv, .ocx)
+        // is treated as a system module; absent non-system extensions (e.g. optional engine
+        // plugins like .unt) fail.
+        if key.ends_with(".dll") || key.ends_with(".drv") || key.ends_with(".ocx") {
+            log::info!("{path}: not in the game files, treating as a system module");
+            return self.load_host(key, path, retain);
+        }
+        Err(LoadError::NotFound(path.to_owned()))
     }
 
     /// A path naming an image already loaded through another spelling, such as

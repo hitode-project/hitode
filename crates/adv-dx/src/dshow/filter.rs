@@ -956,6 +956,13 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
         }
         "Skip" => {
             let count = env.arg(1) as usize;
+            // quartz's filter enumerator refuses to skip past its end; the
+            // pin and media type enumerators skip what remains.
+            if let Some(Obj::EnumFilters { list, position }) = payload(env, this)
+                && count > list.len().saturating_sub(*position)
+            {
+                return r(E_INVALIDARG);
+            }
             let skipped = advance(env, this, count);
             r(if skipped == count { S_OK } else { S_FALSE })
         }

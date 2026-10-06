@@ -12,7 +12,7 @@ use super::filter::{OUTPUT, Role};
 use super::*;
 use crate::dsound::Sound;
 
-pub(crate) const THREAD_ENTRY: &str = "DirectShowStreamThread";
+pub(crate) const THREAD_ENTRY: &str = "<DirectShowStreamThread>";
 const POLL_US: u64 = 10_000;
 const EC_COMPLETE: u32 = 1;
 

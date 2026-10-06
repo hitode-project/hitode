@@ -603,6 +603,15 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
     std::fs::write(path, report).map_err(|e| e.to_string())
 }
 
+fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
+    #[cfg(all(windows, feature = "gpu"))]
+    if runtime.has_native_frame() {
+        return capture_native_after_stop(runtime, wake);
+    }
+    let _ = wake;
+    runtime.capture_latest_frame().map(|_| ())
+}
+
 #[cfg(all(windows, feature = "gpu"))]
 fn capture_native_after_stop(
     runtime: &mut Runtime,
@@ -1074,6 +1083,15 @@ fn run_execution(
                             Err("click has no guest target window".into())
                         }
                     }
+                    control::Command::Move(x, y) => {
+                        let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
+                        if runtime.post_input(0x200, 0, position) {
+                            inputs += 1;
+                            Ok(format!("move {x} {y}"))
+                        } else {
+                            Err("mouse move has no guest target window".into())
+                        }
+                    }
                     control::Command::Key(key) => {
                         let down = runtime.post_input(0x100, key, 1);
                         let up = runtime.post_input(0x101, key, 0xc0000001);
@@ -1109,7 +1127,7 @@ fn run_execution(
                         })
                     }
                     control::Command::Capture(path) => {
-                        runtime.capture_latest_frame()?;
+                        capture_diagnostic_frame(&mut runtime, &wake)?;
                         save_frame(&path, runtime.frame())
                             .map(|_| format!("capture {}", path.display()))
                     }
@@ -1121,7 +1139,7 @@ fn run_execution(
                             0,
                             0,
                         );
-                        runtime.capture_latest_frame()?;
+                        capture_diagnostic_frame(&mut runtime, &wake)?;
                         runtime.machine.sys.trace.flush();
                         let snapshot = build_report(ReportContext {
                             options: &options,

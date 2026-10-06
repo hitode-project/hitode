@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Click(i16, i16),
+    Move(i16, i16),
     Key(u32),
     KeyDown(u32),
     KeyUp(u32),
@@ -34,6 +35,7 @@ impl Command {
         matches!(
             self,
             Self::Click(..)
+                | Self::Move(..)
                 | Self::Key(_)
                 | Self::KeyDown(_)
                 | Self::KeyUp(_)
@@ -63,15 +65,14 @@ impl Command {
                 Ok(Self::DialogTrack(id, value))
             }
             "menu" => Ok(Self::Menu(rest.parse().map_err(|_| "menu requires a decimal command ID")?)),
-            "click" => {
+            "click" | "move" => {
                 let values: Vec<_> = rest.split_whitespace().collect();
                 if values.len() != 2 {
-                    return Err("click requires two signed client coordinates".into());
+                    return Err(format!("{command} requires two signed client coordinates"));
                 }
-                Ok(Self::Click(
-                    values[0].parse().map_err(|_| "invalid click X")?,
-                    values[1].parse().map_err(|_| "invalid click Y")?,
-                ))
+                let x = values[0].parse().map_err(|_| "invalid mouse X")?;
+                let y = values[1].parse().map_err(|_| "invalid mouse Y")?;
+                Ok(if command == "click" { Self::Click(x, y) } else { Self::Move(x, y) })
             }
             "key" | "key-down" | "key-up" => {
                 let key = if let Some(hex) = rest.strip_prefix("0x") {
@@ -121,7 +122,7 @@ impl Command {
             "close" if rest.is_empty() => Ok(Self::Close),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click X Y, key/key-down/key-up VK, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics or close"
+                "expected click/move X Y, key/key-down/key-up VK, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics or close"
                     .into(),
             ),
         }
@@ -408,6 +409,7 @@ mod tests {
             Ok(Command::Click(650, 410))
         );
         assert_eq!(Command::parse("key 0x0d"), Ok(Command::Key(13)));
+        assert_eq!(Command::parse("move -12 410"), Ok(Command::Move(-12, 410)));
         assert_eq!(Command::parse("key-down 0x11"), Ok(Command::KeyDown(17)));
         assert_eq!(Command::parse("key-up 17"), Ok(Command::KeyUp(17)));
         assert_eq!(Command::parse("menus"), Ok(Command::Menus));
@@ -455,6 +457,7 @@ mod tests {
     fn only_input_and_close_commands_request_guest_preemption() {
         for line in [
             "click 1 2",
+            "move 1 2",
             "key 65",
             "key-down 17",
             "key-up 17",

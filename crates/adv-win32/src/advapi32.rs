@@ -424,6 +424,10 @@ fn flush_key(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(result.unwrap_or_else(|error| error))
 }
 
+fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
+    Outcome::Return(0)
+}
+
 pub fn register(reg: &mut Registry) {
     groups::register(reg);
     for (name, argc, handler) in [
@@ -445,6 +449,7 @@ pub fn register(reg: &mut Registry) {
         ("RegQueryValueExW", 6, |e| query_value(e, true)),
         ("RegCloseKey", 1, close_key),
         ("RegFlushKey", 1, flush_key),
+        ("RegNotifyChangeKeyValue", 5, notify_change_key_value),
     ] {
         stdcall(reg, "advapi32.dll", name, argc, handler);
     }

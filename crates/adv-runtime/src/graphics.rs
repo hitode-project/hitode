@@ -158,6 +158,20 @@ fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
 #[cfg(feature = "gpu")]
 pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
+        mode_changed: |env, device, parameters| {
+            if parameters.Windowed == 0 {
+                adv_win32::user32::display::fullscreen(
+                    env,
+                    device,
+                    parameters.hDeviceWindow,
+                    parameters.BackBufferWidth,
+                    parameters.BackBufferHeight,
+                )
+            } else {
+                adv_win32::user32::display::windowed(env, device)
+            }
+        },
+        device_released: adv_win32::user32::display::release,
         display: |ext| {
             let (width, height) = ext.get::<Win32>().user.screen;
             (width.max(1) as u32, height.max(1) as u32, 60)

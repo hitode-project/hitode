@@ -107,7 +107,8 @@ impl<B: Backend> Runtime<B> {
             .and_then(|n| n.to_str())
             .ok_or("invalid executable filename")?;
         let mut cfg = Win32Config::new(game_dir, exe_name, data_dir.as_ref());
-        cfg.screen = (width as i32, height as i32);
+        // The initial render canvas is independent of the virtual desktop.
+        // Games query the desktop before choosing their own window/backbuffer size.
         cfg.os.codepage = if exe_name.to_ascii_lowercase().contains("chs") {
             936
         } else {
@@ -570,6 +571,23 @@ mod tests {
     }
 
     #[test]
+    fn initial_canvas_does_not_resize_the_guest_desktop() {
+        let runtime = looping_executable_runtime();
+        let win32 = runtime.machine.ext.get::<Win32>();
+        let desktop = win32
+            .user
+            .windows
+            .get(&runtime.machine.sys.objects, &win32.user.desktop)
+            .unwrap();
+        assert_eq!(
+            (desktop.rect.width(), desktop.rect.height()),
+            win32.cfg.screen
+        );
+        assert_eq!(win32.cfg.screen, (1920, 1080));
+        assert_eq!((runtime.frame().width, runtime.frame().height), (4, 2));
+    }
+
+    #[test]
     fn runtime_default_has_no_cumulative_budget_and_returns_bounded_slices() {
         let mut runtime = looping_executable_runtime();
         assert_eq!(runtime.machine.cpu.execution_budget(), None);
@@ -622,6 +640,7 @@ mod tests {
             hwnd,
             class: 0,
             proc: 0,
+            unicode: false,
             style: WS_VISIBLE | if parent == 0 { WS_POPUP } else { WS_CHILD },
             ex_style: 0,
             parent,
@@ -629,6 +648,7 @@ mod tests {
             id: 0,
             instance: 0,
             rect,
+            placement: adv_win32::user32::PlacementState::new(rect),
             text: String::new(),
             extra: Vec::new(),
             user_data: 0,
@@ -694,6 +714,108 @@ mod tests {
                 .hwnd,
             0x10020
         );
+    }
+
+    #[test]
+    fn mouse_coordinates_round_trip_for_negative_and_framed_window_origins() {
+        use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
+        use adv_win32::user32::window::{
+            Rect, WS_CAPTION, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, make_long,
+        };
+        let mut runtime = input_runtime();
+        let data = runtime
+            .machine
+            .sys
+            .vm
+            .alloc(&mut runtime.machine.cpu, 4096, Prot::RW)
+            .unwrap();
+        let invoke = |runtime: &mut Runtime, name: &str, args: &[u32]| {
+            let address = runtime.machine.resolve_import("user32.dll", name).unwrap();
+            let thunk =
+                (address - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+            let handler = runtime.machine.sys.thunks.get(thunk).f.handler;
+            runtime.machine.cpu.set_reg(Reg::Esp, data + 2048);
+            for (i, &arg) in args.iter().enumerate() {
+                runtime
+                    .machine
+                    .cpu
+                    .write_u32(data + 2052 + i as u32 * 4, arg)
+                    .unwrap();
+            }
+            let mut env = runtime.env();
+            env.thunk = thunk;
+            assert!(matches!(handler(&mut env), adv_machine::Outcome::Return(1)));
+        };
+        for style in [
+            WS_POPUP | WS_VISIBLE,
+            WS_CAPTION | WS_THICKFRAME | WS_VISIBLE,
+        ] {
+            for (left, top) in [(-80, -60), (560, 240)] {
+                let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
+                let window = user
+                    .windows
+                    .get_mut(&mut runtime.machine.sys.objects, &0x10020)
+                    .unwrap();
+                window.rect = Rect::new(left, top, 800, 600);
+                window.style = style;
+                user.queue(0).capture = 0;
+                for (x, y) in [(0, 0), (400, 300), (-12, -34)] {
+                    let packed = make_long(x, y);
+                    assert!(runtime.post_input(0x200, 0, packed));
+                    let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
+                    let message = user.queue(0).posted.pop_front().unwrap();
+                    assert_eq!((message.hwnd, message.lparam), (0x10020, packed));
+                    let screen = user.cursor_pos;
+                    invoke(&mut runtime, "GetCursorPos", &[data]);
+                    assert_eq!(
+                        (
+                            runtime.machine.cpu.read_u32(data).unwrap() as i32,
+                            runtime.machine.cpu.read_u32(data + 4).unwrap() as i32
+                        ),
+                        screen
+                    );
+                    invoke(&mut runtime, "ScreenToClient", &[0x10020, data]);
+                    assert_eq!(
+                        (
+                            runtime.machine.cpu.read_u32(data).unwrap() as i32,
+                            runtime.machine.cpu.read_u32(data + 4).unwrap() as i32
+                        ),
+                        (x, y)
+                    );
+                    invoke(&mut runtime, "ClientToScreen", &[0x10020, data]);
+                    assert_eq!(
+                        (
+                            runtime.machine.cpu.read_u32(data).unwrap() as i32,
+                            runtime.machine.cpu.read_u32(data + 4).unwrap() as i32
+                        ),
+                        screen
+                    );
+                    assert!(runtime.post_input(0x20a, 120 << 16, packed));
+                    let wheel = runtime
+                        .machine
+                        .ext
+                        .get_mut::<Win32>()
+                        .user
+                        .queue(0)
+                        .posted
+                        .pop_front()
+                        .unwrap();
+                    assert_eq!(wheel.lparam, make_long(screen.0, screen.1));
+                }
+                runtime.machine.ext.get_mut::<Win32>().user.queue(0).capture = 0x10028;
+                assert!(runtime.post_input(0x200, 0, make_long(60, 80)));
+                let message = runtime
+                    .machine
+                    .ext
+                    .get_mut::<Win32>()
+                    .user
+                    .queue(0)
+                    .posted
+                    .pop_front()
+                    .unwrap();
+                assert_eq!((message.hwnd, message.lparam), (0x10028, make_long(20, 30)));
+            }
+        }
     }
 
     #[test]
