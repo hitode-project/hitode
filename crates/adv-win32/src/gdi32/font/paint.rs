@@ -196,6 +196,54 @@ fn output(
     if length != 0 && env.cpu.read(input, &mut bytes).is_err() {
         return fail(env, 87);
     }
+    paint(env, dc, x, y, options, r, &bytes, ansi, 1)
+}
+
+/// DrawText supplies already formatted Unicode, the same selected font/DC and
+/// a logical clipping rectangle. No temporary guest buffer or second provider.
+pub(super) fn singleline(
+    env: &mut Env<'_>,
+    dc: u32,
+    rectangle: [i32; 4],
+    units: &[u16],
+    height: u32,
+) -> Outcome {
+    let [left, top, right, bottom] = rectangle;
+    let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    paint(
+        env,
+        dc,
+        left,
+        top,
+        4,
+        Some(TextBox {
+            left,
+            top,
+            right,
+            bottom,
+        }),
+        &bytes,
+        false,
+        height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint(
+    env: &mut Env<'_>,
+    dc: u32,
+    x: i32,
+    y: i32,
+    options: u32,
+    r: Option<TextBox>,
+    bytes: &[u8],
+    ansi: bool,
+    success: u32,
+) -> Outcome {
+    let fail = |env: &mut Env<'_>, code| {
+        set_last_error(env, code);
+        Outcome::Return(0)
+    };
     let Some(GdiObj::Dc {
         selected,
         palette,
@@ -264,12 +312,12 @@ fn output(
     if env.ext.try_get::<SurfaceStore>().is_none() {
         return unavailable(env, "text surface store is not installed");
     }
-    let converted = ansi.then(|| ansi_text(env, &font, &bytes));
+    let converted = ansi.then(|| ansi_text(env, &font, bytes));
     let units;
     let input = if let Some(converted) = &converted {
         match converted {
             Some(units) => TextInput::Unicode(units),
-            None => TextInput::Encoded(&bytes),
+            None => TextInput::Encoded(bytes),
         }
     } else {
         units = bytes
@@ -337,7 +385,7 @@ fn output(
             if changed && let Some(outcome) = (provider.completed)(env, presented) {
                 outcome
             } else {
-                Outcome::Return(1)
+                Outcome::Return(success)
             }
         }
         Err(error) => unavailable(env, &error),
