@@ -253,3 +253,24 @@ fn display_queries_and_mouse_polling_observe_the_committed_fullscreen_mode() {
     assert_eq!(machine.cpu.read_u32(data + 8).unwrap(), 800);
     assert_eq!(machine.cpu.read_u32(data + 12).unwrap(), 600);
 }
+
+#[test]
+fn display_resize_reconciles_cursor_clipping_and_position_with_guest_bounds() {
+    let mut machine = fixture();
+    let state = &mut machine.ext.get_mut::<Win32>().user;
+    state.cursor_clip = Some(Rect::new(600, 400, 300, 300));
+    state.cursor_pos = (850, 650);
+    screen(&mut env(&mut machine), (800, 600));
+    let state = &machine.ext.get::<Win32>().user;
+    assert_eq!(state.cursor_clip, Some(Rect::new(600, 400, 200, 200)));
+    assert_eq!(state.cursor_pos, (799, 599));
+    screen(&mut env(&mut machine), (320, 240));
+    let state = &machine.ext.get::<Win32>().user;
+    assert_eq!(state.cursor_clip, None);
+    assert_eq!(state.cursor_pos, (319, 239));
+    machine.ext.get_mut::<Win32>().user.cursor_clip = None;
+    screen(&mut env(&mut machine), (640, 480));
+    let state = &machine.ext.get::<Win32>().user;
+    assert_eq!(state.cursor_clip, None);
+    assert_eq!(state.cursor_pos, (319, 239));
+}
