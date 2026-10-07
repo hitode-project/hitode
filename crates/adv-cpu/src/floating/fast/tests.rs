@@ -197,13 +197,13 @@ fn fast_x87_matches_the_transactional_path_bit_for_bit() {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn compiled_x87_matches_the_transactional_path_bit_for_bit() {
     differential(true);
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn compiled_x87_without_fma_matches_the_transactional_path() {
     crate::compile::x87::testing::FORCE_DEKKER.set(true);
     differential(true);
@@ -219,6 +219,7 @@ fn differential(compiled: bool) {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut taken = vec![0u32; programs.len()];
     let (mut rounded_up, mut inexact) = (0, 0);
+    let mut pc64_hits = 0;
     for round in 0..300_000 {
         let index = round % programs.len();
         let mut asm = CodeAssembler::new(32).unwrap();
@@ -332,6 +333,9 @@ fn differential(compiled: bool) {
             fallbacks += 1;
         } else {
             taken[index] += 1;
+            pc64_hits += u32::from(
+                state.x87.control & 0x0f3f == 0x033f && matches!(fast, Fast::Arith { .. }),
+            );
         }
         // Inexact results and magnitude round-ups are the delicate cases.
         rounded_up += u32::from(actual.x87.status & !state.x87.status & C1 != 0);
@@ -396,6 +400,7 @@ fn differential(compiled: bool) {
         assert!(fallbacks > 10_000 && faults > 1000, "{fallbacks} {faults}");
     }
     assert!(rounded_up > 500 && inexact > 1000, "{rounded_up} {inexact}");
+    assert!(pc64_hits > 100, "PC=64 arithmetic hits: {pc64_hits}");
     for (index, count) in taken.iter().enumerate() {
         assert!(
             *count > 100,
@@ -418,4 +423,134 @@ fn dekker_product_error_matches_fused_multiply_add() {
         let p = a * b;
         assert_eq!(dekker_error(a, b, p), a.mul_add(b, -p), "{a:e} {b:e}");
     }
+}
+
+#[test]
+fn pc64_probe_separates_exactness_range_and_operand_boundaries() {
+    use crate::cliffs::X87Pc64::*;
+    let mut asm = CodeAssembler::new(32).unwrap();
+    asm.fadd_2(st0, st1).unwrap();
+    let bytes = asm.assemble(u64::from(CODE)).unwrap();
+    let i = iced_x86::Decoder::with_ip(32, &bytes, u64::from(CODE), 0).decode();
+    let fast = classify(&i).unwrap();
+    let mem = memory(0, &bytes);
+    let one = extended(1.0);
+    for (a, b, category) in [
+        (one, extended(2f64.powi(-52)), Exact),
+        (one, extended(2f64.powi(-63)), Inexact),
+        (one, Ext::from_parts((1 << 63) | 1, 0x3fff), Operand),
+        (extended(2f64.powi(400)), extended(2f64.powi(400)), Exact),
+        (one, extended(2f64.powi(401)), Range),
+        (one, extended(f64::MIN_POSITIVE), Range),
+        (one, Ext::from_parts(1 << 63, 0x3fff - 1074), Operand),
+        (one, Ext::from_parts(1, 0), Operand),
+        (one, Ext::from_parts(1 << 63, 0x7fff), Operand),
+        (one, Ext::from_parts(3 << 62, 0x7fff), Operand),
+        (extended(-0.0), extended(-0.0), Zero),
+        (one, extended(-1.0), Zero),
+    ] {
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        for (logical, value) in [a, b].into_iter().enumerate() {
+            let slot = state.x87.physical_index(logical);
+            state.x87.regs[slot] = value;
+            state.x87.set_physical_tag(slot, value.tag());
+        }
+        assert_eq!(pc64_opportunity(&i, fast, &state, &mem), category);
+    }
+
+    // A normal rounded product alone does not protect its FMA residual: the
+    // true error here is -2^-1126 and rounds to zero even with gradual underflow.
+    let a = (1.0 + 2f64.powi(-52)) * 2f64.powi(-511);
+    let b = (1.0 - 2f64.powi(-52)) * 2f64.powi(-511);
+    let p = a * b;
+    assert!(p.is_normal());
+    assert_eq!(a.mul_add(b, -p), 0.0);
+    assert!(!bounded(a, RANGE) && !bounded(b, RANGE));
+}
+
+#[test]
+fn pc64_probe_candidates_match_extended_interpreter_in_300000_cases() {
+    use crate::cliffs::X87Pc64;
+    let programs: [Asm; 8] = [
+        |a, _| a.fadd_2(st0, st1),
+        |a, _| a.fsub_2(st0, st1),
+        |a, _| a.fsubr_2(st0, st1),
+        |a, _| a.fmul_2(st0, st1),
+        |a, _| a.faddp(st1, st0),
+        |a, _| a.fsubp(st1, st0),
+        |a, _| a.fsubrp(st1, st0),
+        |a, _| a.fmulp(st1, st0),
+    ];
+    let operations: Vec<_> = programs
+        .iter()
+        .map(|program| {
+            let mut asm = CodeAssembler::new(32).unwrap();
+            program(&mut asm, st1).unwrap();
+            let bytes = asm.assemble(u64::from(CODE)).unwrap();
+            let instruction = iced_x86::Decoder::with_ip(32, &bytes, u64::from(CODE), 0).decode();
+            NativeX87 {
+                instruction,
+                opcode: Some(((u16::from(bytes[0]) & 7) << 8) | u16::from(bytes[1])),
+                fast: classify(&instruction),
+            }
+        })
+        .collect();
+    let mut rng = Rng(0x5fe1_933a_129e_a843);
+    let mut mem = memory(0, &[]);
+    let mut hits = [0; 8];
+    let mut categories = std::collections::HashMap::new();
+    for round in 0..300_000 {
+        let index = round % operations.len();
+        let native = &operations[index];
+        let fast = native.fast.unwrap();
+        let mut state = CpuState {
+            eip: CODE,
+            eflags: rng.next() as u32,
+            ..CpuState::default()
+        };
+        state.x87.control = 0x037f;
+        state.x87.status = rng.next() as u16 & 0x7f7f;
+        state.x87.set_top(rng.next() as usize);
+        for logical in 0..2 {
+            let value = register(&mut rng);
+            let slot = state.x87.physical_index(logical);
+            state.x87.regs[slot] = value;
+            state.x87.set_physical_tag(slot, value.tag());
+        }
+        state.refresh_mmx();
+        let category = pc64_opportunity(&native.instruction, fast, &state, &mem);
+        *categories.entry(category).or_insert(0usize) += 1;
+        if !matches!(category, X87Pc64::Exact | X87Pc64::Zero) {
+            continue;
+        }
+        hits[index] += 1;
+        let mut expected = state.clone();
+        assert_eq!(
+            super::super::execute(
+                &native.instruction,
+                super::super::Operation::X87,
+                native.opcode,
+                &mut expected,
+                &mut mem,
+                true
+            ),
+            Step::Executed
+        );
+        let mut actual = state.clone();
+        assert_eq!(execute(native, fast, &mut actual, &mut mem), Some(X87_DONE));
+        assert_eq!(actual, expected, "round {round}, {category:?}");
+        assert_eq!(actual.x87.status & PE, state.x87.status & PE);
+        assert_eq!(actual.x87.status & C1, 0);
+    }
+    assert!(hits.iter().all(|&n| n > 100));
+    for category in [
+        X87Pc64::Exact,
+        X87Pc64::Operand,
+        X87Pc64::Range,
+        X87Pc64::Inexact,
+    ] {
+        assert!(categories[&category] > 1000, "{categories:?}");
+    }
+    eprintln!("PC64 opportunity categories: {categories:?}; exact hits by form: {hits:?}");
 }
