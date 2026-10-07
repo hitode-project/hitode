@@ -38,6 +38,7 @@ mod sync;
 mod time;
 mod timer;
 mod toolhelp;
+pub(crate) use time::delay_until;
 pub use time::filetime_now;
 pub(crate) use time::{civil_from_days, days_from_civil};
 
