@@ -30,13 +30,16 @@ pub(super) struct Helpers {
     /// `(frame, address, kind) -> value | status << 32`, where kind is the
     /// width in bytes plus `SIGNED`; nonzero status means nothing was read.
     pub load: u64,
-    /// `(frame, address, value, width) -> 0` to continue, 1 after a store that
-    /// must leave native code, 2 when not performed.
+    /// `(frame, address, value, kind) -> 0` to continue, 1 after a store that
+    /// must leave native code, 2 when refused. Kind is width plus CHECK_WRITE
+    /// for permission-only probes, which return 0 without writing.
     pub store: u64,
 }
 
 /// Load kind flag: sign-extend the loaded value to 32 bits.
 pub(super) const SIGNED: u32 = 0x100;
+/// Store kind flag: validate write permission without writing (zero shifts).
+pub(super) const CHECK_WRITE: u32 = 0x100;
 
 pub(super) struct Emitter {
     helpers: Helpers,
@@ -59,6 +62,64 @@ pub(super) fn register(r: Register) -> Option<u8> {
         EDI => 26,
         _ => return Option::None,
     })
+}
+fn register_part(r: Register) -> Option<(u8, u32, u32)> {
+    let full = register(r.full_register32())?;
+    let shift = u32::from(matches!(
+        r,
+        Register::AH | Register::CH | Register::DH | Register::BH
+    )) * 8;
+    let bits = r.size() as u32 * 8;
+    matches!(bits, 8 | 16 | 32).then_some((full, shift, bits))
+}
+fn setcc(m: M) -> bool {
+    matches!(
+        m,
+        M::Seto
+            | M::Setno
+            | M::Setb
+            | M::Setae
+            | M::Sete
+            | M::Setne
+            | M::Setbe
+            | M::Seta
+            | M::Sets
+            | M::Setns
+            | M::Setp
+            | M::Setnp
+            | M::Setl
+            | M::Setge
+            | M::Setle
+            | M::Setg
+    )
+}
+fn cmovcc(m: M) -> bool {
+    matches!(
+        m,
+        M::Cmovo
+            | M::Cmovno
+            | M::Cmovb
+            | M::Cmovae
+            | M::Cmove
+            | M::Cmovne
+            | M::Cmovbe
+            | M::Cmova
+            | M::Cmovs
+            | M::Cmovns
+            | M::Cmovp
+            | M::Cmovnp
+            | M::Cmovl
+            | M::Cmovge
+            | M::Cmovle
+            | M::Cmovg
+    )
+}
+fn shift(m: M) -> bool {
+    matches!(m, M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror)
+}
+fn shift_count(i: &Instruction) -> bool {
+    i.op1_kind() == OpKind::Immediate8
+        || i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL
 }
 fn imm(i: &Instruction, op: u32) -> Option<u32> {
     matches!(i.op_kind(op), OpKind::Immediate32 | OpKind::Immediate8to32)
@@ -84,8 +145,9 @@ fn rmw(i: &Instruction) -> bool {
         && matches!(i.memory_size().size(), 1 | 2 | 4)
         && address(i)
         && match i.mnemonic() {
-            M::Add | M::Sub | M::And | M::Or | M::Xor => rmw_source(i),
+            M::Add | M::Adc | M::Sub | M::Sbb | M::And | M::Or | M::Xor => rmw_source(i),
             M::Inc | M::Dec | M::Not | M::Neg => true,
+            m if shift(m) => shift_count(i),
             _ => false,
         }
 }
@@ -123,8 +185,27 @@ pub(super) fn supported(i: &Instruction) -> bool {
             dst && i.op1_kind() == OpKind::Memory
                 && matches!(i.memory_size().size(), 1 | 2)
                 && address(i)
+                || i.op0_kind() == OpKind::Register
+                    && register_part(i.op0_register())
+                        .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                    && i.op1_kind() == OpKind::Register
+                    && register_part(i.op1_register())
+                        .is_some_and(|(_, _, bits)| matches!(bits, 8 | 16))
         }
-        M::Add | M::Sub | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
+        M::Imul => {
+            dst && matches!(i.op_count(), 2 | 3)
+                && (i.op1_kind() == OpKind::Register && register(i.op1_register()).is_some()
+                    || i.op1_kind() == OpKind::Memory && i.memory_size().size() == 4 && address(i))
+                && (i.op_count() == 2 || imm(i, 2).is_some())
+        }
+        M::Cdq => true,
+        M::Xchg => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some()
+                && i.op1_kind() == OpKind::Register
+                && register_part(i.op1_register()).is_some()
+        }
+        M::Add | M::Adc | M::Sub | M::Sbb | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
             let memory =
                 |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
             dst && (source(i, 1) || memory(1))
@@ -140,6 +221,23 @@ pub(super) fn supported(i: &Instruction) -> bool {
         }
         M::Ret => i.op_count() == 0 || i.op0_kind() == OpKind::Immediate16,
         M::Inc | M::Dec | M::Neg | M::Not => dst,
+        m if shift(m) => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some()
+                && shift_count(i)
+        }
+        _ if setcc(i.mnemonic()) => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some_and(|(_, _, bits)| bits == 8)
+                || i.op0_kind() == OpKind::Memory && address(i)
+        }
+        _ if cmovcc(i.mnemonic()) => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register())
+                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                && (i.op1_kind() == OpKind::Register && register_part(i.op1_register()).is_some()
+                    || i.op1_kind() == OpKind::Memory && address(i))
+        }
         _ => {
             i.condition_code() != C::None
                 && i.is_jcc_short_or_near()
@@ -212,6 +310,30 @@ impl Emitter {
             self.mov(d, r);
         } else {
             self.constant(d, imm(i, op).expect("admitted operand"));
+        }
+    }
+    fn read_register(&mut self, d: u8, r: Register, signed: bool) {
+        let (s, shift, bits) = register_part(r).expect("admitted register");
+        self.word(
+            (if signed { 0x1300_0000 } else { 0x5300_0000 })
+                | shift << 16
+                | (shift + bits - 1) << 10
+                | (s as u32) << 5
+                | d as u32,
+        );
+    }
+    fn write_register(&mut self, r: Register, s: u8) {
+        let (d, shift, bits) = register_part(r).expect("admitted register");
+        if bits == 32 {
+            self.mov(d, s);
+        } else {
+            self.word(
+                0x3300_0000
+                    | ((32 - shift) % 32) << 16
+                    | (bits - 1) << 10
+                    | (s as u32) << 5
+                    | d as u32,
+            );
         }
     }
     fn ea(&mut self, i: &Instruction, segment: bool) {
@@ -321,27 +443,17 @@ impl Emitter {
     fn flags(&mut self, dst: u8, subtract: bool, logic: bool, preserve_carry: bool) {
         // ADDS/SUBS/ANDS already produced NZCV. CSET reads it directly and
         // BFI replaces one guest bit, so no other EFLAGS bit is disturbed.
-        const EQ: u32 = 0;
         const CS: u32 = 2;
         const CC: u32 = 3;
-        const MI: u32 = 4;
         const VS: u32 = 6;
-        for (condition, guest) in [(MI, 7), (EQ, 6), (VS, 11)] {
-            self.cset14(condition);
-            self.bfi(dst, 14, guest);
-        }
+        self.szp(dst);
+        self.cset14(VS);
+        self.bfi(dst, 14, 11);
         if !preserve_carry {
             // ARM carry after subtraction is the inverse of x86 borrow.
             self.cset14(if subtract { CC } else { CS });
             self.bfi(dst, 14, 0);
         }
-        // PF: even parity of the low result byte, folded into bit 0.
-        for (n, shift) in [(11, 4), (14, 2), (14, 1)] {
-            // eor w14,wn,wn,lsr #shift
-            self.word(0x4a40_0000 | n << 16 | shift << 10 | n << 5 | 14);
-        }
-        self.word(0x5200_01ce); // eor w14,w14,#1
-        self.bfi(dst, 14, 2);
         // Logical AF is architecturally undefined; match Tier 0 preservation.
         if !logic {
             self.binary(0x4a00_0000, 14, 9, 10);
@@ -350,9 +462,27 @@ impl Emitter {
             self.bfi(dst, 14, 4);
         }
     }
+    /// NZCV describes the width-aligned result; w11 holds its low byte.
+    fn szp(&mut self, dst: u8) {
+        for (condition, guest) in [(4, 7), (0, 6)] {
+            self.cset14(condition);
+            self.bfi(dst, 14, guest);
+        }
+        // PF: even parity of the low result byte, folded into bit 0.
+        for (n, shift) in [(11, 4), (14, 2), (14, 1)] {
+            // eor w14,wn,wn,lsr #shift
+            self.word(0x4a40_0000 | n << 16 | shift << 10 | n << 5 | 14);
+        }
+        self.word(0x5200_01ce); // eor w14,w14,#1
+        self.bfi(dst, 14, 2);
+    }
     /// Compute w11 and flags from w9/w10, retaining the unshifted operands
     /// for AF. Narrow operands align to bit 31 so host NZCV has x86 width.
     fn alu(&mut self, m: M, width: u32, flags: u8) {
+        if matches!(m, M::Adc | M::Sbb) {
+            self.carry_alu(m == M::Sbb, width, flags);
+            return;
+        }
         let logic = matches!(m, M::And | M::Or | M::Xor | M::Test);
         let sub = matches!(m, M::Sub | M::Cmp | M::Dec | M::Neg);
         let op = match m {
@@ -377,6 +507,127 @@ impl Emitter {
             self.lsr(11, 11, (32 - width * 8) as u8);
         }
         self.flags(flags, sub, logic, matches!(m, M::Inc | M::Dec));
+    }
+    /// Carry input is the canonical guest CF, never an earlier host NZCV.
+    fn carry_alu(&mut self, subtract: bool, width: u32, flags: u8) {
+        self.mask(13, 8, 1);
+        if width == 4 {
+            if subtract {
+                self.binary(0x6b00_0000, 31, 31, 13); // cmp wzr,w13
+            } else {
+                self.word(0x7100_05bf); // cmp w13,#1
+            }
+            self.binary(if subtract { 0x7a00_0000 } else { 0x3a00_0000 }, 11, 9, 10);
+            self.flags(flags, subtract, false, false);
+            return;
+        }
+        let bits = width * 8;
+        let mask = (1 << bits) - 1;
+        self.mask(9, 9, mask);
+        self.mask(10, 10, mask);
+        let op = if subtract { 0x4b00_0000 } else { 0x0b00_0000 };
+        self.binary(op, 11, 9, 10);
+        self.binary(op, 11, 11, 13);
+        // The bit above the narrow result is carry/borrow, even after wrap.
+        self.lsr(13, 11, bits as u8);
+        self.bfi(flags, 13, 0);
+        self.mask(11, 11, mask);
+        self.lsl(15, 11, (32 - bits) as u8);
+        self.binary(0x6a00_0000, 31, 15, 15);
+        self.flags(flags, subtract, false, true);
+        // Signed overflow uses the original operands, including when b+CF
+        // crosses the signed boundary. AF above likewise uses original b.
+        self.binary(0x4a00_0000, 15, 9, 11);
+        self.binary(0x4a00_0000, 16, if subtract { 9 } else { 11 }, 10);
+        self.binary(0x0a00_0000, 15, 15, 16);
+        self.lsr(15, 15, (bits - 1) as u8);
+        self.bfi(flags, 15, 11);
+    }
+    /// Shift w9 by the masked count in w10 into w11. Match Tier 0's
+    /// deterministic preservation of AF, multi-bit OF and oversized SHL/SHR CF.
+    fn shift_value(&mut self, m: M, width: u32, flags: u8) {
+        let bits = width * 8;
+        let left = matches!(m, M::Shl | M::Sal | M::Rol);
+        let rotate = matches!(m, M::Rol | M::Ror);
+        self.mask(10, 10, 31);
+        self.mov(11, 9);
+        let zero = self.words.len();
+        self.word(0);
+        if rotate {
+            // Repeat a narrow value across 32 bits before the host rotate.
+            self.mov(15, 9);
+            if bits == 8 {
+                self.lsl(16, 15, 8);
+                self.binary(0x2a00_0000, 15, 15, 16);
+            }
+            if bits < 32 {
+                self.lsl(16, 15, 16);
+                self.binary(0x2a00_0000, 15, 15, 16);
+            }
+            if left {
+                self.binary(0x4b00_0000, 16, 31, 10);
+            } else {
+                self.mov(16, 10);
+            }
+            self.binary(0x1ac0_2c00, 11, 15, 16); // rorv
+        } else {
+            if m == M::Sar && bits < 32 {
+                self.word(0x1300_0000 | (bits - 1) << 10 | 9 << 5 | 9); // sbfx
+            }
+            self.binary(
+                if left {
+                    0x1ac0_2000
+                } else if m == M::Sar {
+                    0x1ac0_2800
+                } else {
+                    0x1ac0_2400
+                },
+                11,
+                9,
+                10,
+            );
+        }
+        if bits < 32 {
+            self.mask(11, 11, (1 << bits) - 1);
+        }
+        if rotate {
+            self.lsr(14, 11, if left { 0 } else { (bits - 1) as u8 });
+            self.bfi(flags, 14, 0);
+        } else {
+            if left {
+                self.constant(16, bits);
+                self.binary(0x4b00_0000, 16, 16, 10);
+            } else {
+                self.word(0x5100_0400 | 10 << 5 | 16); // sub w16,w10,#1
+            }
+            self.binary(0x1ac0_2400, 14, 9, 16);
+            if bits < 32 && m != M::Sar {
+                self.word(0x7100_001f | bits << 10 | 10 << 5); // cmp w10,#bits
+                self.word(0x5400_0048); // b.hi +8
+            }
+            self.bfi(flags, 14, 0);
+            self.lsl(15, 11, (32 - bits) as u8);
+            self.binary(0x6a00_0000, 31, 15, 15);
+            self.szp(flags);
+        }
+        self.word(0x7100_055f); // cmp w10,#1
+        let multiple = self.words.len();
+        self.word(0);
+        if left {
+            self.lsr(14, 11, (bits - 1) as u8);
+            self.binary(0x4a00_0000, 14, 14, flags);
+        } else if m == M::Shr {
+            self.lsr(14, 9, (bits - 1) as u8);
+        } else if m == M::Sar {
+            self.constant(14, 0);
+        } else {
+            self.lsr(14, 11, (bits - 1) as u8);
+            self.lsr(15, 11, (bits - 2) as u8);
+            self.binary(0x4a00_0000, 14, 14, 15);
+        }
+        self.bfi(flags, 14, 11);
+        self.words[zero] = 0x3400_000a | ((self.words.len() - zero) as u32) << 5;
+        self.words[multiple] = 0x5400_0001 | ((self.words.len() - multiple) as u32) << 5;
     }
     fn memory_rmw(&mut self, i: &Instruction) {
         let width = i.memory_size().size() as u32;
@@ -403,15 +654,27 @@ impl Emitter {
                 }
                 _ => self.constant(10, i.immediate(1) as u32),
             }
-            self.alu(i.mnemonic(), width, 12);
+            if shift(i.mnemonic()) {
+                self.shift_value(i.mnemonic(), width, 12);
+            } else {
+                self.alu(i.mnemonic(), width, 12);
+            }
         }
         // Frame scratch survives the helper. Guest flags remain in w8 until
         // the store succeeds; refusal may rerun the entire instruction.
         self.store32(12, 76);
         self.mov(2, 11);
+        self.constant(3, width);
+        if shift(i.mnemonic()) {
+            // Zero shifts check write permission but must not mutate memory.
+            self.word(0x7100_015f); // cmp w10,#0
+            self.cset14(0);
+            self.lsl(14, 14, CHECK_WRITE.trailing_zeros() as u8);
+            self.binary(0x2a00_0000, 3, 3, 14);
+        }
         self.ea(i, true);
         self.mov(1, 9);
-        self.store(width);
+        self.call(self.helpers.store);
         self.stored(i.ip32(), Some(i.next_ip32()), false, |e| e.load32(8, 76));
     }
     /// Resolve before changing ESP: CALL ESP and CALL [ESP - 4] must use
@@ -530,11 +793,46 @@ impl Emitter {
             }
             M::Mov => self.operand(d, i, 1),
             M::Movzx | M::Movsx => {
-                self.ea(i, true);
-                self.mov(1, 9);
-                let signed = if i.mnemonic() == M::Movsx { SIGNED } else { 0 };
-                self.load(pc, i.memory_size().size() as u32 | signed);
-                self.mov(d, 0);
+                if i.op1_kind() == OpKind::Register {
+                    self.read_register(9, i.op1_register(), i.mnemonic() == M::Movsx);
+                    self.write_register(i.op0_register(), 9);
+                } else {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    let signed = if i.mnemonic() == M::Movsx { SIGNED } else { 0 };
+                    self.load(pc, i.memory_size().size() as u32 | signed);
+                    self.mov(d, 0);
+                }
+            }
+            M::Imul => {
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(10, 0);
+                } else {
+                    self.operand(10, i, 1);
+                }
+                if i.op_count() == 3 {
+                    self.mov(9, 10);
+                    self.operand(10, i, 2);
+                } else {
+                    self.mov(9, d);
+                }
+                self.binary(0x9b20_7c00, 11, 9, 10); // smull x11,w9,w10
+                self.word(0x9340_7d6f); // sxtw x15,w11
+                self.binary(0xeb00_0000, 31, 11, 15); // cmp x11,x15
+                self.cset14(1);
+                self.bfi(8, 14, 0);
+                self.bfi(8, 14, 11);
+                self.mov(d, 11);
+            }
+            M::Cdq => self.word(0x131f_7e75), // asr w21,w19,#31
+            M::Xchg => {
+                self.read_register(9, i.op0_register(), false);
+                self.read_register(10, i.op1_register(), false);
+                self.write_register(i.op0_register(), 10);
+                self.write_register(i.op1_register(), 9);
             }
             M::Push => {
                 self.esp_sub(1);
@@ -584,7 +882,43 @@ impl Emitter {
                 self.mov(d, 9);
             }
             M::Not => self.word(0x2a20_03e0 | (d as u32) << 16 | d as u32),
+            m if shift(m) => {
+                self.read_register(9, i.op0_register(), false);
+                if i.op1_kind() == OpKind::Register {
+                    self.mov(10, 20);
+                } else {
+                    self.constant(10, i.immediate8() as u32);
+                }
+                self.shift_value(m, i.op0_register().size() as u32, 8);
+                self.write_register(i.op0_register(), 11);
+            }
             M::Nop => {}
+            _ if setcc(i.mnemonic()) => {
+                self.condition(i.condition_code());
+                if i.op0_kind() == OpKind::Memory {
+                    self.mov(2, 9);
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.store(1);
+                    self.stored(pc, Some(i.next_ip32()), false, |_| {});
+                    return;
+                }
+                self.write_register(i.op0_register(), 9);
+            }
+            _ if cmovcc(i.mnemonic()) => {
+                // The source read is unconditional, including its faults.
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, i.memory_size().size() as u32);
+                    self.mov(11, 0);
+                } else {
+                    self.read_register(11, i.op1_register(), false);
+                }
+                self.condition(i.condition_code());
+                self.word(0x3400_0049); // cbz w9,+8
+                self.write_register(i.op0_register(), 11);
+            }
             M::Jmp => {
                 if i.op0_kind() != OpKind::NearBranch32 {
                     self.indirect_target(i);
