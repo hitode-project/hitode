@@ -67,8 +67,9 @@ fn absent_extensions_do_not_create_modules_without_a_system_provider() {
 #[test]
 fn absent_static_imports_bind_as_system_modules() {
     // Windows refuses to start an image whose static import is missing, so a
-    // natively runnable image's absent import is a system DLL (wtsapi32, glu32,
-    // a VC++ redistributable). Dynamic probes of the same name still fail.
+    // natively runnable image's absent import is treated as a system DLL.
+    // Use an authored name with no provider so future API additions cannot
+    // turn this missing-module case into a supported dynamic load.
     struct Files;
     impl FileSource for Files {
         fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -88,19 +89,23 @@ fn absent_static_imports_bind_as_system_modules() {
             ] {
                 delay_fixture::word(&mut bytes, at, value);
             }
-            bytes[0xa60..0xa6d].copy_from_slice(b"wtsapi32.dll\0");
-            bytes[0xa82..0xa92].copy_from_slice(b"WTSSendMessageW\0");
+            let dll = b"fixture-absent.dll\0";
+            let export = b"FixtureAbsentExport\0";
+            bytes[0xa60..0xa60 + dll.len()].copy_from_slice(dll);
+            bytes[0xa82..0xa82 + export.len()].copy_from_slice(export);
             Some(bytes)
         }
     }
     let mut m = machine();
     assert!(matches!(
-        m.load(&Files, "wtsapi32.dll"),
+        m.load(&Files, "fixture-absent.dll"),
         Err(adv_os::LoadError::NotFound(_))
     ));
     let id = m.load(&Files, "main.dll").unwrap();
     let base = adv_os::modules(&m.ext).get(id).base;
-    let system = adv_os::modules(&m.ext).by_name("wtsapi32.dll").unwrap();
+    let system = adv_os::modules(&m.ext)
+        .by_name("fixture-absent.dll")
+        .unwrap();
     assert_eq!(adv_os::modules(&m.ext).get(system).kind, ModuleKind::Host);
     assert!(is_thunk(m.cpu.read_u32(base + 0xa50).unwrap()));
 }
