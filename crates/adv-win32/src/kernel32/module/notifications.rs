@@ -307,6 +307,9 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
 }
 
 pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
+    if env.sys.process_identity.completion.exit_status().is_some() {
+        return Outcome::ExitProcess(code);
+    }
     if std::mem::replace(&mut env.ext.get_mut::<Win32>().process_exiting, true) {
         return Outcome::ExitProcess(code);
     }

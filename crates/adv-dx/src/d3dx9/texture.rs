@@ -3,6 +3,7 @@ use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 mod decode;
+mod resize;
 
 const INVALID: u32 = 0x8876086c;
 const INVALID_DATA: u32 = 0x88760b59;
@@ -25,6 +26,14 @@ struct ImageInfo {
 pub(super) fn register(registry: &mut Registry) {
     registry.register(info_ABI);
     registry.register(create_ABI);
+    // Legacy D3DX SDK export outside the pinned Win32 metadata projection.
+    registry.register(adv_abi::Api {
+        module: "d3dx9_43.dll",
+        name: "D3DXSaveSurfaceToFileInMemory",
+        conv: adv_abi::Conv::Stdcall { argc: 5 },
+        handler: save_surface,
+        level: adv_abi::ImplementationLevel::Implement,
+    });
 }
 
 fn api(env: &Env<'_>) -> &'static str {
@@ -159,16 +168,21 @@ fn create(
             Err(e) => return Outcome::Return(decoded_error(env, &bytes, e)),
         };
         let dimension = |requested, source: u32| match requested {
-            NONPOW2 | 0 => Some(source),
-            DEFAULT if source.is_power_of_two() => Some(source),
-            n if n == source => Some(source),
-            _ => None,
+            NONPOW2 => Some(source),
+            DEFAULT | 0 => source.checked_next_power_of_two(),
+            n => Some(n),
         };
-        if dimension(width, image.width).is_none() || dimension(height, image.height).is_none() {
-            return Outcome::Return(unavailable(
-                env,
-                "resizing or DEFAULT power-of-two expansion is not implemented; NONPOW2 preserves source dimensions",
-            ));
+        let (Some(width), Some(height)) = (
+            dimension(width, image.width),
+            dimension(height, image.height),
+        ) else {
+            return Outcome::Return(INVALID);
+        };
+        if width == 0
+            || height == 0
+            || u64::from(width) * u64::from(height) > (decode::LIMIT / 4) as u64
+        {
+            return Outcome::Return(INVALID);
         }
         let format = match format {
             0 | -1 => {
@@ -198,15 +212,11 @@ fn create(
                 }
             }
         }
-        let outcome = crate::d3d9::loading::create(
-            env,
-            device.addr(),
-            image.width,
-            image.height,
-            format,
-            pool,
-            pixels,
-        );
+        if width != image.width || height != image.height {
+            pixels = resize::pixels(&pixels, image.width, image.height, width, height, filter);
+        }
+        let outcome =
+            crate::d3d9::loading::create(env, device.addr(), width, height, format, pool, pixels);
         publish(env, output, image_info, image, outcome)
     }
 }
@@ -243,6 +253,78 @@ fn publish(
                 Outcome::Return(INVALID)
             } else {
                 Outcome::Return(0)
+            }
+        }
+        other => other,
+    }
+}
+
+// https://learn.microsoft.com/windows/win32/direct3d9/d3dxsavesurfacetofileinmemory
+fn save_surface(env: &mut Env<'_>) -> Outcome {
+    let output = GuestPtr::<u32>::new(env.arg(0));
+    if output.is_null() || output.write(env.cpu, 0).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    let format = env.arg(1);
+    if format != 0 || env.arg(3) != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "d3dx9_43.dll!D3DXSaveSurfaceToFileInMemory",
+            "surface export supports BMP without a palette",
+        );
+        return Outcome::Return(INVALID);
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        adv_abi::warn_unavailable(
+            env,
+            "d3dx9_43.dll!D3DXSaveSurfaceToFileInMemory",
+            "D3D9 surface export requires the GPU personality",
+        );
+        Outcome::Return(INVALID)
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let rect = GuestPtr::<adv_abi::types::RECT>::new(env.arg(4));
+        let rect = if rect.is_null() {
+            None
+        } else {
+            match rect.read(env.cpu) {
+                Ok(r) => Some(r),
+                Err(_) => return Outcome::Return(INVALID),
+            }
+        };
+        let outcome = crate::d3d9::loading::readable_surface(env, env.arg(2));
+        export_surface(env, output, rect, outcome)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn export_surface(
+    env: &mut Env<'_>,
+    output: GuestPtr<u32>,
+    rect: Option<adv_abi::types::RECT>,
+    outcome: Outcome,
+) -> Outcome {
+    match outcome {
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resumed| {
+                let next = then(env, resumed);
+                export_surface(env, output, rect, next)
+            }),
+        },
+        Outcome::Return(pointer) if pointer != 0 && pointer & 0x80000000 == 0 => {
+            let bytes = crate::d3d9::saving::bmp(env, pointer, rect);
+            crate::d3d9::loading::release_texture(env, pointer);
+            match bytes {
+                Ok(bytes) => Outcome::Return(super::buffer::create(env, &bytes, output)),
+                Err(error) => Outcome::Return(error),
             }
         }
         other => other,

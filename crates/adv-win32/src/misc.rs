@@ -17,6 +17,7 @@ mod shell_execute;
 mod shell_icon;
 mod theme;
 mod variant;
+mod wts;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
@@ -282,6 +283,29 @@ fn path_file_exists_a(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(u32::from(found))
 }
 
+fn path_file_exists_w(env: &mut Env<'_>) -> Outcome {
+    let pointer = env.arg(0);
+    if pointer == 0 {
+        return Outcome::Return(0);
+    }
+    if matches!(env.cpu.read_u16(pointer), Ok(0)) {
+        set_last_error(env, crate::util::err::PATH_NOT_FOUND);
+        return Outcome::Return(0);
+    }
+    // Use the normal attribute entry so overlays, system files and guest NT
+    // attribute providers have exactly the same view as GetFileAttributesW.
+    match env
+        .sys
+        .thunks
+        .resolve(env.cpu, "kernel32.dll", "GetFileAttributesW")
+    {
+        Ok(entry) => Outcome::call(entry, [pointer], |_, resumed| {
+            Outcome::Return(u32::from(resumed.value() != u32::MAX))
+        }),
+        Err(error) => Outcome::Fail(error.to_string()),
+    }
+}
+
 fn path_is_directory_a(env: &mut Env<'_>) -> Outcome {
     let s = codec(env).decode(&cstr(env.cpu, env.arg(0)));
     Outcome::Return(if env.ext.get::<Win32>().vfs.is_dir(&s) {
@@ -366,6 +390,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     dwm::register(reg);
+    wts::register(reg);
     reg.register(path_find_extension_w_ABI);
     reg.register(path_find_file_name_w_ABI);
     theme::register(reg);
@@ -404,6 +429,7 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, SHLWAPI, "PathUnquoteSpacesA", 1, path_unquote_spaces_a);
     stdcall(reg, SHLWAPI, "PathStripPathA", 1, path_strip_path_a);
     stdcall(reg, SHLWAPI, "PathFileExistsA", 1, path_file_exists_a);
+    stdcall(reg, SHLWAPI, "PathFileExistsW", 1, path_file_exists_w);
     stdcall(reg, SHLWAPI, "PathIsDirectoryA", 1, path_is_directory_a);
     stdcall(
         reg,

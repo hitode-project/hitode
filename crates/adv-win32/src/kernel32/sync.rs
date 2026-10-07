@@ -13,6 +13,8 @@ use crate::{Win32, stdcall};
 
 mod local;
 pub(crate) use local::detach_fls;
+#[cfg(test)]
+mod wait_tests;
 
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
@@ -256,30 +258,37 @@ fn wait_result(r: Resume) -> Outcome {
 }
 
 fn wait_one(env: &mut Env<'_>, h: u32, ms: u32) -> Outcome {
-    if let Some(Object::Process { access, .. } | Object::RemoteThread { access, .. }) =
-        env.sys.objects.get(h)
+    // A live caller cannot observe its own process/thread completion. Pseudo
+    // handles need no table alias and retain the ordinary timeout/block path,
+    // even when NULL process termination has published a pending exit status.
+    let current = h == u32::MAX || h == u32::MAX - 1;
+    if !current
+        && let Some(Object::Process { access, .. } | Object::RemoteThread { access, .. }) =
+            env.sys.objects.get(h)
         && access & 0x10_0000 == 0
     {
         set_last_error(env, err::ACCESS_DENIED);
         return Outcome::Return(WAIT_FAILED);
     }
-    if !matches!(
-        env.sys.objects.get(h),
-        Some(
-            Object::Event { .. }
-                | Object::Timer { .. }
-                | Object::Mutex { .. }
-                | Object::Semaphore { .. }
-                | Object::Thread { .. }
-                | Object::Process { .. }
-                | Object::RemoteThread { .. }
+    if !current
+        && !matches!(
+            env.sys.objects.get(h),
+            Some(
+                Object::Event { .. }
+                    | Object::Timer { .. }
+                    | Object::Mutex { .. }
+                    | Object::Semaphore { .. }
+                    | Object::Thread { .. }
+                    | Object::Process { .. }
+                    | Object::RemoteThread { .. }
+            )
         )
-    ) {
+    {
         log::warn!("wait on unknown handle {h:#x} from {:#010x}", env.caller());
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(WAIT_FAILED);
     }
-    if let Some(reason) = env.sys.try_acquire_objects(&[h], false) {
+    if !current && let Some(reason) = env.sys.try_acquire_objects(&[h], false) {
         return wait_result(Resume::Woke(reason));
     }
     if ms == 0 {

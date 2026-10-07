@@ -128,22 +128,20 @@ pub(crate) fn destroy(env: &mut Env<'_>, heap: u32) -> Outcome {
         return Outcome::Return(0);
     };
     let body = move |env: &mut Env<'_>| {
-        if let Some(lock) = sync.lock {
-            if let Err(error) = release_cs_wait(env, lock) {
-                if sync.serialized {
-                    let _ = leave_cs(env, lock);
-                }
-                return Outcome::Fail(error);
+        if let Some(lock) = sync.lock
+            && let Err(error) = release_cs_wait(env, lock)
+        {
+            if sync.serialized {
+                let _ = leave_cs(env, lock);
             }
+            return Outcome::Fail(error);
         }
         let destroyed = env
             .ext
             .get_mut::<Heaps>()
             .destroy(env.cpu, &mut env.sys.vm, heap);
-        if !destroyed {
-            if let Some(lock) = sync.lock.filter(|_| sync.serialized) {
-                let _ = leave_cs(env, lock);
-            }
+        if !destroyed && let Some(lock) = sync.lock.filter(|_| sync.serialized) {
+            let _ = leave_cs(env, lock);
         }
         Outcome::Return(u32::from(destroyed))
     };

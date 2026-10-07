@@ -1359,6 +1359,25 @@ fn run_execution(
                             Err("click has no guest target window".into())
                         }
                     }
+                    control::Command::MouseDown(x, y) | control::Command::MouseUp(x, y) => {
+                        let pressed = matches!(command, control::Command::MouseDown(..));
+                        let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
+                        let moved = runtime.post_input(0x200, u32::from(pressed), position);
+                        let posted = runtime.post_input(
+                            if pressed { 0x201 } else { 0x202 },
+                            u32::from(pressed),
+                            position,
+                        );
+                        inputs += u64::from(moved) + u64::from(posted);
+                        if moved && posted {
+                            Ok(format!(
+                                "mouse-{} {x} {y}",
+                                if pressed { "down" } else { "up" }
+                            ))
+                        } else {
+                            Err("mouse button has no guest target window".into())
+                        }
+                    }
                     control::Command::Move(x, y) => {
                         let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
                         if runtime.post_input(0x200, 0, position) {

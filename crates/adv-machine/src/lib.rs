@@ -994,17 +994,42 @@ impl Dispatch<'_> {
     /// other frame still fails, naming the host call that frame belongs to.
     fn unwind_escaped(
         &mut self,
+        cpu: &dyn Guest,
         escaped: impl Fn(&Frame) -> bool,
         what: &str,
     ) -> Result<(), Parked> {
-        let frames = &mut self.sys.contexts[self.sys.current as usize].frames;
+        let vm = &self.sys.vm;
+        let context = &mut self.sys.contexts[self.sys.current as usize];
+        let thread_stack = (context.stack_lo, context.stack_hi);
+        let frames = &mut context.frames;
         while let Some(frame) = frames.last().filter(|frame| escaped(frame)) {
             if !frame.unwindable {
                 let host = self.sys.thunks.get(frame.origin.thunk);
+                let esp = cpu.reg(Reg::Esp);
+                let reservation = |address| {
+                    vm.containing(address).map_or_else(
+                        || "unreserved".to_owned(),
+                        |(base, size)| format!("{base:#010x}+{size:#x}"),
+                    )
+                };
                 return Err(Parked::Fail(format!(
                     "guest {what} escaped its continuation stack; nonlocal unwind is unsupported \
-                     across {}!{}",
-                    host.module, host.name
+                     across {}!{}; current_pc={:#010x}, current_esp={esp:#010x}, \
+                     frame_id={}, frame_stack={:#010x}, return_floor={:#010x}, \
+                     origin_esp={:#010x}, thread_stack={:#010x}..{:#010x}, \
+                     current_reservation={}, frame_reservation={}, origin_reservation={}",
+                    host.module,
+                    host.name,
+                    cpu.reg(Reg::Eip),
+                    frame.id,
+                    frame.stack,
+                    frame.return_floor,
+                    frame.origin.esp,
+                    thread_stack.0,
+                    thread_stack.1,
+                    reservation(esp),
+                    reservation(frame.stack),
+                    reservation(frame.origin.esp)
                 )));
             }
             frames.pop();
@@ -1043,7 +1068,7 @@ impl Dispatch<'_> {
         event: exception::Exception,
     ) -> Result<(), Parked> {
         let esp = cpu.reg(Reg::Esp);
-        self.unwind_escaped(|frame| esp >= frame.stack, "exception")?;
+        self.unwind_escaped(cpu, |frame| esp >= frame.stack, "exception")?;
         // Retain the original stop before a personality can edit registers or
         // a parked backend replaces EIP. Handled traps do not publish a fault.
         let trap_snapshot = match &event {
@@ -1093,7 +1118,7 @@ impl Dispatch<'_> {
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
         let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
-        self.unwind_escaped(|frame| esp >= frame.stack, "callback")?;
+        self.unwind_escaped(cpu, |frame| esp >= frame.stack, "callback")?;
         let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all)).then(|| {
             (0..u32::from(f.conv.argc()))
                 .map(|i| cpu.arg(i).unwrap_or(0))
@@ -1139,7 +1164,7 @@ impl Dispatch<'_> {
     fn guest_return(&mut self, cpu: &mut dyn Guest) -> Result<(), Parked> {
         let eax = cpu.reg(Reg::Eax);
         let returned_sp = cpu.reg(Reg::Esp);
-        self.unwind_escaped(|frame| returned_sp > frame.stack, "return")?;
+        self.unwind_escaped(cpu, |frame| returned_sp > frame.stack, "return")?;
         if self
             .sys
             .current_context()
@@ -1186,6 +1211,9 @@ impl TrapHandler for Dispatch<'_> {
         let frame_before = self.sys.completed_frames;
         let eip = cpu.reg(Reg::Eip);
         let res = if vector != adv_cpu::backend::asm::TRAP_VECTOR {
+            self.sys
+                .trace
+                .raw_interrupt(self.sys.current, self.sys.frame, vector, cpu);
             self.exception(cpu, exception::Exception::Trap { vector, pc: eip })
         } else if eip == thunk_addr(thunk::RETURN_PAD) + 2 {
             self.guest_return(cpu)
@@ -1207,9 +1235,18 @@ impl TrapHandler for Dispatch<'_> {
                 cpu.set_reg(Reg::Esp, esp.wrapping_add(4));
                 self.host_call(cpu, index.unwrap())
             } else {
-                let snapshot = self.interrupt_snapshot(cpu, vector, eip);
-                self.remember_cpu_fault(snapshot);
-                Err(Parked::Exception(vector))
+                self.sys
+                    .trace
+                    .raw_interrupt(self.sys.current, self.sys.frame, vector, cpu);
+                if self.sys.exception_handler.is_some() {
+                    // A raw guest interrupt never borrows the host thunk token.
+                    // Its OS personality owns system-service or exception policy.
+                    self.exception(cpu, exception::Exception::Trap { vector, pc: eip })
+                } else {
+                    let snapshot = self.interrupt_snapshot(cpu, vector, eip);
+                    self.remember_cpu_fault(snapshot);
+                    Err(Parked::Exception(vector))
+                }
             }
         };
         match res {
@@ -1618,6 +1655,12 @@ impl<B: Backend> Machine<B> {
     }
 
     fn complete_process_exit(&mut self, code: u32) -> RunResult {
+        let code = self
+            .sys
+            .process_identity
+            .completion
+            .exit_status()
+            .unwrap_or(code);
         // Reports retain guest memory after exit, but physical pins must end
         // with the guest process rather than wait for the executor's Drop.
         match self.cpu.retire_locked_pages() {

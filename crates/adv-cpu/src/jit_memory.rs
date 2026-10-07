@@ -101,29 +101,72 @@ pub(crate) unsafe fn code_storage_bytes(functions: [usize; 2]) -> Result<(usize,
     Ok((committed, reserved))
 }
 
+const GRANULARITY: usize = 0x1_0000;
+
+/// Reserve and commit `len` bytes at a free, granularity-aligned `start`.
+/// Another thread may win the race, which returns `None`.
+fn reserve_at(start: usize, len: usize) -> Option<*mut u8> {
+    // SAFETY: a fresh reservation request at an address observed free.
+    let base = unsafe { VirtualAlloc(start as *mut c_void, len, 0x3000, 4) };
+    (!base.is_null()).then_some(base.cast())
+}
+
 /// Cranelift reaches a module's constants with 32-bit PC-relative
-/// relocations. Unhinted reservations of one module can land more than 2 GiB
-/// apart once other threads reserve guest address spaces in between, so later
-/// pieces are placed in the first free range above the module's first one.
-fn near(anchor: usize, len: usize) -> Option<*mut u8> {
-    const GRANULARITY: usize = 0x1_0000;
-    let limit = anchor.checked_add(RELATIVE_WINDOW)?;
-    let mut address = anchor;
-    while address < limit {
-        let region = query(address as *const u8).ok()?;
-        let end = region.base.checked_add(region.region)?;
-        if region.state == 0x10000 {
-            let start = region.base.checked_next_multiple_of(GRANULARITY)?;
-            if start.checked_add(len)? <= end && start + len <= limit {
-                // SAFETY: a fresh reservation at a free, granularity-aligned
-                // address; another thread may win the race, which returns null.
-                let base = unsafe { VirtualAlloc(start as *mut c_void, len, 0x3000, 4) };
-                if !base.is_null() {
-                    return Some(base.cast());
+/// relocations, so every piece of a module must stay inside one
+/// [`RELATIVE_WINDOW`]. A later piece is placed in the nearest free range
+/// above or below the module's current span `[low, high)`; searching only
+/// above failed whenever another thread's guest reservation followed the
+/// first piece.
+fn near(low: usize, high: usize, len: usize) -> Option<*mut u8> {
+    let floor = high.saturating_sub(RELATIVE_WINDOW);
+    let ceiling = low.checked_add(RELATIVE_WINDOW)?;
+    let mut up = Some(high);
+    let mut down = Some(low);
+    while up.is_some() || down.is_some() {
+        if let Some(address) = up {
+            up = None;
+            // A failed query (past the user address space) ends one direction.
+            if address < ceiling
+                && let Ok(region) = query(address as *const u8)
+                && let Some(end) = region.base.checked_add(region.region)
+            {
+                if region.state == 0x10000
+                    && let Some(start) = region.base.checked_next_multiple_of(GRANULARITY)
+                    && start
+                        .checked_add(len)
+                        .is_some_and(|stop| stop <= end.min(ceiling))
+                    && let Some(base) = reserve_at(start, len)
+                {
+                    return Some(base);
+                }
+                up = Some(end);
+            }
+        }
+        if let Some(address) = down {
+            down = None;
+            // VirtualQuery reports a free range from the queried page up, not
+            // from its start, so downward steps try the highest aligned spot
+            // and on conflict continue below the blocking reservation.
+            if let Some(start) = address
+                .checked_sub(len)
+                .map(|start| start & !(GRANULARITY - 1))
+                .filter(|&start| start >= floor && start > 0)
+                && let Ok(region) = query(start as *const u8)
+            {
+                if region.state != 0x10000 {
+                    down = Some(region.allocation);
+                } else if region.base + region.region < start + len {
+                    down = query((region.base + region.region) as *const u8)
+                        .ok()
+                        .map(|blocker| blocker.allocation);
+                } else if let Some(base) = reserve_at(start, len) {
+                    return Some(base);
+                } else {
+                    // Another thread took the range; retry below it.
+                    down = Some(start);
                 }
             }
         }
-        address = end;
     }
     None
 }
@@ -161,7 +204,7 @@ impl WindowsMemory {
         size: usize,
         align: u64,
         kind: Kind,
-        allocate_near: impl FnOnce(usize, usize) -> Option<*mut u8>,
+        allocate_near: impl FnOnce(usize, usize, usize) -> Option<*mut u8>,
     ) -> io::Result<*mut u8> {
         let align =
             usize::try_from(align).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -195,20 +238,26 @@ impl WindowsMemory {
         if len > RELATIVE_WINDOW {
             return Err(io::ErrorKind::OutOfMemory.into());
         }
-        let anchor = self
-            .allocations
-            .first()
-            .map(|first| first.base.as_ptr() as usize);
-        let pointer = match anchor {
-            Some(anchor) => allocate_near(anchor, len)
+        let span = self.allocations.iter().fold(None, |span, piece| {
+            let start = piece.base.as_ptr() as usize;
+            let end = start + piece.len;
+            Some(span.map_or((start, end), |(low, high): (usize, usize)| {
+                (low.min(start), high.max(end))
+            }))
+        });
+        let pointer = match span {
+            Some((low, high)) => allocate_near(low, high, len)
                 // A far fallback can make Cranelift's module-local rel32
                 // references overflow. Reject this compilation instead; its
                 // unmodified guest code remains available to the interpreter.
                 .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?,
             None => {
-                // SAFETY: the first piece owns a fresh unhinted reservation;
-                // all subsequent pieces must stay in its relative window.
-                unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000, 4) }.cast::<u8>()
+                // SAFETY: the first piece owns a fresh reservation; all later
+                // pieces must stay in its relative window. Top-down placement
+                // keeps modules away from bottom-up guest address spaces, which
+                // would otherwise fill the window right after the first piece.
+                unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000 | 0x10_0000, 4) }
+                    .cast::<u8>()
             }
         };
         let base = NonNull::new(pointer).ok_or_else(io::Error::last_os_error)?;
@@ -393,8 +442,9 @@ mod tests {
         for kind in [Kind::Code, Kind::ReadOnly, Kind::Writable] {
             let used = provider.allocations[0].used;
             let error = provider
-                .allocate_with_near(64, 16, kind, |anchor, len| {
-                    assert_eq!(anchor, code as usize);
+                .allocate_with_near(64, 16, kind, |low, high, len| {
+                    assert_eq!(low, code as usize);
+                    assert!(high > low && high - low <= RELATIVE_WINDOW);
                     assert!(len <= RELATIVE_WINDOW);
                     None
                 })
@@ -423,10 +473,21 @@ mod tests {
         assert_eq!(query(storage).unwrap().protection, 2);
     }
     #[test]
+    fn near_search_also_places_pieces_below_the_module() {
+        // Nothing above the 47-bit user address space can be reserved, so the
+        // search must find room below a span that ends there.
+        let top = 0x7fff_ffff_0000;
+        let piece = near(top, top, 0x2_0000).unwrap() as usize;
+        assert!(piece < top && top - piece <= RELATIVE_WINDOW, "{piece:#x}");
+        assert_eq!(piece % GRANULARITY, 0);
+        assert_eq!(query(piece as *const u8).unwrap().protection, 4);
+        assert_ne!(unsafe { VirtualFree(piece as *mut c_void, 0, 0x8000) }, 0);
+    }
+    #[test]
     fn first_piece_cannot_exceed_the_modules_relative_window() {
         let mut provider = WindowsMemory::default();
         let error = provider
-            .allocate_with_near(RELATIVE_WINDOW, 16, Kind::Code, |_, _| {
+            .allocate_with_near(RELATIVE_WINDOW, 16, Kind::Code, |_, _, _| {
                 panic!("a first allocation must not search relative to another owner")
             })
             .unwrap_err();

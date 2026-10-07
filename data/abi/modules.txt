@@ -31,3 +31,4 @@ wininet.dll
 winspool.drv
 opengl32.dll
 sensapi.dll
+wtsapi32.dll
