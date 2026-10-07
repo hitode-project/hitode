@@ -77,6 +77,60 @@ fn next(machine: &mut Machine<JitCpu>, remove: bool) -> Msg {
 }
 
 #[test]
+fn message_extra_info_is_thread_local_and_only_successful_peeks_replace_it() {
+    let (mut machine, _, _) = fixture();
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), 0);
+    assert_eq!(set_message_extra_info(&mut env(&mut machine), i32::MIN), 0);
+    machine.sys.current = 1;
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), 0);
+    assert_eq!(
+        set_message_extra_info(&mut env(&mut machine), 0x12345678),
+        0
+    );
+    machine.sys.current = 0;
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), i32::MIN);
+    let filter = Filter {
+        hwnd: 0,
+        min: 0,
+        max: 0,
+    };
+    assert!(next_message(&mut env(&mut machine), filter, false).is_none());
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), i32::MIN);
+    machine.ext.get_mut::<Win32>().user.queue(0).post(Msg {
+        msg: 0x8000,
+        ..Default::default()
+    });
+    assert!(
+        next_message(
+            &mut env(&mut machine),
+            Filter {
+                hwnd: 0,
+                min: wm::KEYDOWN,
+                max: wm::KEYUP
+            },
+            false
+        )
+        .is_none()
+    );
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), i32::MIN);
+    assert!(next_message(&mut env(&mut machine), filter, false).is_some());
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), 0);
+    assert_eq!(set_message_extra_info(&mut env(&mut machine), -1), 0);
+    assert!(next_message(&mut env(&mut machine), filter, true).is_some());
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), 0);
+    machine.sys.current = 1;
+    assert_eq!(get_message_extra_info(&mut env(&mut machine)), 0x12345678);
+    assert_eq!(
+        get_message_extra_info_ABI.conv,
+        adv_abi::Conv::Stdcall { argc: 0 }
+    );
+    assert_eq!(
+        set_message_extra_info_ABI.conv,
+        adv_abi::Conv::Stdcall { argc: 1 }
+    );
+}
+
+#[test]
 fn queued_down_remains_down_after_live_release_until_this_thread_removes_up() {
     let (mut machine, memory, live) = fixture();
     live.set(0x41, true);
