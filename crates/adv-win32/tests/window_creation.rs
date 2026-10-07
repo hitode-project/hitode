@@ -195,8 +195,11 @@ impl<B: TestCpu> Fixture<B> {
         start
     }
     fn class(&mut self, callback: u32, name: &str, wide: bool) -> u32 {
+        self.class_with_menu(callback, name, wide, 0)
+    }
+    fn class_with_menu(&mut self, callback: u32, name: &str, wide: bool, menu: u32) -> u32 {
         let name = self.text(name, wide);
-        let fields = [0, callback, 0, 16, CODE, 0, 0, 0, 0, name];
+        let fields = [0, callback, 0, 16, CODE, 0, 0, 0, menu, name];
         let structure = self.bytes(
             &fields
                 .into_iter()
@@ -385,6 +388,68 @@ fn creation<B: TestCpu>(cpu: B) {
 fn create_window_ex_w_uses_registered_encoding_atoms_and_real_create_structs() {
     creation(UnicornCpu::new(PARK_ADDR).unwrap());
     creation(JitCpu::new(PARK_ADDR, false).unwrap());
+}
+
+fn absent_class_menu<B: TestCpu>(cpu: B) {
+    let mut test = Fixture::new(cpu);
+    let mut cases = Vec::new();
+    for (index, wide, named, style) in [
+        (0, false, true, 0x00ca0000),
+        (1, true, true, WS_POPUP),
+        (2, false, false, WS_POPUP),
+        (3, true, false, 0x00ca0000),
+    ] {
+        let capture = test.alloc(368);
+        let callback = test.callback(wide, capture, None);
+        let absent = if named {
+            test.text("AbsentDefaultMenu", wide)
+        } else {
+            987
+        };
+        let name = format!("DefaultMenu{index}");
+        let atom = test.class_with_menu(callback, &name, wide, absent);
+        let hwnd = test.call(
+            if wide {
+                "CreateWindowExW"
+            } else {
+                "CreateWindowExA"
+            },
+            &[
+                I(0),
+                M(atom),
+                I(0),
+                I(style),
+                I(20),
+                I(30),
+                I(120),
+                I(80),
+                I(0),
+                I(0),
+                I(CODE),
+                I(0),
+            ],
+        );
+        let menu = test.call("GetMenu", &[M(hwnd)]);
+        cases.push((capture, atom, hwnd, menu));
+    }
+    test.run();
+    for (capture, atom, hwnd, menu) in cases {
+        assert_ne!(test.value(atom), 0);
+        let hwnd = test.value(hwnd);
+        assert_ne!(hwnd, 0);
+        assert_eq!(test.value(menu), 0);
+        assert_eq!(test.value(capture + 8), 0); // CREATESTRUCT.hMenu in NCCREATE.
+        assert_eq!(test.value(capture + 56), 0); // Same value in CREATE.
+        assert_eq!(&test.messages(hwnd)[..2], &[wm::NCCREATE, wm::CREATE]);
+    }
+}
+
+#[test]
+fn absent_default_class_menu_does_not_reject_window_creation() {
+    // Native invisible-window oracle: both named/integer missing menu resources
+    // leave the window without a menu, for overlapped windows and popups.
+    absent_class_menu(UnicornCpu::new(PARK_ADDR).unwrap());
+    absent_class_menu(JitCpu::new(PARK_ADDR, false).unwrap());
 }
 
 fn rejection<B: TestCpu>(cpu: B) {
