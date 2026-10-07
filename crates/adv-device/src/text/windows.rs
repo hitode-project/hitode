@@ -567,6 +567,99 @@ impl Font {
             ],
         ))
     }
+    pub(super) fn outline_metrics(&self) -> Result<OutlineMetrics, TextError> {
+        // SAFETY: this font's private DC retains the same realized HFONT used
+        // by glyph rasterization; NULL output only queries the required size.
+        let size = unsafe { gdi::GetOutlineTextMetricsW(self.dc, 0, std::ptr::null_mut()) };
+        if size < std::mem::size_of::<gdi::OUTLINETEXTMETRICW>() as u32 || size > 65536 {
+            return Err(TextError::Font("outline font metrics unavailable".into()));
+        }
+        // u64 storage supplies the native structure's pointer alignment on all
+        // supported Windows hosts, including the trailing UTF-16 names.
+        let mut storage = vec![0u64; (size as usize).div_ceil(8)];
+        let pointer = storage.as_mut_ptr().cast::<gdi::OUTLINETEXTMETRICW>();
+        // SAFETY: initialized, aligned host storage covers the queried byte
+        // count. GDI receives no guest pointer or guest-owned handle.
+        if unsafe { gdi::GetOutlineTextMetricsW(self.dc, size, pointer) } != size {
+            return Err(TextError::Font("outline font metrics read failed".into()));
+        }
+        // SAFETY: the complete initialized structure was returned above.
+        let m = unsafe { &*pointer };
+        let names = [
+            m.otmpFamilyName,
+            m.otmpFaceName,
+            m.otmpStyleName,
+            m.otmpFullName,
+        ]
+        .map(|offset| {
+            let start = offset as usize;
+            if start % 2 != 0 || start >= size as usize {
+                return Err(TextError::Font("invalid outline font name offset".into()));
+            }
+            // SAFETY: the offset and count stay within the initialized native
+            // buffer, and UTF-16 alignment follows from the even offset.
+            let units = unsafe {
+                std::slice::from_raw_parts(
+                    storage.as_ptr().cast::<u8>().add(start).cast::<u16>(),
+                    (size as usize - start) / 2,
+                )
+            };
+            let end = units
+                .iter()
+                .position(|&unit| unit == 0)
+                .ok_or_else(|| TextError::Font("unterminated outline font name".into()))?;
+            String::from_utf16(&units[..end])
+                .map_err(|_| TextError::Font("invalid outline font name".into()))
+        });
+        let [family, face, style, full] = names;
+        let point = |p: windows_sys::Win32::Foundation::POINT| Point { x: p.x, y: p.y };
+        let p = m.otmPanoseNumber;
+        Ok(OutlineMetrics {
+            text: self.metrics()?,
+            panose: [
+                p.bFamilyType,
+                p.bSerifStyle,
+                p.bWeight,
+                p.bProportion,
+                p.bContrast,
+                p.bStrokeVariation,
+                p.bArmStyle,
+                p.bLetterform,
+                p.bMidline,
+                p.bXHeight,
+            ],
+            selection: m.otmfsSelection,
+            embedding: m.otmfsType,
+            caret_rise: m.otmsCharSlopeRise,
+            caret_run: m.otmsCharSlopeRun,
+            italic_angle: m.otmItalicAngle,
+            em_units: m.otmEMSquare,
+            ascent: m.otmAscent,
+            descent: m.otmDescent,
+            line_gap: m.otmLineGap,
+            cap_height: m.otmsCapEmHeight,
+            x_height: m.otmsXHeight,
+            bounds: TextBox {
+                left: m.otmrcFontBox.left,
+                top: m.otmrcFontBox.top,
+                right: m.otmrcFontBox.right,
+                bottom: m.otmrcFontBox.bottom,
+            },
+            mac_ascent: m.otmMacAscent,
+            mac_descent: m.otmMacDescent,
+            mac_line_gap: m.otmMacLineGap,
+            minimum_ppem: m.otmusMinimumPPEM,
+            subscript_size: point(m.otmptSubscriptSize),
+            subscript_offset: point(m.otmptSubscriptOffset),
+            superscript_size: point(m.otmptSuperscriptSize),
+            superscript_offset: point(m.otmptSuperscriptOffset),
+            strikeout_size: m.otmsStrikeoutSize,
+            strikeout_position: m.otmsStrikeoutPosition,
+            underline_size: m.otmsUnderscoreSize,
+            underline_position: m.otmsUnderscorePosition,
+            names: [family?, face?, style?, full?],
+        })
+    }
     pub(super) fn kerning_pair_count(&self) -> u32 {
         // SAFETY: this font's private measurement DC retains its selected HFONT;
         // NULL output queries the complete native count without allocating.
