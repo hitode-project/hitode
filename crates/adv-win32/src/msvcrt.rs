@@ -20,6 +20,8 @@ mod heap;
 mod intrinsic_math;
 mod locale;
 mod memory_ops;
+mod modern_stdio;
+mod modern_string;
 mod onexit;
 mod path;
 mod random;
@@ -156,6 +158,8 @@ pub fn register(r: &mut Registry) {
     heap::register(r);
     locale::register(r);
     memory_ops::register(r);
+    modern_stdio::register(r);
+    modern_string::register(r);
     wide_string::register(r);
     for (name, argc) in [
         ("malloc", 1),

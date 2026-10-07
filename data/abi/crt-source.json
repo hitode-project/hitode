@@ -88,6 +88,23 @@
     "header": "ucrt/corecrt_memcpy_s.h",
     "sha256": "359f3ce9e84bc00c983f01d9c3375d0ca9e0ef6a42e797d16e119c62b2ef333b"
   },
+  "ordinary_binary_stdio": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "wide_header": "ucrt/corecrt_wstdio.h:139-143",
+    "wide_header_sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515",
+    "stdio_header": "ucrt/stdio.h:152-154,239-244,270-274,286-288",
+    "stdio_header_sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "scope": "Only ucrtbase.dll and api-ms-win-crt-stdio-l1-1-0.dll _wfopen_s, fseek, ftell, fread, fclose: x86 cdecl with3/3/1/4/1 stack words; errno_t/int/long/size_t/int results. Ordinary rb Unicode VFS opening and binary reading/position/close reuse the existing CRT FILE/process-heap owner. No modern FILE layout, text/Unicode conversion, write mode, unused stdio alias or secure-CRT profile matrix is claimed."
+  },
+  "ordinary_modern_string": {
+    "search_header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h:82-85,95-98",
+    "search_header_sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
+    "byte_header": "ucrt/string.h:32-36,60-65",
+    "byte_header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
+    "wide_header": "ucrt/corecrt_wstring.h:39-43",
+    "wide_header_sha256": "c485f918d43f0f846d77a36eaee9e111f57bf2eec32db7d9719ff924771744c6",
+    "scope": "Only vcruntime140.dll strrchr/wcsrchr and ucrtbase.dll plus api-ms-win-crt-string-l1-1-0.dll wcscpy_s/strcpy_s/strncpy_s. Typed checked ordinary NUL-terminated searches and valid-capacity copies delegate to the existing legacy memory kernels; invalid-parameter handling reuses the shared CRT owner. wchar_t is a16-bit code unit in one x86 stack word. Finite-count strncpy_s requires a checked NUL-terminated source; _TRUNCATE and arbitrary unterminated prefix inputs are not advertised. Existing typed wcscat_s is unchanged."
+  },
   "legacy_data": {
     "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
     "adjust_fdiv": "Existing x86 MSVCRT compatibility data cell, int32 zero initial value. The installed Microsoft SysWOW64/msvcrt.dll PE exports _adjust_fdiv from its writable, non-executable .data virtual tail, not a code entry. No modern SDK header declaration is claimed.",

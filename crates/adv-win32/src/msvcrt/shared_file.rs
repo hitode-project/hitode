@@ -48,7 +48,7 @@ fn invalid(env: &mut Env<'_>, clear_dos: bool) -> Outcome {
     invalid_parameter_result(env, &name, 22, 0)
 }
 
-fn io_code(error: &std::io::Error) -> u32 {
+pub(super) fn io_code(error: &std::io::Error) -> u32 {
     #[cfg(windows)]
     if let Some(code) = error.raw_os_error() {
         return code as u32;
@@ -63,7 +63,7 @@ fn io_code(error: &std::io::Error) -> u32 {
     }
 }
 
-fn dos_errno(dos: u32) -> i32 {
+pub(super) fn dos_errno(dos: u32) -> i32 {
     match dos {
         2 | 3 | 15 | 18 | 123 | 206 => 2,
         5 | 16 | 32 | 33 | 65 => 13,
