@@ -6214,6 +6214,10 @@ user32.dll	wvsprintfA	stdcall	i32	i32	param0:Windows.Win32.Foundation.PSTR:str8:
 user32.dll	wvsprintfW	stdcall	i32	i32	param0:Windows.Win32.Foundation.PWSTR:str16:1|param1:Windows.Win32.Foundation.PWSTR:str16:1|arglist:i8*:ptr:1
 uxtheme.dll	IsAppThemed	stdcall	i32	Windows.Win32.Foundation.BOOL	
 uxtheme.dll	IsThemeActive	stdcall	i32	Windows.Win32.Foundation.BOOL	
+vcruntime140.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+vcruntime140.dll	memcpy	cdecl	ptr	void*	destination:void*:ptr:1|source:const void*:ptr:1|count:size_t:u32:1
+vcruntime140.dll	memmove	cdecl	ptr	void*	destination:void*:ptr:1|source:const void*:ptr:1|count:size_t:u32:1
+vcruntime140.dll	memset	cdecl	ptr	void*	destination:void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 version.dll	GetFileVersionInfoA	stdcall	i32	Windows.Win32.Foundation.BOOL	lptstrFilename:Windows.Win32.Foundation.PSTR:str8:1|dwHandle:u32:u32:1|dwLen:u32:u32:1|lpData:void*:ptr:1
 version.dll	GetFileVersionInfoExA	stdcall	i32	Windows.Win32.Foundation.BOOL	dwFlags:Windows.Win32.Storage.FileSystem.GET_FILE_VERSION_INFO_FLAGS:u32:1|lpwstrFilename:Windows.Win32.Foundation.PSTR:str8:1|dwHandle:u32:u32:1|dwLen:u32:u32:1|lpData:void*:ptr:1
 version.dll	GetFileVersionInfoExW	stdcall	i32	Windows.Win32.Foundation.BOOL	dwFlags:Windows.Win32.Storage.FileSystem.GET_FILE_VERSION_INFO_FLAGS:u32:1|lpwstrFilename:Windows.Win32.Foundation.PWSTR:str16:1|dwHandle:u32:u32:1|dwLen:u32:u32:1|lpData:void*:ptr:1

@@ -297,3 +297,7 @@ msvcr90.dll	_CIlog	cdecl	void	void
 msvcrt.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
 msvcr80.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
 msvcr90.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
+vcruntime140.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+vcruntime140.dll	memcpy	cdecl	ptr	void*	destination:void*:ptr:1|source:const void*:ptr:1|count:size_t:u32:1
+vcruntime140.dll	memmove	cdecl	ptr	void*	destination:void*:ptr:1|source:const void*:ptr:1|count:size_t:u32:1
+vcruntime140.dll	memset	cdecl	ptr	void*	destination:void*:ptr:1|value:int:i32:1|count:size_t:u32:1

@@ -4,12 +4,13 @@ use adv_abi::{GuestPtr, guest::check_range, win32};
 use adv_cpu::backend::{Guest, MemFault, Prot};
 
 const PAGE_BYTES: u32 = 4096;
-const MODULES: [&str; 5] = [
+const MODULES: [&str; 6] = [
     "msvcrt.dll",
     "msvcr80.dll",
     "msvcr90.dll",
     "ucrtbase.dll",
     "api-ms-win-crt-string-l1-1-0.dll",
+    "vcruntime140.dll",
 ];
 
 pub(super) fn register(registry: &mut Registry) {

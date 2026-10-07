@@ -19,6 +19,7 @@ mod floating;
 mod heap;
 mod intrinsic_math;
 mod locale;
+mod memory_ops;
 mod onexit;
 mod path;
 mod random;
@@ -154,6 +155,7 @@ pub fn register(r: &mut Registry) {
     thread::register(r);
     heap::register(r);
     locale::register(r);
+    memory_ops::register(r);
     wide_string::register(r);
     for (name, argc) in [
         ("malloc", 1),
@@ -679,22 +681,16 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
         }
         "memcpy" | "memmove" => {
-            if let Err(err) = e.cpu.copy_memory(b, a, c as usize) {
-                return Outcome::Fail(err.to_string());
+            match memory_ops::copy(e, a, b, c) {
+                Ok(pointer) => pointer,
+                Err(err) => return Outcome::Fail(err.to_string()),
             }
-            a
         }
         "memset" => {
-            let chunk = [b as u8; 4096];
-            let mut p = 0;
-            while p < c {
-                let n = (c - p).min(4096);
-                if let Err(err) = e.cpu.write(a.wrapping_add(p), &chunk[..n as usize]) {
-                    return Outcome::Fail(err.to_string());
-                }
-                p += n;
+            match memory_ops::fill(e, a, b as u8, c) {
+                Ok(pointer) => pointer,
+                Err(err) => return Outcome::Fail(err.to_string()),
             }
-            a
         }
         "memcmp" => {
             let mut left = [0; 4096];

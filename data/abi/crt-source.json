@@ -82,7 +82,7 @@
     "source": "Microsoft Visual C++ Build Tools 14.44.35207",
     "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h (included by SDK ucrt/corecrt_memory.h)",
     "sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
-    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT and UCRT/string API-set profiles; no wide scan or other string function is projected."
+    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT and UCRT/string API-set profiles and vcruntime140.dll. Also project only vcruntime140.dll memcpy/memmove(void* destination, const void* source, size_t count) and memset(void* destination, int value, size_t count), each returning void* with three x86 cdecl stack words. These fronts reuse the existing guest byte-copy/fill implementation; memmove supports overlap, memset converts value to unsigned char, and no memcpy overlap contract is claimed. No wide scan or unused alias matrix is projected."
   },
   "corecrt_memcpy_s.h": {
     "header": "ucrt/corecrt_memcpy_s.h",
