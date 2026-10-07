@@ -73,6 +73,7 @@ pub struct SignatureConflict {
 /// Legacy registrations coexist with generated adapters and are audited separately.
 pub struct Registry {
     fns: HashMap<(String, String), Entry>,
+    aliases: HashMap<(String, String), &'static str>,
     signature_conflicts_cache: OnceLock<Vec<SignatureConflict>>,
     data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
@@ -83,6 +84,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             fns: HashMap::new(),
+            aliases: HashMap::new(),
             signature_conflicts_cache: OnceLock::new(),
             data: HashMap::new(),
             mode: RunMode::Strict,
@@ -186,6 +188,47 @@ impl Registry {
             .level = Some(api.level);
     }
 
+    /// Bind an SDK-declared name to a direct implementation in the same DLL.
+    /// Both names must have the same complete ABI; aliases cannot form chains.
+    /// Explicit implementations retain precedence over aliases.
+    pub fn register_alias(
+        &mut self,
+        module: &str,
+        name: &str,
+        target: &'static str,
+    ) -> Result<(), String> {
+        let module = module.to_ascii_lowercase();
+        let key = (module.clone(), name.to_owned());
+        let valid = signature::lookup(&module, name)
+            .zip(signature::lookup(&module, target))
+            .is_some_and(|(alias, original)| {
+                alias.data_size.is_none()
+                    && alias.conv.is_some()
+                    && alias.conv == original.conv
+                    && alias.return_kind == original.return_kind
+                    && alias.return_type == original.return_type
+                    && alias.parameters.len() == original.parameters.len()
+                    && alias
+                        .parameters
+                        .iter()
+                        .zip(&original.parameters)
+                        .all(|(a, b)| {
+                            a.kind == b.kind && a.words == b.words && a.type_name == b.type_name
+                        })
+                    && self
+                        .fns
+                        .get(&(module.clone(), target.to_owned()))
+                        .is_some_and(|entry| Some(entry.host.conv) == original.conv)
+            });
+        if name == target || !valid || self.data.contains_key(&key) {
+            return Err(format!(
+                "invalid function alias: {module}!{name} -> {target}"
+            ));
+        }
+        self.aliases.insert(key, target);
+        Ok(())
+    }
+
     pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
         self.add(module, name, conv, handler);
         self.set_trace(module, name, true);
@@ -242,7 +285,7 @@ impl Registry {
         })
     }
 
-    /// An explicit legacy ordinal implementation wins over an SDK alias.
+    /// An explicit implementation wins over a named or SDK ordinal alias.
     pub fn canonical_name(&self, module: &str, name: &str) -> Option<&'static str> {
         let module = module.to_ascii_lowercase();
         if self.fns.contains_key(&(module.clone(), name.to_owned()))
@@ -250,7 +293,10 @@ impl Registry {
         {
             return None;
         }
-        ordinals::lookup(&module, name)
+        self.aliases
+            .get(&(module.clone(), name.to_owned()))
+            .copied()
+            .or_else(|| ordinals::lookup(&module, name))
     }
 
     pub fn level(&self, module: &str, name: &str) -> Option<ImplementationLevel> {
@@ -486,6 +532,105 @@ mod signature_conflict_cache_tests {
             .unwrap();
         assert!(registry.signature_conflicts_cache.get().is_some());
         assert_eq!(registry.signature_conflicts(), expected);
+    }
+}
+
+#[cfg(test)]
+mod named_alias_tests {
+    use super::*;
+
+    fn registry() -> Registry {
+        let mut registry = Registry::default();
+        registry.register_with_data(
+            Api {
+                module: "kernel32.dll",
+                name: "lstrcpyA",
+                conv: Conv::Stdcall { argc: 2 },
+                handler: |_| Outcome::Return(0),
+                level: ImplementationLevel::Implement,
+            },
+            17,
+        );
+        registry
+    }
+
+    #[test]
+    fn named_alias_uses_live_target_and_preserves_export_case() {
+        let mut registry = registry();
+        registry
+            .register_alias("KERNEL32.DLL", "lstrcpy", "lstrcpyA")
+            .unwrap();
+        assert_eq!(
+            registry.canonical_name("kernel32.dll", "lstrcpy"),
+            Some("lstrcpyA")
+        );
+        assert!(registry.is_implemented("kernel32.dll", "lstrcpy"));
+        assert!(registry.dynamic_available("kernel32.dll", "lstrcpy"));
+        assert_eq!(
+            registry.level("kernel32.dll", "lstrcpy"),
+            Some(ImplementationLevel::Implement)
+        );
+        assert_eq!(registry.get("kernel32.dll", "lstrcpy").unwrap().data, 17);
+        registry.set_trace("kernel32.dll", "lstrcpyA", true);
+        assert!(registry.get("kernel32.dll", "lstrcpy").unwrap().trace);
+        assert!(!registry.is_implemented("kernel32.dll", "LSTRCPY"));
+        assert!(
+            registry
+                .exports("kernel32.dll")
+                .iter()
+                .any(|name| name == "lstrcpy")
+        );
+        assert!(registry.signature_conflicts().is_empty());
+    }
+
+    #[test]
+    fn explicit_alias_implementation_takes_precedence() {
+        let mut registry = registry();
+        registry
+            .register_alias("kernel32.dll", "lstrcpy", "lstrcpyA")
+            .unwrap();
+        registry.add_with_data(
+            "kernel32.dll",
+            "lstrcpy",
+            Conv::Stdcall { argc: 2 },
+            |_| Outcome::Return(0),
+            29,
+        );
+        assert_eq!(registry.canonical_name("kernel32.dll", "lstrcpy"), None);
+        assert_eq!(registry.get("kernel32.dll", "lstrcpy").unwrap().data, 29);
+    }
+
+    #[test]
+    fn undeclared_different_encoding_missing_target_and_cycles_are_rejected() {
+        let mut registry = registry();
+        assert!(
+            registry
+                .register_alias("kernel32.dll", "unknown", "lstrcpyA")
+                .is_err()
+        );
+        assert!(
+            registry
+                .register_alias("kernel32.dll", "lstrcpyW", "lstrcpyA")
+                .is_err()
+        );
+        assert!(
+            registry
+                .register_alias("kernel32.dll", "lstrcpy", "lstrcpy")
+                .is_err()
+        );
+        assert!(
+            registry
+                .register_alias("kernel32.dll", "lstrcpy", "lstrcpyW")
+                .is_err()
+        );
+        registry
+            .register_alias("kernel32.dll", "lstrcpy", "lstrcpyA")
+            .unwrap();
+        assert!(
+            registry
+                .register_alias("kernel32.dll", "lstrcpyA", "lstrcpy")
+                .is_err()
+        );
     }
 }
 

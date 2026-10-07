@@ -1,5 +1,7 @@
 # Exact selected registrations outside modules.txt; sources are the same pinned Win32Metadata.
 # destination DLL<TAB>export<TAB>source DLL<TAB>export<TAB>expected x86 stdcall stack words
+# The legacy x86 Kernel32 export shares the ANSI implementation and address.
+kernel32.dll	lstrcpy	kernel32.dll	lstrcpyA	2
 mpr.dll	WNetGetUniversalNameA	mpr.dll	WNetGetUniversalNameA	4
 mpr.dll	WNetGetUniversalNameW	mpr.dll	WNetGetUniversalNameW	4
 ntdll.dll	RtlFreeUnicodeString	ntdll.dll	RtlFreeUnicodeString	1

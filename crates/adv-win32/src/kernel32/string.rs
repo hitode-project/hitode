@@ -46,6 +46,8 @@ pub(super) fn register(reg: &mut Registry) {
         put_cstr(e.cpu, d, u32::MAX, &v);
         Outcome::Return(d)
     });
+    reg.register_alias(K32, "lstrcpy", "lstrcpyA")
+        .expect("SDK-declared legacy ANSI alias");
     stdcall(reg, K32, "lstrcpyW", 2, |e| {
         let (d, s) = (e.arg(0), e.arg(1));
         let v = wstr(e.cpu, s);
