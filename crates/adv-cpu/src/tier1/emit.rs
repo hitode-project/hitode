@@ -30,8 +30,9 @@ pub(super) struct Helpers {
     /// `(frame, address, kind) -> value | status << 32`, where kind is the
     /// width in bytes plus `SIGNED`; nonzero status means nothing was read.
     pub load: u64,
-    /// `(frame, address, value, width) -> 0` to continue, 1 after a store that
-    /// must leave native code, 2 when not performed.
+    /// `(frame, address, value, kind) -> 0` to continue, 1 after a store that
+    /// must leave native code, 2 when refused. Kind is width plus CHECK_WRITE
+    /// for permission-only probes, which return 0 without writing.
     pub store: u64,
 }
 

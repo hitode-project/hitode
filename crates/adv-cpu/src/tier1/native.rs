@@ -92,6 +92,7 @@ extern "C" fn load(entry: *mut Entry, address: u32, kind: u32) -> u64 {
 
 /// Checked 1/2/4-byte guest store without leaving native code. A store to
 /// executable memory or one that advances the epoch asks the code to leave.
+/// CHECK_WRITE probes only validate permission, matching zero-count shifts.
 extern "C" fn store(entry: *mut Entry, address: u32, value: u32, kind: u32) -> u32 {
     // SAFETY: as for `load`.
     let (memory, inline) = unsafe { (&mut *(*entry).memory, &mut (*entry).inline) };
