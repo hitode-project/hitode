@@ -16,6 +16,7 @@ pub(crate) use file_mapping::prune as prune_file_mappings;
 pub use handle::ProcessHandle;
 mod memory;
 pub(crate) use memory::protect_memory;
+pub(crate) use memory::{allocate_memory, allocation_extent, free_memory, memory_span};
 mod module;
 pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread};
 pub(crate) use module::{find_resource_data, int_or_str, res_id};

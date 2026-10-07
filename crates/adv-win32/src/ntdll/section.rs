@@ -1,6 +1,6 @@
 //! NT section calls share kernel32's backing objects, views and page coherence.
 use crate::kernel32::file_mapping;
-use adv_abi::{Registry, guest::check_range};
+use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
@@ -177,6 +177,150 @@ fn close(env: &mut Env<'_>) -> Outcome {
     let handle = env.arg(0);
     Outcome::Return(super::file::close(env, adv_abi::Handle(handle)) as u32)
 }
+fn vm_process(env: &mut Env<'_>, handle: u32, api: &str) -> Result<(), u32> {
+    if let Some(adv_machine::Object::Process { identity, access }) = env.sys.objects.get(handle) {
+        if access & 8 == 0 {
+            return Err(0xc0000022); // STATUS_ACCESS_DENIED
+        }
+        if identity.pid != env.sys.pid {
+            adv_abi::warn_unavailable(env, api, "remote NT virtual memory is not modeled");
+            return Err(0xc0000002);
+        }
+    }
+    if !super::current_process(env, handle) {
+        return Err(0xc0000008);
+    }
+    Ok(())
+}
+#[win32(ntdll, name = "NtAllocateVirtualMemory", level = implement)]
+fn allocate(
+    env: &mut Env<'_>,
+    process: Handle,
+    base: GuestPtr<u32>,
+    zero: u32,
+    size: GuestPtr<u32>,
+    flags: u32,
+    protection: u32,
+) -> i32 {
+    let (process, base, size) = (process.0, base.addr(), size.addr());
+    let result = (|| -> Result<(), u32> {
+        vm_process(env, process, "ntdll.dll!NtAllocateVirtualMemory")?;
+        for pointer in [base, size] {
+            check_range(env.cpu, pointer, 4, Prot::RW).map_err(|_| 0xc0000005u32)?;
+        }
+        if zero != 0 {
+            adv_abi::warn_unavailable(
+                env,
+                "ntdll.dll!NtAllocateVirtualMemory",
+                "ZeroBits allocation constraints are not modeled",
+            );
+            return Err(0xc0000002);
+        }
+        // Private allocations cannot use copy-on-write protection. Valid
+        // modifiers requiring additional semantics remain an explicit gap.
+        if protection & 0x700 != 0 && matches!(protection & !0x700, 2 | 4 | 0x10 | 0x20 | 0x40) {
+            adv_abi::warn_unavailable(
+                env,
+                "ntdll.dll!NtAllocateVirtualMemory",
+                "page protection modifiers are not modeled",
+            );
+            return Err(0xc0000002);
+        }
+        if !matches!(protection, 1 | 2 | 4 | 0x10 | 0x20 | 0x40) {
+            return Err(0xc0000045); // STATUS_INVALID_PAGE_PROTECTION
+        }
+        let address = env.cpu.read_u32(base).map_err(|_| 0xc0000005u32)?;
+        let count = env.cpu.read_u32(size).map_err(|_| 0xc0000005u32)?;
+        let (page, length) =
+            crate::kernel32::memory_span(address, count).map_err(|error| status(error.code))?;
+        let allocated = crate::kernel32::allocate_memory(env, address, count, flags, protection)
+            .map_err(|error| status(error.code))?;
+        // Explicit reservations include the bytes between the granule-rounded
+        // base and the requested first page. Commits round only to pages.
+        let length = if address == 0 {
+            length
+        } else {
+            page + length - allocated
+        };
+        env.cpu
+            .write_u32(base, allocated)
+            .map_err(|_| 0xc0000005u32)?;
+        env.cpu.write_u32(size, length).map_err(|_| 0xc0000005u32)?;
+        Ok(())
+    })();
+    result.err().unwrap_or(0) as i32
+}
+#[win32(ntdll, name = "ZwAllocateVirtualMemory", level = implement)]
+fn zw_allocate(
+    env: &mut Env<'_>,
+    process: Handle,
+    base: GuestPtr<u32>,
+    zero: u32,
+    size: GuestPtr<u32>,
+    flags: u32,
+    protection: u32,
+) -> i32 {
+    allocate(env, process, base, zero, size, flags, protection)
+}
+#[win32(ntdll, name = "NtFreeVirtualMemory", level = implement)]
+fn free(
+    env: &mut Env<'_>,
+    process: Handle,
+    base: GuestPtr<u32>,
+    size: GuestPtr<u32>,
+    flags: u32,
+) -> i32 {
+    let (process, base, size) = (process.0, base.addr(), size.addr());
+    let result = (|| -> Result<(), u32> {
+        vm_process(env, process, "ntdll.dll!NtFreeVirtualMemory")?;
+        for pointer in [base, size] {
+            check_range(env.cpu, pointer, 4, Prot::RW).map_err(|_| 0xc0000005u32)?;
+        }
+        if !matches!(flags, 0x4000 | 0x8000) {
+            return Err(0xc00000f2); // STATUS_INVALID_PARAMETER_4
+        }
+        let address = env.cpu.read_u32(base).map_err(|_| 0xc0000005u32)?;
+        let count = env.cpu.read_u32(size).map_err(|_| 0xc0000005u32)?;
+        let (owner, extent) =
+            crate::kernel32::allocation_extent(env, address).ok_or(0xc00000a0u32)?; // STATUS_MEMORY_NOT_ALLOCATED
+        let (page, length) = if count == 0 {
+            let page = address & !4095;
+            if page != owner {
+                return Err(0xc000009f); // STATUS_FREE_VM_NOT_AT_BASE
+            }
+            (page, extent)
+        } else {
+            crate::kernel32::memory_span(address, count).map_err(|error| status(error.code))?
+        };
+        if flags == 0x8000 && count != 0 {
+            adv_abi::warn_unavailable(
+                env,
+                "ntdll.dll!NtFreeVirtualMemory",
+                "partial reservation release is not modeled",
+            );
+            return Err(0xc0000002);
+        }
+        if u64::from(page) + u64::from(length) > u64::from(owner) + u64::from(extent) {
+            return Err(0xc000001a); // STATUS_UNABLE_TO_FREE_VM
+        }
+        crate::kernel32::free_memory(env, page, if count == 0 { 0 } else { length }, flags)
+            .map_err(|error| status(error.code))?;
+        env.cpu.write_u32(base, page).map_err(|_| 0xc0000005u32)?;
+        env.cpu.write_u32(size, length).map_err(|_| 0xc0000005u32)?;
+        Ok(())
+    })();
+    result.err().unwrap_or(0) as i32
+}
+#[win32(ntdll, name = "ZwFreeVirtualMemory", level = implement)]
+fn zw_free(
+    env: &mut Env<'_>,
+    process: Handle,
+    base: GuestPtr<u32>,
+    size: GuestPtr<u32>,
+    flags: u32,
+) -> i32 {
+    free(env, process, base, size, flags)
+}
 fn protect(env: &mut Env<'_>) -> Outcome {
     let (process, base, size, protection, old) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
@@ -211,6 +355,10 @@ fn protect(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(result.err().unwrap_or(0))
 }
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(allocate_ABI);
+    reg.register(zw_allocate_ABI);
+    reg.register(free_ABI);
+    reg.register(zw_free_ABI);
     for name in ["NtCreateSection", "ZwCreateSection"] {
         crate::stdcall(reg, "ntdll.dll", name, 7, create);
     }
