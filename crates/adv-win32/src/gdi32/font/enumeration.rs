@@ -333,14 +333,8 @@ fn put_string(codec: adv_os::nls::Codec, bytes: &mut [u8], text: &str, wide: boo
         at += encoded.len();
     }
 }
-fn pack(
-    env: &Env<'_>,
-    font: &EnumeratedFont,
-    wide: bool,
-    mode: FontEnumeration,
-) -> [u8; SCRATCH as usize] {
-    let mut bytes = [0; SCRATCH as usize];
-    let request = &font.font;
+pub(super) fn pack_logfont(env: &Env<'_>, request: &FontRequest, wide: bool) -> [u8; 92] {
+    let mut bytes = [0; 92];
     for (i, value) in [
         request.height,
         request.width,
@@ -399,6 +393,19 @@ fn pack(
     let codec = env.ext.get::<Win32>().codec;
     let unit = if wide { 2 } else { 1 };
     put_string(codec, &mut bytes[28..28 + 32 * unit], &request.face, wide);
+    bytes
+}
+fn pack(
+    env: &Env<'_>,
+    font: &EnumeratedFont,
+    wide: bool,
+    mode: FontEnumeration,
+) -> [u8; SCRATCH as usize] {
+    let mut bytes = [0; SCRATCH as usize];
+    let logical = pack_logfont(env, &font.font, wide);
+    let codec = env.ext.get::<Win32>().codec;
+    let unit = if wide { 2 } else { 1 };
+    bytes[..28 + 32 * unit].copy_from_slice(&logical[..28 + 32 * unit]);
     if mode != FontEnumeration::Faces {
         put_string(
             codec,

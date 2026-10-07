@@ -295,6 +295,12 @@ fn duplicate_handle(env: &mut Env<'_>) -> Outcome {
             if out == 0 {
                 return Ok(0);
             }
+            if !same && let Some(result) = crate::advapi32::token::duplicate(env, source, desired) {
+                let handle = result
+                    .map_err(|code| processes::Error::new(code, "token duplication failed"))?;
+                set_inherit(env, handle, inherit);
+                return Ok(handle);
+            }
             // Keep aliases for ordinary local kernel payloads. Identity objects
             // receive an independent access mask when rights are restricted.
             if same

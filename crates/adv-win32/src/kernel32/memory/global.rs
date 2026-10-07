@@ -73,7 +73,7 @@ fn global_alloc(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
 fn local_alloc(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
     allocate_front(env, flags, size)
 }
-fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
+pub(crate) fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
     if flags & !0x7f72 != 0 {
         return error(env, 87, 0);
     }

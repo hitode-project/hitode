@@ -614,3 +614,54 @@ fn datafile_shrink_rejection_keeps_raw_mapping_length_identity_and_base_bytes() 
     assert_eq!(std::fs::read(root.join("game/raw.dll")).unwrap(), bytes);
     assert!(!root.join("data/overlay/raw.dll").exists());
 }
+
+#[test]
+fn short_paths_without_aliases_keep_guest_names_and_buffer_contracts() {
+    let (mut machine, root) = fixture("short-names");
+    let name = "漢字 long name.txt";
+    std::fs::write(root.join("game").join(name), b"x").unwrap();
+    let units: Vec<_> = name.encode_utf16().chain([0]).collect();
+    machine.cpu.write_u32(0x410000, 0xaabbccdd).unwrap();
+    assert_eq!(
+        path::alias_path(&mut env(&mut machine), name, 0, 0, true, false).unwrap(),
+        units.len() as u32
+    );
+    assert_eq!(
+        path::alias_path(&mut env(&mut machine), name, 0x410000, 1, true, false).unwrap(),
+        units.len() as u32
+    );
+    assert_eq!(machine.cpu.read_u32(0x410000).unwrap(), 0xaabbccdd);
+    assert_eq!(
+        path::alias_path(
+            &mut env(&mut machine),
+            name,
+            0x410000,
+            units.len() as u32,
+            true,
+            false
+        )
+        .unwrap(),
+        units.len() as u32 - 1
+    );
+    for (index, unit) in units.iter().enumerate() {
+        assert_eq!(
+            machine.cpu.read_u16(0x410000 + index as u32 * 2).unwrap(),
+            *unit
+        );
+    }
+    assert_eq!(
+        path::alias_path(
+            &mut env(&mut machine),
+            "missing.txt",
+            0x410000,
+            1024,
+            true,
+            false
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut machine)), 2);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}

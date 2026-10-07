@@ -3486,6 +3486,9 @@ msacm32.dll	acmStreamPrepareHeader	stdcall	u32	u32	has:Windows.Win32.Media.Audio
 msacm32.dll	acmStreamReset	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTREAM:handle:1|fdwReset:u32:u32:1
 msacm32.dll	acmStreamSize	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTREAM:handle:1|cbInput:u32:u32:1|pdwOutputBytes:u32*:ptr:1|fdwSize:u32:u32:1
 msacm32.dll	acmStreamUnprepareHeader	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTREAM:handle:1|pash:Windows.Win32.Media.Audio.ACMSTREAMHEADER*:ptr:1|fdwUnprepare:u32:u32:1
+msimg32.dll	AlphaBlend	stdcall	i32	Windows.Win32.Foundation.BOOL	hdcDest:Windows.Win32.Graphics.Gdi.HDC:handle:1|xoriginDest:i32:i32:1|yoriginDest:i32:i32:1|wDest:i32:i32:1|hDest:i32:i32:1|hdcSrc:Windows.Win32.Graphics.Gdi.HDC:handle:1|xoriginSrc:i32:i32:1|yoriginSrc:i32:i32:1|wSrc:i32:i32:1|hSrc:i32:i32:1|ftn:Windows.Win32.Graphics.Gdi.BLENDFUNCTION:aggregate:1
+msimg32.dll	GradientFill	stdcall	i32	Windows.Win32.Foundation.BOOL	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1|pVertex:Windows.Win32.Graphics.Gdi.TRIVERTEX*:ptr:1|nVertex:u32:u32:1|pMesh:void*:ptr:1|nMesh:u32:u32:1|ulMode:Windows.Win32.Graphics.Gdi.GRADIENT_FILL:u32:1
+msimg32.dll	TransparentBlt	stdcall	i32	Windows.Win32.Foundation.BOOL	hdcDest:Windows.Win32.Graphics.Gdi.HDC:handle:1|xoriginDest:i32:i32:1|yoriginDest:i32:i32:1|wDest:i32:i32:1|hDest:i32:i32:1|hdcSrc:Windows.Win32.Graphics.Gdi.HDC:handle:1|xoriginSrc:i32:i32:1|yoriginSrc:i32:i32:1|wSrc:i32:i32:1|hSrc:i32:i32:1|crTransparent:u32:u32:1
 msvcr80.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr80.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
 msvcr80.dll	_CIcos	cdecl	void	void	
@@ -3797,6 +3800,7 @@ ntdll.dll	ZwAllocateVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	
 ntdll.dll	ZwClose	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	ZwCreateFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1
 ntdll.dll	ZwFreeVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|RegionSize:usize*:ptr:1|FreeType:u32:u32:1
+ntdll.dll	ZwOpenKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1
 ntdll.dll	ZwQueryInformationFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1
 ntdll.dll	ZwReadFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|Buffer:void*:ptr:1|Length:u32:u32:1|ByteOffset:LARGE_INTEGER*:ptr:1|Key:u32*:ptr:1
 ntdll.dll	ZwSetInformationFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1
@@ -4119,6 +4123,24 @@ ole32.dll	StringFromIID	stdcall	i32	Windows.Win32.Foundation.HRESULT	rclsid:Syst
 ole32.dll	WriteClassStg	stdcall	i32	Windows.Win32.Foundation.HRESULT	pStg:Windows.Win32.System.Com.StructuredStorage.IStorage:ptr:1|rclsid:System.Guid*:ptr:1
 ole32.dll	WriteClassStm	stdcall	i32	Windows.Win32.Foundation.HRESULT	pStm:Windows.Win32.System.Com.IStream:ptr:1|rclsid:System.Guid*:ptr:1
 ole32.dll	WriteFmtUserTypeStg	stdcall	i32	Windows.Win32.Foundation.HRESULT	pstg:Windows.Win32.System.Com.StructuredStorage.IStorage:ptr:1|cf:u16:u32:1|lpszUserType:Windows.Win32.Foundation.PWSTR:str16:1
+oleacc.dll	AccNotifyTouchInteraction	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwndApp:Windows.Win32.Foundation.HWND:handle:1|hwndTarget:Windows.Win32.Foundation.HWND:handle:1|ptTarget:Windows.Win32.Foundation.POINT:aggregate:2
+oleacc.dll	AccSetRunningUtilityState	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwndApp:Windows.Win32.Foundation.HWND:handle:1|dwUtilityStateMask:u32:u32:1|dwUtilityState:Windows.Win32.UI.Accessibility.ACC_UTILITY_STATE_FLAGS:u32:1
+oleacc.dll	AccessibleChildren	stdcall	i32	Windows.Win32.Foundation.HRESULT	paccContainer:Windows.Win32.UI.Accessibility.IAccessible:ptr:1|iChildStart:i32:i32:1|cChildren:i32:i32:1|rgvarChildren:Windows.Win32.System.Variant.VARIANT*:ptr:1|pcObtained:i32*:ptr:1
+oleacc.dll	AccessibleObjectFromEvent	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwnd:Windows.Win32.Foundation.HWND:handle:1|dwId:u32:u32:1|dwChildId:u32:u32:1|ppacc:Windows.Win32.UI.Accessibility.IAccessible*:ptr:1|pvarChild:Windows.Win32.System.Variant.VARIANT*:ptr:1
+oleacc.dll	AccessibleObjectFromPoint	stdcall	i32	Windows.Win32.Foundation.HRESULT	ptScreen:Windows.Win32.Foundation.POINT:aggregate:2|ppacc:Windows.Win32.UI.Accessibility.IAccessible*:ptr:1|pvarChild:Windows.Win32.System.Variant.VARIANT*:ptr:1
+oleacc.dll	AccessibleObjectFromWindow	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwnd:Windows.Win32.Foundation.HWND:handle:1|dwId:u32:u32:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+oleacc.dll	CreateStdAccessibleObject	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwnd:Windows.Win32.Foundation.HWND:handle:1|idObject:i32:i32:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+oleacc.dll	CreateStdAccessibleProxyA	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwnd:Windows.Win32.Foundation.HWND:handle:1|pClassName:Windows.Win32.Foundation.PSTR:str8:1|idObject:i32:i32:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+oleacc.dll	CreateStdAccessibleProxyW	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwnd:Windows.Win32.Foundation.HWND:handle:1|pClassName:Windows.Win32.Foundation.PWSTR:str16:1|idObject:i32:i32:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+oleacc.dll	GetOleaccVersionInfo	stdcall	void	void	pVer:u32*:ptr:1|pBuild:u32*:ptr:1
+oleacc.dll	GetProcessHandleFromHwnd	stdcall	handle	Windows.Win32.Foundation.HANDLE	hwnd:Windows.Win32.Foundation.HWND:handle:1
+oleacc.dll	GetRoleTextA	stdcall	u32	u32	lRole:u32:u32:1|lpszRole:Windows.Win32.Foundation.PSTR:str8:1|cchRoleMax:u32:u32:1
+oleacc.dll	GetRoleTextW	stdcall	u32	u32	lRole:u32:u32:1|lpszRole:Windows.Win32.Foundation.PWSTR:str16:1|cchRoleMax:u32:u32:1
+oleacc.dll	GetStateTextA	stdcall	u32	u32	lStateBit:u32:u32:1|lpszState:Windows.Win32.Foundation.PSTR:str8:1|cchState:u32:u32:1
+oleacc.dll	GetStateTextW	stdcall	u32	u32	lStateBit:u32:u32:1|lpszState:Windows.Win32.Foundation.PWSTR:str16:1|cchState:u32:u32:1
+oleacc.dll	LresultFromObject	stdcall	i32	Windows.Win32.Foundation.LRESULT	riid:System.Guid*:ptr:1|wParam:Windows.Win32.Foundation.WPARAM:u32:1|punk:Windows.Win32.System.Com.IUnknown:ptr:1
+oleacc.dll	ObjectFromLresult	stdcall	i32	Windows.Win32.Foundation.HRESULT	lResult:Windows.Win32.Foundation.LRESULT:i32:1|riid:System.Guid*:ptr:1|wParam:Windows.Win32.Foundation.WPARAM:u32:1|ppvObject:void**:ptr:1
+oleacc.dll	WindowFromAccessibleObject	stdcall	i32	Windows.Win32.Foundation.HRESULT	param0:Windows.Win32.UI.Accessibility.IAccessible:ptr:1|phwnd:Windows.Win32.Foundation.HWND*:ptr:1
 oleaut32.dll	BSTR_UserFree	stdcall	void	void	param0:u32*:ptr:1|param1:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	BSTR_UserFree64	stdcall	void	void	param0:u32*:ptr:1|param1:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	BSTR_UserMarshal	stdcall	ptr	u8*	param0:u32*:ptr:1|param1:u8*:ptr:1|param2:Windows.Win32.Foundation.BSTR*:ptr:1

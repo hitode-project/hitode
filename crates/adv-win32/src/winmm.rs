@@ -21,6 +21,7 @@ const WORKER: &str = "__pal_multimedia_timer_worker";
 mod joystick;
 mod mci;
 mod midi;
+mod sound;
 mod timer;
 mod wave_out;
 use timer::{Entry, Queue, Timer};
@@ -39,6 +40,7 @@ pub fn register(registry: &mut Registry) {
     mci::register(registry);
     joystick::register(registry);
     midi::register(registry);
+    sound::register(registry);
     for (name, argc, handler) in [
         ("timeGetDevCaps", 2, caps as adv_machine::Handler),
         ("timeGetTime", 0, get_time),
