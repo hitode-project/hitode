@@ -6,8 +6,8 @@ use adv_machine::Env;
 mod binary;
 mod effect;
 mod matrix_stack;
-mod texture;
 mod preshader;
+mod texture;
 
 type Matrix = [f32; 16];
 type Vector = [f32; 3];

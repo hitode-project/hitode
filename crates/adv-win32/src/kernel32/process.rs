@@ -342,7 +342,9 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     } else {
         match env.cpu.read_u32(record) {
             Ok(code) => code,
-            Err(error) => return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}")),
+            Err(error) => {
+                return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}"));
+            }
         }
     };
     let heaps = env.ext.get_mut::<Heaps>();
@@ -383,11 +385,7 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     for (off, v) in regs {
         let _ = env.cpu.write_u32(c + off, v);
     }
-    let active = super::exception::phase::enter(
-        env,
-        super::exception::phase::Phase::Unwind,
-        code,
-    );
+    let active = super::exception::phase::enter(env, super::exception::phase::Phase::Unwind, code);
     unwind_step(
         env,
         Unwind {

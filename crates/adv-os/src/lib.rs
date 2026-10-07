@@ -11,16 +11,16 @@
 //!   [`vfs::FileObj`] in the machine's handle table, so any personality can reach both.
 //! * [`gdi`] is the device-context table that GDI and DirectDraw share.
 
+pub mod clipboard;
 pub mod com;
 pub mod gdi;
 pub mod global;
-pub mod clipboard;
 pub mod heap;
 pub mod loader;
 pub mod module;
 pub mod nls;
-pub mod processor;
 pub mod processes;
+pub mod processor;
 pub mod registry;
 pub mod synthetic;
 pub mod system_files;

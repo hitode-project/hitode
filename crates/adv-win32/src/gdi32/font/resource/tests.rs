@@ -236,18 +236,33 @@ mod windows {
             // Different valid modes cannot consume this hidden reference.
             for flags in [0, FR_PRIVATE, FR_NOT_ENUM] {
                 assert_eq!(
-                    invoke_flags(&mut machine, "RemoveFontResourceExW", Some("Fonts/字形.ttf"), flags, 0),
+                    invoke_flags(
+                        &mut machine,
+                        "RemoveFontResourceExW",
+                        Some("Fonts/字形.ttf"),
+                        flags,
+                        0
+                    ),
                     0
                 );
             }
             for name in ["AddFontResourceExW", "RemoveFontResourceExW"] {
-                assert_eq!(invoke_flags(&mut machine, name, Some("Fonts/字形.ttf"), 0x40, 0), 0);
+                assert_eq!(
+                    invoke_flags(&mut machine, name, Some("Fonts/字形.ttf"), 0x40, 0),
+                    0
+                );
             }
             // The native oracle also accepts nonzero reserved values without
             // dereferencing them; it shares the same path/flags reference.
             for name in ["AddFontResourceExW", "RemoveFontResourceExW"] {
                 assert_eq!(
-                    invoke_flags(&mut machine, name, Some("Fonts/字形.ttf"), PRIVATE_HIDDEN, 1),
+                    invoke_flags(
+                        &mut machine,
+                        name,
+                        Some("Fonts/字形.ttf"),
+                        PRIVATE_HIDDEN,
+                        1
+                    ),
                     1
                 );
             }

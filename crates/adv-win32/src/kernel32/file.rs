@@ -13,9 +13,9 @@ use crate::util::{
 };
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
+mod attributes;
 mod path;
 mod profile;
-mod attributes;
 #[cfg(test)]
 mod tests;
 
@@ -1013,7 +1013,11 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     let file = profile_path(env, env.arg(3));
     let mut ini = match read_contents(env, &file) {
         Ok(bytes) if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) => {
-            adv_abi::warn_unavailable(env, "kernel32.dll!WritePrivateProfileStringA", "Unicode profile-file writes are unavailable; preserving the existing encoded file");
+            adv_abi::warn_unavailable(
+                env,
+                "kernel32.dll!WritePrivateProfileStringA",
+                "Unicode profile-file writes are unavailable; preserving the existing encoded file",
+            );
             set_last_error(env, 50);
             return Outcome::Return(0);
         }

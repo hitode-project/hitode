@@ -629,7 +629,10 @@ mod tests {
         let mut builder = Builder::new(WakeEvent::new().unwrap()).unwrap();
         let sender = builder.sender(1, 1).unwrap();
         assert_eq!(sender.work_policy(), WorkPolicy::default());
-        let _service = builder.with_work_policy(WorkPolicy::responsive(128)).start().unwrap();
+        let _service = builder
+            .with_work_policy(WorkPolicy::responsive(128))
+            .start()
+            .unwrap();
         assert_eq!(sender.work_policy().background_limit(), Some(128));
     }
 

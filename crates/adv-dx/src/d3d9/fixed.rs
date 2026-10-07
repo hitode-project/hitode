@@ -1049,7 +1049,10 @@ fn prepare_input_checked(
             ];
         }
         let uv = layout.uv.map_or([0.; 2], |at| {
-            [float(layout.streams[2], at), float(layout.streams[2], at + 4)]
+            [
+                float(layout.streams[2], at),
+                float(layout.streams[2], at + 4),
+            ]
         });
         if uv.iter().any(|v| !v.is_finite()) {
             return Err(rejected(

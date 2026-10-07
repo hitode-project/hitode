@@ -8,12 +8,12 @@ use adv_machine::{Env, Outcome};
 
 use crate::Win32;
 
-pub mod font;
 mod batch;
+pub mod font;
 mod palette;
 mod pen;
-mod readback;
 pub mod raster;
+mod readback;
 
 #[cfg(test)]
 mod object_tests {
@@ -234,7 +234,9 @@ fn create_brush_indirect(env: &mut Env<'_>, plbrush: GuestPtr<()>) -> Outcome {
     if plbrush.is_null() {
         return Outcome::Return(0);
     }
-    if adv_abi::guest::check_range(env.cpu, plbrush.addr(), 12, adv_cpu::backend::Prot::READ).is_err() {
+    if adv_abi::guest::check_range(env.cpu, plbrush.addr(), 12, adv_cpu::backend::Prot::READ)
+        .is_err()
+    {
         return Outcome::Return(0);
     }
     let style = env.cpu.read_u32(plbrush.addr()).unwrap_or(0);
@@ -633,7 +635,9 @@ fn move_to_ex(
         return Outcome::Return(0);
     };
     if !lppt.is_null() {
-        if adv_abi::guest::check_range(env.cpu, lppt.addr(), 8, adv_cpu::backend::Prot::WRITE).is_err() {
+        if adv_abi::guest::check_range(env.cpu, lppt.addr(), 8, adv_cpu::backend::Prot::WRITE)
+            .is_err()
+        {
             return Outcome::Return(0);
         }
         let _ = lppt.write(env.cpu, adv_abi::types::POINT { x: 0, y: 0 });
@@ -659,7 +663,9 @@ fn get_current_position_ex(
         return Outcome::Return(0);
     };
     if !lppt.is_null() {
-        if adv_abi::guest::check_range(env.cpu, lppt.addr(), 8, adv_cpu::backend::Prot::WRITE).is_err() {
+        if adv_abi::guest::check_range(env.cpu, lppt.addr(), 8, adv_cpu::backend::Prot::WRITE)
+            .is_err()
+        {
             return Outcome::Return(0);
         }
         let _ = lppt.write(env.cpu, adv_abi::types::POINT { x: 0, y: 0 });
@@ -802,7 +808,10 @@ fn set_di_bits(
             let mut src_pixels = vec![0u8; (copy_w * 3) as usize];
             if env.cpu.read(src_line_addr, &mut src_pixels).is_ok() {
                 let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
-                for (s_pix, d_pix) in src_pixels.chunks_exact(3).zip(dst_pixels.chunks_exact_mut(4)) {
+                for (s_pix, d_pix) in src_pixels
+                    .chunks_exact(3)
+                    .zip(dst_pixels.chunks_exact_mut(4))
+                {
                     d_pix[0] = s_pix[0];
                     d_pix[1] = s_pix[1];
                     d_pix[2] = s_pix[2];
@@ -832,12 +841,23 @@ fn set_di_bits(
             if env.cpu.read(src_line_addr, &mut src_words).is_ok() {
                 let mut dst_pixels = vec![0u8; (copy_w * 4) as usize];
                 let is_565 = bi_compression == 3;
-                for (s_pix, d_pix) in src_words.chunks_exact(2).zip(dst_pixels.chunks_exact_mut(4)) {
+                for (s_pix, d_pix) in src_words
+                    .chunks_exact(2)
+                    .zip(dst_pixels.chunks_exact_mut(4))
+                {
                     let w = u16::from_le_bytes([s_pix[0], s_pix[1]]);
                     let (r, g, b) = if is_565 {
-                        (((w >> 11) & 0x1f) * 255 / 31, ((w >> 5) & 0x3f) * 255 / 63, (w & 0x1f) * 255 / 31)
+                        (
+                            ((w >> 11) & 0x1f) * 255 / 31,
+                            ((w >> 5) & 0x3f) * 255 / 63,
+                            (w & 0x1f) * 255 / 31,
+                        )
                     } else {
-                        (((w >> 10) & 0x1f) * 255 / 31, ((w >> 5) & 0x1f) * 255 / 31, (w & 0x1f) * 255 / 31)
+                        (
+                            ((w >> 10) & 0x1f) * 255 / 31,
+                            ((w >> 5) & 0x1f) * 255 / 31,
+                            (w & 0x1f) * 255 / 31,
+                        )
                     };
                     d_pix[0] = b as u8;
                     d_pix[1] = g as u8;
@@ -852,7 +872,10 @@ fn set_di_bits(
             let mut src_pixels = vec![0u8; (copy_w * 4) as usize];
             if env.cpu.read(src_line_addr, &mut src_pixels).is_ok() {
                 let mut dst_pixels = vec![0u8; (copy_w * 3) as usize];
-                for (s_pix, d_pix) in src_pixels.chunks_exact(4).zip(dst_pixels.chunks_exact_mut(3)) {
+                for (s_pix, d_pix) in src_pixels
+                    .chunks_exact(4)
+                    .zip(dst_pixels.chunks_exact_mut(3))
+                {
                     d_pix[0] = s_pix[0];
                     d_pix[1] = s_pix[1];
                     d_pix[2] = s_pix[2];

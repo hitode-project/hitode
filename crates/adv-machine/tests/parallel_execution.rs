@@ -97,7 +97,9 @@ fn finish(m: &mut Machine<JitCpu>) {
             "parallel scheduler failed to progress"
         );
         match m.run_slice(Duration::from_millis(8)) {
-            SliceResult::Complete(RunResult::HostRequest) => panic!("unexpected process service request"),
+            SliceResult::Complete(RunResult::HostRequest) => {
+                panic!("unexpected process service request")
+            }
             SliceResult::Complete(RunResult::Exited(_)) => break,
             SliceResult::Complete(RunResult::Failed(error)) => panic!("{error:?}"),
             SliceResult::Complete(RunResult::Idle { .. }) => {

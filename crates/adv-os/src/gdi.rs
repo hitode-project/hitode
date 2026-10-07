@@ -2,8 +2,8 @@
 //! DirectDraw surface lends one out between `GetDC` and `ReleaseDC`, so both fronts use this
 //! one process object. Ids come from the surface store, which numbers surfaces and DCs together.
 use adv_machine::Objects;
-mod objects;
 mod clip;
+mod objects;
 pub use clip::DcClip;
 pub use objects::{DcModes, DcState, Gdi, GdiObj, LogFont, stock_object};
 

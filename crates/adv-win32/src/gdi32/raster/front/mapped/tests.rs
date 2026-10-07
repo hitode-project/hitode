@@ -2,11 +2,11 @@ use super::super::tests::{invoke, memory};
 use super::*;
 use crate::kernel32::file_mapping::{create_section, map_section};
 use adv_cpu::{
-    backend::{Backend, Reg},
     JitCpu,
+    backend::{Backend, Reg},
 };
 use adv_device::surface::Snapshot;
-use adv_machine::{layout::PARK_ADDR, Clock, Machine, ObjectLimits};
+use adv_machine::{Clock, Machine, ObjectLimits, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
 
 fn env<B: Backend>(m: &mut Machine<B>) -> Env<'_> {
@@ -234,7 +234,7 @@ fn native_mapped_dib_preserves_shared_bytes_and_survives_view_and_handle_close()
             name: *const u16,
         ) -> usize;
         fn MapViewOfFile(section: usize, access: u32, high: u32, low: u32, bytes: usize)
-            -> *mut u8;
+        -> *mut u8;
         fn UnmapViewOfFile(view: *const u8) -> i32;
         fn CloseHandle(handle: usize) -> i32;
     }

@@ -13,8 +13,8 @@ use std::time::SystemTime;
 
 use crate::OsConfig;
 
-mod portable_saves;
 mod attributes;
+mod portable_saves;
 mod section;
 mod stream;
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};

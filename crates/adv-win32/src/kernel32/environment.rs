@@ -33,7 +33,9 @@ fn initialize(env: &mut Env<'_>) {
         return;
     }
     let mut state = Environment::default();
-    let entries = env.ext.try_get::<adv_os::processes::Parameters>()
+    let entries = env
+        .ext
+        .try_get::<adv_os::processes::Parameters>()
         .map(|p| p.environment.clone())
         .unwrap_or_else(|| super::process::environment(env.ext.get::<Win32>()));
     for entry in entries {

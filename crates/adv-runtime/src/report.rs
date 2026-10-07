@@ -65,24 +65,50 @@ impl<B: Backend> Runtime<B> {
 
     pub fn api_acceptance_eligible(&self) -> bool {
         self.selected_api_acceptance_eligible()
-            && self.family.records.iter().all(|p| p.acceptance_eligible && p.failure.is_none())
+            && self
+                .family
+                .records
+                .iter()
+                .all(|p| p.acceptance_eligible && p.failure.is_none())
             && self.family.parked.values().all(|machine| {
-                let registry = (machine.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<adv_abi::Registry>().unwrap();
+                let registry = (machine.sys.thunks.resolver() as &dyn std::any::Any)
+                    .downcast_ref::<adv_abi::Registry>()
+                    .unwrap();
                 registry.mode() == adv_abi::RunMode::Strict
                     && registry.signature_conflicts().is_empty()
-                    && machine.ext.try_get::<adv_abi::ApiDiagnostics>().is_none_or(|d| d.stub_calls == 0)
-                    && machine.sys.recent.iter().all(|(_, thunk, _)| machine.sys.thunks.get(*thunk).implemented)
+                    && machine
+                        .ext
+                        .try_get::<adv_abi::ApiDiagnostics>()
+                        .is_none_or(|d| d.stub_calls == 0)
+                    && machine
+                        .sys
+                        .recent
+                        .iter()
+                        .all(|(_, thunk, _)| machine.sys.thunks.get(*thunk).implemented)
             })
     }
 
     pub fn missing_apis(&self) -> Vec<String> {
-        let mut missing: std::collections::BTreeSet<_> = self.selected_missing_apis().into_iter().collect();
-        for record in &self.family.records { missing.extend(record.missing_apis.iter().cloned()); }
+        let mut missing: std::collections::BTreeSet<_> =
+            self.selected_missing_apis().into_iter().collect();
+        for record in &self.family.records {
+            missing.extend(record.missing_apis.iter().cloned());
+        }
         for machine in self.family.parked.values() {
-            let called: std::collections::BTreeSet<_> = machine.sys.recent.iter().map(|(_, thunk, _)| *thunk).collect();
-            missing.extend(machine.sys.thunks.iter()
-                .filter(|(index, t)| !t.implemented && (t.requested || called.contains(index)))
-                .map(|(_, t)| format!("{}!{}", t.module, t.name)));
+            let called: std::collections::BTreeSet<_> = machine
+                .sys
+                .recent
+                .iter()
+                .map(|(_, thunk, _)| *thunk)
+                .collect();
+            missing.extend(
+                machine
+                    .sys
+                    .thunks
+                    .iter()
+                    .filter(|(index, t)| !t.implemented && (t.requested || called.contains(index)))
+                    .map(|(_, t)| format!("{}!{}", t.module, t.name)),
+            );
         }
         missing.into_iter().collect()
     }
@@ -125,8 +151,10 @@ impl<B: Backend> Runtime<B> {
             self.missing_apis().join(", ")
         );
         for process in self.process_statuses() {
-            report.push_str(&format!("\nProcess {} parent {:?}: {}; exit {:?}; failure {:?}",
-                process.pid, process.parent, process.image, process.exit_code, process.failure));
+            report.push_str(&format!(
+                "\nProcess {} parent {:?}: {}; exit {:?}; failure {:?}",
+                process.pid, process.parent, process.image, process.exit_code, process.failure
+            ));
         }
         let user = &self.machine.ext.get::<Win32>().user;
         report.push_str(&format!(
