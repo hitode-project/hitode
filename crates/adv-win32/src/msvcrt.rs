@@ -21,6 +21,7 @@ mod path;
 mod random;
 mod scan;
 mod scalar_float;
+mod scalar_round;
 mod secure_memory;
 mod shared_file;
 mod startup;
@@ -107,6 +108,7 @@ pub fn register(r: &mut Registry) {
     time64::register(r);
     random::register(r);
     scalar_float::register(r);
+    scalar_round::register(r);
     onexit::register(r);
     path::register(r);
     startup::register(r);
@@ -139,8 +141,6 @@ pub fn register(r: &mut Registry) {
         ("__p__fmode", 0),
         ("__p__commode", 0),
         ("qsort", 4),
-        ("floor", 2),
-        ("ceil", 2),
         ("ldexp", 3),
         ("frexp", 3),
         ("_CIpow", 0),
@@ -1776,14 +1776,12 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
         "_XcptFilter" => 1,
         "__setusermatherr" => 0,
-        "floor" | "ceil" | "ldexp" | "frexp" => {
+        "ldexp" | "frexp" => {
             let x = match double(e) {
                 Ok(v) => v,
                 Err(err) => return Outcome::Fail(err),
             };
             let result = match name.as_str() {
-                "floor" => x.floor(),
-                "ceil" => x.ceil(),
                 "ldexp" => scale(x, c as i32),
                 _ => {
                     let (v, exp) = split_fraction(x);
