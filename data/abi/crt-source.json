@@ -282,6 +282,11 @@
     "header_sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490",
     "scope": "Three existing CRT aliases: uintptr_t __cdecl _beginthreadex(void*, unsigned int, _beginthreadex_proc_type, void*, unsigned int, unsigned int*) uses six x86 words and unsigned32 result; void __cdecl _endthreadex(unsigned int) uses one word. The guest start routine is unsigned __stdcall(void*), independently of the CRT export calling convention.",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex",
+    "native_oracle_source_sha256": {
+      "vc90": "1e54b07d3acb4415fd6c7e081d32cc188ea91c434c7a2c7713b6bc5d7c8740e0",
+      "installed_legacy": "afabdb7917c345808d6613ef4483326b09b44961980687413145f1a1954a17fc"
+    },
+    "native_verification": "VC90 success and NULL-entry validation set LastError0; success preserves errno/DOS and NULL invokes the returning invalid handler with errno22 and preserved DOS. Installed legacy MSVCRT success preserves LastError and NULL-entry returns UINTPTR_MAX, sets errno22 and invokes no handler. Authored workers return42 or explicitly end with unsigned0x80000001. Guest profiles retain caller-owned waitable handles; no universal equivalence for other legacy builds or native bad-pointer AV is claimed.",
     "profile": "Reuse the Win32 thread startup/exit, scheduler and handle owners and existing CRT error/TLS cleanup. Unsupported creation flags or stack/security profiles must warn and fail rather than borrow legacy dummy suspend/resume behavior."
   },
   "scalar_fraction_split": {
@@ -289,6 +294,8 @@
     "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
     "scope": "Three existing CRT aliases: double __cdecl modf(double value, double* integer). Exactly three x86 argument words: genuine binary64 input spans two, the output pointer spans one; binary64 fractional return in x87 ST0.",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/modf-modff-modfl",
+    "native_oracle_source_sha256": "11524b6683f573ae2047ebcbf181e021d83e8cb74faa2c8dd0e195a33d5ba084",
+    "native_verification": "Authored VC80/90 38 mathematical rows and two isolated NULL-output fault rows measure signed zero, finite/infinite parts, rounding/control preservation, error-owner preservation and special x87 status. Guest support intentionally fails on NaN/subnormal status profiles; NULL or inaccessible outputs are checked memory faults, without a fabricated invalid-parameter callback.",
     "profile": "Use shared binary64/x87 return and CRT error owners, complete eight-byte integer output preflight and measured special-value/control behavior. Unimplemented exception/status or callback profiles must warn and fail without fabricating a double result."
   },
   "byte_set_scan": {
