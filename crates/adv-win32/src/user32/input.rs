@@ -1,8 +1,111 @@
 //! Queries use the configured guest input profile, never host layout/settings.
-use super::{user, user_mut};
+use super::{User, user, user_mut, window::Rect};
 use crate::util::set_last_error;
 use adv_abi::{AnsiStr, Env, GuestPtr, Handle, Registry, WideStr, win32};
 use adv_cpu::backend::{GuestExt, Prot};
+
+fn display_bounds(user: &User) -> Rect {
+    Rect::new(0, 0, user.screen.0.max(1), user.screen.1.max(1))
+}
+
+fn clip_bounds(user: &User) -> Rect {
+    user.cursor_clip.unwrap_or_else(|| display_bounds(user))
+}
+
+fn intersect_display(user: &User, rect: Rect) -> Option<Rect> {
+    let screen = display_bounds(user);
+    let clipped = Rect {
+        left: rect.left.max(screen.left),
+        top: rect.top.max(screen.top),
+        right: rect.right.min(screen.right),
+        bottom: rect.bottom.min(screen.bottom),
+    };
+    (clipped.left <= clipped.right && clipped.top <= clipped.bottom).then_some(clipped)
+}
+
+/// Keep all guest cursor updates in the same desktop constraint, without
+/// changing the host cursor or the host's clipping rectangle.
+pub(super) fn set_cursor_position(user: &mut User, position: (i32, i32)) -> (i32, i32) {
+    let rect = clip_bounds(user);
+    let coordinate = |value, lower, upper: i32| {
+        if value < lower {
+            lower
+        } else if value >= upper {
+            upper.saturating_sub(1)
+        } else {
+            value
+        }
+    };
+    let screen = display_bounds(user);
+    user.cursor_pos = (
+        coordinate(position.0, rect.left, rect.right).clamp(0, screen.right - 1),
+        coordinate(position.1, rect.top, rect.bottom).clamp(0, screen.bottom - 1),
+    );
+    user.cursor_pos
+}
+
+/// Guest display policy: intersect a retained constraint with the resized
+/// desktop, or release it when disjoint. Never retain an off-desktop position.
+pub(super) fn reconcile_cursor_clip(user: &mut User) {
+    user.cursor_clip = user
+        .cursor_clip
+        .and_then(|rect| intersect_display(user, rect));
+    set_cursor_position(user, user.cursor_pos);
+}
+
+#[win32(user32, name = "GetClipCursor", level = state)]
+fn get_clip_cursor(env: &mut Env<'_>, out: GuestPtr<Rect>) -> i32 {
+    if adv_abi::guest::check_range(env.cpu, out.addr(), 16, Prot::WRITE).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    let rect = clip_bounds(user(env));
+    let fields = [rect.left, rect.top, rect.right, rect.bottom];
+    let mut bytes = [0; 16];
+    for (coordinate, output) in fields.into_iter().zip(bytes.chunks_exact_mut(4)) {
+        output.copy_from_slice(&coordinate.to_le_bytes());
+    }
+    if env.cpu.write(out.addr(), &bytes).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    1
+}
+
+#[win32(user32, name = "ClipCursor", level = state)]
+fn clip_cursor(env: &mut Env<'_>, pointer: GuestPtr<Rect>) -> i32 {
+    let rect = if pointer.is_null() {
+        None
+    } else {
+        if adv_abi::guest::check_range(env.cpu, pointer.addr(), 16, Prot::READ).is_err() {
+            set_last_error(env, 998);
+            return 0;
+        }
+        let Some(rect) = Rect::read(env.cpu, pointer.addr()) else {
+            set_last_error(env, 998);
+            return 0;
+        };
+        if rect.left > rect.right || rect.top > rect.bottom {
+            // Wine's test_ClipCursor_desktop records this Windows error value.
+            set_last_error(env, 5); // ERROR_ACCESS_DENIED, preserving the old constraint.
+            return 0;
+        }
+        let Some(rect) = intersect_display(user(env), rect) else {
+            adv_abi::warn_unavailable(
+                env,
+                "user32.dll!ClipCursor",
+                "clip rectangle outside guest desktop is not supported",
+            );
+            set_last_error(env, 50);
+            return 0;
+        };
+        Some(rect)
+    };
+    let state = user_mut(env);
+    state.cursor_clip = rect;
+    reconcile_cursor_clip(state);
+    1
+}
 
 #[win32(user32, name = "SetKeyboardState", level = state)]
 pub(super) fn set_keyboard_state(env: &mut Env<'_>, state: GuestPtr<u8>) -> i32 {
@@ -143,6 +246,8 @@ pub(super) fn register(registry: &mut Registry) {
         set_keyboard_state_ABI,
         get_cursor_info_ABI,
         get_cursor_ABI,
+        get_clip_cursor_ABI,
+        clip_cursor_ABI,
         get_keyboard_layout_ABI,
         get_keyboard_layout_list_ABI,
         get_keyboard_layout_name_a_ABI,
@@ -152,6 +257,9 @@ pub(super) fn register(registry: &mut Registry) {
         registry.register(api);
     }
 }
+
+#[cfg(test)]
+mod cursor_tests;
 
 #[cfg(test)]
 mod tests {

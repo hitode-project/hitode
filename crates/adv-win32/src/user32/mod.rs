@@ -583,7 +583,7 @@ fn get_cursor_pos(env: &mut Env<'_>) -> Outcome {
 
 fn set_cursor_pos(env: &mut Env<'_>) -> Outcome {
     let (x, y) = (env.arg(0) as i32, env.arg(1) as i32);
-    user_mut(env).cursor_pos = (x, y);
+    input::set_cursor_position(user_mut(env), (x, y));
     Outcome::Return(1)
 }
 
@@ -727,7 +727,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "ShowCursor", 1, show_cursor);
     s(reg, "GetCursorPos", 1, get_cursor_pos);
     s(reg, "SetCursorPos", 2, set_cursor_pos);
-    s(reg, "ClipCursor", 1, |_| Outcome::Return(1));
     s(reg, "GetPropA", 2, |_| Outcome::Return(0));
     s(reg, "SetPropA", 3, |_| Outcome::Return(1));
     s(reg, "RemovePropA", 2, |_| Outcome::Return(0));

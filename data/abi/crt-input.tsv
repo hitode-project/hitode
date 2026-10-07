@@ -30,6 +30,7 @@ ucrtbase.dll	_get_invalid_parameter_handler	cdecl	ptr	callback
 msvcrt.dll	_errno	cdecl	ptr	i32*	
 msvcrt.dll	_access	cdecl	i32	int	path:const char*:str8:1|mode:int:i32:1
 msvcrt.dll	_waccess	cdecl	i32	int	path:const wchar_t*:str16:1|mode:int:i32:1
+msvcrt.dll	_memicmp	cdecl	i32	int	left:const void*:ptr:1|right:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	_errno	cdecl	ptr	i32*	
 msvcr90.dll	_errno	cdecl	ptr	i32*	
 ucrtbase.dll	_errno	cdecl	ptr	i32*	

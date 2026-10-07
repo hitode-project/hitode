@@ -131,7 +131,10 @@ impl FileSection {
     fn load_page(&self, index: u64) -> std::io::Result<[u8; 4096]> {
         let mut bytes = [0; 4096];
         if let Some(file) = &self.optical_data {
-            file.read_at(index.checked_mul(PAGE).ok_or(io::ErrorKind::InvalidInput)?, &mut bytes)?;
+            file.read_at(
+                index.checked_mul(PAGE).ok_or(io::ErrorKind::InvalidInput)?,
+                &mut bytes,
+            )?;
             return Ok(bytes);
         }
         if let Some(data) = &self.virtual_data {
