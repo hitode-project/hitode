@@ -32,7 +32,7 @@ pub struct ProcessStatus {
 
 pub(crate) struct Family<B: Backend> {
     pub(crate) parked: BTreeMap<u32, Machine<B>>,
-    prepared: BTreeMap<u32, PreparedProcess>,
+    prepared: BTreeMap<u32, PreparedChild>,
     publication: BTreeMap<u32, Rc<Cell<processes::Publication>>>,
     first_failure: Option<MachineError>,
     completed: BTreeSet<u32>,
@@ -43,6 +43,11 @@ pub(crate) struct Family<B: Backend> {
     width: u32,
     height: u32,
     codec: crate::vorbis::Policy,
+}
+
+struct PreparedChild {
+    image: PreparedProcess,
+    startup_prefix: usize,
 }
 
 impl<B: Backend> Family<B> {
@@ -215,6 +220,11 @@ impl<B: Backend> Runtime<B> {
         Win32::install(&mut child, config).map_err(|e| Error::new(8, e.to_string()))?;
         child
             .ext
+            .get_mut::<Modules>()
+            .inherit_system_image_layout(self.machine.ext.get::<Modules>())
+            .map_err(|e| Error::new(8, e))?;
+        child
+            .ext
             .insert(adv_dx::dinput::InputProvider(crate::boot::input_snapshot));
         child
             .ext
@@ -234,6 +244,7 @@ impl<B: Backend> Runtime<B> {
             .prepare_process(&exe_path)
             .map_err(|e| Error::new(193, e.to_string()))?;
         let exe = prepared.module;
+        Win32::prepare_process_infrastructure(&mut child).map_err(|e| Error::new(8, e))?;
         crate::crt::install(&mut child).map_err(|e| Error::new(8, e))?;
         install_graphics(&mut child, self.family.width, self.family.height)
             .map_err(|e| Error::new(8, e))?;
@@ -254,6 +265,7 @@ impl<B: Backend> Runtime<B> {
         sound.capture_digests = digests;
         adv_dx::dshow::install(&mut child);
         adv_dx::dxdiag::install(&mut child);
+        let startup_prefix = child.sys.process_init.len();
         let main = child
             .start_process(exe)
             .map_err(|e| Error::new(8, e.to_string()))?;
@@ -289,7 +301,13 @@ impl<B: Backend> Runtime<B> {
             missing_apis: Vec::new(),
             acceptance_eligible: true,
         });
-        self.family.prepared.insert(pid, prepared);
+        self.family.prepared.insert(
+            pid,
+            PreparedChild {
+                image: prepared,
+                startup_prefix,
+            },
+        );
         // Local timed-wait acceleration is unsound while another address space
         // can run. Family-wide acceleration is deliberately disabled here.
         self.machine.set_time_skip_source(None);
@@ -349,12 +367,20 @@ impl<B: Backend> Runtime<B> {
                 modules,
                 &win32.vfs,
             );
-            loader.finish_process(prepared).map_err(|e| e.to_string())?;
-            let mut calls = std::mem::take(&mut loader.inits)
-                .into_iter()
-                .collect::<std::collections::VecDeque<_>>();
-            calls.append(&mut self.machine.sys.process_init);
-            self.machine.sys.process_init = calls;
+            loader
+                .finish_process(prepared.image)
+                .map_err(|e| e.to_string())?;
+            let inits = std::mem::take(&mut loader.inits);
+            drop(loader);
+            // Preserve infrastructure before DLL initialization and readiness /
+            // executable entry after it, just as the initial process load does.
+            let mut ready = self
+                .machine
+                .sys
+                .process_init
+                .split_off(prepared.startup_prefix);
+            self.machine.sys.process_init.extend(inits);
+            self.machine.sys.process_init.append(&mut ready);
             // A resumed executable owns the session's display/input from here.
             self.set_foreground(pid)?;
         }

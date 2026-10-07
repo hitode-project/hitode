@@ -388,7 +388,15 @@ pub(crate) fn sleep(env: &mut Env<'_>, ms: u32) -> Outcome {
         return Outcome::Fail("Sleep(INFINITE)".into());
     }
     let until = env.sys.clock.now_us() + u64::from(ms) * 1000;
-    Outcome::block_then_return(Wait::Until(until), 0)
+    delay_until(env, until)
+}
+
+pub(crate) fn delay_until(env: &mut Env<'_>, until: u64) -> Outcome {
+    if until <= env.sys.clock.now_us() {
+        Outcome::block_then_return(Wait::Yield, 0)
+    } else {
+        Outcome::block_then_return(Wait::Until(until), 0)
+    }
 }
 
 fn file_time_to_system_time(env: &mut Env<'_>) -> Outcome {

@@ -15,7 +15,7 @@ use adv_cpu::backend::{Guest, GuestExt, MemFault, Prot};
 use adv_pe::{ExportTarget, ImportName, Pe, PeError, file_flags, scn};
 use thiserror::Error;
 
-use adv_machine::layout::{GRANULE, HOST_MODULE_BASE, HOST_MODULE_CAP, PAGE};
+use adv_machine::layout::{HOST_MODULE_CAP, PAGE};
 use adv_machine::vm::align_up;
 use adv_machine::{Image, InitCall, Sys, TlsImage};
 
@@ -495,11 +495,9 @@ impl<'a> Loader<'a> {
             }
             return self.load_image(key, &resolved, bytes, retain);
         }
-        // Anything the game doesn't ship that is a system PE extension (.dll, .drv, .ocx)
-        // is treated as a system module; absent non-system extensions (e.g. optional engine
-        // plugins like .unt) fail.
-        if key.ends_with(".dll") || key.ends_with(".drv") || key.ends_with(".ocx") {
-            log::info!("{path}: not in the game files, treating as a system module");
+        // An extension alone does not establish a system provider. Optional
+        // absent DLLs must fail rather than publish a fabricated module handle.
+        if is_host_module(self.sys, &key) {
             return self.load_host(key, path, retain);
         }
         Err(LoadError::NotFound(path.to_owned()))
@@ -530,19 +528,10 @@ impl<'a> Loader<'a> {
         if n >= HOST_MODULE_CAP {
             return Err(LoadError::TooManyHostModules);
         }
-        let base = self
-            .modules
-            .iter()
-            .filter(|(_, m)| m.kind == ModuleKind::Host)
-            .map(|(_, m)| align_up(m.base + m.size, GRANULE))
-            .max()
-            .unwrap_or(HOST_MODULE_BASE);
+        let base = self.modules.system_image_base(&key);
         let image = system_image(self.cpu, self.sys, &key, base)?;
         let size = image.bytes.len() as u32;
-        if base
-            .checked_add(size)
-            .is_none_or(|end| end > HOST_MODULE_BASE + HOST_MODULE_CAP * GRANULE)
-        {
+        if !self.modules.reserve_system_image(&key, base, size) {
             return Err(LoadError::NoSpace(key, size));
         }
         let pe = Pe::parse(&image.bytes).map_err(|err| LoadError::Pe {

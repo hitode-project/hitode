@@ -19,6 +19,7 @@ use crate::{Win32, stdcall};
 
 mod datafile;
 mod notifications;
+pub(crate) use notifications::prepare_system_modules;
 pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn_thread};
 
 fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
@@ -252,6 +253,39 @@ fn load_library(env: &mut Env<'_>, name: String) -> Outcome {
 }
 
 fn load_library_search(env: &mut Env<'_>, name: String, altered: bool) -> Outcome {
+    load_library_front(env, name, altered, LibraryFront::Win32)
+}
+
+#[derive(Clone, Copy)]
+enum LibraryFront {
+    Win32,
+    Native(u32),
+}
+
+pub(crate) fn native_load_library(env: &mut Env<'_>, name: String, output: u32) -> Outcome {
+    locked_profile(env, true, move |env| {
+        // The caller may have lost the output while waiting for the loader lock.
+        if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err() {
+            return Outcome::Return(0xc0000005);
+        }
+        load_library_front(env, name, false, LibraryFront::Native(output))
+    })
+}
+
+fn release_loaded(env: &mut Env<'_>, id: ModuleId, result: u32, error: Option<u32>) -> Outcome {
+    let ids = match adv_os::modules_mut(env.ext).release(env.cpu, id) {
+        Ok(ids) => ids,
+        Err(error) => return Outcome::Fail(error.to_string()),
+    };
+    unload(env, ids, result, error)
+}
+
+fn load_library_front(
+    env: &mut Env<'_>,
+    name: String,
+    altered: bool,
+    front: LibraryFront,
+) -> Outcome {
     let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
     let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, modules, &w.vfs);
     let res = if altered {
@@ -276,20 +310,42 @@ fn load_library_search(env: &mut Env<'_>, name: String, altered: bool) -> Outcom
             run_inits(
                 env,
                 inits,
-                Box::new(move |_| Outcome::Return(base)),
-                Box::new(move |env| {
-                    let ids = match adv_os::modules_mut(env.ext).release(env.cpu, id) {
-                        Ok(ids) => ids,
-                        Err(error) => return Outcome::Fail(error.to_string()),
-                    };
-                    unload(env, ids, 0, Some(1114))
+                Box::new(move |env| match front {
+                    LibraryFront::Win32 => Outcome::Return(base),
+                    LibraryFront::Native(output) => {
+                        if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err()
+                            || env.cpu.write_u32(output, base).is_err()
+                        {
+                            // Guest initializers can unmap the caller's output.
+                            // Release only the reference acquired by this call.
+                            release_loaded(env, id, 0xc0000005, None)
+                        } else {
+                            Outcome::Return(0)
+                        }
+                    }
+                }),
+                Box::new(move |env| match front {
+                    LibraryFront::Win32 => release_loaded(env, id, 0, Some(1114)),
+                    LibraryFront::Native(_) => release_loaded(env, id, 0xc0000142, None),
                 }),
             )
         }
         Err(e) => {
             log::warn!("LoadLibrary({name}) failed: {e}");
-            set_last_error(env, load_error_code(&e));
-            Outcome::Return(0)
+            match front {
+                LibraryFront::Win32 => {
+                    set_last_error(env, load_error_code(&e));
+                    Outcome::Return(0)
+                }
+                LibraryFront::Native(_) => Outcome::Return(match e {
+                    adv_os::LoadError::Pe { .. } | adv_os::LoadError::NoRelocs(..) => 0xc000007b,
+                    adv_os::LoadError::NoSpace(..)
+                    | adv_os::LoadError::TooManyHostModules
+                    | adv_os::LoadError::Mem(_) => 0xc0000017,
+                    adv_os::LoadError::MissingExport { .. } => 0xc0000139,
+                    adv_os::LoadError::NotFound(_) => 0xc0000135,
+                }),
+            }
         }
     }
 }

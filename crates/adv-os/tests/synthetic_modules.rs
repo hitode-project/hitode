@@ -451,6 +451,52 @@ fn generated_system_catalog_fits_the_reserved_arena_and_thunk_capacity() {
 }
 
 #[test]
+fn family_system_images_share_addresses_and_keep_independent_bytes_and_references() {
+    for jit in [false, true] {
+        let mut parent = machine(jit);
+        parent.load(&Empty, "comctl32.dll").unwrap();
+        let native = parent.load(&Empty, "ntdll.dll").unwrap();
+        let base = adv_os::modules(&parent.ext).get(native).base;
+        let mut child = machine(jit);
+        adv_os::modules_mut(&mut child.ext)
+            .inherit_system_image_layout(adv_os::modules(&parent.ext))
+            .unwrap();
+        child.load(&Empty, "kernel32.dll").unwrap();
+        let child_native = child.load(&Empty, "ntdll.dll").unwrap();
+        assert_eq!(adv_os::modules(&child.ext).get(child_native).base, base);
+        parent.load(&Empty, "ntdll.dll").unwrap();
+        assert_eq!(adv_os::modules(&child.ext).get(child_native).load_count, 1);
+        child.cpu.write_u32(base + 0x24, 0x12345678).unwrap();
+        assert_ne!(parent.cpu.read_u32(base + 0x24).unwrap(), 0x12345678);
+        assert!(
+            adv_os::modules_mut(&mut child.ext)
+                .inherit_system_image_layout(adv_os::modules(&parent.ext))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn native_initialization_list_precedes_other_dlls_and_keeps_both_link_directions() {
+    let mut m = machine(false);
+    let prior = m.load(&Empty, "comctl32.dll").unwrap();
+    let native = m.load(&Empty, "ntdll.dll").unwrap();
+    let ldr = m
+        .cpu
+        .read_u32(adv_machine::layout::PEB_ADDR + 0x0c)
+        .unwrap();
+    let head = ldr + 0x1c;
+    let first = adv_os::modules(&m.ext).get(native).ldr_entry + 16;
+    let second = adv_os::modules(&m.ext).get(prior).ldr_entry + 16;
+    assert_eq!(m.cpu.read_u32(head).unwrap(), first);
+    assert_eq!(m.cpu.read_u32(first + 4).unwrap(), head);
+    assert_eq!(m.cpu.read_u32(first).unwrap(), second);
+    assert_eq!(m.cpu.read_u32(second + 4).unwrap(), first);
+    assert_eq!(m.cpu.read_u32(second).unwrap(), head);
+    assert_eq!(m.cpu.read_u32(head + 4).unwrap(), second);
+}
+
+#[test]
 fn peb_loader_lists_keep_stable_links_names_counts_and_dll_preferred_bases() {
     struct Files;
     impl FileSource for Files {
