@@ -662,3 +662,6 @@ mod paint_leases;
 
 #[path = "window_text/update_region.rs"]
 mod update_region;
+
+#[path = "window_text/post_queue.rs"]
+mod post_queue;

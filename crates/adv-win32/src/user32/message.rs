@@ -146,6 +146,9 @@ pub struct Msg {
     /// Queue-local key update captured from this input message, independent of
     /// the live physical state which may already include later releases.
     pub input_key: Option<KeyTransition>,
+    /// Character wParam encoding supplied by the posting API, independently of
+    /// the destination class and physical-input category. Never guest MSG data.
+    pub(super) character_wide: bool,
     /// USER-generated post: QS_POSTMESSAGE without QS_ALLPOSTMESSAGE. This
     /// origin is private queue metadata, never inferred from the message number.
     pub(super) system: bool,
@@ -364,6 +367,7 @@ impl Msg {
             input: false,
             input_receipt: 0,
             input_key: None,
+            character_wide: false,
             system: false,
         }
     }
@@ -669,13 +673,20 @@ pub fn send_all(
 
 /// Post to the queue of `hwnd`'s thread (or the current thread's for `hwnd` 0).
 pub fn post(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> bool {
-    post_kind(env, hwnd, msg, wparam, lparam, false)
+    post_kind(env, hwnd, msg, wparam, lparam, PostSource::Ansi)
 }
 
 /// Host physical input uses input queue categories; guest PostMessage and
 /// TranslateMessage-generated characters remain ordinary posted messages.
 pub fn post_input(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> bool {
-    post_kind(env, hwnd, msg, wparam, lparam, true)
+    post_kind(env, hwnd, msg, wparam, lparam, PostSource::Input)
+}
+
+#[derive(Clone, Copy)]
+enum PostSource {
+    Ansi,
+    Unicode,
+    Input,
 }
 
 fn post_kind(
@@ -684,17 +695,25 @@ fn post_kind(
     msg: u32,
     wparam: u32,
     lparam: u32,
-    input: bool,
+    source: PostSource,
 ) -> bool {
+    let input = matches!(source, PostSource::Input);
     let time = env.sys.clock.now_ms();
     let ctx = if hwnd == 0 {
         env.context
     } else {
         match user(env).windows.get(&env.sys.objects, &hwnd) {
             Some(w) => w.thread,
-            None => return false,
+            None => {
+                crate::util::set_last_error(env, 1400);
+                return false;
+            }
         }
     };
+    // Fail before issuing a physical-input receipt or changing queue metadata.
+    if !reserve_post(env, ctx) {
+        return false;
+    }
     let input_receipt = if input {
         let u = &mut env.ext.get_mut::<crate::Win32>().user;
         let vk = match msg {
@@ -732,6 +751,7 @@ fn post_kind(
             input,
             input_receipt,
             input_key: input.then(|| key_transition(msg, wparam, lparam)).flatten(),
+            character_wide: !matches!(source, PostSource::Ansi),
             system: false,
         },
     );
@@ -742,7 +762,28 @@ fn post_kind(
     posted
 }
 
+const POST_MESSAGE_LIMIT: usize = 10_000;
+
+fn reserve_post(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> bool {
+    let queue = user_mut(env).queue(ctx);
+    let error = if queue.posted.len() >= POST_MESSAGE_LIMIT {
+        Some(1816) // ERROR_NOT_ENOUGH_QUOTA; Win32's default posted-message limit.
+    } else if queue.posted.try_reserve(1).is_err() {
+        Some(8)
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        crate::util::set_last_error(env, error);
+        return false;
+    }
+    true
+}
+
 fn post_to_thread(env: &mut Env<'_>, ctx: adv_machine::CtxId, m: Msg) -> bool {
+    if !reserve_post(env, ctx) {
+        return false;
+    }
     user_mut(env).queue(ctx).post(m);
     queue_changed(env, ctx);
     true
@@ -998,6 +1039,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
             input: false,
             input_receipt: 0,
             input_key: None,
+            character_wide: false,
             system: false,
         });
     }
@@ -1020,6 +1062,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 input: false,
                 input_receipt: 0,
                 input_key: None,
+                character_wide: false,
                 system: false,
             });
         }
@@ -1044,6 +1087,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 input: false,
                 input_receipt: 0,
                 input_key: None,
+                character_wide: false,
                 system: false,
             };
             if remove {
@@ -1243,8 +1287,8 @@ fn character_message(message: u32) -> bool {
     matches!(message, wm::CHAR | wm::SYSCHAR | 0x103 | 0x107)
 }
 
-/// Queue producers currently supply either ANSI PostMessageA characters or
-/// UTF-16 host input. TranslateMessage generates ASCII, common to both. A/W
+/// Queue producers retain the A/W posting API's character encoding; physical
+/// host input supplies UTF-16. TranslateMessage generates ASCII, common to both. A/W
 /// thunks support whole single-byte characters; DBCS/UTF-8 split-message state
 /// and IME composition are not implemented, so they must not be guessed.
 fn character_param(
@@ -1298,7 +1342,12 @@ fn next_public_message(
         return Ok(None);
     };
     let parameter = if character_message(message.msg) {
-        character_param(env, message.wparam, message.input, wide)?
+        character_param(
+            env,
+            message.wparam,
+            message.character_wide || message.input,
+            wide,
+        )?
     } else {
         message.wparam
     };
@@ -1531,21 +1580,86 @@ fn get_queue_status(env: &mut Env<'_>) -> Outcome {
     Outcome::Return((pending & flags) << 16 | (changed & flags))
 }
 
-fn post_message_a(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    if hwnd == 0xffff {
-        // HWND_BROADCAST: to every top-level window.
-        let tops = user(env).top.clone();
-        for t in tops {
-            post(env, t, msg, wp, lp);
-        }
-        return Outcome::Return(1);
-    }
-    Outcome::Return(u32::from(post(env, hwnd, msg, wp, lp)))
+// These system/control messages carry pointer parameters in their documented
+// contracts. Asynchronous marshaling is not provided by this virtual process;
+// never queue a pointer for later text decoding or structure access. Custom
+// WM_USER+ messages retain the application's ordinary integer/pointer protocol.
+fn asynchronous_pointer_message(msg: u32) -> bool {
+    matches!(
+        msg,
+        0x0001 | 0x000c | 0x000d | 0x001a | 0x001b | 0x0024 | 0x002b | 0x002c
+            | 0x002d | 0x0039 | 0x0046 | 0x0047 | 0x004a | 0x004e | 0x0053
+            | 0x007c | 0x007d | 0x0081 | 0x0083
+            // EDIT, COMBOBOX and LISTBOX string/array/rectangle parameters.
+            | 0x00b0 | 0x00b2 | 0x00b3 | 0x00b4 | 0x00c2 | 0x00c4 | 0x00cb
+            | 0x0143 | 0x0145 | 0x0148 | 0x014a | 0x014c | 0x014d | 0x0152
+            | 0x0158 | 0x0180 | 0x0181 | 0x0189 | 0x018c | 0x018d | 0x018f
+            | 0x0191 | 0x0192 | 0x0198 | 0x01a2 | 0x0213 | 0x0220 | 0x0309 | 0x030b
+    )
 }
 
-fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
-    let (tid, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+fn post_parameters(env: &mut Env<'_>, msg: u32, api: &str) -> bool {
+    if asynchronous_pointer_message(msg) {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "pointer-bearing system/control messages require synchronous delivery; asynchronous marshaling is unavailable",
+        );
+        crate::util::set_last_error(env, 1159); // ERROR_MESSAGE_SYNC_ONLY
+        return false;
+    }
+    true
+}
+
+fn post_message_front(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> i32 {
+    if !post_parameters(
+        env,
+        msg,
+        if wide {
+            "user32.dll!PostMessageW"
+        } else {
+            "user32.dll!PostMessageA"
+        },
+    ) {
+        return 0;
+    }
+    let source = if wide {
+        PostSource::Unicode
+    } else {
+        PostSource::Ansi
+    };
+    if hwnd == 0xffff {
+        // Existing virtual-process HWND_BROADCAST profile: top-level guest
+        // windows only. Preserve each target's actual queue and source encoding.
+        let tops = user(env).top.clone();
+        let mut success = true;
+        for t in tops {
+            success &= post_kind(env, t, msg, wp, lp, source);
+        }
+        return i32::from(success);
+    }
+    i32::from(post_kind(env, hwnd, msg, wp, lp, source))
+}
+
+fn post_thread_message_front(
+    env: &mut Env<'_>,
+    tid: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> i32 {
+    if !post_parameters(
+        env,
+        msg,
+        if wide {
+            "user32.dll!PostThreadMessageW"
+        } else {
+            "user32.dll!PostThreadMessageA"
+        },
+    ) {
+        return 0;
+    }
     // A terminated context keeps its record for GetExitCodeThread, but its thread
     // id no longer names a live message target. Returning success here can make
     // a caller wait forever for a reply that the exited thread cannot produce.
@@ -1557,10 +1671,16 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
         .map(|c| c.id)
     else {
         crate::util::set_last_error(env, 1444); // ERROR_INVALID_THREAD_ID (winerror.h)
-        return Outcome::Return(0);
+        return 0;
     };
+    // Native self-post initializes the caller's queue; posting from another
+    // thread must not invent a queue for a live kernel-only target.
+    if ctx != env.context && !user(env).queues.contains_key(&ctx) {
+        crate::util::set_last_error(env, 1444);
+        return 0;
+    }
     let time = env.sys.clock.now_ms();
-    Outcome::Return(u32::from(post_to_thread(
+    i32::from(post_to_thread(
         env,
         ctx,
         Msg {
@@ -1573,9 +1693,30 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
             input: false,
             input_receipt: 0,
             input_key: None,
+            character_wide: wide,
             system: false,
         },
-    )))
+    ))
+}
+
+#[win32(user32, name = "PostMessageA", level = implement)]
+fn post_message_a(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_message_front(env, hwnd.0, msg, wp, lp as u32, false)
+}
+
+#[win32(user32, name = "PostMessageW", level = implement)]
+fn post_message_w(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_message_front(env, hwnd.0, msg, wp, lp as u32, true)
+}
+
+#[win32(user32, name = "PostThreadMessageA", level = implement)]
+fn post_thread_message_a(env: &mut Env<'_>, tid: u32, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_thread_message_front(env, tid, msg, wp, lp as u32, false)
+}
+
+#[win32(user32, name = "PostThreadMessageW", level = implement)]
+fn post_thread_message_w(env: &mut Env<'_>, tid: u32, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_thread_message_front(env, tid, msg, wp, lp as u32, true)
 }
 
 fn post_quit_message(env: &mut Env<'_>) -> Outcome {
@@ -2110,8 +2251,10 @@ pub fn register(reg: &mut Registry) {
     reg.register(get_message_w_ABI);
     s(reg, "WaitMessage", 0, wait_message);
     s(reg, "GetQueueStatus", 1, get_queue_status);
-    s(reg, "PostMessageA", 4, post_message_a);
-    s(reg, "PostThreadMessageA", 4, post_thread_message_a);
+    reg.register(post_message_a_ABI);
+    reg.register(post_message_w_ABI);
+    reg.register(post_thread_message_a_ABI);
+    reg.register(post_thread_message_w_ABI);
     s(reg, "PostQuitMessage", 1, post_quit_message);
     s(reg, "SendMessageA", 4, send_message_a);
     reg.register(send_message_w_ABI);
@@ -2146,6 +2289,7 @@ mod receipt_tests {
             input: receipt != 0,
             input_receipt: receipt,
             input_key: None,
+            character_wide: false,
             system: false,
         }
     }
