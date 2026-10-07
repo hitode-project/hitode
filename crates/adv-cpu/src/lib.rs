@@ -3,6 +3,7 @@
 mod architecture;
 mod atomic_memory;
 pub mod backend;
+mod cliffs;
 mod compile;
 mod compile_budget;
 mod compiler;
@@ -35,10 +36,11 @@ mod virtual_memory;
 
 pub use architecture::{ArchitecturalState, StateError};
 pub use backend::jit::JitCpu;
+pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
 pub use compile::coverage::report as loop_coverage;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::SegmentState;
-pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats};
+pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats};
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;
 pub use rows::RowStats;

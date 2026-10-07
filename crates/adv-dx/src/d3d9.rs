@@ -27,6 +27,7 @@ mod presentation;
 mod programmable;
 mod readback;
 mod residency;
+pub(crate) mod saving;
 mod stretch;
 mod targets;
 #[cfg(test)]

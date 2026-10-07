@@ -19,6 +19,10 @@ fn memory(bytes: &[u8]) -> Memory {
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 4096, READ | EXEC).unwrap();
     m.write(DATA, &1.25f64.to_le_bytes()).unwrap();
+    // These comparisons measure instruction effects, including real SMC
+    // epochs. Prepare the same code observation as native capture before the
+    // reference records its per-instruction epoch or changes execution policy.
+    m.watch_code(CODE, bytes.len());
     m
 }
 fn state() -> CpuState {
@@ -49,7 +53,7 @@ fn compare(bytes: &[u8], initial: CpuState, setup: impl Fn(&mut Memory), calls: 
     let mut reference_memory = memory(bytes);
     setup(&mut actual_memory);
     setup(&mut reference_memory);
-    let compiled = compile(&Region::new(CODE, bytes.len()), &actual_memory, false).unwrap();
+    let compiled = compile(&Region::new(CODE, bytes.len()), &mut actual_memory, false).unwrap();
     let mut expected = initial.clone();
     let mut actual = initial;
     let mut interpreter = Interpreter::new();
@@ -133,7 +137,7 @@ fn hot_operations_are_native_even_between_lazy_integer_flags() {
         Some(0),
     );
     #[cfg(target_arch = "x86_64")]
-    let compiled = compile(&Region::new(CODE, code.len()), &memory(&code), false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut memory(&code), false).unwrap();
     // Runtime helper counts prove the exercised path is native; the disassembly
     // additionally protects against accidentally deleting arithmetic lowering.
     #[cfg(target_arch = "x86_64")]
@@ -155,13 +159,23 @@ fn precision_rounding_pending_exceptions_and_mmx_take_the_helper() {
     let code = bytes(|a| {
         a.fmul_2(st0, st1).unwrap();
     });
+    // 1.25 and 2.5 fit 24 bits, so PC=24 and PC=53 are both native.
     for precision in [0u16, 2, 3] {
         for rounding in 0..4 {
             let mut s = state();
             s.x87.control = 0x7f | precision << 8 | rounding << 10;
-            let calls = u64::from(precision != 2 || rounding != 0);
+            let calls = u64::from(precision == 3 || rounding != 0);
             compare(&code, s, |_| {}, Some(calls));
         }
+    }
+    // PC=24 re-rounds a binary64 result, which is exact only for 24-bit inputs.
+    for wide in [1.0 + 2f64.powi(-24), 1.0 / 3.0] {
+        let mut s = state();
+        s.x87.control = 0x007f;
+        let slot = s.x87.top();
+        s.x87.regs[slot] = X87Register(crate::backend::x87::encode_f64(wide));
+        s.refresh_mmx();
+        compare(&code, s, |_| {}, Some(1));
     }
     for status in [0x80, 0x8081] {
         let mut s = state();
@@ -280,7 +294,11 @@ fn address_generation_and_faults_preserve_the_exact_committed_prefix() {
     compare(
         &code,
         state(),
-        |m| m.protect(DATA, 4096, READ | WRITE | EXEC).unwrap(),
+        |m| {
+            m.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
+            // This case exercises a code-page store, not unobserved RWX data.
+            m.watch_code(DATA, 4096);
+        },
         Some(1),
     );
 }
@@ -310,7 +328,7 @@ fn file_backed_operands_and_copy_on_write_use_transactional_helpers() {
         let oracle = crate::backend::FilePage::new(data);
         let mut actual_memory = file_memory(&code, &page, cow);
         let mut reference_memory = file_memory(&code, &oracle, cow);
-        let compiled = compile(&Region::new(CODE, code.len()), &actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
         let mut actual = state();
         let mut expected = actual.clone();
         let mut interpreter = Interpreter::new();
@@ -362,7 +380,7 @@ fn a_lazy_file_fault_is_not_retried_inside_the_same_x87_instruction() {
             }
         });
         let mut memory = file_memory(&code, &page, store);
-        let compiled = compile(&Region::new(CODE, code.len()), &memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut memory, false).unwrap();
         let mut actual = state();
         let before = testing::calls();
         let reason = testing::run(&compiled, &mut actual, &mut memory);
@@ -416,7 +434,7 @@ fn pure_x87_shared_audio_accesses_never_use_ordinary_loads_or_stores() {
     memory.protect(CODE, 4096, READ | EXEC).unwrap();
     let shared = memory.map_shared_audio(DATA, 4096).unwrap();
     shared.store_bytes(0, &1.25f64.to_le_bytes());
-    let compiled = compile(&Region::new(CODE, code.len()), &memory, false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut memory, false).unwrap();
     let mut actual = state();
     let before = testing::calls();
     assert_eq!(
@@ -465,7 +483,7 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
         actual_memory.parallel = Some(fence.clone());
         // A parallel snapshot selects the Fast compilation strategy even when
         // the region requests Speed. The permit exercises foreign-memory helpers.
-        let compiled = compile(&Region::new(CODE, code.len()), &actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
         let mut actual = state();
         actual.x87.control = control;
         let mut expected = actual.clone();
@@ -616,7 +634,7 @@ fn native_x87_rounding_flags_are_independent_of_host_fpcr_and_preserve_fpsr() {
     };
     let mut reference_memory = memory(&code);
     setup(&mut reference_memory);
-    let compiled = compile(&Region::new(CODE, code.len()), &reference_memory, false).unwrap();
+    let compiled = compile(&Region::new(CODE, code.len()), &mut reference_memory, false).unwrap();
     let mut expected = state();
     let mut interpreter = Interpreter::new();
     for _ in 0..6 {
@@ -676,7 +694,7 @@ fn x87_fault_and_budget_exits_restore_the_callers_host_floating_environment() {
         });
         let mut actual_memory = memory(&code);
         actual_memory.protect(DATA + 4096, 4096, 0).unwrap();
-        let compiled = compile(&Region::new(CODE, code.len()), &actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
         let mut expected_memory = memory(&code);
         expected_memory.protect(DATA + 4096, 4096, 0).unwrap();
         let mut expected = state();
@@ -851,7 +869,7 @@ fn helper_effects_keep_fuel_and_exact_state_across_budget_resumptions() {
             region.entries.push(i.ip32());
         }
     }
-    let compiled = compile(&region, &actual_memory, false).unwrap();
+    let compiled = compile(&region, &mut actual_memory, false).unwrap();
     let mut actual = state();
     let mut expected = actual.clone();
     let mut interpreter = Interpreter::new();

@@ -29,7 +29,7 @@ pub(super) fn register(registry: &mut Registry) {
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::CreateOffscreenPlainSurface",level=implement)]
-fn create_offscreen(
+pub(super) fn create_offscreen(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     width: u32,

@@ -786,8 +786,23 @@ unsafe fn try_run(
     }
     // The memory window is page-aligned and permission bytes have one entry
     // per page. No byte is read until range() proves its page index in bounds.
-    let perms =
-        unsafe { std::slice::from_raw_parts(context.perms, descriptor.memory_len / PAGE_SIZE) };
+    // Serial native snapshots may omit the EXEC store barrier on unobserved
+    // RWX data. Row admission retains its existing conservative guest EXEC
+    // exclusion; row workers are outside the observed-code optimization.
+    let perms = if context.bridge.is_null() {
+        // Authored standalone kernel tests provide their own permission table.
+        unsafe { std::slice::from_raw_parts(context.perms, descriptor.memory_len / PAGE_SIZE) }
+    } else {
+        let bridge = unsafe { &*context.bridge.cast::<crate::trap::Bridge<'_>>() };
+        if bridge.memory.is_null() {
+            return pool.reject();
+        }
+        let owner = unsafe { &*bridge.memory };
+        if owner.base != descriptor.memory_base || owner.len != descriptor.memory_len {
+            return pool.reject();
+        }
+        owner.perms.as_slice()
+    };
     if !admission(descriptor, initial, &deltas, perms, rows, width) {
         return pool.reject();
     }

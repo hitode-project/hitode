@@ -189,6 +189,7 @@ impl Executor {
         self.stats.native_blocks += completion.blocks;
         self.stats.bulk_calls += completion.bulk_calls;
         self.stats.bulk_bytes += completion.bulk_bytes;
+        self.stats.cliffs.merge(completion.cliffs);
         Some((
             completion.token,
             ExecutionContext {

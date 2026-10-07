@@ -12,7 +12,7 @@ mod graphics;
 pub use adv_win32::winmm::mmio;
 mod report;
 pub use adv_abi::{DynamicLookupFailure, MessageBoxCall, RunMode};
-pub use adv_cpu::{CompileStrategy, ParallelStats, loop_coverage};
+pub use adv_cpu::{Cliffs, CompileStrategy, ParallelStats, VerifyStats, loop_coverage};
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
 pub use adv_win32::user32::dialog::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow,

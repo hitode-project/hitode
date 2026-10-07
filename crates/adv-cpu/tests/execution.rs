@@ -620,3 +620,101 @@ fn vector_store_fault_checks_both_pages_before_writing() {
     assert_eq!(jit.memory().read(DATA + 4088, 16).unwrap(), [0; 16]);
     assert_eq!(jit.state.xmm[0], [0xa5; 16]);
 }
+
+#[test]
+fn cliffs_count_native_fallbacks_by_instruction() {
+    let code = assemble(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.inc(eax).unwrap();
+        a.cbw().unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.ret().unwrap();
+    });
+    let mut jit = machine(&code, true);
+    reset(&mut jit, [0, 9, 0, 0, 0, 0, 0, 0], 2);
+    assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
+    let cliffs = &jit.stats.cliffs;
+    assert!(cliffs.fallbacks[&iced_x86::Mnemonic::Cbw] >= 9);
+    let fallback = cliffs.interpreter[&adv_cpu::InterpreterReason::Fallback];
+    assert!(fallback.entries >= 9);
+    assert!(fallback.instructions >= fallback.entries);
+}
+
+#[test]
+fn cliffs_attribute_exact_x87_work_to_the_control_word() {
+    for (control, reason) in [
+        (0x027f_u16, None),
+        (0x037f, Some(adv_cpu::X87Cliff::Control)),
+    ] {
+        let code = assemble(|a| {
+            a.fldcw(word_ptr(DATA)).unwrap();
+            a.fld(qword_ptr(DATA + 8)).unwrap();
+            a.fdiv_2(st0, st0).unwrap();
+            a.fld(qword_ptr(DATA + 8)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fstp(qword_ptr(DATA + 16)).unwrap();
+            a.fstp(st0).unwrap();
+            a.ret().unwrap();
+        });
+        let mut jit = machine(&code, true);
+        jit.write(DATA, &control.to_le_bytes()).unwrap();
+        jit.write(DATA + 8, &3.0f64.to_le_bytes()).unwrap();
+        assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(
+            jit.memory().read(DATA + 16, 8).unwrap(),
+            3.0f64.to_le_bytes()
+        );
+        let cliffs = &jit.stats.cliffs;
+        let exact = cliffs
+            .x87_exact
+            .iter()
+            .filter(|((_, r), _)| Some(*r) == reason);
+        assert_eq!(
+            exact.count() > 0,
+            reason.is_some(),
+            "control={control:#x} {cliffs:?}"
+        );
+        assert!(
+            cliffs.x87_exact.keys().all(|(_, r)| Some(*r) == reason),
+            "{cliffs:?}"
+        );
+    }
+}
+
+#[test]
+fn tier_verification_checks_new_regions_without_changing_results() {
+    let code = assemble(|a| {
+        let mut top = a.create_label();
+        let mut leaf = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, 4).unwrap();
+        a.call(leaf).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut leaf).unwrap();
+        a.push(ebx).unwrap();
+        a.lea(ebx, dword_ptr(eax + eax * 2 + 1)).unwrap();
+        a.pop(edx).unwrap();
+        a.ret().unwrap();
+    });
+    let mut results = Vec::new();
+    for verify in [false, true] {
+        let mut jit = machine(&code, true);
+        jit.set_tier_verification(verify.then_some(true));
+        reset(&mut jit, [0, 50, 0, 7, 0, 0, 0, DATA], 2);
+        assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
+        let checks = &jit.stats.verification;
+        assert_eq!(checks.mismatches, 0, "{checks:?}");
+        assert_eq!(checks.verified > 0, verify, "{checks:?}");
+        results.push((
+            jit.state.regs,
+            jit.memory().read(DATA, 256).unwrap().to_vec(),
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}

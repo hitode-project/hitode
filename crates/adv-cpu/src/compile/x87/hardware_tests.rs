@@ -6,11 +6,10 @@ use super::*;
 #[repr(C, align(16))]
 struct HostFp([u8; 512]);
 
-fn hardware(a: f64, b: f64, op: Op) -> ([u8; 10], u16) {
+fn hardware(a: f64, b: f64, op: Op, control: u16) -> ([u8; 10], u16) {
     let mut saved = HostFp([0; 512]);
     let mut raw = [0u8; 10];
     let mut status = 0u16;
-    let control = 0x027fu16;
     macro_rules! execute {
         ($instruction:literal) => {
             // SAFETY: every operand points to a live, correctly sized object;
@@ -70,6 +69,10 @@ fn bounded(seed: &mut u64) -> f64 {
     let exponent = ((bits >> 52) % 801) + (1023 - 400);
     f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (exponent << 52))
 }
+/// A bounded value with a 24-bit significand, as PC=24 code keeps them.
+fn single(seed: &mut u64) -> f64 {
+    f64::from_bits(bounded(seed).to_bits() & !crate::floating::fast::SINGLE_TAIL)
+}
 
 #[test]
 fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
@@ -106,7 +109,7 @@ fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
                 .unwrap();
             });
             let mut mem = memory(&code);
-            let compiled = compile(&Region::new(CODE, code.len()), &mem, false).unwrap();
+            let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
             let mut seed = 0xd93f_517a_982b_410du64;
             let random = (0..8192).map(|_| (bounded(&mut seed), bounded(&mut seed)));
             let edges = edge.iter().flat_map(|&a| edge.iter().map(move |&b| (a, b)));
@@ -117,7 +120,7 @@ fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
                 if op == Op::Div && b == 0.0 {
                     continue; // Divide-by-zero rejection is tested separately.
                 }
-                let (raw, status) = hardware(a, b, op);
+                let (raw, status) = hardware(a, b, op, 0x027f);
                 let mut actual = state();
                 actual.x87.control = 0x027f;
                 let slot = actual.x87.top();
@@ -163,4 +166,110 @@ fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
     );
     assert_eq!(count, 67520);
     eprintln!("hardware x87 oracle: {count} cases, raw80 + exception/C1 bits, zero helper calls");
+}
+
+#[test]
+fn single_precision_arithmetic_matches_hardware_raw80_and_precision_flags() {
+    // 24-bit operands across the bounded exponent range: PC=24 keeps the
+    // extended exponent, so products and quotients leave the binary32 range.
+    let edge = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        1.5,
+        3.0,
+        -3.0,
+        1.0 + 2f64.powi(-23),
+        1.0 - 2f64.powi(-24),
+        2f64.powi(-24),
+        -2f64.powi(-25),
+        16_777_215.0,
+        2f64.powi(-400),
+        -2f64.powi(400),
+        f64::from(0.1f32),
+        f64::from(-1.0f32 / 3.0),
+    ];
+    let mut count = 0usize;
+    let before = testing::calls();
+    for dekker in [false, true] {
+        let _guard = DekkerGuard::set(dekker);
+        for op in [Op::Add, Op::Sub, Op::Mul, Op::Div] {
+            let code = bytes(|a| {
+                match op {
+                    Op::Add => a.fadd(qword_ptr(esi)),
+                    Op::Sub => a.fsub(qword_ptr(esi)),
+                    Op::Mul => a.fmul(qword_ptr(esi)),
+                    Op::Div => a.fdiv(qword_ptr(esi)),
+                }
+                .unwrap();
+            });
+            let mut mem = memory(&code);
+            let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+            let mut seed = 0x6a09_e667_f3bc_c909u64;
+            // Nearby exponents make sums with exact, halfway and carrying tails.
+            let random = (0..8192).map(|n| {
+                let a = single(&mut seed);
+                let b = if n % 2 == 0 {
+                    single(&mut seed)
+                } else {
+                    let shift = (next(&mut seed) % 40) as i32 - 20;
+                    a * 2f64.powi(shift) * (1.0 + f64::from(next(&mut seed) as u16) / 65536.0)
+                };
+                let b = f64::from_bits(b.to_bits() & !crate::floating::fast::SINGLE_TAIL);
+                // Out-of-range operands take the helper, as at PC=53.
+                let exponent = ((b.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+                (a, if exponent.abs() <= 400 { b } else { a })
+            });
+            let edges = edge.iter().flat_map(|&a| edge.iter().map(move |&b| (a, b)));
+            let (mut exact, mut down, mut up) = (0, 0, 0);
+            for (a, b) in edges.chain(random) {
+                if op == Op::Div && b == 0.0 {
+                    continue;
+                }
+                let (raw, status) = hardware(a, b, op, 0x007f);
+                let mut actual = state();
+                actual.x87.control = 0x007f;
+                let slot = actual.x87.top();
+                let value = X87Register(crate::backend::x87::encode_f64(a));
+                actual.x87.regs[slot] = value;
+                actual.x87.set_physical_tag(slot, value.tag());
+                actual.refresh_mmx();
+                mem.write(DATA, &b.to_le_bytes()).unwrap();
+                assert_eq!(
+                    testing::run(&compiled, &mut actual, &mut mem),
+                    Exit::Dispatch as u32
+                );
+                assert_eq!(
+                    actual.x87.regs[slot].0,
+                    raw,
+                    "raw80 op={op:?} dekker={dekker} a={:016x} b={:016x}",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+                assert_eq!(
+                    actual.x87.status & 0x023f,
+                    status & 0x023f,
+                    "exceptions/C1 op={op:?} dekker={dekker} a={:016x} b={:016x}",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+                if status & 0x20 == 0 {
+                    exact += 1;
+                } else if status & 0x200 == 0 {
+                    down += 1;
+                } else {
+                    up += 1;
+                }
+                count += 1;
+            }
+            assert!(exact > 0 && down > 0 && up > 0, "oracle coverage: {op:?}");
+        }
+    }
+    assert_eq!(
+        testing::calls() - before,
+        0,
+        "PC=24 corpus must exercise native emission"
+    );
+    eprintln!("PC=24 hardware x87 oracle: {count} cases, zero helper calls");
 }

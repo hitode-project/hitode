@@ -10,8 +10,10 @@ use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 mod code_store;
 mod interpreter_profile;
 mod parallel;
+mod verify;
 mod warm;
 use code_store::CodeStore;
+pub use verify::VerifyStats;
 
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
@@ -56,6 +58,10 @@ pub struct Stats {
     pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
+    /// Slow-path counters by instruction and reason.
+    pub cliffs: crate::Cliffs,
+    /// Interpreter checks of newly published native code.
+    pub verification: VerifyStats,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -169,6 +175,7 @@ pub struct Executor {
     pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
     interpreter_profile: Option<Box<interpreter_profile::Profile>>,
+    verifier: Option<Box<verify::Verifier>>,
     timestamp: crate::timestamp::Counter,
     pub state: CpuState,
     pub stats: Stats,
@@ -248,6 +255,7 @@ impl Executor {
             unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
+            cliffs: std::mem::take(&mut self.stats.cliffs),
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
         if self.parallel.is_some() {
@@ -268,8 +276,20 @@ impl Executor {
         self.stats.trap_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
+        self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
         self.timestamp = bridge.timestamp;
         result
+    }
+    /// Check the first native entries of current and later publications
+    /// against the interpreter; `strict` turns a mismatch into a run error.
+    pub fn set_tier_verification(&mut self, mode: Option<bool>) {
+        self.verifier = mode.map(|strict| {
+            let mut verifier = verify::Verifier::new(strict);
+            for &start in self.code.compiled.keys() {
+                verifier.pending.insert(start, verify::ENTRIES);
+            }
+            Box::new(verifier)
+        });
     }
     /// Select helper threads before execution. Zero runs admitted batches inline.
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
@@ -365,6 +385,7 @@ impl Executor {
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
             interpreter_profile: interpreter_profile::Profile::from_env(),
+            verifier: verify::Verifier::from_env(),
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
@@ -504,7 +525,7 @@ impl Executor {
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
         let start = Instant::now();
-        let compiled = compile::compile(&region, &self.memory, self.shadow_returns.is_some())?;
+        let compiled = compile::compile(&region, &mut self.memory, self.shadow_returns.is_some())?;
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
         self.pending_regions.remove(&region.start);
@@ -557,6 +578,9 @@ impl Executor {
             self.profiled.push((region.start, profile));
         }
         self.code.compiled.insert(region.start, compiled);
+        if let Some(verifier) = &mut self.verifier {
+            verifier.pending.insert(region.start, verify::ENTRIES);
+        }
         if region.compile_strategy == CompileStrategy::Fast {
             self.code.fast_regions.insert(region.start);
         }
@@ -704,7 +728,7 @@ impl Executor {
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
             return Ok(false);
         }
-        let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
         let mut fragments = if let Some(limit) = limit {
             let budget = crate::compile_budget::background_budget(
@@ -1186,7 +1210,7 @@ impl Executor {
         // Direct leaves already inside this unit's immutable byte window do not
         // need a racy call-target hint. Admission still decodes the current bytes
         // and permits only a bounded, register-only leaf through its return.
-        let direct: BTreeSet<u32> = compile::Snapshot::capture(&old_region, &self.memory)
+        let direct: BTreeSet<u32> = compile::Snapshot::capture(&old_region, &mut self.memory)
             .map(|input| input.direct_leaf_callees().into_iter().collect())
             .unwrap_or_default();
         // Observed indirect call targets join the unit, so the calls and their
@@ -1320,7 +1344,7 @@ impl Executor {
             }))
             .collect();
         let Some(region) = crate::discovery::discover(
-            &self.memory,
+            &mut self.memory,
             pc,
             stop,
             self.auto_compile_strategy,
@@ -1435,6 +1459,21 @@ impl Executor {
                 if self.region_linking && !self.profiling {
                     self.refresh_links();
                 }
+                // Parallel workers share memory, so a private undo is not possible.
+                let serial = self.parallel.is_none();
+                let trace = match self.verifier.as_deref_mut() {
+                    Some(verifier) if serial && verifier.pending.contains_key(&owner) => {
+                        verifier.take(owner);
+                        Some(verifier.record(
+                            owner,
+                            stop,
+                            &mut self.interpreter,
+                            &mut self.state,
+                            &mut self.memory,
+                        )?)
+                    }
+                    _ => None,
+                };
                 let native = &self.code.compiled[&owner];
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
@@ -1447,6 +1486,9 @@ impl Executor {
                     let left = deadline.saturating_duration_since(now).as_micros() as u64;
                     (left / 2).saturating_mul(self.native_rate).max(SAFEPOINT)
                 });
+                // A verified entry runs one block: without back edges, its exit
+                // PC names a single interpreted state.
+                let allowance = if trace.is_some() { 1 } else { allowance };
                 let reserved = self.state.fuel.saturating_sub(allowance);
                 self.state.fuel -= reserved;
                 let before = self.state.fuel;
@@ -1462,16 +1504,38 @@ impl Executor {
                         } else {
                             None
                         },
-                        links: (self.region_linking && !self.profiling).then_some(&self.code.links),
+                        // A verified entry stops at the region boundary.
+                        links: (self.region_linking && !self.profiling && trace.is_none())
+                            .then_some(&self.code.links),
                         stop,
                         interrupt: if self.host_interrupts {
                             self.interrupt.as_ref()
                         } else {
                             &self.inactive_interrupt
                         },
-                        shadow: self.shadow_returns.as_deref_mut(),
+                        shadow: self
+                            .shadow_returns
+                            .as_deref_mut()
+                            .filter(|_| trace.is_none()),
                     },
                 );
+                if let Some(trace) = &trace {
+                    let stats = &mut self.stats.verification;
+                    match trace.check(&self.state, &self.memory) {
+                        None => stats.inconclusive += 1,
+                        Some(Ok(verify::Check::Equal)) => stats.verified += 1,
+                        Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+                        Some(Err(report)) => {
+                            stats.mismatches += 1;
+                            if self.verifier.as_ref().is_some_and(|v| v.strict) {
+                                return Err(format!("tier verification: {report}"));
+                            }
+                            if stats.reports.len() < verify::REPORTS {
+                                stats.reports.push(report);
+                            }
+                        }
+                    }
+                }
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
                     p.native_entries += 1;
@@ -1488,6 +1552,7 @@ impl Executor {
                 let completed = before - self.state.fuel;
                 if let Some((_, now)) = timed
                     && reserved != 0
+                    && trace.is_none()
                     && result == Exit::Budget as u32
                 {
                     let elapsed = (now.elapsed().as_micros() as u64).max(1);
@@ -1546,6 +1611,7 @@ impl Executor {
                     }
                     n if n == Exit::Fallback as u32 => {
                         self.deferred_fallback = Some(self.state.eip);
+                        bridge.cliffs.fallback(&self.memory, self.state.eip);
                         // Preserve the pending instruction across a scheduler
                         // slice, even when its native guard consumed the last unit.
                         if self.state.fuel == 0 {
@@ -1586,9 +1652,9 @@ impl Executor {
             };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
-            if let Some(profile) = &mut self.interpreter_profile {
-                use interpreter_profile::Reason;
-                let reason = if interpreter_only || single_step || pending_fpu {
+            let reason = {
+                use crate::InterpreterReason as Reason;
+                if interpreter_only || single_step || pending_fpu {
                     Reason::Forced
                 } else if self.deferred_fallback == Some(pc) {
                     Reason::Fallback
@@ -1599,7 +1665,10 @@ impl Executor {
                         None if self.attempted.contains(&pc) => Reason::Rejected,
                         None => Reason::Uncovered,
                     }
-                };
+                }
+            };
+            bridge.cliffs.interpreted(reason, execution.units);
+            if let Some(profile) = &mut self.interpreter_profile {
                 profile.record(pc, execution.units, reason, &self.memory);
             }
             if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {
@@ -2727,7 +2796,7 @@ mod tiering_tests {
         m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
         for (sequence, start) in [0x1000u32, 0x1100, 0x1200].into_iter().enumerate() {
             let region = Region::new(start, 2);
-            let snapshot = compile::Snapshot::capture(&region, &m.memory).unwrap();
+            let snapshot = compile::Snapshot::capture(&region, &mut m.memory).unwrap();
             m.deferred_compilations.insert(start, snapshot);
             m.deferred_order.insert(start, sequence as u64);
         }
@@ -3003,16 +3072,16 @@ mod tiering_tests {
             &[0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xc3],
         ];
         for leaf in cases {
-            let m = direct_leaf_machine(leaf, true);
+            let mut m = direct_leaf_machine(leaf, true);
             let region = crate::discovery::discover(
-                &m.memory,
+                &mut m.memory,
                 0x1100,
                 0x3000,
                 CompileStrategy::Fast,
                 &BTreeSet::new(),
             )
             .unwrap();
-            let input = compile::Snapshot::capture(&region, &m.memory).unwrap();
+            let input = compile::Snapshot::capture(&region, &mut m.memory).unwrap();
             assert!(input.direct_leaf_callees().is_empty(), "leaf {leaf:02x?}");
         }
 
@@ -3022,7 +3091,7 @@ mod tiering_tests {
         m.write(0x110f, &0x0du32.to_le_bytes()).unwrap();
         m.write(0x1120, &[0xc3]).unwrap();
         let region = crate::discovery::discover(
-            &m.memory,
+            &mut m.memory,
             0x1100,
             0x3000,
             CompileStrategy::Fast,
@@ -3031,7 +3100,7 @@ mod tiering_tests {
         .unwrap();
         assert!(region.start + region.len as u32 <= 0x1180);
         assert!(
-            compile::Snapshot::capture(&region, &m.memory)
+            compile::Snapshot::capture(&region, &mut m.memory)
                 .unwrap()
                 .direct_leaf_callees()
                 .is_empty()

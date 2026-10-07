@@ -1,5 +1,5 @@
-//! CPU image loaders use the same texture allocation, COM owner and upload path
-//! as CreateTexture/UnlockRect. An unpublished texture is retired on cancellation.
+//! D3DX image transfers reuse D3D9 allocation, ownership and upload/readback lanes.
+//! Unpublished textures and staging surfaces are retired on cancellation.
 use super::*;
 use std::rc::{Rc, Weak};
 
@@ -133,3 +133,68 @@ pub(super) fn cancel_all(env: &mut Env<'_>) {
 
 #[cfg(test)]
 mod tests;
+
+/// Produce an owned CPU surface using the existing asynchronous readback lane.
+/// The same unpublished-resource guard retires a cancelled temporary surface.
+pub(crate) fn readable_surface(env: &mut Env<'_>, source: u32) -> Outcome {
+    if env.ext.try_get::<State>().is_none() {
+        return Outcome::Return(INVALID);
+    }
+    let Some(resource) = resources::resource(env, source) else {
+        return Outcome::Return(INVALID);
+    };
+    if resource.kind != resources::Kind::Surface || resources::locked(env, resource) {
+        return Outcome::Return(INVALID);
+    }
+    let desc = resource.desc;
+    if desc.Pool != 0 {
+        return Outcome::Return(if add_ref(env, source).is_some() {
+            source
+        } else {
+            OUT_OF_MEMORY
+        });
+    }
+    if desc.Usage & 1 == 0 || !matches!(desc.Format, 21 | 22) || desc.MultiSampleType != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "d3dx9_43.dll!D3DXSaveSurfaceToFileInMemory",
+            "GPU export requires a non-multisampled A8R8G8B8/X8R8G8B8 render target",
+        );
+        return Outcome::Return(INVALID);
+    }
+    let Some(Payload::Device(device)) = com(env).get_identity(&env.sys.objects, resource.device)
+    else {
+        return Outcome::Return(INVALID);
+    };
+    let device = device.pointer;
+    let Some(slot) = alloc(env, 4) else {
+        return Outcome::Return(OUT_OF_MEMORY);
+    };
+    let created = readback::create_offscreen(
+        env,
+        GuestPtr::new(device),
+        desc.Width,
+        desc.Height,
+        desc.Format,
+        2,
+        GuestPtr::new(slot),
+        GuestPtr::new(0),
+    );
+    let pointer = GuestPtr::<u32>::new(slot).read(env.cpu).unwrap_or(0);
+    free(env, slot);
+    if !matches!(created, Outcome::Return(0)) || pointer == 0 {
+        return created;
+    }
+    let guard = Rc::new(());
+    env.ext
+        .get_or_default::<Loading>()
+        .pending
+        .push((pointer, Rc::downgrade(&guard)));
+    let outcome = readback::transfer(
+        env,
+        GuestPtr::new(device),
+        GuestPtr::new(source),
+        GuestPtr::new(pointer),
+    );
+    finish(env, pointer, guard, outcome)
+}

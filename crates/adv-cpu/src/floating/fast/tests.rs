@@ -194,8 +194,8 @@ fn differential(compiled: bool) {
         state.xmm = std::array::from_fn(|_| std::array::from_fn(|_| rng.next() as u8));
         state.mxcsr = rng.pick(&[0x1f80, 0x3f80, 0x5f80, 0x7f80, 0xdfc0]);
         state.x87.control = rng.pick(&[
-            0x027f, 0x027f, 0x027f, 0x027f, 0x037f, 0x0e7f, 0x0c7f, 0x007f, 0x025f, 0x021f, 0x047f,
-            0x087f, 0x067f, 0x0a7f, 0x077f, 0x0b7f, 0x0f7f,
+            0x027f, 0x027f, 0x027f, 0x027f, 0x037f, 0x0e7f, 0x0c7f, 0x007f, 0x007f, 0x007f, 0x025f,
+            0x021f, 0x047f, 0x087f, 0x067f, 0x0a7f, 0x077f, 0x0b7f, 0x0f7f,
         ]);
         state.x87.status = rng.pick(&[0, 0x20, 0x3800, 0x4100, 0x0001, 0x80, 0x8081]);
         state.x87.set_top(rng.next() as usize);
@@ -251,8 +251,12 @@ fn differential(compiled: bool) {
         let before = testing::calls();
         let result = if compiled {
             let code = cache.entry(bytes.clone()).or_insert_with(|| {
-                crate::compile::compile(&crate::Region::new(CODE, bytes.len()), &fast_memory, false)
-                    .unwrap_or_else(|error| panic!("compile {:?}: {error}", instruction.mnemonic()))
+                crate::compile::compile(
+                    &crate::Region::new(CODE, bytes.len()),
+                    &mut fast_memory,
+                    false,
+                )
+                .unwrap_or_else(|error| panic!("compile {:?}: {error}", instruction.mnemonic()))
             });
             testing::run(code, &mut actual, &mut fast_memory)
         } else {
