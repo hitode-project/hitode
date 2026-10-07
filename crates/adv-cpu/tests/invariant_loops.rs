@@ -312,3 +312,126 @@ fn shared_file_operands_keep_checked_io_and_observe_each_alias_write() {
         assert_eq!(cpu.stats().interpreter_instructions, 0);
     }
 }
+
+#[test]
+fn scoped_clone_exits_restore_state_and_reprove_a_changed_base_on_reentry() {
+    const SECOND: u32 = DATA + 0x1010;
+    const PASSES: u32 = 6;
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    let mut done = a.create_label();
+    a.push(ebp).unwrap();
+    a.mov(ebp, SLOT).unwrap();
+    // XMM0 changes outside the loop and is not referenced by the clone. Its
+    // new value, and the seven untouched XMM sentinels, must survive its exit.
+    a.movd(xmm0, edx).unwrap();
+    a.mov(dword_ptr(ecx), PASSES).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.mov(eax, dword_ptr(ebp)).unwrap();
+    a.add(eax, 7).unwrap();
+    a.mov(dword_ptr(ebp), eax).unwrap();
+    a.mov(dword_ptr(ebp + 4), eax).unwrap();
+    // A memory counter excludes the counted-loop kernel. Speed instead proves
+    // these ordinary RW slots at the first checked backedge of each entry.
+    a.dec(dword_ptr(ecx)).unwrap();
+    a.jnz(top).unwrap();
+    // Both passes leave the selected scope before reaching this comparison.
+    // The first exit changes EBP and reenters the same checked loop; retaining
+    // the first proof or discarding the clone's final stores corrupts SECOND.
+    a.cmp(ebp, SLOT).unwrap();
+    a.jne(done).unwrap();
+    a.mov(ebp, SECOND).unwrap();
+    a.mov(dword_ptr(ecx), PASSES).unwrap();
+    a.jmp(top).unwrap();
+    a.set_label(&mut done).unwrap();
+    a.pop(ebp).unwrap();
+    a.ret().unwrap();
+    let bytes = a.assemble(u64::from(CODE)).unwrap();
+
+    for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+        // A single sufficiently funded invocation traverses both clone exits.
+        // Small budgets separately test restoring and reloading the scoped
+        // state; they are never treated as Unicorn instruction counts.
+        for budget in [1, 2, 3, 100] {
+            let mut jit = fixture(&bytes, Some(strategy));
+            let mut reference = fixture(&bytes, None);
+            let sentinels: [[u8; 16]; 8] = std::array::from_fn(|reg| {
+                std::array::from_fn(|byte| (reg as u8 * 23).wrapping_add(byte as u8 + 1))
+            });
+            for m in [&mut jit, &mut reference] {
+                m.write(SECOND, &100u32.to_le_bytes()).unwrap();
+                m.write(SECOND + 4, &0x1234_5678u32.to_le_bytes()).unwrap();
+                m.state.xmm = sentinels;
+            }
+            let untouched_regs = jit.state.regs;
+            assert_eq!(jit.run(STOP, 0).unwrap(), RunOutcome::Budget);
+            equal_cpu(&jit, &reference);
+            assert_eq!(jit.state.xmm, sentinels);
+
+            let mut finished = false;
+            for round in 0..128 {
+                let outcome = jit.run(STOP, budget).unwrap();
+                assert!(jit.state.fuel <= budget);
+                if outcome == RunOutcome::Budget {
+                    // PC, both distinct address ranges, and the memory counter
+                    // identify a unique completed prefix even after its reset
+                    // for pass two. Walk the oracle to that prefix one guest
+                    // instruction at a time, rather than equating fuel units.
+                    for step in 0..256 {
+                        if reference.state.eip == jit.state.eip
+                            && word(&reference, COUNT) == word(&jit, COUNT)
+                            && reference.memory().read(SLOT, 8).unwrap()
+                                == jit.memory().read(SLOT, 8).unwrap()
+                            && reference.memory().read(SECOND, 8).unwrap()
+                                == jit.memory().read(SECOND, 8).unwrap()
+                        {
+                            break;
+                        }
+                        assert!(
+                            step != 255,
+                            "oracle missed reentry prefix: strategy={strategy:?}, budget={budget}, round={round}"
+                        );
+                        assert_eq!(reference.run_unicorn(STOP, 1).unwrap(), RunOutcome::Budget);
+                    }
+                } else {
+                    assert_eq!(outcome, RunOutcome::ReachedStop);
+                    assert_eq!(oracle_finish(&mut reference), outcome);
+                    finished = true;
+                }
+                equal_cpu(&jit, &reference);
+                assert_eq!(
+                    jit.state.xmm, reference.state.xmm,
+                    "XMM state at reentry prefix: strategy={strategy:?}, budget={budget}, round={round}"
+                );
+                for at in [SLOT, SECOND, COUNT, STACK - 4] {
+                    let width = if at == SLOT || at == SECOND { 8 } else { 4 };
+                    assert_eq!(
+                        jit.memory().read(at, width).unwrap(),
+                        reference.memory().read(at, width).unwrap(),
+                        "memory prefix: strategy={strategy:?}, budget={budget}, round={round}, address={at:#x}"
+                    );
+                }
+                if finished {
+                    if budget == 100 {
+                        assert_eq!(round, 0, "both loops must run in one native invocation");
+                    }
+                    break;
+                }
+            }
+            assert!(finished, "strategy={strategy:?}, budget={budget}");
+            assert_eq!(word(&jit, SLOT), 10 + PASSES * 7);
+            assert_eq!(word(&jit, SLOT + 4), word(&jit, SLOT));
+            assert_eq!(word(&jit, SECOND), 100 + PASSES * 7);
+            assert_eq!(word(&jit, SECOND + 4), word(&jit, SECOND));
+            assert_eq!(word(&jit, COUNT), 0);
+            for reg in [2, 3, 5, 6, 7] {
+                assert_eq!(jit.state.regs[reg], untouched_regs[reg]);
+            }
+            let mut expected_xmm0 = [0; 16];
+            expected_xmm0[..4].copy_from_slice(&untouched_regs[2].to_le_bytes());
+            assert_eq!(jit.state.xmm[0], expected_xmm0);
+            assert_eq!(jit.state.xmm[1..], sentinels[1..]);
+            assert_eq!(jit.stats.interpreter_entries, 0);
+        }
+    }
+}
