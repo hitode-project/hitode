@@ -162,6 +162,24 @@ class AggregateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 aggregate([report])
 
+    def test_pc64_categories_are_complete_and_optional(self):
+        report = fixture()
+        report["cpu_cliffs"].update({
+            "x87_control": {"PC=64/RC=nearest/masks=3f": 8},
+            "x87_control_rejections": {"PC": 8, "RC": 0, "Masks": 0},
+            "x87_pc64": {"Fadd/Exact": 2, "Fadd/Inexact": 6},
+        })
+        summary = aggregate([report, report, fixture()])
+        self.assertEqual(summary["cpu_cliffs"]["x87_pc64_reports"], 2)
+        self.assertEqual(summary["cpu_cliffs"]["x87_pc64"], {"Fadd/Inexact": 12, "Fadd/Exact": 4})
+        self.assertIn("PC=64 候选细分覆盖 2", markdown(summary))
+        for invalid in ({"Fadd/Exact": 7}, {"Fadd/Exact": 9}, {"Fadd/Exact": True},
+                        {"private/path/Exact": 8}, {"Fadd/private-marker": 8}, {42: 8}):
+            report["cpu_cliffs"]["x87_pc64"] = invalid
+            with self.assertRaises(ValueError) as caught:
+                aggregate([report])
+            self.assertNotIn("private", str(caught.exception))
+
     def test_control_distribution_is_complete_and_guards_overlap(self):
         report = fixture()
         report["cpu_cliffs"]["x87_control"] = {
@@ -182,7 +200,9 @@ class AggregateTests(unittest.TestCase):
                                      if key.startswith("interpreter")})
         report["cpu_cliffs"]["x87_control"] = {"PC=64/RC=nearest/masks=3f": 8}
         report["cpu_cliffs"]["x87_control_rejections"] = {"PC": 8, "RC": 0, "Masks": 0}
+        report["cpu_cliffs"]["x87_pc64"] = {"Fadd/Exact": 3, "Fadd/Inexact": 5}
         summary = aggregate([report])
+        self.assertEqual(summary["cpu_cliffs"]["x87_pc64"], {"Fadd/Inexact": 5, "Fadd/Exact": 3})
         self.assertEqual(summary["cpu_cliffs"]["x87_control_rejections"]["PC"], 8)
         self.assertEqual(summary["cpu_cliffs"]["interpreter_details"]["Rejected/Unsupported/Cbw/Cbw"],
                          {"entries": 2, "instructions": 11})
