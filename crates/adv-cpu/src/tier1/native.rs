@@ -301,8 +301,8 @@ impl Engine {
             return Ok(false);
         }
         let mut emitted = emit::Emitter::new(emit::Helpers {
-            load: load as usize as u64,
-            store: store as usize as u64,
+            load: load as *const () as u64,
+            store: store as *const () as u64,
         });
         for instruction in instructions.values() {
             emitted.instruction(instruction);
