@@ -2555,7 +2555,9 @@ mod topology_tests {
             m.write(pc, &[0x40, 0xc3]).unwrap();
         }
         // Identical guest bytes need not compile to identical sizes at every
-        // address on every host, so size the budget to fit either region alone.
+        // address on every host, or even twice at one address (macOS ARM64
+        // varied by a few bytes), so the budget fits either region alone with
+        // slack but never both.
         let mut probe = machine();
         for pc in [0x1000, 0x1200] {
             probe.write(pc, &[0x40, 0xc3]).unwrap();
@@ -2563,7 +2565,7 @@ mod topology_tests {
         }
         let sizes = [0x1000, 0x1200].map(|pc| probe.code.compiled[&pc].code_size);
         eprintln!("region code sizes: {sizes:?}");
-        let size = sizes[0].max(sizes[1]);
+        let size = sizes[0].max(sizes[1]) + sizes[0].min(sizes[1]) / 2;
         discover(&mut m, 0x1000);
         m.set_code_cache_limits(8, size);
         discover(&mut m, 0x1200);
