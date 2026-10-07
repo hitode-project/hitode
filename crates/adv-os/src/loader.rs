@@ -65,6 +65,12 @@ fn begin_initialization(env: &mut adv_machine::Env<'_>, id: usize) {
 /// (an import descriptor name, possibly relative, or a LoadLibrary argument).
 pub trait FileSource {
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// A loader-only read may defer to work outside the synchronous load stack.
+    /// The caller supplies that result through this source before retrying the
+    /// same transaction. Ordinary file probes keep using `read`.
+    fn read_for_loader(&self, path: &str) -> Result<Option<Vec<u8>>, LoadError> {
+        Ok(self.read(path))
+    }
     fn absolute_path(&self, path: &str) -> String {
         if path.contains(':') {
             path.replace('/', "\\")
@@ -82,26 +88,39 @@ pub fn module_file(
     path: &str,
     importer_dir: Option<&str>,
 ) -> Option<(String, Vec<u8>)> {
-    if let Some(bytes) = files.read(path) {
-        return Some((path.to_owned(), bytes));
+    module_file_with(path, importer_dir, |candidate| Ok(files.read(candidate)))
+        .ok()
+        .flatten()
+}
+
+fn module_file_with(
+    path: &str,
+    importer_dir: Option<&str>,
+    mut read: impl FnMut(&str) -> Result<Option<Vec<u8>>, LoadError>,
+) -> Result<Option<(String, Vec<u8>)>, LoadError> {
+    if let Some(bytes) = read(path)? {
+        return Ok(Some((path.to_owned(), bytes)));
     }
     if !path.contains(['\\', '/']) {
         if let Some(dir) = importer_dir.filter(|d| !d.is_empty()) {
             let near = format!("{dir}\\{path}");
-            if let Some(bytes) = files.read(&near) {
-                return Some((near, bytes));
+            if let Some(bytes) = read(&near)? {
+                return Ok(Some((near, bytes)));
             }
         }
         let bundled = format!("dll\\{path}");
-        if let Some(bytes) = files.read(&bundled) {
-            return Some((bundled, bytes));
+        if let Some(bytes) = read(&bundled)? {
+            return Ok(Some((bundled, bytes)));
         }
     }
-    None
+    Ok(None)
 }
 
 #[derive(Debug, Error)]
 pub enum LoadError {
+    /// No initializer runs before this request unwinds the current transaction.
+    #[error("{0}: loader file read deferred")]
+    DeferredRead(String),
     #[error("{0}: not found")]
     NotFound(String),
     #[error("{path}: {err}")]
@@ -479,17 +498,27 @@ impl<'a> Loader<'a> {
         if self.sys.thunks.resolver().replaces_module(&key) {
             return self.load_host(key, path, retain);
         }
-        let altered = if !self.importers.is_empty() && !path.contains(['\\', '/']) {
-            self.altered_directory.as_ref().and_then(|directory| {
+        let altered = match (
+            !self.importers.is_empty() && !path.contains(['\\', '/']),
+            self.altered_directory.as_ref(),
+        ) {
+            (true, Some(directory)) => {
                 let near = format!("{directory}\\{path}");
-                self.files.read(&near).map(|bytes| (near, bytes))
-            })
-        } else {
-            None
+                self.files
+                    .read_for_loader(&near)?
+                    .map(|bytes| (near, bytes))
+            }
+            _ => None,
         };
-        if let Some((resolved, bytes)) = altered
-            .or_else(|| module_file(self.files, path, self.importers.last().map(String::as_str)))
-        {
+        let resolved = match altered {
+            Some(found) => Some(found),
+            None => module_file_with(
+                path,
+                self.importers.last().map(String::as_str),
+                |candidate| self.files.read_for_loader(candidate),
+            )?,
+        };
+        if let Some((resolved, bytes)) = resolved {
             if resolved != path {
                 log::info!("{path}: found as {resolved}");
             }
@@ -835,6 +864,67 @@ impl<'a> Loader<'a> {
         sym: &ImportName,
     ) -> Result<(u32, ResolutionChanges), LoadError> {
         self.resolve_transaction(m, sym, true)
+    }
+
+    /// Inspect a mapped synthetic code export without calling its pristine
+    /// implementation. A live EAT replacement or changed entry belongs to the
+    /// guest; untouched entries return None regardless of host availability.
+    /// Inspection never loads dependencies or queues initializers. Changed
+    /// forwarders require a separate loader transaction and are rejected here.
+    pub fn guest_override(
+        &mut self,
+        module: ModuleId,
+        name: &str,
+    ) -> Result<Option<u32>, LoadError> {
+        let image = self.modules.get(module);
+        if image.kind != ModuleKind::Host || !image.lifetime.mapped {
+            return Ok(None);
+        }
+        let Some(original) = image.exports_by_name.get(name) else {
+            return Ok(None);
+        };
+        if self
+            .sys
+            .thunks
+            .resolver()
+            .data_size(&image.name, name)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let symbol = ImportName::Name {
+            hint: 0,
+            name: name.to_owned(),
+        };
+        let live = mapped_export(self.cpu, image.base, image.size, &symbol).ok_or_else(|| {
+            LoadError::MissingExport {
+                module: image.name.clone(),
+                name: name.to_owned(),
+            }
+        })?;
+        let rva = match live {
+            ExportTarget::Rva(rva) => rva,
+            ExportTarget::Forwarder(_) if &live == original => return Ok(None),
+            ExportTarget::Forwarder(_) => {
+                return Err(LoadError::Pe {
+                    path: image.path.clone(),
+                    err: PeError::Malformed(
+                        "guest forwarder override inspection is unavailable".into(),
+                    ),
+                });
+            }
+        };
+        let address = image.base + rva;
+        if original != &ExportTarget::Rva(rva) {
+            return Ok(Some(address));
+        }
+        let thunk = self.sys.thunks.publish(self.cpu, &image.name, name)?;
+        let index = (thunk - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        let expected = self.sys.thunks.pristine_entry(index);
+        adv_abi::guest::check_range(self.cpu, address, expected.len() as u32, Prot::READ)?;
+        let mut bytes = vec![0; expected.len()];
+        self.cpu.read(address, &mut bytes)?;
+        Ok((bytes != expected).then_some(address))
     }
 
     fn resolve_transaction(

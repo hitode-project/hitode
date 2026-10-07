@@ -18,6 +18,7 @@ use crate::util::{IntOrStr, cstr, err, put_cstr, put_wstr, set_last_error, wstr}
 use crate::{Win32, stdcall};
 
 mod datafile;
+mod guest_files;
 mod notifications;
 pub(crate) use notifications::prepare_system_modules;
 pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn_thread};
@@ -239,6 +240,15 @@ fn run_inits(
             }
             Outcome::call(c.target, c.args, move |env, resume| {
                 if is_dllmain && resume.value() == 0 {
+                    let caller = env.caller();
+                    env.sys.trace.warning(
+                        env.context,
+                        env.sys.frame,
+                        caller,
+                        "<loader>",
+                        "DLL process initialization returned FALSE",
+                        None,
+                    );
                     failed(env)
                 } else {
                     run_inits(env, inits, finished, failed)
@@ -286,16 +296,64 @@ fn load_library_front(
     altered: bool,
     front: LibraryFront,
 ) -> Outcome {
-    let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
-    let mut l = Loader::new(&mut *env.cpu, &mut *env.sys, modules, &w.vfs);
-    let res = if altered {
-        l.load_altered(&name)
-    } else {
-        l.load(&name)
+    let cache = match guest_files::active(env) {
+        Ok(active) => active.then(guest_files::Files::default),
+        Err(_) => {
+            adv_abi::warn_unavailable(
+                env,
+                "kernel32.dll!LoadLibrary",
+                "native file hook export is invalid or requires unsupported forwarded initialization",
+            );
+            return load_io_error(env, front, 0xc00000bb);
+        }
     };
-    let inits: VecDeque<InitCall> = std::mem::take(&mut l.inits).into();
-    drop(l);
+    load_library_attempt(env, name, altered, front, cache)
+}
+
+fn load_library_attempt(
+    env: &mut Env<'_>,
+    name: String,
+    altered: bool,
+    front: LibraryFront,
+    cache: Option<guest_files::Files>,
+) -> Outcome {
+    let (res, inits) = {
+        let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
+        let adapter = cache
+            .as_ref()
+            .map(|files| guest_files::Source { files, vfs: &w.vfs });
+        let source: &dyn adv_os::loader::FileSource = adapter
+            .as_ref()
+            .map_or(&w.vfs as &dyn adv_os::loader::FileSource, |source| source);
+        let mut loader = Loader::new(env.cpu, env.sys, modules, source);
+        let result = if altered {
+            loader.load_altered(&name)
+        } else {
+            loader.load(&name)
+        };
+        (result, VecDeque::from(std::mem::take(&mut loader.inits)))
+    };
     match res {
+        Err(adv_os::LoadError::DeferredRead(path)) => {
+            let Some(mut cache) = cache else {
+                return Outcome::Fail(
+                    "loader deferred a file without a continuation source".into(),
+                );
+            };
+            // The loader has rolled back its unfinished graph. No guest DLL
+            // initializer ran, and no host borrow survives this guest callback.
+            guest_files::read(
+                env,
+                path.clone(),
+                Box::new(move |env, result| match result {
+                    Ok(bytes) => {
+                        cache.insert(path, bytes);
+                        load_library_attempt(env, name, altered, front, Some(cache))
+                    }
+                    Err(status) => load_io_error(env, front, status),
+                }),
+            )
+        }
         Ok(id) => {
             let base = adv_os::modules(env.ext).get(id).base;
             log::info!("LoadLibrary({name}) = {base:#010x}");
@@ -332,6 +390,17 @@ fn load_library_front(
         }
         Err(e) => {
             log::warn!("LoadLibrary({name}) failed: {e}");
+            if env.sys.trace.enabled() {
+                let caller = env.caller();
+                env.sys.trace.warning(
+                    env.context,
+                    env.sys.frame,
+                    caller,
+                    "<loader>",
+                    &e.to_string(),
+                    None,
+                );
+            }
             match front {
                 LibraryFront::Win32 => {
                     set_last_error(env, load_error_code(&e));
@@ -344,6 +413,7 @@ fn load_library_front(
                     | adv_os::LoadError::Mem(_) => 0xc0000017,
                     adv_os::LoadError::MissingExport { .. } => 0xc0000139,
                     adv_os::LoadError::NotFound(_) => 0xc0000135,
+                    adv_os::LoadError::DeferredRead(_) => unreachable!("handled above"),
                 }),
             }
         }
@@ -358,6 +428,35 @@ fn load_error_code(error: &adv_os::LoadError) -> u32 {
         | adv_os::LoadError::Mem(_) => err::NOT_ENOUGH_MEMORY,
         adv_os::LoadError::MissingExport { .. } => err::PROC_NOT_FOUND,
         adv_os::LoadError::NotFound(_) => err::MOD_NOT_FOUND,
+        adv_os::LoadError::DeferredRead(_) => err::MOD_NOT_FOUND,
+    }
+}
+
+fn load_io_error(env: &mut Env<'_>, front: LibraryFront, status: u32) -> Outcome {
+    // Never publish NT_SUCCESS without a module handle.
+    let status = if status as i32 >= 0 {
+        0xc00000bb
+    } else {
+        status
+    };
+    match front {
+        LibraryFront::Native(_) => Outcome::Return(status),
+        LibraryFront::Win32 => {
+            let error = match status {
+                0xc0000005 => 998,
+                0xc0000008 => 6,
+                0xc000000d => 87,
+                0xc0000017 | 0xc000009a => 8,
+                0xc0000022 => 5,
+                0xc0000043 => 32,
+                0xc00000bb => 50,
+                0xc000007b => 193,
+                0xc0000034 | 0xc000003a => err::MOD_NOT_FOUND,
+                _ => 31,
+            };
+            set_last_error(env, error);
+            Outcome::Return(0)
+        }
     }
 }
 
