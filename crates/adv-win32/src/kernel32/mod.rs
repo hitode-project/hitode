@@ -35,6 +35,7 @@ pub(crate) use process::install_parameters;
 pub(crate) use process::native_resume_thread;
 pub(crate) use process::native_thread_context;
 pub(crate) use process::{command_line, configure_codepage};
+mod registered_wait;
 mod string;
 mod sync;
 mod time;
@@ -49,6 +50,7 @@ use adv_abi::Registry;
 pub(crate) const K32: &str = "kernel32.dll";
 
 pub fn register(reg: &mut Registry) {
+    registered_wait::register(reg);
     atom::register(reg);
     child_process::register(reg);
     environment::register(reg);

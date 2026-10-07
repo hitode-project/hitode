@@ -19,6 +19,7 @@ mod ntdll;
 pub mod printf;
 pub mod user32;
 pub mod util;
+mod vcomp;
 mod version;
 mod vfw;
 pub mod winmm;
@@ -210,6 +211,7 @@ pub fn register(reg: &mut Registry) {
     winsock::register(reg);
     winmm::register(reg);
     xinput::register(reg);
+    vcomp::register(reg);
     ntdll::register(reg);
     guest_code::install(reg);
 }

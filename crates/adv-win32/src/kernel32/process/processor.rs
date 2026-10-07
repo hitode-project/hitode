@@ -106,6 +106,12 @@ fn current_processor_ex(env: &mut Env<'_>, output: GuestPtr<u32>) -> Result<(), 
     output.write(env.cpu, number << 16)
 }
 
+#[win32(kernel32, name = "GetNumaHighestNodeNumber", level = implement)]
+fn highest_numa_node(env: &mut Env<'_>, output: GuestPtr<u32>) -> Result<i32, MemFault> {
+    output.write(env.cpu, 0)?;
+    Ok(1)
+}
+
 fn topology(profile: Processors, relation: u32) -> Option<Vec<u8>> {
     let relations: &[u32] = match relation {
         0 => &[0],
@@ -217,6 +223,7 @@ pub(super) fn register(reg: &mut Registry) {
         native_info_ABI,
         current_processor_ABI,
         current_processor_ex_ABI,
+        highest_numa_node_ABI,
         logical_information_ex_ABI,
         get_group_affinity_ABI,
         set_group_affinity_ABI,
