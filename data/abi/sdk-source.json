@@ -152,5 +152,12 @@
     ],
     "native_oracle_source_sha256": "5757b812129f1c7bd916755b0cdd6ac80861cdd6c62c4324321c176c0018083a",
     "native_verification": "Authored hidden Windows fixture with seven PNG/BMP images: 28 observations of 28-byte SourceInfo formats, NULL Info success, NONPOW2 identity versus DEFAULT expansion, NONE/LINEAR same-source pixels and resource release. Decoder and real guest tests cover bounded DDS DXT1/3/5, CPU and shared GPU storage readback, outputs and final ownership. No game image or host DLL bytes bundled."
+  },
+  "legacy_rtl_current_directory": {
+    "scope": "RtlSetCurrentDirectory_U and RtlGetCurrentDirectory_U only",
+    "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib import symbols, Wine primary RTL declarations, and authored Windows x86 oracle",
+    "stack": "SDK _RtlSetCurrentDirectory_U@4 (one descriptor pointer, NTSTATUS) and _RtlGetCurrentDirectory_U@8 (ULONG byte capacity, PWSTR output, ULONG byte result)",
+    "documentation": "https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/path.c",
+    "native_verification": "24 DWORDs cover Unicode directory, Win32 shared cwd, missing leaf/parent and non-directory NTSTATUS, short/equal/odd byte capacities, successful NUL write and unchanged LastError; no host paths or game data bundled"
   }
 }

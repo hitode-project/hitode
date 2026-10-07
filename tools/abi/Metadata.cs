@@ -329,6 +329,11 @@ public static class AbiMetadata
             bool ntPath = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "RtlDosPathNameToNtPathName_U"
                 && f[3] == "u32" && f[4] == "Windows.Win32.Foundation.BOOLEAN"
                 && f[5] == "DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1";
+            bool ntDirectory = f.Length == 6 && f[0] == "ntdll.dll"
+                && (f[1] == "RtlSetCurrentDirectory_U" && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
+                    && f[5] == "PathName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1"
+                    || f[1] == "RtlGetCurrentDirectory_U" && f[3] == "u32" && f[4] == "u32"
+                    && f[5] == "BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1");
             // User-mode Nt/Zw share one native service. This sole alias uses
             // the SDK winternl.h NtCreateFile declaration and both SDK x86
             // import symbols @44, without projecting other native services.
@@ -353,7 +358,7 @@ public static class AbiMetadata
             bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
-            if ((!vcm && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
+            if ((!vcm && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };
@@ -381,7 +386,7 @@ public static class AbiMetadata
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect || d3dxStack ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dxTexture ? new[] { "ptr", "u32", "i32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(ntDirectory ? new[] { "ptr", "str16", "u32" }.Contains(p[2]) : ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect || d3dxStack ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dxTexture ? new[] { "ptr", "u32", "i32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

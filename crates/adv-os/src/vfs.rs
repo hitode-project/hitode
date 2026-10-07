@@ -32,6 +32,14 @@ pub struct DirEntry {
     pub attributes: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryError {
+    NameNotFound,
+    PathNotFound,
+    NotDirectory,
+    AccessDenied,
+}
+
 /// An open guest file: a host object in the machine's handle table. Every personality
 /// that opens or traces files shares this one type.
 pub struct FileObj {
@@ -271,6 +279,36 @@ impl Vfs {
 
     pub fn is_dir(&self, guest: &str) -> bool {
         self.lookup(guest).is_some_and(|p| p.is_dir())
+    }
+
+    /// Change only this process's DOS directory after validating its VFS target.
+    pub fn set_current_directory(&mut self, guest: &str) -> Result<(), DirectoryError> {
+        let path = self.normalize(guest);
+        let missing = || {
+            let parent = path.rfind('\\').map(|at| &path[..at + 1]);
+            if parent.is_some_and(|parent| self.is_dir(parent)) {
+                DirectoryError::NameNotFound
+            } else {
+                DirectoryError::PathNotFound
+            }
+        };
+        let host = self.lookup(&path).ok_or_else(missing)?;
+        let metadata = std::fs::metadata(host).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing()
+            } else {
+                DirectoryError::AccessDenied
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(DirectoryError::NotDirectory);
+        }
+        self.cwd = if path.len() > 3 {
+            path.trim_end_matches('\\').to_owned()
+        } else {
+            path
+        };
+        Ok(())
     }
 
     /// Merge game, replacement and writable layers, in increasing priority.
