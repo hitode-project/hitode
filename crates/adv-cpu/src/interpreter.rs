@@ -560,6 +560,7 @@ impl DecodedBlock {
                             | Action::Ret(..)
                             | Action::Int(..)
                             | Action::Ud2
+                            | Action::Privileged
                             | Action::String(..)
                             | Action::PopFlags(..)
                             | Action::Rdtsc
@@ -818,6 +819,7 @@ enum Action {
     Flags(M),
     Int(u8),
     Ud2,
+    Privileged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1389,6 +1391,9 @@ fn predecode(i: &Instruction) -> Option<Action> {
         M::Int => Action::Int(i.immediate8()),
         M::Int3 => Action::Int(3),
         M::Ud2 => Action::Ud2,
+        // The flat Windows profile is CPL3 with IOPL0: neither instruction
+        // changes IF or retires before delivering the general protection fault.
+        M::Cli | M::Sti => Action::Privileged,
         _ => return None,
     })
 }
@@ -1943,6 +1948,12 @@ impl Transaction {
                 return Err(Step::Trap {
                     pc: self.pc,
                     vector: 6,
+                });
+            }
+            Action::Privileged => {
+                return Err(Step::Trap {
+                    pc: self.pc,
+                    vector: 13,
                 });
             }
         }
