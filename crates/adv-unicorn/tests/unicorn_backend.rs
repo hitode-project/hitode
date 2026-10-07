@@ -156,6 +156,42 @@ fn fs_base_is_per_context() {
 }
 
 #[test]
+fn sidt_queries_the_owned_table_with_both_operand_sizes_and_saved_contexts() {
+    let output = TEB1 + 0x100;
+    let mut cpu = machine(|a| {
+        a.bytes.extend_from_slice(&[0x0f, 0x01, 0x0d]);
+        a.bytes.extend_from_slice(&(output + 1).to_le_bytes());
+        a.bytes.extend_from_slice(&[0x66, 0x0f, 0x01, 0x0d]);
+        a.bytes.extend_from_slice(&(output + 11).to_le_bytes());
+        a.call(thunk(DONE));
+    });
+    let idt = GDT + SegmentSetup::IDT_OFFSET;
+    let mut gates = [0xff; SegmentSetup::IDT_LIMIT as usize + 1];
+    cpu.read(idt, &mut gates).unwrap();
+    assert!(gates.iter().all(|&byte| byte == 0));
+    cpu.set_reg(Reg::Eax, 0x1357_2468);
+    cpu.set_reg(Reg::Eflags, 0x8d7);
+    let mut context = cpu.new_context();
+    cpu.save(&mut context);
+    for _ in 0..2 {
+        cpu.restore(&context);
+        cpu.write(output, &[0xa5; 18]).unwrap();
+        assert_eq!(cpu.run(&mut Log::default()), Exit::Parked);
+        for destination in [output + 1, output + 11] {
+            assert_eq!(cpu.read_u16(destination).unwrap(), SegmentSetup::IDT_LIMIT);
+            assert_eq!(cpu.read_u32(destination + 2).unwrap(), idt);
+        }
+        let mut bytes = [0; 18];
+        cpu.read(output, &mut bytes).unwrap();
+        for index in [0, 7, 10, 17] {
+            assert_eq!(bytes[index], 0xa5);
+        }
+        assert_eq!(cpu.reg(Reg::Eax), 0x1357_2468);
+        assert_eq!(cpu.reg(Reg::Eflags), 0x8d7);
+    }
+}
+
+#[test]
 fn unmapped_read_faults_with_address() {
     let mut cpu = machine(|a| {
         a.mov_eax_mem(0x0bad_0000).call(thunk(DONE));

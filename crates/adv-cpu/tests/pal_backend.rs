@@ -594,7 +594,7 @@ fn invalidation_recompiles_changed_region_and_revalidates_unchanged_same_page_co
 }
 
 #[test]
-fn setup_segments_uses_supplied_gdt_and_windows_selectors() {
+fn setup_segments_uses_owned_descriptor_tables_and_windows_selectors() {
     const GDT_ADDR: u32 = 0x7e11_0000;
     const TEB: u32 = 0x7ffd_e000;
     for jit in [false, true] {
@@ -612,6 +612,10 @@ fn setup_segments_uses_supplied_gdt_and_windows_selectors() {
         );
         cpu.setup_segments(SegmentSetup { gdt_addr: GDT_ADDR })
             .unwrap();
+        let idt = GDT_ADDR + SegmentSetup::IDT_OFFSET;
+        let mut gates = [0xff; SegmentSetup::IDT_LIMIT as usize + 1];
+        cpu.read(idt, &mut gates).unwrap();
+        assert!(gates.iter().all(|&byte| byte == 0));
         cpu.map(CODE, 4096, Prot::RX).unwrap();
         cpu.map(DATA, 4096, Prot::RW).unwrap();
         cpu.map(TEB, 4096, Prot::RW).unwrap();
@@ -624,6 +628,7 @@ fn setup_segments_uses_supplied_gdt_and_windows_selectors() {
                 a.mov(dword_ptr(DATA as i32 + offset), eax).unwrap();
             }
             a.sgdt(fword_ptr(DATA as i32 + 32)).unwrap();
+            a.sidt(fword_ptr(DATA as i32 + 40)).unwrap();
             a.mov(eax, dword_ptr(0x18).fs()).unwrap();
             a.ret().unwrap();
         });
@@ -640,7 +645,56 @@ fn setup_segments_uses_supplied_gdt_and_windows_selectors() {
         }
         assert_eq!(cpu.read_u16(DATA + 32).unwrap(), 127);
         assert_eq!(cpu.read_u32(DATA + 34).unwrap(), GDT_ADDR);
+        assert_eq!(cpu.read_u16(DATA + 40).unwrap(), SegmentSetup::IDT_LIMIT);
+        assert_eq!(cpu.read_u32(DATA + 42).unwrap(), idt);
         assert_eq!(cpu.reg(Reg::Eax), 0x1234_5678);
+    }
+}
+
+#[test]
+fn sidt_descriptor_identity_survives_context_switches_in_both_execution_modes() {
+    for jit in [false, true] {
+        let mut cpu = cpu(jit);
+        cpu.map(CODE, 4096, Prot::RX).unwrap();
+        cpu.map(DATA, 4096, Prot::RW).unwrap();
+        let bytes = assemble(CODE, |a| {
+            a.sidt(fword_ptr(DATA as i32 + 1)).unwrap();
+            a.ret().unwrap();
+        });
+        cpu.write(CODE, &bytes).unwrap();
+        if jit {
+            cpu.executor_mut()
+                .add_region(adv_cpu::Region::new(CODE, bytes.len()))
+                .unwrap();
+        }
+        let mut contexts = Vec::new();
+        for (base, limit) in [(0xf123_4567, 0x7ff), (0xe765_4321, 0x3ff)] {
+            let state = &mut cpu.executor_mut().state;
+            state.segments.idt_base = base;
+            state.segments.idt_limit = limit;
+            let mut context = cpu.new_context();
+            cpu.save(&mut context);
+            contexts.push(context);
+        }
+        for (index, base, limit) in [
+            (0, 0xf123_4567, 0x7ff),
+            (1, 0xe765_4321, 0x3ff),
+            (0, 0xf123_4567, 0x7ff),
+        ] {
+            cpu.restore(&contexts[index]);
+            cpu.write(DATA, &[0xa5; 8]).unwrap();
+            cpu.set_reg(Reg::Eax, 0x1357_2468);
+            cpu.set_reg(Reg::Eflags, 0x8d7);
+            start(&mut cpu, CODE);
+            assert_eq!(cpu.run(&mut UnexpectedTrap), Exit::Parked);
+            assert_eq!(cpu.read_u16(DATA + 1).unwrap(), limit);
+            assert_eq!(cpu.read_u32(DATA + 3).unwrap(), base);
+            assert_eq!(cpu.reg(Reg::Eax), 0x1357_2468);
+            assert_eq!(cpu.reg(Reg::Eflags), 0x8d7);
+            let mut canaries = [0; 8];
+            cpu.read(DATA, &mut canaries).unwrap();
+            assert_eq!((canaries[0], canaries[7]), (0xa5, 0xa5));
+        }
     }
 }
 

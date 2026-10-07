@@ -5,6 +5,8 @@ mod loader;
 mod loader_lock;
 mod memory;
 mod path;
+mod peb_lock;
+pub(crate) use peb_lock::install as install_peb_lock;
 mod procedure;
 mod strings;
 mod thread;
@@ -209,6 +211,7 @@ pub fn register(reg: &mut Registry) {
     path::register(reg);
     directory::register(reg);
     loader_lock::register(reg);
+    peb_lock::register(reg);
     loader::register(reg);
     strings::register(reg);
     procedure::register(reg);

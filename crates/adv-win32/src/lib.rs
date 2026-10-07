@@ -135,6 +135,7 @@ impl Win32 {
         heaps.process_heap = process_heap;
         m.cpu
             .write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
+        ntdll::install_peb_lock(m)?;
         let vfs = Vfs::new(&cfg.os);
         let w = Win32 {
             codec: Codec::new(cfg.os.codepage),
