@@ -6,6 +6,7 @@ use adv_os::Heaps;
 use std::collections::HashMap;
 mod byte_set;
 mod byte_sort;
+mod byte_output;
 mod convert;
 mod cpp_alloc;
 mod data;
@@ -42,8 +43,26 @@ struct CrtState {
     locks: HashMap<(String, u32), u32>,
     globals: HashMap<(String, String), u32>,
     invalid_handlers: HashMap<String, u32>,
-    files: HashMap<u32, std::fs::File>,
+    files: HashMap<u32, CrtFile>,
     locales: HashMap<String, locale::LocaleState>,
+}
+
+// Stream metadata remains with the existing FILE allocation/file owner.
+// Deref preserves the established read/write/seek/close implementations.
+struct CrtFile {
+    file: std::fs::File,
+    binary: bool,
+}
+impl std::ops::Deref for CrtFile {
+    type Target = std::fs::File;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+impl std::ops::DerefMut for CrtFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
+    }
 }
 
 // API-set imports and their UCRT exports share the same CRT state owner.
@@ -105,6 +124,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 pub fn register(r: &mut Registry) {
     byte_set::register(r);
     byte_sort::register(r);
+    byte_output::register(r);
     data::register(r);
     directory::register(r);
     exceptions::register(r);
@@ -435,7 +455,13 @@ fn crt_open_file_options(
     if e.ext.try_get::<CrtState>().is_none() {
         e.ext.insert(CrtState::default());
     }
-    e.ext.get_mut::<CrtState>().files.insert(ptr, file);
+    e.ext.get_mut::<CrtState>().files.insert(
+        ptr,
+        CrtFile {
+            file,
+            binary: mode.contains('b') && !mode.contains("ccs="),
+        },
+    );
     Ok(ptr)
 }
 
