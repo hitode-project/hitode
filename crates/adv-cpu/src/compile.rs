@@ -2285,7 +2285,7 @@ fn word_stack(i: &Instruction) -> bool {
 fn narrow_alu(mnemonic: M) -> bool {
     matches!(
         mnemonic,
-        M::Add | M::Sub | M::And | M::Or | M::Xor | M::Cmp | M::Test | M::Inc | M::Dec
+        M::Add | M::Sub | M::And | M::Or | M::Xor | M::Cmp | M::Test | M::Inc | M::Dec | M::Neg
     )
 }
 
