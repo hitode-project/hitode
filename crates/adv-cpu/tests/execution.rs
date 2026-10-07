@@ -682,3 +682,39 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
         );
     }
 }
+
+#[test]
+fn tier_verification_checks_new_regions_without_changing_results() {
+    let code = assemble(|a| {
+        let mut top = a.create_label();
+        let mut leaf = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, 4).unwrap();
+        a.call(leaf).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut leaf).unwrap();
+        a.push(ebx).unwrap();
+        a.lea(ebx, dword_ptr(eax + eax * 2 + 1)).unwrap();
+        a.pop(edx).unwrap();
+        a.ret().unwrap();
+    });
+    let mut results = Vec::new();
+    for verify in [false, true] {
+        let mut jit = machine(&code, true);
+        jit.set_tier_verification(verify.then_some(true));
+        reset(&mut jit, [0, 50, 0, 7, 0, 0, 0, DATA], 2);
+        assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
+        let checks = &jit.stats.verification;
+        assert_eq!(checks.mismatches, 0, "{checks:?}");
+        assert_eq!(checks.verified > 0, verify, "{checks:?}");
+        results.push((
+            jit.state.regs,
+            jit.memory().read(DATA, 256).unwrap().to_vec(),
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}

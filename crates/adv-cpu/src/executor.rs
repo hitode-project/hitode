@@ -10,8 +10,10 @@ use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 mod code_store;
 mod interpreter_profile;
 mod parallel;
+mod verify;
 mod warm;
 use code_store::CodeStore;
+pub use verify::VerifyStats;
 
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
@@ -58,6 +60,8 @@ pub struct Stats {
     pub bulk_bytes: u64,
     /// Slow-path counters by instruction and reason.
     pub cliffs: crate::Cliffs,
+    /// Interpreter checks of newly published native code.
+    pub verification: VerifyStats,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -171,6 +175,7 @@ pub struct Executor {
     pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
     interpreter_profile: Option<Box<interpreter_profile::Profile>>,
+    verifier: Option<Box<verify::Verifier>>,
     timestamp: crate::timestamp::Counter,
     pub state: CpuState,
     pub stats: Stats,
@@ -275,6 +280,17 @@ impl Executor {
         self.timestamp = bridge.timestamp;
         result
     }
+    /// Check the first native entries of current and later publications
+    /// against the interpreter; `strict` turns a mismatch into a run error.
+    pub fn set_tier_verification(&mut self, mode: Option<bool>) {
+        self.verifier = mode.map(|strict| {
+            let mut verifier = verify::Verifier::new(strict);
+            for &start in self.code.compiled.keys() {
+                verifier.pending.insert(start, verify::ENTRIES);
+            }
+            Box::new(verifier)
+        });
+    }
     /// Select helper threads before execution. Zero runs admitted batches inline.
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
         if self.stats.native_entries != 0 || self.stats.interpreter_entries != 0 {
@@ -369,6 +385,7 @@ impl Executor {
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
             interpreter_profile: interpreter_profile::Profile::from_env(),
+            verifier: verify::Verifier::from_env(),
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
@@ -561,6 +578,9 @@ impl Executor {
             self.profiled.push((region.start, profile));
         }
         self.code.compiled.insert(region.start, compiled);
+        if let Some(verifier) = &mut self.verifier {
+            verifier.pending.insert(region.start, verify::ENTRIES);
+        }
         if region.compile_strategy == CompileStrategy::Fast {
             self.code.fast_regions.insert(region.start);
         }
@@ -1439,6 +1459,21 @@ impl Executor {
                 if self.region_linking && !self.profiling {
                     self.refresh_links();
                 }
+                // Parallel workers share memory, so a private undo is not possible.
+                let serial = self.parallel.is_none();
+                let trace = match self.verifier.as_deref_mut() {
+                    Some(verifier) if serial && verifier.pending.contains_key(&owner) => {
+                        verifier.take(owner);
+                        Some(verifier.record(
+                            owner,
+                            stop,
+                            &mut self.interpreter,
+                            &mut self.state,
+                            &mut self.memory,
+                        )?)
+                    }
+                    _ => None,
+                };
                 let native = &self.code.compiled[&owner];
                 // Internal region loops do not use the inter-region chain limit.
                 // Reserve unused caller fuel and periodically return through Rust
@@ -1451,6 +1486,9 @@ impl Executor {
                     let left = deadline.saturating_duration_since(now).as_micros() as u64;
                     (left / 2).saturating_mul(self.native_rate).max(SAFEPOINT)
                 });
+                // A verified entry runs one block: without back edges, its exit
+                // PC names a single interpreted state.
+                let allowance = if trace.is_some() { 1 } else { allowance };
                 let reserved = self.state.fuel.saturating_sub(allowance);
                 self.state.fuel -= reserved;
                 let before = self.state.fuel;
@@ -1466,16 +1504,38 @@ impl Executor {
                         } else {
                             None
                         },
-                        links: (self.region_linking && !self.profiling).then_some(&self.code.links),
+                        // A verified entry stops at the region boundary.
+                        links: (self.region_linking && !self.profiling && trace.is_none())
+                            .then_some(&self.code.links),
                         stop,
                         interrupt: if self.host_interrupts {
                             self.interrupt.as_ref()
                         } else {
                             &self.inactive_interrupt
                         },
-                        shadow: self.shadow_returns.as_deref_mut(),
+                        shadow: self
+                            .shadow_returns
+                            .as_deref_mut()
+                            .filter(|_| trace.is_none()),
                     },
                 );
+                if let Some(trace) = &trace {
+                    let stats = &mut self.stats.verification;
+                    match trace.check(&self.state, &self.memory) {
+                        None => stats.inconclusive += 1,
+                        Some(Ok(verify::Check::Equal)) => stats.verified += 1,
+                        Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+                        Some(Err(report)) => {
+                            stats.mismatches += 1;
+                            if self.verifier.as_ref().is_some_and(|v| v.strict) {
+                                return Err(format!("tier verification: {report}"));
+                            }
+                            if stats.reports.len() < verify::REPORTS {
+                                stats.reports.push(report);
+                            }
+                        }
+                    }
+                }
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
                     p.native_entries += 1;
@@ -1492,6 +1552,7 @@ impl Executor {
                 let completed = before - self.state.fuel;
                 if let Some((_, now)) = timed
                     && reserved != 0
+                    && trace.is_none()
                     && result == Exit::Budget as u32
                 {
                     let elapsed = (now.elapsed().as_micros() as u64).max(1);

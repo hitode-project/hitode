@@ -15,6 +15,8 @@ unsafe extern "system" {
 }
 
 const PAGE: usize = 4096;
+// Keep every byte of a module in one interval smaller than rel32's reach.
+const RELATIVE_WINDOW: usize = 1 << 30;
 #[repr(C)]
 #[derive(Default)]
 struct Info {
@@ -105,14 +107,14 @@ pub(crate) unsafe fn code_storage_bytes(functions: [usize; 2]) -> Result<(usize,
 /// pieces are placed in the first free range above the module's first one.
 fn near(anchor: usize, len: usize) -> Option<*mut u8> {
     const GRANULARITY: usize = 0x1_0000;
-    const REACH: usize = 1 << 30;
+    let limit = anchor.checked_add(RELATIVE_WINDOW)?;
     let mut address = anchor;
-    while address < anchor.checked_add(REACH)? {
+    while address < limit {
         let region = query(address as *const u8).ok()?;
         let end = region.base.checked_add(region.region)?;
         if region.state == 0x10000 {
             let start = region.base.checked_next_multiple_of(GRANULARITY)?;
-            if start.checked_add(len)? <= end && start + len <= anchor + REACH {
+            if start.checked_add(len)? <= end && start + len <= limit {
                 // SAFETY: a fresh reservation at a free, granularity-aligned
                 // address; another thread may win the race, which returns null.
                 let base = unsafe { VirtualAlloc(start as *mut c_void, len, 0x3000, 4) };
@@ -151,6 +153,16 @@ unsafe impl Send for WindowsMemory {}
 
 impl WindowsMemory {
     fn allocate(&mut self, size: usize, align: u64, kind: Kind) -> io::Result<*mut u8> {
+        self.allocate_with_near(size, align, kind, near)
+    }
+
+    fn allocate_with_near(
+        &mut self,
+        size: usize,
+        align: u64,
+        kind: Kind,
+        allocate_near: impl FnOnce(usize, usize) -> Option<*mut u8>,
+    ) -> io::Result<*mut u8> {
         let align =
             usize::try_from(align).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         if !align.is_power_of_two() {
@@ -180,15 +192,26 @@ impl WindowsMemory {
         let len = code_len
             .checked_add(if kind == Kind::Code { PAGE } else { 0 })
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        if len > RELATIVE_WINDOW {
+            return Err(io::ErrorKind::OutOfMemory.into());
+        }
         let anchor = self
             .allocations
             .first()
             .map(|first| first.base.as_ptr() as usize);
-        let base = NonNull::new(match anchor.and_then(|anchor| near(anchor, len)) {
-            Some(base) => base,
-            None => unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000, 4) }.cast::<u8>(),
-        })
-        .ok_or_else(io::Error::last_os_error)?;
+        let pointer = match anchor {
+            Some(anchor) => allocate_near(anchor, len)
+                // A far fallback can make Cranelift's module-local rel32
+                // references overflow. Reject this compilation instead; its
+                // unmodified guest code remains available to the interpreter.
+                .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?,
+            None => {
+                // SAFETY: the first piece owns a fresh unhinted reservation;
+                // all subsequent pieces must stay in its relative window.
+                unsafe { VirtualAlloc(std::ptr::null_mut(), len, 0x3000, 4) }.cast::<u8>()
+            }
+        };
+        let base = NonNull::new(pointer).ok_or_else(io::Error::last_os_error)?;
         let mut allocation = Allocation {
             base,
             len,
@@ -361,6 +384,54 @@ mod tests {
         for piece in [constant, data] {
             assert!(piece.abs_diff(code) < 1 << 31, "{code:#x} {piece:#x}");
         }
+    }
+    #[test]
+    fn exhausted_near_search_fails_without_far_fallback_or_partial_owner() {
+        let mut provider = WindowsMemory::default();
+        let code = provider.allocate_readexec(64, 16).unwrap();
+        let allocated_bytes: usize = provider.allocations.iter().map(|piece| piece.len).sum();
+        for kind in [Kind::Code, Kind::ReadOnly, Kind::Writable] {
+            let used = provider.allocations[0].used;
+            let error = provider
+                .allocate_with_near(64, 16, kind, |anchor, len| {
+                    assert_eq!(anchor, code as usize);
+                    assert!(len <= RELATIVE_WINDOW);
+                    None
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+            assert_eq!(provider.allocations.len(), 1);
+            assert_eq!(
+                provider
+                    .allocations
+                    .iter()
+                    .map(|piece| piece.len)
+                    .sum::<usize>(),
+                allocated_bytes
+            );
+            assert_eq!(provider.allocations[0].used, used);
+            assert_eq!(query(code).unwrap().protection, 4);
+        }
+        let constant = provider.allocate_readonly(64, 16).unwrap();
+        assert!((constant as usize).abs_diff(code as usize) < RELATIVE_WINDOW);
+        provider.finalize(BranchProtection::None).unwrap();
+        assert_eq!(query(code).unwrap().protection, 0x20);
+        assert_eq!(query(constant).unwrap().protection, 2);
+        // SAFETY: the live finalized code owner retains its private xdata page.
+        let (storage, capacity) = unsafe { unwind_storage(code as usize, 64) }.unwrap();
+        assert_eq!(capacity, PAGE);
+        assert_eq!(query(storage).unwrap().protection, 2);
+    }
+    #[test]
+    fn first_piece_cannot_exceed_the_modules_relative_window() {
+        let mut provider = WindowsMemory::default();
+        let error = provider
+            .allocate_with_near(RELATIVE_WINDOW, 16, Kind::Code, |_, _| {
+                panic!("a first allocation must not search relative to another owner")
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(provider.allocations.is_empty());
     }
     #[test]
     fn invalid_sizes_and_alignments_leave_no_partial_allocation() {
