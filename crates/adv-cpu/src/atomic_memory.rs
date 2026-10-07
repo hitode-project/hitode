@@ -1,16 +1,6 @@
 //! Matching byte-atomic accesses to validated linear PCM aliases.
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Read a PCM vector into an execution-owner stack temporary. The destination
-/// is private storage, so its ordinary writes and the subsequent vector load
-/// never touch the concurrently read PCM allocation.
-pub(crate) unsafe extern "C" fn load_vector(pointer: *const u8, destination: *mut u8) {
-    for index in 0..16 {
-        let value = unsafe { (&*pointer.add(index).cast::<AtomicU8>()).load(Ordering::Relaxed) };
-        unsafe { destination.add(index).write(value) };
-    }
-}
-
 #[inline]
 unsafe fn write<const N: usize>(pointer: *mut u8, low: u64, high: u64) {
     let bytes = [low.to_le_bytes(), high.to_le_bytes()];

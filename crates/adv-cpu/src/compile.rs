@@ -1041,10 +1041,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         "adv_file_write_prepared",
         crate::file_memory::write_prepared as *const u8,
     );
-    builder.symbol(
-        "adv_atomic_load_vector",
-        crate::atomic_memory::load_vector as *const u8,
-    );
     builder.symbol("adv_range_ok", loops::range_ok as *const u8);
     builder.symbol("adv_nest_run", crate::rows::run as *const u8);
     builder.symbol(
@@ -1124,17 +1120,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     ]);
     let atomic_store_id = module
         .declare_function("adv_atomic_store", Linkage::Import, &atomic_store_signature)
-        .map_err(|e| e.to_string())?;
-    let mut atomic_load_signature = module.make_signature();
-    atomic_load_signature
-        .params
-        .extend([AbiParam::new(ptr_ty); 2]);
-    let atomic_load_id = module
-        .declare_function(
-            "adv_atomic_load_vector",
-            Linkage::Import,
-            &atomic_load_signature,
-        )
         .map_err(|e| e.to_string())?;
     let mut file_signature = module.make_signature();
     file_signature.params.extend([
@@ -1230,7 +1215,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
         let x87_ref = module.declare_func_in_func(x87_id, func);
         let atomic_store_ref = module.declare_func_in_func(atomic_store_id, func);
-        let atomic_load_ref = module.declare_func_in_func(atomic_load_id, func);
         let file_read_ref = module.declare_func_in_func(file_read_id, func);
         let file_write_ref = module.declare_func_in_func(file_write_id, func);
         let file_prepared_ref = module.declare_func_in_func(file_prepared_id, func);
@@ -1642,7 +1626,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
                 .collect(),
             atomic_store_ref,
-            atomic_load_ref,
             file_read_ref,
             file_write_ref,
             file_prepare_ref,
@@ -3032,7 +3015,6 @@ struct Emitter<'a> {
     /// lane then materializes its prefix and re-executes canonically.
     lane: Option<ir::Block>,
     atomic_store_ref: ir::FuncRef,
-    atomic_load_ref: ir::FuncRef,
     file_read_ref: ir::FuncRef,
     file_write_ref: ir::FuncRef,
     file_prepare_ref: ir::FuncRef,
@@ -5120,9 +5102,10 @@ impl Emitter<'_> {
         // any byte is read/written. Mixed file/AUDIO elements use checked Memory
         // helpers, which keep PCM subranges byte atomic.
         let mut combined = None;
-        let compact = self.optimizing;
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        let compact = compact && hardware.is_none();
+        let compact = hardware.is_none();
+        #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+        let compact = true;
         if compact {
             let missing = self.denied(&permissions, permission, 0);
             self.guard(missing, reason, Some(addr));
@@ -5158,36 +5141,11 @@ impl Emitter<'_> {
             self.guard(executable, Exit::Fallback, None);
             self.b.set_cold_block(self.b.current_block().unwrap());
         }
-        let file: Vec<_> = positions
-            .iter()
-            .map(|&position| {
-                let p = self.permission(position);
-                let kind = self
-                    .b
-                    .ins()
-                    .band_imm(p, i64::from(crate::memory::SHARED | crate::memory::AUDIO));
-                self.b
-                    .ins()
-                    .icmp_imm(IntCC::Equal, kind, i64::from(crate::memory::SHARED))
-            })
-            .collect();
-        let file = file[1..]
-            .iter()
-            .fold(file[0], |all, &f| self.b.ins().bor(all, f));
-        let overlay = self.b.create_block();
-        self.b.set_cold_block(overlay);
-        let pcm = self.b.create_block();
-        self.b.set_cold_block(pcm);
-        self.b.ins().brif(file, overlay, &[], pcm, &[]);
-        self.b.switch_to_block(pcm);
-        if let Some(value) = value {
-            self.store_atomic(address, value);
-            self.b.ins().jump(done, &[]);
-        } else {
-            let result = self.load_atomic(address, ty);
-            self.b.ins().jump(done, &[result.into()]);
-        }
-        self.b.switch_to_block(overlay);
+        // The cold helper already preserves byte-atomic PCM subranges and
+        // prepares every lazy/COW page before a store commits. Share it with
+        // pure PCM accesses instead of emitting a second per-width access
+        // graph at every guest operand. Permission and code-write guards above
+        // retain the original fault address, PC and restartable SSA prefix.
         let slot = self.memory_buffer();
         let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
         let width = self.constant(size as u32);
@@ -5276,9 +5234,7 @@ impl Emitter<'_> {
     /// Consume a read immediately into SSA; no buffer pointer escapes or is
     /// live across another helper. One slot therefore serves the whole function.
     fn memory_buffer(&mut self) -> ir::StackSlot {
-        if self.optimizing
-            && let Some(slot) = self.memory_scratch
-        {
+        if let Some(slot) = self.memory_scratch {
             return slot;
         }
         let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
@@ -5286,42 +5242,8 @@ impl Emitter<'_> {
             16,
             4,
         ));
-        if self.optimizing {
-            self.memory_scratch = Some(slot);
-        }
+        self.memory_scratch = Some(slot);
         slot
-    }
-    fn load_atomic(&mut self, pointer: Value, ty: ir::Type) -> Value {
-        if ty.is_vector() {
-            // Sixteen inlined byte loads keep many GPR values live and make
-            // register allocation spill the ordinary copy loop. A bounded
-            // Relaxed helper loads into a private stack buffer instead.
-            let slot = self.memory_buffer();
-            let destination = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
-            self.b
-                .ins()
-                .call(self.atomic_load_ref, &[pointer, destination]);
-            return self.b.ins().stack_load(ty, slot, 0);
-        }
-        let mut value = self.b.ins().iconst(ty, 0);
-        for index in 0..ty.bytes() {
-            let address = self.b.ins().iadd_imm(pointer, i64::from(index));
-            // Cranelift currently exposes SeqCst atomic loads only. They are
-            // stronger than the protocol's Relaxed loads, with the same byte
-            // width. The compiler cannot combine them into an ordinary wide load.
-            let byte = self
-                .b
-                .ins()
-                .atomic_load(types::I8, MemFlags::trusted(), address);
-            if ty == types::I8 {
-                value = byte;
-            } else {
-                let byte = self.b.ins().uextend(ty, byte);
-                let byte = self.b.ins().ishl_imm(byte, i64::from(index * 8));
-                value = self.b.ins().bor(value, byte);
-            }
-        }
-        value
     }
     fn store_memory(&mut self, pointer: GuestPointer, value: Value) {
         if let Some(slot) = self.slot(self.b.func.dfg.value_type(value)) {

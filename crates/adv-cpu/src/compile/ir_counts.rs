@@ -18,8 +18,17 @@ pub(super) struct Counts {
 }
 
 pub(super) fn enabled() -> bool {
+    #[cfg(test)]
+    if FORCE.get() {
+        return true;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("ADV_JIT_IR_COUNTS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Counts {
@@ -145,6 +154,76 @@ mod tests {
     use cranelift_codegen::ir::{InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use iced_x86::{Decoder, DecoderOptions};
+
+    #[test]
+    fn representative_requests_count_all_emitted_functions() {
+        use crate::{CompileStrategy, EXEC, Memory, READ, Region};
+        use iced_x86::code_asm::*;
+        for form in 0..3 {
+            let mut a = CodeAssembler::new(32).unwrap();
+            for index in 0..12 {
+                let offset = index * 16;
+                match form {
+                    0 => {
+                        a.mov(eax, dword_ptr(esi + offset)).unwrap();
+                        a.add(eax, ebx).unwrap();
+                        a.mov(dword_ptr(edi + offset), eax).unwrap();
+                        a.adc(edx, eax).unwrap();
+                    }
+                    1 => {
+                        a.movdqu(xmm0, xmmword_ptr(esi + offset)).unwrap();
+                        a.paddd(xmm0, xmm1).unwrap();
+                        a.movdqu(xmmword_ptr(edi + offset), xmm0).unwrap();
+                        a.add(ebx, 1).unwrap();
+                    }
+                    _ => {
+                        a.fld(qword_ptr(esi + offset)).unwrap();
+                        a.fadd(qword_ptr(esi + offset + 8)).unwrap();
+                        a.fstp(qword_ptr(edi + offset)).unwrap();
+                        a.add(ebx, 1).unwrap();
+                    }
+                }
+            }
+            a.ret().unwrap();
+            let bytes = a.assemble(0x10000).unwrap();
+            let mut memory = Memory::new(0x10000, 4096).unwrap();
+            memory.protect(0x10000, 4096, READ | EXEC).unwrap();
+            memory.write(0x10000, &bytes).unwrap();
+            for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+                let mut region = Region::new(0x10000, bytes.len());
+                region.compile_strategy = strategy;
+                FORCE.set(true);
+                let compiled = super::super::compile(&region, &mut memory, false);
+                FORCE.set(false);
+                let compiled = compiled.unwrap();
+                let summary = compiled.ir_counts.as_ref().unwrap();
+                let raw: serde_json::Value =
+                    serde_json::from_str(&summary.json(compiled.code_size, Duration::ZERO))
+                        .unwrap();
+                assert_eq!(raw["guest"], 49);
+                assert!(raw["functions"].as_u64().unwrap() >= 2);
+                assert!(raw["ir"].as_u64().unwrap() > 49);
+                assert_eq!(
+                    raw["decoded"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row[2].as_u64().unwrap())
+                        .sum::<u64>(),
+                    49
+                );
+                assert_eq!(
+                    raw["rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row[3].as_u64().unwrap())
+                        .sum::<u64>(),
+                    raw["ir"]
+                );
+            }
+        }
+    }
 
     #[test]
     fn counts_reconcile_without_exporting_instruction_locations() {
