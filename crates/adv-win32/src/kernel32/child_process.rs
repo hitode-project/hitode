@@ -1,7 +1,7 @@
 //! Win32 process creation marshals owned arguments to the runtime supervisor.
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, types::SECURITY_ATTRIBUTES, win32};
+use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, types::SECURITY_ATTRIBUTES, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Object, Outcome, process::ProcessIdentity};
 use adv_os::processes::{
@@ -10,7 +10,7 @@ use adv_os::processes::{
 
 use crate::{Win32, util::set_last_error};
 
-pub(super) fn process_target(
+pub(crate) fn process_target(
     env: &Env<'_>,
     handle: u32,
     access: u32,
@@ -387,7 +387,51 @@ fn create_w(
         true,
     )
 }
+#[win32(kernel32, name = "CreateProcessInternalW", level = implement)]
+#[allow(clippy::too_many_arguments)]
+fn create_internal_w(
+    env: &mut Env<'_>,
+    token: Handle,
+    application: WideStr,
+    command: WideStr,
+    process_security: GuestPtr<SECURITY_ATTRIBUTES>,
+    thread_security: GuestPtr<SECURITY_ATTRIBUTES>,
+    inherit: i32,
+    flags: u32,
+    environment: GuestPtr<()>,
+    directory: WideStr,
+    startup: GuestPtr<()>,
+    info: GuestPtr<()>,
+    _new_token: GuestPtr<Handle>,
+) -> Outcome {
+    if token.0 != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!CreateProcessInternalW",
+            "creation under an explicit user token is unavailable",
+        );
+        return fail(env, 50);
+    }
+    // With a NULL input token the native call leaves hNewToken untouched,
+    // including failed creation. It does not publish a synthetic token handle.
+    create(
+        env,
+        application.0.addr(),
+        command.0.addr(),
+        process_security.addr(),
+        thread_security.addr(),
+        inherit,
+        flags,
+        environment.addr(),
+        directory.0.addr(),
+        startup.addr(),
+        info.addr(),
+        true,
+    )
+}
+
 pub fn register(registry: &mut Registry) {
     registry.register(create_a_ABI);
     registry.register(create_w_ABI);
+    registry.register(create_internal_w_ABI);
 }

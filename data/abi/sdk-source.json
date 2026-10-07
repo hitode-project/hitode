@@ -152,5 +152,54 @@
     ],
     "native_oracle_source_sha256": "5757b812129f1c7bd916755b0cdd6ac80861cdd6c62c4324321c176c0018083a",
     "native_verification": "Authored hidden Windows fixture with seven PNG/BMP images: 28 observations of 28-byte SourceInfo formats, NULL Info success, NONPOW2 identity versus DEFAULT expansion, NONE/LINEAR same-source pixels and resource release. Decoder and real guest tests cover bounded DDS DXT1/3/5, CPU and shared GPU storage readback, outputs and final ownership. No game image or host DLL bytes bundled."
+  },
+  "legacy_rtl_current_directory": {
+    "scope": "RtlSetCurrentDirectory_U and RtlGetCurrentDirectory_U only",
+    "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib import symbols, Wine primary RTL declarations, and authored Windows x86 oracle",
+    "stack": "SDK _RtlSetCurrentDirectory_U@4 (one descriptor pointer, NTSTATUS) and _RtlGetCurrentDirectory_U@8 (ULONG byte capacity, PWSTR output, ULONG byte result)",
+    "documentation": "https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/path.c",
+    "native_verification": "24 DWORDs cover Unicode directory, Win32 shared cwd, missing leaf/parent and non-directory NTSTATUS, short/equal/odd byte capacities, successful NUL write and unchanged LastError; no host paths or game data bundled"
+  },
+  "legacy_ldr_loader_lock": {
+    "scope": "LdrLockLoaderLock and LdrUnlockLoaderLock only; supported flags 0/TRY_ONLY, opaque guest cookies",
+    "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib @12/@8 and phnt primary declarations",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "24 DWORDs cover recursion, acquisition dispositions, genuine two-thread contention, invalid flags/missing outputs, zero-cookie unlock and LastError; opaque host cookies are not compared or copied"
+  },
+  "rtl_counted_strings": {
+    "scope": "RtlEqualUnicodeString and RtlInitAnsiString",
+    "source": "Microsoft Learn WDM BOOLEAN declaration, SDK winternl.h ANSI initializer and SDK x86 ntdll.lib @12/@8",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlequalunicodestring",
+      "https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-rtlinitansistring"
+    ],
+    "native_verification": "24 DWORDs cover counted UTF-16 including embedded NUL and raw surrogate, invariant case, BOOLEAN low byte, ANSI borrowed buffer/null/empty descriptors, and unchanged LastError"
+  },
+  "ldr_get_procedure": {
+    "scope": "LdrGetProcedureAddress, four x86 stack words and signed NTSTATUS",
+    "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib @16, phnt primary declaration and authored x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "18 DWORDs cover callable named address identity, counted suffix, name overriding ordinal, entry/ordinal missing status, output zeroing, invalid zero ordinal, RTL target identity and unchanged LastError; loader ownership and diagnostic path shared with GetProcAddress"
+  },
+  "create_process_internal_w": {
+    "scope": "kernel32.dll CreateProcessInternalW only, NULL input token; hNewToken is untouched",
+    "source": "Wine and ReactOS primary twelve-argument BOOL/WINAPI declarations, corroborated by actual Microsoft Windows x86 export through the authored native caller",
+    "documentation": [
+      "https://github.com/wine-mirror/wine/blob/master/dlls/kernelbase/process.c",
+      "https://github.com/reactos/reactos/blob/master/dll/win32/kernel32/client/proc.c"
+    ],
+    "native_verification": "16 DWORDs cover missing image/error/output zeroing, unchanged hNewToken on failure/success, genuine suspended authored child, process/thread publication, previous suspend count, wait/exit 37 and handle close; guest uses the shared CreateProcessW supervisor and independent process/VM owner"
+  },
+  "nt_get_context_thread": {
+    "scope": "NtGetContextThread, HANDLE plus in/out x86 CONTEXT pointer, signed NTSTATUS; suspended thread profile shared with Win32",
+    "source": "phnt primary ntpsapi.h declaration and authored Microsoft Windows x86 native caller",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
+    "native_verification": "authored suspended child: Win32/NT integer context identity, register changes, unrequested groups untouched, invalid handle/access/pointer statuses, unchanged LastError and child lifecycle"
+  },
+  "nt_remote_allocation": {
+    "scope": "NtAllocateVirtualMemory; six x86 stack words, signed NTSTATUS, current/remote process via the common VM owner",
+    "source": "Microsoft Learn ntifs declaration, SDK x86 import symbol and authored Microsoft Windows x86 caller",
+    "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntallocatevirtualmemory",
+    "native_verification": "38 DWORDs: actual suspended child, rounded extent, Win32 query/read/write/free interop, conflicting reservation, invalid protection/flags/zero size/pointers, unchanged outputs/LastError; three executors additionally cover isolated VM and rollback when caller loses output mappings"
   }
 }
