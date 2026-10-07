@@ -314,10 +314,7 @@ fn set_keyboard_state_bad_input_leaves_the_existing_queue_state_intact() {
     let input = memory + 4096 - 128;
     machine.cpu.write(input, &[0x81; 256]).unwrap();
     machine.ext.get_mut::<Win32>().user.queue(0).keyboard.0[0x41] = 0x80;
-    machine
-        .cpu
-        .protect(memory + 4096, 4096, Prot::empty())
-        .unwrap();
+    machine.cpu.protect(memory + 4096, 4096, Prot(0)).unwrap();
     for pointer in [0, input] {
         assert_eq!(
             super::super::input::set_keyboard_state(
