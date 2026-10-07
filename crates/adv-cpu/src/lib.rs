@@ -50,6 +50,11 @@ pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
 pub use tier1::Tier1Stats;
 pub use timestamp::TSC_FREQ;
 pub use trap::ExecutionTrap;
+#[cfg(unix)]
+pub use virtual_memory::{
+    DirectFaultView, FaultClassification, GuestAccess, GuestPageProtection,
+    Reservation as DirectMemoryReservation,
+};
 
 /// Register order follows the x86 encoding: eax, ecx, edx, ebx, esp, ebp, esi, edi.
 #[repr(C)]
