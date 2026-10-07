@@ -3435,6 +3435,7 @@ kernel32.dll	lstrcmpA	stdcall	i32	i32	lpString1:Windows.Win32.Foundation.PSTR:st
 kernel32.dll	lstrcmpW	stdcall	i32	i32	lpString1:Windows.Win32.Foundation.PWSTR:str16:1|lpString2:Windows.Win32.Foundation.PWSTR:str16:1
 kernel32.dll	lstrcmpiA	stdcall	i32	i32	lpString1:Windows.Win32.Foundation.PSTR:str8:1|lpString2:Windows.Win32.Foundation.PSTR:str8:1
 kernel32.dll	lstrcmpiW	stdcall	i32	i32	lpString1:Windows.Win32.Foundation.PWSTR:str16:1|lpString2:Windows.Win32.Foundation.PWSTR:str16:1
+kernel32.dll	lstrcpy	stdcall	str8	Windows.Win32.Foundation.PSTR	lpString1:Windows.Win32.Foundation.PSTR:str8:1|lpString2:Windows.Win32.Foundation.PSTR:str8:1
 kernel32.dll	lstrcpyA	stdcall	str8	Windows.Win32.Foundation.PSTR	lpString1:Windows.Win32.Foundation.PSTR:str8:1|lpString2:Windows.Win32.Foundation.PSTR:str8:1
 kernel32.dll	lstrcpyW	stdcall	str16	Windows.Win32.Foundation.PWSTR	lpString1:Windows.Win32.Foundation.PWSTR:str16:1|lpString2:Windows.Win32.Foundation.PWSTR:str16:1
 kernel32.dll	lstrcpynA	stdcall	str8	Windows.Win32.Foundation.PSTR	lpString1:Windows.Win32.Foundation.PSTR:str8:1|lpString2:Windows.Win32.Foundation.PSTR:str8:1|iMaxLength:i32:i32:1

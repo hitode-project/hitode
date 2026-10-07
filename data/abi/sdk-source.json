@@ -318,6 +318,12 @@
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/debug/pe-format",
     "native_verification": "19 DWORDs: zero-entry or absent relocation directory loads at an alternate base with a callable export, explicit RELOCS_STRIPPED fails with STATUS_CONFLICTING_ADDRESSES / ERROR_INVALID_ADDRESS; native failure preserves output and LastError"
   },
+  "legacy_ansi_string_alias": {
+    "scope": "kernel32.dll lstrcpy only; project the complete pinned lstrcpyA declaration and share its implementation and PE export address",
+    "source": "Microsoft Learn ANSI declaration, SDK 10.0.26100.0 x86 kernel32.lib _lstrcpy@8 and authored Microsoft Windows x86 caller",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcpya",
+    "native_verification": "eight DWORDs: static import equals dynamic legacy and ANSI addresses, original destination returned, ANSI bytes and NUL copied with canary intact, LastError unchanged and callable address belongs to the actual Kernel32 PE image"
+  },
   "nt_delay_execution": {
     "scope": "NtDelayExecution; two x86 stack words, byte BOOLEAN and signed 64-bit 100 ns interval, NTSTATUS",
     "source": "phnt ntexapi.h primary declaration, Microsoft WDM delay contract and authored Microsoft Windows x86 caller",
