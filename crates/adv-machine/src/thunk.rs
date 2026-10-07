@@ -105,6 +105,14 @@ pub struct Thunk {
     pub guest_slot: Option<u32>,
 }
 
+impl Thunk {
+    /// Immutable guest body, including when the optional direct route is off.
+    /// A handler may resume here when CPU execution is part of its semantics.
+    pub fn guest_body(&self) -> Option<u32> {
+        self.guest_slot.map(|slot| slot + 4)
+    }
+}
+
 /// Index 0 is reserved: the pad guest callees return to after an [`Outcome::Call`].
 pub const RETURN_PAD: u32 = 0;
 /// Diagnostic binding for a CPU interruption; never emitted as a callable API.

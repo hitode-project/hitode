@@ -14,6 +14,7 @@ pub(crate) fn install(reg: &mut Registry) {
         ("user32.dll", "UnionRect", &UNION_RECT),
         ("kernel32.dll", "GetLastError", &GET_LAST_ERROR),
         ("kernel32.dll", "SetLastError", &SET_LAST_ERROR),
+        ("kernel32.dll", "DebugBreak", &DEBUG_BREAK),
         ("kernel32.dll", "TlsGetValue", &TLS_GET_VALUE),
         (
             "kernel32.dll",
@@ -29,6 +30,14 @@ pub(crate) fn install(reg: &mut Registry) {
         reg.set_guest(module, name, guest);
     }
 }
+
+/// Authored `int3; ret`: the ordinary CPU exception path owns dispatch and
+/// continuation, so an unhandled breakpoint cannot be silently ignored.
+pub(crate) static DEBUG_BREAK: GuestCode = GuestCode {
+    code: &[0xcc, 0xc3],
+    host: &[],
+    links: &[],
+};
 
 /// `user32.dll!SetRectEmpty`
 /// ```text
