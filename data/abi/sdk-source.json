@@ -250,5 +250,11 @@
     "source": "phnt ntmmapi.h primary declaration and authored Microsoft Windows x86 differential",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
     "native_verification": "36 DWORDs cover readable/writable remote data, PROCESS_VM_WRITE-only handle, protection and partial-copy status/count/unchanged bytes, null source/target, zero-size handle bypass, optional/inaccessible count outputs, unchanged LastError and child exit"
+  },
+  "nt_flush_instruction_cache": {
+    "scope": "NtFlushInstructionCache; three x86 stack words, signed NTSTATUS; emulated x86 instruction coherence through the shared mutation barrier",
+    "source": "phnt ntmmapi.h primary declaration and authored Microsoft Windows x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
+    "native_verification": "18 DWORDs: arbitrary/invalid/restricted handles and ranges accepted by native x86, unchanged LastError; authored routine executes 17, is patched through NtWriteVirtualMemory, then executes 29 on interpreter/JIT after flush. No game code or host protection patch is used."
   }
 }
