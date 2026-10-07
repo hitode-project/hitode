@@ -99,7 +99,6 @@ fn region<B: TestCpu>(cpu: B) {
     let mut expected = Vec::new();
     let initial_ps = t.alloc(64);
     let initial_dc = t.call("BeginPaint", &[M(window), I(initial_ps)]);
-    expected.push((initial_dc, 1));
     check_call(
         &mut t,
         &mut expected,
@@ -428,6 +427,8 @@ fn region<B: TestCpu>(cpu: B) {
         1,
     );
     t.run();
+    assert_ne!(t.value(initial_dc), 0);
+    assert_eq!(t.value(initial_ps), t.value(initial_dc));
     for (p, v) in expected {
         assert_eq!(t.value(p), v, "result {p:x}");
     }
@@ -477,7 +478,7 @@ fn region<B: TestCpu>(cpu: B) {
             .ext
             .get::<Win32>()
             .gdi
-            .get(&t.machine.sys.objects, 1)
+            .get(&t.machine.sys.objects, t.value(initial_dc))
             .is_none()
     );
     assert_eq!(t.machine.ext.get::<adv_abi::ApiDiagnostics>().stub_calls, 0);
