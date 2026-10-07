@@ -17,6 +17,7 @@ mod heap;
 mod intrinsic_math;
 mod locale;
 mod onexit;
+mod path;
 mod random;
 mod scan;
 mod scalar_float;
@@ -107,6 +108,7 @@ pub fn register(r: &mut Registry) {
     random::register(r);
     scalar_float::register(r);
     onexit::register(r);
+    path::register(r);
     startup::register(r);
     convert::register(r);
     cpp_alloc::register(r);
