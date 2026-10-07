@@ -1737,21 +1737,13 @@ fn double_shift_memory_refusal_and_zero_count_do_not_commit() {
 #[test]
 fn counter_branches_preserve_flags_and_wrap_the_selected_counter() {
     for operation in 0..5 {
-        let code = assemble(|a| {
-            let mut taken = a.create_label();
-            match operation {
-                0 => a.jecxz(taken),
-                1 => a.jcxz(taken),
-                2 => a.loop_(taken),
-                3 => a.loope(taken),
-                _ => a.loopne(taken),
-            }
-            .unwrap();
-            a.mov(eax, 1).unwrap();
-            a.ret().unwrap();
-            a.set_label(&mut taken).unwrap();
-            a.mov(eax, 2).unwrap();
-            a.ret().unwrap();
+        use iced_x86::Code;
+        let code = counter_branch_program(match operation {
+            0 => Code::Jecxz_rel8_32,
+            1 => Code::Jcxz_rel8_32,
+            2 => Code::Loop_rel8_32_ECX,
+            3 => Code::Loope_rel8_32_ECX,
+            _ => Code::Loopne_rel8_32_ECX,
         });
         let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
         machines[2].set_tier_verification(Some(true));
@@ -2268,31 +2260,13 @@ fn overlapping_rep_is_verified_at_each_retired_element() {
 
 #[test]
 fn word_counter_loops_preserve_upper_ecx_and_wrap_without_flags() {
-    use iced_x86::{Code, Instruction};
+    use iced_x86::Code;
     for opcode in [
         Code::Loop_rel8_32_CX,
         Code::Loope_rel8_32_CX,
         Code::Loopne_rel8_32_CX,
     ] {
-        let mut code = assemble(|a| {
-            a.add_instruction(Instruction::with_branch(opcode, u64::from(CODE + 16)).unwrap())
-                .unwrap();
-            a.mov(eax, 1).unwrap();
-            a.jmp(u64::from(STOP)).unwrap();
-        });
-        let mut body = CodeAssembler::new(32).unwrap();
-        body.mov(eax, 2).unwrap();
-        body.ret().unwrap();
-        let mut padding = CodeAssembler::new(32).unwrap();
-        for _ in code.len()..16 {
-            padding.nop().unwrap();
-        }
-        code.extend(
-            padding
-                .assemble(u64::from(CODE) + code.len() as u64)
-                .unwrap(),
-        );
-        code.extend(body.assemble(u64::from(CODE + 16)).unwrap());
+        let code = counter_branch_program(opcode);
         let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
         machines[2].set_tier_verification(Some(true));
         for count in [0, 1, 2, 0x12340000, 0x12340001, u32::MAX] {
@@ -2388,4 +2362,29 @@ fn string_fs_wraps_and_word_address_form_stays_in_tier0() {
             if word { 2 } else { 0 }
         );
     }
+}
+
+fn counter_branch_program(opcode: iced_x86::Code) -> Vec<u8> {
+    let mut code = assemble(|a| {
+        a.add_instruction(
+            iced_x86::Instruction::with_branch(opcode, u64::from(CODE + 16)).unwrap(),
+        )
+        .unwrap();
+        a.mov(eax, 1).unwrap();
+        a.ret().unwrap();
+    });
+    let mut padding = CodeAssembler::new(32).unwrap();
+    for _ in code.len()..16 {
+        padding.nop().unwrap();
+    }
+    code.extend(
+        padding
+            .assemble(u64::from(CODE) + code.len() as u64)
+            .unwrap(),
+    );
+    let mut body = CodeAssembler::new(32).unwrap();
+    body.mov(eax, 2).unwrap();
+    body.ret().unwrap();
+    code.extend(body.assemble(u64::from(CODE + 16)).unwrap());
+    code
 }
