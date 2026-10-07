@@ -19,6 +19,21 @@ fn main() {
             .compile("adv_host_fault");
         println!("cargo:rerun-if-changed=src/host_fault.c");
     }
+    if matches!(
+        std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("linux" | "android")
+    ) && matches!(
+        std::env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
+        Ok("x86_64" | "aarch64")
+    ) {
+        cc::Build::new()
+            .file("src/host_fault/posix.c")
+            .file("src/host_fault/probe.S")
+            .opt_level(3)
+            .compile("adv_posix_fault");
+        println!("cargo:rerun-if-changed=src/host_fault/posix.c");
+        println!("cargo:rerun-if-changed=src/host_fault/probe.S");
+    }
     let mut build = cc::Build::new();
     build
         .include("softfloat/include")

@@ -11,6 +11,14 @@ mod cpu_profile;
 mod discovery;
 pub mod execution_abi;
 mod executor;
+#[path = "host_fault/recipe.rs"]
+#[allow(dead_code)]
+mod fault_recipe;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod fault_recovery;
 mod file_memory;
 mod floating;
 // The opt-in fault lane accepts only verified scalar recovery sites. Other
