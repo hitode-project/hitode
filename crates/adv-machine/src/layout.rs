@@ -25,7 +25,7 @@ pub const GUEST_CODE_SIZE: u32 = 0x4_0000;
 
 /// Where a parked guest's EIP points. Mapped, never executed.
 pub const PARK_ADDR: u32 = 0x7e10_0000;
-/// One page for the GDT (never visible to guest code).
+/// One guest-owned page for GDT and IDT descriptor state.
 pub const GDT_ADDR: u32 = 0x7e11_0000;
 
 /// Reserved arena for guest-readable synthetic system PE images. Modules use
@@ -40,7 +40,7 @@ pub const LDR_SIZE: u32 = 0x20_0000;
 /// Regions the host owns; reserved in the VM so images never load over them.
 pub const RESERVED: &[(u32, u32)] = &[
     (0, 0x1_0000),           // null guard
-    (THUNK_BASE, 0x20_0000), // thunks, park page, GDT
+    (THUNK_BASE, 0x20_0000), // thunks, park page, GDT/IDT
     (LDR_BASE, LDR_SIZE),
     (HOST_MODULE_BASE, HOST_MODULE_CAP * GRANULE),
     (0x7ff0_0000, 0x10_0000), // TEBs, PEB, KUSER_SHARED_DATA

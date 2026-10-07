@@ -37,6 +37,15 @@ class FakeProcess:
 
 
 class PlaySessionTests(unittest.TestCase):
+    def test_shader_profiles_are_only_forwarded_when_explicit(self):
+        for sm2, sm3 in ((False, False), (True, False), (False, True)):
+            with tempfile.TemporaryDirectory() as directory:
+                args = self.args(Path(directory), d3d9_sm2=sm2, d3d9_sm3=sm3)
+                (command, _), metadata = self.launch(args)
+                self.assertEqual("--d3d9-sm2" in command, sm2)
+                self.assertEqual("--d3d9-sm3" in command, sm3)
+                self.assertEqual(metadata["command"], command)
+
     def args(self, root, **changes):
         binary = root / "runner.exe"
         game = root / "fixture.exe"

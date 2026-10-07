@@ -1012,6 +1012,31 @@ impl Dispatch<'_> {
         Ok(())
     }
 
+    fn remember_cpu_fault(&mut self, snapshot: exception::CpuFaultSnapshot) {
+        self.sys
+            .first_cpu_fault
+            .get_or_insert_with(|| snapshot.clone());
+        self.sys.latest_cpu_fault = Some(snapshot);
+    }
+
+    fn interrupt_snapshot(
+        &self,
+        cpu: &dyn Guest,
+        vector: u8,
+        pc: u32,
+    ) -> exception::CpuFaultSnapshot {
+        exception::CpuFaultSnapshot::capture(
+            cpu,
+            self.sys.current,
+            &adv_cpu::backend::Fault {
+                pc,
+                kind: adv_cpu::backend::FaultKind::Other(format!(
+                    "unhandled CPU exception/interrupt {vector:#x}"
+                )),
+            },
+        )
+    }
+
     fn exception(
         &mut self,
         cpu: &mut dyn Guest,
@@ -1019,14 +1044,22 @@ impl Dispatch<'_> {
     ) -> Result<(), Parked> {
         let esp = cpu.reg(Reg::Esp);
         self.unwind_escaped(|frame| esp >= frame.stack, "exception")?;
+        // Retain the original stop before a personality can edit registers or
+        // a parked backend replaces EIP. Handled traps do not publish a fault.
+        let trap_snapshot = match &event {
+            exception::Exception::Trap { vector, pc } => {
+                Some(self.interrupt_snapshot(cpu, *vector, *pc))
+            }
+            exception::Exception::Fault(_) => None,
+        };
         if let exception::Exception::Fault(fault) = &event {
             let snapshot = exception::CpuFaultSnapshot::capture(cpu, self.sys.current, fault);
-            self.sys
-                .first_cpu_fault
-                .get_or_insert_with(|| snapshot.clone());
-            self.sys.latest_cpu_fault = Some(snapshot);
+            self.remember_cpu_fault(snapshot);
         }
         let Some(handler) = self.sys.exception_handler else {
+            if let Some(snapshot) = trap_snapshot {
+                self.remember_cpu_fault(snapshot);
+            }
             return Err(Parked::Fail(format!("unhandled CPU stop: {event:?}")));
         };
         let checkpoint = exception::Checkpoint::capture(cpu, self.sys)
@@ -1049,6 +1082,11 @@ impl Dispatch<'_> {
             event,
             checkpoint,
         );
+        if matches!(&out, Outcome::Fail(_))
+            && let Some(snapshot) = trap_snapshot
+        {
+            self.remember_cpu_fault(snapshot);
+        }
         apply(cpu, self.sys, self.ext, out, origin, self.defer_work)
     }
 
@@ -1169,6 +1207,8 @@ impl TrapHandler for Dispatch<'_> {
                 cpu.set_reg(Reg::Esp, esp.wrapping_add(4));
                 self.host_call(cpu, index.unwrap())
             } else {
+                let snapshot = self.interrupt_snapshot(cpu, vector, eip);
+                self.remember_cpu_fault(snapshot);
                 Err(Parked::Exception(vector))
             }
         };

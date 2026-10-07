@@ -144,6 +144,8 @@ enum Recovery {
 struct Resident {
     value: Value,
     range: i32,
+    /// Known to fit a 24-bit significand whenever the lane runs at PC=24.
+    narrow: bool,
 }
 
 #[derive(Clone)]
@@ -195,7 +197,8 @@ impl Emitter<'_> {
             dp: None,
         };
         let mut recoveries = Vec::with_capacity(instructions.len() * 2);
-        let mut arithmetic_admitted = false;
+        // PC=24 flag of the first admitted arithmetic; control is fixed in a lane.
+        let mut tail = None;
         for (index, i) in instructions.iter().enumerate() {
             self.at(i.ip32());
             // Mirror the canonical code's per-block fuel accounting.
@@ -250,7 +253,12 @@ impl Emitter<'_> {
                     self.resident_empty(&mut prefix, target, true, slow);
                     prefix.top = target as u8;
                     let value = self.b.ins().f64const(if one { 1.0 } else { 0.0 });
-                    self.resident_write(&mut prefix, target, Resident { value, range: 0 });
+                    let constant = Resident {
+                        value,
+                        range: 0,
+                        narrow: true,
+                    };
+                    self.resident_write(&mut prefix, target, constant);
                 }
                 Fast::Store {
                     width,
@@ -346,35 +354,31 @@ impl Emitter<'_> {
                     reverse,
                     pop,
                 } => {
-                    if !arithmetic_admitted {
-                        let masked = self.b.ins().band_imm(prefix.control, 0xf3f);
-                        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, masked, 0x23f);
-                        self.x87_reject(bad, slow);
-                        arithmetic_admitted = true;
-                    }
+                    let tail = match tail {
+                        Some(tail) => tail,
+                        None => *tail.insert(self.x87_admit_arithmetic(prefix.control, slow)),
+                    };
                     let target = prefix.slot(dest);
-                    let mut a = self.resident_double(&mut prefix, target, RANGE, slow).value;
-                    let mut b = self
-                        .resident_source(&mut prefix, i, source, RANGE, slow)
-                        .value;
-                    if reverse {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    let zero = self.b.ins().f64const(0.0);
-                    if op == Op::Div {
-                        let bad = self.b.ins().fcmp(FloatCC::Equal, b, zero);
-                        self.x87_reject(bad, slow);
-                    }
-                    let (value, error) = self.x87_arithmetic(op, a, b);
-                    let inexact = self.b.ins().fcmp(FloatCC::NotEqual, error, zero);
-                    let err_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), error);
-                    let result_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), value);
-                    let signs = self.b.ins().bxor(err_bits, result_bits);
-                    let up = self.b.ins().icmp_imm(IntCC::SignedLessThan, signs, 0);
+                    let a = self.resident_double(&mut prefix, target, RANGE, slow);
+                    let b = self.resident_source(&mut prefix, i, source, RANGE, slow);
+                    let (a, b) = if reverse { (b, a) } else { (a, b) };
+                    let (value, inexact, up) = self.x87_rounded_arithmetic(
+                        op,
+                        (a.value, a.narrow),
+                        (b.value, b.narrow),
+                        tail,
+                        slow,
+                    );
                     prefix.status = self.x87_round_flags(prefix.status, inexact, up);
                     // Inputs are bounded, so the result is normal/zero and finite.
                     // It can exceed +-400 and must be guarded before the next op.
-                    self.resident_write(&mut prefix, target, Resident { value, range: 1023 });
+                    // A PC=24 lane rounded it to 24 bits; PC=53 never asks.
+                    let result = Resident {
+                        value,
+                        range: 1023,
+                        narrow: true,
+                    };
+                    self.resident_write(&mut prefix, target, result);
                     if pop {
                         self.resident_pop(&mut prefix);
                     }
@@ -651,7 +655,11 @@ impl Emitter<'_> {
             self.resident_empty(p, slot, false, slow);
             let physical = self.x87_slot(p.base_top, slot as u8);
             let value = self.x87_double(physical, p.tags, range, slow);
-            let resident = Resident { value, range };
+            let resident = Resident {
+                value,
+                range,
+                narrow: false,
+            };
             p.values[slot] = Some(resident);
             p.empty[slot] = Some(false);
             resident
@@ -679,6 +687,7 @@ impl Emitter<'_> {
                 Source::I32 => 31,
                 _ => range,
             },
+            narrow: matches!(source, Source::F32 | Source::I16),
         }
     }
 

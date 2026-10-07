@@ -6,6 +6,7 @@ use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
+mod dwm;
 mod image_list;
 pub(crate) mod imm;
 mod internet;
@@ -364,6 +365,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    dwm::register(reg);
     reg.register(path_find_extension_w_ABI);
     reg.register(path_find_file_name_w_ABI);
     theme::register(reg);

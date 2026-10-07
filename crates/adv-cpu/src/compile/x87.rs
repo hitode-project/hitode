@@ -3,9 +3,10 @@
 //! Canonical 80-bit registers are materialized at every observable boundary.
 //! Bounded straight-line segments retain admitted binary64 values between ops.
 //! Only exact binary64 inputs
-//! are admitted; arithmetic additionally requires PC=53, RC=nearest, masked
-//! exceptions and the same 2^+-400 bounds as floating::fast. Error-free residuals
-//! reproduce PE/C1, including signed zero. Every rejection precedes guest writes
+//! are admitted; arithmetic additionally requires PC=53 or PC=24 with 24-bit
+//! operands, RC=nearest, masked exceptions and the same 2^+-400 bounds as
+//! floating::fast. Error-free residuals and the 24-bit re-rounding reproduce
+//! PE/C1, including signed zero. Every rejection precedes guest writes
 //! and joins the existing transactional helper without leaving the region.
 //!
 //! Ordinary single-page memory only: shared/file/audio, cross-page and executable
@@ -304,26 +305,13 @@ impl Emitter<'_> {
                 reverse,
                 pop,
             } => {
-                let masked = self.b.ins().band_imm(control, 0xf3f);
-                let bad = self.b.ins().icmp_imm(IntCC::NotEqual, masked, 0x23f);
-                self.x87_reject(bad, slow);
+                let single = self.x87_admit_arithmetic(control, slow);
                 let target = self.x87_slot(top, dest);
-                let mut a = self.x87_double(target, tags, RANGE, slow);
-                let (mut b, at) = self.x87_source(i, source, top, tags, RANGE, slow);
-                if reverse {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                let zero = self.b.ins().f64const(0.0);
-                if op == Op::Div {
-                    let bad = self.b.ins().fcmp(FloatCC::Equal, b, zero);
-                    self.x87_reject(bad, slow);
-                }
-                let (result, error) = self.x87_arithmetic(op, a, b);
-                let inexact = self.b.ins().fcmp(FloatCC::NotEqual, error, zero);
-                let err_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), error);
-                let result_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
-                let signs = self.b.ins().bxor(err_bits, result_bits);
-                let up = self.b.ins().icmp_imm(IntCC::SignedLessThan, signs, 0);
+                let a = (self.x87_double(target, tags, RANGE, slow), false);
+                let (b, at) = self.x87_source(i, source, top, tags, RANGE, slow);
+                let b = (b, matches!(source, Source::F32 | Source::I16));
+                let (a, b) = if reverse { (b, a) } else { (a, b) };
+                let (result, inexact, up) = self.x87_rounded_arithmetic(op, a, b, single, slow);
                 status = self.x87_round_flags(status, inexact, up);
                 writes.push((target, result));
                 dp = at;
@@ -672,6 +660,66 @@ impl Emitter<'_> {
             self.x87_require(valid, slow);
         }
         (value, Some(at))
+    }
+    /// Admit RC=nearest, masked exceptions and PC=53 or PC=24; the result is
+    /// true for PC=24.
+    fn x87_admit_arithmetic(&mut self, control: Value, slow: ir::Block) -> Value {
+        let masked = self.b.ins().band_imm(control, 0xf3f);
+        let double = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x23f);
+        let single = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x03f);
+        let valid = self.b.ins().bor(double, single);
+        self.x87_require(valid, slow);
+        single
+    }
+    /// One admitted arithmetic operation: (result, inexact, rounded up). PC=24
+    /// rejects operands wider than 24 bits, except those known to be narrow,
+    /// then re-rounds the binary64 result exactly as floating::fast does.
+    fn x87_rounded_arithmetic(
+        &mut self,
+        op: Op,
+        (a, a_narrow): (Value, bool),
+        (b, b_narrow): (Value, bool),
+        single: Value,
+        slow: ir::Block,
+    ) -> (Value, Value, Value) {
+        let tail = crate::floating::fast::SINGLE_TAIL as i64;
+        let unknown: Vec<_> = [(a, a_narrow), (b, b_narrow)]
+            .into_iter()
+            .filter(|&(_, narrow)| !narrow)
+            .map(|(value, _)| self.b.ins().bitcast(types::I64, MemFlags::new(), value))
+            .collect();
+        if let Some(wide) = unknown.into_iter().reduce(|x, y| self.b.ins().bor(x, y)) {
+            let wide = self.b.ins().band_imm(wide, tail);
+            let wide = self.b.ins().icmp_imm(IntCC::NotEqual, wide, 0);
+            let bad = self.b.ins().band(wide, single);
+            self.x87_reject(bad, slow);
+        }
+        let zero = self.b.ins().f64const(0.0);
+        if op == Op::Div {
+            let bad = self.b.ins().fcmp(FloatCC::Equal, b, zero);
+            self.x87_reject(bad, slow);
+        }
+        let (result, error) = self.x87_arithmetic(op, a, b);
+        let inexact = self.b.ins().fcmp(FloatCC::NotEqual, error, zero);
+        let err_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), error);
+        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
+        let signs = self.b.ins().bxor(err_bits, bits);
+        let up = self.b.ins().icmp_imm(IntCC::SignedLessThan, signs, 0);
+        // Nearest-even on the significand; a carry correctly bumps the exponent.
+        let odd = self.b.ins().ushr_imm(bits, 29);
+        let odd = self.b.ins().band_imm(odd, 1);
+        let narrow = self.b.ins().iadd_imm(bits, (1 << 28) - 1);
+        let narrow = self.b.ins().iadd(narrow, odd);
+        let narrow = self.b.ins().band_imm(narrow, !tail);
+        // Same sign: the encoding orders magnitudes.
+        let grew = self.b.ins().icmp(IntCC::UnsignedGreaterThan, narrow, bits);
+        let changed = self.b.ins().icmp(IntCC::NotEqual, narrow, bits);
+        let narrow = self.b.ins().bitcast(types::F64, MemFlags::new(), narrow);
+        let result = self.b.ins().select(single, narrow, result);
+        let changed = self.b.ins().band(changed, single);
+        let inexact = self.b.ins().bor(inexact, changed);
+        let up = self.b.ins().select(changed, grew, up);
+        (result, inexact, up)
     }
     fn x87_round_flags(&mut self, status: Value, inexact: Value, up: Value) -> Value {
         let up = self.b.ins().uextend(types::I32, up);

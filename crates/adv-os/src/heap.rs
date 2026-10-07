@@ -33,6 +33,7 @@ fn zero_memory(cpu: &mut dyn Guest, addr: u32, len: u32) -> Result<(), MemFault>
 
 #[derive(Default)]
 pub struct Heap {
+    synchronization: HeapSynchronization,
     executable: bool,
     free_by_addr: BTreeMap<u32, u32>,
     free_by_size: BTreeSet<(u32, u32)>,
@@ -41,6 +42,23 @@ pub struct Heap {
     /// Blocks with their own VM region.
     large: HashMap<u32, u32>,
     arenas: Vec<u32>,
+}
+
+/// Process-owned serialization identity; the personality initializes and waits
+/// on the lock stored in this heap's reserved infrastructure header.
+#[derive(Clone, Copy)]
+pub struct HeapSynchronization {
+    pub serialized: bool,
+    pub lock: Option<u32>,
+}
+
+impl Default for HeapSynchronization {
+    fn default() -> Self {
+        Self {
+            serialized: true,
+            lock: None,
+        }
+    }
 }
 
 impl Heap {
@@ -103,7 +121,17 @@ impl Heaps {
     /// Create a heap; its handle is the address of a small reserved region (like Windows,
     /// where a heap handle points at the heap's header).
     pub fn create(&mut self, cpu: &mut dyn Guest, vm: &mut Vm) -> Result<u32, MemFault> {
-        self.create_with_execute(cpu, vm, false)
+        self.create_with_options(cpu, vm, true, false)
+    }
+
+    /// Create an independently owned heap with its caller-selected serialization.
+    pub fn create_with_serialization(
+        &mut self,
+        cpu: &mut dyn Guest,
+        vm: &mut Vm,
+        serialized: bool,
+    ) -> Result<u32, MemFault> {
+        self.create_with_options(cpu, vm, serialized, false)
     }
 
     /// Executable heaps retain their permission for initial, grown and large arenas.
@@ -113,8 +141,23 @@ impl Heaps {
         vm: &mut Vm,
         executable: bool,
     ) -> Result<u32, MemFault> {
+        self.create_with_options(cpu, vm, true, executable)
+    }
+
+    /// Heap serialization and execute permission are independent creation options.
+    pub fn create_with_options(
+        &mut self,
+        cpu: &mut dyn Guest,
+        vm: &mut Vm,
+        serialized: bool,
+        executable: bool,
+    ) -> Result<u32, MemFault> {
         let mut h = Heap {
             executable,
+            synchronization: HeapSynchronization {
+                serialized,
+                lock: None,
+            },
             ..Heap::default()
         };
         let base = vm.alloc(cpu, ARENA, h.protection())?;
@@ -123,6 +166,31 @@ impl Heaps {
         h.insert_free(base + 0x1000, vm.region(base).unwrap_or(ARENA) - 0x1000);
         self.heaps.insert(base, h);
         Ok(base)
+    }
+
+    /// Normalize the allocator's existing zero-handle process-heap alias.
+    pub fn normalize(&self, handle: u32) -> Option<u32> {
+        let handle = if handle == 0 {
+            self.process_heap
+        } else {
+            handle
+        };
+        self.heaps.contains_key(&handle).then_some(handle)
+    }
+
+    pub fn synchronization(&self, handle: u32) -> Option<HeapSynchronization> {
+        self.heaps
+            .get(&self.normalize(handle)?)
+            .map(|heap| heap.synchronization)
+    }
+
+    /// Publish a personality-owned lock only after its guest storage is initialized.
+    pub fn set_lock(&mut self, handle: u32, lock: u32) -> bool {
+        let Some(handle) = self.normalize(handle) else {
+            return false;
+        };
+        self.heaps.get_mut(&handle).unwrap().synchronization.lock = Some(lock);
+        true
     }
 
     pub fn destroy(&mut self, cpu: &mut dyn Guest, vm: &mut Vm, handle: u32) -> bool {
@@ -393,6 +461,29 @@ mod tests {
         assert!(heaps.destroy(&mut cpu, &mut vm, code));
         for address in blocks {
             assert!(!cpu.accessible(address, 1, Prot::READ));
+        }
+    }
+
+    #[test]
+    fn serialization_and_execute_options_are_independent() {
+        use adv_cpu::JitCpu;
+        let mut cpu = JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+        let (mut vm, mut heaps) = (Vm::new(), Heaps::default());
+        for serialized in [false, true] {
+            for executable in [false, true] {
+                let heap = heaps
+                    .create_with_options(&mut cpu, &mut vm, serialized, executable)
+                    .unwrap();
+                let synchronization = heaps.synchronization(heap).unwrap();
+                assert_eq!(synchronization.serialized, serialized);
+                assert_eq!(synchronization.lock, None);
+                for size in [32, 0x90000] {
+                    let block = heaps.alloc(&mut cpu, &mut vm, heap, size, false).unwrap();
+                    assert!(cpu.accessible(block, size, Prot::RW));
+                    assert_eq!(cpu.accessible(block, size, Prot::EXEC), executable);
+                }
+                assert!(heaps.destroy(&mut cpu, &mut vm, heap));
+            }
         }
     }
 

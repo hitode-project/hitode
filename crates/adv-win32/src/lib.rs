@@ -13,6 +13,7 @@ mod advapi32;
 pub mod codec_kernels;
 pub mod gdi32;
 mod guest_code;
+pub(crate) mod heap_lock;
 pub mod kernel32;
 mod misc;
 mod ntdll;
