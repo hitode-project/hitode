@@ -332,8 +332,17 @@
   "x87_intrinsic_natural_logarithm": {
     "source": "Microsoft Learn _CIlog x86 compiler intrinsic declaration, 2026-10-07 read",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cilog",
+    "native_oracle_source_sha256": "abd154e44aba0574cf41dc4006bc789abd690df1f86a0f61c90ea32fd16ed3a6",
+    "native_c1_oracle_source_sha256": "efb305f32171fbcb66e305161238770abb2867b3f450bf82743ba36c4fbabffd",
+    "native_verification": "Authored VC80/90 eight-row no-UI probe measures exact normal inputs 2,1024,2048 under PC53 and 2 under PC64 with seeded sticky status. One additional VC90 ln(2) C1-seeded case measures status 0x2b04 to0x2904, clearing only C1. Results agree within two binary64 ULP, while lower80-bit payload, ESP, control, errno/DOS/LastError and measured sticky flags survive. Exceptional/domain/extended operands remain explicitly unavailable; no universal CRT extended-precision bit identity is claimed.",
     "scope": "Official void __cdecl _CIlog(); zero ordinary integer-stack words for three existing CRT aliases. The top x87 operand is consumed and replaced by its natural logarithm through the existing architectural/result bridge.",
     "profile": "Reuse the common x87 architecture and CRT error owners; positive normal numeric/control/status profiles require a native oracle, with unsupported domain/range/control inputs warning and failing before consuming the original operand."
+  },
+  "binary64_power_of_two_scaling": {
+    "source": "Microsoft Learn ldexp declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ldexp",
+    "scope": "double __cdecl ldexp(double value, int exponent); three x86 argument words for three existing CRT aliases. Return the value multiplied by an integral power of two through the shared x87 result bridge.",
+    "profile": "Reuse existing scalar scale implementation and CRT error/floating environment owners. Native ordinary scaling and state preservation require a small oracle; unimplemented range, exception or special-control profiles must explicitly warn and fail."
   },
   "guest_comparator_sort": {
     "header": "ucrt/corecrt_search.h:23-24,60-65",

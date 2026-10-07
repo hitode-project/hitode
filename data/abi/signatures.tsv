@@ -3539,6 +3539,7 @@ msvcr80.dll	ispunct	cdecl	i32	int	character:int:i32:1
 msvcr80.dll	isspace	cdecl	i32	int	character:int:i32:1
 msvcr80.dll	isupper	cdecl	i32	int	character:int:i32:1
 msvcr80.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
 msvcr80.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcr80.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
@@ -3630,6 +3631,7 @@ msvcr90.dll	ispunct	cdecl	i32	int	character:int:i32:1
 msvcr90.dll	isspace	cdecl	i32	int	character:int:i32:1
 msvcr90.dll	isupper	cdecl	i32	int	character:int:i32:1
 msvcr90.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
 msvcr90.dll	localeconv	cdecl	ptr	struct lconv*	
 msvcr90.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcr90.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
@@ -3707,6 +3709,7 @@ msvcrt.dll	ispunct	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	isspace	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	isupper	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
 msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1

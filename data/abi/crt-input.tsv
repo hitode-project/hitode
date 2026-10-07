@@ -294,3 +294,6 @@ msvcr90.dll	_CIlog10	cdecl	void	void
 msvcrt.dll	_CIlog	cdecl	void	void	
 msvcr80.dll	_CIlog	cdecl	void	void	
 msvcr90.dll	_CIlog	cdecl	void	void	
+msvcrt.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
+msvcr80.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
+msvcr90.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
