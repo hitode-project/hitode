@@ -79,6 +79,41 @@
       "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
     ]
   },
+  "native_virtual_memory": {
+    "scope": "ntdll.dll!NtAllocateVirtualMemory/ZwAllocateVirtualMemory and NtFreeVirtualMemory/ZwFreeVirtualMemory only; current-process private VM fronts reuse the kernel32 reservation owner",
+    "source": "Microsoft Learn ntifs.h declarations and documented user-mode Nt/Zw equivalence, corroborated by Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib imports; absent from pinned WinMD",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS; HANDLE, PVOID*, ULONG_PTR, PSIZE_T and ULONG each occupy one 32-bit stack word; allocate uses six words and free uses four",
+    "native_verification": "Authored no-UI native calls confirm null-base MEM_COMMIT, explicit granule alignment, page-rounded extents, decommit/release output values and selected failure statuses; no host DLL or game bytes are bundled",
+    "limitations": "Nonzero ZeroBits, protection modifiers, remote NT VM and partial reservation release explicitly return STATUS_NOT_IMPLEMENTED",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntallocatevirtualmemory",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntfreevirtualmemory",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/using-nt-and-zw-versions-of-the-native-system-services-routines"
+    ]
+  },
+  "native_continue": {
+    "scope": "ntdll.dll!NtContinue only; no NtContinueEx, remote-thread context or general native-service projection",
+    "source": "DynamoRIO primary raw NT syscall declaration (PCONTEXT, BOOLEAN) corroborated by the installed Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib _NtContinue@8 import; SDK winnt.h defines the i386 CONTEXT layout",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI (__stdcall), signed 32-bit NTSTATUS; PCONTEXT and BOOLEAN occupy two 32-bit stack words, only the low eight bits of TestAlert are significant",
+    "declaration": "https://github.com/DynamoRIO/dynamorio/blob/b81b41cb47ad99b6f1e7b53a6608abd0183133cf/core/win32/ntdll.c",
+    "native_verification": "No invocation contract observed. The export remains a declared strict generated thunk; no CPU state or context continuation semantics are fabricated"
+  },
+  "native_initializer_exports": {
+    "scope": "NtQuerySection, NtOpenKey, NtCreateKey, NtQueryKey, NtQueryObject, NtEnumerateKey, NtEnumerateValueKey, NtSetInformationProcess, RtlAcquirePebLock, RtlReleasePebLock, NtWriteVirtualMemory, NtReadVirtualMemory, CsrClientCallServer, NtResumeThread, RtlQueryEnvironmentVariable_U, NtQueryFullAttributesFile, NtQueryVirtualMemory, NtDuplicateObject, NtQueryDirectoryFile, NtQueryAttributesFile, and the NtCreateFile/NtReadFile/NtQueryInformationFile aliases only",
+    "source": "Microsoft SDK winternl.h where declared, Microsoft Learn NtQuerySection and NtQueryDirectoryFile, and the pinned primary phnt/DynamoRIO declarations for exports absent from public SDK headers",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "phnt_commit": "53fbbdc5b5d2b08761db1c7b26bfa8c820924356",
+    "declarations": [
+      "https://github.com/winsiderss/phnt/tree/53fbbdc5b5d2b08761db1c7b26bfa8c820924356",
+      "https://github.com/DynamoRIO/dynamorio/blob/b81b41cb47ad99b6f1e7b53a6608abd0183133cf/core/win32/ntdll.c",
+      "https://learn.microsoft.com/en-us/windows/win32/devnotes/ntquerysection",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile"
+    ],
+    "target": "Every curated export's exact x86 stdcall decoration was verified in the hashed SDK ntdll.lib. HANDLE, pointers, ULONG/SIZE_T, BOOLEAN and signed information-class enums each occupy one 32-bit stack word. PEB lock functions have no parameters and return VOID; other supplemental entries return signed NTSTATUS. RtlNtStatusToDosError is selected directly from pinned WinMD.",
+    "behavior": "Declarations publish guest-readable EAT entries. Unimplemented calls stop through the existing strict generated thunks; no invented success or NT server behavior. Three Nt file aliases share their existing typed Zw owner and documented user-mode semantics."
+  },
   "legacy_d3dx_math": {
     "source": "Microsoft Learn legacy D3dx9math.h declarations; Scaling/Translation additionally verified in Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package (not present in pinned WinMD or installed modern SDK)",
     "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixScaling, D3DXMatrixTranslation, D3DXMatrixLookAtLH, D3DXVec3Project, D3DXMatrixRotationYawPitchRoll, D3DXMatrixRotationY, D3DXMatrixPerspectiveFovLH, D3DXVec4Transform, D3DXVec3TransformCoord, D3DXVec3Transform, D3DXVec3CatmullRom only",
@@ -140,6 +175,14 @@
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatematrixstack",
     "native_oracle_source_sha256": "fe6063286513cc9a440f4d8e16759a4f9abb282b55e27f6294ec16d358e9df60",
     "native_verification": "Authored x86 probe against installed d3dx9_43.dll: initialized identity, successful base Pop preserves the base matrix, guest-written GetTop survives Push/Pop, world right multiplication and local left multiplication, alias square, normalized/nonunit and zero axis, yaw/pitch/roll and final Release. GetTop storage may change after stack operations; no capacity-address pattern is emulated."
+  },
+  "legacy_directinput": {
+    "source": "Microsoft Windows SDK 10.0.26100.0 um/dinput.h",
+    "header_sha256": "ff440b043bb853835e6bd3e641ee3bfd11b63fc08af7a935bab2983f2a52070a",
+    "scope": "DirectInputCreateA/W, complete IDirectInputA/W and IDirectInputDeviceA/W declarations only",
+    "target": "x86 WINAPI/STDMETHODCALLTYPE stdcall; HRESULT signed 32 bits, ULONG/DWORD and pointers each one 32-bit word; legacy factories have eight slots and legacy devices eighteen slots",
+    "layouts": "SDK DIDATAFORMAT is six 32-bit fields; DIOBJECTDATAFORMAT four; legacy DIMOUSESTATE is three LONG axes and four BYTE buttons",
+    "limitations": "Keyboard and mouse use the runtime's shared input provider; unsupported formats and properties fail explicitly. No host controller or native input device is opened."
   },
   "legacy_d3dx_texture_memory": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9tex.h, image-info declaration lines319-322 and Ex texture lines1474-1489",
