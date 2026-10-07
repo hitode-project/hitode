@@ -2,6 +2,7 @@
 mod allocation;
 mod directory;
 mod loader_lock;
+mod memory;
 mod path;
 mod procedure;
 mod strings;
@@ -209,6 +210,7 @@ pub fn register(reg: &mut Registry) {
     procedure::register(reg);
     thread::register(reg);
     allocation::register(reg);
+    memory::register(reg);
     stdcall(
         reg,
         NTDLL,

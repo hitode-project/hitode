@@ -15,6 +15,7 @@ pub(crate) use file::{open_with_share, read_coherent};
 pub(crate) use file_mapping::prune as prune_file_mappings;
 pub use handle::ProcessHandle;
 mod memory;
+pub(crate) use memory::native_write_memory;
 pub(crate) use memory::protect_memory;
 pub(crate) use memory::{allocate_memory, free_memory, memory_span};
 mod module;
