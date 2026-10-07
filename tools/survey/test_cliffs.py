@@ -12,7 +12,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from cliffs import aggregate, main, markdown, read_reports
+from cliffs import (aggregate, main, markdown, read_reports, SCHEDULE_HISTOGRAMS,
+                    SCHEDULE_GLOBALS, SCHEDULE_COUNTERS)
 
 
 def fixture():
@@ -42,6 +43,45 @@ def empty_fixture():
 
 
 class AggregateTests(unittest.TestCase):
+    def schedule_fixture(self):
+        report = empty_fixture()
+        histogram = {"count": 1, "sum": 3, "max": 3, "log2_bins": [0, 0, 1] + [0] * 62}
+        schedule = {"version": 1, "compile_threads": 3, "available_cores": 8,
+                    **dict.fromkeys(SCHEDULE_COUNTERS, 2),
+                    **{key: copy.deepcopy(histogram) for key in SCHEDULE_GLOBALS}}
+        for strategy in ("fast", "speed"):
+            schedule[strategy] = {key: copy.deepcopy(histogram) for key in SCHEDULE_HISTOGRAMS}
+            schedule[strategy]["interpreter_units_by_stage"] = [1, 2, 3, 4]
+        report["compilation_schedule"] = schedule
+        return report
+
+    def test_schedule_merges_distributions_and_marks_unmeasured_reports(self):
+        report = self.schedule_fixture()
+        result = aggregate([report, report, empty_fixture()])["compilation_schedule"]
+        self.assertEqual((result["report_count"], result["unmeasured_reports"]), (2, 1))
+        self.assertEqual(result["fast"]["queue_us"]["sum"], 6)
+        self.assertEqual(result["fast"]["queue_us"]["max"], 3)
+        self.assertEqual(result["speed"]["interpreter_units_by_stage"], [2, 4, 6, 8])
+        self.assertEqual(result["configurations"], [{"compile_threads": 3, "available_cores": 8, "reports": 2}])
+
+    def test_schedule_rejects_malformed_distributions_and_stages(self):
+        for key, value in (("count", 9), ("max", 4), ("log2_bins", [1]), ("sum", -1)):
+            with self.subTest(key=key):
+                report = self.schedule_fixture()
+                report["compilation_schedule"]["fast"]["queue_us"][key] = value
+                with self.assertRaises(ValueError):
+                    aggregate([report])
+        report = self.schedule_fixture()
+        report["compilation_schedule"]["fast"]["interpreter_units_by_stage"] = [1, 2, 3]
+        with self.assertRaises(ValueError):
+            aggregate([report])
+
+    def test_schedule_drops_unknown_private_fields(self):
+        report = self.schedule_fixture()
+        report["compilation_schedule"]["private"] = "private-schedule-marker"
+        report["compilation_schedule"]["fast"]["queue_us"]["private"] = "private-schedule-marker"
+        self.assertNotIn("private-schedule-marker", json.dumps(aggregate([report])))
+
     def detailed_fixture(self):
         report = empty_fixture()
         report["cpu_cliffs"].update(
