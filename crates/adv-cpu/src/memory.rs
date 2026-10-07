@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+mod direct;
 mod fast;
 mod locks;
 
@@ -106,6 +107,11 @@ impl WorkerLayout {
     /// facade is dropped. It may execute guarded native helpers only.
     pub(crate) unsafe fn into_memory(self) -> Memory {
         Memory {
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            direct_engine: None,
             parallel: None,
             parallel_view: true,
             base: self.base,
@@ -131,6 +137,11 @@ impl WorkerLayout {
 }
 
 pub struct Memory {
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) direct_engine: Option<crate::direct_memory::Engine>,
     pub(crate) parallel: Option<Arc<crate::parallel_memory::Fence>>,
     parallel_view: bool,
     pub(crate) base: u32,
@@ -208,6 +219,9 @@ impl Memory {
         // executable stores, and may hold an inline permit on this thread.
         let selective = self.selective_code_writes();
         self.quiesce_code_observation();
+        #[cfg(not(windows))]
+        self.protect_direct_code(first..last + 1)
+            .expect("protect observed direct guest code before publication");
         self.watched[first..=last].fill(true);
         if selective {
             self.fast.invalidate(first..last + 1);
@@ -469,6 +483,11 @@ impl Memory {
         // SAFETY: nonzero, valid layout; Memory exclusively owns this allocation.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or("guest allocation failed")?;
         Ok(Self {
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            direct_engine: None,
             parallel: None,
             parallel_view: false,
             base,
@@ -512,6 +531,11 @@ impl Memory {
         let reserved_len = len;
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
         Ok(Self {
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            direct_engine: None,
             parallel: None,
             parallel_view: false,
             base,
@@ -965,6 +989,9 @@ impl Memory {
     /// page. Dropping SHARED never invalidates a native assumption: code
     /// still holding the old permission takes the helper path to these bytes.
     fn make_resident(&mut self, page: usize) {
+        if self.direct_memory_enabled() {
+            return;
+        }
         #[cfg(windows)]
         if self.native_protection {
             return;
@@ -1303,7 +1330,10 @@ impl Memory {
             return Err(format!("{error}; pin restoration: {restoration:?}"));
         }
         #[cfg(not(windows))]
-        let _ = retired;
+        {
+            debug_assert!(retired.is_empty());
+            self.protect_direct_pages(range.start / PAGE_SIZE..range.end / PAGE_SIZE, perms)?;
+        }
         self.fast
             .invalidate(range.start / PAGE_SIZE..range.end / PAGE_SIZE);
         for page in

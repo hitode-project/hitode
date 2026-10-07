@@ -17,6 +17,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 pub(crate) mod coverage;
 mod diagnostics;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod direct;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
 #[cfg(target_arch = "aarch64")]
@@ -67,6 +72,7 @@ pub(crate) struct Compiled {
     window_len: usize,
     pub entries: BTreeSet<u32>,
     pub code_size: usize,
+    pub direct_sites: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
     _nests: Box<[crate::rows::Descriptor]>,
@@ -110,7 +116,8 @@ impl Compiled {
         unsafe { crate::jit_memory::code_storage_bytes([self.tail_entry, self.entry as usize]) }
     }
     pub fn valid(&self, memory: &Memory) -> bool {
-        memory.base == self.window_base
+        self.input.direct_memory == memory.direct_memory_enabled()
+            && memory.base == self.window_base
             && memory.len == self.window_len
             && self
                 .pages
@@ -138,6 +145,9 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
+        if self.input.direct_memory != memory.direct_memory_enabled() {
+            return (Exit::Fallback as u32, 0);
+        }
         #[cfg(target_arch = "aarch64")]
         let _fp_environment = fp_environment::Guard::enter();
         // Authored/private callers may reuse compiled code with another Memory
@@ -278,6 +288,7 @@ impl Profile {
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
     parallel: bool,
+    direct_memory: bool,
     pub region: Box<Region>,
     base: u32,
     len: usize,
@@ -328,6 +339,7 @@ impl Snapshot {
         let last = ((self.origin - self.base) as usize + end) / 4096;
         Ok(Self {
             parallel: self.parallel,
+            direct_memory: self.direct_memory,
             origin: region.start,
             region: Box::new(region),
             base: self.base,
@@ -393,6 +405,7 @@ impl Snapshot {
         }
         Ok(Self {
             parallel: memory.is_parallel(),
+            direct_memory: memory.direct_memory_enabled(),
             region: Box::new(region),
             origin,
             base: memory.base,
@@ -416,7 +429,8 @@ impl Snapshot {
     }
 
     pub fn valid(&self, memory: &Memory) -> bool {
-        self.parallel == memory.is_parallel()
+        self.direct_memory == memory.direct_memory_enabled()
+            && self.parallel == memory.is_parallel()
             && memory.base == self.base
             && memory.len == self.len
             && self.pages.iter().all(|stamp| {
@@ -972,6 +986,22 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
     #[cfg(all(target_os = "android", target_arch = "aarch64"))]
     builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    builder.symbol(
+        "adv_direct_scalar",
+        crate::direct_memory::access as *const u8,
+    );
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    builder.symbol(
+        "adv_direct_checked",
+        crate::direct_memory::checked as *const u8,
+    );
     builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
     builder.symbol("adv_x87", x87::helper_address());
     builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
@@ -1026,6 +1056,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .map_err(|e| e.to_string())
         })
         .transpose()?;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let direct_ids = if snapshot.direct_memory {
+        Some(direct::declare(&mut module)?)
+    } else {
+        None
+    };
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -1468,6 +1507,18 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                             && blocks.contains_key(&i.near_branch32())
                     })
         });
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let direct_refs = direct_ids
+            .filter(|_| kernel.is_none() && !invariant_body)
+            .map(|(access, checked)| {
+                (
+                    module.declare_func_in_func(access, b.func),
+                    module.declare_func_in_func(checked, b.func),
+                )
+            });
         let mut e = Emitter {
             b,
             optimizing: opt_level == "speed",
@@ -1567,6 +1618,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             file_prepare_ref,
             file_prepared_ref,
             timestamp_ref,
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            direct_refs,
             source_map,
             source_origin: region.start,
             source: if source_map {
@@ -2215,6 +2271,29 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         window_base: snapshot.base,
         window_len: snapshot.len,
         entries,
+        direct_sites: {
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            {
+                if snapshot.direct_memory {
+                    instructions
+                        .values()
+                        .filter(|i| direct::candidate(i))
+                        .count()
+                } else {
+                    0
+                }
+            }
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "android"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
+            {
+                0
+            }
+        },
         code_size,
         _x87: x87,
         _nests: descriptors,
@@ -2895,6 +2974,11 @@ struct Emitter<'a> {
     timestamp_ref: ir::FuncRef,
     // Optional sampler attribution (compile::diagnostics); `source` is the
     // current tag, restored after fault markers.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    direct_refs: Option<(ir::FuncRef, ir::FuncRef)>,
     source_map: bool,
     source_origin: u32,
     source: ir::SourceLoc,
@@ -5576,6 +5660,21 @@ impl Emitter<'_> {
         )
     }
     fn instruction(&mut self, i: &Instruction) -> bool {
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.direct_refs.is_some() {
+            if self.lane.is_none() && direct::candidate(i) {
+                self.direct_mov(i);
+                return false;
+            }
+            if (0..i.op_count()).any(|operand| i.op_kind(operand) == OpKind::Memory) {
+                self.b
+                    .ins()
+                    .call(self.direct_refs.unwrap().1, &[self.bridge]);
+            }
+        }
         if let Some(&(operation, opcode)) = self.x87.get(&i.ip32()) {
             self.native_x87_instruction(i, operation, opcode);
             return false;

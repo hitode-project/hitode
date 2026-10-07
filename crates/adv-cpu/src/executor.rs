@@ -64,6 +64,18 @@ pub struct Stats {
     pub cliffs: crate::Cliffs,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
+    pub direct_memory: DirectMemoryStats,
+}
+
+/// Direct scalar site publications and dynamic access outcomes.
+#[derive(Default, Clone, Debug)]
+pub struct DirectMemoryStats {
+    pub sites: u64,
+    pub accesses: u64,
+    pub recoveries: u64,
+    pub violations: u64,
+    pub checked_fallbacks: u64,
+    pub code_writes: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -298,6 +310,18 @@ impl Executor {
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
         self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(engine) = &self.memory.direct_engine {
+            let stats = &mut self.stats.direct_memory;
+            stats.accesses = engine.accesses.get();
+            stats.recoveries = engine.recoveries.get();
+            stats.violations = engine.violations.get();
+            stats.checked_fallbacks = engine.checked.get();
+            stats.code_writes = engine.code_writes.get();
+        }
         self.timestamp = bridge.timestamp;
         result
     }
@@ -337,6 +361,31 @@ impl Executor {
             .as_ref()
             .map_or_else(Default::default, |pool| pool.stats())
     }
+    /// Choose before compiling or executing. The default remains checked.
+    /// Disabling after reservation requires a fresh owner, so outstanding host
+    /// aliases can never silently move to a different allocation.
+    pub fn set_direct_memory(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled == self.memory.direct_memory_enabled() {
+            return Ok(());
+        }
+        if !enabled {
+            return Err("create a fresh executor to disable direct memory".into());
+        }
+        if self.stats.native_entries != 0
+            || self.stats.interpreter_entries != 0
+            || !self.code.compiled.is_empty()
+            || !self.pending_regions.is_empty()
+            || !self.deferred_compilations.is_empty()
+            || self.tier1.is_some()
+        {
+            return Err(
+                "direct memory must be selected before compilation and execution, without Tier 1"
+                    .into(),
+            );
+        }
+        self.memory.enable_direct_memory()
+    }
+
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Self::create(Memory::new(base, len)?)
     }
@@ -355,7 +404,7 @@ impl Executor {
                 None
             }
         };
-        Ok(Self {
+        let mut executor = Self {
             rows,
             parallel: None,
             parallel_image: None,
@@ -412,7 +461,11 @@ impl Executor {
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
-        })
+        };
+        if std::env::var("ADV_DIRECT_MEMORY").is_ok_and(|value| value == "1") {
+            executor.set_direct_memory(true)?;
+        }
+        Ok(executor)
     }
 
     pub(crate) fn setup_wow64_segments(&mut self, addr: u32) -> Result<(), String> {
@@ -596,6 +649,7 @@ impl Executor {
             }
             self.demand.remove(&pc);
         }
+        self.stats.direct_memory.sites += compiled.direct_sites as u64;
         self.stats.native_code_bytes += compiled.code_size;
         if let Some(profile) = compiled.shared_profile() {
             self.profiled.push((region.start, profile));

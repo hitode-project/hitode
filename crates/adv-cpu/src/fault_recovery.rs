@@ -194,8 +194,10 @@ fn install() -> Result<(), String> {
 ///
 /// # Safety
 /// The closure runs only the borrowed code and never exposes a Rust reference
-/// into `state` while native code can mutate it. Recovery stubs must call
-/// `recover_current` outside signal context and return through their own frame.
+/// into `state` while native code can mutate it. Recovery stubs return through
+/// their own frame. They call `recover_current` outside signal context, either
+/// in that frame or immediately after its epilogue in this closure. No guest
+/// effect or use of the interrupted result may precede that completion.
 /// A store proof covers the actual private backing for this entire closure.
 /// The caller materializes `state.fuel` before entering the registered segment;
 /// `committed_units` reports its prefix and is never subtracted a second time.
@@ -374,8 +376,8 @@ unsafe extern "C" fn dispatch(
 /// A same-frame stub calls this after the signal handler has returned.
 ///
 /// # Safety
-/// Must be called only by the published recovery stub in its active native
-/// frame, with no outstanding Rust reference into the running CpuState bytes.
+/// Must be called by the published recovery stub or its immediate continuation
+/// within `with_session`, with no outstanding Rust reference into CpuState.
 pub unsafe fn recover_current() -> Option<RecoveryOutcome> {
     ACTIVE
         .try_with(|slot| {
