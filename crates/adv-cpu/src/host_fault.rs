@@ -154,8 +154,12 @@ impl<'a> CodeRegion<'a> {
         sites: &'a [FaultSite],
         recipes: &'a [recipe::Recipe],
     ) -> Result<Self, String> {
-        if sites.len() != recipes.len() || recipes.iter().any(|recipe| !recipe.valid())
-            || sites.iter().any(|site| site.access != Access::Read || !matches!(site.width, 1 | 2 | 4)) {
+        if sites.len() != recipes.len()
+            || recipes.iter().any(|recipe| !recipe.valid())
+            || sites
+                .iter()
+                .any(|site| site.access != Access::Read || !matches!(site.width, 1 | 2 | 4))
+        {
             return Err("incomplete native recovery recipes".into());
         }
         let mut region = unsafe { Self::new(owner, start, len, sites) }?;

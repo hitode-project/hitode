@@ -174,6 +174,7 @@ pub struct Class {
     /// 0 for system (global) classes.
     pub instance: u32,
     pub icon: u32,
+    pub small_icon: u32,
     pub cursor: u32,
     pub background: u32,
     pub menu_name: u32,
@@ -537,6 +538,7 @@ impl User {
             wnd_extra,
             instance,
             icon: 0,
+            small_icon: 0,
             cursor: 0,
             background: 0,
             menu_name: 0,
@@ -770,10 +772,15 @@ fn register_class_w(env: &mut Env<'_>, extended: bool) -> Outcome {
     let fields: Vec<_> = (start..start + 10)
         .map(|at| env.cpu.read_u32(pointer + at * 4).unwrap_or(0))
         .collect();
-    register_class(env, &fields, 0, true)
+    let small_icon = if extended {
+        env.cpu.read_u32(pointer + 44).unwrap_or(0)
+    } else {
+        0
+    };
+    register_class(env, &fields, small_icon, true)
 }
 
-fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) -> Outcome {
+fn register_class(env: &mut Env<'_>, f: &[u32], small_icon: u32, wide: bool) -> Outcome {
     let menu_text = if f[8] >= 0x1_0000 {
         let Some(text) = super::message::read_text(env, f[8], wide) else {
             set_last_error(env, 998);
@@ -803,6 +810,7 @@ fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) ->
     let i = u.add_class_raw(&name, f[0], f[1], f[3], f[4]);
     let c = &mut u.classes[i];
     (c.cls_extra, c.icon, c.cursor, c.background, c.menu_name) = (f[2], f[5], f[6], f[7], f[8]);
+    c.small_icon = small_icon;
     c.menu_text = menu_text;
     c.unicode = Some(wide);
     let atom = c.atom;
@@ -835,7 +843,7 @@ fn unregister_class_a(env: &mut Env<'_>) -> Outcome {
 
 fn get_class_info_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name, out) = (env.arg(0), env.arg(1), env.arg(2));
-    get_class_info(env, inst, name, out, false)
+    get_class_info(env, inst, name, out, false, false)
 }
 
 #[win32(user32, name = "GetClassInfoW", level = state)]
@@ -845,17 +853,49 @@ fn get_class_info_w(
     name: WideStr,
     out: GuestPtr<u8>,
 ) -> Outcome {
-    get_class_info(env, instance.0, name.0.addr(), out.addr(), true)
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), true, false)
 }
 
-fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool) -> Outcome {
-    let api = if wide {
-        "user32.dll!GetClassInfoW"
-    } else {
-        "user32.dll!GetClassInfoA"
+#[win32(user32, name = "GetClassInfoExA", level = state)]
+fn get_class_info_ex_a(
+    env: &mut Env<'_>,
+    instance: AbiHandle,
+    name: AnsiStr,
+    out: GuestPtr<u8>,
+) -> Outcome {
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), false, true)
+}
+
+#[win32(user32, name = "GetClassInfoExW", level = state)]
+fn get_class_info_ex_w(
+    env: &mut Env<'_>,
+    instance: AbiHandle,
+    name: WideStr,
+    out: GuestPtr<u8>,
+) -> Outcome {
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), true, true)
+}
+
+fn get_class_info(
+    env: &mut Env<'_>,
+    inst: u32,
+    name: u32,
+    out: u32,
+    wide: bool,
+    extended: bool,
+) -> Outcome {
+    let api = match (wide, extended) {
+        (false, false) => "user32.dll!GetClassInfoA",
+        (true, false) => "user32.dll!GetClassInfoW",
+        (false, true) => "user32.dll!GetClassInfoExA",
+        (true, true) => "user32.dll!GetClassInfoExW",
     };
     if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
-        adv_abi::warn_unavailable(env, api, "class query ANSI code page has no supported encoder");
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "class query ANSI code page has no supported encoder",
+        );
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
@@ -874,14 +914,21 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
     };
     let u = user(env);
     let c = &u.classes[i];
-    if c.unicode.is_some_and(|registered_wide| registered_wide != wide) {
+    if c.unicode
+        .is_some_and(|registered_wide| registered_wide != wide)
+    {
         // Native returns an A/W procedure thunk for a custom class queried via
         // the opposite encoding. A raw guest procedure is not that thunk.
-        adv_abi::warn_unavailable(env, api, "cross-encoding custom class procedure thunk is unavailable");
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "cross-encoding custom class procedure thunk is unavailable",
+        );
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
-    if adv_abi::guest::check_range(env.cpu, out, 40, adv_cpu::backend::Prot::WRITE).is_err() {
+    let size = if extended { 48 } else { 40 };
+    if adv_abi::guest::check_range(env.cpu, out, size, adv_cpu::backend::Prot::WRITE).is_err() {
         // The checked-pointer profile reports 998 rather than reproducing a native AV.
         set_last_error(env, 998);
         return Outcome::Return(0);
@@ -898,6 +945,7 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
         c.menu_name,
         name,
     ];
+    let small_icon = c.small_icon;
     let atom = c.atom;
     let encoding = usize::from(wide);
     let mut allocated = 0;
@@ -912,8 +960,15 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
             f[8] = allocated;
         }
     }
-    let bytes: Vec<_> = f.into_iter().flat_map(u32::to_le_bytes).collect();
-    if env.cpu.write(out, &bytes).is_err() {
+    let mut bytes: Vec<_> = f.into_iter().flat_map(u32::to_le_bytes).collect();
+    let target = if extended {
+        bytes.extend(small_icon.to_le_bytes());
+        // Native fills WNDCLASSEX's fields while preserving the caller's cbSize.
+        out + 4
+    } else {
+        out
+    };
+    if env.cpu.write(target, &bytes).is_err() {
         temp_free(env, allocated);
         set_last_error(env, 998);
         return Outcome::Return(0);
@@ -2020,8 +2075,18 @@ fn procedure_encoding(env: &Env<'_>, proc: u32) -> Option<bool> {
 }
 
 fn stock_procedure(u: &User, proc: u32) -> bool {
-    proc != 0 && [u.procs.def_window, u.procs.def_dlg, u.procs.button, u.procs.static_,
-        u.procs.edit, u.procs.combo, u.procs.trackbar, u.procs.tab].contains(&proc)
+    proc != 0
+        && [
+            u.procs.def_window,
+            u.procs.def_dlg,
+            u.procs.button,
+            u.procs.static_,
+            u.procs.edit,
+            u.procs.combo,
+            u.procs.trackbar,
+            u.procs.tab,
+        ]
+        .contains(&proc)
 }
 
 fn procedure_boundary(env: &mut Env<'_>, api: &str, reason: &str) -> Outcome {
@@ -2038,7 +2103,11 @@ fn get_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, wide: bool) -> Outcom
     if idx == GWL_WNDPROC && w.unicode != wide {
         return procedure_boundary(
             env,
-            if wide { "user32.dll!GetWindowLongW" } else { "user32.dll!GetWindowLongA" },
+            if wide {
+                "user32.dll!GetWindowLongW"
+            } else {
+                "user32.dll!GetWindowLongA"
+            },
             "cross-encoding GWL_WNDPROC query requires an unavailable procedure thunk",
         );
     }
@@ -2059,11 +2128,18 @@ fn get_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, wide: bool) -> Outcom
                 if !can_capture_procedures(user(env), &[v]) {
                     return procedure_boundary(
                         env,
-                        if wide { "user32.dll!GetWindowLongW" } else { "user32.dll!GetWindowLongA" },
+                        if wide {
+                            "user32.dll!GetWindowLongW"
+                        } else {
+                            "user32.dll!GetWindowLongA"
+                        },
                         "saved procedure encoding metadata reached its bounded capacity",
                     );
                 }
-                *user_mut(env).saved_procedure_encodings.entry(v).or_default() |= if wide { 2 } else { 1 };
+                *user_mut(env)
+                    .saved_procedure_encodings
+                    .entry(v)
+                    .or_default() |= if wide { 2 } else { 1 };
             }
             Outcome::Return(v)
         }
@@ -2092,15 +2168,25 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
     if idx == GWL_HWNDPARENT {
         return procedure_boundary(
             env,
-            if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+            if wide {
+                "user32.dll!SetWindowLongW"
+            } else {
+                "user32.dll!SetWindowLongA"
+            },
             "GWL_HWNDPARENT reparent/owner lifecycle is unsupported",
         );
     }
     if idx == GWL_WNDPROC {
-        if current.unicode != wide || procedure_encoding(env, v).is_some_and(|target| target != wide) {
+        if current.unicode != wide
+            || procedure_encoding(env, v).is_some_and(|target| target != wide)
+        {
             return procedure_boundary(
                 env,
-                if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+                if wide {
+                    "user32.dll!SetWindowLongW"
+                } else {
+                    "user32.dll!SetWindowLongA"
+                },
                 "cross-encoding GWL_WNDPROC replacement requires an unavailable procedure thunk",
             );
         }
@@ -2111,7 +2197,11 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
         if !can_capture_procedures(user(env), &[current.proc, v]) {
             return procedure_boundary(
                 env,
-                if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+                if wide {
+                    "user32.dll!SetWindowLongW"
+                } else {
+                    "user32.dll!SetWindowLongA"
+                },
                 "saved procedure encoding metadata reached its bounded capacity",
             );
         }
@@ -2170,15 +2260,27 @@ pub(super) fn call_window_proc(
     lp: u32,
     wide: bool,
 ) -> Outcome {
-    let api = if wide { "user32.dll!CallWindowProcW" } else { "user32.dll!CallWindowProcA" };
+    let api = if wide {
+        "user32.dll!CallWindowProcW"
+    } else {
+        "user32.dll!CallWindowProcA"
+    };
     if procedure_encoding(env, proc).is_some_and(|target| target != wide) {
-        return procedure_boundary(env, api, "saved/custom procedure A/W conversion thunk is unavailable");
+        return procedure_boundary(
+            env,
+            api,
+            "saved/custom procedure A/W conversion thunk is unavailable",
+        );
     }
     let u = user(env);
     let stock = stock_procedure(u, proc);
     if stock {
         let Some(target) = u.windows.get(&env.sys.objects, &hwnd) else {
-            return procedure_boundary(env, api, "shared built-in procedure requires a captured USER window");
+            return procedure_boundary(
+                env,
+                api,
+                "shared built-in procedure requires a captured USER window",
+            );
         };
         if target.unicode != wide {
             if matches!(msg, wm::SETTEXT | wm::GETTEXT | wm::GETTEXTLENGTH) {
@@ -2188,16 +2290,32 @@ pub(super) fn call_window_proc(
             // CREATE/NCCREATE do not read CREATESTRUCT strings, and destruction
             // has no encoding-sensitive payload. DialogWndProc instead invokes
             // an application DLGPROC first, so it cannot use this exception.
-            let creation_metadata = matches!(msg, wm::CREATE | wm::NCCREATE | wm::DESTROY | wm::NCDESTROY)
-                && [u.procs.def_window, u.procs.button, u.procs.static_, u.procs.edit,
-                    u.procs.combo, u.procs.trackbar, u.procs.tab].contains(&proc);
-            let numeric = matches!(msg, 0 | wm::MOVE | wm::SIZE | wm::SETFONT | wm::GETFONT
+            let creation_metadata =
+                matches!(msg, wm::CREATE | wm::NCCREATE | wm::DESTROY | wm::NCDESTROY)
+                    && [
+                        u.procs.def_window,
+                        u.procs.button,
+                        u.procs.static_,
+                        u.procs.edit,
+                        u.procs.combo,
+                        u.procs.trackbar,
+                        u.procs.tab,
+                    ]
+                    .contains(&proc);
+            let numeric = matches!(
+                msg,
+                0 | wm::MOVE | wm::SIZE | wm::SETFONT | wm::GETFONT
                 | wm::ENABLE | 0x000b /* WM_SETREDRAW */ | wm::PAINT | wm::ERASEBKGND
                 | wm::SETFOCUS | wm::KILLFOCUS | wm::GETDLGCODE
                 | wm::WINDOWPOSCHANGING | wm::WINDOWPOSCHANGED
-                | wm::KEYDOWN | wm::KEYUP | wm::SYSKEYDOWN | 0x0105 /* WM_SYSKEYUP */);
+                | wm::KEYDOWN | wm::KEYUP | wm::SYSKEYDOWN | 0x0105 /* WM_SYSKEYUP */
+            );
             if !creation_metadata && !numeric {
-                return procedure_boundary(env, api, "saved built-in message needs an unavailable A/W structure or character conversion");
+                return procedure_boundary(
+                    env,
+                    api,
+                    "saved built-in message needs an unavailable A/W structure or character conversion",
+                );
             }
         }
     }
@@ -2228,7 +2346,7 @@ fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
         -24 => c.proc,
         -26 => c.style,
         -14 => c.icon,
-        -34 => c.icon,
+        -34 => c.small_icon,
         -12 => c.cursor,
         -10 => c.background,
         -18 => c.wnd_extra,
@@ -2250,7 +2368,8 @@ fn set_class_long_a(env: &mut Env<'_>) -> Outcome {
     let slot = match idx {
         -24 => &mut c.proc,
         -26 => &mut c.style,
-        -14 | -34 => &mut c.icon,
+        -14 => &mut c.icon,
+        -34 => &mut c.small_icon,
         -12 => &mut c.cursor,
         -10 => &mut c.background,
         _ => return Outcome::Return(0),
@@ -2677,6 +2796,8 @@ pub fn register(reg: &mut Registry) {
     s(reg, "UnregisterClassA", 2, unregister_class_a);
     s(reg, "GetClassInfoA", 3, get_class_info_a);
     reg.register(get_class_info_w_ABI);
+    reg.register(get_class_info_ex_a_ABI);
+    reg.register(get_class_info_ex_w_ABI);
     s(reg, "GetClassNameA", 3, get_class_name_a);
     s(reg, "CreateWindowExA", 12, create_window_ex_a);
     reg.register(create_window_ex_w_ABI);

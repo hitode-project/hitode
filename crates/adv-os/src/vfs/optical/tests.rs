@@ -68,6 +68,24 @@ fn optical_fixture_lists_iso_and_joliet_names_and_rejects_writes() {
     assert!(vfs.mapping_write_path("D:/ReadMe.txt").is_none()); // privacy: allow authored guest optical path
     assert!(vfs.list("D:/ReadMe.txt").is_none()); // privacy: allow authored guest optical path
     assert!(vfs.open_optical_file("D:/").is_err()); // privacy: allow authored guest optical path
+    vfs.set_current_directory("D:/Sub").unwrap(); // privacy: allow authored guest optical path
+    assert_eq!(
+        vfs.open_optical_file("日本.txt")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        vfs.set_current_directory("日本.txt"),
+        Err(super::super::DirectoryError::NotDirectory)
+    );
+    assert_eq!(
+        vfs.set_current_directory("missing"),
+        Err(super::super::DirectoryError::NameNotFound)
+    );
+    assert!(vfs.open_optical_file("日本.txt").is_ok());
     // Primary-only discs retain the conventional name without ;1 or final dot.
     let mut primary = FIXTURE.to_vec();
     primary[17 * 2048..18 * 2048].fill(0);

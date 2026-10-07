@@ -21,13 +21,13 @@ pub mod process;
 pub mod sched;
 pub mod schedule_trace;
 pub mod scheduling;
+#[cfg(test)]
+mod spawn_tests;
 pub mod stats;
 pub mod thunk;
 pub mod trace;
 pub mod vm;
 mod wake_queue;
-#[cfg(test)]
-mod spawn_tests;
 pub use wake_queue::WakePriority;
 
 use std::collections::VecDeque;
@@ -183,7 +183,9 @@ impl Env<'_> {
 impl Sys {
     /// Assign a distinct process identity before creating any guest context.
     pub fn set_process_identity(&mut self, pid: u32) -> Result<(), &'static str> {
-        if !self.contexts.is_empty() || pid > u32::MAX - 0x1000 { return Err("process identity already published"); }
+        if !self.contexts.is_empty() || pid > u32::MAX - 0x1000 {
+            return Err("process identity already published");
+        }
         self.pid = pid;
         self.next_tid = pid + 4;
         self.process_identity = process::ProcessIdentity::new(pid);
@@ -191,19 +193,27 @@ impl Sys {
     }
     pub fn thread_identity(&self, id: CtxId) -> Option<process::ThreadIdentity> {
         let context = self.contexts.get(id as usize)?;
-        Some(process::ThreadIdentity { process: self.process_identity.clone(), context: id,
-            tid: context.tid, completion: context.completion.clone() })
+        Some(process::ThreadIdentity {
+            process: self.process_identity.clone(),
+            context: id,
+            tid: context.tid,
+            completion: context.completion.clone(),
+        })
     }
     pub fn suspend_context(&mut self, id: CtxId) -> Option<u32> {
         let context = self.contexts.get_mut(id as usize)?;
-        if context.is_done() || context.suspend_count == 127 { return None; }
+        if context.is_done() || context.suspend_count == 127 {
+            return None;
+        }
         let old = context.suspend_count;
         context.suspend_count += 1;
         Some(old)
     }
     pub fn resume_context(&mut self, id: CtxId) -> Option<u32> {
         let context = self.contexts.get_mut(id as usize)?;
-        if context.is_done() { return None; }
+        if context.is_done() {
+            return None;
+        }
         let old = context.suspend_count;
         context.suspend_count = old.saturating_sub(1);
         Some(old)
@@ -649,9 +659,11 @@ impl Sys {
     fn advance_if_only_polling(&mut self, polled: &mut [bool]) {
         if !self.clock.is_virtual()
             || !self.only_polling()
-            || !self.contexts.iter().enumerate().all(|(i, c)| {
-                !c.is_ready() || polled.get(i) == Some(&true)
-            })
+            || !self
+                .contexts
+                .iter()
+                .enumerate()
+                .all(|(i, c)| !c.is_ready() || polled.get(i) == Some(&true))
         {
             return;
         }
@@ -674,11 +686,7 @@ impl Sys {
         {
             return false;
         }
-        let mut ready = self
-            .contexts
-            .iter()
-            .filter(|c| c.is_ready())
-            .peekable();
+        let mut ready = self.contexts.iter().filter(|c| c.is_ready()).peekable();
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
 
@@ -756,7 +764,10 @@ fn process_start(env: &mut Env<'_>) -> Outcome {
 
 /// Why a context stopped running inside a trap.
 enum Parked {
-    HostRequest { then: outcome::DeferredContinuation, origin: Origin },
+    HostRequest {
+        then: outcome::DeferredContinuation,
+        origin: Origin,
+    },
     /// Return to the host after committing a frame-producing trap, without a guest wait.
     HostYield {
         resume_eip: u32,
@@ -1493,15 +1504,34 @@ impl<B: Backend> Machine<B> {
 
     /// Supervisor access after all CPU leases have returned. Selecting a context
     /// materializes its own registers; the next scheduler selection saves them.
-    pub fn visit_context<R>(&mut self, context: Option<CtxId>, task: impl FnOnce(&mut Env<'_>) -> R) -> Result<R, String> {
+    pub fn visit_context<R>(
+        &mut self,
+        context: Option<CtxId>,
+        task: impl FnOnce(&mut Env<'_>) -> R,
+    ) -> Result<R, String> {
         self.collect_at_boundary()?;
         let prior = self.loaded;
         if let Some(id) = context {
-            if self.sys.contexts.get(id as usize).is_none_or(|c| c.is_done()) { return Err("invalid target context".into()); }
+            if self
+                .sys
+                .contexts
+                .get(id as usize)
+                .is_none_or(|c| c.is_done())
+            {
+                return Err("invalid target context".into());
+            }
             self.switch_to(id).map_err(|e| e.to_string())?;
         }
-        let result = task(&mut Env { context: self.sys.current, cpu: &mut self.cpu, sys: &mut self.sys, ext: &mut self.ext, thunk: 0 });
-        if let Some(prior) = prior { self.switch_to(prior).map_err(|e| e.to_string())?; }
+        let result = task(&mut Env {
+            context: self.sys.current,
+            cpu: &mut self.cpu,
+            sys: &mut self.sys,
+            ext: &mut self.ext,
+            thunk: 0,
+        });
+        if let Some(prior) = prior {
+            self.switch_to(prior).map_err(|e| e.to_string())?;
+        }
         Ok(result)
     }
 
@@ -1563,7 +1593,9 @@ impl<B: Backend> Machine<B> {
         let ctx = &mut self.sys.contexts[id as usize];
         match p {
             Parked::HostRequest { then, origin } => {
-                ctx.state = State::Ready { resume: Some(ReadyResume::Deferred { then, origin }) };
+                ctx.state = State::Ready {
+                    resume: Some(ReadyResume::Deferred { then, origin }),
+                };
                 ctx.yielded = false;
                 return Some(RunResult::HostRequest);
             }
@@ -1839,9 +1871,12 @@ impl<B: Backend> Machine<B> {
             // can wait (at most 1 ms) like the OS would schedule them.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
-                && self.sys.contexts.iter().enumerate().all(|(i, c)| {
-                    !c.is_ready() || ran.get(i) == Some(&true)
-                })
+                && self
+                    .sys
+                    .contexts
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| !c.is_ready() || ran.get(i) == Some(&true))
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
@@ -2255,12 +2290,7 @@ impl<B: Backend> Machine<B> {
         }
         self.sys.scheduling.frame_host_yields += 1;
         self.sys.wake();
-        if self
-            .sys
-            .contexts
-            .iter()
-            .any(|c| c.is_ready())
-        {
+        if self.sys.contexts.iter().any(|c| c.is_ready()) {
             SliceResult::Yielded
         } else {
             let next_deadline = self.sys.next_deadline();

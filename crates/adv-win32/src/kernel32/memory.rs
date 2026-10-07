@@ -10,6 +10,7 @@ use adv_os::Heaps;
 mod global;
 mod locks;
 mod virtual_memory;
+pub(crate) use virtual_memory::native_write_memory;
 pub(crate) use virtual_memory::protect_memory;
 pub(crate) use virtual_memory::{
     allocate as allocate_memory, allocation_extent, release as free_memory, span as memory_span,

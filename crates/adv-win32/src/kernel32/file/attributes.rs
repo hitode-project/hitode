@@ -85,15 +85,23 @@ fn get(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
             return Outcome::Return(u32::MAX);
         }
     };
-    let guest = env.ext.get::<Win32>().vfs.normalize(&path);
-    if matches!(system_file(env, &guest), Ok(Some(_))) {
-        return Outcome::Return(FILE_ATTRIBUTE_ARCHIVE | 1);
-    }
-    match env.ext.get::<Win32>().vfs.file_attributes(&path) {
+    match file_attributes_path(env, &path, api) {
         Ok(attributes) => Outcome::Return(attributes),
+        Err(_) => Outcome::Return(u32::MAX),
+    }
+}
+
+/// One guest attribute view, also used by CRT access checks without opening files.
+pub(crate) fn file_attributes_path(env: &mut Env<'_>, path: &str, api: &str) -> Result<u32, u32> {
+    let guest = env.ext.get::<Win32>().vfs.normalize(path);
+    if matches!(system_file(env, &guest), Ok(Some(_))) {
+        return Ok(FILE_ATTRIBUTE_ARCHIVE | 1);
+    }
+    match env.ext.get::<Win32>().vfs.file_attributes(path) {
+        Ok(attributes) => Ok(attributes),
         Err(error) => {
-            failed(env, api, &path, &error);
-            Outcome::Return(u32::MAX)
+            failed(env, api, path, &error);
+            Err(crate::util::last_error(env))
         }
     }
 }

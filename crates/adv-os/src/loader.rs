@@ -220,8 +220,17 @@ impl<'a> Loader<'a> {
         let loaded = self.load(path);
         self.defer_executable = false;
         let module = loaded?;
-        if self.modules.get(module).is_dll { return Err(LoadError::Pe { path: path.into(), err: PeError::Malformed("process image is a DLL".into()) }); }
-        Ok(PreparedProcess { module, initializers: std::mem::take(&mut self.inits), delay: std::mem::take(&mut self.pending_delay) })
+        if self.modules.get(module).is_dll {
+            return Err(LoadError::Pe {
+                path: path.into(),
+                err: PeError::Malformed("process image is a DLL".into()),
+            });
+        }
+        Ok(PreparedProcess {
+            module,
+            initializers: std::mem::take(&mut self.inits),
+            delay: std::mem::take(&mut self.pending_delay),
+        })
     }
 
     /// Bind the live guest import directory, including allocations beyond the
@@ -230,22 +239,37 @@ impl<'a> Loader<'a> {
     pub fn finish_process(&mut self, prepared: PreparedProcess) -> Result<(), LoadError> {
         let module = self.modules.get(prepared.module);
         let (base, path) = (module.base, module.path.clone());
-        let invalid = || LoadError::Pe { path: path.clone(), err: PeError::Malformed("invalid mapped process import directory".into()) };
+        let invalid = || LoadError::Pe {
+            path: path.clone(),
+            err: PeError::Malformed("invalid mapped process import directory".into()),
+        };
         let add = |base: u32, offset: u32| base.checked_add(offset).ok_or_else(&invalid);
         let read = |cpu: &dyn Guest, address| -> Result<u32, LoadError> {
-            if !cpu.accessible(address, 4, Prot::READ) { return Err(invalid()); }
+            if !cpu.accessible(address, 4, Prot::READ) {
+                return Err(invalid());
+            }
             Ok(cpu.read_u32(address)?)
         };
-        if !self.cpu.accessible(base, 64, Prot::READ) || self.cpu.read_u16(base)? != 0x5a4d { return Err(invalid()); }
+        if !self.cpu.accessible(base, 64, Prot::READ) || self.cpu.read_u16(base)? != 0x5a4d {
+            return Err(invalid());
+        }
         let nt_offset = read(self.cpu, add(base, 0x3c)?)?;
-        if nt_offset > 0x100000 { return Err(invalid()); }
+        if nt_offset > 0x100000 {
+            return Err(invalid());
+        }
         let nt = add(base, nt_offset)?;
-        if !self.cpu.accessible(nt, 136, Prot::READ) || read(self.cpu, nt)? != 0x4550
+        if !self.cpu.accessible(nt, 136, Prot::READ)
+            || read(self.cpu, nt)? != 0x4550
             || self.cpu.read_u16(add(nt, 20)?)? < 112
             || self.cpu.read_u16(add(nt, 24)?)? != 0x10b
-            || read(self.cpu, add(nt, 116)?)? < 2 { return Err(invalid()); }
+            || read(self.cpu, add(nt, 116)?)? < 2
+        {
+            return Err(invalid());
+        }
         let import = read(self.cpu, add(nt, 128)?)?;
-        let directory = path.rfind(['\\', '/']).map_or(String::new(), |at| path[..at].to_owned());
+        let directory = path
+            .rfind(['\\', '/'])
+            .map_or(String::new(), |at| path[..at].to_owned());
         self.importers.push(directory);
         let result = (|| {
             let mut writes = Vec::new();
@@ -257,8 +281,13 @@ impl<'a> Loader<'a> {
                     let original = read(self.cpu, descriptor)?;
                     let name = read(self.cpu, add(descriptor, 12)?)?;
                     let first = read(self.cpu, add(descriptor, 16)?)?;
-                    if original == 0 && name == 0 && first == 0 { ended = true; break; }
-                    if name == 0 || first == 0 { return Err(invalid()); }
+                    if original == 0 && name == 0 && first == 0 {
+                        ended = true;
+                        break;
+                    }
+                    if name == 0 || first == 0 {
+                        return Err(invalid());
+                    }
                     let dll = mapped_string(self.cpu, add(base, name)?, 32768)?;
                     let dependency = self.load_inner(&dll, false)?;
                     self.dependency(prepared.module, dependency)?;
@@ -267,37 +296,65 @@ impl<'a> Loader<'a> {
                     let mut terminated = false;
                     for n in 0..65536u32 {
                         let word = read(self.cpu, add(lookup, n * 4)?)?;
-                        if word == 0 { terminated = true; break; }
-                        if writes.len() >= 65536 { return Err(invalid()); }
+                        if word == 0 {
+                            terminated = true;
+                            break;
+                        }
+                        if writes.len() >= 65536 {
+                            return Err(invalid());
+                        }
                         let symbol = if word & 0x80000000 != 0 {
                             ImportName::Ordinal(word as u16)
                         } else {
                             let hint = add(base, word)?;
-                            if !self.cpu.accessible(hint, 2, Prot::READ) { return Err(invalid()); }
-                            ImportName::Name { hint: self.cpu.read_u16(hint)?, name: mapped_string(self.cpu, add(hint, 2)?, 4096)? }
+                            if !self.cpu.accessible(hint, 2, Prot::READ) {
+                                return Err(invalid());
+                            }
+                            ImportName::Name {
+                                hint: self.cpu.read_u16(hint)?,
+                                name: mapped_string(self.cpu, add(hint, 2)?, 4096)?,
+                            }
                         };
                         let address = self.resolve_inner(dependency, &symbol, 0, false)?;
                         let slot = add(target, n * 4)?;
-                        if !self.cpu.accessible(slot, 4, Prot::default()) { return Err(invalid()); }
+                        if !self.cpu.accessible(slot, 4, Prot::default()) {
+                            return Err(invalid());
+                        }
                         writes.push((slot, address));
                     }
-                    if !terminated { return Err(invalid()); }
+                    if !terminated {
+                        return Err(invalid());
+                    }
                 }
-                if !ended { return Err(invalid()); }
+                if !ended {
+                    return Err(invalid());
+                }
             }
             // Preserve the existing eager delay-load shortcut without rewriting
             // any other bytes that the parent patched in the mapped image.
             for delayed in prepared.delay {
                 let dependency = self.load_inner(&delayed.dll, false)?;
                 self.dependency(prepared.module, dependency)?;
-                if delayed.module_handle_rva != 0 { writes.push((add(base, delayed.module_handle_rva)?, self.modules.get(dependency).base)); }
+                if delayed.module_handle_rva != 0 {
+                    writes.push((
+                        add(base, delayed.module_handle_rva)?,
+                        self.modules.get(dependency).base,
+                    ));
+                }
                 for import in delayed.imports {
                     let address = self.resolve_inner(dependency, &import.name, 0, false)?;
                     writes.push((add(base, import.iat_rva)?, address));
                 }
             }
-            if writes.iter().any(|(slot, _)| !self.cpu.accessible(*slot, 4, Prot::default())) { return Err(invalid()); }
-            for (slot, address) in writes { self.cpu.write_u32(slot, address)?; }
+            if writes
+                .iter()
+                .any(|(slot, _)| !self.cpu.accessible(*slot, 4, Prot::default()))
+            {
+                return Err(invalid());
+            }
+            for (slot, address) in writes {
+                self.cpu.write_u32(slot, address)?;
+            }
             Ok(())
         })();
         self.importers.pop();
@@ -686,7 +743,9 @@ impl<'a> Loader<'a> {
         let bound = if self.defer_executable && !pe.is_dll() {
             self.pending_delay = pe.delay_imports_at(base).unwrap_or_default();
             Ok(())
-        } else { self.bind(&mut pe, path, base, id) };
+        } else {
+            self.bind(&mut pe, path, base, id)
+        };
         self.importers.pop();
         bound?;
 
@@ -1181,11 +1240,28 @@ mod host_dir_tests {
 fn mapped_string(cpu: &dyn Guest, at: u32, limit: u32) -> Result<String, LoadError> {
     let mut bytes = Vec::new();
     for offset in 0..limit {
-        let address = at.checked_add(offset).ok_or(MemFault { addr: at, len: limit })?;
-        if !cpu.accessible(address, 1, Prot::READ) { return Err(MemFault { addr: address, len: 1 }.into()); }
+        let address = at.checked_add(offset).ok_or(MemFault {
+            addr: at,
+            len: limit,
+        })?;
+        if !cpu.accessible(address, 1, Prot::READ) {
+            return Err(MemFault {
+                addr: address,
+                len: 1,
+            }
+            .into());
+        }
         let byte = cpu.read_u8(address)?;
-        if byte == 0 { return String::from_utf8(bytes).map_err(|_| LoadError::Pe { path: "mapped import".into(), err: PeError::Malformed("non-UTF8 import name".into()) }); }
+        if byte == 0 {
+            return String::from_utf8(bytes).map_err(|_| LoadError::Pe {
+                path: "mapped import".into(),
+                err: PeError::Malformed("non-UTF8 import name".into()),
+            });
+        }
         bytes.push(byte);
     }
-    Err(LoadError::Pe { path: "mapped import".into(), err: PeError::Malformed("unterminated import name".into()) })
+    Err(LoadError::Pe {
+        path: "mapped import".into(),
+        err: PeError::Malformed("unterminated import name".into()),
+    })
 }

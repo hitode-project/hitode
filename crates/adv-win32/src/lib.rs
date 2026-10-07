@@ -10,10 +10,10 @@
 //! `env.ext.get_mut::<Win32>()`, alongside `env.cpu` and `env.sys`.
 
 mod advapi32;
+pub mod codec_kernels;
 pub mod gdi32;
 mod guest_code;
 pub mod kernel32;
-pub mod codec_kernels;
 mod misc;
 mod ntdll;
 pub mod printf;

@@ -581,12 +581,19 @@ impl Font {
         // selected native font as the preceding count and other text queries.
         let written = unsafe { gdi::GetKerningPairsW(self.dc, capacity, pairs.as_mut_ptr()) };
         if written > capacity {
-            return Err(TextError::Font("native kerning-pair count exceeds capacity".into()));
+            return Err(TextError::Font(
+                "native kerning-pair count exceeds capacity".into(),
+            ));
         }
         pairs.truncate(written as usize);
-        Ok(pairs.into_iter().map(|pair| KerningPair {
-            first: pair.wFirst, second: pair.wSecond, adjustment: pair.iKernAmount,
-        }).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|pair| KerningPair {
+                first: pair.wFirst,
+                second: pair.wSecond,
+                adjustment: pair.iKernAmount,
+            })
+            .collect())
     }
     pub(super) fn extent(&self, input: TextInput<'_>) -> Result<TextExtent, TextError> {
         let mut size = windows_sys::Win32::Foundation::SIZE::default();
@@ -704,7 +711,6 @@ impl Font {
             data,
         })
     }
-
 }
 
 /// One bounded scratch bitmap shared by the font cache, never by guest handles.

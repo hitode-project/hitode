@@ -273,3 +273,58 @@ fn keyboard_output_fault_checks_the_full_span_and_preserves_its_writable_prefix(
     assert_eq!(bytes, [0xa5; 256]);
     assert_eq!(keyboard(&mut machine, 0), 0);
 }
+
+#[test]
+fn set_keyboard_state_changes_only_this_queue_and_preserves_pending_input() {
+    let (mut machine, memory, live) = fixture();
+    let input = memory + 256;
+    let output = memory + 512;
+    let bytes = std::array::from_fn::<_, 256, _>(|i| i as u8);
+    machine.cpu.write(input, &bytes).unwrap();
+    live.set(0x41, true);
+    assert!(post_input(&mut env(&mut machine), 0, wm::KEYUP, 0x80, 1));
+    crate::util::set_last_error(&mut env(&mut machine), 1234);
+    assert_eq!(
+        super::super::input::set_keyboard_state(
+            &mut env(&mut machine),
+            adv_abi::GuestPtr::new(input)
+        ),
+        1
+    );
+    assert_eq!(crate::util::last_error(&env(&mut machine)), 1234);
+    assert_eq!(keyboard(&mut machine, output), 1);
+    let mut actual = [0; 256];
+    machine.cpu.read(output, &mut actual).unwrap();
+    assert_eq!(actual, bytes.map(|value| value & 0x81));
+    assert_eq!(key(&mut machine, 0x41, true), 0x8000);
+    assert_eq!(key(&mut machine, 0x41, false), 1);
+    machine.sys.current = 1;
+    assert_eq!(key(&mut machine, 0x81, false), 0);
+    machine.sys.current = 0;
+    assert_eq!(key(&mut machine, 0x80, false), 0xffff_8000);
+    assert_eq!(next(&mut machine, false).msg, wm::KEYUP);
+    assert_eq!(key(&mut machine, 0x80, false), 0xffff_8000);
+    next(&mut machine, true);
+    assert_eq!(key(&mut machine, 0x80, false), 0);
+}
+
+#[test]
+fn set_keyboard_state_bad_input_leaves_the_existing_queue_state_intact() {
+    let (mut machine, memory, _) = fixture();
+    let input = memory + 4096 - 128;
+    machine.cpu.write(input, &[0x81; 256]).unwrap();
+    machine.ext.get_mut::<Win32>().user.queue(0).keyboard.0[0x41] = 0x80;
+    machine.cpu.protect(memory + 4096, 4096, Prot(0)).unwrap();
+    for pointer in [0, input] {
+        assert_eq!(
+            super::super::input::set_keyboard_state(
+                &mut env(&mut machine),
+                adv_abi::GuestPtr::new(pointer)
+            ),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut machine)), 998);
+        assert_eq!(key(&mut machine, 0x41, false), 0xffff_8000);
+        assert_eq!(key(&mut machine, 0x80, false), 0);
+    }
+}

@@ -13,14 +13,14 @@ use std::time::SystemTime;
 
 use crate::OsConfig;
 
-mod portable_saves;
 mod attributes;
+mod optical;
+mod portable_saves;
 mod section;
 mod stream;
-mod optical;
+pub use optical::{OpticalDriveInfo, OpticalFile};
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
 pub use stream::FileStream;
-pub use optical::{OpticalDriveInfo, OpticalFile};
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
@@ -32,6 +32,14 @@ pub struct DirEntry {
     pub modified: Option<SystemTime>,
     /// The same process-owned attribute view queried through Vfs::file_attributes.
     pub attributes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryError {
+    NameNotFound,
+    PathNotFound,
+    NotDirectory,
+    AccessDenied,
 }
 
 /// An open guest file: a host object in the machine's handle table. Every personality
@@ -287,6 +295,41 @@ impl Vfs {
             return self.optical_entry(guest).is_ok_and(|entry| entry.is_dir);
         }
         self.lookup(guest).is_some_and(|p| p.is_dir())
+    }
+
+    /// Change only this process's DOS directory after validating its VFS target.
+    pub fn set_current_directory(&mut self, guest: &str) -> Result<(), DirectoryError> {
+        let path = self.normalize(guest);
+        let missing = || {
+            let parent = path.rfind('\\').map(|at| &path[..at + 1]);
+            if parent.is_some_and(|parent| self.is_dir(parent)) {
+                DirectoryError::NameNotFound
+            } else {
+                DirectoryError::PathNotFound
+            }
+        };
+        let is_dir = if self.is_optical_path(&path) {
+            self.optical_entry(&path).map(|entry| entry.is_dir)
+        } else {
+            let host = self.lookup(&path).ok_or_else(missing)?;
+            std::fs::metadata(host).map(|metadata| metadata.is_dir())
+        }
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing()
+            } else {
+                DirectoryError::AccessDenied
+            }
+        })?;
+        if !is_dir {
+            return Err(DirectoryError::NotDirectory);
+        }
+        self.cwd = if path.len() > 3 {
+            path.trim_end_matches('\\').to_owned()
+        } else {
+            path
+        };
+        Ok(())
     }
 
     /// Merge game, replacement and writable layers, in increasing priority.

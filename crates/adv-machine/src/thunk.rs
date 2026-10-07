@@ -232,7 +232,11 @@ impl ThunkTable {
         );
         let mut code = guest.code.to_vec();
         let host = guest.host.iter().map(|&at| (at, Self::trap_addr(index)));
-        let links = guest.links.iter().zip(links).map(|(&(at, ..), &target)| (at, target));
+        let links = guest
+            .links
+            .iter()
+            .zip(links)
+            .map(|(&(at, ..), &target)| (at, target));
         for (at, target) in host.chain(links) {
             let next = body + at as u32 + 4;
             code[at..at + 4].copy_from_slice(&target.wrapping_sub(next).to_le_bytes());

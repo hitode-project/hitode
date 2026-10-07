@@ -74,8 +74,12 @@ impl Completion {
         (value >> 32 != 0).then_some(value as u32)
     }
     pub fn complete(&self, code: u32) {
-        let _ = self.0.compare_exchange(0, (1u64 << 32) | u64::from(code),
-            std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+        let _ = self.0.compare_exchange(
+            0,
+            (1u64 << 32) | u64::from(code),
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
     }
 }
 
@@ -86,7 +90,10 @@ pub struct ProcessIdentity {
 }
 impl ProcessIdentity {
     pub fn new(pid: u32) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { pid, completion: Completion::default() })
+        std::sync::Arc::new(Self {
+            pid,
+            completion: Completion::default(),
+        })
     }
 }
 

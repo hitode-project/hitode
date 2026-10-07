@@ -2213,6 +2213,7 @@ kernel32.dll	CreatePipe	stdcall	i32	Windows.Win32.Foundation.BOOL	hReadPipe:Wind
 kernel32.dll	CreatePrivateNamespaceA	stdcall	handle	Windows.Win32.Foundation.HANDLE	lpPrivateNamespaceAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|lpBoundaryDescriptor:void*:ptr:1|lpAliasPrefix:Windows.Win32.Foundation.PSTR:str8:1
 kernel32.dll	CreatePrivateNamespaceW	stdcall	handle	Windows.Win32.Foundation.HANDLE	lpPrivateNamespaceAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|lpBoundaryDescriptor:void*:ptr:1|lpAliasPrefix:Windows.Win32.Foundation.PWSTR:str16:1
 kernel32.dll	CreateProcessA	stdcall	i32	Windows.Win32.Foundation.BOOL	lpApplicationName:Windows.Win32.Foundation.PSTR:str8:1|lpCommandLine:Windows.Win32.Foundation.PSTR:str8:1|lpProcessAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|lpThreadAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|bInheritHandles:Windows.Win32.Foundation.BOOL:i32:1|dwCreationFlags:Windows.Win32.System.Threading.PROCESS_CREATION_FLAGS:u32:1|lpEnvironment:void*:ptr:1|lpCurrentDirectory:Windows.Win32.Foundation.PSTR:str8:1|lpStartupInfo:Windows.Win32.System.Threading.STARTUPINFOA*:ptr:1|lpProcessInformation:Windows.Win32.System.Threading.PROCESS_INFORMATION*:ptr:1
+kernel32.dll	CreateProcessInternalW	stdcall	i32	Windows.Win32.Foundation.BOOL	hToken:Windows.Win32.Foundation.HANDLE:handle:1|lpApplicationName:Windows.Win32.Foundation.PCWSTR:str16:1|lpCommandLine:Windows.Win32.Foundation.PWSTR:str16:1|lpProcessAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|lpThreadAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|bInheritHandles:Windows.Win32.Foundation.BOOL:i32:1|dwCreationFlags:u32:u32:1|lpEnvironment:void*:ptr:1|lpCurrentDirectory:Windows.Win32.Foundation.PCWSTR:str16:1|lpStartupInfo:STARTUPINFOW*:ptr:1|lpProcessInformation:PROCESS_INFORMATION*:ptr:1|hNewToken:Windows.Win32.Foundation.HANDLE*:ptr:1
 kernel32.dll	CreateProcessW	stdcall	i32	Windows.Win32.Foundation.BOOL	lpApplicationName:Windows.Win32.Foundation.PWSTR:str16:1|lpCommandLine:Windows.Win32.Foundation.PWSTR:str16:1|lpProcessAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|lpThreadAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|bInheritHandles:Windows.Win32.Foundation.BOOL:i32:1|dwCreationFlags:Windows.Win32.System.Threading.PROCESS_CREATION_FLAGS:u32:1|lpEnvironment:void*:ptr:1|lpCurrentDirectory:Windows.Win32.Foundation.PWSTR:str16:1|lpStartupInfo:Windows.Win32.System.Threading.STARTUPINFOW*:ptr:1|lpProcessInformation:Windows.Win32.System.Threading.PROCESS_INFORMATION*:ptr:1
 kernel32.dll	CreatePseudoConsole	stdcall	i32	Windows.Win32.Foundation.HRESULT	size:Windows.Win32.System.Console.COORD:aggregate:1|hInput:Windows.Win32.Foundation.HANDLE:handle:1|hOutput:Windows.Win32.Foundation.HANDLE:handle:1|dwFlags:u32:u32:1|phPC:Windows.Win32.System.Console.HPCON*:ptr:1
 kernel32.dll	CreateRemoteThread	stdcall	handle	Windows.Win32.Foundation.HANDLE	hProcess:Windows.Win32.Foundation.HANDLE:handle:1|lpThreadAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|dwStackSize:usize:u32:1|lpStartAddress:Windows.Win32.System.Threading.LPTHREAD_START_ROUTINE:ptr:1|lpParameter:void*:ptr:1|dwCreationFlags:u32:u32:1|lpThreadId:u32*:ptr:1
@@ -3675,6 +3676,7 @@ msvcrt.dll	_CIsqrt	cdecl	void	void
 msvcrt.dll	_CItan	cdecl	void	void	
 msvcrt.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcrt.dll	_access	cdecl	i32	int	path:const char*:str8:1|mode:int:i32:1
 msvcrt.dll	_acmdln	data	ptr	char*	
 msvcrt.dll	_adjust_fdiv	data	i32	int	
 msvcrt.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
@@ -3694,6 +3696,7 @@ msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
 msvcrt.dll	_splitpath_s	cdecl	i32	errno_t	fullPath:const char*:str8:1|drive:char*:str8:1|driveNumberOfElements:size_t:u32:1|dir:char*:str8:1|dirNumberOfElements:size_t:u32:1|fname:char*:str8:1|nameNumberOfElements:size_t:u32:1|ext:char*:str8:1|extNumberOfElements:size_t:u32:1
 msvcrt.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
+msvcrt.dll	_waccess	cdecl	i32	int	path:const wchar_t*:str16:1|mode:int:i32:1
 msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
 msvcrt.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
@@ -3740,6 +3743,9 @@ msvcrt.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
 ntdll.dll	CsrClientCallServer	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Message:void*:ptr:1|CaptureBuffer:void*:ptr:1|ApiNumber:u32:u32:1|DataLength:u32:u32:1
+ntdll.dll	LdrGetProcedureAddress	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllHandle:void*:ptr:1|ProcedureName:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|ProcedureNumber:u32:u32:1|ProcedureAddress:void**:ptr:1
+ntdll.dll	LdrLockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Disposition:u32*:ptr:1|Cookie:void**:ptr:1
+ntdll.dll	LdrUnlockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Cookie:void*:ptr:1
 ntdll.dll	NtAllocateVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|ZeroBits:usize:u32:1|RegionSize:usize*:ptr:1|AllocationType:u32:u32:1|Protect:u32:u32:1
 ntdll.dll	NtContinue	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ContextRecord:CONTEXT*:ptr:1|TestAlert:Windows.Win32.Foundation.BOOLEAN:u32:1
 ntdll.dll	NtCreateFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1
@@ -3748,6 +3754,7 @@ ntdll.dll	NtDuplicateObject	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Source
 ntdll.dll	NtEnumerateKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE:handle:1|Index:u32:u32:1|KeyInformationClass:KEY_INFORMATION_CLASS:i32:1|KeyInformation:void*:ptr:1|Length:u32:u32:1|ResultLength:u32*:ptr:1
 ntdll.dll	NtEnumerateValueKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE:handle:1|Index:u32:u32:1|KeyValueInformationClass:KEY_VALUE_INFORMATION_CLASS:i32:1|KeyValueInformation:void*:ptr:1|Length:u32:u32:1|ResultLength:u32*:ptr:1
 ntdll.dll	NtFreeVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|RegionSize:usize*:ptr:1|FreeType:u32:u32:1
+ntdll.dll	NtGetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|ThreadContext:CONTEXT*:ptr:1
 ntdll.dll	NtOpenKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1
 ntdll.dll	NtQueryAttributesFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|FileInformation:FILE_BASIC_INFORMATION*:ptr:1
 ntdll.dll	NtQueryDirectoryFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE:handle:1|Event:Windows.Win32.Foundation.HANDLE:handle:1|ApcRoutine:PIO_APC_ROUTINE:ptr:1|ApcContext:void*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|FileInformation:void*:ptr:1|Length:u32:u32:1|FileInformationClass:FILE_INFORMATION_CLASS:i32:1|ReturnSingleEntry:Windows.Win32.Foundation.BOOLEAN:u32:1|FileName:UNICODE_STRING*:ptr:1|RestartScan:Windows.Win32.Foundation.BOOLEAN:u32:1
@@ -3764,11 +3771,15 @@ ntdll.dll	NtSetInformationProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	
 ntdll.dll	NtWriteVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToWrite:usize:u32:1|NumberOfBytesWritten:usize*:ptr:1
 ntdll.dll	RtlAcquirePebLock	stdcall	void	void	
 ntdll.dll	RtlDosPathNameToNtPathName_U	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1
+ntdll.dll	RtlEqualUnicodeString	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	String1:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|String2:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|CaseInSensitive:Windows.Win32.Foundation.BOOLEAN:u32:1
 ntdll.dll	RtlFreeUnicodeString	stdcall	void	void	UnicodeString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
+ntdll.dll	RtlGetCurrentDirectory_U	stdcall	u32	u32	BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1
+ntdll.dll	RtlInitAnsiString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PCSTR:str8:1
 ntdll.dll	RtlInitUnicodeString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PWSTR:str16:1
 ntdll.dll	RtlNtStatusToDosError	stdcall	u32	u32	Status:Windows.Win32.Foundation.NTSTATUS:i32:1
 ntdll.dll	RtlQueryEnvironmentVariable_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Environment:void*:ptr:1|Name:UNICODE_STRING*:ptr:1|Value:UNICODE_STRING*:ptr:1
 ntdll.dll	RtlReleasePebLock	stdcall	void	void	
+ntdll.dll	RtlSetCurrentDirectory_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	PathName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
 ntdll.dll	ZwAllocateVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|ZeroBits:usize:u32:1|RegionSize:usize*:ptr:1|AllocationType:u32:u32:1|Protect:u32:u32:1
 ntdll.dll	ZwClose	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	ZwCreateFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1

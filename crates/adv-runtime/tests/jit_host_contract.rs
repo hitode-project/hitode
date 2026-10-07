@@ -313,7 +313,10 @@ fn cdecl_callback_and_deadline_resume_invalidate_warm_code() {
         assert!(matches!(m.run(), RunResult::Idle { next_deadline: Some(t) } if t == deadline));
         m.sys.clock.advance_to(deadline);
         let result = m.run();
-        assert!(matches!(result, RunResult::Exited(77)), "{backend}: {result:?}");
+        assert!(
+            matches!(result, RunResult::Exited(77)),
+            "{backend}: {result:?}"
+        );
         assert_eq!(m.cpu.read_u32(DATA).unwrap(), 1);
         assert_eq!(
             m.cpu.read_u32(DATA + 4).unwrap(),

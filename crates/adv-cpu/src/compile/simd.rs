@@ -41,17 +41,22 @@ pub(super) fn supported(i: &Instruction) -> bool {
             | M::Pmulhuw
             | M::Punpcklbw
             | M::Punpckhbw
+            | M::Punpcklwd
             | M::Packuswb
             | M::Packsswb
             | M::Psrlw
             | M::Psrld
             | M::Psllw
             | M::Pslld
+            | M::Psraw
     ) || i.op_count() != 2
     {
         return false;
     }
-    let shift = matches!(i.mnemonic(), M::Psrlw | M::Psrld | M::Psllw | M::Pslld);
+    let shift = matches!(
+        i.mnemonic(),
+        M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw
+    );
     for n in 0..2 {
         match i.op_kind(n) {
             OpKind::Register if register(i.op_register(n)).is_some() => {}
@@ -61,12 +66,12 @@ pub(super) fn supported(i: &Instruction) -> bool {
                         .iter()
                         .all(|&r| r == R::None || reg_index(r).is_some())
                     && (n == 1 || matches!(i.mnemonic(), M::Movdqa | M::Movdqu))
-                    && !shift => {}
+                    && (!shift || i.mnemonic() == M::Psraw) => {}
             OpKind::Immediate8 if n == 1 && shift => {}
             _ => return false,
         }
     }
-    !shift || i.op1_kind() == OpKind::Immediate8
+    !shift || i.op1_kind() == OpKind::Immediate8 || i.mnemonic() == M::Psraw
 }
 
 impl Emitter<'_> {
@@ -119,7 +124,10 @@ impl Emitter<'_> {
             return;
         }
         let a = self.vector_read(i, 0);
-        let shift = matches!(i.mnemonic(), M::Psrlw | M::Psrld | M::Psllw | M::Pslld);
+        let shift = matches!(
+            i.mnemonic(),
+            M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw
+        );
         let ty = match i.mnemonic() {
             M::Pavgw
             | M::Paddw
@@ -131,12 +139,26 @@ impl Emitter<'_> {
             | M::Packuswb
             | M::Packsswb
             | M::Psrlw
+            | M::Psraw
             | M::Psllw => types::I16X8,
             M::Paddd | M::Psubd | M::Psrld | M::Pslld => types::I32X4,
             _ => types::I8X16,
         };
         let a = self.vector_cast(a, ty);
-        let result = if shift {
+        let result = if i.mnemonic() == M::Psraw {
+            let count = if i.op1_kind() == OpKind::Immediate8 {
+                self.constant(u32::from(i.immediate8()).min(15))
+            } else {
+                // SSE2 takes the entire low quadword, not a masked lane count.
+                let source = self.vector_read(i, 1);
+                let source = self.vector_cast(source, types::I64X2);
+                let count = self.b.ins().extractlane(source, 0);
+                let limit = self.b.ins().iconst(types::I64, 15);
+                let count = self.b.ins().umin(count, limit);
+                self.b.ins().ireduce(types::I32, count)
+            };
+            self.b.ins().sshr(a, count)
+        } else if shift {
             let count = i.immediate8();
             if u32::from(count) >= ty.lane_bits() {
                 self.b.ins().bxor(a, a)
@@ -181,6 +203,18 @@ impl Emitter<'_> {
                 }
                 M::Packuswb => self.b.ins().unarrow(a, b),
                 M::Packsswb => self.b.ins().snarrow(a, b),
+                M::Punpcklwd => {
+                    let mask: Vec<u8> = (0..4u8)
+                        .flat_map(|lane| [lane * 2, lane * 2 + 1, 16 + lane * 2, 17 + lane * 2])
+                        .collect();
+                    let imm = self
+                        .b
+                        .func
+                        .dfg
+                        .immediates
+                        .push(ir::ConstantData::from(mask));
+                    self.b.ins().shuffle(a, b, imm)
+                }
                 M::Punpcklbw | M::Punpckhbw => {
                     let base = if i.mnemonic() == M::Punpckhbw { 8u8 } else { 0 };
                     let mask: Vec<u8> = (0..8u8)
