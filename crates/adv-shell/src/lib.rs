@@ -1899,9 +1899,9 @@ fn verification_report(v: &adv_runtime::VerifyStats) -> String {
 /// Slow-path counters, each list cut to its most frequent entries.
 fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
     const ROWS: usize = 24;
-    let counts = |rows: Vec<(String, u64)>| {
+    let counts = |rows: Vec<(String, u64)>, limit: usize| {
         rows.into_iter()
-            .take(ROWS)
+            .take(limit)
             .map(|(key, n)| format!("{}:{n}", json(&key)))
             .collect::<Vec<_>>()
             .join(",")
@@ -1920,11 +1920,13 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
         c.x87_helper_calls,
         c.x87_fast,
-        counts(c.x87_exact_rows()),
-        counts(c.fallback_rows()),
+        counts(c.x87_exact_rows(), ROWS),
+        counts(c.x87_control_rows(), usize::MAX),
+        counts(c.x87_control_rejections(), usize::MAX),
+        counts(c.fallback_rows(), ROWS),
         interpreter
     )
 }

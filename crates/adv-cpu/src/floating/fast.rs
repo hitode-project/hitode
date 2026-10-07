@@ -40,6 +40,7 @@ pub(crate) enum Op {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fast {
+    Wait,
     Load(Source),
     /// FST/FSTP to m32/m64 (width 4/8) or FIST/FISTP to m32/m64 (integer).
     Store {
@@ -112,6 +113,7 @@ pub(crate) fn classify(i: &Instruction) -> Option<Fast> {
     let m = i.mnemonic();
     let memory = i.op0_kind() == OpKind::Memory;
     Some(match m {
+        M::Wait => Fast::Wait,
         M::Fld | M::Fild => Fast::Load(source(i, m == M::Fild)?),
         M::Fst | M::Fstp | M::Fist | M::Fistp if memory => {
             let width = i.memory_size().size() as u8;
@@ -472,6 +474,9 @@ pub(super) fn execute(
     let slot = |top: usize, logical: usize| (top + logical) & 7;
     let empty = |physical: usize| x87.physical_tag(physical) == 3;
     match fast {
+        // ES and deferred MMX were checked above. WAIT changes neither C1 nor
+        // the last x87 instruction/data metadata, regardless of the control word.
+        Fast::Wait => metadata = false,
         Fast::Load(source) => {
             let (value, at) = load(source, i, state, memory, i32::MAX)?;
             let target = top.wrapping_sub(1) & 7;

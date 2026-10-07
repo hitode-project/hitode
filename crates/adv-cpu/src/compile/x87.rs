@@ -183,6 +183,17 @@ impl Emitter<'_> {
         let pending = self.b.ins().band_imm(status, 0x80);
         let pending = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
         self.x87_reject(pending, slow);
+        if fast == Fast::Wait {
+            // The success path is a guarded NOP. In particular, preserve C1,
+            // FIP/FDP/FOP and the stack; the helper still delivers pending #MF.
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(slow);
+            self.x87_instruction(i, operation);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(done);
+            self.b.seal_block(done);
+            return;
+        }
         let control = self.x87_word(offset_of!(X87State, control));
         let mut tags = self.x87_word(offset_of!(X87State, tag));
         let top = self.b.ins().ushr_imm(status, 11);
@@ -194,6 +205,7 @@ impl Emitter<'_> {
         status = self.b.ins().band_imm(status, !C1);
 
         match fast {
+            Fast::Wait => unreachable!(),
             Fast::Load(source) => {
                 let (value, at) = self.x87_source(i, source, top, tags, 1023, slow);
                 let target = self.x87_slot(top, 7);
