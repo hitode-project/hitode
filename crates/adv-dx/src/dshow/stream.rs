@@ -22,7 +22,7 @@ pub(crate) struct Session {
     pub graph: u32,
     splitter: u32,
     /// Host output pin connected to a guest input.
-    video: Option<u32>,
+    video: Option<VideoTarget>,
     /// Mixer stream of a host audio renderer.
     audio: Option<u64>,
     wake: Handle,
@@ -38,7 +38,14 @@ pub(crate) struct Session {
 
 enum End {
     Guest(u32),
+    VideoRenderer(u32),
     AudioRenderer,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VideoTarget {
+    Guest(u32),
+    Host(u32),
 }
 
 /// Follow host-to-host connections from a splitter output to its stream's end.
@@ -55,6 +62,7 @@ fn follow(env: &Env<'_>, mut out: u32) -> Option<End> {
         let filter = state.filters.get(&peer.filter)?;
         match filter.role {
             Role::AudioRenderer => return Some(End::AudioRenderer),
+            Role::VideoRenderer => return Some(End::VideoRenderer(peer.filter)),
             Role::VideoDecoder | Role::AudioDecoder => {
                 out = *filter.pins.iter().find(|p| state.pins[p].dir == OUTPUT)?;
             }
@@ -82,7 +90,10 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
     let (mut video, mut audio_renderer) = (None, false);
     for out in outputs {
         match follow(env, out) {
-            Some(End::Guest(pin)) if video.is_none() => video = Some(pin),
+            Some(End::Guest(pin)) if video.is_none() => video = Some(VideoTarget::Guest(pin)),
+            Some(End::VideoRenderer(renderer)) if video.is_none() => {
+                video = Some(VideoTarget::Host(renderer));
+            }
             Some(End::AudioRenderer) => audio_renderer = true,
             _ => {}
         }
@@ -219,7 +230,7 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     if ended || (paused && prerolled) {
         return wait(env, id, None);
     }
-    let position = graph::current(env, graph);
+    let position = graph::stream_position(env, graph);
     let media_us = (position.max(0) / 10) as u64;
     let update = state(env)
         .filters
@@ -274,13 +285,30 @@ fn process_update(
     }
     let video = s.video;
     match (update.video, video) {
-        (Some(frame), Some(pin)) if !past_stop => deliver(env, id, pin, frame, move |env| {
-            if ended {
-                end_of_stream(env, id)
-            } else {
-                pump(env, id)
+        (Some(frame), Some(VideoTarget::Guest(pin))) if !past_stop => {
+            deliver(env, id, pin, frame, move |env| {
+                if ended {
+                    end_of_stream(env, id)
+                } else {
+                    pump(env, id)
+                }
+            })
+        }
+        (Some(frame), Some(VideoTarget::Host(renderer))) if !past_stop => {
+            if !state(env)
+                .filters
+                .get(&renderer)
+                .is_some_and(|f| f.graph == graph)
+            {
+                return abort_stream(env, id, VFW_E_NOT_CONNECTED, "video renderer was detached");
             }
-        }),
+            match video::publish(env, graph, frame) {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) if ended => end_of_stream(env, id),
+                Ok(None) => pump(env, id),
+                Err(hr) => abort_stream(env, id, hr, "video presentation failed"),
+            }
+        }
         _ if ended => end_of_stream(env, id),
         _ => {
             let deadline = env.sys.clock.now_us() + POLL_US;
@@ -310,6 +338,9 @@ fn finish(env: &mut Env<'_>, id: u32) -> Outcome {
 /// Report the error to the graph, discard queued PCM and end this stream thread.
 fn abort_stream(env: &mut Env<'_>, id: u32, hresult: u32, reason: &str) -> Outcome {
     let graph = session(env, id).graph;
+    if matches!(session(env, id).video, Some(VideoTarget::Host(_))) {
+        video::detach(env, graph);
+    }
     log::warn!("DirectShow: {reason} ({hresult:#x})");
     adv_abi::warn_unavailable(env, "DirectShowStream", reason);
     graph::notify(env, graph, EC_ERRORABORT, hresult, 0);
@@ -326,7 +357,7 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     s.discontinuity = true;
     s.pending_audio.clear();
     let (graph, splitter, video, audio) = (s.graph, s.splitter, s.video, s.audio);
-    let position = graph::current(env, graph).max(0);
+    let position = graph::stream_position(env, graph).max(0);
     session(env, id).segment = position;
     let stop = state(env).graphs[&graph]
         .stop
@@ -346,7 +377,7 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
         sound.audio.flush_pcm(stream);
     }
     let mut calls = VecDeque::new();
-    if let Some(pin) = video {
+    if let Some(VideoTarget::Guest(pin)) = video {
         let peer = state(env).pins[&pin].peer;
         if flush {
             calls.push_back(Call(peer, 15, vec![]));
@@ -388,9 +419,13 @@ fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
     let then =
         move |env: &mut Env<'_>| graph::flush_posts(env, Box::new(move |env, _| pump(env, id)));
     match video {
-        Some(pin) => {
+        Some(VideoTarget::Guest(pin)) => {
             let peer = state(env).pins[&pin].peer;
             guest_call(env, peer, 14, vec![], move |env, _| then(env))
+        }
+        Some(VideoTarget::Host(_)) => {
+            graph::notify(env, graph, EC_COMPLETE, 0, 0);
+            then(env)
         }
         None => then(env),
     }
@@ -551,7 +586,7 @@ mod tests {
                 graph,
                 splitter: 0,
                 // Error handling must not call this renderer's EndOfStream.
-                video: Some(0xdead_beef),
+                video: Some(VideoTarget::Guest(0xdead_beef)),
                 audio: None,
                 wake,
                 generation: 1,

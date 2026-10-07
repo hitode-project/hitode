@@ -389,6 +389,8 @@ pub struct Queue {
     pub capture: u32,
     pub last_time: u32,
     pub last_pos: (i32, i32),
+    /// Application value, replaced on retrieval by the untagged message's zero.
+    pub extra_info: i32,
 }
 
 impl Queue {

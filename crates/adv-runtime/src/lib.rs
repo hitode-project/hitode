@@ -5,8 +5,8 @@ pub use adv_win32::msacm32 as acm;
 pub mod boot;
 pub mod compat;
 pub use adv_win32::msvcrt as crt;
-mod font;
 mod family;
+mod font;
 pub use family::ProcessStatus;
 mod graphics;
 pub use adv_win32::winmm::mmio;
@@ -22,5 +22,6 @@ pub use adv_win32::user32::menu::{MenuBar, MenuCommand, MenuEvent, MenuItem, Men
 pub use adv_win32::vorbisfile as vorbis;
 pub use graphics::{
     FrameConsumer, FrameProducer, FrameView, Graphics, GraphicsStats, IID_DDRAW7, IID_SURFACE7,
-    PendingFrame, Presenter, Snapshot, api, frame_mailbox, install_graphics, register_graphics,
+    PendingFrame, Presenter, Snapshot, VideoCursorRegion, api, frame_mailbox, install_graphics,
+    register_graphics,
 };

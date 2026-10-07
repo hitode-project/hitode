@@ -204,12 +204,14 @@ fn automatic_audio_graph_owns_the_file_and_negotiates_pcm_without_a_video_render
         .find(|(_, f)| f.role == Role::Splitter)
         .unwrap()
         .0;
-    assert!(state.filters[splitter]
-        .source
-        .as_ref()
-        .unwrap()
-        .decoder
-        .is_some());
+    assert!(
+        state.filters[splitter]
+            .source
+            .as_ref()
+            .unwrap()
+            .decoder
+            .is_some()
+    );
     let renderer = state
         .filters
         .values()

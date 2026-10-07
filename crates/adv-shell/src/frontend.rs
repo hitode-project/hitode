@@ -269,6 +269,7 @@ impl Ui {
                 if let Some(completed) = completed {
                     self.metric(Delivery::Native(completed.stats));
                     repaint |= window.native_canvas(completed.rendered.canvas)?;
+                    window.set_video_cursor_regions(completed.rendered.cursor_regions);
                     if matches!(
                         completed.rendered.result,
                         crate::native_gpu::DrawResult::Presented
@@ -301,6 +302,9 @@ impl Ui {
             if Instant::now() >= next && (frames.has_update() || repaint) {
                 let present_started = Instant::now();
                 let updated = frames.update();
+                let cursor_regions = updated
+                    .then(|| frames.current().video_cursor_regions())
+                    .transpose()?;
                 let changed = if updated {
                     frames.current().snapshot(&mut candidate)?;
                     let changed = snapshot.width != candidate.width
@@ -319,6 +323,9 @@ impl Ui {
                         present_started.elapsed(),
                         Instant::now(),
                     ));
+                }
+                if let Some(regions) = cursor_regions {
+                    window.set_video_cursor_regions(Arc::from(regions));
                 }
                 repaint = false;
                 next = window.next_refresh();

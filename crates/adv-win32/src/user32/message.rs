@@ -975,6 +975,16 @@ fn is_descendant(
 
 /// The next message for the current thread, removed from the queue with `remove`.
 fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
+    let message = next_message_inner(env, f, remove);
+    if message.is_some() {
+        // Posted/generated messages and the supported host-input path carry no
+        // driver tag. PM_NOREMOVE updates metadata too; empty/filtered peeks do not.
+        let context = env.context;
+        user_mut(env).queue(context).extra_info = 0;
+    }
+    message
+}
+fn next_message_inner(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
     observe_retrieval(env, f);
     let ctx = env.context;
     let now = env.sys.clock.now_us();
@@ -2241,8 +2251,20 @@ fn redraw_window(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
+#[win32(user32, name = "GetMessageExtraInfo", level = state)]
+fn get_message_extra_info(env: &mut Env<'_>) -> i32 {
+    let context = env.context;
+    user_mut(env).queue(context).extra_info
+}
+#[win32(user32, name = "SetMessageExtraInfo", level = state)]
+fn set_message_extra_info(env: &mut Env<'_>, value: i32) -> i32 {
+    let context = env.context;
+    std::mem::replace(&mut user_mut(env).queue(context).extra_info, value)
+}
 pub fn register(reg: &mut Registry) {
     reg.register(def_window_proc_w_ABI);
+    reg.register(get_message_extra_info_ABI);
+    reg.register(set_message_extra_info_ABI);
     stdcall(reg, USER32, DEFAULT_PROC, 4, default_proc);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "PeekMessageA", 5, peek_message_a);

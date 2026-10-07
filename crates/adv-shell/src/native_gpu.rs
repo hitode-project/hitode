@@ -3,8 +3,10 @@
 //! so it belongs to startup or an owned background job, never the UI paint path.
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use adv_device::gpu::{NativeContext, NativeFrame, Submission};
+use adv_device::surface::{Rect, VideoCursorRegion, VideoFrame, VideoLayer, VideoLayout};
 use adv_runtime::{FrameConsumer, Snapshot};
 use adv_sync::{WakeEvent, background, mailbox::Observer, spsc};
 use std::time::{Duration, Instant};
@@ -151,11 +153,13 @@ impl WindowPresenter {
     fn draw_view(
         &self,
         source: &wgpu::TextureView,
-        width: u32,
-        height: u32,
+        size: (u32, u32),
         rectangle: [f32; 4],
+        canvas: (u32, u32),
+        overlays: &[VideoOverlay],
         submission: &Submission<'_>,
     ) -> Result<DrawResult, String> {
+        let (width, height) = size;
         if (width, height) != (self.configuration.width, self.configuration.height) {
             return Ok(DrawResult::Reconfigure);
         }
@@ -187,6 +191,40 @@ impl WindowPresenter {
             rectangle,
             submission,
         )?;
+        for overlay in overlays {
+            if let Some((rect, _)) = overlay.layout.background {
+                self.compositor.compose_view_region(
+                    &overlay.border.as_ref().unwrap().view,
+                    &view,
+                    self.configuration.format,
+                    CompositionRegion::video(
+                        rect,
+                        [0., 0., 1., 1.],
+                        rectangle,
+                        canvas,
+                        (width, height),
+                    ),
+                    false,
+                    submission,
+                )?;
+            }
+            if let Some(video) = overlay.layout.video {
+                self.compositor.compose_view_region(
+                    &overlay.image.as_ref().unwrap().view,
+                    &view,
+                    self.configuration.format,
+                    CompositionRegion::video(
+                        video.destination,
+                        video.source_uv,
+                        rectangle,
+                        canvas,
+                        (width, height),
+                    ),
+                    false,
+                    submission,
+                )?;
+            }
+        }
         submission.present(output);
         self.context
             .device
@@ -226,6 +264,16 @@ impl Compositor {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -330,6 +378,42 @@ impl Compositor {
         rectangle: [f32; 4],
         submission: &Submission<'_>,
     ) -> Result<(), String> {
+        self.compose_view_load(source, destination, format, rectangle, true, submission)
+    }
+
+    fn compose_view_load(
+        &self,
+        source: &wgpu::TextureView,
+        destination: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        rectangle: [f32; 4],
+        clear: bool,
+        submission: &Submission<'_>,
+    ) -> Result<(), String> {
+        self.compose_view_region(
+            source,
+            destination,
+            format,
+            CompositionRegion {
+                rectangle,
+                source_uv: [0., 0., 1., 1.],
+                scissor: None,
+            },
+            clear,
+            submission,
+        )
+    }
+
+    fn compose_view_region(
+        &self,
+        source: &wgpu::TextureView,
+        destination: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        region: CompositionRegion,
+        clear: bool,
+        submission: &Submission<'_>,
+    ) -> Result<(), String> {
+        let rectangle = region.rectangle;
         let pipeline = self
             .pipelines
             .get(&format)
@@ -340,6 +424,29 @@ impl Compositor {
         {
             return Err("invalid native composition viewport".into());
         }
+        let uv = self.context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("adv composition source UV"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: true,
+        });
+        {
+            let mut bytes = uv
+                .slice(..)
+                .get_mapped_range_mut()
+                .map_err(|error| error.to_string())?;
+            let mut packed = [0u8; 16];
+            for (out, value) in packed
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(region.source_uv)
+            {
+                out.copy_from_slice(&value.to_le_bytes());
+            }
+            bytes.copy_from_slice(&packed);
+        }
+        uv.unmap();
         let binding = self
             .context
             .device
@@ -355,6 +462,10 @@ impl Compositor {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: uv.as_entire_binding(),
+                    },
                 ],
             });
         let mut encoder = self
@@ -367,7 +478,11 @@ impl Compositor {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: if clear {
+                        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
                     store: wgpu::StoreOp::Store,
                 },
             })];
@@ -385,10 +500,168 @@ impl Compositor {
                 0.0,
                 1.0,
             );
+            if let Some(rect) = region.scissor {
+                pass.set_scissor_rect(rect.x, rect.y, rect.w, rect.h);
+            }
             pass.draw(0..3, 0..1);
         }
         submission.submit([encoder.finish()]);
         Ok(())
+    }
+}
+
+struct CompositionRegion {
+    rectangle: [f32; 4],
+    source_uv: [f32; 4],
+    scissor: Option<Rect>,
+}
+impl CompositionRegion {
+    fn video(
+        rect: Rect,
+        source_uv: [f32; 4],
+        viewport: [f32; 4],
+        canvas: (u32, u32),
+        output: (u32, u32),
+    ) -> Self {
+        let sx = viewport[2] / canvas.0 as f32;
+        let sy = viewport[3] / canvas.1 as f32;
+        let rectangle = [
+            viewport[0] + rect.x as f32 * sx,
+            viewport[1] + rect.y as f32 * sy,
+            rect.w as f32 * sx,
+            rect.h as f32 * sy,
+        ];
+        let left = rectangle[0].floor().max(0.) as u32;
+        let top = rectangle[1].floor().max(0.) as u32;
+        let right = (rectangle[0] + rectangle[2]).ceil().min(output.0 as f32) as u32;
+        let bottom = (rectangle[1] + rectangle[3]).ceil().min(output.1 as f32) as u32;
+        Self {
+            rectangle,
+            source_uv,
+            scissor: Some(Rect {
+                x: left,
+                y: top,
+                w: right - left,
+                h: bottom - top,
+            }),
+        }
+    }
+}
+
+struct VideoTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: (u32, u32),
+}
+impl VideoTexture {
+    fn new(context: &NativeContext, width: u32, height: u32) -> Self {
+        let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("adv decoded video texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        Self {
+            texture,
+            view,
+            size: (width, height),
+        }
+    }
+}
+struct VideoOverlay {
+    key: u64,
+    image: Option<VideoTexture>,
+    frame: Option<VideoFrame>,
+    border: Option<VideoTexture>,
+    color: Option<[u8; 4]>,
+    layout: VideoLayout,
+}
+impl VideoOverlay {
+    fn new(key: u64, layout: VideoLayout) -> Self {
+        Self {
+            key,
+            image: None,
+            frame: None,
+            border: None,
+            color: None,
+            layout,
+        }
+    }
+    fn update(
+        &mut self,
+        layer: &VideoLayer,
+        layout: VideoLayout,
+        context: &NativeContext,
+        submission: &Submission<'_>,
+    ) -> u64 {
+        self.layout = layout;
+        let mut uploads = 0;
+        if layout.video.is_some() {
+            let size = (layer.frame.width, layer.frame.height);
+            if self.image.as_ref().is_none_or(|image| image.size != size) {
+                self.image = Some(VideoTexture::new(context, size.0, size.1));
+                self.frame = None;
+            }
+            if self.frame.as_ref().is_none_or(|frame| {
+                frame.pitch != layer.frame.pitch || !Arc::ptr_eq(&frame.bgra, &layer.frame.bgra)
+            }) {
+                submission.write_texture(
+                    self.image.as_ref().unwrap().texture.as_image_copy(),
+                    &layer.frame.bgra,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(layer.frame.pitch),
+                        rows_per_image: Some(layer.frame.height),
+                    },
+                    wgpu::Extent3d {
+                        width: layer.frame.width,
+                        height: layer.frame.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.frame = Some(layer.frame.clone());
+                uploads += 1;
+            }
+        } else {
+            self.image = None;
+            self.frame = None;
+        }
+        if let Some((_, color)) = layout.background {
+            if self.border.is_none() {
+                self.border = Some(VideoTexture::new(context, 1, 1));
+            }
+            if self.color != Some(color) {
+                submission.write_texture(
+                    self.border.as_ref().unwrap().texture.as_image_copy(),
+                    &color,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4),
+                        rows_per_image: Some(1),
+                    },
+                    wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.color = Some(color);
+                uploads += 1;
+            }
+        } else {
+            self.border = None;
+            self.color = None;
+        }
+        uploads
     }
 }
 
@@ -405,12 +678,16 @@ pub(crate) struct Session {
     serial: u64,
     width: u32,
     height: u32,
+    video: Arc<[(u64, VideoLayer)]>,
+    overlays: Vec<VideoOverlay>,
+    cursor_regions: Arc<[VideoCursorRegion]>,
     stats: crate::performance::NativePresentation,
 }
 pub(crate) struct Rendered {
     pub(crate) result: DrawResult,
     pub(crate) serial: u64,
     pub(crate) canvas: (u32, u32),
+    pub(crate) cursor_regions: Arc<[VideoCursorRegion]>,
 }
 impl Session {
     pub(crate) fn new(presenter: WindowPresenter, frames: FrameConsumer) -> Self {
@@ -424,6 +701,9 @@ impl Session {
             serial: 0,
             width: 0,
             height: 0,
+            video: Arc::from([]),
+            overlays: Vec::new(),
+            cursor_regions: Arc::from([]),
             stats: crate::performance::NativePresentation {
                 // Includes the real startup configure, which ran before any
                 // guest submission. Its cost is distinct from max_job_ns.
@@ -444,6 +724,38 @@ impl Session {
             )
     }
 
+    fn update_video(
+        &mut self,
+        context: &NativeContext,
+        submission: &Submission<'_>,
+    ) -> Result<(), String> {
+        let mut used = 0;
+        let mut cursor_regions = Vec::new();
+        for (key, layer) in self.video.iter() {
+            let layout = layer.layout((self.width, self.height))?;
+            if let Some(region) = layout.cursor_region(layer.hide_cursor) {
+                cursor_regions.push(region);
+            }
+            if layout.video.is_none() && layout.background.is_none() {
+                continue;
+            }
+            if self.overlays.get(used).is_none_or(|old| old.key != *key) {
+                let overlay = VideoOverlay::new(*key, layout);
+                if used < self.overlays.len() {
+                    self.overlays[used] = overlay;
+                } else {
+                    self.overlays.push(overlay);
+                }
+            }
+            let overlay = &mut self.overlays[used];
+            self.stats.uploads += overlay.update(layer, layout, context, submission);
+            used += 1;
+        }
+        self.overlays.truncate(used);
+        self.cursor_regions = Arc::from(cursor_regions);
+        Ok(())
+    }
+
     pub(crate) fn render(
         &mut self,
         width: u32,
@@ -455,16 +767,26 @@ impl Session {
         let mut changed = false;
         if self.frames.update() {
             self.stats.consumed += 1;
+            let video = self.frames.current().shared_video_layers();
+            let video_changed = !Arc::ptr_eq(&self.video, &video);
+            self.video = video;
             if let Some(frame) = self.frames.current().native() {
                 if frame.context().device != context.device {
                     return Err("frame GPU context changed and needs presenter recovery".into());
                 }
+                let update_video = video_changed
+                    || self.native.is_none()
+                    || (self.width, self.height) != self.frames.current().extent();
                 self.width = frame.image.width();
                 self.height = frame.image.height();
                 self.serial = frame.serial;
                 self.native = Some(frame.clone());
+                if update_video {
+                    self.update_video(&context, &submission)?;
+                }
                 changed = true;
             } else {
+                self.cursor_regions = Arc::from(self.frames.current().video_cursor_regions()?);
                 self.candidate.width = 0;
                 self.candidate.height = 0;
                 self.candidate.bgra.clear();
@@ -474,6 +796,7 @@ impl Session {
                         result: DrawResult::Skipped,
                         serial: self.serial,
                         canvas: (self.width, self.height),
+                        cursor_regions: self.cursor_regions.clone(),
                     });
                 }
                 changed = self.native.is_some()
@@ -523,6 +846,7 @@ impl Session {
                     std::mem::swap(&mut self.snapshot, &mut self.candidate);
                 }
                 self.native = None;
+                self.overlays.clear();
             }
         }
         let canvas = (self.width, self.height);
@@ -536,6 +860,7 @@ impl Session {
                 result: DrawResult::Skipped,
                 serial: self.serial,
                 canvas,
+                cursor_regions: self.cursor_regions.clone(),
             });
         }
         let rectangle = crate::window::native_viewport(width, height, self.width, self.height);
@@ -548,14 +873,20 @@ impl Session {
                 .ok_or("missing final software frame")?
                 .1
         };
-        let result = self
-            .presenter
-            .draw_view(view, width, height, rectangle, &submission)?;
+        let result = self.presenter.draw_view(
+            view,
+            (width, height),
+            rectangle,
+            canvas,
+            &self.overlays,
+            &submission,
+        )?;
         self.stats.presented += u64::from(matches!(result, DrawResult::Presented));
         Ok(Rendered {
             result,
             serial: self.serial,
             canvas,
+            cursor_regions: self.cursor_regions.clone(),
         })
     }
 }
@@ -725,12 +1056,13 @@ const SHADER: &str = r#"
 struct Fragment { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> }
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
+@group(0) @binding(2) var<uniform> source_uv: vec4<f32>;
 @vertex fn vertex_main(@builtin(vertex_index) index: u32) -> Fragment {
     let positions = array(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
     let position = positions[index];
     var output: Fragment;
     output.position = vec4(position,0.0,1.0);
-    output.uv = vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5);
+    output.uv = source_uv.xy + vec2((position.x+1.0)*0.5,(1.0-position.y)*0.5) * source_uv.zw;
     return output;
 }
 @fragment fn fragment_main(input: Fragment) -> @location(0) vec4<f32> {
@@ -750,6 +1082,147 @@ mod tests {
     use adv_device::gpu::Gpu;
     use adv_device::surface::Rect;
     use std::time::Duration;
+
+    #[test]
+    fn video_load_pass_preserves_native_base_and_restores_it_without_a_window() {
+        use adv_device::surface::{BlitRect, VideoFrame};
+        let mut gpu = pollster::block_on(Gpu::request(true)).unwrap();
+        let target = gpu.target(6, 2, false).unwrap();
+        gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+        let base = gpu.present(&target.image, 1).unwrap();
+        let destination = gpu.image(6, 2).unwrap();
+        let layer = VideoLayer {
+            frame: VideoFrame {
+                width: 4,
+                height: 1,
+                pitch: 16,
+                bgra: Arc::from([
+                    7, 7, 7, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 0, 255, 255,
+                ]),
+            },
+            source: Rect {
+                x: 1,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+            destination: BlitRect {
+                x: -160,
+                y: 0,
+                w: 640,
+                h: 544,
+            },
+            background: Some((
+                BlitRect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 544,
+                },
+                [9, 0, 0, 255],
+            )),
+            clip: Rect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 544,
+            },
+            canvas: (960, 544),
+            visible: true,
+            hide_cursor: false,
+        };
+        let mut patch = Snapshot::default();
+        let bounds = layer.rasterize((6, 2), &mut patch).unwrap().unwrap();
+        let layout = layer.layout((6, 2)).unwrap();
+        let mut overlay = VideoOverlay::new(1, layout);
+        let compositor = Compositor::new(gpu.context().clone(), wgpu::TextureFormat::Bgra8Unorm);
+        compositor
+            .compose(
+                &base,
+                destination.view(),
+                wgpu::TextureFormat::Bgra8Unorm,
+                [0., 0., 6., 2.],
+            )
+            .unwrap();
+        {
+            let context = gpu.context().clone();
+            let submission = context.submission().unwrap();
+            assert_eq!(overlay.update(&layer, layout, &context, &submission), 2);
+            let mut moved = layer.clone();
+            moved.destination.x += 160;
+            assert_eq!(
+                overlay.update(&moved, moved.layout((6, 2)).unwrap(), &context, &submission),
+                0
+            );
+            assert_eq!(overlay.update(&layer, layout, &context, &submission), 0);
+            let background = layout.background.unwrap().0;
+            compositor
+                .compose_view_region(
+                    &overlay.border.as_ref().unwrap().view,
+                    destination.view(),
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    CompositionRegion::video(
+                        background,
+                        [0., 0., 1., 1.],
+                        [0., 0., 6., 2.],
+                        (6, 2),
+                        (6, 2),
+                    ),
+                    false,
+                    &submission,
+                )
+                .unwrap();
+            let video = layout.video.unwrap();
+            compositor
+                .compose_view_region(
+                    &overlay.image.as_ref().unwrap().view,
+                    destination.view(),
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    CompositionRegion::video(
+                        video.destination,
+                        video.source_uv,
+                        [0., 0., 6., 2.],
+                        (6, 2),
+                        (6, 2),
+                    ),
+                    false,
+                    &submission,
+                )
+                .unwrap();
+        }
+        assert_eq!(gpu.stats().readbacks, 0);
+        let mut transfer = gpu.readback(&destination, None).unwrap();
+        transfer.take_completion_job().unwrap()();
+        let composed = transfer.poll().unwrap().unwrap();
+        assert_eq!(
+            composed,
+            [
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 9, 0, 0, 255, 9, 0, 0, 255, 0, 0,
+                255, 255
+            ]
+            .repeat(2)
+        );
+        for y in 0..2usize {
+            assert_eq!(
+                &composed[y * 24..y * 24 + bounds.w as usize * 4],
+                &patch.bgra[y * 20..(y + 1) * 20]
+            );
+        }
+        compositor
+            .compose(
+                &base,
+                destination.view(),
+                wgpu::TextureFormat::Bgra8Unorm,
+                [0., 0., 6., 2.],
+            )
+            .unwrap();
+        let mut transfer = gpu.readback(&destination, None).unwrap();
+        transfer.take_completion_job().unwrap()();
+        assert_eq!(
+            transfer.poll().unwrap().unwrap(),
+            [0, 0, 255, 255].repeat(12)
+        );
+    }
 
     fn completed(ui: &mut UiPresenter, wake: &WakeEvent) -> Completed {
         let deadline = Instant::now() + Duration::from_secs(10);

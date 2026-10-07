@@ -1,8 +1,9 @@
 use adv_device::surface::{
     BlitOptions, BlitRect, PixelFormat, Rect, Sampling, Snapshot, SurfaceMemory, Surfaces,
-    frame_mailbox,
+    VideoCursorRegion, VideoFrame, VideoLayer, frame_mailbox,
 };
 use std::borrow::Cow;
+use std::sync::Arc;
 
 struct Memory {
     bytes: Vec<u8>,
@@ -55,6 +56,185 @@ impl SurfaceMemory for Memory {
 }
 fn store() -> Surfaces<Snapshot> {
     Surfaces::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
+}
+
+fn video_layer() -> VideoLayer {
+    VideoLayer {
+        frame: VideoFrame {
+            width: 2,
+            height: 1,
+            pitch: 8,
+            bgra: Arc::from([22, 0, 0, 255, 33, 0, 0, 255]),
+        },
+        source: Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 1,
+        },
+        destination: BlitRect {
+            x: -1,
+            y: 1,
+            w: 4,
+            h: 2,
+        },
+        background: Some((
+            BlitRect {
+                x: 0,
+                y: 1,
+                w: 4,
+                h: 2,
+            },
+            [9, 0, 0, 255],
+        )),
+        clip: Rect {
+            x: 0,
+            y: 1,
+            w: 4,
+            h: 2,
+        },
+        canvas: (5, 4),
+        visible: true,
+        hide_cursor: true,
+    }
+}
+
+#[test]
+fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
+    let mut store = store();
+    let mut memory = Memory::new(false);
+    let base = store
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    let pixels = [11, 12, 13, 255].repeat(20);
+    memory.write(store[base].pixels, &pixels).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    store.present(base, &memory).unwrap();
+    // Later writes are not a presentation and cannot replace the retained base.
+    memory.write(store[base].pixels, &[0; 80]).unwrap();
+    let layer = video_layer();
+    assert_eq!(store.set_video_layer(7, Some(layer.clone())).unwrap(), 2);
+    assert!(consumer.update());
+    assert!(consumer.current().hide_cursor());
+    let mut cursor = consumer.current().video_cursor_regions().unwrap();
+    assert!(VideoCursorRegion::hidden_at(&cursor, 1, 1));
+    assert!(!VideoCursorRegion::hidden_at(&cursor, 4, 1));
+    cursor.push(VideoCursorRegion {
+        rectangle: Rect {
+            x: 1,
+            y: 1,
+            w: 1,
+            h: 1,
+        },
+        hide_cursor: false,
+    });
+    assert!(!VideoCursorRegion::hidden_at(&cursor, 1, 1));
+    assert!(VideoCursorRegion::hidden_at(&cursor, 2, 1));
+    let mut composed = Snapshot::default();
+    consumer.current().snapshot(&mut composed).unwrap();
+    assert_eq!(&composed.bgra[..20], &pixels[..20]);
+    assert_eq!(
+        &composed.bgra[20..36],
+        &[22, 0, 0, 255, 33, 0, 0, 255, 33, 0, 0, 255, 9, 0, 0, 255]
+    );
+    assert_eq!(&composed.bgra[36..40], &pixels[36..40]);
+    let mut patch = Snapshot::default();
+    let bounds = layer.rasterize((5, 4), &mut patch).unwrap().unwrap();
+    assert_eq!(
+        bounds,
+        Rect {
+            x: 0,
+            y: 1,
+            w: 4,
+            h: 2
+        }
+    );
+    assert_eq!(patch.bgra[..16], composed.bgra[20..36]);
+    let mut hidden = layer.clone();
+    hidden.visible = false;
+    store.set_video_layer(7, Some(hidden)).unwrap();
+    assert!(consumer.update());
+    assert!(!consumer.current().hide_cursor());
+    consumer.current().snapshot(&mut composed).unwrap();
+    assert_eq!(composed.bgra, pixels);
+    store.set_video_layer(7, Some(layer)).unwrap();
+    assert_eq!(store.set_video_layer(7, None).unwrap(), 5);
+    assert!(consumer.update());
+    consumer.current().snapshot(&mut composed).unwrap();
+    assert_eq!(composed.bgra, pixels);
+    assert_eq!(store.set_video_layer(7, None).unwrap(), 5);
+
+    // USER's 960x544 client and a 1280x720 backbuffer describe the same whole
+    // canvas. Scale the video, border and clip together, rather than covering 75%.
+    let mut scaled = video_layer();
+    scaled.canvas = (960, 544);
+    scaled.destination = BlitRect {
+        x: 0,
+        y: 0,
+        w: 960,
+        h: 544,
+    };
+    scaled.background = Some((scaled.destination, [9, 0, 0, 255]));
+    scaled.clip = Rect {
+        x: 0,
+        y: 0,
+        w: 960,
+        h: 544,
+    };
+    assert_eq!(
+        scaled.rasterize((1280, 720), &mut patch).unwrap(),
+        Some(Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 720
+        })
+    );
+    assert_eq!((patch.width, patch.height), (1280, 720));
+    assert_eq!(&patch.bgra[639 * 4..640 * 4], &[22, 0, 0, 255]);
+    assert_eq!(&patch.bgra[640 * 4..641 * 4], &[33, 0, 0, 255]);
+    assert_eq!(&patch.bgra[patch.bgra.len() - 4..], &[33, 0, 0, 255]);
+    store.set_video_layer(7, Some(scaled)).unwrap();
+    assert!(consumer.update());
+    consumer.current().snapshot(&mut composed).unwrap();
+    for row in composed.bgra.chunks_exact(20) {
+        assert_eq!(
+            row,
+            &[
+                22, 0, 0, 255, 22, 0, 0, 255, 33, 0, 0, 255, 33, 0, 0, 255, 33, 0, 0, 255
+            ]
+        );
+    }
+    store.set_video_layer(7, None).unwrap();
+    assert!(consumer.update());
+    consumer.current().snapshot(&mut composed).unwrap();
+    assert_eq!(composed.bgra, pixels);
+}
+
+#[test]
+fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
+    let mut store = store();
+    let (producer, mut consumer) = frame_mailbox();
+    store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    for color in 1..=100u8 {
+        let mut layer = video_layer();
+        layer.frame.bgra = Arc::from([color, 0, 0, 255, color, 0, 0, 255]);
+        store.set_video_layer(3, Some(layer)).unwrap();
+    }
+    assert!(consumer.update());
+    assert!(!consumer.update());
+    let mut shown = Snapshot::default();
+    consumer.current().snapshot(&mut shown).unwrap();
+    assert_eq!(shown.frames, 100);
+    assert_eq!(&shown.bgra[..4], &[0; 4]);
+    assert_eq!(&shown.bgra[20..24], &[100, 0, 0, 255]);
+    assert!(store.capture_latest().unwrap());
+    assert_eq!(store.presenter.bgra, shown.bgra);
+    assert_eq!(store.stats.coalesced_frames, 99);
+    store.set_video_layer(3, None).unwrap();
+    store.capture_latest().unwrap();
+    assert!(store.presenter.bgra.iter().all(|byte| *byte == 0));
 }
 
 #[test]
