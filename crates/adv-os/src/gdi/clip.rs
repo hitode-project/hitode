@@ -150,6 +150,36 @@ impl DcClip {
             .any(|y| !self.spans(y, width).is_empty())
     }
 
+    /// Tight device bounds and GDI complexity of the final surface-visible mask.
+    /// Use constant-topology row bands, including USER paint boundaries, rather
+    /// than scanning pixels or constructing a second region representation.
+    pub fn bounding_box(&self, width: u32, height: u32) -> Option<(u32, [i32; 4])> {
+        let width_i32 = i32::try_from(width).ok()?;
+        let height_i32 = i32::try_from(height).ok()?;
+        let mut edges = vec![0, height_i32];
+        edges.extend(self.edges().filter(|&y| y > 0 && y < height_i32));
+        edges.sort_unstable();
+        edges.dedup();
+        let mut bounds = [width_i32, height_i32, 0, 0];
+        let mut area = 0_u64;
+        for band in edges.windows(2) {
+            let spans = self.spans(band[0], width);
+            if let (Some(&(left, _)), Some(&(_, right))) = (spans.first(), spans.last()) {
+                bounds[0] = bounds[0].min(left as i32);
+                bounds[1] = bounds[1].min(band[0]);
+                bounds[2] = bounds[2].max(right as i32);
+                bounds[3] = bounds[3].max(band[1]);
+                area += spans.iter().map(|&(l, r)| u64::from(r - l)).sum::<u64>()
+                    * (band[1] - band[0]) as u64;
+            }
+        }
+        if area == 0 {
+            return Some((1, [0; 4]));
+        }
+        let rectangle_area = (bounds[2] - bounds[0]) as u64 * (bounds[3] - bounds[1]) as u64;
+        Some((if area == rectangle_area { 2 } else { 3 }, bounds))
+    }
+
     /// RectVisible's MM_TEXT query over the selected surface's visible bounds.
     /// Native normalizes reversed coordinates and gives zero-length axes one
     /// logical unit, including a point rectangle. Use i64 for the i32::MAX edge.
