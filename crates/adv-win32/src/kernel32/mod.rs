@@ -36,14 +36,17 @@ pub(crate) use environment::entries as environment_entries;
 pub(crate) use process::install_parameters;
 pub(crate) use process::native_resume_thread;
 pub(crate) use process::native_thread_context;
+pub(crate) use process::terminate_process_owner;
 pub(crate) use process::{command_line, configure_codepage};
 mod registered_wait;
 mod string;
 mod sync;
 pub(crate) use sync::{CS_SIZE, enter_cs, initialize_cs, leave_cs, release_cs_wait};
+mod thread_handles;
 mod time;
 mod timer;
 mod toolhelp;
+pub(crate) use thread_handles::{find_thread, publish_thread, thread_access};
 pub(crate) use time::delay_until;
 pub use time::filetime_now;
 pub(crate) use time::{civil_from_days, days_from_civil};
@@ -73,4 +76,5 @@ pub fn register(reg: &mut Registry) {
     time::register(reg);
     timer::register(reg);
     toolhelp::register(reg);
+    thread_handles::register(reg);
 }

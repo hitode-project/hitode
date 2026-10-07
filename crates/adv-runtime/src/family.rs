@@ -520,8 +520,18 @@ impl<B: Backend> Runtime<B> {
                 .find(|p| *p > self.family.last && !visited.contains(p))
                 .or_else(|| live.iter().copied().find(|p| !visited.contains(p)));
             let Some(pid) = next else {
+                // A parent can publish a child after that child's pending ticket
+                // was visited in this round, then immediately wait for it.
+                // Give newly published runnable work a turn before host sleep.
+                let published_ready =
+                    self.family.publication.iter().any(|(pid, ticket)| {
+                        ticket.get() == processes::Publication::Published
+                            && self.family.parked.get(pid).is_some_and(|child| {
+                                child.sys.contexts.iter().any(|c| c.is_ready())
+                            })
+                    });
                 self.select_process(self.family.foreground);
-                if any_yielded {
+                if any_yielded || published_ready {
                     self.machine.sys.clock.begin_work();
                     return SliceResult::Yielded;
                 }
@@ -536,12 +546,14 @@ impl<B: Backend> Runtime<B> {
             self.machine.sys.clock.begin_work();
             if let Some(code) = self.machine.sys.process_identity.completion.exit_code() {
                 self.record_exit(code, None);
+                any_yielded = true;
                 continue;
             }
             if let Some(publication) = self.family.publication.get(&pid).map(|ticket| ticket.get())
             {
                 if publication == processes::Publication::Cancelled {
                     self.record_exit(995, None);
+                    any_yielded = true;
                     continue;
                 }
                 if publication == processes::Publication::Pending {
@@ -551,6 +563,7 @@ impl<B: Backend> Runtime<B> {
             self.family.publication.remove(&pid);
             if let Err(message) = self.initialize_selected() {
                 self.record_exit(0xc000_0142, Some(message.clone()));
+                any_yielded = true;
                 self.family
                     .first_failure
                     .get_or_insert_with(|| MachineError {
@@ -580,12 +593,15 @@ impl<B: Backend> Runtime<B> {
                 }
                 SliceResult::Complete(RunResult::Exited(code)) => {
                     self.record_exit(code, None);
+                    // Earlier peers may now have satisfied process/thread waits.
+                    any_yielded = true;
                 }
                 SliceResult::Complete(RunResult::Failed(error)) => {
                     // A guest exception retains its native status. A missing
                     // implementation or host-device error is NOT_SUPPORTED.
                     let code = self.machine.sys.guest_failure_code.unwrap_or(0xc000_00bb);
                     self.record_exit(code, Some(error.message.clone()));
+                    any_yielded = true;
                     self.family.first_failure.get_or_insert(error);
                     continue;
                 }

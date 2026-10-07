@@ -5,6 +5,7 @@
 //!
 //! `<ctx>\t<frame>\t<module>!<name>\t<arg0,arg1,...>\t<ret>` (numbers in hex)
 
+use adv_cpu::backend::{Guest, Reg};
 use std::collections::HashSet;
 use std::io::Write;
 use std::{cell::RefCell, rc::Rc};
@@ -70,6 +71,18 @@ impl Trace {
 
     pub fn enabled(&self) -> bool {
         self.sink.is_some()
+    }
+
+    /// Architectural trap input before OS-personality handling. Valid host
+    /// transport interrupts are excluded; comments do not become API records.
+    pub fn raw_interrupt(&mut self, context: u32, frame: u32, vector: u8, cpu: &dyn Guest) {
+        if let Some(w) = &mut self.sink {
+            let _ = write!(w, "# raw_interrupt\t{context}\t{frame}\t{vector:02x}");
+            for reg in [Reg::Eax, Reg::Edx, Reg::Eip, Reg::Esp, Reg::Eflags] {
+                let _ = write!(w, "\t{reg:?}={:08x}", cpu.reg(reg));
+            }
+            let _ = writeln!(w);
+        }
     }
 
     /// Diagnostic-only dynamic import metadata. Comment records leave completed

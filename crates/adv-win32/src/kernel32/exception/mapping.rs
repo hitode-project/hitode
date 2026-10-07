@@ -1,5 +1,5 @@
 //! Win32 codes for precise x86 CPU stops. Faults retain the stopped PC;
-//! breakpoint addresses/CONTEXT follow native x86's one-byte PC adjustment.
+//! breakpoint addresses/CONTEXT follow native x86's one-byte PC adjustment;
 //! Continuing execution always requires the guest handler's disposition.
 //! Codes follow SDK ntstatus.h and Microsoft Learn's GetExceptionCode table.
 //! An authored x86 Windows oracle (target/exception-arithmetic-native/probe.c)
@@ -113,6 +113,21 @@ pub(super) fn normalize_context(record: &Record, state: &mut ArchitecturalState)
     }
 }
 
+pub(super) fn raw_int2e_address(cpu: &dyn Guest, retired_pc: u32) -> Result<u32, String> {
+    let address = retired_pc
+        .checked_sub(2)
+        .ok_or_else(|| "x86 system-service interrupt PC underflow".to_owned())?;
+    let mut bytes = [0; 2];
+    if cpu.accessible(address, 2, Prot::EXEC)
+        && cpu.read(address, &mut bytes).is_ok()
+        && bytes == [0xcd, 0x2e]
+    {
+        Ok(address)
+    } else {
+        Err("x86 system-service classification requires an executed INT 2E instruction".into())
+    }
+}
+
 fn breakpoint_address(cpu: &dyn Guest, pc: u32) -> Result<u32, String> {
     let last = pc
         .checked_sub(1)
@@ -210,5 +225,7 @@ fn divisor(cpu: &dyn Guest, state: &ArchitecturalState) -> Result<u32, String> {
 
 #[cfg(test)]
 mod breakpoint_tests;
+#[cfg(test)]
+mod int2e_tests;
 #[cfg(test)]
 mod tests;

@@ -317,15 +317,7 @@ fn unhandled_interrupt_keeps_original_registers_and_stack_before_parking() {
             let RunResult::Failed(error) = machine.run_virtual(100000) else {
                 panic!("unhandled interrupt must keep its original failure semantics")
             };
-            if vector == 0x2e {
-                assert!(
-                    error
-                        .message
-                        .contains("unhandled CPU exception/interrupt 0x2e")
-                );
-            } else {
-                assert!(error.message.contains("personality declined"));
-            }
+            assert!(error.message.contains("personality declined"));
             let original = machine.sys.first_cpu_fault.as_ref().unwrap();
             assert_eq!(original.context, 0);
             assert_eq!(original.fault.pc, stopped);

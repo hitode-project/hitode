@@ -71,15 +71,73 @@ pub struct Completion(std::sync::atomic::AtomicU64);
 impl Completion {
     pub fn exit_code(&self) -> Option<u32> {
         let value = self.0.load(std::sync::atomic::Ordering::Acquire);
+        (value >> 32 == 1).then_some(value as u32)
+    }
+    /// A reported termination status may precede the last live thread's exit.
+    /// Waits and supervisor liveness must continue to use `exit_code`.
+    pub fn exit_status(&self) -> Option<u32> {
+        let value = self.0.load(std::sync::atomic::Ordering::Acquire);
         (value >> 32 != 0).then_some(value as u32)
     }
+    /// Publish the first termination status without signaling completion.
+    pub fn begin_termination(&self, code: u32) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                (2u64 << 32) | u64::from(code),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
     pub fn complete(&self, code: u32) {
-        let _ = self.0.compare_exchange(
-            0,
-            (1u64 << 32) | u64::from(code),
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        );
+        let mut previous = self.0.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if previous >> 32 == 1 {
+                return;
+            }
+            let code = if previous >> 32 == 2 {
+                previous as u32
+            } else {
+                code
+            };
+            match self.0.compare_exchange(
+                previous,
+                (1u64 << 32) | u64::from(code),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(value) => previous = value,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::Completion;
+
+    #[test]
+    fn pending_termination_reports_the_first_status_without_signaling() {
+        let completion = Completion::default();
+        assert_eq!(completion.exit_code(), None);
+        assert_eq!(completion.exit_status(), None);
+        assert!(completion.begin_termination(37));
+        assert_eq!(completion.exit_status(), Some(37));
+        assert_eq!(completion.exit_code(), None);
+        assert!(!completion.begin_termination(42));
+        completion.complete(99);
+        assert_eq!(completion.exit_code(), Some(37));
+        assert_eq!(completion.exit_status(), Some(37));
+        completion.complete(42);
+        assert_eq!(completion.exit_code(), Some(37));
+
+        let normal = Completion::default();
+        normal.complete(78);
+        assert_eq!(normal.exit_code(), Some(78));
+        assert!(!normal.begin_termination(42));
+        assert_eq!(normal.exit_status(), Some(78));
     }
 }
 
