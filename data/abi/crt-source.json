@@ -322,6 +322,8 @@
   "guest_comparator_sort": {
     "header": "ucrt/corecrt_search.h:23-24,60-65",
     "header_sha256": "fe06c4dd27c3df5ca6bed52a433b8848f32e14ed0f3712d00f7e602416471c1b",
+    "native_oracle_source_sha256": "9917f22135f97cf8f51cb5dccc0435e8c972a3962c8eebe3db106ce947b2e32f",
+    "native_verification": "Authored VC80/90 18-row no-UI probe measures ordinary in-place sorting with real element addresses and unchanged errno/DOS/LastError, plus zero/one element validation. Zero width and NULL comparator invoke the returning invalid handler with errno22 and LastError0; NULL base is valid only for zero count. Guest generation keeps unmeasured legacy MSVCRT invalid-parameter handling explicitly unavailable rather than claim VC equivalence. Sorting order of equal elements and callback order are not native bit-identity guarantees.",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/qsort",
     "scope": "Three existing CRT aliases: void __cdecl qsort(void* base, size_t number, size_t width, comparator). Four x86 argument words; comparator is int __cdecl(const void*, const void*) with signed ordering and two real array-element pointers. Equal-element relative order is unspecified.",
     "profile": "Use existing guest callbacks, memory and CRT error/invalid-parameter owners. Checked bounded in-place sorting must call the real guest comparator; unavailable input/range profiles warn and fail without fabricated sorted output."
