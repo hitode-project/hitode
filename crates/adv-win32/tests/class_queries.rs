@@ -28,11 +28,13 @@ impl<B: Backend> Fixture<B> {
     fn new(cpu: B) -> Self {
         let mut registry = Registry::default();
         adv_win32::register(&mut registry);
-        assert_eq!(
-            registry.get("user32.dll", "GetClassInfoW").unwrap().conv,
-            Conv::Stdcall { argc: 3 }
-        );
-        assert!(registry.dynamic_available("user32.dll", "GetClassInfoW"));
+        for api in ["GetClassInfoW", "GetClassInfoExA", "GetClassInfoExW"] {
+            assert_eq!(
+                registry.get("user32.dll", api).unwrap().conv,
+                Conv::Stdcall { argc: 3 }
+            );
+            assert!(registry.dynamic_available("user32.dll", api));
+        }
         assert!(registry.signature_conflicts().is_empty());
         let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
         machine.ext.get_or_default::<adv_abi::ApiDiagnostics>();
@@ -127,6 +129,49 @@ impl<B: Backend> Fixture<B> {
                 "GetClassInfoW"
             } else {
                 "GetClassInfoA"
+            },
+            &[I(inst), name, I(out)],
+        )
+    }
+    fn class_ex(&mut self, name: &str, wide: bool, instance: u32, menu: u32) -> (u32, u32) {
+        let name = self.text(name, wide);
+        let proc = self.function(if wide {
+            "DefWindowProcW"
+        } else {
+            "DefWindowProcA"
+        });
+        let fields = [
+            48, 8, proc, 4, 8, instance, 1001, 1004, 12, menu, name, 1002,
+        ];
+        let wc = self.bytes(
+            &fields
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        (
+            self.call(
+                if wide {
+                    "RegisterClassExW"
+                } else {
+                    "RegisterClassExA"
+                },
+                &[I(wc)],
+            ),
+            proc,
+        )
+    }
+    fn out_ex(&mut self, size: u32) -> u32 {
+        let out = self.bytes(&[0xcc; 56]);
+        self.machine.cpu.write_u32(out, size).unwrap();
+        out
+    }
+    fn query_ex(&mut self, wide: bool, inst: u32, name: Arg, out: u32) -> u32 {
+        self.call(
+            if wide {
+                "GetClassInfoExW"
+            } else {
+                "GetClassInfoExA"
             },
             &[I(inst), name, I(out)],
         )
@@ -298,4 +343,157 @@ fn failures<B: Backend>(cpu: B) {
 fn class_query_failures_preserve_outputs_and_reject_unavailable_cross_encoding_thunks() {
     failures(UnicornCpu::new(PARK_ADDR).unwrap());
     failures(JitCpu::new(PARK_ADDR, false).unwrap());
+}
+
+fn extended_queries<B: Backend>(cpu: B) {
+    let mut t = Fixture::new(cpu);
+    let ansi_name = t.text("SharedOwnerClass", false);
+    let missing = t.out_ex(48);
+    let mr = t.query_ex(false, CODE, I(ansi_name), missing);
+    let me = t.error();
+    let menu = t.text("Menu星", true);
+    let (aa, ap) = t.class_ex("SharedOwnerClass", false, CODE, 77);
+    let (other_atom, _) = t.class_ex("SharedOwnerClass", false, CODE + 0x1000, 88);
+    let (wa, wp) = t.class_ex("类Extended", true, CODE, menu);
+    let wide_name = t.text("类Extended", true);
+    t.code.mov_mem_imm(menu, u32::from(b'X'));
+    t.call("kernel32.dll!SetLastError", &[I(0x12345678)]);
+    let a = t.out_ex(48);
+    let ar = t.query_ex(false, CODE, I(ansi_name), a);
+    let ae = t.error();
+    let w = t.out_ex(48);
+    let wr = t.query_ex(true, CODE, I(wide_name), w);
+    let we = t.error();
+    let atom = t.out_ex(0);
+    let atom_result = t.query_ex(false, CODE, M(aa), atom);
+    let other = t.out_ex(1);
+    let other_result = t.query_ex(false, CODE + 0x1000, I(ansi_name), other);
+    let classic = t.out();
+    t.query(true, CODE, M(wa), classic);
+    let system_name = t.text("Button", true);
+    let stock = t.out_ex(48);
+    let sr = t.query_ex(true, 0, I(system_name), stock);
+    let window = t.call(
+        "CreateWindowExA",
+        &[
+            I(0),
+            M(aa),
+            I(0),
+            I(0),
+            I(0),
+            I(0),
+            I(40),
+            I(40),
+            I(0),
+            I(0),
+            I(CODE),
+            I(0),
+        ],
+    );
+    let small = t.call("GetClassLongA", &[M(window), I((-34i32) as u32)]);
+    let old_small = t.call("SetClassLongA", &[M(window), I((-34i32) as u32), I(1003)]);
+    let large = t.call("GetClassLongA", &[M(window), I((-14i32) as u32)]);
+    let changed = t.out_ex(48);
+    t.query_ex(false, CODE, M(aa), changed);
+    t.run();
+    assert_eq!((t.value(mr), t.value(me)), (0, 1411));
+    assert_eq!(t.value(missing), 48);
+    assert_eq!(t.read(missing + 4, 52), [0xcc; 52]);
+    assert_eq!((t.value(ar), t.value(wr)), (t.value(aa), t.value(wa)));
+    assert_eq!((t.value(ae), t.value(we)), (0x12345678, 0x12345678));
+    for (out, proc, name) in [(a, ap, ansi_name), (w, wp, wide_name)] {
+        let fields: [u32; 12] = std::array::from_fn(|i| t.value(out + 4 * i as u32));
+        assert_eq!(&fields[..9], &[48, 8, proc, 4, 8, CODE, 1001, 1004, 12]);
+        assert_eq!(&fields[10..], &[name, 1002]);
+        assert_eq!(t.read(out + 48, 8), [0xcc; 8]);
+    }
+    assert_eq!(t.value(a + 36), 77);
+    assert_eq!(
+        t.read(t.value(w + 36), utf16("Menu星").len()),
+        utf16("Menu星")
+    );
+    assert_eq!(t.value(classic + 32), t.value(w + 36));
+    assert_eq!(t.value(atom_result), t.value(aa));
+    assert_eq!((t.value(atom), t.value(atom + 40)), (0, t.value(aa)));
+    assert_eq!(t.value(other_result), t.value(other_atom));
+    assert_ne!(t.value(aa), t.value(other_atom));
+    assert_eq!(
+        (t.value(other), t.value(other + 20), t.value(other + 36)),
+        (1, CODE + 0x1000, 88)
+    );
+    assert_ne!(t.value(sr), 0);
+    assert_eq!(
+        (
+            t.value(stock + 20),
+            t.value(stock + 40),
+            t.value(stock + 44)
+        ),
+        (0, system_name, 0)
+    );
+    assert_ne!(t.value(window), 0);
+    assert_eq!(
+        (t.value(small), t.value(old_small), t.value(large)),
+        (1002, 1002, 1001)
+    );
+    assert_eq!(t.value(changed + 44), 1003);
+    assert_eq!(t.machine.ext.get::<adv_abi::ApiDiagnostics>().stub_calls, 0);
+}
+
+#[test]
+fn extended_class_queries_allow_registration_and_preserve_owner_layout_and_small_icons() {
+    extended_queries(UnicornCpu::new(PARK_ADDR).unwrap());
+    extended_queries(JitCpu::new(PARK_ADDR, false).unwrap());
+}
+
+fn extended_failures<B: Backend>(cpu: B) {
+    let mut t = Fixture::new(cpu);
+    let (aw, _) = t.class_ex("WideExtendedOnly", true, CODE, 0);
+    let (aa, _) = t.class_ex("AnsiExtendedOnly", false, CODE, 0);
+    let missing = t.text("AbsentClass", true);
+    let mut cases = Vec::new();
+    for (wide, name, instance, error) in [
+        (true, I(missing), CODE, 1411),
+        (true, M(aw), CODE + 1, 1411),
+        (true, I(0x700000), CODE, 998),
+        (true, M(aa), CODE, 50),
+        (false, M(aw), CODE, 50),
+    ] {
+        let out = t.out_ex(48);
+        let result = t.query_ex(wide, instance, name, out);
+        let last = t.error();
+        cases.push((out, result, last, error));
+    }
+    let ro = t.query_ex(true, CODE, M(aw), READONLY);
+    let roe = t.error();
+    // Forty bytes of WNDCLASS would fit; the extended result must check all 48.
+    let end = DATA + 8192 - 44;
+    t.machine.cpu.write(end, &[0xcc; 44]).unwrap();
+    let partial = t.query_ex(false, CODE, M(aa), end);
+    let partial_error = t.error();
+    let null = t.query_ex(true, CODE, M(aw), 0);
+    let null_error = t.error();
+    t.run();
+    for (out, result, last, error) in cases {
+        assert_eq!((t.value(result), t.value(last)), (0, error));
+        assert_eq!(t.value(out), 48);
+        assert_eq!(t.read(out + 4, 52), [0xcc; 52]);
+    }
+    assert_eq!((t.value(ro), t.value(roe)), (0, 998));
+    assert_eq!(t.read(READONLY, 48), [0xcc; 48]);
+    assert_eq!((t.value(partial), t.value(partial_error)), (0, 998));
+    assert_eq!(t.read(end, 44), [0xcc; 44]);
+    assert_eq!((t.value(null), t.value(null_error)), (0, 998));
+    let d = t.machine.ext.get::<adv_abi::ApiDiagnostics>();
+    assert_eq!(d.stub_calls, 0);
+    for api in ["user32.dll!GetClassInfoExA", "user32.dll!GetClassInfoExW"] {
+        assert!(d.warnings.iter().any(|((name, reason), count)| name == api
+            && reason.contains("procedure thunk")
+            && *count == 1));
+    }
+}
+
+#[test]
+fn extended_class_query_failures_preserve_output_and_report_unavailable_thunks() {
+    extended_failures(UnicornCpu::new(PARK_ADDR).unwrap());
+    extended_failures(JitCpu::new(PARK_ADDR, false).unwrap());
 }
