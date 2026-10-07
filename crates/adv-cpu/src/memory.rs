@@ -6,7 +6,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+mod fast;
 mod locks;
+
+pub(crate) use fast::FastPermissions;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const READ: u8 = 1;
@@ -17,6 +20,9 @@ pub(crate) const SHARED: u8 = 8;
 /// A shared PCM page has a stable alias at base + guest offset. Access must
 /// still use only matching byte atomics, even for guest word/vector operations.
 pub(crate) const AUDIO: u8 = 16;
+/// Derived grants in immutable native metadata, never guest protection flags.
+pub(crate) const FAST_READ: u8 = READ << 5;
+pub(crate) const FAST_WRITE: u8 = WRITE << 5;
 
 enum SharedPage {
     Audio {
@@ -90,6 +96,7 @@ pub(crate) struct WorkerLayout {
     len: usize,
     pointer: usize,
     perms: Arc<Vec<u8>>,
+    fast: Arc<Vec<u8>>,
     mapped: Arc<Vec<bool>>,
 }
 
@@ -105,6 +112,7 @@ impl WorkerLayout {
             len: self.len,
             ptr: NonNull::new(self.pointer as *mut u8).expect("pinned guest window"),
             perms: self.perms,
+            fast: FastPermissions::from_snapshot(self.fast),
             mapped: self.mapped,
             epoch: 0,
             versions: Vec::new(),
@@ -128,6 +136,7 @@ pub struct Memory {
     pub(crate) len: usize,
     pub(crate) ptr: NonNull<u8>,
     pub(crate) perms: Arc<Vec<u8>>,
+    pub(crate) fast: FastPermissions,
     pub(crate) epoch: u64,
     pub(crate) versions: Vec<u64>,
     pub(crate) mapped: Arc<Vec<bool>>,
@@ -183,13 +192,14 @@ impl Memory {
         }
     }
 
-    pub(crate) fn worker_layout(&self) -> WorkerLayout {
+    pub(crate) fn worker_layout(&mut self) -> WorkerLayout {
         assert!(self.parallel.is_some());
         WorkerLayout {
             base: self.base,
             len: self.len,
             pointer: self.ptr.as_ptr() as usize,
             perms: self.perms.clone(),
+            fast: self.fast.snapshot(&self.perms),
             mapped: self.mapped.clone(),
         }
     }
@@ -393,6 +403,7 @@ impl Memory {
             len,
             ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
+            fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
@@ -434,6 +445,7 @@ impl Memory {
             len,
             ptr: reservation.ptr,
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
+            fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
@@ -544,6 +556,7 @@ impl Memory {
             self.shared_pages.remove(&page);
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(false);
+        self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages].fill(0);
         self.touch(addr, len);
         Ok(())
@@ -830,6 +843,7 @@ impl Memory {
             );
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
+        self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages]
             .fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
         self.touch(addr, len);
@@ -865,6 +879,7 @@ impl Memory {
             );
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
+        self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages].fill(perms | SHARED);
         self.touch(addr, len);
         Ok(())
@@ -903,6 +918,7 @@ impl Memory {
         self.shared_pages.remove(&page);
         self.resident.insert(page, storage);
         Arc::make_mut(&mut self.perms)[page] &= !SHARED;
+        self.fast.invalidate(page..page + 1);
         self.touch(self.base + (page * PAGE_SIZE) as u32, PAGE_SIZE);
     }
     pub(crate) fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
@@ -1218,6 +1234,8 @@ impl Memory {
         }
         #[cfg(not(windows))]
         let _ = retired;
+        self.fast
+            .invalidate(range.start / PAGE_SIZE..range.end / PAGE_SIZE);
         for page in
             &mut Arc::make_mut(&mut self.perms)[range.start / PAGE_SIZE..range.end / PAGE_SIZE]
         {
