@@ -163,6 +163,8 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
         format!("Eip={next:08x}"),
         format!("Esp={:08x}", rd(0)),
         format!("Eflags={:08x}", rd(4)),
+        format!("StackTop={token:08x}"),
+        "Candidate=\"test\"!\"forbidden\"".to_owned(),
     ] {
         assert!(raw[0].contains(&field), "missing {field}: {}", raw[0]);
     }

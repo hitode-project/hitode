@@ -15,6 +15,7 @@ mod virtual_memory;
 pub(crate) use virtual_memory::native_read_memory;
 pub(crate) use virtual_memory::native_write_memory;
 pub(crate) use virtual_memory::protect_memory;
+pub(crate) use virtual_memory::query as query_memory;
 pub(crate) use virtual_memory::{
     allocate as allocate_memory, allocation_extent, release as free_memory, span as memory_span,
 };
@@ -24,7 +25,7 @@ const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 
 /// Highest application address in the existing flat x86 Win32 process profile.
 /// GetSystemInfo and VirtualQuery must describe the same address domain.
-pub(super) const MAX_APPLICATION_ADDRESS: u32 = 0x7ffe_ffff;
+pub(crate) const MAX_APPLICATION_ADDRESS: u32 = 0x7ffe_ffff;
 
 fn heap_create(env: &mut Env<'_>) -> Outcome {
     let flags = env.arg(0);

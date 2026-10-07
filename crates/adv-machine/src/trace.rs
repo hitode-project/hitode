@@ -5,7 +5,7 @@
 //!
 //! `<ctx>\t<frame>\t<module>!<name>\t<arg0,arg1,...>\t<ret>` (numbers in hex)
 
-use adv_cpu::backend::{Guest, Reg};
+use adv_cpu::backend::{Guest, GuestExt, Reg};
 use std::collections::HashSet;
 use std::io::Write;
 use std::{cell::RefCell, rc::Rc};
@@ -75,11 +75,26 @@ impl Trace {
 
     /// Architectural trap input before OS-personality handling. Valid host
     /// transport interrupts are excluded; comments do not become API records.
-    pub fn raw_interrupt(&mut self, context: u32, frame: u32, vector: u8, cpu: &dyn Guest) {
+    pub fn raw_interrupt(
+        &mut self,
+        context: u32,
+        frame: u32,
+        vector: u8,
+        cpu: &dyn Guest,
+        candidate: Option<(&str, &str)>,
+    ) {
         if let Some(w) = &mut self.sink {
             let _ = write!(w, "# raw_interrupt\t{context}\t{frame}\t{vector:02x}");
             for reg in [Reg::Eax, Reg::Edx, Reg::Eip, Reg::Esp, Reg::Eflags] {
                 let _ = write!(w, "\t{reg:?}={:08x}", cpu.reg(reg));
+            }
+            if let Ok(word) = cpu.read_u32(cpu.reg(Reg::Esp)) {
+                let _ = write!(w, "\tStackTop={word:08x}");
+            }
+            // A coincidental stack word is only a diagnostic candidate. It
+            // never validates transport or authorizes a host API dispatch.
+            if let Some((module, name)) = candidate {
+                let _ = write!(w, "\tCandidate={module:?}!{name:?}");
             }
             let _ = writeln!(w);
         }

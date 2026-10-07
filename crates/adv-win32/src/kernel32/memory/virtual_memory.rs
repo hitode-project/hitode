@@ -352,7 +352,7 @@ fn page_protection(env: &Env<'_>, page: u32) -> Option<u32> {
     )
 }
 
-fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
+pub(crate) fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
     if addr > MAX_APPLICATION_ADDRESS {
         return Err(error(err::INVALID_PARAMETER));
     }

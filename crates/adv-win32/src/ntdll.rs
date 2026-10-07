@@ -14,6 +14,7 @@ mod strings;
 mod termination;
 mod thread;
 mod thread_open;
+mod virtual_query;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -227,6 +228,7 @@ pub fn register(reg: &mut Registry) {
     termination::register(reg);
     allocation::register(reg);
     memory::register(reg);
+    virtual_query::register(reg);
     registry::register(reg);
     stdcall(
         reg,

@@ -1213,7 +1213,7 @@ impl TrapHandler for Dispatch<'_> {
         let res = if vector != adv_cpu::backend::asm::TRAP_VECTOR {
             self.sys
                 .trace
-                .raw_interrupt(self.sys.current, self.sys.frame, vector, cpu);
+                .raw_interrupt(self.sys.current, self.sys.frame, vector, cpu, None);
             self.exception(cpu, exception::Exception::Trap { vector, pc: eip })
         } else if eip == thunk_addr(thunk::RETURN_PAD) + 2 {
             self.guest_return(cpu)
@@ -1235,9 +1235,19 @@ impl TrapHandler for Dispatch<'_> {
                 cpu.set_reg(Reg::Esp, esp.wrapping_add(4));
                 self.host_call(cpu, index.unwrap())
             } else {
-                self.sys
-                    .trace
-                    .raw_interrupt(self.sys.current, self.sys.frame, vector, cpu);
+                let candidate = index
+                    .filter(|i| *i > thunk::EXCEPTION_DISPATCH && *i < self.sys.thunks.len())
+                    .map(|i| {
+                        let binding = self.sys.thunks.get(i);
+                        (binding.module.as_str(), binding.name.as_str())
+                    });
+                self.sys.trace.raw_interrupt(
+                    self.sys.current,
+                    self.sys.frame,
+                    vector,
+                    cpu,
+                    candidate,
+                );
                 if self.sys.exception_handler.is_some() {
                     // A raw guest interrupt never borrows the host thunk token.
                     // Its OS personality owns system-service or exception policy.
