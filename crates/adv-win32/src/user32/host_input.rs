@@ -46,12 +46,13 @@ pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
         // Frontend coordinates describe the displayed top-level client.
         // A captured child receives coordinates in its own client area.
         let (ox, oy) = user.client_origin(&env.sys.objects, top);
-        user.cursor_pos = (x + ox, y + oy);
+        let (sx, sy) =
+            super::input::set_cursor_position(user, (x.saturating_add(ox), y.saturating_add(oy)));
         if message == 0x20a || message == 0x20e {
-            lparam = make_long(x + ox, y + oy);
-        } else if hwnd != top {
+            lparam = make_long(sx, sy);
+        } else {
             let (tx, ty) = user.client_origin(&env.sys.objects, hwnd);
-            lparam = make_long(x + ox - tx, y + oy - ty);
+            lparam = make_long(sx.wrapping_sub(tx), sy.wrapping_sub(ty));
         }
         for (down, up, vk) in [(0x201, 0x202, 1), (0x204, 0x205, 2), (0x207, 0x208, 4)] {
             if message == down {

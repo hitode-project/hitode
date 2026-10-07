@@ -34,6 +34,7 @@ fn screen(env: &mut Env<'_>, size: (i32, i32)) {
         return;
     }
     win32.user.screen = size;
+    super::input::reconcile_cursor_clip(&mut win32.user);
     let desktop = win32.user.desktop;
     if let Some(window) = win32.user.windows.get_mut(&mut env.sys.objects, &desktop) {
         window.rect = Rect::new(0, 0, size.0, size.1);

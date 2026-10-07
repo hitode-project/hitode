@@ -450,6 +450,8 @@ pub struct User {
     pub icon_title_font: super::system_parameters::IconFont,
     pub clipboard: adv_os::clipboard::Clipboard,
     pub cursor_pos: (i32, i32),
+    /// Shared guest desktop constraint; None follows the current display bounds.
+    pub(super) cursor_clip: Option<Rect>,
     pub cursor_count: i32,
     pub cursor_handle: u32,
     pub locked_window: Option<u32>,
@@ -489,6 +491,7 @@ impl User {
             icon_title_font: super::system_parameters::IconFont::default(),
             clipboard: adv_os::clipboard::Clipboard::default(),
             cursor_pos: (screen.0 / 2, screen.1 / 2),
+            cursor_clip: None,
             cursor_count: 0,
             cursor_handle: 0,
             locked_window: None,
