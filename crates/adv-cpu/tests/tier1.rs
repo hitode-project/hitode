@@ -3048,3 +3048,60 @@ fn simd_cross_page_faults_alignment_and_pending_mmx_are_precise() {
         }
     }
 }
+
+#[test]
+fn simd_mmx_read_only_effects_and_budget_boundaries_preserve_raw80() {
+    for operation in 0..3 {
+        let code = assemble(|a| {
+            match operation {
+                0 => a.movd(ebx, mm4),
+                1 => a.movd(dword_ptr(DATA as i32), mm4),
+                _ => a.movq(qword_ptr(DATA as i32), mm4),
+            }
+            .unwrap();
+            a.emms().unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 2)];
+        let initial = simd_seed(0x1122334455667788);
+        for m in &mut machines {
+            m.state = initial.clone();
+            assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
+            assert_eq!(m.state.x87.regs, initial.x87.regs);
+            assert_eq!(m.state.x87.tag, 0);
+            assert_eq!(m.state.x87.top(), 0);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        assert_eq!(machines[1].tier1_stats().fallback_instructions, 0);
+        for m in &mut machines {
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.state.x87.tag, 0xffff);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        assert_eq!(machines[1].tier1_stats().fallback_instructions, 1);
+    }
+}
+
+#[test]
+fn simd_code_store_dispatches_before_executing_modified_code() {
+    let code = assemble(|a| {
+        a.movdqu(xmm0, xmmword_ptr(DATA as i32)).unwrap();
+        a.movdqu(xmmword_ptr(CODE as i32 + 128), xmm0).unwrap();
+        a.jmp(u64::from(CODE + 128)).unwrap();
+    });
+    let mut replacement = assemble(|a| {
+        a.mov(eax, 0x87654321u32).unwrap();
+        a.ret().unwrap();
+    });
+    replacement.resize(16, 0x90);
+    let mut machines = [machine(&code, 0), machine(&code, 2)];
+    for m in &mut machines {
+        m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+        m.write(DATA, &replacement).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 0x87654321);
+    }
+    equivalent(&machines[0], &machines[1], u32::MAX);
+    assert_eq!(machines[1].tier1_stats().fallback_instructions, 0);
+    assert!(machines[1].tier1_stats().invalidations > 0);
+}

@@ -1,7 +1,7 @@
 //! Bounded ARM64 templates for the versioned fixed-register entry ABI.
 //! These encodings cover the declared integer and SIMD subsets; all
 //! other forms leave before the instruction and use the existing interpreter.
-use super::forms::{cmovcc, double_shift, imm, register, register_part, rmw, setcc, shift, string};
+use super::forms::{cmovcc, double_shift, register, register_part, rmw, setcc, shift, string};
 pub(super) use super::forms::{counter_branch, supported};
 use super::{BUDGET, DISPATCH, FALLBACK, LOAD, STORE};
 use iced_x86::{ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
