@@ -215,42 +215,44 @@ impl Emitter {
         self.word(0x9100_058c); // add x12,x12,#1
         self.word(0xf900_1f6c); // str x12,[x27,#56]
     }
+    /// Replace bit `lsb` of w`d` with bit 0 of w`n` (BFI).
+    fn bfi(&mut self, d: u8, n: u8, lsb: u32) {
+        self.word(0x3300_0000 | ((32 - lsb) % 32) << 16 | (n as u32) << 5 | d as u32);
+    }
+    /// w14 = 1 when the host condition holds (CSET).
+    fn cset14(&mut self, condition: u32) {
+        self.word(0x1a9f_07ee | (condition ^ 1) << 12);
+    }
     fn flags(&mut self, subtract: bool, logic: bool, preserve_carry: bool) {
-        // ADDS/SUBS/ANDS already produced NZCV. MOV/UBFM never change it.
-        self.word(0xd53b_420c); // mrs x12,nzcv
-        if preserve_carry {
-            self.mask(0, 8, 1);
+        // ADDS/SUBS/ANDS already produced NZCV. CSET reads it directly and
+        // BFI replaces one guest bit, so no other EFLAGS bit is disturbed.
+        const EQ: u32 = 0;
+        const CS: u32 = 2;
+        const CC: u32 = 3;
+        const MI: u32 = 4;
+        const VS: u32 = 6;
+        for (condition, guest) in [(MI, 7), (EQ, 6), (VS, 11)] {
+            self.cset14(condition);
+            self.bfi(8, 14, guest);
         }
+        if !preserve_carry {
+            // ARM carry after subtraction is the inverse of x86 borrow.
+            self.cset14(if subtract { CC } else { CS });
+            self.bfi(8, 14, 0);
+        }
+        // PF: even parity of the low result byte, folded into bit 0.
+        for (n, shift) in [(11, 4), (14, 2), (14, 1)] {
+            // eor w14,wn,wn,lsr #shift
+            self.word(0x4a40_0000 | n << 16 | shift << 10 | n << 5 | 14);
+        }
+        self.word(0x5200_01ce); // eor w14,w14,#1
+        self.bfi(8, 14, 2);
         // Logical AF is architecturally undefined; match Tier 0 preservation.
-        self.mask(8, 8, !(if logic { 0x8c5 } else { 0x8d5 }));
-        for (host, guest) in [(31, 7), (30, 6), (29, 0), (28, 11)] {
-            self.lsr(14, 12, host);
-            self.mask(14, 14, 1);
-            if host == 29 && subtract {
-                self.constant(17, 1);
-                self.binary(0x4a00_0000, 14, 14, 17);
-            }
-            if host == 29 && preserve_carry {
-                self.mov(14, 0);
-            }
-            self.lsl(14, 14, guest);
-            self.binary(0x2a00_0000, 8, 8, 14);
-        }
-        self.lsr(14, 11, 4);
-        self.binary(0x4a00_0000, 14, 14, 11);
-        self.lsr(15, 14, 2);
-        self.binary(0x4a00_0000, 14, 14, 15);
-        self.lsr(15, 14, 1);
-        self.binary(0x4a00_0000, 14, 14, 15);
-        self.word(0x2a20_03ee | 14 << 16); // mvn w14,w14
-        self.mask(14, 14, 1);
-        self.lsl(14, 14, 2);
-        self.binary(0x2a00_0000, 8, 8, 14);
         if !logic {
             self.binary(0x4a00_0000, 14, 9, 10);
             self.binary(0x4a00_0000, 14, 14, 11);
-            self.mask(14, 14, 16);
-            self.binary(0x2a00_0000, 8, 8, 14);
+            self.lsr(14, 14, 4);
+            self.bfi(8, 14, 4);
         }
     }
     fn condition(&mut self, c: C) {
