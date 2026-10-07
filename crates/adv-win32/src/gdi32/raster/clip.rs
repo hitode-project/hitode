@@ -14,9 +14,79 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(exclude_ABI);
     reg.register(intersect_ABI);
     reg.register(rect_visible_ABI);
+    reg.register(get_clip_box_ABI);
     reg.register(window_origin_ABI);
     reg.register(set_window_origin_ABI);
     reg.register(set_viewport_origin_ABI);
+}
+
+#[win32(gdi32, name = "GetClipBox", level = state)]
+fn get_clip_box(env: &mut Env<'_>, dc: Handle, output: GuestPtr<RECT>) -> Outcome {
+    let Some(GdiObj::Dc {
+        selected,
+        modes,
+        clip,
+        ..
+    }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
+    else {
+        set_last_error(env, 6);
+        return Outcome::Return(0);
+    };
+    // Native bad-output failure leaves LastError and every output byte alone.
+    if output.is_null()
+        || adv_abi::guest::check_range(env.cpu, output.addr(), 16, Prot::WRITE).is_err()
+    {
+        return Outcome::Return(0);
+    }
+    let unavailable = |env: &mut Env<'_>, reason: &str| {
+        adv_abi::warn_unavailable(env, "gdi32.dll!GetClipBox", reason);
+        set_last_error(env, 50);
+        Outcome::Return(0)
+    };
+    if modes.map != 1 {
+        return unavailable(env, "only MM_TEXT clipping bounds are available");
+    }
+    let Some(surface) = env
+        .ext
+        .try_get::<SurfaceStore>()
+        .and_then(|s| s.get(selected[3]))
+    else {
+        return unavailable(env, "the DC has no shared raster surface");
+    };
+    let Some((complexity, bounds)) = clip.bounding_box(surface.width, surface.height) else {
+        return unavailable(env, "the surface bounds exceed the supported device range");
+    };
+    let bounds = if complexity == 1 {
+        // Native keeps an empty RECT canonical instead of translating its zero.
+        [0; 4]
+    } else {
+        let [left, top] = modes.to_logical(i64::from(bounds[0]), i64::from(bounds[1]));
+        let [right, bottom] = modes.to_logical(i64::from(bounds[2]), i64::from(bounds[3]));
+        let [Ok(left), Ok(top), Ok(right), Ok(bottom)] =
+            [left, top, right, bottom].map(i32::try_from)
+        else {
+            return unavailable(
+                env,
+                "the translated clipping bounds exceed the supported logical range",
+            );
+        };
+        [left, top, right, bottom]
+    };
+    if output
+        .write(
+            env.cpu,
+            RECT {
+                left: bounds[0],
+                top: bounds[1],
+                right: bounds[2],
+                bottom: bounds[3],
+            },
+        )
+        .is_err()
+    {
+        return Outcome::Return(0);
+    }
+    Outcome::Return(complexity)
 }
 fn unsupported(env: &mut Env<'_>, reason: &str) -> Outcome {
     adv_abi::warn_unavailable(env, "gdi32.dll!ExcludeClipRect", reason);
