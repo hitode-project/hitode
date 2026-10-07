@@ -599,3 +599,52 @@ fn a_w_attributes_use_only_live_attribute_hooks_and_release_native_scratch() {
         }
     }
 }
+
+#[test]
+fn wide_path_exists_uses_attributes_and_preserves_null_error() {
+    let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), "path-exists");
+    std::fs::write(root.join("game/存档.dat"), b"authored save").unwrap();
+    std::fs::create_dir(root.join("game/folder")).unwrap();
+    for (index, text) in ["存档.dat", "folder", "missing.dat", ""].iter().enumerate() {
+        wide(&mut machine, DATA + 0x400 + index as u32 * 0x100, text);
+    }
+    let exists = machine
+        .resolve_import("shlwapi.dll", "PathFileExistsW")
+        .unwrap();
+    let get_error = machine.resolve_import(K32, "GetLastError").unwrap();
+    let set_error = machine.resolve_import(K32, "SetLastError").unwrap();
+    let exit = machine.resolve_import(K32, "ExitProcess").unwrap();
+    let mut code = Asm::new(CODE);
+    for (index, pointer) in [DATA + 0x400, DATA + 0x500, DATA + 0x600, DATA + 0x700, 0]
+        .into_iter()
+        .enumerate()
+    {
+        code.push_imm(0x1357).call(set_error);
+        call(
+            &mut code,
+            exists,
+            &[pointer],
+            OUT + index as u32 * 8,
+            get_error,
+        );
+    }
+    code.push_imm(0).call(exit);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.spawn("path-exists", CODE, &[], 65536).unwrap();
+    assert!(matches!(
+        machine.run_virtual(1_000_000),
+        RunResult::Exited(0)
+    ));
+    for (index, (found, error)) in [(1, 0x1357), (1, 0x1357), (0, 2), (0, 3), (0, 0x1357)]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(machine.cpu.read_u32(OUT + index as u32 * 8).unwrap(), found);
+        assert_eq!(
+            machine.cpu.read_u32(OUT + index as u32 * 8 + 4).unwrap(),
+            error
+        );
+    }
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
