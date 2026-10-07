@@ -286,3 +286,83 @@ fn first_fetch_fault_keeps_original_branch_and_stack_after_exception_handler_ret
         assert_eq!(machine.sys.first_cpu_fault.as_ref().unwrap(), &original);
     }
 }
+
+#[test]
+fn unhandled_interrupt_keeps_original_registers_and_stack_before_parking() {
+    for jit in [false, true] {
+        for vector in [0x2e, 0x81] {
+            let mut machine = Machine::new(
+                JitCpu::new(PARK_ADDR, jit).unwrap(),
+                Registry::default(),
+                Clock::virtual_time(),
+            )
+            .unwrap();
+            machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
+            let mut code = Asm::new(CODE);
+            code.bytes.push(0xb8); // Authored MOV EAX, immediate.
+            code.bytes.extend(u32::MAX.to_le_bytes());
+            code.bytes.push(0xba); // Authored MOV EDX, immediate.
+            code.bytes.extend(0x2468_1357u32.to_le_bytes());
+            code.push_imm(0xdead_beef);
+            code.bytes.extend([0xcd, vector]);
+            let stopped = code.here();
+            code.ret();
+            machine.cpu.write(CODE, &code.bytes).unwrap();
+            machine.sys.exception_handler = Some(|env, _, _| {
+                env.cpu.set_reg(Reg::Eax, 0);
+                env.cpu.set_reg(Reg::Edx, 0);
+                Outcome::Fail("personality declined the interrupt".into())
+            });
+            machine.spawn("main", CODE, &[], 0x10000).unwrap();
+            let RunResult::Failed(error) = machine.run_virtual(100000) else {
+                panic!("unhandled interrupt must keep its original failure semantics")
+            };
+            if vector == 0x2e {
+                assert!(
+                    error
+                        .message
+                        .contains("unhandled CPU exception/interrupt 0x2e")
+                );
+            } else {
+                assert!(error.message.contains("personality declined"));
+            }
+            let original = machine.sys.first_cpu_fault.as_ref().unwrap();
+            assert_eq!(original.context, 0);
+            assert_eq!(original.fault.pc, stopped);
+            assert_eq!(
+                original.reason(),
+                Some(format!("unhandled CPU exception/interrupt {vector:#x}").as_str())
+            );
+            assert!(original.registers.contains(&(Reg::Eip, stopped)));
+            assert!(original.registers.contains(&(Reg::Eax, 0xffff_ffff)));
+            assert!(original.registers.contains(&(Reg::Edx, 0x2468_1357)));
+            assert_eq!(original.stack[0], 0xdead_beef);
+            assert_eq!(machine.sys.latest_cpu_fault.as_ref(), Some(original));
+        }
+    }
+}
+
+#[test]
+fn handled_interrupt_does_not_publish_a_fault_snapshot() {
+    for jit in [false, true] {
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, jit).unwrap(),
+            Registry::default(),
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
+        let mut code = Asm::new(CODE);
+        code.int3();
+        code.bytes.push(0xb8);
+        code.bytes.extend(17u32.to_le_bytes());
+        code.ret();
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        machine.sys.exception_handler =
+            Some(|_, _, checkpoint| Outcome::ResumeExecution(checkpoint));
+        machine.spawn("main", CODE, &[], 0x10000).unwrap();
+        assert!(matches!(machine.run_virtual(100000), RunResult::Exited(17)));
+        assert!(machine.sys.first_cpu_fault.is_none());
+        assert!(machine.sys.latest_cpu_fault.is_none());
+    }
+}
