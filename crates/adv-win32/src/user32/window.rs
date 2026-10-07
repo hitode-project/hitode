@@ -174,6 +174,7 @@ pub struct Class {
     /// 0 for system (global) classes.
     pub instance: u32,
     pub icon: u32,
+    pub small_icon: u32,
     pub cursor: u32,
     pub background: u32,
     pub menu_name: u32,
@@ -537,6 +538,7 @@ impl User {
             wnd_extra,
             instance,
             icon: 0,
+            small_icon: 0,
             cursor: 0,
             background: 0,
             menu_name: 0,
@@ -770,10 +772,15 @@ fn register_class_w(env: &mut Env<'_>, extended: bool) -> Outcome {
     let fields: Vec<_> = (start..start + 10)
         .map(|at| env.cpu.read_u32(pointer + at * 4).unwrap_or(0))
         .collect();
-    register_class(env, &fields, 0, true)
+    let small_icon = if extended {
+        env.cpu.read_u32(pointer + 44).unwrap_or(0)
+    } else {
+        0
+    };
+    register_class(env, &fields, small_icon, true)
 }
 
-fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) -> Outcome {
+fn register_class(env: &mut Env<'_>, f: &[u32], small_icon: u32, wide: bool) -> Outcome {
     let menu_text = if f[8] >= 0x1_0000 {
         let Some(text) = super::message::read_text(env, f[8], wide) else {
             set_last_error(env, 998);
@@ -803,6 +810,7 @@ fn register_class(env: &mut Env<'_>, f: &[u32], _small_icon: u32, wide: bool) ->
     let i = u.add_class_raw(&name, f[0], f[1], f[3], f[4]);
     let c = &mut u.classes[i];
     (c.cls_extra, c.icon, c.cursor, c.background, c.menu_name) = (f[2], f[5], f[6], f[7], f[8]);
+    c.small_icon = small_icon;
     c.menu_text = menu_text;
     c.unicode = Some(wide);
     let atom = c.atom;
@@ -835,7 +843,7 @@ fn unregister_class_a(env: &mut Env<'_>) -> Outcome {
 
 fn get_class_info_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name, out) = (env.arg(0), env.arg(1), env.arg(2));
-    get_class_info(env, inst, name, out, false)
+    get_class_info(env, inst, name, out, false, false)
 }
 
 #[win32(user32, name = "GetClassInfoW", level = state)]
@@ -845,14 +853,42 @@ fn get_class_info_w(
     name: WideStr,
     out: GuestPtr<u8>,
 ) -> Outcome {
-    get_class_info(env, instance.0, name.0.addr(), out.addr(), true)
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), true, false)
 }
 
-fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool) -> Outcome {
-    let api = if wide {
-        "user32.dll!GetClassInfoW"
-    } else {
-        "user32.dll!GetClassInfoA"
+#[win32(user32, name = "GetClassInfoExA", level = state)]
+fn get_class_info_ex_a(
+    env: &mut Env<'_>,
+    instance: AbiHandle,
+    name: AnsiStr,
+    out: GuestPtr<u8>,
+) -> Outcome {
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), false, true)
+}
+
+#[win32(user32, name = "GetClassInfoExW", level = state)]
+fn get_class_info_ex_w(
+    env: &mut Env<'_>,
+    instance: AbiHandle,
+    name: WideStr,
+    out: GuestPtr<u8>,
+) -> Outcome {
+    get_class_info(env, instance.0, name.0.addr(), out.addr(), true, true)
+}
+
+fn get_class_info(
+    env: &mut Env<'_>,
+    inst: u32,
+    name: u32,
+    out: u32,
+    wide: bool,
+    extended: bool,
+) -> Outcome {
+    let api = match (wide, extended) {
+        (false, false) => "user32.dll!GetClassInfoA",
+        (true, false) => "user32.dll!GetClassInfoW",
+        (false, true) => "user32.dll!GetClassInfoExA",
+        (true, true) => "user32.dll!GetClassInfoExW",
     };
     if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
         adv_abi::warn_unavailable(
@@ -891,7 +927,8 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
-    if adv_abi::guest::check_range(env.cpu, out, 40, adv_cpu::backend::Prot::WRITE).is_err() {
+    let size = if extended { 48 } else { 40 };
+    if adv_abi::guest::check_range(env.cpu, out, size, adv_cpu::backend::Prot::WRITE).is_err() {
         // The checked-pointer profile reports 998 rather than reproducing a native AV.
         set_last_error(env, 998);
         return Outcome::Return(0);
@@ -908,6 +945,7 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
         c.menu_name,
         name,
     ];
+    let small_icon = c.small_icon;
     let atom = c.atom;
     let encoding = usize::from(wide);
     let mut allocated = 0;
@@ -922,8 +960,15 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
             f[8] = allocated;
         }
     }
-    let bytes: Vec<_> = f.into_iter().flat_map(u32::to_le_bytes).collect();
-    if env.cpu.write(out, &bytes).is_err() {
+    let mut bytes: Vec<_> = f.into_iter().flat_map(u32::to_le_bytes).collect();
+    let target = if extended {
+        bytes.extend(small_icon.to_le_bytes());
+        // Native fills WNDCLASSEX's fields while preserving the caller's cbSize.
+        out + 4
+    } else {
+        out
+    };
+    if env.cpu.write(target, &bytes).is_err() {
         temp_free(env, allocated);
         set_last_error(env, 998);
         return Outcome::Return(0);
@@ -2301,7 +2346,7 @@ fn get_class_long_a(env: &mut Env<'_>) -> Outcome {
         -24 => c.proc,
         -26 => c.style,
         -14 => c.icon,
-        -34 => c.icon,
+        -34 => c.small_icon,
         -12 => c.cursor,
         -10 => c.background,
         -18 => c.wnd_extra,
@@ -2323,7 +2368,8 @@ fn set_class_long_a(env: &mut Env<'_>) -> Outcome {
     let slot = match idx {
         -24 => &mut c.proc,
         -26 => &mut c.style,
-        -14 | -34 => &mut c.icon,
+        -14 => &mut c.icon,
+        -34 => &mut c.small_icon,
         -12 => &mut c.cursor,
         -10 => &mut c.background,
         _ => return Outcome::Return(0),
@@ -2750,6 +2796,8 @@ pub fn register(reg: &mut Registry) {
     s(reg, "UnregisterClassA", 2, unregister_class_a);
     s(reg, "GetClassInfoA", 3, get_class_info_a);
     reg.register(get_class_info_w_ABI);
+    reg.register(get_class_info_ex_a_ABI);
+    reg.register(get_class_info_ex_w_ABI);
     s(reg, "GetClassNameA", 3, get_class_name_a);
     s(reg, "CreateWindowExA", 12, create_window_ex_a);
     reg.register(create_window_ex_w_ABI);
