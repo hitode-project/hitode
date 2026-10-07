@@ -5,6 +5,7 @@ use adv_abi::{GuestPtr, Registry, types::D3DVIEWPORT9, win32};
 use adv_machine::Env;
 mod binary;
 mod effect;
+mod matrix_stack;
 mod preshader;
 
 type Matrix = [f32; 16];
@@ -30,6 +31,7 @@ pub fn register(registry: &mut Registry) {
         registry.register(api);
     }
     effect::register(registry);
+    matrix_stack::register(registry);
 }
 
 fn product(left: Matrix, right: Matrix) -> Matrix {
@@ -60,14 +62,18 @@ fn scaling(
 ) -> GuestPtr<Matrix> {
     // Scalar assignments retain their IEEE bits, including negative zero and
     // NaN payloads. Every other coefficient is explicitly initialized.
-    let value = [
-        sx, 0., 0., 0., 0., sy, 0., 0., 0., 0., sz, 0., 0., 0., 0., 1.,
-    ];
+    let value = scaling_value(sx, sy, sz);
     if output.write(env.cpu, value).is_ok() {
         output
     } else {
         GuestPtr::default()
     }
+}
+
+fn scaling_value(sx: f32, sy: f32, sz: f32) -> Matrix {
+    [
+        sx, 0., 0., 0., 0., sy, 0., 0., 0., 0., sz, 0., 0., 0., 0., 1.,
+    ]
 }
 
 #[win32(d3dx9_43, name = "D3DXMatrixTranslation", level = implement)]
@@ -79,12 +85,16 @@ fn translation(
     z: f32,
 ) -> GuestPtr<Matrix> {
     // D3DX uses row vectors: the translation occupies the fourth matrix row.
-    let value = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, z, 1.];
+    let value = translation_value(x, y, z);
     if output.write(env.cpu, value).is_ok() {
         output
     } else {
         GuestPtr::default()
     }
+}
+
+fn translation_value(x: f32, y: f32, z: f32) -> Matrix {
+    [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, z, 1.]
 }
 
 #[win32(d3dx9_43, name = "D3DXMatrixRotationYawPitchRoll", level = implement)]
@@ -95,13 +105,22 @@ fn rotation_yaw_pitch_roll(
     pitch: f32,
     roll: f32,
 ) -> GuestPtr<Matrix> {
+    let value = rotation_yaw_pitch_roll_value(yaw, pitch, roll);
+    if output.write(env.cpu, value).is_ok() {
+        output
+    } else {
+        GuestPtr::default()
+    }
+}
+
+fn rotation_yaw_pitch_roll_value(yaw: f32, pitch: f32, roll: f32) -> Matrix {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
     let (sr, cr) = roll.sin_cos();
     // Row vectors apply roll, then pitch, then yaw: Rz * Rx * Ry. Expanding
     // that product keeps the affine coefficients explicitly zero/one even
     // when the trigonometric part produces an IEEE non-finite result.
-    let value = [
+    [
         cr * cy + sr * sp * sy,
         sr * cp,
         -cr * sy + sr * sp * cy,
@@ -118,12 +137,7 @@ fn rotation_yaw_pitch_roll(
         0.,
         0.,
         1.,
-    ];
-    if output.write(env.cpu, value).is_ok() {
-        output
-    } else {
-        GuestPtr::default()
-    }
+    ]
 }
 
 #[win32(d3dx9_43, name = "D3DXMatrixRotationY", level = implement)]

@@ -137,7 +137,9 @@
     "header_sha256": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9",
     "scope": "D3DXCreateMatrixStack export only; pure CPU matrix stack, no shader or effect pipeline changes",
     "target": "x86 WINAPI stdcall, HRESULT return, DWORD Flags and LPD3DXMATRIXSTACK* ppStack (two 32-bit stack words)",
-    "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatematrixstack"
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatematrixstack",
+    "native_oracle_source_sha256": "fe6063286513cc9a440f4d8e16759a4f9abb282b55e27f6294ec16d358e9df60",
+    "native_verification": "Authored x86 probe against installed d3dx9_43.dll: initialized identity, successful base Pop preserves the base matrix, guest-written GetTop survives Push/Pop, world right multiplication and local left multiplication, alias square, normalized/nonunit and zero axis, yaw/pitch/roll and final Release. GetTop storage may change after stack operations; no capacity-address pattern is emulated."
   },
   "legacy_d3dx_texture_memory": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9tex.h, image-info declaration lines319-322 and Ex texture lines1474-1489",
