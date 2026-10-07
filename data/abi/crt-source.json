@@ -309,6 +309,12 @@
     ],
     "profile": "Read raw guest bytes through one bounded byte-membership scanner, including high bytes; no locale or Unicode conversion, new string storage, or fabricated invalid-parameter callback. Stop before unnecessary source-tail reads and warn/fail outside supported bounds."
   },
+  "x87_intrinsic_power": {
+    "source": "Microsoft Learn _CIpow x86 compiler intrinsic declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cipow",
+    "scope": "Official void __cdecl _CIpow(); zero ordinary integer-stack words for three existing CRT aliases. Two x87 operands are consumed and the power result is pushed onto the x87 stack, using the existing FP result bridge. The void declaration describes compiler-specific register-stack effects; no invented ordinary double-return C prototype or two stack double arguments.",
+    "profile": "Reuse the common guest floating environment, x87 argument/result and CRT error owners; preserve lower stack levels and guest ESP. Only measured numeric/control/status profiles may succeed; unimplemented exception or special-value profiles must explicitly warn and fail."
+  },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
     "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",

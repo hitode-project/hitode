@@ -276,3 +276,6 @@ msvcr80.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8
 msvcr90.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
 msvcr90.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
 msvcr90.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt.dll	_CIpow	cdecl	void	void	
+msvcr80.dll	_CIpow	cdecl	void	void	
+msvcr90.dll	_CIpow	cdecl	void	void	
