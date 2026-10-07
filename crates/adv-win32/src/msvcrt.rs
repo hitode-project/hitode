@@ -22,6 +22,7 @@ mod path;
 mod random;
 mod scan;
 mod scalar_float;
+mod scalar_power;
 mod scalar_round;
 mod scalar_split;
 mod secure_memory;
@@ -112,6 +113,7 @@ pub fn register(r: &mut Registry) {
     time64::register(r);
     random::register(r);
     scalar_float::register(r);
+    scalar_power::register(r);
     scalar_round::register(r);
     scalar_split::register(r);
     onexit::register(r);
@@ -149,7 +151,6 @@ pub fn register(r: &mut Registry) {
         ("qsort", 4),
         ("ldexp", 3),
         ("frexp", 3),
-        ("_CIpow", 0),
         ("_ftol", 0),
         ("time", 1),
         ("_time32", 1),
@@ -1798,13 +1799,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 }
             };
             e.cpu.push_f64(result);
-            0
-        }
-        "_CIpow" => {
-            let (Some(y), Some(x)) = (e.cpu.pop_f64(), e.cpu.pop_f64()) else {
-                return Outcome::Fail("_CIpow: empty x87 stack".into());
-            };
-            e.cpu.push_f64(x.powf(y));
             0
         }
         "_ftol" => {
