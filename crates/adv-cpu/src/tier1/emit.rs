@@ -184,6 +184,25 @@ pub(super) fn supported(i: &Instruction) -> bool {
             dst && i.op1_kind() == OpKind::Memory
                 && matches!(i.memory_size().size(), 1 | 2)
                 && address(i)
+                || i.op0_kind() == OpKind::Register
+                    && register_part(i.op0_register())
+                        .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                    && i.op1_kind() == OpKind::Register
+                    && register_part(i.op1_register())
+                        .is_some_and(|(_, _, bits)| matches!(bits, 8 | 16))
+        }
+        M::Imul => {
+            dst && matches!(i.op_count(), 2 | 3)
+                && (i.op1_kind() == OpKind::Register && register(i.op1_register()).is_some()
+                    || i.op1_kind() == OpKind::Memory && i.memory_size().size() == 4 && address(i))
+                && (i.op_count() == 2 || imm(i, 2).is_some())
+        }
+        M::Cdq => true,
+        M::Xchg => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some()
+                && i.op1_kind() == OpKind::Register
+                && register_part(i.op1_register()).is_some()
         }
         M::Add | M::Adc | M::Sub | M::Sbb | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
             let memory =
@@ -773,11 +792,46 @@ impl Emitter {
             }
             M::Mov => self.operand(d, i, 1),
             M::Movzx | M::Movsx => {
-                self.ea(i, true);
-                self.mov(1, 9);
-                let signed = if i.mnemonic() == M::Movsx { SIGNED } else { 0 };
-                self.load(pc, i.memory_size().size() as u32 | signed);
-                self.mov(d, 0);
+                if i.op1_kind() == OpKind::Register {
+                    self.read_register(9, i.op1_register(), i.mnemonic() == M::Movsx);
+                    self.write_register(i.op0_register(), 9);
+                } else {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    let signed = if i.mnemonic() == M::Movsx { SIGNED } else { 0 };
+                    self.load(pc, i.memory_size().size() as u32 | signed);
+                    self.mov(d, 0);
+                }
+            }
+            M::Imul => {
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(10, 0);
+                } else {
+                    self.operand(10, i, 1);
+                }
+                if i.op_count() == 3 {
+                    self.mov(9, 10);
+                    self.operand(10, i, 2);
+                } else {
+                    self.mov(9, d);
+                }
+                self.binary(0x9b20_7c00, 11, 9, 10); // smull x11,w9,w10
+                self.word(0x9340_7d6f); // sxtw x15,w11
+                self.binary(0xeb00_0000, 31, 11, 15); // cmp x11,x15
+                self.cset14(1);
+                self.bfi(8, 14, 0);
+                self.bfi(8, 14, 11);
+                self.mov(d, 11);
+            }
+            M::Cdq => self.word(0x131f_7e75), // asr w21,w19,#31
+            M::Xchg => {
+                self.read_register(9, i.op0_register(), false);
+                self.read_register(10, i.op1_register(), false);
+                self.write_register(i.op0_register(), 10);
+                self.write_register(i.op1_register(), 9);
             }
             M::Push => {
                 self.esp_sub(1);

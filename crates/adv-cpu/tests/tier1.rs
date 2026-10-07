@@ -1307,3 +1307,146 @@ fn conditional_memory_faults_read_false_cmov_and_retry_setcc() {
         }
     }
 }
+#[test]
+fn signed_multiply_matches_overflow_and_preserves_undefined_flags() {
+    for form in 0..7 {
+        let code = assemble(|a| {
+            match form {
+                0 => a.imul_2(eax, ecx),
+                1 => a.imul_2(eax, dword_ptr(edi)),
+                2 => a.imul_3(eax, ecx, -1),
+                3 => a.imul_3(eax, dword_ptr(edi), -127),
+                4 => a.imul_3(eax, ecx, 0x7fffffff),
+                5 => a.imul_3(eax, dword_ptr(edi), 0x80000000u32 as i32),
+                _ => a.imul_2(eax, eax),
+            }
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        let values = [
+            0,
+            1,
+            2,
+            0xffff,
+            0x10000,
+            0x7fffffff,
+            0x80000000,
+            0xfffffffe,
+            u32::MAX,
+        ];
+        for left in values {
+            for right in values {
+                for flags in [2, 0xcd7] {
+                    for m in &mut machines {
+                        reset(m, [left, right, 5, 7, 0, 11, 13, DATA], flags);
+                        m.write(DATA, &right.to_le_bytes()).unwrap();
+                        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    }
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                }
+            }
+        }
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+        assert_eq!(machines[2].stats.verification.mismatches, 0);
+    }
+}
+
+#[test]
+fn register_extensions_exchange_and_cdq_preserve_aliases_and_flags() {
+    for form in 0..16 {
+        let code = assemble(|a| {
+            match form {
+                0 => a.cdq(),
+                1 => a.movzx(eax, cl),
+                2 => a.movzx(eax, ch),
+                3 => a.movzx(eax, cx),
+                4 => a.movsx(eax, cl),
+                5 => a.movsx(eax, ch),
+                6 => a.movsx(eax, cx),
+                7 => a.movsx(ax, ah),
+                8 => a.movzx(ax, ah),
+                9 => a.xchg(eax, ecx),
+                10 => a.xchg(ax, cx),
+                11 => a.xchg(al, ch),
+                12 => a.xchg(al, ah),
+                13 => a.xchg(eax, eax),
+                14 => a.movsx(eax, ah),
+                _ => a.lea(eax, dword_ptr(ebx + ecx * 8 + 0x7fffffff)),
+            }
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        let values = [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0xff,
+            0x7fff,
+            0x8000,
+            0xffff,
+            0x7fffffff,
+            0x80000000,
+            u32::MAX,
+        ];
+        for left in values {
+            for right in values {
+                for m in &mut machines {
+                    reset(
+                        m,
+                        [left, right, 0x12345678, 0xfffffff0, 0, 11, 13, DATA],
+                        0xcd7,
+                    );
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(m.state.eflags, 0xcd7);
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+            }
+        }
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+        assert_eq!(machines[2].stats.verification.mismatches, 0);
+    }
+}
+
+#[test]
+fn multiply_and_carry_memory_source_faults_preserve_destination_and_flags() {
+    for form in 0..4 {
+        let code = assemble(|a| {
+            a.mov(esi, 17).unwrap();
+            match form {
+                0 => a.imul_2(eax, dword_ptr(edi)),
+                1 => a.imul_3(eax, dword_ptr(edi), -1),
+                2 => a.adc(eax, dword_ptr(edi)),
+                _ => a.sbb(eax, dword_ptr(edi)),
+            }
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            reset(m, [0x80000000, 3, 5, 7, 0, 11, 0, DATA + 4095], 0xcd7);
+            m.write(DATA + 4095, &u32::MAX.to_le_bytes()).unwrap();
+            m.protect(DATA + 4096, 4096, 0).unwrap();
+        }
+        let outcome = machines[0].run(STOP, 100).unwrap();
+        assert!(matches!(outcome, RunOutcome::ReadFault { .. }));
+        for m in &mut machines[1..] {
+            assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        assert_eq!(machines[2].tier1_stats().native_instructions, 1);
+        for m in &mut machines {
+            m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
