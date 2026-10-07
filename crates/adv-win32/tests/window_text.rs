@@ -660,6 +660,9 @@ mod call_proc;
 #[path = "window_text/paint_leases.rs"]
 mod paint_leases;
 
+#[path = "window_text/private_dc.rs"]
+mod private_dc;
+
 #[path = "window_text/update_region.rs"]
 mod update_region;
 
