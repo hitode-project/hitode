@@ -1,3 +1,13 @@
+<#
+.SYNOPSIS
+Compare authored zero-fixup DLL loading on native Windows, interpreter and JIT.
+.DESCRIPTION
+Runner selects adv-run; OutputDirectory stores authored binaries and 19 scalar
+outcomes under target/architecture-acceptance. NativeOnly skips guest replays.
+No sample DLL is loaded or modified. Mismatched outputs terminate with an error.
+.EXAMPLE
+pwsh tools/fixtures/test-empty-relocation-directory.ps1 -NativeOnly
+#>
 param(
     [string]$Runner=(Join-Path $PSScriptRoot '../../target/debug/adv-run.exe'),
     [string]$OutputDirectory=(Join-Path $PSScriptRoot '../../target/architecture-acceptance/empty-relocation-directory'),
