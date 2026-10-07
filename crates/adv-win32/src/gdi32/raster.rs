@@ -198,7 +198,7 @@ impl Raster {
         mode: u32,
     ) -> Result<u32, String> {
         Ok({
-            if !dcs.is_window_dc(objects, dc) && !dcs.contains(objects, dc) {
+            if dc != adv_os::gdi::WINDOW_DC && dcs.modes(objects, dc).is_none() {
                 return Ok(self.fail(6));
             }
             if !(1..=3).contains(&mode) {

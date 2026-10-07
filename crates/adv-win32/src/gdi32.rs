@@ -574,6 +574,7 @@ fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
 /// from the newest. Either way the restored state and every newer one leave the stack.
 #[win32(gdi32, name = "RestoreDC", level = implement)]
 fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
+    let display = raster::front::is_user_dc(env, dc.0);
     let (state, raster, bitmap) = match get_mut(env, dc.0) {
         Some(GdiObj::Dc {
             saved,
@@ -611,7 +612,9 @@ fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
     {
         let kept = selected[3];
         *selected = state.selected;
-        if raster {
+        if raster || display {
+            // USER owns the current primary binding, not the saved logical
+            // bitmap selection. Restoring attributes cannot rebind its canvas.
             selected[3] = kept;
         }
         *palette = state.palette;

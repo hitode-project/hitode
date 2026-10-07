@@ -3,6 +3,7 @@ use super::*;
 use adv_cpu::backend::Reg;
 
 mod clipbox;
+mod display_dc;
 mod drawdib;
 
 fn call(m: &mut Machine<JitCpu>, data: u32, api: &str, args: &[u32]) -> u32 {

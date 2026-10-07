@@ -5,6 +5,8 @@ mod loader;
 mod loader_lock;
 mod memory;
 mod path;
+mod peb_lock;
+pub(crate) use peb_lock::install as install_peb_lock;
 mod procedure;
 mod strings;
 mod thread;
@@ -16,6 +18,7 @@ use adv_os::Heaps;
 
 use crate::stdcall;
 mod file;
+mod heap;
 mod open;
 mod section;
 
@@ -204,9 +207,11 @@ fn rtl_init_unicode_string(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    heap::register(reg);
     path::register(reg);
     directory::register(reg);
     loader_lock::register(reg);
+    peb_lock::register(reg);
     loader::register(reg);
     strings::register(reg);
     procedure::register(reg);

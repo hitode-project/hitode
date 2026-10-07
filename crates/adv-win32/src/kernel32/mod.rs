@@ -38,6 +38,7 @@ pub(crate) use process::{command_line, configure_codepage};
 mod registered_wait;
 mod string;
 mod sync;
+pub(crate) use sync::{CS_SIZE, enter_cs, initialize_cs, leave_cs};
 mod time;
 mod timer;
 mod toolhelp;

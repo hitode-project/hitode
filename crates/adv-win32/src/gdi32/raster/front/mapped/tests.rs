@@ -63,7 +63,8 @@ fn header<B: Backend>(m: &mut Machine<B>, address: u32, bpp: u16, bottom_up: boo
 fn shared<B: Backend>(cpu: B) {
     let (mut m, data) = fixture(cpu);
     m.ext.get_mut::<Win32>().user.screen = (3, 2);
-    assert_eq!(invoke(&mut m, data, get_dc_ABI, &[0]), WINDOW_DC);
+    let screen_dc = invoke(&mut m, data, get_dc_ABI, &[0]);
+    assert_ne!(screen_dc, 0);
     for offset in [40u32, 0x10028] {
         for bottom_up in [false, true] {
             let section = value(create_section(
@@ -111,7 +112,7 @@ fn shared<B: Backend>(cpu: B) {
                     &mut m,
                     data,
                     bit_blt_ABI,
-                    &[WINDOW_DC, 0, 0, 3, 2, dc, 0, 0, 0x00cc0020]
+                    &[screen_dc, 0, 0, 3, 2, dc, 0, 0, 0x00cc0020]
                 ),
                 1
             );

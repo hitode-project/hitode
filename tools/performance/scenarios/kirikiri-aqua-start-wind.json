@@ -1,0 +1,54 @@
+[
+  {
+    "at": 90,
+    "checkpoint": "title"
+  },
+  {
+    "at": 93,
+    "command": "click 280 655"
+  },
+  {
+    "at": 96,
+    "checkpoint": "chapters"
+  },
+  {
+    "at": 99,
+    "command": "click 320 617"
+  },
+  {
+    "at": 108,
+    "checkpoint": "story"
+  },
+  {
+    "at": 112,
+    "command": "key 13"
+  },
+  {
+    "at": 118,
+    "checkpoint": "advance-one"
+  },
+  {
+    "at": 121,
+    "command": "click 640 500"
+  },
+  {
+    "at": 127,
+    "checkpoint": "advance-two"
+  },
+  {
+    "at": 130,
+    "command": "key 113"
+  },
+  {
+    "at": 136,
+    "checkpoint": "save-screen"
+  },
+  {
+    "at": 140,
+    "command": "click 220 280"
+  },
+  {
+    "at": 146,
+    "checkpoint": "saved-slot"
+  }
+]
