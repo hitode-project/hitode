@@ -41,6 +41,8 @@ pub(super) fn supported(i: &Instruction) -> bool {
     let count = i.op_count();
     match i.mnemonic() {
         M::Emms => count == 0,
+        M::Movq2dq => count == 2 && simd::register(i.op0_register()).is_some() && mm(1),
+        M::Movdq2q => count == 2 && mm(0) && simd::register(i.op1_register()).is_some(),
         M::Movd => {
             count == 2 && (mm(0) && (gpr(1) || memory(1, 4)) || (gpr(0) || memory(0, 4)) && mm(1))
         }
@@ -188,7 +190,23 @@ impl Emitter<'_> {
             return;
         }
         let lanes = self.lanes_active();
-        if i.mnemonic() == M::Movd && lanes {
+        if i.mnemonic() == M::Movq2dq {
+            let value = self.mmx_read(i, 1);
+            let value = self.mmx_cast(value, types::I64X2);
+            let low = self.b.ins().extractlane(value, 0);
+            // MMX temporaries may have nonzero, nonarchitectural upper lanes.
+            let value = self.b.ins().scalar_to_vector(types::I64X2, low);
+            let value = self.mmx_cast(value, types::I8X16);
+            self.b.def_var(
+                self.xmm[simd::register(i.op0_register()).unwrap()].unwrap(),
+                value,
+            );
+        } else if i.mnemonic() == M::Movdq2q {
+            let value = self
+                .b
+                .use_var(self.xmm[simd::register(i.op1_register()).unwrap()].unwrap());
+            self.set_mmx(i, value);
+        } else if i.mnemonic() == M::Movd && lanes {
             if register(i.op0_register()).is_some() {
                 let value = if i.op1_kind() == OpKind::Memory {
                     self.lane_load(4)
