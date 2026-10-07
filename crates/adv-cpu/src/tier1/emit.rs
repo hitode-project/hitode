@@ -23,7 +23,19 @@ struct Fixup {
     kind: Branch,
 }
 
+/// Host addresses of the checked scalar access helpers. Each takes the entry
+/// frame in x0 and follows AAPCS64, so guest registers in x19-x28 survive.
+#[derive(Clone, Copy)]
+pub(super) struct Helpers {
+    /// `(frame, address) -> value | status << 32`; nonzero status leaves.
+    pub load: u64,
+    /// `(frame, address, value) -> 0` to continue, 1 after a store that
+    /// must leave native code, 2 when not performed.
+    pub store: u64,
+}
+
 pub(super) struct Emitter {
+    helpers: Helpers,
     pub words: Vec<u32>,
     pub entries: BTreeMap<u32, usize>,
     exits: BTreeMap<u32, usize>,
@@ -91,8 +103,9 @@ pub(super) fn supported(i: &Instruction) -> bool {
 }
 
 impl Emitter {
-    pub fn new() -> Self {
+    pub fn new(helpers: Helpers) -> Self {
         Self {
+            helpers,
             words: Vec::new(),
             entries: BTreeMap::new(),
             exits: BTreeMap::new(),
@@ -168,6 +181,31 @@ impl Emitter {
             self.load32(10, 72);
             self.binary(0x0b00_0000, 9, 9, 10);
         }
+    }
+    fn address64(&mut self, d: u8, n: u64) {
+        self.word(0xd280_0000 | ((n & 0xffff) as u32) << 5 | d as u32);
+        for (shift, movk) in [(16, 0xf2a0_0000), (32, 0xf2c0_0000), (48, 0xf2e0_0000)] {
+            self.word(movk | (((n >> shift) & 0xffff) as u32) << 5 | d as u32);
+        }
+    }
+    /// Call a helper with x0 = frame and w1/w2 already set. Caller-saved
+    /// flags, remaining units and stop are spilled to the frame around it.
+    fn call(&mut self, target: u64) {
+        self.store32(8, 32);
+        self.word(0xf900_1767); // str x7,[x27,#40]
+        self.word(0xa9bf_7bfd); // stp x29,x30,[sp,#-16]!
+        self.word(0x9100_03fd); // mov x29,sp
+        self.word(0xaa1b_03e0); // mov x0,x27
+        self.address64(16, target);
+        self.word(0xd63f_0200); // blr x16
+        self.word(0xa8c1_7bfd); // ldp x29,x30,[sp],#16
+        self.load32(8, 32);
+        self.word(0xf940_1767); // ldr x7,[x27,#40]
+        self.load32(6, 48);
+    }
+    /// Branch over the next `words` instructions when w`r` is nonzero.
+    fn skip_nonzero(&mut self, r: u8, words: u32) {
+        self.word(0x3500_0000 | (words + 1) << 5 | r as u32);
     }
     fn charge(&mut self) {
         self.word(0xd100_04e7);
@@ -266,6 +304,17 @@ impl Emitter {
         match i.mnemonic() {
             M::Mov if i.op1_kind() == OpKind::Memory => {
                 self.ea(i, true);
+                self.mov(1, 9);
+                self.call(self.helpers.load);
+                self.word(0xd360_fc09); // lsr x9,x0,#32
+                self.skip_nonzero(9, 3);
+                self.mov(d, 0);
+                self.charge();
+                self.jump(Label::Guest(i.next_ip32()), Branch::B);
+                // The helper refused: leave through the checked exit, which
+                // reports the exact fault. The call clobbered w5.
+                self.constant(5, pc);
+                self.ea(i, true);
                 self.store32(9, 64);
                 self.constant(9, u32::from(d - 19));
                 self.store32(9, 76);
@@ -275,6 +324,23 @@ impl Emitter {
                 return;
             }
             M::Mov if i.op0_kind() == OpKind::Memory => {
+                self.ea(i, true);
+                self.mov(1, 9);
+                self.operand(2, i, 1);
+                self.call(self.helpers.store);
+                self.skip_nonzero(0, 2);
+                self.charge();
+                self.jump(Label::Guest(i.next_ip32()), Branch::B);
+                // A committed store that changed code or the memory epoch
+                // leaves so the owner revalidates before the next instruction.
+                self.word(0x7100_041f); // cmp w0,#1
+                let refused = self.words.len();
+                self.word(0);
+                self.charge();
+                self.constant(5, i.next_ip32());
+                self.jump(Label::Exit(DISPATCH), Branch::B);
+                self.words[refused] = 0x5400_0001 | ((self.words.len() - refused) as u32) << 5; // b.ne
+                self.constant(5, pc);
                 self.ea(i, true);
                 self.store32(9, 64);
                 self.operand(9, i, 1);

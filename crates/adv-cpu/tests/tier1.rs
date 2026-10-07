@@ -119,7 +119,8 @@ fn direct_loop_checked_memory_and_single_instruction_fallback_continue() {
     equivalent(&machines[0], &machines[2], 0x8d5);
     let stats = machines[2].tier1_stats();
     assert_eq!(stats.fallback_instructions, 13);
-    assert_eq!(stats.checked_accesses, 2);
+    assert_eq!(stats.inline_accesses, 2);
+    assert_eq!(stats.checked_accesses, 0);
     assert!(stats.direct_transfers >= 12);
     assert_eq!(stats.saves, stats.restores);
     println!(
@@ -210,6 +211,9 @@ fn faults_keep_committed_prefix_and_retry_only_the_faulting_access() {
         ));
         equivalent(&reference, &tier, 0x8d5);
         assert_eq!(tier.state.regs[1], 1);
+        // The committed store stayed inline; only the refused access left.
+        assert_eq!(tier.tier1_stats().inline_accesses, 1);
+        assert_eq!(tier.tier1_stats().checked_accesses, 1);
         for m in [&mut reference, &mut tier] {
             m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
             assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
@@ -382,4 +386,33 @@ fn tier_verification_counts_tier1_steps_through_loops_memory_and_fallbacks() {
         ));
     }
     assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn compile_latency_is_reported_for_both_native_tiers() {
+    // Diagnostic only: host compile cost for the same straight-line unit.
+    let code = assemble(|a| {
+        for n in 0..30u32 {
+            a.add(eax, ecx).unwrap();
+            a.xor(edx, eax).unwrap();
+            a.mov(dword_ptr(DATA + n * 4), edx).unwrap();
+            a.mov(ebx, dword_ptr(DATA + n * 4)).unwrap();
+        }
+        a.ret().unwrap();
+    });
+    let mut tiers = [machine(&code, 1), machine(&code, 2)];
+    for m in &mut tiers {
+        reset(m, [3, 5, 0, 0, 0, 0, 0, 0], 2);
+        assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
+    }
+    equivalent(&tiers[0], &tiers[1], 0x8d5);
+    let tier1 = tiers[1].tier1_stats();
+    assert_eq!(tier1.compilations, 1);
+    assert_eq!(tier1.inline_accesses, 60);
+    println!(
+        "compile latency (121 guest instructions): cranelift_ns={} tier1_ns={} tier1_code_bytes={}",
+        tiers[0].stats.compile_time.as_nanos(),
+        tier1.compile_time.as_nanos(),
+        tier1.code_bytes
+    );
 }

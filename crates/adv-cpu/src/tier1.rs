@@ -1,5 +1,6 @@
 //! Explicit ARM64 Tier 1 lane: bounded integer templates with exact Tier 0 exits.
-//! Memory operations retain the existing checked Memory contract. No hardware
+//! Memory operations retain the existing checked Memory contract, through
+//! helper calls from native code and an exit when a helper refuses. No hardware
 //! fault recovery, floating approximation or parallel guest execution is enabled.
 #![cfg_attr(
     not(all(target_arch = "aarch64", target_os = "linux")),
@@ -24,7 +25,10 @@ pub struct Tier1Stats {
     pub saves: u64,
     pub restores: u64,
     pub fallback_instructions: u64,
+    /// Accesses that left native code for the checked Rust exit.
     pub checked_accesses: u64,
+    /// Accesses completed by a helper call without leaving native code.
+    pub inline_accesses: u64,
     pub invalidations: u64,
 }
 

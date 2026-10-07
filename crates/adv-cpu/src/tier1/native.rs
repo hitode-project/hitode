@@ -54,6 +54,57 @@ unsafe extern "C" {
     fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);
 }
 
+/// The entry frame followed by owner state that only the access helpers use.
+/// The frame comes first, so the pointer in x27 is also the helpers' context.
+#[repr(C)]
+struct Entry {
+    frame: Tier1Frame,
+    memory: *mut Memory,
+    inline: u64,
+}
+
+/// Checked 4-byte guest load without leaving native code. The checks are the
+/// same as the LOAD exit, which reports the exact fault when this refuses.
+extern "C" fn load(entry: *mut Entry, address: u32) -> u64 {
+    // SAFETY: called only by emitted code inside `run_block`, which derived
+    // `memory` from its exclusive borrow and does not touch it until return.
+    let (memory, inline) = unsafe { (&*(*entry).memory, &mut (*entry).inline) };
+    if !crate::interpreter::accessible(memory, address, 4, crate::READ) {
+        return 1 << 32;
+    }
+    match memory.read_data(address, 4) {
+        Ok(bytes) => {
+            *inline += 1;
+            u64::from(u32::from_le_bytes(
+                bytes.as_ref().try_into().expect("checked scalar size"),
+            ))
+        }
+        Err(_) => 1 << 32,
+    }
+}
+
+/// Checked 4-byte guest store without leaving native code. A store to
+/// executable memory or one that advances the epoch asks the code to leave.
+extern "C" fn store(entry: *mut Entry, address: u32, value: u32) -> u32 {
+    // SAFETY: as for `load`.
+    let (memory, inline) = unsafe { (&mut *(*entry).memory, &mut (*entry).inline) };
+    // Memory::write is a host write API; guest permissions must be checked
+    // before it so immutable code and guards cannot be bypassed.
+    if !crate::interpreter::accessible(memory, address, 4, crate::WRITE) {
+        return 2;
+    }
+    let epoch = memory.epoch;
+    if memory.write(address, &value.to_le_bytes()).is_err() {
+        return 2;
+    }
+    *inline += 1;
+    u32::from(
+        memory.epoch != epoch
+            || memory.executable(address, 1)
+            || memory.executable(address.wrapping_add(3), 1),
+    )
+}
+
 struct Code {
     pointer: NonNull<u8>,
     len: usize,
@@ -201,7 +252,10 @@ impl Engine {
         if !instructions.contains_key(&start) {
             return Ok(false);
         }
-        let mut emitted = emit::Emitter::new();
+        let mut emitted = emit::Emitter::new(emit::Helpers {
+            load: load as usize as u64,
+            store: store as usize as u64,
+        });
         for instruction in instructions.values() {
             emitted.instruction(instruction);
         }
@@ -255,24 +309,32 @@ impl Engine {
             });
         }
         let (unit, offset) = &self.entries[&state.eip];
-        let mut frame = Tier1Frame {
-            regs: state.regs,
-            flags: state.eflags,
-            pc: state.eip,
-            remaining: u64::from(units),
-            stop,
-            fs_base: state.fs_base,
-            ..Default::default()
+        let window = memory.ptr.as_ptr();
+        let mut entry = Entry {
+            frame: Tier1Frame {
+                regs: state.regs,
+                flags: state.eflags,
+                pc: state.eip,
+                remaining: u64::from(units),
+                stop,
+                fs_base: state.fs_base,
+                ..Default::default()
+            },
+            memory: std::ptr::from_mut(memory),
+            inline: 0,
         };
         // SAFETY: this owner pins all code and exclusively owns the CPU/memory.
-        // Every emitted entry uses the fixed ABI; helpers run only after return.
+        // Every emitted entry uses the fixed ABI; the access helpers reach
+        // memory only through `entry`, and `memory` is unused until return.
         unsafe {
             adv_tier1_enter(
-                &mut frame,
+                (&raw mut entry).cast(),
                 unit.code.pointer.as_ptr().add(*offset),
-                memory.ptr.as_ptr(),
+                window,
             );
         }
+        let frame = entry.frame;
+        self.stats.inline_accesses += entry.inline;
         state.regs = frame.regs;
         state.eflags = frame.flags;
         state.eip = frame.pc;
