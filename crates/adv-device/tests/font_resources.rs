@@ -50,6 +50,11 @@ fn loaded_faces_change_real_matching_and_cache_then_retire_with_selected_fonts()
     let before = text.glyph(&request, glyph()).unwrap();
     let (id, faces) = text.add_resource(SINGLE).unwrap();
     assert_eq!(faces, 1);
+    assert!(
+        text.enumerate(Some(&request.face), FontEnumeration::Families)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(text.stats().fonts, 0);
     assert_eq!(text.stats().glyphs, 0);
     let loaded = text.glyph(&request, glyph()).unwrap();
@@ -81,6 +86,42 @@ fn loaded_faces_change_real_matching_and_cache_then_retire_with_selected_fonts()
         &restored,
         &text.glyph(&request, glyph()).unwrap()
     ));
+}
+
+#[test]
+fn file_visibility_is_independent_of_private_registration_and_real_matching() {
+    let _lock = RESOURCES.lock().unwrap();
+    let request = font("ADV Resource Fixture");
+    let baseline = Text::default().glyph(&request, glyph()).unwrap();
+    for enumerable in [false, true] {
+        let mut text = Text::default();
+        let (id, faces) = text.add_file_resource(SINGLE, enumerable).unwrap();
+        assert_eq!(faces, 1);
+        let loaded = text.glyph(&request, glyph()).unwrap();
+        assert_eq!(loaded.metrics.advance_x, 20);
+        assert_ne!(loaded.data, baseline.data);
+        for mode in [
+            FontEnumeration::Faces,
+            FontEnumeration::Families,
+            FontEnumeration::FamiliesEx(Encoding::Automatic),
+        ] {
+            let entries = text.enumerate(Some(&request.face), mode).unwrap();
+            assert_eq!(!entries.is_empty(), enumerable);
+            assert!(entries.iter().all(|entry| entry.font.face == request.face));
+        }
+        assert!(text.remove_resource(id).unwrap());
+        assert!(
+            text.enumerate(Some(&request.face), FontEnumeration::Families)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(text.glyph(&request, glyph()).unwrap().data, baseline.data);
+        assert_eq!(
+            loaded.metrics.advance_x, 20,
+            "retained glyph ownership survives removal"
+        );
+        assert_eq!(text.resource_stats(), (0, 0));
+    }
 }
 
 #[test]

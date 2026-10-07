@@ -18,6 +18,7 @@ mod resource;
 mod widths;
 mod charset;
 mod logical;
+mod kerning;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -28,7 +29,7 @@ const GDI_ERROR: u32 = u32::MAX;
 #[derive(Default)]
 struct Fonts {
     text: Text,
-    resources: std::collections::BTreeMap<String, resource::Reference>,
+    resources: std::collections::BTreeMap<(String, u32), resource::Reference>,
 }
 
 pub fn register(registry: &mut Registry) {
@@ -40,6 +41,7 @@ pub fn register(registry: &mut Registry) {
     widths::register(registry);
     charset::register(registry);
     logical::register(registry);
+    kerning::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,

@@ -364,6 +364,15 @@ pub struct TextExtent {
     pub width: i32,
     pub height: i32,
 }
+/// A Unicode pair and its signed advance adjustment in logical font units.
+/// This is a backend result, not a packed guest KERNINGPAIR structure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KerningPair {
+    pub first: u16,
+    pub second: u16,
+    pub adjustment: i32,
+}
+pub const MAX_KERNING_PAIRS: u32 = 1024 * 1024;
 /// The actual portable face and rendering size, for reproducible references.
 /// This reports the selected bytes, including a registered guest resource.
 #[cfg(not(windows))]
@@ -418,7 +427,7 @@ pub struct Text {
     bytes: usize,
     hits: u64,
     #[cfg(windows)]
-    resources: BTreeMap<FontResourceId, windows::MemoryFont>,
+    resources: BTreeMap<FontResourceId, windows::FontResource>,
     #[cfg(windows)]
     next_resource: u64,
     #[cfg(windows)]
@@ -435,7 +444,7 @@ pub const MAX_FONT_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 pub const FONT_CACHE_CAPACITY: usize = 128;
 impl Text {
     /// Enumerate current backend fonts without exposing a native DC or font
-    /// handle. Memory-font registrations retain the provider's visibility rules.
+    /// handle. Memory resources and hidden file resources are not enumerable.
     pub fn enumerate(
         &self,
         face: Option<&str>,
@@ -453,6 +462,23 @@ impl Text {
     /// Install owned backend font data. Successful resource changes invalidate
     /// matching and glyph caches; immutable glyph results held by callers live on.
     pub fn add_resource(&mut self, bytes: &[u8]) -> Result<(FontResourceId, u32), TextError> {
+        self.register_resource(bytes, None)
+    }
+    /// Register a file image read through the guest filesystem. The backend
+    /// owns its private registration and copied data; file visibility is separate
+    /// from memory resources, which are always hidden from enumeration.
+    pub fn add_file_resource(
+        &mut self,
+        bytes: &[u8],
+        enumerable: bool,
+    ) -> Result<(FontResourceId, u32), TextError> {
+        self.register_resource(bytes, Some(enumerable))
+    }
+    fn register_resource(
+        &mut self,
+        bytes: &[u8],
+        file_visibility: Option<bool>,
+    ) -> Result<(FontResourceId, u32), TextError> {
         #[cfg(windows)]
         {
             if bytes.is_empty()
@@ -465,8 +491,8 @@ impl Text {
                 .next_resource
                 .checked_add(1)
                 .ok_or_else(|| TextError::Font("font resource identity exhausted".into()))?;
-            let resource = windows::MemoryFont::new(bytes)?;
-            let count = resource.faces;
+            let resource = windows::FontResource::new(bytes, file_visibility)?;
+            let count = resource.faces();
             self.invalidate_fonts();
             let id = FontResourceId(next);
             self.resources.insert(id, resource);
@@ -476,7 +502,9 @@ impl Text {
         }
         #[cfg(not(windows))]
         {
-            let result = self.backend.add_resource(bytes)?;
+            let result = self
+                .backend
+                .add_resource(bytes, file_visibility.unwrap_or(false))?;
             self.invalidate_fonts();
             Ok(result)
         }
@@ -493,7 +521,7 @@ impl Text {
             resource.remove()?;
             self.invalidate_fonts();
             let resource = self.resources.remove(&id).unwrap();
-            self.resource_bytes -= resource.bytes;
+            self.resource_bytes -= resource.bytes();
             Ok(true)
         }
         #[cfg(not(windows))]
@@ -681,6 +709,45 @@ impl Text {
         #[cfg(not(windows))]
         {
             self.font(request)?.extent(input)
+        }
+    }
+    /// Query the selected font's complete Unicode kerning-pair count using the
+    /// same realized-font owner as metrics, extents and glyph rasterization.
+    pub fn kerning_pair_count(&mut self, request: &FontRequest) -> Result<u32, TextError> {
+        #[cfg(windows)]
+        {
+            Ok(self.font(request)?.kerning_pair_count())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = request;
+            Err(TextError::Font(
+                "complete Unicode kerning-pair enumeration is unavailable on the portable font backend"
+                    .into(),
+            ))
+        }
+    }
+    /// Copy at most capacity real pairs in provider order. The native provider
+    /// supports partial buffers, preserving its signed logical-unit adjustments.
+    pub fn kerning_pairs(
+        &mut self,
+        request: &FontRequest,
+        capacity: u32,
+    ) -> Result<Vec<KerningPair>, TextError> {
+        if capacity == 0 || capacity > MAX_KERNING_PAIRS {
+            return Err(TextError::Font("invalid kerning-pair capacity".into()));
+        }
+        #[cfg(windows)]
+        {
+            self.font(request)?.kerning_pairs(capacity)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = request;
+            Err(TextError::Font(
+                "complete Unicode kerning-pair enumeration is unavailable on the portable font backend"
+                    .into(),
+            ))
         }
     }
     pub fn glyph(

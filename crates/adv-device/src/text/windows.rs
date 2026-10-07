@@ -5,6 +5,132 @@ use windows_sys::Win32::Graphics::Gdi::{self as gdi, HDC, HFONT, HGDIOBJ};
 
 pub(super) mod enumeration;
 
+pub(super) enum FontResource {
+    Memory(MemoryFont),
+    File(FileFont),
+}
+impl FontResource {
+    pub(super) fn new(bytes: &[u8], file_visibility: Option<bool>) -> Result<Self, TextError> {
+        match file_visibility {
+            Some(enumerable) => FileFont::new(bytes, enumerable).map(Self::File),
+            None => MemoryFont::new(bytes).map(Self::Memory),
+        }
+    }
+    pub(super) fn faces(&self) -> u32 {
+        match self {
+            Self::Memory(resource) => resource.faces,
+            Self::File(resource) => resource.faces,
+        }
+    }
+    pub(super) fn bytes(&self) -> usize {
+        match self {
+            Self::Memory(resource) => resource.bytes,
+            Self::File(resource) => resource.bytes,
+        }
+    }
+    pub(super) fn remove(&mut self) -> Result<(), TextError> {
+        match self {
+            Self::Memory(resource) => resource.remove(),
+            Self::File(resource) => resource.remove(),
+        }
+    }
+}
+
+/// GDI file registration supplies native enumeration metadata and matching.
+/// The copied VFS image and its native reference retire with the resource owner.
+pub(super) struct FileFont {
+    path: std::path::PathBuf,
+    wide_path: Vec<u16>,
+    flags: u32,
+    registered: bool,
+    faces: u32,
+    bytes: usize,
+}
+impl FileFont {
+    fn new(bytes: &[u8], enumerable: bool) -> Result<Self, TextError> {
+        use std::{
+            io::Write,
+            os::windows::ffi::OsStrExt,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut resource = None;
+        for _ in 0..64 {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("adv-host-font-{}-{serial}.ttf", std::process::id()));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(TextError::Font(format!("font resource copy: {error}"))),
+            };
+            let owner = Self {
+                wide_path: path.as_os_str().encode_wide().chain([0]).collect(),
+                path,
+                // Every host registration belongs to this guest's process owner;
+                // guest session visibility never installs fonts for other apps.
+                flags: gdi::FR_PRIVATE | if enumerable { 0 } else { gdi::FR_NOT_ENUM },
+                registered: false,
+                faces: 0,
+                bytes: bytes.len(),
+            };
+            let written = file.write_all(bytes);
+            drop(file);
+            written.map_err(|error| TextError::Font(format!("font resource copy: {error}")))?;
+            resource = Some(owner);
+            break;
+        }
+        let Some(mut resource) = resource else {
+            return Err(TextError::Font(
+                "font resource copy identity exhausted".into(),
+            ));
+        };
+        // SAFETY: terminated host path to the exclusively owned VFS copy. The
+        // private flag is unconditional; the reserved parameter is NULL.
+        let faces = unsafe {
+            gdi::AddFontResourceExW(
+                resource.wide_path.as_ptr(),
+                resource.flags,
+                std::ptr::null(),
+            )
+        };
+        if faces <= 0 {
+            return Err(TextError::Font("invalid font resource".into()));
+        }
+        resource.registered = true;
+        resource.faces = faces as u32;
+        Ok(resource)
+    }
+    fn remove(&mut self) -> Result<(), TextError> {
+        // SAFETY: the same owned path and characteristics used for registration.
+        if unsafe {
+            gdi::RemoveFontResourceExW(self.wide_path.as_ptr(), self.flags, std::ptr::null())
+        } == 0
+        {
+            return Err(TextError::Font("font resource removal failed".into()));
+        }
+        self.registered = false;
+        Ok(())
+    }
+}
+impl Drop for FileFont {
+    fn drop(&mut self) {
+        if self.registered
+            && let Err(error) = self.remove()
+        {
+            log::warn!("{error}");
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            log::warn!("font resource copy cleanup: {error}");
+        }
+    }
+}
+
 pub(super) struct MemoryFont {
     handle: windows_sys::Win32::Foundation::HANDLE,
     pub faces: u32,
@@ -441,6 +567,27 @@ impl Font {
             ],
         ))
     }
+    pub(super) fn kerning_pair_count(&self) -> u32 {
+        // SAFETY: this font's private measurement DC retains its selected HFONT;
+        // NULL output queries the complete native count without allocating.
+        unsafe { gdi::GetKerningPairsW(self.dc, 0, std::ptr::null_mut()) }
+    }
+    pub(super) fn kerning_pairs(&self, capacity: u32) -> Result<Vec<KerningPair>, TextError> {
+        if capacity == 0 || capacity > MAX_KERNING_PAIRS {
+            return Err(TextError::Font("invalid kerning-pair capacity".into()));
+        }
+        let mut pairs = vec![gdi::KERNINGPAIR::default(); capacity as usize];
+        // SAFETY: bounded initialized native storage, with the same DC and
+        // selected native font as the preceding count and other text queries.
+        let written = unsafe { gdi::GetKerningPairsW(self.dc, capacity, pairs.as_mut_ptr()) };
+        if written > capacity {
+            return Err(TextError::Font("native kerning-pair count exceeds capacity".into()));
+        }
+        pairs.truncate(written as usize);
+        Ok(pairs.into_iter().map(|pair| KerningPair {
+            first: pair.wFirst, second: pair.wSecond, adjustment: pair.iKernAmount,
+        }).collect())
+    }
     pub(super) fn extent(&self, input: TextInput<'_>) -> Result<TextExtent, TextError> {
         let mut size = windows_sys::Win32::Foundation::SIZE::default();
         let result = match input {
@@ -557,6 +704,7 @@ impl Font {
             data,
         })
     }
+
 }
 
 /// One bounded scratch bitmap shared by the font cache, never by guest handles.
