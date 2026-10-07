@@ -720,7 +720,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n",
+            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
@@ -760,6 +760,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         stats.native_entries,
         stats.interpreter_entries,
         cliffs_report(&stats.cliffs),
+        verification_report(&stats.verification),
         stats.compilations,
         options.jit && options.async_compilation,
         stats.compile_time.as_secs_f64(),
@@ -1851,6 +1852,22 @@ pub fn run_cli() -> std::process::ExitCode {
 mod deadline_tests;
 
 /// Wall-time overlap includes the inline lane's API work; it is not CPU usage.
+/// `ADV_JIT_VERIFY` interpreter checks of newly published native code.
+fn verification_report(v: &adv_runtime::VerifyStats) -> String {
+    format!(
+        "{{\"verified\":{},\"inconclusive\":{},\"mismatches\":{},\"mxcsr_flags\":{},\"reports\":[{}]}}",
+        v.verified,
+        v.inconclusive,
+        v.mismatches,
+        v.mxcsr_flags,
+        v.reports
+            .iter()
+            .map(|r| json(r))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// Slow-path counters, each list cut to its most frequent entries.
 fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
     const ROWS: usize = 24;
