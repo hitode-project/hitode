@@ -10,8 +10,12 @@ typedef struct Buffer Buffer;
 typedef struct { HRESULT (WINAPI *query)(Buffer*,REFIID,void**); ULONG (WINAPI *add)(Buffer*); ULONG (WINAPI *release)(Buffer*); void* (WINAPI *data)(Buffer*); DWORD (WINAPI *size)(Buffer*); } BufferTable;
 struct Buffer {BufferTable *v;};
 typedef HRESULT (WINAPI *Load)(IDirect3DDevice9*,const void*,UINT,UINT,UINT,UINT,DWORD,D3DFORMAT,D3DPOOL,DWORD,DWORD,D3DCOLOR,void*,void*,IDirect3DTexture9**);
+typedef HRESULT (WINAPI *SaveFile)(LPCWSTR,UINT,IDirect3DSurface9*,const PALETTEENTRY*,const RECT*);
 typedef HRESULT (WINAPI *Save)(Buffer**,UINT,IDirect3DSurface9*,const PALETTEENTRY*,const RECT*);
 static DWORD checks[512],count;
+static BYTE filebytes[1024];static DWORD filelength;
+static void* WINAPI filedata(Buffer *b){(void)b;return filebytes;}
+static DWORD WINAPI filesize(Buffer *b){(void)b;return filelength;}
 static void check(BOOL value){checks[count++]=!!value;}
 static void finish(void){DWORD written;HANDLE f=CreateFileA("d3dx9-surface-save.bin",GENERIC_WRITE,0,0,CREATE_ALWAYS,0,0);if(f==INVALID_HANDLE_VALUE)ExitProcess(90);WriteFile(f,checks,count*4,&written,0);CloseHandle(f);ExitProcess(written==count*4?0:91);}
 static void required(HRESULT hr){check(SUCCEEDED(hr));if(FAILED(hr))finish();}
@@ -65,6 +69,22 @@ void mainCRTStartup(void){
  required(b->v->query(b,&unknown,(void**)&q));check(q==b);check(q->v->release(q)==1);
  check(b->v->release(b)==0);b=0;
  required(save(&b,0,s,0,&crop));image(b,2,2,1,1);check(b->v->release(b)==0);b=0;
+ { SaveFile savefile=(SaveFile)GetProcAddress(GetModuleHandleA("d3dx9_43.dll"),"D3DXSaveSurfaceToFileW");
+   static const WCHAR path[]=L"thumb-\x5b58\x6863.bmp";
+   BufferTable table={0,0,0,filedata,filesize};Buffer filebuffer={&table};HANDLE file;
+   check(savefile!=0);if(!savefile)finish();required(savefile(path,0,s,0,0));
+   file=CreateFileW(path,GENERIC_READ,1,0,OPEN_EXISTING,0,0);check(file!=INVALID_HANDLE_VALUE);if(file==INVALID_HANDLE_VALUE)finish();
+   check(ReadFile(file,filebytes,sizeof(filebytes),&filelength,0));CloseHandle(file);image(&filebuffer,4,3,0,0);
+   /* Exercise failure through ordinary exclusive sharing. Parent creation is
+      an independent VFS policy, not part of this image-export fixture. */
+   file=CreateFileW(path,GENERIC_READ,0,0,OPEN_EXISTING,0,0);check(file!=INVALID_HANDLE_VALUE);
+   check(FAILED(savefile(path,0,s,0,0)));CloseHandle(file);
+   required(savefile(L"thumb-png.png",3,s,0,0));
+   file=CreateFileW(L"thumb-png.png",GENERIC_READ,1,0,OPEN_EXISTING,0,0);check(file!=INVALID_HANDLE_VALUE);if(file==INVALID_HANDLE_VALUE)finish();
+   check(ReadFile(file,filebytes,sizeof(filebytes),&filelength,0));CloseHandle(file);
+   check(filelength>8&&filebytes[0]==137&&filebytes[1]==80&&filebytes[2]==78&&filebytes[3]==71);
+   texture_roundtrip(d,&filebuffer);
+ }
  check(FAILED(save(&b,0,s,0,&bad)));
  required(IDirect3DDevice9_CreateRenderTarget(d,4,3,21,0,0,FALSE,&target,0));
  required(IDirect3DDevice9_GetRenderTarget(d,0,&back));

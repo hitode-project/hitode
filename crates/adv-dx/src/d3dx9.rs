@@ -8,6 +8,7 @@ mod buffer;
 mod effect;
 mod matrix_stack;
 mod preshader;
+mod save_file;
 mod texture;
 
 type Matrix = [f32; 16];
@@ -36,6 +37,7 @@ pub fn register(registry: &mut Registry) {
     effect::register(registry);
     matrix_stack::register(registry);
     texture::register(registry);
+    save_file::register(registry);
 }
 
 fn product(left: Matrix, right: Matrix) -> Matrix {
@@ -434,3 +436,8 @@ fn project(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "gpu")]
+pub(crate) fn reap_file_exports(env: &mut Env<'_>, cancel_all: bool) {
+    save_file::reap(env, cancel_all);
+}

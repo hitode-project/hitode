@@ -39,6 +39,7 @@ mod startup;
 mod stream_position;
 mod thread;
 mod time64;
+mod wide_scan;
 mod wide_string;
 
 #[derive(Default)]
@@ -148,6 +149,7 @@ pub fn register(r: &mut Registry) {
     convert::register(r);
     cpp_alloc::register(r);
     scan::register(r);
+    wide_scan::register(r);
     secure_memory::register(r);
     shared_file::register(r);
     stream_position::register(r);

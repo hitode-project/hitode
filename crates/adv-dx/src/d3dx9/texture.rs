@@ -266,11 +266,13 @@ fn save_surface(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(INVALID);
     }
     let format = env.arg(1);
-    if format != 0 || env.arg(3) != 0 {
+    if !matches!(format, 0 | 3) || env.arg(3) != 0 {
         adv_abi::warn_unavailable(
             env,
             "d3dx9_43.dll!D3DXSaveSurfaceToFileInMemory",
-            "surface export supports BMP without a palette",
+            &format!(
+                "surface export supports BMP/PNG without a palette; requested format={format}"
+            ),
         );
         return Outcome::Return(INVALID);
     }
@@ -295,7 +297,7 @@ fn save_surface(env: &mut Env<'_>) -> Outcome {
             }
         };
         let outcome = crate::d3d9::loading::readable_surface(env, env.arg(2));
-        export_surface(env, output, rect, outcome)
+        export_surface(env, output, rect, format, outcome)
     }
 }
 
@@ -304,6 +306,7 @@ fn export_surface(
     env: &mut Env<'_>,
     output: GuestPtr<u32>,
     rect: Option<adv_abi::types::RECT>,
+    file_format: u32,
     outcome: Outcome,
 ) -> Outcome {
     match outcome {
@@ -316,11 +319,11 @@ fn export_surface(
             allow_time_skip,
             then: Box::new(move |env, resumed| {
                 let next = then(env, resumed);
-                export_surface(env, output, rect, next)
+                export_surface(env, output, rect, file_format, next)
             }),
         },
         Outcome::Return(pointer) if pointer != 0 && pointer & 0x80000000 == 0 => {
-            let bytes = crate::d3d9::saving::bmp(env, pointer, rect);
+            let bytes = crate::d3d9::saving::image(env, pointer, rect, file_format);
             crate::d3d9::loading::release_texture(env, pointer);
             match bytes {
                 Ok(bytes) => Outcome::Return(super::buffer::create(env, &bytes, output)),

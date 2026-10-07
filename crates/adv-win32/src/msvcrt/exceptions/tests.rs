@@ -340,3 +340,32 @@ fn cpp_raise_and_external_unwind_record_remain_explicitly_unknown_per_thread() {
         phase_guest(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
     }
 }
+
+#[test]
+fn empty_type_info_cleanup_is_idempotent_and_nonempty_cache_is_not_discarded() {
+    use adv_cpu::backend::{Guest, Reg};
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap());
+    m.spawn("empty cleanup", PARK_ADDR, &[], 65536).unwrap();
+    let thunk = (m
+        .resolve_import("msvcr80.dll", "__clean_type_info_names_internal")
+        .unwrap()
+        - THUNK_BASE)
+        / THUNK_STRIDE;
+    m.cpu.set_reg(Reg::Esp, DATA);
+    m.cpu.write_u32(DATA + 4, DATA + 128).unwrap();
+    let mut env = Env {
+        context: 0,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk,
+    };
+    crate::util::set_last_error(&mut env, 0x1357);
+    for _ in 0..2 {
+        assert!(matches!(clean_names(&mut env), Outcome::Return(0)));
+    }
+    assert_eq!(crate::util::last_error(&env), 0x1357);
+    env.cpu.write_u32(DATA + 128, 0x1234).unwrap();
+    assert!(matches!(clean_names(&mut env), Outcome::Fail(_)));
+    assert_eq!(env.cpu.read_u32(DATA + 128).unwrap(), 0x1234);
+}
