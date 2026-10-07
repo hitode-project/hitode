@@ -40,6 +40,10 @@ class ComparisonTests(unittest.TestCase):
         summary = driver.compare(runs(actual), 20)
         self.assertTrue(summary['all_match'])
         self.assertEqual(summary['module_cost_ratio']['jit'], 2)
+        sample = runs(actual)
+        sample['jit']['max_poll_gap_ns'] = 15_000_000
+        # The native QPC window does not inherit the guest polling resolution.
+        self.assertEqual(driver.compare(sample, 20)['module_cost_ratio']['jit'], 2)
 
     def test_differences_in_return_or_hash_block_ratios(self):
         for actual in (result(eax=124), result(hashes=[]), result(iterations=99)):

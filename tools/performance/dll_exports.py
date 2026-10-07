@@ -166,7 +166,7 @@ def compare(runs: dict[str, dict[str, Any]], min_ms: float) -> dict[str, Any]:
             measured_ns = actual['observed_loop_ns']
             # Polling delay can exceed the requested interval under heavy load.
             threshold_ns = max(min_ms * 1_000_000, 10 * run['max_poll_gap_ns'])
-            measurable = baseline_ns >= threshold_ns and measured_ns >= threshold_ns
+            measurable = baseline_ns >= min_ms * 1_000_000 and measured_ns >= threshold_ns
             ratio = measured_ns / baseline_ns if matches and measurable else None
             entry['variants'][variant] = {
                 'matches': matches, 'host_loop_ms': measured_ns / 1_000_000,
