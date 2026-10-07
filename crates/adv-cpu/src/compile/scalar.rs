@@ -162,6 +162,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
             Code::Pushfw | Code::Pushfd | Code::Popfw | Code::Popfd
         ),
         M::Cdq => i.code() == Code::Cdq,
+        M::Cwde => i.code() == Code::Cwde,
         M::Leave => i.code() == Code::Leaved,
         M::Adc | M::Sbb => {
             i.op_count() == 2
@@ -420,6 +421,13 @@ impl Emitter<'_> {
             let value = self.b.use_var(self.regs[0]);
             let sign = self.b.ins().sshr_imm(value, 31);
             self.b.def_var(self.regs[2], sign);
+            return;
+        }
+        if i.code() == Code::Cwde {
+            let value = self.b.use_var(self.regs[0]);
+            let low = self.b.ins().ireduce(types::I16, value);
+            let extended = self.b.ins().sextend(types::I32, low);
+            self.b.def_var(self.regs[0], extended);
             return;
         }
         if i.code() == Code::Leaved {
