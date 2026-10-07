@@ -27,6 +27,7 @@ fn fixture() -> Machine<JitCpu> {
         .unwrap();
     machine.cpu.set_reg(Reg::Esp, stack);
     let window = Window {
+        dc_style: 0,
         hwnd: 0x10020,
         class: 0,
         proc: procedure,

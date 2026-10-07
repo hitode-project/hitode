@@ -7,6 +7,7 @@ use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Namespace, Objects, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
 mod radio;
+mod text_query;
 
 #[derive(Default)]
 pub struct Menus {
@@ -1099,6 +1100,7 @@ fn load_indirect(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     radio::register(reg);
+    text_query::register(reg);
     reg.register(draw_menu_bar_ABI);
     stdcall(reg, super::USER32, "GetSystemMenu", 2, get_system_menu);
     stdcall(reg, super::USER32, "InsertMenuItemA", 4, |e| {

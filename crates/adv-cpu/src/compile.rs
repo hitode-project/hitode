@@ -19,6 +19,7 @@ pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
+mod invariants;
 mod loops;
 mod mmx;
 mod nest;
@@ -76,6 +77,8 @@ pub(crate) struct Compiled {
     versioned_loops: usize,
     #[cfg(test)]
     vectorized_loops: usize,
+    #[cfg(test)]
+    invariant_body: bool,
 }
 
 impl Drop for Compiled {
@@ -793,6 +796,15 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         CompileStrategy::Speed => "speed",
         CompileStrategy::Fast => "none",
     };
+    let invariant_plan = (opt_level == "speed"
+        && !snapshot.parallel
+        && plans.is_empty()
+        && nests.is_empty()
+        && write_summary::Summary::for_region(&instructions).is_some())
+    .then(|| invariants::analyze(&instructions))
+    .flatten();
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
     let mut builder = JITBuilder::with_flags(
         &[
             ("opt_level", opt_level),
@@ -852,9 +864,14 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
-    let shadow_ref = snapshot
-        .shadow_returns
-        .then(|| module.declare_func_in_func(id, &mut ctx.func));
+    let invariant_id = invariant_plan
+        .as_ref()
+        .map(|_| {
+            module
+                .declare_function("guest_invariant", Linkage::Local, &tail_signature)
+                .map_err(|e| e.to_string())
+        })
+        .transpose()?;
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut trap_signature = module.make_signature();
     trap_signature.params.extend([AbiParam::new(ptr_ty); 2]);
@@ -974,7 +991,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                     kernel: Option<usize>,
                     kernels: &[usize],
                     track_writes: bool,
-                    descriptors: &[usize]| {
+                    descriptors: &[usize],
+                    invariant_body: bool| {
+        // Shadow returns always target the checked entry. An external callee
+        // can change a base register, invalidating the old invocation's proof.
+        let shadow_ref = (snapshot.shadow_returns && kernel.is_none())
+            .then(|| module.declare_func_in_func(id, func));
+        let invariant_ref = (!invariant_body)
+            .then_some(invariant_id)
+            .flatten()
+            .map(|id| module.declare_func_in_func(id, func));
         let nest_ref = module.declare_func_in_func(nest_id, func);
         let trap_ref = module.declare_func_in_func(host_id, func);
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
@@ -987,7 +1013,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let file_prepare_ref = module.declare_func_in_func(prepare_id, func);
         let timestamp_ref = module.declare_func_in_func(timestamp_id, func);
         let range_ok_ref = module.declare_func_in_func(range_id, func);
-        let shadow_ref = if kernel.is_some() { None } else { shadow_ref };
         // A kernel loads and stores only the state its loop can touch.
         let scope: Vec<&Instruction> = match kernel {
             Some(index) => instructions
@@ -1111,6 +1136,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let flags = b.declare_var(types::I32);
         let lazy: [Variable; 7] = std::array::from_fn(|_| b.declare_var(types::I32));
         let zero = b.ins().iconst(types::I32, 0);
+        let invariant_gate = invariant_ref.map(|entry| {
+            let attempted = b.declare_var(types::I32);
+            b.def_var(attempted, zero);
+            (entry, attempted)
+        });
         for var in lazy {
             b.def_var(var, zero);
         }
@@ -1268,6 +1298,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let mut e = Emitter {
             b,
             optimizing: opt_level == "speed",
+            invariant_plan: invariant_plan.clone(),
+            invariant_body,
+            invariant_gate,
             row_hooks,
             nest_ref,
             written,
@@ -1661,6 +1694,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             &[],
             row,
             &[],
+            false,
         );
         let kernel_id = module
             .declare_function(
@@ -1731,6 +1765,42 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         .iter()
         .map(|desc| desc as *const _ as usize)
         .collect();
+    if let Some(id) = invariant_id {
+        let mut invariant_ctx = module.make_context();
+        invariant_ctx.func.signature = tail_signature.clone();
+        if dump_dir.is_some() {
+            invariant_ctx.set_disasm(true);
+        }
+        emit(
+            &mut module,
+            &mut invariant_ctx.func,
+            &mut fb_ctx,
+            None,
+            &kernels,
+            false,
+            &addresses,
+            true,
+        );
+        #[cfg(feature = "cross-dump")]
+        let cross = dump_dir.as_ref().map(|_| invariant_ctx.func.clone());
+        module
+            .define_function(id, &mut invariant_ctx)
+            .map_err(|e| format!("{e:?}"))?;
+        let name = format!("region-{:08x}.invariant", region.start);
+        dump(&dump_dir, &name, &invariant_ctx)?;
+        #[cfg(feature = "cross-dump")]
+        if let (Some(directory), Some(function)) = (&dump_dir, cross) {
+            let code = aarch64_vcode(function, opt_level)?;
+            std::fs::write(
+                std::path::Path::new(directory).join(format!("{name}.aarch64.vcode")),
+                code,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // Finalize after the checked body: its shadow-return address and this
+        // body's absolute func_addr references must both be defined first.
+        kernel_functions.push((id, invariant_ctx));
+    }
     emit(
         &mut module,
         &mut ctx.func,
@@ -1739,6 +1809,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         &kernels,
         false,
         &addresses,
+        false,
     );
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
@@ -1801,7 +1872,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         };
         let size = code.code_buffer().len();
         code_size += size;
-        let recorded = diagnostics::record_body(region, "kernel", base, size, 0);
+        let kind = if Some(*id) == invariant_id {
+            opt_level
+        } else {
+            "kernel"
+        };
+        let recorded = diagnostics::record_body(region, kind, base, size, 0);
         if diagnostics::instruction_map_enabled() {
             let ranges = code
                 .buffer
@@ -1954,6 +2030,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         versioned_loops,
         #[cfg(test)]
         vectorized_loops,
+        #[cfg(test)]
+        invariant_body: invariant_id.is_some(),
     })
 }
 
@@ -2026,6 +2104,38 @@ mod snapshot_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_counted_loops_get_an_invariant_body_only_in_serial_speed_code() {
+        use iced_x86::code_asm::*;
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(ebp - 8)).unwrap();
+        a.add(eax, dword_ptr(ebp - 4)).unwrap();
+        a.mov(dword_ptr(esi), eax).unwrap();
+        a.dec(dword_ptr(edi)).unwrap();
+        a.jnz(top).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(0x10000, &bytes).unwrap();
+        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+            for parallel in [false, true] {
+                let mut region = Region::new(0x10000, bytes.len());
+                region.compile_strategy = strategy;
+                let mut input = Snapshot::capture(&region, &memory).unwrap();
+                input.parallel = parallel;
+                let compiled = compile_snapshot(&input).unwrap();
+                assert_eq!(compiled.versioned_loops, 0);
+                assert_eq!(
+                    compiled.invariant_body,
+                    strategy == CompileStrategy::Speed && !parallel
+                );
+            }
+        }
+    }
 
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     #[test]
@@ -2482,6 +2592,9 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
+    invariant_plan: Option<invariants::Plan>,
+    invariant_body: bool,
+    invariant_gate: Option<(ir::FuncRef, Variable)>,
     row_hooks: Vec<nest_emit::Hook>,
     nest_ref: ir::FuncRef,
     written: Option<Variable>,
@@ -3246,6 +3359,9 @@ impl Emitter<'_> {
                 }
             }
             self.flush_mmx_effects();
+            if pc <= self.pc && self.enter_invariant(pc, block) {
+                return;
+            }
             let versioned = self
                 .fast
                 .is_none()
@@ -3263,6 +3379,63 @@ impl Emitter<'_> {
             }
         } else {
             self.exit_const(Exit::Dispatch, pc);
+        }
+    }
+    /// Prove invariant ranges only after one ordinary iteration. Failure is
+    /// not a guest fault and is not retried until the next native invocation.
+    fn enter_invariant(&mut self, pc: u32, checked: ir::Block) -> bool {
+        let Some((entry, attempted)) = self.invariant_gate else {
+            return false;
+        };
+        let groups = self.invariant_plan.as_ref().unwrap().groups.clone();
+        let attempt = self.b.create_block();
+        let tried = self.b.use_var(attempted);
+        self.b.ins().brif(tried, checked, &[], attempt, &[]);
+        self.b.switch_to_block(attempt);
+        let one = self.constant(1);
+        self.b.def_var(attempted, one);
+        for group in groups {
+            let sum = self.invariant_sum(&group);
+            let sum = self.b.ins().uextend(types::I64, sum);
+            let start = self.b.ins().iadd_imm(sum, group.low - i64::from(self.base));
+            let end = self
+                .b
+                .ins()
+                .iadd_imm(sum, group.high - i64::from(self.base));
+            let len = self.b.ins().iconst(types::I64, self.len as i64);
+            let required = self.constant(u32::from(
+                (if group.read { READ } else { 0 }) | (if group.write { WRITE } else { 0 }),
+            ));
+            let forbidden = self.constant(u32::from(
+                crate::memory::SHARED | if group.write { EXEC } else { 0 },
+            ));
+            let call = self.b.ins().call(
+                self.range_ok_ref,
+                &[self.perms, start, end, len, required, forbidden],
+            );
+            let valid = self.b.inst_results(call)[0];
+            let next = self.b.create_block();
+            self.b.ins().brif(valid, next, &[], checked, &[]);
+            self.b.switch_to_block(next);
+        }
+        let target = self.constant(pc);
+        self.save_state(target);
+        let address = self.b.ins().func_addr(self.ptr_ty, entry);
+        self.b
+            .ins()
+            .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        true
+    }
+
+    fn invariant_sum(&mut self, group: &invariants::Group) -> Value {
+        let base = group.base.map(|index| self.b.use_var(self.regs[index]));
+        match group.index {
+            Some((index, scale)) => {
+                let value = self.b.use_var(self.regs[index]);
+                let scaled = self.b.ins().imul_imm(value, i64::from(scale));
+                base.map_or(scaled, |base| self.b.ins().iadd(base, scaled))
+            }
+            None => base.expect("invariant operand has a register base or index"),
         }
     }
     /// Whether the fuel pays for every block of one more iteration of loop
@@ -3775,6 +3948,19 @@ impl Emitter<'_> {
     /// of the host access: loop-invariant bases then share one hoisted value
     /// instead of one per displacement.
     fn proven(&mut self, size: usize) -> Option<(Value, i32)> {
+        if self.invariant_body
+            && let Some(plan) = &self.invariant_plan
+            && let Some(site) = plan.sites.get(&self.pc)
+            && size as u32 <= site.width
+        {
+            let displacement = site.displacement;
+            let group = plan.groups[site.group].clone();
+            let sum = self.invariant_sum(&group);
+            let sum = self.b.ins().uextend(self.ptr_ty, sum);
+            let biased = self.b.ins().iadd_imm(self.mem, -i64::from(self.base));
+            let address = self.b.ins().iadd(biased, sum);
+            return Some((address, displacement));
+        }
         let plan = &self.plans[self.fast?];
         let operand = *plan.proven.get(&self.pc)?;
         if size as u32 > operand.width {

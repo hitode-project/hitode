@@ -3,7 +3,7 @@ use crate::{Win32, util::set_last_error};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, types::RECT, win32};
 use adv_cpu::backend::Prot;
 use adv_device::surface::{PixelFormat, Rect, SurfaceStore};
-use adv_os::gdi::{GdiObj, WINDOW_DC, stock_object};
+use adv_os::gdi::{GdiObj, stock_object};
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(fill_ABI);
@@ -212,6 +212,11 @@ fn paint_rectangles(
         }
         _ => u32::from_le_bytes(surface.encode_pixel([rgb[2], rgb[1], rgb[0], 0])),
     };
+    let window = env
+        .ext
+        .get::<Win32>()
+        .gdi
+        .is_window_dc(&env.sys.objects, dc.0);
     let result = {
         let store = env.ext.get_mut::<SurfaceStore>();
         let mut raw = (provider.memory)(env.cpu);
@@ -224,7 +229,7 @@ fn paint_rectangles(
             }
         }
         result.and_then(|()| {
-            if dc.0 == WINDOW_DC {
+            if window {
                 store.present(target, &memory)
             } else {
                 Ok(())
@@ -233,7 +238,7 @@ fn paint_rectangles(
     };
     match result {
         Ok(()) => {
-            if dc.0 == WINDOW_DC {
+            if window {
                 let serial = env.ext.get::<SurfaceStore>().stats.presentations;
                 if let Some(o) = (provider.completed)(env, serial) {
                     return o;
@@ -346,6 +351,11 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
         }
         _ => u32::from_le_bytes(surface.encode_pixel([rgb[2], rgb[1], rgb[0], 0])),
     };
+    let window = env
+        .ext
+        .get::<Win32>()
+        .gdi
+        .is_window_dc(&env.sys.objects, dc.0);
     let result = {
         let store = env.ext.get_mut::<SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
@@ -362,7 +372,7 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
                 &mut memory,
             )
             .and_then(|()| {
-                if dc.0 == WINDOW_DC {
+                if window {
                     store.present(target, &memory)
                 } else {
                     Ok(())
@@ -371,7 +381,7 @@ fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outco
     };
     match result {
         Ok(()) => {
-            if dc.0 == WINDOW_DC {
+            if window {
                 let serial = env.ext.get::<SurfaceStore>().stats.presentations;
                 if let Some(outcome) = (provider.completed)(env, serial) {
                     return outcome;
@@ -557,6 +567,11 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
         }
         _ => u32::from_le_bytes(surface.encode_pixel([rgb[2], rgb[1], rgb[0], 0])),
     };
+    let window = env
+        .ext
+        .get::<Win32>()
+        .gdi
+        .is_window_dc(&env.sys.objects, dc.0);
     let result = {
         let store = env.ext.get_mut::<SurfaceStore>();
         let mut raw = (provider.memory)(env.cpu);
@@ -574,7 +589,7 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
                 &mut memory,
             )
             .and_then(|()| {
-                if dc.0 == WINDOW_DC {
+                if window {
                     store.present(target, &memory)
                 } else {
                     Ok(())
@@ -583,7 +598,7 @@ fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u
     };
     match result {
         Ok(()) => {
-            if dc.0 == WINDOW_DC {
+            if window {
                 let serial = env.ext.get::<SurfaceStore>().stats.presentations;
                 if let Some(outcome) = (provider.completed)(env, serial) {
                     return outcome;

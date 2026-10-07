@@ -347,6 +347,11 @@ fn paint(
         clip: if options & 4 != 0 { r } else { None },
         fill: if options & 2 != 0 { r } else { None },
     };
+    let window = env
+        .ext
+        .get::<Win32>()
+        .gdi
+        .is_window_dc(&env.sys.objects, dc);
     let (result, presented, changed) = {
         let (fonts, store) = env.ext.get2_installed_mut::<Fonts, SurfaceStore>();
         let Some(surface) = store.get(target) else {
@@ -369,7 +374,7 @@ fn paint(
         let result = store.draw_text(target, &mut memory, &mut fonts.text, &font, paint);
         let before = store.stats.presentations;
         let result = result.and_then(|changed| {
-            if changed && dc == adv_os::gdi::WINDOW_DC {
+            if changed && window {
                 store.present(target, &memory)?;
             }
             Ok(())

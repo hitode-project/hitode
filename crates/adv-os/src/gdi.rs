@@ -70,6 +70,10 @@ impl DeviceContexts {
         self.get(objects, dc).is_some()
     }
 
+    pub fn is_window_dc(&self, objects: &Objects, dc: u32) -> bool {
+        dc == WINDOW_DC || self.gdi.is_window_dc(objects, dc)
+    }
+
     /// Publish the GDI handle for pixels owned by the common device surface store.
     pub fn register_bitmap(
         &mut self,
