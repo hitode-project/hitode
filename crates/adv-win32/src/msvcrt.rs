@@ -4,6 +4,7 @@ use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
+mod access;
 mod byte_output;
 mod byte_set;
 mod byte_sort;
@@ -122,6 +123,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 }
 
 pub fn register(r: &mut Registry) {
+    access::register(r);
     byte_set::register(r);
     byte_sort::register(r);
     byte_output::register(r);

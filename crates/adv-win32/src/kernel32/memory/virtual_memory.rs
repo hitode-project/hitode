@@ -672,7 +672,7 @@ fn read_process_memory(env: &mut Env<'_>) -> Outcome {
 }
 /// Windows can report the accessible prefix on failure without changing any
 /// target bytes. Preflight the complete transfer before performing the copy.
-fn write_target(env: &mut Env<'_>, address: u32, bytes: &[u8]) -> (u32, u32) {
+fn write_target(env: &mut Env<'_>, address: u32, bytes: &[u8], debugger: bool) -> (u32, u32) {
     let size = bytes.len() as u32;
     let mut checked = 0;
     let mut temporary = Vec::new();
@@ -682,7 +682,7 @@ fn write_target(env: &mut Env<'_>, address: u32, bytes: &[u8]) -> (u32, u32) {
         let len = (PAGE - (at & (PAGE - 1))).min(size - checked);
         if env.cpu.accessible(at, len, Prot::WRITE) {
             // Writable pages need no debugger protection override.
-        } else if env.cpu.accessible(at, len, Prot::EXEC) {
+        } else if debugger && env.cpu.accessible(at, len, Prot::EXEC) {
             temporary.push((page, decode(page_protection(env, page).unwrap()).unwrap()));
         } else {
             let code = if checked == 0 && env.cpu.accessible(at, len, Prot::default()) {
@@ -723,6 +723,100 @@ fn write_target(env: &mut Env<'_>, address: u32, bytes: &[u8]) -> (u32, u32) {
     }
 }
 
+/// Native transfers keep page permissions and best-effort the optional count.
+/// Unlike the Win32 debugger frontend, no execute-page write override is used.
+pub(crate) fn native_write_memory(
+    env: &mut Env<'_>,
+    handle: u32,
+    address: u32,
+    buffer: u32,
+    size: u32,
+    copied: u32,
+) -> Outcome {
+    fn publish(env: &mut Env<'_>, pointer: u32, count: u32) {
+        // Windows preserves the transfer status even if this optional output is
+        // inaccessible. Capture source bytes before publishing an aliased count.
+        if pointer != 0 && adv_abi::guest::check_range(env.cpu, pointer, 4, Prot::WRITE).is_ok() {
+            let _ = env.cpu.write_u32(pointer, count);
+        }
+    }
+    let fail = |env: &mut Env<'_>, status| {
+        publish(env, copied, 0);
+        Outcome::Return(status)
+    };
+    if size == 0 {
+        return fail(env, 0);
+    }
+    if size > MAX_TRANSFER {
+        adv_abi::warn_unavailable(
+            env,
+            "ntdll.dll!NtWriteVirtualMemory",
+            "transfers beyond the bounded owned-payload limit are unavailable",
+        );
+        return fail(env, 0xc00000bb);
+    }
+    let target = match child_process::process_target(env, handle, VM_WRITE) {
+        Ok(target) => target,
+        Err(error) => {
+            return fail(
+                env,
+                if error.code == 5 {
+                    0xc0000022
+                } else {
+                    0xc0000008
+                },
+            );
+        }
+    };
+    if transfer_range(address, size).is_err() || transfer_range(buffer, size).is_err() {
+        return fail(env, 0xc0000005);
+    }
+    let bytes = match read_target(env.cpu, buffer, size) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return fail(
+                env,
+                if error.code == 8 {
+                    0xc0000017
+                } else {
+                    0x8000000d
+                },
+            );
+        }
+    };
+    processes::visit(
+        env,
+        target.pid,
+        None,
+        move |remote| Ok(write_target(remote, address, &bytes, false)),
+        move |caller, result| {
+            let (count, status) = match result {
+                Ok((count, 0)) => (count, 0),
+                Ok((count, _)) => (count, 0x8000000d),
+                Err(error) => (
+                    0,
+                    match error.code {
+                        5 => 0xc0000022,
+                        6 => 0xc0000008,
+                        8 => 0xc0000017,
+                        50 => {
+                            adv_abi::warn_unavailable(
+                                caller,
+                                "ntdll.dll!NtWriteVirtualMemory",
+                                &error.message,
+                            );
+                            0xc00000bb
+                        }
+                        _ => 0xc0000001,
+                    },
+                ),
+            };
+            publish(caller, copied, count);
+            Outcome::Return(status)
+        },
+    )
+}
+
 fn write_process_memory(env: &mut Env<'_>) -> Outcome {
     let (h, a, buf, size, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let prepare =
@@ -751,7 +845,7 @@ fn write_process_memory(env: &mut Env<'_>) -> Outcome {
         env,
         target.pid,
         None,
-        move |e| Ok(write_target(e, a, &bytes)),
+        move |e| Ok(write_target(e, a, &bytes, true)),
         move |e, result| {
             let result = result.and_then(|(written, code)| {
                 count(e, out, written)?;
