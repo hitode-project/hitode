@@ -235,7 +235,9 @@ fn segment_planning_respects_real_entries_and_bounds_native_body_size() {
     assert!(
         // Bound the recovery lane's code size, not an execution-speed claim.
         // Throughput is measured separately by the native x87 A/B example.
-        resident.code_size <= single.code_size * 6 / 5,
+        // PC=24 re-rounding keeps per-op temporaries live until the lane's
+        // status is consumed, which costs about a fifth over single-op code.
+        resident.code_size <= single.code_size * 5 / 4,
         "resident {}, single {}",
         resident.code_size,
         single.code_size

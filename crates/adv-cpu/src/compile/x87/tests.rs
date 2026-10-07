@@ -152,13 +152,23 @@ fn precision_rounding_pending_exceptions_and_mmx_take_the_helper() {
     let code = bytes(|a| {
         a.fmul_2(st0, st1).unwrap();
     });
+    // 1.25 and 2.5 fit 24 bits, so PC=24 and PC=53 are both native.
     for precision in [0u16, 2, 3] {
         for rounding in 0..4 {
             let mut s = state();
             s.x87.control = 0x7f | precision << 8 | rounding << 10;
-            let calls = u64::from(precision != 2 || rounding != 0);
+            let calls = u64::from(precision == 3 || rounding != 0);
             compare(&code, s, |_| {}, Some(calls));
         }
+    }
+    // PC=24 re-rounds a binary64 result, which is exact only for 24-bit inputs.
+    for wide in [1.0 + 2f64.powi(-24), 1.0 / 3.0] {
+        let mut s = state();
+        s.x87.control = 0x007f;
+        let slot = s.x87.top();
+        s.x87.regs[slot] = X87Register(crate::backend::x87::encode_f64(wide));
+        s.refresh_mmx();
+        compare(&code, s, |_| {}, Some(1));
     }
     for status in [0x80, 0x8081] {
         let mut s = state();
