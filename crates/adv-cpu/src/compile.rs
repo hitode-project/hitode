@@ -5530,13 +5530,75 @@ impl Emitter<'_> {
     fn materialize_flags(&mut self) -> Value {
         let source = self.source;
         self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Flags));
-        let old = self.b.use_var(self.flags);
-        let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
-        for bit in [0, 2, 4, 6, 7, 11] {
-            let value = self.flag(bit);
-            let value = self.b.ins().ishl_imm(value, i64::from(bit));
-            flags = self.b.ins().bor(flags, value);
+        if self.optimizing {
+            // Speed already folds individual constant recipes. Keeping that
+            // shape avoids extending shared-expression live ranges at exits.
+            let old = self.b.use_var(self.flags);
+            let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
+            for bit in [0, 2, 4, 6, 7, 11] {
+                let value = self.flag(bit);
+                let value = self.b.ins().ishl_imm(value, i64::from(bit));
+                flags = self.b.ins().bor(flags, value);
+            }
+            self.mark_source(source);
+            return flags;
         }
+        // Materialize the complete word once. Independent flag consumers still
+        // use flag(), but a checkpoint shares the recipe decoding and masks.
+        let old = self.b.use_var(self.flags);
+        let a = self.b.use_var(self.lazy[0]);
+        let b = self.b.use_var(self.lazy[1]);
+        let result = self.b.use_var(self.lazy[2]);
+        let kind = self.b.use_var(self.lazy[3]);
+        let base = self.b.ins().band_imm(kind, 3);
+        let shift = self.b.ins().ushr_imm(kind, 8);
+        let raw = self.b.ins().icmp_imm(IntCC::Equal, base, 0);
+        let logical = self.b.ins().icmp_imm(IntCC::Equal, base, 3);
+        let zero = self.constant(0);
+        let ab = self.b.ins().bxor(a, b);
+
+        let low = self.b.ins().ushr(result, shift);
+        let byte = self.b.ins().band_imm(low, 255);
+        let parity = self.b.ins().popcnt(byte);
+        let parity = self.b.ins().band_imm(parity, 1);
+        let parity = self.b.ins().bxor_imm(parity, 1);
+        let parity = self.b.ins().ishl_imm(parity, 2);
+        let zf = self.b.ins().icmp_imm(IntCC::Equal, result, 0);
+        let zf = self.b.ins().uextend(types::I32, zf);
+        let zf = self.b.ins().ishl_imm(zf, 6);
+        let sf = self.b.ins().ushr_imm(result, 24);
+        let sf = self.b.ins().band_imm(sf, 0x80);
+        let af = self.b.ins().bxor(ab, result);
+        let af = self.b.ins().ushr(af, shift);
+        let af = self.b.ins().band_imm(af, 0x10);
+        let af = self.b.ins().select(logical, zero, af);
+        let derived = self.b.ins().bor(parity, zf);
+        let derived = self.b.ins().bor(derived, sf);
+        let derived = self.b.ins().bor(derived, af);
+        let canonical = self.b.ins().band_imm(old, 0xd4);
+        let partial = self.b.ins().select(raw, canonical, derived);
+
+        // OF may be replaced by a later rotate/multiply while PF/AF/ZF/SF
+        // still refer to the previous recipe (including canonical entry flags).
+        let add = self.b.ins().icmp_imm(IntCC::Equal, base, 1);
+        let not_ab = self.b.ins().bnot(ab);
+        let first = self.b.ins().select(add, not_ab, ab);
+        let ar = self.b.ins().bxor(a, result);
+        let overflow = self.b.ins().band(first, ar);
+        let overflow = self.b.ins().ushr_imm(overflow, 20);
+        let overflow = self.b.ins().band_imm(overflow, 0x800);
+        let overflow = self.b.ins().select(logical, zero, overflow);
+        let carried = self.b.ins().band_imm(kind, 4);
+        let carried_value = self.b.ins().ishl_imm(b, 11);
+        let overflow = self.b.ins().select(carried, carried_value, overflow);
+        let raw_of = self.b.ins().icmp_imm(IntCC::Equal, kind, 0);
+        let old_of = self.b.ins().band_imm(old, 0x800);
+        let overflow = self.b.ins().select(raw_of, old_of, overflow);
+        let carry = self.flag(0);
+        let preserved = self.b.ins().band_imm(old, !0x8d5_i64);
+        let flags = self.b.ins().bor(preserved, partial);
+        let flags = self.b.ins().bor(flags, overflow);
+        let flags = self.b.ins().bor(flags, carry);
         self.mark_source(source);
         flags
     }
