@@ -98,6 +98,116 @@ fn native_info(env: &mut Env<'_>, output: GuestPtr<[u32; 9]>) -> Result<(), MemF
 fn current_processor(env: &mut Env<'_>) -> u32 {
     env.ext.get_or_default::<Processors>().current()
 }
+
+#[win32(kernel32, name = "GetCurrentProcessorNumberEx", level = implement)]
+fn current_processor_ex(env: &mut Env<'_>, output: GuestPtr<u32>) -> Result<(), MemFault> {
+    // PROCESSOR_NUMBER: WORD Group, BYTE Number, BYTE Reserved.
+    let number = env.ext.get_or_default::<Processors>().current();
+    output.write(env.cpu, number << 16)
+}
+
+fn topology(profile: Processors, relation: u32) -> Option<Vec<u8>> {
+    let relations: &[u32] = match relation {
+        0 => &[0],
+        1 => &[1],
+        2 => &[], // The virtual processor profile exposes no cache hierarchy.
+        3 => &[3],
+        4 => &[4],
+        0xffff => &[0, 1, 3, 4],
+        _ => return None,
+    };
+    let mut output = Vec::new();
+    for &kind in relations {
+        let size = if kind == 4 { 76 } else { 44 };
+        let start = output.len();
+        output.resize(start + size, 0);
+        let record = &mut output[start..];
+        record[..4].copy_from_slice(&kind.to_le_bytes());
+        record[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        if kind == 4 {
+            record[8..10].copy_from_slice(&1u16.to_le_bytes());
+            record[10..12].copy_from_slice(&1u16.to_le_bytes());
+            record[32] = profile.count() as u8;
+            record[33] = profile.count() as u8;
+            record[72..76].copy_from_slice(&profile.active_mask().to_le_bytes());
+        } else {
+            record[30..32].copy_from_slice(&1u16.to_le_bytes());
+            record[32..36].copy_from_slice(&profile.active_mask().to_le_bytes());
+        }
+    }
+    Some(output)
+}
+
+#[win32(kernel32, name = "GetLogicalProcessorInformationEx", level = implement)]
+fn logical_information_ex(
+    env: &mut Env<'_>,
+    relation: u32,
+    output: GuestPtr<u8>,
+    length: GuestPtr<u32>,
+) -> Result<i32, MemFault> {
+    let profile = *env.ext.get_or_default::<Processors>();
+    let Some(bytes) = topology(profile, relation) else {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Ok(0);
+    };
+    let capacity = length.read(env.cpu)?;
+    length.write(env.cpu, bytes.len() as u32)?;
+    if capacity < bytes.len() as u32 || (output.addr() == 0 && !bytes.is_empty()) {
+        set_last_error(env, 122); // ERROR_INSUFFICIENT_BUFFER
+        return Ok(0);
+    }
+    if !bytes.is_empty() {
+        adv_abi::guest::check_range(
+            env.cpu,
+            output.addr(),
+            bytes.len() as u32,
+            adv_cpu::backend::Prot::WRITE,
+        )?;
+        env.cpu.write(output.addr(), &bytes)?;
+    }
+    Ok(1)
+}
+
+#[win32(kernel32, name = "GetThreadGroupAffinity", level = implement)]
+fn get_group_affinity(
+    env: &mut Env<'_>,
+    handle: Handle,
+    output: GuestPtr<[u32; 3]>,
+) -> Result<i32, MemFault> {
+    if let Err(error) = super::thread_target(env, handle.0, 0x40) {
+        set_last_error(env, error.code);
+        return Ok(0);
+    }
+    let mask = env.ext.get_or_default::<Processors>().process_mask();
+    output.write(env.cpu, [mask, 0, 0])?;
+    Ok(1)
+}
+
+#[win32(kernel32, name = "SetThreadGroupAffinity", level = implement)]
+fn set_group_affinity(
+    env: &mut Env<'_>,
+    handle: Handle,
+    input: GuestPtr<[u32; 3]>,
+    previous: GuestPtr<[u32; 3]>,
+) -> Result<i32, MemFault> {
+    if let Err(error) = super::thread_target(env, handle.0, 0x20) {
+        set_last_error(env, error.code);
+        return Ok(0);
+    }
+    // x86 GROUP_AFFINITY is a DWORD mask, a WORD group and three reserved WORDs.
+    let [mask, group_reserved, reserved] = input.read(env.cpu)?;
+    let profile = *env.ext.get_or_default::<Processors>();
+    // Native accepts zero to restore the group's default affinity.
+    if (mask != 0 && !profile.accepts_mask(mask)) || group_reserved != 0 || reserved != 0 {
+        set_last_error(env, err::INVALID_PARAMETER);
+        return Ok(0);
+    }
+    if previous.addr() != 0 {
+        previous.write(env.cpu, [profile.process_mask(), 0, 0])?;
+    }
+    // Only group zero and its single processor exist in the shared profile.
+    Ok(1)
+}
 pub(super) fn register(reg: &mut Registry) {
     for api in [
         get_affinity_ABI,
@@ -106,6 +216,10 @@ pub(super) fn register(reg: &mut Registry) {
         system_info_ABI,
         native_info_ABI,
         current_processor_ABI,
+        current_processor_ex_ABI,
+        logical_information_ex_ABI,
+        get_group_affinity_ABI,
+        set_group_affinity_ABI,
     ] {
         reg.register(api);
     }
