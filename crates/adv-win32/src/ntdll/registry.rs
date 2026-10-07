@@ -49,8 +49,10 @@ fn counted_name(env: &Env<'_>, descriptor: u32) -> Result<Vec<u16>, u32> {
             .map_err(|_| ACCESS_VIOLATION)?;
     }
     let units: Vec<_> = bytes
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| u16::from_le_bytes(*bytes))
         .collect();
     // Keep counted NULs and raw UTF-16 units; neither NUL termination nor lossy
     // decoding may turn the requested name into another existing key.

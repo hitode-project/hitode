@@ -30,8 +30,8 @@ pub fn sid_string(bytes: &[u8]) -> Option<String> {
     } else {
         format!("S-1-0x{authority:X}")
     };
-    for rid in bytes[8..].chunks_exact(4) {
-        result.push_str(&format!("-{}", u32::from_le_bytes(rid.try_into().ok()?)));
+    for rid in bytes[8..].as_chunks::<4>().0 {
+        result.push_str(&format!("-{}", u32::from_le_bytes(*rid)));
     }
     Some(result)
 }

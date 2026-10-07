@@ -124,12 +124,11 @@ fn query(
         {
             return fail(env, 998);
         }
-        if capacity >= 2 {
-            if check_range(env.cpu, buffer, 4, Prot::WRITE).is_err()
-                || env.cpu.write(buffer, &[0; 4]).is_err()
-            {
-                return fail(env, 998);
-            }
+        if capacity >= 2
+            && (check_range(env.cpu, buffer, 4, Prot::WRITE).is_err()
+                || env.cpu.write(buffer, &[0; 4]).is_err())
+        {
+            return fail(env, 998);
         }
         return fail(env, err::INSUFFICIENT_BUFFER);
     }
