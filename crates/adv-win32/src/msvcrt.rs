@@ -5,6 +5,7 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
 mod byte_set;
+mod byte_sort;
 mod convert;
 mod cpp_alloc;
 mod data;
@@ -103,6 +104,7 @@ pub fn install<B: adv_cpu::backend::Backend>(
 
 pub fn register(r: &mut Registry) {
     byte_set::register(r);
+    byte_sort::register(r);
     data::register(r);
     directory::register(r);
     exceptions::register(r);
@@ -148,7 +150,6 @@ pub fn register(r: &mut Registry) {
         ("__set_app_type", 1),
         ("__p__fmode", 0),
         ("__p__commode", 0),
-        ("qsort", 4),
         ("ldexp", 3),
         ("frexp", 3),
         ("_ftol", 0),
@@ -375,41 +376,6 @@ fn scale(mut x: f64, mut exp: i32) -> f64 {
         exp += 512;
     }
     x * 2f64.powi(exp)
-}
-fn sort_step(
-    _e: &mut Env<'_>,
-    base: u32,
-    count: u32,
-    size: u32,
-    cmp: u32,
-    i: u32,
-    j: u32,
-) -> Outcome {
-    if i >= count {
-        return Outcome::Return(0);
-    }
-    let (i, j) = if j == 0 { (i + 1, i + 1) } else { (i, j) };
-    if i >= count {
-        return Outcome::Return(0);
-    }
-    let left = base + (j - 1) * size;
-    let right = base + j * size;
-    Outcome::call(cmp, [left, right], move |e, result| {
-        if result.value() as i32 > 0 {
-            let mut temporary = vec![0; size as usize];
-            if let Err(err) = e
-                .cpu
-                .read(left, &mut temporary)
-                .and_then(|_| e.cpu.copy_memory(right, left, size as usize))
-                .and_then(|_| e.cpu.write(right, &temporary))
-            {
-                return Outcome::Fail(err.to_string());
-            }
-            sort_step(e, base, count, size, cmp, i, j - 1)
-        } else {
-            sort_step(e, base, count, size, cmp, i + 1, i + 1)
-        }
-    })
 }
 const CRT_ALLOCATION_LIMIT: u32 = 0x40000000;
 fn allocate(e: &mut Env<'_>, size: u32, zero: bool) -> u32 {
@@ -745,16 +711,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Fail("invalid initializer range".into());
             }
             return initializers(e, a, b, name == "_initterm_e");
-        }
-        "qsort" => {
-            if b < 2 || c == 0 {
-                return Outcome::Return(0);
-            }
-            if c > 1024 * 1024 || b.checked_mul(c).and_then(|n| a.checked_add(n)).is_none() {
-                return Outcome::Fail("invalid qsort range".into());
-            }
-            let cmp = e.arg(3);
-            return sort_step(e, a, b, c, cmp, 1, 1);
         }
         "time" | "_time32" => {
             let ft = crate::kernel32::filetime_now(e);
