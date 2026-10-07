@@ -45,11 +45,12 @@ pub(crate) fn bmp(env: &mut Env<'_>, surface: u32, rect: Option<RECT>) -> Result
         let row = &mut pixels[(y * width * 4) as usize..((y + 1) * width * 4) as usize];
         env.cpu.read(storage + offset, row).map_err(|_| INVALID)?;
     }
-    encode(width, height, &pixels).ok_or(INVALID)
+    encode(width, height, &pixels, desc.Format == 21).ok_or(INVALID)
 }
 
-fn encode(width: u32, height: u32, bgra: &[u8]) -> Option<Vec<u8>> {
-    let stride = width.checked_mul(3)?.checked_add(3)? & !3;
+fn encode(width: u32, height: u32, bgra: &[u8], alpha: bool) -> Option<Vec<u8>> {
+    let pixel_size = if alpha { 4 } else { 3 };
+    let stride = width.checked_mul(pixel_size)?.checked_add(3)? & !3;
     let size = stride.checked_mul(height)?.checked_add(54)?;
     if width == 0
         || height == 0
@@ -71,12 +72,13 @@ fn encode(width: u32, height: u32, bgra: &[u8]) -> Option<Vec<u8>> {
         bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
     bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
-    bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+    bytes[28..30].copy_from_slice(&((pixel_size * 8) as u16).to_le_bytes());
     for y in 0..height as usize {
         for x in 0..width as usize {
             let src = (y * width as usize + x) * 4;
-            let dst = 54 + (height as usize - 1 - y) * stride as usize + x * 3;
-            bytes[dst..dst + 3].copy_from_slice(&bgra[src..src + 3]);
+            let dst = 54 + (height as usize - 1 - y) * stride as usize + x * pixel_size as usize;
+            bytes[dst..dst + pixel_size as usize]
+                .copy_from_slice(&bgra[src..src + pixel_size as usize]);
         }
     }
     Some(bytes)
@@ -87,13 +89,15 @@ mod tests {
     use super::*;
     #[test]
     fn bmp_has_bottom_up_bgr_rows_and_zero_padding() {
-        let bytes = encode(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let bytes = encode(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8], false).unwrap();
         assert_eq!(bytes.len(), 62);
         assert_eq!(&bytes[..2], b"BM");
         assert_eq!(&bytes[54..], &[5, 6, 7, 0, 1, 2, 3, 0]);
         assert_eq!(u32::from_le_bytes(bytes[18..22].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(bytes[22..26].try_into().unwrap()), 2);
-        assert!(encode(0, 2, &[]).is_none());
-        assert!(encode(u32::MAX, 2, &[]).is_none());
+        let alpha = encode(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8], true).unwrap();
+        assert_eq!(&alpha[54..], &[5, 6, 7, 8, 1, 2, 3, 4]);
+        assert!(encode(0, 2, &[], false).is_none());
+        assert!(encode(u32::MAX, 2, &[], false).is_none());
     }
 }

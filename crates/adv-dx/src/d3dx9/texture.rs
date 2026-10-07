@@ -3,6 +3,7 @@ use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 mod decode;
+mod resize;
 
 const INVALID: u32 = 0x8876086c;
 const INVALID_DATA: u32 = 0x88760b59;
@@ -167,16 +168,21 @@ fn create(
             Err(e) => return Outcome::Return(decoded_error(env, &bytes, e)),
         };
         let dimension = |requested, source: u32| match requested {
-            NONPOW2 | 0 => Some(source),
-            DEFAULT if source.is_power_of_two() => Some(source),
-            n if n == source => Some(source),
-            _ => None,
+            NONPOW2 => Some(source),
+            DEFAULT | 0 => source.checked_next_power_of_two(),
+            n => Some(n),
         };
-        if dimension(width, image.width).is_none() || dimension(height, image.height).is_none() {
-            return Outcome::Return(unavailable(
-                env,
-                "resizing or DEFAULT power-of-two expansion is not implemented; NONPOW2 preserves source dimensions",
-            ));
+        let (Some(width), Some(height)) = (
+            dimension(width, image.width),
+            dimension(height, image.height),
+        ) else {
+            return Outcome::Return(INVALID);
+        };
+        if width == 0
+            || height == 0
+            || u64::from(width) * u64::from(height) > (decode::LIMIT / 4) as u64
+        {
+            return Outcome::Return(INVALID);
         }
         let format = match format {
             0 | -1 => {
@@ -206,15 +212,11 @@ fn create(
                 }
             }
         }
-        let outcome = crate::d3d9::loading::create(
-            env,
-            device.addr(),
-            image.width,
-            image.height,
-            format,
-            pool,
-            pixels,
-        );
+        if width != image.width || height != image.height {
+            pixels = resize::pixels(&pixels, image.width, image.height, width, height, filter);
+        }
+        let outcome =
+            crate::d3d9::loading::create(env, device.addr(), width, height, format, pool, pixels);
         publish(env, output, image_info, image, outcome)
     }
 }
