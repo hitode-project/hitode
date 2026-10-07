@@ -15,6 +15,8 @@ pub struct DcModes {
     pub window_origin: [i32; 2],
     /// Device viewport origin. MM_TEXT uses translation without scaling.
     pub viewport_origin: [i32; 2],
+    /// Brush alignment in client device coordinates, independent of mapping.
+    pub brush_origin: [i32; 2],
 }
 impl Default for DcModes {
     fn default() -> Self {
@@ -26,6 +28,7 @@ impl Default for DcModes {
             text_align: 0,
             window_origin: [0, 0],
             viewport_origin: [0, 0],
+            brush_origin: [0, 0],
         }
     }
 }

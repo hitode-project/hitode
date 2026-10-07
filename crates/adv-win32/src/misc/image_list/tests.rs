@@ -17,6 +17,7 @@ enum Arg {
     Memory(u32),
 }
 use Arg::{Memory as M, Value as I};
+mod streams;
 
 struct Fixture {
     machine: Machine<JitCpu>,
@@ -286,7 +287,7 @@ fn stock_pixels_streams_formats_and_bad_outputs_fail_without_mutating_list_or_si
             (index, index_error, u32::MAX, 6),
             (bad_icon, bad_icon_error, u32::MAX, 6),
             (invalid_handle, invalid_handle_error, u32::MAX, 6),
-            (stream, stream_error, 0, 50),
+            (stream, stream_error, 0, 998),
             (unsupported_format, unsupported_format_error, 0, 50),
             (bad_dimension, bad_dimension_error, 0, 87),
             (null, null_error, 0, 0x12345678),
@@ -316,13 +317,6 @@ fn stock_pixels_streams_formats_and_bad_outputs_fail_without_mutating_list_or_si
                 .keys()
                 .any(|key| key.0 == "comctl32.dll!ImageList_ReplaceIcon"
                     && key.1.contains("decoded pixels are unavailable"))
-        );
-        assert!(
-            diagnostic
-                .warnings
-                .keys()
-                .any(|key| key.0 == "comctl32.dll!ImageList_Read"
-                    && key.1.contains("deserialization"))
         );
     }
 }
