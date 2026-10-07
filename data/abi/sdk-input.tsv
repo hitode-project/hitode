@@ -37,3 +37,4 @@ kernel32.dll	CreateProcessInternalW	stdcall	i32	Windows.Win32.Foundation.BOOL	hT
 ntdll.dll	NtGetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|ThreadContext:CONTEXT*:ptr:1
 ntdll.dll	NtAllocateVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|ZeroBits:usize:u32:1|RegionSize:usize*:ptr:1|AllocationType:u32:u32:1|Protect:u32:u32:1
 ntdll.dll	NtWriteVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToWrite:usize:u32:1|NumberOfBytesWritten:usize*:ptr:1
+ntdll.dll	NtFlushInstructionCache	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|RegionSize:usize:u32:1
