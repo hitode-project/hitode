@@ -6,6 +6,7 @@ pub(super) fn bytes(format: u32) -> Option<u32> {
     match format {
         21 | 22 => Some(4),
         26 => Some(2),
+        28 => Some(1),
         _ => None,
     }
 }
@@ -37,16 +38,22 @@ pub(super) fn upload(
     if width == 0 || pitch < row || pixels.len() < required as usize {
         return None;
     }
-    if format == 26 {
+    if matches!(format, 26 | 28) {
         let output_pitch = width.checked_mul(4)?;
         let mut output = vec![0; output_pitch.checked_mul(height)? as usize];
         for y in 0..height as usize {
             for x in 0..width as usize {
-                let at = y * pitch as usize + x * 2;
-                let packed = u16::from_le_bytes(pixels[at..at + 2].try_into().ok()?);
-                let at = y * output_pitch as usize + x * 4;
-                for channel in 0..4 {
-                    output[at + channel] = ((packed >> (channel * 4)) & 15) as u8 * 17;
+                let destination = y * output_pitch as usize + x * 4;
+                if format == 28 {
+                    // D3DFMT_A8 is the documented undefined-channel exception:
+                    // sampled RGB is zero, and the one guest byte is alpha.
+                    output[destination + 3] = pixels[y * pitch as usize + x];
+                } else {
+                    let at = y * pitch as usize + x * 2;
+                    let packed = u16::from_le_bytes(pixels[at..at + 2].try_into().ok()?);
+                    for channel in 0..4 {
+                        output[destination + channel] = ((packed >> (channel * 4)) & 15) as u8 * 17;
+                    }
                 }
             }
         }
@@ -68,6 +75,16 @@ pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
     bytes(format)?;
     if pixels.len() % 4 != 0 {
         return None;
+    }
+    if format == 28 {
+        return Some(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[3])
+                .collect(),
+        );
     }
     if format != 26 {
         return Some(pixels);
