@@ -125,7 +125,7 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
     let result = machine.run_virtual(1_000_000);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
     let rd = |slot| machine.cpu.read_u32(DATA + slot).unwrap();
-    assert_eq!(rd(8), 0xc000_0002);
+    assert_eq!(rd(8), 0xc000_001c);
     assert_eq!(
         [rd(12), rd(16), rd(20), rd(24), rd(28)],
         [
@@ -148,7 +148,7 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
     assert_eq!(diagnostics.warnings.len(), 1);
     let ((api, reason), count) = diagnostics.warnings.iter().next().unwrap();
     assert_eq!(api, "native x86 INT 2E");
-    assert!(reason.contains("not modeled"));
+    assert!(reason.contains("no registered services"));
     assert_eq!(*count, 1);
     let output = String::from_utf8(log.borrow().clone()).unwrap();
     let raw: Vec<_> = output
@@ -171,7 +171,7 @@ fn unsupported<B: TestCpu>(cpu: B, prefix: bool, selector: u32) {
 #[test]
 fn raw_int2e_native_x86_fails_without_guessing_services_or_touching_other_state() {
     for prefix in [false, true] {
-        for selector in [u32::MAX, 0x1234_5678] {
+        for selector in [0, 0xfff, 0x1000, 0x1fff, 0x4000_0000, 0x4000_1000] {
             unsupported(JitCpu::new(PARK_ADDR, false).unwrap(), prefix, selector);
             unsupported(JitCpu::new(PARK_ADDR, true).unwrap(), prefix, selector);
             unsupported(UnicornCpu::new(PARK_ADDR).unwrap(), prefix, selector);
