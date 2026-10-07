@@ -42,8 +42,10 @@ fn set(env: &mut Env<'_>, descriptor: GuestPtr<()>) -> i32 {
         return ACCESS_VIOLATION;
     }
     let units: Vec<_> = bytes
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .collect();
     let Ok(path) = String::from_utf16(&units) else {
         warn_unavailable(
