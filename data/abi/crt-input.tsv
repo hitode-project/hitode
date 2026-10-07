@@ -202,3 +202,44 @@ msvcr90.dll	_CItan	cdecl	void	void
 msvcr90.dll	_CIsin	cdecl	void	void	
 msvcr90.dll	_CIcos	cdecl	void	void	
 msvcr90.dll	_CIsqrt	cdecl	void	void	
+msvcrt.dll	tolower	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	toupper	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isalpha	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isalnum	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isdigit	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isspace	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	iscntrl	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isupper	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	islower	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	ispunct	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isprint	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isgraph	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	tolower	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	toupper	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isalpha	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isalnum	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isdigit	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isspace	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	iscntrl	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isupper	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	islower	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	ispunct	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isprint	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isgraph	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	tolower	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	toupper	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isalpha	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isalnum	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isdigit	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isspace	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	iscntrl	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isupper	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	islower	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	ispunct	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isprint	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isgraph	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcr80.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1

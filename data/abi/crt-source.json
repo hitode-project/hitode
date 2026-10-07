@@ -244,5 +244,27 @@
     ],
     "projection": "void __cdecl _CItan/_CIsin/_CIcos/_CIsqrt(void); zero integer-stack parameter slots, specialized x87 input/result in ST0. Result must replace the operand while preserving lower x87 stack and guest ESP; not a two-slot cdecl double input.",
     "profile": "Only legacy CRT aliases. Reuse guest FPU owner, measured finite nearest/masked inputs; unavailable exceptional/control profiles must warn and fail rather than claim complete CRT math compatibility."
+  },
+  "byte_ctype": {
+    "header": "ucrt/ctype.h:31-66",
+    "sha256": "6a10e9f0505b896d356d986d671c939b7fb0602012e463314ff7bfd0182a861f",
+    "scope": [
+      "tolower",
+      "toupper",
+      "isalpha",
+      "isalnum",
+      "isdigit",
+      "isspace",
+      "iscntrl",
+      "isupper",
+      "islower",
+      "isxdigit",
+      "ispunct",
+      "isprint",
+      "isgraph"
+    ],
+    "projection": "int __cdecl function(int character), one signed32 x86 slot; three existing legacy CRT aliases. Shared LC_CTYPE profile/table logic; no host locale, duplicate classifier cache or Win32 ACP mutation.",
+    "profile": "Byte input and measured legacy EOF contracts; supported C/932/936/1252 profiles share existing byte flags. Unsupported packed DBCS or out-of-domain inputs must warn and fail; native error side effects and localized EOF case behavior retained where measured.",
+    "setlocale_aliases": "Existing verified VC90 setlocale cdecl2 char* signature extended to MSVCRT/VC80 only; same existing category grammar, per-module locale owner and heap buffers. No new locale implementation or Win32 ACP change."
   }
 }
