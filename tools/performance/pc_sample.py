@@ -182,17 +182,18 @@ def dump_regions(process, pid, directory, wanted):
     if path.exists():
         for line in path.read_text().splitlines():
             fields = line.split("\t")
-            base, size, guest = map(int, fields[1:4])
+            ns, base, size, guest = map(int, fields[:4])
             if guest in wanted:
-                latest[guest] = (base, size, fields[4])
+                latest[guest] = (ns, base, size, fields[4])
     dumps = []
-    for guest, (base, size, mode) in sorted(latest.items()):
+    for guest, (ns, base, size, mode) in sorted(latest.items()):
         data = C.create_string_buffer(size)
         read = C.c_size_t()
         if ReadMemory(process, base, data, size, C.byref(read)) and read.value == size:
             name = f"native-{guest:08x}-{mode}.bin"
             (directory / name).write_bytes(data.raw)
-            dumps.append({"guest": guest, "base": base, "size": size, "mode": mode, "file": name})
+            dumps.append({"guest": guest, "ns": ns, "base": base, "size": size, "mode": mode,
+                          "file": name})
     (directory / "native-dumps.json").write_text(json.dumps(dumps, indent=2))
     return dumps
 
