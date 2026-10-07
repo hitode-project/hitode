@@ -291,3 +291,6 @@ msvcr90.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcrt.dll	_CIlog10	cdecl	void	void	
 msvcr80.dll	_CIlog10	cdecl	void	void	
 msvcr90.dll	_CIlog10	cdecl	void	void	
+msvcrt.dll	_CIlog	cdecl	void	void	
+msvcr80.dll	_CIlog	cdecl	void	void	
+msvcr90.dll	_CIlog	cdecl	void	void	

@@ -324,8 +324,16 @@
   "x87_intrinsic_logarithm": {
     "source": "Microsoft Learn _CIlog10 x86 compiler intrinsic declaration, 2026-10-07 read",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cilog10",
+    "native_oracle_source_sha256": "0a2237b76d0cab51e11c66c37b1de7dde8b6a8de31cb472cb7d19be222b0b702",
+    "native_verification": "Authored VC80/90 26-row no-UI probe measures positive normal binary64 inputs and PC64 FILD(volume)/1000 for volumes 1,10,100,700,999,1000. Lower80-bit payload, ESP, control and errno/DOS/LastError survive; successful return clears C1 while retaining other measured status bits. Binary64 logarithms agree within two ULP; sequential multiply by33.2 then100 and truncation gives -9960,-6640,-3320,-514,-1,0. This does not establish universal extended-precision or exceptional CRT equivalence.",
     "scope": "Official void __cdecl _CIlog10(); zero ordinary integer-stack words for three existing CRT aliases. The top x87 operand is consumed and replaced by its base10 logarithm through the existing architectural/result bridge; no ordinary double-return C prototype or stack double argument.",
     "profile": "Reuse the common x87 architecture and CRT error owners, preserve lower80-bit registers and ESP. Positive numeric/control/status profiles must be measured; domain/range/unsupported controls must explicitly warn and fail without losing the original operand."
+  },
+  "x87_intrinsic_natural_logarithm": {
+    "source": "Microsoft Learn _CIlog x86 compiler intrinsic declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cilog",
+    "scope": "Official void __cdecl _CIlog(); zero ordinary integer-stack words for three existing CRT aliases. The top x87 operand is consumed and replaced by its natural logarithm through the existing architectural/result bridge.",
+    "profile": "Reuse the common x87 architecture and CRT error owners; positive normal numeric/control/status profiles require a native oracle, with unsupported domain/range/control inputs warning and failing before consuming the original operand."
   },
   "guest_comparator_sort": {
     "header": "ucrt/corecrt_search.h:23-24,60-65",

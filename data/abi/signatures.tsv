@@ -3477,6 +3477,7 @@ msacm32.dll	acmStreamUnprepareHeader	stdcall	u32	u32	has:Windows.Win32.Media.Aud
 msvcr80.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr80.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
 msvcr80.dll	_CIcos	cdecl	void	void	
+msvcr80.dll	_CIlog	cdecl	void	void	
 msvcr80.dll	_CIlog10	cdecl	void	void	
 msvcr80.dll	_CIpow	cdecl	void	void	
 msvcr80.dll	_CIsin	cdecl	void	void	
@@ -3562,6 +3563,7 @@ msvcr80.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u3
 msvcr90.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr90.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
 msvcr90.dll	_CIcos	cdecl	void	void	
+msvcr90.dll	_CIlog	cdecl	void	void	
 msvcr90.dll	_CIlog10	cdecl	void	void	
 msvcr90.dll	_CIpow	cdecl	void	void	
 msvcr90.dll	_CIsin	cdecl	void	void	
@@ -3653,6 +3655,7 @@ msvcr90.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u3
 msvcrt.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
 msvcrt.dll	_CIcos	cdecl	void	void	
+msvcrt.dll	_CIlog	cdecl	void	void	
 msvcrt.dll	_CIlog10	cdecl	void	void	
 msvcrt.dll	_CIpow	cdecl	void	void	
 msvcrt.dll	_CIsin	cdecl	void	void	
