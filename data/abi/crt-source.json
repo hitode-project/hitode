@@ -301,6 +301,8 @@
   "byte_set_scan": {
     "header": "ucrt/string.h:137-140,401-404,430-433",
     "header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
+    "native_oracle_source_sha256": "428e97500fcc40b87b0d27a8f8e77d0ef52395c317b1e21f1326214fa6978fd6",
+    "native_verification": "Authored VC90 seven-case probe covers unsigned high-byte membership, empty/NUL/repeated sets and early stopping before guard-page tails. All three functions preserve errno, DOS errno and LastError. Guest scans independently bound control and source to16MiB; limit violations warn/fail rather than return a fabricated NULL or span, and checked pointer faults are not advertised as native AV equivalence.",
     "scope": "Three existing CRT aliases: strpbrk/strcspn/strspn are cdecl with two const char* arguments and two x86 words. strpbrk returns a pointer into the source or NULL; strcspn/strspn return unsigned32 size_t byte counts. C ABI strpbrk return is char* regardless of C++ const-correct overloads.",
     "documentation": [
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strpbrk-wcspbrk-mbspbrk-mbspbrk-l",
