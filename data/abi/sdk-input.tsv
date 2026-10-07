@@ -28,3 +28,5 @@ d3dx9_43.dll	D3DXCreateTextureFromFileInMemoryEx	stdcall	i32	HRESULT	pDevice:LPD
 d3dx9_43.dll	D3DXGetImageInfoFromFileInMemory	stdcall	i32	HRESULT	pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1
 ntdll.dll	RtlSetCurrentDirectory_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	PathName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
 ntdll.dll	RtlGetCurrentDirectory_U	stdcall	u32	u32	BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1
+ntdll.dll	LdrLockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Disposition:u32*:ptr:1|Cookie:void**:ptr:1
+ntdll.dll	LdrUnlockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Cookie:void*:ptr:1

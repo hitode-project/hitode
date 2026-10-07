@@ -69,6 +69,14 @@ fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
 }
 
 fn loader_mutex(env: &mut Env<'_>) -> Option<u32> {
+    let handle = native_loader_mutex(env);
+    if handle.is_none() {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+    }
+    handle
+}
+
+pub(crate) fn native_loader_mutex(env: &mut Env<'_>) -> Option<u32> {
     match env.ext.get::<Win32>().loader_lock {
         Some(handle) => Some(handle),
         None => {
@@ -77,7 +85,6 @@ fn loader_mutex(env: &mut Env<'_>) -> Option<u32> {
                 recursion: 0,
             });
             if handle == 0 {
-                set_last_error(env, err::NOT_ENOUGH_MEMORY);
                 return None;
             }
             env.ext.get_mut::<Win32>().loader_lock = Some(handle);

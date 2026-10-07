@@ -159,5 +159,11 @@
     "stack": "SDK _RtlSetCurrentDirectory_U@4 (one descriptor pointer, NTSTATUS) and _RtlGetCurrentDirectory_U@8 (ULONG byte capacity, PWSTR output, ULONG byte result)",
     "documentation": "https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/path.c",
     "native_verification": "24 DWORDs cover Unicode directory, Win32 shared cwd, missing leaf/parent and non-directory NTSTATUS, short/equal/odd byte capacities, successful NUL write and unchanged LastError; no host paths or game data bundled"
+  },
+  "legacy_ldr_loader_lock": {
+    "scope": "LdrLockLoaderLock and LdrUnlockLoaderLock only; supported flags 0/TRY_ONLY, opaque guest cookies",
+    "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib @12/@8 and phnt primary declarations",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "24 DWORDs cover recursion, acquisition dispositions, genuine two-thread contention, invalid flags/missing outputs, zero-cookie unlock and LastError; opaque host cookies are not compared or copied"
   }
 }

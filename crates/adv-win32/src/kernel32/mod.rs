@@ -17,6 +17,7 @@ pub use handle::ProcessHandle;
 mod memory;
 pub(crate) use memory::protect_memory;
 mod module;
+pub(crate) use module::native_loader_mutex;
 pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread};
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
 mod nlsapi;

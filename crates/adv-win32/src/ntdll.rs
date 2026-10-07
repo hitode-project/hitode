@@ -1,6 +1,7 @@
 //! NT compatibility entry points over the existing virtual process, VFS and VM.
 mod path;
 mod directory;
+mod loader_lock;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -199,6 +200,7 @@ fn rtl_init_unicode_string(env: &mut Env<'_>) -> Outcome {
 pub fn register(reg: &mut Registry) {
     path::register(reg);
     directory::register(reg);
+    loader_lock::register(reg);
     stdcall(
         reg,
         NTDLL,
