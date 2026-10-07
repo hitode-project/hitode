@@ -330,7 +330,11 @@ fn executable_audio_store_uses_the_self_modification_guard() {
     // unobserved RWX audio page takes the native store.
     let (mut cpu, shared) = fixture(&code, true);
     cpu.protect(DATA, 8192, Prot::RWX).unwrap();
-    run(&mut cpu);
+    assert_eq!(
+        cpu.executor_mut().run(STOP, 1_000_000).unwrap(),
+        RunOutcome::ReachedStop,
+        "unobserved RWX audio page"
+    );
     let mut actual = [0; 4];
     shared.read_alias.copy_into(0, &mut actual);
     assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
@@ -343,7 +347,11 @@ fn executable_audio_store_uses_the_self_modification_guard() {
     cpu.executor_mut()
         .add_region(Region::new(DATA + 16, 1))
         .unwrap();
-    run(&mut cpu);
+    assert_eq!(
+        cpu.executor_mut().run(STOP, 1_000_000).unwrap(),
+        RunOutcome::ReachedStop,
+        "observed code on the audio page"
+    );
     shared.read_alias.copy_into(0, &mut actual);
     assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
     assert!(cpu.executor().stats.interpreter_instructions > 0);

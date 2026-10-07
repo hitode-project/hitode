@@ -39,8 +39,15 @@ static const struct adv_fpsimd_context *adv_fpsimd(const ucontext_t *context) {
         if (head->magic == 0x46508001) {
             if (head->size < sizeof(struct adv_fpsimd_context) || fp) return NULL;
             fp = (const void *)head;
+        } else if (head->magic == 0x53564501) {
+            /* Linux adds an SVE record on every SVE-capable CPU, header-only
+             * when no SVE state is live. Outside streaming mode the kernel
+             * still copies each Z register's low 128 bits, FPSR and FPCR into
+             * the FPSIMD record, and recovery changes only the PC, so that
+             * record stays authoritative. Streaming mode is not admitted. */
+            if (head->size < 16 || *(const uint16_t *)(records + offset + 10) & 1) return NULL;
         } else if (head->magic != 0x45535201) {
-            /* SVE, SME, and extension storage are not admitted by this lane. */
+            /* SME, extension storage and unknown records are not admitted. */
             return NULL;
         }
         offset += head->size;

@@ -2519,8 +2519,17 @@ mod topology_tests {
         for pc in [0x1000, 0x1200] {
             m.write(pc, &[0x40, 0xc3]).unwrap();
         }
+        // Identical guest bytes need not compile to identical sizes at every
+        // address on every host, so size the budget to fit either region alone.
+        let mut probe = machine();
+        for pc in [0x1000, 0x1200] {
+            probe.write(pc, &[0x40, 0xc3]).unwrap();
+            discover(&mut probe, pc);
+        }
+        let sizes = [0x1000, 0x1200].map(|pc| probe.code.compiled[&pc].code_size);
+        eprintln!("region code sizes: {sizes:?}");
+        let size = sizes[0].max(sizes[1]);
         discover(&mut m, 0x1000);
-        let size = m.stats.native_code_bytes;
         m.set_code_cache_limits(8, size);
         discover(&mut m, 0x1200);
         assert!(m.stats.native_code_bytes <= size);

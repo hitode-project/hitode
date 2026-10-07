@@ -19,8 +19,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  linux-arm64:
-    runs-on: ubuntu-24.04-arm
+  linux:
+    # x64 runs the same steps so ARM64-only failures stand out.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: '4'
@@ -50,7 +55,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: arm64-linux-${{ github.sha }}
+          name: linux-${{ matrix.runner }}-${{ github.sha }}
           path: |
             ${{ runner.temp }}/environment.txt
             ${{ runner.temp }}/tests.txt

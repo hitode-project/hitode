@@ -561,6 +561,8 @@ fn conditional_moves_memory_shifts_bit_tests_and_exchanges_stay_native() {
 }
 
 #[test]
+// Parallel guest workers exist only on Windows x64 MSVC.
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 fn locked_forms_fall_back_while_other_guest_threads_may_run() {
     let bytes = assemble(|a| {
         a.lock().inc(dword_ptr(edi)).unwrap();
