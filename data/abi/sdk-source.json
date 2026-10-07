@@ -180,5 +180,14 @@
     "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib @16, phnt primary declaration and authored x86 oracle",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
     "native_verification": "18 DWORDs cover callable named address identity, counted suffix, name overriding ordinal, entry/ordinal missing status, output zeroing, invalid zero ordinal, RTL target identity and unchanged LastError; loader ownership and diagnostic path shared with GetProcAddress"
+  },
+  "create_process_internal_w": {
+    "scope": "kernel32.dll CreateProcessInternalW only, NULL input token; hNewToken is untouched",
+    "source": "Wine and ReactOS primary twelve-argument BOOL/WINAPI declarations, corroborated by actual Microsoft Windows x86 export through the authored native caller",
+    "documentation": [
+      "https://github.com/wine-mirror/wine/blob/master/dlls/kernelbase/process.c",
+      "https://github.com/reactos/reactos/blob/master/dll/win32/kernel32/client/proc.c"
+    ],
+    "native_verification": "16 DWORDs cover missing image/error/output zeroing, unchanged hNewToken on failure/success, genuine suspended authored child, process/thread publication, previous suspend count, wait/exit 37 and handle close; guest uses the shared CreateProcessW supervisor and independent process/VM owner"
   }
 }
