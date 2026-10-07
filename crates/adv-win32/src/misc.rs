@@ -102,7 +102,41 @@ fn path_find_extension_a(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     let s = cstr(env.cpu, p);
     let c = codec(env);
-    Outcome::Return(p + ext_dot(&c, &s).unwrap_or(s.len()) as u32)
+    let offset = extension_offset(
+        char_starts(&c, &s)
+            .into_iter()
+            .map(|i| (i, u32::from(s[i]))),
+        s.len(),
+    );
+    Outcome::Return(p + offset as u32)
+}
+
+fn extension_offset(units: impl Iterator<Item = (usize, u32)>, end: usize) -> usize {
+    let mut dot = None;
+    for (index, unit) in units {
+        match unit {
+            46 => dot = Some(index),
+            32 | 92 => dot = None,
+            _ => {}
+        }
+    }
+    dot.unwrap_or(end)
+}
+
+#[adv_abi::win32(shlwapi, name = "PathFindExtensionW", level = implement)]
+fn path_find_extension_w(env: &mut Env<'_>, path: adv_abi::WideStr) -> Outcome {
+    let Ok(units) = path.read(env.cpu, 65536) else {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
+    };
+    let offset = extension_offset(
+        units
+            .iter()
+            .enumerate()
+            .map(|(i, unit)| (i, u32::from(*unit))),
+        units.len(),
+    );
+    Outcome::Return(path.0.addr() + offset as u32 * 2)
 }
 
 fn path_remove_extension_a(env: &mut Env<'_>) -> Outcome {
@@ -302,6 +336,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    reg.register(path_find_extension_w_ABI);
     theme::register(reg);
     internet::register(reg);
     shell_execute::register(reg);
@@ -417,6 +452,35 @@ mod tests {
         assert_eq!(last_sep(&c, &s), Some(2));
         let s = [b'a', 0x95, 0x5c, b'.', b't', b'x', b't'];
         assert_eq!(ext_dot(&c, &s), Some(3));
+        let s = [b'a', b'.', b'b', 0x95, 0x5c];
+        assert_eq!(
+            extension_offset(
+                char_starts(&c, &s)
+                    .into_iter()
+                    .map(|i| (i, u32::from(s[i]))),
+                s.len()
+            ),
+            1
+        );
+        for (path, expected) in [
+            ("abc", 3),
+            ("a.b c", 5),
+            ("a.b/c", 1),
+            ("a.b:c", 1),
+            (r"a.b\c", 5),
+            (".a", 0),
+            ("a..b", 2),
+            ("字體.dll", 2),
+        ] {
+            let units: Vec<_> = path.encode_utf16().collect();
+            assert_eq!(
+                extension_offset(
+                    units.iter().enumerate().map(|(i, u)| (i, u32::from(*u))),
+                    units.len()
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
