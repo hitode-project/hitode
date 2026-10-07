@@ -1001,7 +1001,22 @@ mod tests {
             "mixed-read",
             "rollback-readonly-write",
         ] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let executable = std::env::current_exe().unwrap();
+            #[cfg(target_arch = "aarch64")]
+            let mut child = if let Some(runner) =
+                std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
+            {
+                // A user-mode emulator cannot exec a target ELF through the
+                // host kernel without its configured runner or binfmt support.
+                let mut command = std::process::Command::new(runner);
+                command.arg(&executable);
+                command
+            } else {
+                std::process::Command::new(executable)
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let mut child = std::process::Command::new(executable);
+            let output = child
                 .args([
                     "--exact",
                     "virtual_memory::direct::tests::fault_child",
@@ -1014,7 +1029,8 @@ mod tests {
             assert_eq!(
                 output.status.signal(),
                 Some(libc::SIGSEGV),
-                "probe {scenario}: {}",
+                "probe {scenario} ({}): {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
         }
