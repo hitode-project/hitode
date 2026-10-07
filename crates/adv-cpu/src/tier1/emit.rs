@@ -23,7 +23,23 @@ struct Fixup {
     kind: Branch,
 }
 
+/// Host addresses of the checked scalar access helpers. Each takes the entry
+/// frame in x0 and follows AAPCS64, so guest registers in x19-x28 survive.
+#[derive(Clone, Copy)]
+pub(super) struct Helpers {
+    /// `(frame, address, kind) -> value | status << 32`, where kind is the
+    /// width in bytes plus `SIGNED`; nonzero status means nothing was read.
+    pub load: u64,
+    /// `(frame, address, value) -> 0` to continue, 1 after a store that
+    /// must leave native code, 2 when not performed.
+    pub store: u64,
+}
+
+/// Load kind flag: sign-extend the loaded value to 32 bits.
+pub(super) const SIGNED: u32 = 0x100;
+
 pub(super) struct Emitter {
+    helpers: Helpers,
     pub words: Vec<u32>,
     pub entries: BTreeMap<u32, usize>,
     exits: BTreeMap<u32, usize>,
@@ -79,7 +95,22 @@ pub(super) fn supported(i: &Instruction) -> bool {
                     && address(i)
         }
         M::Lea => dst && i.op1_kind() == OpKind::Memory && address(i),
-        M::Add | M::Sub | M::Cmp | M::And | M::Or | M::Xor | M::Test => dst && source(i, 1),
+        M::Movzx | M::Movsx => {
+            dst && i.op1_kind() == OpKind::Memory
+                && matches!(i.memory_size().size(), 1 | 2)
+                && address(i)
+        }
+        M::Add | M::Sub | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
+            let memory =
+                |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
+            dst && (source(i, 1) || memory(1))
+                // Reading forms only; read-modify-write stays in Tier 0.
+                || matches!(i.mnemonic(), M::Cmp | M::Test) && memory(0) && source(i, 1)
+        }
+        M::Push => i.stack_pointer_increment() == -4 && source(i, 0),
+        M::Pop => dst && i.stack_pointer_increment() == 4,
+        M::Call => i.op0_kind() == OpKind::NearBranch32,
+        M::Ret => i.op_count() == 0 || i.op0_kind() == OpKind::Immediate16,
         M::Inc | M::Dec | M::Neg | M::Not => dst,
         M::Jmp => i.op0_kind() == OpKind::NearBranch32,
         _ => {
@@ -91,8 +122,9 @@ pub(super) fn supported(i: &Instruction) -> bool {
 }
 
 impl Emitter {
-    pub fn new() -> Self {
+    pub fn new(helpers: Helpers) -> Self {
         Self {
+            helpers,
             words: Vec::new(),
             entries: BTreeMap::new(),
             exits: BTreeMap::new(),
@@ -169,6 +201,71 @@ impl Emitter {
             self.binary(0x0b00_0000, 9, 9, 10);
         }
     }
+    fn address64(&mut self, d: u8, n: u64) {
+        self.word(0xd280_0000 | ((n & 0xffff) as u32) << 5 | d as u32);
+        for (shift, movk) in [(16, 0xf2a0_0000), (32, 0xf2c0_0000), (48, 0xf2e0_0000)] {
+            self.word(movk | (((n >> shift) & 0xffff) as u32) << 5 | d as u32);
+        }
+    }
+    /// Call a helper with x0 = frame and w1/w2 already set. Caller-saved
+    /// flags, remaining units and stop are spilled to the frame around it.
+    fn call(&mut self, target: u64) {
+        self.store32(8, 32);
+        self.word(0xf900_1767); // str x7,[x27,#40]
+        self.word(0xa9bf_7bfd); // stp x29,x30,[sp,#-16]!
+        self.word(0x9100_03fd); // mov x29,sp
+        self.word(0xaa1b_03e0); // mov x0,x27
+        self.address64(16, target);
+        self.word(0xd63f_0200); // blr x16
+        self.word(0xa8c1_7bfd); // ldp x29,x30,[sp],#16
+        self.load32(8, 32);
+        self.word(0xf940_1767); // ldr x7,[x27,#40]
+        self.load32(6, 48);
+    }
+    /// Load `kind` from the address in w1 into w0. A refused load committed
+    /// nothing, so the whole instruction reruns exactly in Tier 0.
+    fn load(&mut self, pc: u32, kind: u32) {
+        self.constant(2, kind);
+        self.call(self.helpers.load);
+        self.word(0xd360_fc09); // lsr x9,x0,#32
+        let ok = self.words.len();
+        self.word(0);
+        self.constant(5, pc);
+        self.jump(Label::Exit(FALLBACK), Branch::B);
+        self.words[ok] = 0x3400_0009 | ((self.words.len() - ok) as u32) << 5; // cbz w9
+    }
+    /// Continue after the store helper. `commit` applies the instruction's
+    /// register effects once the store is performed; a refused store reruns
+    /// the instruction in Tier 0 and one that must leave dispatches `target`.
+    fn stored(&mut self, pc: u32, target: u32, link: bool, commit: impl Fn(&mut Self)) {
+        self.word(0x7100_081f); // cmp w0,#2
+        let refused = self.words.len();
+        self.word(0);
+        commit(self);
+        self.charge();
+        let leave = self.words.len();
+        self.word(0);
+        if link {
+            self.link();
+        }
+        self.jump(Label::Guest(target), Branch::B);
+        self.words[leave] = 0x3500_0000 | ((self.words.len() - leave) as u32) << 5; // cbnz w0
+        self.constant(5, target);
+        self.jump(Label::Exit(DISPATCH), Branch::B);
+        self.words[refused] = 0x5400_0000 | ((self.words.len() - refused) as u32) << 5; // b.eq
+        self.constant(5, pc);
+        self.jump(Label::Exit(FALLBACK), Branch::B);
+    }
+    fn esp_add(&mut self, n: u32) {
+        self.word(0x1100_0000 | n << 10 | 23 << 5 | 23); // add w23,w23,#n
+    }
+    fn esp_sub(&mut self, d: u8) {
+        self.word(0x5100_1000 | 23 << 5 | d as u32); // sub wd,w23,#4
+    }
+    /// Branch over the next `words` instructions when w`r` is nonzero.
+    fn skip_nonzero(&mut self, r: u8, words: u32) {
+        self.word(0x3500_0000 | (words + 1) << 5 | r as u32);
+    }
     fn charge(&mut self) {
         self.word(0xd100_04e7);
     } // sub x7,x7,#1
@@ -177,42 +274,44 @@ impl Emitter {
         self.word(0x9100_058c); // add x12,x12,#1
         self.word(0xf900_1f6c); // str x12,[x27,#56]
     }
+    /// Replace bit `lsb` of w`d` with bit 0 of w`n` (BFI).
+    fn bfi(&mut self, d: u8, n: u8, lsb: u32) {
+        self.word(0x3300_0000 | ((32 - lsb) % 32) << 16 | (n as u32) << 5 | d as u32);
+    }
+    /// w14 = 1 when the host condition holds (CSET).
+    fn cset14(&mut self, condition: u32) {
+        self.word(0x1a9f_07ee | (condition ^ 1) << 12);
+    }
     fn flags(&mut self, subtract: bool, logic: bool, preserve_carry: bool) {
-        // ADDS/SUBS/ANDS already produced NZCV. MOV/UBFM never change it.
-        self.word(0xd53b_420c); // mrs x12,nzcv
-        if preserve_carry {
-            self.mask(0, 8, 1);
+        // ADDS/SUBS/ANDS already produced NZCV. CSET reads it directly and
+        // BFI replaces one guest bit, so no other EFLAGS bit is disturbed.
+        const EQ: u32 = 0;
+        const CS: u32 = 2;
+        const CC: u32 = 3;
+        const MI: u32 = 4;
+        const VS: u32 = 6;
+        for (condition, guest) in [(MI, 7), (EQ, 6), (VS, 11)] {
+            self.cset14(condition);
+            self.bfi(8, 14, guest);
         }
+        if !preserve_carry {
+            // ARM carry after subtraction is the inverse of x86 borrow.
+            self.cset14(if subtract { CC } else { CS });
+            self.bfi(8, 14, 0);
+        }
+        // PF: even parity of the low result byte, folded into bit 0.
+        for (n, shift) in [(11, 4), (14, 2), (14, 1)] {
+            // eor w14,wn,wn,lsr #shift
+            self.word(0x4a40_0000 | n << 16 | shift << 10 | n << 5 | 14);
+        }
+        self.word(0x5200_01ce); // eor w14,w14,#1
+        self.bfi(8, 14, 2);
         // Logical AF is architecturally undefined; match Tier 0 preservation.
-        self.mask(8, 8, !(if logic { 0x8c5 } else { 0x8d5 }));
-        for (host, guest) in [(31, 7), (30, 6), (29, 0), (28, 11)] {
-            self.lsr(14, 12, host);
-            self.mask(14, 14, 1);
-            if host == 29 && subtract {
-                self.constant(17, 1);
-                self.binary(0x4a00_0000, 14, 14, 17);
-            }
-            if host == 29 && preserve_carry {
-                self.mov(14, 0);
-            }
-            self.lsl(14, 14, guest);
-            self.binary(0x2a00_0000, 8, 8, 14);
-        }
-        self.lsr(14, 11, 4);
-        self.binary(0x4a00_0000, 14, 14, 11);
-        self.lsr(15, 14, 2);
-        self.binary(0x4a00_0000, 14, 14, 15);
-        self.lsr(15, 14, 1);
-        self.binary(0x4a00_0000, 14, 14, 15);
-        self.word(0x2a20_03ee | 14 << 16); // mvn w14,w14
-        self.mask(14, 14, 1);
-        self.lsl(14, 14, 2);
-        self.binary(0x2a00_0000, 8, 8, 14);
         if !logic {
             self.binary(0x4a00_0000, 14, 9, 10);
             self.binary(0x4a00_0000, 14, 14, 11);
-            self.mask(14, 14, 16);
-            self.binary(0x2a00_0000, 8, 8, 14);
+            self.lsr(14, 14, 4);
+            self.bfi(8, 14, 4);
         }
     }
     fn condition(&mut self, c: C) {
@@ -266,6 +365,18 @@ impl Emitter {
         match i.mnemonic() {
             M::Mov if i.op1_kind() == OpKind::Memory => {
                 self.ea(i, true);
+                self.mov(1, 9);
+                self.constant(2, 4);
+                self.call(self.helpers.load);
+                self.word(0xd360_fc09); // lsr x9,x0,#32
+                self.skip_nonzero(9, 3);
+                self.mov(d, 0);
+                self.charge();
+                self.jump(Label::Guest(i.next_ip32()), Branch::B);
+                // The helper refused: leave through the checked exit, which
+                // reports the exact fault. The call clobbered w5.
+                self.constant(5, pc);
+                self.ea(i, true);
                 self.store32(9, 64);
                 self.constant(9, u32::from(d - 19));
                 self.store32(9, 76);
@@ -276,6 +387,23 @@ impl Emitter {
             }
             M::Mov if i.op0_kind() == OpKind::Memory => {
                 self.ea(i, true);
+                self.mov(1, 9);
+                self.operand(2, i, 1);
+                self.call(self.helpers.store);
+                self.skip_nonzero(0, 2);
+                self.charge();
+                self.jump(Label::Guest(i.next_ip32()), Branch::B);
+                // A committed store that changed code or the memory epoch
+                // leaves so the owner revalidates before the next instruction.
+                self.word(0x7100_041f); // cmp w0,#1
+                let refused = self.words.len();
+                self.word(0);
+                self.charge();
+                self.constant(5, i.next_ip32());
+                self.jump(Label::Exit(DISPATCH), Branch::B);
+                self.words[refused] = 0x5400_0001 | ((self.words.len() - refused) as u32) << 5; // b.ne
+                self.constant(5, pc);
+                self.ea(i, true);
                 self.store32(9, 64);
                 self.operand(9, i, 1);
                 self.store32(9, 68);
@@ -285,6 +413,49 @@ impl Emitter {
                 return;
             }
             M::Mov => self.operand(d, i, 1),
+            M::Movzx | M::Movsx => {
+                self.ea(i, true);
+                self.mov(1, 9);
+                let signed = if i.mnemonic() == M::Movsx { SIGNED } else { 0 };
+                self.load(pc, i.memory_size().size() as u32 | signed);
+                self.mov(d, 0);
+            }
+            M::Push => {
+                self.esp_sub(1);
+                self.operand(2, i, 0);
+                self.call(self.helpers.store);
+                self.stored(pc, i.next_ip32(), false, |e| e.esp_sub(23));
+                return;
+            }
+            M::Pop => {
+                self.mov(1, 23);
+                self.load(pc, 4);
+                // POP ESP stores the loaded value after the increment.
+                self.esp_add(4);
+                self.mov(d, 0);
+            }
+            M::Call => {
+                self.esp_sub(1);
+                self.constant(2, i.next_ip32());
+                self.call(self.helpers.store);
+                self.stored(pc, i.near_branch32(), true, |e| e.esp_sub(23));
+                return;
+            }
+            M::Ret => {
+                self.mov(1, 23);
+                self.load(pc, 4);
+                let release = if i.op_count() == 0 {
+                    0
+                } else {
+                    u32::from(i.immediate16())
+                };
+                self.constant(10, 4 + release);
+                self.binary(0x0b00_0000, 23, 23, 10);
+                self.mov(5, 0);
+                self.charge();
+                self.jump(Label::Exit(DISPATCH), Branch::B);
+                return;
+            }
             M::Lea => {
                 self.ea(i, false);
                 self.mov(d, 9);
@@ -306,14 +477,29 @@ impl Emitter {
                 return;
             }
             m => {
-                self.mov(9, d);
-                if matches!(m, M::Inc | M::Dec) {
-                    self.constant(10, 1);
-                } else if m == M::Neg {
-                    self.mov(10, 9);
-                    self.constant(9, 0);
-                } else {
+                // Left operand in w9, right operand in w10.
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(10, 0);
+                    self.mov(9, d);
+                } else if i.op0_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(9, 0);
                     self.operand(10, i, 1);
+                } else {
+                    self.mov(9, d);
+                    match m {
+                        M::Inc | M::Dec => self.constant(10, 1),
+                        M::Neg => {
+                            self.mov(10, 9);
+                            self.constant(9, 0);
+                        }
+                        _ => self.operand(10, i, 1),
+                    }
                 }
                 let logic = matches!(m, M::And | M::Or | M::Xor | M::Test);
                 let sub = matches!(m, M::Sub | M::Cmp | M::Dec | M::Neg);

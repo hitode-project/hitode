@@ -52,6 +52,22 @@ jobs:
         run: |
           set -o pipefail
           cargo test --release --locked -p adv-cpu --no-fail-fast --tests 2>&1 | tee "$RUNNER_TEMP/strict.txt"
+      - name: Direct memory execution layer
+        if: always()
+        env:
+          ADV_DIRECT_MEMORY: '1'
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/direct.txt"
+      - name: Direct memory differential verification (strict)
+        if: always()
+        continue-on-error: true
+        env:
+          ADV_DIRECT_MEMORY: '1'
+          ADV_JIT_VERIFY: strict
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests 2>&1 | tee "$RUNNER_TEMP/direct-strict.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -60,6 +76,8 @@ jobs:
             ${{ runner.temp }}/environment.txt
             ${{ runner.temp }}/tests.txt
             ${{ runner.temp }}/strict.txt
+            ${{ runner.temp }}/direct.txt
+            ${{ runner.temp }}/direct-strict.txt
           if-no-files-found: ignore
           retention-days: 14
 

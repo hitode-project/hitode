@@ -568,6 +568,12 @@ impl DirectFaultView<'_> {
 
 #[cfg(unix)]
 impl Reservation {
+    /// Stable alias for the existing software-checked Memory owner. The caller
+    /// must enforce guest permissions and the normal code invalidation protocol.
+    pub(crate) fn checked_pointer(&self) -> Option<NonNull<u8>> {
+        self.direct_alias.as_ref().map(|alias| alias.pointer)
+    }
+
     /// Explicit opt-in; existing Reservation::new and Memory constructors keep
     /// software permissions and their existing RW mapping behavior unchanged.
     pub fn new_direct(len: usize) -> Result<Self, String> {
@@ -999,7 +1005,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn protected_window_faults_only_in_child_process() {
         use std::os::unix::process::ExitStatusExt;
@@ -1011,7 +1017,7 @@ mod tests {
             "rollback-readonly-write",
         ] {
             let executable = std::env::current_exe().unwrap();
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
             let mut child = if let Some(runner) =
                 std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
             {
@@ -1023,7 +1029,7 @@ mod tests {
             } else {
                 std::process::Command::new(executable)
             };
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
             let mut child = std::process::Command::new(executable);
             let output = child
                 .args([
@@ -1045,7 +1051,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     #[ignore = "expected SIGSEGV; executed only by protected_window_faults_only_in_child_process"]
     fn fault_child() {

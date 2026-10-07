@@ -64,6 +64,18 @@ pub struct Stats {
     pub cliffs: crate::Cliffs,
     /// Interpreter checks of newly published native code.
     pub verification: VerifyStats,
+    pub direct_memory: DirectMemoryStats,
+}
+
+/// Direct scalar site publications and dynamic access outcomes.
+#[derive(Default, Clone, Debug)]
+pub struct DirectMemoryStats {
+    pub sites: u64,
+    pub accesses: u64,
+    pub recoveries: u64,
+    pub violations: u64,
+    pub checked_fallbacks: u64,
+    pub code_writes: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -298,6 +310,18 @@ impl Executor {
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
         self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if let Some(engine) = &self.memory.direct_engine {
+            let stats = &mut self.stats.direct_memory;
+            stats.accesses = engine.accesses.get();
+            stats.recoveries = engine.recoveries.get();
+            stats.violations = engine.violations.get();
+            stats.checked_fallbacks = engine.checked.get();
+            stats.code_writes = engine.code_writes.get();
+        }
         self.timestamp = bridge.timestamp;
         result
     }
@@ -311,6 +335,28 @@ impl Executor {
             }
             Box::new(verifier)
         });
+    }
+    /// Account one verified native exit; strict mode stops at a mismatch.
+    fn record_verification(
+        &mut self,
+        check: Option<Result<verify::Check, String>>,
+    ) -> Result<(), String> {
+        let stats = &mut self.stats.verification;
+        match check {
+            None => stats.inconclusive += 1,
+            Some(Ok(verify::Check::Equal)) => stats.verified += 1,
+            Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+            Some(Err(report)) => {
+                stats.mismatches += 1;
+                if self.verifier.as_ref().is_some_and(|v| v.strict) {
+                    return Err(format!("tier verification: {report}"));
+                }
+                if stats.reports.len() < verify::REPORTS {
+                    stats.reports.push(report);
+                }
+            }
+        }
+        Ok(())
     }
     /// Select helper threads before execution. Zero runs admitted batches inline.
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
@@ -337,6 +383,31 @@ impl Executor {
             .as_ref()
             .map_or_else(Default::default, |pool| pool.stats())
     }
+    /// Choose before compiling or executing. The default remains checked.
+    /// Disabling after reservation requires a fresh owner, so outstanding host
+    /// aliases can never silently move to a different allocation.
+    pub fn set_direct_memory(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled == self.memory.direct_memory_enabled() {
+            return Ok(());
+        }
+        if !enabled {
+            return Err("create a fresh executor to disable direct memory".into());
+        }
+        if self.stats.native_entries != 0
+            || self.stats.interpreter_entries != 0
+            || !self.code.compiled.is_empty()
+            || !self.pending_regions.is_empty()
+            || !self.deferred_compilations.is_empty()
+            || self.tier1.is_some()
+        {
+            return Err(
+                "direct memory must be selected before compilation and execution, without Tier 1"
+                    .into(),
+            );
+        }
+        self.memory.enable_direct_memory()
+    }
+
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         Self::create(Memory::new(base, len)?)
     }
@@ -355,7 +426,7 @@ impl Executor {
                 None
             }
         };
-        Ok(Self {
+        let mut executor = Self {
             rows,
             parallel: None,
             parallel_image: None,
@@ -412,7 +483,11 @@ impl Executor {
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
             stats: Stats::default(),
-        })
+        };
+        if std::env::var("ADV_DIRECT_MEMORY").is_ok_and(|value| value == "1") {
+            executor.set_direct_memory(true)?;
+        }
+        Ok(executor)
     }
 
     pub(crate) fn setup_wow64_segments(&mut self, addr: u32) -> Result<(), String> {
@@ -596,6 +671,7 @@ impl Executor {
             }
             self.demand.remove(&pc);
         }
+        self.stats.direct_memory.sites += compiled.direct_sites as u64;
         self.stats.native_code_bytes += compiled.code_size;
         if let Some(profile) = compiled.shared_profile() {
             self.profiled.push((region.start, profile));
@@ -1545,21 +1621,8 @@ impl Executor {
                     },
                 );
                 if let Some(trace) = &trace {
-                    let stats = &mut self.stats.verification;
-                    match trace.check(&self.state, &self.memory) {
-                        None => stats.inconclusive += 1,
-                        Some(Ok(verify::Check::Equal)) => stats.verified += 1,
-                        Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
-                        Some(Err(report)) => {
-                            stats.mismatches += 1;
-                            if self.verifier.as_ref().is_some_and(|v| v.strict) {
-                                return Err(format!("tier verification: {report}"));
-                            }
-                            if stats.reports.len() < verify::REPORTS {
-                                stats.reports.push(report);
-                            }
-                        }
-                    }
+                    let check = trace.check(&self.state, &self.memory);
+                    self.record_verification(check)?;
                 }
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
@@ -2555,7 +2618,9 @@ mod topology_tests {
             m.write(pc, &[0x40, 0xc3]).unwrap();
         }
         // Identical guest bytes need not compile to identical sizes at every
-        // address on every host, so size the budget to fit either region alone.
+        // address on every host, or even twice at one address (macOS ARM64
+        // varied by a few bytes), so the budget fits either region alone with
+        // slack but never both.
         let mut probe = machine();
         for pc in [0x1000, 0x1200] {
             probe.write(pc, &[0x40, 0xc3]).unwrap();
@@ -2563,7 +2628,7 @@ mod topology_tests {
         }
         let sizes = [0x1000, 0x1200].map(|pc| probe.code.compiled[&pc].code_size);
         eprintln!("region code sizes: {sizes:?}");
-        let size = sizes[0].max(sizes[1]);
+        let size = sizes[0].max(sizes[1]) + sizes[0].min(sizes[1]) / 2;
         discover(&mut m, 0x1000);
         m.set_code_cache_limits(8, size);
         discover(&mut m, 0x1200);
