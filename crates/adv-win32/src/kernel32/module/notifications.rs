@@ -9,8 +9,10 @@ use adv_machine::outcome::DeferredContinuation;
 pub(super) const INTERNAL: &str = "<win32>";
 pub(super) const THREAD_START: &str = "thread_start";
 
+mod shutdown;
 #[cfg(test)]
 mod tests;
+pub(crate) use shutdown::shutdown_process;
 
 pub(crate) fn install_startup<B: Backend>(machine: &mut Machine<B>) -> Result<(), MemFault> {
     machine.sys.process_return = Some(exit_process);
@@ -318,22 +320,6 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     env.cpu.quiesce_memory();
     crate::user32::hooks::exit_process(env);
     env.sys.terminate_other_contexts(code);
-    // As for thread exit, current-thread FLS runs before process DLL detach.
-    super::super::sync::detach_fls(
-        env,
-        Box::new(move |env| {
-            terminal_notifications(
-                env,
-                0,
-                Box::new(move |env| {
-                    match crate::msvcrt::detach_process(env)
-                        .and_then(|()| crate::gdi32::font::detach_process(env))
-                    {
-                        Ok(()) => Outcome::ExitProcess(code),
-                        Err(error) => Outcome::Fail(error),
-                    }
-                }),
-            )
-        }),
-    )
+    let shutdown = shutdown_process(env);
+    after(env, shutdown, Box::new(move |_| Outcome::ExitProcess(code)))
 }

@@ -13,6 +13,7 @@ const CODE: u32 = 0x400000;
 const PEER: u32 = CODE + 256;
 const DATA: u32 = 0x410000;
 const PARK: u32 = adv_machine::layout::PARK_ADDR;
+mod shutdown;
 #[derive(Default)]
 struct Calls(Vec<[u32; 4]>);
 

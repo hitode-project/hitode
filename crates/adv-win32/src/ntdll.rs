@@ -9,6 +9,7 @@ mod peb_lock;
 pub(crate) use peb_lock::install as install_peb_lock;
 mod procedure;
 mod registry;
+mod shutdown;
 mod strings;
 mod termination;
 mod thread;
@@ -218,6 +219,7 @@ pub fn register(reg: &mut Registry) {
     loader_lock::register(reg);
     peb_lock::register(reg);
     loader::register(reg);
+    shutdown::register(reg);
     strings::register(reg);
     procedure::register(reg);
     thread::register(reg);

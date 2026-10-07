@@ -237,6 +237,14 @@ fn differential(compiled: bool) {
 
         let mut expected = state.clone();
         let mut reference = memory(data, &bytes);
+        let mut fast_memory = memory(data, &bytes);
+        if compiled {
+            // Compilation observes the code page, which advances the epoch
+            // once. Observe it in both memories up front so the comparison
+            // sees only the instruction's own effects, cached code or not.
+            reference.watch_code(CODE, bytes.len());
+            fast_memory.watch_code(CODE, bytes.len());
+        }
         let epoch = reference.epoch;
         let step = super::super::execute(
             &instruction,
@@ -247,7 +255,6 @@ fn differential(compiled: bool) {
             true,
         );
         let mut actual = state.clone();
-        let mut fast_memory = memory(data, &bytes);
         let before = testing::calls();
         let result = if compiled {
             let code = cache.entry(bytes.clone()).or_insert_with(|| {

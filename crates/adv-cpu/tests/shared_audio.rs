@@ -326,10 +326,24 @@ fn executable_audio_store_uses_the_self_modification_guard() {
         a.mov(dword_ptr(DATA as i32), 0x1234_5678).unwrap();
         a.ret().unwrap();
     });
+    // Executable permission alone no longer reserves a write barrier: an
+    // unobserved RWX audio page takes the native store.
     let (mut cpu, shared) = fixture(&code, true);
     cpu.protect(DATA, 8192, Prot::RWX).unwrap();
     run(&mut cpu);
     let mut actual = [0; 4];
+    shared.read_alias.copy_into(0, &mut actual);
+    assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
+    assert_eq!(cpu.executor().stats.interpreter_instructions, 0);
+
+    // Once code on the page is observed, the store goes through the guard.
+    let (mut cpu, shared) = fixture(&code, true);
+    cpu.protect(DATA, 8192, Prot::RWX).unwrap();
+    cpu.write(DATA + 16, &[0xc3]).unwrap();
+    cpu.executor_mut()
+        .add_region(Region::new(DATA + 16, 1))
+        .unwrap();
+    run(&mut cpu);
     shared.read_alias.copy_into(0, &mut actual);
     assert_eq!(actual, 0x1234_5678u32.to_le_bytes());
     assert!(cpu.executor().stats.interpreter_instructions > 0);
