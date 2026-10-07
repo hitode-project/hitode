@@ -3544,6 +3544,9 @@ msvcr80.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8
 msvcr80.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcr80.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
 msvcr80.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcr80.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr80.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr80.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
 msvcr80.dll	strtod	cdecl	f64	double	text:const char*:str8:1|end:char**:ptr:1
 msvcr80.dll	swprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1
 msvcr80.dll	tolower	cdecl	i32	int	character:int:i32:1
@@ -3627,6 +3630,9 @@ msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8
 msvcr90.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcr90.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
 msvcr90.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcr90.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr90.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr90.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
 msvcr90.dll	strtod	cdecl	f64	double	text:const char*:str8:1|end:char**:ptr:1
 msvcr90.dll	swprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1
 msvcr90.dll	tolower	cdecl	i32	int	character:int:i32:1
@@ -3693,6 +3699,9 @@ msvcrt.dll	rand	cdecl	i32	int
 msvcrt.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
 msvcrt.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcrt.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcrt.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcrt.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
 msvcrt.dll	strtod	cdecl	f64	double	text:const char*:str8:1|end:char**:ptr:1
 msvcrt.dll	tolower	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	toupper	cdecl	i32	int	character:int:i32:1

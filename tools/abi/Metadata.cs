@@ -236,6 +236,15 @@ public static class AbiMetadata
             bool crtRound = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && new[] { "floor", "ceil", "fabs" }.Contains(f[1]) && f[2] == "cdecl"
                 && f[3] == "f64" && f[4] == "double" && f[5] == "value:double:f64:2";
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "strpbrk", "strcspn", "strspn" }.Contains(f[1]))
+            {
+                bool pointer = f[1] == "strpbrk";
+                if (f[2] != "cdecl" || f[3] != (pointer ? "ptr" : "u32")
+                    || f[4] != (pointer ? "char*" : "size_t")
+                    || f[5] != "text:const char*:str8:1|set:const char*:str8:1")
+                    throw new InvalidDataException("CRT byte-set scan stack contract changed: " + row);
+            }
             bool crtModf = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && f[1] == "modf" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
                 && f[5] == "value:double:f64:2|integer:double*:ptr:1";

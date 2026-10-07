@@ -291,6 +291,17 @@
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/modf-modff-modfl",
     "profile": "Use shared binary64/x87 return and CRT error owners, complete eight-byte integer output preflight and measured special-value/control behavior. Unimplemented exception/status or callback profiles must warn and fail without fabricating a double result."
   },
+  "byte_set_scan": {
+    "header": "ucrt/string.h:137-140,401-404,430-433",
+    "header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
+    "scope": "Three existing CRT aliases: strpbrk/strcspn/strspn are cdecl with two const char* arguments and two x86 words. strpbrk returns a pointer into the source or NULL; strcspn/strspn return unsigned32 size_t byte counts. C ABI strpbrk return is char* regardless of C++ const-correct overloads.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strpbrk-wcspbrk-mbspbrk-mbspbrk-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcspn-wcscspn-mbscspn-mbscspn-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strspn-wcsspn-mbsspn-mbsspn-l"
+    ],
+    "profile": "Read raw guest bytes through one bounded byte-membership scanner, including high bytes; no locale or Unicode conversion, new string storage, or fabricated invalid-parameter callback. Stop before unnecessary source-tail reads and warn/fail outside supported bounds."
+  },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
     "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
