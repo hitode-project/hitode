@@ -25,12 +25,13 @@ const PE: i64 = 0x20;
 const RANGE: i32 = 400;
 
 pub(super) fn enabled() -> bool {
-    // ARM keeps its validated helper until native emission is tested on hardware.
+    // Other architectures retain the transactional helper. Guest precision and
+    // operand guards below remain mandatory on both native emission targets.
     #[cfg(test)]
     if testing::HELPER_ONLY.get() {
         return false;
     }
-    cfg!(target_arch = "x86_64")
+    cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
         && std::env::var_os("ADV_JIT_X87_HELPER_ONLY").is_none_or(|v| v != "1")
 }
 
@@ -41,7 +42,9 @@ fn use_fma() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     return std::arch::is_x86_feature_detected!("fma");
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    return true;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     false
 }
 
@@ -844,5 +847,5 @@ pub(crate) mod testing {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests;

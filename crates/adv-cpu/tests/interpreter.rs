@@ -128,6 +128,108 @@ fn sldt_reads_owned_selector_and_failed_memory_store_does_not_commit() {
     assert_eq!(actual.eflags, initial.eflags);
 }
 
+#[test]
+fn sidt_operand_sizes_write_six_owned_bytes_and_preserve_other_state() {
+    for word in [false, true] {
+        let mut bytes = code(|a| {
+            a.sidt(fword_ptr(DATA + 1)).unwrap();
+        });
+        if word {
+            bytes.insert(0, 0x66);
+        }
+        let mut memory = memory(&bytes);
+        memory.write(DATA, &[0xa5; 8]).unwrap();
+        let mut actual = state();
+        actual.segments.idt_base = 0xf123_4567;
+        actual.segments.idt_limit = 0x7ff;
+        let mut expected = actual.clone();
+        expected.eip += bytes.len() as u32;
+        assert_eq!(
+            Interpreter::new().step(&mut actual, &mut memory),
+            Step::Executed
+        );
+        assert_eq!(
+            memory.read(DATA, 8).unwrap(),
+            [0xa5, 0xff, 7, 0x67, 0x45, 0x23, 0xf1, 0xa5]
+        );
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn sidt_uses_address_size_wrapping_before_fs_base() {
+    let bytes = code(|a| {
+        a.sidt(fword_ptr(bx + si + 0x20).fs()).unwrap();
+    });
+    let mut memory = memory(&bytes);
+    let mut actual = state();
+    actual.regs[3] = 0x1234_fff0;
+    actual.regs[6] = 0x5678_0030;
+    actual.fs_base = DATA;
+    actual.segments.idt_base = 0xe123_4567;
+    actual.segments.idt_limit = 0x7ff;
+    let mut expected = actual.clone();
+    expected.eip += bytes.len() as u32;
+    assert_eq!(
+        Interpreter::new().step(&mut actual, &mut memory),
+        Step::Executed
+    );
+    assert_eq!(
+        memory.read(DATA + 0x40, 6).unwrap(),
+        [0xff, 7, 0x67, 0x45, 0x23, 0xe1]
+    );
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn sidt_failed_second_write_is_restartable_and_does_not_commit_the_limit() {
+    let bytes = code(|a| {
+        a.sidt(fword_ptr(DATA + 4094)).unwrap();
+    });
+    let mut memory = memory(&bytes);
+    memory.write(DATA + 4094, &[0xa5; 6]).unwrap();
+    memory.protect(DATA + 4096, 4096, READ).unwrap();
+    let mut actual = state();
+    actual.segments.idt_base = 0xf123_4567;
+    actual.segments.idt_limit = 0x7ff;
+    let initial = actual.clone();
+    let mut interpreter = Interpreter::new();
+    assert_eq!(
+        interpreter.step(&mut actual, &mut memory),
+        Step::WriteFault {
+            pc: CODE,
+            address: DATA + 4096,
+        }
+    );
+    assert_eq!(memory.read(DATA + 4094, 6).unwrap(), [0xa5; 6]);
+    assert_eq!(actual, initial);
+    memory.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+    assert_eq!(interpreter.step(&mut actual, &mut memory), Step::Executed);
+    assert_eq!(
+        memory.read(DATA + 4094, 6).unwrap(),
+        [0xff, 7, 0x67, 0x45, 0x23, 0xf1]
+    );
+    assert_eq!(actual.eflags, initial.eflags);
+}
+
+#[test]
+fn sidt_overflow_does_not_wrap_or_commit_cpu_state() {
+    let bytes = code(|a| {
+        a.sidt(fword_ptr(0xffff_fffbu32)).unwrap();
+    });
+    let mut memory = memory(&bytes);
+    let mut actual = state();
+    let initial = actual.clone();
+    assert_eq!(
+        Interpreter::new().step(&mut actual, &mut memory),
+        Step::WriteFault {
+            pc: CODE,
+            address: 0xffff_fffb,
+        }
+    );
+    assert_eq!(actual, initial);
+}
+
 struct Reference {
     uc: Guarded<'static, ()>,
     memory: Memory,

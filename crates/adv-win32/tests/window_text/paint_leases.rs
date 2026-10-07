@@ -1,4 +1,4 @@
-//! Reentrant guest WM_PAINT retains the actual shared DC, not just its handle.
+//! Reentrant WM_PAINT borrows independent common DC attributes over shared pixels.
 use super::*;
 use adv_abi::{Env, Outcome};
 use adv_cpu::backend::Guest;
@@ -111,6 +111,7 @@ fn nested<B: TestCpu>(cpu: B) {
     let black = adv_win32::gdi32::stock_object(4);
     let white = adv_win32::gdi32::stock_object(0);
     let mut expected = Vec::new();
+    let mut handles = Vec::new();
     let procedure = t.procedure;
     let mut code = Asm::new(procedure);
     on_message(&mut code, wm::PAINT, |code| {
@@ -119,8 +120,8 @@ fn nested<B: TestCpu>(cpu: B) {
             code,
             |code| {
                 let inner = record(&mut t, code, "BeginPaint", &[S(4), I(inner_ps)]);
-                expected.push((inner, 1));
-                expected.push((record(&mut t, code, "gdi32.dll!SaveDC", &[M(inner)]), 2));
+                handles.push(inner);
+                expected.push((record(&mut t, code, "gdi32.dll!SaveDC", &[M(inner)]), 1));
                 expected.push((
                     record(
                         &mut t,
@@ -128,7 +129,7 @@ fn nested<B: TestCpu>(cpu: B) {
                         "gdi32.dll!SelectObject",
                         &[M(inner), I(white)],
                     ),
-                    black,
+                    white,
                 ));
                 expected.push((
                     record(
@@ -140,7 +141,7 @@ fn nested<B: TestCpu>(cpu: B) {
                     1,
                 ));
                 expected.push((
-                    record(&mut t, code, "gdi32.dll!RestoreDC", &[M(inner), I(2)]),
+                    record(&mut t, code, "gdi32.dll!RestoreDC", &[M(inner), I(1)]),
                     1,
                 ));
                 expected.push((record(&mut t, code, "EndPaint", &[S(4), I(inner_ps)]), 1));
@@ -151,7 +152,7 @@ fn nested<B: TestCpu>(cpu: B) {
         );
         code.mov_mem_imm(depth, 1);
         let dc = record(&mut t, code, "BeginPaint", &[S(4), I(outer_ps)]);
-        expected.push((dc, 1));
+        handles.push(dc);
         expected.push((record(&mut t, code, "gdi32.dll!SaveDC", &[M(dc)]), 1));
         expected.push((
             record(&mut t, code, "gdi32.dll!SelectObject", &[M(dc), I(black)]),
@@ -175,17 +176,22 @@ fn nested<B: TestCpu>(cpu: B) {
             ),
             3,
         ));
-        expected.push((record(&mut t, code, "GetDC", &[S(4)]), 1));
-        expected.push((record(&mut t, code, "GetWindowDC", &[S(4)]), 1));
+        let common = record(&mut t, code, "GetDC", &[S(4)]);
+        let window = record(&mut t, code, "GetWindowDC", &[S(4)]);
+        handles.extend([common, window]);
         expected.push((record(&mut t, code, "ReleaseDC", &[M(other), M(dc)]), 0));
         expected.push((record(&mut t, code, "gdi32.dll!DeleteDC", &[M(dc)]), 0));
-        expected.push((record(&mut t, code, "GetDC", &[M(other)]), 0));
-        expected.push((record(&mut t, code, "kernel32.dll!GetLastError", &[]), 50));
+        let other_dc = record(&mut t, code, "GetDC", &[M(other)]);
+        let other_paint = record(&mut t, code, "BeginPaint", &[M(other), I(denied_ps)]);
+        handles.extend([other_dc, other_paint]);
         expected.push((
-            record(&mut t, code, "BeginPaint", &[M(other), I(denied_ps)]),
-            0,
+            record(&mut t, code, "EndPaint", &[M(other), I(denied_ps)]),
+            1,
         ));
-        expected.push((record(&mut t, code, "kernel32.dll!GetLastError", &[]), 50));
+        expected.push((
+            record(&mut t, code, "ReleaseDC", &[M(other), M(other_dc)]),
+            1,
+        ));
         code.mov_mem_imm(unmatched_ps, 1);
         expected.push((
             record(&mut t, code, "EndPaint", &[S(4), I(unmatched_ps)]),
@@ -261,14 +267,19 @@ fn nested<B: TestCpu>(cpu: B) {
         expected.push((record(&mut t, code, "EndPaint", &[S(4), I(outer_ps)]), 1));
         expected.push((
             record(&mut t, code, "gdi32.dll!GetCurrentObject", &[M(dc), I(2)]),
-            black,
+            0,
         ));
-        expected.push((record(&mut t, code, "ReleaseDC", &[S(4), M(dc)]), 1));
+        expected.push((record(&mut t, code, "ReleaseDC", &[S(4), M(common)]), 1));
         expected.push((
-            record(&mut t, code, "gdi32.dll!GetCurrentObject", &[M(dc), I(2)]),
-            black,
+            record(
+                &mut t,
+                code,
+                "gdi32.dll!GetCurrentObject",
+                &[M(window), I(2)],
+            ),
+            white,
         ));
-        expected.push((record(&mut t, code, "ReleaseDC", &[S(4), M(dc)]), 1));
+        expected.push((record(&mut t, code, "ReleaseDC", &[S(4), M(window)]), 1));
         expected.push((
             record(&mut t, code, "gdi32.dll!GetCurrentObject", &[M(dc), I(2)]),
             0,
@@ -290,15 +301,28 @@ fn nested<B: TestCpu>(cpu: B) {
     for (pointer, value) in expected {
         assert_eq!(t.value(pointer), value, "result {pointer:x}");
     }
+    for &handle in &handles {
+        assert_ne!(t.value(handle), 0);
+    }
+    assert_eq!(
+        handles
+            .iter()
+            .map(|&p| t.value(p))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        handles.len()
+    );
     assert_eq!(t.value(outer_esp), t.value(resumed_esp));
     assert_eq!(
         t.read(point, 8),
         [(-4i32).to_le_bytes(), (-5i32).to_le_bytes()].concat()
     );
     assert_eq!(t.read(current, 8), [0; 8]);
-    assert_eq!(t.read(denied_ps, 64), [0xa5; 64]);
+    assert_eq!(&t.read(denied_ps, 64)[4..], &[0; 60]);
     let gdi = &t.machine.ext.get::<Win32>().gdi;
-    assert!(gdi.get(&t.machine.sys.objects, 1).is_none());
+    for &handle in &handles {
+        assert!(gdi.get(&t.machine.sys.objects, t.value(handle)).is_none());
+    }
     let surface = t.machine.ext.get::<SurfaceStore>().primary_id().unwrap();
     let surface = t.machine.ext.get::<SurfaceStore>().get(surface).unwrap();
     let pixels = surface.pixels;
@@ -307,10 +331,10 @@ fn nested<B: TestCpu>(cpu: B) {
     assert_ne!(t.read(pixels, 4), [0; 4]);
     // Checked publication failure after a valid GetDC cannot retire that lease.
     let hwnd = t.value(hwnd);
-    assert!(matches!(
-        direct(&mut t, "GetDC", &[hwnd]),
-        Outcome::Return(1)
-    ));
+    let Outcome::Return(dc) = direct(&mut t, "GetDC", &[hwnd]) else {
+        panic!("GetDC must return a handle");
+    };
+    assert_ne!(dc, 0);
     assert!(matches!(
         direct(&mut t, "BeginPaint", &[hwnd, READONLY]),
         Outcome::Fail(_)
@@ -320,11 +344,11 @@ fn nested<B: TestCpu>(cpu: B) {
             .ext
             .get::<Win32>()
             .gdi
-            .get(&t.machine.sys.objects, 1)
+            .get(&t.machine.sys.objects, dc)
             .is_some()
     );
     assert!(matches!(
-        direct(&mut t, "ReleaseDC", &[hwnd, 1]),
+        direct(&mut t, "ReleaseDC", &[hwnd, dc]),
         Outcome::Return(1)
     ));
     assert!(
@@ -332,7 +356,7 @@ fn nested<B: TestCpu>(cpu: B) {
             .ext
             .get::<Win32>()
             .gdi
-            .get(&t.machine.sys.objects, 1)
+            .get(&t.machine.sys.objects, dc)
             .is_none()
     );
     assert_eq!(t.machine.ext.get::<adv_abi::ApiDiagnostics>().stub_calls, 0);
@@ -341,13 +365,12 @@ fn nested<B: TestCpu>(cpu: B) {
             .ext
             .get::<adv_abi::ApiDiagnostics>()
             .warnings
-            .keys()
-            .any(|(api, _)| api == "user32.dll!BeginPaint")
+            .is_empty()
     );
 }
 
 #[test]
-fn nested_guest_paint_and_get_dc_leases_preserve_saved_state_until_the_last_release() {
+fn nested_guest_paint_and_get_dc_leases_keep_independent_saved_state_and_shared_pixels() {
     nested(UnicornCpu::new(PARK_ADDR).unwrap());
     nested(JitCpu::new(PARK_ADDR, false).unwrap());
     nested(JitCpu::new(PARK_ADDR, true).unwrap());

@@ -448,8 +448,16 @@ fn native_file_aliases_are_projected_with_only_their_exact_sdk_stack_contracts()
         Conv::Stdcall { argc: 1 }
     );
     assert!(registry.dynamic_available("ntdll.dll", "NtClose"));
-    for name in ["NtCreateFile", "NtReadFile"] {
-        assert!(!registry.dynamic_available("ntdll.dll", name));
+    for (name, argc) in [("NtCreateFile", 11), ("NtReadFile", 9)] {
+        assert_eq!(
+            registry.get("ntdll.dll", name).unwrap().conv,
+            Conv::Stdcall { argc }
+        );
+        assert_eq!(
+            registry.level("ntdll.dll", name),
+            Some(ImplementationLevel::Implement)
+        );
+        assert!(registry.dynamic_available("ntdll.dll", name));
     }
     assert!(registry.signature_conflicts().is_empty());
 }

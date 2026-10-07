@@ -93,6 +93,9 @@ fn paint_rectangles(
     rectangles: &[[i64; 4]],
     api: &str,
 ) -> Outcome {
+    if super::front::unavailable_pixels(env, dc.0, api) {
+        return Outcome::Return(0);
+    }
     let Some(GdiObj::Dc {
         selected,
         palette,
@@ -279,6 +282,9 @@ const CLR_INVALID: u32 = 0xffff_ffff;
 
 #[win32(gdi32, name = "SetPixel", level = implement)]
 fn set_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Outcome {
+    if super::front::unavailable_pixels(env, dc.0, "gdi32.dll!SetPixel") {
+        return Outcome::Return(CLR_INVALID);
+    }
     let Some(GdiObj::Dc {
         selected,
         palette,
@@ -404,6 +410,9 @@ fn set_pixel_v(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, color: u32) -> Out
 
 #[win32(gdi32, name = "GetPixel", level = implement)]
 fn get_pixel(env: &mut Env<'_>, dc: Handle, x: i32, y: i32) -> Outcome {
+    if super::front::unavailable_pixels(env, dc.0, "gdi32.dll!GetPixel") {
+        return Outcome::Return(CLR_INVALID);
+    }
     let Some(GdiObj::Dc {
         selected, modes, ..
     }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc.0)
@@ -465,6 +474,9 @@ const WHITENESS: u32 = 0x00FF0062;
 
 #[win32(gdi32, name = "PatBlt", level = implement)]
 fn pat_blt(env: &mut Env<'_>, dc: Handle, x: i32, y: i32, w: i32, h: i32, rop: u32) -> Outcome {
+    if super::front::unavailable_pixels(env, dc.0, "gdi32.dll!PatBlt") {
+        return Outcome::Return(0);
+    }
     if w <= 0 || h <= 0 {
         return Outcome::Return(1);
     }

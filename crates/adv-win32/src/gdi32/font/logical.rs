@@ -48,7 +48,7 @@ fn create_indirect_w(env: &mut Env<'_>, pointer: GuestPtr<[u8; 92]>) -> Handle {
         raw[at..at + bytes.len()].copy_from_slice(&bytes);
         at += bytes.len();
     }
-    Handle(add_logfont_with_face(env, raw, face))
+    Handle(add_logfont_with_face(env, raw, face, Some(wide)))
 }
 
 pub(super) fn register(registry: &mut Registry) {

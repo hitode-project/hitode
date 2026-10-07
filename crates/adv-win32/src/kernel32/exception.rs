@@ -48,8 +48,30 @@ pub(crate) fn install<B: Backend>(machine: &mut Machine<B>) {
 }
 
 pub(super) fn register(registry: &mut Registry) {
-    for api in [add_vectored_ABI, remove_vectored_ABI, raise_ABI] {
+    for api in [
+        add_vectored_ABI,
+        remove_vectored_ABI,
+        raise_ABI,
+        debug_break_ABI,
+    ] {
         registry.register(api);
+    }
+}
+
+#[win32(kernel32, name = "DebugBreak", level = implement)]
+fn debug_break(env: &mut Env<'_>) -> Outcome {
+    // A real INT3 preserves the native breakpoint address and lets the handler
+    // edit CONTEXT before execution resumes. Keep this behavior when optional
+    // direct guest API routes have been disabled for diagnosis.
+    let Some(body) = env.sys.thunks.get(env.thunk).guest_body() else {
+        return Outcome::Fail("DebugBreak breakpoint body is missing".into());
+    };
+    match env.checkpoint() {
+        Ok(mut checkpoint) => {
+            checkpoint.state.eip = body;
+            Outcome::ResumeExecution(checkpoint)
+        }
+        Err(error) => Outcome::Fail(error.to_string()),
     }
 }
 
@@ -100,7 +122,7 @@ fn remove_vectored(env: &mut Env<'_>, handle: GuestPtr<()>) -> Outcome {
 }
 
 #[win32(kernel32, name = "RaiseException", level = implement)]
-fn raise(
+pub(super) fn raise(
     env: &mut Env<'_>,
     code: u32,
     flags: u32,

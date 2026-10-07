@@ -251,7 +251,14 @@ fn cursor_clipping_frontend_messages_use_clipped_screen_and_target_client_coordi
         );
     }
     user_mut(&mut env).queue(0).capture = 0;
-    assert!(post(&mut env, 0x200, 0, make_long(0, 0)));
-    let msg = user(&env).queues[&0].posted.back().unwrap();
-    assert_eq!((msg.hwnd, msg.lparam), (top, make_long(20, 30)));
+    // Without capture, choose the child under the clipped physical cursor,
+    // then express the position in that target's client coordinates.
+    for (point, target, local) in [((0, 0), child, (10, 10)), ((300, 200), top, (49, 39))] {
+        assert!(post(&mut env, 0x200, 0, make_long(point.0, point.1)));
+        let msg = user(&env).queues[&0].posted.back().unwrap();
+        assert_eq!(
+            (msg.hwnd, msg.lparam),
+            (target, make_long(local.0, local.1))
+        );
+    }
 }

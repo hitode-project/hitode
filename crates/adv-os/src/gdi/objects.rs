@@ -72,8 +72,10 @@ pub struct LogFont {
     pub italic: bool,
     pub charset: u8,
     pub face: String,
-    /// The raw LOGFONTA for GetObject.
+    /// The raw LOGFONTA for GetObjectA.
     pub raw: Vec<u8>,
+    /// LOGFONTW retains the Unicode creation field, including its fixed tail.
+    pub wide: [u8; 92],
 }
 
 #[derive(Clone, Debug)]
@@ -152,8 +154,8 @@ impl Gdi {
 
     /// Display DC identity is independent of the shared primary surface handle.
     pub fn is_window_dc(&self, objects: &Objects, dc: u32) -> bool {
-        matches!(self.get(objects, dc), Some(GdiObj::Dc { raster: false, hwnd, .. })
-            if *hwnd != 0 || dc == super::WINDOW_DC)
+        matches!(self.get(objects, dc), Some(GdiObj::Dc { raster: false, hwnd, selected, .. })
+            if *hwnd != 0 || dc == super::WINDOW_DC || selected[3] != 0)
     }
     pub fn remove(&self, objects: &mut Objects, h: u32) -> Option<GdiObj> {
         objects.lookup_alias::<GdiObj>(self.namespace.get()?, h)?;

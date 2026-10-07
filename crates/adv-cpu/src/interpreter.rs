@@ -786,7 +786,7 @@ enum Action {
     Cpuid,
     Rdtsc,
     ReadSegment(Operand, usize),
-    StoreGdt(Address),
+    StoreDescriptorTable(Address, bool),
     StoreLdt(Operand),
     String(StringOp),
     Mov(Operand, Operand, bool),
@@ -1104,7 +1104,9 @@ fn predecode(i: &Instruction) -> Option<Action> {
         M::Cpuid => Action::Cpuid,
         M::Rdtsc => Action::Rdtsc,
         M::Xlatb => Action::Mov(Operand::Register(Reg::decode(R::AL)?), op(0)?, false),
-        M::Sgdt if i.op0_kind() == OpKind::Memory => Action::StoreGdt(Address::decode(i, false)?),
+        M::Sgdt | M::Sidt if i.op0_kind() == OpKind::Memory => {
+            Action::StoreDescriptorTable(Address::decode(i, false)?, i.mnemonic() == M::Sidt)
+        }
         M::Mov
             if matches!(
                 i.op1_register(),
@@ -1549,7 +1551,14 @@ impl Transaction {
                 // memory always receives the two-byte selector.
                 self.store(memory, dst, u32::from(self.segments.ldt_selector))?;
             }
-            Action::StoreGdt(address) => {
+            Action::StoreDescriptorTable(address, interrupt) => {
+                // On the virtual post-286 CPU, both operand sizes store all
+                // six bytes. Address-size wrapping and FS still apply normally.
+                let (base, limit) = if interrupt {
+                    (self.segments.idt_base, self.segments.idt_limit)
+                } else {
+                    (self.segments.gdt_base, self.segments.gdt_limit)
+                };
                 let address = address.resolve(self);
                 if u64::from(address) + 6 > 1 << 32 {
                     return Err(Step::WriteFault {
@@ -1560,13 +1569,9 @@ impl Transaction {
                 self.store(
                     memory,
                     Self::stack_operand_width(address, 2),
-                    u32::from(self.segments.gdt_limit),
+                    u32::from(limit),
                 )?;
-                self.store(
-                    memory,
-                    Self::stack_operand(address + 2),
-                    self.segments.gdt_base,
-                )?;
+                self.store(memory, Self::stack_operand(address + 2), base)?;
             }
             Action::Mov(dst, src, sign_extend) => {
                 let value = self.read(memory, src)?;

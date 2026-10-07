@@ -754,6 +754,13 @@ impl Backend for UnicornCpu {
     type Context = UcContext;
 
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault> {
+        let fault = MemFault {
+            addr: seg.gdt_addr,
+            len: 4096,
+        };
+        if !seg.gdt_addr.is_multiple_of(4096) || !self.accessible(seg.gdt_addr, 4096, Prot(0)) {
+            return Err(fault);
+        }
         self.gdt = Some(seg.gdt_addr);
         let zero = [0u8; (sel::GDT_ENTRIES * 8) as usize];
         self.write(seg.gdt_addr, &zero)?;
@@ -778,6 +785,13 @@ impl Backend for UnicornCpu {
         };
         self.uc
             .reg_write_long(RegisterX86::GDTR, &mmr)
+            .map_err(|_| fault)?;
+        let idt_base = seg.gdt_addr + SegmentSetup::IDT_OFFSET;
+        self.write(idt_base, &[0; SegmentSetup::IDT_LIMIT as usize + 1])?;
+        mmr[8..16].copy_from_slice(&u64::from(idt_base).to_le_bytes());
+        mmr[16..20].copy_from_slice(&u32::from(SegmentSetup::IDT_LIMIT).to_le_bytes());
+        self.uc
+            .reg_write_long(RegisterX86::IDTR, &mmr)
             .map_err(|_| fault)?;
         for (r, s) in [
             (RegisterX86::SS, sel::SS),

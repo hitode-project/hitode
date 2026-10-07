@@ -1,5 +1,6 @@
 //! kernel32.dll.
 
+mod activation;
 mod atom;
 pub(crate) mod child_process;
 mod environment;
@@ -8,6 +9,7 @@ pub(crate) use exception::install as install_exceptions;
 pub(crate) use exception::uncaught_query_blocker;
 mod file;
 pub(crate) mod file_mapping;
+mod format_message;
 mod handle;
 pub use file::open as open_file;
 pub(crate) use file::{create_directory_path, file_attributes_path};
@@ -18,6 +20,7 @@ mod memory;
 pub(crate) use memory::native_read_memory;
 pub(crate) use memory::native_write_memory;
 pub(crate) use memory::protect_memory;
+pub(crate) use memory::{allocate_local_memory, release_local_memory};
 pub(crate) use memory::{allocate_memory, allocation_extent, free_memory, memory_span};
 mod module;
 pub(crate) use module::native_get_procedure;
@@ -34,8 +37,10 @@ pub(crate) use process::install_parameters;
 pub(crate) use process::native_resume_thread;
 pub(crate) use process::native_thread_context;
 pub(crate) use process::{command_line, configure_codepage};
+mod registered_wait;
 mod string;
 mod sync;
+pub(crate) use sync::{CS_SIZE, enter_cs, initialize_cs, leave_cs, release_cs_wait};
 mod time;
 mod timer;
 mod toolhelp;
@@ -48,11 +53,14 @@ use adv_abi::Registry;
 pub(crate) const K32: &str = "kernel32.dll";
 
 pub fn register(reg: &mut Registry) {
+    activation::register(reg);
+    registered_wait::register(reg);
     atom::register(reg);
     child_process::register(reg);
     environment::register(reg);
     exception::register(reg);
     file::register(reg);
+    format_message::register(reg);
     file_mapping::register(reg);
     handle::register(reg);
     memory::register(reg);

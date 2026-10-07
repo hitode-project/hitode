@@ -132,14 +132,17 @@ fn hot_operations_are_native_even_between_lazy_integer_flags() {
         |m| m.write(DATA + 0x100, &[0xa5; 16]).unwrap(),
         Some(0),
     );
+    #[cfg(target_arch = "x86_64")]
     let compiled = compile(&Region::new(CODE, code.len()), &memory(&code), false).unwrap();
     // Runtime helper counts prove the exercised path is native; the disassembly
     // additionally protects against accidentally deleting arithmetic lowering.
+    #[cfg(target_arch = "x86_64")]
     assert!(
         compiled.disasm.contains("addsd") || compiled.disasm.contains("vaddsd"),
         "{}",
         compiled.disasm
     );
+    #[cfg(target_arch = "x86_64")]
     assert!(
         compiled.disasm.contains("divsd") || compiled.disasm.contains("vdivsd"),
         "{}",
@@ -405,7 +408,12 @@ fn a_lazy_file_fault_is_not_retried_inside_the_same_x87_instruction() {
 }
 
 #[test]
-#[cfg(windows)]
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+))]
 fn pure_x87_shared_audio_accesses_never_use_ordinary_loads_or_stores() {
     let code = bytes(|a| {
         a.fld(qword_ptr(esi)).unwrap();
@@ -445,6 +453,7 @@ fn helper_only_compilation_retains_a_reproducible_comparison_lane() {
 }
 
 #[test]
+#[cfg(target_arch = "x86_64")] // Parallel execution is not enabled on ARM64.
 fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
     use std::sync::Arc;
 
@@ -505,7 +514,219 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
 mod segment_tests;
 
 #[path = "hardware_tests.rs"]
+#[cfg(target_arch = "x86_64")]
 mod hardware_tests;
+
+#[test]
+fn exceptional_binary32_and_binary64_memory_operands_use_transactional_helpers() {
+    for width in [4, 8] {
+        let code = bytes(|a| {
+            if width == 4 {
+                a.fadd(dword_ptr(esi)).unwrap();
+            } else {
+                a.fadd(qword_ptr(esi)).unwrap();
+            }
+        });
+        let values: &[u64] = if width == 4 {
+            &[
+                1,
+                0x007f_ffff,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7fc0_1234,
+                0x7f80_1234,
+            ]
+        } else {
+            &[
+                1,
+                0x000f_ffff_ffff_ffff,
+                0x7ff0_0000_0000_0000,
+                0xfff0_0000_0000_0000,
+                0x7ff8_0000_0000_1234,
+                0x7ff0_0000_0000_1234,
+            ]
+        };
+        for &bits in values {
+            compare(
+                &code,
+                state(),
+                |m| m.write(DATA, &bits.to_le_bytes()[..width]).unwrap(),
+                Some(1),
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn host_fp_state() -> (u64, u64) {
+    let fpcr;
+    let fpsr;
+    // SAFETY: read only the current thread's floating-point system registers.
+    unsafe {
+        core::arch::asm!(
+            "mrs {fpcr}, fpcr", "mrs {fpsr}, fpsr",
+            fpcr = out(reg) fpcr, fpsr = out(reg) fpsr,
+            options(nostack, preserves_flags),
+        );
+    }
+    (fpcr, fpsr)
+}
+
+#[cfg(target_arch = "aarch64")]
+struct HostFpGuard((u64, u64));
+
+#[cfg(target_arch = "aarch64")]
+impl HostFpGuard {
+    fn set(fpcr: u64, fpsr: u64) -> Self {
+        let saved = Self(host_fp_state());
+        // SAFETY: the caller supplies architectural controls/status bits and
+        // enters only guarded generated execution before restoring them. Drop
+        // restores both original registers on panic.
+        unsafe {
+            core::arch::asm!(
+                "msr fpcr, {fpcr}", "msr fpsr, {fpsr}", "isb",
+                fpcr = in(reg) fpcr, fpsr = in(reg) fpsr,
+                options(nostack, preserves_flags),
+            );
+        }
+        saved
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Drop for HostFpGuard {
+    fn drop(&mut self) {
+        // SAFETY: these are the same thread's exact previously saved registers.
+        unsafe {
+            core::arch::asm!(
+                "msr fpcr, {fpcr}", "msr fpsr, {fpsr}", "isb",
+                fpcr = in(reg) self.0.0, fpsr = in(reg) self.0.1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn native_x87_rounding_flags_are_independent_of_host_fpcr_and_preserve_fpsr() {
+    let code = bytes(|a| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(esi + 8)).unwrap();
+        a.fadd(qword_ptr(esi)).unwrap();
+        a.fst(qword_ptr(esi + 16)).unwrap();
+        a.fadd(qword_ptr(esi + 8)).unwrap();
+        a.fnstsw(ax).unwrap();
+    });
+    let setup = |m: &mut Memory| {
+        m.write(DATA, &1.0f64.to_le_bytes()).unwrap();
+        // 0.75 of the binary64 spacing at 1.0; both additions round upward.
+        m.write(DATA + 8, &0x3ca8_0000_0000_0000u64.to_le_bytes())
+            .unwrap();
+    };
+    let mut reference_memory = memory(&code);
+    setup(&mut reference_memory);
+    let compiled = compile(&Region::new(CODE, code.len()), &reference_memory, false).unwrap();
+    let mut expected = state();
+    let mut interpreter = Interpreter::new();
+    for _ in 0..6 {
+        assert!(matches!(
+            interpreter.step(&mut expected, &mut reference_memory),
+            Step::Executed
+        ));
+    }
+    assert_eq!(
+        expected.x87.status & 0x220,
+        0x220,
+        "both PE and C1 are observable"
+    );
+    // Produce the oracle before perturbation. Native execution must normalize
+    // its environment at entry and restore the caller's exact FPCR and FPSR.
+    for fpcr in [
+        0,
+        1 << 22,
+        2 << 22,
+        3 << 22,
+        1 << 24,
+        1 << 25,
+        0x1f00 | 0x8000, // Every architectural FP exception-enable bit.
+        (3 << 22) | (1 << 24) | (1 << 25) | (1 << 19),
+    ] {
+        let mut actual_memory = memory(&code);
+        setup(&mut actual_memory);
+        let mut actual = state();
+        let seeded_fpsr = 0x0800_009f;
+        let before = testing::calls();
+        let _guard = HostFpGuard::set(fpcr, seeded_fpsr);
+        // Optional FPCR fields may be RES0 on older AArch64 CPUs. Preserve the
+        // environment actually accepted by hardware, not an unsupported bit.
+        let caller_host = host_fp_state();
+        let exit = testing::run(&compiled, &mut actual, &mut actual_memory);
+        let after_host = host_fp_state();
+        drop(_guard);
+        assert_eq!(exit, Exit::Dispatch as u32);
+        assert_eq!(testing::calls() - before, 0, "FPCR {fpcr:#x}: native path");
+        assert_eq!(after_host, caller_host, "host controls/status restored");
+        expected.fuel = actual.fuel;
+        assert_eq!(actual, expected, "FPCR {fpcr:#x}: complete guest state");
+        assert_eq!(
+            actual_memory.read_data(DATA, 32).unwrap(),
+            reference_memory.read_data(DATA, 32).unwrap()
+        );
+    }
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn x87_fault_and_budget_exits_restore_the_callers_host_floating_environment() {
+    for fault in [false, true] {
+        let code = bytes(|a| {
+            a.fadd(qword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(esi + 4096)).unwrap();
+        });
+        let mut actual_memory = memory(&code);
+        actual_memory.protect(DATA + 4096, 4096, 0).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &actual_memory, false).unwrap();
+        let mut expected_memory = memory(&code);
+        expected_memory.protect(DATA + 4096, 4096, 0).unwrap();
+        let mut expected = state();
+        let mut interpreter = Interpreter::new();
+        assert!(matches!(
+            interpreter.step(&mut expected, &mut expected_memory),
+            Step::Executed
+        ));
+        if fault {
+            assert!(
+                matches!(interpreter.step(&mut expected, &mut expected_memory),
+                             Step::WriteFault { address, .. } if address == DATA + 4096)
+            );
+            expected.fault_addr = DATA + 4096;
+        }
+        let mut actual = state();
+        actual.fuel = if fault { 100 } else { 1 };
+        let before = testing::calls();
+        let fpcr = (1 << 22) | (1 << 24);
+        let fpsr = 0x0800_009f;
+        let _guard = HostFpGuard::set(fpcr, fpsr);
+        let caller_host = host_fp_state();
+        let exit = testing::run(&compiled, &mut actual, &mut actual_memory);
+        let after_host = host_fp_state();
+        drop(_guard);
+        assert_eq!(
+            exit,
+            if fault {
+                Exit::WriteFault
+            } else {
+                Exit::Budget
+            } as u32
+        );
+        assert_eq!(testing::calls() - before, u64::from(fault));
+        assert_eq!(after_host, caller_host);
+        expected.fuel = actual.fuel;
+        assert_eq!(actual, expected);
+        assert_eq!(actual_memory.epoch, expected_memory.epoch);
+    }
+}
 
 #[test]
 fn helper_effects_preserve_dirty_address_aliases_integer_flags_and_xmm() {

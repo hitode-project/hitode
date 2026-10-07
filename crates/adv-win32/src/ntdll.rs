@@ -5,7 +5,10 @@ mod loader;
 mod loader_lock;
 mod memory;
 mod path;
+mod peb_lock;
+pub(crate) use peb_lock::install as install_peb_lock;
 mod procedure;
+mod registry;
 mod strings;
 mod thread;
 
@@ -16,6 +19,7 @@ use adv_os::Heaps;
 
 use crate::stdcall;
 mod file;
+mod heap;
 mod open;
 mod section;
 
@@ -138,9 +142,11 @@ fn rtl_format_current_user_key_path(env: &mut Env<'_>) -> Outcome {
     if out == 0 {
         return Outcome::Return(0xc000_000d); // STATUS_INVALID_PARAMETER
     }
-    // Path: \REGISTRY\USER\S-1-5-21-0-0-0-1000
-    const PATH: &str = r"\REGISTRY\USER\S-1-5-21-0-0-0-1000";
-    let units: Vec<u16> = PATH.encode_utf16().chain([0]).collect();
+    let path = format!(
+        r"\REGISTRY\USER\{}",
+        adv_os::identity::current_user_sid_string()
+    );
+    let units: Vec<u16> = path.encode_utf16().chain([0]).collect();
     let byte_len = ((units.len() - 1) * 2) as u16;
     let max_byte_len = (units.len() * 2) as u16;
 
@@ -204,15 +210,18 @@ fn rtl_init_unicode_string(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    heap::register(reg);
     path::register(reg);
     directory::register(reg);
     loader_lock::register(reg);
+    peb_lock::register(reg);
     loader::register(reg);
     strings::register(reg);
     procedure::register(reg);
     thread::register(reg);
     allocation::register(reg);
     memory::register(reg);
+    registry::register(reg);
     stdcall(
         reg,
         NTDLL,

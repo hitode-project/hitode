@@ -352,6 +352,40 @@ pub struct TextMetrics {
     pub family: Family,
     pub encoding: Encoding,
 }
+/// Outline-font design metrics in the realized font's logical coordinate space.
+/// Typographic ascent/descent are independent of the cell metrics above. Names
+/// remain Unicode; a personality chooses its encoding and structure layout.
+#[derive(Clone, Debug)]
+pub struct OutlineMetrics {
+    pub text: TextMetrics,
+    pub panose: [u8; 10],
+    pub selection: u32,
+    pub embedding: u32,
+    pub caret_rise: i32,
+    pub caret_run: i32,
+    pub italic_angle: i32,
+    pub em_units: u32,
+    pub ascent: i32,
+    pub descent: i32,
+    pub line_gap: u32,
+    pub cap_height: u32,
+    pub x_height: u32,
+    pub bounds: TextBox,
+    pub mac_ascent: i32,
+    pub mac_descent: i32,
+    pub mac_line_gap: u32,
+    pub minimum_ppem: u32,
+    pub subscript_size: Point,
+    pub subscript_offset: Point,
+    pub superscript_size: Point,
+    pub superscript_offset: Point,
+    pub strikeout_size: u32,
+    pub strikeout_position: i32,
+    pub underline_size: i32,
+    pub underline_position: i32,
+    /// Family, face, style and full names from the same selected outline font.
+    pub names: [String; 4],
+}
 /// Explicitly counted units. Encoded bytes follow the selected font repertoire;
 /// UTF-16 keeps surrogate pairs and embedded zero units intact.
 #[derive(Clone, Copy)]
@@ -666,6 +700,18 @@ impl Text {
     ) -> Result<FontResolution, TextError> {
         self.font(request)?.resolved_character(code)
     }
+    /// Describe the logical font retained by the existing provider. Default
+    /// requests use the same selected face/profile as measurement and drawing.
+    pub fn logical_font(&mut self, request: &FontRequest) -> Result<FontRequest, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(request)?.logical_font()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(self.font(request)?.logical_font())
+        }
+    }
     pub fn metrics(&mut self, request: &FontRequest) -> Result<TextMetrics, TextError> {
         #[cfg(windows)]
         {
@@ -674,6 +720,17 @@ impl Text {
         #[cfg(not(windows))]
         {
             Ok(self.font(request)?.metrics())
+        }
+    }
+    pub fn outline_metrics(&mut self, request: &FontRequest) -> Result<OutlineMetrics, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(request)?.outline_metrics()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = request;
+            Err(TextError::Unavailable)
         }
     }
     /// Unicode range, default and break characters from the same realized font

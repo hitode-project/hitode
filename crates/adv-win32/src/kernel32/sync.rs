@@ -4,7 +4,7 @@
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use adv_abi::{AnsiStr, Registry, WideStr, win32};
-use adv_cpu::backend::GuestExt;
+use adv_cpu::backend::{Guest, GuestExt, MemFault};
 use adv_machine::{Env, Object, Outcome, Resume, Wait, WakeReason};
 
 use super::K32;
@@ -26,6 +26,7 @@ const INFINITE: u32 = u32::MAX;
 const CS_LOCK_COUNT: u32 = 4;
 const CS_RECURSION: u32 = 8;
 const CS_OWNER: u32 = 12;
+pub(crate) const CS_SIZE: u32 = 24;
 
 /// Guest EnterCriticalSection has counted the caller and found another owner.
 pub(crate) const CS_WAIT: &str = "<EnterCriticalSectionWait>";
@@ -48,7 +49,7 @@ impl Drop for CriticalTicket {
     }
 }
 
-fn release_cs_wait(env: &mut Env<'_>, cs: u32) -> Result<(), String> {
+pub(crate) fn release_cs_wait(env: &mut Env<'_>, cs: u32) -> Result<(), String> {
     let waits = env.ext.get_or_default::<CriticalWaits>();
     if waits.0.get(&cs).is_some_and(|wait| wait.pending.get() != 0) {
         return Err(format!(
@@ -61,13 +62,17 @@ fn release_cs_wait(env: &mut Env<'_>, cs: u32) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn initialize_cs(cpu: &mut dyn Guest, cs: u32) -> Result<(), MemFault> {
+    cpu.write(cs, &[0; CS_SIZE as usize])?;
+    cpu.write_u32(cs + CS_LOCK_COUNT, u32::MAX)
+}
+
 fn init_cs(env: &mut Env<'_>) -> Outcome {
     let cs = env.arg(0);
     if let Err(error) = release_cs_wait(env, cs) {
         return Outcome::Fail(error);
     }
-    crate::util::zero(env.cpu, cs, 24);
-    let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, u32::MAX);
+    let _ = initialize_cs(env.cpu, cs);
     Outcome::Return(1)
 }
 
@@ -159,7 +164,7 @@ fn wake_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
     }
 }
 
-fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
+pub(crate) fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
     // Guest code on other workers updates the same fields with locked instructions.
     env.cpu.quiesce_memory();
     let tid = env.ctx().tid;
@@ -198,8 +203,7 @@ fn try_enter_cs(env: &mut Env<'_>, cs: u32) -> bool {
     true
 }
 
-fn leave_cs(env: &mut Env<'_>) -> Outcome {
-    let cs = env.arg(0);
+pub(crate) fn leave_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
     env.cpu.quiesce_memory();
     let rec = env.cpu.read_u32(cs + CS_RECURSION).unwrap_or(0);
     if rec == 0 {
@@ -651,7 +655,10 @@ pub(super) fn register(reg: &mut Registry) {
         let cs = e.arg(0);
         Outcome::Return(u32::from(try_enter_cs(e, cs)))
     });
-    stdcall(reg, K32, "LeaveCriticalSection", 1, leave_cs);
+    stdcall(reg, K32, "LeaveCriticalSection", 1, |e| {
+        let cs = e.arg(0);
+        leave_cs(e, cs)
+    });
     stdcall(reg, K32, CS_WAIT, 1, |e| {
         let cs = e.arg(0);
         wait_cs(e, cs)

@@ -211,3 +211,150 @@ fn calloc_crt_actual_cdecl_request_overflow_callback_and_free_run_in_interpreter
     guest_calloc(UnicornCpu::new(PARK_ADDR).unwrap());
     guest_calloc(JitCpu::new(PARK_ADDR, false).unwrap());
 }
+
+fn invoke<B: Backend>(machine: &mut Machine<B>, module: &str, name: &str, args: &[u32]) -> Outcome {
+    let entry = machine.resolve_import(module, name).unwrap();
+    machine.cpu.set_reg(adv_cpu::backend::Reg::Esp, DATA + 512);
+    machine.cpu.write_u32(DATA + 512, PARK_ADDR).unwrap();
+    for (index, &value) in args.iter().enumerate() {
+        machine
+            .cpu
+            .write_u32(DATA + 516 + index as u32 * 4, value)
+            .unwrap();
+    }
+    let handler = machine
+        .sys
+        .thunks
+        .get((entry - THUNK_BASE) / THUNK_STRIDE)
+        .f
+        .handler;
+    handler(&mut env(machine, entry))
+}
+
+fn contended<B: Backend>(
+    machine: &mut Machine<B>,
+    module: &str,
+    name: &str,
+    args: &[u32],
+    unchanged: impl FnOnce(&mut Machine<B>),
+) -> u32 {
+    let entry = machine.resolve_import(module, name).unwrap();
+    let heap = machine.ext.get::<Heaps>().process_heap;
+    machine.sys.current = 0;
+    assert!(matches!(
+        crate::heap_lock::lock(&mut env(machine, entry), heap),
+        Outcome::Return(1)
+    ));
+    machine.sys.current = 1;
+    let Outcome::Block {
+        wait: adv_machine::Wait::Object { handle, .. },
+        then,
+        ..
+    } = invoke(machine, module, name, args)
+    else {
+        panic!("{module}!{name} must wait for the process heap owner")
+    };
+    unchanged(machine);
+    machine.sys.current = 0;
+    assert!(matches!(
+        crate::heap_lock::unlock(&mut env(machine, entry), heap),
+        Outcome::Return(1)
+    ));
+    machine.sys.current = 1;
+    assert!(machine.sys.try_acquire(handle));
+    let Outcome::Return(value) = then(
+        &mut env(machine, entry),
+        adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+    ) else {
+        panic!("{module}!{name} must finish after heap handoff")
+    };
+    value
+}
+
+fn serialization<B: Backend>(cpu: B) {
+    let mut machine = machine(cpu);
+    for name in ["heap owner", "heap waiter"] {
+        machine.spawn(name, PARK_ADDR, &[], 65536).unwrap();
+    }
+    let heap = machine.ext.get::<Heaps>().process_heap;
+    for module in [
+        "msvcrt.dll",
+        "msvcr80.dll",
+        "msvcr90.dll",
+        "ucrtbase.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+    ] {
+        let pointer = contended(&mut machine, module, "malloc", &[16], |_| {});
+        assert_ne!(pointer, 0);
+        machine.cpu.write_u32(pointer, 0x13572468).unwrap();
+        let resized = contended(&mut machine, module, "realloc", &[pointer, 64], |m| {
+            assert_eq!(m.ext.get_mut::<Heaps>().size(heap, pointer), Some(16));
+            assert_eq!(m.cpu.read_u32(pointer).unwrap(), 0x13572468);
+        });
+        assert_ne!(resized, 0);
+        assert_eq!(machine.cpu.read_u32(resized).unwrap(), 0x13572468);
+        assert_eq!(
+            contended(&mut machine, module, "free", &[resized], |m| {
+                assert_eq!(m.ext.get::<Heaps>().owner(resized), Some(heap));
+            }),
+            0
+        );
+        assert!(machine.ext.get::<Heaps>().owner(resized).is_none());
+        let zeroed = contended(&mut machine, module, "calloc", &[4, 16], |_| {});
+        let mut bytes = [0xff; 64];
+        machine.cpu.read(zeroed, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 64]);
+        assert!(matches!(
+            invoke(&mut machine, module, "free", &[zeroed]),
+            Outcome::Return(0)
+        ));
+        let entry = machine.resolve_import(module, "free").unwrap();
+        machine.sys.current = 0;
+        assert!(matches!(
+            crate::heap_lock::lock(&mut env(&mut machine, entry), heap),
+            Outcome::Return(1)
+        ));
+        machine.sys.current = 1;
+        assert!(matches!(
+            invoke(&mut machine, module, "free", &[0]),
+            Outcome::Return(0)
+        ));
+        machine.sys.current = 0;
+        assert!(matches!(
+            crate::heap_lock::unlock(&mut env(&mut machine, entry), heap),
+            Outcome::Return(1)
+        ));
+    }
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+        for (new, delete) in [
+            ("??2@YAPAXI@Z", "??3@YAXPAX@Z"),
+            ("??_U@YAPAXI@Z", "??_V@YAXPAX@Z"),
+        ] {
+            let pointer = contended(&mut machine, module, new, &[16], |_| {});
+            assert_eq!(machine.ext.get::<Heaps>().owner(pointer), Some(heap));
+            assert_eq!(
+                contended(&mut machine, module, delete, &[pointer], |m| {
+                    assert_eq!(m.ext.get::<Heaps>().owner(pointer), Some(heap));
+                }),
+                0
+            );
+            assert!(machine.ext.get::<Heaps>().owner(pointer).is_none());
+        }
+    }
+    for (name, args) in [("_malloc_crt", &[16][..]), ("_calloc_crt", &[4, 16][..])] {
+        let pointer = contended(&mut machine, MODULE, name, args, |_| {});
+        assert_ne!(pointer, 0);
+        assert!(matches!(
+            invoke(&mut machine, MODULE, "free", &[pointer]),
+            Outcome::Return(0)
+        ));
+    }
+}
+
+#[test]
+fn standard_crt_heap_fronts_wait_and_preserve_blocks_until_handoff() {
+    serialization(UnicornCpu::new(PARK_ADDR).unwrap());
+    for jit in [false, true] {
+        serialization(JitCpu::new(PARK_ADDR, jit).unwrap());
+    }
+}

@@ -319,7 +319,7 @@ fn ansi_and_unicode_display_dcs_share_pixels_and_fonts_but_have_independent_owne
     );
     assert_eq!(machine.ext.get::<SurfaceStore>().live_surfaces(), 1);
     let borrowed = invoke(&mut machine, data, "user32.dll", "GetDC", &[0]);
-    assert_eq!(borrowed, WINDOW_DC);
+    assert_ne!(borrowed, 0);
     assert_eq!(
         invoke(&mut machine, data, "gdi32.dll", "DeleteDC", &[borrowed]),
         0

@@ -1,6 +1,6 @@
 //! Process, thread, environment, version, and error-reporting functions.
 
-use adv_abi::Registry;
+use adv_abi::{GuestPtr, Handle, Registry, types::FILETIME, win32};
 use adv_cpu::backend::{GuestExt, Prot, Reg};
 use adv_machine::{Env, Object, Outcome, Wait, process::ThreadIdentity};
 use adv_os::{Heaps, processes};
@@ -151,6 +151,29 @@ fn thread_target(
         _ => None,
     }
     .ok_or_else(|| processes::Error::new(err::INVALID_HANDLE, "invalid thread handle"))
+}
+
+#[win32(kernel32, name = "GetThreadTimes", level = safe_fail)]
+fn get_thread_times(
+    env: &mut Env<'_>,
+    handle: Handle,
+    _creation: GuestPtr<FILETIME>,
+    _exit: GuestPtr<FILETIME>,
+    _kernel: GuestPtr<FILETIME>,
+    _user: GuestPtr<FILETIME>,
+) -> Outcome {
+    if let Err(error) = thread_target(env, handle.0, 0x40) {
+        return api_error(env, error, 0);
+    }
+    // Scheduler wall time includes compilation and host service work; it is not
+    // Windows per-thread user/kernel CPU time. Let callers use their fallback.
+    adv_abi::warn_unavailable(
+        env,
+        "kernel32.dll!GetThreadTimes",
+        "per-thread creation/exit and user/kernel CPU accounting is unavailable",
+    );
+    set_last_error(env, 50); // ERROR_NOT_SUPPORTED; leave all outputs untouched.
+    Outcome::Return(0)
 }
 
 fn flush_instruction_cache(env: &mut Env<'_>) -> Outcome {
@@ -946,6 +969,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SuspendThread", 1, suspend_thread);
     stdcall(reg, K32, "ResumeThread", 1, resume_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);
+    reg.register(get_thread_times_ABI);
     stdcall(reg, K32, "GetExitCodeProcess", 2, get_exit_code_process);
     stdcall(reg, K32, "GetThreadContext", 2, get_thread_context);
     stdcall(reg, K32, "SetThreadContext", 2, set_thread_context);

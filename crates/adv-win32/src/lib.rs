@@ -13,12 +13,14 @@ mod advapi32;
 pub mod codec_kernels;
 pub mod gdi32;
 mod guest_code;
+pub(crate) mod heap_lock;
 pub mod kernel32;
 mod misc;
 mod ntdll;
 pub mod printf;
 pub mod user32;
 pub mod util;
+mod vcomp;
 mod version;
 mod vfw;
 pub mod winmm;
@@ -68,13 +70,25 @@ pub struct FindObj {
     pub next: usize,
 }
 
-/// One Toolhelp handle owner, with independently frozen thread/module rows and
+/// One Toolhelp handle owner, with independently frozen process/thread/module/heap rows and
 /// cursors. The existing public thread fields retain their meaning.
 pub struct ThreadSnapshot {
     pub rows: Vec<(u32, u32)>,
     pub cursor: usize,
     pub(crate) modules: Vec<SnapshotModule>,
     pub(crate) module_cursor: usize,
+    pub(crate) processes: Vec<SnapshotProcess>,
+    pub(crate) process_cursor: usize,
+    pub(crate) heaps: Vec<(u32, u32, u32)>,
+    pub(crate) heap_cursor: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotProcess {
+    pub pid: u32,
+    pub parent: u32,
+    pub threads: u32,
+    pub name: String,
 }
 
 #[derive(Clone)]
@@ -123,6 +137,7 @@ impl Win32 {
         heaps.process_heap = process_heap;
         m.cpu
             .write_u32(PEB_ADDR + peb::PROCESS_HEAP, process_heap)?;
+        ntdll::install_peb_lock(m)?;
         let vfs = Vfs::new(&cfg.os);
         let w = Win32 {
             codec: Codec::new(cfg.os.codepage),
@@ -198,6 +213,7 @@ pub fn register(reg: &mut Registry) {
     winsock::register(reg);
     winmm::register(reg);
     xinput::register(reg);
+    vcomp::register(reg);
     ntdll::register(reg);
     guest_code::install(reg);
 }
