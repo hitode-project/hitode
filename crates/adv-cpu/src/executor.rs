@@ -312,6 +312,28 @@ impl Executor {
             Box::new(verifier)
         });
     }
+    /// Account one verified native exit; strict mode stops at a mismatch.
+    fn record_verification(
+        &mut self,
+        check: Option<Result<verify::Check, String>>,
+    ) -> Result<(), String> {
+        let stats = &mut self.stats.verification;
+        match check {
+            None => stats.inconclusive += 1,
+            Some(Ok(verify::Check::Equal)) => stats.verified += 1,
+            Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+            Some(Err(report)) => {
+                stats.mismatches += 1;
+                if self.verifier.as_ref().is_some_and(|v| v.strict) {
+                    return Err(format!("tier verification: {report}"));
+                }
+                if stats.reports.len() < verify::REPORTS {
+                    stats.reports.push(report);
+                }
+            }
+        }
+        Ok(())
+    }
     /// Select helper threads before execution. Zero runs admitted batches inline.
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
         if self.stats.native_entries != 0 || self.stats.interpreter_entries != 0 {
@@ -1545,21 +1567,8 @@ impl Executor {
                     },
                 );
                 if let Some(trace) = &trace {
-                    let stats = &mut self.stats.verification;
-                    match trace.check(&self.state, &self.memory) {
-                        None => stats.inconclusive += 1,
-                        Some(Ok(verify::Check::Equal)) => stats.verified += 1,
-                        Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
-                        Some(Err(report)) => {
-                            stats.mismatches += 1;
-                            if self.verifier.as_ref().is_some_and(|v| v.strict) {
-                                return Err(format!("tier verification: {report}"));
-                            }
-                            if stats.reports.len() < verify::REPORTS {
-                                stats.reports.push(report);
-                            }
-                        }
-                    }
+                    let check = trace.check(&self.state, &self.memory);
+                    self.record_verification(check)?;
                 }
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();

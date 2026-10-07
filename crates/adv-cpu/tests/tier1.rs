@@ -349,3 +349,37 @@ fn guest_code_write_invalidates_the_next_native_entry() {
     assert_eq!(tier.state.regs[2], 1);
     assert!(tier.tier1_stats().invalidations > 0);
 }
+#[test]
+fn tier_verification_counts_tier1_steps_through_loops_memory_and_fallbacks() {
+    let code = assemble(|a| {
+        let mut top = a.create_label();
+        a.mov(ecx, 12).unwrap();
+        a.mov(eax, 0x12345678u32).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.add(eax, 17).unwrap();
+        a.bswap(eax).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.mov(ebx, dword_ptr(edi)).unwrap();
+        a.xor(edx, ebx).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.ret().unwrap();
+    });
+    let mut results = Vec::new();
+    for verify in [false, true] {
+        let mut m = machine(&code, 2);
+        m.set_tier_verification(verify.then_some(true));
+        reset(&mut m, [0, 0, 0, 0, 0, 0, 0, DATA], 2);
+        assert_eq!(m.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+        let checks = &m.stats.verification;
+        assert_eq!(checks.mismatches, 0, "{checks:?}");
+        assert_eq!(checks.verified > 0, verify, "{checks:?}");
+        assert!(m.tier1_stats().native_instructions > 0);
+        results.push((
+            m.state.regs,
+            m.state.eflags & 0x8d5,
+            m.memory().read(DATA, 4).unwrap().to_vec(),
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}

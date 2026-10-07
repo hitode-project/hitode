@@ -9,6 +9,10 @@
 //! back edge, so that PC names a single interpreted state. Native writes
 //! outside the interpreted footprint go unseen. Strict mode turns a mismatch
 //! into a run error, so a bisection stops at the first divergent region.
+//!
+//! ARM64 Tier 1 counts every retired instruction, so its exit is compared
+//! with the interpreted state after the same number of steps instead of the
+//! first state at the exit PC; its internal loops stay enabled.
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -43,6 +47,10 @@ pub(crate) struct Verifier {
     pub strict: bool,
     /// Published regions and how many of their next native entries to verify.
     pub pending: HashMap<u32, u8>,
+    /// Tier 1 entry PCs and how many of their entries were verified since the
+    /// engine's last compilation, which any replaced code requires.
+    tier1: HashMap<u32, u8>,
+    tier1_generation: u64,
     factory: InstructionInfoFactory,
 }
 
@@ -77,6 +85,8 @@ impl Verifier {
         Self {
             strict,
             pending: HashMap::new(),
+            tier1: HashMap::new(),
+            tier1_generation: 0,
             factory: InstructionInfoFactory::new(),
         }
     }
@@ -87,6 +97,21 @@ impl Verifier {
             if *left == 0 {
                 self.pending.remove(&owner);
             }
+        }
+    }
+
+    /// Whether this Tier 1 entry is among the first `ENTRIES` at its PC since
+    /// the engine's compilation count was `generation`. Every instruction is a
+    /// Tier 1 entry, so the count is per PC rather than per published region.
+    pub(crate) fn take_tier1(&mut self, pc: u32, generation: u64) -> bool {
+        if generation != self.tier1_generation {
+            self.tier1.clear();
+            self.tier1_generation = generation;
+        }
+        let seen = self.tier1.entry(pc).or_default();
+        *seen < ENTRIES && {
+            *seen += 1;
+            true
         }
     }
 
@@ -161,39 +186,73 @@ impl Trace {
     pub(crate) fn check(&self, state: &CpuState, memory: &Memory) -> Option<Result<Check, String>> {
         let native = state.clone().capture_architecture();
         let mut best: Option<Vec<String>> = None;
-        let mut mxcsr = false;
-        for (interpreted, logged, undefined) in
-            self.states.iter().filter(|(s, ..)| s.eip == native.eip)
-        {
-            let mut interpreted = interpreted.clone();
-            interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
-            if interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS
-                && interpreted.mxcsr != native.mxcsr
-            {
-                interpreted.mxcsr = native.mxcsr;
-                mxcsr = true;
-            }
-            let mut diff = differences(&interpreted, &native);
-            diff.extend(self.memory_differences(*logged, memory));
-            if diff.is_empty() {
-                return Some(Ok(if mxcsr {
-                    Check::MxcsrFlags
-                } else {
-                    Check::Equal
-                }));
-            }
-            if best.as_ref().is_none_or(|b| diff.len() < b.len()) {
-                best = Some(diff);
+        for recorded in self.states.iter().filter(|(s, ..)| s.eip == native.eip) {
+            match self.compare(recorded, &native, memory) {
+                Ok(check) => return Some(Ok(check)),
+                Err(diff) => {
+                    if best.as_ref().is_none_or(|b| diff.len() < b.len()) {
+                        best = Some(diff);
+                    }
+                }
             }
         }
         let diff = best.filter(|_| !self.cut)?;
-        Some(Err(format!(
+        Some(Err(self.report(&native, &diff)))
+    }
+
+    /// Compare a native exit after exactly `steps` guest instructions with the
+    /// interpreted state after the same count. Lanes that count every retired
+    /// instruction use this, so a loop revisiting a PC cannot match an earlier
+    /// iteration. `None` when the trace stopped before that many steps.
+    pub(crate) fn check_at(
+        &self,
+        steps: usize,
+        state: &CpuState,
+        memory: &Memory,
+    ) -> Option<Result<Check, String>> {
+        let recorded = self.states.get(steps)?;
+        let native = state.clone().capture_architecture();
+        Some(
+            self.compare(recorded, &native, memory)
+                .map_err(|diff| self.report(&native, &diff)),
+        )
+    }
+
+    fn compare(
+        &self,
+        (interpreted, logged, undefined): &(ArchitecturalState, usize, u32),
+        native: &ArchitecturalState,
+        memory: &Memory,
+    ) -> Result<Check, Vec<String>> {
+        let mut interpreted = interpreted.clone();
+        interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
+        let mut mxcsr = false;
+        if interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS
+            && interpreted.mxcsr != native.mxcsr
+        {
+            interpreted.mxcsr = native.mxcsr;
+            mxcsr = true;
+        }
+        let mut diff = differences(&interpreted, native);
+        diff.extend(self.memory_differences(*logged, memory));
+        if !diff.is_empty() {
+            return Err(diff);
+        }
+        Ok(if mxcsr {
+            Check::MxcsrFlags
+        } else {
+            Check::Equal
+        })
+    }
+
+    fn report(&self, native: &ArchitecturalState, diff: &[String]) -> String {
+        format!(
             "region {:#x} entry {:#x} exit {:#x}: {}",
             self.owner,
             self.entry,
             native.eip,
             diff.join(", ")
-        )))
+        )
     }
 
     /// Bytes whose native value differs from the interpreted memory after the
@@ -252,6 +311,12 @@ fn eflags(bits: u32) -> u32 {
 fn differences(interpreted: &ArchitecturalState, native: &ArchitecturalState) -> Vec<String> {
     const NAMES: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
     let mut diff = Vec::new();
+    if interpreted.eip != native.eip {
+        diff.push(format!(
+            "eip native={:#x} interpreter={:#x}",
+            native.eip, interpreted.eip
+        ));
+    }
     for (index, name) in NAMES.iter().enumerate() {
         if interpreted.regs[index] != native.regs[index] {
             diff.push(format!(
@@ -418,6 +483,21 @@ mod tests {
         memory.write(DATA, &[9]).unwrap();
         let report = trace.check(&state, &memory).unwrap().unwrap_err();
         assert!(report.contains("native=0x09 interpreter=0x02"), "{report}");
+    }
+
+    #[test]
+    fn counted_exits_compare_with_the_state_after_the_same_steps() {
+        let (trace, state, memory) = traced(&CODE_BYTES);
+        assert!(matches!(
+            trace.check_at(3, &state, &memory),
+            Some(Ok(Check::Equal))
+        ));
+        let report = trace.check_at(2, &state, &memory).unwrap().unwrap_err();
+        assert!(report.contains("eip native="), "{report}");
+        assert!(
+            trace.check_at(4, &state, &memory).is_none(),
+            "the trace stopped before UD2 executed"
+        );
     }
 
     #[test]
