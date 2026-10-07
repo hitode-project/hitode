@@ -1919,8 +1919,39 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let detail_rows = c.interpreter_detail_rows();
+    let omitted_rows = detail_rows.len().saturating_sub(ROWS);
+    let details = detail_rows
+        .iter()
+        .take(ROWS)
+        .map(|(label, n)| {
+            format!(
+                "{}:{{\"entries\":{},\"instructions\":{}}}",
+                json(label),
+                n.entries,
+                n.instructions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let omitted = ["Uncovered", "Rejected"]
+        .map(|reason| {
+            let mut entries = 0;
+            let mut instructions = 0;
+            for (label, n) in detail_rows.iter().skip(ROWS) {
+                if label.starts_with(&format!("{reason}/")) {
+                    entries += n.entries;
+                    instructions += n.instructions;
+                }
+            }
+            format!(
+                "{}:{{\"entries\":{entries},\"instructions\":{instructions}}}",
+                json(reason)
+            )
+        })
+        .join(",");
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows()),

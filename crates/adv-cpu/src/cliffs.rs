@@ -8,7 +8,7 @@
 //! left generated code, so the native fast path pays nothing.
 use std::collections::HashMap;
 
-use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic};
 
 use crate::Memory;
 
@@ -45,6 +45,29 @@ pub enum InterpreterReason {
     Forced,
 }
 
+/// Observed entry state, not a guess about the instructions inside a batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum InterpreterDetail {
+    AutoJitDisabled,
+    Tier1,
+    NonExecutable,
+    BelowThreshold,
+    PendingCompilation,
+    DeferredCompilation,
+    QueueCapacity,
+    RegionBoundary,
+    UnregisteredEntry,
+    NotDiscovered,
+    DiscoveryBoundary,
+    DiscoveryMemory,
+    DiscoverySize,
+    WorkBudget,
+    CompileFailure,
+    CachePolicy,
+    NoPublishedEntry,
+    Unsupported(Code),
+}
+
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Count {
     pub entries: u64,
@@ -61,6 +84,7 @@ pub struct Cliffs {
     /// Native exits that handed the instruction at their PC to the interpreter.
     pub fallbacks: HashMap<Mnemonic, u64>,
     pub interpreter: HashMap<InterpreterReason, Count>,
+    pub(crate) interpreter_details: HashMap<(InterpreterReason, InterpreterDetail), Count>,
 }
 
 impl Cliffs {
@@ -78,6 +102,11 @@ impl Cliffs {
             count.entries += n.entries;
             count.instructions += n.instructions;
         }
+        for (key, n) in other.interpreter_details {
+            let count = self.interpreter_details.entry(key).or_default();
+            count.entries += n.entries;
+            count.instructions += n.instructions;
+        }
     }
 
     pub(crate) fn fallback(&mut self, memory: &Memory, pc: u32) {
@@ -88,6 +117,40 @@ impl Cliffs {
         let count = self.interpreter.entry(reason).or_default();
         count.entries += 1;
         count.instructions += u64::from(units);
+    }
+
+    pub(crate) fn detail(
+        &mut self,
+        reason: InterpreterReason,
+        detail: InterpreterDetail,
+        units: u32,
+    ) {
+        let count = self
+            .interpreter_details
+            .entry((reason, detail))
+            .or_default();
+        count.entries += 1;
+        count.instructions += u64::from(units);
+    }
+
+    /// Uncovered/Rejected entry states, ranked by interpreted instruction units.
+    /// Code labels contain only instruction forms, never operands or addresses.
+    pub fn interpreter_detail_rows(&self) -> Vec<(String, Count)> {
+        let mut rows: Vec<_> = self
+            .interpreter_details
+            .iter()
+            .map(|(&(reason, detail), &n)| {
+                let label = match detail {
+                    InterpreterDetail::Unsupported(code) => {
+                        format!("Unsupported/{:?}/{code:?}", code.mnemonic())
+                    }
+                    other => format!("{other:?}"),
+                };
+                (format!("{reason:?}/{label}"), n)
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| b.1.instructions.cmp(&a.1.instructions).then(a.0.cmp(&b.0)));
+        rows
     }
 
     /// Exact-model x87 calls as (`mnemonic/reason`, count), most frequent first.
@@ -133,4 +196,51 @@ fn mnemonic_at(memory: &Memory, pc: u32) -> Mnemonic {
     Decoder::with_ip(32, &bytes, u64::from(pc), DecoderOptions::NONE)
         .decode()
         .mnemonic()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_merge_and_ranking_preserve_whole_batch_units() {
+        let mut first = Cliffs::default();
+        first.detail(
+            InterpreterReason::Rejected,
+            InterpreterDetail::Unsupported(Code::Cbw),
+            9,
+        );
+        let mut second = Cliffs::default();
+        second.detail(
+            InterpreterReason::Rejected,
+            InterpreterDetail::Unsupported(Code::Cbw),
+            11,
+        );
+        second.detail(
+            InterpreterReason::Uncovered,
+            InterpreterDetail::BelowThreshold,
+            20,
+        );
+        first.merge(second);
+        let rows = first.interpreter_detail_rows();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Rejected/Unsupported/Cbw/Cbw".into(),
+                    Count {
+                        entries: 2,
+                        instructions: 20
+                    }
+                ),
+                (
+                    "Uncovered/BelowThreshold".into(),
+                    Count {
+                        entries: 1,
+                        instructions: 20
+                    }
+                ),
+            ]
+        );
+    }
 }

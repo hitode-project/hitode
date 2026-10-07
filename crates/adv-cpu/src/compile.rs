@@ -72,6 +72,8 @@ pub(crate) struct Compiled {
     window_base: u32,
     window_len: usize,
     pub entries: BTreeSet<u32>,
+    /// Entry forms deliberately left to the interpreter after code generation.
+    pub excluded_entries: BTreeMap<u32, iced_x86::Code>,
     pub code_size: usize,
     pub direct_sites: usize,
     /// x87 instructions called from generated code by address.
@@ -2222,9 +2224,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // Unsupported entry instructions belong to the cold executor. This also prevents
     // a one-unit scheduler slice from repeatedly entering native code without progress.
     // Callee code stays owned by its own unit; only calls from here reach it.
+    let mut excluded_entries = BTreeMap::new();
     entries.retain(|pc| {
-        !callee_code.contains(pc)
-            && (supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc))
+        if callee_code.contains(pc) {
+            return false;
+        }
+        let admitted =
+            supported(&instructions[pc]) || x87.iter().any(|op| op.instruction.ip32() == *pc);
+        if !admitted {
+            excluded_entries.insert(*pc, instructions[pc].code());
+        }
+        admitted
     });
     let input = snapshot.with_coverage(&instructions, &pages);
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -2277,6 +2287,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         window_base: snapshot.base,
         window_len: snapshot.len,
         entries,
+        excluded_entries,
         direct_sites: {
             #[cfg(all(
                 any(target_os = "linux", target_os = "android"),

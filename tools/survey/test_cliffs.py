@@ -1,6 +1,6 @@
 """Synthetic report tests: python -m unittest discover -s tools/survey -p test_cliffs.py.
 
-Input fixtures are generated in memory or under target/scratch/cliff-survey.
+Input fixtures are generated in memory or the system temporary directory.
 No real reports are used. Output is unittest's assertion summary.
 """
 from contextlib import redirect_stderr, redirect_stdout
@@ -41,6 +41,67 @@ def empty_fixture():
 
 
 class AggregateTests(unittest.TestCase):
+    def detailed_fixture(self):
+        report = empty_fixture()
+        report["cpu_cliffs"].update(
+            interpreter={"Rejected": {"entries": 2, "instructions": 11}},
+            interpreter_details={"Rejected/Unsupported/Cbw/Cbw": {"entries": 2, "instructions": 11}},
+            interpreter_details_omitted={reason: {"entries": 0, "instructions": 0}
+                                         for reason in ("Uncovered", "Rejected")},
+            interpreter_detail_rows_omitted=0)
+        return report
+
+    def test_details_merge_and_old_reports_remain_explicitly_unknown(self):
+        report = self.detailed_fixture()
+        old = empty_fixture()
+        old["cpu_cliffs"]["interpreter"] = {"Uncovered": {"entries": 3, "instructions": 20}}
+        result = aggregate([report, report, old])
+        self.assertEqual(result["cpu_cliffs"]["interpreter_details"]["Rejected/Unsupported/Cbw/Cbw"],
+                         {"entries": 4, "instructions": 22})
+        self.assertEqual(result["cpu_cliffs"]["interpreter_details_unknown"]["Uncovered"],
+                         {"entries": 3, "instructions": 20})
+        self.assertEqual(result["report_limits"]["interpreter_detail_reports"], 2)
+
+    def test_detail_truncation_reconciles_both_counters(self):
+        report = self.detailed_fixture()
+        cliffs = report["cpu_cliffs"]
+        cliffs["interpreter_details"] = {
+            f"Rejected/Unsupported/Op{i}/Op{i}_rm32": {"entries": 1, "instructions": 3}
+            for i in range(24)}
+        cliffs["interpreter_details_omitted"]["Rejected"] = {"entries": 5, "instructions": 7}
+        cliffs["interpreter_detail_rows_omitted"] = 2
+        cliffs["interpreter"]["Rejected"] = {"entries": 29, "instructions": 79}
+        result = aggregate([report])
+        self.assertEqual(result["cpu_cliffs"]["interpreter_details_omitted"]["Rejected"]["instructions"], 7)
+        self.assertIn("源报告截断行数：2", markdown(result))
+        cliffs["interpreter"]["Rejected"]["entries"] += 1
+        with self.assertRaisesRegex(ValueError, "reconcile"):
+            aggregate([report])
+
+    def test_detail_schema_rejects_partial_or_private_labels(self):
+        for label in ("Rejected/UnknownReason", "Uncovered/private/path", "Rejected/Unsupported/Mov/private",
+                      "Rejected/Unsupported/Mov/Mov_0x1234-operand", "Forced/BelowThreshold"):
+            report = self.detailed_fixture()
+            report["cpu_cliffs"]["interpreter_details"] = {label: {"entries": 2, "instructions": 11}}
+            with self.assertRaises(ValueError) as caught:
+                aggregate([report])
+            self.assertNotIn("private", str(caught.exception))
+        for key in ("interpreter_details", "interpreter_details_omitted", "interpreter_detail_rows_omitted"):
+            report = self.detailed_fixture()
+            del report["cpu_cliffs"][key]
+            with self.assertRaises(ValueError):
+                aggregate([report])
+
+    def test_detail_limits_and_counter_types_are_checked(self):
+        for key, bad in (("interpreter_detail_rows_omitted", True),
+                         ("interpreter_detail_rows_omitted", 1),
+                         ("interpreter_details", []),
+                         ("interpreter_details_omitted", {})):
+            report = self.detailed_fixture()
+            report["cpu_cliffs"][key] = bad
+            with self.assertRaises(ValueError):
+                aggregate([report])
+
     def test_merges_mnemonics_reasons_and_verification(self):
         first = fixture()
         second = fixture()
@@ -160,9 +221,7 @@ class AggregateTests(unittest.TestCase):
 
 class CliTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path(__file__).resolve().parents[2] / "target" / "scratch" / "cliff-survey"
-        scratch.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
+        self.temporary = tempfile.TemporaryDirectory(prefix="adv-cliffs-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 

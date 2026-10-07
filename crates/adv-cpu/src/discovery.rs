@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
+use crate::cliffs::InterpreterDetail;
 use crate::{CompileStrategy, Memory, Region};
 
 const MAX_BYTES: usize = 16 * 1024;
@@ -14,12 +15,13 @@ pub(crate) fn discover(
     stop: u32,
     strategy: CompileStrategy,
     boundaries: &BTreeSet<u32>,
-) -> Option<Region> {
+) -> Result<Region, InterpreterDetail> {
     let mut pending = vec![entry];
     let mut instructions = BTreeSet::new();
     let mut frontier = BTreeSet::new();
     let mut start = entry;
     let mut end = u64::from(entry);
+    let mut rejection = InterpreterDetail::DiscoveryBoundary;
     while let Some(mut pc) = pending.pop() {
         loop {
             if instructions.contains(&pc) {
@@ -48,6 +50,7 @@ pub(crate) fn discover(
                 available += 1;
             }
             if available == 0 {
+                rejection = InterpreterDetail::DiscoveryMemory;
                 frontier.insert(pc);
                 break;
             }
@@ -62,6 +65,15 @@ pub(crate) fn discover(
                     && u64::from(stop) < candidate_end)
                 || !memory.executable(candidate_start, len)
             {
+                rejection = if len > MAX_BYTES {
+                    InterpreterDetail::DiscoverySize
+                } else if u64::from(stop) >= u64::from(candidate_start)
+                    && u64::from(stop) < candidate_end
+                {
+                    InterpreterDetail::DiscoveryBoundary
+                } else {
+                    InterpreterDetail::DiscoveryMemory
+                };
                 frontier.insert(pc);
                 break;
             }
@@ -98,7 +110,7 @@ pub(crate) fn discover(
         }
     }
     if instructions.is_empty() {
-        return None;
+        return Err(rejection);
     }
     frontier.retain(|pc| !instructions.contains(pc));
     let mut region = Region::new(start, (end - u64::from(start)) as usize);
@@ -107,5 +119,5 @@ pub(crate) fn discover(
     region.reachable = true;
     region.complete_tail = true;
     region.compile_strategy = strategy;
-    Some(region)
+    Ok(region)
 }
