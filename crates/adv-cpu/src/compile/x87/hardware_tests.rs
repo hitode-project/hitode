@@ -7,6 +7,9 @@ use super::*;
 struct HostFp([u8; 512]);
 
 fn hardware(a: f64, b: f64, op: Op, control: u16) -> ([u8; 10], u16) {
+    // Match a pre-seeded canonical ST0. Loading m64 here would additionally
+    // raise DE for a binary64 subnormal (which is a normal extended value).
+    let a_raw = crate::backend::x87::encode_f64(a);
     let mut saved = HostFp([0; 512]);
     let mut raw = [0u8; 10];
     let mut status = 0u16;
@@ -21,14 +24,15 @@ fn hardware(a: f64, b: f64, op: Op, control: u16) -> ([u8; 10], u16) {
                     "fxsave64 [{saved}]",
                     "fninit",
                     "fldcw word ptr [{control}]",
-                    "fld qword ptr [{a}]",
+                    "fld tbyte ptr [{a}]",
                     $instruction,
+                    "fwait",
                     "fnstsw word ptr [{status}]",
                     "fstp tbyte ptr [{raw}]",
                     "fxrstor64 [{saved}]",
                     saved = in(reg) &mut saved,
                     control = in(reg) &control,
-                    a = in(reg) &a,
+                    a = in(reg) &a_raw,
                     b = in(reg) &b,
                     status = in(reg) &mut status,
                     raw = in(reg) &mut raw,
@@ -72,6 +76,66 @@ fn bounded(seed: &mut u64) -> f64 {
 /// A bounded value with a 24-bit significand, as PC=24 code keeps them.
 fn single(seed: &mut u64) -> f64 {
     f64::from_bits(bounded(seed).to_bits() & !crate::floating::fast::SINGLE_TAIL)
+}
+
+#[test]
+fn arithmetic_then_wait_matches_hardware_across_controls_and_special_values() {
+    let values = [
+        (1.0, 3.0),
+        (1.0, 2f64.powi(-63)),
+        (-1.0, 1.0),
+        (-0.0, -0.0),
+        (f64::from_bits(1), 2.0),
+        (f64::MIN_POSITIVE, f64::MIN_POSITIVE),
+        (f64::MAX, f64::MAX),
+        (f64::INFINITY, f64::NEG_INFINITY),
+        (f64::from_bits(0x7ff8_0000_0000_1234), 1.0),
+        (f64::from_bits(0x7ff0_0000_0000_1234), 1.0),
+    ];
+    for op in [Op::Add, Op::Sub, Op::Mul, Op::Div] {
+        let code = bytes(|a| {
+            match op {
+                Op::Add => a.fadd(qword_ptr(esi)),
+                Op::Sub => a.fsub(qword_ptr(esi)),
+                Op::Mul => a.fmul(qword_ptr(esi)),
+                Op::Div => a.fdiv(qword_ptr(esi)),
+            }
+            .unwrap();
+            a.wait().unwrap();
+        });
+        let mut mem = memory(&code);
+        let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
+        for pc in [0, 2, 3] {
+            for rc in 0..4 {
+                let control = 0x7f | pc << 8 | rc << 10;
+                for (a, b) in values {
+                    let (raw, status) = hardware(a, b, op, control);
+                    let mut actual = state();
+                    actual.x87.control = control;
+                    let slot = actual.x87.top();
+                    let value = X87Register(crate::backend::x87::encode_f64(a));
+                    actual.x87.regs[slot] = value;
+                    actual.x87.set_physical_tag(slot, value.tag());
+                    actual.refresh_mmx();
+                    mem.write(DATA, &b.to_le_bytes()).unwrap();
+                    assert_eq!(
+                        testing::run(&compiled, &mut actual, &mut mem),
+                        Exit::Dispatch as u32
+                    );
+                    assert_eq!(
+                        actual.x87.regs[slot].0, raw,
+                        "{op:?} PC={pc} RC={rc} a={a:?} b={b:?}"
+                    );
+                    assert_eq!(
+                        actual.x87.status & 0x023f,
+                        status & 0x023f,
+                        "{op:?} PC={pc} RC={rc} a={a:?} b={b:?}"
+                    );
+                    assert_eq!(actual.eflags, state().eflags);
+                }
+            }
+        }
+    }
 }
 
 #[test]

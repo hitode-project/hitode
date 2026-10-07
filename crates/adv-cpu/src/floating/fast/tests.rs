@@ -6,8 +6,62 @@ const BASE: u32 = 0x10000;
 const CODE: u32 = BASE + 0x4000;
 type Asm = fn(&mut CodeAssembler, AsmRegisterSt) -> Result<(), IcedError>;
 
+#[test]
+fn wait_helper_checks_es_and_preserves_every_status_bit() {
+    let mut asm = CodeAssembler::new(32).unwrap();
+    asm.wait().unwrap();
+    let bytes = asm.assemble(u64::from(CODE)).unwrap();
+    let instruction = iced_x86::Decoder::with_ip(32, &bytes, u64::from(CODE), 0).decode();
+    let op = NativeX87 {
+        instruction,
+        opcode: None,
+        fast: classify(&instruction),
+    };
+    assert_eq!(op.fast, Some(Fast::Wait));
+    let mut mem = memory(0, &bytes);
+    for status in 0..=u16::MAX {
+        let mut initial = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        initial.x87.status = status;
+        initial.x87.control = status.rotate_left(3);
+        initial.x87.ip = CODE - 16;
+        initial.x87.dp = BASE;
+        initial.x87.opcode = 0x123;
+        initial.eflags = 0xad7;
+        initial.refresh_mmx();
+        let mut actual = initial.clone();
+        let result = execute(&op, Fast::Wait, &mut actual, &mut mem);
+        if status & 0x80 == 0 {
+            assert_eq!(result, Some(X87_DONE));
+            initial.eip = instruction.next_ip32();
+            assert_eq!(actual, initial);
+        } else {
+            assert_eq!(result, None);
+            assert_eq!(actual, initial);
+            assert_eq!(
+                super::super::execute(
+                    &instruction,
+                    super::super::Operation::X87,
+                    None,
+                    &mut actual,
+                    &mut mem,
+                    true
+                ),
+                Step::Trap {
+                    pc: CODE,
+                    vector: 16
+                }
+            );
+            assert_eq!(actual, initial);
+        }
+    }
+}
+
 fn programs() -> Vec<Asm> {
     vec![
+        |a, _| a.wait(),
         |a, _| a.fld(dword_ptr(esi)),
         |a, _| a.fld(qword_ptr(esi)),
         |a, _| a.fild(dword_ptr(esi)),

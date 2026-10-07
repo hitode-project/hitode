@@ -95,7 +95,11 @@ pub(in crate::compile) fn segments(
         }
         let mut run = vec![*i];
         let numeric = |i: &Instruction| {
-            floating(i) && crate::floating::fast::classify(i) != Some(Fast::LoadControl)
+            floating(i)
+                && !matches!(
+                    crate::floating::fast::classify(i),
+                    Some(Fast::LoadControl | Fast::Wait)
+                )
         };
         let mut count = usize::from(numeric(i));
         while count < LIMIT && run.len() < SPAN {
@@ -269,6 +273,11 @@ impl Emitter<'_> {
                 self.x87_reject(bad, slow);
             }
             let fast = crate::floating::fast::classify(i).unwrap();
+            // Entry rejects ES/MMX, and every admitted lane operation keeps ES
+            // clear (including FLDCW). WAIT preserves the entire resident prefix.
+            if fast == Fast::Wait {
+                continue;
+            }
             if fast != Fast::LoadControl {
                 prefix.status = self.b.ins().band_imm(prefix.status, !C1);
             }
@@ -506,7 +515,7 @@ impl Emitter<'_> {
                     // FLDCW leaves C1, FIP/FDP/FOP and TOP/tag unchanged.
                     continue;
                 }
-                Fast::StoreControl | Fast::StoreStatus => unreachable!(),
+                Fast::Wait | Fast::StoreControl | Fast::StoreStatus => unreachable!(),
             }
             prefix.metadata = Some((i.ip32(), self.x87[&i.ip32()].1));
         }

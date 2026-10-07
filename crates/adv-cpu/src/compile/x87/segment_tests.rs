@@ -7,6 +7,42 @@ fn decoded(code: &[u8]) -> Vec<Instruction> {
 }
 
 #[test]
+fn waits_preserve_resident_values_metadata_and_exception_delivery() {
+    let code = bytes(|a| {
+        a.wait().unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.wait().unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.wait().unwrap();
+        a.fstp(qword_ptr(esi + 16)).unwrap();
+        a.wait().unwrap();
+    });
+    compare(&code, state(), |_| {}, Some(0));
+    let mut pending = state();
+    pending.x87.control &= !4;
+    pending.x87.status |= 0x8084;
+    compare(&code, pending, |_| {}, Some(1));
+
+    // A control change that unmasks a sticky exception must commit and leave
+    // the lane before WAIT; resumption then delivers #MF without changing FIP.
+    let code = bytes(|a| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.wait().unwrap();
+        a.fldcw(word_ptr(esi + 64)).unwrap();
+        a.wait().unwrap();
+        a.fadd_2(st0, st1).unwrap();
+    });
+    let mut initial = state();
+    initial.x87.status |= 4;
+    compare(
+        &code,
+        initial,
+        |m| m.write(DATA + 64, &0x027bu16.to_le_bytes()).unwrap(),
+        Some(1),
+    );
+}
+
+#[test]
 fn region_fact_emission_counts() {
     for control_changes in [false, true] {
         let code = bytes(|a| {
@@ -294,8 +330,10 @@ fn code_observation_epoch_precedes_x87_instruction_effects() {
 #[test]
 fn resident_stack_wrap_and_dead_raw_slots_match_every_budget_prefix() {
     let code = bytes(|a| {
+        a.wait().unwrap();
         a.fld(dword_ptr(esi)).unwrap();
         a.fadd(dword_ptr(esi + 4)).unwrap();
+        a.wait().unwrap();
         a.fld1().unwrap();
         a.fxch(st0, st1).unwrap();
         a.fmulp(st1, st0).unwrap();
@@ -307,6 +345,7 @@ fn resident_stack_wrap_and_dead_raw_slots_match_every_budget_prefix() {
         a.fxch(st0, st1).unwrap();
         a.fsubr_2(st0, st1).unwrap();
         a.fcompp().unwrap();
+        a.wait().unwrap();
     });
     let instructions = decoded(&code);
     for top in 0..8 {
