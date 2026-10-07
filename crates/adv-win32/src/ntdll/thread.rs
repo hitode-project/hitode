@@ -7,6 +7,12 @@ fn get_context(env: &mut Env<'_>, thread: Handle, context: GuestPtr<()>) -> Outc
     crate::kernel32::native_thread_context(env, thread.0, context.addr(), false)
 }
 
+#[win32(ntdll, name = "NtSetContextThread", level = implement)]
+fn set_context(env: &mut Env<'_>, thread: Handle, context: GuestPtr<()>) -> Outcome {
+    crate::kernel32::native_thread_context(env, thread.0, context.addr(), true)
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_context_ABI);
+    registry.register(set_context_ABI);
 }
