@@ -165,7 +165,7 @@ fn binding_replaces_the_fvf_and_set_fvf_releases_the_declaration() {
 }
 
 #[test]
-fn only_fvf_equivalent_stream_zero_inputs_map_onto_the_fixed_pipeline() {
+fn only_fvf_equivalent_inputs_map_onto_the_fixed_pipeline() {
     let encode = |list: &[(u16, u16, u8, u8, u8)]| -> Vec<[u8; 8]> {
         list.iter()
             .map(|&(stream, offset, kind, usage, index)| {
@@ -192,11 +192,12 @@ fn only_fvf_equivalent_stream_zero_inputs_map_onto_the_fixed_pipeline() {
             position: 12,
             color: Some(8),
             uv: Some(0),
+            streams: [0; 3],
             size: 24,
         })
     );
     for (list, reason) in [
-        (&[(1, 0, 2, 0, 0)][..], "stream other than 0"),
+        (&[(16, 0, 2, 0, 0)][..], "outside the bound stream range"),
         (
             &[(0, 0, 2, 0, 0), (0, 12, 2, 3, 0)][..],
             "no fixed-function equivalent",

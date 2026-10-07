@@ -481,7 +481,7 @@ fn back_buffer(
     Outcome::Return(0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::CreateTexture",level=implement)]
-fn create_texture(
+pub(super) fn create_texture(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     width: u32,
@@ -505,12 +505,12 @@ fn create_texture(
         || usage & !(1 | 0x200) != 0
         || (pool != 0 && usage != 0)
         || (usage & 1 != 0 && usage & 0x200 != 0)
-        || (format == 26 && usage & 1 != 0)
+        || (matches!(format, 26 | 28) && usage & 1 != 0)
     {
         let reason = if format::bytes(format).is_none() {
-            "pixel format is unsupported (supported: 21/22/26)"
-        } else if format == 26 && usage & 1 != 0 {
-            "packed 26 render targets are unavailable; 26 supports sampled textures"
+            "pixel format is unsupported (supported: 21/22/26/28)"
+        } else if matches!(format, 26 | 28) && usage & 1 != 0 {
+            "packed or alpha-only render targets are unavailable; formats 26/28 support sampled textures"
         } else {
             "usage/pool or shared-handle combination is unsupported"
         };
@@ -834,7 +834,80 @@ pub(super) fn texture_unlock_internal(
     dirty::flush(env, this.addr())
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetTexture",level=state)]
-fn set_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, texture: GuestPtr<()>) -> u32 {
+fn set_texture(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    stage: u32,
+    texture: GuestPtr<()>,
+) -> Outcome {
+    let Some(device) = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .filter(|_| super::device(env, this.addr()).is_some())
+    else {
+        return Outcome::Return(INVALID);
+    };
+    if super::programmable::sampler_slot(stage).is_none() {
+        return Outcome::Return(INVALID);
+    }
+    if !texture.is_null()
+        && resource(env, texture.addr()).is_some_and(|r| {
+            r.kind == Kind::Texture
+                && r.desc.Pool == 1
+                && (residency::cold(env, texture.addr())
+                    || r.levels.iter().any(|level| level.dirty))
+        })
+    {
+        let Some(r) = resource(env, texture.addr()).filter(|r| r.device == device) else {
+            return Outcome::Return(INVALID);
+        };
+        // Binding a CPU-locked texture is valid. Unlock/DC release restores it
+        // before it can be sampled; normal draw admission still rejects locks.
+        if !locked(env, r) {
+            let restored = residency::ensure(env, texture.addr());
+            if restored != 0 {
+                return Outcome::Return(restored);
+            }
+            let outcome = dirty::flush(env, texture.addr());
+            return texture_restored(env, this.addr(), stage, texture.addr(), outcome);
+        }
+    }
+    Outcome::Return(set_texture_binding(env, this, stage, texture))
+}
+fn texture_restored(
+    env: &mut Env<'_>,
+    device: u32,
+    stage: u32,
+    texture: u32,
+    outcome: Outcome,
+) -> Outcome {
+    match outcome {
+        Outcome::Return(0) => Outcome::Return(set_texture_binding(
+            env,
+            GuestPtr::new(device),
+            stage,
+            GuestPtr::new(texture),
+        )),
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resume| {
+                let result = then(env, resume);
+                texture_restored(env, device, stage, texture, result)
+            }),
+        },
+        other => other,
+    }
+}
+fn set_texture_binding(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    stage: u32,
+    texture: GuestPtr<()>,
+) -> u32 {
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
@@ -892,6 +965,7 @@ fn set_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, texture: Guest
     }
     0
 }
+
 #[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement)]
 fn get_texture(
     env: &mut Env<'_>,

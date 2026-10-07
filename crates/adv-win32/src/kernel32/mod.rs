@@ -5,17 +5,19 @@ pub(crate) mod child_process;
 mod environment;
 mod exception;
 pub(crate) use exception::install as install_exceptions;
+pub(crate) use exception::uncaught_query_blocker;
 mod file;
 pub(crate) mod file_mapping;
 mod handle;
 pub use file::open as open_file;
 pub(crate) use file::{open_with_share, read_coherent};
+pub(crate) use file::create_directory_path;
 pub(crate) use file_mapping::prune as prune_file_mappings;
 pub use handle::ProcessHandle;
 mod memory;
 pub(crate) use memory::protect_memory;
 mod module;
-pub(crate) use module::{exit_process, install_startup, spawn_thread};
+pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread};
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
 mod nlsapi;
 mod osversion;
@@ -29,6 +31,7 @@ mod time;
 mod timer;
 mod toolhelp;
 pub use time::filetime_now;
+pub(crate) use time::{civil_from_days, days_from_civil};
 
 use adv_abi::Registry;
 

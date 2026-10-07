@@ -1,9 +1,12 @@
 //! x86 Windows exception records and handler search. CPU stops and callback
 //! scheduling stay in adv-machine; all ABI layouts and dispositions live here.
 pub(super) mod context;
+mod mapping;
+pub(super) mod phase;
+pub(crate) use phase::uncaught_query_blocker;
 
 use adv_abi::{GuestPtr, Registry, win32};
-use adv_cpu::backend::{Backend, FaultKind, GuestExt, Prot, Reg};
+use adv_cpu::backend::{Backend, GuestExt, Prot, Reg};
 use adv_machine::exception::{Checkpoint, Exception};
 use adv_machine::{Env, Identity, Machine, Namespace, Outcome};
 use std::collections::VecDeque;
@@ -145,43 +148,16 @@ fn raise(
     )
 }
 
-fn cpu_exception(env: &mut Env<'_>, event: Exception, checkpoint: Checkpoint) -> Outcome {
-    let mut information = [0; 15];
-    let (code, count) = match event {
-        Exception::Fault(fault) => match fault.kind {
-            FaultKind::Read(address) | FaultKind::Write(address) | FaultKind::Fetch(address) => {
-                information[0] = match fault.kind {
-                    FaultKind::Read(_) => 0,
-                    FaultKind::Write(_) => 1,
-                    _ => 8,
-                };
-                information[1] = address;
-                (0xc000_0005, 2)
-            }
-            FaultKind::InvalidInstruction => (0xc000_001d, 0),
-            FaultKind::Other(message) => {
-                return Outcome::Fail(format!("unclassified CPU fault: {message}"));
-            }
-        },
-        Exception::Trap { vector: 6, .. } => (0xc000_001d, 0),
-        other => {
-            return Outcome::Fail(format!(
-                "Windows exception mapping not implemented for {other:?}"
-            ));
+fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) -> Outcome {
+    let record = match mapping::map(env.cpu, &event, &checkpoint.state) {
+        Ok(record) => record,
+        Err(reason) => {
+            adv_abi::warn_unavailable(env, "Win32 exception mapping", &reason);
+            return Outcome::Fail(reason);
         }
     };
-    let address = checkpoint.state.eip;
-    dispatch(
-        env,
-        checkpoint,
-        Record {
-            code,
-            flags: 0,
-            address,
-            count,
-            information,
-        },
-    )
+    mapping::normalize_context(&record, &mut checkpoint.state);
+    dispatch(env, checkpoint, record)
 }
 
 struct Record {
@@ -198,6 +174,8 @@ struct Search {
     vectored: VecDeque<Identity<VectoredHandler>>,
     frame: Option<u32>,
     searched: usize,
+    // Survives vectored/frame callbacks, and expires on resume or nonlocal exit.
+    _phase: Rc<phase::Phase>,
     /// (scratch, establisher) of interrupted frame handlers, innermost first.
     outer: VecDeque<(u32, u32)>,
     /// Native NestedFrame: the highest establisher whose handler was running.
@@ -247,6 +225,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
         return Outcome::Fail(error.to_string());
     }
     let vectored = env.ext.get_or_default::<Vectored>().order.clone();
+    let active = phase::enter(env, phase::Phase::Dispatch, record.code);
     search(
         env,
         Search {
@@ -256,6 +235,7 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
             vectored,
             frame: None,
             searched: 0,
+            _phase: active,
             outer: outer.into(),
             nested: None,
         },

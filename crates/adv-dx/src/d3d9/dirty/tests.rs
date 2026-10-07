@@ -732,3 +732,274 @@ fn packed_argb_rejects_render_targets_and_keeps_offscreen_guest_locks_packed() {
     assert!(m.ext.get::<State>().transfers.is_empty());
     assert_eq!(release(&mut env(&mut m), surface), 0);
 }
+
+#[test]
+fn a8_bytes_mip_aliases_identity_sampling_and_managed_restoration_match_native() {
+    // Native authored a8-native/probe.c, SHA256
+    // 2C24C2F0D023F65BEC88F4DBBA8F3C1389D544D85D06748776F4A4DE2E1CFC18.
+    // Fixed COLOR/ALPHA SELECTTEXTURE returns zero RGB and the original alpha;
+    // a borrowed surface write and an eviction preserve those same 16 pixels.
+    use adv_device::gpu::AlphaMode;
+    #[track_caller]
+    fn okay(outcome: Outcome) {
+        match outcome {
+            Outcome::Return(value) => assert_eq!(value, 0, "A8 fixture API result"),
+            _ => panic!("unexpected A8 fixture continuation"),
+        }
+    }
+    let (mut m, device) = machine(true);
+    let output = packet(&mut m, 0u32);
+    let factory = create(&mut env(&mut m), 32).addr();
+    for usage in [0, 0x200] {
+        okay(call(
+            &mut m,
+            "IDirect3D9::CheckDeviceFormat",
+            &[factory, 0, 1, 22, usage, 3, 28],
+        ));
+    }
+    for (usage, kind) in [(1, 3), (0, 1), (0, 4), (0x400, 3), (0x100000, 3)] {
+        assert!(matches!(
+            call(
+                &mut m,
+                "IDirect3D9::CheckDeviceFormat",
+                &[factory, 0, 1, 22, usage, kind, 28]
+            ),
+            Outcome::Return(UNAVAILABLE)
+        ));
+    }
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::CreateTexture",
+        &[device, 4, 4, 3, 0, 28, 1, output, 0],
+    ));
+    let texture = m.cpu.read_u32(output).unwrap();
+    let storage = resources::resource(&env(&mut m), texture).unwrap().storage;
+    let levels = resources::resource(&env(&mut m), texture)
+        .unwrap()
+        .levels
+        .clone();
+    assert_eq!(
+        levels.iter().map(|level| level.offset).collect::<Vec<_>>(),
+        [0, 16, 20]
+    );
+    let mut raw = vec![0u8, 64, 128, 255].repeat(4);
+    let mip_data = [raw.clone(), vec![17, 85, 170, 255], vec![128]];
+    for (level, side) in [4, 2, 1].into_iter().enumerate() {
+        let locked = lock(&mut m, texture, level as u32, 0, 0);
+        assert_eq!(locked.Pitch, side);
+        assert_eq!(locked.pBits, storage + levels[level].offset);
+        m.cpu.write(locked.pBits, &mip_data[level]).unwrap();
+    }
+    let before = submissions(&m);
+    okay(unlock(&mut m, texture, 0));
+    okay(unlock(&mut m, texture, 1));
+    assert_eq!(submissions(&m), before);
+    okay(unlock(&mut m, texture, 2));
+    for (level, bytes) in mip_data.iter().enumerate() {
+        let image = image(&mut m, texture, level);
+        assert_eq!(image.alpha_mode(), AlphaMode::Stored);
+        assert_eq!(
+            pixels(&mut m, &image),
+            bytes.iter().flat_map(|&a| [0, 0, 0, a]).collect::<Vec<_>>()
+        );
+    }
+    okay(call(
+        &mut m,
+        "IDirect3DTexture9::GetSurfaceLevel",
+        &[texture, 0, output],
+    ));
+    let alias = m.cpu.read_u32(output).unwrap();
+    let rect = packet(
+        &mut m,
+        RECT {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 3,
+        },
+    );
+    let lock_output = packet(&mut m, D3DLOCKED_RECT::default());
+    okay(call(
+        &mut m,
+        "IDirect3DSurface9::LockRect",
+        &[alias, lock_output, rect, 0],
+    ));
+    let locked: D3DLOCKED_RECT = GuestPtr::new(lock_output).read(&m.cpu).unwrap();
+    assert_eq!((locked.Pitch, locked.pBits), (4, storage + 5));
+    m.cpu.write(locked.pBits, &[17]).unwrap();
+    raw[5] = 17;
+    okay(call(&mut m, "IDirect3DSurface9::UnlockRect", &[alias]));
+    let locked = lock(&mut m, texture, 0, 0, 0x10);
+    let mut actual = [0; 16];
+    m.cpu.read(locked.pBits, &mut actual).unwrap();
+    assert_eq!(actual.as_slice(), raw);
+    okay(unlock(&mut m, texture, 0));
+    // Let the acquired surface reference be the texture's sole public owner;
+    // the fixture's three-reference ceiling leaves room for normal binding.
+    assert_eq!(release(&mut env(&mut m), texture), 1);
+
+    // A driver may pad A8 rows. The conversion consumes alpha bytes only and
+    // restores one guest byte per pixel, irrespective of canonical RGB.
+    let (expanded, pitch) =
+        format::upload(28, vec![0, 64, 128, 0xcc, 255, 17, 85], 4, 3, 2).unwrap();
+    assert_eq!(pitch, 12);
+    assert_eq!(
+        expanded,
+        [0, 64, 128, 255, 17, 85]
+            .into_iter()
+            .flat_map(|a| [0, 0, 0, a])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        format::readback(28, expanded).unwrap(),
+        [0, 64, 128, 255, 17, 85]
+    );
+
+    // The shared ownership fixture deliberately limits each object to three
+    // references. Use its existing implicit back buffer, as the native probe
+    // does, instead of adding a second RT resource beside the borrowed alias.
+    let target = m
+        .ext
+        .get::<State>()
+        .gpu
+        .as_ref()
+        .unwrap()
+        .target(4, 4, false)
+        .unwrap()
+        .with_alpha_mode(AlphaMode::Stored);
+    let target_surface = {
+        let surfaces = m.ext.get_mut::<Surfaces>();
+        surfaces.next += 1;
+        surfaces.targets.insert(surfaces.next, target.clone());
+        surfaces.next
+    };
+    {
+        let e = env(&mut m);
+        let owner = com(&e).identity::<Payload>(&e.sys.objects, device).unwrap();
+        let back = com(&e).get_identity(&e.sys.objects, owner).and_then(|payload| {
+            if let Payload::Device(d) = payload { d.back_buffer } else { None }
+        }).unwrap_or_else(|| e.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com(&e).namespace())
+            .find_map(|(id, _)| matches!(com(&e).get_identity(&e.sys.objects, id), Some(Payload::Resource(r)) if r.kind == Kind::Surface && r.container.is_none()).then_some(id)).unwrap());
+        if let Some(Payload::Resource(r)) = com(&e).get_identity_mut(&mut e.sys.objects, back) {
+            r.surface = Some(target_surface);
+            r.desc.Format = 21;
+            r.desc.Pool = 0;
+            r.desc.Usage = 1;
+            r.desc.Width = 4;
+            r.desc.Height = 4;
+        }
+        if let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) {
+            d.surface = target_surface;
+            d.back_buffer = Some(back);
+            d.fixed.target_changed(4, 4);
+        }
+    }
+    okay(call(&mut m, "IDirect3DDevice9::SetFVF", &[device, 0x144]));
+    for (state, value) in [(7, 0), (22, 1), (27, 0), (15, 0)] {
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::SetRenderState",
+            &[device, state, value],
+        ));
+    }
+    for (state, value) in [(1, 2), (2, 2), (4, 2), (5, 2)] {
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::SetTextureStageState",
+            &[device, 0, state, value],
+        ));
+    }
+    for (state, value) in [(5, 1), (6, 1), (7, 0)] {
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::SetSamplerState",
+            &[device, 0, state, value],
+        ));
+    }
+    let mut vertices = [0u32; 28];
+    for (index, (x, y, u, v)) in [
+        (-0.5f32, -0.5f32, 0f32, 0f32),
+        (3.5, -0.5, 1., 0.),
+        (-0.5, 3.5, 0., 1.),
+        (3.5, 3.5, 1., 1.),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        vertices[index * 7..index * 7 + 7].copy_from_slice(&[
+            x.to_bits(),
+            y.to_bits(),
+            0,
+            1f32.to_bits(),
+            u32::MAX,
+            u.to_bits(),
+            v.to_bits(),
+        ]);
+    }
+    let vertices = packet(&mut m, vertices);
+    for restored in [false, true] {
+        if restored {
+            okay(call(
+                &mut m,
+                "IDirect3DDevice9::EvictManagedResources",
+                &[device],
+            ));
+            assert!(
+                resources::resource(&env(&mut m), alias)
+                    .unwrap()
+                    .surface
+                    .is_none()
+            );
+            assert_eq!(
+                resources::resource(&env(&mut m), texture).unwrap().storage,
+                storage
+            );
+        }
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::SetTexture",
+            &[device, 0, texture],
+        ));
+        let e = env(&mut m);
+        assert_eq!(
+            resources::resource(&e, alias).unwrap().surface,
+            resources::resource(&e, texture).unwrap().levels[0].surface
+        );
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::Clear",
+            &[device, 0, 0, 1, u32::MAX, 1f32.to_bits(), 0],
+        ));
+        okay(call(&mut m, "IDirect3DDevice9::BeginScene", &[device]));
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[device, 5, 2, vertices, 28],
+        ));
+        okay(call(&mut m, "IDirect3DDevice9::EndScene", &[device]));
+        assert_eq!(
+            pixels(&mut m, &target.image),
+            raw.iter().flat_map(|&a| [0, 0, 0, a]).collect::<Vec<_>>()
+        );
+        okay(call(
+            &mut m,
+            "IDirect3DDevice9::SetTexture",
+            &[device, 0, 0],
+        ));
+    }
+    assert!(matches!(
+        call(
+            &mut m,
+            "IDirect3DDevice9::CreateTexture",
+            &[device, 4, 4, 1, 1, 28, 0, output, 0]
+        ),
+        Outcome::Return(UNAVAILABLE)
+    ));
+    assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
+    assert!(m.ext.get::<State>().pending.is_empty());
+    assert!(m.ext.get::<State>().transfers.is_empty());
+    assert_eq!(release(&mut env(&mut m), alias), 0);
+    assert_eq!(release(&mut env(&mut m), factory), 0);
+    assert_eq!(release(&mut env(&mut m), device), 0);
+    assert!(m.ext.get::<Surfaces>().targets.is_empty());
+}

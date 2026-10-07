@@ -1,263 +1,20 @@
-//! ExtractIconEx reads guest files and creates ordinary, owned USER icon objects.
+//! Shell extraction reads guest files and creates ordinary, owned USER icons.
 //! PE group resources and classic ICO DIBs share the same checked pixel decoder.
 use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::Env;
-use adv_pe::{Pe, PeError, ResId, ResourceDir, ResourceNode};
-use std::io::Read;
+use adv_pe::ResId;
 
 use crate::{
     Win32,
-    user32::IconImage,
-    util::{MAX_STR, set_last_error},
+    user32::image::{
+        decode::{ico_groups, image, pe_groups},
+        file_bytes,
+    },
+    util::{MAX_STR, last_error, set_last_error},
 };
 
-const MAX_FILE: u64 = 128 * 1024 * 1024;
 const ERROR_NOACCESS: u32 = 998;
-
-fn word(bytes: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
-    ))
-}
-fn dword(bytes: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
-    ))
-}
-
-struct Candidate {
-    width: u32,
-    height: u32,
-    bits: u16,
-    bytes: Vec<u8>,
-}
-struct Group {
-    id: Option<ResId>,
-    images: Vec<Candidate>,
-}
-
-fn file_slice<'a>(pe: &Pe, file: &'a [u8], rva: u32, length: u32) -> Option<&'a [u8]> {
-    let offset = if rva < pe.size_of_headers {
-        (rva.checked_add(length)? <= pe.size_of_headers).then_some(rva)?
-    } else {
-        pe.sections.iter().find_map(|section| {
-            let delta = rva.checked_sub(section.virtual_address)?;
-            (delta.checked_add(length)? <= section.raw_size)
-                .then(|| section.raw_offset.checked_add(delta))
-                .flatten()
-        })?
-    } as usize;
-    file.get(offset..offset.checked_add(length as usize)?)
-}
-
-fn pe_groups(file: &[u8]) -> Option<Vec<Group>> {
-    let pe = Pe::parse_headers(file).ok()?;
-    let resource = pe.dir(adv_pe::dir::RESOURCE);
-    if !resource.is_present() {
-        return Some(Vec::new());
-    }
-    let resources = ResourceDir::read(resource.rva, |rva, bytes| {
-        let length = bytes.len() as u32;
-        let source =
-            file_slice(&pe, file, rva, length).ok_or(PeError::OutOfImage { rva, len: length })?;
-        bytes.copy_from_slice(source);
-        Ok(())
-    })
-    .ok()?;
-    let Some(ResourceNode::Dir(names)) = resources.get(&ResId::Id(14)) else {
-        return Some(Vec::new());
-    };
-    let mut groups = Vec::new();
-    for entry in &names.entries {
-        let Some((language, data)) = resources.find(&ResId::Id(14), &entry.id, None) else {
-            continue;
-        };
-        let Some(group) = file_slice(&pe, file, data.rva, data.size) else {
-            continue;
-        };
-        let mut images = Vec::new();
-        if word(group, 0) == Some(0) && word(group, 2) == Some(1) {
-            let count = usize::from(word(group, 4)?);
-            for index in 0..count {
-                let offset = 6usize.checked_add(index.checked_mul(14)?)?;
-                let Some(raw) = group.get(offset..offset.checked_add(14)?) else {
-                    break;
-                };
-                let image_id = word(raw, 12)?;
-                let Some((_, data)) =
-                    resources.find(&ResId::Id(3), &ResId::Id(image_id), Some(language))
-                else {
-                    continue;
-                };
-                let declared_size = dword(raw, 8)?;
-                let Some(bytes) = file_slice(&pe, file, data.rva, data.size.min(declared_size))
-                else {
-                    continue;
-                };
-                images.push(Candidate {
-                    width: if raw[0] == 0 { 256 } else { u32::from(raw[0]) },
-                    height: if raw[1] == 0 { 256 } else { u32::from(raw[1]) },
-                    bits: word(raw, 6)?,
-                    bytes: bytes.to_vec(),
-                });
-            }
-        }
-        groups.push(Group {
-            id: Some(entry.id.clone()),
-            images,
-        });
-    }
-    Some(groups)
-}
-
-fn ico_groups(file: &[u8]) -> Option<Vec<Group>> {
-    if word(file, 0) != Some(0) || word(file, 2) != Some(1) {
-        return None;
-    }
-    let count = usize::from(word(file, 4)?);
-    if count == 0 || count > 4096 {
-        return None;
-    }
-    let mut images = Vec::new();
-    for index in 0..count {
-        let offset = 6usize.checked_add(index.checked_mul(16)?)?;
-        let raw = file.get(offset..offset.checked_add(16)?)?;
-        let size = dword(raw, 8)? as usize;
-        let data = dword(raw, 12)? as usize;
-        let bytes = file.get(data..data.checked_add(size)?)?;
-        images.push(Candidate {
-            width: if raw[0] == 0 { 256 } else { u32::from(raw[0]) },
-            height: if raw[1] == 0 { 256 } else { u32::from(raw[1]) },
-            bits: word(raw, 6)?,
-            bytes: bytes.to_vec(),
-        });
-    }
-    Some(vec![Group { id: None, images }])
-}
-
-fn bitmap(bytes: &[u8], target: u32) -> Option<IconImage> {
-    let header = dword(bytes, 0)? as usize;
-    let (width, total_height, planes, bits, colors, palette_entry) = if header == 12 {
-        (
-            u32::from(word(bytes, 4)?),
-            u32::from(word(bytes, 6)?),
-            word(bytes, 8)?,
-            word(bytes, 10)?,
-            0,
-            3usize,
-        )
-    } else if matches!(header, 40 | 52 | 56 | 108 | 124) {
-        if dword(bytes, 16)? != 0 {
-            return None;
-        } // Compressed/bitfield DIBs are unsupported.
-        let width = dword(bytes, 4)? as i32;
-        let height = dword(bytes, 8)? as i32;
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-        (
-            width as u32,
-            height as u32,
-            word(bytes, 12)?,
-            word(bytes, 14)?,
-            dword(bytes, 32)?,
-            4usize,
-        )
-    } else {
-        return None;
-    }; // PNG and unknown encodings contain no supported icon.
-    if planes != 1
-        || width == 0
-        || total_height == 0
-        || total_height % 2 != 0
-        || width > 1024
-        || total_height > 2048
-        || !matches!(bits, 1 | 4 | 8 | 24 | 32)
-    {
-        return None;
-    }
-    let height = total_height / 2;
-    let colors = if bits <= 8 {
-        let maximum = 1u32 << bits;
-        if colors > maximum {
-            return None;
-        }
-        if colors == 0 { maximum } else { colors }
-    } else {
-        0
-    } as usize;
-    let pixels = header.checked_add(colors.checked_mul(palette_entry)?)?;
-    let stride = ((width.checked_mul(u32::from(bits))?.checked_add(31)? / 32) * 4) as usize;
-    let mask_stride = (width.checked_add(31)? / 32 * 4) as usize;
-    let mask = pixels.checked_add(stride.checked_mul(height as usize)?)?;
-    bytes.get(..mask.checked_add(mask_stride.checked_mul(height as usize)?)?)?;
-    let has_alpha = bits == 32
-        && (0..height as usize)
-            .any(|row| (0..width as usize).any(|x| bytes[pixels + row * stride + x * 4 + 3] != 0));
-    let mut rgba = Vec::with_capacity((target * target * 4) as usize);
-    let mut and_mask = Vec::with_capacity((target * target) as usize);
-    for y in 0..target {
-        let sy = (height - 1 - y * height / target) as usize;
-        for x in 0..target {
-            let sx = (x * width / target) as usize;
-            let row = pixels + sy * stride;
-            let and = (bytes[mask + sy * mask_stride + sx / 8] >> (7 - sx % 8)) & 1;
-            let (r, g, b, a) = if matches!(bits, 24 | 32) {
-                let offset = row + sx * usize::from(bits / 8);
-                (
-                    bytes[offset + 2],
-                    bytes[offset + 1],
-                    bytes[offset],
-                    if has_alpha {
-                        bytes[offset + 3]
-                    } else if and != 0 {
-                        0
-                    } else {
-                        255
-                    },
-                )
-            } else {
-                let index = match bits {
-                    1 => (bytes[row + sx / 8] >> (7 - sx % 8)) & 1,
-                    4 => (bytes[row + sx / 2] >> if sx % 2 == 0 { 4 } else { 0 }) & 15,
-                    _ => bytes[row + sx],
-                } as usize;
-                if index >= colors {
-                    return None;
-                }
-                let offset = header + index * palette_entry;
-                (
-                    bytes[offset + 2],
-                    bytes[offset + 1],
-                    bytes[offset],
-                    if and != 0 { 0 } else { 255 },
-                )
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
-            and_mask.push(and);
-        }
-    }
-    Some(IconImage {
-        width: target,
-        height: target,
-        pixels: rgba,
-        mask: and_mask,
-    })
-}
-
-fn image(group: &Group, size: u32) -> Option<IconImage> {
-    let mut candidates: Vec<_> = group.images.iter().collect();
-    candidates.sort_by_key(|entry| {
-        (
-            entry.width.abs_diff(size) + entry.height.abs_diff(size),
-            u16::MAX - entry.bits,
-        )
-    });
-    candidates
-        .into_iter()
-        .find_map(|entry| bitmap(&entry.bytes, size))
-}
 
 fn fail(env: &mut Env<'_>, error: u32) -> u32 {
     set_last_error(env, error);
@@ -271,6 +28,7 @@ fn extract(
     large: u32,
     small: u32,
     count: u32,
+    api: &str,
 ) -> u32 {
     let query = index == -1 && large == 0 && small == 0;
     // Native rejects a zero extraction count without altering caller outputs or
@@ -282,36 +40,19 @@ fn extract(
         Ok(path) => path,
         Err(error) => return fail(env, error),
     };
-    let Some(host) = env.ext.get::<Win32>().vfs.lookup(&path) else {
-        set_last_error(env, 2);
-        return if query { 0 } else { u32::MAX };
-    };
-    let file = std::fs::File::open(host);
-    let mut file = match file {
-        Ok(file) => file,
-        Err(error) => {
-            return fail(
-                env,
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    2
-                } else {
-                    5
-                },
-            );
+    // LoadImage and shell extraction use one temporary FileObj, including guest
+    // sharing checks and dirty mapped-file content. Its open must not reset the
+    // extraction front's otherwise unspecified success LastError.
+    let saved_error = last_error(env);
+    let bytes = match file_bytes(env, &path, api) {
+        Ok(bytes) => bytes,
+        Err(2) if query => {
+            set_last_error(env, 2);
+            return 0;
         }
+        Err(error) => return fail(env, error),
     };
-    let mut bytes = Vec::new();
-    if file
-        .by_ref()
-        .take(MAX_FILE + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return fail(env, 5);
-    }
-    if bytes.len() as u64 > MAX_FILE {
-        return fail(env, 8);
-    }
+    set_last_error(env, saved_error);
     let portable_executable = bytes.starts_with(b"MZ");
     let groups = if portable_executable {
         pe_groups(&bytes)
@@ -449,7 +190,15 @@ fn extract_a(
         .read(env.cpu, MAX_STR)
         .map(|bytes| env.ext.get::<Win32>().codec.decode(&bytes))
         .map_err(|_| ERROR_NOACCESS);
-    extract(env, path, index, large.addr(), small.addr(), count)
+    extract(
+        env,
+        path,
+        index,
+        large.addr(),
+        small.addr(),
+        count,
+        "shell32.dll!ExtractIconExA",
+    )
 }
 #[win32(shell32, name = "ExtractIconExW", level = implement)]
 fn extract_w(
@@ -464,17 +213,173 @@ fn extract_w(
         .read(env.cpu, MAX_STR)
         .map(|units| String::from_utf16_lossy(&units))
         .map_err(|_| ERROR_NOACCESS);
-    extract(env, path, index, large.addr(), small.addr(), count)
+    extract(
+        env,
+        path,
+        index,
+        large.addr(),
+        small.addr(),
+        count,
+        "shell32.dll!ExtractIconExW",
+    )
+}
+
+fn associated_fail(env: &mut Env<'_>, error: u32) -> Handle {
+    set_last_error(env, error);
+    Handle(0)
+}
+
+fn associated_unavailable(env: &mut Env<'_>, api: &str, reason: &str, error: u32) -> Handle {
+    adv_abi::warn_unavailable(env, api, reason);
+    associated_fail(env, error)
+}
+
+fn associated(env: &mut Env<'_>, path: u32, index: GuestPtr<u16>, wide: bool) -> Handle {
+    let api = if wide {
+        "shell32.dll!ExtractAssociatedIconW"
+    } else {
+        "shell32.dll!ExtractAssociatedIconA"
+    };
+    if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        return associated_unavailable(
+            env,
+            api,
+            "ANSI icon path code page has no supported decoder",
+            50,
+        );
+    }
+    let decoded = if wide {
+        WideStr(GuestPtr::new(path))
+            .read(env.cpu, MAX_STR)
+            .map_err(|_| ERROR_NOACCESS)
+            .and_then(|units| {
+                let bytes = (units.len() as u32 + 1) * 2;
+                String::from_utf16(&units)
+                    .map(|text| (text, bytes))
+                    .map_err(|_| 1113)
+            })
+    } else {
+        AnsiStr(GuestPtr::new(path))
+            .read(env.cpu, MAX_STR)
+            .map(|bytes| {
+                (
+                    env.ext.get::<Win32>().codec.decode(&bytes),
+                    bytes.len() as u32 + 1,
+                )
+            })
+            .map_err(|_| ERROR_NOACCESS)
+    };
+    let (text, length) = match decoded {
+        Ok(decoded) => decoded,
+        Err(1113) => {
+            return associated_unavailable(
+                env,
+                api,
+                "icon path contains unpaired UTF-16 surrogates",
+                1113,
+            );
+        }
+        Err(error) => return associated_fail(env, error),
+    };
+    // This direct-source profile preserves the original path (including relative
+    // spelling) and WORD ordinal, as native PE/ICO extraction does. Validate both
+    // inout spans before creating an icon; no MAX_PATH-sized write is invented.
+    if check_range(env.cpu, path, length, Prot::WRITE).is_err()
+        || check_range(env.cpu, index.addr(), 2, Prot::RW).is_err()
+    {
+        return associated_fail(env, ERROR_NOACCESS);
+    }
+    let ordinal = match env.cpu.read_u16(index.addr()) {
+        Ok(ordinal) => usize::from(ordinal),
+        Err(_) => return associated_fail(env, ERROR_NOACCESS),
+    };
+    let saved_error = last_error(env);
+    let bytes = match file_bytes(env, &text, api) {
+        Ok(bytes) => bytes,
+        Err(error) => return associated_fail(env, error),
+    };
+    let portable_executable = bytes.starts_with(b"MZ");
+    let groups = if portable_executable {
+        pe_groups(&bytes)
+    } else {
+        ico_groups(&bytes)
+    };
+    let Some(groups) = groups else {
+        return associated_unavailable(
+            env,
+            api,
+            "direct icon source is unsupported or malformed; shell file associations are unavailable",
+            50,
+        );
+    };
+    // A PE WORD selects the zero-based group ordinal, not RT_GROUP_ICON's ID.
+    // An ICO has one logical icon with several sizes, independent of its WORD.
+    let group = if portable_executable {
+        groups.get(ordinal)
+    } else {
+        groups.first()
+    };
+    let Some(group) = group else {
+        return associated_unavailable(
+            env,
+            api,
+            "requested file icon is absent; shell file associations are unavailable",
+            50,
+        );
+    };
+    let Some(image) = image(group, 32) else {
+        return associated_unavailable(
+            env,
+            api,
+            "direct icon has no decodable classic DIB pixels; shell file associations are unavailable",
+            50,
+        );
+    };
+    let description = format!("associated icon extracted {text} {:?} 32x32", group.id);
+    let Some(handle) = env.ext.get_mut::<Win32>().user.objects.create_icon(
+        &mut env.sys.objects,
+        description,
+        image,
+    ) else {
+        return associated_fail(env, 8);
+    };
+    // Success LastError is unspecified; never reproduce incidental host loader
+    // errors (native PE and ICO extraction leave different internal values).
+    set_last_error(env, saved_error);
+    Handle(handle)
+}
+
+#[win32(shell32, name = "ExtractAssociatedIconA", level = implement)]
+fn associated_a(
+    env: &mut Env<'_>,
+    _instance: Handle,
+    path: AnsiStr,
+    index: GuestPtr<u16>,
+) -> Handle {
+    associated(env, path.0.addr(), index, false)
+}
+
+#[win32(shell32, name = "ExtractAssociatedIconW", level = implement)]
+fn associated_w(
+    env: &mut Env<'_>,
+    _instance: Handle,
+    path: WideStr,
+    index: GuestPtr<u16>,
+) -> Handle {
+    associated(env, path.0.addr(), index, true)
 }
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(extract_a_ABI);
     registry.register(extract_w_ABI);
+    registry.register(associated_a_ABI);
+    registry.register(associated_w_ABI);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::user32::image::decode::{Candidate, Group, bitmap};
 
     fn color_dib(size: u32, color: [u8; 4]) -> Vec<u8> {
         let mask_stride = (size + 31) / 32 * 4;

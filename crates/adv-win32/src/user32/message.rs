@@ -18,7 +18,6 @@ use adv_machine::{Env, Object, Outcome, Wait};
 
 use super::window::{self, destroy_window, make_long, wm};
 use super::{USER32, user, user_mut};
-use crate::util::put_cstr;
 use crate::{Win32, stdcall};
 pub(crate) mod sent;
 
@@ -26,17 +25,21 @@ pub(crate) mod sent;
 pub const DEFAULT_PROC: &str = "<DefaultWndProc>";
 
 pub(super) fn read_text(env: &Env<'_>, pointer: u32, wide: bool) -> Option<String> {
+    read_text_limit(env, pointer, wide, crate::util::MAX_STR)
+}
+
+fn read_text_limit(env: &Env<'_>, pointer: u32, wide: bool, limit: usize) -> Option<String> {
     if pointer == 0 {
         return Some(String::new());
     }
     if wide {
         WideStr(GuestPtr::new(pointer))
-            .read(env.cpu, crate::util::MAX_STR)
+            .read(env.cpu, limit)
             .ok()
             .map(|units| String::from_utf16_lossy(&units))
     } else {
         AnsiStr(GuestPtr::new(pointer))
-            .read(env.cpu, crate::util::MAX_STR)
+            .read(env.cpu, limit)
             .ok()
             .map(|bytes| env.ext.get::<Win32>().codec.decode(&bytes))
     }
@@ -60,20 +63,55 @@ pub(super) fn write_text(
     if capacity == 0 {
         return Some(0);
     }
-    let length = text_length(env, text, wide).min(capacity - 1);
-    let bytes = (length + 1).checked_mul(if wide { 2 } else { 1 })?;
-    adv_abi::guest::check_range(env.cpu, pointer, bytes, adv_cpu::backend::Prot::WRITE).ok()?;
-    if wide {
-        crate::util::put_wstr(
-            env.cpu,
-            pointer,
-            capacity,
-            &text.encode_utf16().collect::<Vec<_>>(),
-        );
+    let (length, bytes) = if wide {
+        let units: Vec<_> = text.encode_utf16().take(capacity as usize - 1).collect();
+        let count = units.len() as u32;
+        (
+            count,
+            units
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .chain([0, 0])
+                .collect::<Vec<_>>(),
+        )
     } else {
-        let bytes = env.ext.get::<Win32>().codec.encode(text);
-        put_cstr(env.cpu, pointer, capacity, &bytes);
-    }
+        let codec = env.ext.get::<Win32>().codec;
+        let mut bytes = codec.encode(text);
+        let limit = bytes.len().min(capacity as usize - 1);
+        let mut end = 0;
+        if codec.acp == 65001 {
+            end = limit;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+        } else {
+            // DefWindowProcA truncates complete DBCS characters, not a lead
+            // byte followed by NUL. The returned count remains an ACP byte count.
+            while end < limit {
+                let next = end
+                    + if codec.is_lead_byte(0, bytes[end]) {
+                        2
+                    } else {
+                        1
+                    };
+                if next > limit {
+                    break;
+                }
+                end = next;
+            }
+        }
+        bytes.truncate(end);
+        bytes.push(0);
+        (end as u32, bytes)
+    };
+    adv_abi::guest::check_range(
+        env.cpu,
+        pointer,
+        bytes.len() as u32,
+        adv_cpu::backend::Prot::WRITE,
+    )
+    .ok()?;
+    env.cpu.write(pointer, &bytes).ok()?;
     Some(length)
 }
 
@@ -108,6 +146,9 @@ pub struct Msg {
     /// Queue-local key update captured from this input message, independent of
     /// the live physical state which may already include later releases.
     pub input_key: Option<KeyTransition>,
+    /// Character wParam encoding supplied by the posting API, independently of
+    /// the destination class and physical-input category. Never guest MSG data.
+    pub(super) character_wide: bool,
     /// USER-generated post: QS_POSTMESSAGE without QS_ALLPOSTMESSAGE. This
     /// origin is private queue metadata, never inferred from the message number.
     pub(super) system: bool,
@@ -326,6 +367,7 @@ impl Msg {
             input: false,
             input_receipt: 0,
             input_key: None,
+            character_wide: false,
             system: false,
         }
     }
@@ -384,6 +426,69 @@ pub(super) fn send_encoded(
     wide: bool,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
+    encoded_to(env, None, hwnd, msg, wp, lp, wide, then)
+}
+
+/// Share bounded text conversion while calling an immutable saved procedure.
+/// This deliberately bypasses SendMessage/current-procedure/thread dispatch.
+pub(super) fn call_proc_encoded(
+    env: &mut Env<'_>,
+    proc: u32,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> Outcome {
+    let api = if wide { "user32.dll!CallWindowProcW" } else { "user32.dll!CallWindowProcA" };
+    if !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        adv_abi::warn_unavailable(env, api, "saved-procedure ANSI text conversion requires guest ACP 932/936/1252/65001");
+        crate::util::set_last_error(env, 50);
+        return Outcome::Return(0);
+    }
+    if msg == wm::GETTEXT && wp != 0 {
+        let size = wp.checked_mul(if wide { 2 } else { 1 });
+        if wp as usize > crate::util::MAX_STR || size.is_none() {
+            adv_abi::warn_unavailable(env, api, "saved-procedure text capacity exceeds the bounded buffer profile");
+            crate::util::set_last_error(env, 87);
+            return Outcome::Return(0);
+        }
+        if adv_abi::guest::check_range(env.cpu, lp, size.unwrap(), adv_cpu::backend::Prot::WRITE).is_err() {
+            crate::util::set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
+    }
+    encoded_to(env, Some(proc), hwnd, msg, wp, lp, wide, |_, r| Outcome::Return(r))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_encoded(
+    env: &mut Env<'_>,
+    proc: Option<u32>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    if let Some(proc) = proc {
+        call_proc(proc, hwnd, msg, wp, lp, then)
+    } else {
+        send(env, hwnd, msg, wp, lp, then)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoded_to(
+    env: &mut Env<'_>,
+    proc: Option<u32>,
+    hwnd: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     let Some(target_wide) = user(env)
         .windows
         .get(&env.sys.objects, &hwnd)
@@ -392,7 +497,7 @@ pub(super) fn send_encoded(
         return then(env, 0);
     };
     if wide == target_wide {
-        return send(env, hwnd, msg, wp, lp, then);
+        return dispatch_encoded(env, proc, hwnd, msg, wp, lp, then);
     }
     let combo = user(env)
         .windows
@@ -403,6 +508,9 @@ pub(super) fn send_encoded(
                 .eq_ignore_ascii_case("ComboBox")
         });
     if msg == wm::SETTEXT || (combo && matches!(msg, 0x143 | 0x14a | 0x14c | 0x14d | 0x158)) {
+        if msg == wm::SETTEXT && lp == 0 {
+            return dispatch_encoded(env, proc, hwnd, msg, wp, 0, then);
+        }
         let Some(text) = read_text(env, lp, wide) else {
             crate::util::set_last_error(env, 87);
             return then(env, 0);
@@ -412,7 +520,7 @@ pub(super) fn send_encoded(
             crate::util::set_last_error(env, 8);
             return then(env, 0);
         }
-        return send(env, hwnd, msg, wp, pointer, move |env, result| {
+        return dispatch_encoded(env, proc, hwnd, msg, wp, pointer, move |env, result| {
             window::temp_free(env, pointer);
             then(env, result)
         });
@@ -421,12 +529,21 @@ pub(super) fn send_encoded(
         if wp == 0 {
             return then(env, 0);
         }
-        // An ANSI procedure may need several bytes per UTF-16 unit.
-        let Some(capacity) = wp.checked_mul(if target_wide { 1 } else { 4 }) else {
+        // ACP936 native W->A sends wp*2 bytes. Follow the shared GetCPInfo
+        // profile for other guest encoders, not the host's active code page.
+        let cp = env.ext.get::<Win32>().codec.acp;
+        let max_char_size = if cp == 65001 {
+            4
+        } else if adv_os::nls::lead_byte_ranges(cp).is_empty() {
+            1
+        } else {
+            2
+        };
+        let Some(capacity) = wp.checked_mul(if target_wide { 1 } else { max_char_size }) else {
             crate::util::set_last_error(env, 87);
             return then(env, 0);
         };
-        return converted_text(env, hwnd, msg, capacity, 0, lp, wp, wide, target_wide, then);
+        return converted_text(env, proc, hwnd, msg, capacity, 0, lp, wp, wide, target_wide, then);
     }
     if msg == wm::GETTEXTLENGTH || (combo && matches!(msg, 0x148 | 0x149)) {
         let query = if combo && msg != wm::GETTEXTLENGTH {
@@ -434,7 +551,7 @@ pub(super) fn send_encoded(
         } else {
             wm::GETTEXTLENGTH
         };
-        return send(env, hwnd, query, wp, 0, move |env, length| {
+        return dispatch_encoded(env, proc, hwnd, query, wp, 0, move |env, length| {
             if length == u32::MAX {
                 return then(env, length);
             }
@@ -443,6 +560,7 @@ pub(super) fn send_encoded(
             };
             converted_text(
                 env,
+                proc,
                 hwnd,
                 if query == 0x149 { 0x148 } else { wm::GETTEXT },
                 capacity,
@@ -455,12 +573,13 @@ pub(super) fn send_encoded(
             )
         });
     }
-    send(env, hwnd, msg, wp, lp, then)
+    dispatch_encoded(env, proc, hwnd, msg, wp, lp, then)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn converted_text(
     env: &mut Env<'_>,
+    proc: Option<u32>,
     hwnd: u32,
     msg: u32,
     capacity: u32,
@@ -477,6 +596,11 @@ fn converted_text(
         .checked_mul(if target_wide { 2 } else { 1 })
         .filter(|size| *size <= crate::util::MAX_STR as u32 * 4)
     else {
+        adv_abi::warn_unavailable(
+            env,
+            "user32.dll!A/W text conversion",
+            "temporary text capacity exceeds the supported bounded buffer profile",
+        );
         crate::util::set_last_error(env, 87);
         return then(env, 0);
     };
@@ -485,14 +609,15 @@ fn converted_text(
         crate::util::set_last_error(env, 8);
         return then(env, 0);
     }
-    send(
+    dispatch_encoded(
         env,
+        proc,
         hwnd,
         msg,
         if msg == wm::GETTEXT { capacity } else { index },
         pointer,
         move |env, result| {
-            let text = read_text(env, pointer, target_wide);
+            let text = read_text_limit(env, pointer, target_wide, capacity as usize);
             window::temp_free(env, pointer);
             if result == u32::MAX {
                 return then(env, result);
@@ -548,13 +673,20 @@ pub fn send_all(
 
 /// Post to the queue of `hwnd`'s thread (or the current thread's for `hwnd` 0).
 pub fn post(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> bool {
-    post_kind(env, hwnd, msg, wparam, lparam, false)
+    post_kind(env, hwnd, msg, wparam, lparam, PostSource::Ansi)
 }
 
 /// Host physical input uses input queue categories; guest PostMessage and
 /// TranslateMessage-generated characters remain ordinary posted messages.
 pub fn post_input(env: &mut Env<'_>, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> bool {
-    post_kind(env, hwnd, msg, wparam, lparam, true)
+    post_kind(env, hwnd, msg, wparam, lparam, PostSource::Input)
+}
+
+#[derive(Clone, Copy)]
+enum PostSource {
+    Ansi,
+    Unicode,
+    Input,
 }
 
 fn post_kind(
@@ -563,17 +695,25 @@ fn post_kind(
     msg: u32,
     wparam: u32,
     lparam: u32,
-    input: bool,
+    source: PostSource,
 ) -> bool {
+    let input = matches!(source, PostSource::Input);
     let time = env.sys.clock.now_ms();
     let ctx = if hwnd == 0 {
         env.context
     } else {
         match user(env).windows.get(&env.sys.objects, &hwnd) {
             Some(w) => w.thread,
-            None => return false,
+            None => {
+                crate::util::set_last_error(env, 1400);
+                return false;
+            }
         }
     };
+    // Fail before issuing a physical-input receipt or changing queue metadata.
+    if !reserve_post(env, ctx) {
+        return false;
+    }
     let input_receipt = if input {
         let u = &mut env.ext.get_mut::<crate::Win32>().user;
         let vk = match msg {
@@ -611,6 +751,7 @@ fn post_kind(
             input,
             input_receipt,
             input_key: input.then(|| key_transition(msg, wparam, lparam)).flatten(),
+            character_wide: !matches!(source, PostSource::Ansi),
             system: false,
         },
     );
@@ -621,7 +762,28 @@ fn post_kind(
     posted
 }
 
+const POST_MESSAGE_LIMIT: usize = 10_000;
+
+fn reserve_post(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> bool {
+    let queue = user_mut(env).queue(ctx);
+    let error = if queue.posted.len() >= POST_MESSAGE_LIMIT {
+        Some(1816) // ERROR_NOT_ENOUGH_QUOTA; Win32's default posted-message limit.
+    } else if queue.posted.try_reserve(1).is_err() {
+        Some(8)
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        crate::util::set_last_error(env, error);
+        return false;
+    }
+    true
+}
+
 fn post_to_thread(env: &mut Env<'_>, ctx: adv_machine::CtxId, m: Msg) -> bool {
+    if !reserve_post(env, ctx) {
+        return false;
+    }
     user_mut(env).queue(ctx).post(m);
     queue_changed(env, ctx);
     true
@@ -737,7 +899,7 @@ pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
     queue_status_for(env, env.context)
 }
 
-fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
+pub(super) fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
     let sent = u32::from(sent::pending(env, ctx)) * sent::QS_SEND;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
@@ -877,6 +1039,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
             input: false,
             input_receipt: 0,
             input_key: None,
+            character_wide: false,
             system: false,
         });
     }
@@ -899,6 +1062,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 input: false,
                 input_receipt: 0,
                 input_key: None,
+                character_wide: false,
                 system: false,
             });
         }
@@ -923,6 +1087,7 @@ fn next_message(env: &mut Env<'_>, f: Filter, remove: bool) -> Option<Msg> {
                 input: false,
                 input_receipt: 0,
                 input_key: None,
+                character_wide: false,
                 system: false,
             };
             if remove {
@@ -1065,21 +1230,166 @@ fn finish_hooked_message(env: &mut Env<'_>, mut original: Msg, out: u32, removed
 
 fn peek_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max, flags) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    peek_message_front(env, out, hwnd, min, max, flags, false)
+}
+
+#[win32(user32, name = "PeekMessageW", level = implement)]
+fn peek_message_w(
+    env: &mut Env<'_>,
+    out: GuestPtr<()>,
+    hwnd: AbiHandle,
+    min: u32,
+    max: u32,
+    flags: u32,
+) -> Outcome {
+    peek_message_front(env, out.addr(), hwnd.0, min, max, flags, true)
+}
+
+fn peek_message_front(
+    env: &mut Env<'_>,
+    out: u32,
+    hwnd: u32,
+    min: u32,
+    max: u32,
+    flags: u32,
+    wide: bool,
+) -> Outcome {
     let f = Filter { hwnd, min, max };
     let remove = flags & PM_REMOVE != 0;
     if flags >> 16 == 0 || flags & (sent::QS_SEND << 16) != 0 {
-        sent::drain(env, move |env| peek_message(env, out, f, remove))
+        sent::drain(env, move |env| peek_message(env, out, f, remove, wide))
     } else {
-        peek_message(env, out, f, remove)
+        peek_message(env, out, f, remove, wide)
     }
 }
 
-fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool) -> Outcome {
-    if let Some(m) = next_message(env, f, remove).or_else(|| {
-        headless_idle(env)
-            .then(|| next_message(env, f, remove))
-            .flatten()
-    }) {
+// Public retrieval owns a checked 28-byte x86 MSG. Recheck after draining sent
+// callbacks or waking a blocked GetMessage: guest code can change mappings.
+fn retrieval_output(env: &mut Env<'_>, out: u32, f: Filter) -> bool {
+    if f.hwnd != 0
+        && f.hwnd != u32::MAX
+        && !user(env)
+            .windows
+            .get(&env.sys.objects, &f.hwnd)
+            .is_some_and(|window| window.thread == env.context)
+    {
+        crate::util::set_last_error(env, 1400);
+        return false;
+    }
+    if adv_abi::guest::check_range(env.cpu, out, 28, adv_cpu::backend::Prot::WRITE).is_err() {
+        crate::util::set_last_error(env, 998);
+        return false;
+    }
+    true
+}
+
+fn character_message(message: u32) -> bool {
+    matches!(message, wm::CHAR | wm::SYSCHAR | 0x103 | 0x107)
+}
+
+/// Queue producers retain the A/W posting API's character encoding; physical
+/// host input supplies UTF-16. TranslateMessage generates ASCII, common to both. A/W
+/// thunks support whole single-byte characters; DBCS/UTF-8 split-message state
+/// and IME composition are not implemented, so they must not be guessed.
+fn character_param(
+    env: &Env<'_>,
+    parameter: u32,
+    source_wide: bool,
+    target_wide: bool,
+) -> Result<u32, &'static str> {
+    if source_wide == target_wide {
+        return Ok(parameter);
+    }
+    if parameter < 0x80 {
+        return Ok(parameter);
+    }
+    let codec = &env.ext.get::<Win32>().codec;
+    if !matches!(codec.acp, 932 | 936 | 1252 | 65001) {
+        return Err("character conversion requires a supported guest ANSI encoder");
+    }
+    if source_wide {
+        let unit = u16::try_from(parameter)
+            .ok()
+            .filter(|unit| !(0xd800..=0xdfff).contains(unit))
+            .ok_or("cross-encoding UTF-16 surrogate character messages are unsupported")?;
+        let (bytes, _) = codec.from_utf16(0, &[unit]);
+        if bytes.len() != 1 {
+            return Err(
+                "multibyte character dispatch requires unsupported split-message conversion",
+            );
+        }
+        Ok(u32::from(bytes[0]))
+    } else {
+        let byte = u8::try_from(parameter)
+            .map_err(|_| "packed or split multibyte character retrieval is unsupported")?;
+        let (units, invalid) = codec.to_utf16_checked(0, &[byte]);
+        if invalid || units.len() != 1 {
+            return Err(
+                "multibyte character retrieval requires unsupported split-message conversion",
+            );
+        }
+        Ok(u32::from(units[0]))
+    }
+}
+
+fn next_public_message(
+    env: &mut Env<'_>,
+    filter: Filter,
+    remove: bool,
+    wide: bool,
+) -> Result<Option<Msg>, &'static str> {
+    let Some(mut message) = next_message(env, filter, false) else {
+        return Ok(None);
+    };
+    let parameter = if character_message(message.msg) {
+        character_param(
+            env,
+            message.wparam,
+            message.character_wide || message.input,
+            wide,
+        )?
+    } else {
+        message.wparam
+    };
+    // No guest callback or scheduling occurs between these observations. Only
+    // remove after conversion succeeds, retaining unsupported queued input.
+    if remove {
+        message = next_message(env, filter, true).expect("peeked message remains queued");
+    }
+    message.wparam = parameter;
+    Ok(Some(message))
+}
+
+fn character_failure(env: &mut Env<'_>, api: &str, reason: &str, result: u32) -> Outcome {
+    adv_abi::warn_unavailable(env, api, reason);
+    crate::util::set_last_error(env, 50);
+    Outcome::Return(result)
+}
+
+fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool, wide: bool) -> Outcome {
+    if !retrieval_output(env, out, f) {
+        return Outcome::Return(0);
+    }
+    let mut next = next_public_message(env, f, remove, wide);
+    if matches!(next, Ok(None)) && headless_idle(env) {
+        next = next_public_message(env, f, remove, wide);
+    }
+    let m = match next {
+        Ok(message) => message,
+        Err(reason) => {
+            return character_failure(
+                env,
+                if wide {
+                    "user32.dll!PeekMessageW"
+                } else {
+                    "user32.dll!PeekMessageA"
+                },
+                reason,
+                0,
+            );
+        }
+    };
+    if let Some(m) = m {
         write_message(env, m, out, remove);
         return super::hooks::retrieved(env, out, remove, move |env| {
             finish_hooked_message(env, m, out, remove);
@@ -1092,15 +1402,53 @@ fn peek_message(env: &mut Env<'_>, out: u32, f: Filter, remove: bool) -> Outcome
 
 fn get_message_a(env: &mut Env<'_>) -> Outcome {
     let (out, hwnd, min, max) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    get_message(env, out, Filter { hwnd, min, max })
+    get_message(env, out, Filter { hwnd, min, max }, false)
 }
 
-fn get_message(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
-    sent::drain(env, move |env| get_message_inner(env, out, f))
+#[win32(user32, name = "GetMessageW", level = implement)]
+fn get_message_w(
+    env: &mut Env<'_>,
+    out: GuestPtr<()>,
+    hwnd: AbiHandle,
+    min: u32,
+    max: u32,
+) -> Outcome {
+    get_message(
+        env,
+        out.addr(),
+        Filter {
+            hwnd: hwnd.0,
+            min,
+            max,
+        },
+        true,
+    )
 }
 
-fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
-    if let Some(m) = next_message(env, f, true) {
+fn get_message(env: &mut Env<'_>, out: u32, f: Filter, wide: bool) -> Outcome {
+    sent::drain(env, move |env| get_message_inner(env, out, f, wide))
+}
+
+fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter, wide: bool) -> Outcome {
+    if !retrieval_output(env, out, f) {
+        return Outcome::Return(u32::MAX);
+    }
+    let next = match next_public_message(env, f, true, wide) {
+        Ok(message) => message,
+        Err(reason) => {
+            return character_failure(
+                env,
+                if wide {
+                    "user32.dll!GetMessageW"
+                } else {
+                    "user32.dll!GetMessageA"
+                },
+                reason,
+                u32::MAX,
+            );
+        }
+    };
+    if let Some(m) = next {
         write_message(env, m, out, true);
         return super::hooks::retrieved(env, out, true, move |env| {
             let message = finish_hooked_message(env, m, out, true);
@@ -1108,7 +1456,7 @@ fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
         });
     }
     if headless_idle(env) {
-        return get_message(env, out, f);
+        return get_message(env, out, f, wide);
     }
     let event = queue_event(env);
     if event == 0 {
@@ -1121,7 +1469,7 @@ fn get_message_inner(env: &mut Env<'_>, out: u32, f: Filter) -> Outcome {
             handle: event,
             deadline,
         },
-        move |env, _| get_message(env, out, f),
+        move |env, _| get_message(env, out, f, wide),
     )
 }
 
@@ -1232,21 +1580,86 @@ fn get_queue_status(env: &mut Env<'_>) -> Outcome {
     Outcome::Return((pending & flags) << 16 | (changed & flags))
 }
 
-fn post_message_a(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    if hwnd == 0xffff {
-        // HWND_BROADCAST: to every top-level window.
-        let tops = user(env).top.clone();
-        for t in tops {
-            post(env, t, msg, wp, lp);
-        }
-        return Outcome::Return(1);
-    }
-    Outcome::Return(u32::from(post(env, hwnd, msg, wp, lp)))
+// These system/control messages carry pointer parameters in their documented
+// contracts. Asynchronous marshaling is not provided by this virtual process;
+// never queue a pointer for later text decoding or structure access. Custom
+// WM_USER+ messages retain the application's ordinary integer/pointer protocol.
+fn asynchronous_pointer_message(msg: u32) -> bool {
+    matches!(
+        msg,
+        0x0001 | 0x000c | 0x000d | 0x001a | 0x001b | 0x0024 | 0x002b | 0x002c
+            | 0x002d | 0x0039 | 0x0046 | 0x0047 | 0x004a | 0x004e | 0x0053
+            | 0x007c | 0x007d | 0x0081 | 0x0083
+            // EDIT, COMBOBOX and LISTBOX string/array/rectangle parameters.
+            | 0x00b0 | 0x00b2 | 0x00b3 | 0x00b4 | 0x00c2 | 0x00c4 | 0x00cb
+            | 0x0143 | 0x0145 | 0x0148 | 0x014a | 0x014c | 0x014d | 0x0152
+            | 0x0158 | 0x0180 | 0x0181 | 0x0189 | 0x018c | 0x018d | 0x018f
+            | 0x0191 | 0x0192 | 0x0198 | 0x01a2 | 0x0213 | 0x0220 | 0x0309 | 0x030b
+    )
 }
 
-fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
-    let (tid, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+fn post_parameters(env: &mut Env<'_>, msg: u32, api: &str) -> bool {
+    if asynchronous_pointer_message(msg) {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "pointer-bearing system/control messages require synchronous delivery; asynchronous marshaling is unavailable",
+        );
+        crate::util::set_last_error(env, 1159); // ERROR_MESSAGE_SYNC_ONLY
+        return false;
+    }
+    true
+}
+
+fn post_message_front(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> i32 {
+    if !post_parameters(
+        env,
+        msg,
+        if wide {
+            "user32.dll!PostMessageW"
+        } else {
+            "user32.dll!PostMessageA"
+        },
+    ) {
+        return 0;
+    }
+    let source = if wide {
+        PostSource::Unicode
+    } else {
+        PostSource::Ansi
+    };
+    if hwnd == 0xffff {
+        // Existing virtual-process HWND_BROADCAST profile: top-level guest
+        // windows only. Preserve each target's actual queue and source encoding.
+        let tops = user(env).top.clone();
+        let mut success = true;
+        for t in tops {
+            success &= post_kind(env, t, msg, wp, lp, source);
+        }
+        return i32::from(success);
+    }
+    i32::from(post_kind(env, hwnd, msg, wp, lp, source))
+}
+
+fn post_thread_message_front(
+    env: &mut Env<'_>,
+    tid: u32,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> i32 {
+    if !post_parameters(
+        env,
+        msg,
+        if wide {
+            "user32.dll!PostThreadMessageW"
+        } else {
+            "user32.dll!PostThreadMessageA"
+        },
+    ) {
+        return 0;
+    }
     // A terminated context keeps its record for GetExitCodeThread, but its thread
     // id no longer names a live message target. Returning success here can make
     // a caller wait forever for a reply that the exited thread cannot produce.
@@ -1258,10 +1671,16 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
         .map(|c| c.id)
     else {
         crate::util::set_last_error(env, 1444); // ERROR_INVALID_THREAD_ID (winerror.h)
-        return Outcome::Return(0);
+        return 0;
     };
+    // Native self-post initializes the caller's queue; posting from another
+    // thread must not invent a queue for a live kernel-only target.
+    if ctx != env.context && !user(env).queues.contains_key(&ctx) {
+        crate::util::set_last_error(env, 1444);
+        return 0;
+    }
     let time = env.sys.clock.now_ms();
-    Outcome::Return(u32::from(post_to_thread(
+    i32::from(post_to_thread(
         env,
         ctx,
         Msg {
@@ -1274,9 +1693,30 @@ fn post_thread_message_a(env: &mut Env<'_>) -> Outcome {
             input: false,
             input_receipt: 0,
             input_key: None,
+            character_wide: wide,
             system: false,
         },
-    )))
+    ))
+}
+
+#[win32(user32, name = "PostMessageA", level = implement)]
+fn post_message_a(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_message_front(env, hwnd.0, msg, wp, lp as u32, false)
+}
+
+#[win32(user32, name = "PostMessageW", level = implement)]
+fn post_message_w(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_message_front(env, hwnd.0, msg, wp, lp as u32, true)
+}
+
+#[win32(user32, name = "PostThreadMessageA", level = implement)]
+fn post_thread_message_a(env: &mut Env<'_>, tid: u32, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_thread_message_front(env, tid, msg, wp, lp as u32, false)
+}
+
+#[win32(user32, name = "PostThreadMessageW", level = implement)]
+fn post_thread_message_w(env: &mut Env<'_>, tid: u32, msg: u32, wp: u32, lp: i32) -> i32 {
+    post_thread_message_front(env, tid, msg, wp, lp as u32, true)
 }
 
 fn post_quit_message(env: &mut Env<'_>) -> Outcome {
@@ -1296,11 +1736,38 @@ pub fn post_quit(env: &mut Env<'_>, code: u32) {
 
 fn send_message_a(env: &mut Env<'_>) -> Outcome {
     let (hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    send_message(env, hwnd, msg, wp, lp, false)
+}
+
+#[win32(user32, name = "SendMessageW", level = implement)]
+fn send_message_w(env: &mut Env<'_>, hwnd: AbiHandle, msg: u32, wp: u32, lp: i32) -> Outcome {
+    send_message(env, hwnd.0, msg, wp, lp as u32, true)
+}
+
+fn send_message(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> Outcome {
     if hwnd == 0xffff {
-        let tops: VecDeque<[u32; 4]> = user(env).top.iter().map(|&t| [t, msg, wp, lp]).collect();
-        return send_all(env, tops, |_| Outcome::Return(1));
+        let tops = user(env).top.iter().copied().collect();
+        return broadcast_encoded(env, tops, msg, wp, lp, wide);
     }
-    send_encoded(env, hwnd, msg, wp, lp, false, |_, r| Outcome::Return(r))
+    send_encoded(env, hwnd, msg, wp, lp, wide, |_, r| Outcome::Return(r))
+}
+
+fn broadcast_encoded(
+    env: &mut Env<'_>,
+    mut windows: VecDeque<u32>,
+    msg: u32,
+    wp: u32,
+    lp: u32,
+    wide: bool,
+) -> Outcome {
+    let Some(hwnd) = windows.pop_front() else {
+        return Outcome::Return(1);
+    };
+    // A broadcast can reach both class encodings. Each receiver uses the same
+    // conversion, callback and cross-thread send lifetime as an ordinary send.
+    send_encoded(env, hwnd, msg, wp, lp, wide, move |env, _| {
+        broadcast_encoded(env, windows, msg, wp, lp, wide)
+    })
 }
 
 fn send_message_timeout_a(env: &mut Env<'_>) -> Outcome {
@@ -1400,19 +1867,72 @@ fn timeout_to(
 
 fn dispatch_message_a(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
+    dispatch_message(env, address, false)
+}
+
+#[win32(user32, name = "DispatchMessageW", level = implement)]
+fn dispatch_message_w(env: &mut Env<'_>, message: GuestPtr<()>) -> Outcome {
+    dispatch_message(env, message.addr(), true)
+}
+
+fn dispatch_message(env: &mut Env<'_>, address: u32, wide: bool) -> Outcome {
+    if adv_abi::guest::check_range(env.cpu, address, 28, adv_cpu::backend::Prot::READ).is_err() {
+        crate::util::set_last_error(env, 998);
+        return Outcome::Return(0);
+    }
     let m = Msg::read(env.cpu, address);
+    let target_wide = user(env)
+        .windows
+        .get(&env.sys.objects, &m.hwnd)
+        .map(|w| w.unicode);
+    let parameter = if character_message(m.msg)
+        && let Some(target) = target_wide
+    {
+        match character_param(env, m.wparam, wide, target) {
+            Ok(parameter) => parameter,
+            Err(reason) => {
+                return character_failure(
+                    env,
+                    if wide {
+                        "user32.dll!DispatchMessageW"
+                    } else {
+                        "user32.dll!DispatchMessageA"
+                    },
+                    reason,
+                    0,
+                );
+            }
+        }
+    } else {
+        m.wparam
+    };
     let ctx = env.context;
-    let m = user_mut(env)
+    let mut m = user_mut(env)
         .input_tracking
         .as_mut()
         .map_or(m, |tracking| tracking.take(ctx, address, m));
-    dispatch(env, m, |_, r| Outcome::Return(r))
+    m.wparam = parameter;
+    let encoding = if character_message(m.msg) {
+        target_wide.unwrap_or(wide)
+    } else {
+        wide
+    };
+    dispatch_common(env, m, Some(encoding), |_, r| Outcome::Return(r))
 }
 
 /// DispatchMessage: timer callbacks, else the window procedure.
 pub fn dispatch(
     env: &mut Env<'_>,
     m: Msg,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    dispatch_common(env, m, None, then)
+}
+
+fn dispatch_common(
+    env: &mut Env<'_>,
+    m: Msg,
+    wide: Option<bool>,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
     if m.input_receipt != 0
@@ -1434,7 +1954,11 @@ pub fn dispatch(
     if m.hwnd == 0 {
         return then(env, 0);
     }
-    send(env, m.hwnd, m.msg, m.wparam, m.lparam, then)
+    if let Some(wide) = wide {
+        send_encoded(env, m.hwnd, m.msg, m.wparam, m.lparam, wide, then)
+    } else {
+        send(env, m.hwnd, m.msg, m.wparam, m.lparam, then)
+    }
 }
 
 fn translate_message(env: &mut Env<'_>) -> Outcome {
@@ -1590,7 +2114,7 @@ pub(super) fn def_window_proc_encoded(
                 .get_mut(&mut env.sys.objects, &hwnd)
             {
                 w.text = text;
-                w.needs_paint = true;
+                w.invalidate_client(true);
             }
             1
         }
@@ -1630,7 +2154,22 @@ pub(super) fn def_window_proc_encoded(
             validate(env, hwnd);
             0
         }
-        wm::ERASEBKGND => 1,
+        wm::ERASEBKGND => {
+            let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
+                return then(env, 0);
+            };
+            let (width, height) = w.client_size();
+            let brush = user(env).classes[w.class].background;
+            if brush == 0 { return then(env, 0); }
+            let brush = if brush <= 31 {
+                super::system_colors::brush(env, brush - 1)
+            } else { brush };
+            let api = if wide { "user32.dll!DefWindowProcW" } else { "user32.dll!DefWindowProcA" };
+            return match crate::gdi32::raster::fill::erase_background(env, wp, width, height, brush, api) {
+                Outcome::Return(result) => then(env, result),
+                other => other,
+            };
+        }
         wm::NCHITTEST => 1, // HTCLIENT
         wm::MOUSEACTIVATE => 1,
         wm::ACTIVATE if wp & 0xffff != 0 => {
@@ -1668,7 +2207,7 @@ pub fn validate(env: &mut Env<'_>, hwnd: u32) {
         .windows
         .get_mut(&mut env.sys.objects, &hwnd)
     {
-        w.needs_paint = false;
+        super::update::clear(w);
         w.thread
     } else {
         return;
@@ -1679,39 +2218,13 @@ pub fn validate(env: &mut Env<'_>, hwnd: u32) {
 
 fn call_window_proc_a(env: &mut Env<'_>) -> Outcome {
     let (proc, hwnd, msg, wp, lp) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    call_proc(proc, hwnd, msg, wp, lp, |_, r| Outcome::Return(r))
+    window::call_window_proc(env, proc, hwnd, msg, wp, lp, false)
 }
 
 // ---- painting ----
 
-fn invalidate_rect(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
-    let u = &mut env.ext.get_mut::<crate::Win32>().user;
-    if hwnd == 0 {
-        u.windows
-            .for_each_mut(&mut env.sys.objects, |w| w.needs_paint = true);
-        return Outcome::Return(1);
-    }
-    match u.windows.get_mut(&mut env.sys.objects, &hwnd) {
-        Some(w) => {
-            w.needs_paint = true;
-            Outcome::Return(1)
-        }
-        None => Outcome::Return(0),
-    }
-}
-
-fn validate_rect(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
-    validate(env, hwnd);
-    Outcome::Return(1)
-}
-
 fn end_paint(env: &mut Env<'_>) -> Outcome {
-    let ps = env.arg(1);
-    let hdc = env.cpu.read_u32(ps).unwrap_or(0);
-    crate::gdi32::release_dc(env, hdc);
-    Outcome::Return(1)
+    crate::gdi32::raster::front::end_paint_value(env, env.arg(0), env.arg(1))
 }
 
 fn redraw_window(env: &mut Env<'_>) -> Outcome {
@@ -1723,7 +2236,7 @@ fn redraw_window(env: &mut Env<'_>) -> Outcome {
         .windows
         .get_mut(&mut env.sys.objects, &hwnd)
     {
-        w.needs_paint = true;
+        w.invalidate_client(true);
     }
     Outcome::Return(1)
 }
@@ -1733,17 +2246,23 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, USER32, DEFAULT_PROC, 4, default_proc);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "PeekMessageA", 5, peek_message_a);
+    reg.register(peek_message_w_ABI);
     s(reg, "GetMessageA", 4, get_message_a);
+    reg.register(get_message_w_ABI);
     s(reg, "WaitMessage", 0, wait_message);
     s(reg, "GetQueueStatus", 1, get_queue_status);
-    s(reg, "PostMessageA", 4, post_message_a);
-    s(reg, "PostThreadMessageA", 4, post_thread_message_a);
+    reg.register(post_message_a_ABI);
+    reg.register(post_message_w_ABI);
+    reg.register(post_thread_message_a_ABI);
+    reg.register(post_thread_message_w_ABI);
     s(reg, "PostQuitMessage", 1, post_quit_message);
     s(reg, "SendMessageA", 4, send_message_a);
+    reg.register(send_message_w_ABI);
     s(reg, "SendMessageTimeoutA", 7, send_message_timeout_a);
     s(reg, "InSendMessage", 0, sent::in_send);
     s(reg, "ReplyMessage", 1, sent::reply_message);
     s(reg, "DispatchMessageA", 1, dispatch_message_a);
+    reg.register(dispatch_message_w_ABI);
     s(reg, "TranslateMessage", 1, translate_message);
     s(reg, "GetMessageTime", 0, get_message_time);
     s(reg, "GetMessagePos", 0, get_message_pos);
@@ -1751,8 +2270,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "KillTimer", 2, kill_timer);
     s(reg, "DefWindowProcA", 4, def_window_proc_a);
     s(reg, "CallWindowProcA", 5, call_window_proc_a);
-    s(reg, "InvalidateRect", 3, invalidate_rect);
-    s(reg, "ValidateRect", 2, validate_rect);
     s(reg, "EndPaint", 2, end_paint);
     s(reg, "RedrawWindow", 4, redraw_window);
 }
@@ -1772,6 +2289,7 @@ mod receipt_tests {
             input: receipt != 0,
             input_receipt: receipt,
             input_key: None,
+            character_wide: false,
             system: false,
         }
     }

@@ -196,6 +196,54 @@ fn output(
     if length != 0 && env.cpu.read(input, &mut bytes).is_err() {
         return fail(env, 87);
     }
+    paint(env, dc, x, y, options, r, &bytes, ansi, 1)
+}
+
+/// DrawText supplies already formatted Unicode, the same selected font/DC and
+/// a logical clipping rectangle. No temporary guest buffer or second provider.
+pub(super) fn singleline(
+    env: &mut Env<'_>,
+    dc: u32,
+    rectangle: [i32; 4],
+    units: &[u16],
+    height: u32,
+) -> Outcome {
+    let [left, top, right, bottom] = rectangle;
+    let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    paint(
+        env,
+        dc,
+        left,
+        top,
+        4,
+        Some(TextBox {
+            left,
+            top,
+            right,
+            bottom,
+        }),
+        &bytes,
+        false,
+        height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint(
+    env: &mut Env<'_>,
+    dc: u32,
+    x: i32,
+    y: i32,
+    options: u32,
+    r: Option<TextBox>,
+    bytes: &[u8],
+    ansi: bool,
+    success: u32,
+) -> Outcome {
+    let fail = |env: &mut Env<'_>, code| {
+        set_last_error(env, code);
+        Outcome::Return(0)
+    };
     let Some(GdiObj::Dc {
         selected,
         palette,
@@ -226,6 +274,34 @@ fn output(
         );
     }
     let opaque_background = *bk_mode == 2;
+    let modes = *modes;
+    let Some([x, y]) = modes.device_point(x, y) else {
+        return unavailable(
+            env,
+            "translated text coordinates exceed the supported device range",
+        );
+    };
+    let r = match r {
+        Some(r) => {
+            let (Some([left, top]), Some([right, bottom])) = (
+                modes.device_point(r.left, r.top),
+                modes.device_point(r.right, r.bottom),
+            ) else {
+                return unavailable(
+                    env,
+                    "translated text rectangle exceeds the supported device range",
+                );
+            };
+            Some(TextBox {
+                left,
+                top,
+                right,
+                bottom,
+            })
+        }
+        None => None,
+    };
+    let clip = super::super::raster::clip::snapshot(env, dc);
     let font = font_request(env, dc);
     if font.baseline_angle != 0 || font.glyph_angle != 0 || font.face.starts_with('@') {
         return unavailable(env, "rotated or vertical text is not supported");
@@ -236,12 +312,12 @@ fn output(
     if env.ext.try_get::<SurfaceStore>().is_none() {
         return unavailable(env, "text surface store is not installed");
     }
-    let converted = ansi.then(|| ansi_text(env, &font, &bytes));
+    let converted = ansi.then(|| ansi_text(env, &font, bytes));
     let units;
     let input = if let Some(converted) = &converted {
         match converted {
             Some(units) => TextInput::Unicode(units),
-            None => TextInput::Encoded(&bytes),
+            None => TextInput::Encoded(bytes),
         }
     } else {
         units = bytes
@@ -287,7 +363,9 @@ fn output(
         {
             return fail(env, 87);
         }
-        let mut memory = (provider.memory)(env.cpu);
+        let surface = surface.clone();
+        let mut raw = (provider.memory)(env.cpu);
+        let mut memory = super::super::raster::clip::ClippedMemory::new(&mut raw, surface, &clip);
         let result = store.draw_text(target, &mut memory, &mut fonts.text, &font, paint);
         let before = store.stats.presentations;
         let result = result.and_then(|changed| {
@@ -307,7 +385,7 @@ fn output(
             if changed && let Some(outcome) = (provider.completed)(env, presented) {
                 outcome
             } else {
-                Outcome::Return(1)
+                Outcome::Return(success)
             }
         }
         Err(error) => unavailable(env, &error),

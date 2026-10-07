@@ -9,6 +9,10 @@ use adv_cpu::backend::{Guest, MemFault};
 use crate::util::{cstr, wstr};
 use adv_os::Codec;
 
+/// Strict, bounded CRT formatting. The measured WINAPIV parser below keeps
+/// its independent legacy behavior; CRT buffer fronts share this one profile.
+pub(crate) mod crt;
+
 /// Supplies successive 32-bit argument slots.
 pub trait Args {
     fn next(&mut self) -> u32;

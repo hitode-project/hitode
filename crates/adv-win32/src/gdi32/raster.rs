@@ -6,9 +6,10 @@ use adv_device::surface::{
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 
+pub(crate) mod clip;
 mod color_table;
 mod dib;
-mod fill;
+pub(crate) mod fill;
 pub mod front;
 pub use front::{DrawingProvider, install, register, set_provider};
 
@@ -258,14 +259,18 @@ impl Raster {
             let (Some(s), Some(d)) = (surfaces.get(src), surfaces.get(dst)) else {
                 return Ok(self.fail(6));
             };
-            let (x, y, w, h, sx, sy) = (
-                x as i32 as i64,
-                y as i32 as i64,
-                width as i32 as i64,
-                height as i32 as i64,
-                source_x as i32 as i64,
-                source_y as i32 as i64,
-            );
+            let (Some(dm), Some(sm)) = (
+                dcs.modes(objects, destination_dc),
+                dcs.modes(objects, source_dc),
+            ) else {
+                return Ok(self.fail(6));
+            };
+            if dm.map != 1 || sm.map != 1 {
+                return Ok(self.fail(50));
+            }
+            let [x, y] = dm.to_device(i64::from(x as i32), i64::from(y as i32));
+            let [sx, sy] = sm.to_device(i64::from(source_x as i32), i64::from(source_y as i32));
+            let (x, y, w, h, sx, sy) = (x, y, width as i32 as i64, height as i32 as i64, sx, sy);
             if w < 0 || h < 0 {
                 return Ok(self.fail(87));
             }
@@ -297,9 +302,12 @@ impl Raster {
                 y: top as u32,
                 ..sr
             };
-            surfaces.copy(src, sr, dst, dr, m)?;
+            let clip = dcs.clip(objects, destination_dc);
+            let surface = surfaces.get(dst).unwrap().clone();
+            let mut m = clip::ClippedMemory::new(m, surface, &clip);
+            surfaces.copy(src, sr, dst, dr, &mut m)?;
             if destination_dc == WINDOW_DC {
-                surfaces.present(dst, m)?;
+                surfaces.present(dst, &m)?;
             }
             1
         })
@@ -346,6 +354,15 @@ impl Raster {
             // no pixels are accessed and no completed frame is produced.
             return Ok(dib.height);
         }
+        let Some(modes) = dcs.modes(objects, destination_dc) else {
+            return Ok(self.fail(6));
+        };
+        if modes.map != 1 {
+            return Ok(self.fail(50));
+        }
+        let Some([x, y]) = modes.device_point(x, y) else {
+            return Ok(self.fail(50));
+        };
         let Some(transfer) = dib::transfer(
             &dib,
             x,
@@ -379,16 +396,19 @@ impl Raster {
                 _ => Sampling::AndColour,
             },
         };
+        let clip = dcs.clip(objects, destination_dc);
+        let surface = surfaces.get(dst).unwrap().clone();
+        let mut m = clip::ClippedMemory::new(m, surface, &clip);
         surfaces.blit_from(
             &source,
             transfer.source,
             dst,
             transfer.destination,
             options,
-            m,
+            &mut m,
         )?;
         if destination_dc == WINDOW_DC {
-            surfaces.present(dst, m)?;
+            surfaces.present(dst, &m)?;
         }
         Ok(transfer.scan_lines)
     }
@@ -428,13 +448,24 @@ impl Raster {
             let (Some(s), Some(_d)) = (surfaces.get(src), surfaces.get(dst)) else {
                 return Ok(self.fail(6));
             };
+            let (Some(dm), Some(sm)) = (
+                dcs.modes(objects, destination_dc),
+                dcs.modes(objects, source_dc),
+            ) else {
+                return Ok(self.fail(6));
+            };
+            if dm.map != 1 || sm.map != 1 {
+                return Ok(self.fail(50));
+            }
+            let [x, y] = dm.to_device(i64::from(x as i32), i64::from(y as i32));
+            let [sx, sy] = sm.to_device(i64::from(source_x as i32), i64::from(source_y as i32));
             let (x, y, w, h, sx, sy, sw, sh) = (
-                i64::from(x as i32),
-                i64::from(y as i32),
+                x,
+                y,
                 width as i32,
                 height as i32,
-                i64::from(source_x as i32),
-                i64::from(source_y as i32),
+                sx,
+                sy,
                 source_width as i32,
                 source_height as i32,
             );
@@ -471,9 +502,12 @@ impl Raster {
                     _ => Sampling::And,
                 },
             };
-            surfaces.blit(src, sr, dst, dr, options, m)?;
+            let clip = dcs.clip(objects, destination_dc);
+            let surface = surfaces.get(dst).unwrap().clone();
+            let mut m = clip::ClippedMemory::new(m, surface, &clip);
+            surfaces.blit(src, sr, dst, dr, options, &mut m)?;
             if destination_dc == WINDOW_DC {
-                surfaces.present(dst, m)?;
+                surfaces.present(dst, &m)?;
             }
             1
         })

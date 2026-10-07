@@ -24,6 +24,7 @@ bytemuck = "1"
 log.workspace = true
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
 sha2 = "0.10"
+png = "0.17"
 
 [dev-dependencies]
 adv-win32 = { path = "../adv-win32" }

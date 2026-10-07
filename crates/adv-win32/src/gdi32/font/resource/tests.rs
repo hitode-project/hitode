@@ -9,6 +9,10 @@ fn resource_entry_points_use_the_single_generated_abi() {
         "AddFontResourceW",
         "RemoveFontResourceA",
         "RemoveFontResourceW",
+        "AddFontResourceExA",
+        "AddFontResourceExW",
+        "RemoveFontResourceExA",
+        "RemoveFontResourceExW",
     ] {
         assert_eq!(
             registry.level("gdi32.dll", name),
@@ -266,25 +270,25 @@ mod windows {
                 assert!(Arc::ptr_eq(&cached, &glyph(&mut machine)));
             }
         }
-        let key = "c:\\game\\fonts\\fixture.ttf";
+        let key = ("c:\\game\\fonts\\fixture.ttf".to_owned(), 0);
         machine
             .ext
             .get_mut::<Fonts>()
             .resources
-            .get_mut(key)
+            .get_mut(&key)
             .unwrap()
             .count = u32::MAX;
         assert_eq!(
             invoke(&mut machine, "AddFontResourceA", Some("Fonts/fixture.ttf")),
             0
         );
-        assert_eq!(machine.ext.get::<Fonts>().resources[key].count, u32::MAX);
+        assert_eq!(machine.ext.get::<Fonts>().resources[&key].count, u32::MAX);
         assert!(Arc::ptr_eq(&cached, &glyph(&mut machine)));
         machine
             .ext
             .get_mut::<Fonts>()
             .resources
-            .get_mut(key)
+            .get_mut(&key)
             .unwrap()
             .count = 1;
         assert_eq!(

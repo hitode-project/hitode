@@ -29,7 +29,21 @@
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/lc-codepage-func",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/calloc",
     "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-func",
-    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-pwctype-wctype-mbctype-mbcasemap"
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/pctype-pwctype-wctype-mbctype-mbcasemap",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/uncaught-exception",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/sprintf-s-sprintf-s-l-swprintf-s-swprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/snprintf-s-snprintf-s-l-snwprintf-s-snwprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsprintf-s-vsprintf-s-l-vswprintf-s-vswprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vsnprintf-s-vsnprintf-s-l-vsnwprintf-s-vsnwprintf-s-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/scprintf-scprintf-l-scwprintf-scwprintf-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/vscprintf-vscprintf-l-vscwprintf-vscwprintf-l",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localeconv",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memchr-wmemchr",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/mkdir-wmkdir",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findfirst-functions",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findnext-functions",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/findclose",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strtod-strtod-l-wcstod-wcstod-l"
   ],
   "invalid_parameter_header": {
     "header": "ucrt/stdlib.h",
@@ -64,9 +78,32 @@
     "sha256": "8ee45e7db7f08475d1ddf33d493fd7cb5cd10b54b4756b39156c8548281b3e63",
     "projection": "x86 __cdecl scalar operator new(size_t) and operator delete(void*), legacy MSVC decorated names"
   },
+  "vcruntime_string.h": {
+    "source": "Microsoft Visual C++ Build Tools 14.44.35207",
+    "header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h (included by SDK ucrt/corecrt_memory.h)",
+    "sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
+    "projection": "memchr: x86 __cdecl, const void* buffer, int value, size_t count, void* return in the C declaration. A byte scan with unsigned-char conversion, shared by the existing three legacy CRT and UCRT/string API-set profiles and vcruntime140.dll. Also project only vcruntime140.dll memcpy/memmove(void* destination, const void* source, size_t count) and memset(void* destination, int value, size_t count), each returning void* with three x86 cdecl stack words. These fronts reuse the existing guest byte-copy/fill implementation; memmove supports overlap, memset converts value to unsigned char, and no memcpy overlap contract is claimed. No wide scan or unused alias matrix is projected."
+  },
   "corecrt_memcpy_s.h": {
     "header": "ucrt/corecrt_memcpy_s.h",
     "sha256": "359f3ce9e84bc00c983f01d9c3375d0ca9e0ef6a42e797d16e119c62b2ef333b"
+  },
+  "ordinary_binary_stdio": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "wide_header": "ucrt/corecrt_wstdio.h:139-143",
+    "wide_header_sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515",
+    "stdio_header": "ucrt/stdio.h:152-154,239-244,270-274,286-288",
+    "stdio_header_sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "scope": "Only ucrtbase.dll and api-ms-win-crt-stdio-l1-1-0.dll _wfopen_s, fseek, ftell, fread, fclose: x86 cdecl with3/3/1/4/1 stack words; errno_t/int/long/size_t/int results. Ordinary rb Unicode VFS opening and binary reading/position/close reuse the existing CRT FILE/process-heap owner. No modern FILE layout, text/Unicode conversion, write mode, unused stdio alias or secure-CRT profile matrix is claimed."
+  },
+  "ordinary_modern_string": {
+    "search_header": "VC/Tools/MSVC/14.44.35207/include/vcruntime_string.h:82-85,95-98",
+    "search_header_sha256": "b05204f6814d1d7b7ca729b41d4192d0e47722f162c0b1d322f994bf9650af63",
+    "byte_header": "ucrt/string.h:32-36,60-65",
+    "byte_header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
+    "wide_header": "ucrt/corecrt_wstring.h:39-43",
+    "wide_header_sha256": "c485f918d43f0f846d77a36eaee9e111f57bf2eec32db7d9719ff924771744c6",
+    "scope": "Only vcruntime140.dll strrchr/wcsrchr and ucrtbase.dll plus api-ms-win-crt-string-l1-1-0.dll wcscpy_s/strcpy_s/strncpy_s. Typed checked ordinary NUL-terminated searches and valid-capacity copies delegate to the existing legacy memory kernels; invalid-parameter handling reuses the shared CRT owner. wchar_t is a16-bit code unit in one x86 stack word. Finite-count strncpy_s requires a checked NUL-terminated source; _TRUNCATE and arbitrary unterminated prefix inputs are not advertised. Existing typed wcscat_s is unchanged."
   },
   "legacy_data": {
     "declarations": "corecrt_startup.h declares extern char* _acmdln and extern wchar_t* _wcmdln; Microsoft Learn identifies these exported command-line pointer variables. Projected for the three existing legacy CRT profiles only.",
@@ -76,12 +113,20 @@
   "locale.h": {
     "header": "ucrt/locale.h",
     "sha256": "877aa49e1f22814dd5634e785d305210d3c7ac0a1274e8552ce4f687a91ac4cb",
-    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5. Also declares unsigned int __cdecl ___lc_codepage_func(void)."
+    "projection": "msvcr90 setlocale: x86 __cdecl, int category, optional NUL-terminated const char* locale, char* result; LC_ALL=0 through LC_TIME=5. Also declares unsigned int __cdecl ___lc_codepage_func(void) and struct lconv* __cdecl localeconv(void). The modern SDK lconv wide tail is not projected as VC90 layout."
   },
   "legacy_locale_handle": {
     "declaration": "Microsoft Learn previous-versions ff730814(v=vs.120) declares LCID* ___lc_handle_func(void), indexed by locale.h categories. This legacy LCID-array getter is absent from modern UCRT headers; no modern header declaration is claimed.",
     "projection": "msvcr90 x86 CRT cdecl zero parameters, pointer to six 32-bit LCIDs (LC_ALL reserved zero, categories1..5). Authored x86 Microsoft SysWOW64/msvcrt.dll probe confirms C=0, Japanese=0x411, Simplified Chinese=0x804, English=0x409 and mixed category indices; this is a legacy MSVCRT semantic oracle, not a VC90 binary oracle.",
     "msvcrt_pe_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f"
+  },
+  "legacy_localeconv": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "projection": "SDK locale.h supplies the zero-argument cdecl pointer-return declaration. Only the legacy 48-byte prefix (ten 32-bit ANSI pointers followed by eight char fields) is published; no modern wchar_t fields or thread-locale API is claimed.",
+    "oracle": "Authored x86 native probe verifies four supported locale profiles, mixed LC_NUMERIC/LC_MONETARY categories, and currency encoding snapshots across LC_CTYPE/code-page changes. Numeric and monetary categories provide independent data; changing LC_CTYPE alone or setting an unchanged LC_MONETARY locale leaves monetary strings unchanged. A changed monetary locale uses current non-C LC_CTYPE code page, or its own code page with C LC_CTYPE. CP932/936/1252 yen bytes are 5C/A3A4/A5. Results describe the existing virtual locale defaults, not arbitrary host regional customizations.",
+    "oracle_source_sha256": "a5091d642b3eb39d73c1a10e9652130d3ba49110c3f5ca416c2ff313c85be986",
+    "oracle_exe_sha256": "816ec88a86367e1ec7f360b150e3ebf3c7efb52b1148cb6bd1d48a2b10436d93"
   },
   "legacy_calloc_crt": {
     "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
@@ -98,10 +143,254 @@
     "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
     "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
     "behavior": "Authored activation-context VC90 probe reads the EOF slot at pointer[-1] and all256 byte slots. C is distinct from localized tables. Japanese/Chinese/English LC_CTYPE names crossed with CP932/936/1252 produce identical classification for each codepage, so the supported four profiles are keyed by CP0/932/936/1252 independently of language and host ACP. Compact classification data is derived from observed tables, not copied from SDK implementation headers.",
-    "fnv1a64_514_bytes": { "C": "48cabdc90fcb0865", "932": "44eb5be34d5b7579", "936": "e33c618c172b2971", "1252": "006150ad6479dba0" }
+    "fnv1a64_514_bytes": {
+      "C": "48cabdc90fcb0865",
+      "932": "44eb5be34d5b7579",
+      "936": "e33c618c172b2971",
+      "1252": "006150ad6479dba0"
+    }
+  },
+  "eh.h": {
+    "source": "Microsoft Visual C++ Build Tools 14.44.35207",
+    "header": "VC/Tools/MSVC/14.44.35207/include/eh.h",
+    "sha256": "f9809ac3f6929a584a971f14823be5a737e763a8d8f93bd50af2c3575c286c52",
+    "declaration": "bool __cdecl __uncaught_exception(void). x86 bool is returned in AL; canonical u32 projection carries the boolean 0/1 value, not a Win32 BOOL declaration."
+  },
+  "legacy_uncaught_exception": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "behavior": "Export RVA0x5ca6b calls _getptd, tests DWORD[PTD+0x90] against zero, sets AL and returns with RET. This corroborates the SDK cdecl zero-parameter bool declaration. Supported profile returns false only for a thread with no active Windows dispatch/unwind or unknown observed C++ exception state; other profiles explicitly fail instead of inventing a processingThrow counter."
   },
   "process.h": {
     "header": "ucrt/process.h",
     "sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490"
+  },
+  "stdio.h": {
+    "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "header": "ucrt/stdio.h",
+    "projection": "x86 cdecl fixed va_list and variadic mandatory parameters for six paired secure buffer/count families in VC80/90 profiles; sprintf at1764-1767 and vsprintf at1465-1469 add the two/three mandatory x86 pointer slots without a capacity parameter in the existing MSVCRT/VC80/VC90 profiles"
+  },
+  "direct.h": {
+    "header": "ucrt/direct.h",
+    "sha256": "06177549ad0ab3f269f44895a70c31cbe65f02446457b21b1aa393cb9fd77b2a",
+    "projection": "int __cdecl _mkdir(char const* _Path), one x86 pointer argument, 32-bit signed int result; projected only for the existing MSVCRT/VC80/VC90 profiles. No deprecated mkdir alias or other directory API is projected."
+  },
+  "corecrt_wdirect.h": {
+    "header": "ucrt/corecrt_wdirect.h",
+    "sha256": "b8477593983d23ed4ef93c3efcabb8239375b518ba589a65338db29bb0dc2237",
+    "projection": "int __cdecl _wmkdir(wchar_t const* _Path), one x86 pointer to UTF16 code units; the parameter remains str16, not ANSI. Same three legacy CRT profiles and no other wide directory API."
+  },
+  "corecrt_wstdio.h": {
+    "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515",
+    "header": "ucrt/corecrt_wstdio.h",
+    "projection": "wchar_t pointer parameters and character capacities remain UTF-16; va_list is an x86 pointer, variadic functions retain only mandatory parameter slots"
+  },
+  "corecrt_io.h": {
+    "header": "ucrt/corecrt_io.h",
+    "sha256": "0ea13520ed2078b7db3dedaccc882ae61dd517dbd3af831b8e76fae5cca3c830",
+    "projection": "int __cdecl _findclose(intptr_t _FindHandle); x86 intptr_t is signed 32-bit. Only the three existing MSVCRT/VC80/VC90 profiles are declared."
+  },
+  "corecrt_wio.h": {
+    "header": "ucrt/corecrt_wio.h",
+    "sha256": "e6a08ad4c75ef96fd5fafcff334048c4cc610f990f39c15e07c03af14d607197",
+    "projection": "intptr_t __cdecl _wfindfirst64i32(wchar_t const*, struct _wfinddata64i32_t*) and int __cdecl _wfindnext64i32(intptr_t, struct _wfinddata64i32_t*). wchar_t input remains str16, output is a pointer; no ANSI or other time/size-width find family is declared."
+  },
+  "legacy_find64i32": {
+    "source": "Microsoft x86 VC90 CRT 9.0.30729.9635 installed in Windows WinSxS",
+    "msvcr90_pe_sha256": "1e984b8d06618ed54733d00a2a3f44fde4c6cb11d9a2e4635c7c0312cde7b91a",
+    "layout": "Authored x86 probe corroborates SDK _wfinddata64i32_t: sizeof560, unsigned attrib at0, signed time64 at8/16/24, unsigned size32 at32 and UTF16 name[260] at36. Alignment padding at4 and556 are not overwritten; no unrelated modern find_t layout is projected.",
+    "behavior": "Native NORMAL attributes become _A_NORMAL=0. Creation/access/write times independently match three authored UTC-second values. No-match and EOF assign errno2; NULL pattern/output and next handle=-1 invoke the returning invalid handler with errno22. _findclose success is0, stale/-1 failure is-1 with errno22 and no invalid callback. All these failures retain prior DOS errno; success retains prior CRT errno. Shared VFS snapshots, rather than host filesystem bypasses, supply virtual rows.",
+    "oracle_source_sha256": "aafb9efd45e94ed15fc67804ee8df2582681abe19de32452db8b4f652f179ef0"
+  },
+  "buffer_float_profile": {
+    "target": "VC80 finite binary64 f/e/E/g/G, decimal-dot and nearest guest rounding; precision0-64. The existing bounded x86 formatter consumes two pointer-sized argument slots per promoted double and preserves integer/string fronts.",
+    "behavior": "Authored VC80 oracle39 cases confirm decimal ties away from zero, the legacy 17-significant-digit stage, three-digit exponent and g selection after rounding. Native NULL format/destination fails with returning invalid handler errno22 without a destination write; successful legacy sprintf/vsprintf writes only produced bytes plus NUL and preserves errno.",
+    "limitations": "Nonfinite, hexadecimal floating, capital F, extended precision, unknown numeric locale and non-nearest rounding remain explicit unsupported failures. Legacy count-output/prefix callback and permissive unknown/trailing syntax are rejected without a fabricated native invalid callback; no complete CRT/C99 equivalence is claimed.",
+    "oracle_source_sha256": "c0d739a468416bebb6b94629f2ba15f75a328c4fb632206cdcd33bb17b29a476"
+  },
+  "random": {
+    "header": "ucrt/stdlib.h:350-352",
+    "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+    "projection": "void __cdecl srand(unsigned int seed), one x86 scalar slot; int __cdecl rand(void), zero arguments and signed32 result. Only the existing MSVCRT/VC80/VC90 profiles.",
+    "profile": "Legacy noncryptographic random state belongs to the same CRT module/thread owner; no host random source or separate process-global generator."
+  },
+  "time64": {
+    "header": "ucrt/time.h:193-196,212-214,236-238,321-323",
+    "sha256": "b775fe03a3288dfcd68a72caad43e8198283164eae94b665fdd3375a3baea44c",
+    "tm_header": "ucrt/corecrt_wtime.h:26-37",
+    "tm_sha256": "4e487fddafbc724cf4e6df45feb920bc46dae80f54ffe5d983bf742a1fd9a12f",
+    "projection": "Legacy _time64 uses one pointer slot and signed time64 bits in EDX:EAX; _gmtime64/_localtime64 use one pointer slot and return a thread-owned pointer to nine signed32 tm fields. _difftime64 consumes two signed time64 values as four x86 DWORD slots and returns binary64 in ST0. Only existing MSVCRT/VC80/VC90 profiles.",
+    "behavior": "Authored VC80 oracle confirms one shared per-thread 36-byte gm/local buffer, NULL input clears tm fields to -1 before returning invalid handler errno22, negative seconds clear the buffer and fail errno22 without a callback. Differences subtract integers before rounding to binary64, preserving a one-second delta above2^53; negative input fails errno22, while negative valid difference is supported.",
+    "profile": "Clock and civil conversion reuse the existing Win32 owner, including configured fixed UTC offset and no DST; supported UTC input is1970-3000, with larger native ranges explicitly unavailable. No independent host clock or time-zone cache.",
+    "oracle_source_sha256": "74d0058010cd20aa7a42778e4f1e68805f41a54da45591494defffcfe1ffaee2"
+  },
+  "strtod": {
+    "header": "ucrt/stdlib.h:502-505",
+    "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+    "projection": "double __cdecl strtod(char const* _String, char** _EndPtr), two x86 pointer slots and an IEEE binary64 x87 ST0 return. Only the existing MSVCRT/VC80/VC90 export profiles; no locale-object or C99 conversion family is projected.",
+    "behavior": "Authored x86 VC80 8.0.50727.9680 oracle: decimal prefix with incomplete exponent rollback; hex stops after initial decimal zero, inf/nan do not convert. Overflow and nonzero mantissa rounding to zero assign errno34; nonzero subnormal retains errno. NULL source zeros endptr and calls returning invalid handler with errno22. Existing supported C/JP/CN/EN numeric categories use decimal dot; byte-space classification follows module LC_CTYPE, including CP1252 A0.",
+    "oracle_source_sha256": "f2000268d660b2b42b987a9db6bc26aad7d8d4b47bee059edef18ffaa3f75fa7"
+  },
+  "shared_open": {
+    "headers": [
+      {
+        "header": "ucrt/stdio.h:255-259",
+        "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6"
+      },
+      {
+        "header": "ucrt/corecrt_wstdio.h:162-166",
+        "sha256": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515"
+      }
+    ],
+    "projection": "FILE* __cdecl _fsopen/_wfsopen(filename, mode, int share), three x86 slots; legacy CRT aliases only.",
+    "binary_write_oracle_source_sha256": "bfdf2b22338d5898076889140c74d41f46a9f83791c6cd48f88697d7c9a2177e",
+    "binary_write_profile": "Authored VC80/90 six-row no-UI probe covers A/W wb+SH_DENYNO creation, binary fwrite/flush/close and error-owner observations. Guest wb uses the existing FILE/VFS private overlay and preflights incoming writer sharing before creation/truncation; rb retains its reader sharing check. Text/update/append and other sharing modes remain explicit ENOSYS warnings. Existing VFS creates parent directories, so native missing-parent failure rows are comparison data, not a claim of equivalent guest directory behavior.",
+    "profile": "Use the existing CRT stream and VFS owner; unsupported sharing modes must fail with qualified warning rather than fabricated success."
+  },
+  "stream_position": {
+    "header": "ucrt/stdio.h:73,191-194,263-266",
+    "sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "projection": "int __cdecl fgetpos(FILE*, fpos_t*) and fsetpos(FILE*, const fpos_t*), two x86 pointer slots; fpos_t typedef signed __int64, 8-byte guest position; legacy CRT aliases only.",
+    "profile": "Use the existing CRT stream cursor; bounded atomic guest position accesses, no separate stream or host pathname owner."
+  },
+  "x87_intrinsic_math": {
+    "source": "Microsoft Learn x86 CRT intrinsic declarations, 2026-10-07 read",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/citan",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisin",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cicos",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cisqrt"
+    ],
+    "projection": "void __cdecl _CItan/_CIsin/_CIcos/_CIsqrt(void); zero integer-stack parameter slots, specialized x87 input/result in ST0. Result must replace the operand while preserving lower x87 stack and guest ESP; not a two-slot cdecl double input.",
+    "profile": "Only legacy CRT aliases. Reuse guest FPU owner, measured finite nearest/masked inputs; unavailable exceptional/control profiles must warn and fail rather than claim complete CRT math compatibility."
+  },
+  "byte_ctype": {
+    "header": "ucrt/ctype.h:31-66",
+    "sha256": "6a10e9f0505b896d356d986d671c939b7fb0602012e463314ff7bfd0182a861f",
+    "scope": [
+      "tolower",
+      "toupper",
+      "isalpha",
+      "isalnum",
+      "isdigit",
+      "isspace",
+      "iscntrl",
+      "isupper",
+      "islower",
+      "isxdigit",
+      "ispunct",
+      "isprint",
+      "isgraph"
+    ],
+    "projection": "int __cdecl function(int character), one signed32 x86 slot; three existing legacy CRT aliases. Shared LC_CTYPE profile/table logic; no host locale, duplicate classifier cache or Win32 ACP mutation.",
+    "profile": "Byte input and measured legacy EOF contracts; supported C/932/936/1252 profiles share existing byte flags. Unsupported packed DBCS or out-of-domain inputs must warn and fail; native error side effects and localized EOF case behavior retained where measured.",
+    "setlocale_aliases": "Existing verified VC90 setlocale cdecl2 char* signature extended to MSVCRT/VC80 only; same existing category grammar, per-module locale owner and heap buffers. No new locale implementation or Win32 ACP change."
+  },
+  "secure_path_split": {
+    "headers": {
+      "ucrt/stdlib.h:1114-1124": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+      "ucrt/corecrt_wstdlib.h:388-398": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
+    },
+    "scope": "_splitpath_s and _wsplitpath_s cdecl nine32-bit x86 stack words, signed errno_t result; three existing CRT aliases; size_t is32-bit count of char/wchar_t elements",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/splitpath-s-wsplitpath-s",
+    "native_oracle_source_sha256": "267785bb87b72767f6c04a7ff27a061ca1e5f6029a96e4e989b3ff6be92279c1",
+    "native_verification": "Authored VC80 probe measures lexical split, element capacities, optional output pairing, success errno/DOS/LastError preservation, EINVAL buffer-clear-before-handler ordering and ERANGE clear-first-unit with prior copied tails. Narrow default multibyte scanning is independent of later LC_CTYPE changes; guest configured ACP supplies this default. Input/output overlap and unmeasured profiles explicitly warn ENOSYS rather than claim unspecified alias behavior."
+  },
+  "extended_thread": {
+    "header": "ucrt/process.h:85,96-107",
+    "header_sha256": "c11858d0260086e5a61cf0c02d3533ebec6d4ec6133c18967d8b8cfe8231f490",
+    "scope": "Three existing CRT aliases: uintptr_t __cdecl _beginthreadex(void*, unsigned int, _beginthreadex_proc_type, void*, unsigned int, unsigned int*) uses six x86 words and unsigned32 result; void __cdecl _endthreadex(unsigned int) uses one word. The guest start routine is unsigned __stdcall(void*), independently of the CRT export calling convention.",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex",
+    "native_oracle_source_sha256": {
+      "vc90": "1e54b07d3acb4415fd6c7e081d32cc188ea91c434c7a2c7713b6bc5d7c8740e0",
+      "installed_legacy": "afabdb7917c345808d6613ef4483326b09b44961980687413145f1a1954a17fc"
+    },
+    "native_verification": "VC90 success and NULL-entry validation set LastError0; success preserves errno/DOS and NULL invokes the returning invalid handler with errno22 and preserved DOS. Installed legacy MSVCRT success preserves LastError and NULL-entry returns UINTPTR_MAX, sets errno22 and invokes no handler. Authored workers return42 or explicitly end with unsigned0x80000001. Guest profiles retain caller-owned waitable handles; no universal equivalence for other legacy builds or native bad-pointer AV is claimed.",
+    "profile": "Reuse the Win32 thread startup/exit, scheduler and handle owners and existing CRT error/TLS cleanup. Unsupported creation flags or stack/security profiles must warn and fail rather than borrow legacy dummy suspend/resume behavior."
+  },
+  "scalar_fraction_split": {
+    "header": "ucrt/corecrt_math.h:559",
+    "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
+    "scope": "Three existing CRT aliases: double __cdecl modf(double value, double* integer). Exactly three x86 argument words: genuine binary64 input spans two, the output pointer spans one; binary64 fractional return in x87 ST0.",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/modf-modff-modfl",
+    "native_oracle_source_sha256": "11524b6683f573ae2047ebcbf181e021d83e8cb74faa2c8dd0e195a33d5ba084",
+    "native_verification": "Authored VC80/90 38 mathematical rows and two isolated NULL-output fault rows measure signed zero, finite/infinite parts, rounding/control preservation, error-owner preservation and special x87 status. Guest support intentionally fails on NaN/subnormal status profiles; NULL or inaccessible outputs are checked memory faults, without a fabricated invalid-parameter callback.",
+    "profile": "Use shared binary64/x87 return and CRT error owners, complete eight-byte integer output preflight and measured special-value/control behavior. Unimplemented exception/status or callback profiles must warn and fail without fabricating a double result."
+  },
+  "byte_set_scan": {
+    "header": "ucrt/string.h:137-140,401-404,430-433",
+    "header_sha256": "39767b2e1963b8ef679b62d5e27cb2d0ca1de6a6173b75389b79c9d575da92fc",
+    "native_oracle_source_sha256": "428e97500fcc40b87b0d27a8f8e77d0ef52395c317b1e21f1326214fa6978fd6",
+    "native_verification": "Authored VC90 seven-case probe covers unsigned high-byte membership, empty/NUL/repeated sets and early stopping before guard-page tails. All three functions preserve errno, DOS errno and LastError. Guest scans independently bound control and source to16MiB; limit violations warn/fail rather than return a fabricated NULL or span, and checked pointer faults are not advertised as native AV equivalence.",
+    "scope": "Three existing CRT aliases: strpbrk/strcspn/strspn are cdecl with two const char* arguments and two x86 words. strpbrk returns a pointer into the source or NULL; strcspn/strspn return unsigned32 size_t byte counts. C ABI strpbrk return is char* regardless of C++ const-correct overloads.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strpbrk-wcspbrk-mbspbrk-mbspbrk-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strcspn-wcscspn-mbscspn-mbscspn-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strspn-wcsspn-mbsspn-mbsspn-l"
+    ],
+    "profile": "Read raw guest bytes through one bounded byte-membership scanner, including high bytes; no locale or Unicode conversion, new string storage, or fabricated invalid-parameter callback. Stop before unnecessary source-tail reads and warn/fail outside supported bounds."
+  },
+  "x87_intrinsic_power": {
+    "source": "Microsoft Learn _CIpow x86 compiler intrinsic declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cipow",
+    "scope": "Official void __cdecl _CIpow(); zero ordinary integer-stack words for three existing CRT aliases. Two x87 operands are consumed and the power result is pushed onto the x87 stack, using the existing FP result bridge. The void declaration describes compiler-specific register-stack effects; no invented ordinary double-return C prototype or two stack double arguments.",
+    "native_oracle_source_sha256": "5f2bd9c4688a25e57358cbb129fd2b0bfad1bc49981469f034f7184857c3b1c4",
+    "native_verification": "Authored VC80/90 38-row no-UI probe measures two x87 inputs consumed, one result, lower80-bit register payload and ESP/CW/status/error-owner preservation for normal finite and positive zero-base powers. Host binary64 powf is checked within two ULP of measured normals; this does not establish universal CRT extended-precision bit identity. Special values, range/domain or unsupported control/precision inputs remain warning/failure with original x87 stack preserved.",
+    "profile": "Reuse the common guest floating environment, x87 argument/result and CRT error owners; preserve lower stack levels and guest ESP. Only measured numeric/control/status profiles may succeed; unimplemented exception or special-value profiles must explicitly warn and fail."
+  },
+  "x87_intrinsic_logarithm": {
+    "source": "Microsoft Learn _CIlog10 x86 compiler intrinsic declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cilog10",
+    "native_oracle_source_sha256": "0a2237b76d0cab51e11c66c37b1de7dde8b6a8de31cb472cb7d19be222b0b702",
+    "native_verification": "Authored VC80/90 26-row no-UI probe measures positive normal binary64 inputs and PC64 FILD(volume)/1000 for volumes 1,10,100,700,999,1000. Lower80-bit payload, ESP, control and errno/DOS/LastError survive; successful return clears C1 while retaining other measured status bits. Binary64 logarithms agree within two ULP; sequential multiply by33.2 then100 and truncation gives -9960,-6640,-3320,-514,-1,0. This does not establish universal extended-precision or exceptional CRT equivalence.",
+    "scope": "Official void __cdecl _CIlog10(); zero ordinary integer-stack words for three existing CRT aliases. The top x87 operand is consumed and replaced by its base10 logarithm through the existing architectural/result bridge; no ordinary double-return C prototype or stack double argument.",
+    "profile": "Reuse the common x87 architecture and CRT error owners, preserve lower80-bit registers and ESP. Positive numeric/control/status profiles must be measured; domain/range/unsupported controls must explicitly warn and fail without losing the original operand."
+  },
+  "x87_intrinsic_natural_logarithm": {
+    "source": "Microsoft Learn _CIlog x86 compiler intrinsic declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cilog",
+    "native_oracle_source_sha256": "abd154e44aba0574cf41dc4006bc789abd690df1f86a0f61c90ea32fd16ed3a6",
+    "native_c1_oracle_source_sha256": "efb305f32171fbcb66e305161238770abb2867b3f450bf82743ba36c4fbabffd",
+    "native_verification": "Authored VC80/90 eight-row no-UI probe measures exact normal inputs 2,1024,2048 under PC53 and 2 under PC64 with seeded sticky status. One additional VC90 ln(2) C1-seeded case measures status 0x2b04 to0x2904, clearing only C1. Results agree within two binary64 ULP, while lower80-bit payload, ESP, control, errno/DOS/LastError and measured sticky flags survive. Exceptional/domain/extended operands remain explicitly unavailable; no universal CRT extended-precision bit identity is claimed.",
+    "scope": "Official void __cdecl _CIlog(); zero ordinary integer-stack words for three existing CRT aliases. The top x87 operand is consumed and replaced by its natural logarithm through the existing architectural/result bridge.",
+    "profile": "Reuse the common x87 architecture and CRT error owners; positive normal numeric/control/status profiles require a native oracle, with unsupported domain/range/control inputs warning and failing before consuming the original operand."
+  },
+  "binary64_power_of_two_scaling": {
+    "source": "Microsoft Learn ldexp declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ldexp",
+    "native_oracle_source_sha256": "3f268318b2a50a9e982427527263bf2fe467678e64834c8618c6280ca15f0baf",
+    "native_verification": "One authored no-UI 15-row probe across the three CRT aliases measures the Vorbis unpack case ldexp(-1048576,-20)=-1, signed zeros and normal endpoint exponents -788/+235 with bit-exact results. Guest ESP, lower80-bit payloads, PC53/64 and errno/DOS/LastError survive. All observed returns clear C1; VC80/90 comparison condition bits distinguish positive/negative/zero, while legacy MSVCRT does not establish that same condition-code profile. No exceptional range or universal FP status equivalence is claimed.",
+    "scope": "double __cdecl ldexp(double value, int exponent); three x86 argument words for three existing CRT aliases. Return the value multiplied by an integral power of two through the shared x87 result bridge.",
+    "profile": "Reuse existing scalar scale implementation and CRT error/floating environment owners. Native ordinary scaling and state preservation require a small oracle; unimplemented range, exception or special-control profiles must explicitly warn and fail."
+  },
+  "guest_comparator_sort": {
+    "header": "ucrt/corecrt_search.h:23-24,60-65",
+    "header_sha256": "fe06c4dd27c3df5ca6bed52a433b8848f32e14ed0f3712d00f7e602416471c1b",
+    "native_oracle_source_sha256": "9917f22135f97cf8f51cb5dccc0435e8c972a3962c8eebe3db106ce947b2e32f",
+    "native_verification": "Authored VC80/90 18-row no-UI probe measures ordinary in-place sorting with real element addresses and unchanged errno/DOS/LastError, plus zero/one element validation. Zero width and NULL comparator invoke the returning invalid handler with errno22 and LastError0; NULL base is valid only for zero count. Guest generation keeps unmeasured legacy MSVCRT invalid-parameter handling explicitly unavailable rather than claim VC equivalence. Sorting order of equal elements and callback order are not native bit-identity guarantees.",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/qsort",
+    "scope": "Three existing CRT aliases: void __cdecl qsort(void* base, size_t number, size_t width, comparator). Four x86 argument words; comparator is int __cdecl(const void*, const void*) with signed ordering and two real array-element pointers. Equal-element relative order is unspecified.",
+    "profile": "Use existing guest callbacks, memory and CRT error/invalid-parameter owners. Checked bounded in-place sorting must call the real guest comparator; unavailable input/range profiles warn and fail without fabricated sorted output."
+  },
+  "byte_stream_output": {
+    "header": "ucrt/stdio.h:221-224,347-350",
+    "header_sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "native_oracle_source_sha256": "9faf9f421f48d681fff8516eabb0f80e5c920119b9af07a636a9d428de5b974a",
+    "native_verification": "Authored VC80/90 18-row no-UI probe measures binary fputc unsigned-byte truncation/return, unchanged errno/DOS/LastError, rb write EOF with errno9 and preserved DOS/LastError, and NULL returning-invalid-handler behavior. Guest FILE metadata remains in the existing stream owner; explicit binary streams write one real byte. Text/Unicode orientation, closed/unknown/pseudo streams and unmeasured legacy NULL behavior warn/fail. No complete native buffering, FILE field, ferror or orientation equivalence is asserted.",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fputc-fputwc",
+    "scope": "Three existing CRT aliases: int __cdecl fputc/putc(int character, FILE* stream), two x86 argument words. Character is converted to unsigned char; success returns that byte and failure returns EOF(-1).",
+    "profile": "Use existing shared FILE, binary write and CRT error owners. Unsupported text/orientation or non-owned/pseudo-stream profiles must explicitly warn and fail; do not invent a FILE layout or a private stream table."
+  },
+  "scalar_rounding": {
+    "header": "ucrt/corecrt_math.h:512,530,539",
+    "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
+    "scope": "floor/ceil/fabs for three CRT aliases, double __cdecl(double), exactly two32-bit argument words and x87 double return; genuine f64 kind, not a u64 parameter alias",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/floor-floorf-floorl",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ceil-ceilf-ceill",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fabs-fabsf-fabsl"
+    ],
+    "native_oracle_source_sha256": "fffaf19a1e0de2acd6f263f4d4a042974ba2133ea5b60e2c4bac6631fd534a33",
+    "native_verification": "Authored VC80 probe measures 45 cases: finite rounding, signed zero, infinities, quiet-NaN payload/sign and EDOM, x87 rounding/control preservation, signaling-NaN invalid status and fabs denormal status. Guest tests cover typed binary64 arguments, x87 return and lower stack, caller stack cleanup and shared error ownership. Signaling-NaN and subnormal fabs status/exception handling remain qualified unsupported failures; custom matherr callbacks are outside the existing CRT profile."
   }
 }

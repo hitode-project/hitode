@@ -164,37 +164,6 @@ fn string_realloc(env: &mut Env<'_>, counted: bool) -> Outcome {
     Outcome::Return(1)
 }
 
-fn variant_init(env: &mut Env<'_>) -> Outcome {
-    let p = env.arg(0);
-    if p != 0 {
-        let _ = env.cpu.write(p, &[0u8; 16]);
-    }
-    Outcome::Return(0)
-}
-
-fn variant_clear(env: &mut Env<'_>) -> Outcome {
-    let p = env.arg(0);
-    if p != 0 {
-        let mut vt_bytes = [0u8; 2];
-        if env.cpu.read(p, &mut vt_bytes).is_ok() {
-            let vt = u16::from_le_bytes(vt_bytes);
-            if vt == 8 {
-                if let Ok(bstr) = env.cpu.read_u32(p + 8) {
-                    if bstr != 0 {
-                        if !free_bstr(env, bstr) {
-                            // Preserve VariantClear's existing best-effort
-                            // invalid-BSTR behavior while sharing valid ownership.
-                            free(env, bstr.saturating_sub(4));
-                        }
-                    }
-                }
-            }
-        }
-        let _ = env.cpu.write(p, &[0u8; 16]);
-    }
-    Outcome::Return(0)
-}
-
 fn format_guid(bytes: &[u8; 16]) -> String {
     let d1 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let d2 = u16::from_le_bytes([bytes[4], bytes[5]]);
@@ -388,8 +357,6 @@ pub(super) fn register(registry: &mut Registry) {
         ("SysStringLen", "#7", 1, |e| string_length(e, false)),
         ("SysAllocStringByteLen", "#150", 2, |e| string_alloc(e, 2)),
         ("SysStringByteLen", "#149", 1, |e| string_length(e, true)),
-        ("VariantInit", "#8", 1, variant_init),
-        ("VariantClear", "#9", 1, variant_clear),
     ] {
         stdcall(registry, "oleaut32.dll", name, argc, handler);
         stdcall(registry, "oleaut32.dll", ordinal, argc, handler);

@@ -21,7 +21,7 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
     let codepages = 1u32 | (1 << 17);
     declared[478..482].copy_from_slice(&codepages.to_be_bytes());
     let mut text = Text::with_font_directories(&[]);
-    text.add_resource(&declared).unwrap();
+    text.add_file_resource(&declared, true).unwrap();
     let entries = text
         .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
         .unwrap();
@@ -473,7 +473,7 @@ fn resources_enumerate_match_invalidate_and_keep_immutable_glyphs_alive() {
     let mut text = Text::with_font_directories(&[]);
     let request = font("ADV Collection Two");
     assert!(text.metrics(&request).is_err());
-    let (id, count) = text.add_resource(COLLECTION).unwrap();
+    let (id, count) = text.add_file_resource(COLLECTION, true).unwrap();
     assert_eq!(count, 2);
     assert_eq!(text.resource_stats(), (1, COLLECTION.len()));
     let list = text.enumerate(None, FontEnumeration::Families).unwrap();

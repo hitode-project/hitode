@@ -518,7 +518,27 @@ fn wait_on_thread_handle_joins() {
 #[test]
 fn unimplemented_import_fails_with_its_name() {
     let mut t = T::new();
-    let missing = t.m.resolve_import("KERNEL32.dll", "FlsAlloc").unwrap();
+    let buf = Rc::new(RefCell::new(Vec::new()));
+    t.m.sys.trace = Trace::to_writer(Box::new(SharedBuf(buf.clone())));
+    // An SDK-known export now has an ABI-generated stub. Use an authored name
+    // absent from the resolver to exercise the machine's actual fallback.
+    let missing =
+        t.m.resolve_import("UNREGISTERED.dll", "AbsentFrontMethod")
+            .unwrap();
+    let binding =
+        t.m.sys
+            .thunks
+            .iter()
+            .find(|(_, t)| t.name == "AbsentFrontMethod")
+            .unwrap()
+            .1;
+    assert_eq!(binding.f.conv, Conv::Cdecl { argc: 0 });
+    assert!(!binding.f.trace);
+    assert!(!binding.implemented);
+    assert!(
+        buf.borrow().is_empty(),
+        "resolving a thunk does not execute it"
+    );
     t.code(CODE, |a| {
         a.call(missing);
     });
@@ -526,7 +546,22 @@ fn unimplemented_import_fails_with_its_name() {
     let RunResult::Failed(e) = t.m.run_virtual(1_000_000) else {
         panic!()
     };
-    assert!(e.message.contains("kernel32.dll!FlsAlloc"), "{e}");
+    assert!(
+        e.message.contains("unregistered.dll!AbsentFrontMethod"),
+        "{e}"
+    );
+    assert_eq!(
+        e.message,
+        "unimplemented: unregistered.dll!AbsentFrontMethod"
+    );
+    let trace = String::from_utf8(buf.borrow().clone()).unwrap();
+    assert_eq!(
+        trace,
+        format!(
+            "# warning\t0\t0\t{:08x}\tunregistered.dll!AbsentFrontMethod\t\"host implementation is unavailable (machine thunk fallback)\"\t\n",
+            CODE + 5
+        )
+    );
 }
 
 #[test]

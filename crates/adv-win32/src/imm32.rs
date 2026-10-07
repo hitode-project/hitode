@@ -19,8 +19,8 @@ fn default_window(_env: &mut Env<'_>, _window: Handle) -> Handle {
 
 /// This personality creates neither an IME window nor an input context.
 #[win32(imm32, name = "ImmGetContext", level = state)]
-fn get_context(_env: &mut Env<'_>, _window: Handle) -> Handle {
-    Handle(0)
+fn get_context(env: &mut Env<'_>, window: Handle) -> Handle {
+    crate::misc::imm::get_context(env, window)
 }
 
 /// Native NULL-HIMC GET fails without changing LastError. Other nonexistent

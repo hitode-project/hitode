@@ -29,6 +29,7 @@ struct FaceStore {
 struct Resource {
     faces: Vec<ID>,
     bytes: usize,
+    enumerable: bool,
 }
 #[derive(Default)]
 pub(super) struct Backend {
@@ -106,6 +107,7 @@ impl Backend {
     pub(super) fn add_resource(
         &mut self,
         bytes: &[u8],
+        enumerable: bool,
     ) -> Result<(FontResourceId, u32), TextError> {
         if bytes.is_empty()
             || self.resources.len() >= MAX_FONT_RESOURCES
@@ -145,6 +147,7 @@ impl Backend {
             Resource {
                 faces,
                 bytes: bytes.len(),
+                enumerable,
             },
         );
         self.next_resource = next;
@@ -244,8 +247,15 @@ impl Backend {
         }
         let mut output = Vec::new();
         let mut seen = BTreeSet::new();
+        let hidden: BTreeSet<_> = self
+            .resources
+            .values()
+            .filter(|resource| !resource.enumerable)
+            .flat_map(|resource| resource.faces.iter().copied())
+            .collect();
         for info in db
             .faces()
+            .filter(|info| !hidden.contains(&info.id))
             .filter(|info| face.is_none_or(|name| name.is_empty() || family_matches(info, name)))
         {
             let name = info

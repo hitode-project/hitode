@@ -192,6 +192,9 @@ fn check_format(
                 3 => matches!(usage, 0 | 0x200),
                 _ => false,
             })
+        // A8 is an ordinary 2D sampled/dynamic format. Do not advertise A8
+        // render targets, standalone DEFAULT surfaces, vertex fetch or autogen.
+        || (check == 28 && resource == 3 && matches!(usage, 0 | 0x200))
         || (resource == 1 && usage == 2 && depth::format(check).is_some());
     if available(env) && format == 22 && supported {
         0

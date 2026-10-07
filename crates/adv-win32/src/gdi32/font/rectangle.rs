@@ -1,4 +1,5 @@
-//! USER DrawText measurement uses the same selected GDI font and guest codec.
+//! USER DrawText measurement and single-line painting share the selected GDI
+//! font, guest ACP and CPU text surface. Advanced paragraph layout is explicit.
 use super::*;
 use adv_cpu::backend::Prot;
 use adv_device::text::TextInput;
@@ -14,14 +15,141 @@ fn fail(env: &mut Env<'_>) -> Outcome {
     set_last_error(env, 87);
     Outcome::Return(0)
 }
-fn unavailable(env: &mut Env<'_>) -> Outcome {
-    adv_abi::warn_unavailable(
-        env,
-        "DrawText",
-        "only DT_CALCRECT without word wrapping, ellipses or custom tab stops is supported",
-    );
+fn unavailable(env: &mut Env<'_>, reason: &str) -> Outcome {
+    let thunk = env.sys.thunks.get(env.thunk);
+    let api = format!("{}!{}", thunk.module, thunk.name);
+    adv_abi::warn_unavailable(env, &api, reason);
     set_last_error(env, 120);
     Outcome::Return(0)
+}
+
+fn read_input(env: &mut Env<'_>, input: u32, count: i32, ansi: bool) -> Result<Vec<u8>, Outcome> {
+    if count == -1 {
+        if ansi {
+            AnsiStr(GuestPtr::new(input))
+                .read(env.cpu, 1024 * 1024)
+                .map_err(|_| fail(env))
+        } else {
+            WideStr(GuestPtr::new(input))
+                .read(env.cpu, 512 * 1024)
+                .map(|units| units.into_iter().flat_map(u16::to_le_bytes).collect())
+                .map_err(|_| fail(env))
+        }
+    } else {
+        let Some(length) = u32::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(if ansi { 1 } else { 2 }))
+            .filter(|&n| n <= 1024 * 1024)
+        else {
+            return Err(fail(env));
+        };
+        if adv_abi::guest::check_range(env.cpu, input, length, Prot::READ).is_err() {
+            return Err(fail(env));
+        }
+        let mut bytes = vec![0; length as usize];
+        if length > 0 && env.cpu.read(input, &mut bytes).is_err() {
+            return Err(fail(env));
+        }
+        Ok(bytes)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render(
+    env: &mut Env<'_>,
+    dc: u32,
+    input: u32,
+    count: i32,
+    rect: GuestPtr<[i32; 4]>,
+    flags: u32,
+    ansi: bool,
+) -> Outcome {
+    if flags & SINGLE == 0 || flags & !(SINGLE | NO_PREFIX) != 0 {
+        return unavailable(
+            env,
+            "painting supports DT_SINGLELINE left/top clipping only; paragraph layout, tabs and ellipses are unavailable",
+        );
+    }
+    if adv_abi::guest::check_range(env.cpu, rect.addr(), 16, Prot::READ).is_err() {
+        return fail(env);
+    }
+    let Ok(rectangle) = rect.read(env.cpu) else {
+        return fail(env);
+    };
+    if modes(env, dc).text_align != 0 {
+        return unavailable(
+            env,
+            "DrawText painting requires TA_LEFT, TA_TOP and TA_NOUPDATECP",
+        );
+    }
+    if ansi && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
+        return unavailable(env, "single-line painting ANSI code page is unavailable");
+    }
+    if count == 0 {
+        if ansi {
+            return Outcome::Return(0);
+        }
+        return match GuestPtr::<u16>::new(input).read(env.cpu) {
+            Ok(first) if first != 0 => Outcome::Return(1),
+            Ok(_) => {
+                let request = font_request(env, dc);
+                match env.ext.get_mut::<Fonts>().text.metrics(&request) {
+                    Ok(metrics) => Outcome::Return(metrics.height.max(1) as u32),
+                    Err(_) => fail(env),
+                }
+            }
+            Err(_) => fail(env),
+        };
+    }
+    let bytes = match read_input(env, input, count, ansi) {
+        Ok(bytes) => bytes,
+        Err(outcome) => return outcome,
+    };
+    if ansi && bytes.is_empty() {
+        return Outcome::Return(0);
+    }
+    let units: Vec<u16> = if ansi {
+        // USER converts the guest ACP, regardless of the selected LOGFONT charset.
+        env.ext.get::<Win32>().codec.to_utf16(0, &bytes)
+    } else {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes(*unit))
+            .collect()
+    };
+    if units.len() > text::MAX_PAINT_UNITS {
+        return unavailable(env, "single-line painting exceeds 8192 UTF-16 units");
+    }
+    if units.iter().any(|&unit| unit < 32) {
+        return unavailable(env, "single-line control-character layout is unavailable");
+    }
+    if flags & NO_PREFIX == 0 {
+        let mut at = 0;
+        while at < units.len() {
+            if units[at] == 38 {
+                if units.get(at + 1) != Some(&38) {
+                    return unavailable(
+                        env,
+                        "mnemonic prefix underlining is unavailable; literal && and DT_NOPREFIX are supported",
+                    );
+                }
+                at += 1;
+            }
+            at += 1;
+        }
+    }
+    let formatted = lines(&units, flags).pop().unwrap();
+    let request = font_request(env, dc);
+    let height = match env.ext.get_mut::<Fonts>().text.metrics(&request) {
+        Ok(metrics) => metrics.height.max(1) as u32,
+        Err(TextError::Unavailable) => {
+            return unavailable(env, "selected font metrics are unavailable");
+        }
+        Err(_) => return fail(env),
+    };
+    super::paint::singleline(env, dc, rectangle, &formatted, height)
 }
 
 fn lines(input: &[u16], flags: u32) -> Vec<Vec<u16>> {
@@ -66,8 +194,14 @@ fn measure(
     if reject_dc(env, dc) {
         return Outcome::Return(0);
     }
-    if flags & CALC == 0 || flags & !SUPPORTED != 0 {
-        return unavailable(env);
+    if flags & CALC == 0 {
+        return render(env, dc, input, count, rect, flags, ansi);
+    }
+    if flags & !SUPPORTED != 0 {
+        return unavailable(
+            env,
+            "DT_CALCRECT does not support word wrapping, ellipses or custom tab stops",
+        );
     }
     let Ok([left, top, _, _]) = rect.read(env.cpu) else {
         return fail(env);
@@ -86,34 +220,9 @@ fn measure(
             return Outcome::Return(1);
         }
     }
-    let bytes = if count == -1 {
-        if ansi {
-            let Ok(bytes) = AnsiStr(GuestPtr::new(input)).read(env.cpu, 1024 * 1024) else {
-                return fail(env);
-            };
-            bytes
-        } else {
-            let Ok(units) = WideStr(GuestPtr::new(input)).read(env.cpu, 512 * 1024) else {
-                return fail(env);
-            };
-            units.into_iter().flat_map(u16::to_le_bytes).collect()
-        }
-    } else {
-        let Some(length) = u32::try_from(count)
-            .ok()
-            .and_then(|n| n.checked_mul(if ansi { 1 } else { 2 }))
-            .filter(|&n| n <= 1024 * 1024)
-        else {
-            return fail(env);
-        };
-        if adv_abi::guest::check_range(env.cpu, input, length, Prot::READ).is_err() {
-            return fail(env);
-        }
-        let mut bytes = vec![0; length as usize];
-        if length > 0 && env.cpu.read(input, &mut bytes).is_err() {
-            return fail(env);
-        }
-        bytes
+    let bytes = match read_input(env, input, count, ansi) {
+        Ok(bytes) => bytes,
+        Err(outcome) => return outcome,
     };
     // The ANSI wrapper's zero-length conversion returns failure and leaves
     // RECT unchanged; Unicode's empty-string rectangle rules differ.
@@ -205,3 +314,6 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(measure_a_ABI);
     registry.register(measure_w_ABI);
 }
+
+#[cfg(test)]
+mod tests;

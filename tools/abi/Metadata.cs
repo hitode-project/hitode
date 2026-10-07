@@ -221,13 +221,78 @@ public static class AbiMetadata
         foreach (var row in File.ReadLines(supplement).Where(line => line.Length != 0 && !line.StartsWith('#')))
         {
             var f = row.Split('\t');
-            if (f.Length != 6 || !new[] { "cdecl", "data" }.Contains(f[2]) || !new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3])
+            bool crtVariadic = f.Length == 6 && new[] { "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "sprintf_s", "_snprintf_s", "swprintf_s", "_snwprintf_s", "_scprintf", "_scwprintf" }.Contains(f[1])
+                && f[2] == "variadic" && f[3] == "i32" && f[4] == "int";
+            bool crtSprintf = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "sprintf" && f[2] == "variadic" && f[3] == "i32" && f[4] == "int"
+                && f[5] == "buffer:char*:str8:1|format:const char*:str8:1";
+            bool crtStrtod = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "strtod" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
+                && f[5] == "text:const char*:str8:1|end:char**:ptr:1";
+            bool crtDifftime = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "_difftime64" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
+                && f[5] == "end:__time64_t:u64:2|begin:__time64_t:u64:2";
+            bool crtRound = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "floor", "ceil", "fabs" }.Contains(f[1]) && f[2] == "cdecl"
+                && f[3] == "f64" && f[4] == "double" && f[5] == "value:double:f64:2";
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "_CIpow", "_CIlog10", "_CIlog" }.Contains(f[1])
+                && (f[2] != "cdecl" || f[3] != "void" || f[4] != "void" || f[5].Length != 0))
+                throw new InvalidDataException("CRT register-stack x87 intrinsic contract changed: " + row);
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "qsort"
+                && (f[2] != "cdecl" || f[3] != "void" || f[4] != "void"
+                    || f[5] != "base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1"))
+                throw new InvalidDataException("CRT guest comparator sort stack contract changed: " + row);
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "fputc", "putc" }.Contains(f[1])
+                && (f[2] != "cdecl" || f[3] != "i32" || f[4] != "int"
+                    || f[5] != "character:int:i32:1|stream:FILE*:ptr:1"))
+                throw new InvalidDataException("CRT byte stream output stack contract changed: " + row);
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "strpbrk", "strcspn", "strspn" }.Contains(f[1]))
+            {
+                bool pointer = f[1] == "strpbrk";
+                if (f[2] != "cdecl" || f[3] != (pointer ? "ptr" : "u32")
+                    || f[4] != (pointer ? "char*" : "size_t")
+                    || f[5] != "text:const char*:str8:1|set:const char*:str8:1")
+                    throw new InvalidDataException("CRT byte-set scan stack contract changed: " + row);
+            }
+            bool crtModf = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "modf" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
+                && f[5] == "value:double:f64:2|integer:double*:ptr:1";
+            bool crtLdexp = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "ldexp" && f[2] == "cdecl" && f[3] == "f64" && f[4] == "double"
+                && f[5] == "value:double:f64:2|exponent:int:i32:1";
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "ldexp" && !crtLdexp)
+                throw new InvalidDataException("CRT binary64 scaling stack contract changed: " + row);
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "modf" && !crtModf)
+                throw new InvalidDataException("CRT fractional split stack contract changed: " + row);
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "_beginthreadex", "_endthreadex" }.Contains(f[1]))
+            {
+                bool begin = f[1] == "_beginthreadex";
+                string parameters = begin
+                    ? "security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1"
+                    : "returnCode:unsigned int:u32:1";
+                if (f[2] != "cdecl" || f[3] != (begin ? "u32" : "void")
+                    || f[4] != (begin ? "uintptr_t" : "void") || f[5] != parameters)
+                    throw new InvalidDataException("CRT extended thread stack contract changed: " + row);
+            }
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1")
+                bool crtTime64Parameter = crtDifftime && p.Length == 4
+                    && p[1] == "__time64_t" && p[2] == "u64" && p[3] == "2";
+                bool crtRoundParameter = (crtRound || crtModf || crtLdexp) && p.Length == 4
+                    && p[1] == "double" && p[2] == "f64" && p[3] == "2";
+                if (p.Length != 4 || ((!new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1") && !crtTime64Parameter && !crtRoundParameter))
                     throw new InvalidDataException("Invalid supplemental x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];
@@ -243,11 +308,20 @@ public static class AbiMetadata
             var f = row.Split('\t');
             bool vcm = f.Length == 6 && f[0] == "msvfw32.dll" && new[] { "ICInstall", "ICRemove" }.Contains(f[1]) && f[3] == "i32";
             bool d3dx = f.Length == 6 && f[0] == "d3dx9_43.dll"
-                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixLookAtLH", "D3DXVec3Project" }.Contains(f[1])
-                && f[3] == "ptr" && f[4] == (f[1] == "D3DXVec3Project" ? "D3DXVECTOR3*" : "D3DXMATRIX*");
+                && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixPerspectiveFovLH", "D3DXVec4Transform", "D3DXVec3TransformCoord", "D3DXVec3Transform", "D3DXVec3CatmullRom" }.Contains(f[1])
+                && f[3] == "ptr" && f[4] == (f[1] switch { "D3DXVec3Project" or "D3DXVec3TransformCoord" or "D3DXVec3CatmullRom" => "D3DXVECTOR3*", "D3DXVec4Transform" or "D3DXVec3Transform" => "D3DXVECTOR4*", _ => "D3DXMATRIX*" });
+            bool d3dxScalars = d3dx && new[] { "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixPerspectiveFovLH", "D3DXVec3CatmullRom" }.Contains(f[1]);
             bool d3dxEffect = f.Length == 6 && f[0] == "d3dx9_43.dll"
                 && new[] { "D3DXCreateEffect", "D3DXGetShaderOutputSemantics" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "HRESULT";
+            bool d3dxStack = f.Length == 6 && f[0] == "d3dx9_43.dll" && f[1] == "D3DXCreateMatrixStack"
+                && f[3] == "i32" && f[4] == "HRESULT"
+                && f[5] == "Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1";
+            bool d3dxTexture = f.Length == 6 && f[0] == "d3dx9_43.dll" && f[3] == "i32" && f[4] == "HRESULT"
+                && (f[1] == "D3DXCreateTextureFromFileInMemoryEx"
+                    && f[5] == "pDevice:LPDIRECT3DDEVICE9:ptr:1|pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|Width:UINT:u32:1|Height:UINT:u32:1|MipLevels:UINT:u32:1|Usage:DWORD:u32:1|Format:D3DFORMAT:i32:1|Pool:D3DPOOL:i32:1|Filter:DWORD:u32:1|MipFilter:DWORD:u32:1|ColorKey:D3DCOLOR:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1|pPalette:PALETTEENTRY*:ptr:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1"
+                    || f[1] == "D3DXGetImageInfoFromFileInMemory"
+                    && f[5] == "pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1");
             // The old RTL export is absent from WinMD. Its BOOLEAN (AL) return
             // and RET 16 are verified by the Microsoft x86 wrapper and SDK
             // import library; the WithStatus documentation supplies its four
@@ -279,19 +353,35 @@ public static class AbiMetadata
             bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
-            if ((!vcm && !d3dx && !d3dxEffect && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
+            if ((!vcm && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
-                int expected = f[1] switch { "D3DXMatrixMultiply" => 3, "D3DXMatrixTranspose" => 2, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" => 6, _ => 0 };
+                int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };
                 if (f[5].Split('|', StringSplitOptions.RemoveEmptyEntries).Length != expected)
                     throw new InvalidDataException("D3DX x86 stack contract changed: " + row);
+                string scalarDeclaration = f[1] switch {
+                    "D3DXMatrixScaling" => "pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1",
+                    "D3DXMatrixTranslation" => "pOut:D3DXMATRIX*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1",
+                    "D3DXMatrixRotationYawPitchRoll" => "pOut:D3DXMATRIX*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1",
+                    "D3DXMatrixRotationY" => "pOut:D3DXMATRIX*:ptr:1|Angle:FLOAT:f32:1",
+                    "D3DXMatrixPerspectiveFovLH" => "pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1",
+                    "D3DXVec3CatmullRom" => "pOut:D3DXVECTOR3*:ptr:1|pV0:const D3DXVECTOR3*:ptr:1|pV1:const D3DXVECTOR3*:ptr:1|pV2:const D3DXVECTOR3*:ptr:1|pV3:const D3DXVECTOR3*:ptr:1|s:FLOAT:f32:1",
+                    _ => null
+                };
+                if (d3dxScalars && f[5] != scalarDeclaration)
+                    throw new InvalidDataException("D3DX scalar matrix declaration changed: " + row);
+                if (f[1] == "D3DXVec4Transform" && f[5] != "pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1")
+                    throw new InvalidDataException("D3DX vector4 declaration changed: " + row);
+                if (f[1] == "D3DXVec3TransformCoord" && f[5] != "pOut:D3DXVECTOR3*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1"
+                    || f[1] == "D3DXVec3Transform" && f[5] != "pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1")
+                    throw new InvalidDataException("D3DX vector3 declaration changed: " + row);
             }
             if (d3dxEffect && f[5].Split('|').Length != (f[1] == "D3DXCreateEffect" ? 9 : 3))
                 throw new InvalidDataException("D3DX Effect x86 stack contract changed: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? p[2] == "ptr" : d3dxEffect ? new[] { "ptr", "u32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect || d3dxStack ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dxTexture ? new[] { "ptr", "u32", "i32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];
@@ -346,7 +436,7 @@ public static class AbiMetadata
         File.WriteAllText(Path.Combine(output, "structs.rs"), structs.ToString(), new UTF8Encoding(false));
 
         var com = new List<string> { "# Generated x86 COM vtable signatures: interface\tslot\tmethod\treturn kind\treturn type\tparameters (including this)" };
-        foreach (string name in new[] { "IDirectDraw", "IDirectDraw7", "IDirectDrawClipper", "IDirectDrawSurface", "IDirectDrawSurface7", "IDirectSound", "IDirectSound8", "IDirectSoundBuffer", "IDirectSoundBuffer8", "IDirectSoundNotify", "IDirectInput8A", "IDirectInput8W", "IDirect3D9", "IDirect3DDevice9", "IDirect3DResource9", "IDirect3DBaseTexture9", "IDirect3DTexture9", "IDirect3DSurface9", "IDirect3DVertexBuffer9", "IDirect3DIndexBuffer9", "IDirect3DSwapChain9", "IDirect3DStateBlock9", "IDirect3DVertexDeclaration9", "IDirect3DVertexShader9", "IDirect3DPixelShader9", "IDirect3DQuery9", "IGraphBuilder", "IFilterGraph", "IFilterGraph2", "IMediaControl", "IMediaEvent", "IMediaEventEx", "IMediaEventSink", "IMediaSeeking", "IMediaPosition", "IMediaFilter", "IBasicAudio", "IBasicVideo", "IVideoWindow", "IBaseFilter", "IEnumFilters", "IEnumPins", "IPin", "IEnumMediaTypes", "IMemInputPin", "IMemAllocator", "IMediaSample", "IAsyncReader", "IReferenceClock", "IFileSourceFilter" })
+        foreach (string name in new[] { "IDirectDraw", "IDirectDraw7", "IDirectDrawClipper", "IDirectDrawSurface", "IDirectDrawSurface7", "IDirectSound", "IDirectSound8", "IDirectSoundBuffer", "IDirectSoundBuffer8", "IDirectSoundNotify", "IDirectInput8A", "IDirectInput8W", "IDirect3D9", "IDirect3DDevice9", "IDirect3DResource9", "IDirect3DBaseTexture9", "IDirect3DTexture9", "IDirect3DSurface9", "IDirect3DVertexBuffer9", "IDirect3DIndexBuffer9", "IDirect3DSwapChain9", "IDirect3DStateBlock9", "IDirect3DVertexDeclaration9", "IDirect3DVertexShader9", "IDirect3DPixelShader9", "IDirect3DQuery9", "IGraphBuilder", "IFilterGraph", "IFilterGraph2", "IMediaControl", "IMediaEvent", "IMediaEventEx", "IMediaEventSink", "IMediaSeeking", "IMediaPosition", "IMediaFilter", "IBasicAudio", "IBasicVideo", "IVideoWindow", "IBaseFilter", "IEnumFilters", "IEnumPins", "IPin", "IEnumMediaTypes", "IMemInputPin", "IMemAllocator", "IMediaSample", "IAsyncReader", "IReferenceClock", "IFileSourceFilter", "ITfThreadMgr", "ITfDocumentMgr", "ITfContext" })
         {
             int slot = 0;
             foreach (var mh in ComMethods(r, types, types.Find(name)))
@@ -359,7 +449,7 @@ public static class AbiMetadata
         if (sdkSupplement != null)
         {
             var seen = new HashSet<string>(com.Skip(1).Select(row => string.Join('\t', row.Split('\t').Take(2))));
-            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0 };
+            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0, ["ID3DXMatrixStack"] = 0 };
             foreach (var row in File.ReadLines(Path.Combine(Path.GetDirectoryName(sdkSupplement), "sdk-com-input.tsv"))
                 .Where(line => line.Length != 0 && !line.StartsWith('#')))
             {
@@ -370,7 +460,7 @@ public static class AbiMetadata
                 foreach (var parameter in f[5].Split('|'))
                 {
                     var p = parameter.Split(':');
-                    if (p.Length != 4 || !(f[0] == "ID3DXEffect" ? new[] { "ptr", "u32", "i32", "f32", "str8" }.Contains(p[2]) : new[] { "ptr", "u32", "str16" }.Contains(p[2])) || p[3] != "1")
+                    if (p.Length != 4 || !(f[0] == "ID3DXEffect" ? new[] { "ptr", "u32", "i32", "f32", "str8" }.Contains(p[2]) : f[0] == "ID3DXMatrixStack" ? new[] { "ptr", "f32" }.Contains(p[2]) : new[] { "ptr", "u32", "str16" }.Contains(p[2])) || p[3] != "1")
                         throw new InvalidDataException("Invalid SDK COM parameter: " + parameter);
                 }
                 if (!seen.Add(f[0] + "\t" + f[1]))
@@ -382,6 +472,8 @@ public static class AbiMetadata
                 throw new InvalidDataException("Incomplete SDK DxDiag vtable declarations");
             if (counts["ID3DXEffect"] != 79)
                 throw new InvalidDataException("Incomplete SDK ID3DXEffect vtable declarations");
+            if (counts["ID3DXMatrixStack"] != 18)
+                throw new InvalidDataException("Incomplete SDK ID3DXMatrixStack vtable declarations");
         }
         File.WriteAllLines(Path.Combine(output, "com.tsv"), com, new UTF8Encoding(false));
         var constants = new SortedSet<string>(StringComparer.Ordinal);

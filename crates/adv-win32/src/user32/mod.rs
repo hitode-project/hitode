@@ -9,14 +9,17 @@ pub mod controls;
 pub mod dialog;
 pub mod display;
 mod enumeration;
+mod encoding;
 mod formatting;
 pub(crate) mod hooks;
 pub mod host_input;
 mod input;
+pub(crate) mod image;
 pub mod menu;
 pub mod message;
 mod monitor;
 mod placement;
+mod rectangle;
 mod resources;
 mod scroll;
 mod station;
@@ -24,9 +27,10 @@ pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
 mod tab;
+pub(crate) mod update;
 pub mod window;
 
-use adv_abi::{Conv, Registry};
+use adv_abi::{Conv, Handle as AbiHandle, Registry, WideStr, win32};
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
@@ -422,7 +426,13 @@ fn load_user_object(env: &mut Env<'_>, kind: &str, inst: u32, name: u32) -> Outc
         if name >= 0x1_0000 {
             return Outcome::Return(0);
         }
-        return stock_object(env, window::SYSTEM_OBJECT_BASE + (name & 0xfff) * 4);
+        // One USER owner, with separate fixed stock identity ranges. Preserve
+        // the existing cursor values (also used by cursor_handle defaults).
+        let kind_offset = if kind == "icon" { 0x4000 } else { 0 };
+        return stock_object(
+            env,
+            window::SYSTEM_OBJECT_BASE + kind_offset + (name & 0xfff) * 4,
+        );
     }
     let id = crate::kernel32::res_id(crate::kernel32::int_or_str(env, name, false));
     let key = format!("{kind} {inst:#x} {id:?}");
@@ -475,7 +485,12 @@ fn stock_object(env: &mut Env<'_>, handle: u32) -> Outcome {
 
 fn load_cursor_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name) = (env.arg(0), env.arg(1));
-    load_user_object(env, "cursor", inst, name)
+    Outcome::Return(image::load_cursor(env, inst, name, false).0)
+}
+
+#[win32(user32, name = "LoadCursorW", level = implement)]
+fn load_cursor_w(env: &mut Env<'_>, instance: AbiHandle, name: WideStr) -> AbiHandle {
+    image::load_cursor(env, instance.0, name.0.addr(), true)
 }
 
 fn load_cursor_from_file_a(env: &mut Env<'_>) -> Outcome {
@@ -485,23 +500,6 @@ fn load_cursor_from_file_a(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     stock_object(env, window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
-}
-
-fn load_icon_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name) = (env.arg(0), env.arg(1));
-    load_user_object(env, "icon", inst, name)
-}
-
-fn load_image_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name, ty) = (env.arg(0), env.arg(1), env.arg(2));
-    match ty {
-        1 => load_user_object(env, "icon", inst, name),
-        2 => load_user_object(env, "cursor", inst, name),
-        _ => {
-            log::warn!("LoadImageA type {ty}: bitmaps not supported yet");
-            Outcome::Return(0)
-        }
-    }
 }
 
 fn create_icon_indirect(env: &mut Env<'_>) -> Outcome {
@@ -659,6 +657,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    update::register(reg);
     formatting::register(reg);
     hooks::register(reg);
     monitor::register(reg);
@@ -667,7 +666,9 @@ pub fn register(reg: &mut Registry) {
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
+    encoding::register(reg);
     placement::register(reg);
+    rectangle::register(reg);
     message::register(reg);
     controls::register(reg);
     dialog::register(reg);
@@ -676,6 +677,7 @@ pub fn register(reg: &mut Registry) {
     enumeration::register(reg);
     menu::register(reg);
     input::register(reg);
+    image::register(reg);
     clipboard::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "MessageBoxA", 4, message_box_a);
@@ -714,10 +716,9 @@ pub fn register(reg: &mut Registry) {
     s(reg, "EnumDisplaySettingsW", 3, enum_display_settings);
     s(reg, "WINNLSEnableIME", 2, |_| Outcome::Return(1));
     s(reg, "LoadCursorA", 2, load_cursor_a);
+    reg.register(load_cursor_w_ABI);
     s(reg, "LoadCursorFromFileA", 1, load_cursor_from_file_a);
     s(reg, "LoadCursorFromFileW", 1, load_cursor_from_file_a);
-    s(reg, "LoadIconA", 2, load_icon_a);
-    s(reg, "LoadImageA", 6, load_image_a);
     s(reg, "CreateIconIndirect", 1, create_icon_indirect);
     s(reg, "DestroyIcon", 1, destroy_user_object);
     s(reg, "DestroyCursor", 1, destroy_user_object);

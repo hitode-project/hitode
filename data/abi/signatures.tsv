@@ -633,9 +633,18 @@ api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	exit	cdecl	void	void	status:i32:i32:1
+api-ms-win-crt-stdio-l1-1-0.dll	_wfopen_s	cdecl	i32	errno_t	output:FILE**:ptr:1|filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+api-ms-win-crt-stdio-l1-1-0.dll	fclose	cdecl	i32	int	stream:FILE*:ptr:1
+api-ms-win-crt-stdio-l1-1-0.dll	fread	cdecl	u32	size_t	buffer:void*:ptr:1|size:size_t:u32:1|count:size_t:u32:1|stream:FILE*:ptr:1
+api-ms-win-crt-stdio-l1-1-0.dll	fseek	cdecl	i32	int	stream:FILE*:ptr:1|offset:long:i32:1|origin:int:i32:1
+api-ms-win-crt-stdio-l1-1-0.dll	ftell	cdecl	i32	long	stream:FILE*:ptr:1
+api-ms-win-crt-string-l1-1-0.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 api-ms-win-crt-string-l1-1-0.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 api-ms-win-crt-string-l1-1-0.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+api-ms-win-crt-string-l1-1-0.dll	strcpy_s	cdecl	i32	errno_t	output:char*:ptr:1|capacity:rsize_t:u32:1|source:const char*:str8:1
+api-ms-win-crt-string-l1-1-0.dll	strncpy_s	cdecl	i32	errno_t	output:char*:ptr:1|capacity:rsize_t:u32:1|source:const char*:str8:1|count:rsize_t:u32:1
 api-ms-win-crt-string-l1-1-0.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
+api-ms-win-crt-string-l1-1-0.dll	wcscpy_s	cdecl	i32	errno_t	output:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
 avifil32.dll	AVIBuildFilterA	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PSTR:str8:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIBuildFilterW	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpszFilter:Windows.Win32.Foundation.PWSTR:str16:1|cbFilter:i32:i32:1|fSaving:Windows.Win32.Foundation.BOOL:i32:1
 avifil32.dll	AVIClearClipboard	stdcall	i32	Windows.Win32.Foundation.HRESULT	
@@ -862,11 +871,23 @@ d3d9.dll	Direct3DCreate9Ex	stdcall	i32	Windows.Win32.Foundation.HRESULT	SDKVersi
 d3d9.dll	Direct3DCreate9On12	stdcall	ptr	Windows.Win32.Graphics.Direct3D9.IDirect3D9	SDKVersion:u32:u32:1|pOverrideList:Windows.Win32.Graphics.Direct3D9on12.D3D9ON12_ARGS*:ptr:1|NumOverrideEntries:u32:u32:1
 d3d9.dll	Direct3DCreate9On12Ex	stdcall	i32	Windows.Win32.Foundation.HRESULT	SDKVersion:u32:u32:1|pOverrideList:Windows.Win32.Graphics.Direct3D9on12.D3D9ON12_ARGS*:ptr:1|NumOverrideEntries:u32:u32:1|ppOutputInterface:Windows.Win32.Graphics.Direct3D9.IDirect3D9Ex*:ptr:1
 d3dx9_43.dll	D3DXCreateEffect	stdcall	i32	HRESULT	pDevice:IDirect3DDevice9*:ptr:1|pSrcData:void*:ptr:1|SrcDataLen:UINT:u32:1|pDefines:D3DXMACRO*:ptr:1|pInclude:ID3DXInclude*:ptr:1|Flags:DWORD:u32:1|pPool:ID3DXEffectPool*:ptr:1|ppEffect:ID3DXEffect**:ptr:1|ppCompilationErrors:ID3DXBuffer**:ptr:1
+d3dx9_43.dll	D3DXCreateMatrixStack	stdcall	i32	HRESULT	Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1
+d3dx9_43.dll	D3DXCreateTextureFromFileInMemoryEx	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|Width:UINT:u32:1|Height:UINT:u32:1|MipLevels:UINT:u32:1|Usage:DWORD:u32:1|Format:D3DFORMAT:i32:1|Pool:D3DPOOL:i32:1|Filter:DWORD:u32:1|MipFilter:DWORD:u32:1|ColorKey:D3DCOLOR:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1|pPalette:PALETTEENTRY*:ptr:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1
+d3dx9_43.dll	D3DXGetImageInfoFromFileInMemory	stdcall	i32	HRESULT	pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1
 d3dx9_43.dll	D3DXGetShaderOutputSemantics	stdcall	i32	HRESULT	pFunction:DWORD*:ptr:1|pSemantics:D3DXSEMANTIC*:ptr:1|pCount:UINT*:ptr:1
 d3dx9_43.dll	D3DXMatrixLookAtLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pEye:D3DXVECTOR3*:ptr:1|pAt:D3DXVECTOR3*:ptr:1|pUp:D3DXVECTOR3*:ptr:1
 d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXMatrixPerspectiveFovLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixRotationY	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|Angle:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixRotationYawPitchRoll	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixScaling	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1
+d3dx9_43.dll	D3DXMatrixTranslation	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
 d3dx9_43.dll	D3DXMatrixTranspose	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXVec3CatmullRom	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV0:const D3DXVECTOR3*:ptr:1|pV1:const D3DXVECTOR3*:ptr:1|pV2:const D3DXVECTOR3*:ptr:1|pV3:const D3DXVECTOR3*:ptr:1|s:FLOAT:f32:1
 d3dx9_43.dll	D3DXVec3Project	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV:D3DXVECTOR3*:ptr:1|pViewport:Windows.Win32.Graphics.Direct3D9.D3DVIEWPORT9*:ptr:1|pProjection:D3DXMATRIX*:ptr:1|pView:D3DXMATRIX*:ptr:1|pWorld:D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXVec3Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXVec3TransformCoord	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+d3dx9_43.dll	D3DXVec4Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 ddraw.dll	DirectDrawCreate	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGUID:System.Guid*:ptr:1|lplpDD:Windows.Win32.Graphics.DirectDraw.IDirectDraw*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateClipper	stdcall	i32	Windows.Win32.Foundation.HRESULT	dwFlags:u32:u32:1|lplpDDClipper:Windows.Win32.Graphics.DirectDraw.IDirectDrawClipper*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
 ddraw.dll	DirectDrawCreateEx	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpGuid:System.Guid*:ptr:1|lplpDD:void**:ptr:1|iid:System.Guid*:ptr:1|pUnkOuter:Windows.Win32.System.Com.IUnknown:ptr:1
@@ -3463,67 +3484,257 @@ msacm32.dll	acmStreamSize	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTRE
 msacm32.dll	acmStreamUnprepareHeader	stdcall	u32	u32	has:Windows.Win32.Media.Audio.HACMSTREAM:handle:1|pash:Windows.Win32.Media.Audio.ACMSTREAMHEADER*:ptr:1|fdwUnprepare:u32:u32:1
 msvcr80.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr80.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr80.dll	_CIcos	cdecl	void	void	
+msvcr80.dll	_CIlog	cdecl	void	void	
+msvcr80.dll	_CIlog10	cdecl	void	void	
+msvcr80.dll	_CIpow	cdecl	void	void	
+msvcr80.dll	_CIsin	cdecl	void	void	
+msvcr80.dll	_CIsqrt	cdecl	void	void	
+msvcr80.dll	_CItan	cdecl	void	void	
 msvcr80.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr80.dll	_acmdln	data	ptr	char*	
+msvcr80.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr80.dll	_cexit	cdecl	void	void	
 msvcr80.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
+msvcr80.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcr80.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr80.dll	_errno	cdecl	ptr	i32*	
 msvcr80.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcr80.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcr80.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+msvcr80.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr80.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr80.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr80.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
+msvcr80.dll	_scprintf	variadic	i32	int	format:const char*:str8:1
+msvcr80.dll	_scwprintf	variadic	i32	int	format:const wchar_t*:str16:1
 msvcr80.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr80.dll	_snprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1
+msvcr80.dll	_snwprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr80.dll	_splitpath_s	cdecl	i32	errno_t	fullPath:const char*:str8:1|drive:char*:str8:1|driveNumberOfElements:size_t:u32:1|dir:char*:str8:1|dirNumberOfElements:size_t:u32:1|fname:char*:str8:1|nameNumberOfElements:size_t:u32:1|ext:char*:str8:1|extNumberOfElements:size_t:u32:1
+msvcr80.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
+msvcr80.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr80.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr80.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr80.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr80.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr80.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
+msvcr80.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr80.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcr80.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	fabs	cdecl	f64	double	value:double:f64:2
+msvcr80.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
+msvcr80.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcr80.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr80.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
+msvcr80.dll	isalnum	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isalpha	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	iscntrl	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isdigit	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isgraph	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	islower	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isprint	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	ispunct	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isspace	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isupper	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
+msvcr80.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcr80.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcr80.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr80.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcr80.dll	rand	cdecl	i32	int	
+msvcr80.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcr80.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
+msvcr80.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
+msvcr80.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcr80.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr80.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr80.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr80.dll	strtod	cdecl	f64	double	text:const char*:str8:1|end:char**:ptr:1
+msvcr80.dll	swprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr80.dll	tolower	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	toupper	cdecl	i32	int	character:int:i32:1
+msvcr80.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr80.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcr90.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcr90.dll	_CIcos	cdecl	void	void	
+msvcr90.dll	_CIlog	cdecl	void	void	
+msvcr90.dll	_CIlog10	cdecl	void	void	
+msvcr90.dll	_CIpow	cdecl	void	void	
+msvcr90.dll	_CIsin	cdecl	void	void	
+msvcr90.dll	_CIsqrt	cdecl	void	void	
+msvcr90.dll	_CItan	cdecl	void	void	
 msvcr90.dll	___lc_codepage_func	cdecl	u32	unsigned int	
 msvcr90.dll	___lc_handle_func	cdecl	ptr	LCID*	
 msvcr90.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr90.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	__pctype_func	cdecl	ptr	const unsigned short*	
+msvcr90.dll	__uncaught_exception	cdecl	u32	bool	
 msvcr90.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	_acmdln	data	ptr	char*	
+msvcr90.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr90.dll	_calloc_crt	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr90.dll	_cexit	cdecl	void	void	
 msvcr90.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
+msvcr90.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcr90.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr90.dll	_errno	cdecl	ptr	i32*	
 msvcr90.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcr90.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcr90.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
 msvcr90.dll	_get_invalid_parameter_handler	cdecl	ptr	callback	
+msvcr90.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr90.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcr90.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcr90.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
+msvcr90.dll	_scprintf	variadic	i32	int	format:const char*:str8:1
+msvcr90.dll	_scwprintf	variadic	i32	int	format:const wchar_t*:str16:1
 msvcr90.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+msvcr90.dll	_snprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1
+msvcr90.dll	_snwprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr90.dll	_splitpath_s	cdecl	i32	errno_t	fullPath:const char*:str8:1|drive:char*:str8:1|driveNumberOfElements:size_t:u32:1|dir:char*:str8:1|dirNumberOfElements:size_t:u32:1|fname:char*:str8:1|nameNumberOfElements:size_t:u32:1|ext:char*:str8:1|extNumberOfElements:size_t:u32:1
+msvcr90.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
+msvcr90.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
+msvcr90.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	_vsnwprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	_wcmdln	data	ptr	wchar_t*	
+msvcr90.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr90.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcr90.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
+msvcr90.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr90.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcr90.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr90.dll	fabs	cdecl	f64	double	value:double:f64:2
+msvcr90.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
+msvcr90.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcr90.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr90.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
+msvcr90.dll	isalnum	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isalpha	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	iscntrl	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isdigit	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isgraph	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	islower	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isprint	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	ispunct	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isspace	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isupper	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
+msvcr90.dll	localeconv	cdecl	ptr	struct lconv*	
+msvcr90.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcr90.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcr90.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr90.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcr90.dll	rand	cdecl	i32	int	
 msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcr90.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
+msvcr90.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
+msvcr90.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcr90.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr90.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcr90.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcr90.dll	strtod	cdecl	f64	double	text:const char*:str8:1|end:char**:ptr:1
+msvcr90.dll	swprintf_s	variadic	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1
+msvcr90.dll	tolower	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	toupper	cdecl	i32	int	character:int:i32:1
+msvcr90.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	vsprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
+msvcr90.dll	vswprintf_s	cdecl	i32	int	buffer:wchar_t*:str16:1|capacity:size_t:u32:1|format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcrt.dll	??2@YAPAXI@Z	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt.dll	??3@YAXPAX@Z	cdecl	void	void	block:void*:ptr:1
+msvcrt.dll	_CIcos	cdecl	void	void	
+msvcrt.dll	_CIlog	cdecl	void	void	
+msvcrt.dll	_CIlog10	cdecl	void	void	
+msvcrt.dll	_CIpow	cdecl	void	void	
+msvcrt.dll	_CIsin	cdecl	void	void	
+msvcrt.dll	_CIsqrt	cdecl	void	void	
+msvcrt.dll	_CItan	cdecl	void	void	
 msvcrt.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	_acmdln	data	ptr	char*	
 msvcrt.dll	_adjust_fdiv	data	i32	int	
+msvcrt.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcrt.dll	_cexit	cdecl	void	void	
 msvcrt.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcrt.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcrt.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
+msvcrt.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcrt.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcrt.dll	_errno	cdecl	ptr	i32*	
 msvcrt.dll	_exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	_findclose	cdecl	i32	int	handle:intptr_t:i32:1
+msvcrt.dll	_fsopen	cdecl	ptr	FILE*	filename:const char*:str8:1|mode:const char*:str8:1|share:int:i32:1
+msvcrt.dll	_gmtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcrt.dll	_localtime64	cdecl	ptr	struct tm*	input:const __time64_t*:ptr:1
+msvcrt.dll	_mkdir	cdecl	i32	int	path:const char*:str8:1
 msvcrt.dll	_onexit	cdecl	ptr	_onexit_t	function:_onexit_t:ptr:1
+msvcrt.dll	_splitpath_s	cdecl	i32	errno_t	fullPath:const char*:str8:1|drive:char*:str8:1|driveNumberOfElements:size_t:u32:1|dir:char*:str8:1|dirNumberOfElements:size_t:u32:1|fname:char*:str8:1|nameNumberOfElements:size_t:u32:1|ext:char*:str8:1|extNumberOfElements:size_t:u32:1
+msvcrt.dll	_time64	cdecl	u64	__time64_t	output:__time64_t*:ptr:1
 msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
+msvcrt.dll	_wfindfirst64i32	cdecl	i32	intptr_t	pattern:const wchar_t*:str16:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcrt.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfinddata64i32_t*:ptr:1
+msvcrt.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
+msvcrt.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcrt.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	fabs	cdecl	f64	double	value:double:f64:2
+msvcrt.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
+msvcrt.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcrt.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcrt.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
+msvcrt.dll	isalnum	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isalpha	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	iscntrl	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isdigit	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isgraph	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	islower	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isprint	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	ispunct	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isspace	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isupper	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	isxdigit	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	ldexp	cdecl	f64	double	value:double:f64:2|exponent:int:i32:1
+msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+msvcrt.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcrt.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcrt.dll	rand	cdecl	i32	int	
+msvcrt.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcrt.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
+msvcrt.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
+msvcrt.dll	strcspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt.dll	strpbrk	cdecl	ptr	char*	text:const char*:str8:1|set:const char*:str8:1
+msvcrt.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8:1
+msvcrt.dll	strtod	cdecl	f64	double	text:const char*:str8:1|end:char**:ptr:1
+msvcrt.dll	tolower	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	toupper	cdecl	i32	int	character:int:i32:1
+msvcrt.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|arguments:va_list:ptr:1
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
 ntdll.dll	RtlDosPathNameToNtPathName_U	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1
@@ -5237,14 +5448,23 @@ ucrtbase.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
 ucrtbase.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
 ucrtbase.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
 ucrtbase.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	_wfopen_s	cdecl	i32	errno_t	output:FILE**:ptr:1|filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
 ucrtbase.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 ucrtbase.dll	exit	cdecl	void	void	status:i32:i32:1
+ucrtbase.dll	fclose	cdecl	i32	int	stream:FILE*:ptr:1
+ucrtbase.dll	fread	cdecl	u32	size_t	buffer:void*:ptr:1|size:size_t:u32:1|count:size_t:u32:1|stream:FILE*:ptr:1
 ucrtbase.dll	free	cdecl	void	void	block:void*:ptr:1
+ucrtbase.dll	fseek	cdecl	i32	int	stream:FILE*:ptr:1|offset:long:i32:1|origin:int:i32:1
+ucrtbase.dll	ftell	cdecl	i32	long	stream:FILE*:ptr:1
 ucrtbase.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+ucrtbase.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 ucrtbase.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
+ucrtbase.dll	strcpy_s	cdecl	i32	errno_t	output:char*:ptr:1|capacity:rsize_t:u32:1|source:const char*:str8:1
+ucrtbase.dll	strncpy_s	cdecl	i32	errno_t	output:char*:ptr:1|capacity:rsize_t:u32:1|source:const char*:str8:1|count:rsize_t:u32:1
 ucrtbase.dll	wcscat_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
+ucrtbase.dll	wcscpy_s	cdecl	i32	errno_t	output:wchar_t*:ptr:1|capacity:rsize_t:u32:1|source:const wchar_t*:str16:1
 ucrtbase.dll	wcstoull	cdecl	u64	u64	text:wchar_t*:str16:1|end:wchar_t**:ptr:1|base:i32:i32:1
 user32.dll	ActivateKeyboardLayout	stdcall	handle	Windows.Win32.UI.Input.KeyboardAndMouse.HKL	hkl:Windows.Win32.UI.Input.KeyboardAndMouse.HKL:handle:1|Flags:Windows.Win32.UI.Input.KeyboardAndMouse.ACTIVATE_KEYBOARD_LAYOUT_FLAGS:u32:1
 user32.dll	AddClipboardFormatListener	stdcall	i32	Windows.Win32.Foundation.BOOL	hwnd:Windows.Win32.Foundation.HWND:handle:1
@@ -6008,6 +6228,14 @@ user32.dll	wsprintfA	variadic	i32	i32	param0:Windows.Win32.Foundation.PSTR:str8:
 user32.dll	wsprintfW	variadic	i32	i32	param0:Windows.Win32.Foundation.PWSTR:str16:1|param1:Windows.Win32.Foundation.PWSTR:str16:1
 user32.dll	wvsprintfA	stdcall	i32	i32	param0:Windows.Win32.Foundation.PSTR:str8:1|param1:Windows.Win32.Foundation.PSTR:str8:1|arglist:i8*:ptr:1
 user32.dll	wvsprintfW	stdcall	i32	i32	param0:Windows.Win32.Foundation.PWSTR:str16:1|param1:Windows.Win32.Foundation.PWSTR:str16:1|arglist:i8*:ptr:1
+uxtheme.dll	IsAppThemed	stdcall	i32	Windows.Win32.Foundation.BOOL	
+uxtheme.dll	IsThemeActive	stdcall	i32	Windows.Win32.Foundation.BOOL	
+vcruntime140.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+vcruntime140.dll	memcpy	cdecl	ptr	void*	destination:void*:ptr:1|source:const void*:ptr:1|count:size_t:u32:1
+vcruntime140.dll	memmove	cdecl	ptr	void*	destination:void*:ptr:1|source:const void*:ptr:1|count:size_t:u32:1
+vcruntime140.dll	memset	cdecl	ptr	void*	destination:void*:ptr:1|value:int:i32:1|count:size_t:u32:1
+vcruntime140.dll	strrchr	cdecl	ptr	char*	source:const char*:str8:1|value:int:i32:1
+vcruntime140.dll	wcsrchr	cdecl	ptr	wchar_t*	source:const wchar_t*:str16:1|value:wchar_t:u32:1
 version.dll	GetFileVersionInfoA	stdcall	i32	Windows.Win32.Foundation.BOOL	lptstrFilename:Windows.Win32.Foundation.PSTR:str8:1|dwHandle:u32:u32:1|dwLen:u32:u32:1|lpData:void*:ptr:1
 version.dll	GetFileVersionInfoExA	stdcall	i32	Windows.Win32.Foundation.BOOL	dwFlags:Windows.Win32.Storage.FileSystem.GET_FILE_VERSION_INFO_FLAGS:u32:1|lpwstrFilename:Windows.Win32.Foundation.PSTR:str8:1|dwHandle:u32:u32:1|dwLen:u32:u32:1|lpData:void*:ptr:1
 version.dll	GetFileVersionInfoExW	stdcall	i32	Windows.Win32.Foundation.BOOL	dwFlags:Windows.Win32.Storage.FileSystem.GET_FILE_VERSION_INFO_FLAGS:u32:1|lpwstrFilename:Windows.Win32.Foundation.PWSTR:str16:1|dwHandle:u32:u32:1|dwLen:u32:u32:1|lpData:void*:ptr:1

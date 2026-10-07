@@ -123,7 +123,16 @@ pub struct ThunkTable {
 
 fn unimplemented(env: &mut Env<'_>) -> Outcome {
     let t = env.sys.thunks.get(env.thunk);
-    Outcome::Fail(format!("unimplemented: {}!{}", t.module, t.name))
+    let api = format!("{}!{}", t.module, t.name);
+    let caller = env.caller();
+    let reason = "host implementation is unavailable (machine thunk fallback)";
+    // This fallback terminates the run, so one stderr/trace record needs no
+    // additional diagnostic owner or ABI-layer dependency.
+    eprintln!("warning: {api}: {reason} (guest caller {caller:#010x})");
+    env.sys
+        .trace
+        .warning(env.context, env.sys.frame, caller, &api, reason, None);
+    Outcome::Fail(format!("unimplemented: {api}"))
 }
 
 fn return_pad(_: &mut Env<'_>) -> Outcome {

@@ -10,6 +10,7 @@ description = "Execution layer: x86-32 interpreter, hot-region JIT and the guest
 [dependencies]
 adv-sync = { path = "../adv-sync" }
 libc = "0.2"
+log.workspace = true
 thiserror.workspace = true
 cranelift-codegen = "0.125"
 cranelift-frontend = "0.125"

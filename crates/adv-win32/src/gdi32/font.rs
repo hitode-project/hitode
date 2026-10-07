@@ -16,6 +16,9 @@ mod rectangle;
 mod paint;
 mod resource;
 mod widths;
+mod charset;
+mod logical;
+mod kerning;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
@@ -26,7 +29,7 @@ const GDI_ERROR: u32 = u32::MAX;
 #[derive(Default)]
 struct Fonts {
     text: Text,
-    resources: std::collections::BTreeMap<String, resource::Reference>,
+    resources: std::collections::BTreeMap<(String, u32), resource::Reference>,
 }
 
 pub fn register(registry: &mut Registry) {
@@ -36,10 +39,14 @@ pub fn register(registry: &mut Registry) {
     enumeration::register(registry);
     rectangle::register(registry);
     widths::register(registry);
+    charset::register(registry);
+    logical::register(registry);
+    kerning::register(registry);
     for api in [
         glyph_a_ABI,
         glyph_w_ABI,
         metrics_a_ABI,
+        metrics_w_ABI,
         outline_metrics_a_ABI,
         set_map_mode_ABI,
         get_map_mode_ABI,
@@ -300,6 +307,57 @@ fn metrics_a(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> Outcome {
         _ => {
             set_last_error(env, 87);
             Outcome::Return(0)
+        }
+    }
+}
+
+#[win32(gdi32, name = "GetTextMetricsW", level = implement)]
+fn metrics_w(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> i32 {
+    // Authored native memory-DC oracle: NULL HDC or NULL output returns FALSE
+    // without changing LastError or publishing any metrics.
+    if dc.0 == 0 {
+        return 0;
+    }
+    if reject_dc(env, dc.0) {
+        return 0;
+    }
+    if output.is_null() {
+        return 0;
+    }
+    // Preflight all 60 SDK bytes before realizing a font or publishing data.
+    // Non-NULL inaccessible guest output follows this GDI personality's
+    // checked failure contract; it does not claim native AV equivalence.
+    if adv_abi::guest::check_range(env.cpu, output.addr(), 60, adv_cpu::backend::Prot::WRITE)
+        .is_err()
+    {
+        set_last_error(env, 87);
+        return 0;
+    }
+    let request = font_request(env, dc.0);
+    match env.ext.get_mut::<Fonts>().text.unicode_metrics(&request) {
+        Ok((metrics, characters)) => {
+            let common = pack_metrics(&metrics);
+            let mut bytes = [0; 60];
+            bytes[..44].copy_from_slice(&common[..44]);
+            for (index, character) in characters.into_iter().enumerate() {
+                bytes[44 + index * 2..46 + index * 2]
+                    .copy_from_slice(&character.to_le_bytes());
+            }
+            bytes[52..57].copy_from_slice(&common[48..53]);
+            if env.cpu.write(output.addr(), &bytes).is_err() {
+                set_last_error(env, 87);
+                return 0;
+            }
+            1
+        }
+        Err(error) => {
+            adv_abi::warn_unavailable(
+                env,
+                "gdi32.dll!GetTextMetricsW",
+                &format!("selected font Unicode metrics unavailable: {error}"),
+            );
+            set_last_error(env, 50);
+            0
         }
     }
 }

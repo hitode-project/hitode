@@ -4,26 +4,70 @@ use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
+mod byte_set;
+mod byte_sort;
+mod byte_output;
 mod convert;
 mod cpp_alloc;
 mod data;
+mod directory;
+mod exceptions;
+mod find;
+mod formatting;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
+mod intrinsic_math;
 mod locale;
+mod memory_ops;
+mod modern_stdio;
+mod modern_string;
 mod onexit;
+mod path;
+mod random;
+mod scan;
+mod scalar_float;
+mod scalar_log;
+mod scalar_power;
+mod scalar_round;
+mod scalar_scale;
+mod scalar_split;
 mod secure_memory;
+mod shared_file;
 mod startup;
+mod stream_position;
+mod thread;
+mod time64;
 mod wide_string;
 
 #[derive(Default)]
 struct CrtState {
     errno: HashMap<(String, u32), u32>,
+    tm_buffers: HashMap<(String, u32), u32>,
+    random_seeds: HashMap<(String, u32), u32>,
     locks: HashMap<(String, u32), u32>,
     globals: HashMap<(String, String), u32>,
     invalid_handlers: HashMap<String, u32>,
-    files: HashMap<u32, std::fs::File>,
+    files: HashMap<u32, CrtFile>,
     locales: HashMap<String, locale::LocaleState>,
+}
+
+// Stream metadata remains with the existing FILE allocation/file owner.
+// Deref preserves the established read/write/seek/close implementations.
+struct CrtFile {
+    file: std::fs::File,
+    binary: bool,
+}
+impl std::ops::Deref for CrtFile {
+    type Target = std::fs::File;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+impl std::ops::DerefMut for CrtFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
+    }
 }
 
 // API-set imports and their UCRT exports share the same CRT state owner.
@@ -45,6 +89,15 @@ fn invalid_parameter_result(
     error: i32,
     result: u32,
 ) -> Outcome {
+    invalid_parameter_then(env, function, error, move |_| Outcome::Return(result))
+}
+
+fn invalid_parameter_then(
+    env: &mut Env<'_>,
+    function: &str,
+    error: i32,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
     let errno = floating::errno_address(env);
     if errno.is_null() || errno.write(env.cpu, error).is_err() {
         return Outcome::Fail("CRT errno allocation/write failed".into());
@@ -63,9 +116,7 @@ fn invalid_parameter_result(
     }
     // Release UCRT passes no diagnostic strings. errno is assigned before the
     // callback, and a returning callback may change it or wait via the Machine.
-    Outcome::call(handler, [0, 0, 0, 0, 0], move |_, _| {
-        Outcome::Return(result)
-    })
+    Outcome::call(handler, [0, 0, 0, 0, 0], move |env, _| then(env))
 }
 
 pub fn install<B: adv_cpu::backend::Backend>(
@@ -76,15 +127,39 @@ pub fn install<B: adv_cpu::backend::Backend>(
 }
 
 pub fn register(r: &mut Registry) {
+    byte_set::register(r);
+    byte_sort::register(r);
+    byte_output::register(r);
     data::register(r);
+    directory::register(r);
+    exceptions::register(r);
+    find::register(r);
+    formatting::register(r);
     floating::register(r);
+    intrinsic_math::register(r);
+    time64::register(r);
+    random::register(r);
+    scalar_float::register(r);
+    scalar_log::register(r);
+    scalar_power::register(r);
+    scalar_round::register(r);
+    scalar_scale::register(r);
+    scalar_split::register(r);
     onexit::register(r);
+    path::register(r);
     startup::register(r);
     convert::register(r);
     cpp_alloc::register(r);
+    scan::register(r);
     secure_memory::register(r);
+    shared_file::register(r);
+    stream_position::register(r);
+    thread::register(r);
     heap::register(r);
     locale::register(r);
+    memory_ops::register(r);
+    modern_stdio::register(r);
+    modern_string::register(r);
     wide_string::register(r);
     for name in ["memset", "memcpy", "memmove"] {
         r.add("vcruntime140.dll", name, Conv::Cdecl { argc: 3 }, call);
@@ -108,13 +183,7 @@ pub fn register(r: &mut Registry) {
         ("__set_app_type", 1),
         ("__p__fmode", 0),
         ("__p__commode", 0),
-        ("toupper", 1),
-        ("qsort", 4),
-        ("floor", 2),
-        ("ceil", 2),
-        ("ldexp", 3),
         ("frexp", 3),
-        ("_CIpow", 0),
         ("_ftol", 0),
         ("time", 1),
         ("_time32", 1),
@@ -268,14 +337,18 @@ pub fn register(r: &mut Registry) {
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
+    random::release(env, Some(env.context));
+    time64::release(env, Some(env.context))?;
     release_errno(env, Some(env.context))
 }
 
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
+    random::release(env, None);
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
     locale::release_process_tables(env)?;
+    time64::release(env, None)?;
     release_errno(env, None)
 }
 
@@ -336,41 +409,6 @@ fn scale(mut x: f64, mut exp: i32) -> f64 {
     }
     x * 2f64.powi(exp)
 }
-fn sort_step(
-    _e: &mut Env<'_>,
-    base: u32,
-    count: u32,
-    size: u32,
-    cmp: u32,
-    i: u32,
-    j: u32,
-) -> Outcome {
-    if i >= count {
-        return Outcome::Return(0);
-    }
-    let (i, j) = if j == 0 { (i + 1, i + 1) } else { (i, j) };
-    if i >= count {
-        return Outcome::Return(0);
-    }
-    let left = base + (j - 1) * size;
-    let right = base + j * size;
-    Outcome::call(cmp, [left, right], move |e, result| {
-        if result.value() as i32 > 0 {
-            let mut temporary = vec![0; size as usize];
-            if let Err(err) = e
-                .cpu
-                .read(left, &mut temporary)
-                .and_then(|_| e.cpu.copy_memory(right, left, size as usize))
-                .and_then(|_| e.cpu.write(right, &temporary))
-            {
-                return Outcome::Fail(err.to_string());
-            }
-            sort_step(e, base, count, size, cmp, i, j - 1)
-        } else {
-            sort_step(e, base, count, size, cmp, i + 1, i + 1)
-        }
-    })
-}
 const CRT_ALLOCATION_LIMIT: u32 = 0x40000000;
 fn allocate(e: &mut Env<'_>, size: u32, zero: bool) -> u32 {
     if size > CRT_ALLOCATION_LIMIT {
@@ -406,21 +444,37 @@ fn file_open_options(mode: &str) -> Option<std::fs::OpenOptions> {
 
 fn crt_open_file(e: &mut Env<'_>, name: &str, mode: &str) -> Option<u32> {
     let opts = file_open_options(mode)?;
+    crt_open_file_options(e, name, mode, opts).ok()
+}
+
+fn crt_open_file_options(
+    e: &mut Env<'_>,
+    name: &str,
+    mode: &str,
+    opts: std::fs::OpenOptions,
+) -> std::io::Result<u32> {
+    let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
     let host_path = if mode.starts_with('w') || mode.starts_with('a') {
-        e.ext.try_get::<crate::Win32>()?.vfs.write_path(name)?
+        e.ext.try_get::<crate::Win32>().ok_or_else(missing)?.vfs.write_path(name).ok_or_else(missing)?
     } else {
-        e.ext.try_get::<crate::Win32>()?.vfs.lookup(name)?
+        e.ext.try_get::<crate::Win32>().ok_or_else(missing)?.vfs.lookup(name).ok_or_else(missing)?
     };
-    let file = opts.open(&host_path).ok()?;
+    let file = opts.open(&host_path)?;
     let ptr = allocate(e, 32, true);
     if ptr == 0 {
-        return None;
+        return Err(std::io::ErrorKind::OutOfMemory.into());
     }
     if e.ext.try_get::<CrtState>().is_none() {
         e.ext.insert(CrtState::default());
     }
-    e.ext.get_mut::<CrtState>().files.insert(ptr, file);
-    Some(ptr)
+    e.ext.get_mut::<CrtState>().files.insert(
+        ptr,
+        CrtFile {
+            file,
+            binary: mode.contains('b') && !mode.contains("ccs="),
+        },
+    );
+    Ok(ptr)
 }
 
 fn initializers(e: &mut Env<'_>, mut p: u32, end: u32, stop_on_error: bool) -> Outcome {
@@ -634,22 +688,16 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
         }
         "memcpy" | "memmove" => {
-            if let Err(err) = e.cpu.copy_memory(b, a, c as usize) {
-                return Outcome::Fail(err.to_string());
+            match memory_ops::copy(e, a, b, c) {
+                Ok(pointer) => pointer,
+                Err(err) => return Outcome::Fail(err.to_string()),
             }
-            a
         }
         "memset" => {
-            let chunk = [b as u8; 4096];
-            let mut p = 0;
-            while p < c {
-                let n = (c - p).min(4096);
-                if let Err(err) = e.cpu.write(a.wrapping_add(p), &chunk[..n as usize]) {
-                    return Outcome::Fail(err.to_string());
-                }
-                p += n;
+            match memory_ops::fill(e, a, b as u8, c) {
+                Ok(pointer) => pointer,
+                Err(err) => return Outcome::Fail(err.to_string()),
             }
-            a
         }
         "memcmp" => {
             let mut left = [0; 4096];
@@ -695,23 +743,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Fail("invalid initializer range".into());
             }
             return initializers(e, a, b, name == "_initterm_e");
-        }
-        "toupper" => {
-            if a <= 255 {
-                u32::from((a as u8).to_ascii_uppercase())
-            } else {
-                a
-            }
-        }
-        "qsort" => {
-            if b < 2 || c == 0 {
-                return Outcome::Return(0);
-            }
-            if c > 1024 * 1024 || b.checked_mul(c).and_then(|n| a.checked_add(n)).is_none() {
-                return Outcome::Fail("invalid qsort range".into());
-            }
-            let cmp = e.arg(3);
-            return sort_step(e, a, b, c, cmp, 1, 1);
         }
         "time" | "_time32" => {
             let ft = crate::kernel32::filetime_now(e);
@@ -1740,31 +1771,16 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
         "_XcptFilter" => 1,
         "__setusermatherr" => 0,
-        "floor" | "ceil" | "ldexp" | "frexp" => {
+        "frexp" => {
             let x = match double(e) {
                 Ok(v) => v,
                 Err(err) => return Outcome::Fail(err),
             };
-            let result = match name.as_str() {
-                "floor" => x.floor(),
-                "ceil" => x.ceil(),
-                "ldexp" => scale(x, c as i32),
-                _ => {
-                    let (v, exp) = split_fraction(x);
-                    if let Err(err) = e.cpu.write_u32(c, exp as u32) {
-                        return Outcome::Fail(err.to_string());
-                    }
-                    v
-                }
-            };
+            let (result, exp) = split_fraction(x);
+            if let Err(err) = e.cpu.write_u32(c, exp as u32) {
+                return Outcome::Fail(err.to_string());
+            }
             e.cpu.push_f64(result);
-            0
-        }
-        "_CIpow" => {
-            let (Some(y), Some(x)) = (e.cpu.pop_f64(), e.cpu.pop_f64()) else {
-                return Outcome::Fail("_CIpow: empty x87 stack".into());
-            };
-            e.cpu.push_f64(x.powf(y));
             0
         }
         "_ftol" => {

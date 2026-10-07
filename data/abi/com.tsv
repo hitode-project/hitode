@@ -867,6 +867,47 @@ IFileSourceFilter	1	AddRef	u32	u32	this:IFileSourceFilter*:ptr:1
 IFileSourceFilter	2	Release	u32	u32	this:IFileSourceFilter*:ptr:1
 IFileSourceFilter	3	Load	i32	Windows.Win32.Foundation.HRESULT	this:IFileSourceFilter*:ptr:1|pszFileName:Windows.Win32.Foundation.PWSTR:str16:1|pmt:Windows.Win32.Media.MediaFoundation.AM_MEDIA_TYPE*:ptr:1
 IFileSourceFilter	4	GetCurFile	i32	Windows.Win32.Foundation.HRESULT	this:IFileSourceFilter*:ptr:1|ppszFileName:Windows.Win32.Foundation.PWSTR*:ptr:1|pmt:Windows.Win32.Media.MediaFoundation.AM_MEDIA_TYPE*:ptr:1
+ITfThreadMgr	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+ITfThreadMgr	1	AddRef	u32	u32	this:ITfThreadMgr*:ptr:1
+ITfThreadMgr	2	Release	u32	u32	this:ITfThreadMgr*:ptr:1
+ITfThreadMgr	3	Activate	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|ptid:u32*:ptr:1
+ITfThreadMgr	4	Deactivate	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1
+ITfThreadMgr	5	CreateDocumentMgr	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|ppdim:Windows.Win32.UI.TextServices.ITfDocumentMgr*:ptr:1
+ITfThreadMgr	6	EnumDocumentMgrs	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|ppEnum:Windows.Win32.UI.TextServices.IEnumTfDocumentMgrs*:ptr:1
+ITfThreadMgr	7	GetFocus	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|ppdimFocus:Windows.Win32.UI.TextServices.ITfDocumentMgr*:ptr:1
+ITfThreadMgr	8	SetFocus	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|pdimFocus:Windows.Win32.UI.TextServices.ITfDocumentMgr:ptr:1
+ITfThreadMgr	9	AssociateFocus	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|hwnd:Windows.Win32.Foundation.HWND:handle:1|pdimNew:Windows.Win32.UI.TextServices.ITfDocumentMgr:ptr:1|ppdimPrev:Windows.Win32.UI.TextServices.ITfDocumentMgr*:ptr:1
+ITfThreadMgr	10	IsThreadFocus	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|pfThreadFocus:Windows.Win32.Foundation.BOOL*:ptr:1
+ITfThreadMgr	11	GetFunctionProvider	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|clsid:System.Guid*:ptr:1|ppFuncProv:Windows.Win32.UI.TextServices.ITfFunctionProvider*:ptr:1
+ITfThreadMgr	12	EnumFunctionProviders	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|ppEnum:Windows.Win32.UI.TextServices.IEnumTfFunctionProviders*:ptr:1
+ITfThreadMgr	13	GetGlobalCompartment	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|ppCompMgr:Windows.Win32.UI.TextServices.ITfCompartmentMgr*:ptr:1
+ITfDocumentMgr	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+ITfDocumentMgr	1	AddRef	u32	u32	this:ITfDocumentMgr*:ptr:1
+ITfDocumentMgr	2	Release	u32	u32	this:ITfDocumentMgr*:ptr:1
+ITfDocumentMgr	3	CreateContext	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|tidOwner:u32:u32:1|dwFlags:u32:u32:1|punk:Windows.Win32.System.Com.IUnknown:ptr:1|ppic:Windows.Win32.UI.TextServices.ITfContext*:ptr:1|pecTextStore:u32*:ptr:1
+ITfDocumentMgr	4	Push	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|pic:Windows.Win32.UI.TextServices.ITfContext:ptr:1
+ITfDocumentMgr	5	Pop	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|dwFlags:u32:u32:1
+ITfDocumentMgr	6	GetTop	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|ppic:Windows.Win32.UI.TextServices.ITfContext*:ptr:1
+ITfDocumentMgr	7	GetBase	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|ppic:Windows.Win32.UI.TextServices.ITfContext*:ptr:1
+ITfDocumentMgr	8	EnumContexts	i32	Windows.Win32.Foundation.HRESULT	this:ITfDocumentMgr*:ptr:1|ppEnum:Windows.Win32.UI.TextServices.IEnumTfContexts*:ptr:1
+ITfContext	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+ITfContext	1	AddRef	u32	u32	this:ITfContext*:ptr:1
+ITfContext	2	Release	u32	u32	this:ITfContext*:ptr:1
+ITfContext	3	RequestEditSession	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|tid:u32:u32:1|pes:Windows.Win32.UI.TextServices.ITfEditSession:ptr:1|dwFlags:Windows.Win32.UI.TextServices.TF_CONTEXT_EDIT_CONTEXT_FLAGS:u32:1|phrSession:Windows.Win32.Foundation.HRESULT*:ptr:1
+ITfContext	4	InWriteSession	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|tid:u32:u32:1|pfWriteSession:Windows.Win32.Foundation.BOOL*:ptr:1
+ITfContext	5	GetSelection	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ec:u32:u32:1|ulIndex:u32:u32:1|ulCount:u32:u32:1|pSelection:Windows.Win32.UI.TextServices.TF_SELECTION*:ptr:1|pcFetched:u32*:ptr:1
+ITfContext	6	SetSelection	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ec:u32:u32:1|ulCount:u32:u32:1|pSelection:Windows.Win32.UI.TextServices.TF_SELECTION*:ptr:1
+ITfContext	7	GetStart	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ec:u32:u32:1|ppStart:Windows.Win32.UI.TextServices.ITfRange*:ptr:1
+ITfContext	8	GetEnd	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ec:u32:u32:1|ppEnd:Windows.Win32.UI.TextServices.ITfRange*:ptr:1
+ITfContext	9	GetActiveView	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ppView:Windows.Win32.UI.TextServices.ITfContextView*:ptr:1
+ITfContext	10	EnumViews	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ppEnum:Windows.Win32.UI.TextServices.IEnumTfContextViews*:ptr:1
+ITfContext	11	GetStatus	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|pdcs:Windows.Win32.UI.TextServices.TS_STATUS*:ptr:1
+ITfContext	12	GetProperty	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|guidProp:System.Guid*:ptr:1|ppProp:Windows.Win32.UI.TextServices.ITfProperty*:ptr:1
+ITfContext	13	GetAppProperty	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|guidProp:System.Guid*:ptr:1|ppProp:Windows.Win32.UI.TextServices.ITfReadOnlyProperty*:ptr:1
+ITfContext	14	TrackProperties	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|prgProp:System.Guid**:ptr:1|cProp:u32:u32:1|prgAppProp:System.Guid**:ptr:1|cAppProp:u32:u32:1|ppProperty:Windows.Win32.UI.TextServices.ITfReadOnlyProperty*:ptr:1
+ITfContext	15	EnumProperties	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ppEnum:Windows.Win32.UI.TextServices.IEnumTfProperties*:ptr:1
+ITfContext	16	GetDocumentMgr	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ppDm:Windows.Win32.UI.TextServices.ITfDocumentMgr*:ptr:1
+ITfContext	17	CreateRangeBackup	i32	Windows.Win32.Foundation.HRESULT	this:ITfContext*:ptr:1|ec:u32:u32:1|pRange:Windows.Win32.UI.TextServices.ITfRange:ptr:1|ppBackup:Windows.Win32.UI.TextServices.ITfRangeBackup*:ptr:1
 IDxDiagProvider	0	QueryInterface	i32	HRESULT	this:IDxDiagProvider*:ptr:1|riid:GUID*:ptr:1|ppvObj:void**:ptr:1
 IDxDiagProvider	1	AddRef	u32	ULONG	this:IDxDiagProvider*:ptr:1
 IDxDiagProvider	2	Release	u32	ULONG	this:IDxDiagProvider*:ptr:1
@@ -960,3 +1001,21 @@ ID3DXEffect	75	ApplyParameterBlock	i32	HRESULT	this:ID3DXEffect*:ptr:1|hParamete
 ID3DXEffect	76	DeleteParameterBlock	i32	HRESULT	this:ID3DXEffect*:ptr:1|hParameterBlock:D3DXHANDLE:ptr:1
 ID3DXEffect	77	CloneEffect	i32	HRESULT	this:ID3DXEffect*:ptr:1|pDevice:LPDIRECT3DDEVICE9:ptr:1|ppEffect:LPD3DXEFFECT*:ptr:1
 ID3DXEffect	78	SetRawValue	i32	HRESULT	this:ID3DXEffect*:ptr:1|hParameter:D3DXHANDLE:ptr:1|pData:LPCVOID:ptr:1|ByteOffset:UINT:u32:1|Bytes:UINT:u32:1
+ID3DXMatrixStack	0	QueryInterface	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|riid:REFIID:ptr:1|ppvObj:LPVOID*:ptr:1
+ID3DXMatrixStack	1	AddRef	u32	ULONG	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	2	Release	u32	ULONG	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	3	Pop	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	4	Push	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	5	LoadIdentity	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	6	LoadMatrix	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+ID3DXMatrixStack	7	MultMatrix	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+ID3DXMatrixStack	8	MultMatrixLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+ID3DXMatrixStack	9	RotateAxis	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|Angle:FLOAT:f32:1
+ID3DXMatrixStack	10	RotateAxisLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|Angle:FLOAT:f32:1
+ID3DXMatrixStack	11	RotateYawPitchRoll	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
+ID3DXMatrixStack	12	RotateYawPitchRollLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
+ID3DXMatrixStack	13	Scale	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	14	ScaleLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	15	Translate	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	16	TranslateLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	17	GetTop	ptr	D3DXMATRIX*	this:ID3DXMatrixStack*:ptr:1
