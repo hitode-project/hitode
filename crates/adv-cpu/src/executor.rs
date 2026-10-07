@@ -1169,6 +1169,12 @@ impl Executor {
         let old_region = region.clone();
         let mut optimized = old_region.clone();
         optimized.compile_strategy = CompileStrategy::Speed;
+        // Direct leaves already inside this unit's immutable byte window do not
+        // need a racy call-target hint. Admission still decodes the current bytes
+        // and permits only a bounded, register-only leaf through its return.
+        let direct: BTreeSet<u32> = compile::Snapshot::capture(&old_region, &self.memory)
+            .map(|input| input.direct_leaf_callees().into_iter().collect())
+            .unwrap_or_default();
         // Observed indirect call targets join the unit, so the calls and their
         // returns dispatch inside it. Each target is offered once per unit.
         let tried = self.callee_attempts.entry(owner).or_default();
@@ -1178,6 +1184,7 @@ impl Executor {
             .unwrap_or_default();
         let fresh: Vec<u32> = observed
             .into_iter()
+            .chain(direct.iter().copied())
             .filter(|target| !tried.contains(target))
             .collect();
         if !old_region.callees.is_empty() && fresh.is_empty() {
@@ -1188,6 +1195,11 @@ impl Executor {
         for target in fresh {
             if optimized.callees.len() < CALLEES && !optimized.callees.contains(&target) {
                 optimized.callees.push(target);
+            }
+            if direct.contains(&target) && optimized.callees.contains(&target) {
+                // Only this verified leaf's entry changes from external to
+                // internal. Other published, pending and CFG frontiers survive.
+                optimized.frontier.retain(|pc| *pc != target);
             }
             tried.insert(target);
         }
@@ -2759,6 +2771,211 @@ mod tiering_tests {
         assert!(m.stats.native_entries - entries <= 2);
         assert_eq!(m.run(0x3000, u64::MAX).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[3], 100_000);
+    }
+
+    fn direct_leaf_machine(leaf: &[u8], tiering: bool) -> Executor {
+        let mut m = Executor::new(0x1000, 0x4000).unwrap();
+        m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
+            .unwrap();
+        // CALL 1180; ADD [4000],EAX; DEC ECX; JNZ 1100; JMP 1200.
+        // The final direct jump makes 1180 lie inside the discovered byte span,
+        // while CALL discovery still leaves it on the initial frontier.
+        m.write(
+            0x1100,
+            &[
+                0xe8, 0x7b, 0, 0, 0, 0x01, 0x05, 0, 0x40, 0, 0, 0x49, 0x75, 0xf2, 0xe9, 0xed, 0, 0,
+                0,
+            ],
+        )
+        .unwrap();
+        m.write(0x1180, leaf).unwrap();
+        m.write(0x1200, &[0xc3]).unwrap();
+        m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
+        m.enable_auto_jit(true);
+        m.set_auto_compile_strategy(CompileStrategy::Fast);
+        m.set_async_compilation(true);
+        m.set_tiered_compilation(tiering);
+        seed_direct_leaf(&mut m, 100_000);
+        m
+    }
+
+    fn seed_direct_leaf(m: &mut Executor, iterations: u32) {
+        m.state = CpuState::default();
+        m.state.regs = [
+            5, iterations, 0xabcdef01, 3, 0x4f00, 0x4500, 0x12345678, 0x98765432,
+        ];
+        m.state.eip = 0x1100;
+        m.state.eflags = 0x202;
+        for (index, register) in m.state.xmm.iter_mut().enumerate() {
+            *register = [index as u8 * 7 + 3; 16];
+        }
+        m.write(0x4000, &[0; 64]).unwrap();
+        m.write(0x4ee0, &[0; 64]).unwrap();
+        m.write(0x4f00, &0x3000u32.to_le_bytes()).unwrap();
+    }
+
+    fn warm_direct_leaf(m: &mut Executor, merged: bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ready = m.code.compiled.contains_key(&0x1100)
+                && if merged {
+                    m.code.regions[&0x1100].callees.contains(&0x1180)
+                        && m.stats.tier_up_publications > 0
+                } else {
+                    m.code.compiled.contains_key(&0x1180)
+                };
+            if ready {
+                return;
+            }
+            let outcome = m.run(0x3000, 1000).unwrap();
+            assert!(matches!(
+                outcome,
+                RunOutcome::Budget | RunOutcome::ReachedStop
+            ));
+            if outcome == RunOutcome::ReachedStop {
+                seed_direct_leaf(m, 100_000);
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn automatic_tier_up_merges_direct_register_leaves_with_exact_state_and_fewer_entries() {
+        // ADD EAX,3; XOR EBX,EAX; PADDB XMM0,XMM1; RET.
+        let leaf = [0x83, 0xc0, 3, 0x31, 0xc3, 0x66, 0x0f, 0xfc, 0xc1, 0xc3];
+        let mut merged = direct_leaf_machine(&leaf, true);
+        let mut separate = direct_leaf_machine(&leaf, false);
+        warm_direct_leaf(&mut merged, true);
+        warm_direct_leaf(&mut separate, false);
+        assert!(!merged.code.regions[&0x1100].frontier.contains(&0x1180));
+        assert!(separate.code.regions[&0x1100].frontier.contains(&0x1180));
+        assert_eq!(merged.code.entry_owner.get(&0x1180), Some(&0x1180));
+        for m in [&mut merged, &mut separate] {
+            seed_direct_leaf(m, 1000);
+        }
+        let before_merged = merged.stats.native_entries;
+        let before_separate = separate.stats.native_entries;
+        assert_eq!(merged.run(0x3000, 10_000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(
+            separate.run(0x3000, 10_000).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        assert_eq!(merged.state, separate.state);
+        for (address, length) in [(0x4000, 64), (0x4ee0, 64)] {
+            assert_eq!(
+                merged.memory.read_data(address, length).unwrap(),
+                separate.memory.read_data(address, length).unwrap()
+            );
+        }
+        assert!(merged.stats.native_entries - before_merged <= 2);
+        assert!(separate.stats.native_entries - before_separate >= 2000);
+
+        // Scheduler slices stop at the same guest boundary after fusion.
+        for m in [&mut merged, &mut separate] {
+            seed_direct_leaf(m, 11);
+        }
+        for budget in [1, 2, 1, 5, 3, 8, 1, 2, 10, 100] {
+            let a = merged.run(0x3000, budget).unwrap();
+            let b = separate.run(0x3000, budget).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(merged.state, separate.state, "fuel {budget}");
+            if a == RunOutcome::ReachedStop {
+                break;
+            }
+        }
+
+        // Pending owner interrupts retain the same architectural boundary.
+        let interrupt = Arc::new(AtomicBool::new(true));
+        for m in [&mut merged, &mut separate] {
+            seed_direct_leaf(m, 3);
+            m.set_host_interrupt_flag(interrupt.clone());
+        }
+        let a = merged.run(0x3000, 100).unwrap();
+        let b = separate.run(0x3000, 100).unwrap();
+        assert_eq!(a, RunOutcome::Interrupted);
+        assert_eq!(a, b);
+        assert_eq!(merged.state, separate.state);
+        interrupt.store(false, Ordering::Release);
+
+        // SMC in the captured leaf invalidates the fused caller as well.
+        let invalidations = merged.stats.invalidations;
+        merged.write(0x1182, &[7]).unwrap();
+        separate.write(0x1182, &[7]).unwrap();
+        for m in [&mut merged, &mut separate] {
+            seed_direct_leaf(m, 3);
+        }
+        assert_eq!(merged.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(separate.run(0x3000, 100).unwrap(), RunOutcome::ReachedStop);
+        assert!(merged.stats.invalidations > invalidations);
+        // SMC queues asynchronous recompilation. Each side can publish at a
+        // different instruction: interpreted work charges instructions, native
+        // work charges blocks. The 3-iteration program has 26 instructions, so
+        // either mix must finish with 1..=26 charged units. Only this cold SMC
+        // comparison normalizes fuel; the warm and sliced checks above do not.
+        for m in [&merged, &separate] {
+            assert!((74..100).contains(&m.state.fuel));
+        }
+        let mut a = merged.state.clone();
+        let mut b = separate.state.clone();
+        a.fuel = 0;
+        b.fuel = 0;
+        assert_eq!(a, b);
+        for (address, length) in [(0x4000, 64), (0x4ee0, 64)] {
+            assert_eq!(
+                merged.memory.read_data(address, length).unwrap(),
+                separate.memory.read_data(address, length).unwrap()
+            );
+        }
+        assert_eq!(merged.state.regs[0], 26);
+    }
+
+    #[test]
+    fn direct_leaf_admission_rejects_helpers_memory_stack_changes_and_other_control_flow() {
+        let cases: &[&[u8]] = &[
+            &[0x0f, 0xa2, 0xc3],          // CPUID helper.
+            &[0x8b, 0x00, 0xc3],          // MOV EAX,[EAX].
+            &[0x89, 0x00, 0xc3],          // MOV [EAX],EAX, possibly executable.
+            &[0x89, 0xc4, 0xc3],          // MOV ESP,EAX.
+            &[0xe8, 0x7b, 0, 0, 0, 0xc3], // Nested CALL.
+            &[0xeb, 0, 0xc3],             // JMP.
+            &[0xff, 0xe0, 0xc3],          // Indirect JMP EAX.
+            &[0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xc3],
+        ];
+        for leaf in cases {
+            let m = direct_leaf_machine(leaf, true);
+            let region = crate::discovery::discover(
+                &m.memory,
+                0x1100,
+                0x3000,
+                CompileStrategy::Fast,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let input = compile::Snapshot::capture(&region, &m.memory).unwrap();
+            assert!(input.direct_leaf_callees().is_empty(), "leaf {leaf:02x?}");
+        }
+
+        let mut m = direct_leaf_machine(&[0x40, 0xc3], true);
+        // Move the caller's continuation below the leaf: the CALL target is now
+        // outside the captured span and cannot borrow even its executable page.
+        m.write(0x110f, &0x0du32.to_le_bytes()).unwrap();
+        m.write(0x1120, &[0xc3]).unwrap();
+        let region = crate::discovery::discover(
+            &m.memory,
+            0x1100,
+            0x3000,
+            CompileStrategy::Fast,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(region.start + region.len as u32 <= 0x1180);
+        assert!(
+            compile::Snapshot::capture(&region, &m.memory)
+                .unwrap()
+                .direct_leaf_callees()
+                .is_empty()
+        );
     }
 
     #[test]

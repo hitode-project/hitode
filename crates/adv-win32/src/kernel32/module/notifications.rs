@@ -71,25 +71,39 @@ pub(super) fn startup_enter(env: &mut Env<'_>) -> Outcome {
 /// Keep this in the personality startup gate, not GetModuleHandle: queries
 /// must never implicitly load arbitrary modules or change reference counts.
 fn startup_system_modules(env: &mut Env<'_>, handle: u32) -> Outcome {
-    let result = (|| -> Result<(), String> {
-        let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
-        for name in ["ntdll.dll", "kernel32.dll"] {
-            if modules.by_name(name).is_some() {
-                continue;
-            }
-            let mut loader = Loader::new(env.cpu, env.sys, modules, &win32.vfs);
-            loader
-                .load(&format!("C:\\Windows\\System32\\{name}"))
-                .map_err(|error| format!("Win32 startup {name}: {error}"))?;
-            // Synthetic system images have no guest TLS/DllMain callbacks.
-            debug_assert!(loader.inits.is_empty());
-        }
-        Ok(())
-    })();
+    let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
+    let result = resident_system_modules(env.cpu, env.sys, win32, modules);
     match result {
         Ok(()) => Outcome::Return(1),
         Err(error) => release_lock(env, handle, Outcome::Fail(error)),
     }
+}
+
+pub(crate) fn prepare_system_modules<B: adv_cpu::backend::Backend>(
+    machine: &mut adv_machine::Machine<B>,
+) -> Result<(), String> {
+    let (win32, modules) = machine.ext.get2_mut::<Win32, Modules>();
+    resident_system_modules(&mut machine.cpu, &mut machine.sys, win32, modules)
+}
+
+fn resident_system_modules(
+    cpu: &mut dyn adv_cpu::backend::Guest,
+    sys: &mut adv_machine::Sys,
+    win32: &Win32,
+    modules: &mut Modules,
+) -> Result<(), String> {
+    for name in ["ntdll.dll", "kernel32.dll"] {
+        if modules.by_name(name).is_some() {
+            continue;
+        }
+        let mut loader = Loader::new(cpu, sys, modules, &win32.vfs);
+        loader
+            .load(&format!("C:\\Windows\\System32\\{name}"))
+            .map_err(|error| format!("Win32 startup {name}: {error}"))?;
+        // Synthetic system images have no guest TLS/DllMain callbacks.
+        debug_assert!(loader.inits.is_empty());
+    }
+    Ok(())
 }
 
 pub(super) fn startup_leave(env: &mut Env<'_>) -> Outcome {
