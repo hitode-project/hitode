@@ -367,6 +367,9 @@ fn differences(interpreted: &ArchitecturalState, native: &ArchitecturalState) ->
             native.mxcsr, interpreted.mxcsr
         ));
     }
+    // Architectural snapshots materialize MMX writes into physical raw80.
+    // Comparing x87 therefore includes MMX payloads, exponents, TOP and tags,
+    // without comparing a potentially stale nonarchitectural MMX cache.
     if interpreted.x87 != native.x87 {
         let mut text = String::from("x87");
         let (a, b) = (&interpreted.x87, &native.x87);
@@ -392,7 +395,7 @@ fn differences(interpreted: &ArchitecturalState, native: &ArchitecturalState) ->
         }
         for (physical, (a, b)) in a.regs.iter().zip(&b.regs).enumerate() {
             if a != b {
-                let _ = write!(text, " raw80[{physical}]");
+                let _ = write!(text, " physical{physical}/mm{physical}");
             }
         }
         diff.push(text);
@@ -545,6 +548,34 @@ mod tests {
         memory.write(DATA, &[9]).unwrap();
         let report = trace.check(&state, &memory).unwrap().unwrap_err();
         assert!(report.contains("native=0x09 interpreter=0x02"), "{report}");
+    }
+
+    #[test]
+    fn strict_comparison_observes_vectors_and_canonical_mmx_aliases() {
+        let mut cpu = CpuState::default();
+        let before = cpu.capture_architecture();
+        cpu.xmm[7][15] = 0x80;
+        cpu.mmx[3] = 0x1234;
+        cpu.mmx_mode = 5 | (1 << 11);
+        let after = cpu.capture_architecture();
+        let report = differences(&before, &after).join(" ");
+        assert!(report.contains("xmm7"), "{report}");
+        assert!(report.contains("physical3/mm3"), "{report}");
+        assert!(report.contains("tag native="), "{report}");
+        let mut changed = after.clone();
+        changed.x87.set_top(5);
+        assert!(
+            differences(&after, &changed)
+                .join(" ")
+                .contains("status native=")
+        );
+        changed = after.clone();
+        changed.x87.regs[3] = crate::X87Register::from_parts(0x1234, 0x3fff);
+        assert!(
+            differences(&after, &changed)
+                .join(" ")
+                .contains("physical3/mm3")
+        );
     }
 
     #[test]

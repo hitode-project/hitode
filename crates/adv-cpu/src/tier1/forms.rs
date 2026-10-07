@@ -205,6 +205,72 @@ pub(super) fn x87(i: &Instruction) -> bool {
         && (i.op0_kind() != OpKind::Memory || address(i))
 }
 
+/// Legacy integer vectors only: no AVX, floating arithmetic or MXCSR effects.
+/// Keep address/prefix guards shared with the platform-independent census.
+pub(super) fn simd(i: &Instruction) -> bool {
+    let vector = |op: u32| {
+        i.op_kind(op) == OpKind::Register
+            && ((Register::MM0..=Register::MM7).contains(&i.op_register(op))
+                || (Register::XMM0..=Register::XMM7).contains(&i.op_register(op)))
+    };
+    let memory = |op| i.op_kind(op) == OpKind::Memory && address(i);
+    let same = || {
+        vector(0) && (memory(1) || vector(1) && i.op0_register().size() == i.op1_register().size())
+    };
+    match i.mnemonic() {
+        M::Movd => {
+            i.op_count() == 2 && (vector(0) && scalar32(i, 1) || scalar32(i, 0) && vector(1))
+        }
+        M::Movq => i.op_count() == 2 && (same() || memory(0) && vector(1)),
+        M::Movaps | M::Movups | M::Movdqa | M::Movdqu | M::Movss => {
+            i.op_count() == 2
+                && (same() || memory(0) && vector(1))
+                && (0..2)
+                    .filter(|&op| i.op_kind(op) == OpKind::Register)
+                    .all(|op| i.op_register(op).size() == 16)
+        }
+        M::Shufps => {
+            same()
+                && i.op0_register().size() == 16
+                && i.op_count() == 3
+                && i.op2_kind() == OpKind::Immediate8
+        }
+        M::Psrlw | M::Psrld | M::Psrlq | M::Psllw | M::Pslld | M::Psllq | M::Psraw | M::Psrad => {
+            i.op_count() == 2 && (same() || vector(0) && i.op1_kind() == OpKind::Immediate8)
+        }
+        M::Punpcklbw
+        | M::Punpckhbw
+        | M::Punpcklwd
+        | M::Punpckhwd
+        | M::Punpckldq
+        | M::Punpckhdq
+        | M::Packuswb
+        | M::Packsswb
+        | M::Packssdw
+        | M::Paddb
+        | M::Paddw
+        | M::Paddd
+        | M::Psubb
+        | M::Psubw
+        | M::Psubd
+        | M::Paddsb
+        | M::Paddsw
+        | M::Paddusb
+        | M::Paddusw
+        | M::Psubsb
+        | M::Psubsw
+        | M::Psubusb
+        | M::Psubusw
+        | M::Pmullw
+        | M::Pmulhw
+        | M::Pand
+        | M::Por
+        | M::Pxor
+        | M::Pandn => i.op_count() == 2 && same(),
+        _ => false,
+    }
+}
+
 pub(crate) fn supported(i: &Instruction) -> bool {
     if i.has_lock_prefix() {
         return false;
@@ -215,7 +281,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     if i.has_rep_prefix() || i.has_repne_prefix() {
         return false;
     }
-    if x87(i) {
+    if x87(i) || simd(i) {
         return true;
     }
     if rmw(i) {
@@ -335,6 +401,49 @@ pub(crate) fn supported(i: &Instruction) -> bool {
             i.condition_code() != C::None
                 && i.is_jcc_short_or_near()
                 && i.op0_kind() == OpKind::NearBranch32
+        }
+    }
+}
+
+#[cfg(test)]
+mod simd_tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions, code_asm::*};
+    #[test]
+    fn simd_forms_keep_memory_prefix_and_floating_guards() {
+        let cases: Vec<(bool, Instruction)> = vec![
+            (
+                true,
+                Instruction::with2(Code::Movq_mm_mmm64, Register::MM0, Register::MM1).unwrap(),
+            ),
+            (
+                true,
+                Instruction::with2(Code::Movss_xmm_xmmm32, Register::XMM0, Register::XMM1).unwrap(),
+            ),
+            (
+                false,
+                Instruction::with2(Code::Addps_xmm_xmmm128, Register::XMM0, Register::XMM1)
+                    .unwrap(),
+            ),
+            (false, Instruction::with(Code::Emms)),
+        ];
+        for (expected, mut i) in cases {
+            assert_eq!(supported(&i), expected);
+            i.set_has_lock_prefix(true);
+            assert!(!supported(&i));
+        }
+        for address16 in [false, true] {
+            let mut a = CodeAssembler::new(32).unwrap();
+            if address16 {
+                a.movdqa(xmm0, xmmword_ptr(bx + si)).unwrap();
+            } else {
+                a.movdqa(xmm0, xmmword_ptr(eax)).unwrap();
+            }
+            let bytes = a.assemble(0).unwrap();
+            let mut i = Decoder::new(32, &bytes, DecoderOptions::NONE).decode();
+            assert_eq!(supported(&i), !address16);
+            i.set_segment_prefix(Register::GS);
+            assert!(!supported(&i));
         }
     }
 }

@@ -1,19 +1,19 @@
 //! Bounded ARM64 templates for the versioned fixed-register entry ABI.
-//! These encodings cover declared integer forms and guarded x87 calls; all
+//! These encodings cover declared integer and SIMD subsets and guarded x87 calls; all
 //! other forms leave before the instruction and use the existing interpreter.
-use super::forms::{cmovcc, double_shift, imm, register, register_part, rmw, setcc, shift, string};
+use super::forms::{cmovcc, double_shift, register, register_part, rmw, setcc, shift, string};
 pub(super) use super::forms::{counter_branch, supported};
 use super::{BUDGET, DISPATCH, FALLBACK, LOAD, STORE};
 use iced_x86::{ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]
-enum Label {
+pub(super) enum Label {
     Guest(u32),
     Exit(u32),
 }
 #[derive(Clone, Copy)]
-enum Branch {
+pub(super) enum Branch {
     B,
     Equal,
     Zero64(u8),
@@ -25,7 +25,7 @@ struct Fixup {
     kind: Branch,
 }
 
-/// Host addresses of the checked scalar access helpers. Each takes the entry
+/// Host addresses of the checked access helpers. Each takes the entry
 /// frame in x0 and follows AAPCS64, so guest registers in x19-x28 survive.
 #[derive(Clone, Copy)]
 pub(super) struct Helpers {
@@ -40,6 +40,9 @@ pub(super) struct Helpers {
     pub stack_all: u64,
     /// `(frame, operation) -> store status`; x87 stays canonical in CpuState.
     pub x87: u64,
+    /// Complete 4/8/16-byte access via Entry::vector, with store-style status.
+    pub vector_load: u64,
+    pub vector_store: u64,
 }
 
 /// Load kind flag: sign-extend the loaded value to 32 bits.
@@ -48,7 +51,7 @@ pub(super) const SIGNED: u32 = 0x100;
 pub(super) const CHECK_WRITE: u32 = 0x100;
 
 pub(super) struct Emitter {
-    helpers: Helpers,
+    pub(super) helpers: Helpers,
     pub words: Vec<u32>,
     pub entries: BTreeMap<u32, usize>,
     exits: BTreeMap<u32, usize>,
@@ -65,13 +68,13 @@ impl Emitter {
             fixups: Vec::new(),
         }
     }
-    fn word(&mut self, x: u32) {
+    pub(super) fn word(&mut self, x: u32) {
         self.words.push(x);
     }
-    fn mov(&mut self, d: u8, s: u8) {
+    pub(super) fn mov(&mut self, d: u8, s: u8) {
         self.word(0x2a00_03e0 | (s as u32) << 16 | d as u32);
     }
-    fn constant(&mut self, d: u8, n: u32) {
+    pub(super) fn constant(&mut self, d: u8, n: u32) {
         self.word(0x5280_0000 | (n & 0xffff) << 5 | d as u32);
         if n >> 16 != 0 {
             self.word(0x72a0_0000 | (n >> 16) << 5 | d as u32);
@@ -96,7 +99,7 @@ impl Emitter {
             );
         }
     }
-    fn mask(&mut self, d: u8, a: u8, bits: u32) {
+    pub(super) fn mask(&mut self, d: u8, a: u8, bits: u32) {
         self.constant(17, bits);
         self.binary(0x0a00_0000, d, a, 17);
     }
@@ -106,7 +109,7 @@ impl Emitter {
     fn store32(&mut self, d: u8, offset: u32) {
         self.word(0xb900_0000 | (offset / 4) << 10 | 27 << 5 | d as u32);
     }
-    fn jump(&mut self, label: Label, kind: Branch) {
+    pub(super) fn jump(&mut self, label: Label, kind: Branch) {
         self.fixups.push(Fixup {
             at: self.words.len(),
             label,
@@ -147,7 +150,7 @@ impl Emitter {
             );
         }
     }
-    fn ea(&mut self, i: &Instruction, segment: bool) {
+    pub(super) fn ea(&mut self, i: &Instruction, segment: bool) {
         self.constant(9, i.memory_displacement32());
         if let Some(r) = register(i.memory_base()) {
             self.binary(0x0b00_0000, 9, 9, r);
@@ -169,7 +172,7 @@ impl Emitter {
     }
     /// Call a helper with x0 = frame and w1/w2/w3 already set. Caller-saved
     /// flags, remaining units and stop are spilled to the frame around it.
-    fn call(&mut self, target: u64) {
+    pub(super) fn call(&mut self, target: u64) {
         self.store32(8, 32);
         self.word(0xf900_1767); // str x7,[x27,#40]
         self.word(0xa9bf_7bfd); // stp x29,x30,[sp,#-16]!
@@ -202,7 +205,13 @@ impl Emitter {
     /// register effects once the store is performed; a refused store reruns
     /// the instruction in Tier 0 and one that must leave dispatches `target`.
     /// A dynamic target is staged at frame offset 76 and always dispatches.
-    fn stored(&mut self, pc: u32, target: Option<u32>, link: bool, commit: impl Fn(&mut Self)) {
+    pub(super) fn stored(
+        &mut self,
+        pc: u32,
+        target: Option<u32>,
+        link: bool,
+        commit: impl Fn(&mut Self),
+    ) {
         self.word(0x7100_081f); // cmp w0,#2
         let refused = self.words.len();
         self.word(0);
@@ -235,7 +244,7 @@ impl Emitter {
     fn skip_nonzero(&mut self, r: u8, words: u32) {
         self.word(0x3500_0000 | (words + 1) << 5 | r as u32);
     }
-    fn charge(&mut self) {
+    pub(super) fn charge(&mut self) {
         self.word(0xd100_04e7);
     } // sub x7,x7,#1
     fn link(&mut self) {
@@ -759,6 +768,10 @@ impl Emitter {
         }
         if let Some((width, read, write)) = string(i) {
             self.string_instruction(i, width, read, write);
+            return;
+        }
+        if super::forms::simd(i) {
+            self.simd_instruction(i);
             return;
         }
         if rmw(i) {

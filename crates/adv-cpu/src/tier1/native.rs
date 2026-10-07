@@ -55,7 +55,7 @@ unsafe extern "C" {
     fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);
 }
 
-/// The entry frame followed by owner state that only the access helpers use.
+/// The entry frame followed by exclusive helper and architectural-state data.
 /// The frame comes first, so the pointer in x27 is also the helpers' context.
 #[repr(C)]
 pub(super) struct Entry {
@@ -63,6 +63,7 @@ pub(super) struct Entry {
     pub(super) memory: *mut Memory,
     pub(super) inline: u64,
     pub(super) state: *mut CpuState,
+    pub(super) vector: [u64; 2],
 }
 
 /// Checked 1/2/4-byte guest load without leaving native code, zero- or
@@ -373,6 +374,8 @@ impl Engine {
             store: store as *const () as u64,
             stack_all: stack_all as *const () as u64,
             x87: super::x87::call as *const () as u64,
+            vector_load: super::simd::load as *const () as u64,
+            vector_store: super::simd::store as *const () as u64,
         });
         for instruction in instructions.values() {
             emitted.instruction(instruction, x87.get(instruction.ip32()));
@@ -432,6 +435,7 @@ impl Engine {
         }
         let (unit, offset) = &self.entries[&state.eip];
         let window = memory.ptr.as_ptr();
+        state.commit_mmx();
         let mut entry = Entry {
             frame: Tier1Frame {
                 regs: state.regs,
@@ -445,6 +449,7 @@ impl Engine {
             memory: std::ptr::from_mut(memory),
             inline: 0,
             state: std::ptr::from_mut(state),
+            vector: [0; 2],
         };
         // SAFETY: this owner pins all code and exclusively owns the CPU/memory.
         // Every emitted entry uses the fixed ABI; the access helpers reach
