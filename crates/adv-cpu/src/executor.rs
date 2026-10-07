@@ -13,6 +13,8 @@ mod coverage;
 mod instruction_trace;
 mod interpreter_profile;
 mod parallel;
+mod schedule;
+pub use schedule::CompilationSchedule;
 mod tier1;
 mod verify;
 mod warm;
@@ -38,6 +40,7 @@ pub struct Stats {
     /// Largest responsive work estimate; zero means unrestricted/unmeasured.
     pub max_compile_work: usize,
     pub compile_time: Duration,
+    pub compilation_schedule: CompilationSchedule,
     pub native_code_bytes: usize,
     pub native_regions: usize,
     pub cache_evictions: u64,
@@ -156,6 +159,7 @@ pub struct Executor {
     profiled: Vec<(u32, Arc<compile::Profile>)>,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
+    schedule: schedule::Tracker,
     background_sender: Option<adv_sync::background::LocalSender>,
     background_service: Option<std::rc::Rc<adv_sync::background::Service>>,
     background_wake: Option<adv_sync::WakeEvent>,
@@ -451,6 +455,7 @@ impl Executor {
             profiled: Vec::new(),
             async_compilation: false,
             compiler: None,
+            schedule: Default::default(),
             background_sender: None,
             background_service: None,
             background_wake: None,
@@ -819,6 +824,7 @@ impl Executor {
         if self.pending_regions.contains_key(&region.start)
             || self.deferred_compilations.contains_key(&region.start)
         {
+            self.stats.compilation_schedule.duplicate_requests += 1;
             return Ok(false);
         }
         let policy = self.background_sender()?.borrow().work_policy();
@@ -827,6 +833,7 @@ impl Executor {
         // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
+            self.stats.compilation_schedule.capacity_rejections += 1;
             return Ok(false);
         }
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
@@ -863,6 +870,7 @@ impl Executor {
         // The owner may hold bounded immutable fragments waiting for a permit;
         // no submission waits and no single job contains the original giant unit.
         if self.deferred_compilations.len() + fragments.len() > 4096 {
+            self.stats.compilation_schedule.capacity_rejections += 1;
             return Ok(false);
         }
         self.stats.compile_slices += fragments.len().saturating_sub(1) as u64;
@@ -875,6 +883,7 @@ impl Executor {
         }
         for fragment in fragments {
             if !self.pending_regions.contains_key(&fragment.region.start) {
+                self.schedule_deferred(fragment.region.start);
                 self.deferred_sequence += 1;
                 self.deferred_order
                     .insert(fragment.region.start, self.deferred_sequence);
@@ -927,6 +936,9 @@ impl Executor {
                 worker.set_waker(wake.clone());
             }
             self.compiler = Some(worker);
+            self.stats.compilation_schedule.compile_threads = self.compile_threads.max(1);
+            self.stats.compilation_schedule.available_cores =
+                std::thread::available_parallelism().map_or(1, usize::from);
         }
         while self.pending_regions.len() < crate::compiler::CAPACITY {
             let Some(start) = self.next_deferred() else {
@@ -945,6 +957,7 @@ impl Executor {
             let region = (*snapshot.region).clone();
             match self.compiler.as_mut().unwrap().try_submit(snapshot.clone()) {
                 Ok(ticket) => {
+                    self.schedule_submitted(&region, ticket);
                     self.deferred_compilations.remove(&start);
                     self.stats.compile_requests += 1;
                     self.stats.max_compile_work = self
@@ -960,7 +973,10 @@ impl Executor {
                     self.automatic_regions.insert(region.start);
                     self.index_region(region);
                 }
-                Err(crate::compiler::SubmitError::Full) => break,
+                Err(crate::compiler::SubmitError::Full) => {
+                    self.stats.compilation_schedule.worker_full += 1;
+                    break;
+                }
                 Err(crate::compiler::SubmitError::Closed) => {
                     return Err("compiler worker disconnected".into());
                 }
@@ -995,6 +1011,7 @@ impl Executor {
                 }
             };
             self.stats.compilations += 1;
+            self.schedule_completed(&completion);
             self.stats.compile_time += completion.duration;
             let start = completion.region.start;
             if self.pending_regions.get(&start) != Some(&completion.ticket) {
@@ -1144,6 +1161,7 @@ impl Executor {
     pub fn set_async_compilation(&mut self, enabled: bool) {
         self.async_compilation = enabled;
         if !enabled {
+            self.schedule = Default::default();
             self.tier_attempted.clear();
             self.pending_regions.clear();
             self.deferred_compilations.clear();
@@ -1424,6 +1442,7 @@ impl Executor {
                 .values()
                 .any(|input| covers(&input.region))
         {
+            self.stats.compilation_schedule.window_deferrals += 1;
             return Ok(());
         }
         let boundaries = self
@@ -1789,6 +1808,15 @@ impl Executor {
             self.stats.interpreter_entries += u64::from(interpreted);
             self.stats.interpreter_instructions += u64::from(interpreted_units);
             if interpreted {
+                if matches!(
+                    detail,
+                    Some(
+                        InterpreterDetail::PendingCompilation
+                            | InterpreterDetail::DeferredCompilation
+                    )
+                ) {
+                    self.schedule_interpreted(pc, interpreted_units);
+                }
                 bridge.cliffs.interpreted(reason, interpreted_units);
                 if let Some(detail) = detail {
                     bridge.cliffs.detail(reason, detail, interpreted_units);
