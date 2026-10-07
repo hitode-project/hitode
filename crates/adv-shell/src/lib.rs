@@ -518,10 +518,12 @@ fn api_report(runtime: &Runtime) -> String {
             .join(", ")
     });
     let processes = runtime.process_statuses().iter().map(|process| format!(
-        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}}}",
+        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}, \"first_cpu_fault\": {}, \"latest_cpu_fault\": {}}}",
         process.pid, process.parent.map_or_else(|| "null".into(), |v| v.to_string()), json(&process.image),
         process.exit_code.map_or_else(|| "null".into(), |v| v.to_string()),
-        process.failure.as_deref().map_or_else(|| "null".into(), json)
+        process.failure.as_deref().map_or_else(|| "null".into(), json),
+        cpu_fault_json(process.first_cpu_fault.as_ref()),
+        cpu_fault_json(process.latest_cpu_fault.as_ref())
     )).collect::<Vec<_>>().join(", ");
     format!(
         concat!(

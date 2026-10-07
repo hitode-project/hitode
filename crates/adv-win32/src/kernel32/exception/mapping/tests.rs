@@ -59,6 +59,8 @@ enum Case {
     UnsignedOverflow,
     SignedOverflow,
     Illegal,
+    Cli,
+    Sti,
 }
 fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
     let mut machine = machine(cpu);
@@ -86,11 +88,15 @@ fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
             0x80000000,
             0,
         ),
-        Case::Illegal => (
+        Case::Illegal | Case::Cli | Case::Sti => (
             0x12345678,
             0x23456789,
             0x34567890,
-            ILLEGAL_INSTRUCTION,
+            if matches!(case, Case::Illegal) {
+                ILLEGAL_INSTRUCTION
+            } else {
+                PRIVILEGED_INSTRUCTION
+            },
             0x12345678,
             0x23456789,
         ),
@@ -107,6 +113,8 @@ fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
         Case::Zero | Case::UnsignedOverflow => &[0xf7, 0xf1], // div ecx
         Case::SignedOverflow => &[0xf7, 0xf9],                // idiv ecx
         Case::Illegal => &[0x0f, 0x0b],                       // ud2
+        Case::Cli => &[0xfa],
+        Case::Sti => &[0xfb],
     });
     let next = code.here();
     code.mov_mem_eax(DATA + 64);
@@ -143,13 +151,13 @@ fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
         handler.mov_mem_eax(DATA + 16 + slot as u32 * 4);
     }
     imm(&mut handler, &[0xff, 0x05], DATA + 48); // callback count.
-    // Repair the saved state, then retry DIV at its original EIP. UD2 is the
-    // only instruction this handler explicitly skips by writing CONTEXT.Eip.
+    // Repair the saved state, then retry DIV at its original EIP. The handler
+    // explicitly skips illegal/privileged instructions by writing CONTEXT.Eip.
     let (offset, value) = match case {
         Case::Zero => (0xac, 3),
         Case::UnsignedOverflow => (0xa8, 0),
         Case::SignedOverflow => (0xac, 1),
-        Case::Illegal => (0xb8, next),
+        Case::Illegal | Case::Cli | Case::Sti => (0xb8, next),
     };
     store(&mut handler, &[0xc7, 0x82], offset, value);
     imm(&mut handler, &[0xbb], 0xdeadbeef); // live callback clobber must not escape.
@@ -190,6 +198,40 @@ fn exercise<B: TestCpu>(cpu: B, case: Case, vectored: bool) {
         thunk: 0,
     };
     assert_eq!(super::super::phase::uncaught_query_blocker(&env), None);
+}
+
+#[test]
+fn user_interrupt_flag_instructions_preserve_state_and_resume_after_guest_context_repair() {
+    for case in [Case::Cli, Case::Sti] {
+        for vectored in [true, false] {
+            // Unicorn's flat mode does not model CPL3 privilege checks.
+            exercise(JitCpu::new(PARK_ADDR, false).unwrap(), case, vectored);
+            exercise(JitCpu::new(PARK_ADDR, true).unwrap(), case, vectored);
+        }
+    }
+}
+
+#[test]
+fn general_protection_mapping_requires_a_privileged_opcode_and_handles_page_end() {
+    let mut machine = machine(JitCpu::new(PARK_ADDR, false).unwrap());
+    let mut state = machine.cpu.capture_architecture().unwrap();
+    state.eip = CODE + 4095;
+    machine.cpu.write(state.eip, &[0xfb]).unwrap();
+    let event = Exception::Trap {
+        pc: state.eip,
+        vector: 13,
+    };
+    assert_eq!(
+        map(&machine.cpu, &event, &state).unwrap().code,
+        PRIVILEGED_INSTRUCTION
+    );
+    machine.cpu.write(state.eip, &[0x90]).unwrap();
+    assert!(
+        map(&machine.cpu, &event, &state)
+            .err()
+            .expect("unrelated general protection must remain unclassified")
+            .contains("unmapped x86 CPU exception vector 13")
+    );
 }
 
 #[test]

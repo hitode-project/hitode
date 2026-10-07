@@ -28,6 +28,9 @@ pub struct ProcessStatus {
     pub failure: Option<String>,
     pub missing_apis: Vec<String>,
     pub acceptance_eligible: bool,
+    /// Owned backend evidence survives process selection and child retirement.
+    pub first_cpu_fault: Option<adv_machine::exception::CpuFaultSnapshot>,
+    pub latest_cpu_fault: Option<adv_machine::exception::CpuFaultSnapshot>,
 }
 
 pub(crate) struct Family<B: Backend> {
@@ -74,6 +77,8 @@ impl<B: Backend> Family<B> {
                 failure: None,
                 missing_apis: Vec::new(),
                 acceptance_eligible: true,
+                first_cpu_fault: None,
+                latest_cpu_fault: None,
             }],
             services,
             foreground: machine.sys.pid,
@@ -300,6 +305,8 @@ impl<B: Backend> Runtime<B> {
             failure: None,
             missing_apis: Vec::new(),
             acceptance_eligible: true,
+            first_cpu_fault: None,
+            latest_cpu_fault: None,
         });
         self.family.prepared.insert(
             pid,
@@ -407,6 +414,8 @@ impl<B: Backend> Runtime<B> {
         record.failure = failure;
         record.missing_apis = missing;
         record.acceptance_eligible = eligible;
+        record.first_cpu_fault = self.machine.sys.first_cpu_fault.clone();
+        record.latest_cpu_fault = self.machine.sys.latest_cpu_fault.clone();
         #[cfg(feature = "gpu")]
         adv_dx::d3d9::cancel_pending(&mut self.machine);
         adv_dx::dsound::shutdown(&mut self.machine.ext);

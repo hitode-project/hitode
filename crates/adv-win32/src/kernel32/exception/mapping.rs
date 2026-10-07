@@ -15,6 +15,7 @@ const ACCESS_VIOLATION: u32 = 0xc000_0005;
 const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
 const INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
 const INTEGER_OVERFLOW: u32 = 0xc000_0095;
+const PRIVILEGED_INSTRUCTION: u32 = 0xc000_0096;
 const BREAKPOINT: u32 = 0x8000_0003;
 
 pub(super) fn map(
@@ -82,6 +83,14 @@ fn map_stop(
             }
         }
         Exception::Trap { vector: 6, .. } => ILLEGAL_INSTRUCTION,
+        Exception::Trap { vector: 13, .. }
+            if matches!(
+                instruction(cpu, pc).mnemonic(),
+                Mnemonic::Cli | Mnemonic::Sti
+            ) =>
+        {
+            PRIVILEGED_INSTRUCTION
+        }
         Exception::Trap { vector: 3, .. } => {
             record.address = breakpoint_address(cpu, pc)?;
             record.count = 1; // Owned x86 native CC/CD03 oracle: Information[0]=0.
@@ -147,13 +156,13 @@ fn register(state: &ArchitecturalState, register: Register) -> Option<u64> {
     Some(u64::from(value))
 }
 
-fn divisor(cpu: &dyn Guest, state: &ArchitecturalState) -> Result<u32, String> {
+fn instruction(cpu: &dyn Guest, pc: u32) -> iced_x86::Instruction {
     // Read only available executable bytes; an instruction may end at a page
     // boundary with the following page unmapped. No 15-byte overread is needed.
     let mut bytes = [0; 15];
     let mut length = 0;
     for (index, byte) in bytes.iter_mut().enumerate() {
-        let address = state.eip.wrapping_add(index as u32);
+        let address = pc.wrapping_add(index as u32);
         if !cpu.accessible(address, 1, Prot::EXEC) {
             break;
         }
@@ -163,13 +172,11 @@ fn divisor(cpu: &dyn Guest, state: &ArchitecturalState) -> Result<u32, String> {
         *byte = value;
         length += 1;
     }
-    let instruction = Decoder::with_ip(
-        32,
-        &bytes[..length],
-        u64::from(state.eip),
-        DecoderOptions::NONE,
-    )
-    .decode();
+    Decoder::with_ip(32, &bytes[..length], u64::from(pc), DecoderOptions::NONE).decode()
+}
+
+fn divisor(cpu: &dyn Guest, state: &ArchitecturalState) -> Result<u32, String> {
+    let instruction = instruction(cpu, state.eip);
     if instruction.is_invalid() || !matches!(instruction.mnemonic(), Mnemonic::Div | Mnemonic::Idiv)
     {
         return Err(

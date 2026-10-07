@@ -753,13 +753,39 @@ fn stretch_dib(
     usage: u32,
     rop: u32,
 ) -> Outcome {
+    dib_transfer(
+        env,
+        dst,
+        [x, y, width, height],
+        [sx, sy, sw, sh],
+        bits,
+        info,
+        usage,
+        rop,
+        "gdi32.dll!StretchDIBits",
+        false,
+    )
+}
+
+pub(crate) fn dib_transfer(
+    env: &mut Env<'_>,
+    dst: Handle,
+    [x, y, width, height]: [i32; 4],
+    [sx, sy, sw, sh]: [i32; 4],
+    bits: GuestPtr<()>,
+    info: GuestPtr<()>,
+    usage: u32,
+    rop: u32,
+    api: &str,
+    boolean: bool,
+) -> Outcome {
     if !available(env) {
         return fail(env, 6);
     }
     if adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err() {
         return fail(env, 87);
     }
-    raster_call_named(env, Some("gdi32.dll!StretchDIBits"), |r, s, d, o, m| {
+    raster_call_named(env, Some(api), |r, s, d, o, m| {
         r.stretch_dib(
             s,
             d,
@@ -779,6 +805,13 @@ fn stretch_dib(
             usage,
             rop,
         )
+        .map(|value| {
+            if boolean {
+                u32::from(value != 0)
+            } else {
+                value
+            }
+        })
     })
 }
 

@@ -8,14 +8,26 @@
   "documentation": [
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icinstall",
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-icremove",
-    "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibopen"
+    "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibopen",
+    "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibclose",
+    "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibdraw"
   ],
   "drawdib_open": {
-    "scope": "仅补充 msvfw32.dll!DrawDibOpen，不扩展其他 DrawDib 函数",
+    "scope": "仅补充 msvfw32.dll!DrawDibOpen/Close/Draw，不扩展其他 DrawDib 函数",
     "declaration": "typedef HANDLE HDRAWDIB; extern HDRAWDIB VFWAPI DrawDibOpen(void);",
     "return": "HDRAWDIB 是 HANDLE 别名，按 32 位 handle ABI 分类；成功返回 DrawDib DC 句柄，失败返回 NULL",
     "calling_convention": "VFWAPI 展开为 WINAPI，x86 为 __stdcall；无参数，栈参数字数为零",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibopen"
+  },
+  "drawdib_draw_close": {
+    "scope": "DrawDibClose 的一个 HDRAWDIB 参数和 DrawDibDraw 的十三个参数按 SDK 精确投影；二者均返回 BOOL",
+    "declarations": "BOOL VFWAPI DrawDibClose(HDRAWDIB hdd); BOOL VFWAPI DrawDibDraw(HDRAWDIB hdd, HDC hdc, int xDst, int yDst, int dxDst, int dyDst, LPBITMAPINFOHEADER lpbi, LPVOID lpBits, int xSrc, int ySrc, int dxSrc, int dySrc, UINT wFlags);",
+    "native_verification": "自造 8/32 位正高度 BI_RGB DIB 验证左上源坐标、裁剪、缩放、NULL bits 连续存储、零尺寸、关闭后失效及 LastError 保留；flags=0 将目标 DC 的伸缩模式改为 COLORONCOLOR",
+    "behavior": "DrawDib 句柄归共用 Objects；flags=0 的 40 字节 BI_RGB 8/32 位数据复用 GDI 的 DIB 解码、DC 状态、surface 与 clip；其余 flags、压缩和格式显式告警失败",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibclose",
+      "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibdraw"
+    ]
   },
   "legacy_nt_dos_path": {
     "scope": "ntdll.dll!RtlDosPathNameToNtPathName_U only; no WithStatus export is projected",
@@ -305,6 +317,12 @@
     "source": "Microsoft PE specification and authored Microsoft Windows x86 zero-fixup DLL oracle",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/debug/pe-format",
     "native_verification": "19 DWORDs: zero-entry or absent relocation directory loads at an alternate base with a callable export, explicit RELOCS_STRIPPED fails with STATUS_CONFLICTING_ADDRESSES / ERROR_INVALID_ADDRESS; native failure preserves output and LastError"
+  },
+  "legacy_ansi_string_alias": {
+    "scope": "kernel32.dll lstrcpy only; project the complete pinned lstrcpyA declaration and share its implementation and PE export address",
+    "source": "Microsoft Learn ANSI declaration, SDK 10.0.26100.0 x86 kernel32.lib _lstrcpy@8 and authored Microsoft Windows x86 caller",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrcpya",
+    "native_verification": "eight DWORDs: static import equals dynamic legacy and ANSI addresses, original destination returned, ANSI bytes and NUL copied with canary intact, LastError unchanged and callable address belongs to the actual Kernel32 PE image"
   },
   "nt_delay_execution": {
     "scope": "NtDelayExecution; two x86 stack words, byte BOOLEAN and signed 64-bit 100 ns interval, NTSTATUS",

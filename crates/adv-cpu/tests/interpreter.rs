@@ -59,6 +59,31 @@ fn state() -> CpuState {
     }
 }
 
+#[test]
+fn user_cli_sti_fault_before_flags_or_instruction_state_commit() {
+    for bytes in [
+        &[0xfa][..],
+        &[0xfb][..],
+        &[0x66, 0xfa][..],
+        &[0x66, 0xfb][..],
+    ] {
+        let mut memory = memory(bytes);
+        let initial = state();
+        let mut actual = initial.clone();
+        assert_eq!(
+            Interpreter::new().step(&mut actual, &mut memory),
+            Step::Trap {
+                pc: CODE,
+                vector: 13
+            }
+        );
+        assert_eq!(actual.regs, initial.regs);
+        assert_eq!(actual.eip, initial.eip);
+        assert_eq!(actual.eflags, initial.eflags);
+        assert_eq!(actual.fuel, initial.fuel);
+    }
+}
+
 struct Reference {
     uc: Guarded<'static, ()>,
     memory: Memory,
