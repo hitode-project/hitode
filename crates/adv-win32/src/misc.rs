@@ -89,13 +89,41 @@ fn path_find_file_name_a(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
     let s = cstr(env.cpu, p);
     let c = codec(env);
-    // A trailing separator is skipped, like the real function.
-    let trimmed = if s.len() > 1 && s.ends_with(b"\\") {
-        &s[..s.len() - 1]
-    } else {
-        &s[..]
+    let offset = filename_offset(
+        char_starts(&c, &s)
+            .into_iter()
+            .map(|i| (i, u32::from(s[i]))),
+    );
+    Outcome::Return(p + offset as u32)
+}
+
+fn filename_offset(units: impl Iterator<Item = (usize, u32)>) -> usize {
+    let mut units = units.peekable();
+    let mut start = 0;
+    while let Some((_, unit)) = units.next() {
+        if matches!(unit, 47 | 58 | 92)
+            && let Some(&(index, next)) = units.peek()
+            && !matches!(next, 47 | 92)
+        {
+            start = index;
+        }
+    }
+    start
+}
+
+#[adv_abi::win32(shlwapi, name = "PathFindFileNameW", level = implement)]
+fn path_find_file_name_w(env: &mut Env<'_>, path: adv_abi::WideStr) -> Outcome {
+    let Ok(units) = path.read(env.cpu, 65536) else {
+        set_last_error(env, 998);
+        return Outcome::Return(0);
     };
-    Outcome::Return(p + last_sep(&c, trimmed).map_or(0, |i| i as u32 + 1))
+    let offset = filename_offset(
+        units
+            .iter()
+            .enumerate()
+            .map(|(i, unit)| (i, u32::from(*unit))),
+    );
+    Outcome::Return(path.0.addr() + offset as u32 * 2)
 }
 
 fn path_find_extension_a(env: &mut Env<'_>) -> Outcome {
@@ -337,6 +365,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     reg.register(path_find_extension_w_ABI);
+    reg.register(path_find_file_name_w_ABI);
     theme::register(reg);
     internet::register(reg);
     shell_execute::register(reg);
@@ -490,5 +519,40 @@ mod tests {
         assert!(reg.get("comctl32.dll", "InitCommonControls").is_some());
         assert!(reg.get("comctl32.dll", "InitCommonControlsEx").is_some());
         assert!(reg.get("comctl32.dll", "ImageList_Read").is_some());
+    }
+
+    #[test]
+    fn filename_offsets_match_native_roots_colons_and_trailing_separators() {
+        for (path, expected) in [
+            ("abc", 0),
+            ("C:abc", 2),
+            (r"C:\", 0),
+            (r"abc\", 0),
+            ("abc/", 0),
+            (r"a\\b", 3),
+            ("a//b", 3),
+            ("C:/b", 3),
+            (r"a\b\\", 2),
+            (r"\\server\share\", 9),
+        ] {
+            assert_eq!(
+                filename_offset(
+                    path.encode_utf16()
+                        .enumerate()
+                        .map(|(i, u)| (i, u32::from(u)))
+                ),
+                expected
+            );
+        }
+        let codec = Codec::new(932);
+        let path = [b'a', b'\\', 0x95, 0x5c, b'b'];
+        assert_eq!(
+            filename_offset(
+                char_starts(&codec, &path)
+                    .into_iter()
+                    .map(|i| (i, u32::from(path[i])))
+            ),
+            2
+        );
     }
 }
