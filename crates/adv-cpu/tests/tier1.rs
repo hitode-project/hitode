@@ -2568,7 +2568,14 @@ fn narrow_register_alu_memory_sources_and_carry_match_all_tiers() {
                             m.protect(DATA + 4096, 4096, 0).unwrap();
                             assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
                         }
-                        equivalent(&machines[0], &machines[1], u32::MAX);
+                        // Cranelift may clear undefined logical AF; Tier 1 must
+                        // still match Tier 0 preservation, including that bit.
+                        let mask = if matches!(operation, 4 | 5 | 6 | 8) {
+                            !0x10
+                        } else {
+                            u32::MAX
+                        };
+                        equivalent(&machines[0], &machines[1], mask);
                         equivalent(&machines[0], &machines[2], u32::MAX);
                     }
                 }
@@ -2609,7 +2616,9 @@ fn narrow_memory_comparisons_are_read_only_and_fault_before_flags_change() {
                 for m in &mut machines[1..] {
                     assert_eq!(m.run(STOP, 100).unwrap(), expected);
                 }
-                equivalent(&machines[0], &machines[1], u32::MAX);
+                // TEST leaves AF undefined only after successful retirement.
+                let mask = if test && width == 1 { !0x10 } else { u32::MAX };
+                equivalent(&machines[0], &machines[1], mask);
                 equivalent(&machines[0], &machines[2], u32::MAX);
                 if width == 2 {
                     assert!(matches!(expected, RunOutcome::ReadFault { .. }));
@@ -2618,7 +2627,11 @@ fn narrow_memory_comparisons_are_read_only_and_fault_before_flags_change() {
                         m.protect(DATA + 4096, 4096, READ).unwrap();
                         assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
                     }
-                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(
+                        &machines[0],
+                        &machines[1],
+                        if test { !0x10 } else { u32::MAX },
+                    );
                     equivalent(&machines[0], &machines[2], u32::MAX);
                 } else {
                     assert_eq!(expected, RunOutcome::ReachedStop);
