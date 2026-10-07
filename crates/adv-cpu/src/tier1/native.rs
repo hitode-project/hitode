@@ -58,10 +58,12 @@ unsafe extern "C" {
 /// The entry frame followed by owner state that only the access helpers use.
 /// The frame comes first, so the pointer in x27 is also the helpers' context.
 #[repr(C)]
-struct Entry {
+pub(super) struct Entry {
     frame: Tier1Frame,
-    memory: *mut Memory,
-    inline: u64,
+    pub(super) memory: *mut Memory,
+    pub(super) inline: u64,
+    pub(super) state: *mut CpuState,
+    pub(super) vector: [u64; 2],
 }
 
 /// Checked 1/2/4-byte guest load without leaving native code, zero- or
@@ -368,6 +370,8 @@ impl Engine {
             load: load as *const () as u64,
             store: store as *const () as u64,
             stack_all: stack_all as *const () as u64,
+            vector_load: super::simd::load as *const () as u64,
+            vector_store: super::simd::store as *const () as u64,
         });
         for instruction in instructions.values() {
             emitted.instruction(instruction);
@@ -423,6 +427,7 @@ impl Engine {
         }
         let (unit, offset) = &self.entries[&state.eip];
         let window = memory.ptr.as_ptr();
+        state.commit_mmx();
         let mut entry = Entry {
             frame: Tier1Frame {
                 regs: state.regs,
@@ -435,6 +440,8 @@ impl Engine {
             },
             memory: std::ptr::from_mut(memory),
             inline: 0,
+            state: std::ptr::from_mut(state),
+            vector: [0; 2],
         };
         // SAFETY: this owner pins all code and exclusively owns the CPU/memory.
         // Every emitted entry uses the fixed ABI; the access helpers reach

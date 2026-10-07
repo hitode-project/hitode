@@ -4,6 +4,7 @@
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "android")
 ))]
+mod support;
 use adv_cpu::{CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 const CODE: u32 = 0x10000;
@@ -2714,5 +2715,336 @@ fn memory_push_and_leave_faults_keep_stack_registers_restartable() {
         }
         equivalent(&machines[0], &machines[1], u32::MAX);
         equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
+
+// SIMD tests use the same Tier 0/Cranelift/Tier 1 machines plus Unicorn.
+fn simd_seed(seed: u64) -> CpuState {
+    let mut state = CpuState {
+        eip: CODE,
+        eflags: 0xcd7,
+        ..Default::default()
+    };
+    state.regs[4] = STACK;
+    state.x87.status = 0x4500 | (3 << 11);
+    state.x87.tag = 0xe4e4;
+    let mut n = seed;
+    for slot in 0..8 {
+        n ^= n << 13;
+        n ^= n >> 7;
+        n ^= n << 17;
+        state.xmm[slot][..8].copy_from_slice(&n.to_le_bytes());
+        state.xmm[slot][8..].copy_from_slice(&n.rotate_left(23).to_le_bytes());
+        state.x87.regs[slot] = adv_cpu::X87Register::from_parts(n, 0x3ffe + slot as u16);
+    }
+    state.refresh_mmx();
+    state
+}
+fn simd_oracle(code: &[u8]) -> support::Oracle {
+    let mut m = support::Oracle::new(CODE, 0x30000).unwrap();
+    m.protect(CODE, 0x30000, READ | WRITE).unwrap();
+    m.write(CODE, code).unwrap();
+    m.protect(CODE, 4096, READ | EXEC).unwrap();
+    m.protect(STOP, 4096, READ | EXEC).unwrap();
+    m.write(STACK, &STOP.to_le_bytes()).unwrap();
+    m
+}
+fn simd_compare_oracle(m: &Executor, oracle: &support::Oracle) {
+    assert_eq!(m.state.regs, oracle.state.regs);
+    assert_eq!(m.state.eflags, oracle.state.eflags);
+    assert_eq!(m.state.xmm, oracle.state.xmm);
+    assert_eq!(m.state.mmx, oracle.state.mmx);
+    assert_eq!(m.state.x87.top(), oracle.state.x87.top());
+    assert_eq!(m.state.mxcsr, oracle.state.mxcsr);
+    // Unicorn reconstructs full tags from raw80; Tier 0 and strict verify
+    // independently compare the payload-independent full tag word below.
+}
+
+#[test]
+fn simd_packed_random_and_saturation_edges_match_all_executors() {
+    for operation in 0..29 {
+        for xmm in [false, true] {
+            for memory in [false, true] {
+                let code = assemble(|a| {
+                    macro_rules! emit {
+                        ($dst:expr, $src:expr) => {
+                            match operation {
+                                0 => a.punpcklbw($dst, $src),
+                                1 => a.punpckhbw($dst, $src),
+                                2 => a.punpcklwd($dst, $src),
+                                3 => a.punpckhwd($dst, $src),
+                                4 => a.punpckldq($dst, $src),
+                                5 => a.punpckhdq($dst, $src),
+                                6 => a.packuswb($dst, $src),
+                                7 => a.packsswb($dst, $src),
+                                8 => a.packssdw($dst, $src),
+                                9 => a.paddb($dst, $src),
+                                10 => a.paddw($dst, $src),
+                                11 => a.paddd($dst, $src),
+                                12 => a.psubb($dst, $src),
+                                13 => a.psubw($dst, $src),
+                                14 => a.psubd($dst, $src),
+                                15 => a.paddsb($dst, $src),
+                                16 => a.paddsw($dst, $src),
+                                17 => a.paddusb($dst, $src),
+                                18 => a.paddusw($dst, $src),
+                                19 => a.psubsb($dst, $src),
+                                20 => a.psubsw($dst, $src),
+                                21 => a.psubusb($dst, $src),
+                                22 => a.psubusw($dst, $src),
+                                23 => a.pmullw($dst, $src),
+                                24 => a.pmulhw($dst, $src),
+                                25 => a.pand($dst, $src),
+                                26 => a.por($dst, $src),
+                                27 => a.pxor($dst, $src),
+                                28 => a.pandn($dst, $src),
+                                _ => unreachable!(),
+                            }
+                            .unwrap()
+                        };
+                    }
+                    match (xmm, memory) {
+                        (true, false) => emit!(xmm3, xmm6),
+                        (true, true) => emit!(xmm3, xmmword_ptr(DATA as i32)),
+                        (false, false) => emit!(mm3, mm6),
+                        (false, true) => emit!(mm3, qword_ptr(DATA as i32)),
+                    }
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                machines[2].set_tier_verification(Some(true));
+                let mut oracle = simd_oracle(&code);
+                for seed in [
+                    0,
+                    1,
+                    0x123456789abcdef,
+                    u64::MAX,
+                    0x80007fffffff0001,
+                    0x00ff0100ff000080,
+                    0x808080807f7f7f7f,
+                ] {
+                    let mut state = simd_seed(seed);
+                    // Include exact saturation edges, alongside randomized lanes.
+                    state.xmm[3][..8].copy_from_slice(&seed.to_le_bytes());
+                    state.x87.regs[3] = adv_cpu::X87Register::from_parts(seed, 0x4001);
+                    state.refresh_mmx();
+                    let data = state.xmm[6];
+                    for m in &mut machines {
+                        m.state = state.clone();
+                        m.write(DATA, &data).unwrap();
+                        assert_eq!(
+                            m.run(STOP, 100).unwrap(),
+                            RunOutcome::ReachedStop,
+                            "operation {operation}, xmm {xmm}, memory {memory}"
+                        );
+                    }
+                    oracle.state = state;
+                    oracle.write(DATA, &data).unwrap();
+                    assert_eq!(
+                        oracle.run_unicorn(STOP, 100).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                    simd_compare_oracle(&machines[2], &oracle);
+                    if !xmm {
+                        assert_eq!(machines[2].state.x87.tag, 0);
+                        assert_eq!(machines[2].state.x87.regs[3].sign_exponent(), 0xffff);
+                        assert_eq!(machines[2].state.x87.regs[6].sign_exponent(), 0x4004);
+                    }
+                }
+                assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                assert_eq!(machines[2].stats.verification.mismatches, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn simd_shifts_use_full_unsigned_counts_and_preserve_aliases() {
+    for operation in 0..8 {
+        for xmm in [false, true] {
+            for source in 0..3 {
+                for count in [
+                    0u64,
+                    1,
+                    7,
+                    15,
+                    16,
+                    17,
+                    31,
+                    32,
+                    33,
+                    63,
+                    64,
+                    65,
+                    127,
+                    128,
+                    255,
+                    256,
+                    1 << 32,
+                    1 << 63,
+                    u64::MAX,
+                ] {
+                    if source == 0 && count > 255 {
+                        continue;
+                    }
+                    let code = assemble(|a| {
+                        macro_rules! emit {
+                            ($dst:expr, $src:expr) => {
+                                match operation {
+                                    0 => a.psrlw($dst, $src),
+                                    1 => a.psllw($dst, $src),
+                                    2 => a.psraw($dst, $src),
+                                    3 => a.psrld($dst, $src),
+                                    4 => a.pslld($dst, $src),
+                                    5 => a.psrad($dst, $src),
+                                    6 => a.psrlq($dst, $src),
+                                    7 => a.psllq($dst, $src),
+                                    _ => unreachable!(),
+                                }
+                                .unwrap()
+                            };
+                        }
+                        match (xmm, source) {
+                            (true, 0) => emit!(xmm3, count as u32),
+                            (true, 1) => emit!(xmm3, xmm6),
+                            (true, _) => emit!(xmm3, xmmword_ptr(DATA as i32)),
+                            (false, 0) => emit!(mm3, count as u32),
+                            (false, 1) => emit!(mm3, mm6),
+                            (false, _) => emit!(mm3, qword_ptr(DATA as i32)),
+                        }
+                        a.ret().unwrap();
+                    });
+                    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                    machines[2].set_tier_verification(Some(true));
+                    let mut state = simd_seed(0x80017ffeffff0001);
+                    state.xmm[6][..8].copy_from_slice(&count.to_le_bytes());
+                    state.x87.regs[6] = adv_cpu::X87Register::from_parts(count, 0x4004);
+                    state.refresh_mmx();
+                    let data = state.xmm[6];
+                    for m in &mut machines {
+                        m.state = state.clone();
+                        m.write(DATA, &data).unwrap();
+                        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    }
+                    let mut oracle = simd_oracle(&code);
+                    oracle.state = state;
+                    oracle.write(DATA, &data).unwrap();
+                    assert_eq!(
+                        oracle.run_unicorn(STOP, 100).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                    simd_compare_oracle(&machines[2], &oracle);
+                    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn simd_moves_partial_writes_shuffles_and_helper_clobbers() {
+    for mask in 0..256u32 {
+        let code = assemble(|a| {
+            a.movq(mm2, mm5).unwrap();
+            a.movq(qword_ptr(DATA as i32), mm2).unwrap();
+            a.movq(mm7, qword_ptr(DATA as i32)).unwrap();
+            a.movd(ebx, mm7).unwrap();
+            a.movd(mm1, ebx).unwrap();
+            a.movd(dword_ptr(DATA as i32 + 16), mm1).unwrap();
+            a.movd(mm4, dword_ptr(DATA as i32 + 16)).unwrap();
+            a.movaps(xmm2, xmm5).unwrap();
+            a.movups(xmmword_ptr(DATA as i32 + 35), xmm2).unwrap();
+            a.movups(xmm7, xmmword_ptr(DATA as i32 + 35)).unwrap();
+            a.movdqa(xmmword_ptr(DATA as i32 + 64), xmm7).unwrap();
+            a.movdqa(xmm3, xmmword_ptr(DATA as i32 + 64)).unwrap();
+            a.movdqu(xmmword_ptr(DATA as i32 + 83), xmm3).unwrap();
+            a.movdqu(xmm6, xmmword_ptr(DATA as i32 + 83)).unwrap();
+            a.movaps(xmmword_ptr(DATA as i32 + 112), xmm6).unwrap();
+            a.movaps(xmm1, xmmword_ptr(DATA as i32 + 112)).unwrap();
+            a.movss(xmm1, xmm4).unwrap();
+            a.movss(dword_ptr(DATA as i32 + 132), xmm1).unwrap();
+            a.movss(xmm0, dword_ptr(DATA as i32 + 132)).unwrap();
+            a.movd(xmm2, ebx).unwrap();
+            a.movd(ecx, xmm2).unwrap();
+            a.shufps(xmm3, xmm6, mask).unwrap();
+            a.shufps(xmm4, xmmword_ptr(DATA as i32 + 64), mask).unwrap();
+            a.shufps(xmm5, xmm5, mask).unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        let state = simd_seed(0xabcdef0123456789 ^ u64::from(mask));
+        for m in &mut machines {
+            m.state = state.clone();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        let mut oracle = simd_oracle(&code);
+        oracle.state = state;
+        assert_eq!(
+            oracle.run_unicorn(STOP, 100).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        simd_compare_oracle(&machines[2], &oracle);
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+    }
+}
+
+#[test]
+fn simd_cross_page_faults_alignment_and_pending_mmx_are_precise() {
+    for operation in 0..10 {
+        for offset in [4080, 4088, 4092, 4095] {
+            for permissions in [0, READ, READ | WRITE] {
+                for pending in [false, true] {
+                    let code = assemble(|a| {
+                        a.pxor(xmm7, xmm7).unwrap(); // A committed prefix.
+                        match operation {
+                            0 => a.movups(xmm0, xmmword_ptr(edi)),
+                            1 => a.movups(xmmword_ptr(edi), xmm0),
+                            2 => a.movaps(xmm0, xmmword_ptr(edi)),
+                            3 => a.movaps(xmmword_ptr(edi), xmm0),
+                            4 => a.movdqa(xmm0, xmmword_ptr(edi)),
+                            5 => a.movdqa(xmmword_ptr(edi), xmm0),
+                            6 => a.movq(mm0, qword_ptr(edi)),
+                            7 => a.movq(qword_ptr(edi), mm0),
+                            8 => a.movss(xmm0, dword_ptr(edi)),
+                            _ => a.movss(dword_ptr(edi), xmm0),
+                        }
+                        .unwrap();
+                        a.ret().unwrap();
+                    });
+                    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                    let mut state = simd_seed(0x807fff00abcdef);
+                    state.regs[7] = DATA + offset;
+                    if pending {
+                        state.x87.status |= 0x8081;
+                        state.x87.control &= !1;
+                    }
+                    let mut results = Vec::new();
+                    for m in &mut machines {
+                        m.state = state.clone();
+                        m.write(DATA, &[0x5a; 8192]).unwrap();
+                        m.protect(DATA + 4096, 4096, permissions).unwrap();
+                        results.push(m.run(STOP, 100));
+                    }
+                    assert_eq!(
+                        results[0], results[2],
+                        "operation {operation}, offset {offset}, permission {permissions}, pending {pending}"
+                    );
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                    // Cranelift's existing pending-MMX guard is outside this
+                    // task. Compare the ordinary access/fault path here.
+                    if !pending {
+                        assert_eq!(results[0], results[1]);
+                        equivalent(&machines[0], &machines[1], u32::MAX);
+                    }
+                }
+            }
+        }
     }
 }

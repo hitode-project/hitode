@@ -1,4 +1,4 @@
-//! Explicit ARM64 Tier 1 lane: bounded integer templates with exact Tier 0 exits.
+//! Explicit ARM64 Tier 1 lane: bounded integer/SIMD templates with exact Tier 0 exits.
 //! Memory operations retain the existing checked Memory contract, through
 //! helper calls from native code and an exit when a helper refuses. No hardware
 //! fault recovery, floating approximation or parallel guest execution is enabled.
@@ -48,6 +48,11 @@ mod emit;
     any(target_os = "linux", target_os = "android")
 ))]
 mod native;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
+mod simd;
 
 pub(crate) struct Execution {
     pub execution: crate::interpreter::Execution,
