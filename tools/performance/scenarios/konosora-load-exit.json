@@ -1,0 +1,66 @@
+[
+  {
+    "at": 29,
+    "checkpoint": "title"
+  },
+  {
+    "at": 30,
+    "command": "mouse-down 500 620"
+  },
+  {
+    "at": 30.5,
+    "command": "mouse-up 500 620"
+  },
+  {
+    "at": 35,
+    "checkpoint": "load-menu"
+  },
+  {
+    "at": 36,
+    "command": "mouse-down 555 190"
+  },
+  {
+    "at": 36.5,
+    "command": "mouse-up 555 190"
+  },
+  {
+    "at": 40,
+    "command": "mouse-down 555 423"
+  },
+  {
+    "at": 40.5,
+    "command": "mouse-up 555 423"
+  },
+  {
+    "at": 48,
+    "checkpoint": "loaded"
+  },
+  {
+    "at": 49,
+    "command": "key 13"
+  },
+  {
+    "at": 53,
+    "checkpoint": "advanced"
+  },
+  {
+    "at": 55,
+    "command": "mouse-down 1219 673"
+  },
+  {
+    "at": 55.5,
+    "command": "mouse-up 1219 673"
+  },
+  {
+    "at": 59,
+    "checkpoint": "config"
+  },
+  {
+    "at": 60,
+    "command": "mouse-down 1188 692"
+  },
+  {
+    "at": 60.5,
+    "command": "mouse-up 1188 692"
+  }
+]

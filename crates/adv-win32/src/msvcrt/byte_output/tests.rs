@@ -177,6 +177,25 @@ fn guest<B: Backend>(cpu: impl Fn() -> B) {
             out + 8,
         );
         seed(&mut machine, &mut main, module, out + 4);
+        for slot in 0..8u32 {
+            let get = machine
+                .resolve_import(module, if slot % 2 == 0 { "fgetc" } else { "getc" })
+                .unwrap();
+            main.push(dword_ptr((out + 8) as i32)).unwrap();
+            main.call(u64::from(get)).unwrap();
+            main.add(esp, 4).unwrap();
+            main.mov(
+                dword_ptr((DATA + 2560 + index as u32 * 64 + slot * 4) as i32),
+                eax,
+            )
+            .unwrap();
+        }
+        let seek = machine.resolve_import(module, "fseek").unwrap();
+        main.push(0).unwrap();
+        main.push(0).unwrap();
+        main.push(dword_ptr((out + 8) as i32)).unwrap();
+        main.call(u64::from(seek)).unwrap();
+        main.add(esp, 12).unwrap();
         let put = machine.resolve_import(module, "fputc").unwrap();
         main.push(dword_ptr((out + 8) as i32)).unwrap();
         main.push(65).unwrap();
@@ -257,6 +276,20 @@ fn guest<B: Backend>(cpu: impl Fn() -> B) {
     }
     for (offset, expected) in [(608, 1), (616, u32::MAX), (620, 22), (624, 91), (628, 0)] {
         assert_eq!(machine.cpu.read_u32(DATA + offset).unwrap(), expected);
+    }
+    for module in 0..3u32 {
+        for (slot, expected) in [0, 10, 26, 128, 255, 255, u32::MAX, u32::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                machine
+                    .cpu
+                    .read_u32(DATA + 2560 + module * 64 + slot as u32 * 4)
+                    .unwrap(),
+                expected
+            );
+        }
     }
     assert!(machine.ext.get::<CrtState>().files.is_empty());
 
