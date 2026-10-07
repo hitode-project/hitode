@@ -174,6 +174,51 @@ fn versioned_copy_matches_unicorn_inside_and_across_page_permissions() {
 }
 
 #[test]
+fn loop_instruction_latches_match_unicorn_inside_and_across_page_permissions() {
+    // MMX quadword copy and fill loops closed by LOOP, as in compiler-era memcpy.
+    let copy = code(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(edi, 8).unwrap();
+        a.loop_(top).unwrap();
+        a.emms().unwrap();
+        a.ret().unwrap();
+    });
+    let fill = code(|a| {
+        let mut top = a.create_label();
+        a.pxor(mm0, mm0).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(edi, 8).unwrap();
+        a.loop_(top).unwrap();
+        a.emms().unwrap();
+        a.ret().unwrap();
+    });
+    let all = |_: &mut Executor| {};
+    let readonly = |m: &mut Executor| m.protect(DST + 0x2000, 4096, READ).unwrap();
+    for (name, bytes) in [("copy", &copy), ("fill", &fill)] {
+        differential(name, bytes, regs(1500, SRC, DST), all, 1 << 30);
+        differential(name, bytes, regs(1, SRC, DST), all, 1 << 30);
+        differential(name, bytes, regs(1500, SRC, DST), all, 37);
+        differential(name, bytes, regs(1500, SRC, DST), readonly, 1 << 30);
+        // The last quadword before the read-only page, and one past it.
+        differential(name, bytes, regs(1024, SRC, DST), readonly, 1 << 30);
+        differential(name, bytes, regs(1025, SRC, DST), readonly, 1 << 30);
+    }
+    let mut m = machine(&copy, Some(CompileStrategy::Speed));
+    m.state.regs = regs(1500, SRC, DST);
+    assert_eq!(m.run(STOP, 1 << 30).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(m.stats.interpreter_instructions, 0);
+    assert_eq!(
+        m.memory().read(DST, 12000).unwrap(),
+        m.memory().read(SRC, 12000).unwrap()
+    );
+}
+
+#[test]
 fn versioned_loops_with_negative_steps_narrow_counters_and_skips_match_unicorn() {
     let backwards = counted(false, |a| {
         a.movd(mm0, dword_ptr(esi - 4)).unwrap();

@@ -172,10 +172,17 @@ pub(super) fn supported(i: &Instruction) -> bool {
         M::Mul | M::Div | M::Idiv => i.op_count() == 1 && source32(i, 0),
         M::Imul => match i.op_count() {
             1 => source32(i, 0),
+            2 if i.op0_kind() == OpKind::Register && i.op0_register().is_gpr16() => {
+                operand(i, 1, &[2])
+            }
             2 => {
                 i.op0_kind() == OpKind::Register
                     && reg_index(i.op0_register()).is_some()
                     && source32(i, 1)
+            }
+            3 if i.op0_kind() == OpKind::Register && i.op0_register().is_gpr16() => {
+                operand(i, 1, &[2])
+                    && matches!(i.op2_kind(), OpKind::Immediate16 | OpKind::Immediate8to16)
             }
             3 => {
                 i.op0_kind() == OpKind::Register
@@ -464,6 +471,10 @@ impl Emitter<'_> {
             return;
         }
         let signed = i.mnemonic() == M::Imul;
+        if signed && i.op_count() >= 2 && operand_size(i, 0) == 2 {
+            self.signed_multiply16(i);
+            return;
+        }
         let (a, b) = match i.op_count() {
             1 => (self.b.use_var(self.regs[0]), self.read(i, 0)),
             2 => (self.read(i, 0), self.read(i, 1)),
@@ -493,6 +504,26 @@ impl Emitter<'_> {
         }
         // MUL/IMUL only define CF and OF. Preserve the other flags rather than
         // inventing arithmetic flags for the low half of the product.
+        let carry = self.b.ins().uextend(types::I32, overflow);
+        self.set_carry_overflow(carry, carry);
+    }
+
+    /// Two- and three-operand IMUL r16: the 32-bit product of the sign-extended
+    /// operands is exact, and CF/OF report whether it fits in 16 bits.
+    fn signed_multiply16(&mut self, i: &Instruction) {
+        let (a, b) = match i.op_count() {
+            2 => (self.read(i, 0), self.read(i, 1)),
+            _ => (self.read(i, 1), self.read(i, 2)),
+        };
+        let a = self.b.ins().ireduce(types::I16, a);
+        let a = self.b.ins().sextend(types::I32, a);
+        let b = self.b.ins().ireduce(types::I16, b);
+        let b = self.b.ins().sextend(types::I32, b);
+        let product = self.b.ins().imul(a, b);
+        let low = self.b.ins().ireduce(types::I16, product);
+        let extended = self.b.ins().sextend(types::I32, low);
+        let overflow = self.b.ins().icmp(IntCC::NotEqual, product, extended);
+        self.write(i, None, product);
         let carry = self.b.ins().uextend(types::I32, overflow);
         self.set_carry_overflow(carry, carry);
     }

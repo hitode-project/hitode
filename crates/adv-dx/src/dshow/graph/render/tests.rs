@@ -3,8 +3,8 @@
 use super::*;
 use crate::dshow::graph::source::tests::finish;
 use crate::dshow::tests::{activate, env};
-use adv_cpu::backend::Guest;
 use adv_cpu::JitCpu;
+use adv_cpu::backend::Guest;
 use adv_machine::{Clock, Conv, Machine};
 use std::collections::BTreeMap;
 

@@ -254,6 +254,10 @@ pub(super) fn batch(
     if !plan.windows.is_empty() {
         return Err("windows".into());
     }
+    // A LOOP latch is its own counter step; batches replay steps separately.
+    if plan.counter_step == plan.latch {
+        return Err("loop latch".into());
+    }
     if !plan.slots.is_empty() {
         return Err("slots".into());
     }

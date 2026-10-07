@@ -2,6 +2,7 @@ use adv_runtime::Snapshot;
 pub use adv_sync::WakeEvent;
 #[cfg(all(windows, feature = "gpu"))]
 pub(crate) use native::native_viewport;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -35,7 +36,7 @@ mod native {
     mod dialog;
     mod menu;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0,
+        CloseHandle, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0,
         WAIT_TIMEOUT, WPARAM,
     };
     use windows_sys::Win32::Graphics::Gdi::*;
@@ -57,10 +58,24 @@ mod native {
         client_width: i32,
         client_height: i32,
         closed: bool,
+        cursor_visible: bool,
+        video_cursor_regions: Arc<[adv_runtime::VideoCursorRegion]>,
         retained: RetainedFrame,
         paint_error: Option<String>,
         #[cfg(feature = "gpu")]
         gpu_mode: bool,
+    }
+    impl State {
+        fn cursor_visible_at(&self, point: &POINT, client: &RECT) -> bool {
+            let (x, y) = Viewport::fit(client, self.width, self.height).position(
+                point.x,
+                point.y,
+                self.width,
+                self.height,
+            );
+            self.cursor_visible
+                && !adv_runtime::VideoCursorRegion::hidden_at(&self.video_cursor_regions, x, y)
+        }
     }
     pub struct Window {
         hwnd: HWND,
@@ -590,6 +605,26 @@ mod native {
                         }
                         return 0;
                     }
+                    WM_SETCURSOR
+                        if wparam as HWND == hwnd && lparam as u32 & 0xffff == HTCLIENT =>
+                    {
+                        let mut point = std::mem::zeroed();
+                        let mut client: RECT = std::mem::zeroed();
+                        let visible = if GetCursorPos(&mut point) != 0
+                            && ScreenToClient(hwnd, &mut point) != 0
+                            && GetClientRect(hwnd, &mut client) != 0
+                        {
+                            state.cursor_visible_at(&point, &client)
+                        } else {
+                            state.cursor_visible
+                        };
+                        SetCursor(if visible {
+                            LoadCursorW(null_mut(), IDC_ARROW)
+                        } else {
+                            null_mut()
+                        });
+                        return 1;
+                    }
                     _ => {}
                 }
             }
@@ -646,6 +681,8 @@ mod native {
                 client_width: width as i32,
                 client_height: height as i32,
                 closed: false,
+                cursor_visible: true,
+                video_cursor_regions: Arc::from([]),
                 retained: RetainedFrame::default(),
                 paint_error: None,
                 #[cfg(feature = "gpu")]
@@ -739,6 +776,43 @@ mod native {
                 .events
                 .extend(self.dialogs.take_events().map(Event::Dialog));
             self.state.events.drain(..).collect()
+        }
+
+        /// Change the canvas cursor without modifying Win32's global ShowCursor
+        /// counter. Non-client areas and other applications keep their cursors.
+        pub fn set_cursor_visible(&mut self, visible: bool) {
+            if self.state.cursor_visible == visible {
+                return;
+            }
+            self.state.cursor_visible = visible;
+            self.refresh_cursor();
+        }
+
+        pub fn set_video_cursor_regions(&mut self, regions: Arc<[adv_runtime::VideoCursorRegion]>) {
+            self.state.video_cursor_regions = regions;
+            self.refresh_cursor();
+        }
+
+        fn refresh_cursor(&mut self) {
+            unsafe {
+                let mut point = std::mem::zeroed();
+                let mut client: RECT = std::mem::zeroed();
+                if GetCursorPos(&mut point) != 0
+                    && WindowFromPoint(point) == self.hwnd
+                    && ScreenToClient(self.hwnd, &mut point) != 0
+                    && GetClientRect(self.hwnd, &mut client) != 0
+                    && point.x >= 0
+                    && point.y >= 0
+                    && point.x < client.right
+                    && point.y < client.bottom
+                {
+                    SetCursor(if self.state.cursor_visible_at(&point, &client) {
+                        LoadCursorW(null_mut(), IDC_ARROW)
+                    } else {
+                        null_mut()
+                    });
+                }
+            }
         }
 
         pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
@@ -1219,6 +1293,8 @@ pub fn initialize_dpi() -> Result<(), String> {
 pub struct Window;
 #[cfg(not(windows))]
 impl Window {
+    pub fn set_video_cursor_regions(&mut self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
+    pub fn set_cursor_visible(&mut self, _: bool) {}
     pub fn set_dialogs(&mut self, _: &adv_runtime::DialogSet) -> Result<(), String> {
         Ok(())
     }

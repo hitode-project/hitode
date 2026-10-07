@@ -107,6 +107,69 @@ fn multiply_forms_match_unicorn_results_and_defined_flags() {
 }
 
 #[test]
+fn word_multiply_forms_match_unicorn_and_stay_native() {
+    let values = [0, 1, 2, 0x7f, 0xff, 0x100, 0x7fff, 0x8000, 0xfffe, 0xffff];
+    for form in 0..5 {
+        let bytes = assemble(|a| {
+            match form {
+                0 => a.imul_2(bx, cx),
+                1 => a.imul_3(bx, cx, -7),
+                2 => a.imul_3(bx, cx, 0x1234),
+                3 => a.imul_2(bx, word_ptr(DATA as i32)),
+                _ => a.imul_3(dx, word_ptr(DATA as i32), 3),
+            }
+            .unwrap();
+            // CF and OF through native branches, as in the doubleword test.
+            let mut carry = a.create_label();
+            let mut after_carry = a.create_label();
+            let mut overflow = a.create_label();
+            let mut done = a.create_label();
+            a.jb(carry).unwrap();
+            a.mov(esi, 0).unwrap();
+            a.jmp(after_carry).unwrap();
+            a.set_label(&mut carry).unwrap();
+            a.mov(esi, 1).unwrap();
+            a.set_label(&mut after_carry).unwrap();
+            a.jo(overflow).unwrap();
+            a.mov(edi, 0).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut overflow).unwrap();
+            a.mov(edi, 1).unwrap();
+            a.set_label(&mut done).unwrap();
+            a.ret().unwrap();
+        });
+        let mut jit = machine(&bytes, true);
+        let mut uc = machine(&bytes, false);
+        for &left in &values {
+            for &right in &values {
+                for flags in [2, 0xcd7] {
+                    // High halves must survive the 16-bit destination write.
+                    let regs = [
+                        0,
+                        0xabcd_0000 | right,
+                        0x9876_0000,
+                        0x5555_0000 | left,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ];
+                    for m in [&mut jit, &mut uc] {
+                        reset(m, regs, flags);
+                        m.write(DATA, &(right as u16).to_le_bytes()).unwrap();
+                    }
+                    differential(&mut jit, &mut uc, 0x801);
+                }
+            }
+        }
+        assert_eq!(
+            jit.stats.interpreter_entries, 0,
+            "word multiply form {form}"
+        );
+    }
+}
+
+#[test]
 fn shifts_match_unicorn_at_zero_one_and_masked_counts() {
     let values = [0, 1, 2, 0x1234_5678, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
     let counts = [0u8, 1, 2, 7, 15, 31, 32, 33, 63, 255];

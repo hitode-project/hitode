@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 pub use adv_device::surface::{
     FrameConsumer, FrameProducer, FrameView, GraphicsStats, PendingFrame, Presenter, Snapshot,
-    SurfaceMemory, Surfaces, frame_mailbox,
+    SurfaceMemory, Surfaces, VideoCursorRegion, frame_mailbox,
 };
 pub use adv_dx::ddraw::{IID_DDRAW7, IID_SURFACE7};
 /// Compatibility name; ownership is the device store, with no API frontend payload.
@@ -62,6 +62,65 @@ fn window_geometry(
         origin: win32.user.client_origin(objects, hwnd),
     })
 }
+fn video_window_geometry(
+    ext: &Ext,
+    objects: &Objects,
+    hwnd: u32,
+) -> Option<adv_dx::dshow::VideoWindowGeometry> {
+    let user = &ext.get::<Win32>().user;
+    let window = user.windows.get(objects, &hwnd)?;
+    if window.destroying {
+        return None;
+    }
+    let (width, height) = window.client_size();
+    let mut visible = width > 0 && height > 0;
+    let mut ancestor = hwnd;
+    let mut root = hwnd;
+    let mut valid_chain = false;
+    for _ in 0..=user.windows.len() {
+        let parent = user.windows.get(objects, &ancestor)?;
+        if parent.destroying {
+            return None;
+        }
+        visible &= parent.visible() && parent.style & 0x2000_0000 == 0;
+        root = ancestor;
+        if parent.parent == 0 {
+            valid_chain = true;
+            break;
+        }
+        ancestor = parent.parent;
+    }
+    if !valid_chain {
+        return None;
+    }
+    // Use the same displayed top-level canvas as host input coordinates.
+    let top = user
+        .top
+        .iter()
+        .copied()
+        .find(|id| {
+            user.windows
+                .get(objects, id)
+                .is_some_and(|window| window.visible() && !window.destroying)
+        })
+        .unwrap_or(root);
+    let origin = user.client_origin(objects, hwnd);
+    let canvas_origin = user.client_origin(objects, top);
+    visible &= root == top;
+    // USER coordinates describe this top-level client, while a D3D backbuffer
+    // may have a different size. The neutral compositor maps the whole layer.
+    let canvas = user.windows.get(objects, &top)?.client_size();
+    Some(adv_dx::dshow::VideoWindowGeometry {
+        width: width as u32,
+        height: height as u32,
+        origin: (
+            origin.0.saturating_sub(canvas_origin.0),
+            origin.1.saturating_sub(canvas_origin.1),
+        ),
+        canvas: (canvas.0 as u32, canvas.1 as u32),
+        visible,
+    })
+}
 pub fn register_graphics(registry: &mut Registry) {
     adv_win32::gdi32::raster::register(registry);
     adv_dx::ddraw::register(registry);
@@ -99,6 +158,14 @@ pub fn install_graphics<B: Backend>(
         width, height, arena, arena_len, snapshot,
     )?);
     machine.ext.insert(RunControl::default());
+    adv_dx::dshow::set_video_provider(
+        &mut machine.ext,
+        adv_dx::dshow::VideoProvider {
+            update: |ext, key, layer| ext.get_mut::<SurfaceStore>().set_video_layer(key, layer),
+            window: video_window_geometry,
+            completed: frame_completed,
+        },
+    );
     adv_win32::gdi32::raster::set_provider(
         &mut machine.ext,
         adv_win32::gdi32::raster::DrawingProvider {

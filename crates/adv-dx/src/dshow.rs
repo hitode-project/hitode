@@ -18,6 +18,8 @@ mod filter;
 mod graph;
 mod sample;
 mod stream;
+mod video;
+pub use video::{VideoProvider, VideoWindowGeometry, pump_video, set_video_provider};
 
 pub(crate) const S_OK: u32 = 0;
 pub(crate) const S_FALSE: u32 = 1;
@@ -140,6 +142,12 @@ pub(crate) const FORMAT_WAVEFORMATEX: Iid = guid(
 pub(crate) const GUID_NULL: Iid = [0; 16];
 
 const CLSID_FILTERGRAPH: Iid = amovie(0xe436_ebb3);
+const CLSID_VIDEO_RENDER: Iid = guid(
+    0x70e1_02b0,
+    0x5556,
+    0x11ce,
+    [0x97, 0xc0, 0, 0xaa, 0, 0x55, 0x59, 0x5a],
+);
 const CLSID_FILTERGRAPH_NO_THREAD: Iid = amovie(0xe436_ebb8);
 const CLSID_MPEG1_SPLITTER: Iid = guid(
     0x3364_75d0,
@@ -473,7 +481,8 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
     let state = state(env);
     match value {
         Obj::Graph => {
-            state.graphs.remove(&canonical);
+            video::detach(env, canonical);
+            self::state(env).graphs.remove(&canonical);
         }
         Obj::Filter => {
             let handle = state

@@ -170,6 +170,80 @@ fn delayed_native_capture_keeps_source_pixels_dimensions_and_monotonic_serial() 
     assert!(!surfaces.has_pending_frame());
 }
 
+#[test]
+fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture() {
+    use adv_device::surface::{BlitRect, Snapshot, Surfaces, VideoFrame, VideoLayer};
+    let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    let mut surfaces = Surfaces::new(3, 1, 0x1000, 0x10000, Snapshot::default()).unwrap();
+    surfaces.set_deferred_presentation(true).unwrap();
+    let target = surfaces.create_native(&gpu, 3, 1, false).unwrap();
+    gpu.clear(
+        surfaces.native_target(target).unwrap(),
+        Some([1., 0., 0., 1.]),
+        None,
+    )
+    .unwrap();
+    surfaces.present_native(target, &mut gpu).unwrap();
+    let layer = VideoLayer {
+        frame: VideoFrame {
+            width: 1,
+            height: 1,
+            pitch: 4,
+            bgra: Arc::from([255, 0, 0, 255]),
+        },
+        source: Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+        destination: BlitRect {
+            x: 1,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+        background: None,
+        clip: Rect {
+            x: 0,
+            y: 0,
+            w: 3,
+            h: 1,
+        },
+        canvas: (3, 1),
+        visible: true,
+        hide_cursor: true,
+    };
+    assert_eq!(surfaces.set_video_layer(5, Some(layer.clone())).unwrap(), 2);
+    let composition = surfaces.latest_frame().unwrap().clone();
+    assert!(composition.native().is_some());
+    assert_eq!(gpu.stats().readbacks, 0);
+    let mut transfer = gpu
+        .readback(&composition.native().unwrap().image, None)
+        .unwrap();
+    let complete = transfer.take_completion_job().unwrap();
+    let mut newer = layer;
+    newer.frame.bgra = Arc::from([0, 255, 0, 255]);
+    surfaces.set_video_layer(5, Some(newer)).unwrap();
+    complete();
+    let pixels = transfer.poll().unwrap().unwrap();
+    assert!(
+        surfaces
+            .capture_native_frame_pixels(&composition, &pixels)
+            .unwrap()
+    );
+    assert_eq!(surfaces.presenter.frames, 2);
+    assert_eq!(
+        surfaces.presenter.bgra,
+        [0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 255, 255]
+    );
+    assert_eq!(surfaces.set_video_layer(5, None).unwrap(), 4);
+    let restored = surfaces.latest_native_frame().unwrap().clone();
+    let pixels = read(&mut gpu, &restored.image);
+    assert!(surfaces.capture_native_pixels(4, 3, 1, &pixels).unwrap());
+    assert_eq!(surfaces.presenter.bgra, [0, 0, 255, 255].repeat(3));
+}
+
 fn pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let at = ((y * width + x) * 4) as usize;
     bytes[at..at + 4].try_into().unwrap()

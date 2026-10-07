@@ -28,7 +28,7 @@
 //! unproven accesses may call never change permissions, so a range proven at
 //! its latch stays proven for every remaining iteration.
 use super::*;
-use iced_x86::{CodeSize, CpuidFeature, InstructionInfoFactory, OpAccess};
+use iced_x86::{Code, CodeSize, CpuidFeature, InstructionInfoFactory, OpAccess};
 
 /// Largest per-iteration pointer step considered; keeps range arithmetic in i64.
 const MAX_STEP: i64 = 1 << 16;
@@ -283,13 +283,19 @@ fn plan(
     }
 
     // The counter: the register the last flag write before the latch
-    // compares, either its own step or a CMP/TEST.
-    let producer = *body[..body.len() - 1]
-        .iter()
-        .rev()
-        .find(|i| i.rflags_modified() != 0)
-        .ok_or("counter")?;
-    if producer.op_count() == 0 || producer.op0_kind() != OpKind::Register {
+    // compares, either its own step or a CMP/TEST. LOOP is its own step of
+    // ECX and compares the result with zero without flags.
+    let looping = latch.code() == Code::Loop_rel8_32_ECX;
+    let producer = if looping {
+        latch
+    } else {
+        *body[..body.len() - 1]
+            .iter()
+            .rev()
+            .find(|i| i.rflags_modified() != 0)
+            .ok_or("counter")?
+    };
+    if !looping && (producer.op_count() == 0 || producer.op0_kind() != OpKind::Register) {
         let kind = if producer.op_count() != 0 && producer.op0_kind() == OpKind::Memory {
             " memory"
         } else {
@@ -300,7 +306,11 @@ fn plan(
     if !always(producer.ip32()) {
         return Err("counter path".into());
     }
-    let counter_register = producer.op0_register();
+    let counter_register = if looping {
+        R::ECX
+    } else {
+        producer.op0_register()
+    };
     let counter = reg_index(counter_register.full_register32())
         .ok_or_else(|| format!("counter {}", name(producer)))?;
     // How the flags relate the counter to the bound: the result of its own
@@ -417,7 +427,7 @@ fn plan(
     // compare its result with zero; their overflow flag is clear while the
     // counter moves toward zero from the side the condition requires.
     let inclusive = match (compared, latch.mnemonic(), up) {
-        (_, M::Jne, _) => false,
+        (_, M::Jne, _) | (Compared::Step, M::Loop, false) => false,
         (Compared::Step, M::Js | M::Jl, true) | (Compared::Step, M::Jg, false) => false,
         (Compared::Step, M::Jle, true) | (Compared::Step, M::Jns | M::Jge, false) => true,
         (Compared::Difference | Compared::Value, M::Jb | M::Jl, true)
@@ -756,6 +766,9 @@ fn step(i: &Instruction, register: R) -> Option<i64> {
         }
         _ => None,
     };
+    if i.code() == Code::Loop_rel8_32_ECX {
+        return (register == R::ECX).then_some(-1);
+    }
     if i.op_count() == 0 || i.op0_kind() != OpKind::Register || i.op0_register() != register {
         return None;
     }
@@ -859,6 +872,40 @@ mod tests {
                 assert_eq!(plans.len(), usize::from(!after_counter));
             }
         }
+    }
+
+    #[test]
+    fn loop_latch_counts_ecx_down_to_zero() {
+        let (instructions, entries) = decode(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.add(esi, 8).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+            a.add(edi, 8).unwrap();
+            a.loop_(top).unwrap();
+            a.ret().unwrap();
+        });
+        let plans = super::plans(&instructions, &entries, |_| true);
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!((plan.counter, plan.counter_size), (1, 4));
+        assert_eq!(plan.counter_step, plan.latch);
+        assert_eq!(plan.bound, Bound::Constant(0));
+        assert!(!plan.inclusive);
+        assert_eq!(plan.steps[1], -1);
+        assert_eq!(plan.proven.len(), 2);
+        // Another write of ECX leaves the count unknown.
+        let (instructions, entries) = decode(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(esi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.loop_(top).unwrap();
+            a.ret().unwrap();
+        });
+        assert!(super::plans(&instructions, &entries, |_| true).is_empty());
     }
 
     #[test]

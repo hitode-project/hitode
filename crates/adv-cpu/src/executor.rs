@@ -244,6 +244,8 @@ impl Executor {
             handler,
             parked: false,
             deadline: self.deadline,
+            clock_due: true,
+            unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
         };
