@@ -249,3 +249,12 @@ msvcr80.dll	_splitpath_s	cdecl	i32	errno_t	fullPath:const char*:str8:1|drive:cha
 msvcr80.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcr90.dll	_splitpath_s	cdecl	i32	errno_t	fullPath:const char*:str8:1|drive:char*:str8:1|driveNumberOfElements:size_t:u32:1|dir:char*:str8:1|dirNumberOfElements:size_t:u32:1|fname:char*:str8:1|nameNumberOfElements:size_t:u32:1|ext:char*:str8:1|extNumberOfElements:size_t:u32:1
 msvcr90.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
+msvcrt.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcrt.dll	ceil	cdecl	f64	double	value:double:f64:2
+msvcrt.dll	fabs	cdecl	f64	double	value:double:f64:2
+msvcr80.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcr80.dll	ceil	cdecl	f64	double	value:double:f64:2
+msvcr80.dll	fabs	cdecl	f64	double	value:double:f64:2
+msvcr90.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcr90.dll	ceil	cdecl	f64	double	value:double:f64:2
+msvcr90.dll	fabs	cdecl	f64	double	value:double:f64:2

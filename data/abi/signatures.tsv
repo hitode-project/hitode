@@ -3516,8 +3516,11 @@ msvcr80.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const 
 msvcr80.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr80.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcr80.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr80.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcr80.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
+msvcr80.dll	floor	cdecl	f64	double	value:double:f64:2
 msvcr80.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcr80.dll	isalnum	cdecl	i32	int	character:int:i32:1
 msvcr80.dll	isalpha	cdecl	i32	int	character:int:i32:1
@@ -3592,8 +3595,11 @@ msvcr90.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const 
 msvcr90.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr90.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcr90.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcr90.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
+msvcr90.dll	floor	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcr90.dll	isalnum	cdecl	i32	int	character:int:i32:1
 msvcr90.dll	isalpha	cdecl	i32	int	character:int:i32:1
@@ -3654,8 +3660,11 @@ msvcrt.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const w
 msvcrt.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt.dll	_wsplitpath_s	cdecl	i32	errno_t	fullPath:const wchar_t*:str16:1|drive:wchar_t*:str16:1|driveNumberOfElements:size_t:u32:1|dir:wchar_t*:str16:1|dirNumberOfElements:size_t:u32:1|fname:wchar_t*:str16:1|nameNumberOfElements:size_t:u32:1|ext:wchar_t*:str16:1|extNumberOfElements:size_t:u32:1
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
+msvcrt.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1
+msvcrt.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcrt.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
+msvcrt.dll	floor	cdecl	f64	double	value:double:f64:2
 msvcrt.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcrt.dll	isalnum	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	isalpha	cdecl	i32	int	character:int:i32:1

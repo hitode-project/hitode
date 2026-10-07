@@ -276,5 +276,15 @@
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/splitpath-s-wsplitpath-s",
     "native_oracle_source_sha256": "267785bb87b72767f6c04a7ff27a061ca1e5f6029a96e4e989b3ff6be92279c1",
     "native_verification": "Authored VC80 probe measures lexical split, element capacities, optional output pairing, success errno/DOS/LastError preservation, EINVAL buffer-clear-before-handler ordering and ERANGE clear-first-unit with prior copied tails. Narrow default multibyte scanning is independent of later LC_CTYPE changes; guest configured ACP supplies this default. Input/output overlap and unmeasured profiles explicitly warn ENOSYS rather than claim unspecified alias behavior."
+  },
+  "scalar_rounding": {
+    "header": "ucrt/corecrt_math.h:512,530,539",
+    "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
+    "scope": "floor/ceil/fabs for three CRT aliases, double __cdecl(double), exactly two32-bit argument words and x87 double return; genuine f64 kind, not a u64 parameter alias",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/floor-floorf-floorl",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ceil-ceilf-ceill",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fabs-fabsf-fabsl"
+    ]
   }
 }
