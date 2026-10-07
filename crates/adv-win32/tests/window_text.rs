@@ -243,17 +243,25 @@ impl<B: TestCpu> Fixture<B> {
             },
             &[I(class_info)],
         );
-        // CreateWindowExA also creates a genuinely Unicode window when the
-        // class was registered with RegisterClassW. This existing common path
-        // converts CREATESTRUCT strings to that class's ABI.
-        let create_class = if wide {
+        // Exercise A-to-W CREATESTRUCT conversion when an ANSI encoder exists.
+        // Unsupported ACP guards require a genuinely W-created fixture first.
+        let native_wide = wide
+            && !matches!(
+                self.machine.ext.get::<Win32>().codec.acp,
+                932 | 936 | 1252 | 65001
+            );
+        let create_class = if wide && !native_wide {
             self.text("OwnedWide", false)
         } else {
             class
         };
-        let title = self.text("old", false);
+        let title = self.text("old", native_wide);
         self.call(
-            "CreateWindowExA",
+            if native_wide {
+                "CreateWindowExW"
+            } else {
+                "CreateWindowExA"
+            },
             &[
                 I(0),
                 I(create_class),
