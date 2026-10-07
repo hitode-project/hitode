@@ -1,6 +1,7 @@
 //! NT compatibility entry points over the existing virtual process, VFS and VM.
 mod allocation;
 mod directory;
+mod loader;
 mod loader_lock;
 mod memory;
 mod path;
@@ -206,6 +207,7 @@ pub fn register(reg: &mut Registry) {
     path::register(reg);
     directory::register(reg);
     loader_lock::register(reg);
+    loader::register(reg);
     strings::register(reg);
     procedure::register(reg);
     thread::register(reg);

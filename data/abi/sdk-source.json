@@ -269,6 +269,12 @@
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
     "native_verification": "20 DWORDs: invalid handle/output preserves state, actual old suspend count, NT/Win32 count interop, NULL output, completed valid thread reports zero without rescheduling, LastError unchanged, child exit 37"
   },
+  "ldr_load_dll": {
+    "scope": "LdrLoadDll, four x86 stack words and signed NTSTATUS; default search with NULL or zero characteristics",
+    "source": "phnt ntldr.h primary declaration and authored Microsoft Windows x86 caller",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "20 DWORDs: counted UTF-16 DLL name, missing DLL preserves output and LastError, actual DllMain LastError change and callable export, two genuine load references and final unload, failed initialization releases the image while preserving output"
+  },
   "nt_read_virtual_memory_implementation": {
     "scope": "NtReadVirtualMemory frontend; reuse the master supplemental declaration and common VM/process owner",
     "source": "phnt ntmmapi.h and authored Microsoft Windows x86 oracle",
