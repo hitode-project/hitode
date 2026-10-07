@@ -26,6 +26,7 @@ mod secure_memory;
 mod shared_file;
 mod startup;
 mod stream_position;
+mod thread;
 mod time64;
 mod wide_string;
 
@@ -118,6 +119,7 @@ pub fn register(r: &mut Registry) {
     secure_memory::register(r);
     shared_file::register(r);
     stream_position::register(r);
+    thread::register(r);
     heap::register(r);
     locale::register(r);
     wide_string::register(r);
