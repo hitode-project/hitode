@@ -918,6 +918,7 @@ fn get_computer_name_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(get_console_window_ABI);
     // A 32-bit Windows: not under WOW64.
     stdcall(reg, K32, "IsWow64Process", 2, |e| {
         let p = e.arg(1);
