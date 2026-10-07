@@ -385,7 +385,11 @@
     "header": "ucrt/corecrt_memory.h:28-32",
     "header_sha256": "18ca520416579183bc369c0a8e555914db5c7577075b9359173fc6bc45595560",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memicmp-memicmp-l",
-    "projection": "int __cdecl _memicmp(void const*, void const*, size_t), three x86 argument words. Only the observed MSVCRT profile is advertised; the locale uses the existing module-owned LC_CTYPE byte casing and comparison consumes exactly count bytes, including embedded NULs."
+    "projection": "int __cdecl _memicmp(void const*, void const*, size_t), three x86 argument words. Only the observed MSVCRT profile is advertised; the locale uses the existing module-owned LC_CTYPE byte casing and comparison consumes exactly count bytes, including embedded NULs.",
+    "native_msvcrt_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f",
+    "native_probe_source_sha256": "db71986db47eac0c9fa03cc6719f7bf9ff3084387d4b27614dc24ad691225171",
+    "native_probe_exe_sha256": "6f811d3eac5099a4d8ff33352618672867515579931ccd7e18683d5e7e3a0523",
+    "native_verification": "Authored x86 MSVCRT probe, 60 cases across initial C, CP932/936/1252 and restored C. C normalizes nonzero results to -1/+1; installed non-C profiles return the unsigned lowercase-byte difference. Zero count returns0 even with NULL buffers; positive-count NULL returns INT_MAX and errno22, preserving DOS errno/LastError. Embedded NUL bytes remain part of the comparison."
   },
   "legacy_access": {
     "headers": [
