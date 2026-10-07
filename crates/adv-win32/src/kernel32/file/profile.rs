@@ -1,4 +1,4 @@
-//! File-backed INI string queries over the existing VFS/FileObj/coherent reader.
+//! File-backed INI queries over the existing VFS/FileObj/coherent reader.
 //! No host Windows profile/registry or parallel file/cache owner is consulted.
 use super::*;
 use adv_abi::{AnsiStr, GuestPtr, WideStr, guest::check_range, win32};
@@ -13,12 +13,7 @@ const MAX_INPUT_UNITS: usize = 65536;
 fn supported_cp(env: &Env<'_>) -> bool {
     matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001)
 }
-fn unavailable(env: &mut Env<'_>, wide: bool, reason: &str, error: u32) -> Outcome {
-    let api = if wide {
-        "kernel32.dll!GetPrivateProfileStringW"
-    } else {
-        "kernel32.dll!GetPrivateProfileStringA"
-    };
+fn unavailable(env: &mut Env<'_>, api: &'static str, reason: &str, error: u32) -> Outcome {
     adv_abi::warn_unavailable(env, api, reason);
     set_last_error(env, error);
     Outcome::Return(0)
@@ -276,7 +271,7 @@ fn render(
     )
 }
 
-fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
+fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool, api: &'static str) -> Outcome {
     let [app, key, default, out, capacity, filename] = pointers;
     let bytes = match capacity.checked_mul(if wide { 2 } else { 1 }) {
         Some(bytes) => bytes,
@@ -292,7 +287,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
     if !wide && !supported_cp(env) {
         return unavailable(
             env,
-            wide,
+            api,
             "profile ANSI argument/output conversion requires a supported guest ACP (932/936/1252/65001)",
             50,
         );
@@ -327,7 +322,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
         Err(()) => {
             return unavailable(
                 env,
-                wide,
+                api,
                 "profile filename contains an invalid UTF16 path",
                 1113,
             );
@@ -337,7 +332,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
         Ok(bytes) => match decode(env, &bytes) {
             Ok(data) => Some(data),
             Err(ReadError::Unsupported(reason, error)) => {
-                return unavailable(env, wide, reason, error);
+                return unavailable(env, api, reason, error);
             }
             Err(ReadError::Io(_)) => unreachable!(),
         },
@@ -358,7 +353,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
                 Some(error),
             );
         }
-        Err(ReadError::Unsupported(reason, error)) => return unavailable(env, wide, reason, error),
+        Err(ReadError::Unsupported(reason, error)) => return unavailable(env, api, reason, error),
     };
     let answer = Ini::new(&data.unwrap()).query(app.as_deref(), key.as_deref());
     match answer {
@@ -426,6 +421,7 @@ fn get_a(
             filename.0.addr(),
         ],
         false,
+        "kernel32.dll!GetPrivateProfileStringA",
     )
 }
 #[win32(kernel32,name="GetPrivateProfileStringW",level=implement)]
@@ -449,9 +445,216 @@ fn get_w(
             filename.0.addr(),
         ],
         true,
+        "kernel32.dll!GetPrivateProfileStringW",
     )
 }
+
+fn integer(units: &[u16]) -> u32 {
+    let start = units
+        .iter()
+        .position(|&unit| !matches!(unit, 9..=13 | 32))
+        .unwrap_or(units.len());
+    let units = &units[start..];
+    let (negative, units) = match units.first() {
+        Some(45) => (true, &units[1..]),
+        Some(43) => (false, &units[1..]),
+        _ => (false, units),
+    };
+    let (base, units) = if matches!(units, [48, 120 | 88, ..]) {
+        (16u32, &units[2..])
+    } else {
+        (10u32, units)
+    };
+    let mut value = 0u32;
+    for &unit in units {
+        let digit = match unit {
+            48..=57 => u32::from(unit - 48),
+            65..=70 => u32::from(unit - 65) + 10,
+            97..=102 => u32::from(unit - 97) + 10,
+            _ => break,
+        };
+        if digit >= base {
+            break;
+        }
+        value = value.wrapping_mul(base).wrapping_add(digit);
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+fn get_int(env: &mut Env<'_>, pointers: [u32; 4], wide: bool, api: &'static str) -> Outcome {
+    let [app, key, default, filename] = pointers;
+    if !wide && !supported_cp(env) {
+        unavailable(
+            env,
+            api,
+            "profile ANSI argument conversion requires a supported guest ACP (932/936/1252/65001)",
+            50,
+        );
+        return Outcome::Return(default);
+    }
+    let names = [app, key, filename].map(|pointer| text(env, pointer, wide));
+    let [Ok(app), Ok(key), Ok(filename)] = names else {
+        set_last_error(env, 998);
+        return Outcome::Return(default);
+    };
+    let filename = match path(filename) {
+        Ok(filename) => filename,
+        Err(()) => {
+            unavailable(
+                env,
+                api,
+                "profile filename contains an invalid UTF16 path",
+                1113,
+            );
+            return Outcome::Return(default);
+        }
+    };
+    let data = match contents(env, &filename).and_then(|bytes| decode(env, &bytes)) {
+        Ok(data) => data,
+        Err(ReadError::Io(error)) => {
+            set_last_error(env, error);
+            return Outcome::Return(default);
+        }
+        Err(ReadError::Unsupported(reason, error)) => {
+            unavailable(env, api, reason, error);
+            return Outcome::Return(default);
+        }
+    };
+    let (Some(app), Some(key)) = (app, key) else {
+        set_last_error(env, 2);
+        return Outcome::Return(default);
+    };
+    let Some(Answer::Scalar(value)) = Ini::new(&data).query(Some(&app), Some(&key)) else {
+        set_last_error(env, 2);
+        return Outcome::Return(default);
+    };
+    set_last_error(env, 0);
+    // A present empty value uses the caller's default but retains lookup success.
+    Outcome::Return(if value.is_empty() {
+        default
+    } else {
+        integer(&value)
+    })
+}
+
+// https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-getprivateprofileintw
+#[win32(kernel32, name = "GetPrivateProfileIntA", level = implement)]
+fn int_a(
+    env: &mut Env<'_>,
+    app: AnsiStr,
+    key: AnsiStr,
+    default: i32,
+    filename: AnsiStr,
+) -> Outcome {
+    get_int(
+        env,
+        [
+            app.0.addr(),
+            key.0.addr(),
+            default as u32,
+            filename.0.addr(),
+        ],
+        false,
+        "kernel32.dll!GetPrivateProfileIntA",
+    )
+}
+#[win32(kernel32, name = "GetPrivateProfileIntW", level = implement)]
+fn int_w(
+    env: &mut Env<'_>,
+    app: WideStr,
+    key: WideStr,
+    default: i32,
+    filename: WideStr,
+) -> Outcome {
+    get_int(
+        env,
+        [
+            app.0.addr(),
+            key.0.addr(),
+            default as u32,
+            filename.0.addr(),
+        ],
+        true,
+        "kernel32.dll!GetPrivateProfileIntW",
+    )
+}
+// https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-getprofileintw
+#[win32(kernel32, name = "GetProfileIntA", level = implement)]
+fn profile_int_a(env: &mut Env<'_>, app: AnsiStr, key: AnsiStr, default: i32) -> Outcome {
+    get_int(
+        env,
+        [app.0.addr(), key.0.addr(), default as u32, 0],
+        false,
+        "kernel32.dll!GetProfileIntA",
+    )
+}
+#[win32(kernel32, name = "GetProfileIntW", level = implement)]
+fn profile_int_w(env: &mut Env<'_>, app: WideStr, key: WideStr, default: i32) -> Outcome {
+    get_int(
+        env,
+        [app.0.addr(), key.0.addr(), default as u32, 0],
+        true,
+        "kernel32.dll!GetProfileIntW",
+    )
+}
+#[win32(kernel32, name = "GetProfileStringA", level = implement)]
+fn profile_string_a(
+    env: &mut Env<'_>,
+    app: AnsiStr,
+    key: AnsiStr,
+    default: AnsiStr,
+    out: AnsiStr,
+    capacity: u32,
+) -> Outcome {
+    get(
+        env,
+        [
+            app.0.addr(),
+            key.0.addr(),
+            default.0.addr(),
+            out.0.addr(),
+            capacity,
+            0,
+        ],
+        false,
+        "kernel32.dll!GetProfileStringA",
+    )
+}
+#[win32(kernel32, name = "GetProfileStringW", level = implement)]
+fn profile_string_w(
+    env: &mut Env<'_>,
+    app: WideStr,
+    key: WideStr,
+    default: WideStr,
+    out: WideStr,
+    capacity: u32,
+) -> Outcome {
+    get(
+        env,
+        [
+            app.0.addr(),
+            key.0.addr(),
+            default.0.addr(),
+            out.0.addr(),
+            capacity,
+            0,
+        ],
+        true,
+        "kernel32.dll!GetProfileStringW",
+    )
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_a_ABI);
     registry.register(get_w_ABI);
+    registry.register(int_a_ABI);
+    registry.register(int_w_ABI);
+    registry.register(profile_int_a_ABI);
+    registry.register(profile_int_w_ABI);
+    registry.register(profile_string_a_ABI);
+    registry.register(profile_string_w_ABI);
 }

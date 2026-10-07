@@ -1005,10 +1005,6 @@ fn section_name(line: &[u8]) -> Option<&[u8]> {
 }
 
 impl Ini {
-    fn load(env: &Env<'_>, guest: &str) -> Ini {
-        Self::from_bytes(&read_contents(env, guest).unwrap_or_default())
-    }
-
     fn from_bytes(data: &[u8]) -> Ini {
         Ini {
             lines: data
@@ -1052,31 +1048,6 @@ impl Ini {
             })
             .collect()
     }
-
-    fn get(&self, section: &[u8], key: &[u8]) -> Option<Vec<u8>> {
-        self.entries(section)
-            .into_iter()
-            .find(|(_, k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, _, v)| v)
-    }
-}
-
-fn get_private_profile_int_a(env: &mut Env<'_>) -> Outcome {
-    let (sec, key, def) = (
-        cstr(env.cpu, env.arg(0)),
-        cstr(env.cpu, env.arg(1)),
-        env.arg(2),
-    );
-    let file = profile_path(env, env.arg(3));
-    let Some(v) = Ini::load(env, &file).get(&sec, &key) else {
-        return Outcome::Return(def);
-    };
-    let s = String::from_utf8_lossy(&v);
-    let s = s.trim();
-    let (neg, digits) = s.strip_prefix('-').map_or((false, s), |r| (true, r));
-    let n: String = digits.chars().take_while(char::is_ascii_digit).collect();
-    let v: i64 = n.parse().unwrap_or(0);
-    Outcome::Return((if neg { -v } else { v }) as i32 as u32)
 }
 
 fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
@@ -1588,13 +1559,6 @@ pub(super) fn register(reg: &mut Registry) {
     path::register(reg);
     profile::register(reg);
 
-    stdcall(
-        reg,
-        K32,
-        "GetPrivateProfileIntA",
-        4,
-        get_private_profile_int_a,
-    );
     stdcall(
         reg,
         K32,
