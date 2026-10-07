@@ -22,11 +22,10 @@
 //! original code: forwarding them would keep one host register (or spill slot)
 //! per slot live across the loop for loads that cost no more.
 //!
-//! The permission table is read-only for one native invocation: every change
-//! advances the memory epoch and a trap that observes a new epoch leaves native
-//! code. A versioned loop contains no guest calls, and the memory helpers its
-//! unproven accesses may call never change permissions, so a range proven at
-//! its latch stays proven for every remaining iteration.
+//! Native code pins an immutable page-metadata snapshot. Revocations advance
+//! the memory epoch and a trap observing a new epoch leaves native code. File
+//! helpers may promote pages, but the running snapshot remains conservative;
+//! a range proven at the latch stays proven for every remaining iteration.
 use super::*;
 use iced_x86::{Code, CodeSize, CpuidFeature, InstructionInfoFactory, OpAccess};
 
@@ -282,18 +281,26 @@ fn plan(
         }
     }
 
-    // The counter: the register the last flag write before the latch
-    // compares, either its own step or a CMP/TEST. LOOP is its own step of
-    // ECX and compares the result with zero without flags.
+    // The counter: the register the last write of flags read by the latch
+    // compares, either its own step or a CMP/TEST. Writes of unrelated flags
+    // leave this comparison intact. LOOP steps ECX and tests zero without flags.
     let looping = latch.code() == Code::Loop_rel8_32_ECX;
     let producer = if looping {
         latch
     } else {
-        *body[..body.len() - 1]
+        let required = latch.rflags_read();
+        let producer = *body[..body.len() - 1]
             .iter()
             .rev()
-            .find(|i| i.rflags_modified() != 0)
-            .ok_or("counter")?
+            .find(|i| i.rflags_modified() & required != 0)
+            .ok_or("counter")?;
+        // Every flag the latch needs must come from this comparison. For
+        // example, a rotate after CMP replaces OF but keeps SF, so JL cannot
+        // be proved from either producer alone.
+        if required & !producer.rflags_modified() != 0 {
+            return Err("counter flags".into());
+        }
+        producer
     };
     if !looping && (producer.op_count() == 0 || producer.op0_kind() != OpKind::Register) {
         let kind = if producer.op_count() != 0 && producer.op0_kind() == OpKind::Memory {
@@ -844,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn carry_controls_do_not_supply_a_counter_comparison() {
+    fn carry_controls_preserve_the_zero_latch_counter_comparison() {
         for carry in [
             (|a: &mut CodeAssembler| a.clc().unwrap()) as fn(&mut CodeAssembler),
             |a| a.stc().unwrap(),
@@ -866,10 +873,182 @@ mod tests {
                     a.jne(top).unwrap();
                     a.ret().unwrap();
                 });
-                // A later partial flag writer conservatively rejects the
-                // proof, even though this particular JNE does not read CF.
                 let plans = super::plans(&instructions, &entries, super::super::supported);
-                assert_eq!(plans.len(), usize::from(!after_counter));
+                assert_eq!(plans.len(), 1);
+                let plan = &plans[0];
+                assert_eq!((plan.counter, plan.counter_size), (1, 4));
+                assert_eq!(plan.steps[1], -1);
+                assert_eq!(instructions[&plan.counter_step].mnemonic(), M::Dec);
+                assert_eq!(plan.proven.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_counter_and_unsigned_comparison_ignore_unread_flags() {
+        let (instructions, entries) = decode(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(esi, 4).unwrap();
+            a.dec(cx).unwrap();
+            a.cmc().unwrap();
+            a.jnz(top).unwrap();
+            a.ret().unwrap();
+        });
+        let plans = super::plans(&instructions, &entries, super::super::supported);
+        assert_eq!(plans.len(), 1);
+        assert_eq!((plans[0].counter, plans[0].counter_size), (1, 2));
+        assert_eq!(plans[0].steps[1], -1);
+
+        // DF does not contribute to an unsigned order comparison.
+        let (instructions, entries) = decode(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(esi, 4).unwrap();
+            a.inc(ecx).unwrap();
+            a.cmp(ecx, edx).unwrap();
+            a.std().unwrap();
+            a.jbe(top).unwrap();
+            a.ret().unwrap();
+        });
+        let plans = super::plans(&instructions, &entries, super::super::supported);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].bound, Bound::Register(2));
+        assert!(plans[0].inclusive);
+    }
+
+    #[test]
+    fn latches_reject_comparisons_with_flags_from_multiple_producers() {
+        // JBE would combine CMP's ZF with a carry control's replacement CF.
+        for carry in [
+            (|a: &mut CodeAssembler| a.clc().unwrap()) as fn(&mut CodeAssembler),
+            |a| a.stc().unwrap(),
+            |a| a.cmc().unwrap(),
+        ] {
+            let (instructions, entries) = decode(|a| {
+                let mut top = a.create_label();
+                a.set_label(&mut top).unwrap();
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.add(esi, 4).unwrap();
+                a.inc(ecx).unwrap();
+                a.cmp(ecx, edx).unwrap();
+                carry(a);
+                a.jbe(top).unwrap();
+                a.ret().unwrap();
+            });
+            let (plans, rejected) = survey(&instructions, &entries, super::super::supported);
+            assert!(plans.is_empty());
+            assert_eq!(rejected[0].reason, "counter flags");
+        }
+
+        // ROL keeps ZF, but replaces OF: JNZ can still use CMP, whereas JL
+        // would combine CMP's SF with the rotation's OF.
+        for signed in [false, true] {
+            let (instructions, entries) = decode(|a| {
+                let mut top = a.create_label();
+                a.set_label(&mut top).unwrap();
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.add(esi, 4).unwrap();
+                a.dec(ecx).unwrap();
+                a.cmp(ecx, 0).unwrap();
+                a.rol(ebx, 1).unwrap();
+                if signed {
+                    a.jl(top).unwrap();
+                } else {
+                    a.jnz(top).unwrap();
+                }
+                a.ret().unwrap();
+            });
+            let (plans, rejected) = survey(&instructions, &entries, super::super::supported);
+            assert_eq!(plans.len(), usize::from(!signed));
+            if signed {
+                assert_eq!(rejected[0].reason, "counter flags");
+            }
+        }
+    }
+
+    #[test]
+    fn versioned_partial_flag_loops_publish_exact_state_on_completion_and_fault() {
+        use crate::{CompileStrategy, Executor, Region, RunOutcome};
+        for carry in [
+            (|a: &mut CodeAssembler| a.clc().unwrap()) as fn(&mut CodeAssembler),
+            |a| a.stc().unwrap(),
+            |a| a.cmc().unwrap(),
+            |a| a.ror(edx, 1).unwrap(),
+        ] {
+            let mut a = CodeAssembler::new(32).unwrap();
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.lea(esi, dword_ptr(esi + 4)).unwrap();
+            a.dec(ecx).unwrap();
+            carry(&mut a);
+            a.jnz(top).unwrap();
+            a.ret().unwrap();
+            let bytes = a.assemble(0x1000).unwrap();
+            let mut decoder = Decoder::with_ip(32, &bytes, 0x1000, DecoderOptions::NONE);
+            let instructions: Vec<_> = decoder.iter().collect();
+            let latch = instructions
+                .iter()
+                .find(|i| i.flow_control() == FlowControl::ConditionalBranch)
+                .unwrap();
+            assert_eq!(latch.rflags_read(), iced_x86::RflagsBits::ZF);
+            let writer = &instructions[instructions.len() - 3];
+            assert_eq!(writer.rflags_modified() & latch.rflags_read(), 0);
+            for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
+                for fault in [false, true] {
+                    for incoming_carry in [0, 1] {
+                        let machine = |native: bool| {
+                            let mut m = Executor::new(0x1000, 0x4000).unwrap();
+                            m.protect(0x1000, 0x4000, crate::READ | crate::WRITE)
+                                .unwrap();
+                            m.write(0x1000, &bytes).unwrap();
+                            m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
+                            m.protect(0x2000, 4096, crate::READ | crate::EXEC).unwrap();
+                            m.write(0x4f00, &0x2000u32.to_le_bytes()).unwrap();
+                            if fault {
+                                m.protect(0x4000, 4096, 0).unwrap();
+                            }
+                            if native {
+                                let mut region = Region::new(0x1000, bytes.len());
+                                region.compile_strategy = strategy;
+                                m.add_region(region).unwrap();
+                            }
+                            m.state.eip = 0x1000;
+                            m.state.regs[1] = 17;
+                            m.state.regs[2] = 0x8000_0001;
+                            m.state.regs[4] = 0x4f00;
+                            m.state.regs[6] = if fault { 0x3ff0 } else { 0x3000 };
+                            m.state.eflags = 0x202 | incoming_carry;
+                            m
+                        };
+                        let mut jit = machine(true);
+                        let mut reference = machine(false);
+                        // Small slices also exercise the kernel's fuel exits.
+                        let run = |m: &mut Executor| {
+                            for _ in 0..128 {
+                                let outcome = m.run(0x2000, 3).unwrap();
+                                if outcome != RunOutcome::Budget {
+                                    return outcome;
+                                }
+                            }
+                            panic!("partial-flag loop did not finish");
+                        };
+                        let actual = run(&mut jit);
+                        let expected = run(&mut reference);
+                        assert_eq!(actual, expected);
+                        assert_eq!(jit.state.regs, reference.state.regs);
+                        assert_eq!(jit.state.eip, reference.state.eip);
+                        assert_eq!(jit.state.eflags, reference.state.eflags);
+                        assert_eq!(jit.state.fault_addr, reference.state.fault_addr);
+                        assert_eq!(
+                            jit.stats.interpreter_entries, 0,
+                            "partial-flag loop must remain native"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1221,15 +1400,15 @@ mod tests {
                 },
                 Err("counter step"),
             ),
-            // A later partial flag write makes finding the earlier counter
-            // conservative; it must not borrow flags from the wrong result.
+            // ROR changes CF/OF while preserving the DEC result's ZF. JNE
+            // therefore still compares the decremented EBX with zero.
             (
                 |a, top| {
                     a.dec(ebx).unwrap();
                     a.ror(edx, 1).unwrap();
                     a.jne(top).unwrap();
                 },
-                Err("counter ror"),
+                Ok((3, -1, Bound::Constant(0), false)),
             ),
         ];
         for (n, (close, expected)) in cases.into_iter().enumerate() {

@@ -30,6 +30,7 @@ pub(crate) enum Operation {
     Neg,
     Cast,
     SignExtend(u8),
+    UnsignedLessThan,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Source {
@@ -134,6 +135,7 @@ impl Recipe {
                         Operation::Add => left.wrapping_add(right),
                         Operation::Sub => left.wrapping_sub(right),
                         Operation::Mul => left.wrapping_mul(right),
+                        Operation::UnsignedLessThan => u64::from(left < right),
                         Operation::And => left & right,
                         Operation::Or => left | right,
                         Operation::Xor => left ^ right,

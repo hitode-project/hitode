@@ -248,6 +248,60 @@ struct Builder<'a> {
     seen: BTreeMap<Value, u8>,
 }
 impl Builder<'_> {
+    fn constant(&self, value: Value) -> Option<u64> {
+        let dfg = &self.function.dfg;
+        let value = dfg.resolve_aliases(value);
+        // The first checked entry explicitly seeds every lazy kind with zero.
+        // It may still be a phi at this point because an indirect transfer can
+        // revisit the block; the recovery contract already maps that entry
+        // value to Input::Zero rather than a later traversal's value.
+        if self.seeds.iter().any(|(seed, input)| {
+            matches!(input, Input::Zero) && dfg.resolve_aliases(*seed) == value
+        }) {
+            return Some(0);
+        }
+        let ValueDef::Result(instruction, 0) = dfg.value_def(value) else {
+            return None;
+        };
+        let InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } = dfg.insts[instruction]
+        else {
+            return None;
+        };
+        let bits = dfg.value_type(value).bits();
+        matches!(bits, 8 | 16 | 32 | 64).then(|| imm.bits() as u64 & (u64::MAX >> (64 - bits)))
+    }
+
+    fn constant_condition(&self, value: Value) -> Option<bool> {
+        if let Some(value) = self.constant(value) {
+            return Some(value != 0);
+        }
+        let dfg = &self.function.dfg;
+        let value = dfg.resolve_aliases(value);
+        let ValueDef::Result(instruction, 0) = dfg.value_def(value) else {
+            return None;
+        };
+        let InstructionData::IntCompareImm {
+            opcode: Opcode::IcmpImm,
+            cond,
+            arg,
+            imm,
+        } = dfg.insts[instruction]
+        else {
+            return None;
+        };
+        let left = self.constant(arg)?;
+        let bits = dfg.value_type(arg).bits();
+        let right = imm.bits() as u64 & (u64::MAX >> (64 - bits));
+        match cond {
+            IntCC::Equal => Some(left == right),
+            IntCC::NotEqual => Some(left != right),
+            _ => None,
+        }
+    }
+
     fn push(&mut self, source: Source, bits: u8, value: Option<Value>) -> Option<u8> {
         if self.nodes.len() == MAX_NODES {
             return None;
@@ -291,6 +345,32 @@ impl Builder<'_> {
                     && i32::from(offset) == offset_of!(CpuState, fs_base) as i32 =>
                 {
                     Source::Input(Input::FsBase)
+                }
+                InstructionData::IntCompare {
+                    opcode: Opcode::Icmp,
+                    cond: IntCC::UnsignedLessThan,
+                    args,
+                } => {
+                    let left = self.value(args[0], depth + 1)?;
+                    let right = self.value(args[1], depth + 1)?;
+                    Source::Calculate(Operation::UnsignedLessThan, left, right)
+                }
+                InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args: [condition, if_true, if_false],
+                } => {
+                    // The entry's carry kind can still be an unsealed SSA
+                    // parameter when INC/DEC emits a select. Resolve only a
+                    // now-proven constant condition; dynamic selects remain
+                    // outside the bounded recovery expression set.
+                    let selected = if self.constant_condition(condition)? {
+                        if_true
+                    } else {
+                        if_false
+                    };
+                    let index = self.value(selected, depth + 1)?;
+                    self.seen.insert(value, index);
+                    return Some(index);
                 }
                 InstructionData::Binary { opcode, args } => {
                     let operation = binary(opcode)?;
@@ -400,4 +480,67 @@ fn epilogue(code: &[u8], mut offset: usize) -> bool {
         offset = instruction.next_ip() as usize;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_proven_constant_selects_enter_the_recovery_recipe() {
+        let mut function = ir::Function::new();
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(types::I32));
+        function
+            .signature
+            .params
+            .push(ir::AbiParam::new(types::I32));
+        let mut context = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut function, &mut context);
+        let block = b.create_block();
+        b.append_block_params_for_function_params(block);
+        b.switch_to_block(block);
+        let carry = b.block_params(block)[0];
+        let entry_kind = b.block_params(block)[1];
+        let zero = b.ins().iconst(types::I32, 0);
+        let one = b.ins().iconst(types::I32, 1);
+        // The inactive branch is deliberately outside the recipe vocabulary.
+        let other = b.ins().rotl(carry, one);
+        let yes = b.ins().icmp_imm(IntCC::Equal, zero, 0);
+        let no = b.ins().icmp_imm(IntCC::NotEqual, zero, 0);
+        let from_true = b.ins().select(yes, carry, other);
+        let from_false = b.ins().select(no, other, carry);
+        let unknown = b.ins().icmp_imm(IntCC::Equal, carry, 0);
+        let dynamic = b.ins().select(unknown, carry, other);
+        let negative = b.ins().iconst(types::I32, -1);
+        let equal_negative = b.ins().icmp_imm(IntCC::Equal, negative, -1);
+        let from_negative = b.ins().select(equal_negative, carry, other);
+        let raw_entry_kind = b.ins().icmp_imm(IntCC::Equal, entry_kind, 0);
+        let from_entry_kind = b.ins().select(raw_entry_kind, carry, other);
+        b.ins().return_(&[]);
+        b.seal_all_blocks();
+        b.finalize();
+
+        let seeds = [(carry, Input::Carry), (entry_kind, Input::Zero)];
+        let mut builder = Builder {
+            function: &function,
+            seeds: &seeds,
+            state: carry,
+            nodes: Vec::new(),
+            values: Vec::new(),
+            seen: BTreeMap::new(),
+        };
+        let index = builder.value(from_true, 0).unwrap();
+        assert_eq!(builder.value(from_false, 0), Some(index));
+        assert_eq!(builder.value(from_negative, 0), Some(index));
+        assert_eq!(builder.value(from_entry_kind, 0), Some(index));
+        assert!(builder.value(dynamic, 0).is_none());
+        assert_eq!(builder.nodes.len(), 1);
+        assert!(matches!(
+            builder.nodes[0].source,
+            Source::Input(Input::Carry)
+        ));
+    }
 }

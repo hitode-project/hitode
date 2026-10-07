@@ -416,11 +416,12 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
             };
             cpu.fuel = 256;
             let (slots, mask) = image.links.parts();
+            let permissions = memory.fast.snapshot(&memory.perms);
             let mut context = NativeContext {
                 state: &mut cpu,
                 rows: std::ptr::null(),
                 written: 0,
-                perms: memory.perms.as_ptr(),
+                perms: permissions.as_ptr(),
                 bridge: (&mut bridge as *mut crate::trap::Bridge<'_>).cast(),
                 interrupt: &fence.stop,
                 slots,
