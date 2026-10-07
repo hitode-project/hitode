@@ -58,6 +58,8 @@ pub struct GuestCode {
     pub code: &'static [u8],
     /// Offsets of the rel32 fields of jumps to the host implementation.
     pub host: &'static [usize],
+    /// rel32 fields of jumps to other bindings, as `(offset, module, name)`.
+    pub links: &'static [(usize, &'static str, &'static str)],
 }
 
 /// Where host implementations come from. The machine only binds what it is given; naming,
@@ -203,12 +205,14 @@ impl ThunkTable {
         thunk_addr(index) + 12
     }
 
-    /// Install `guest` behind a pointer slot in the arena.
+    /// Install `guest` behind a pointer slot in the arena. `links` are the
+    /// bound addresses of `guest.links`.
     fn place(
         &mut self,
         cpu: &mut dyn Guest,
         index: u32,
         guest: &GuestCode,
+        links: &[u32],
     ) -> Result<u32, MemFault> {
         let slot = self.guest_next;
         let body = slot + 4;
@@ -218,10 +222,11 @@ impl ThunkTable {
             "guest code arena full"
         );
         let mut code = guest.code.to_vec();
-        for &at in guest.host {
+        let host = guest.host.iter().map(|&at| (at, Self::trap_addr(index)));
+        let links = guest.links.iter().zip(links).map(|(&(at, ..), &target)| (at, target));
+        for (at, target) in host.chain(links) {
             let next = body + at as u32 + 4;
-            code[at..at + 4]
-                .copy_from_slice(&Self::trap_addr(index).wrapping_sub(next).to_le_bytes());
+            code[at..at + 4].copy_from_slice(&target.wrapping_sub(next).to_le_bytes());
         }
         let target = if self.guest_code {
             body
@@ -310,13 +315,18 @@ impl ThunkTable {
             self.thunks[i as usize].requested |= requested;
             return Ok(thunk_addr(i));
         }
-        let index = self.thunks.len() as u32;
-        assert!(index < THUNK_CAP, "thunk table full");
         let found = self
             .internal
             .get(&key)
             .copied()
             .or_else(|| self.resolver.host_fn(&key.0, name));
+        // Bindings guest code jumps to come first: they take thunk indices too.
+        let mut links = Vec::new();
+        for &(_, module, name) in found.and_then(|f| f.guest).map_or(&[][..], |g| g.links) {
+            links.push(self.bind(cpu, module, name, false)?);
+        }
+        let index = self.thunks.len() as u32;
+        assert!(index < THUNK_CAP, "thunk table full");
         let (f, implemented) = match found {
             Some(f) => (
                 f,
@@ -335,7 +345,7 @@ impl ThunkTable {
             ),
         };
         let guest_slot = match f.guest {
-            Some(guest) => Some(self.place(cpu, index, guest)?),
+            Some(guest) => Some(self.place(cpu, index, guest, &links)?),
             None => None,
         };
         cpu.write(thunk_addr(index), &Self::emit(index, f.conv, guest_slot))?;

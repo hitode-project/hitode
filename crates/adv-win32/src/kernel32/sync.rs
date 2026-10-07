@@ -17,9 +17,17 @@ const WAIT_FAILED: u32 = u32::MAX;
 const INFINITE: u32 = u32::MAX;
 
 // CRITICAL_SECTION (x86): DebugInfo, LockCount, RecursionCount, OwningThread, LockSemaphore, SpinCount.
+// LockCount follows Windows: -1 when free, plus one for every hold (recursion
+// included) and every waiter. One locked update decides each transition, so the
+// guest code for Enter/Leave (`guest_code`) and these handlers interoperate.
 const CS_LOCK_COUNT: u32 = 4;
 const CS_RECURSION: u32 = 8;
 const CS_OWNER: u32 = 12;
+
+/// Guest EnterCriticalSection has counted the caller and found another owner.
+pub(crate) const CS_WAIT: &str = "<EnterCriticalSectionWait>";
+/// Guest LeaveCriticalSection released the section while others were counted.
+pub(crate) const CS_WAKE: &str = "<LeaveCriticalSectionWake>";
 
 #[derive(Default)]
 struct CriticalWaits(HashMap<u32, CriticalWait>);
@@ -60,47 +68,48 @@ fn init_cs(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-/// Take the lock if free or already ours.
-fn try_take(env: &mut Env<'_>, cs: u32) -> bool {
-    let tid = env.ctx().tid;
-    let owner = env.cpu.read_u32(cs + CS_OWNER).unwrap_or(0);
-    if owner != 0 && owner != tid {
-        return false;
-    }
-    let rec = env.cpu.read_u32(cs + CS_RECURSION).unwrap_or(0);
-    let lock = env.cpu.read_u32(cs + CS_LOCK_COUNT).unwrap_or(u32::MAX);
-    let _ = env.cpu.write_u32(cs + CS_OWNER, tid);
-    let _ = env.cpu.write_u32(cs + CS_RECURSION, rec + 1);
-    let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_add(1));
-    env.sys
-        .schedule_trace
-        .event("cs_take", env.context, u64::from(cs), u64::from(rec + 1), 0);
-    true
-}
-
-fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
-    if try_take(env, cs) {
-        return Outcome::Return(0);
-    }
-    // One lazily allocated private event per contended critical section. Signal,
-    // registration and reacquisition all run on the owner, so no release can be
-    // lost between this check and installing the scheduler wait.
+/// One lazily allocated auto-reset event per contended critical section. A
+/// release signals it only while somebody is counted, and nobody can take the
+/// section before that waiter does, so at most one signal is ever pending.
+fn cs_event(env: &mut Env<'_>, cs: u32) -> Option<u32> {
     let waits = env.ext.get_or_default::<CriticalWaits>();
-    if let std::collections::hash_map::Entry::Vacant(entry) = waits.0.entry(cs) {
-        let event = env.sys.objects.insert(Object::Event {
-            manual_reset: false,
-            signaled: false,
-        });
-        if event == 0 {
-            return Outcome::Fail("critical section wait resource limit exhausted".into());
-        }
-        entry.insert(CriticalWait {
+    if let Some(wait) = waits.0.get(&cs) {
+        return Some(wait.event);
+    }
+    let event = env.sys.objects.insert(Object::Event {
+        manual_reset: false,
+        signaled: false,
+    });
+    if event == 0 {
+        return None;
+    }
+    waits.0.insert(
+        cs,
+        CriticalWait {
             event,
             pending: Rc::new(Cell::new(0)),
-        });
-    }
-    let wait = &waits.0[&cs];
-    let event = wait.event;
+        },
+    );
+    Some(event)
+}
+
+fn cs_taken(env: &mut Env<'_>, cs: u32, recursion: u32) {
+    env.sys.schedule_trace.event(
+        "cs_take",
+        env.context,
+        u64::from(cs),
+        u64::from(recursion),
+        0,
+    );
+}
+
+/// The caller is already counted in LockCount; the release that wakes it hands
+/// the section over.
+fn wait_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
+    let Some(event) = cs_event(env, cs) else {
+        return Outcome::Fail("critical section wait resource limit exhausted".into());
+    };
+    let wait = &env.ext.get_or_default::<CriticalWaits>().0[&cs];
     wait.pending.set(wait.pending.get() + 1);
     let ticket = CriticalTicket(wait.pending.clone());
     if env.sys.schedule_trace.enabled() {
@@ -112,9 +121,6 @@ fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
             u64::from(event),
         );
     }
-    // Discard an old unconsumed signal when somebody has already reacquired.
-    // Previously granted ready continuations keep their wake independently.
-    env.sys.reset_event(event);
     Outcome::block(
         Wait::Object {
             handle: event,
@@ -131,13 +137,67 @@ fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
             {
                 return Outcome::Fail(format!("critical section {cs:#x} changed while waiting"));
             }
-            enter_cs(env, cs)
+            let tid = env.ctx().tid;
+            let _ = env.cpu.write_u32(cs + CS_OWNER, tid);
+            let _ = env.cpu.write_u32(cs + CS_RECURSION, 1);
+            cs_taken(env, cs, 1);
+            Outcome::Return(0)
         },
     )
 }
 
+fn wake_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
+    match cs_event(env, cs) {
+        Some(event) => {
+            env.sys.set_event(event);
+            Outcome::Return(0)
+        }
+        None => Outcome::Fail("critical section wait resource limit exhausted".into()),
+    }
+}
+
+fn enter_cs(env: &mut Env<'_>, cs: u32) -> Outcome {
+    // Guest code on other workers updates the same fields with locked instructions.
+    env.cpu.quiesce_memory();
+    let tid = env.ctx().tid;
+    let lock = env.cpu.read_u32(cs + CS_LOCK_COUNT).unwrap_or(u32::MAX);
+    let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_add(1));
+    if lock == u32::MAX {
+        let _ = env.cpu.write_u32(cs + CS_OWNER, tid);
+        let _ = env.cpu.write_u32(cs + CS_RECURSION, 1);
+        cs_taken(env, cs, 1);
+        return Outcome::Return(0);
+    }
+    if env.cpu.read_u32(cs + CS_OWNER).unwrap_or(0) == tid {
+        let rec = env.cpu.read_u32(cs + CS_RECURSION).unwrap_or(0) + 1;
+        let _ = env.cpu.write_u32(cs + CS_RECURSION, rec);
+        cs_taken(env, cs, rec);
+        return Outcome::Return(0);
+    }
+    wait_cs(env, cs)
+}
+
+fn try_enter_cs(env: &mut Env<'_>, cs: u32) -> bool {
+    env.cpu.quiesce_memory();
+    let tid = env.ctx().tid;
+    let lock = env.cpu.read_u32(cs + CS_LOCK_COUNT).unwrap_or(0);
+    let rec = if lock == u32::MAX {
+        let _ = env.cpu.write_u32(cs + CS_OWNER, tid);
+        1
+    } else if env.cpu.read_u32(cs + CS_OWNER).unwrap_or(0) == tid {
+        env.cpu.read_u32(cs + CS_RECURSION).unwrap_or(0) + 1
+    } else {
+        return false;
+    };
+    let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_add(1));
+    let _ = env.cpu.write_u32(cs + CS_RECURSION, rec);
+    cs_taken(env, cs, rec);
+    true
+}
+
 fn leave_cs(env: &mut Env<'_>) -> Outcome {
     let cs = env.arg(0);
+    env.cpu.quiesce_memory();
     let rec = env.cpu.read_u32(cs + CS_RECURSION).unwrap_or(0);
     if rec == 0 {
         log::warn!(
@@ -146,9 +206,16 @@ fn leave_cs(env: &mut Env<'_>) -> Outcome {
         );
         return Outcome::Return(0);
     }
-    let lock = env.cpu.read_u32(cs + CS_LOCK_COUNT).unwrap_or(0);
+    let lock = env
+        .cpu
+        .read_u32(cs + CS_LOCK_COUNT)
+        .unwrap_or(0)
+        .wrapping_sub(1);
     let _ = env.cpu.write_u32(cs + CS_RECURSION, rec - 1);
-    let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock.wrapping_sub(1));
+    if rec == 1 {
+        let _ = env.cpu.write_u32(cs + CS_OWNER, 0);
+    }
+    let _ = env.cpu.write_u32(cs + CS_LOCK_COUNT, lock);
     env.sys.schedule_trace.event(
         "cs_release",
         env.context,
@@ -156,13 +223,8 @@ fn leave_cs(env: &mut Env<'_>) -> Outcome {
         u64::from(rec - 1),
         0,
     );
-    if rec == 1 {
-        let _ = env.cpu.write_u32(cs + CS_OWNER, 0);
-        if let Some(wait) = env.ext.get_or_default::<CriticalWaits>().0.get(&cs)
-            && wait.pending.get() != 0
-        {
-            env.sys.set_event(wait.event);
-        }
+    if rec == 1 && (lock as i32) >= 0 {
+        return wake_cs(env, cs);
     }
     Outcome::Return(0)
 }
@@ -583,9 +645,17 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "TryEnterCriticalSection", 1, |e| {
         let cs = e.arg(0);
-        Outcome::Return(u32::from(try_take(e, cs)))
+        Outcome::Return(u32::from(try_enter_cs(e, cs)))
     });
     stdcall(reg, K32, "LeaveCriticalSection", 1, leave_cs);
+    stdcall(reg, K32, CS_WAIT, 1, |e| {
+        let cs = e.arg(0);
+        wait_cs(e, cs)
+    });
+    stdcall(reg, K32, CS_WAKE, 1, |e| {
+        let cs = e.arg(0);
+        wake_cs(e, cs)
+    });
     stdcall(reg, K32, "InterlockedIncrement", 1, |e| {
         interlocked(e, |o, _, _| (o.wrapping_add(1), o.wrapping_add(1)))
     });

@@ -108,9 +108,13 @@ struct Outcome {
 }
 
 fn machine<B: Backend>(cpu: B, guest_code: bool) -> Machine<B> {
+    machine_with(cpu, guest_code, Clock::virtual_time())
+}
+
+fn machine_with<B: Backend>(cpu: B, guest_code: bool, clock: Clock) -> Machine<B> {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
-    let mut m = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+    let mut m = Machine::new(cpu, registry, clock).unwrap();
     m.sys.thunks.set_guest_code(&mut m.cpu, guest_code).unwrap();
     m.cpu.map(CODE, 0x1_0000, Prot::RX).unwrap();
     m.cpu.map(DATA, 0x1_0000, Prot::RW).unwrap();
@@ -341,4 +345,110 @@ fn last_error_and_tls_guest_code_keep_their_teb_contract() {
     assert_eq!(run(UnicornCpu::new(PARK_ADDR).unwrap(), true), host);
     assert_eq!(run(JitCpu::new(PARK_ADDR, false).unwrap(), true), host);
     assert_eq!(run(jit(), true), host);
+}
+
+const CS: u32 = DATA + 0x200;
+const COUNTER: u32 = DATA + 0x240;
+const TRIES: u32 = DATA + 0x244;
+const HANDLES: u32 = DATA + 0x280;
+const THREADS: u32 = 4;
+const ROUNDS: u32 = 200;
+
+/// Threads take one section recursively, yield inside it, and update a counter
+/// without atomics; TryEnter succeeds for the owner. Every lost update, missed
+/// wakeup or broken handoff shows in the counter, the deadline or LockCount.
+fn contend<B: Backend>(cpu: B, guest_code: bool, real_time: bool) {
+    let clock = if real_time {
+        Clock::real()
+    } else {
+        Clock::virtual_time()
+    };
+    let mut m = machine_with(cpu, guest_code, clock);
+    let f = |m: &mut Machine<B>, name: &str| m.resolve_import("kernel32.dll", name).unwrap();
+    let (init, enter, leave, try_enter, sleep, create, wait) = (
+        f(&mut m, "InitializeCriticalSection"),
+        f(&mut m, "EnterCriticalSection"),
+        f(&mut m, "LeaveCriticalSection"),
+        f(&mut m, "TryEnterCriticalSection"),
+        f(&mut m, "Sleep"),
+        f(&mut m, "CreateThread"),
+        f(&mut m, "WaitForMultipleObjects"),
+    );
+    let worker = CODE + 0x8000;
+    let mut w = Asm::new(worker);
+    w.bytes.push(0x53); // push ebx
+    raw(&mut w, &[0xbb], ROUNDS); // mov ebx, ROUNDS
+    let top = w.here();
+    w.push_imm(CS).call(enter).push_imm(CS).call(enter);
+    w.mov_eax_mem(COUNTER).push_eax();
+    w.push_imm(0).call(sleep);
+    w.bytes.extend_from_slice(&[0x58, 0x40]); // pop eax; inc eax
+    raw(&mut w, &[0xa3], COUNTER);
+    w.push_imm(CS).call(leave).push_imm(CS).call(try_enter);
+    raw(&mut w, &[0x01, 0x05], TRIES); // add [TRIES], eax
+    w.push_imm(CS).call(leave).push_imm(CS).call(leave);
+    w.bytes.push(0x4b); // dec ebx
+    let next = w.here() + 6;
+    raw(&mut w, &[0x0f, 0x85], top.wrapping_sub(next)); // jnz top
+    w.bytes.push(0x5b); // pop ebx
+    raw(&mut w, &[0xb8], 0);
+    w.ret_n(4);
+    m.cpu.write(worker, &w.bytes).unwrap();
+
+    let mut a = Asm::new(CODE);
+    a.push_imm(CS).call(init);
+    for i in 0..THREADS {
+        for arg in [0, 0, 0, worker, 0, 0] {
+            a.push_imm(arg);
+        }
+        a.call(create);
+        raw(&mut a, &[0xa3], HANDLES + 4 * i);
+    }
+    for arg in [u32::MAX, 1, HANDLES, THREADS] {
+        a.push_imm(arg);
+    }
+    a.call(wait);
+    raw(&mut a, &[0xb8], 0);
+    a.ret();
+    m.cpu.write(CODE, &a.bytes).unwrap();
+    m.spawn("MAIN", CODE, &[], 0x1_0000).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "threads stopped making progress"
+        );
+        match m.run_slice(std::time::Duration::from_millis(8)) {
+            adv_machine::SliceResult::Complete(RunResult::Exited(0)) => break,
+            adv_machine::SliceResult::Complete(RunResult::Idle { .. }) => {
+                std::thread::sleep(std::time::Duration::from_millis(1))
+            }
+            adv_machine::SliceResult::Complete(other) => panic!("{other:?}"),
+            adv_machine::SliceResult::Yielded => {}
+        }
+    }
+    let word = |at: u32| m.cpu.read_u32(at).unwrap();
+    assert_eq!(
+        word(COUNTER),
+        THREADS * ROUNDS,
+        "updates inside the section"
+    );
+    assert_eq!(word(TRIES), THREADS * ROUNDS, "TryEnter by the owner");
+    assert_eq!(
+        [word(CS + 4), word(CS + 8), word(CS + 12)],
+        [u32::MAX, 0, 0],
+        "LockCount, RecursionCount, OwningThread"
+    );
+}
+
+#[test]
+fn contended_critical_sections_hand_over_between_guest_code_and_host() {
+    for guest_code in [false, true] {
+        contend(UnicornCpu::new(PARK_ADDR).unwrap(), guest_code, false);
+        contend(JitCpu::new(PARK_ADDR, false).unwrap(), guest_code, false);
+        contend(jit(), guest_code, false);
+        let mut parallel = JitCpu::new(PARK_ADDR, true).unwrap();
+        parallel.set_guest_workers(2).unwrap();
+        contend(parallel, guest_code, true);
+    }
 }

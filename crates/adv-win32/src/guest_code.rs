@@ -15,6 +15,16 @@ pub(crate) fn install(reg: &mut Registry) {
         ("kernel32.dll", "GetLastError", &GET_LAST_ERROR),
         ("kernel32.dll", "SetLastError", &SET_LAST_ERROR),
         ("kernel32.dll", "TlsGetValue", &TLS_GET_VALUE),
+        (
+            "kernel32.dll",
+            "EnterCriticalSection",
+            &ENTER_CRITICAL_SECTION,
+        ),
+        (
+            "kernel32.dll",
+            "LeaveCriticalSection",
+            &LEAVE_CRITICAL_SECTION,
+        ),
     ] {
         reg.set_guest(module, name, guest);
     }
@@ -42,6 +52,7 @@ pub(crate) static SET_RECT_EMPTY: GuestCode = GuestCode {
         0x04, 0x00,
     ],
     host: &[],
+    links: &[],
 };
 
 /// `user32.dll!IsRectEmpty`
@@ -67,6 +78,7 @@ pub(crate) static IS_RECT_EMPTY: GuestCode = GuestCode {
         0xc2, 0x04, 0x00,
     ],
     host: &[],
+    links: &[],
 };
 
 /// `user32.dll!IntersectRect`
@@ -137,6 +149,7 @@ pub(crate) static INTERSECT_RECT: GuestCode = GuestCode {
         0x08, 0x89, 0x48, 0x0c, 0x31, 0xc0, 0x5d, 0x5f, 0x5e, 0x5b, 0xc2, 0x0c, 0x00,
     ],
     host: &[],
+    links: &[],
 };
 
 /// `user32.dll!UnionRect`
@@ -235,6 +248,7 @@ pub(crate) static UNION_RECT: GuestCode = GuestCode {
         0x0c, 0x00,
     ],
     host: &[],
+    links: &[],
 };
 
 /// `kernel32.dll!GetLastError`
@@ -245,6 +259,7 @@ pub(crate) static UNION_RECT: GuestCode = GuestCode {
 pub(crate) static GET_LAST_ERROR: GuestCode = GuestCode {
     code: &[0x64, 0xa1, 0x34, 0x00, 0x00, 0x00, 0xc3],
     host: &[],
+    links: &[],
 };
 
 /// `kernel32.dll!SetLastError`
@@ -258,6 +273,7 @@ pub(crate) static SET_LAST_ERROR: GuestCode = GuestCode {
         0x8b, 0x44, 0x24, 0x04, 0x64, 0xa3, 0x34, 0x00, 0x00, 0x00, 0xc2, 0x04, 0x00,
     ],
     host: &[],
+    links: &[],
 };
 
 /// `kernel32.dll!TlsGetValue`
@@ -276,4 +292,60 @@ pub(crate) static TLS_GET_VALUE: GuestCode = GuestCode {
         0x00, 0x00, 0xc2, 0x04, 0x00,
     ],
     host: &[9],
+    links: &[],
+};
+
+/// `kernel32.dll!EnterCriticalSection`
+/// ```text
+///     mov edx, dword ptr [esp+4]
+///     mov ecx, dword ptr fs:[0x24]
+///     mov eax, 1
+///     lock xadd dword ptr [edx+4], eax
+///     inc eax
+///     jnz busy
+///     mov dword ptr [edx+12], ecx
+///     mov dword ptr [edx+8], 1
+///     ret 4
+/// busy:
+///     cmp dword ptr [edx+12], ecx
+///     jne LINK:kernel32.dll!<EnterCriticalSectionWait>
+///     inc dword ptr [edx+8]
+///     ret 4
+/// ```
+pub(crate) static ENTER_CRITICAL_SECTION: GuestCode = GuestCode {
+    code: &[
+        0x8b, 0x54, 0x24, 0x04, 0x64, 0x8b, 0x0d, 0x24, 0x00, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00,
+        0x00, 0xf0, 0x0f, 0xc1, 0x42, 0x04, 0x40, 0x75, 0x0d, 0x89, 0x4a, 0x0c, 0xc7, 0x42, 0x08,
+        0x01, 0x00, 0x00, 0x00, 0xc2, 0x04, 0x00, 0x39, 0x4a, 0x0c, 0x0f, 0x85, 0xd2, 0x0f, 0x00,
+        0x50, 0xff, 0x42, 0x08, 0xc2, 0x04, 0x00,
+    ],
+    host: &[],
+    links: &[(42, "kernel32.dll", "<EnterCriticalSectionWait>")],
+};
+
+/// `kernel32.dll!LeaveCriticalSection`
+/// ```text
+///     mov edx, dword ptr [esp+4]
+///     mov ecx, dword ptr fs:[0x24]
+///     cmp dword ptr [edx+12], ecx
+///     jne HOST
+///     dec dword ptr [edx+8]
+///     jnz held
+///     mov dword ptr [edx+12], 0
+///     lock dec dword ptr [edx+4]
+///     jns LINK:kernel32.dll!<LeaveCriticalSectionWake>
+///     ret 4
+/// held:
+///     lock dec dword ptr [edx+4]
+///     ret 4
+/// ```
+pub(crate) static LEAVE_CRITICAL_SECTION: GuestCode = GuestCode {
+    code: &[
+        0x8b, 0x54, 0x24, 0x04, 0x64, 0x8b, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x39, 0x4a, 0x0c, 0x0f,
+        0x85, 0xec, 0xff, 0xff, 0x3f, 0xff, 0x4a, 0x08, 0x75, 0x14, 0xc7, 0x42, 0x0c, 0x00, 0x00,
+        0x00, 0x00, 0xf0, 0xff, 0x4a, 0x04, 0x0f, 0x89, 0xd6, 0x0f, 0x00, 0x50, 0xc2, 0x04, 0x00,
+        0xf0, 0xff, 0x4a, 0x04, 0xc2, 0x04, 0x00,
+    ],
+    host: &[16],
+    links: &[(38, "kernel32.dll", "<LeaveCriticalSectionWake>")],
 };
