@@ -1206,6 +1206,10 @@ impl TrapHandler for Dispatch<'_> {
             if valid {
                 cpu.set_reg(Reg::Esp, esp.wrapping_add(4));
                 self.host_call(cpu, index.unwrap())
+            } else if self.sys.exception_handler.is_some() {
+                // A raw guest interrupt never borrows the host thunk token.
+                // Its OS personality owns system-service or exception policy.
+                self.exception(cpu, exception::Exception::Trap { vector, pc: eip })
             } else {
                 let snapshot = self.interrupt_snapshot(cpu, vector, eip);
                 self.remember_cpu_fault(snapshot);
