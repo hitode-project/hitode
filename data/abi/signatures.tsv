@@ -4874,6 +4874,7 @@ opengl32.dll	wglUseFontBitmapsA	stdcall	i32	Windows.Win32.Foundation.BOOL	param0
 opengl32.dll	wglUseFontBitmapsW	stdcall	i32	Windows.Win32.Foundation.BOOL	param0:Windows.Win32.Graphics.Gdi.HDC:handle:1|param1:u32:u32:1|param2:u32:u32:1|param3:u32:u32:1
 opengl32.dll	wglUseFontOutlinesA	stdcall	i32	Windows.Win32.Foundation.BOOL	param0:Windows.Win32.Graphics.Gdi.HDC:handle:1|param1:u32:u32:1|param2:u32:u32:1|param3:u32:u32:1|param4:f32:f32:1|param5:f32:f32:1|param6:i32:i32:1|param7:Windows.Win32.Graphics.OpenGL.GLYPHMETRICSFLOAT*:ptr:1
 opengl32.dll	wglUseFontOutlinesW	stdcall	i32	Windows.Win32.Foundation.BOOL	param0:Windows.Win32.Graphics.Gdi.HDC:handle:1|param1:u32:u32:1|param2:u32:u32:1|param3:u32:u32:1|param4:f32:f32:1|param5:f32:f32:1|param6:i32:i32:1|param7:Windows.Win32.Graphics.OpenGL.GLYPHMETRICSFLOAT*:ptr:1
+quartz.dll	AMGetErrorTextA	stdcall	u32	u32	hr:Windows.Win32.Foundation.HRESULT:i32:1|pbuffer:Windows.Win32.Foundation.PSTR:str8:1|MaxLen:u32:u32:1
 sensapi.dll	IsDestinationReachableA	stdcall	i32	Windows.Win32.Foundation.BOOL	lpszDestination:Windows.Win32.Foundation.PSTR:str8:1|lpQOCInfo:Windows.Win32.System.EventNotificationService.QOCINFO*:ptr:1
 sensapi.dll	IsDestinationReachableW	stdcall	i32	Windows.Win32.Foundation.BOOL	lpszDestination:Windows.Win32.Foundation.PWSTR:str16:1|lpQOCInfo:Windows.Win32.System.EventNotificationService.QOCINFO*:ptr:1
 sensapi.dll	IsNetworkAlive	stdcall	i32	Windows.Win32.Foundation.BOOL	lpdwFlags:u32*:ptr:1

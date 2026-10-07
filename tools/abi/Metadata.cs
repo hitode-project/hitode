@@ -312,6 +312,9 @@ public static class AbiMetadata
             bool drawDib = f.Length == 6 && f[0] == "msvfw32.dll" && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && ((f[1] == "DrawDibClose" && f[5] == "hdd:Windows.Win32.Foundation.HANDLE:handle:1")
                     || (f[1] == "DrawDibDraw" && f[5] == "hdd:Windows.Win32.Foundation.HANDLE:handle:1|hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1|xDst:i32:i32:1|yDst:i32:i32:1|dxDst:i32:i32:1|dyDst:i32:i32:1|lpbi:Windows.Win32.Graphics.Gdi.BITMAPINFOHEADER*:ptr:1|lpBits:void*:ptr:1|xSrc:i32:i32:1|ySrc:i32:i32:1|dxSrc:i32:i32:1|dySrc:i32:i32:1|wFlags:u32:u32:1"));
+            bool amErrorText = f.Length == 6 && f[0] == "quartz.dll" && f[1] == "AMGetErrorTextA"
+                && f[3] == "u32" && f[4] == "u32"
+                && f[5] == "hr:Windows.Win32.Foundation.HRESULT:i32:1|pbuffer:Windows.Win32.Foundation.PSTR:str8:1|MaxLen:u32:u32:1";
             bool d3dx = f.Length == 6 && f[0] == "d3dx9_43.dll"
                 && new[] { "D3DXMatrixMultiply", "D3DXMatrixTranspose", "D3DXMatrixScaling", "D3DXMatrixTranslation", "D3DXMatrixLookAtLH", "D3DXVec3Project", "D3DXMatrixRotationYawPitchRoll", "D3DXMatrixRotationY", "D3DXMatrixPerspectiveFovLH", "D3DXVec4Transform", "D3DXVec3TransformCoord", "D3DXVec3Transform", "D3DXVec3CatmullRom" }.Contains(f[1])
                 && f[3] == "ptr" && f[4] == (f[1] switch { "D3DXVec3Project" or "D3DXVec3TransformCoord" or "D3DXVec3CatmullRom" => "D3DXVECTOR3*", "D3DXVec4Transform" or "D3DXVec3Transform" => "D3DXVECTOR4*", _ => "D3DXMATRIX*" });
@@ -430,7 +433,7 @@ public static class AbiMetadata
             bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
-            if ((!vcm && !drawDibOpen && !drawDib && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntDelay && !internalProcess && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
+            if ((!vcm && !drawDibOpen && !drawDib && !amErrorText && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntDelay && !internalProcess && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };
