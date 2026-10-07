@@ -1,5 +1,6 @@
 //! kernel32.dll.
 
+mod activation;
 mod atom;
 pub(crate) mod child_process;
 mod environment;
@@ -48,6 +49,7 @@ use adv_abi::Registry;
 pub(crate) const K32: &str = "kernel32.dll";
 
 pub fn register(reg: &mut Registry) {
+    activation::register(reg);
     atom::register(reg);
     child_process::register(reg);
     environment::register(reg);
