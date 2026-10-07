@@ -163,6 +163,135 @@ fn method(code: &mut Asm, object_pointer: u32, slot: u8, args: &[u32], result: u
 }
 
 #[test]
+fn legacy_controller_enumeration_is_empty_without_callback_or_owner_side_effects() {
+    for jit in [false, true] {
+        for wide in [false, true] {
+            let (mut m, data) = fixture(jit);
+            m.ext.get_or_default::<adv_abi::ApiDiagnostics>();
+            let before = m.sys.objects.object_count();
+            let code_address = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RX).unwrap();
+            let callback = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RX).unwrap();
+            let mut counter = Asm::new(callback);
+            counter.bytes.extend([0xff, 0x05]); // inc dword [callback count]
+            counter.bytes.extend((data + 64).to_le_bytes());
+            counter.bytes.extend([0x31, 0xc0]);
+            counter.ret_n(8);
+            m.cpu.write(callback, &counter.bytes).unwrap();
+            m.cpu.write_u32(data + 68, 0x12345678).unwrap();
+            let create = m
+                .resolve_import(
+                    "dinput.dll",
+                    if wide {
+                        "DirectInputCreateW"
+                    } else {
+                        "DirectInputCreateA"
+                    },
+                )
+                .unwrap();
+            let mut code = Asm::new(code_address);
+            code.bytes.extend([0x89, 0xe0]);
+            code.mov_mem_eax(data + 72);
+            for arg in [0, data, 0x500, 0x400000] {
+                code.push_imm(arg);
+            }
+            code.call(create).mov_mem_eax(data + 100);
+            for (index, flags) in [0, 1, 0x101, 0x30101].into_iter().enumerate() {
+                method(
+                    &mut code,
+                    data,
+                    4,
+                    &[4, callback, data + 68, flags],
+                    data + 104 + index as u32 * 4,
+                );
+            }
+            for (index, kind) in [0, 1, 2, 3].into_iter().enumerate() {
+                method(
+                    &mut code,
+                    data,
+                    4,
+                    &[kind, callback, data + 68, 1],
+                    data + 120 + index as u32 * 4,
+                );
+            }
+            for (index, (kind, target, flags)) in [
+                (5, callback, 1),
+                (4, 0, 1),
+                (4, data, 1),
+                (4, callback, 2),
+                (4, callback, 0x40000),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                method(
+                    &mut code,
+                    data,
+                    4,
+                    &[kind, target, data + 68, flags],
+                    data + 136 + index as u32 * 4,
+                );
+            }
+            method(&mut code, data, 2, &[], data + 156);
+            // The retired alias must not be accepted by enumeration.
+            method(&mut code, data, 4, &[4, callback, data + 68, 1], data + 160);
+            code.bytes.extend([0x89, 0xe0]);
+            code.mov_mem_eax(data + 76);
+            code.bytes.extend([0x31, 0xc0]);
+            code.ret();
+            m.cpu.write(code_address, &code.bytes).unwrap();
+            if jit {
+                let mut region = Region::new(code_address, code.bytes.len());
+                region.reachable = true;
+                m.cpu.executor_mut().add_region(region).unwrap();
+                m.cpu.executor_mut().enable_auto_jit(false);
+            }
+            m.spawn("legacy controller enumeration", code_address, &[], 65536)
+                .unwrap();
+            let result = m.run_virtual(1_000_000);
+            assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+            for offset in [100, 104, 108, 112, 116, 156] {
+                assert_eq!(m.cpu.read_u32(data + offset).unwrap(), 0);
+            }
+            for offset in [120, 124, 128, 132] {
+                assert_eq!(m.cpu.read_u32(data + offset).unwrap(), UNSUPPORTED);
+            }
+            for offset in [136, 140, 144, 148, 152, 160] {
+                assert_eq!(m.cpu.read_u32(data + offset).unwrap(), INVALID);
+            }
+            assert_eq!(m.cpu.read_u32(data + 64).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(data + 68).unwrap(), 0x12345678);
+            assert_eq!(
+                m.cpu.read_u32(data + 72).unwrap(),
+                m.cpu.read_u32(data + 76).unwrap()
+            );
+            assert_eq!(m.sys.objects.object_count(), before + 1); // only the guest thread
+            assert_eq!(
+                m.sys
+                    .objects
+                    .all_hosts::<adv_os::com::ComObject<Device>>()
+                    .count(),
+                0
+            );
+            assert_eq!(
+                m.sys
+                    .objects
+                    .all_hosts::<adv_os::com::ComObject<LegacyFactory>>()
+                    .count(),
+                0
+            );
+            let diagnostics = m.ext.get::<adv_abi::ApiDiagnostics>();
+            assert_eq!(diagnostics.stub_calls, 0);
+            assert!(diagnostics.warnings.keys().any(|key| key.0
+                == if wide {
+                    "dinput.dll!IDirectInputW::EnumDevices"
+                } else {
+                    "dinput.dll!IDirectInputA::EnumDevices"
+                }));
+        }
+    }
+}
+
+#[test]
 fn sdk_legacy_slots_execute_through_both_guest_vtables_and_preserve_stack() {
     for jit in [false, true] {
         for wide in [false, true] {
