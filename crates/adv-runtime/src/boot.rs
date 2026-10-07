@@ -566,6 +566,16 @@ impl<B: Backend> Runtime<B> {
         adv_win32::set_codepage(&mut self.env(), codepage).map_err(|error| error.to_string())
     }
 
+    /// Attach media before execution; child processes inherit the same immutable media.
+    pub fn mount_iso(&mut self, drive: char, image: &Path) -> Result<(), String> {
+        self.machine
+            .ext
+            .get_mut::<Win32>()
+            .vfs
+            .mount_iso(drive, image)
+            .map_err(|error| format!("mount optical drive {drive}: {error}"))
+    }
+
     /// Post host input to the window that would receive it (see
     /// [`adv_win32::user32::host_input::post`]).
     pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> bool {

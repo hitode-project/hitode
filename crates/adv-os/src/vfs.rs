@@ -17,8 +17,10 @@ mod portable_saves;
 mod attributes;
 mod section;
 mod stream;
+mod optical;
 pub use section::{FileIdentity, FileSection, SharedFiles, file_identity};
 pub use stream::FileStream;
+pub use optical::{OpticalDriveInfo, OpticalFile};
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
@@ -63,6 +65,7 @@ pub struct Vfs {
     resources: Option<PathBuf>,
     overlay: PathBuf,
     other: PathBuf,
+    optical: BTreeMap<char, std::sync::Arc<optical::OpticalMedia>>,
 }
 
 /// Existing host path for `comps` under `base`, matching each component case-insensitively.
@@ -125,6 +128,7 @@ impl Vfs {
             resources: cfg.resource_dir.clone(),
             overlay: cfg.data_dir.join("overlay"),
             other: cfg.data_dir.join("c"),
+            optical: BTreeMap::new(),
         }
     }
 
@@ -217,6 +221,9 @@ impl Vfs {
 
     /// Existing host file or directory for reading.
     pub fn lookup(&self, guest: &str) -> Option<PathBuf> {
+        if self.is_optical_path(guest) {
+            return None;
+        }
         match self.locate(guest)? {
             Loc::Game(rel) => ci_find(&self.overlay, &rel)
                 .or_else(|| self.resources.as_ref().and_then(|p| ci_find(p, &rel)))
@@ -233,6 +240,9 @@ impl Vfs {
 
     /// Host path to create or write `guest` at; parent directories are created.
     pub fn write_path(&self, guest: &str) -> Option<PathBuf> {
+        if self.is_optical_path(guest) {
+            return None;
+        }
         let p = match self.locate(guest)? {
             Loc::Game(rel) => {
                 // Read-only replacements retain copy-on-write semantics. Ordinary saves
@@ -261,6 +271,9 @@ impl Vfs {
     /// File mappings always persist game changes in the isolated overlay,
     /// including when ordinary portable saves use the game directory.
     pub fn mapping_write_path(&self, guest: &str) -> Option<PathBuf> {
+        if self.is_optical_path(guest) {
+            return None;
+        }
         let path = match self.locate(guest)? {
             Loc::Game(rel) => ci_path(&self.overlay, &rel),
             Loc::Other(rel) => ci_path(&self.other, &rel),
@@ -270,11 +283,17 @@ impl Vfs {
     }
 
     pub fn is_dir(&self, guest: &str) -> bool {
+        if self.is_optical_path(guest) {
+            return self.optical_entry(guest).is_ok_and(|entry| entry.is_dir);
+        }
         self.lookup(guest).is_some_and(|p| p.is_dir())
     }
 
     /// Merge game, replacement and writable layers, in increasing priority.
     pub fn list(&self, guest_dir: &str) -> Option<Vec<DirEntry>> {
+        if self.is_optical_path(guest_dir) {
+            return self.optical_list(guest_dir).ok();
+        }
         if !self.is_dir(guest_dir) {
             return None;
         }
@@ -396,6 +415,13 @@ impl crate::FileSource for Vfs {
         self.normalize(path)
     }
     fn read(&self, path: &str) -> Option<Vec<u8>> {
+        if self.is_optical_path(path) {
+            use std::io::Read;
+            let mut file = self.open_optical_file(path).ok()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
+            return Some(bytes);
+        }
         let p = self.lookup(path)?;
         p.is_file().then(|| std::fs::read(p).ok()).flatten()
     }
