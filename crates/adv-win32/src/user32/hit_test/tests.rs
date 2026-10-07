@@ -229,7 +229,7 @@ fn host_mouse_routes_to_hit_child_preserves_capture_and_keeps_keyboard_focus() {
 
 #[test]
 fn host_full_client_child_receives_frame_relative_move_down_up() {
-    use super::super::super::window::{WS_CAPTION, WS_THICKFRAME};
+    use super::super::window::{WS_CAPTION, WS_THICKFRAME};
     let (mut m, data) = fixture();
     let user = &mut m.ext.get_mut::<Win32>().user;
     let root = user.windows.get_mut(&mut m.sys.objects, &ROOT).unwrap();
