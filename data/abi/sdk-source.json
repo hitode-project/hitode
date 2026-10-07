@@ -371,5 +371,11 @@
     "source": "Microsoft NtOpenThread declaration, SDK x86 object/client layout and ntdll.lib @16 symbols, authored native x86 oracle",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/devnotes/ntopenthread",
     "native_verification": "158 scalar outcomes: actual current, suspended-child and still-referenced exited thread ownership; CID and object attributes, rights/generic mapping, output validation/clearing, inherited flag, invalid handles, Resume versus Suspend access and unchanged NT LastError"
+  },
+  "ldr_shutdown_process": {
+    "scope": "LdrShutdownProcess; zero x86 stack arguments and void return",
+    "source": "phnt ntldr.h primary declaration and authored native x86 DLL/FLS shutdown fixture",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "Authored native caller observes one-time DLL process detach with non-NULL reserved, current-thread FLS cleanup, surviving peer thread, retained module mapping and returning repeated shutdown."
   }
 }

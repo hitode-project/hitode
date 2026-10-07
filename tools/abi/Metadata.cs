@@ -356,6 +356,8 @@ public static class AbiMetadata
             bool ntLibrary = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "LdrLoadDll"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "DllPath:Windows.Win32.Foundation.PCWSTR:str16:1|DllCharacteristics:u32*:ptr:1|DllName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|DllHandle:void**:ptr:1";
+            bool ntShutdown = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "LdrShutdownProcess"
+                && f[3] == "void" && f[4] == "void" && f[5] == "";
             bool ntDelay = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "NtDelayExecution"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "Alertable:Windows.Win32.Foundation.BOOLEAN:u32:1|DelayInterval:LARGE_INTEGER*:ptr:1";
@@ -454,7 +456,7 @@ public static class AbiMetadata
             bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
-            if ((!vcm && !drawDibOpen && !drawDib && !amErrorText && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntHeap && !ntHeapLock && !ntDelay && !internalProcess && !ntRegistryOpen && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntThreadOpen && !ntTerminateProcess && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
+            if ((!vcm && !drawDibOpen && !drawDib && !amErrorText && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntShutdown && !ntHeap && !ntHeapLock && !ntDelay && !internalProcess && !ntRegistryOpen && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntThreadOpen && !ntTerminateProcess && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };

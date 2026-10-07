@@ -3754,6 +3754,7 @@ ntdll.dll	CsrClientCallServer	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Mess
 ntdll.dll	LdrGetProcedureAddress	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllHandle:void*:ptr:1|ProcedureName:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|ProcedureNumber:u32:u32:1|ProcedureAddress:void**:ptr:1
 ntdll.dll	LdrLoadDll	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllPath:Windows.Win32.Foundation.PCWSTR:str16:1|DllCharacteristics:u32*:ptr:1|DllName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|DllHandle:void**:ptr:1
 ntdll.dll	LdrLockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Disposition:u32*:ptr:1|Cookie:void**:ptr:1
+ntdll.dll	LdrShutdownProcess	stdcall	void	void	
 ntdll.dll	LdrUnlockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Cookie:void*:ptr:1
 ntdll.dll	NtAllocateVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|ZeroBits:usize:u32:1|RegionSize:usize*:ptr:1|AllocationType:u32:u32:1|Protect:u32:u32:1
 ntdll.dll	NtContinue	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ContextRecord:CONTEXT*:ptr:1|TestAlert:Windows.Win32.Foundation.BOOLEAN:u32:1
