@@ -318,6 +318,15 @@
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/debug/pe-format",
     "native_verification": "19 DWORDs: zero-entry or absent relocation directory loads at an alternate base with a callable export, explicit RELOCS_STRIPPED fails with STATUS_CONFLICTING_ADDRESSES / ERROR_INVALID_ADDRESS; native failure preserves output and LastError"
   },
+  "rtl_heap_frontends": {
+    "scope": "RtlAllocateHeap and RtlFreeHeap only; three x86 words, PVOID/ULONG/SIZE_T and modern LOGICAL return",
+    "source": "Microsoft Learn ntifs declarations, SDK 10.0.26100.0 x86 ntdll.lib @12 symbols and authored Microsoft Windows x86 caller",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-rtlallocateheap",
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-rtlfreeheap"
+    ],
+    "native_verification": "24 DWORDs: genuine process/custom heap owners, zero bytes, alignment and requested sizes, NT/Win32 cross-free, full LOGICAL return and NULL free, zero-size block, overflow failure sets ERROR_NOT_ENOUGH_MEMORY while successful calls preserve LastError"
+  },
   "legacy_ansi_string_alias": {
     "scope": "kernel32.dll lstrcpy only; project the complete pinned lstrcpyA declaration and share its implementation and PE export address",
     "source": "Microsoft Learn ANSI declaration, SDK 10.0.26100.0 x86 kernel32.lib _lstrcpy@8 and authored Microsoft Windows x86 caller",
