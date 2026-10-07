@@ -443,6 +443,7 @@ fn helper_only_compilation_retains_a_reproducible_comparison_lane() {
 }
 
 #[test]
+#[cfg(target_arch = "x86_64")] // Parallel execution is not enabled on ARM64.
 fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
     use std::sync::Arc;
 
