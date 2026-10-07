@@ -321,6 +321,12 @@
     "native_verification": "Authored VC80/90 38-row no-UI probe measures two x87 inputs consumed, one result, lower80-bit register payload and ESP/CW/status/error-owner preservation for normal finite and positive zero-base powers. Host binary64 powf is checked within two ULP of measured normals; this does not establish universal CRT extended-precision bit identity. Special values, range/domain or unsupported control/precision inputs remain warning/failure with original x87 stack preserved.",
     "profile": "Reuse the common guest floating environment, x87 argument/result and CRT error owners; preserve lower stack levels and guest ESP. Only measured numeric/control/status profiles may succeed; unimplemented exception or special-value profiles must explicitly warn and fail."
   },
+  "x87_intrinsic_logarithm": {
+    "source": "Microsoft Learn _CIlog10 x86 compiler intrinsic declaration, 2026-10-07 read",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cilog10",
+    "scope": "Official void __cdecl _CIlog10(); zero ordinary integer-stack words for three existing CRT aliases. The top x87 operand is consumed and replaced by its base10 logarithm through the existing architectural/result bridge; no ordinary double-return C prototype or stack double argument.",
+    "profile": "Reuse the common x87 architecture and CRT error owners, preserve lower80-bit registers and ESP. Positive numeric/control/status profiles must be measured; domain/range/unsupported controls must explicitly warn and fail without losing the original operand."
+  },
   "guest_comparator_sort": {
     "header": "ucrt/corecrt_search.h:23-24,60-65",
     "header_sha256": "fe06c4dd27c3df5ca6bed52a433b8848f32e14ed0f3712d00f7e602416471c1b",
