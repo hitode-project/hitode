@@ -262,5 +262,11 @@
     "source": "phnt ntpsapi.h primary declaration and authored Microsoft Windows x86 caller",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
     "native_verification": "30 DWORDs: actual suspended child, native get/set register changes read back by both NT and Win32, unrequested groups, restricted/closed handles and inaccessible pointer, unchanged LastError, original context restored and child exits 37"
+  },
+  "nt_resume_thread_implementation": {
+    "scope": "NtResumeThread frontend over the shared thread suspend count and process supervisor; reuse the supplemental master declaration",
+    "source": "phnt ntpsapi.h and authored Microsoft Windows x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
+    "native_verification": "20 DWORDs: invalid handle/output preserves state, actual old suspend count, NT/Win32 count interop, NULL output, completed valid thread reports zero without rescheduling, LastError unchanged, child exit 37"
   }
 }
