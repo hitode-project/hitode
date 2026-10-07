@@ -21,6 +21,7 @@ pub(crate) use memory::protect_memory;
 pub(crate) use memory::{allocate_memory, allocation_extent, free_memory, memory_span};
 mod module;
 pub(crate) use module::native_get_procedure;
+pub(crate) use module::native_load_library;
 pub(crate) use module::native_loader_mutex;
 pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread};
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
@@ -37,6 +38,7 @@ mod sync;
 mod time;
 mod timer;
 mod toolhelp;
+pub(crate) use time::delay_until;
 pub use time::filetime_now;
 pub(crate) use time::{civil_from_days, days_from_civil};
 
