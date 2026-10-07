@@ -22,6 +22,13 @@ pub(super) fn register(reg: R) -> Option<usize> {
         _ => return None,
     })
 }
+
+/// Conversions have MXCSR effects and scalar XMM inputs/outputs; the integer
+/// MMX lane batching and parallel-row contracts do not cover these effects.
+pub(super) fn conversion(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), M::Cvtps2pi | M::Cvttps2pi | M::Cvtpi2ps)
+}
+
 pub(super) fn supported(i: &Instruction) -> bool {
     let mm = |n: u32| i.op_kind(n) == OpKind::Register && register(i.op_register(n)).is_some();
     let gpr = |n: u32| {
@@ -193,7 +200,7 @@ impl Emitter<'_> {
             self.mmx_effects.as_mut().unwrap().or_mask |= 2;
             return;
         }
-        if matches!(i.mnemonic(), M::Cvtps2pi | M::Cvttps2pi | M::Cvtpi2ps) {
+        if conversion(i) {
             self.sse_mmx_conversion(i);
             if i.mnemonic() != M::Cvtpi2ps || i.op1_kind() == OpKind::Register {
                 self.mmx_written(register(i.op0_register()));

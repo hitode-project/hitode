@@ -371,3 +371,42 @@ fn common_conversions_execute_natively_and_publish_mmx_state() {
         }
     }
 }
+
+#[test]
+fn memory_conversion_loops_preserve_every_iteration_and_sticky_status() {
+    for kind in [PsPi, TpsPi] {
+        let code = assemble(|a| {
+            let mut again = a.create_label();
+            a.set_label(&mut again).unwrap();
+            kind.emit(a, true);
+            a.movq(qword_ptr(edi), mm0).unwrap();
+            a.add(edx, 8).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(again).unwrap();
+        });
+        let mut m = machines(&code);
+        let mut input = Vec::new();
+        for lane in 0..64 {
+            input.extend_from_slice(&(lane as f32 - 31.5).to_le_bytes());
+        }
+        for machine in &mut m {
+            machine.write(DATA, &input).unwrap();
+        }
+        let source = input[..16].try_into().unwrap();
+        let mut state = initial(source, 0x1f80);
+        state.regs[1] = 32;
+        state.regs[7] = DATA + 1024;
+        compare(&mut m, state, source, true);
+        if std::env::var_os("ADV_JIT_VERIFY").is_none() {
+            assert_eq!(m[0].stats.interpreter_instructions, 0);
+        }
+        for index in [1, 2] {
+            assert_eq!(
+                m[0].memory().read(DATA + 1024, input.len()).unwrap(),
+                m[index].memory().read(DATA + 1024, input.len()).unwrap(),
+                "{kind:?}"
+            );
+        }
+    }
+}
