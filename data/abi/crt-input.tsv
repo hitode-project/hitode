@@ -264,3 +264,6 @@ msvcr80.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:un
 msvcr80.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr90.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
 msvcr90.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
+msvcrt.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr80.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr90.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1

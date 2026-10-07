@@ -284,6 +284,13 @@
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex",
     "profile": "Reuse the Win32 thread startup/exit, scheduler and handle owners and existing CRT error/TLS cleanup. Unsupported creation flags or stack/security profiles must warn and fail rather than borrow legacy dummy suspend/resume behavior."
   },
+  "scalar_fraction_split": {
+    "header": "ucrt/corecrt_math.h:559",
+    "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
+    "scope": "Three existing CRT aliases: double __cdecl modf(double value, double* integer). Exactly three x86 argument words: genuine binary64 input spans two, the output pointer spans one; binary64 fractional return in x87 ST0.",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/modf-modff-modfl",
+    "profile": "Use shared binary64/x87 return and CRT error owners, complete eight-byte integer output preflight and measured special-value/control behavior. Unimplemented exception/status or callback profiles must warn and fail without fabricating a double result."
+  },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
     "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",
