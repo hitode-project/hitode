@@ -112,6 +112,52 @@ impl UserObjects {
         objects.owned(*self.index.get(&handle)?)?._image.as_ref()
     }
 
+    /// CopyIcon also accepts cursor identities. The copy always has a private
+    /// lifetime, including when its source is a process-owned shared resource.
+    /// `bool` reports whether actual pixel/mask data was available to copy.
+    pub(super) fn copy_icon(
+        &mut self,
+        objects: &mut Objects,
+        source: u32,
+    ) -> Result<(u32, bool), u32> {
+        fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, u32> {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(bytes.len()).map_err(|_| 8_u32)?;
+            copy.extend_from_slice(bytes);
+            Ok(copy)
+        }
+
+        let identity = *self.index.get(&source).ok_or(1402_u32)?;
+        let source = objects.owned(identity).ok_or(1402_u32)?;
+        let image = source
+            ._image
+            .as_ref()
+            .map(|image| -> Result<IconImage, u32> {
+                Ok(IconImage {
+                    width: image.width,
+                    height: image.height,
+                    pixels: copy_bytes(&image.pixels)?,
+                    mask: copy_bytes(&image.mask)?,
+                })
+            })
+            .transpose()?;
+        // Copies must not become LoadImage's shared resource-cache key. A fixed
+        // description also avoids growing it when a guest repeatedly copies a copy.
+        let label = "independent icon/cursor copy";
+        let mut description = String::new();
+        description
+            .try_reserve_exact(label.len())
+            .map_err(|_| 8_u32)?;
+        description.push_str(label);
+        let has_pixels = image.is_some();
+        let handle = match image {
+            Some(image) => self.create_image(objects, description, image, false),
+            None => self.create_metadata(objects, description, false),
+        }
+        .ok_or(8_u32)?;
+        Ok((handle, has_pixels))
+    }
+
     pub(super) fn stock(&mut self, objects: &mut Objects, handle: u32) -> Option<u32> {
         if self
             .index

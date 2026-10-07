@@ -1,4 +1,6 @@
 //! Guest LoadImage calls and common USER image-owner observations.
+mod copying;
+
 use super::*;
 use adv_cpu::{
     JitCpu, Region,

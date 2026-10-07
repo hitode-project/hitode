@@ -519,11 +519,35 @@ fn load_icon_w(env: &mut Env<'_>, instance: Handle, icon: WideStr) -> Handle {
     )
 }
 
+#[win32(user32, name = "CopyIcon", level = implement)]
+fn copy_icon(env: &mut Env<'_>, icon: Handle) -> Handle {
+    match env
+        .ext
+        .get_mut::<Win32>()
+        .user
+        .objects
+        .copy_icon(&mut env.sys.objects, icon.0)
+    {
+        Ok((handle, has_pixels)) => {
+            if !has_pixels {
+                adv_abi::warn_unavailable(
+                    env,
+                    "user32.dll!CopyIcon",
+                    "independent headless icon/cursor identity copied; source pixel data is unavailable",
+                );
+            }
+            Handle(handle)
+        }
+        Err(error) => fail(env, error),
+    }
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(load_a_ABI);
     registry.register(load_w_ABI);
     registry.register(load_icon_a_ABI);
     registry.register(load_icon_w_ABI);
+    registry.register(copy_icon_ABI);
 }
 
 #[cfg(test)]
