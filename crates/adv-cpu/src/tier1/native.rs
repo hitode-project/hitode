@@ -3,7 +3,7 @@ use super::{BUDGET, DISPATCH, Execution, FALLBACK, LOAD, STORE, Tier1Stats, emit
 use crate::execution_abi::Tier1Frame;
 use crate::interpreter::{Execution as Interpreted, Interpreter, Step};
 use crate::{CpuState, Memory};
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 use std::collections::{BTreeMap, VecDeque};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -90,25 +90,28 @@ extern "C" fn load(entry: *mut Entry, address: u32, kind: u32) -> u64 {
     })
 }
 
-/// Checked 4-byte guest store without leaving native code. A store to
+/// Checked 1/2/4-byte guest store without leaving native code. A store to
 /// executable memory or one that advances the epoch asks the code to leave.
-extern "C" fn store(entry: *mut Entry, address: u32, value: u32) -> u32 {
+extern "C" fn store(entry: *mut Entry, address: u32, value: u32, width: u32) -> u32 {
     // SAFETY: as for `load`.
     let (memory, inline) = unsafe { (&mut *(*entry).memory, &mut (*entry).inline) };
     // Memory::write is a host write API; guest permissions must be checked
     // before it so immutable code and guards cannot be bypassed.
-    if !crate::interpreter::accessible(memory, address, 4, crate::WRITE) {
+    if !crate::interpreter::accessible(memory, address, width as u8, crate::WRITE) {
         return 2;
     }
     let epoch = memory.epoch;
-    if memory.write(address, &value.to_le_bytes()).is_err() {
+    if memory
+        .write(address, &value.to_le_bytes()[..width as usize])
+        .is_err()
+    {
         return 2;
     }
     *inline += 1;
     u32::from(
         memory.epoch != epoch
             || memory.executable(address, 1)
-            || memory.executable(address.wrapping_add(3), 1),
+            || memory.executable(address.wrapping_add(width - 1), 1),
     )
 }
 
@@ -286,13 +289,16 @@ impl Engine {
             }
             if instruction.is_jcc_short_or_near()
                 || matches!(instruction.mnemonic(), Mnemonic::Jmp | Mnemonic::Call)
+                    && instruction.op0_kind() == OpKind::NearBranch32
             {
                 queue.push_back(instruction.near_branch32());
             }
             // A call's return point is likely code; bytes after RET or JMP are not.
             if !matches!(
                 instruction.flow_control(),
-                FlowControl::UnconditionalBranch | FlowControl::Return
+                FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+                    | FlowControl::Return
             ) {
                 queue.push_back(instruction.next_ip32());
             }
