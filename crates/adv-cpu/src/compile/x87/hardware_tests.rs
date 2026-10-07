@@ -205,7 +205,7 @@ fn single_precision_arithmetic_matches_hardware_raw80_and_precision_flags() {
                 .unwrap();
             });
             let mut mem = memory(&code);
-            let compiled = compile(&Region::new(CODE, code.len()), &mem, false).unwrap();
+            let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
             let mut seed = 0x6a09_e667_f3bc_c909u64;
             // Nearby exponents make sums with exact, halfway and carrying tails.
             let random = (0..8192).map(|n| {
