@@ -1,0 +1,62 @@
+[
+  {
+    "at": 90,
+    "checkpoint": "title"
+  },
+  {
+    "at": 93,
+    "command": "click 460 655"
+  },
+  {
+    "at": 100,
+    "checkpoint": "load-screen"
+  },
+  {
+    "at": 104,
+    "command": "click 220 280"
+  },
+  {
+    "at": 110,
+    "checkpoint": "loading"
+  },
+  {
+    "at": 113,
+    "command": "click 565 438"
+  },
+  {
+    "at": 125,
+    "checkpoint": "loaded"
+  },
+  {
+    "at": 129,
+    "command": "key 13"
+  },
+  {
+    "at": 136,
+    "checkpoint": "advance-one"
+  },
+  {
+    "at": 139,
+    "command": "click 640 450"
+  },
+  {
+    "at": 146,
+    "checkpoint": "advance-two"
+  },
+  {
+    "at": 149,
+    "command": "key 113"
+  },
+  {
+    "at": 156,
+    "checkpoint": "save-screen"
+  },
+  {
+    "at": 159,
+    "command": "click 1120 628"
+  },
+  {
+    "at": 165,
+    "checkpoint": "closed"
+  }
+]
