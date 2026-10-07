@@ -796,9 +796,7 @@ mod tests {
     }
 
     fn input_runtime() -> Runtime {
-        use adv_win32::user32::window::{
-            ControlState, Rect, WS_CHILD, WS_POPUP, WS_VISIBLE, Window,
-        };
+        use adv_win32::user32::window::{Rect, WS_CHILD, WS_POPUP, WS_VISIBLE, Window};
         let mut machine = crate::graphics::test_machine();
         Win32::install(
             &mut machine,
@@ -808,32 +806,17 @@ mod tests {
         machine
             .ext
             .insert(adv_dx::dinput::InputProvider(input_snapshot));
-        let window = |hwnd, parent, rect| Window {
-            hwnd,
-            class: 0,
-            proc: 0,
-            unicode: false,
-            style: WS_VISIBLE | if parent == 0 { WS_POPUP } else { WS_CHILD },
-            ex_style: 0,
-            parent,
-            owner: 0,
-            id: 0,
-            instance: 0,
-            rect,
-            placement: adv_win32::user32::PlacementState::new(rect),
-            text: String::new(),
-            extra: Vec::new(),
-            user_data: 0,
-            thread: 0,
-            children: Vec::new(),
-            font: 0,
-            needs_paint: false,
-            created_us: 0,
-            initial_geometry_reported: false,
-            destroying: false,
-            hidden_popup: false,
-            control: ControlState::default(),
-            auto_clicks: 0,
+        let window = |hwnd, parent, rect| {
+            Window::new(
+                hwnd,
+                0,
+                0,
+                WS_VISIBLE | if parent == 0 { WS_POPUP } else { WS_CHILD },
+                0,
+                parent,
+                rect,
+                0,
+            )
         };
         let user = &mut machine.ext.get_mut::<Win32>().user;
         user.top = vec![0x10020];

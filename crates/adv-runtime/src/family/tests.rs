@@ -256,5 +256,22 @@ fn unhandled_child_exception_preserves_native_status_while_parent_runs() {
             .contains("unhandled Windows exception")
     );
     assert_eq!(runtime.family.records[0].exit_code, None);
+    let record = &runtime.family.records[1];
+    let first = record
+        .first_cpu_fault
+        .as_ref()
+        .expect("retired child fault evidence");
+    assert_eq!(first.fault.pc, 0x401000);
+    assert_eq!(first.access(), Some(("write", 0)));
+    assert_eq!(record.latest_cpu_fault.as_ref(), Some(first));
+    assert!(runtime.family.records[0].first_cpu_fault.is_none());
+    assert!(
+        runtime.machine.sys.first_cpu_fault.is_none(),
+        "child evidence must not become parent state"
+    );
+    assert!(
+        !runtime.family.parked.contains_key(&pid),
+        "evidence must survive child retirement"
+    );
     cleanup(exe);
 }
