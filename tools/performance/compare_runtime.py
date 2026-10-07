@@ -4,6 +4,8 @@
 No assets, screenshots or traces are collected. Raw reports and stdout can still
 contain private paths: keep the output directory local and ignored by Git.
 Final-frame equality is a necessary gate, not full execution/audio equivalence.
+Use --mode hidden to retain the interactive compiler policy and presentation
+thread without showing a window; requested hardware audio is muted in that mode.
 """
 from __future__ import annotations
 
@@ -105,6 +107,7 @@ def main() -> None:
     parser.add_argument('--codepage', choices=('932', '936'), default='932')
     parser.add_argument('--backend', choices=('jit', 'interpreter'), default='jit')
     parser.add_argument('--audio', action='store_true')
+    parser.add_argument('--mode', choices=('headless', 'hidden'), default='headless')
     parser.add_argument('--auto-dialog-ms', type=int)
     parser.add_argument('--seed-data', type=Path, help='copy this overlay separately for each run')
     parser.add_argument('--output', type=Path, default=Path('target/perf-runtime'))
@@ -134,7 +137,11 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     metadata = {'binary_sha256': hashes, 'sample': str(exe.relative_to(root)),
                 'frames': args.frames, 'pairs': args.pairs, 'audio': args.audio,
-                'backend': args.backend, 'codepage': args.codepage, 'order': []}
+                'backend': args.backend, 'codepage': args.codepage,
+                'mode': args.mode, 'order': []}
+    environment = dict(os.environ)
+    if args.mode == 'hidden' and args.audio:
+        environment['ADV_AUDIO_MUTE_DEVICE'] = '1'
     try:
         for pair in range(args.pairs):
             order = ('baseline', 'candidate') if pair % 2 == 0 else ('candidate', 'baseline')
@@ -148,7 +155,7 @@ def main() -> None:
                         shutil.copytree(args.seed_data, overlay)
                     else:
                         overlay.mkdir()
-                    command = [str(binaries[label]), str(exe), '--headless', '--backend',
+                    command = [str(binaries[label]), str(exe), '--' + args.mode, '--backend',
                                args.backend, '--compile', 'fast', '--frames', str(args.frames),
                                '--codepage', args.codepage, '--data-dir', str(overlay),
                                '--report', str(report_path)]
@@ -159,7 +166,8 @@ def main() -> None:
                     started = time.perf_counter()
                     with (output / f'{name}.log').open('wb') as log:
                         subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                                       timeout=args.timeout, check=True)
+                                       timeout=args.timeout, check=True, env=environment,
+                                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                     elapsed = time.perf_counter() - started
                 report = json.loads(report_path.read_text(encoding='utf-8'))
                 signature(report, args.frames)

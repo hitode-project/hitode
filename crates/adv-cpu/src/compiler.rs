@@ -216,7 +216,13 @@ impl Worker {
             return Err(SubmitError::Closed);
         }
         let work = if let Some(limit) = self.sender.borrow().work_policy().background_limit() {
-            let (work, limit) = crate::compile_budget::work_and_allowance(&input, limit);
+            let budget = crate::compile_budget::background_budget(
+                input.region.compile_strategy,
+                limit,
+                self.pool.is_some(),
+            );
+            let (work, limit) =
+                crate::compile_budget::work_and_allowance_with_budget(&input, budget);
             if work > limit {
                 return Err(SubmitError::WorkLimit { work, limit });
             }
@@ -696,6 +702,66 @@ mod tests {
         worker.try_submit(admitted).unwrap();
         receive(&mut worker);
         assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn dedicated_speed_rechecks_its_absolute_cap_without_relaxing_fast() {
+        let mut builder = Builder::new(WakeEvent::new().unwrap())
+            .unwrap()
+            .with_work_policy(WorkPolicy::responsive(256));
+        let sender = builder.sender(2, CAPACITY).unwrap().into_local();
+        let service = builder.start().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let mut worker = Worker::with_sender_compiler(sender, move |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Err("admitted on dedicated thread".into())
+        });
+        let loop_input = |accesses: usize, strategy| {
+            let mut memory = Memory::new(0x10000, 4096).unwrap();
+            memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
+            let mut bytes = [0x8b, 0x00].repeat(accesses);
+            bytes.push(0x49);
+            let displacement = -i32::try_from(bytes.len() + 6).unwrap();
+            bytes.extend([0x0f, 0x85]);
+            bytes.extend(displacement.to_le_bytes());
+            bytes.push(0xc3);
+            memory.write(0x10000, &bytes).unwrap();
+            let mut region = Region::new(0x10000, bytes.len());
+            region.compile_strategy = strategy;
+            Snapshot::capture(&region, &memory).unwrap()
+        };
+        assert!(matches!(
+            worker.try_submit(loop_input(64, crate::CompileStrategy::Speed)),
+            Err(SubmitError::WorkLimit {
+                work: 2116,
+                limit: 2048
+            })
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        worker.pool = Some(Pool::new(1).unwrap());
+        worker
+            .try_submit(loop_input(64, crate::CompileStrategy::Speed))
+            .unwrap();
+        assert!(receive(&mut worker).result.is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(worker.last_work(), 2116);
+        assert!(matches!(
+            worker.try_submit(loop_input(254, crate::CompileStrategy::Speed)),
+            Err(SubmitError::WorkLimit {
+                work: 8196,
+                limit: 8192
+            })
+        ));
+        assert!(matches!(
+            worker.try_submit(loop_input(254, crate::CompileStrategy::Fast)),
+            Err(SubmitError::WorkLimit {
+                work: 2049,
+                limit: 2048
+            })
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(service.stats(Priority::Background).submitted, 0);
     }
 
     #[test]

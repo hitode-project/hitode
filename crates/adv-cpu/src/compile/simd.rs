@@ -17,6 +17,23 @@ pub(super) fn register(reg: R) -> Option<usize> {
 }
 
 pub(super) fn supported(i: &Instruction) -> bool {
+    if i.mnemonic() == M::Pinsrw {
+        return i.op_count() == 3
+            && register(i.op0_register()).is_some()
+            && i.op2_kind() == OpKind::Immediate8
+            && (i.op1_kind() == OpKind::Register && reg_index(i.op1_register()).is_some()
+                || i.op1_kind() == OpKind::Memory
+                    && i.memory_size().size() == 2
+                    && [i.memory_base(), i.memory_index()]
+                        .iter()
+                        .all(|&r| r == R::None || reg_index(r).is_some()));
+    }
+    if i.mnemonic() == M::Maskmovdqu {
+        return i.op_count() == 3
+            && i.op0_kind() == OpKind::MemorySegEDI
+            && register(i.op1_register()).is_some()
+            && register(i.op2_register()).is_some();
+    }
     if !matches!(
         i.mnemonic(),
         M::Movdqu
@@ -42,20 +59,23 @@ pub(super) fn supported(i: &Instruction) -> bool {
             | M::Punpcklbw
             | M::Punpckhbw
             | M::Punpcklwd
+            | M::Punpckhwd
             | M::Packuswb
             | M::Packsswb
+            | M::Packssdw
             | M::Psrlw
             | M::Psrld
             | M::Psllw
             | M::Pslld
             | M::Psraw
+            | M::Psrad
     ) || i.op_count() != 2
     {
         return false;
     }
     let shift = matches!(
         i.mnemonic(),
-        M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw
+        M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw | M::Psrad
     );
     for n in 0..2 {
         match i.op_kind(n) {
@@ -66,12 +86,12 @@ pub(super) fn supported(i: &Instruction) -> bool {
                         .iter()
                         .all(|&r| r == R::None || reg_index(r).is_some())
                     && (n == 1 || matches!(i.mnemonic(), M::Movdqa | M::Movdqu))
-                    && (!shift || i.mnemonic() == M::Psraw) => {}
+                    && (!shift || matches!(i.mnemonic(), M::Psraw | M::Psrad)) => {}
             OpKind::Immediate8 if n == 1 && shift => {}
             _ => return false,
         }
     }
-    !shift || i.op1_kind() == OpKind::Immediate8 || i.mnemonic() == M::Psraw
+    !shift || i.op1_kind() == OpKind::Immediate8 || matches!(i.mnemonic(), M::Psraw | M::Psrad)
 }
 
 impl Emitter<'_> {
@@ -110,6 +130,24 @@ impl Emitter<'_> {
     }
 
     pub(super) fn simd_instruction(&mut self, i: &Instruction) {
+        if i.mnemonic() == M::Maskmovdqu {
+            self.simd_masked_store(i);
+            return;
+        }
+        if i.mnemonic() == M::Pinsrw {
+            let previous = self.vector_read(i, 0);
+            let previous = self.vector_cast(previous, types::I16X8);
+            // The memory form reads only one unaligned word.
+            let word = self.read(i, 1);
+            let word = self.b.ins().ireduce(types::I16, word);
+            let value = self.b.ins().insertlane(previous, word, i.immediate8() & 7);
+            let value = self.vector_cast(value, types::I8X16);
+            self.b.def_var(
+                self.xmm[register(i.op0_register()).unwrap()].unwrap(),
+                value,
+            );
+            return;
+        }
         if matches!(i.mnemonic(), M::Movdqa | M::Movdqu) {
             let value = self.vector_read(i, 1);
             if i.op0_kind() == OpKind::Memory {
@@ -126,7 +164,7 @@ impl Emitter<'_> {
         let a = self.vector_read(i, 0);
         let shift = matches!(
             i.mnemonic(),
-            M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw
+            M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw | M::Psrad
         );
         let ty = match i.mnemonic() {
             M::Pavgw
@@ -141,19 +179,20 @@ impl Emitter<'_> {
             | M::Psrlw
             | M::Psraw
             | M::Psllw => types::I16X8,
-            M::Paddd | M::Psubd | M::Psrld | M::Pslld => types::I32X4,
+            M::Paddd | M::Psubd | M::Psrld | M::Pslld | M::Psrad | M::Packssdw => types::I32X4,
             _ => types::I8X16,
         };
         let a = self.vector_cast(a, ty);
-        let result = if i.mnemonic() == M::Psraw {
+        let result = if matches!(i.mnemonic(), M::Psraw | M::Psrad) {
+            let maximum = ty.lane_bits() - 1;
             let count = if i.op1_kind() == OpKind::Immediate8 {
-                self.constant(u32::from(i.immediate8()).min(15))
+                self.constant(u32::from(i.immediate8()).min(maximum))
             } else {
                 // SSE2 takes the entire low quadword, not a masked lane count.
                 let source = self.vector_read(i, 1);
                 let source = self.vector_cast(source, types::I64X2);
                 let count = self.b.ins().extractlane(source, 0);
-                let limit = self.b.ins().iconst(types::I64, 15);
+                let limit = self.b.ins().iconst(types::I64, i64::from(maximum));
                 let count = self.b.ins().umin(count, limit);
                 self.b.ins().ireduce(types::I32, count)
             };
@@ -202,9 +241,10 @@ impl Emitter<'_> {
                     self.b.ins().unarrow(lo, hi)
                 }
                 M::Packuswb => self.b.ins().unarrow(a, b),
-                M::Packsswb => self.b.ins().snarrow(a, b),
-                M::Punpcklwd => {
-                    let mask: Vec<u8> = (0..4u8)
+                M::Packsswb | M::Packssdw => self.b.ins().snarrow(a, b),
+                M::Punpcklwd | M::Punpckhwd => {
+                    let first = if i.mnemonic() == M::Punpckhwd { 4 } else { 0 };
+                    let mask: Vec<u8> = (first..first + 4u8)
                         .flat_map(|lane| [lane * 2, lane * 2 + 1, 16 + lane * 2, 17 + lane * 2])
                         .collect();
                     let imm = self
@@ -236,5 +276,64 @@ impl Emitter<'_> {
             self.xmm[register(i.op0_register()).unwrap()].unwrap(),
             result,
         );
+    }
+
+    /// Prove the whole possible destination before emitting any selected byte.
+    /// Nonordinary or partially inaccessible spans retry the transactional
+    /// interpreter, which validates only selected bytes and handles SMC/PCM.
+    fn simd_masked_store(&mut self, i: &Instruction) {
+        let bytes = self.vector_read(i, 1);
+        let mask = self.vector_read(i, 2);
+        let bits = self.b.ins().vhigh_bits(types::I32, mask);
+        let active = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(bits, active, &[], done, &[]);
+        self.b.switch_to_block(active);
+        let mut addr = self.b.use_var(self.regs[7]);
+        if i.segment_prefix() == R::FS {
+            let fs = self.b.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                self.state,
+                offset_of!(CpuState, fs_base) as i32,
+            );
+            addr = self.b.ins().iadd(addr, fs);
+        }
+        let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
+        let outside =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, offset, (self.len - 16) as i64);
+        self.guard(outside, Exit::Fallback, None);
+        let end = self.b.ins().iadd_imm(offset, 15);
+        let first = self.permission(offset);
+        let last = self.permission(end);
+        let denied = self.denied(&[first, last], WRITE, crate::memory::SHARED | EXEC);
+        self.guard(denied, Exit::Fallback, None);
+        let address = self.window_address(addr);
+        let all = self.b.ins().icmp_imm(IntCC::Equal, bits, 0xffff);
+        let full = self.b.create_block();
+        let partial = self.b.create_block();
+        self.b.ins().brif(all, full, &[], partial, &[]);
+        self.b.switch_to_block(full);
+        self.b.ins().store(MemFlags::new(), bytes, address, 0);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(partial);
+        for lane in 0..16u8 {
+            let selected = self.b.ins().band_imm(bits, 1i64 << lane);
+            let store = self.b.create_block();
+            let next = self.b.create_block();
+            self.b.ins().brif(selected, store, &[], next, &[]);
+            self.b.switch_to_block(store);
+            let byte = self.b.ins().extractlane(bytes, lane);
+            self.b
+                .ins()
+                .store(MemFlags::new(), byte, address, i32::from(lane));
+            self.b.ins().jump(next, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+        self.b.seal_block(done);
     }
 }
