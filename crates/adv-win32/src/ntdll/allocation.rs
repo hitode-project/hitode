@@ -127,8 +127,74 @@ fn allocate(
     )
 }
 
+#[win32(ntdll, name = "NtFreeVirtualMemory", level = implement)]
+fn free(
+    env: &mut Env<'_>,
+    process: Handle,
+    base: GuestPtr<u32>,
+    size: GuestPtr<u32>,
+    flags: u32,
+) -> i32 {
+    let (process, base, size) = (process.0, base.addr(), size.addr());
+    let result = (|| -> Result<(), u32> {
+        let target = process_target(env, process, 8).map_err(status)?;
+        if target.pid != env.sys.pid {
+            warn_unavailable(
+                env,
+                "ntdll.dll!NtFreeVirtualMemory",
+                "remote NT free is not modeled",
+            );
+            return Err(0xc0000002);
+        }
+        for pointer in [base, size] {
+            check_range(env.cpu, pointer, 4, Prot::RW).map_err(|_| 0xc0000005u32)?;
+        }
+        if !matches!(flags, 0x4000 | 0x8000) {
+            return Err(0xc00000f2); // STATUS_INVALID_PARAMETER_4
+        }
+        let address = env.cpu.read_u32(base).map_err(|_| 0xc0000005u32)?;
+        let count = env.cpu.read_u32(size).map_err(|_| 0xc0000005u32)?;
+        let (owner, extent) =
+            crate::kernel32::allocation_extent(env, address).ok_or(0xc00000a0u32)?; // STATUS_MEMORY_NOT_ALLOCATED
+        let (page, length) = if count == 0 {
+            let page = address & !4095;
+            if page != owner {
+                return Err(0xc000009f); // STATUS_FREE_VM_NOT_AT_BASE
+            }
+            (page, extent)
+        } else {
+            crate::kernel32::memory_span(address, count).map_err(|error| status(error))?
+        };
+        if flags == 0x8000 && count != 0 {
+            adv_abi::warn_unavailable(
+                env,
+                "ntdll.dll!NtFreeVirtualMemory",
+                "partial reservation release is not modeled",
+            );
+            return Err(0xc0000002);
+        }
+        if u64::from(page) + u64::from(length) > u64::from(owner) + u64::from(extent) {
+            return Err(0xc000001a); // STATUS_UNABLE_TO_FREE_VM
+        }
+        crate::kernel32::free_memory(env, page, if count == 0 { 0 } else { length }, flags)
+            .map_err(|error| status(error))?;
+        env.cpu.write_u32(base, page).map_err(|_| 0xc0000005u32)?;
+        env.cpu.write_u32(size, length).map_err(|_| 0xc0000005u32)?;
+        Ok(())
+    })();
+    result.err().unwrap_or(0) as i32
+}
 pub(super) fn register(registry: &mut Registry) {
     registry.register(allocate_ABI);
+    registry.register(adv_abi::Api {
+        name: "ZwAllocateVirtualMemory",
+        ..allocate_ABI
+    });
+    registry.register(free_ABI);
+    registry.register(adv_abi::Api {
+        name: "ZwFreeVirtualMemory",
+        ..free_ABI
+    });
 }
 
 #[cfg(test)]

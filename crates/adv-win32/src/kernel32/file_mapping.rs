@@ -175,6 +175,12 @@ fn file_backing(
         }
         return Ok(env.ext.get::<Win32>().vfs.sections.memory(data));
     }
+    if let Some(file) = source.file.optical_file() {
+        if writable || maximum > source.file.metadata().map_err(|e| io_error(&e))?.len() {
+            return Err(5);
+        }
+        return Ok(env.ext.get::<Win32>().vfs.sections.optical(file.clone()));
+    }
     let old_id = identity(source.file.host().ok_or(6u32)?).map_err(|e| io_error(&e))?;
     let guest_path = source.guest_path.clone();
     let length = source.file.metadata().map_err(|e| io_error(&e))?.len();

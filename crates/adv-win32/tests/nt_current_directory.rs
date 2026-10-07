@@ -111,11 +111,7 @@ fn contract<B: Backend>(cpu: B, backend: &str) {
         0xc0000033
     );
     assert_eq!(
-        invoke(
-            &mut m,
-            "RtlGetCurrentDirectory_U",
-            &[length + 2, READ_ONLY]
-        ),
+        invoke(&mut m, "RtlGetCurrentDirectory_U", &[length + 2, READ_ONLY]),
         0
     );
 }

@@ -260,27 +260,34 @@ pub(crate) fn exit_thread(env: &mut Env<'_>, code: u32) -> Outcome {
     {
         return Outcome::ExitThread(code);
     }
-    terminal_notifications(
+    // FLS cleanup precedes DLL_THREAD_DETACH, while the registering module's
+    // dependencies are still alive. Native authored DLL probes verify the order.
+    super::super::sync::detach_fls(
         env,
-        3,
         Box::new(move |env| {
-            crate::user32::clipboard::exit_thread(env, move |env| {
-                if let Err(error) = crate::msvcrt::detach_thread(env) {
-                    return Outcome::Fail(error);
-                }
-                crate::user32::message::sent::exit_thread(env);
-                crate::user32::hooks::exit_thread(env);
-                if env
-                    .sys
-                    .contexts
-                    .iter()
-                    .all(|context| context.id == env.context || context.is_done())
-                {
-                    exit_process(env, code)
-                } else {
-                    Outcome::ExitThread(code)
-                }
-            })
+            terminal_notifications(
+                env,
+                3,
+                Box::new(move |env| {
+                    crate::user32::clipboard::exit_thread(env, move |env| {
+                        if let Err(error) = crate::msvcrt::detach_thread(env) {
+                            return Outcome::Fail(error);
+                        }
+                        crate::user32::message::sent::exit_thread(env);
+                        crate::user32::hooks::exit_thread(env);
+                        if env
+                            .sys
+                            .contexts
+                            .iter()
+                            .all(|context| context.id == env.context || context.is_done())
+                        {
+                            exit_process(env, code)
+                        } else {
+                            Outcome::ExitThread(code)
+                        }
+                    })
+                }),
+            )
         }),
     )
 }
@@ -294,16 +301,22 @@ pub(crate) fn exit_process(env: &mut Env<'_>, code: u32) -> Outcome {
     env.cpu.quiesce_memory();
     crate::user32::hooks::exit_process(env);
     env.sys.terminate_other_contexts(code);
-    terminal_notifications(
+    // As for thread exit, current-thread FLS runs before process DLL detach.
+    super::super::sync::detach_fls(
         env,
-        0,
         Box::new(move |env| {
-            match crate::msvcrt::detach_process(env)
-                .and_then(|()| crate::gdi32::font::detach_process(env))
-            {
-                Ok(()) => Outcome::ExitProcess(code),
-                Err(error) => Outcome::Fail(error),
-            }
+            terminal_notifications(
+                env,
+                0,
+                Box::new(move |env| {
+                    match crate::msvcrt::detach_process(env)
+                        .and_then(|()| crate::gdi32::font::detach_process(env))
+                    {
+                        Ok(()) => Outcome::ExitProcess(code),
+                        Err(error) => Outcome::Fail(error),
+                    }
+                }),
+            )
         }),
     )
 }

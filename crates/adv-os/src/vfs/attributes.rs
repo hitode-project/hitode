@@ -95,12 +95,19 @@ impl Vfs {
     /// Baseline guest file metadata is ARCHIVE/DIRECTORY. An explicitly cleared
     /// regular-file instance reads NORMAL through both lookup and enumeration.
     pub fn file_attributes(&self, guest: &str) -> io::Result<u32> {
+        if self.is_optical_path(guest) {
+            return Ok(self.optical_entry(guest)?.attributes);
+        }
         let path = self.lookup(guest).ok_or(io::ErrorKind::NotFound)?;
         self.attributes.read(&path, &std::fs::metadata(&path)?)
     }
     /// Publish NORMAL only after verifying a live ordinary VFS instance. Host
     /// permissions/attributes and every read-only source layer remain untouched.
     pub fn set_file_normal(&self, guest: &str) -> io::Result<()> {
+        if self.is_optical_path(guest) {
+            self.optical_entry(guest)?;
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
         let path = self.lookup(guest).ok_or(io::ErrorKind::NotFound)?;
         self.attributes
             .set_normal(&path, &std::fs::metadata(&path)?)

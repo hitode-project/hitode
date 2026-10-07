@@ -17,7 +17,7 @@ pub use handle::ProcessHandle;
 mod memory;
 pub(crate) use memory::native_write_memory;
 pub(crate) use memory::protect_memory;
-pub(crate) use memory::{allocate_memory, free_memory, memory_span};
+pub(crate) use memory::{allocate_memory, allocation_extent, free_memory, memory_span};
 mod module;
 pub(crate) use module::native_get_procedure;
 pub(crate) use module::native_loader_mutex;

@@ -158,9 +158,6 @@ pub fn register(r: &mut Registry) {
     modern_stdio::register(r);
     modern_string::register(r);
     wide_string::register(r);
-    for name in ["memset", "memcpy", "memmove"] {
-        r.add("vcruntime140.dll", name, Conv::Cdecl { argc: 3 }, call);
-    }
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),

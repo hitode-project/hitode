@@ -28,6 +28,14 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(set_ABI);
     registry.register(read_ABI);
     registry.register(close_ABI);
+    // Nt/Zw user-mode names have the same declarations and behavior.
+    for (api, name) in [
+        (create_ABI, "NtCreateFile"),
+        (query_ABI, "NtQueryInformationFile"),
+        (read_ABI, "NtReadFile"),
+    ] {
+        registry.register(adv_abi::Api { name, ..api });
+    }
 }
 
 #[win32(ntdll, name = "ZwClose", level = implement)]

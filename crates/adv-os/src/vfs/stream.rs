@@ -14,17 +14,20 @@ pub struct HostFile {
 pub enum FileStream {
     Host(HostFile),
     ReadOnly(Cursor<Arc<[u8]>>),
+    Optical(super::OpticalFile),
 }
 
 pub enum Metadata {
     Host(std::fs::Metadata),
     ReadOnly(u64),
+    Optical(u64, Option<SystemTime>),
 }
 impl Metadata {
     pub fn len(&self) -> u64 {
         match self {
             Self::Host(info) => info.len(),
             Self::ReadOnly(len) => *len,
+            Self::Optical(len, _) => *len,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -34,18 +37,21 @@ impl Metadata {
         match self {
             Self::Host(info) => info.created(),
             Self::ReadOnly(_) => Ok(SystemTime::UNIX_EPOCH),
+            Self::Optical(_, time) => Ok(time.unwrap_or(SystemTime::UNIX_EPOCH)),
         }
     }
     pub fn accessed(&self) -> io::Result<SystemTime> {
         match self {
             Self::Host(info) => info.accessed(),
             Self::ReadOnly(_) => Ok(SystemTime::UNIX_EPOCH),
+            Self::Optical(_, time) => Ok(time.unwrap_or(SystemTime::UNIX_EPOCH)),
         }
     }
     pub fn modified(&self) -> io::Result<SystemTime> {
         match self {
             Self::Host(info) => info.modified(),
             Self::ReadOnly(_) => Ok(SystemTime::UNIX_EPOCH),
+            Self::Optical(_, time) => Ok(time.unwrap_or(SystemTime::UNIX_EPOCH)),
         }
     }
 }
@@ -62,7 +68,7 @@ impl FileStream {
     pub fn host(&self) -> Option<&std::fs::File> {
         match self {
             Self::Host(file) => Some(&file.file),
-            Self::ReadOnly(_) => None,
+            Self::ReadOnly(_) | Self::Optical(_) => None,
         }
     }
     /// No syscall. Unknown/non-file identities simply have no shared content.
@@ -70,12 +76,19 @@ impl FileStream {
         match self {
             Self::Host(file) => file.identity,
             Self::ReadOnly(cursor) => Some((u64::MAX, cursor.get_ref().as_ptr() as usize as u64)),
+            Self::Optical(file) => Some(file.identity()),
         }
     }
     pub fn memory_bytes(&self) -> Option<&Arc<[u8]>> {
         match self {
-            Self::Host(_) => None,
+            Self::Host(_) | Self::Optical(_) => None,
             Self::ReadOnly(cursor) => Some(cursor.get_ref()),
+        }
+    }
+    pub fn optical_file(&self) -> Option<&super::OpticalFile> {
+        match self {
+            Self::Optical(file) => Some(file),
+            _ => None,
         }
     }
     pub fn stream_position(&self) -> io::Result<u64> {
@@ -85,18 +98,20 @@ impl FileStream {
                 file.stream_position()
             }
             Self::ReadOnly(cursor) => Ok(cursor.position()),
+            Self::Optical(file) => Ok(file.position()),
         }
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
         match self {
             Self::Host(file) => file.file.metadata().map(Metadata::Host),
             Self::ReadOnly(cursor) => Ok(Metadata::ReadOnly(cursor.get_ref().len() as u64)),
+            Self::Optical(file) => Ok(Metadata::Optical(file.len(), file.modified())),
         }
     }
     pub fn set_len(&self, len: u64) -> io::Result<()> {
         match self {
             Self::Host(file) => file.file.set_len(len),
-            Self::ReadOnly(_) => Err(io::ErrorKind::PermissionDenied.into()),
+            Self::ReadOnly(_) | Self::Optical(_) => Err(io::ErrorKind::PermissionDenied.into()),
         }
     }
 }
@@ -105,6 +120,7 @@ impl Read for FileStream {
         match self {
             Self::Host(file) => file.file.read(output),
             Self::ReadOnly(cursor) => cursor.read(output),
+            Self::Optical(file) => file.read(output),
         }
     }
 }
@@ -112,13 +128,13 @@ impl Write for FileStream {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         match self {
             Self::Host(file) => file.file.write(input),
-            Self::ReadOnly(_) => Err(io::ErrorKind::PermissionDenied.into()),
+            Self::ReadOnly(_) | Self::Optical(_) => Err(io::ErrorKind::PermissionDenied.into()),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Host(file) => file.file.flush(),
-            Self::ReadOnly(_) => Ok(()),
+            Self::ReadOnly(_) | Self::Optical(_) => Ok(()),
         }
     }
 }
@@ -127,6 +143,7 @@ impl Seek for FileStream {
         match self {
             Self::Host(file) => file.file.seek(position),
             Self::ReadOnly(cursor) => cursor.seek(position),
+            Self::Optical(file) => file.seek(position),
         }
     }
 }

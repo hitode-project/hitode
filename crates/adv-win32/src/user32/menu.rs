@@ -365,7 +365,9 @@ pub(super) fn attach_creation(
         let win = &user(env).windows.get(&env.sys.objects, &hwnd).unwrap();
         let resource = user(env).menus.class_resources.get(&win.class).cloned();
         if let Some(resource) = resource {
-            load_resource(env, win.instance, &resource)?
+            // A class menu is optional: native USER still creates the window
+            // without a menu when its default resource cannot be loaded.
+            load_resource(env, win.instance, &resource).unwrap_or(0)
         } else {
             0
         }

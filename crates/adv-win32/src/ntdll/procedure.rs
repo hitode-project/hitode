@@ -26,7 +26,11 @@ fn lookup(
             return Outcome::Return(0xc000000d);
         }
         if ordinal > u32::from(u16::MAX) {
-            warn_unavailable(env, "ntdll.dll!LdrGetProcedureAddress", "export ordinals beyond the shared 16-bit import-name profile are unavailable");
+            warn_unavailable(
+                env,
+                "ntdll.dll!LdrGetProcedureAddress",
+                "export ordinals beyond the shared 16-bit import-name profile are unavailable",
+            );
             return Outcome::Return(0xc00000bb);
         }
         ImportName::Ordinal(ordinal as u16)
