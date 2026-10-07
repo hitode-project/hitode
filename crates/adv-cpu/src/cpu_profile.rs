@@ -8,6 +8,10 @@ pub struct SegmentState {
     pub selectors: [u16; 6],
     pub gdt_base: u32,
     pub gdt_limit: u16,
+    /// Guest-owned table identity, never a host kernel address. Exception
+    /// delivery stays with the execution owner's existing exception pipeline.
+    pub idt_base: u32,
+    pub idt_limit: u16,
     /// The flat process has no local descriptor table unless its owner installs one.
     pub ldt_selector: u16,
 }
@@ -17,6 +21,8 @@ impl Default for SegmentState {
             selectors: [16, 8, 16, 16, 24, 0],
             gdt_base: 0,
             gdt_limit: 0,
+            idt_base: 0,
+            idt_limit: 0,
             ldt_selector: 0,
         }
     }
