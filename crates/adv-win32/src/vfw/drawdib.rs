@@ -124,8 +124,9 @@ fn draw(
     } else {
         bits
     };
-    let width = if width == -1 { bitmap_width } else { width };
-    let height = if height == -1 { bitmap_height } else { height };
+    // Native defaults to the requested source extent, including a cropped DIB.
+    let width = if width == -1 { sw } else { width };
+    let height = if height == -1 { sh } else { height };
     if width < 0 || height < 0 {
         return unsupported(env, "mirrored DrawDib destinations are unavailable");
     }
