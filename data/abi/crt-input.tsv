@@ -279,3 +279,6 @@ msvcr90.dll	strspn	cdecl	u32	size_t	text:const char*:str8:1|set:const char*:str8
 msvcrt.dll	_CIpow	cdecl	void	void	
 msvcr80.dll	_CIpow	cdecl	void	void	
 msvcr90.dll	_CIpow	cdecl	void	void	
+msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1

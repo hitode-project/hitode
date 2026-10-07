@@ -241,6 +241,11 @@ public static class AbiMetadata
                 && (f[2] != "cdecl" || f[3] != "void" || f[4] != "void" || f[5].Length != 0))
                 throw new InvalidDataException("CRT binary x87 intrinsic stack contract changed: " + row);
             if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && f[1] == "qsort"
+                && (f[2] != "cdecl" || f[3] != "void" || f[4] != "void"
+                    || f[5] != "base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1"))
+                throw new InvalidDataException("CRT guest comparator sort stack contract changed: " + row);
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && new[] { "strpbrk", "strcspn", "strspn" }.Contains(f[1]))
             {
                 bool pointer = f[1] == "strpbrk";

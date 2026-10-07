@@ -315,7 +315,16 @@
     "source": "Microsoft Learn _CIpow x86 compiler intrinsic declaration, 2026-10-07 read",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cipow",
     "scope": "Official void __cdecl _CIpow(); zero ordinary integer-stack words for three existing CRT aliases. Two x87 operands are consumed and the power result is pushed onto the x87 stack, using the existing FP result bridge. The void declaration describes compiler-specific register-stack effects; no invented ordinary double-return C prototype or two stack double arguments.",
+    "native_oracle_source_sha256": "5f2bd9c4688a25e57358cbb129fd2b0bfad1bc49981469f034f7184857c3b1c4",
+    "native_verification": "Authored VC80/90 38-row no-UI probe measures two x87 inputs consumed, one result, lower80-bit register payload and ESP/CW/status/error-owner preservation for normal finite and positive zero-base powers. Host binary64 powf is checked within two ULP of measured normals; this does not establish universal CRT extended-precision bit identity. Special values, range/domain or unsupported control/precision inputs remain warning/failure with original x87 stack preserved.",
     "profile": "Reuse the common guest floating environment, x87 argument/result and CRT error owners; preserve lower stack levels and guest ESP. Only measured numeric/control/status profiles may succeed; unimplemented exception or special-value profiles must explicitly warn and fail."
+  },
+  "guest_comparator_sort": {
+    "header": "ucrt/corecrt_search.h:23-24,60-65",
+    "header_sha256": "fe06c4dd27c3df5ca6bed52a433b8848f32e14ed0f3712d00f7e602416471c1b",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/qsort",
+    "scope": "Three existing CRT aliases: void __cdecl qsort(void* base, size_t number, size_t width, comparator). Four x86 argument words; comparator is int __cdecl(const void*, const void*) with signed ordering and two real array-element pointers. Equal-element relative order is unspecified.",
+    "profile": "Use existing guest callbacks, memory and CRT error/invalid-parameter owners. Checked bounded in-place sorting must call the real guest comparator; unavailable input/range profiles warn and fail without fabricated sorted output."
   },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
