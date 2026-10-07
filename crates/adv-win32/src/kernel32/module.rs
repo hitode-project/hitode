@@ -19,6 +19,7 @@ use crate::{Win32, stdcall};
 
 mod datafile;
 mod notifications;
+pub(crate) use notifications::prepare_system_modules;
 pub(crate) use notifications::{exit_process, exit_thread, install_startup, spawn_thread};
 
 fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
