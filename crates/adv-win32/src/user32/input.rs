@@ -12,6 +12,17 @@ fn clip_bounds(user: &User) -> Rect {
     user.cursor_clip.unwrap_or_else(|| display_bounds(user))
 }
 
+fn intersect_display(user: &User, rect: Rect) -> Option<Rect> {
+    let screen = display_bounds(user);
+    let clipped = Rect {
+        left: rect.left.max(screen.left),
+        top: rect.top.max(screen.top),
+        right: rect.right.min(screen.right),
+        bottom: rect.bottom.min(screen.bottom),
+    };
+    (clipped.left <= clipped.right && clipped.top <= clipped.bottom).then_some(clipped)
+}
+
 /// Keep all guest cursor updates in the same desktop constraint, without
 /// changing the host cursor or the host's clipping rectangle.
 pub(super) fn set_cursor_position(user: &mut User, position: (i32, i32)) -> (i32, i32) {
@@ -33,23 +44,12 @@ pub(super) fn set_cursor_position(user: &mut User, position: (i32, i32)) -> (i32
     user.cursor_pos
 }
 
-/// A display resize cannot retain a constraint or position beyond the guest
-/// desktop. A wholly disjoint request falls back to the display bounds.
+/// Guest display policy: intersect a retained constraint with the resized
+/// desktop, or release it when disjoint. Never retain an off-desktop position.
 pub(super) fn reconcile_cursor_clip(user: &mut User) {
-    let screen = display_bounds(user);
-    if let Some(rect) = user.cursor_clip {
-        let rect = Rect {
-            left: rect.left.max(screen.left),
-            top: rect.top.max(screen.top),
-            right: rect.right.min(screen.right),
-            bottom: rect.bottom.min(screen.bottom),
-        };
-        user.cursor_clip = Some(if rect.left > rect.right || rect.top > rect.bottom {
-            screen
-        } else {
-            rect
-        });
-    }
+    user.cursor_clip = user
+        .cursor_clip
+        .and_then(|rect| intersect_display(user, rect));
     set_cursor_position(user, user.cursor_pos);
 }
 
@@ -86,9 +86,19 @@ fn clip_cursor(env: &mut Env<'_>, pointer: GuestPtr<Rect>) -> i32 {
             return 0;
         };
         if rect.left > rect.right || rect.top > rect.bottom {
+            // Wine's test_ClipCursor_desktop records this Windows error value.
             set_last_error(env, 5); // ERROR_ACCESS_DENIED, preserving the old constraint.
             return 0;
         }
+        let Some(rect) = intersect_display(user(env), rect) else {
+            adv_abi::warn_unavailable(
+                env,
+                "user32.dll!ClipCursor",
+                "clip rectangle outside guest desktop is not supported",
+            );
+            set_last_error(env, 50);
+            return 0;
+        };
         Some(rect)
     };
     let state = user_mut(env);
@@ -247,6 +257,9 @@ pub(super) fn register(registry: &mut Registry) {
         registry.register(api);
     }
 }
+
+#[cfg(test)]
+mod cursor_tests;
 
 #[cfg(test)]
 mod tests {
