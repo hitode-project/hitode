@@ -22,6 +22,7 @@ mod random;
 mod scan;
 mod scalar_float;
 mod scalar_round;
+mod scalar_split;
 mod secure_memory;
 mod shared_file;
 mod startup;
@@ -110,6 +111,7 @@ pub fn register(r: &mut Registry) {
     random::register(r);
     scalar_float::register(r);
     scalar_round::register(r);
+    scalar_split::register(r);
     onexit::register(r);
     path::register(r);
     startup::register(r);
