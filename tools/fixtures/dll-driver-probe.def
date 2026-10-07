@@ -1,0 +1,9 @@
+LIBRARY fixture_export_probe
+EXPORTS
+    Fold @1
+    Add=_Add@8 @2
+    Advance @3
+    Identity @4
+    Wide @5
+    Indirect @6
+    NoArgs @7
