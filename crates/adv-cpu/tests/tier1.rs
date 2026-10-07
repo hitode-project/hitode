@@ -1164,3 +1164,146 @@ fn zero_memory_shift_does_not_write_executable_page_or_advance_epoch() {
         assert_eq!(stats.fallback_instructions, 0);
     }
 }
+
+macro_rules! set_condition {
+    ($a:expr, $condition:expr, $dst:expr) => {
+        match $condition {
+            0 => $a.seto($dst),
+            1 => $a.setno($dst),
+            2 => $a.setb($dst),
+            3 => $a.setae($dst),
+            4 => $a.sete($dst),
+            5 => $a.setne($dst),
+            6 => $a.setbe($dst),
+            7 => $a.seta($dst),
+            8 => $a.sets($dst),
+            9 => $a.setns($dst),
+            10 => $a.setp($dst),
+            11 => $a.setnp($dst),
+            12 => $a.setl($dst),
+            13 => $a.setge($dst),
+            14 => $a.setle($dst),
+            _ => $a.setg($dst),
+        }
+        .unwrap()
+    };
+}
+
+macro_rules! cmov_condition {
+    ($a:expr, $condition:expr, $dst:expr, $src:expr) => {
+        match $condition {
+            0 => $a.cmovo($dst, $src),
+            1 => $a.cmovno($dst, $src),
+            2 => $a.cmovb($dst, $src),
+            3 => $a.cmovae($dst, $src),
+            4 => $a.cmove($dst, $src),
+            5 => $a.cmovne($dst, $src),
+            6 => $a.cmovbe($dst, $src),
+            7 => $a.cmova($dst, $src),
+            8 => $a.cmovs($dst, $src),
+            9 => $a.cmovns($dst, $src),
+            10 => $a.cmovp($dst, $src),
+            11 => $a.cmovnp($dst, $src),
+            12 => $a.cmovl($dst, $src),
+            13 => $a.cmovge($dst, $src),
+            14 => $a.cmovle($dst, $src),
+            _ => $a.cmovg($dst, $src),
+        }
+        .unwrap()
+    };
+}
+
+#[test]
+fn setcc_and_cmovcc_cover_every_condition_and_preserve_flags() {
+    for condition in 0..16 {
+        for form in 0..8 {
+            let code = assemble(|a| {
+                match form {
+                    0 => set_condition!(a, condition, al),
+                    1 => set_condition!(a, condition, ah),
+                    2 => set_condition!(a, condition, byte_ptr(edi)),
+                    3 => cmov_condition!(a, condition, eax, ecx),
+                    4 => cmov_condition!(a, condition, eax, dword_ptr(edi)),
+                    5 => cmov_condition!(a, condition, ax, cx),
+                    6 => cmov_condition!(a, condition, ax, word_ptr(edi)),
+                    _ => cmov_condition!(a, condition, eax, eax),
+                }
+                a.ret().unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            machines[2].set_tier_verification(Some(true));
+            for flags in 0..32 {
+                let flags = 0x412
+                    | (flags & 1)
+                    | (flags & 2) << 1
+                    | (flags & 4) << 4
+                    | (flags & 8) << 4
+                    | (flags & 16) << 7;
+                for m in &mut machines {
+                    reset(
+                        m,
+                        [0xabcd1234, 0x8765fedc, 7, 9, 0, 11, 13, DATA + 3],
+                        flags,
+                    );
+                    m.write(DATA, &[0xa5; 12]).unwrap();
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(m.state.eflags, flags);
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+            }
+            assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+            assert_eq!(machines[2].stats.verification.mismatches, 0);
+        }
+    }
+}
+
+#[test]
+fn conditional_memory_faults_read_false_cmov_and_retry_setcc() {
+    for form in 0..3 {
+        for flags in [2, 0x42] {
+            let code = assemble(|a| {
+                a.mov(esi, 17).unwrap();
+                match form {
+                    0 => a.sete(byte_ptr(edi)),
+                    1 => a.cmove(eax, dword_ptr(edi)),
+                    _ => a.cmove(ax, word_ptr(edi)),
+                }
+                .unwrap();
+                a.ret().unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            let address = DATA + if form == 0 { 4096 } else { 4095 };
+            for m in &mut machines {
+                reset(m, [0xabcd1234, 3, 5, 7, 0, 11, 0, address], flags);
+                m.write(address, &0x8765fedcu32.to_le_bytes()).unwrap();
+                m.protect(DATA + 4096, 4096, if form == 0 { READ } else { 0 })
+                    .unwrap();
+            }
+            let outcome = machines[0].run(STOP, 100).unwrap();
+            assert!(if form == 0 {
+                matches!(outcome, RunOutcome::WriteFault { .. })
+            } else {
+                matches!(outcome, RunOutcome::ReadFault { .. })
+            });
+            for m in &mut machines[1..] {
+                assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+            assert_eq!(machines[2].tier1_stats().native_instructions, 1);
+            for m in &mut machines {
+                m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+            for m in &machines[1..] {
+                assert_eq!(
+                    machines[0].memory().read_data(address, 4).unwrap(),
+                    m.memory().read_data(address, 4).unwrap()
+                );
+            }
+        }
+    }
+}

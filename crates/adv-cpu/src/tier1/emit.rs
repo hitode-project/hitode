@@ -71,6 +71,48 @@ fn register_part(r: Register) -> Option<(u8, u32, u32)> {
     let bits = r.size() as u32 * 8;
     matches!(bits, 8 | 16 | 32).then_some((full, shift, bits))
 }
+fn setcc(m: M) -> bool {
+    matches!(
+        m,
+        M::Seto
+            | M::Setno
+            | M::Setb
+            | M::Setae
+            | M::Sete
+            | M::Setne
+            | M::Setbe
+            | M::Seta
+            | M::Sets
+            | M::Setns
+            | M::Setp
+            | M::Setnp
+            | M::Setl
+            | M::Setge
+            | M::Setle
+            | M::Setg
+    )
+}
+fn cmovcc(m: M) -> bool {
+    matches!(
+        m,
+        M::Cmovo
+            | M::Cmovno
+            | M::Cmovb
+            | M::Cmovae
+            | M::Cmove
+            | M::Cmovne
+            | M::Cmovbe
+            | M::Cmova
+            | M::Cmovs
+            | M::Cmovns
+            | M::Cmovp
+            | M::Cmovnp
+            | M::Cmovl
+            | M::Cmovge
+            | M::Cmovle
+            | M::Cmovg
+    )
+}
 fn shift(m: M) -> bool {
     matches!(m, M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror)
 }
@@ -163,6 +205,18 @@ pub(super) fn supported(i: &Instruction) -> bool {
             i.op0_kind() == OpKind::Register
                 && register_part(i.op0_register()).is_some()
                 && shift_count(i)
+        }
+        _ if setcc(i.mnemonic()) => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some_and(|(_, _, bits)| bits == 8)
+                || i.op0_kind() == OpKind::Memory && address(i)
+        }
+        _ if cmovcc(i.mnemonic()) => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register())
+                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                && (i.op1_kind() == OpKind::Register && register_part(i.op1_register()).is_some()
+                    || i.op1_kind() == OpKind::Memory && address(i))
         }
         _ => {
             i.condition_code() != C::None
@@ -784,6 +838,32 @@ impl Emitter {
                 self.write_register(i.op0_register(), 11);
             }
             M::Nop => {}
+            _ if setcc(i.mnemonic()) => {
+                self.condition(i.condition_code());
+                if i.op0_kind() == OpKind::Memory {
+                    self.mov(2, 9);
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.store(1);
+                    self.stored(pc, Some(i.next_ip32()), false, |_| {});
+                    return;
+                }
+                self.write_register(i.op0_register(), 9);
+            }
+            _ if cmovcc(i.mnemonic()) => {
+                // The source read is unconditional, including its faults.
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, i.memory_size().size() as u32);
+                    self.mov(11, 0);
+                } else {
+                    self.read_register(11, i.op1_register(), false);
+                }
+                self.condition(i.condition_code());
+                self.word(0x3400_0049); // cbz w9,+8
+                self.write_register(i.op0_register(), 11);
+            }
             M::Jmp => {
                 if i.op0_kind() != OpKind::NearBranch32 {
                     self.indirect_target(i);
