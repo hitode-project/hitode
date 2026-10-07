@@ -472,9 +472,6 @@ fn rep_element_slices_preserve_progress_across_context_switches_and_interrupts()
         let code = string_code(kind, 2, 1, true);
         let stop = CODE + code.len() as u32;
         let mut native = machine(&code, Some(CompileStrategy::Speed));
-        // Verification executes its own bounded reference prefix, so test the
-        // scheduler's exact one-element shape separately from strict semantics.
-        native.set_tier_verification(None);
         let mut interpreted = machine(&code, None);
         let flag = Arc::new(AtomicBool::new(false));
         native.set_host_interrupt_flag(flag.clone());
