@@ -1975,12 +1975,13 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         })
         .join(",");
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows(), ROWS),
         counts(c.x87_control_rows(), usize::MAX),
         counts(c.x87_control_rejections(), usize::MAX),
+        counts(c.x87_pc64_rows(), usize::MAX),
         counts(c.fallback_rows(), ROWS),
         interpreter
     )

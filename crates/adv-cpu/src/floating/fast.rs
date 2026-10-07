@@ -8,7 +8,8 @@
 //! result directly. Precision control 24 additionally needs 24-bit operands:
 //! rounding their binary64 result again to 24 bits is then the correctly rounded
 //! result (53 >= 2 * 24 + 2), with the extended exponent range kept. Everything
-//! else returns `None` before any state changes and takes the transactional path.
+//! at PC=64 requires an exact add/subtract/product, including signed zero;
+//! other cases return `None` before state changes and take the transaction.
 use super::{Memory, NativeX87, X87_DONE, X87_EXIT, reg_index};
 use crate::{CpuState, PAGE_SIZE, READ, WRITE, X87Register as Ext};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
@@ -425,12 +426,69 @@ fn rounded_up(error: f64, result: f64) -> bool {
 }
 
 /// Precision control of an arithmetic-eligible control word: round to nearest,
-/// every exception masked, and PC=24 or PC=53.
+/// every exception masked, and PC=24 or PC=53. PC=64 is admitted separately
+/// only when a result is exact; rejections retain the Control diagnostic class.
 pub(crate) fn arithmetic_precision(control: u16) -> Option<u32> {
     match control & 0x0f3f {
         0x023f => Some(53),
         0x003f => Some(24),
         _ => None,
+    }
+}
+
+/// Probe only rejected PC=64/nearest/masked calls, without changing state or
+/// faulting in file-backed memory. Range and zero are separate from candidates.
+pub(super) fn pc64_opportunity(
+    i: &Instruction,
+    fast: Fast,
+    state: &CpuState,
+    memory: &Memory,
+) -> crate::cliffs::X87Pc64 {
+    use crate::cliffs::X87Pc64;
+    let Fast::Arith {
+        op,
+        dest,
+        source,
+        reverse,
+        ..
+    } = fast
+    else {
+        return X87Pc64::Other;
+    };
+    // Division needs a separate quotient-residual proof and is not a candidate.
+    if op == Op::Div {
+        return X87Pc64::Other;
+    }
+    let target = state.x87.physical_index(usize::from(dest));
+    if state.x87.physical_tag(target) == 3 {
+        return X87Pc64::Operand;
+    }
+    let Some(mut a) = double(state.x87.regs[target], i32::MAX) else {
+        return X87Pc64::Operand;
+    };
+    let Some((mut b, _)) = load(source, i, state, memory, i32::MAX) else {
+        return X87Pc64::Operand;
+    };
+    if !bounded(a, RANGE) || !bounded(b, RANGE) {
+        return X87Pc64::Range;
+    }
+    if reverse {
+        std::mem::swap(&mut a, &mut b);
+    }
+    // Every nonzero input is >= 2^-400 and a multiple of 2^-452.
+    // Products and their residuals are multiples of 2^-904; sums and their
+    // residuals are multiples of 2^-452. No nonzero residual can underflow.
+    // The largest product is < 2^802; Dekker's split cannot overflow either.
+    // Thus TwoSum/TwoProduct gives exact = rounded + error, so error == 0
+    // proves an exactly representable result, also at extended precision.
+    let (result, error) = arithmetic(op, a, b);
+    if error != 0.0 {
+        X87Pc64::Inexact
+    } else if result == 0.0 {
+        X87Pc64::Zero
+    } else {
+        debug_assert!(result.is_normal());
+        X87Pc64::Exact
     }
 }
 
@@ -510,7 +568,7 @@ pub(super) fn execute(
             if empty(physical) {
                 return None;
             }
-            let value = double(x87.regs[physical], 1022)?;
+            let value = double(x87.regs[physical], 1023)?;
             let (bytes, exact, up) = if integer {
                 let result = match control >> 10 & 3 {
                     0 => value.round_ties_even(),
@@ -577,7 +635,14 @@ pub(super) fn execute(
             reverse,
             pop,
         } => {
-            let precision = arithmetic_precision(control)?;
+            let precision = if control & 0x0f3f == 0x033f {
+                if op == Op::Div {
+                    return None;
+                }
+                64
+            } else {
+                arithmetic_precision(control)?
+            };
             let target = slot(top, usize::from(dest));
             if empty(target) {
                 return None;
@@ -594,6 +659,12 @@ pub(super) fn execute(
                 return None;
             }
             let (mut result, error) = arithmetic(op, a, b);
+            // The range proof in pc64_opportunity rules out lost residuals.
+            // Nearest cancellation gives +0 (except -0 + -0); multiplication
+            // preserves sign XOR. These zero rules match the extended model.
+            if precision == 64 && error != 0.0 {
+                return None;
+            }
             let mut inexact = error != 0.0;
             let mut up = rounded_up(error, result);
             if precision == 24 {

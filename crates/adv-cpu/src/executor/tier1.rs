@@ -53,7 +53,7 @@ impl Executor {
         if let Some(verifier) = self.verifier.as_deref_mut()
             && verifier.take_tier1(self.state.eip, before.compilations)
         {
-            trace = Some(verifier.record(
+            trace = Some(verifier.record_tier1(
                 self.state.eip,
                 stop,
                 &mut self.interpreter,

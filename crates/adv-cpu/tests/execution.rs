@@ -647,6 +647,10 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
     for (control, reason) in [
         (0x027f_u16, None),
         (0x037f, Some(adv_cpu::X87Cliff::Control)),
+        (0x077f, Some(adv_cpu::X87Cliff::Control)),
+        (0x0b7f, Some(adv_cpu::X87Cliff::Control)),
+        (0x0f7f, Some(adv_cpu::X87Cliff::Control)),
+        (0x037e, Some(adv_cpu::X87Cliff::Control)),
     ] {
         let code = assemble(|a| {
             a.fldcw(word_ptr(DATA)).unwrap();
@@ -680,6 +684,21 @@ fn cliffs_attribute_exact_x87_work_to_the_control_word() {
             cliffs.x87_exact.keys().all(|(_, r)| Some(*r) == reason),
             "{cliffs:?}"
         );
+        let candidates = cliffs.x87_pc64_rows();
+        if control == 0x037f {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(label, n)| label == "Fdiv/Other" && *n > 0)
+            );
+            assert!(!candidates.iter().any(|(label, _)| label == "Fmul/Exact"));
+            assert_eq!(
+                candidates.iter().map(|(_, n)| n).sum::<u64>(),
+                cliffs.x87_control[&0x033f]
+            );
+        } else {
+            assert!(candidates.is_empty(), "{control:#x}: {candidates:?}");
+        }
     }
 }
 

@@ -231,12 +231,12 @@ fn precision_rounding_pending_exceptions_and_mmx_take_the_helper() {
     let code = bytes(|a| {
         a.fmul_2(st0, st1).unwrap();
     });
-    // 1.25 and 2.5 fit 24 bits, so PC=24 and PC=53 are both native.
+    // 1.25 and 2.5 fit 24 bits and multiply exactly at all three precisions.
     for precision in [0u16, 2, 3] {
         for rounding in 0..4 {
             let mut s = state();
             s.x87.control = 0x7f | precision << 8 | rounding << 10;
-            let calls = u64::from(precision == 3 || rounding != 0);
+            let calls = u64::from(rounding != 0);
             compare(&code, s, |_| {}, Some(calls));
         }
     }
@@ -576,9 +576,8 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
         );
         assert_eq!(
             testing::calls() - before,
-            // A rejected segment resumes the remaining instruction at its
-            // canonical cold helper entry before the two extended transfers.
-            if control == 0x027f { 2 } else { 4 }
+            // The exact PC=64 sum is native too; only raw80 transfers use helpers.
+            2
         );
         assert_eq!(actual, expected);
         assert_eq!(actual_memory.epoch, reference_memory.epoch);
@@ -592,6 +591,9 @@ fn parallel_fast_compilation_preserves_native_and_transactional_x87_state() {
 
 #[path = "segment_tests.rs"]
 mod segment_tests;
+
+#[path = "pc64_tests.rs"]
+mod pc64_tests;
 
 #[path = "hardware_tests.rs"]
 #[cfg(target_arch = "x86_64")]
