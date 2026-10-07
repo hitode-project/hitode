@@ -4,6 +4,7 @@
 use adv_abi::{GuestPtr, Registry, types::D3DVIEWPORT9, win32};
 use adv_machine::Env;
 mod binary;
+mod buffer;
 mod effect;
 mod matrix_stack;
 mod preshader;
@@ -31,6 +32,7 @@ pub fn register(registry: &mut Registry) {
     ] {
         registry.register(api);
     }
+    buffer::register(registry);
     effect::register(registry);
     matrix_stack::register(registry);
     texture::register(registry);

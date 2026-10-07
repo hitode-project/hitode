@@ -862,3 +862,31 @@ fn vec3_transforms_and_catmull_rom_match_native_with_aliases_and_atomic_bounds()
         }
     }
 }
+
+#[test]
+fn unavailable_surface_encoding_clears_output_without_reading_surface() {
+    let mut registry = Registry::default();
+    register(&mut registry);
+    let api = registry
+        .get("d3dx9_43.dll", "D3DXSaveSurfaceToFileInMemory")
+        .unwrap();
+    let api = adv_abi::Api {
+        module: "d3dx9_43.dll",
+        name: "D3DXSaveSurfaceToFileInMemory",
+        conv: api.conv,
+        handler: api.handler,
+        level: ImplementationLevel::SafeFail,
+    };
+    let mut fixture = Fixture::new();
+    for output in [0, UNMAPPED, READ_ONLY, OUTPUT] {
+        fixture.put(OUTPUT, 0x13579bdfu32);
+        assert_eq!(
+            fixture.call(api, &[output, 1, UNMAPPED, UNMAPPED, UNMAPPED]),
+            0x8876086c
+        );
+        assert_eq!(
+            fixture.0.cpu.read_u32(OUTPUT).unwrap(),
+            if output == OUTPUT { 0 } else { 0x13579bdf }
+        );
+    }
+}
