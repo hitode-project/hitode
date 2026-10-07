@@ -384,6 +384,17 @@ fn differences(interpreted: &ArchitecturalState, native: &ArchitecturalState) ->
                 b.status, a.status
             );
         }
+        if a.top() != b.top() {
+            let _ = write!(text, " top native={} interpreter={}", b.top(), a.top());
+        }
+        if a.tag != b.tag {
+            let _ = write!(text, " tag native={:#x} interpreter={:#x}", b.tag, a.tag);
+        }
+        for (physical, (a, b)) in a.regs.iter().zip(&b.regs).enumerate() {
+            if a != b {
+                let _ = write!(text, " raw80[{physical}]");
+            }
+        }
         diff.push(text);
     }
     diff
@@ -549,6 +560,38 @@ mod tests {
             trace.check_at(4, &state, &memory).is_none(),
             "the trace stopped before UD2 executed"
         );
+    }
+
+    #[test]
+    fn counted_x87_verification_detects_raw80_top_tags_and_every_status_bit() {
+        let (trace, state, memory) = traced(&CODE_BYTES);
+        for part in 0..27 {
+            let mut changed = state.clone();
+            let expected = match part {
+                0..=7 => {
+                    changed.x87.regs[part].0[0] ^= 1;
+                    "raw80"
+                }
+                8 => {
+                    changed.x87.set_top((state.x87.top() + 1) & 7);
+                    "top"
+                }
+                9 => {
+                    changed.x87.tag ^= 1;
+                    "tag"
+                }
+                10 => {
+                    changed.x87.control ^= 0x400;
+                    "control"
+                }
+                _ => {
+                    changed.x87.status ^= 1 << (part - 11);
+                    "status"
+                }
+            };
+            let report = trace.check_at(3, &changed, &memory).unwrap().unwrap_err();
+            assert!(report.contains(expected), "{report}");
+        }
     }
 
     #[test]

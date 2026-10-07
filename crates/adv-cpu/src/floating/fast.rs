@@ -507,7 +507,7 @@ pub(crate) fn round_single_precision(value: f64) -> (f64, bool) {
 }
 
 /// Run `op` if it qualifies; `None` leaves every piece of state untouched.
-pub(super) fn execute(
+pub(crate) fn execute(
     op: &NativeX87,
     fast: Fast,
     state: &mut CpuState,

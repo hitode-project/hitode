@@ -58,10 +58,11 @@ unsafe extern "C" {
 /// The entry frame followed by owner state that only the access helpers use.
 /// The frame comes first, so the pointer in x27 is also the helpers' context.
 #[repr(C)]
-struct Entry {
-    frame: Tier1Frame,
-    memory: *mut Memory,
-    inline: u64,
+pub(super) struct Entry {
+    pub(super) frame: Tier1Frame,
+    pub(super) memory: *mut Memory,
+    pub(super) inline: u64,
+    pub(super) state: *mut CpuState,
 }
 
 /// Checked 1/2/4-byte guest load without leaving native code, zero- or
@@ -276,6 +277,8 @@ mod publication_tests {
 struct Unit {
     code: Code,
     input: Vec<(u32, Vec<u8>)>,
+    // Descriptors embedded in native calls share the immutable code lifetime.
+    _x87: super::x87::Operations,
 }
 impl Unit {
     fn valid(&self, memory: &Memory) -> bool {
@@ -364,13 +367,15 @@ impl Engine {
         if !instructions.contains_key(&start) {
             return Ok(false);
         }
+        let x87 = super::x87::Operations::new(&instructions, &input);
         let mut emitted = emit::Emitter::new(emit::Helpers {
             load: load as *const () as u64,
             store: store as *const () as u64,
             stack_all: stack_all as *const () as u64,
+            x87: super::x87::call as *const () as u64,
         });
         for instruction in instructions.values() {
-            emitted.instruction(instruction);
+            emitted.instruction(instruction, x87.get(instruction.ip32()));
         }
         let emitted = emitted.finish()?;
         let code = Code::new(&emitted.words)?;
@@ -379,7 +384,11 @@ impl Engine {
         }
         self.stats.compilations += 1;
         self.stats.code_bytes += emitted.words.len() as u64 * 4;
-        let unit = Rc::new(Unit { code, input });
+        let unit = Rc::new(Unit {
+            code,
+            input,
+            _x87: x87,
+        });
         for pc in instructions.keys() {
             self.entries
                 .insert(*pc, (unit.clone(), emitted.entries[pc]));
@@ -435,6 +444,7 @@ impl Engine {
             },
             memory: std::ptr::from_mut(memory),
             inline: 0,
+            state: std::ptr::from_mut(state),
         };
         // SAFETY: this owner pins all code and exclusively owns the CPU/memory.
         // Every emitted entry uses the fixed ABI; the access helpers reach

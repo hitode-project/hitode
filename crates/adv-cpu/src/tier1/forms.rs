@@ -168,6 +168,43 @@ pub(super) fn counter_branch(i: &Instruction) -> Option<bool> {
     })
 }
 
+/// Audited x87 forms only; dynamic precision/exception guards live in the helper.
+pub(super) fn x87(i: &Instruction) -> bool {
+    use Code::*;
+    matches!(
+        i.code(),
+        Fld_m32fp
+            | Fld_m64fp
+            | Fld_sti
+            | Fst_m32fp
+            | Fst_m64fp
+            | Fstp_m32fp
+            | Fstp_m64fp
+            | Fstp_sti
+            | Fadd_m32fp
+            | Fadd_m64fp
+            | Fadd_st0_sti
+            | Fadd_sti_st0
+            | Fsub_m32fp
+            | Fsub_m64fp
+            | Fsub_st0_sti
+            | Fsub_sti_st0
+            | Fsubr_m32fp
+            | Fsubr_m64fp
+            | Fsubr_st0_sti
+            | Fsubr_sti_st0
+            | Fmul_m32fp
+            | Fmul_m64fp
+            | Fmul_st0_sti
+            | Fmul_sti_st0
+            | Fxch_st0_sti
+    ) && !i.has_lock_prefix()
+        && !i.has_rep_prefix()
+        && !i.has_repne_prefix()
+        && i.segment_prefix() != Register::GS
+        && (i.op0_kind() != OpKind::Memory || address(i))
+}
+
 pub(crate) fn supported(i: &Instruction) -> bool {
     if i.has_lock_prefix() {
         return false;
@@ -177,6 +214,9 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     }
     if i.has_rep_prefix() || i.has_repne_prefix() {
         return false;
+    }
+    if x87(i) {
+        return true;
     }
     if rmw(i) {
         return true;

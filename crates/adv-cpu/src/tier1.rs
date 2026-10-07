@@ -1,4 +1,4 @@
-//! Explicit ARM64 Tier 1 lane: bounded integer templates with exact Tier 0 exits.
+//! Explicit ARM64 Tier 1 lane: bounded templates and guarded x87 helper calls.
 //! Memory operations retain the existing checked Memory contract, through
 //! helper calls from native code and an exit when a helper refuses. No hardware
 //! fault recovery, floating approximation or parallel guest execution is enabled.
@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub(crate) mod census;
 pub(crate) mod forms;
+mod x87;
 
 pub(crate) const DISPATCH: u32 = 0;
 pub(crate) const FALLBACK: u32 = 1;

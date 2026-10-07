@@ -1,5 +1,5 @@
 //! Bounded ARM64 templates for the versioned fixed-register entry ABI.
-//! These encodings deliberately cover only the declared integer subset; all
+//! These encodings cover declared integer forms and guarded x87 calls; all
 //! other forms leave before the instruction and use the existing interpreter.
 use super::forms::{cmovcc, double_shift, imm, register, register_part, rmw, setcc, shift, string};
 pub(super) use super::forms::{counter_branch, supported};
@@ -38,6 +38,8 @@ pub(super) struct Helpers {
     pub store: u64,
     /// `(frame, pop) -> store status`; stages all GPR effects in the frame.
     pub stack_all: u64,
+    /// `(frame, operation) -> store status`; x87 stays canonical in CpuState.
+    pub x87: u64,
 }
 
 /// Load kind flag: sign-extend the loaded value to 32 bits.
@@ -733,7 +735,7 @@ impl Emitter {
             self.jump(Label::Exit(FALLBACK), Branch::B);
         }
     }
-    pub fn instruction(&mut self, i: &Instruction) {
+    pub fn instruction(&mut self, i: &Instruction, x87: Option<u64>) {
         let pc = i.ip32();
         self.entries.insert(pc, self.words.len() * 4);
         self.constant(5, pc);
@@ -742,6 +744,17 @@ impl Emitter {
         self.jump(Label::Exit(BUDGET), Branch::Zero64(7));
         if !supported(i) {
             self.jump(Label::Exit(FALLBACK), Branch::B);
+            return;
+        }
+        if let Some(operation) = x87 {
+            // Address inputs must reflect the live fixed-register frame. The
+            // helper changes no GPRs/flags; call preserves the remaining ABI.
+            for n in 0..8 {
+                self.store32(19 + n, u32::from(n) * 4);
+            }
+            self.address64(1, operation);
+            self.call(self.helpers.x87);
+            self.stored(pc, Some(i.next_ip32()), false, |_| {});
             return;
         }
         if let Some((width, read, write)) = string(i) {

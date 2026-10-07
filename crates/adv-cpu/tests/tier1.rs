@@ -6,6 +6,8 @@
 ))]
 use adv_cpu::{CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
+#[path = "tier1/x87.rs"]
+mod x87;
 const CODE: u32 = 0x10000;
 const STOP: u32 = 0x1f000;
 const DATA: u32 = 0x20000;
