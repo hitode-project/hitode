@@ -19,6 +19,8 @@ pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 mod fault;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod fp_environment;
 mod invariants;
 mod loops;
 mod mmx;
@@ -136,6 +138,8 @@ impl Compiled {
         bridge: &mut crate::trap::Bridge<'_>,
         mut controls: NativeRun<'_>,
     ) -> (u32, u64) {
+        #[cfg(target_arch = "aarch64")]
+        let _fp_environment = fp_environment::Guard::enter();
         bridge.memory = memory;
         assert!(!self.input.shadow_returns || controls.shadow.is_some());
         let shadow = controls
