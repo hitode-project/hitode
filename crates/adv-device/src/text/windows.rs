@@ -514,6 +514,22 @@ impl Font {
             })
         }
     }
+    pub(super) fn logical_font(&self) -> Result<FontRequest, TextError> {
+        let mut logical = gdi::LOGFONTW::default();
+        // SAFETY: this font is owned or retained as a stock object by this
+        // provider; the output covers exactly one initialized host LOGFONTW.
+        if unsafe {
+            gdi::GetObjectW(
+                self.font,
+                std::mem::size_of_val(&logical) as i32,
+                (&mut logical as *mut gdi::LOGFONTW).cast(),
+            )
+        } != std::mem::size_of_val(&logical) as i32
+        {
+            return Err(TextError::Font("native logical font query failed".into()));
+        }
+        Ok(enumeration::request(&logical))
+    }
     pub(super) fn metrics(&self) -> Result<TextMetrics, TextError> {
         let mut m = gdi::TEXTMETRICA::default();
         // SAFETY: self owns the DC; m is initialized writable host storage.

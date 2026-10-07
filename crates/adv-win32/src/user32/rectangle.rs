@@ -6,6 +6,28 @@ use adv_machine::Env;
 use super::window::Rect;
 use crate::util::set_last_error;
 
+#[win32(user32, name = "CopyRect", level = implement)]
+fn copy(env: &mut Env<'_>, output: GuestPtr<Rect>, input: GuestPtr<Rect>) -> i32 {
+    if output.is_null() || input.is_null() {
+        return 0;
+    }
+    if check_range(env.cpu, input.addr(), 16, Prot::READ).is_err()
+        || check_range(env.cpu, output.addr(), 16, Prot::WRITE).is_err()
+    {
+        set_last_error(env, 998);
+        return 0;
+    }
+    // Snapshot before publishing so aliased rectangles retain every coordinate.
+    let mut bytes = [0; 16];
+    if env.cpu.read(input.addr(), &mut bytes).is_err()
+        || env.cpu.write(output.addr(), &bytes).is_err()
+    {
+        set_last_error(env, 998);
+        return 0;
+    }
+    1
+}
+
 #[win32(user32, name = "InflateRect", level = implement)]
 fn inflate(env: &mut Env<'_>, pointer: GuestPtr<Rect>, dx: i32, dy: i32) -> i32 {
     // Native NULL failure preserves LastError. Other unreadable/unwritable
@@ -41,6 +63,7 @@ fn inflate(env: &mut Env<'_>, pointer: GuestPtr<Rect>, dx: i32, dy: i32) -> i32 
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    registry.register(copy_ABI);
     registry.register(inflate_ABI);
 }
 

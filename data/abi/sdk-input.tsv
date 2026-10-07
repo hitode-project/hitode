@@ -39,6 +39,7 @@ dinput.dll	DirectInputCreateA	stdcall	i32	HRESULT	hinst:Windows.Win32.Foundation
 dinput.dll	DirectInputCreateW	stdcall	i32	HRESULT	hinst:Windows.Win32.Foundation.HINSTANCE:handle:1|dwVersion:u32:u32:1|ppDI:void**:ptr:1|punkOuter:void*:ptr:1
 ntdll.dll	NtQuerySection	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	SectionHandle:Windows.Win32.Foundation.HANDLE:handle:1|SectionInformationClass:SECTION_INFORMATION_CLASS:i32:1|SectionInformation:void*:ptr:1|SectionInformationLength:usize:u32:1|ReturnLength:usize*:ptr:1
 ntdll.dll	NtOpenKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1
+ntdll.dll	ZwOpenKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1
 ntdll.dll	NtCreateKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|TitleIndex:u32:u32:1|Class:UNICODE_STRING*:ptr:1|CreateOptions:u32:u32:1|Disposition:u32*:ptr:1
 ntdll.dll	NtQueryKey	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	KeyHandle:Windows.Win32.Foundation.HANDLE:handle:1|KeyInformationClass:KEY_INFORMATION_CLASS:i32:1|KeyInformation:void*:ptr:1|Length:u32:u32:1|ResultLength:u32*:ptr:1
 ntdll.dll	NtQueryObject	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1|ObjectInformationClass:OBJECT_INFORMATION_CLASS:i32:1|ObjectInformation:void*:ptr:1|ObjectInformationLength:u32:u32:1|ReturnLength:u32*:ptr:1
@@ -75,3 +76,5 @@ ntdll.dll	LdrLoadDll	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllPath:Windo
 ntdll.dll	NtDelayExecution	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Alertable:Windows.Win32.Foundation.BOOLEAN:u32:1|DelayInterval:LARGE_INTEGER*:ptr:1
 ntdll.dll	RtlAllocateHeap	stdcall	ptr	void*	HeapHandle:void*:ptr:1|Flags:u32:u32:1|Size:usize:u32:1
 ntdll.dll	RtlFreeHeap	stdcall	u32	LOGICAL	HeapHandle:void*:ptr:1|Flags:u32:u32:1|BaseAddress:void*:ptr:1
+ntdll.dll	RtlLockHeap	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	HeapHandle:Windows.Win32.Foundation.HANDLE:handle:1
+ntdll.dll	RtlUnlockHeap	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	HeapHandle:Windows.Win32.Foundation.HANDLE:handle:1

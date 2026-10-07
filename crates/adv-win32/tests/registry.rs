@@ -97,6 +97,32 @@ impl Fixture {
     fn call(&mut self, name: &str, args: &[Arg]) -> u32 {
         self.call_in("advapi32.dll", name, args)
     }
+    fn nt_attributes(&mut self, root: Arg, path: &str) -> u32 {
+        let buffer = self.w(path);
+        let length = (path.encode_utf16().count() * 2) as u16;
+        let descriptor = self.blob(
+            &[
+                length.to_le_bytes().as_slice(),
+                length.to_le_bytes().as_slice(),
+                buffer.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        let root_value = match root {
+            I(value) => value,
+            L(_) => 0,
+        };
+        let attributes = self.blob(
+            &[24u32, root_value, descriptor, 0x40, 0, 0]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        if let L(pointer) = root {
+            self.asm.mov_eax_mem(pointer).mov_mem_eax(attributes + 4);
+        }
+        attributes
+    }
     fn call_in(&mut self, dll: &str, name: &str, args: &[Arg]) -> u32 {
         let target = self.machine.resolve_import(dll, name).unwrap();
         for &arg in args.iter().rev() {
@@ -159,6 +185,208 @@ impl Fixture {
         self.machine.cpu.read(at, &mut bytes).unwrap();
         bytes
     }
+}
+
+#[test]
+fn nt_key_opens_share_win32_roots_access_and_close_ownership() {
+    let mut f = Fixture::new(936);
+    let path = f.w("Software\\Nt Registry Fixture\\Child");
+    let (created, win32_key, _) = f.create(path, true, 3);
+    let value_name = f.w("Number");
+    let data = f.word(0xabcdef01);
+    let set = f.call(
+        "RegSetValueExW",
+        &[L(win32_key), I(value_name), I(0), I(4), I(data), I(4)],
+    );
+    f.call_in("kernel32.dll", "SetLastError", &[I(0x12345678)]);
+    let absolute = f.nt_attributes(
+        I(0),
+        &format!(
+            "\\registry\\user\\{}\\software\\nt registry fixture\\child",
+            adv_os::identity::current_user_sid_string(),
+        ),
+    );
+    let first = f.word(0xcccccccc);
+    let opened = f.call_in(
+        "ntdll.dll",
+        "NtOpenKey",
+        &[I(first), I(0x80000000), I(absolute)],
+    );
+    let required = f.word(4);
+    let read_data = f.word(0);
+    let queried = f.call(
+        "RegQueryValueExW",
+        &[
+            L(first),
+            I(value_name),
+            I(0),
+            I(0),
+            I(read_data),
+            I(required),
+        ],
+    );
+    let denied = f.call(
+        "RegSetValueExW",
+        &[L(first), I(value_name), I(0), I(4), I(data), I(4)],
+    );
+    let users = f.nt_attributes(I(0), "\\Registry\\User");
+    let user_root = f.word(0);
+    let users_opened = f.call_in("ntdll.dll", "ZwOpenKey", &[I(user_root), I(1), I(users)]);
+    let relative = f.nt_attributes(
+        L(user_root),
+        &format!(
+            "{}\\Software\\Nt Registry Fixture\\Child",
+            adv_os::identity::current_user_sid_string(),
+        ),
+    );
+    let second = f.word(0);
+    let relative_opened = f.call_in("ntdll.dll", "ZwOpenKey", &[I(second), I(1), I(relative)]);
+    let empty = f.nt_attributes(L(second), "");
+    let third = f.word(0);
+    let empty_opened = f.call_in("ntdll.dll", "NtOpenKey", &[I(third), I(1), I(empty)]);
+    let machine = f.nt_attributes(I(0), "\\Registry\\\\Machine\\");
+    let descriptor = f.machine.cpu.read_u32(machine + 8).unwrap();
+    f.machine
+        .cpu
+        .write(descriptor + 2, &0u16.to_le_bytes())
+        .unwrap();
+    let machine_key = f.word(0);
+    let machine_opened = f.call_in(
+        "ntdll.dll",
+        "NtOpenKey",
+        &[I(machine_key), I(1), I(machine)],
+    );
+    let mut closes = Vec::new();
+    closes.push(f.call_in("ntdll.dll", "NtClose", &[L(win32_key)]));
+    closes.push(f.call("RegCloseKey", &[L(first)]));
+    for key in [second, third, user_root, machine_key] {
+        closes.push(f.call_in("ntdll.dll", "ZwClose", &[L(key)]));
+    }
+    let stale = f.call_in("ntdll.dll", "NtClose", &[L(second)]);
+    let predefined = f.call_in("ntdll.dll", "NtClose", &[I(HKCU)]);
+    let last_error = f.call_in("kernel32.dll", "GetLastError", &[]);
+    f.run();
+    for result in [
+        created,
+        set,
+        opened,
+        queried,
+        users_opened,
+        relative_opened,
+        empty_opened,
+        machine_opened,
+    ]
+    .into_iter()
+    .chain(closes)
+    {
+        assert_eq!(f.get(result), 0);
+    }
+    assert_ne!(f.get(first), f.get(second));
+    assert_ne!(f.get(second), f.get(third));
+    assert_eq!(f.get(read_data), 0xabcdef01);
+    assert_eq!(f.get(denied), 5);
+    assert_eq!((f.get(stale), f.get(predefined)), (0xc0000008, 0xc0000008));
+    assert_eq!(f.get(last_error), 0x12345678);
+    assert_eq!(
+        f.machine
+            .sys
+            .objects
+            .all_hosts::<adv_os::registry::OpenKey>()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn nt_key_open_validates_counted_names_and_guest_permissions_before_allocation() {
+    let mut f = Fixture::new(932);
+    let mut checks = Vec::new();
+    for (path, root, expected) in [
+        ("\\Registry\\Machine\\Nt Missing Fixture", I(0), 0xc0000034),
+        (
+            "\\Registry\\Machine\\Nt Missing Fixture\\Child",
+            I(0),
+            0xc0000034,
+        ),
+        (
+            "\\Registry\\Machine\\Nt Missing Fixture\0Suffix",
+            I(0),
+            0xc0000034,
+        ),
+        ("Relative", I(0), 0xc000003b),
+        ("", I(0), 0xc000003b),
+        ("Relative", I(0x12345678), 0xc0000008),
+        ("Relative", I(HKCU), 0xc0000008),
+    ] {
+        let attributes = f.nt_attributes(root, path);
+        let output = f.word(0xcccccccc);
+        let result = f.call_in("ntdll.dll", "NtOpenKey", &[I(output), I(1), I(attributes)]);
+        checks.push((result, expected, output, 0));
+    }
+    for (field, value, expected, preserved) in [
+        (0, 20, 0xc000000d, true),
+        (12, 2, 0xc00000bb, false),
+        (8, 0, 0xc0000005, false),
+    ] {
+        let attributes = f.nt_attributes(I(0), "\\Registry\\Machine");
+        f.machine.cpu.write_u32(attributes + field, value).unwrap();
+        let output = f.word(0xcccccccc);
+        let result = f.call_in("ntdll.dll", "NtOpenKey", &[I(output), I(1), I(attributes)]);
+        checks.push((
+            result,
+            expected,
+            output,
+            if preserved { 0xcccccccc } else { 0 },
+        ));
+    }
+    for (length, maximum, buffer) in [(1u16, 2u16, None), (2, 2, Some(0))] {
+        let attributes = f.nt_attributes(I(0), "\\Registry\\Machine");
+        let descriptor = f.machine.cpu.read_u32(attributes + 8).unwrap();
+        f.machine
+            .cpu
+            .write(descriptor, &length.to_le_bytes())
+            .unwrap();
+        f.machine
+            .cpu
+            .write(descriptor + 2, &maximum.to_le_bytes())
+            .unwrap();
+        if let Some(buffer) = buffer {
+            f.machine.cpu.write_u32(descriptor + 4, buffer).unwrap();
+        }
+        let output = f.word(0xcccccccc);
+        let result = f.call_in("ntdll.dll", "NtOpenKey", &[I(output), I(1), I(attributes)]);
+        checks.push((
+            result,
+            if buffer.is_some() {
+                0xc0000005
+            } else {
+                0xc0000033
+            },
+            output,
+            0,
+        ));
+    }
+    let attributes = f.nt_attributes(I(0), "\\Registry\\Machine");
+    let protected_output = f.call_in(
+        "ntdll.dll",
+        "NtOpenKey",
+        &[I(READ_ONLY), I(1), I(attributes)],
+    );
+    let inaccessible_attributes = f.call_in("ntdll.dll", "NtOpenKey", &[I(DATA), I(1), I(0)]);
+    f.run();
+    for (result, expected, output, value) in checks {
+        assert_eq!((f.get(result), f.get(output)), (expected, value));
+    }
+    assert_eq!(f.get(protected_output), 0xc0000005);
+    assert_eq!(f.get(inaccessible_attributes), 0xc0000005);
+    assert_eq!(
+        f.machine
+            .sys
+            .objects
+            .all_hosts::<adv_os::registry::OpenKey>()
+            .count(),
+        0
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@ fn string(units: &[u16]) -> String {
             .unwrap_or(units.len())],
     )
 }
-fn request(font: &gdi::LOGFONTW) -> FontRequest {
+pub(super) fn request(font: &gdi::LOGFONTW) -> FontRequest {
     FontRequest {
         default: None,
         face: string(&font.lfFaceName),

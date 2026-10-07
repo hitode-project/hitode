@@ -283,7 +283,18 @@ impl Pe {
 
     fn map_image(&mut self, file: &[u8]) -> Result<()> {
         let pe = self;
-        let mut image = vec![0u8; pe.size_of_image as usize];
+        // SEC_IMAGE rounds the reserved extent to a page even when a linker
+        // leaves SizeOfImage unaligned. Preserve the header value, but include
+        // the final page's raw padding in the mapped buffer and bounds checks.
+        let mapped_size = if pe.section_alignment >= 0x1000 {
+            pe.size_of_image
+                .checked_add(0xfff)
+                .map(|size| size & !0xfff)
+                .ok_or_else(|| PeError::Malformed("SizeOfImage rounding overflows".into()))?
+        } else {
+            pe.size_of_image
+        };
+        let mut image = vec![0u8; mapped_size as usize];
         let hdr = (pe.size_of_headers as usize)
             .min(file.len())
             .min(image.len());
@@ -304,7 +315,7 @@ impl Pe {
             };
             if s.virtual_address
                 .checked_add(mapped)
-                .is_none_or(|end| end > pe.size_of_image)
+                .is_none_or(|end| end > mapped_size)
             {
                 return Err(PeError::Malformed(format!(
                     "section {} exceeds SizeOfImage",

@@ -1,6 +1,6 @@
 //! Process identity shares Win32's configured virtual owner, independently of
 //! the mutable process environment. No host account or impersonation provider.
-use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, guest::check_range, win32};
+use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, guest::check_range, win32};
 use adv_cpu::backend::Prot;
 use adv_machine::{Env, Outcome};
 use adv_os::nls::{CP_UTF8, lead_byte_ranges};
@@ -15,7 +15,6 @@ const UNLEN: usize = 256;
 pub(super) fn register(registry: &mut Registry) {
     registry.register(user_name_a_ABI);
     registry.register(user_name_w_ABI);
-    registry.register(open_process_token_ABI);
 }
 
 #[win32(advapi32, name = "GetUserNameA", level = implement)]
@@ -115,24 +114,4 @@ fn query(env: &mut Env<'_>, buffer: u32, size: GuestPtr<u32>, wide: bool, api: &
     // Successful native calls do not promise a particular LastError value.
     // This virtual provider performs no account-service call, so preserves it.
     Outcome::Return(1)
-}
-
-// Process tokens are deliberately unavailable in the current identity profile.
-// The BOOL failure contract leaves the output untouched and exposes a reason;
-// callers can take their non-token fallback without acquiring a host token.
-// https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocesstoken
-#[win32(advapi32, name = "OpenProcessToken", level = safe_fail)]
-fn open_process_token(
-    env: &mut Env<'_>,
-    _process: Handle,
-    _desired_access: u32,
-    _token: GuestPtr<Handle>,
-) -> i32 {
-    adv_abi::warn_unavailable(
-        env,
-        "advapi32.dll!OpenProcessToken",
-        "process security tokens are unavailable in the virtual identity profile",
-    );
-    set_last_error(env, NOT_SUPPORTED);
-    0
 }
