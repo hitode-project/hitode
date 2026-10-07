@@ -27,6 +27,7 @@ mod scalar_float;
 mod scalar_log;
 mod scalar_power;
 mod scalar_round;
+mod scalar_scale;
 mod scalar_split;
 mod secure_memory;
 mod shared_file;
@@ -139,6 +140,7 @@ pub fn register(r: &mut Registry) {
     scalar_log::register(r);
     scalar_power::register(r);
     scalar_round::register(r);
+    scalar_scale::register(r);
     scalar_split::register(r);
     onexit::register(r);
     path::register(r);
@@ -172,7 +174,6 @@ pub fn register(r: &mut Registry) {
         ("__set_app_type", 1),
         ("__p__fmode", 0),
         ("__p__commode", 0),
-        ("ldexp", 3),
         ("frexp", 3),
         ("_ftol", 0),
         ("time", 1),
@@ -1767,21 +1768,15 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
         "_XcptFilter" => 1,
         "__setusermatherr" => 0,
-        "ldexp" | "frexp" => {
+        "frexp" => {
             let x = match double(e) {
                 Ok(v) => v,
                 Err(err) => return Outcome::Fail(err),
             };
-            let result = match name.as_str() {
-                "ldexp" => scale(x, c as i32),
-                _ => {
-                    let (v, exp) = split_fraction(x);
-                    if let Err(err) = e.cpu.write_u32(c, exp as u32) {
-                        return Outcome::Fail(err.to_string());
-                    }
-                    v
-                }
-            };
+            let (result, exp) = split_fraction(x);
+            if let Err(err) = e.cpu.write_u32(c, exp as u32) {
+                return Outcome::Fail(err.to_string());
+            }
             e.cpu.push_f64(result);
             0
         }
