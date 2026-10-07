@@ -268,14 +268,18 @@ fn set_rect(env: &mut Env<'_>) -> Outcome {
 
 fn set_rect_empty(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
-    if p != 0 {
-        let _ = env.cpu.write(p, &[0u8; 16]);
+    if p == 0 {
+        return Outcome::Return(0);
     }
+    let _ = env.cpu.write(p, &[0u8; 16]);
     Outcome::Return(1)
 }
 
 fn is_rect_empty(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
+    if p == 0 {
+        return Outcome::Return(1);
+    }
     let l = env.cpu.read_u32(p).unwrap_or(0) as i32;
     let t = env.cpu.read_u32(p + 4).unwrap_or(0) as i32;
     let r = env.cpu.read_u32(p + 8).unwrap_or(0) as i32;
@@ -309,6 +313,9 @@ fn offset_rect(env: &mut Env<'_>) -> Outcome {
 
 fn intersect_rect(env: &mut Env<'_>) -> Outcome {
     let (dst, s1, s2) = (env.arg(0), env.arg(1), env.arg(2));
+    if dst == 0 || s1 == 0 || s2 == 0 {
+        return Outcome::Return(0);
+    }
     let l1 = env.cpu.read_u32(s1).unwrap_or(0) as i32;
     let t1 = env.cpu.read_u32(s1 + 4).unwrap_or(0) as i32;
     let r1 = env.cpu.read_u32(s1 + 8).unwrap_or(0) as i32;
@@ -342,6 +349,9 @@ fn intersect_rect(env: &mut Env<'_>) -> Outcome {
 
 fn union_rect(env: &mut Env<'_>) -> Outcome {
     let (dst, s1, s2) = (env.arg(0), env.arg(1), env.arg(2));
+    if dst == 0 || s1 == 0 || s2 == 0 {
+        return Outcome::Return(0);
+    }
     let l1 = env.cpu.read_u32(s1).unwrap_or(0) as i32;
     let t1 = env.cpu.read_u32(s1 + 4).unwrap_or(0) as i32;
     let r1 = env.cpu.read_u32(s1 + 8).unwrap_or(0) as i32;

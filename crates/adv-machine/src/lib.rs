@@ -46,7 +46,7 @@ pub use process::{Image, Images, InitCall, TlsImage};
 use sched::{Context, Frame, Origin, ReadyResume, State};
 pub use sched::{CtxId, Handle, Object, Objects, Wait};
 pub use stats::{FrameRow, Stats};
-pub use thunk::{Conv, Handler, HostFn, Resolver, ThunkTable};
+pub use thunk::{Conv, GuestCode, Handler, HostFn, Resolver, ThunkTable};
 pub use trace::{Trace, TraceRecord};
 pub use vm::Vm;
 
@@ -1245,6 +1245,7 @@ impl<B: Backend> Machine<B> {
                 handler: process_start,
                 data: 0,
                 trace: false,
+                guest: None,
             },
         );
         assert_eq!(
@@ -1253,6 +1254,7 @@ impl<B: Backend> Machine<B> {
             "backend park address must be layout::PARK_ADDR"
         );
         cpu.map(THUNK_BASE, THUNK_SIZE, Prot::RX)?;
+        cpu.map(GUEST_CODE_BASE, GUEST_CODE_SIZE, Prot::RX)?;
         let mut pad = Asm::new(thunk_addr(thunk::RETURN_PAD));
         pad.trap().hlt();
         cpu.write(thunk_addr(thunk::RETURN_PAD), &pad.bytes)?;

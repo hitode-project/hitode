@@ -11,6 +11,7 @@
 
 mod advapi32;
 pub mod gdi32;
+mod guest_code;
 pub mod kernel32;
 pub mod codec_kernels;
 mod misc;
@@ -179,6 +180,7 @@ pub fn register(reg: &mut Registry) {
     winmm::register(reg);
     xinput::register(reg);
     ntdll::register(reg);
+    guest_code::install(reg);
 }
 
 /// `reg.add` for stdcall functions.

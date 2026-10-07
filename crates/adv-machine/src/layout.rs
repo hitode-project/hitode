@@ -19,6 +19,10 @@ pub const THUNK_STRIDE: u32 = 32;
 pub const THUNK_CAP: u32 = 0x4000;
 pub const THUNK_SIZE: u32 = THUNK_STRIDE * THUNK_CAP;
 
+/// Native-semantics guest implementations that thunks jump to.
+pub const GUEST_CODE_BASE: u32 = THUNK_BASE + THUNK_SIZE;
+pub const GUEST_CODE_SIZE: u32 = 0x4_0000;
+
 /// Where a parked guest's EIP points. Mapped, never executed.
 pub const PARK_ADDR: u32 = 0x7e10_0000;
 /// One page for the GDT (never visible to guest code).

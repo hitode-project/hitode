@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, MemFault};
 
-use crate::layout::{THUNK_CAP, thunk_addr};
+use crate::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, THUNK_CAP, thunk_addr};
 use crate::{Env, Outcome};
 
 pub type Handler = fn(&mut Env<'_>) -> Outcome;
@@ -46,6 +46,18 @@ pub struct HostFn {
     pub data: u64,
     /// Record calls in the trace.
     pub trace: bool,
+    /// Native-semantics guest code that runs instead of the trap when it can.
+    pub guest: Option<&'static GuestCode>,
+}
+
+/// Position-independent x86 code a thunk jumps to, entered with the caller's
+/// frame (return address at `[esp]`). It leaves through its own `ret`, or by
+/// jumping to the host implementation with the frame unchanged.
+#[derive(Debug)]
+pub struct GuestCode {
+    pub code: &'static [u8],
+    /// Offsets of the rel32 fields of jumps to the host implementation.
+    pub host: &'static [usize],
 }
 
 /// Where host implementations come from. The machine only binds what it is given; naming,
@@ -86,6 +98,9 @@ pub struct Thunk {
     /// An import or dynamic lookup requested this binding. Merely publishing a
     /// module's export table must not count every diagnostic export as imported.
     pub requested: bool,
+    /// Address of the pointer the entry jumps through: to the guest code, or to
+    /// the trap after it when guest code is off.
+    pub guest_slot: Option<u32>,
 }
 
 /// Index 0 is reserved: the pad guest callees return to after an [`Outcome::Call`].
@@ -99,6 +114,9 @@ pub struct ThunkTable {
     internal: HashMap<(String, String), HostFn>,
     thunks: Vec<Thunk>,
     by_name: HashMap<(String, String), u32>,
+    /// Next free byte of the guest code arena.
+    guest_next: u32,
+    guest_code: bool,
 }
 
 fn unimplemented(env: &mut Env<'_>) -> Outcome {
@@ -120,9 +138,11 @@ impl ThunkTable {
                 handler: return_pad,
                 data: 0,
                 trace: false,
+                guest: None,
             },
             implemented: true,
             requested: false,
+            guest_slot: None,
         };
         Self {
             resolver,
@@ -137,12 +157,16 @@ impl ThunkTable {
                         handler: return_pad,
                         data: 0,
                         trace: false,
+                        guest: None,
                     },
                     implemented: true,
                     requested: false,
+                    guest_slot: None,
                 },
             ],
             by_name: HashMap::new(),
+            guest_next: GUEST_CODE_BASE,
+            guest_code: true,
         }
     }
 
@@ -153,7 +177,61 @@ impl ThunkTable {
     /// Immutable encoding of an existing binding, independent of guest hook
     /// writes to either its published entry or the original thunk page.
     pub fn pristine_entry(&self, index: u32) -> Vec<u8> {
-        Self::emit(index, self.get(index).f.conv)
+        let thunk = self.get(index);
+        Self::emit(index, thunk.f.conv, thunk.guest_slot)
+    }
+
+    /// Guest code replaces host traps for later bindings, and existing entries
+    /// switch at once. Off, every call reaches the host (e.g. a full API trace).
+    pub fn set_guest_code(&mut self, cpu: &mut dyn Guest, on: bool) -> Result<(), MemFault> {
+        self.guest_code = on;
+        for (index, thunk) in self.thunks.iter().enumerate() {
+            if let Some(slot) = thunk.guest_slot {
+                let target = if on {
+                    slot + 4
+                } else {
+                    Self::trap_addr(index as u32)
+                };
+                cpu.write(slot, &target.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `push index; int` pair of a thunk with guest code.
+    fn trap_addr(index: u32) -> u32 {
+        thunk_addr(index) + 12
+    }
+
+    /// Install `guest` behind a pointer slot in the arena.
+    fn place(
+        &mut self,
+        cpu: &mut dyn Guest,
+        index: u32,
+        guest: &GuestCode,
+    ) -> Result<u32, MemFault> {
+        let slot = self.guest_next;
+        let body = slot + 4;
+        let end = (body + guest.code.len() as u32 + 15) & !15;
+        assert!(
+            end <= GUEST_CODE_BASE + GUEST_CODE_SIZE,
+            "guest code arena full"
+        );
+        let mut code = guest.code.to_vec();
+        for &at in guest.host {
+            let next = body + at as u32 + 4;
+            code[at..at + 4]
+                .copy_from_slice(&Self::trap_addr(index).wrapping_sub(next).to_le_bytes());
+        }
+        let target = if self.guest_code {
+            body
+        } else {
+            Self::trap_addr(index)
+        };
+        cpu.write(slot, &target.to_le_bytes())?;
+        cpu.write(body, &code)?;
+        self.guest_next = end;
+        Ok(slot)
     }
 
     /// The resolver as its concrete type, to add implementations after the machine exists.
@@ -169,12 +247,18 @@ impl ThunkTable {
 
     /// A hook library can relocate the entry instructions or the entire thunk. The token
     /// identifies the handler independently of the address where `int 0x2e` executes.
-    pub(crate) fn emit(index: u32, conv: Conv) -> Vec<u8> {
+    pub(crate) fn emit(index: u32, conv: Conv, guest_slot: Option<u32>) -> Vec<u8> {
         let mut a = Asm::new(thunk_addr(index));
         // mov edi,edi; push ebp; mov ebp,esp; pop ebp. The first five bytes are
         // ordinary relocatable instructions; the frame is gone before argument decoding.
         a.bytes
             .extend_from_slice(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d]);
+        if let Some(slot) = guest_slot {
+            // jmp [slot]: absolute, so copies of the entry in synthetic system
+            // images reach the same code.
+            a.bytes.extend_from_slice(&[0xff, 0x25]);
+            a.bytes.extend_from_slice(&slot.to_le_bytes());
+        }
         a.push_imm(index);
         a.trap();
         match conv {
@@ -245,17 +329,23 @@ impl ThunkTable {
                     handler: unimplemented,
                     data: 0,
                     trace: false,
+                    guest: None,
                 },
                 false,
             ),
         };
-        cpu.write(thunk_addr(index), &Self::emit(index, f.conv))?;
+        let guest_slot = match f.guest {
+            Some(guest) => Some(self.place(cpu, index, guest)?),
+            None => None,
+        };
+        cpu.write(thunk_addr(index), &Self::emit(index, f.conv, guest_slot))?;
         self.thunks.push(Thunk {
             module: key.0.clone(),
             name: name.to_owned(),
             f,
             implemented,
             requested,
+            guest_slot,
         });
         self.by_name.insert(key, index);
         Ok(thunk_addr(index))

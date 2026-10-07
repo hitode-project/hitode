@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub use adv_abi_macros::win32;
-pub use adv_machine::{Conv, Env, Handler, HostFn, Outcome};
+pub use adv_machine::{Conv, Env, GuestCode, Handler, HostFn, Outcome};
 
 #[doc(hidden)]
 pub mod capability;
@@ -125,6 +125,7 @@ impl Registry {
                     handler,
                     trace: false,
                     data,
+                    guest: None,
                 },
                 level: None,
             },
@@ -189,6 +190,16 @@ impl Registry {
         self.set_trace(module, name, true);
     }
 
+    /// Run `guest` in place of the host trap. The registered handler stays the
+    /// implementation of record for the cases the guest code hands over.
+    pub fn set_guest(&mut self, module: &str, name: &str, guest: &'static GuestCode) {
+        self.fns
+            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
+            .unwrap_or_else(|| panic!("guest code for unregistered {module}!{name}"))
+            .host
+            .guest = Some(guest);
+    }
+
     pub fn set_trace(&mut self, module: &str, name: &str, on: bool) {
         if let Some(f) = self
             .fns
@@ -226,6 +237,7 @@ impl Registry {
             handler: stub::dispatch,
             trace: true,
             data: index as u64,
+            guest: None,
         })
     }
 
