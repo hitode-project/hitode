@@ -25,7 +25,7 @@ struct Fixup {
     kind: Branch,
 }
 
-/// Host addresses of the checked scalar access helpers. Each takes the entry
+/// Host addresses of the checked access helpers. Each takes the entry
 /// frame in x0 and follows AAPCS64, so guest registers in x19-x28 survive.
 #[derive(Clone, Copy)]
 pub(super) struct Helpers {

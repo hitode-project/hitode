@@ -96,7 +96,8 @@ pub struct NativeRecoveryPoint {
 }
 
 /// Fixed ARM64 entry frame. Floating state remains canonical in CpuState;
-/// floating/extended instructions leave native code for one Tier 0 instruction.
+/// extension templates reach it through the exclusive owner Entry, without
+/// changing these fixed GPR offsets. Unsupported forms leave for Tier 0.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(

@@ -55,7 +55,7 @@ unsafe extern "C" {
     fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);
 }
 
-/// The entry frame followed by owner state that only the access helpers use.
+/// The entry frame followed by exclusive helper and architectural-state data.
 /// The frame comes first, so the pointer in x27 is also the helpers' context.
 #[repr(C)]
 pub(super) struct Entry {
