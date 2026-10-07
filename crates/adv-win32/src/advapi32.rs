@@ -5,6 +5,8 @@ mod groups;
 mod identity;
 pub(crate) mod token;
 
+mod legacy;
+
 use adv_abi::Registry;
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
@@ -431,6 +433,7 @@ fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    legacy::register(reg);
     groups::register(reg);
     identity::register(reg);
     token::register(reg);

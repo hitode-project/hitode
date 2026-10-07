@@ -433,7 +433,11 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
             };
-            let result = unsafe { entry(&mut context, memory.ptr.as_ptr()) };
+            let result = {
+                #[cfg(target_arch = "aarch64")]
+                let _fp_environment = crate::compile::fp_environment::Guard::enter();
+                unsafe { entry(&mut context, memory.ptr.as_ptr()) }
+            };
             entries += 1 + context.linked_entries;
             blocks += 256 - cpu.fuel;
             match result {

@@ -60,7 +60,12 @@ impl Attributes {
         if self.normal.borrow().is_empty() {
             return Ok(ARCHIVE);
         }
-        let identity = identity(path, metadata)?;
+        self.read_instance(identity(path, metadata)?, metadata)
+    }
+    fn read_instance(&self, identity: FileIdentity, metadata: &Metadata) -> io::Result<u32> {
+        if metadata.is_dir() {
+            return Ok(DIRECTORY);
+        }
         let mut normal = self.normal.borrow_mut();
         match normal.get(&identity) {
             Some(stamp) if stamp == &Stamp::new(metadata) => Ok(NORMAL),
@@ -92,6 +97,19 @@ impl Attributes {
     }
 }
 impl Vfs {
+    /// Query the same guest attribute view for the opened backing instance,
+    /// even after its path was renamed, removed, or replaced.
+    pub fn file_handle_attributes(&self, file: &std::fs::File) -> io::Result<u32> {
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Ok(DIRECTORY);
+        }
+        if self.attributes.normal.borrow().is_empty() {
+            return Ok(ARCHIVE);
+        }
+        self.attributes
+            .read_instance(file_identity(file)?, &metadata)
+    }
     /// Baseline guest file metadata is ARCHIVE/DIRECTORY. An explicitly cleared
     /// regular-file instance reads NORMAL through both lookup and enumeration.
     pub fn file_attributes(&self, guest: &str) -> io::Result<u32> {

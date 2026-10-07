@@ -3782,8 +3782,10 @@ ntdll.dll	NtSetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Threa
 ntdll.dll	NtSetInformationProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ProcessInformationClass:PROCESSINFOCLASS:i32:1|ProcessInformation:void*:ptr:1|ProcessInformationLength:u32:u32:1
 ntdll.dll	NtWriteVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToWrite:usize:u32:1|NumberOfBytesWritten:usize*:ptr:1
 ntdll.dll	RtlAcquirePebLock	stdcall	void	void	
+ntdll.dll	RtlAllocateHeap	stdcall	ptr	void*	HeapHandle:void*:ptr:1|Flags:u32:u32:1|Size:usize:u32:1
 ntdll.dll	RtlDosPathNameToNtPathName_U	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1
 ntdll.dll	RtlEqualUnicodeString	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	String1:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|String2:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|CaseInSensitive:Windows.Win32.Foundation.BOOLEAN:u32:1
+ntdll.dll	RtlFreeHeap	stdcall	u32	LOGICAL	HeapHandle:void*:ptr:1|Flags:u32:u32:1|BaseAddress:void*:ptr:1
 ntdll.dll	RtlFreeUnicodeString	stdcall	void	void	UnicodeString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
 ntdll.dll	RtlGetCurrentDirectory_U	stdcall	u32	u32	BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1
 ntdll.dll	RtlInitAnsiString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PCSTR:str8:1

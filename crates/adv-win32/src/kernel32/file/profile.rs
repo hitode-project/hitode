@@ -273,7 +273,7 @@ fn render(
             (units, true)
         }
     };
-    let required = units.len() + 1;
+    let required = units.len().max(usize::from(list)) + 1;
     let truncated = required > capacity as usize;
     let copied = if truncated {
         capacity.saturating_sub(if list { 2 } else { 1 }) as usize
@@ -310,7 +310,13 @@ fn render(
     )
 }
 
-fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool, api: &'static str) -> Outcome {
+fn get(
+    env: &mut Env<'_>,
+    pointers: [u32; 6],
+    wide: bool,
+    sections_only: bool,
+    api: &'static str,
+) -> Outcome {
     let [app, key, default, out, capacity, filename] = pointers;
     let bytes = match capacity.checked_mul(if wide { 2 } else { 1 }) {
         Some(bytes) => bytes,
@@ -380,6 +386,16 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool, api: &'static str) -> 
                     Err(ReadError::Io(_)) => unreachable!(),
                 },
                 Err(ReadError::Io(error)) => {
+                    if sections_only {
+                        return output(
+                            env,
+                            Answer::List(Vec::new()),
+                            capacity,
+                            out,
+                            wide,
+                            Some(error),
+                        );
+                    }
                     let default = match text(env, default, wide) {
                         Ok(default) => default.unwrap_or_default(),
                         Err(_) => {
@@ -403,6 +419,9 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool, api: &'static str) -> 
             let answer = Ini::new(&data.unwrap()).query(app.as_deref(), key.as_deref());
             match answer {
                 Some(answer) => output(env, answer, capacity, out, wide, None),
+                None if sections_only => {
+                    output(env, Answer::List(Vec::new()), capacity, out, wide, None)
+                }
                 None => {
                     let default = match text(env, default, wide) {
                         Ok(default) => default.unwrap_or_default(),
@@ -473,6 +492,7 @@ fn get_a(
             filename.0.addr(),
         ],
         false,
+        false,
         "kernel32.dll!GetPrivateProfileStringA",
     )
 }
@@ -497,6 +517,7 @@ fn get_w(
             filename.0.addr(),
         ],
         true,
+        false,
         "kernel32.dll!GetPrivateProfileStringW",
     )
 }
@@ -679,6 +700,7 @@ fn profile_string_a(
             0,
         ],
         false,
+        false,
         "kernel32.dll!GetProfileStringA",
     )
 }
@@ -702,13 +724,38 @@ fn profile_string_w(
             0,
         ],
         true,
+        false,
         "kernel32.dll!GetProfileStringW",
+    )
+}
+
+#[win32(kernel32, name = "GetPrivateProfileSectionNamesA", level = implement)]
+fn sections_a(env: &mut Env<'_>, out: AnsiStr, capacity: u32, filename: AnsiStr) -> Outcome {
+    get(
+        env,
+        [0, 0, 0, out.0.addr(), capacity, filename.0.addr()],
+        false,
+        true,
+        "kernel32.dll!GetPrivateProfileSectionNamesA",
+    )
+}
+
+#[win32(kernel32, name = "GetPrivateProfileSectionNamesW", level = implement)]
+fn sections_w(env: &mut Env<'_>, out: WideStr, capacity: u32, filename: WideStr) -> Outcome {
+    get(
+        env,
+        [0, 0, 0, out.0.addr(), capacity, filename.0.addr()],
+        true,
+        true,
+        "kernel32.dll!GetPrivateProfileSectionNamesW",
     )
 }
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_a_ABI);
     registry.register(get_w_ABI);
+    registry.register(sections_a_ABI);
+    registry.register(sections_w_ABI);
     registry.register(int_a_ABI);
     registry.register(int_w_ABI);
     registry.register(profile_int_a_ABI);

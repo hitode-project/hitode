@@ -15,6 +15,9 @@ use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
 mod attributes;
 pub(in crate::kernel32) mod native;
+
+mod information;
+mod locking;
 pub(crate) use attributes::file_attributes_path;
 mod path;
 mod profile;
@@ -1531,6 +1534,8 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
     stdcall(reg, K32, "SetFileTime", 4, |_| Outcome::Return(1));
     attributes::register(reg);
+    information::register(reg);
+    locking::register(reg);
     stdcall(reg, K32, "FindFirstFileA", 2, |e| {
         let p = path_a(e, e.arg(0));
         find_first_file(e, p, e.arg(1), false)

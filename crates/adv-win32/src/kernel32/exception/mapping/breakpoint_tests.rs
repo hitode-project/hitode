@@ -315,3 +315,85 @@ fn unhandled_breakpoints_and_unknown_traps_fail_and_preserve_original_pc_diagnos
     normalize_context(&record, &mut state);
     assert_eq!(state, original);
 }
+
+fn debug_break_api<B: TestCpu>(cpu: B, direct: bool, handled: bool) {
+    let mut machine = machine(cpu);
+    let api = machine
+        .resolve_import("kernel32.dll", "DebugBreak")
+        .unwrap();
+    machine
+        .sys
+        .thunks
+        .set_guest_code(&mut machine.cpu, direct)
+        .unwrap();
+    let add = machine
+        .resolve_import("kernel32.dll", "AddVectoredExceptionHandler")
+        .unwrap();
+    let mut code = Asm::new(CODE);
+    if handled {
+        code.push_imm(HANDLER).push_imm(1).call(add);
+    }
+    imm(&mut code, &[0x89, 0x25], DATA + 16);
+    code.call(api);
+    imm(&mut code, &[0x89, 0x25], DATA + 20);
+    store(&mut code, &[0xc7, 0x05], DATA + 24, 1);
+    code.bytes.extend_from_slice(&[0x31, 0xc0]);
+    code.ret();
+    let mut handler = Asm::new(HANDLER);
+    // ECX = exception record, EDX = context. Save the externally visible
+    // contract, then explicitly advance over the one-byte breakpoint.
+    handler
+        .bytes
+        .extend_from_slice(&[0x8b, 0x44, 0x24, 4, 0x8b, 0x08, 0x8b, 0x50, 4]);
+    for (index, offset) in [0u8, 12, 16].into_iter().enumerate() {
+        handler.bytes.extend_from_slice(&[0x8b, 0x41, offset]);
+        handler.mov_mem_eax(DATA + index as u32 * 4);
+    }
+    imm(&mut handler, &[0x8b, 0x82], 0xb8);
+    handler.mov_mem_eax(DATA + 12);
+    handler
+        .bytes
+        .extend_from_slice(&[0x83, 0x82, 0xb8, 0, 0, 0, 1]);
+    imm(&mut handler, &[0xb8], u32::MAX);
+    handler.ret();
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.cpu.write(HANDLER, &handler.bytes).unwrap();
+    machine.cpu.regions(code.bytes.len(), handler.bytes.len());
+    machine.spawn("DebugBreak API", CODE, &[], 65536).unwrap();
+    let result = machine.run_virtual(1_000_000);
+    if handled {
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        let read = |offset| machine.cpu.read_u32(DATA + offset).unwrap();
+        assert_eq!(read(0), BREAKPOINT);
+        assert_eq!(read(4), read(12));
+        assert_eq!(machine.cpu.read_u8(read(4)).unwrap(), 0xcc);
+        assert_eq!(read(8), 1);
+        assert_eq!(
+            read(16),
+            read(20),
+            "zero-argument stdcall preserves the stack"
+        );
+        assert_eq!(read(24), 1);
+    } else {
+        let RunResult::Failed(error) = result else {
+            panic!("unhandled breakpoint returned");
+        };
+        assert!(
+            error
+                .message
+                .contains("unhandled Windows exception 0x80000003")
+        );
+        assert_eq!(machine.cpu.read_u32(DATA + 24).unwrap(), 0);
+    }
+}
+
+#[test]
+fn debug_break_api_executes_a_real_breakpoint_with_both_guest_routes() {
+    for direct in [true, false] {
+        for handled in [true, false] {
+            debug_break_api(UnicornCpu::new(PARK_ADDR).unwrap(), direct, handled);
+            debug_break_api(JitCpu::new(PARK_ADDR, false).unwrap(), direct, handled);
+            debug_break_api(JitCpu::new(PARK_ADDR, true).unwrap(), direct, handled);
+        }
+    }
+}

@@ -399,6 +399,122 @@ fn actual_x86_aw_codepages_large_wide_capacity_and_overlay_write_read_share_the_
 }
 
 #[test]
+fn section_names_aw_preserve_native_lists_truncation_and_empty_files() {
+    for unicode in [false, true] {
+        let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), "section-names");
+        std::fs::write(
+            root.join("game/sections.ini"),
+            b"[one]\r\na=b\r\n[two]\r\nx=y\r\n[ONE]\r\nz=v\r\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("game/empty.ini"), []).unwrap();
+        let stride = if unicode { 2 } else { 1 };
+        if unicode {
+            wide(&mut machine, DATA + 0x800, ".\\sections.ini");
+        } else {
+            ansi(&mut machine, DATA + 0x800, b".\\sections.ini");
+        }
+        let name = if unicode {
+            "GetPrivateProfileSectionNamesW"
+        } else {
+            "GetPrivateProfileSectionNamesA"
+        };
+        let api = machine.resolve_import(K32, name).unwrap();
+        let get_error = machine.resolve_import(K32, "GetLastError").unwrap();
+        let mut code = Asm::new(CODE);
+        call(
+            &mut code,
+            api,
+            &[OUT, 32, DATA + 0x800],
+            DATA + 0x80,
+            get_error,
+        );
+        code.bytes.extend_from_slice(&[0x31, 0xc0]);
+        code.ret();
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        machine
+            .spawn("section names stdcall", CODE, &[], 65536)
+            .unwrap();
+        assert!(matches!(
+            machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
+        assert_eq!(machine.cpu.read_u32(DATA + 0x80).unwrap(), 12);
+        assert_eq!(machine.cpu.read_u32(DATA + 0x84).unwrap(), 0);
+        let expected = if unicode {
+            utf16("one\0two\0ONE\0\0")
+        } else {
+            b"one\0two\0ONE\0\0".to_vec()
+        };
+        assert_eq!(bytes(&machine, OUT, expected.len()), expected);
+        for (capacity, expected, count) in [
+            (0, b"".as_slice(), 0),
+            (1, b"\0", 0),
+            (2, b"\0\0", 0),
+            (3, b"o\0\0", 1),
+            (5, b"one\0\0", 3),
+            (6, b"one\0\0\0", 4),
+        ] {
+            machine.cpu.write(OUT, &[0xcc; 32]).unwrap();
+            let result = get(
+                &mut env(&mut machine),
+                [0, 0, 0, OUT, capacity, DATA + 0x800],
+                unicode,
+                true,
+                if unicode {
+                    "kernel32.dll!GetPrivateProfileSectionNamesW"
+                } else {
+                    "kernel32.dll!GetPrivateProfileSectionNamesA"
+                },
+            );
+            assert!(matches!(result, Outcome::Return(n) if n == count));
+            assert_eq!(error(&mut machine), 234);
+            let expected: Vec<_> = if unicode {
+                expected
+                    .iter()
+                    .flat_map(|b| u16::from(*b).to_le_bytes())
+                    .collect()
+            } else {
+                expected.to_vec()
+            };
+            assert_eq!(
+                bytes(&machine, OUT, expected.len() + stride),
+                [expected, vec![0xcc; stride]].concat()
+            );
+        }
+        if unicode {
+            wide(&mut machine, DATA + 0x800, ".\\empty.ini");
+        } else {
+            ansi(&mut machine, DATA + 0x800, b".\\empty.ini");
+        }
+        for capacity in [0, 1, 2, 32] {
+            machine.cpu.write(OUT, &[0xcc; 8]).unwrap();
+            let result = get(
+                &mut env(&mut machine),
+                [0, 0, 0, OUT, capacity, DATA + 0x800],
+                unicode,
+                true,
+                if unicode {
+                    "kernel32.dll!GetPrivateProfileSectionNamesW"
+                } else {
+                    "kernel32.dll!GetPrivateProfileSectionNamesA"
+                },
+            );
+            assert!(matches!(result, Outcome::Return(0)));
+            assert_eq!(error(&mut machine), if capacity < 2 { 234 } else { 0 });
+            assert_eq!(
+                bytes(&machine, OUT, stride),
+                vec![if capacity == 0 { 0xcc } else { 0 }; stride]
+            );
+            assert_eq!(
+                bytes(&machine, OUT + stride as u32, stride),
+                vec![0xcc; stride]
+            );
+        }
+    }
+}
+
+#[test]
 fn native_defaults_quotes_duplicates_and_small_enumeration_capacities_match() {
     let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), "native-contract");
     machine.spawn("query", PARK_ADDR, &[], 65536).unwrap();

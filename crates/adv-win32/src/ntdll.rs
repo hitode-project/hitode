@@ -17,6 +17,7 @@ use adv_os::Heaps;
 
 use crate::stdcall;
 mod file;
+mod heap;
 mod open;
 mod section;
 
@@ -207,6 +208,7 @@ fn rtl_init_unicode_string(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    heap::register(reg);
     path::register(reg);
     directory::register(reg);
     loader_lock::register(reg);

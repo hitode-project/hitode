@@ -9,6 +9,7 @@ pub(crate) use exception::install as install_exceptions;
 pub(crate) use exception::uncaught_query_blocker;
 mod file;
 pub(crate) mod file_mapping;
+mod format_message;
 mod handle;
 pub use file::open as open_file;
 pub(crate) use file::{create_directory_path, file_attributes_path};
@@ -56,6 +57,7 @@ pub fn register(reg: &mut Registry) {
     environment::register(reg);
     exception::register(reg);
     file::register(reg);
+    format_message::register(reg);
     file_mapping::register(reg);
     handle::register(reg);
     memory::register(reg);
