@@ -787,6 +787,7 @@ enum Action {
     Rdtsc,
     ReadSegment(Operand, usize),
     StoreGdt(Address),
+    StoreLdt(Operand),
     String(StringOp),
     Mov(Operand, Operand, bool),
     Lea(Reg, Address),
@@ -1390,6 +1391,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
         }
         M::Int => Action::Int(i.immediate8()),
         M::Int3 => Action::Int(3),
+        M::Sldt => Action::StoreLdt(op(0)?),
         M::Ud2 => Action::Ud2,
         // The flat Windows profile is CPL3 with IOPL0: neither instruction
         // changes IF or retires before delivering the general protection fault.
@@ -1540,6 +1542,12 @@ impl Transaction {
             }
             Action::ReadSegment(dst, index) => {
                 self.store(memory, dst, u32::from(self.segments.selectors[index]))?;
+            }
+            Action::StoreLdt(dst) => {
+                // UMIP is absent from the virtual CPU profile. SLDT is a
+                // read-only query: register width follows the operand while
+                // memory always receives the two-byte selector.
+                self.store(memory, dst, u32::from(self.segments.ldt_selector))?;
             }
             Action::StoreGdt(address) => {
                 let address = address.resolve(self);

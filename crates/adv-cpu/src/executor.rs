@@ -389,6 +389,7 @@ impl Executor {
             selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
             gdt_base: addr,
             gdt_limit: 127,
+            ldt_selector: 0,
         };
         Ok(())
     }
