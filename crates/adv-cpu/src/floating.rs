@@ -1,5 +1,5 @@
 //! Transactional x87, SSE and packed-integer execution on canonical CPU state.
-use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, interpreter::Step};
+use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, X87Cliff, interpreter::Step};
 use iced_x86::{Instruction, Mnemonic as M, Register as R};
 pub(crate) mod fast;
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -89,11 +89,27 @@ pub(crate) unsafe extern "C" fn x87_call(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the bridge's memory is the executor's exclusively borrowed Memory.
         let memory = unsafe { &mut *bridge.memory };
+        let cliffs = &mut bridge.cliffs;
+        cliffs.x87_helper_calls += 1;
         if let Some(fast) = operation.fast
             && let Some(result) = fast::execute(operation, fast, state, memory)
         {
+            cliffs.x87_fast += 1;
             return result;
         }
+        let reason = if operation.fast.is_none() {
+            X87Cliff::NoFastForm
+        } else if state.x87.status & 0x80 != 0 || state.mmx_mode != 0 {
+            X87Cliff::Pending
+        } else if fast::arithmetic_precision(state.x87.control).is_none() {
+            X87Cliff::Control
+        } else {
+            X87Cliff::Operand
+        };
+        *cliffs
+            .x87_exact
+            .entry((operation.instruction.mnemonic(), reason))
+            .or_default() += 1;
         let epoch = memory.epoch;
         match execute(
             &operation.instruction,

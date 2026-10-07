@@ -56,6 +56,8 @@ pub struct Stats {
     pub trap_calls: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
+    /// Slow-path counters by instruction and reason.
+    pub cliffs: crate::Cliffs,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -248,6 +250,7 @@ impl Executor {
             unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
+            cliffs: std::mem::take(&mut self.stats.cliffs),
         };
         let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
         if self.parallel.is_some() {
@@ -268,6 +271,7 @@ impl Executor {
         self.stats.trap_calls += bridge.calls;
         self.stats.bulk_calls += bridge.bulk_calls;
         self.stats.bulk_bytes += bridge.bulk_bytes;
+        self.stats.cliffs = std::mem::take(&mut bridge.cliffs);
         self.timestamp = bridge.timestamp;
         result
     }
@@ -1546,6 +1550,7 @@ impl Executor {
                     }
                     n if n == Exit::Fallback as u32 => {
                         self.deferred_fallback = Some(self.state.eip);
+                        bridge.cliffs.fallback(&self.memory, self.state.eip);
                         // Preserve the pending instruction across a scheduler
                         // slice, even when its native guard consumed the last unit.
                         if self.state.fuel == 0 {
@@ -1586,9 +1591,9 @@ impl Executor {
             };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
-            if let Some(profile) = &mut self.interpreter_profile {
-                use interpreter_profile::Reason;
-                let reason = if interpreter_only || single_step || pending_fpu {
+            let reason = {
+                use crate::InterpreterReason as Reason;
+                if interpreter_only || single_step || pending_fpu {
                     Reason::Forced
                 } else if self.deferred_fallback == Some(pc) {
                     Reason::Fallback
@@ -1599,7 +1604,10 @@ impl Executor {
                         None if self.attempted.contains(&pc) => Reason::Rejected,
                         None => Reason::Uncovered,
                     }
-                };
+                }
+            };
+            bridge.cliffs.interpreted(reason, execution.units);
+            if let Some(profile) = &mut self.interpreter_profile {
                 profile.record(pc, execution.units, reason, &self.memory);
             }
             if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {

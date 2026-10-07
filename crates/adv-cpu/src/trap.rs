@@ -38,6 +38,7 @@ pub(crate) struct Bridge<'a> {
     pub unclocked_bytes: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
+    pub cliffs: crate::Cliffs,
 }
 
 // Bulk work between wall-clock checks: tens of microseconds at memcpy rates.
