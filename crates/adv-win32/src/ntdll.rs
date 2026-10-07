@@ -4,6 +4,7 @@ mod directory;
 mod loader_lock;
 mod strings;
 mod procedure;
+mod thread;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -205,6 +206,7 @@ pub fn register(reg: &mut Registry) {
     loader_lock::register(reg);
     strings::register(reg);
     procedure::register(reg);
+    thread::register(reg);
     stdcall(
         reg,
         NTDLL,

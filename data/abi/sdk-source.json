@@ -189,5 +189,11 @@
       "https://github.com/reactos/reactos/blob/master/dll/win32/kernel32/client/proc.c"
     ],
     "native_verification": "16 DWORDs cover missing image/error/output zeroing, unchanged hNewToken on failure/success, genuine suspended authored child, process/thread publication, previous suspend count, wait/exit 37 and handle close; guest uses the shared CreateProcessW supervisor and independent process/VM owner"
+  },
+  "nt_get_context_thread": {
+    "scope": "NtGetContextThread, HANDLE plus in/out x86 CONTEXT pointer, signed NTSTATUS; suspended thread profile shared with Win32",
+    "source": "phnt primary ntpsapi.h declaration and authored Microsoft Windows x86 native caller",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
+    "native_verification": "authored suspended child: Win32/NT integer context identity, register changes, unrequested groups untouched, invalid handle/access/pointer statuses, unchanged LastError and child lifecycle"
   }
 }
