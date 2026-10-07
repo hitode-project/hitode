@@ -1161,7 +1161,7 @@ fn begin(env: &mut Env<'_>, this: u32, output: u32, flags: u32) -> Outcome {
     }
     let count = o.binary.techniques[o.current].passes.len() as u32;
     let device = o.device;
-    if !words(env, output, &[count]) {
+    if output != 0 && !words(env, output, &[count]) {
         return Outcome::Return(INVALID);
     }
     if flags & 1 != 0 {
