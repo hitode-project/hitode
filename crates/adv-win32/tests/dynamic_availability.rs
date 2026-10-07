@@ -19,8 +19,28 @@ impl FileSource for Empty {
     }
 }
 fn machine<B: Backend>(cpu: B, mode: RunMode) -> Machine<B> {
+    let mut production = Registry::default();
+    adv_win32::register(&mut production);
+    // Production now implements FLS. Model a provider without it explicitly:
+    // metadata-only probes must still select the real TLS fallback below.
+    for name in ["FlsAlloc", "FlsFree", "FlsGetValue", "FlsSetValue"] {
+        assert!(production.is_implemented("kernel32.dll", name));
+        assert!(production.dynamic_available("kernel32.dll", name));
+    }
     let mut registry = Registry::default();
-    adv_win32::register(&mut registry);
+    for name in [
+        "GetProcAddress",
+        "TlsAlloc",
+        "TlsFree",
+        "TlsGetValue",
+        "TlsSetValue",
+    ] {
+        let api = production.get("kernel32.dll", name).unwrap();
+        registry.add_with_data("kernel32.dll", name, api.conv, api.handler, api.data);
+        if let Some(guest) = api.guest {
+            registry.set_guest("kernel32.dll", name, guest);
+        }
+    }
     registry.set_mode(mode);
     let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
     Win32::install(
