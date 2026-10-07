@@ -618,7 +618,9 @@ fn dispatch(env: &mut Env<'_>, this: u32, slot: u32, args: &[u32]) -> Outcome {
         64 => begin_pass(env, this, a(0) as usize),
         65 => {
             let Some(pass) = object(env, this).unwrap().active_pass else {
-                return Outcome::Return(INVALID);
+                // Native CommitChanges is a no-op outside an active pass;
+                // parameter storage is applied by the next BeginPass.
+                return Outcome::Return(0);
             };
             apply_pass(env, this, pass)
         }
@@ -1201,8 +1203,13 @@ fn begin_pass(env: &mut Env<'_>, this: u32, pass: usize) -> Outcome {
 }
 fn end(env: &mut Env<'_>, this: u32) -> Outcome {
     let o = object_mut(env, this).unwrap();
-    if !o.started || o.active_pass.is_some() {
+    if o.active_pass.is_some() {
         return Outcome::Return(INVALID);
+    }
+    if !o.started {
+        // A repeated native End succeeds without restoring/releasing twice.
+        // An unexpected retained state block is not silently discarded.
+        return Outcome::Return(if o.saved_state == 0 { 0 } else { INVALID });
     }
     o.started = false;
     let saved = std::mem::take(&mut o.saved_state);
