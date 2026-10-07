@@ -29,6 +29,9 @@ pub struct State {
     /// Only identities are retained here; all private DC attributes have the
     /// same GDI object owner as common display and compatible memory DCs.
     private_dcs: std::collections::BTreeMap<u32, u32>,
+    /// Non-owning USER window currently represented by the shared primary; zero
+    /// identifies the screen. Other display DCs may still borrow metadata.
+    canvas_window: Option<u32>,
 }
 const MAX_WINDOW_LEASES: usize = 4096;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) {
         surface_dcs: Default::default(),
         window_leases: Vec::new(),
         private_dcs: Default::default(),
+        canvas_window: None,
     });
 }
 pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
@@ -61,6 +65,49 @@ pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
 }
 pub(crate) fn provider(ext: &Ext) -> Option<DrawingProvider> {
     ext.try_get::<State>().and_then(|state| state.provider)
+}
+/// Independent display metadata must never silently draw into another window's
+/// primary. Memory/surface DCs and the legacy primary identity retain their path.
+pub(in crate::gdi32) fn pixels_unavailable(env: &Env<'_>, dc: u32) -> bool {
+    let Some(adv_os::gdi::GdiObj::Dc {
+        raster: false,
+        hwnd,
+        selected,
+        ..
+    }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc)
+    else {
+        return false;
+    };
+    if dc == WINDOW_DC {
+        return false;
+    }
+    if selected[3] != 0
+        && env
+            .ext
+            .try_get::<State>()
+            .is_some_and(|s| s.canvas_window == Some(*hwnd))
+    {
+        return false;
+    }
+    true
+}
+pub(in crate::gdi32) fn unavailable_pixels(env: &mut Env<'_>, dc: u32, api: &str) -> bool {
+    if !pixels_unavailable(env, dc) {
+        return false;
+    }
+    adv_abi::warn_unavailable(
+        env,
+        api,
+        "this display DC has metadata but no bound primary pixels",
+    );
+    set_last_error(env, 50);
+    true
+}
+pub(in crate::gdi32) fn is_user_dc(env: &Env<'_>, dc: u32) -> bool {
+    env.ext.try_get::<State>().is_some_and(|s| {
+        s.window_leases.iter().any(|lease| lease.dc == dc)
+            || s.private_dcs.values().any(|&private| private == dc)
+    })
 }
 /// Stable diagnostic ids, independent of runtime ABI decoding.
 pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
@@ -192,29 +239,24 @@ fn acquire_window_dc(env: &mut Env<'_>, hwnd: u32, usage: WindowDcUse, api: &str
         adv_abi::warn_unavailable(env, api, "window DC acquisition capacity is exhausted");
         return fail(env, 50);
     }
-    // The single display canvas cannot be rebound while another window or
-    // thread still owns it. Same-window reentry retains its GDI state instead.
-    if raster
-        && state
-            .window_leases
-            .iter()
-            .any(|lease| lease.hwnd != hwnd || lease.context != env.context)
-    {
-        adv_abi::warn_unavailable(
-            env,
-            api,
-            "simultaneous display DC acquisitions for different windows or threads are unavailable",
-        );
-        return fail(env, 50);
-    }
     if state.window_leases.try_reserve(1).is_err() {
         return fail(env, 8);
     }
-    let dc = match acquire_window_dc_owner(env, hwnd, width, height, raster, private) {
+    let bind = raster
+        && !env.ext.get::<State>().window_leases.iter().any(|lease| {
+            let gdi = &env.ext.get::<Win32>().gdi;
+            let backed = matches!(gdi.get(&env.sys.objects, lease.dc),
+            Some(adv_os::gdi::GdiObj::Dc { selected, .. }) if selected[3] != 0);
+            backed && lease.hwnd != hwnd
+        });
+    let dc = match acquire_window_dc_owner(env, hwnd, width, height, bind, private) {
         Outcome::Return(0) => return Outcome::Return(0),
         Outcome::Return(dc) => dc,
         result => return result,
     };
+    if bind {
+        env.ext.get_mut::<State>().canvas_window = Some(hwnd);
+    }
     env.ext
         .get_mut::<State>()
         .window_leases
@@ -265,19 +307,17 @@ fn acquire_window_dc_owner(
             env.ext.get_mut::<State>().private_dcs.insert(hwnd, dc);
             dc
         }
-    } else if raster {
-        WINDOW_DC
     } else {
         super::super::window_dc(env, hwnd)
     };
-    let Some(primary) = primary else {
-        return Outcome::Return(dc);
-    };
+    if dc == 0 {
+        return fail(env, 8);
+    }
     let gdi = &mut env.ext.get_mut::<Win32>().gdi;
     if !gdi.register_external_dc(&mut env.sys.objects, dc, hwnd) {
         return fail(env, 8);
     }
-    gdi.set_external_bitmap(&mut env.sys.objects, dc, primary);
+    gdi.set_external_bitmap(&mut env.sys.objects, dc, primary.unwrap_or(0));
     Outcome::Return(dc)
 }
 fn release_window_dc(env: &mut Env<'_>, hwnd: u32, dc: u32, usage: WindowDcUse) -> bool {
@@ -289,7 +329,8 @@ fn release_window_dc(env: &mut Env<'_>, hwnd: u32, dc: u32, usage: WindowDcUse) 
             && (lease.usage == usage
                 || (usage == WindowDcUse::Get && lease.usage == WindowDcUse::Window))
     }) else {
-        return false;
+        // ReleaseDC has no effect on an owned DC, including repeated release.
+        return usage == WindowDcUse::Get && state.private_dcs.get(&hwnd) == Some(&dc);
     };
     let lease = state.window_leases.remove(index);
     if let Some(previous) = lease.paint_before
@@ -677,6 +718,11 @@ fn bit_blt(
     sy: i32,
     rop: u32,
 ) -> Outcome {
+    if unavailable_pixels(env, dst.0, "gdi32.dll!BitBlt")
+        || unavailable_pixels(env, src.0, "gdi32.dll!BitBlt")
+    {
+        return Outcome::Return(0);
+    }
     if !available(env) {
         return fail(env, 6);
     }
@@ -713,6 +759,11 @@ fn stretch_blt(
     sh: i32,
     rop: u32,
 ) -> Outcome {
+    if unavailable_pixels(env, dst.0, "gdi32.dll!StretchBlt")
+        || unavailable_pixels(env, src.0, "gdi32.dll!StretchBlt")
+    {
+        return Outcome::Return(0);
+    }
     if !available(env) {
         return fail(env, 6);
     }
@@ -779,6 +830,9 @@ pub(crate) fn dib_transfer(
     api: &str,
     boolean: bool,
 ) -> Outcome {
+    if unavailable_pixels(env, dst.0, api) {
+        return Outcome::Return(0);
+    }
     if !available(env) {
         return fail(env, 6);
     }
