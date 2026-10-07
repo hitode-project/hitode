@@ -79,6 +79,7 @@ pub struct Count {
 
 #[derive(Default, Clone, Debug)]
 pub struct Cliffs {
+    pub tier1_census: Option<crate::Tier1Census>,
     pub x87_helper_calls: u64,
     /// Helper calls completed by the host-double fast path.
     pub x87_fast: u64,
@@ -95,6 +96,11 @@ pub struct Cliffs {
 
 impl Cliffs {
     pub(crate) fn merge(&mut self, other: Cliffs) {
+        if let Some(census) = other.tier1_census {
+            self.tier1_census
+                .get_or_insert_with(Default::default)
+                .merge(census);
+        }
         self.x87_helper_calls += other.x87_helper_calls;
         self.x87_fast += other.x87_fast;
         for (key, n) in other.x87_exact {

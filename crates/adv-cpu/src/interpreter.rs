@@ -124,6 +124,8 @@ pub struct Interpreter {
     blocks: HashMap<u32, DecodedBlock>,
     capacity: usize,
     decodes: u64,
+    pub(crate) census_enabled: bool,
+    pub(crate) census: Option<crate::tier1::census::Entry>,
 }
 
 impl Default for Interpreter {
@@ -144,6 +146,8 @@ impl Interpreter {
             blocks: HashMap::new(),
             capacity,
             decodes: 0,
+            census_enabled: std::env::var_os("ADV_TIER1_CENSUS").is_some_and(|v| v == "1"),
+            census: None,
         }
     }
 
@@ -178,21 +182,34 @@ impl Interpreter {
             };
         }
         let pc = state.eip;
-        let decoded = if let Some(entry) = self.cache.get(&pc).filter(|e| e.valid(memory)) {
-            entry.decoded
+        let (decoded, form) = if let Some(entry) = self.cache.get(&pc).filter(|e| e.valid(memory)) {
+            (
+                entry.decoded,
+                self.census.as_ref().map(|_| {
+                    crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize])
+                }),
+            )
         } else {
             self.decodes += 1;
             let entry = fetch(memory, pc);
             let decoded = entry.decoded;
+            let form = self
+                .census
+                .as_ref()
+                .map(|_| crate::tier1::census::Form::decode(&entry.bytes[..entry.len as usize]));
             if self.capacity != 0 {
                 if self.cache.len() >= self.capacity {
                     self.cache.clear();
                 }
                 self.cache.insert(pc, entry);
             }
-            decoded
+            (decoded, form)
         };
-        execute_decoded(decoded, state, memory, max_units, None)
+        let execution = execute_decoded(decoded, state, memory, max_units, None);
+        if let (Some(census), Some(form)) = (&mut self.census, form) {
+            census.record(form, execution.units);
+        }
+        execution
     }
 
     /// Execute one bounded predecoded basic block. This is internal to Executor:
@@ -221,9 +238,15 @@ impl Interpreter {
             .get(&pc)
             .is_some_and(|block| block.revision == revision && block.valid(memory))
         {
-            let block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
+            let mut block = DecodedBlock::fetch(memory, pc, native, &mut self.decodes);
             if self.capacity == 0 {
-                return block.execute(state, memory, max_units, stop);
+                return block.execute_observed(
+                    state,
+                    memory,
+                    max_units,
+                    stop,
+                    self.census.as_mut(),
+                );
             }
             // Bound each independent cache in entries. A larger block working set
             // avoids flushing hot floating fallback sequences during discovery.
@@ -232,7 +255,13 @@ impl Interpreter {
             }
             self.blocks.insert(pc, block);
         }
-        self.blocks[&pc].execute(state, memory, max_units, stop)
+        self.blocks.get_mut(&pc).unwrap().execute_observed(
+            state,
+            memory,
+            max_units,
+            stop,
+            self.census.as_mut(),
+        )
     }
 }
 
@@ -518,6 +547,7 @@ struct DecodedBlock {
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
+    forms: Option<Vec<crate::tier1::census::Form>>,
 }
 
 impl DecodedBlock {
@@ -543,6 +573,7 @@ impl DecodedBlock {
             bytes: Vec::new(),
             pages: Vec::new(),
             revision: native.map(|(_, revision)| revision),
+            forms: None,
         };
         let mut pc = start;
         while block.instructions.len() < BLOCK_INSTRUCTIONS && block.bytes.len() < BLOCK_BYTES {
@@ -602,12 +633,40 @@ impl DecodedBlock {
         block
     }
 
+    fn execute_observed(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        max_units: u32,
+        stop: u32,
+        census: Option<&mut crate::tier1::census::Entry>,
+    ) -> (Execution, u32) {
+        if let Some(census) = census {
+            self.forms.get_or_insert_with(|| {
+                self.instructions
+                    .iter()
+                    .map(|(pc, _)| {
+                        let offset = pc.wrapping_sub(self.pc) as usize;
+                        crate::tier1::census::Form::decode(&self.bytes[offset..])
+                    })
+                    .collect()
+            });
+            let forms = self.forms.as_ref().unwrap().as_slice();
+            self.execute(state, memory, max_units, stop, |n, units| {
+                census.record(forms[n], units)
+            })
+        } else {
+            self.execute(state, memory, max_units, stop, |_, _| {})
+        }
+    }
+
     fn execute(
         &self,
         state: &mut CpuState,
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
+        mut observe: impl FnMut(usize, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
         let mut result = Execution {
@@ -616,7 +675,7 @@ impl DecodedBlock {
         };
         let mut last_units = 0;
         let mut deferred_mmx = false;
-        for &(pc, decoded) in &self.instructions {
+        for (n, &(pc, decoded)) in self.instructions.iter().enumerate() {
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
@@ -627,6 +686,7 @@ impl DecodedBlock {
                 max_units - result.units,
                 Some(&mut deferred_mmx),
             );
+            observe(n, execution.units);
             result.units += execution.units;
             result.step = execution.step;
             last_units = execution.units;

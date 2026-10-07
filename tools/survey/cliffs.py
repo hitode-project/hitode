@@ -16,7 +16,10 @@ report. Rankings therefore cover retained rows only. Missing x87 exact calls
 are counted as unattributed; omitted fallback counts cannot be reconstructed.
 Interpreter details keep the top 24 rows by instruction units, with explicit
 omitted counters. Older reports remain readable but their details are unknown.
-These are execution counts, not time measurements or Tier 1 coverage counts.
+These are execution counts, not time measurements. ADV_TIER1_CENSUS=1 adds
+shared-form Tier 1 coverage for Uncovered/Rejected work, split into three
+disjoint groups. Prefix histograms use decoded instructions; supported counts
+use retirement units (REP elements). All-supported prefixes are right-censored.
 Optional x87_control fields retain the complete PC/RC/mask distribution and
 independent guard counts. Reports predating those fields are counted separately.
 """
@@ -100,6 +103,65 @@ def ranked(values: dict) -> dict:
     return dict(sorted(values.items(), key=lambda row: (-row[1], row[0])))
 
 
+CENSUS_GROUPS = ("PendingCompilation", "Uncovered", "Rejected")
+CENSUS_COUNTERS = ("entries", "instructions", "supported_units", "unsupported_units",
+                   "prefix_units", "omitted_rows", "omitted_units")
+CENSUS_PREFIXES = ("blocked_prefixes", "censored_prefixes")
+
+
+def empty_census() -> dict:
+    return {name: dict(dict.fromkeys(CENSUS_COUNTERS, 0), unsupported={},
+                       blocked_prefixes=[0] * 8, censored_prefixes=[0] * 8)
+            for name in CENSUS_GROUPS}
+
+
+def merge_census(destination: dict, source: object, interpreter: dict) -> None:
+    """Validate bounded anonymous form counters and reconcile observed work."""
+    source = mapping(source)
+    if set(source) != set(CENSUS_GROUPS):
+        raise ValueError("invalid Tier 1 census groups")
+    entries = units = 0
+    for name in CENSUS_GROUPS:
+        row = mapping(source[name])
+        values = {key: count(required(row, key)) for key in CENSUS_COUNTERS}
+        histograms = {}
+        for key in CENSUS_PREFIXES:
+            bins = required(row, key)
+            if not isinstance(bins, list) or len(bins) != 8:
+                raise ValueError("invalid Tier 1 prefix histogram")
+            histograms[key] = [count(n) for n in bins]
+        if sum(map(sum, histograms.values())) != values["entries"]:
+            raise ValueError("Tier 1 prefix entries do not reconcile")
+        forms = mapping(required(row, "unsupported"))
+        if len(forms) > REPORT_ROW_LIMIT or (values["omitted_rows"] and len(forms) != REPORT_ROW_LIMIT):
+            raise ValueError("inconsistent Tier 1 form row limit")
+        retained = {}
+        for label, n in forms.items():
+            if (not isinstance(label, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,95}", label)
+                    or re.search(r"(?:^|_)(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]{8,})(?:_|$)", label)):
+                raise ValueError("invalid Tier 1 form label")
+            retained[label] = count(n)
+        if ((not values["omitted_rows"] and values["omitted_units"])
+                or sum(retained.values()) + values["omitted_units"] != values["unsupported_units"]):
+            raise ValueError("Tier 1 unsupported units do not reconcile")
+        total = values["supported_units"] + values["unsupported_units"]
+        if values["instructions"] > total or values["prefix_units"] > values["supported_units"]:
+            raise ValueError("inconsistent Tier 1 instruction units")
+        entries += values["entries"]
+        units += total
+        dest = destination[name]
+        for key, n in values.items():
+            dest[key] += n
+        for key, bins in histograms.items():
+            dest[key] = [a + b for a, b in zip(dest[key], bins)]
+        for label, n in retained.items():
+            dest["unsupported"][label] = dest["unsupported"].get(label, 0) + n
+        dest["unsupported"] = ranked(dest["unsupported"])
+    expected = [entry_count(interpreter.get(name, dict.fromkeys(COUNT_KEYS, 0))) for name in DETAIL_BUCKETS]
+    if entries != sum(row["entries"] for row in expected) or units != sum(row["instructions"] for row in expected):
+        raise ValueError("Tier 1 census does not reconcile with interpreter buckets")
+
+
 def aggregate(reports: Iterable[dict]) -> dict:
     """Sum retained counters; reject incomplete or inconsistent input reports."""
     fallbacks = Counter()
@@ -114,6 +176,8 @@ def aggregate(reports: Iterable[dict]) -> dict:
     omitted = {reason: dict.fromkeys(COUNT_KEYS, 0) for reason in DETAIL_BUCKETS}
     unknown = {reason: dict.fromkeys(COUNT_KEYS, 0) for reason in DETAIL_BUCKETS}
     omitted_rows = detail_reports = 0
+    census = empty_census()
+    census_reports = 0
     verification = dict.fromkeys(VERIFY_COUNTERS, 0)
     per_report = []
     helpers = fast = unattributed = fallback_limits = exact_limits = 0
@@ -207,6 +271,9 @@ def aggregate(reports: Iterable[dict]) -> dict:
                 for reason in DETAIL_BUCKETS:
                     for key, value in entry_count(run_interpreter.get(reason, dict.fromkeys(COUNT_KEYS, 0))).items():
                         unknown[reason][key] += value
+            if cliffs.get("tier1_census") is not None:
+                merge_census(census, cliffs["tier1_census"], run_interpreter)
+                census_reports += 1
             run_verification = {key: count(required(verify, key)) for key in VERIFY_COUNTERS}
             for key, value in run_verification.items():
                 verification[key] += value
@@ -223,6 +290,8 @@ def aggregate(reports: Iterable[dict]) -> dict:
     return {
         "report_count": len(per_report),
         "cpu_cliffs": {
+            "tier1_census": census,
+            "tier1_census_reports": census_reports,
             "fallbacks": ranked(fallbacks),
             "fallbacks_retained_total": sum(fallbacks.values()),
             "interpreter": dict(sorted(interpreter.items(),
@@ -298,6 +367,16 @@ def markdown(summary: dict) -> str:
                   "| 大桶 | 源报告截断指令单位 | 旧报告未细分指令单位 |", "|---|---:|---:|"])
     lines.extend(f"| {reason} | {cliffs['interpreter_details_omitted'][reason]['instructions']} | "
                  f"{cliffs['interpreter_details_unknown'][reason]['instructions']} |" for reason in DETAIL_BUCKETS)
+    lines.extend(["", f"Tier 1 普查覆盖 {cliffs['tier1_census_reports']} 份报告；缺失或关闭不视为零。",
+                  "只统计 Uncovered/Rejected 的实际退休单位，PendingCompilation 单列且不重复。",
+                  "形式可发射不保证访存、代码验证、预算或 CFG 准入；全支持前缀为截尾下界。", "",
+                  "| 入口组 | 支持单位 | 不支持单位 | 连续前缀单位 | 截去的不支持单位 |", "|---|---:|---:|---:|---:|"])
+    for group, row in cliffs["tier1_census"].items():
+        lines.append(f"| {group} | {row['supported_units']} | {row['unsupported_units']} | {row['prefix_units']} | {row['omitted_units']} |")
+        lines.extend(["", f"{group} 不支持 Top 24（各报告保留行之和）", "", "| iced Code | 单位 |", "|---|---:|"])
+        lines.extend(f"| {label} | {n} |" for label, n in list(row["unsupported"].items())[:REPORT_ROW_LIMIT])
+        lines.extend(["", "前缀长度桶：0、1、2–3、4–7、8–15、16–31、32–63、64+（解码指令条数）。",
+                      f"遇阻：{row['blocked_prefixes']}；仍全支持：{row['censored_prefixes']}。"])
     lines.extend(["", f"x87 helper：{cliffs['x87_helper_calls']}；fast：{cliffs['x87_fast']}；"
                   f"exact：{cliffs['x87_exact_total']}；未归因 exact：{cliffs['x87_exact_unattributed']}。",
                   "", "| x87 原因 | 次数（保留行） |", "|---|---:|"])

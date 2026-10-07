@@ -12,7 +12,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from cliffs import aggregate, main, markdown, read_reports
+from cliffs import aggregate, empty_census, main, markdown, read_reports
 
 
 def fixture():
@@ -42,6 +42,56 @@ def empty_fixture():
 
 
 class AggregateTests(unittest.TestCase):
+    def census_fixture(self):
+        report = empty_fixture()
+        c = report["cpu_cliffs"]
+        c["interpreter"] = {"Uncovered": {"entries": 2, "instructions": 20}}
+        c["tier1_census"] = empty_census()
+        row = c["tier1_census"]["PendingCompilation"]
+        row.update(entries=2, instructions=4, supported_units=18, unsupported_units=2,
+                   prefix_units=17, unsupported={"Fld1": 2})
+        row["blocked_prefixes"][1] = 1
+        row["censored_prefixes"][1] = 1
+        return report
+
+    def test_census_merges_rep_units_prefixes_and_unknown_reports(self):
+        result = aggregate([self.census_fixture(), empty_fixture(), self.census_fixture()])
+        cliffs = result["cpu_cliffs"]
+        self.assertEqual(cliffs["tier1_census_reports"], 2)
+        row = cliffs["tier1_census"]["PendingCompilation"]
+        self.assertEqual(row["supported_units"], 36)
+        self.assertEqual(row["unsupported"], {"Fld1": 4})
+        self.assertEqual(row["blocked_prefixes"][1], 2)
+        self.assertNotIn("private", markdown(result))
+
+    def test_census_truncation_and_bucket_reconciliation(self):
+        report = self.census_fixture()
+        row = report["cpu_cliffs"]["tier1_census"]["PendingCompilation"]
+        row.update(unsupported={f"Form{n}_rm32": 1 for n in range(24)},
+                   unsupported_units=27, omitted_rows=2, omitted_units=3)
+        report["cpu_cliffs"]["interpreter"]["Uncovered"]["instructions"] = 45
+        self.assertEqual(aggregate([report])["cpu_cliffs"]["tier1_census"]["PendingCompilation"]["omitted_units"], 3)
+        row["omitted_units"] = 2
+        with self.assertRaisesRegex(ValueError, "reconcile"):
+            aggregate([report])
+
+    def test_census_rejects_private_labels_bad_histograms_and_partial_fields(self):
+        for key, value in (("unsupported", {"Mov_0x1234": 2}),
+                           ("unsupported", {"private/path": 2}),
+                           ("blocked_prefixes", [True] * 8),
+                           ("censored_prefixes", [0]),
+                           ("entries", 3), ("instructions", 100),
+                           ("prefix_units", 19), ("omitted_rows", 1)):
+            report = self.census_fixture()
+            report["cpu_cliffs"]["tier1_census"]["PendingCompilation"][key] = value
+            with self.assertRaises(ValueError) as caught:
+                aggregate([report])
+            self.assertNotIn("private", str(caught.exception))
+        report = self.census_fixture()
+        del report["cpu_cliffs"]["tier1_census"]["Rejected"]
+        with self.assertRaises(ValueError):
+            aggregate([report])
+
     def detailed_fixture(self):
         report = empty_fixture()
         report["cpu_cliffs"].update(

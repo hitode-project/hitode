@@ -63,6 +63,7 @@ pub use parallel::ParallelStats;
 pub use rows::RowStats;
 pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
 pub use tier1::Tier1Stats;
+pub use tier1::census::{Coverage as Tier1Coverage, Tier1Census};
 pub use timestamp::TSC_FREQ;
 pub use trap::ExecutionTrap;
 #[cfg(unix)]
