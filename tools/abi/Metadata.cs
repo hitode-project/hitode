@@ -236,6 +236,17 @@ public static class AbiMetadata
             bool crtRound = f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && new[] { "floor", "ceil", "fabs" }.Contains(f[1]) && f[2] == "cdecl"
                 && f[3] == "f64" && f[4] == "double" && f[5] == "value:double:f64:2";
+            if (f.Length == 6 && new[] { "msvcrt.dll", "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
+                && new[] { "_beginthreadex", "_endthreadex" }.Contains(f[1]))
+            {
+                bool begin = f[1] == "_beginthreadex";
+                string parameters = begin
+                    ? "security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1"
+                    : "returnCode:unsigned int:u32:1";
+                if (f[2] != "cdecl" || f[3] != (begin ? "u32" : "void")
+                    || f[4] != (begin ? "uintptr_t" : "void") || f[5] != parameters)
+                    throw new InvalidDataException("CRT extended thread stack contract changed: " + row);
+            }
             if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime && !crtRound)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);

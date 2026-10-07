@@ -258,3 +258,9 @@ msvcr80.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	floor	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	ceil	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	fabs	cdecl	f64	double	value:double:f64:2
+msvcrt.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
+msvcrt.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
+msvcr80.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
+msvcr80.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
+msvcr90.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
+msvcr90.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
