@@ -264,6 +264,7 @@ fn swap_mouse_button(env: &mut Env<'_>, swap: i32) -> u32 {
     ))
 }
 pub(super) fn register(registry: &mut Registry) {
+    key_names::register(registry);
     for api in [
         set_keyboard_state_ABI,
         get_cursor_info_ABI,
@@ -287,6 +288,8 @@ mod cursor_tests;
 
 #[cfg(test)]
 mod keymap_tests;
+
+mod key_names;
 
 #[cfg(test)]
 mod tests {

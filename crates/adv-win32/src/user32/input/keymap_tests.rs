@@ -5,7 +5,7 @@ use adv_cpu::{
 };
 use adv_machine::{Clock, Machine, Outcome, layout::PARK_ADDR};
 
-fn fixture() -> Machine<JitCpu> {
+pub(super) fn fixture() -> Machine<JitCpu> {
     let mut registry = Registry::default();
     crate::register(&mut registry);
     let mut machine = Machine::new(
@@ -22,9 +22,10 @@ fn fixture() -> Machine<JitCpu> {
     )
     .unwrap();
     machine.spawn("keymap", PARK_ADDR, &[], 65536).unwrap();
+    machine.ext.get_or_default::<adv_abi::ApiDiagnostics>();
     machine
 }
-fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
+pub(super) fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
         context: machine.sys.current,
         cpu: &mut machine.cpu,
