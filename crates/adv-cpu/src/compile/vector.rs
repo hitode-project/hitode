@@ -202,6 +202,7 @@ fn general_supported(i: &Instruction) -> bool {
 /// own halves, with constant shift counts.
 fn mmx_supported(i: &Instruction) -> bool {
     mmx::supported(i)
+        && !mmx::conversion(i)
         && !matches!(
             i.mnemonic(),
             M::Emms | M::Pextrw | M::Pinsrw | M::Pmovmskb | M::Psadbw | M::Pmuludq

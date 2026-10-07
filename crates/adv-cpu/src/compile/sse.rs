@@ -1,12 +1,14 @@
 //! SSE/SSE2 floating point, moves and shuffles. Arithmetic, comparisons and
-//! conversions run natively only under the default MXCSR control (all
+//! floating-format conversions run natively only under the default MXCSR control (all
 //! exceptions masked, round to nearest, no DAZ/FTZ); any other control falls
 //! back before the instruction changes state. Results, NaN selection and
 //! out-of-range conversions follow x86 exactly on every host. Native code does
-//! not accumulate the MXCSR status flags, which nothing can trap on while all
-//! exceptions are masked; the interpreter still sets them.
+//! not accumulate arithmetic status flags. Integer conversions instead compute
+//! full guest status or guard exact results; see `convert`.
 use super::*;
 use cranelift_codegen::ir::condcodes::FloatCC;
+
+mod convert;
 
 fn xmm(i: &Instruction, n: u32) -> bool {
     i.op_kind(n) == OpKind::Register && simd::register(i.op_register(n)).is_some()
@@ -420,48 +422,6 @@ impl Emitter<'_> {
         }
     }
 
-    /// x86 float to int32: in-range values convert, everything else
-    /// (including NaN) becomes the integer indefinite 0x80000000.
-    fn sse_to_int(&mut self, value: Value, truncate: bool) -> Value {
-        let ty = self.b.func.dfg.value_type(value);
-        let rounded = if truncate {
-            value
-        } else {
-            self.b.ins().nearest(value)
-        };
-        let (low, low_cc) = if ty.lane_type() == types::F64 && truncate {
-            // Truncation keeps (-2^31 - 1, -2^31] in range.
-            ((-2_147_483_649f64).to_bits(), FloatCC::GreaterThan)
-        } else if ty.lane_type() == types::F64 {
-            ((-2_147_483_648f64).to_bits(), FloatCC::GreaterThanOrEqual)
-        } else {
-            (
-                u64::from((-2_147_483_648f32).to_bits()),
-                FloatCC::GreaterThanOrEqual,
-            )
-        };
-        let high = if ty.lane_type() == types::F64 {
-            2_147_483_648f64.to_bits()
-        } else {
-            u64::from(2_147_483_648f32.to_bits())
-        };
-        let low = self.sse_splat(ty, low);
-        let high = self.sse_splat(ty, high);
-        let above = self.b.ins().fcmp(low_cc, rounded, low);
-        let below = self.b.ins().fcmp(FloatCC::LessThan, rounded, high);
-        let fits = self.b.ins().band(above, below);
-        if ty.is_vector() {
-            let converted = self.b.ins().fcvt_to_sint_sat(types::I32X4, rounded);
-            let indefinite = self.sse_splat(types::I32X4, 0x8000_0000);
-            let fits = self.sse_cast(fits, types::I32X4);
-            self.b.ins().bitselect(fits, converted, indefinite)
-        } else {
-            let converted = self.b.ins().fcvt_to_sint_sat(types::I32, rounded);
-            let indefinite = self.constant(0x8000_0000);
-            self.b.ins().select(fits, converted, indefinite)
-        }
-    }
-
     fn sse_shuffle(&mut self, a: Value, b: Value, lanes: &[u8], width: u8) -> Value {
         let mask: Vec<u8> = lanes
             .iter()
@@ -480,6 +440,22 @@ impl Emitter<'_> {
 
     pub(super) fn sse_instruction(&mut self, i: &Instruction) {
         let m = i.mnemonic();
+        if matches!(
+            m,
+            M::Cvtsi2ss
+                | M::Cvtsi2sd
+                | M::Cvtss2si
+                | M::Cvttss2si
+                | M::Cvtsd2si
+                | M::Cvttsd2si
+                | M::Cvtdq2ps
+                | M::Cvtps2dq
+                | M::Cvttps2dq
+                | M::Cvtpd2dq
+                | M::Cvttpd2dq
+        ) {
+            self.sse_conversion_memory(i);
+        }
         match m {
             M::Prefetchnta | M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2 => {}
             M::Sfence | M::Lfence => {}
@@ -698,14 +674,13 @@ impl Emitter<'_> {
                 self.sse_define(i.op0_register(), value);
             }
             M::Cvtsi2ss | M::Cvtsi2sd => {
-                self.sse_default_control();
                 let lane = if m == M::Cvtsi2sd {
                     types::F64
                 } else {
                     types::F32
                 };
                 let integer = self.read(i, 1);
-                let result = self.b.ins().fcvt_from_sint(lane, integer);
+                let result = self.sse_from_int_exact(integer, lane);
                 let old = self.sse_register(i.op0_register(), lane.by(16 / lane.bytes()).unwrap());
                 let value = self.b.ins().insertlane(old, result, 0);
                 self.sse_define(i.op0_register(), value);
@@ -728,26 +703,28 @@ impl Emitter<'_> {
                 self.sse_define(i.op0_register(), value);
             }
             M::Cvtss2si | M::Cvttss2si | M::Cvtsd2si | M::Cvttsd2si => {
-                self.sse_default_control();
+                let mxcsr = self.sse_conversion_control();
                 let lane = if matches!(m, M::Cvtsd2si | M::Cvttsd2si) {
                     types::F64
                 } else {
                     types::F32
                 };
                 let source = self.sse_scalar(i, 1, lane);
-                let value = self.sse_to_int(source, matches!(m, M::Cvttss2si | M::Cvttsd2si));
+                let (value, flags) =
+                    self.sse_to_int(source, matches!(m, M::Cvttss2si | M::Cvttsd2si), mxcsr);
+                self.sse_conversion_status(mxcsr, flags);
                 self.write(i, None, value);
             }
             M::Cvtdq2ps => {
-                self.sse_default_control();
                 let source = self.sse_vector(i, 1, types::I32X4);
-                let value = self.b.ins().fcvt_from_sint(types::F32X4, source);
+                let value = self.sse_from_int_exact(source, types::F32X4);
                 self.sse_define(i.op0_register(), value);
             }
             M::Cvtps2dq | M::Cvttps2dq => {
-                self.sse_default_control();
+                let mxcsr = self.sse_conversion_control();
                 let source = self.sse_vector(i, 1, types::F32X4);
-                let value = self.sse_to_int(source, m == M::Cvttps2dq);
+                let (value, flags) = self.sse_to_int(source, m == M::Cvttps2dq, mxcsr);
+                self.sse_conversion_status(mxcsr, flags);
                 self.sse_define(i.op0_register(), value);
             }
             M::Cvtps2pd | M::Cvtdq2pd => {
@@ -784,13 +761,15 @@ impl Emitter<'_> {
                 self.sse_define(i.op0_register(), value);
             }
             M::Cvtpd2dq | M::Cvttpd2dq => {
-                self.sse_default_control();
+                let mxcsr = self.sse_conversion_control();
                 let source = self.sse_vector(i, 1, types::F64X2);
                 let truncate = m == M::Cvttpd2dq;
                 let low = self.b.ins().extractlane(source, 0);
                 let high = self.b.ins().extractlane(source, 1);
-                let low = self.sse_to_int(low, truncate);
-                let high = self.sse_to_int(high, truncate);
+                let (low, low_flags) = self.sse_to_int(low, truncate, mxcsr);
+                let (high, high_flags) = self.sse_to_int(high, truncate, mxcsr);
+                let flags = self.b.ins().bor(low_flags, high_flags);
+                self.sse_conversion_status(mxcsr, flags);
                 let value = self.b.ins().scalar_to_vector(types::I32X4, low);
                 let value = self.b.ins().insertlane(value, high, 1);
                 self.sse_define(i.op0_register(), value);
@@ -1102,13 +1081,36 @@ mod tests {
                 assert_eq!(jit.state.xmm, reference.state.xmm, "{context}");
                 assert_eq!(jit.state.regs, reference.state.regs, "{context}");
                 assert_eq!(jit.state.eflags, reference.state.eflags, "{context}");
+                if matches!(
+                    name,
+                    "cvtps2dq"
+                        | "cvttps2dq"
+                        | "cvtpd2dq"
+                        | "cvttpd2dq"
+                        | "cvtdq2ps"
+                        | "cvtsi2ss"
+                        | "cvtsi2sd"
+                        | "cvtss2si"
+                        | "cvttss2si"
+                        | "cvtsd2si"
+                        | "cvttsd2si"
+                ) {
+                    assert_eq!(jit.state.mxcsr, reference.state.mxcsr, "{context}");
+                }
                 assert_eq!(
                     jit.memory().read(DATA + 32, 32).unwrap(),
                     reference.memory().read(DATA + 32, 32).unwrap(),
                     "{context}"
                 );
             }
-            assert_eq!(jit.stats.interpreter_entries, 0, "{name}");
+            if matches!(name, "cvtdq2ps" | "cvtsi2ss") {
+                // Inexact int32 -> binary32 lanes now require the guarded
+                // exact path so rounding and precision status stay observable.
+                assert!(jit.stats.interpreter_entries > 0, "{name}");
+                assert!(jit.stats.native_entries > 0, "{name}");
+            } else {
+                assert_eq!(jit.stats.interpreter_entries, 0, "{name}");
+            }
         }
         FOREIGN_NANS.store(false, Ordering::Relaxed);
     }
