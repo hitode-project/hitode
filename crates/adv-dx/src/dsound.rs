@@ -734,7 +734,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 }
                 let flags = e.cpu.read_u32(b + 4).map_err(|e| e.to_string())?;
                 // This device implements software PCM, without 3D, hardware voices or FX.
-                if flags
+                let unsupported = flags
                     & !(0x1
                         | 0x2
                         | 0x8
@@ -745,9 +745,15 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         | 0x4000
                         | 0x8000
                         | 0x10000
-                        | 0x80000)
-                    != 0
-                {
+                        | 0x80000);
+                if unsupported != 0 {
+                    adv_abi::warn_unavailable(
+                        e,
+                        &format!("dsound.dll!{full}"),
+                        &format!(
+                            "software PCM buffer flags are unsupported: flags=0x{flags:08x}, unsupported_mask=0x{unsupported:08x}; 3D, hardware voices and FX are unavailable (HRESULT=0x80004001)"
+                        ),
+                    );
                     return Ok(UNSUPPORTED);
                 }
                 let len = e.cpu.read_u32(b + 8).map_err(|e| e.to_string())?;
@@ -2755,6 +2761,41 @@ mod tests {
     fn duplicate_sound_buffer_rejects_primary_buffer_and_invalid_args() {
         let mut m = machine();
         let dev = device(&mut m);
+        let objects = m.sys.objects.object_count();
+        let header = heap_next(&mut m);
+        // Invalid structure size is distinct from an unsupported capability.
+        m.cpu.write_u32(DATA, 19).unwrap();
+        m.cpu.write_u32(DATA + 4, 0x10).unwrap();
+        assert_eq!(
+            invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &[dev, DATA, DATA + 128, 0]),
+            INVALID
+        );
+        assert!(
+            m.ext
+                .get_or_default::<adv_abi::ApiDiagnostics>()
+                .warnings
+                .is_empty()
+        );
+        m.cpu.write_u32(DATA, 20).unwrap();
+        for _ in 0..128 {
+            m.cpu.write_u32(DATA + 128, 0xcccccccc).unwrap();
+            assert_eq!(
+                invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &[dev, DATA, DATA + 128, 0]),
+                UNSUPPORTED
+            );
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+        }
+        let diagnostics = m.ext.get::<adv_abi::ApiDiagnostics>();
+        assert_eq!(diagnostics.warnings.len(), 1);
+        let ((api, reason), count) = diagnostics.warnings.first_key_value().unwrap();
+        assert_eq!(api, "dsound.dll!IDirectSound8::CreateSoundBuffer");
+        assert!(reason.contains("flags=0x00000010"));
+        assert!(reason.contains("unsupported_mask=0x00000010"));
+        assert!(reason.contains("HRESULT=0x80004001"));
+        assert_eq!(*count, 128);
+        assert_eq!(m.sys.objects.object_count(), objects);
+        assert_eq!(heap_next(&mut m), header);
+        assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
         // Create primary buffer
         m.cpu.write_u32(DATA, 20).unwrap();
         m.cpu.write_u32(DATA + 4, 1).unwrap(); // DSBCAPS_PRIMARYBUFFER
@@ -2766,6 +2807,16 @@ mod tests {
             0
         );
         let primary = m.cpu.read_u32(DATA + 128).unwrap();
+        assert_eq!(m.ext.get::<adv_abi::ApiDiagnostics>().warnings.len(), 1);
+        assert_eq!(
+            *m.ext
+                .get::<adv_abi::ApiDiagnostics>()
+                .warnings
+                .values()
+                .next()
+                .unwrap(),
+            128
+        );
         assert_eq!(
             invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, primary, DATA + 132]),
             0x88780032, // DSERR_INVALIDCALL
