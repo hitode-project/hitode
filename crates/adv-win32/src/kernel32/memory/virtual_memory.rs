@@ -254,6 +254,15 @@ pub(crate) fn allocate(
     Ok(if reserve { base } else { page })
 }
 
+pub(crate) fn allocation_extent(env: &Env<'_>, addr: u32) -> Option<(u32, u32)> {
+    let (base, extent) = env.sys.vm.containing(addr)?;
+    env.ext
+        .try_get::<Allocations>()?
+        .0
+        .contains_key(&base)
+        .then_some((base, extent))
+}
+
 pub(crate) fn release(env: &mut Env<'_>, addr: u32, size: u32, ty: u32) -> Result<u32, Error> {
     if !matches!(ty, MEM_RELEASE | MEM_DECOMMIT) {
         return Err(error(err::INVALID_PARAMETER));

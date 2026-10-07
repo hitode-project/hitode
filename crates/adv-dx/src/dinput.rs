@@ -7,6 +7,8 @@ use adv_os::{
     Heaps,
     com::{Com, Iid, QueryError},
 };
+mod legacy;
+pub use legacy::{InputProvider, InputSnapshot, post_input, release_input};
 
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
@@ -23,6 +25,7 @@ struct Factory;
 struct State {
     com: Com,
     tables: [u32; 2],
+    legacy: Option<legacy::Tables>,
 }
 fn alloc(env: &mut Env<'_>, size: u32) -> Option<u32> {
     let heaps = env.ext.get_mut::<Heaps>();
@@ -61,7 +64,11 @@ fn initialize(env: &mut Env<'_>) -> bool {
             }
         }
         let com = Com::new(&mut env.sys.objects)?;
-        env.ext.insert(State { com, tables });
+        env.ext.insert(State {
+            com,
+            tables,
+            legacy: None,
+        });
         Some(())
     })();
     if result.is_none() {
@@ -273,6 +280,7 @@ factory_methods!(
     "IDirectInput8W::EnumDevices"
 );
 pub fn register(registry: &mut Registry) {
+    legacy::register(registry);
     for api in [
         create_ABI,
         query_a_ABI,

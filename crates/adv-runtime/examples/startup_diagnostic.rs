@@ -168,7 +168,11 @@ fn save_fault(
 fn observe_exception(env: &mut Env<'_>, event: Exception, checkpoint: Checkpoint) -> Outcome {
     let (original, capture) = {
         let observer = env.ext.get_mut::<FaultDiagnostics>();
-        let capture = if matches!(event, Exception::Fault(_)) && observer.faults < 8 {
+        let capture = if matches!(
+            event,
+            Exception::Fault(_) | Exception::Trap { vector: 3, .. }
+        ) && observer.faults < 8
+        {
             observer.faults += 1;
             Some((observer.directory.clone(), observer.faults))
         } else {

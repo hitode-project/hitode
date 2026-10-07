@@ -13,7 +13,7 @@ mod virtual_memory;
 pub(crate) use virtual_memory::native_write_memory;
 pub(crate) use virtual_memory::protect_memory;
 pub(crate) use virtual_memory::{
-    allocate as allocate_memory, release as free_memory, span as memory_span,
+    allocate as allocate_memory, allocation_extent, release as free_memory, span as memory_span,
 };
 
 const HEAP_ZERO_MEMORY: u32 = 0x8;

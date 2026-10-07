@@ -7,6 +7,154 @@ use adv_machine::{Clock, Machine, layout::PARK_ADDR};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+#[test]
+fn optical_volume_file_copy_and_mapping_share_read_only_media() {
+    let (mut machine, root) = fixture("optical");
+    let image = root.join("media.iso");
+    std::fs::write(
+        &image,
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adv-os/tests/fixtures/optical.iso"
+        )),
+    )
+    .unwrap();
+    machine
+        .ext
+        .get_mut::<Win32>()
+        .vfs
+        .mount_iso('D', &image)
+        .unwrap();
+    machine.cpu.write(0x410000, b"D:\\\0").unwrap(); // privacy: allow authored guest optical path
+    args(&mut machine, &[0x410000]);
+    assert_eq!(returned(get_drive_type(&mut env(&mut machine))), 5);
+    assert_eq!(drive_letters(&env(&mut machine)), vec!['C', 'D']);
+    assert_eq!(
+        returned(get_logical_drive_strings(
+            &mut env(&mut machine),
+            0,
+            0,
+            false
+        )),
+        9
+    );
+    assert_eq!(
+        returned(get_logical_drive_strings(
+            &mut env(&mut machine),
+            9,
+            0x410020,
+            false
+        )),
+        8
+    );
+    let mut roots = [0; 9];
+    machine.cpu.read(0x410020, &mut roots).unwrap();
+    assert_eq!(&roots, b"C:\\\0D:\\\0\0");
+    args(
+        &mut machine,
+        &[
+            0x410000, 0x410100, 64, 0x410200, 0x410204, 0x410208, 0x410180, 32,
+        ],
+    );
+    assert_eq!(
+        returned(get_volume_information(&mut env(&mut machine), false)),
+        1
+    );
+    assert_eq!(
+        machine.cpu.read_cstr(0x410100, 64).unwrap(),
+        b"OPTICAL_TEST"
+    );
+    assert_eq!(machine.cpu.read_cstr(0x410180, 32).unwrap(), b"CDFS");
+    assert_eq!(machine.cpu.read_u32(0x410208).unwrap(), 0x80005);
+    assert_eq!(machine.cpu.read_u32(0x410204).unwrap(), 110);
+    // Short output fails before changing any of the caller's other outputs.
+    machine.cpu.write_u32(0x410200, 0xfeedbeef).unwrap();
+    args(&mut machine, &[0x410000, 0x410100, 1, 0x410200, 0, 0, 0, 0]);
+    assert_eq!(
+        returned(get_volume_information(&mut env(&mut machine), false)),
+        0
+    );
+    assert_eq!(machine.cpu.read_u32(0x410200).unwrap(), 0xfeedbeef);
+    let file = open_with_share(
+        &mut env(&mut machine),
+        r"D:\readme.TXT", // privacy: allow authored guest optical path
+        0x80000000,
+        OPEN_EXISTING,
+        7,
+    );
+    assert_ne!(file, INVALID_HANDLE_VALUE);
+    args(&mut machine, &[file, 0x410300, 32, 0x410280, 0]);
+    assert_eq!(returned(read_file(&mut env(&mut machine))), 1);
+    assert_eq!(machine.cpu.read_u32(0x410280).unwrap(), 11);
+    assert_eq!(
+        read_contents(&env(&mut machine), r"D:\ReadMe.txt").unwrap(), // privacy: allow authored guest optical path
+        b"hello world"
+    );
+    assert_eq!(
+        open(
+            &mut env(&mut machine),
+            r"D:\ReadMe.txt", // privacy: allow authored guest optical path
+            GENERIC_WRITE,
+            OPEN_EXISTING
+        ),
+        INVALID_HANDLE_VALUE
+    );
+    assert_eq!(crate::util::last_error(&env(&mut machine)), 19);
+    for device in [r"\\.\D:", r"\\?\D:"] {
+        assert_eq!(
+            open(&mut env(&mut machine), device, 0, OPEN_EXISTING),
+            INVALID_HANDLE_VALUE
+        );
+        assert_eq!(crate::util::last_error(&env(&mut machine)), 50);
+    }
+    assert_eq!(
+        returned(copy_file(
+            &mut env(&mut machine),
+            r"D:\ReadMe.txt".into(), // privacy: allow authored guest optical path
+            r"C:\Game\copy.txt".into(),
+            true,
+            false
+        )),
+        1
+    );
+    assert_eq!(
+        read_contents(&env(&mut machine), r"C:\Game\copy.txt").unwrap(),
+        b"hello world"
+    );
+    let section = returned(super::super::file_mapping::create_section(
+        &mut env(&mut machine),
+        file,
+        0,
+        2,
+        0,
+        None,
+    ));
+    assert_ne!(section, 0);
+    let view = returned(super::super::file_mapping::map_section(
+        &mut env(&mut machine),
+        section,
+        4,
+        0,
+        0,
+        0,
+    ));
+    assert_ne!(view, 0);
+    machine.sys.objects.close(file);
+    machine.sys.objects.close(section);
+    let mut bytes = [0; 11];
+    machine.cpu.read(view, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"hello world");
+    assert_eq!(
+        returned(super::super::file_mapping::unmap_section(
+            &mut env(&mut machine),
+            view
+        )),
+        1
+    );
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn fixture(name: &str) -> (Machine<JitCpu>, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/file-mutation-contract-tests")

@@ -121,6 +121,11 @@ fn replace_contents(
 
 fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
     let vfs = &env.ext.get::<Win32>().vfs;
+    if vfs.is_optical_path(guest) {
+        let mut bytes = Vec::new();
+        vfs.open_optical_file(guest)?.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
     let Some(path) = vfs.lookup(guest) else {
         return Ok(Vec::new());
     };
@@ -174,6 +179,26 @@ pub(crate) fn open_with_share(
         return INVALID_HANDLE_VALUE;
     }
     let guest = env.ext.get::<Win32>().vfs.normalize(path);
+    if let Some(device) = path
+        .strip_prefix(r"\\.\")
+        .or_else(|| path.strip_prefix(r"\\?\"))
+        && device.len() == 2
+        && device.as_bytes()[1] == b':'
+        && env
+            .ext
+            .get::<Win32>()
+            .vfs
+            .optical_drive(device.as_bytes()[0] as char)
+            .is_some()
+    {
+        adv_abi::warn_unavailable(
+            env,
+            "kernel32.dll!CreateFile",
+            "raw optical device handles are not modeled; mounted image files are available",
+        );
+        set_last_error(env, 50);
+        return INVALID_HANDLE_VALUE;
+    }
     if share & !7 != 0 {
         set_last_error(env, err::INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
@@ -190,6 +215,41 @@ pub(crate) fn open_with_share(
     }) {
         set_last_error(env, 32); // ERROR_SHARING_VIOLATION, before opening/truncating.
         return INVALID_HANDLE_VALUE;
+    }
+    if env.ext.get::<Win32>().vfs.is_optical_path(&guest) {
+        if access & (GENERIC_WRITE | 0x10000000 | 0x10000 | 2 | 4) != 0
+            || !matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS | CREATE_NEW)
+        {
+            set_last_error(env, 19); // ERROR_WRITE_PROTECT
+            return INVALID_HANDLE_VALUE;
+        }
+        match env.ext.get::<Win32>().vfs.open_optical_file(&guest) {
+            Ok(_) if disposition == CREATE_NEW => {
+                set_last_error(env, err::FILE_EXISTS);
+                return INVALID_HANDLE_VALUE;
+            }
+            Ok(file) => {
+                let handle = env.sys.objects.insert_host(FileObj {
+                    file,
+                    guest_path: guest,
+                    access,
+                    share,
+                });
+                set_last_error(
+                    env,
+                    if disposition == OPEN_ALWAYS {
+                        err::ALREADY_EXISTS
+                    } else {
+                        0
+                    },
+                );
+                return handle;
+            }
+            Err(error) => {
+                io_error(env, &error);
+                return INVALID_HANDLE_VALUE;
+            }
+        }
     }
     match system_file(env, &guest) {
         Ok(Some(bytes)) => {
@@ -674,10 +734,16 @@ pub(super) fn copy_file(
     remove_src: bool,
 ) -> Outcome {
     let w = env.ext.get::<Win32>();
-    let Some(from) = w.vfs.lookup(&src).filter(|p| p.is_file()) else {
+    let optical = w.vfs.is_optical_path(&src);
+    if w.vfs.is_optical_path(&dst) || (remove_src && optical) {
+        set_last_error(env, 19);
+        return Outcome::Return(0);
+    }
+    let from = w.vfs.lookup(&src).filter(|p| p.is_file());
+    if from.is_none() && !optical {
         set_last_error(env, err::FILE_NOT_FOUND);
         return Outcome::Return(0);
-    };
+    }
     if fail_if_exists && w.vfs.lookup(&dst).is_some() {
         set_last_error(env, err::FILE_EXISTS);
         return Outcome::Return(0);
@@ -704,7 +770,7 @@ pub(super) fn copy_file(
             set_last_error(env, err::PATH_NOT_FOUND);
             return Outcome::Return(0);
         };
-        return match std::fs::rename(&from, &to) {
+        return match std::fs::rename(from.as_ref().unwrap(), &to) {
             Ok(()) => Outcome::Return(1),
             Err(e) => {
                 io_error(env, &e);
@@ -714,17 +780,21 @@ pub(super) fn copy_file(
     }
     // Resolve alias/hardlink identity before opening or writing the destination.
     // Normalizing names alone cannot detect two names for the same host file.
-    let mut source = match std::fs::File::open(&from) {
+    let mut source = match if optical {
+        w.vfs.open_optical_file(&src)
+    } else {
+        std::fs::File::open(from.as_ref().unwrap()).map(adv_os::vfs::FileStream::from)
+    } {
         Ok(file) => file,
         Err(error) => {
             io_error(env, &error);
             return Outcome::Return(0);
         }
     };
-    let identity = match adv_os::vfs::file_identity(&source) {
-        Ok(identity) => identity,
-        Err(error) => {
-            io_error(env, &error);
+    let identity = match source.cached_identity() {
+        Some(identity) => identity,
+        None => {
+            set_last_error(env, err::ACCESS_DENIED);
             return Outcome::Return(0);
         }
     };
@@ -1090,7 +1160,7 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     }
 }
 
-/// Drives: the guest has only a fixed `C:` (no removable or optical drives).
+/// Fixed guest system volume plus explicitly attached optical media.
 const DRIVE_NO_ROOT_DIR: u32 = 1;
 const DRIVE_FIXED: u32 = 3;
 
@@ -1112,6 +1182,14 @@ fn get_drive_type(env: &mut Env<'_>) -> Outcome {
     let d = drive_of(env, env.arg(0));
     Outcome::Return(if d == Some(b'C') {
         DRIVE_FIXED
+    } else if d.is_some_and(|d| {
+        env.ext
+            .get::<Win32>()
+            .vfs
+            .optical_drive(d as char)
+            .is_some()
+    }) {
+        5 // DRIVE_CDROM
     } else {
         DRIVE_NO_ROOT_DIR
     })
@@ -1133,6 +1211,14 @@ fn get_drive_type_w(env: &mut Env<'_>) -> Outcome {
     let d = drive_of_w(env, env.arg(0));
     Outcome::Return(if d == Some(b'C') {
         DRIVE_FIXED
+    } else if d.is_some_and(|d| {
+        env.ext
+            .get::<Win32>()
+            .vfs
+            .optical_drive(d as char)
+            .is_some()
+    }) {
+        5
     } else {
         DRIVE_NO_ROOT_DIR
     })
@@ -1152,11 +1238,23 @@ fn query_dos_device(
         return Outcome::Return(0);
     }
     let mapping = match name {
-        None => vec!["C:".to_string()],
+        None => drive_letters(env)
+            .into_iter()
+            .map(|d| format!("{d}:"))
+            .collect(),
         Some(s) => {
             let trimmed = s.trim_end_matches('\\');
             if trimmed.eq_ignore_ascii_case("C:") || trimmed.eq_ignore_ascii_case("C") {
                 vec![r"\Device\HarddiskVolume1".to_string()]
+            } else if let Some((index, _)) = env
+                .ext
+                .get::<Win32>()
+                .vfs
+                .optical_drives()
+                .enumerate()
+                .find(|(_, (letter, _))| trimmed.eq_ignore_ascii_case(&format!("{letter}:")))
+            {
+                vec![format!(r"\Device\CdRom{index}")]
             } else {
                 set_last_error(env, ERROR_FILE_NOT_FOUND);
                 return Outcome::Return(0);
@@ -1213,23 +1311,81 @@ fn query_dos_device_w(env: &mut Env<'_>) -> Outcome {
 }
 
 /// GetVolumeInformationA(root, name, name_cap, serial, max_component, flags, fs, fs_cap).
-fn get_volume_information(env: &mut Env<'_>) -> Outcome {
-    if drive_of(env, env.arg(0)) != Some(b'C') {
+fn get_volume_information(env: &mut Env<'_>, wide: bool) -> Outcome {
+    let drive = if wide {
+        drive_of_w(env, env.arg(0))
+    } else {
+        drive_of(env, env.arg(0))
+    };
+    let optical = drive.and_then(|d| env.ext.get::<Win32>().vfs.optical_drive(d as char));
+    let (label, id, component, attributes, filesystem) = if let Some(disc) = optical {
+        (
+            disc.label.clone(),
+            disc.serial,
+            disc.max_component_length,
+            disc.filesystem_flags,
+            disc.filesystem.to_string(),
+        )
+    } else if drive == Some(b'C') {
+        (String::new(), 0x5041_4c00, 255, 0xf, "NTFS".into())
+    } else {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
-    }
+    };
     let (name, name_cap, fs, fs_cap) = (env.arg(1), env.arg(2), env.arg(6), env.arg(7));
-    if name != 0 {
-        let _ = put_cstr(env.cpu, name, name_cap, b"");
-    }
     let (serial, max_component, flags) = (env.arg(3), env.arg(4), env.arg(5));
-    out_u32(env.cpu, serial, 0x5041_4c00);
-    out_u32(env.cpu, max_component, 255);
-    // FILE_CASE_SENSITIVE_SEARCH | CASE_PRESERVED_NAMES | UNICODE_ON_DISK | PERSISTENT_ACLS
-    out_u32(env.cpu, flags, 0xf);
-    if fs != 0 {
-        let _ = put_cstr(env.cpu, fs, fs_cap, b"NTFS");
+    let encode = |s: &str| -> Vec<u8> {
+        if wide {
+            s.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        } else {
+            let mut b = env.ext.get::<Win32>().codec.encode(s);
+            b.push(0);
+            b
+        }
+    };
+    let label = encode(&label);
+    let filesystem = encode(&filesystem);
+    for (pointer, cap, bytes) in [(name, name_cap, &label), (fs, fs_cap, &filesystem)] {
+        if pointer == 0 {
+            continue;
+        }
+        if u64::from(cap) * if wide { 2 } else { 1 } < bytes.len() as u64 {
+            set_last_error(env, 234); // ERROR_MORE_DATA
+            return Outcome::Return(0);
+        }
+        if adv_abi::guest::check_range(
+            env.cpu,
+            pointer,
+            bytes.len() as u32,
+            adv_cpu::backend::Prot::WRITE,
+        )
+        .is_err()
+        {
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
     }
+    for pointer in [serial, max_component, flags] {
+        if pointer != 0
+            && adv_abi::guest::check_range(env.cpu, pointer, 4, adv_cpu::backend::Prot::WRITE)
+                .is_err()
+        {
+            set_last_error(env, 998);
+            return Outcome::Return(0);
+        }
+    }
+    if name != 0 {
+        let _ = env.cpu.write(name, &label);
+    }
+    if fs != 0 {
+        let _ = env.cpu.write(fs, &filesystem);
+    }
+    out_u32(env.cpu, serial, id);
+    out_u32(env.cpu, max_component, component);
+    out_u32(env.cpu, flags, attributes);
     Outcome::Return(1)
 }
 
@@ -1240,15 +1396,26 @@ fn get_disk_free_space(env: &mut Env<'_>, wide: bool) -> Outcome {
     } else {
         drive_of(env, root)
     };
-    if drive != Some(b'C') {
+    let geometry = if let Some(disc) =
+        drive.and_then(|d| env.ext.get::<Win32>().vfs.optical_drive(d as char))
+    {
+        (
+            1,
+            disc.bytes_per_sector,
+            0,
+            (disc.total_bytes / u64::from(disc.bytes_per_sector)) as u32,
+        )
+    } else if drive == Some(b'C') {
+        (8, 512, 500_000, 524_288)
+    } else {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
-    }
+    };
     let (sectors, bytes, free, total) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    out_u32(env.cpu, sectors, 8);
-    out_u32(env.cpu, bytes, 512);
-    out_u32(env.cpu, free, 500_000);
-    out_u32(env.cpu, total, 524_288);
+    out_u32(env.cpu, sectors, geometry.0);
+    out_u32(env.cpu, bytes, geometry.1);
+    out_u32(env.cpu, free, geometry.2);
+    out_u32(env.cpu, total, geometry.3);
     Outcome::Return(1)
 }
 
@@ -1263,11 +1430,17 @@ fn get_disk_free_space_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     } else {
         drive_of(env, root)
     };
-    if drive != Some(b'C') {
+    let (free, total) = if let Some(disc) =
+        drive.and_then(|d| env.ext.get::<Win32>().vfs.optical_drive(d as char))
+    {
+        (0, disc.total_bytes)
+    } else if drive == Some(b'C') {
+        (FREE, TOTAL)
+    } else {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
-    }
-    for (i, v) in [(1, FREE), (2, TOTAL), (3, FREE)] {
+    };
+    for (i, v) in [(1, free), (2, total), (3, free)] {
         let p = env.arg(i);
         if p != 0 {
             out_u32(env.cpu, p, v as u32);
@@ -1277,20 +1450,36 @@ fn get_disk_free_space_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     Outcome::Return(1)
 }
 
+fn drive_letters(env: &Env<'_>) -> Vec<char> {
+    let mut drives = vec!['C'];
+    drives.extend(
+        env.ext
+            .get::<Win32>()
+            .vfs
+            .optical_drives()
+            .map(|(letter, _)| letter),
+    );
+    drives.sort_unstable();
+    drives
+}
 fn get_logical_drive_strings(env: &mut Env<'_>, cap: u32, buf: u32, wide: bool) -> Outcome {
-    const REQUIRED: u32 = 5;
-    const RETURN_LEN: u32 = 4;
-    if cap < REQUIRED || buf == 0 {
-        return Outcome::Return(REQUIRED);
+    let drives = drive_letters(env);
+    let required = drives.len() as u32 * 4 + 1;
+    if cap < required || buf == 0 {
+        return Outcome::Return(required);
     }
+    let mut bytes: Vec<u8> = drives
+        .iter()
+        .flat_map(|d| [*d as u8, b':', b'\\', 0])
+        .collect();
+    bytes.push(0);
     if wide {
-        let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0, 0];
+        let units: Vec<u16> = bytes.into_iter().map(u16::from).collect();
         crate::util::write_units(env.cpu, buf, &units);
     } else {
-        let bytes = [b'C', b':', b'\\', 0, 0];
         let _ = env.cpu.write(buf, &bytes);
     }
-    Outcome::Return(RETURN_LEN)
+    Outcome::Return(required - 1)
 }
 
 fn get_logical_drive_strings_a(env: &mut Env<'_>) -> Outcome {
@@ -1304,7 +1493,13 @@ fn get_logical_drive_strings_w(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
-    stdcall(reg, K32, "GetLogicalDrives", 0, |_| Outcome::Return(1 << 2));
+    stdcall(reg, K32, "GetLogicalDrives", 0, |env| {
+        Outcome::Return(
+            drive_letters(env)
+                .iter()
+                .fold(0, |mask, d| mask | (1 << (*d as u32 - 'A' as u32))),
+        )
+    });
     stdcall(
         reg,
         K32,
@@ -1323,7 +1518,12 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetDriveTypeW", 1, get_drive_type_w);
     stdcall(reg, K32, "QueryDosDeviceA", 3, query_dos_device_a);
     stdcall(reg, K32, "QueryDosDeviceW", 3, query_dos_device_w);
-    stdcall(reg, K32, "GetVolumeInformationA", 8, get_volume_information);
+    stdcall(reg, K32, "GetVolumeInformationA", 8, |env| {
+        get_volume_information(env, false)
+    });
+    stdcall(reg, K32, "GetVolumeInformationW", 8, |env| {
+        get_volume_information(env, true)
+    });
     stdcall(reg, K32, "AreFileApisANSI", 0, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetFileApisToOEM", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "SetFileApisToANSI", 0, |_| Outcome::Return(0));

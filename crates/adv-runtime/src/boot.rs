@@ -79,6 +79,32 @@ pub fn api_registry(codec: crate::vorbis::Policy) -> Registry {
     registry
 }
 
+/// DirectInput observes the same physical state and foreground window as USER.
+pub(crate) fn input_snapshot(
+    ext: &adv_machine::Ext,
+    objects: &adv_machine::Objects,
+    hwnd: u32,
+) -> Option<adv_dx::dinput::InputSnapshot> {
+    let user = &ext.get::<Win32>().user;
+    let window = user.windows.get(objects, &hwnd)?;
+    if window.destroying {
+        return None;
+    }
+    let foreground = user.top.iter().copied().find(|top| {
+        user.windows
+            .get(objects, top)
+            .is_some_and(|w| w.visible() && !w.destroying)
+    });
+    Some(adv_dx::dinput::InputSnapshot {
+        keys: user
+            .host_keys
+            .as_ref()
+            .map_or(user.keys, |keys| keys.snapshot()),
+        cursor: user.cursor_pos,
+        foreground: foreground == Some(user.root(objects, hwnd)),
+    })
+}
+
 impl Runtime<JitCpu> {
     pub fn with_codec(
         exe: impl AsRef<Path>,
@@ -171,6 +197,9 @@ impl<B: Backend> Runtime<B> {
         // step_for still bounds guest execution by its soft slice and quantum.
         machine.set_execution_budget(None);
         Win32::install(&mut machine, cfg).map_err(|e| e.to_string())?;
+        machine
+            .ext
+            .insert(adv_dx::dinput::InputProvider(input_snapshot));
         crate::vorbis::install(&mut machine, codec)?;
         // Load images before allocating the graphics arena, preserving their preferred bases.
         let exe = machine.load(&files, exe_name).map_err(|e| e.to_string())?;
@@ -566,10 +595,25 @@ impl<B: Backend> Runtime<B> {
         adv_win32::set_codepage(&mut self.env(), codepage).map_err(|error| error.to_string())
     }
 
+    /// Attach media before execution; child processes inherit the same immutable media.
+    pub fn mount_iso(&mut self, drive: char, image: &Path) -> Result<(), String> {
+        self.machine
+            .ext
+            .get_mut::<Win32>()
+            .vfs
+            .mount_iso(drive, image)
+            .map_err(|error| format!("mount optical drive {drive}: {error}"))
+    }
+
     /// Post host input to the window that would receive it (see
     /// [`adv_win32::user32::host_input::post`]).
     pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> bool {
-        adv_win32::user32::host_input::post(&mut self.env(), message, wparam, lparam)
+        let accepted =
+            adv_win32::user32::host_input::post(&mut self.env(), message, wparam, lparam);
+        if accepted {
+            adv_dx::dinput::post_input(&mut self.env(), message, wparam, lparam);
+        }
+        accepted
     }
 
     /// Immutable native-menu projection; this is called only by execution.
@@ -602,7 +646,9 @@ impl<B: Backend> Runtime<B> {
 
     /// Release held keys and buttons when the host loses focus.
     pub fn release_input(&mut self) -> usize {
-        adv_win32::user32::host_input::release(&mut self.env())
+        let released = adv_win32::user32::host_input::release(&mut self.env());
+        adv_dx::dinput::release_input(&mut self.env());
+        released
     }
 
     /// Handler context outside any guest call, for host-originated work.
@@ -759,6 +805,9 @@ mod tests {
             Win32Config::new(std::env::temp_dir(), "input.exe", std::env::temp_dir()),
         )
         .unwrap();
+        machine
+            .ext
+            .insert(adv_dx::dinput::InputProvider(input_snapshot));
         let window = |hwnd, parent, rect| Window {
             hwnd,
             class: 0,
@@ -807,6 +856,172 @@ mod tests {
         user.queue(0).capture = 0x10028;
         let family = crate::family::Family::new(&mut machine, 4, 2, crate::vorbis::Policy::Guest);
         Runtime { machine, family }
+    }
+
+    #[test]
+    fn legacy_input_observes_live_keys_and_routes_buffered_transitions_through_runtime() {
+        use adv_cpu::backend::{Guest, GuestExt, Prot, Reg};
+        use adv_machine::Outcome;
+        let mut runtime = input_runtime();
+        adv_dx::dinput::register(
+            runtime
+                .machine
+                .sys
+                .thunks
+                .resolver_mut::<Registry>()
+                .unwrap(),
+        );
+        let data = runtime
+            .machine
+            .sys
+            .vm
+            .alloc(&mut runtime.machine.cpu, 4096, Prot::RW)
+            .unwrap();
+        fn call(runtime: &mut Runtime, data: u32, name: &str, args: &[u32]) -> u32 {
+            runtime.machine.resolve_import("dinput.dll", name).unwrap();
+            let thunk = runtime
+                .machine
+                .sys
+                .thunks
+                .iter()
+                .find(|(_, t)| t.module == "dinput.dll" && t.name == name)
+                .unwrap()
+                .0;
+            let handler = runtime.machine.sys.thunks.get(thunk).f.handler;
+            runtime.machine.cpu.set_reg(Reg::Esp, data + 3500);
+            for (index, arg) in args.iter().enumerate() {
+                runtime
+                    .machine
+                    .cpu
+                    .write_u32(data + 3504 + index as u32 * 4, *arg)
+                    .unwrap();
+            }
+            let mut env = runtime.env();
+            env.thunk = thunk;
+            match handler(&mut env) {
+                Outcome::Return(value) => value,
+                _ => panic!("unexpected guest callback"),
+            }
+        }
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "DirectInputCreateA",
+                &[0x400000, 0x500, data, 0]
+            ),
+            0
+        );
+        let factory = runtime.machine.cpu.read_u32(data).unwrap();
+        runtime
+            .machine
+            .cpu
+            .write(
+                data + 32,
+                &[
+                    0x61, 0x2b, 0x1d, 0x6f, 0xa0, 0xd5, 0xcf, 0x11, 0xbf, 0xc7, 0x44, 0x45, 0x53,
+                    0x54, 0, 0,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputA::CreateDevice",
+                &[factory, data + 32, data + 4, 0]
+            ),
+            0
+        );
+        let device = runtime.machine.cpu.read_u32(data + 4).unwrap();
+        for (offset, words) in [
+            (128, vec![24, 16, 2, 1, 1, data + 160]),
+            (160, vec![0, 0, 0x1e0c, 0]),
+            (192, vec![20, 16, 0, 0, 4]),
+        ] {
+            for (index, word) in words.into_iter().enumerate() {
+                runtime
+                    .machine
+                    .cpu
+                    .write_u32(data + offset + index as u32 * 4, word)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::SetDataFormat",
+                &[device, data + 128]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::SetCooperativeLevel",
+                &[device, 0x10020, 6]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::SetProperty",
+                &[device, 1, data + 192]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::Acquire",
+                &[device]
+            ),
+            0
+        );
+        let live = std::sync::Arc::new(adv_sync::input::KeyState::default());
+        runtime.set_host_keys(live.clone());
+        live.set(0x41, true);
+        live.set(0x41, false);
+        assert!(runtime.post_input(0x100, 0x41, 0x1e0001));
+        assert!(runtime.post_input(0x101, 0x41, 0xc01e0001));
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::GetDeviceState",
+                &[device, 1, data + 256]
+            ),
+            0
+        );
+        assert_eq!(runtime.machine.cpu.read_u8(data + 256).unwrap(), 0);
+        runtime.machine.cpu.write_u32(data + 224, 4).unwrap();
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::GetDeviceData",
+                &[device, 16, data + 256, data + 224, 0]
+            ),
+            0
+        );
+        assert_eq!(runtime.machine.cpu.read_u32(data + 224).unwrap(), 2);
+        assert_eq!(runtime.machine.cpu.read_u32(data + 260).unwrap(), 0x80);
+        assert_eq!(runtime.machine.cpu.read_u32(data + 276).unwrap(), 0);
+        runtime.release_input();
+        assert_eq!(
+            call(
+                &mut runtime,
+                data,
+                "IDirectInputDeviceA::GetDeviceState",
+                &[device, 1, data + 256]
+            ),
+            0x8007000c
+        );
     }
 
     #[test]
