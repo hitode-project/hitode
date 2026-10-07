@@ -116,6 +116,7 @@ impl WorkerLayout {
             mapped: self.mapped,
             epoch: 0,
             versions: Vec::new(),
+            watched: Vec::new(),
             dirty_pages: BTreeSet::new(),
             reservation: None,
             shared_pages: BTreeMap::new(),
@@ -139,6 +140,8 @@ pub struct Memory {
     pub(crate) fast: FastPermissions,
     pub(crate) epoch: u64,
     pub(crate) versions: Vec<u64>,
+    /// Monotonic code observations owned by the controller, not guest protection.
+    watched: Vec<bool>,
     pub(crate) mapped: Arc<Vec<bool>>,
     pub(crate) dirty_pages: BTreeSet<u32>,
     reservation: Option<crate::virtual_memory::Reservation>,
@@ -154,6 +157,73 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Only serial, software-checked memory distinguishes RWX data from code.
+    /// Native host protection and guest workers retain the full EXEC barrier.
+    fn selective_code_writes(&self) -> bool {
+        if self.is_parallel() {
+            return false;
+        }
+        #[cfg(windows)]
+        if self.native_protection {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn native_permissions(&mut self) -> Arc<Vec<u8>> {
+        let watched = self
+            .selective_code_writes()
+            .then_some(self.watched.as_slice());
+        self.fast.snapshot(&self.perms, watched)
+    }
+
+    /// Conservative modes already forbid every executable guest store in
+    /// native peers. Sampling code there needs no new grant-revocation fence.
+    pub(crate) fn quiesce_code_observation(&self) {
+        if self.selective_code_writes() {
+            self.quiesce_workers();
+        }
+    }
+
+    /// Register every sampled code page before reading or reusing its bytes.
+    /// This is monotonic, including negative tail dependencies and remappings.
+    /// The epoch revokes grants at a paused trap without changing byte stamps.
+    pub(crate) fn watch_code(&mut self, address: u32, len: usize) {
+        assert!(
+            !self.parallel_view,
+            "worker attempted to observe guest code"
+        );
+        let begin = u64::from(address).max(u64::from(self.base));
+        let end = (u64::from(address).saturating_add(len as u64))
+            .min(u64::from(self.base) + self.len as u64);
+        if begin >= end {
+            return;
+        }
+        let first = ((begin - u64::from(self.base)) / PAGE_SIZE as u64) as usize;
+        let last = ((end - u64::from(self.base) - 1) / PAGE_SIZE as u64) as usize;
+        if self.watched[first..=last].iter().all(|&watched| watched) {
+            return;
+        }
+        // Revoke only a selective table: conservative peers already forbid
+        // executable stores, and may hold an inline permit on this thread.
+        let selective = self.selective_code_writes();
+        self.quiesce_code_observation();
+        self.watched[first..=last].fill(true);
+        if selective {
+            self.fast.invalidate(first..last + 1);
+            self.epoch += 1;
+        }
+    }
+
+    fn writes_code(&self, range: &std::ops::Range<usize>) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        let selective = self.selective_code_writes();
+        (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+            .any(|page| self.perms[page] & EXEC != 0 && (!selective || self.watched[page]))
+    }
+
     /// Search the existing page table in one bounded metadata slice pass. This
     /// does not issue a guest access/protection query for every empty page.
     pub(crate) fn next_mapped_page(&self, addr: u32, limit: u64) -> Option<u32> {
@@ -199,7 +269,7 @@ impl Memory {
             len: self.len,
             pointer: self.ptr.as_ptr() as usize,
             perms: self.perms.clone(),
-            fast: self.fast.snapshot(&self.perms),
+            fast: self.native_permissions(),
             mapped: self.mapped.clone(),
         }
     }
@@ -356,6 +426,8 @@ impl Memory {
                 scope.retain();
             }
             self.native_protection = true;
+            // A trap cannot resume with a snapshot that still grants RWX data stores.
+            self.epoch += 1;
             Ok(())
         }
     }
@@ -406,6 +478,7 @@ impl Memory {
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
+            watched: vec![false; len / PAGE_SIZE],
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: None,
@@ -448,6 +521,7 @@ impl Memory {
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: 0,
             versions: vec![0; len / PAGE_SIZE],
+            watched: vec![false; len / PAGE_SIZE],
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeSet::new(),
             reservation: Some(reservation),
@@ -1026,11 +1100,7 @@ impl Memory {
             }
             return Ok(());
         }
-        if !dst.is_empty()
-            && self.perms[dst.start / PAGE_SIZE..=(dst.end - 1) / PAGE_SIZE]
-                .iter()
-                .any(|p| p & EXEC != 0)
-        {
+        if self.writes_code(&dst) {
             self.touch(destination, len);
         }
         #[cfg(windows)]
@@ -1092,11 +1162,7 @@ impl Memory {
         if overlays && !range.is_empty() {
             self.prepare_file_range(&range, true)?;
         }
-        if !range.is_empty()
-            && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
-                .iter()
-                .any(|p| p & EXEC != 0)
-        {
+        if self.writes_code(&range) {
             self.touch(addr, bytes.len());
         }
         #[cfg(windows)]

@@ -106,7 +106,7 @@ fn native_arithmetic_matches_hardware_raw80_and_precision_flags() {
                 .unwrap();
             });
             let mut mem = memory(&code);
-            let compiled = compile(&Region::new(CODE, code.len()), &mem, false).unwrap();
+            let compiled = compile(&Region::new(CODE, code.len()), &mut mem, false).unwrap();
             let mut seed = 0xd93f_517a_982b_410du64;
             let random = (0..8192).map(|_| (bounded(&mut seed), bounded(&mut seed)));
             let edges = edge.iter().flat_map(|&a| edge.iter().map(move |&b| (a, b)));
