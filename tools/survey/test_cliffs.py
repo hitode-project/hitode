@@ -64,6 +64,19 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(row["blocked_prefixes"][1], 2)
         self.assertNotIn("private", markdown(result))
 
+    def test_census_and_pc64_distributions_coexist(self):
+        report = fixture()
+        report["cpu_cliffs"].update({
+            key: value for key, value in self.census_fixture()["cpu_cliffs"].items()
+            if key in ("interpreter", "tier1_census")})
+        report["cpu_cliffs"].update(
+            x87_control={"PC=64/RC=nearest/masks=3f": 8},
+            x87_control_rejections={"PC": 8, "RC": 0, "Masks": 0},
+            x87_pc64={"Fadd/Exact": 3, "Fadd/Inexact": 5})
+        counters = aggregate([report])["cpu_cliffs"]
+        self.assertEqual(counters["x87_pc64"], {"Fadd/Inexact": 5, "Fadd/Exact": 3})
+        self.assertEqual(counters["tier1_census"]["PendingCompilation"]["supported_units"], 18)
+
     def test_census_truncation_and_bucket_reconciliation(self):
         report = self.census_fixture()
         row = report["cpu_cliffs"]["tier1_census"]["PendingCompilation"]
