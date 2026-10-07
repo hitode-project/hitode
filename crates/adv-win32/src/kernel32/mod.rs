@@ -27,6 +27,7 @@ pub(crate) use module::native_get_procedure;
 pub(crate) use module::native_load_library;
 pub(crate) use module::native_loader_mutex;
 pub(crate) use module::prepare_system_modules;
+pub(crate) use module::shutdown_process;
 pub(crate) use module::{exit_process, exit_thread, install_startup, spawn_thread};
 pub(crate) use module::{find_resource_data, int_or_str, res_id};
 mod nlsapi;
