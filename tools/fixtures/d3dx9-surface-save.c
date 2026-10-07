@@ -9,24 +9,43 @@ void *memset(void *p,int c,unsigned n){unsigned char *q=p;while(n--)*q++=(unsign
 typedef struct Buffer Buffer;
 typedef struct { HRESULT (WINAPI *query)(Buffer*,REFIID,void**); ULONG (WINAPI *add)(Buffer*); ULONG (WINAPI *release)(Buffer*); void* (WINAPI *data)(Buffer*); DWORD (WINAPI *size)(Buffer*); } BufferTable;
 struct Buffer {BufferTable *v;};
+typedef HRESULT (WINAPI *Load)(IDirect3DDevice9*,const void*,UINT,UINT,UINT,UINT,DWORD,D3DFORMAT,D3DPOOL,DWORD,DWORD,D3DCOLOR,void*,void*,IDirect3DTexture9**);
 typedef HRESULT (WINAPI *Save)(Buffer**,UINT,IDirect3DSurface9*,const PALETTEENTRY*,const RECT*);
-static DWORD checks[128],count;
+static DWORD checks[512],count;
 static void check(BOOL value){checks[count++]=!!value;}
 static void finish(void){DWORD written;HANDLE f=CreateFileA("d3dx9-surface-save.bin",GENERIC_WRITE,0,0,CREATE_ALWAYS,0,0);if(f==INVALID_HANDLE_VALUE)ExitProcess(90);WriteFile(f,checks,count*4,&written,0);CloseHandle(f);ExitProcess(written==count*4?0:91);}
 static void required(HRESULT hr){check(SUCCEEDED(hr));if(FAILED(hr))finish();}
 static const GUID iid={0x8ba5fb08,0x5195,0x40e2,{0xac,0x58,0x0d,0x98,0x9c,0x3a,1,2}};
 static const GUID unknown={0,0,0,{0xc0,0,0,0,0,0,0,0x46}};
+static void texture_roundtrip(IDirect3DDevice9 *device,Buffer *buffer){
+ Load load=(Load)GetProcAddress(GetModuleHandleA("d3dx9_43.dll"),"D3DXCreateTextureFromFileInMemoryEx");
+ const DWORD green[3][4]={{30,90,150,0},{30,30,90,150},{45,68,113,135}};
+ UINT filter,x,y;check(load!=0);if(!load)return;
+ for(filter=1;filter<=3;filter++){
+  IDirect3DTexture9 *texture=0;D3DSURFACE_DESC desc;D3DLOCKED_RECT lock;DWORD info[7]={0};
+  required(load(device,buffer->v->data(buffer),buffer->v->size(buffer),0,0,1,0,21,1,filter,1,0,info,0,&texture));
+  check(info[0]==4&&info[1]==3);
+  required(IDirect3DTexture9_GetLevelDesc(texture,0,&desc));check(desc.Width==4&&desc.Height==4);
+  required(IDirect3DTexture9_LockRect(texture,0,&lock,0,16));
+  for(y=0;y<4;y++)for(x=0;x<4;x++){
+   DWORD expected=(filter==1&&y==3)?0:(0x7f1f0000|(green[filter-1][y]<<8)|(20+x*40));
+   check(((DWORD*)((BYTE*)lock.pBits+y*lock.Pitch))[x]==expected);
+  }
+  required(IDirect3DTexture9_UnlockRect(texture,0));check(IDirect3DTexture9_Release(texture)==0);
+ }
+}
 static void image(Buffer *b,UINT width,UINT height,UINT left,UINT top){
  BYTE *bytes=b->v->data(b);DWORD size=b->v->size(b),offset,stride,y,x,bits;LONG h;
  check(bytes!=0);check(size>=54);if(!bytes||size<54)return;
  offset=*(DWORD*)(bytes+10);bits=*(WORD*)(bytes+28);h=*(LONG*)(bytes+22);
  check(bytes[0]=='B'&&bytes[1]=='M');check(*(DWORD*)(bytes+2)==size);
  check(*(DWORD*)(bytes+18)==width);check(h==(LONG)height||h==-(LONG)height);
- check(bits==24||bits==32);if(bits!=24&&bits!=32)return;
+ check(bits==32);if(bits!=24&&bits!=32)return;
  stride=((width*bits+31)/32)*4;check(offset+stride*height<=size);if(offset+stride*height>size)return;
  for(y=0;y<height;y++)for(x=0;x<width;x++){
   BYTE *p=bytes+offset+(h>0?height-1-y:y)*stride+x*(bits/8);
-  check(left==99 ? (p[0]==1&&p[1]==11&&p[2]==31) : (p[0]==left+x+1&&p[1]==top+y+11&&p[2]==31));
+  check(bits==32 && p[3]==127);
+  check(left==99 ? (p[0]==1&&p[1]==11&&p[2]==31) : (p[0]==20+(left+x)*40&&p[1]==30+(top+y)*60&&p[2]==31));
  }
 }
 void mainCRTStartup(void){
@@ -38,9 +57,9 @@ void mainCRTStartup(void){
  required(IDirect3D9_CreateDevice(f,0,1,w,0x22,&pp,&d));
  required(IDirect3DDevice9_CreateOffscreenPlainSurface(d,4,3,21,D3DPOOL_SYSTEMMEM,&s,0));
  required(IDirect3DSurface9_LockRect(s,&lock,0,0));
- for(y=0;y<3;y++)for(x=0;x<4;x++)((DWORD*)((BYTE*)lock.pBits+y*lock.Pitch))[x]=0x7f1f0000|((y+11)<<8)|(x+1);
+ for(y=0;y<3;y++)for(x=0;x<4;x++)((DWORD*)((BYTE*)lock.pBits+y*lock.Pitch))[x]=0x7f1f0000|((30+y*60)<<8)|(20+x*40);
  required(IDirect3DSurface9_UnlockRect(s));
- required(save(&b,0,s,0,0));image(b,4,3,0,0);
+ required(save(&b,0,s,0,0));image(b,4,3,0,0);texture_roundtrip(d,b);
  check(b->v->add(b)==2);check(b->v->release(b)==1);
  required(b->v->query(b,&iid,(void**)&q));check(q==b);check(q->v->release(q)==1);
  required(b->v->query(b,&unknown,(void**)&q));check(q==b);check(q->v->release(q)==1);

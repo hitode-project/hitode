@@ -17,6 +17,7 @@ mod shell_execute;
 mod shell_icon;
 mod theme;
 mod variant;
+mod wts;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
@@ -389,6 +390,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 
 pub fn register(reg: &mut Registry) {
     dwm::register(reg);
+    wts::register(reg);
     reg.register(path_find_extension_w_ABI);
     reg.register(path_find_file_name_w_ABI);
     theme::register(reg);

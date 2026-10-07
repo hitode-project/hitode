@@ -78,3 +78,8 @@ ntdll.dll	RtlAllocateHeap	stdcall	ptr	void*	HeapHandle:void*:ptr:1|Flags:u32:u32
 ntdll.dll	RtlFreeHeap	stdcall	u32	LOGICAL	HeapHandle:void*:ptr:1|Flags:u32:u32:1|BaseAddress:void*:ptr:1
 ntdll.dll	RtlLockHeap	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	HeapHandle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	RtlUnlockHeap	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	HeapHandle:Windows.Win32.Foundation.HANDLE:handle:1
+ntdll.dll	NtTerminateProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ExitStatus:Windows.Win32.Foundation.NTSTATUS:i32:1
+ntdll.dll	ZwTerminateProcess	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|ExitStatus:Windows.Win32.Foundation.NTSTATUS:i32:1
+ntdll.dll	NtOpenThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|ClientId:CLIENT_ID*:ptr:1
+ntdll.dll	ZwOpenThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|ClientId:CLIENT_ID*:ptr:1
+ntdll.dll	LdrShutdownProcess	stdcall	void	void	

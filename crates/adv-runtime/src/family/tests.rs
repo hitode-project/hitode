@@ -155,6 +155,136 @@ fn unpublished_and_abandoned_creation_never_executes_and_releases_address_space(
     cleanup(exe);
 }
 
+struct PublishAndWait {
+    ticket: Rc<Cell<processes::Publication>>,
+    process: u32,
+}
+fn publish_and_wait(env: &mut adv_machine::Env<'_>) -> adv_machine::Outcome {
+    let publication = env.ext.get::<PublishAndWait>();
+    publication.ticket.set(processes::Publication::Published);
+    adv_machine::Outcome::block_then_return(
+        adv_machine::Wait::Object {
+            handle: publication.process,
+            deadline: Some(env.sys.clock.now_us() + 5_000_000),
+        },
+        0,
+    )
+}
+fn call_and_loop(machine: &mut Machine<JitCpu>, entry: u32) {
+    let mut code = vec![0xb8]; // mov eax, entry; call eax; jmp $
+    code.extend_from_slice(&entry.to_le_bytes());
+    code.extend_from_slice(&[0xff, 0xd0, 0xeb, 0xfe]);
+    machine.cpu.write(0x401000, &code).unwrap();
+    machine.cpu.set_reg(Reg::Eip, 0x401000);
+}
+fn install_call(machine: &mut Machine<JitCpu>, name: &str, handler: adv_machine::Handler) {
+    machine
+        .sys
+        .thunks
+        .resolver_mut::<adv_abi::Registry>()
+        .unwrap()
+        .add(
+            "family-test",
+            name,
+            adv_machine::Conv::Cdecl { argc: 0 },
+            handler,
+        );
+    let entry = machine.resolve_import("family-test", name).unwrap();
+    call_and_loop(machine, entry);
+}
+
+#[test]
+fn publication_after_a_pending_visit_wakes_only_runnable_children() {
+    for suspended in [false, true] {
+        let (mut runtime, mut spec, exe) = fixture();
+        // Finish startup before installing the parent's authored publisher.
+        assert!(matches!(
+            runtime.machine.run_slice(Duration::from_millis(2)),
+            SliceResult::Yielded
+        ));
+        spec.suspended = suspended;
+        let created = runtime.create_child(spec).unwrap();
+        let pid = created.process.pid;
+        let process = runtime
+            .machine
+            .sys
+            .objects
+            .insert(adv_machine::Object::Process {
+                identity: created.process.clone(),
+                access: 0x100000,
+            });
+        runtime.machine.ext.insert(PublishAndWait {
+            ticket: created.publication.clone(),
+            process,
+        });
+        install_call(&mut runtime.machine, "publish_and_wait", publish_and_wait);
+        // The child is considered first while Pending; the parent's handler
+        // publishes it later in the same fairness round and blocks for it.
+        runtime.family.last = runtime.machine.sys.pid;
+        let result = runtime.step_for(Duration::from_millis(40));
+        assert_eq!(created.publication.get(), processes::Publication::Published);
+        assert_eq!(runtime.family.parked[&pid].sys.host_calls, 0);
+        if suspended {
+            assert!(matches!(
+                result,
+                SliceResult::Complete(RunResult::Idle {
+                    next_deadline: Some(_)
+                })
+            ));
+        } else {
+            assert!(matches!(result, SliceResult::Yielded));
+            let _ = runtime.step_for(Duration::from_millis(2));
+            assert!(!runtime.family.prepared.contains_key(&pid));
+        }
+        drop(created);
+        cleanup(exe);
+    }
+}
+
+#[test]
+fn child_exit_revisits_a_parent_wait_before_host_sleep() {
+    let (mut runtime, spec, exe) = fixture();
+    assert!(matches!(
+        runtime.machine.run_slice(Duration::from_millis(2)),
+        SliceResult::Yielded
+    ));
+    let created = runtime.create_child(spec).unwrap();
+    let pid = created.process.pid;
+    let process = runtime
+        .machine
+        .sys
+        .objects
+        .insert(adv_machine::Object::Process {
+            identity: created.process.clone(),
+            access: 0x100000,
+        });
+    runtime.machine.ext.insert(PublishAndWait {
+        ticket: created.publication.clone(),
+        process,
+    });
+    created.publication.set(processes::Publication::Published);
+    install_call(&mut runtime.machine, "wait_for_child", publish_and_wait);
+    let child = runtime.family.parked.get_mut(&pid).unwrap();
+    install_call(child, "exit_child", |_| {
+        adv_machine::Outcome::ExitProcess(37)
+    });
+    // The parent first blocks; the child exits later in the same round.
+    runtime.family.last = pid;
+    let result = runtime.step_for(Duration::from_millis(40));
+    assert_eq!(created.process.completion.exit_code(), Some(37));
+    assert!(matches!(result, SliceResult::Yielded));
+    let _ = runtime.step_for(Duration::from_millis(40));
+    runtime.select_process(runtime.family.records[0].pid);
+    assert!(
+        runtime.machine.sys.contexts[0].blocked_thunk().is_none(),
+        "parent state: {}, wait: {:?}",
+        runtime.machine.sys.contexts[0].state_name(),
+        runtime.machine.sys.contexts[0].waiting_on()
+    );
+    drop(created);
+    cleanup(exe);
+}
+
 #[test]
 fn failed_publication_reaps_even_when_the_parent_remains_live() {
     let (mut runtime, spec, exe) = fixture();

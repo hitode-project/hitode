@@ -330,6 +330,16 @@ impl Objects {
         self.entries.len()
     }
 
+    /// Retained kernel payloads, once per identity rather than once per alias.
+    /// Closed original aliases remain visible while another real reference owns
+    /// the payload; destroyed identities and nonkernel payloads are excluded.
+    pub fn kernel_objects(&self) -> impl Iterator<Item = &Object> {
+        self.entries
+            .values()
+            .filter(|entry| entry.kernel_identity.is_some())
+            .map(|entry| &entry.value)
+    }
+
     /// Preflight a default-namespace insertion before external side effects.
     /// Valid until the next mutation of this exclusively owned table.
     pub fn can_insert(&self) -> bool {
@@ -646,6 +656,21 @@ impl Objects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_payload_iteration_tracks_retained_identity_not_closed_original_alias() {
+        let mut objects = Objects::default();
+        let ns = objects.new_namespace().unwrap();
+        objects.insert_host_in(ns, 1_u32).unwrap();
+        let original = objects.insert_host(2_u32);
+        let duplicate = objects.duplicate(original).unwrap();
+        assert_eq!(objects.kernel_objects().count(), 1);
+        objects.close(original);
+        assert_eq!(objects.kernel_objects().count(), 1);
+        objects.close(duplicate);
+        assert_eq!(objects.kernel_objects().count(), 0);
+        assert_eq!(objects.object_count(), 1);
+    }
 
     #[test]
     fn kernel_alias_flags_are_independent_masked_and_removed_with_the_alias() {

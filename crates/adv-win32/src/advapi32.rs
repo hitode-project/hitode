@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 mod groups;
 mod identity;
+mod scm;
 pub(crate) mod token;
 
 mod legacy;
@@ -436,6 +437,7 @@ pub fn register(reg: &mut Registry) {
     legacy::register(reg);
     groups::register(reg);
     identity::register(reg);
+    scm::register(reg);
     token::register(reg);
     for (name, argc, handler) in [
         (

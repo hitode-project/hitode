@@ -3,6 +3,7 @@
 pub(super) mod context;
 mod mapping;
 pub(super) mod phase;
+mod system_service;
 pub(crate) use phase::uncaught_query_blocker;
 
 use adv_abi::{GuestPtr, Registry, win32};
@@ -171,6 +172,27 @@ pub(super) fn raise(
 }
 
 fn cpu_exception(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) -> Outcome {
+    if let Exception::Trap { vector: 0x2e, pc } = &event {
+        if *pc != checkpoint.state.eip {
+            return Outcome::Fail(
+                "native system-service PC disagrees with captured x86 EIP".into(),
+            );
+        }
+        if let Err(reason) = mapping::raw_int2e_address(env.cpu, *pc) {
+            adv_abi::warn_unavailable(env, "Win32 exception mapping", &reason);
+            return Outcome::Fail(reason);
+        }
+        // This native x86 OS profile publishes an empty numeric directory. Keep
+        // the retired PC and every other register; never dereference EDX or
+        // borrow a host thunk token to guess a service implementation.
+        adv_abi::warn_unavailable(
+            env,
+            "native x86 INT 2E",
+            "direct-service numeric directory has no registered services in the native x86 guest profile",
+        );
+        checkpoint.state.regs[0] = system_service::failure(checkpoint.state.regs[0]);
+        return Outcome::ResumeExecution(checkpoint);
+    }
     let record = match mapping::map(env.cpu, &event, &checkpoint.state) {
         Ok(record) => record,
         Err(reason) => {

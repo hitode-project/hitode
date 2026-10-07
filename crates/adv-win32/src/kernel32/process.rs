@@ -32,25 +32,50 @@ fn terminate_process(env: &mut Env<'_>) -> Outcome {
         Ok(identity) => identity,
         Err(error) => return api_error(env, error, 0),
     };
-    if identity.completion.exit_code().is_some() {
+    if identity.completion.exit_code().is_some()
+        || (identity.pid != env.sys.pid && identity.completion.exit_status().is_some())
+    {
         return api_error(
             env,
             processes::Error::new(err::ACCESS_DENIED, "process has exited"),
             0,
         );
     }
-    if identity.pid == env.sys.pid {
+    terminate_process_owner(env, identity.pid, code, |env, result| {
+        api_result(env, result, 0)
+    })
+}
+
+pub(crate) fn terminate_process_owner(
+    env: &mut Env<'_>,
+    pid: u32,
+    code: u32,
+    complete: impl FnOnce(&mut Env<'_>, Result<u32, processes::Error>) -> Outcome + 'static,
+) -> Outcome {
+    if pid == env.sys.pid {
         return Outcome::ExitProcess(code);
     }
     processes::visit(
         env,
-        identity.pid,
+        pid,
         None,
         move |target| {
+            if target
+                .sys
+                .process_identity
+                .completion
+                .exit_status()
+                .is_some()
+            {
+                return Err(processes::Error::new(
+                    err::ACCESS_DENIED,
+                    "process has begun termination",
+                ));
+            }
             target.sys.terminate_process_stopped(code);
             Ok(1)
         },
-        |env, result| api_result(env, result, 0),
+        complete,
     )
 }
 
@@ -108,7 +133,7 @@ fn get_exit_code_process(env: &mut Env<'_>) -> Outcome {
     write_exit_code(
         env,
         env.arg(1),
-        identity.completion.exit_code().unwrap_or(259),
+        identity.completion.exit_status().unwrap_or(259),
     )
 }
 
@@ -146,6 +171,9 @@ fn thread_target(
         }) => {
             let permitted = if access == 0x40 {
                 granted & (0x40 | 0x800) != 0
+            } else if access == 0x1000 {
+                // THREAD_RESUME permits resuming without granting suspension.
+                granted & (2 | 0x1000) != 0
             } else {
                 granted & access == access
             };
@@ -621,7 +649,7 @@ fn change_suspend_front(
     {
         return Outcome::Return(0xc0000005);
     }
-    let identity = match thread_target(env, handle, 2) {
+    let identity = match thread_target(env, handle, if suspend { 2 } else { 0x1000 }) {
         Ok(identity) => identity,
         Err(error) => return suspend_error(env, error, native),
     };
