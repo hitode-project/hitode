@@ -78,7 +78,11 @@ fn memicmp(env: &mut Env<'_>, left: GuestPtr<u8>, right: GuestPtr<u8>, count: u3
         return Outcome::Fail("CRT memory comparison locale is unavailable".into());
     };
     match compare(env, left.addr(), right.addr(), count, Some(&lowercase)) {
-        Ok(difference) => Outcome::Return(difference as u32),
+        Ok(difference) => Outcome::Return(if super::locale::formatting_codepage(env) == 0 {
+            difference.signum() as u32
+        } else {
+            difference as u32
+        }),
         Err(error) => memory_failure(error),
     }
 }
