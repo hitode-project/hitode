@@ -1,7 +1,7 @@
 //! DrawDib aliases borrow the ordinary object table and the existing DIB raster.
 #![allow(clippy::too_many_arguments)] // Fixed SDK signature.
 use adv_abi::{GuestPtr, Handle, Registry, win32};
-use adv_cpu::backend::{GuestExt, Prot};
+use adv_cpu::backend::Prot;
 use adv_machine::{Env, Namespace, Outcome};
 
 use crate::{Win32, gdi32::raster::front, util::set_last_error};
