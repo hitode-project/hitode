@@ -12,6 +12,7 @@ const GUEST_PAGE_SIZE: usize = 4096;
 mod direct;
 #[cfg(unix)]
 pub use direct::DirectFaultView;
+#[cfg(unix)]
 pub use direct::{FaultClassification, GuestAccess, GuestPageProtection};
 
 #[cfg(windows)]

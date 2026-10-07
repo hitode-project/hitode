@@ -4,9 +4,11 @@
 //! stop all users before changing mappings. This owner is deliberately not Sync.
 //! Guest x86 code bytes are data here, never host-executable memory. Shared/file
 //! mappings and executor invalidation are separate contracts, not enabled here.
+#[cfg(any(unix, test))]
 use crate::memory::{EXEC, READ, WRITE};
 
 /// Guest access attempted by a registered native access site.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestAccess {
     Read,
@@ -15,12 +17,14 @@ pub enum GuestAccess {
 }
 
 /// Guest permission bits and an independently maintained code-write barrier.
+#[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestPageProtection {
     permissions: u8,
     code_write_protected: bool,
 }
 
+#[cfg(any(unix, test))]
 impl GuestPageProtection {
     pub const NONE: Self = Self {
         permissions: 0,
@@ -52,6 +56,8 @@ impl GuestPageProtection {
         self.code_write_protected
     }
 
+    // Only the unix fault classifier consults permissions.
+    #[cfg(unix)]
     fn allows(self, access: GuestAccess) -> bool {
         let bit = match access {
             GuestAccess::Read => READ,
@@ -64,6 +70,7 @@ impl GuestPageProtection {
 
 /// Classification only; no signal installation, guest exception dispatch, or
 /// retry is implied. A code barrier is reported only for a guest-permitted write.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultClassification {
     OutsideGuest,
@@ -112,6 +119,8 @@ impl NativeProtection {
         }
     }
 
+    // Only the unix fault classifier consults permissions.
+    #[cfg(unix)]
     fn allows(self, access: GuestAccess) -> bool {
         match access {
             GuestAccess::Read => self != Self::None,
