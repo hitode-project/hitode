@@ -1,5 +1,5 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
-use adv_abi::{GuestPtr, Registry, win32};
+use adv_abi::{GuestPtr, Registry, guest::check_range, win32};
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
 use adv_machine::{Conv, Env, Machine, Objects, Outcome};
@@ -16,6 +16,11 @@ const UNSUPPORTED: u32 = 0x80004001;
 const NO_INTERFACE: u32 = 0x80004002;
 const OUT_OF_MEMORY: u32 = 0x8007000e;
 const INVALID_CALL: u32 = 0x88780032;
+const CONTROL_UNAVAILABLE: u32 = 0x8878001e;
+const OBJECT_NOT_FOUND: u32 = 0x88781161;
+const CLASS_NOT_REGISTERED: u32 = 0x80040154;
+const CTRL_FX: u32 = 0x200;
+const MAX_FX_DESCRIPTORS: u32 = 64;
 const DEVICE: &[(&str, u8)] = &[
     ("QueryInterface", 3),
     ("AddRef", 1),
@@ -595,6 +600,100 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
     }
     Ok(Some(ptr))
 }
+/// The shared buffer always owns an empty effects chain. Nonempty requests fail
+/// without publishing an effect object or discarding a requested DSP as success.
+fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, String> {
+    let args: [u32; 5] = std::array::from_fn(|i| e.arg(i as u32));
+    let com = e.ext.get::<Sound>().com;
+    let Some(buffer) = com
+        .get::<Object>(&e.sys.objects, pointer)
+        .and_then(|object| object.buffer.as_ref())
+    else {
+        return Ok(INVALID);
+    };
+    let (flags, len, format) = (buffer.flags, buffer.len, buffer.format);
+    if flags & CTRL_FX == 0 {
+        return Ok(CONTROL_UNAVAILABLE);
+    }
+    if name == "GetObjectInPath" {
+        if args[1] == 0 || args[3] == 0 || args[4] == 0 {
+            return Ok(INVALID);
+        }
+        for address in [args[1], args[3]] {
+            check_range(e.cpu, address, 16, Prot::READ).map_err(|error| error.to_string())?;
+        }
+        check_range(e.cpu, args[4], 4, Prot::WRITE).map_err(|error| error.to_string())?;
+        // The native empty-chain failure preserves *ppObject, including a
+        // caller's sentinel. No interface reference or COM header is allocated.
+        return Ok(OBJECT_NOT_FOUND);
+    }
+    let playing = buffer.playing
+        && (buffer.looping
+            || buffer.len == 0
+            || buffer.progress(e.sys.clock.now_us()) < u64::from(buffer.len));
+    if playing || buffer.lock.is_some() {
+        return Ok(INVALID_CALL);
+    }
+    let count = args[1];
+    if count == 0 {
+        // No DSP, interface, array or per-effect allocation exists to retire.
+        return Ok(0);
+    }
+    let api = "dsound.dll!IDirectSoundBuffer8::SetFX";
+    if count > MAX_FX_DESCRIPTORS {
+        adv_abi::warn_unavailable(
+            e,
+            api,
+            "effect descriptor count exceeds the bounded 64-effect profile; no chain was changed",
+        );
+        return Ok(UNSUPPORTED);
+    }
+    if args[2] == 0 {
+        return Ok(INVALID);
+    }
+    check_range(e.cpu, args[2], count * 32, Prot::READ).map_err(|error| error.to_string())?;
+    if args[3] != 0 {
+        check_range(e.cpu, args[3], count * 4, Prot::WRITE).map_err(|error| error.to_string())?;
+    }
+    let mut registered_class = false;
+    for index in 0..count {
+        let mut descriptor = [0; 32];
+        e.cpu
+            .read(args[2] + index * 32, &mut descriptor)
+            .map_err(|error| error.to_string())?;
+        let word = |offset| u32::from_le_bytes(descriptor[offset..offset + 4].try_into().unwrap());
+        if word(0) != 32 || word(4) & !3 != 0 || word(4) == 3 || word(24) != 0 || word(28) != 0 {
+            return Ok(INVALID);
+        }
+        let class: [u8; 16] = descriptor[8..24].try_into().unwrap();
+        registered_class |= e
+            .ext
+            .try_get::<adv_os::com::ClassFactories>()
+            .is_some_and(|factories| factories.get(&class).is_some());
+    }
+    if args[3] != 0 {
+        for index in 0..count {
+            e.cpu
+                .write_u32(args[3] + index * 4, 5)
+                .map_err(|error| error.to_string())?; // DSFXR_UNKNOWN
+        }
+    }
+    let hr = if registered_class {
+        UNSUPPORTED
+    } else {
+        CLASS_NOT_REGISTERED
+    };
+    adv_abi::warn_unavailable(
+        e,
+        api,
+        &format!(
+            "nonempty effect DSP is unavailable; chain remains empty: count={count}, flags=0x{flags:08x}, bytes={len}, PCM rate={}, channels={}, bits={}, HRESULT=0x{hr:08x}",
+            format.rate, format.channels, format.bits,
+        ),
+    );
+    Ok(hr)
+}
+
 fn result(e: &mut Env<'_>) -> Result<u32, String> {
     e.ext.get::<Sound>().audio.sync_clock(e.sys.clock.now_us());
     let full = e.sys.thunks.get(e.thunk).name.clone();
@@ -663,7 +762,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             e,
             Kind::Device {
                 initialized: true,
-                version8: true,
+                version8: name == "DirectSoundCreate8",
             },
             false,
         )?
@@ -727,13 +826,21 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 if e.arg(3) != 0 {
                     return Ok(0x80040110);
                 }
-                e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                check_range(e.cpu, b, 4, Prot::READ).map_err(|error| error.to_string())?;
                 let size = e.cpu.read_u32(b).map_err(|e| e.to_string())?;
                 if !matches!(size, 20 | 36) {
+                    e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
                     return Ok(INVALID);
                 }
+                check_range(e.cpu, b, size, Prot::READ).map_err(|error| error.to_string())?;
                 let flags = e.cpu.read_u32(b + 4).map_err(|e| e.to_string())?;
-                // This device implements software PCM, without 3D, hardware voices or FX.
+                let fx = flags & CTRL_FX != 0;
+                check_range(e.cpu, c, 4, Prot::WRITE).map_err(|error| error.to_string())?;
+                if !fx {
+                    e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                }
+                // Software PCM supports an empty FX chain, without 3D,
+                // hardware voices or effect-DSP constructors.
                 let unsupported = flags
                     & !(0x1
                         | 0x2
@@ -742,6 +849,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         | 0x40
                         | 0x80
                         | 0x100
+                        | CTRL_FX
                         | 0x4000
                         | 0x8000
                         | 0x10000
@@ -751,7 +859,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         e,
                         &format!("dsound.dll!{full}"),
                         &format!(
-                            "software PCM buffer flags are unsupported: flags=0x{flags:08x}, unsupported_mask=0x{unsupported:08x}; 3D, hardware voices and FX are unavailable (HRESULT=0x80004001)"
+                            "software PCM buffer flags are unsupported: flags=0x{flags:08x}, unsupported_mask=0x{unsupported:08x}; 3D and hardware voices are unavailable (HRESULT=0x80004001)"
                         ),
                     );
                     return Ok(UNSUPPORTED);
@@ -759,6 +867,12 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 let len = e.cpu.read_u32(b + 8).map_err(|e| e.to_string())?;
                 let fp = e.cpu.read_u32(b + 16).map_err(|e| e.to_string())?;
                 let primary = flags & 1 != 0;
+                if fx && (!version8 || primary) {
+                    return Ok(if !version8 { 0x887800be } else { INVALID });
+                }
+                if fx {
+                    check_range(e.cpu, fp, 16, Prot::READ).map_err(|error| error.to_string())?;
+                }
                 let format = if primary && fp == 0 {
                     Format::default()
                 } else {
@@ -772,6 +886,30 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     || (primary && len != 0)
                 {
                     return Ok(INVALID);
+                }
+                if fx {
+                    if e.cpu.read_u32(fp + 8).map_err(|error| error.to_string())?
+                        != format.rate * format.align()
+                    {
+                        return Ok(0x88780064); // DSERR_BADFORMAT, no publication.
+                    }
+                    if format.bits != 16 {
+                        adv_abi::warn_unavailable(
+                            e,
+                            &format!("dsound.dll!{full}"),
+                            &format!(
+                                "CTRLFX empty-chain profile requires 16-bit PCM: flags=0x{flags:08x}, bytes={len}, rate={}, channels={}, bits={} (HRESULT=0x80004001)",
+                                format.rate, format.channels, format.bits,
+                            ),
+                        );
+                        return Ok(UNSUPPORTED);
+                    }
+                    if u64::from(len) * 1000
+                        < u64::from(format.rate) * u64::from(format.align()) * 150
+                    {
+                        return Ok(0x887800b4); // DSERR_BUFFERTOOSMALL; preserve output.
+                    }
+                    e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
                 }
                 let audio_id = e.ext.get::<Sound>().next_audio_id;
                 let Some(next_audio_id) = audio_id.checked_add(1) else {
@@ -919,8 +1057,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     ),
                     None => return Ok(INVALID),
                 };
-                if orig_flags & 1 != 0 {
-                    // Cannot duplicate primary buffer
+                if orig_flags & (1 | CTRL_FX) != 0 {
+                    // Cannot duplicate primary or effects-capable buffers.
                     return Ok(INVALID_CALL);
                 }
                 let Some(sample_storage) = orig_storage else {
@@ -1062,6 +1200,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             );
         }
         return Ok(0);
+    }
+    if matches!(name, "SetFX" | "GetObjectInPath") {
+        return empty_fx(e, a, name);
     }
     let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
     let s = e.ext.get_mut::<Sound>();
@@ -1572,6 +1713,7 @@ mod tests {
     use adv_cpu::JitCpu;
     use adv_cpu::backend::Reg;
     use adv_machine::{Clock, Object as WaitObject};
+    mod empty_fx;
     const DATA: u32 = 0x500000;
     const STACK: u32 = 0x600000;
 
