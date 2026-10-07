@@ -3,6 +3,8 @@ gdi32.dll	EnableEUDC	stdcall	i32	Windows.Win32.Foundation.BOOL	fEnableEUDC:Windo
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
 msvfw32.dll	DrawDibOpen	stdcall	handle	Windows.Win32.Foundation.HANDLE	
+msvfw32.dll	DrawDibClose	stdcall	i32	Windows.Win32.Foundation.BOOL	hdd:Windows.Win32.Foundation.HANDLE:handle:1
+msvfw32.dll	DrawDibDraw	stdcall	i32	Windows.Win32.Foundation.BOOL	hdd:Windows.Win32.Foundation.HANDLE:handle:1|hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1|xDst:i32:i32:1|yDst:i32:i32:1|dxDst:i32:i32:1|dyDst:i32:i32:1|lpbi:Windows.Win32.Graphics.Gdi.BITMAPINFOHEADER*:ptr:1|lpBits:void*:ptr:1|xSrc:i32:i32:1|ySrc:i32:i32:1|dxSrc:i32:i32:1|dySrc:i32:i32:1|wFlags:u32:u32:1
 d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXMatrixTranspose	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM:D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXMatrixScaling	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|sx:FLOAT:f32:1|sy:FLOAT:f32:1|sz:FLOAT:f32:1
