@@ -197,8 +197,17 @@ fn win32_only_install_does_not_register_or_seed_crt_exports() {
         ),
     )
     .unwrap();
-    assert!(machine.ext.get::<Win32>().statics.is_empty());
+    // Win32 owns the Unicode command line and PEB parameters even without CRT.
+    // Installing that infrastructure must not eagerly seed the ANSI CRT string.
+    let statics = &machine.ext.get::<Win32>().statics;
+    assert!(statics.contains_key("cmdline_w"));
+    assert!(!statics.contains_key("cmdline_a"));
     let registry = machine.sys.thunks.resolver_mut::<Registry>().unwrap();
-    assert!(!registry.is_implemented("msvcrt.dll", "_acmdln"));
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+        for name in ["_acmdln", "_wcmdln"] {
+            assert!(!registry.is_implemented(module, name));
+            assert!(registry.data(module, name).is_none());
+        }
+    }
     assert!(!registry.is_implemented("msvcrt.dll", "_adjust_fdiv"));
 }

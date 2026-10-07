@@ -738,9 +738,16 @@ fn granted_event_has_one_wake_turn_then_the_normal_peer_runs() {
         a.call(normal);
     });
     m.spawn("receiver", CODE, &[], 65536).unwrap();
+    prepare(&mut m);
+    // Establish the wait before publishing the signaler. Native compilation can
+    // consume a quantum before the receiver reaches its first host call.
+    assert!(matches!(
+        step(&mut m),
+        SliceResult::Complete(RunResult::Idle { .. })
+    ));
+    assert_eq!(m.sys.context(0).state_name(), "Blocked");
     m.spawn("signaler", PROC, &[], 65536).unwrap();
     m.spawn("normal peer", PROC + 32, &[], 65536).unwrap();
-    prepare(&mut m);
     let started = Instant::now();
     loop {
         assert!(started.elapsed() < Duration::from_secs(3));

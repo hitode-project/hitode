@@ -143,6 +143,7 @@ fn clipped_and_overlapping_gdi_blits_preserve_pixels() {
         let mut f = fixture(false, 64, 32, bottom_up);
         f.run().unwrap();
         let dc = u32_at(&f.machine, DC_OUT);
+        let screen_dc = u32_at(&f.machine, DATA + 0x220);
         let pixels = u32_at(&f.machine, DATA + 0x200);
         let mut expected = f.read(pixels, 64 * 32 * 4);
         let original = expected.clone();
@@ -170,7 +171,7 @@ fn clipped_and_overlapping_gdi_blits_preserve_pixels() {
             invoke(
                 &mut f,
                 api::BITBLT,
-                &[1, (-2i32) as u32, 0, 6, 2, dc, 0, 0, 0x00cc0020]
+                &[screen_dc, (-2i32) as u32, 0, 6, 2, dc, 0, 0, 0x00cc0020]
             ),
             1
         );

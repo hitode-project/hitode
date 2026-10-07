@@ -49,6 +49,8 @@ fn failed_dynamic_query_and_error_message_are_reported_without_tracing() {
         let report_path = directory.join(format!("discovery-{backend}.json"));
         let output = Command::new(env!("CARGO_BIN_EXE_adv-run"))
             .arg(directory.join("fixture_discovery.exe"))
+            // MessageBox is modal; headless automation must choose its policy.
+            .args(["--auto-dialog-ms", "0"])
             .args([
                 "--headless",
                 "--backend",

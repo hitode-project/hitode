@@ -394,6 +394,8 @@ fn a_hook_for_another_guest_thread_runs_there_and_is_removed_on_thread_exit() {
     t.callbacks();
     let worker_address = CODE + 0x2800;
     let mut worker = Asm::new(worker_address);
+    // A remote post requires the target to have created its USER queue.
+    t.retrieve(&mut worker, false, false, MESSAGE, RESULT);
     t.call(&mut worker, "Sleep", &[Arg::I(1)]);
     t.retrieve(&mut worker, false, true, MESSAGE, RESULT);
     t.call(&mut worker, "ExitThread", &[Arg::I(7)]);

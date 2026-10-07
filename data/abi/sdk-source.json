@@ -383,5 +383,15 @@
     "source": "Microsoft ntifs.h ZwQueryVirtualMemory declaration and existing scoped Nt signature",
     "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-zwqueryvirtualmemory",
     "verification_boundary": "Authored host WoW64 probes are a comparison reference; user output marshaling differences do not define the virtual native x86 pointer contract."
+  },
+  "legacy_d3dx_surface_save": {
+    "source": "Microsoft Learn D3dx9tex.h declarations",
+    "scope": "D3DXSaveSurfaceToFileInMemory and D3DXSaveSurfaceToFileW only",
+    "target": "x86 WINAPI stdcall, HRESULT return, five stack words; signed image format enum and pointer arguments, Unicode filename for the W export",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxsavesurfacetofileinmemory",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxsavesurfacetofile"
+    ],
+    "verification": "Runtime signature audit and repository-authored D3DX surface save fixtures"
   }
 }

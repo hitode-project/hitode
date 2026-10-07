@@ -34,5 +34,14 @@
     "header_sha256": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9",
     "scope": "ID3DXMatrixStack 18 x86 slots including IUnknown; slot17 GetTop returns D3DXMATRIX*; pointers, ULONG, HRESULT and FLOAT are one stack word",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxmatrixstack"
+  },
+  "legacy_d3dx_buffer": {
+    "source": "Microsoft Learn ID3DXBuffer and IUnknown declarations",
+    "scope": "Five x86 stdcall slots including inherited IUnknown; GetBufferPointer returns LPVOID and GetBufferSize returns DWORD",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxbuffer",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxbuffer--getbufferpointer",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxbuffer--getbuffersize"
+    ]
   }
 }
