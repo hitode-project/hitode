@@ -60,7 +60,20 @@ fn execute(op: &NativeX87, state: &mut CpuState, memory: &mut Memory) -> u32 {
         .fast
         .and_then(|fast| fast::execute(op, fast, state, memory))
     {
-        Some(X87_DONE) => 0,
+        Some(X87_DONE) => {
+            // Match Tier 1 store even when selective invalidation skips an
+            // executable page that has no watched code yet. FDP was committed
+            // by this successful store, so it is the checked effective address.
+            if let Some(fast::Fast::Store { width, .. }) = op.fast {
+                let at = state.x87.dp;
+                u32::from(
+                    memory.executable(at, 1)
+                        || memory.executable(at.wrapping_add(u32::from(width) - 1), 1),
+                )
+            } else {
+                0
+            }
+        }
         Some(_) => 1,
         None => 2,
     }

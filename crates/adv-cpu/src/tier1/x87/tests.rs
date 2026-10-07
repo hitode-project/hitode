@@ -162,12 +162,16 @@ fn x87_cross_page_refusal_and_executable_store_follow_checked_exit_protocol() {
         assert_eq!(state, before);
         assert_eq!(memory.read_data(DATA + 4094, 2).unwrap().as_ref(), prefix);
     }
-    let (ops, mut memory, mut state) = fixture(|a| a.fstp(qword_ptr(esi)));
-    memory.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
-    memory.watch_code(DATA, 8);
-    let top = state.x87.top();
-    assert_eq!(execute(&ops.0[0], &mut state, &mut memory), 1);
-    assert_eq!(state.x87.top(), (top + 1) & 7);
+    for watched in [false, true] {
+        let (ops, mut memory, mut state) = fixture(|a| a.fstp(qword_ptr(esi)));
+        memory.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
+        if watched {
+            memory.watch_code(DATA, 8);
+        }
+        let top = state.x87.top();
+        assert_eq!(execute(&ops.0[0], &mut state, &mut memory), 1);
+        assert_eq!(state.x87.top(), (top + 1) & 7);
+    }
 }
 
 #[test]
