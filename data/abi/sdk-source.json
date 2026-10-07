@@ -359,5 +359,17 @@
       "https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaplock"
     ],
     "native_verification": "Authored x86 heap-lock fixture checks valid BOOLEAN return, recursion, native/Win32 interop, serialized allocation waiting and NO_SERIALIZE behavior."
+  },
+  "nt_terminate_process": {
+    "scope": "NtTerminateProcess and ZwTerminateProcess; two x86 words, HANDLE and signed NTSTATUS, NTSTATUS return",
+    "source": "Microsoft ntddk declaration, SDK 10.0.26100.0 x86 ntdll.lib @8 symbols and authored Windows x86 caller",
+    "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-zwterminateprocess",
+    "native_verification": "55 DWORDs: invalid/type-mismatched/restricted handles, real remote termination and repeated status, own real/pseudo handle nonreturn, NULL returns while terminating peers and reporting a latched exit status without signaling process completion, subsequent final exit retains the first code, LastError preserved The last thread retains its own later exit code independently of the latched process status."
+  },
+  "nt_thread_open": {
+    "scope": "NtOpenThread and ZwOpenThread; four x86 words: PHANDLE, ACCESS_MASK, OBJECT_ATTRIBUTES pointer and CLIENT_ID pointer; signed NTSTATUS",
+    "source": "Microsoft NtOpenThread declaration, SDK x86 object/client layout and ntdll.lib @16 symbols, authored native x86 oracle",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/devnotes/ntopenthread",
+    "native_verification": "158 scalar outcomes: actual current, suspended-child and still-referenced exited thread ownership; CID and object attributes, rights/generic mapping, output validation/clearing, inherited flag, invalid handles, Resume versus Suspend access and unchanged NT LastError"
   }
 }
