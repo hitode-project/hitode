@@ -345,7 +345,7 @@ public static class AbiMetadata
             bool ntProcedure = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "LdrGetProcedureAddress"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "DllHandle:void*:ptr:1|ProcedureName:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|ProcedureNumber:u32:u32:1|ProcedureAddress:void**:ptr:1";
-            bool ntThreadContext = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "NtGetContextThread"
+            bool ntThreadContext = f.Length == 6 && f[0] == "ntdll.dll" && new[] { "NtGetContextThread", "NtSetContextThread" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|ThreadContext:CONTEXT*:ptr:1";
             bool ntAllocation = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "NtAllocateVirtualMemory"

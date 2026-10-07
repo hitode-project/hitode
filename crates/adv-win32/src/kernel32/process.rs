@@ -644,17 +644,37 @@ pub(crate) fn native_thread_context(
     pointer: u32,
     set: bool,
 ) -> Outcome {
-    thread_context_front(env, handle, pointer, set, ContextFront::Native)
+    thread_context_front(
+        env,
+        handle,
+        pointer,
+        set,
+        ContextFront::Native(if set {
+            "ntdll.dll!NtSetContextThread"
+        } else {
+            "ntdll.dll!NtGetContextThread"
+        }),
+    )
 }
 
 #[derive(Clone, Copy)]
 enum ContextFront {
     Win32,
-    Native,
+    Native(&'static str),
 }
 impl ContextFront {
+    fn api(self) -> &'static str {
+        match self {
+            Self::Native(api) => api,
+            Self::Win32 => "kernel32.dll!GetThreadContext",
+        }
+    }
     fn success(self) -> Outcome {
-        Outcome::Return(if matches!(self, Self::Native) { 0 } else { 1 })
+        Outcome::Return(if matches!(self, Self::Native(_)) {
+            0
+        } else {
+            1
+        })
     }
     fn error(self, env: &mut Env<'_>, error: processes::Error) -> Outcome {
         if matches!(self, Self::Win32) {
@@ -667,7 +687,7 @@ impl ContextFront {
             87 => 0xc000000d,
             998 => 0xc0000005,
             50 => {
-                adv_abi::warn_unavailable(env, "ntdll.dll!NtGetContextThread", &error.message);
+                adv_abi::warn_unavailable(env, self.api(), &error.message);
                 0xc00000bb
             }
             _ => 0xc0000001,
@@ -717,8 +737,8 @@ fn thread_context_front(
         return front.error(env, processes::Error::new(998, "unreadable thread CONTEXT"));
     }
     if let Err(error) = thread_context::flags(&bytes) {
-        if matches!(front, ContextFront::Native) {
-            adv_abi::warn_unavailable(env, "ntdll.dll!NtGetContextThread", &error.message);
+        if matches!(front, ContextFront::Native(_)) {
+            adv_abi::warn_unavailable(env, front.api(), &error.message);
             return Outcome::Return(0xc00000bb);
         }
         return front.error(env, error);

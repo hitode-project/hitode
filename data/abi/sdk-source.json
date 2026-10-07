@@ -256,5 +256,11 @@
     "source": "phnt ntmmapi.h primary declaration and authored Microsoft Windows x86 oracle",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
     "native_verification": "18 DWORDs: arbitrary/invalid/restricted handles and ranges accepted by native x86, unchanged LastError; authored routine executes 17, is patched through NtWriteVirtualMemory, then executes 29 on interpreter/JIT after flush. No game code or host protection patch is used."
+  },
+  "nt_set_context_thread": {
+    "scope": "NtSetContextThread, HANDLE and x86 CONTEXT pointer; two stack words and signed NTSTATUS, same stopped-process architecture owner as Win32/NT get",
+    "source": "phnt ntpsapi.h primary declaration and authored Microsoft Windows x86 caller",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
+    "native_verification": "30 DWORDs: actual suspended child, native get/set register changes read back by both NT and Win32, unrequested groups, restricted/closed handles and inaccessible pointer, unchanged LastError, original context restored and child exits 37"
   }
 }

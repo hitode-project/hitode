@@ -143,13 +143,17 @@ impl Compiled {
                 stack as *mut _
             });
         let (slots, mask) = controls.links.map_or((std::ptr::null(), 0), Table::parts);
+        // Helpers may promote file pages before this chain returns. Keep one
+        // immutable metadata snapshot; raw Memory permissions remain free to
+        // change without cloning a megabyte on each first-touch promotion.
+        let permissions = memory.fast.snapshot(&memory.perms);
         let mut context = NativeContext {
             state,
             rows: controls
                 .rows
                 .map_or(std::ptr::null(), |pool| pool as *const _),
             written: 0,
-            perms: memory.perms.as_ptr(),
+            perms: permissions.as_ptr(),
             bridge: (bridge as *mut crate::trap::Bridge<'_>).cast(),
             interrupt: controls.interrupt,
             slots,
@@ -992,6 +996,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .collect(),
             None => instructions.values().collect(),
         };
+        let write_summary = write_summary::Summary::for_region(&instructions);
+        // CpuState stays canonical at every region boundary. A pure region
+        // cannot change unreferenced GPRs, so do not load them or keep them
+        // alive through its fault guards. Include write-only GPRs: a budget
+        // exit or fault may precede their first write, including side entries.
+        let footprint = write_summary.filter(|_| {
+            opt_level == "speed" && kernel.is_none() && !snapshot.parallel && nests.is_empty()
+        });
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        let footprint = footprint.filter(|_| !snapshot.native_fault_reads);
         let mut b = FunctionBuilder::new(func, fb_ctx);
         let prologue = b.create_block();
         b.append_block_params_for_function_params(prologue);
@@ -1130,6 +1144,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         };
         let fuel = b.declare_var(types::I64);
         for (i, reg) in regs.iter().enumerate() {
+            if footprint.is_some_and(|summary| summary.gpr_used & (1 << i) == 0) {
+                b.def_var(*reg, zero);
+                continue;
+            }
             let v = b
                 .ins()
                 .load(types::I32, MemFlags::trusted(), state, (i * 4) as i32);
@@ -1220,7 +1238,6 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         if shadow_ref.is_some() {
             b.append_block_param(hot_dispatch, ptr_ty);
         }
-        let write_summary = write_summary::Summary::for_region(&instructions);
         let hot_exits = kernel.is_none()
             && write_summary.is_some()
             && write_summary::crosses_regions(&instructions);
@@ -1250,6 +1267,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         });
         let mut e = Emitter {
             b,
+            optimizing: opt_level == "speed",
             row_hooks,
             nest_ref,
             written,
@@ -1283,11 +1301,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             coverage: coverage.clone(),
             range_ok_ref,
             site: None,
-            unchanged: 0,
+            unchanged: footprint.map_or(0, |summary| !summary.gpr),
             frames: BTreeMap::new(),
             kernel: None,
             dispatch,
             shared_exit,
+            flag_exits: BTreeMap::new(),
             pc: region.start,
             return_hint,
             local_return_hint,
@@ -1517,31 +1536,44 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         switch.emit(&mut e.b, target, outside);
         e.b.switch_to_block(outside);
         e.exit_predicted(Exit::Dispatch, target, prediction);
-        // SSA variables merge each predecessor's state here. Keep one writeback
-        // and one lazy-flags materialization instead of duplicating them at every
-        // memory/budget guard. Fault addresses are still stored at the fault site.
-        e.b.switch_to_block(shared_exit);
-        e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
-        // Every predecessor has materialized its own MMX prefix. The last
-        // emitted guest block's compile-time recipe does not describe this merge.
-        e.mmx_effects = None;
-        let reason = e.b.block_params(shared_exit)[0];
-        let pc = e.b.block_params(shared_exit)[1];
-        e.save_state(pc);
-        if let Some(written) = e.written {
-            let value = e.b.use_var(written);
-            e.b.ins().store(
-                MemFlags::trusted(),
-                value,
-                e.context,
-                offset_of!(NativeContext, written) as i32,
-            );
-        }
-        if hot_exits || kernel.is_some() {
-            e.b.ins().return_(&[reason]);
-        } else {
-            let prediction = shadow_ref.map(|_| e.b.block_params(shared_exit)[2]);
-            e.chain_or_return(pc, None, Some(reason), prediction);
+        // Merge only compatible flag recipes at specialized cold exits. A
+        // single generic merge makes kind/width and unused operands live on
+        // every predecessor. Limit duplication and retain the generic exit for
+        // dynamic recipes, including kernel fuel settlement.
+        let flag_exits = std::mem::take(&mut e.flag_exits);
+        for (recipe, block) in flag_exits
+            .into_iter()
+            .map(|(recipe, block)| (Some(recipe), block))
+            .chain(std::iter::once((None, shared_exit)))
+        {
+            e.b.switch_to_block(block);
+            e.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Exit));
+            // Each predecessor already committed its own deferred MMX prefix.
+            e.mmx_effects = None;
+            if let Some((kind, carry_kind)) = recipe {
+                let kind = e.constant(kind);
+                let carry_kind = e.constant(carry_kind);
+                e.b.def_var(e.lazy[3], kind);
+                e.b.def_var(e.lazy[6], carry_kind);
+            }
+            let reason = e.b.block_params(block)[0];
+            let pc = e.b.block_params(block)[1];
+            e.save_state(pc);
+            if let Some(written) = e.written {
+                let value = e.b.use_var(written);
+                e.b.ins().store(
+                    MemFlags::trusted(),
+                    value,
+                    e.context,
+                    offset_of!(NativeContext, written) as i32,
+                );
+            }
+            if hot_exits || kernel.is_some() {
+                e.b.ins().return_(&[reason]);
+            } else {
+                let prediction = shadow_ref.map(|_| e.b.block_params(block)[2]);
+                e.chain_or_return(pc, None, Some(reason), prediction);
+            }
         }
         // Normal transfers do not merge with fault/budget prefixes. Bound the
         // number of constant-target footers, sharing all remaining destinations.
@@ -2496,8 +2528,8 @@ struct Emitter<'a> {
     /// The current instruction's operand address and size once a kernel
     /// validated its windows (`precheck`).
     site: Option<(u32, Value, u32)>,
-    /// In a kernel, the registers its loop never writes: `CpuState` already
-    /// holds them at every exit.
+    /// Registers this body never writes: CpuState already holds their exact
+    /// values at every exit. Includes the invariant registers of a kernel.
     unchanged: u8,
     /// In a kernel, the host address of each unchanged base register.
     frames: BTreeMap<usize, Variable>,
@@ -2506,6 +2538,9 @@ struct Emitter<'a> {
     kernel: Option<(usize, Variable, ir::StackSlot)>,
     dispatch: ir::Block,
     shared_exit: ir::Block,
+    flag_exits: BTreeMap<(u32, u32), ir::Block>,
+    /// Additional guarded paths pay off after the optimizing tier folds them.
+    optimizing: bool,
     pc: u32,
     return_hint: Option<u32>,
     local_return_hint: Option<u32>,
@@ -2895,17 +2930,41 @@ impl Emitter<'_> {
             return;
         }
         let reason = self.constant(reason as u32);
+        let block = self.flag_exit();
         if self.shadow_ref.is_some() {
             let prediction = prediction.unwrap_or_else(|| self.b.ins().iconst(self.ptr_ty, 0));
-            self.b.ins().jump(
-                self.shared_exit,
-                &[reason.into(), pc.into(), prediction.into()],
-            );
-        } else {
             self.b
                 .ins()
-                .jump(self.shared_exit, &[reason.into(), pc.into()]);
+                .jump(block, &[reason.into(), pc.into(), prediction.into()]);
+        } else {
+            self.b.ins().jump(block, &[reason.into(), pc.into()]);
         }
+    }
+    fn flag_exit(&mut self) -> ir::Block {
+        if !self.optimizing {
+            return self.shared_exit;
+        }
+        let kind = self.b.use_var(self.lazy[3]);
+        let carry_kind = self.b.use_var(self.lazy[6]);
+        let (Some(kind), Some(carry_kind)) = (self.known(kind), self.known(carry_kind)) else {
+            return self.shared_exit;
+        };
+        let recipe = (kind, carry_kind);
+        if let Some(&block) = self.flag_exits.get(&recipe) {
+            return block;
+        }
+        if self.flag_exits.len() == 8 {
+            return self.shared_exit;
+        }
+        let block = self.b.create_block();
+        self.b.set_cold_block(block);
+        self.b.append_block_param(block, types::I32);
+        self.b.append_block_param(block, types::I32);
+        if self.shadow_ref.is_some() {
+            self.b.append_block_param(block, self.ptr_ty);
+        }
+        self.flag_exits.insert(recipe, block);
+        block
     }
     fn save_state(&mut self, pc: Value) {
         self.flush_mmx_effects();
@@ -3852,6 +3911,11 @@ impl Emitter<'_> {
         addr
     }
     fn known(&self, value: Value) -> Option<u32> {
+        let value = if self.optimizing {
+            self.b.func.dfg.resolve_aliases(value)
+        } else {
+            value
+        };
         let inst = self.b.func.dfg.value_def(value).inst()?;
         match self.b.func.dfg.insts[inst] {
             ir::InstructionData::UnaryImm {
@@ -3886,10 +3950,10 @@ impl Emitter<'_> {
         let end = self.b.ins().iadd_imm(offset, size as i64 - 1);
         (offset, vec![offset, end])
     }
-    /// Loads the permission byte for an in-window position. Every permission
-    /// change advances the memory epoch, and a trap that observes a new epoch
-    /// leaves native code (trap.rs), so the table is read-only for one native
-    /// invocation. Equal loads merge; constant in-window positions may leave loops.
+    /// Loads exact permissions from the pinned native metadata snapshot.
+    /// File promotions retain their conservative SHARED classification until
+    /// re-entry; permission revocations leave native through the trap epoch.
+    /// Equal loads merge; constant in-window positions may leave loops.
     fn permission(&mut self, position: Value) -> Value {
         let mut flags = MemFlags::trusted().with_readonly();
         if self
@@ -4276,7 +4340,71 @@ impl Emitter<'_> {
         let offset = self.b.ins().uextend(self.ptr_ty, addr);
         self.b.ins().iadd(biased, offset)
     }
-    /// An unproven access through the page table.
+    /// One conservative metadata test on ordinary dynamic accesses. A miss is
+    /// not a fault: the precise path still accepts non-crossing accesses next
+    /// to a protected/shared page and preserves every special-page operation.
+    fn fast_memory_guard(&mut self, addr: Value, size: usize, write: bool, ordinary: ir::Block) {
+        debug_assert!((1..=16).contains(&size));
+        self.mark(diagnostics::Part::Check);
+        let offset = self.b.ins().iadd_imm(addr, -i64::from(self.base));
+        let full = self.base == 0 && self.len as u64 == 1_u64 << 32;
+        if !full {
+            let bad =
+                self.b
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThan, offset, (self.len - size) as i64);
+            let reason = if write {
+                Exit::WriteFault
+            } else {
+                Exit::ReadFault
+            };
+            self.guard(bad, reason, Some(addr));
+        }
+        let page = self.b.ins().ushr_imm(offset, 12);
+        let page = self.b.ins().uextend(self.ptr_ty, page);
+        let at = self.b.ins().iadd(self.perms, page);
+        let mut flags = MemFlags::trusted().with_readonly();
+        // Only full windows make every possible u32 page index dereferenceable
+        // before the bounds guard. The final entry has no two-page grants.
+        if full {
+            flags = flags.with_can_move();
+        }
+        let metadata = self.b.ins().load(types::I8, flags, at, 0);
+        let permission = if write { WRITE } else { READ };
+        let pair = if write {
+            crate::memory::FAST_WRITE
+        } else {
+            crate::memory::FAST_READ
+        };
+        let grants = self.b.ins().band_imm(metadata, i64::from(pair));
+        let single = self.b.create_block();
+        // Allocation-end pages are common; keep their ordinary proof warm.
+        let cold = self.b.create_block();
+        self.b.set_cold_block(cold);
+        self.b.ins().brif(grants, ordinary, &[], single, &[]);
+        self.b.switch_to_block(single);
+        self.b.seal_block(single);
+        // Stack/heap allocation end pages often have an unmapped neighbor.
+        // The same metadata load also grants an entirely in-page access;
+        // those ordinary accesses must not pay the exact shared-page checks.
+        let mask = permission | crate::memory::SHARED | if write { EXEC } else { 0 };
+        let single = self.b.ins().band_imm(metadata, i64::from(mask));
+        let missing = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, single, i64::from(permission));
+        let within = self.b.ins().band_imm(offset, 4095);
+        let crosses =
+            self.b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, within, (4096 - size) as i64);
+        let bad = self.b.ins().bor(missing, crosses);
+        self.b.ins().brif(bad, cold, &[], ordinary, &[]);
+        self.b.switch_to_block(cold);
+        self.b.seal_block(cold);
+    }
+
+    /// An unproven access through the exact page table.
     fn checked_memory(&mut self, addr: Value, ty: ir::Type, value: Option<Value>) -> Option<Value> {
         let write = value.is_some();
         let size = ty.bytes() as usize;
@@ -4296,9 +4424,24 @@ impl Emitter<'_> {
         } else {
             Exit::ReadFault
         };
+        // Both grants enter the same ordinary load/store block. Duplicating
+        // the access would add result phis and lengthen guest-state liveness.
+        let fast = self.optimizing && self.known(addr).is_none() && self.lane.is_none();
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        let fast = fast && self.fault_pc != Some(self.pc);
+        let ordinary = fast.then(|| self.b.create_block());
+        let fast_address = fast.then(|| self.window_address(addr));
+        if let Some(ok) = ordinary {
+            self.fast_memory_guard(addr, size, write, ok);
+        }
         let (offset, positions) = self.access_range(addr, size, reason);
-        let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
-        let address = self.b.ins().iadd(self.mem, host_offset);
+        let address = fast_address.unwrap_or_else(|| {
+            let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
+            self.b.ins().iadd(self.mem, host_offset)
+        });
+        if fast {
+            self.b.set_cold_block(self.b.current_block().unwrap());
+        }
         let atomic = self.lane.unwrap_or_else(|| {
             let block = self.b.create_block();
             self.b.set_cold_block(block);
@@ -4347,7 +4490,7 @@ impl Emitter<'_> {
             crate::memory::SHARED
         };
         let bad = self.denied(&permissions, permission, forbidden);
-        let ok = self.b.create_block();
+        let ok = ordinary.unwrap_or_else(|| self.b.create_block());
         self.b.ins().brif(bad, atomic, &[], ok, &[]);
         self.b.switch_to_block(ok);
         self.b.seal_block(ok);
@@ -4756,9 +4899,16 @@ impl Emitter<'_> {
             let a = self.b.use_var(self.lazy[4]);
             let b = self.b.use_var(self.lazy[5]);
             let kind = self.b.use_var(self.lazy[6]);
+            if self.optimizing && self.known(kind) == Some(0) {
+                return a;
+            }
+            let known_compare = self.optimizing && self.known(kind) == Some(1);
             let raw = self.b.ins().icmp_imm(IntCC::Equal, kind, 0);
             let c = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
             let c = self.b.ins().uextend(types::I32, c);
+            if known_compare {
+                return c;
+            }
             return self.b.ins().select(raw, a, c);
         }
         let old = self.b.use_var(self.flags);
