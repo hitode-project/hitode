@@ -40,7 +40,7 @@ fn equal_state(a: &Executor, b: &Executor) {
     assert_eq!(a.state.eip, b.state.eip);
     assert_eq!(a.state.eflags & 0xcd5, b.state.eflags & 0xcd5);
     assert_eq!(a.state.xmm, b.state.xmm);
-    // Unicorn omits the precision flag for CVTPS2PI. Its control bits remain
+    // Unicorn omits precision flags for packed conversions. Its control bits remain
     // an independent oracle; compare our complete flags to the interpreter.
     assert_eq!(a.state.mxcsr & !0x3f, b.state.mxcsr & !0x3f);
     assert_eq!(
@@ -86,7 +86,9 @@ fn unsupported_sequence_returns_to_the_native_continuation() {
 #[test]
 fn exact_conversion_hands_canonical_mmx_state_to_native_continuation() {
     let code = assemble(|a| {
-        a.cvtps2pi(mm0, xmm0).unwrap();
+        // Keep testing a statically unsupported form after CVTPS2PI gains
+        // native emission; dynamic guard exits have a different entry shape.
+        a.cvtpd2pi(mm0, xmm0).unwrap();
         a.movq(qword_ptr(DATA), mm0).unwrap();
         a.emms().unwrap();
         a.mov(eax, 42).unwrap();
@@ -100,8 +102,8 @@ fn exact_conversion_hands_canonical_mmx_state_to_native_continuation() {
         ];
         for m in &mut machines {
             m.state.mxcsr = 0x1f80 | rounding;
-            m.state.xmm[0][..4].copy_from_slice(&1.75f32.to_le_bytes());
-            m.state.xmm[0][4..8].copy_from_slice(&(-2.25f32).to_le_bytes());
+            m.state.xmm[0][..8].copy_from_slice(&1.75f64.to_le_bytes());
+            m.state.xmm[0][8..].copy_from_slice(&(-2.25f64).to_le_bytes());
         }
         compare(&mut machines, RunOutcome::ReachedStop);
         assert_eq!(machines[0].stats.interpreter_instructions, 1);

@@ -41,6 +41,10 @@ pub(super) fn supported(i: &Instruction) -> bool {
     let count = i.op_count();
     match i.mnemonic() {
         M::Emms => count == 0,
+        M::Cvtps2pi | M::Cvttps2pi => {
+            count == 2 && mm(0) && (simd::register(i.op1_register()).is_some() || memory(1, 8))
+        }
+        M::Cvtpi2ps => count == 2 && simd::register(i.op0_register()).is_some() && source(1),
         M::Movq2dq => count == 2 && simd::register(i.op0_register()).is_some() && mm(1),
         M::Movdq2q => count == 2 && mm(0) && simd::register(i.op1_register()).is_some(),
         M::Movd => {
@@ -142,7 +146,7 @@ impl Emitter<'_> {
         }
     }
     /// An operand's value; inside a batch, every lane's in its own half.
-    fn mmx_read(&mut self, i: &Instruction, n: u32) -> Value {
+    pub(super) fn mmx_read(&mut self, i: &Instruction, n: u32) -> Value {
         if self.lanes_active() {
             return if i.op_kind(n) == OpKind::Memory {
                 let value = self.lane_load(8);
@@ -174,7 +178,7 @@ impl Emitter<'_> {
             .push(ir::ConstantData::from(mask));
         self.b.ins().shuffle(a, b, imm)
     }
-    fn set_mmx(&mut self, i: &Instruction, value: Value) {
+    pub(super) fn set_mmx(&mut self, i: &Instruction, value: Value) {
         let value = self.mmx_cast(value, types::I8X16);
         let index = register(i.op0_register()).unwrap();
         let var = if self.lanes_active() {
@@ -187,6 +191,13 @@ impl Emitter<'_> {
     pub(super) fn mmx_instruction(&mut self, i: &Instruction) {
         if i.mnemonic() == M::Emms {
             self.mmx_effects.as_mut().unwrap().or_mask |= 2;
+            return;
+        }
+        if matches!(i.mnemonic(), M::Cvtps2pi | M::Cvttps2pi | M::Cvtpi2ps) {
+            self.sse_mmx_conversion(i);
+            if i.mnemonic() != M::Cvtpi2ps || i.op1_kind() == OpKind::Register {
+                self.mmx_written(register(i.op0_register()));
+            }
             return;
         }
         let lanes = self.lanes_active();
