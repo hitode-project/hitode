@@ -72,7 +72,7 @@ fn checked_range(
     let last = (range.end - 1) / 4096;
     for page in first..=last {
         // Permission validation itself must remain interruptible for huge ranges.
-        if (page - first).is_multiple_of(256) && expired(deadline) {
+        if page != first && (page - first).is_multiple_of(256) && expired(deadline) {
             return Err(BUDGET);
         }
         let perms = memory.perms[page];
@@ -87,7 +87,7 @@ fn checked_range(
 }
 
 fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation: u32) -> u32 {
-    if expired(bridge.deadline) {
+    if bridge.expired() {
         return BUDGET;
     }
     if (6..18).contains(&operation) {
@@ -140,7 +140,7 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     } else {
         0
     };
-    if expired(bridge.deadline) {
+    if bridge.expired() {
         return BUDGET;
     }
     let mut bytes = len.min(if memory.foreign_access_required() {
@@ -252,6 +252,7 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     }
     bridge.bulk_calls += 1;
     bridge.bulk_bytes += u64::from(bytes);
+    bridge.charge_bulk(u64::from(bytes));
     if state.regs[1] == 0 { 0 } else { MORE }
 }
 
@@ -300,7 +301,7 @@ fn backwards(
     {
         return FALLBACK;
     }
-    if expired(bridge.deadline) {
+    if bridge.expired() {
         return BUDGET;
     }
     // Every access lies in the checked ordinary RAM chunk. Explicit machine
@@ -331,6 +332,7 @@ fn backwards(
     }
     bridge.bulk_calls += 1;
     bridge.bulk_bytes += u64::from(bytes);
+    bridge.charge_bulk(u64::from(bytes));
     if state.regs[1] == 0 { 0 } else { MORE }
 }
 
@@ -705,8 +707,11 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     let (mut source, mut destination) = (state.regs[6], state.regs[7]);
     let mut completed = 0;
     let (mut left, mut right) = (0, 0);
+    let mut charged = 0;
     let outcome = 'scan: loop {
-        if expired(bridge.deadline) {
+        bridge.charge_bulk(u64::from((completed - charged) * width));
+        charged = completed;
+        if bridge.expired() {
             if !fully_checked || completed == 0 {
                 return BUDGET;
             }

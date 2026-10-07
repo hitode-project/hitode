@@ -387,6 +387,8 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
         handler: None,
         parked: false,
         deadline: Some(deadline),
+        clock_due: true,
+        unclocked_bytes: 0,
         bulk_calls: 0,
         bulk_bytes: 0,
     };

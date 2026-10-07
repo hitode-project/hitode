@@ -31,11 +31,42 @@ pub(crate) struct Bridge<'a> {
     pub handler: Option<&'a mut dyn ExecutionTrap>,
     pub parked: bool,
     pub deadline: Option<std::time::Instant>,
+    /// Whether bulk string work must read the wall clock before continuing:
+    /// set by host calls of unknown duration and after CLOCK_BYTES of bulk
+    /// work, so short REP operations do not each query the clock.
+    pub clock_due: bool,
+    pub unclocked_bytes: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
 }
 
+// Bulk work between wall-clock checks: tens of microseconds at memcpy rates.
+const CLOCK_BYTES: u64 = 256 << 10;
+
 impl Bridge<'_> {
+    /// The wall deadline has passed. Reads the clock only when a check is due.
+    pub fn expired(&mut self) -> bool {
+        let Some(at) = self.deadline else {
+            return false;
+        };
+        if !self.clock_due {
+            return false;
+        }
+        if std::time::Instant::now() >= at {
+            return true;
+        }
+        self.clock_due = false;
+        self.unclocked_bytes = 0;
+        false
+    }
+
+    pub fn charge_bulk(&mut self, bytes: u64) {
+        self.unclocked_bytes += bytes;
+        if self.unclocked_bytes >= CLOCK_BYTES {
+            self.clock_due = true;
+        }
+    }
+
     pub fn read_timestamp(&mut self) -> u64 {
         let now = self.handler.as_mut().and_then(|h| h.guest_time_us());
         self.timestamp.read(now)
@@ -61,6 +92,7 @@ pub(crate) fn call_trap(bridge: &mut Bridge<'_>, state: &mut CpuState, vector: u
         handler.call(state, unsafe { &mut *bridge.memory }, vector)
     }))
     .unwrap_or_else(|_| Err("CPU trap handler panicked".into()));
+    bridge.clock_due = true;
     match result {
         Ok(parked) => {
             bridge.parked = parked;

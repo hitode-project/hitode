@@ -773,6 +773,8 @@ pub(crate) mod testing {
             handler: None,
             parked: false,
             deadline: None,
+            clock_due: true,
+            unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
         };
