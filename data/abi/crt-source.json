@@ -266,5 +266,13 @@
     "projection": "int __cdecl function(int character), one signed32 x86 slot; three existing legacy CRT aliases. Shared LC_CTYPE profile/table logic; no host locale, duplicate classifier cache or Win32 ACP mutation.",
     "profile": "Byte input and measured legacy EOF contracts; supported C/932/936/1252 profiles share existing byte flags. Unsupported packed DBCS or out-of-domain inputs must warn and fail; native error side effects and localized EOF case behavior retained where measured.",
     "setlocale_aliases": "Existing verified VC90 setlocale cdecl2 char* signature extended to MSVCRT/VC80 only; same existing category grammar, per-module locale owner and heap buffers. No new locale implementation or Win32 ACP change."
+  },
+  "secure_path_split": {
+    "headers": {
+      "ucrt/stdlib.h:1114-1124": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c",
+      "ucrt/corecrt_wstdlib.h:388-398": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
+    },
+    "scope": "_splitpath_s and _wsplitpath_s cdecl nine32-bit x86 stack words, signed errno_t result; three existing CRT aliases; size_t is32-bit count of char/wchar_t elements",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/splitpath-s-wsplitpath-s"
   }
 }
