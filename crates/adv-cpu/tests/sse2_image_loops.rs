@@ -475,6 +475,10 @@ fn masked_protection_fallback_is_transactional_and_zero_mask_never_accesses_memo
             m.write(DATA, &before).unwrap();
             m.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
         }
+        // Only observed code pages reserve a write barrier, so publish code
+        // on the target page to keep the masked store on the guarded path.
+        jit.write(DATA + 0x800, &[0xc3]).unwrap();
+        jit.add_region(Region::new(DATA + 0x800, 1)).unwrap();
         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(interpreter.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         equal_cpu(&jit.state, &interpreter.state);
