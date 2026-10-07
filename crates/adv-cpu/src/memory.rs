@@ -1028,7 +1028,11 @@ impl Memory {
             if permissions.iter().any(|p| p & required == 0) {
                 return Err("native guest access permission fault".into());
             }
-            if write && permissions.iter().any(|p| p & EXEC != 0) {
+            // The same rule as the native permission snapshot: only observed
+            // code pages keep the store barrier in selective mode. Rejecting
+            // every EXEC page here turned unobserved RWX shared-page stores,
+            // which the snapshot admits, into guest write faults.
+            if write && self.writes_code(&range) {
                 return Err("native executable-page stores require the cold lane".into());
             }
         }
