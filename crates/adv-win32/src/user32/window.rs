@@ -693,8 +693,9 @@ impl User {
 }
 
 impl Window {
+    /// Construct metadata with the default DC policy, before USER notifications.
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         hwnd: u32,
         class: usize,
         proc: u32,
