@@ -15,6 +15,8 @@ adv-run currently keeps at most 24 fallback and 24 x87 mnemonic/reason rows per
 report. Rankings therefore cover retained rows only. Missing x87 exact calls
 are counted as unattributed; omitted fallback counts cannot be reconstructed.
 These are execution counts, not time measurements or Tier 1 coverage counts.
+Optional x87_control fields retain the complete PC/RC/mask distribution and
+independent guard counts. Reports predating those fields are counted separately.
 """
 from __future__ import annotations
 
@@ -70,6 +72,9 @@ def aggregate(reports: Iterable[dict]) -> dict:
     exact = Counter()
     by_mnemonic = Counter()
     by_reason = Counter(dict.fromkeys(X87_REASONS, 0))
+    controls = Counter()
+    control_guards = Counter(dict.fromkeys(("PC", "RC", "Masks"), 0))
+    control_reports = 0
     interpreter = {reason: {"entries": 0, "instructions": 0} for reason in INTERPRETER_REASONS}
     verification = dict.fromkeys(VERIFY_COUNTERS, 0)
     per_report = []
@@ -85,6 +90,7 @@ def aggregate(reports: Iterable[dict]) -> dict:
             run_exact = mapping(required(cliffs, "x87_exact"))
             run_interpreter = mapping(required(cliffs, "interpreter"))
             retained_exact = 0
+            retained_control = 0
             for name, value in run_fallbacks.items():
                 fallbacks[mnemonic(name)] += count(value)
             for label, value in run_exact.items():
@@ -97,8 +103,34 @@ def aggregate(reports: Iterable[dict]) -> dict:
                 by_mnemonic[name] += value
                 by_reason[reason] += value
                 retained_exact += value
+                if reason == "Control":
+                    retained_control += value
             if run_fast + retained_exact > run_helpers:
                 raise ValueError("x87 counters exceed helper calls")
+            if "x87_control" in cliffs or "x87_control_rejections" in cliffs:
+                distribution = mapping(required(cliffs, "x87_control"))
+                guards = mapping(required(cliffs, "x87_control_rejections"))
+                expected = dict.fromkeys(("PC", "RC", "Masks"), 0)
+                total = 0
+                for label, value in distribution.items():
+                    if not isinstance(label, str):
+                        raise ValueError("invalid x87 control label")
+                    match = re.fullmatch(r"PC=(24|53|64|reserved)/RC=(nearest|down|up|zero)/masks=([0-3][0-9a-f])", label)
+                    if match is None:
+                        raise ValueError("invalid x87 control label")
+                    pc, rc, masks = match.groups()
+                    value = count(value)
+                    expected["PC"] += value * (pc not in ("24", "53"))
+                    expected["RC"] += value * (rc != "nearest")
+                    expected["Masks"] += value * (masks != "3f")
+                    total += value
+                    controls[label] += value
+                if set(guards) != set(expected) or any(count(guards[k]) != n for k, n in expected.items()):
+                    raise ValueError("inconsistent x87 control guards")
+                if not retained_control <= total <= run_helpers - run_fast:
+                    raise ValueError("x87 control distribution exceeds exact counts")
+                control_guards.update(expected)
+                control_reports += 1
             for reason, values in run_interpreter.items():
                 if reason not in INTERPRETER_REASONS:
                     raise ValueError("invalid interpreter reason label")
@@ -134,6 +166,9 @@ def aggregate(reports: Iterable[dict]) -> dict:
             "x87_exact_by_mnemonic": ranked(by_mnemonic),
             "x87_exact_by_reason": ranked(by_reason),
             "x87_exact_unattributed": unattributed,
+            "x87_control_reports": control_reports,
+            "x87_control": ranked(controls),
+            "x87_control_rejections": dict(control_guards),
         },
         "report_limits": {
             "producer_row_limit": REPORT_ROW_LIMIT,
@@ -184,6 +219,11 @@ def markdown(summary: dict) -> str:
     lines.extend(f"| {reason} | {value} |" for reason, value in cliffs["x87_exact_by_reason"].items())
     lines.extend(["", "| x87 助记符 / 原因 | 次数（保留行） |", "|---|---:|"])
     lines.extend(f"| {label} | {value} |" for label, value in cliffs["x87_exact"].items())
+    lines.extend(["", f"Control 细分覆盖 {cliffs['x87_control_reports']} 份报告；"
+                  "PC／RC／Masks 为独立计数，不相加。非算术指令仍可能因操作数拒绝。",
+                  "", "| 控制字分类 | 次数 |", "|---|---:|"])
+    lines.extend(f"| {label} | {value} |" for label, value in cliffs["x87_control"].items())
+    lines.extend(f"| {label} 拒绝 | {value} |" for label, value in cliffs["x87_control_rejections"].items())
     lines.extend(["", "Tier verification（报告序号按输入顺序；全零不证明启用了校验）", "",
                   "| 报告 | verified | inconclusive | mismatches | mxcsr_flags |",
                   "|---|---:|---:|---:|---:|"])
