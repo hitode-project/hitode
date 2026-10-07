@@ -183,6 +183,7 @@ fn cursor_clipping_failures_preserve_rectangles_positions_and_output_buffers() {
 fn add_window(machine: &mut Machine<JitCpu>, hwnd: u32, parent: u32, rect: Rect) {
     use super::super::window::{ControlState, WS_CHILD, WS_POPUP, WS_VISIBLE, Window};
     let window = Window {
+        dc_style: 0,
         hwnd,
         class: 0,
         proc: 0,

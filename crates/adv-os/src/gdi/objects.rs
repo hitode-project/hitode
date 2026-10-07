@@ -143,6 +143,12 @@ impl Gdi {
     pub fn get_mut<'a>(&self, objects: &'a mut Objects, h: u32) -> Option<&'a mut GdiObj> {
         objects.owned_mut(objects.lookup_alias(self.namespace.get()?, h)?)
     }
+
+    /// Display DC identity is independent of the shared primary surface handle.
+    pub fn is_window_dc(&self, objects: &Objects, dc: u32) -> bool {
+        matches!(self.get(objects, dc), Some(GdiObj::Dc { raster: false, hwnd, .. })
+            if *hwnd != 0 || dc == super::WINDOW_DC)
+    }
     pub fn remove(&self, objects: &mut Objects, h: u32) -> Option<GdiObj> {
         objects.lookup_alias::<GdiObj>(self.namespace.get()?, h)?;
         match objects.close_alias(self.namespace.get()?, h)?? {

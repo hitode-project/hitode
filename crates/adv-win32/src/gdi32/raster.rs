@@ -4,7 +4,7 @@
 use adv_device::surface::{
     BlitOptions, BlitRect, Presenter, Rect, Sampling, Surface, SurfaceMemory, Surfaces,
 };
-use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
+use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP};
 
 pub(crate) mod clip;
 mod color_table;
@@ -198,7 +198,7 @@ impl Raster {
         mode: u32,
     ) -> Result<u32, String> {
         Ok({
-            if dc != WINDOW_DC && !dcs.contains(objects, dc) {
+            if !dcs.is_window_dc(objects, dc) && !dcs.contains(objects, dc) {
                 return Ok(self.fail(6));
             }
             if !(1..=3).contains(&mode) {
@@ -248,10 +248,15 @@ impl Raster {
             if rop != 0x00cc0020 {
                 return Ok(self.fail(87));
             }
-            let Some(src) = dcs.get(objects, source_dc) else {
-                return Ok(self.fail(6));
+            let src = if dcs.is_window_dc(objects, source_dc) {
+                surfaces.primary(m)?
+            } else {
+                let Some(src) = dcs.get(objects, source_dc) else {
+                    return Ok(self.fail(6));
+                };
+                src
             };
-            let dst = if destination_dc == WINDOW_DC {
+            let dst = if dcs.is_window_dc(objects, destination_dc) {
                 surfaces.primary(m)?
             } else {
                 dcs.get(objects, destination_dc).unwrap_or(0)
@@ -306,7 +311,7 @@ impl Raster {
             let surface = surfaces.get(dst).unwrap().clone();
             let mut m = clip::ClippedMemory::new(m, surface, &clip);
             surfaces.copy(src, sr, dst, dr, &mut m)?;
-            if destination_dc == WINDOW_DC {
+            if dcs.is_window_dc(objects, destination_dc) {
                 surfaces.present(dst, &m)?;
             }
             1
@@ -338,7 +343,7 @@ impl Raster {
         let Some(dib) = dib::read(m, info, usage)? else {
             return Ok(self.fail(87));
         };
-        let dst = if destination_dc == WINDOW_DC {
+        let dst = if dcs.is_window_dc(objects, destination_dc) {
             surfaces.primary(m)?
         } else {
             dcs.get(objects, destination_dc).unwrap_or(0)
@@ -407,7 +412,7 @@ impl Raster {
             options,
             &mut m,
         )?;
-        if destination_dc == WINDOW_DC {
+        if dcs.is_window_dc(objects, destination_dc) {
             surfaces.present(dst, &m)?;
         }
         Ok(transfer.scan_lines)
@@ -435,12 +440,12 @@ impl Raster {
             if rop != 0x00cc0020 {
                 return Ok(self.fail(87));
             }
-            let src = if source_dc == WINDOW_DC {
+            let src = if dcs.is_window_dc(objects, source_dc) {
                 surfaces.primary(m)?
             } else {
                 dcs.get(objects, source_dc).unwrap_or(0)
             };
-            let dst = if destination_dc == WINDOW_DC {
+            let dst = if dcs.is_window_dc(objects, destination_dc) {
                 surfaces.primary(m)?
             } else {
                 dcs.get(objects, destination_dc).unwrap_or(0)
@@ -506,7 +511,7 @@ impl Raster {
             let surface = surfaces.get(dst).unwrap().clone();
             let mut m = clip::ClippedMemory::new(m, surface, &clip);
             surfaces.blit(src, sr, dst, dr, options, &mut m)?;
-            if destination_dc == WINDOW_DC {
+            if dcs.is_window_dc(objects, destination_dc) {
                 surfaces.present(dst, &m)?;
             }
             1
