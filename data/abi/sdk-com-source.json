@@ -20,5 +20,12 @@
     "header_sha256": "72d6665d54c425b8a99fe0716518b2711f7cece6a3b2f8e7c6fc307e0a3fae26",
     "scope": "ID3DXEffect 79 x86 slots, including inherited ID3DXBaseEffect/IUnknown methods; metadata only, no header or DLL bundled",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxeffect"
+  },
+  "legacy_d3dx_matrix_stack": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
+    "header": "build/native/include/d3dx9math.h",
+    "header_sha256": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9",
+    "scope": "ID3DXMatrixStack 18 x86 slots including IUnknown; slot17 GetTop returns D3DXMATRIX*; pointers, ULONG, HRESULT and FLOAT are one stack word",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/id3dxmatrixstack"
   }
 }

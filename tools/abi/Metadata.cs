@@ -263,6 +263,9 @@ public static class AbiMetadata
             bool d3dxEffect = f.Length == 6 && f[0] == "d3dx9_43.dll"
                 && new[] { "D3DXCreateEffect", "D3DXGetShaderOutputSemantics" }.Contains(f[1])
                 && f[3] == "i32" && f[4] == "HRESULT";
+            bool d3dxStack = f.Length == 6 && f[0] == "d3dx9_43.dll" && f[1] == "D3DXCreateMatrixStack"
+                && f[3] == "i32" && f[4] == "HRESULT"
+                && f[5] == "Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1";
             // The old RTL export is absent from WinMD. Its BOOLEAN (AL) return
             // and RET 16 are verified by the Microsoft x86 wrapper and SDK
             // import library; the WithStatus documentation supplies its four
@@ -294,7 +297,7 @@ public static class AbiMetadata
             bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
-            if ((!vcm && !d3dx && !d3dxEffect && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
+            if ((!vcm && !d3dx && !d3dxEffect && !d3dxStack && !ntPath && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };
@@ -322,7 +325,7 @@ public static class AbiMetadata
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect ? new[] { "ptr", "u32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect || d3dxStack ? new[] { "ptr", "u32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];
@@ -390,7 +393,7 @@ public static class AbiMetadata
         if (sdkSupplement != null)
         {
             var seen = new HashSet<string>(com.Skip(1).Select(row => string.Join('\t', row.Split('\t').Take(2))));
-            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0 };
+            var counts = new Dictionary<string, int> { ["IDxDiagProvider"] = 0, ["IDxDiagContainer"] = 0, ["ID3DXEffect"] = 0, ["ID3DXMatrixStack"] = 0 };
             foreach (var row in File.ReadLines(Path.Combine(Path.GetDirectoryName(sdkSupplement), "sdk-com-input.tsv"))
                 .Where(line => line.Length != 0 && !line.StartsWith('#')))
             {
@@ -401,7 +404,7 @@ public static class AbiMetadata
                 foreach (var parameter in f[5].Split('|'))
                 {
                     var p = parameter.Split(':');
-                    if (p.Length != 4 || !(f[0] == "ID3DXEffect" ? new[] { "ptr", "u32", "i32", "f32", "str8" }.Contains(p[2]) : new[] { "ptr", "u32", "str16" }.Contains(p[2])) || p[3] != "1")
+                    if (p.Length != 4 || !(f[0] == "ID3DXEffect" ? new[] { "ptr", "u32", "i32", "f32", "str8" }.Contains(p[2]) : f[0] == "ID3DXMatrixStack" ? new[] { "ptr", "f32" }.Contains(p[2]) : new[] { "ptr", "u32", "str16" }.Contains(p[2])) || p[3] != "1")
                         throw new InvalidDataException("Invalid SDK COM parameter: " + parameter);
                 }
                 if (!seen.Add(f[0] + "\t" + f[1]))
@@ -413,6 +416,8 @@ public static class AbiMetadata
                 throw new InvalidDataException("Incomplete SDK DxDiag vtable declarations");
             if (counts["ID3DXEffect"] != 79)
                 throw new InvalidDataException("Incomplete SDK ID3DXEffect vtable declarations");
+            if (counts["ID3DXMatrixStack"] != 18)
+                throw new InvalidDataException("Incomplete SDK ID3DXMatrixStack vtable declarations");
         }
         File.WriteAllLines(Path.Combine(output, "com.tsv"), com, new UTF8Encoding(false));
         var constants = new SortedSet<string>(StringComparer.Ordinal);

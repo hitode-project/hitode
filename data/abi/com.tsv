@@ -960,3 +960,21 @@ ID3DXEffect	75	ApplyParameterBlock	i32	HRESULT	this:ID3DXEffect*:ptr:1|hParamete
 ID3DXEffect	76	DeleteParameterBlock	i32	HRESULT	this:ID3DXEffect*:ptr:1|hParameterBlock:D3DXHANDLE:ptr:1
 ID3DXEffect	77	CloneEffect	i32	HRESULT	this:ID3DXEffect*:ptr:1|pDevice:LPDIRECT3DDEVICE9:ptr:1|ppEffect:LPD3DXEFFECT*:ptr:1
 ID3DXEffect	78	SetRawValue	i32	HRESULT	this:ID3DXEffect*:ptr:1|hParameter:D3DXHANDLE:ptr:1|pData:LPCVOID:ptr:1|ByteOffset:UINT:u32:1|Bytes:UINT:u32:1
+ID3DXMatrixStack	0	QueryInterface	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|riid:REFIID:ptr:1|ppvObj:LPVOID*:ptr:1
+ID3DXMatrixStack	1	AddRef	u32	ULONG	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	2	Release	u32	ULONG	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	3	Pop	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	4	Push	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	5	LoadIdentity	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1
+ID3DXMatrixStack	6	LoadMatrix	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+ID3DXMatrixStack	7	MultMatrix	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+ID3DXMatrixStack	8	MultMatrixLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pM:const D3DXMATRIX*:ptr:1
+ID3DXMatrixStack	9	RotateAxis	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|Angle:FLOAT:f32:1
+ID3DXMatrixStack	10	RotateAxisLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|Angle:FLOAT:f32:1
+ID3DXMatrixStack	11	RotateYawPitchRoll	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
+ID3DXMatrixStack	12	RotateYawPitchRollLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|Yaw:FLOAT:f32:1|Pitch:FLOAT:f32:1|Roll:FLOAT:f32:1
+ID3DXMatrixStack	13	Scale	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	14	ScaleLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	15	Translate	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	16	TranslateLocal	i32	HRESULT	this:ID3DXMatrixStack*:ptr:1|x:FLOAT:f32:1|y:FLOAT:f32:1|z:FLOAT:f32:1
+ID3DXMatrixStack	17	GetTop	ptr	D3DXMATRIX*	this:ID3DXMatrixStack*:ptr:1
