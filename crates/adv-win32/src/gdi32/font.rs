@@ -26,7 +26,7 @@ const GDI_ERROR: u32 = u32::MAX;
 #[derive(Default)]
 struct Fonts {
     text: Text,
-    resources: std::collections::BTreeMap<String, resource::Reference>,
+    resources: std::collections::BTreeMap<resource::Key, resource::Reference>,
 }
 
 pub fn register(registry: &mut Registry) {

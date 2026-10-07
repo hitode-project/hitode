@@ -9,6 +9,10 @@ fn resource_entry_points_use_the_single_generated_abi() {
         "AddFontResourceW",
         "RemoveFontResourceA",
         "RemoveFontResourceW",
+        "AddFontResourceExA",
+        "AddFontResourceExW",
+        "RemoveFontResourceExA",
+        "RemoveFontResourceExW",
     ] {
         assert_eq!(
             registry.level("gdi32.dll", name),
@@ -88,6 +92,9 @@ mod windows {
         (machine, directory)
     }
     fn invoke(machine: &mut Machine<JitCpu>, name: &str, path: Option<&str>) -> u32 {
+        invoke_flags(machine, name, path, 0, 0)
+    }
+    fn invoke_flags(machine: &mut Machine<JitCpu>, name: &str, path: Option<&str>, flags: u32, reserved: u32) -> u32 {
         let pointer = path.map_or(0, |path| {
             let bytes = if name.ends_with('W') {
                 path.encode_utf16()
@@ -112,6 +119,8 @@ mod windows {
         let handler = machine.sys.thunks.get(index).f.handler;
         machine.cpu.set_reg(Reg::Esp, DATA + 2048);
         machine.cpu.write_u32(DATA + 2052, pointer).unwrap();
+        machine.cpu.write_u32(DATA + 2056, flags).unwrap();
+        machine.cpu.write_u32(DATA + 2060, reserved).unwrap();
         let result = handler(&mut Env {
             context: machine.sys.current,
             cpu: &mut machine.cpu,
@@ -170,6 +179,160 @@ mod windows {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn private_hidden_flags_share_ansi_wide_references_and_real_glyphs() {
+        let _native = NATIVE.lock().unwrap();
+        for codepage in [932, 936] {
+            let (mut machine, _) = fixture(codepage);
+            let fallback = glyph(&mut machine);
+            for name in ["AddFontResourceExA", "AddFontResourceExW"] {
+                assert_eq!(
+                    invoke_flags(
+                        &mut machine,
+                        name,
+                        Some("Fonts/字形.ttf"),
+                        PRIVATE_HIDDEN,
+                        0
+                    ),
+                    1
+                );
+            }
+            assert_eq!(glyph(&mut machine).metrics.advance_x, 20);
+            assert_ne!(glyph(&mut machine).data, fallback.data);
+            assert!(
+                machine
+                    .ext
+                    .get::<Fonts>()
+                    .text
+                    .enumerate(
+                        Some("ADV Resource Fixture"),
+                        text::FontEnumeration::Families
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(machine.ext.get::<Fonts>().resources.len(), 1);
+            assert_eq!(
+                invoke(&mut machine, "RemoveFontResourceW", Some("Fonts/字形.ttf")),
+                0
+            );
+            for (flags, reserved) in [(0, 0), (0x10, 0), (0x20, 0), (0x40, 0), (PRIVATE_HIDDEN, 1)]
+            {
+                assert_eq!(
+                    invoke_flags(
+                        &mut machine,
+                        "AddFontResourceExW",
+                        Some("Fonts/字形.ttf"),
+                        flags,
+                        reserved
+                    ),
+                    0
+                );
+                assert_eq!(
+                    invoke_flags(
+                        &mut machine,
+                        "RemoveFontResourceExW",
+                        Some("Fonts/字形.ttf"),
+                        flags,
+                        reserved
+                    ),
+                    0
+                );
+            }
+            assert_eq!(
+                machine
+                    .ext
+                    .get::<Fonts>()
+                    .resources
+                    .values()
+                    .next()
+                    .unwrap()
+                    .count,
+                2
+            );
+            assert_eq!(
+                invoke_flags(
+                    &mut machine,
+                    "RemoveFontResourceExA",
+                    Some("c:/gAmE/Fonts/./字形.ttf"),
+                    PRIVATE_HIDDEN,
+                    0
+                ),
+                1
+            );
+            assert_eq!(glyph(&mut machine).metrics.advance_x, 20);
+            assert_eq!(
+                invoke_flags(
+                    &mut machine,
+                    "RemoveFontResourceExW",
+                    Some("Fonts/字形.ttf"),
+                    PRIVATE_HIDDEN,
+                    0
+                ),
+                1
+            );
+            assert_eq!(glyph(&mut machine).data, fallback.data);
+            assert_eq!(
+                invoke_flags(
+                    &mut machine,
+                    "RemoveFontResourceExW",
+                    Some("Fonts/字形.ttf"),
+                    PRIVATE_HIDDEN,
+                    0
+                ),
+                0
+            );
+            assert!(machine.ext.get::<Fonts>().resources.is_empty());
+        }
+    }
+
+    #[test]
+    fn private_hidden_bad_paths_preserve_resources_and_process_exit_retires_them() {
+        let _native = NATIVE.lock().unwrap();
+        let (mut machine, _) = fixture(936);
+        let fallback = glyph(&mut machine);
+        assert_eq!(
+            invoke_flags(
+                &mut machine,
+                "AddFontResourceExW",
+                Some("Fonts/fixture.ttf"),
+                PRIVATE_HIDDEN,
+                0
+            ),
+            1
+        );
+        let cached = glyph(&mut machine);
+        for path in [
+            None,
+            Some(""),
+            Some("Fonts/missing.ttf"),
+            Some("Fonts/corrupt.ttf"),
+        ] {
+            for name in [
+                "AddFontResourceExA",
+                "AddFontResourceExW",
+                "RemoveFontResourceExA",
+                "RemoveFontResourceExW",
+            ] {
+                assert_eq!(invoke_flags(&mut machine, name, path, PRIVATE_HIDDEN, 0), 0);
+                assert!(Arc::ptr_eq(&cached, &glyph(&mut machine)));
+            }
+        }
+        let exit = machine
+            .resolve_import("kernel32.dll", "ExitProcess")
+            .unwrap();
+        let mut code = Asm::new(CODE);
+        code.push_imm(0).call(exit);
+        machine.cpu.write(CODE, &code.bytes).unwrap();
+        assert!(matches!(
+            machine.run_virtual(1_000_000),
+            RunResult::Exited(0)
+        ));
+        assert!(machine.ext.get::<Fonts>().resources.is_empty());
+        assert_eq!(machine.ext.get::<Fonts>().text.resource_stats(), (0, 0));
+        assert_eq!(glyph(&mut machine).data, fallback.data);
     }
 
     #[test]
@@ -266,25 +429,25 @@ mod windows {
                 assert!(Arc::ptr_eq(&cached, &glyph(&mut machine)));
             }
         }
-        let key = "c:\\game\\fonts\\fixture.ttf";
+        let key = ("c:\\game\\fonts\\fixture.ttf".to_owned(), 0);
         machine
             .ext
             .get_mut::<Fonts>()
             .resources
-            .get_mut(key)
+            .get_mut(&key)
             .unwrap()
             .count = u32::MAX;
         assert_eq!(
             invoke(&mut machine, "AddFontResourceA", Some("Fonts/fixture.ttf")),
             0
         );
-        assert_eq!(machine.ext.get::<Fonts>().resources[key].count, u32::MAX);
+        assert_eq!(machine.ext.get::<Fonts>().resources[&key].count, u32::MAX);
         assert!(Arc::ptr_eq(&cached, &glyph(&mut machine)));
         machine
             .ext
             .get_mut::<Fonts>()
             .resources
-            .get_mut(key)
+            .get_mut(&key)
             .unwrap()
             .count = 1;
         assert_eq!(

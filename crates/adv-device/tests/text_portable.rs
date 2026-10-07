@@ -469,6 +469,43 @@ fn missing_unicode_and_invalid_dbcs_glyphs_use_visible_default_outlines() {
 }
 
 #[test]
+fn hidden_resources_still_render_and_leave_other_font_owners_unchanged() {
+    let mut text = Text::with_font_directories(&[]);
+    let mut other = Text::with_font_directories(&[]);
+    let request = font("ADV Collection Two");
+    let (id, count) = text.add_hidden_resource(COLLECTION).unwrap();
+    assert_eq!(count, 2);
+    assert!(
+        text.enumerate(None, FontEnumeration::Families)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        text.enumerate(Some("ADV Collection Two"), FontEnumeration::Families)
+            .unwrap()
+            .is_empty()
+    );
+    let held = text
+        .glyph(&request, glyph(Character::Unicode(66), GlyphFormat::Gray8))
+        .unwrap();
+    assert_eq!(held.metrics.advance_x, 36);
+    assert!(other.metrics(&request).is_err());
+    for bad in [&[][..], &[0x5a; 128][..]] {
+        assert!(text.add_hidden_resource(bad).is_err());
+    }
+    assert!(Arc::ptr_eq(
+        &held,
+        &text
+            .glyph(&request, glyph(Character::Unicode(66), GlyphFormat::Gray8))
+            .unwrap()
+    ));
+    assert!(text.remove_resource(id).unwrap());
+    assert_eq!(text.resource_stats(), (0, 0));
+    assert!(text.metrics(&request).is_err());
+    assert_eq!(held.metrics.advance_x, 36);
+}
+
+#[test]
 fn resources_enumerate_match_invalidate_and_keep_immutable_glyphs_alive() {
     let mut text = Text::with_font_directories(&[]);
     let request = font("ADV Collection Two");

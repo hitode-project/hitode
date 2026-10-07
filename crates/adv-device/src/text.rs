@@ -482,6 +482,20 @@ impl Text {
         }
     }
 
+    /// Register owned font data for matching/rasterization without enumeration.
+    pub fn add_hidden_resource(&mut self, bytes: &[u8]) -> Result<(FontResourceId, u32), TextError> {
+        #[cfg(windows)]
+        {
+            // Native memory fonts already have non-enumerable visibility.
+            self.add_resource(bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            let result = self.backend.add_hidden_resource(bytes)?;
+            self.invalidate_fonts();
+            Ok(result)
+        }
+    }
     /// Unregister before retiring the cached native font references. A failed
     /// backend operation preserves the resource and all existing cache owners.
     pub fn remove_resource(&mut self, id: FontResourceId) -> Result<bool, TextError> {
