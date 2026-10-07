@@ -59,6 +59,75 @@ fn state() -> CpuState {
     }
 }
 
+#[test]
+fn user_cli_sti_fault_before_flags_or_instruction_state_commit() {
+    for bytes in [
+        &[0xfa][..],
+        &[0xfb][..],
+        &[0x66, 0xfa][..],
+        &[0x66, 0xfb][..],
+    ] {
+        let mut memory = memory(bytes);
+        let initial = state();
+        let mut actual = initial.clone();
+        assert_eq!(
+            Interpreter::new().step(&mut actual, &mut memory),
+            Step::Trap {
+                pc: CODE,
+                vector: 13
+            }
+        );
+        assert_eq!(actual.regs, initial.regs);
+        assert_eq!(actual.eip, initial.eip);
+        assert_eq!(actual.eflags, initial.eflags);
+        assert_eq!(actual.fuel, initial.fuel);
+    }
+}
+
+#[test]
+fn sldt_register_widths_and_memory_match_the_flat_native_profile() {
+    for bytes in [
+        vec![0x0f, 0x00, 0xc0],
+        vec![0x66, 0x0f, 0x00, 0xc0],
+        code(|a| {
+            a.sldt(word_ptr(DATA + 1)).unwrap();
+        }),
+    ] {
+        let mut reference = Reference::new(&bytes);
+        reference.put(DATA, &[0xab, 0xcd, 0xef, 0x12]);
+        reference.check(&state(), ARITH);
+    }
+}
+
+#[test]
+fn sldt_reads_owned_selector_and_failed_memory_store_does_not_commit() {
+    let bytes = code(|a| {
+        a.sldt(word_ptr(DATA + 4095)).unwrap();
+    });
+    let mut memory = memory(&bytes);
+    memory.write(DATA + 4095, &[0xaa, 0xbb]).unwrap();
+    let mut actual = state();
+    actual.segments.ldt_selector = 0x28;
+    let initial = actual.clone();
+    memory.protect(DATA + 4096, 4096, READ).unwrap();
+    let mut interpreter = Interpreter::new();
+    assert_eq!(
+        interpreter.step(&mut actual, &mut memory),
+        Step::WriteFault {
+            pc: CODE,
+            address: DATA + 4095
+        }
+    );
+    assert_eq!(memory.read(DATA + 4095, 2).unwrap(), [0xaa, 0xbb]);
+    assert_eq!(actual.regs, initial.regs);
+    assert_eq!(actual.eflags, initial.eflags);
+    assert_eq!(actual.eip, CODE);
+    memory.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+    assert_eq!(interpreter.step(&mut actual, &mut memory), Step::Executed);
+    assert_eq!(memory.read(DATA + 4095, 2).unwrap(), [0x28, 0]);
+    assert_eq!(actual.eflags, initial.eflags);
+}
+
 struct Reference {
     uc: Guarded<'static, ()>,
     memory: Memory,

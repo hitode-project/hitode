@@ -28,6 +28,7 @@ foreach ($suffix in @('A', 'W')) {
     $original = $rows['shell32.dll!SHGetFolderPath' + $suffix]
     if (($alias[2..5] -join "`t") -cne ($original[2..5] -join "`t")) { throw 'Shell alias changed its source declaration' }
 }
+if (($rows['kernel32.dll!lstrcpy'][2..5] -join "`t") -cne ($rows['kernel32.dll!lstrcpyA'][2..5] -join "`t")) { throw 'Legacy ANSI alias changed its source declaration' }
 function Assert-Rejected([string]$Name, [string[]]$InputLines, [string]$Reason) {
     $inputPath = Join-Path $cache ($Name + '.tsv')
     [IO.File]::WriteAllLines($inputPath, $InputLines)

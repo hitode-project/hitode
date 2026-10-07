@@ -8,6 +8,8 @@ pub struct SegmentState {
     pub selectors: [u16; 6],
     pub gdt_base: u32,
     pub gdt_limit: u16,
+    /// The flat process has no local descriptor table unless its owner installs one.
+    pub ldt_selector: u16,
 }
 impl Default for SegmentState {
     fn default() -> Self {
@@ -15,6 +17,7 @@ impl Default for SegmentState {
             selectors: [16, 8, 16, 16, 24, 0],
             gdt_base: 0,
             gdt_limit: 0,
+            ldt_selector: 0,
         }
     }
 }

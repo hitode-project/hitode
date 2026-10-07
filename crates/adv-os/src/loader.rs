@@ -500,6 +500,16 @@ impl<'a> Loader<'a> {
         if is_host_module(self.sys, &key) {
             return self.load_host(key, path, retain);
         }
+        // Windows refuses to start an image whose static import is missing, so
+        // an absent import of a natively runnable image is a system DLL (glu32,
+        // wtsapi32, a VC++ redistributable). Its unimplemented exports bind to
+        // diagnosed stubs; dynamic probes above still fail.
+        if !self.importers.is_empty() {
+            log::info!(
+                "{path}: imported but absent from the game files, binding as a system module"
+            );
+            return self.load_host(key, path, retain);
+        }
         Err(LoadError::NotFound(path.to_owned()))
     }
 

@@ -1289,6 +1289,9 @@ impl<B: Backend> Machine<B> {
         cpu.map(GDT_ADDR, PAGE, Prot::RW)?;
         cpu.setup_segments(SegmentSetup { gdt_addr: GDT_ADDR })?;
         cpu.map(PEB_ADDR, PAGE, Prot::RW)?;
+        // Native Windows user threads start with IF enabled. Capture it in
+        // the shared initial template so every backend and new thread agrees.
+        cpu.set_reg(Reg::Eflags, cpu.reg(Reg::Eflags) | 0x200);
         let mut blank = cpu.new_context();
         cpu.save(&mut blank);
         let mut vm = Vm::new();

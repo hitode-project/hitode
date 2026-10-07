@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay normal/held-key play through the production frontend, with tracing off.
+"""Replay normal/held-key play through the production frontend.
 
 The JSON schedule is a list of {"at": seconds, "command": "key-down 17"} or
 {"at": seconds, "checkpoint": "normal", "reset_metrics": true} entries.
@@ -10,6 +10,9 @@ All guest writes and evidence go to --output. Game assets are never modified.
 Use --audio --mute-audio --mode hidden (or window) to keep the real audio device
 path active while sending silence to hardware, without enabling capture or tracing.
 session.json records whether the hardware was requested to be muted.
+
+Tracing is off by default; --trace writes api.trace for compatibility diagnosis
+and marks the session unsuitable for performance comparison.
 """
 from __future__ import annotations
 
@@ -103,6 +106,8 @@ def run(args: argparse.Namespace) -> None:
         command.append("--sync-compilation")
     if args.no_tiering:
         command.append("--no-tiering")
+    if args.trace:
+        command.extend(["--trace", str(output / "api.trace")])
     acknowledgement: queue.Queue[str | None] = queue.Queue()
     actions = []
     metadata = {"command": command, "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -111,7 +116,8 @@ def run(args: argparse.Namespace) -> None:
                 "audio_device_expected": args.audio and args.mode != "headless",
                 "muted": getattr(args, "mute_audio", False) or args.capture_audio,
                 "diagnostic_capture": args.capture_audio,
-                "suitable_for_performance_comparison": not args.capture_audio}
+                "diagnostic_api_trace": args.trace,
+                "suitable_for_performance_comparison": not (args.capture_audio or args.trace)}
     (output / "session.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     start = time.monotonic()
     with (output / "stdout.log").open("w", encoding="utf-8") as stdout, \
@@ -215,6 +221,7 @@ if __name__ == "__main__":
     parser.add_argument("--mute-audio", action="store_true",
                         help="mute hardware output without diagnostics; requires --audio and --mode hidden/window")
     parser.add_argument("--capture-audio", action="store_true", help="capture actual callbacks and source PCM; hardware receives zeros; excludes performance comparisons")
+    parser.add_argument("--trace", action="store_true", help="write API trace in the session output for compatibility diagnosis; excludes performance comparisons")
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--sync-compilation", action="store_true")
     parser.add_argument("--no-tiering", action="store_true",

@@ -104,14 +104,32 @@ fn identity(dialog: u32, window: &Window) -> DialogTarget {
     }
 }
 
-fn is_dialog(user: &User, window: &Window) -> bool {
+fn is_dialog(user: &User, objects: &Objects, window: &Window) -> bool {
     window.parent == 0
         && window.visible()
         && !window.destroying
         && window.control.dialog_end.is_none()
-        && user.classes[window.class]
+        && (user.classes[window.class]
             .name
             .eq_ignore_ascii_case("#32770")
+            || is_control_panel(user, objects, window))
+}
+
+/// A custom top-level window built only from standard controls, with a push
+/// button to answer it, is a dialog in all but class: engines create startup
+/// prompts this way and pump them with IsDialogMessage. A game canvas has no
+/// such children, so it is never projected.
+fn is_control_panel(user: &User, objects: &Objects, window: &Window) -> bool {
+    let mut push_button = false;
+    !window.children.is_empty()
+        && window.children.iter().all(|hwnd| {
+            user.windows.get(objects, hwnd).is_some_and(|child| {
+                let class = &user.classes[child.class].name;
+                push_button |= class.eq_ignore_ascii_case("Button") && child.style & 0xf <= 1;
+                supported(class, child.style)
+            })
+        })
+        && push_button
 }
 
 fn font(win32: &Win32, objects: &Objects, window: &Window) -> Option<DialogFont> {
@@ -145,7 +163,7 @@ pub fn presentation(win32: &Win32, objects: &Objects) -> Result<DialogSet, Strin
         let Some(window) = user
             .windows
             .get(objects, &hwnd)
-            .filter(|w| is_dialog(user, w))
+            .filter(|w| is_dialog(user, objects, w))
         else {
             continue;
         };
@@ -223,7 +241,7 @@ fn valid(user: &User, objects: &Objects, target: DialogTarget) -> bool {
     let Some(dialog) = user.windows.get(objects, &target.dialog) else {
         return false;
     };
-    if !is_dialog(user, dialog) || !dialog.enabled() {
+    if !is_dialog(user, objects, dialog) || !dialog.enabled() {
         return false;
     }
     let Some(window) = user.windows.get(objects, &target.hwnd) else {

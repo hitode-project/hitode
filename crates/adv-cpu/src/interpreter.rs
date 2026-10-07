@@ -560,6 +560,7 @@ impl DecodedBlock {
                             | Action::Ret(..)
                             | Action::Int(..)
                             | Action::Ud2
+                            | Action::Privileged
                             | Action::String(..)
                             | Action::PopFlags(..)
                             | Action::Rdtsc
@@ -786,6 +787,7 @@ enum Action {
     Rdtsc,
     ReadSegment(Operand, usize),
     StoreGdt(Address),
+    StoreLdt(Operand),
     String(StringOp),
     Mov(Operand, Operand, bool),
     Lea(Reg, Address),
@@ -818,6 +820,7 @@ enum Action {
     Flags(M),
     Int(u8),
     Ud2,
+    Privileged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1388,7 +1391,11 @@ fn predecode(i: &Instruction) -> Option<Action> {
         }
         M::Int => Action::Int(i.immediate8()),
         M::Int3 => Action::Int(3),
+        M::Sldt => Action::StoreLdt(op(0)?),
         M::Ud2 => Action::Ud2,
+        // The flat Windows profile is CPL3 with IOPL0: neither instruction
+        // changes IF or retires before delivering the general protection fault.
+        M::Cli | M::Sti => Action::Privileged,
         _ => return None,
     })
 }
@@ -1535,6 +1542,12 @@ impl Transaction {
             }
             Action::ReadSegment(dst, index) => {
                 self.store(memory, dst, u32::from(self.segments.selectors[index]))?;
+            }
+            Action::StoreLdt(dst) => {
+                // UMIP is absent from the virtual CPU profile. SLDT is a
+                // read-only query: register width follows the operand while
+                // memory always receives the two-byte selector.
+                self.store(memory, dst, u32::from(self.segments.ldt_selector))?;
             }
             Action::StoreGdt(address) => {
                 let address = address.resolve(self);
@@ -1943,6 +1956,12 @@ impl Transaction {
                 return Err(Step::Trap {
                     pc: self.pc,
                     vector: 6,
+                });
+            }
+            Action::Privileged => {
+                return Err(Step::Trap {
+                    pc: self.pc,
+                    vector: 13,
                 });
             }
         }

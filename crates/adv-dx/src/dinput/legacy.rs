@@ -263,6 +263,62 @@ fn create_w(
 ) -> u32 {
     create_legacy(env, instance, version, output, outer, true)
 }
+fn enumerate_controllers(
+    env: &mut Env<'_>,
+    this: u32,
+    kind: u32,
+    callback: GuestPtr<()>,
+    flags: u32,
+    wide: bool,
+) -> u32 {
+    if !env.ext.try_get::<State>().is_some_and(|state| {
+        state
+            .com
+            .get::<LegacyFactory>(&env.sys.objects, this)
+            .is_some()
+    }) || kind > 4
+        || flags & !0x30101 != 0
+        || adv_abi::guest::check_range(env.cpu, callback.addr(), 1, Prot::EXEC).is_err()
+    {
+        return INVALID;
+    }
+    // Legacy DIDEVTYPE_JOYSTICK is 4; the shared input profile has no controllers.
+    // Existing keyboard/mouse devices must not be hidden by a false empty ALL set.
+    if kind != 4 {
+        return unsupported(
+            env,
+            if wide {
+                "IDirectInputW::EnumDevices"
+            } else {
+                "IDirectInputA::EnumDevices"
+            },
+            "only the empty controller set is enumerable; keyboard/mouse enumeration is unavailable",
+        );
+    }
+    0
+}
+#[win32(dinput, name="IDirectInputA::EnumDevices", level=state)]
+fn enum_a(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    kind: u32,
+    callback: GuestPtr<()>,
+    _context: GuestPtr<()>,
+    flags: u32,
+) -> u32 {
+    enumerate_controllers(env, this.addr(), kind, callback, flags, false)
+}
+#[win32(dinput, name="IDirectInputW::EnumDevices", level=state)]
+fn enum_w(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    kind: u32,
+    callback: GuestPtr<()>,
+    _context: GuestPtr<()>,
+    flags: u32,
+) -> u32 {
+    enumerate_controllers(env, this.addr(), kind, callback, flags, true)
+}
 fn query_owned<T: 'static>(
     env: &mut Env<'_>,
     this: u32,
@@ -993,9 +1049,11 @@ pub(super) fn register(registry: &mut Registry) {
         input_query_a_ABI,
         input_add_a_ABI,
         input_release_a_ABI,
+        enum_a_ABI,
         input_query_w_ABI,
         input_add_w_ABI,
         input_release_w_ABI,
+        enum_w_ABI,
         device_query_a_ABI,
         device_add_a_ABI,
         device_release_a_ABI,
