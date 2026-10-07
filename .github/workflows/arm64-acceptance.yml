@@ -1,0 +1,95 @@
+name: ARM64 hardware acceptance
+
+# Real ARM64 hardware for the parts QEMU cannot model: instruction cache
+# coherence, weak memory ordering and (on Apple Silicon) native 16 KiB pages.
+# Synthetic fixtures only; no samples are available or referenced here.
+# Android sigchain/ART coexistence still needs a device and is not covered.
+
+on:
+  push:
+    branches:
+      - 'ci/arm64**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '4'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record source and environment
+        run: |
+          rustup update stable --no-self-update
+          { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; echo "page size: $(getconf PAGESIZE)"; lscpu; } > "$RUNNER_TEMP/environment.txt"
+          cat "$RUNNER_TEMP/environment.txt"
+      - name: Test execution layer
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.txt"
+      - name: Differential tier verification (strict)
+        # Tests that assert native execution shape fail under verification by
+        # design; the log is compared against the x64 strict failure set.
+        if: always()
+        continue-on-error: true
+        env:
+          ADV_JIT_VERIFY: strict
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --tests 2>&1 | tee "$RUNNER_TEMP/strict.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: arm64-linux-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/environment.txt
+            ${{ runner.temp }}/tests.txt
+            ${{ runner.temp }}/strict.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  macos-arm64:
+    # Probe: macOS is not yet a supported execution host, so a failure here is
+    # a finding to triage rather than a regression gate.
+    runs-on: macos-14
+    timeout-minutes: 45
+    continue-on-error: true
+    env:
+      CARGO_BUILD_JOBS: '3'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record source and environment
+        run: |
+          rustup update stable --no-self-update
+          { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; echo "page size: $(sysctl -n hw.pagesize)"; sysctl -n machdep.cpu.brand_string; } > "$RUNNER_TEMP/environment.txt"
+          cat "$RUNNER_TEMP/environment.txt"
+      - name: Build execution layer and tests
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-run 2>&1 | tee "$RUNNER_TEMP/build.txt"
+      - name: Test execution layer
+        run: |
+          set -o pipefail
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: arm64-macos-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/environment.txt
+            ${{ runner.temp }}/build.txt
+            ${{ runner.temp }}/tests.txt
+          if-no-files-found: ignore
+          retention-days: 14
