@@ -388,9 +388,10 @@
     ],
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/access-waccess",
     "projection": "int __cdecl _access(char const*, int) and int __cdecl _waccess(wchar_t const*, int); only the observed legacy msvcrt profile is advertised, with two x86 argument words and signed int return.",
-    "native_msvcrt_sha256": "a1bd0acd64e1a60368b8878d3987f603d966ed45be2252d2d4d0f92feb10fa8e",
-    "native_probe_source_sha256": "6ce1242f849645abc0951d78d2b85aecc9ab568da888fc68ecfc8fcfcc495055",
-    "native_verification": "Authored host MSVCRT probe: success preserves errno, DOS errno and LastError; missing leaf/parent set errno2 with DOS/LastError2/3; empty paths report errno2/DOS3; read-only write checks set errno13/DOS5 while preserving LastError. This legacy runtime accepts modes0..15 and rejects NULL or other modes with errno22/DOS0 while preserving LastError, unlike modern invalid-parameter-handler documentation. Guest access queries borrow the common VFS attribute view, so isolated resource layers remain writable through copy-on-write and synthetic system files remain read-only."
+    "native_msvcrt_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f",
+    "native_probe_source_sha256": "026416664f01764d555668a55ab60d86df912e657080b81b8c8882ee4b7ea207",
+    "native_probe_exe_sha256": "c458d6d8398e50325edd7c6b752dd548301be349c5412407857a58a578b5da10",
+    "native_verification": "Authored x86 MSVCRT probe, 112 cases: success preserves errno, DOS errno and LastError; missing leaf/parent set errno2 with DOS/LastError2/3; empty paths report errno2/DOS3; read-only write checks set errno13/DOS5 while preserving LastError. This legacy runtime accepts modes0..15 and rejects NULL or other modes with errno22/DOS0 while preserving LastError, unlike modern invalid-parameter-handler documentation. Guest access queries borrow the common VFS attribute view, so isolated resource layers remain writable through copy-on-write and synthetic system files remain read-only."
   },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
