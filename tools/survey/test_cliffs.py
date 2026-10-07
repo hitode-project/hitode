@@ -126,6 +126,19 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(counters["x87_control_rejections"], {"PC": 16, "RC": 6, "Masks": 6})
         self.assertIn("Control 细分覆盖 2", markdown(summary))
 
+    def test_control_and_entry_details_reconcile_in_the_same_report(self):
+        report = fixture()
+        report["cpu_cliffs"].update({key: value for key, value in self.detailed_fixture()["cpu_cliffs"].items()
+                                     if key.startswith("interpreter")})
+        report["cpu_cliffs"]["x87_control"] = {"PC=64/RC=nearest/masks=3f": 8}
+        report["cpu_cliffs"]["x87_control_rejections"] = {"PC": 8, "RC": 0, "Masks": 0}
+        summary = aggregate([report])
+        self.assertEqual(summary["cpu_cliffs"]["x87_control_rejections"]["PC"], 8)
+        self.assertEqual(summary["cpu_cliffs"]["interpreter_details"]["Rejected/Unsupported/Cbw/Cbw"],
+                         {"entries": 2, "instructions": 11})
+        self.assertIn("Control 细分覆盖 1", markdown(summary))
+        self.assertIn("Rejected/Unsupported/Cbw/Cbw", markdown(summary))
+
     def test_control_distribution_rejects_private_labels_and_inconsistent_counts(self):
         for label, value, guards in [
             (42, 8, {"PC": 8, "RC": 0, "Masks": 0}),
