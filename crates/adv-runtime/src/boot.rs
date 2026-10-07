@@ -539,6 +539,17 @@ impl<B: Backend> Runtime<B> {
     pub fn begin_native_capture(
         &mut self,
     ) -> Result<Option<(u64, adv_device::gpu::Readback)>, adv_device::gpu::Error> {
+        // A report followed by a capture can observe the same presentation.
+        // Its pixels are already retained; a duplicate readback would be
+        // rejected by the monotonic capture serial guard as superseded.
+        if !self
+            .machine
+            .ext
+            .get::<Graphics<Snapshot>>()
+            .has_pending_frame()
+        {
+            return Ok(None);
+        }
         let Some(frame) = self
             .machine
             .ext
