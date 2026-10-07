@@ -99,11 +99,7 @@ pub fn directinput_virtual_key(scan: u8) -> Option<usize> {
 /// Map the standard enhanced guest keyboard for its retained input locale.
 /// `None` denotes an unavailable profile/type; an unmapped key is `Some(0)`.
 pub fn map_virtual_key(layout: u32, code: u32, kind: u32) -> Option<u32> {
-    let japanese = match layout {
-        0x0411_0411 => true,
-        0x0409_0409 | 0x0804_0804 => false,
-        _ => return None,
-    };
+    let japanese = japanese_profile(layout)?;
     Some(match kind {
         0 | 4 => {
             let scan = virtual_key_scan(code, japanese);
@@ -131,6 +127,107 @@ pub fn map_virtual_key(layout: u32, code: u32, kind: u32) -> Option<u32> {
         2 => virtual_key_character(code),
         _ => return None,
     })
+}
+
+fn japanese_profile(layout: u32) -> Option<bool> {
+    match layout {
+        0x0411_0411 => true,
+        0x0409_0409 | 0x0804_0804 => false,
+        _ => return None,
+    }
+    .into()
+}
+
+/// Names for the same enhanced keyboard. Labels follow its native layout table;
+/// unknown positions have an empty name, while an unknown profile is unavailable.
+pub fn key_name(layout: u32, parameter: u32) -> Option<String> {
+    let japanese = japanese_profile(layout)?;
+    let mut scan = (parameter >> 16) & 0xff;
+    let mut extended = parameter & (1 << 24) != 0;
+    if parameter & (1 << 25) != 0 {
+        if scan == 0x36 {
+            scan = 0x2a;
+        }
+        if matches!(scan, 0x1d | 0x38) {
+            extended = false;
+        }
+    }
+    let label = if extended {
+        match scan {
+            0x1c => "Num Enter",
+            0x1d if japanese => "Right Control",
+            0x1d => "Right Ctrl",
+            0x35 => "Num /",
+            0x37 => "Prnt Scrn",
+            0x38 => "Right Alt",
+            0x45 => "Num Lock",
+            0x46 => "Break",
+            0x47 => "Home",
+            0x48 => "Up",
+            0x49 => "Page Up",
+            0x4b => "Left",
+            0x4d => "Right",
+            0x4f => "End",
+            0x50 => "Down",
+            0x51 => "Page Down",
+            0x52 => "Insert",
+            0x53 => "Delete",
+            0x54 if !japanese => "<00>",
+            0x56 if !japanese => "Help",
+            0x5b => "Left Windows",
+            0x5c => "Right Windows",
+            0x5d => "Application",
+            _ => "",
+        }
+    } else {
+        match scan {
+            0x01 => "Esc",
+            0x0e => "Backspace",
+            0x0f => "Tab",
+            0x1c => "Enter",
+            0x1d => "Ctrl",
+            0x2a => "Shift",
+            0x36 => "Right Shift",
+            0x37 => "Num *",
+            0x38 => "Alt",
+            0x39 => "Space",
+            0x3a => "Caps Lock",
+            0x3b..=0x44 => return Some(format!("F{}", scan - 0x3a)),
+            0x45 => "Pause",
+            0x46 => "Scroll Lock",
+            0x47 => "Num 7",
+            0x48 => "Num 8",
+            0x49 => "Num 9",
+            0x4a => "Num -",
+            0x4b => "Num 4",
+            0x4c => "Num 5",
+            0x4d => "Num 6",
+            0x4e => "Num +",
+            0x4f => "Num 1",
+            0x50 => "Num 2",
+            0x51 => "Num 3",
+            0x52 => "Num 0",
+            0x53 => "Num Del",
+            0x54 => "Sys Req",
+            0x57 => "F11",
+            0x58 => "F12",
+            0x7c..=0x87 => return Some(format!("F{}", scan - 0x6f)),
+            0xf1 if japanese => "ImeOff",
+            0xf2 if japanese => "ImeOn",
+            _ => "",
+        }
+    };
+    if !label.is_empty() {
+        return Some(label.into());
+    }
+    // Native's unnamed-position fallback uses the unprefixed scan translation,
+    // including characters such as extended Esc/Tab and OEM punctuation.
+    let character = virtual_key_character(scan_virtual_key(scan, japanese));
+    Some(
+        char::from_u32(character)
+            .filter(|&c| c != '\0')
+            .map_or_else(String::new, |c| c.to_string()),
+    )
 }
 
 fn virtual_key_scan(code: u32, japanese: bool) -> u32 {
