@@ -30,12 +30,15 @@ pub enum X87Cliff {
 /// Why a block ran in the interpreter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum InterpreterReason {
-    /// No region owns the address.
+    /// No published entry owns the address and discovery has not attempted it.
     #[default]
     Uncovered,
-    /// Discovery tried the address and compiled nothing for it.
+    /// Discovery attempted this unowned entry. Compilation may still be queued,
+    /// or publication may have excluded its form; this is not a failure count.
     Rejected,
-    /// A region owns the address but has no native code yet.
+    /// An indexed entry owns the address but has no native code yet. Automatic
+    /// queued regions do not index entries until publication, so their waiting
+    /// work remains in Uncovered/Rejected for historical comparability.
     Pending,
     /// Native code owns the address but has no entry there.
     Interior,

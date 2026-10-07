@@ -52,7 +52,7 @@ def detail_label(label: object) -> str:
     if (len(parts) == 4 and parts[1] == "Unsupported"
             and mnemonic(parts[2]) == parts[2]
             and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,95}", parts[3])
-            and parts[3].split("_")[0].lower() == parts[2].lower()):
+            and parts[3].split("_")[0].lower().startswith(parts[2].lower())):
         return label
     raise ValueError("invalid interpreter detail label")
 

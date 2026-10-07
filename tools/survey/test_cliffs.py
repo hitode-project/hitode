@@ -62,6 +62,14 @@ class AggregateTests(unittest.TestCase):
                          {"entries": 3, "instructions": 20})
         self.assertEqual(result["report_limits"]["interpreter_detail_reports"], 2)
 
+    def test_iced_forms_can_suffix_the_mnemonic_with_operand_size(self):
+        for label in ("Uncovered/Unsupported/Popa/Popaw", "Rejected/Unsupported/Ret/Retnd"):
+            report = self.detailed_fixture()
+            bucket = label.split("/")[0]
+            report["cpu_cliffs"]["interpreter"] = {bucket: {"entries": 2, "instructions": 11}}
+            report["cpu_cliffs"]["interpreter_details"] = {label: {"entries": 2, "instructions": 11}}
+            self.assertIn(label, aggregate([report])["cpu_cliffs"]["interpreter_details"])
+
     def test_detail_truncation_reconciles_both_counters(self):
         report = self.detailed_fixture()
         cliffs = report["cpu_cliffs"]
