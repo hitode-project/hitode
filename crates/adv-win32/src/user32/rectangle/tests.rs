@@ -3,7 +3,7 @@
 use super::*;
 use adv_cpu::{
     JitCpu,
-    backend::{Backend, GuestExt, asm::Asm},
+    backend::{Backend, Guest, GuestExt, asm::Asm},
 };
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_unicorn::UnicornCpu;
@@ -17,6 +17,45 @@ const WRITE_ONLY: u32 = 0x440000;
 const MISSING_TAIL: u32 = 0x450000;
 const LAST_ERROR: u32 = 0x12345678;
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn copy_preserves_signed_coordinates_aliases_and_failed_outputs() {
+    let mut machine = machine(JitCpu::new(PARK_ADDR, false).unwrap());
+    machine
+        .spawn("rectangle copy", PARK_ADDR, &[], 65536)
+        .unwrap();
+    machine.cpu.map(READ_ONLY, 4096, Prot::READ).unwrap();
+    let original = bytes([i32::MIN, 8, -7, i32::MAX]);
+    machine.cpu.write(DATA, &original).unwrap();
+    let mut env = Env {
+        context: 0,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    set_last_error(&mut env, LAST_ERROR);
+    assert_eq!(
+        copy(&mut env, GuestPtr::new(DATA + 4), GuestPtr::new(DATA)),
+        1
+    );
+    let mut observed = [0; 16];
+    env.cpu.read(DATA + 4, &mut observed).unwrap();
+    assert_eq!(observed.as_slice(), original);
+    assert_eq!(
+        copy(&mut env, GuestPtr::new(DATA + 4), GuestPtr::new(DATA + 4)),
+        1
+    );
+    assert_eq!(copy(&mut env, GuestPtr::new(DATA + 4), GuestPtr::new(0)), 0);
+    assert_eq!(crate::util::last_error(&env), LAST_ERROR);
+    assert_eq!(
+        copy(&mut env, GuestPtr::new(READ_ONLY - 8), GuestPtr::new(DATA)),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env), 998);
+    env.cpu.read(DATA + 4, &mut observed).unwrap();
+    assert_eq!(observed.as_slice(), original);
+}
 
 fn machine<B: Backend>(cpu: B) -> Machine<B> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
