@@ -8,6 +8,7 @@ use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
 mod code_store;
+mod instruction_trace;
 mod interpreter_profile;
 mod parallel;
 mod tier1;
@@ -177,6 +178,7 @@ pub struct Executor {
     pub compile_errors: BTreeMap<u32, String>,
     deferred_fallback: Option<u32>,
     interpreter_profile: Option<Box<interpreter_profile::Profile>>,
+    instruction_trace: Option<Box<instruction_trace::Trace>>,
     verifier: Option<Box<verify::Verifier>>,
     timestamp: crate::timestamp::Counter,
     pub state: CpuState,
@@ -259,7 +261,24 @@ impl Executor {
             bulk_bytes: 0,
             cliffs: std::mem::take(&mut self.stats.cliffs),
         };
-        let result = self.run_inner(stop, budget, &mut bridge, interpreter_only);
+        // Diagnostics use only the explicitly selected interpreter backend.
+        // Disabled runs retain block execution and its instruction hot path.
+        let mut instruction_trace = interpreter_only
+            .then(|| self.instruction_trace.take())
+            .flatten();
+        let result = self.run_inner(
+            stop,
+            budget,
+            &mut bridge,
+            interpreter_only,
+            instruction_trace.as_deref_mut(),
+        );
+        if let Some(trace) = &mut instruction_trace {
+            trace.boundary(&result, &self.state, &self.memory);
+        }
+        if interpreter_only {
+            self.instruction_trace = instruction_trace;
+        }
         if self.parallel.is_some() {
             if self.stats.interpreter_entries != interpreted_before {
                 self.admission.cold();
@@ -388,6 +407,7 @@ impl Executor {
             compile_errors: BTreeMap::new(),
             deferred_fallback: None,
             interpreter_profile: interpreter_profile::Profile::from_env(),
+            instruction_trace: instruction_trace::Trace::from_env(),
             verifier: verify::Verifier::from_env(),
             timestamp: crate::timestamp::Counter::default(),
             state: CpuState::default(),
@@ -1384,6 +1404,7 @@ impl Executor {
         budget: u64,
         bridge: &mut Bridge<'_>,
         interpreter_only: bool,
+        mut instruction_trace: Option<&mut instruction_trace::Trace>,
     ) -> Result<RunOutcome, String> {
         self.validate_stop(stop)?;
         self.state.refresh_mmx();
@@ -1636,11 +1657,16 @@ impl Executor {
             // decoded block. Transfers, exceptions, SMC and REP return here; native
             // publications change the revision used to build fallthrough boundaries.
             let units = self.state.fuel.min(256) as u32;
+            let (units, observed) = instruction_trace
+                .as_deref_mut()
+                .map_or((units, None), |trace| {
+                    trace.prepare(units, &self.state, &self.memory)
+                });
             let tier1 =
                 self.run_tier1(stop, units, interpreter_only || single_step || pending_fpu)?;
             let (execution, last_units) = if let Some(result) = &tier1 {
                 (result.execution, result.last_units)
-            } else if self.profiling || single_step {
+            } else if self.profiling || single_step || observed.is_some() {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1721,6 +1747,15 @@ impl Executor {
                 }
                 other => other,
             };
+            if let Some(observed) = observed {
+                instruction_trace.as_deref_mut().unwrap().complete(
+                    observed,
+                    step,
+                    execution.units,
+                    &self.state,
+                    &self.memory,
+                );
+            }
             match step {
                 Step::Executed => {}
                 Step::ReadTimestamp { .. } => unreachable!("completed by the execution owner"),
