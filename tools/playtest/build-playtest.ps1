@@ -1,10 +1,12 @@
 # Build a self-contained Windows playtest folder: release runner (GPU, and movie
 # decoding when an LGPL FFmpeg 8 root is given), its FFmpeg DLLs and the launcher.
+# -Games copies a local preset list (games.json, see launcher.ps1) next to it.
 # Output goes outside the source tree's tracked files; nothing here is committed.
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '../../target/playtest/adv-playtest'),
     [string]$TargetDirectory = (Join-Path $PSScriptRoot '../../target'),
-    [string]$FfmpegDirectory = $env:FFMPEG_DIR
+    [string]$FfmpegDirectory = $env:FFMPEG_DIR,
+    [string]$Games
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -35,6 +37,10 @@ if ($FfmpegDirectory) {
 }
 Copy-Item -Force (Join-Path $PSScriptRoot 'launcher.ps1') $OutputDirectory
 Copy-Item -Force (Join-Path $PSScriptRoot 'README.txt') $OutputDirectory
+if ($Games) {
+    $null = Get-Content -LiteralPath $Games -Raw -Encoding UTF8 | ConvertFrom-Json
+    Copy-Item -Force -LiteralPath $Games (Join-Path $OutputDirectory 'games.json')
+}
 Set-Content -Path (Join-Path $OutputDirectory 'Play.cmd') -Encoding ASCII -Value @(
     '@echo off',
     'start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "%~dp0launcher.ps1"'

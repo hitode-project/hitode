@@ -34,6 +34,12 @@ impl Default for DcModes {
 }
 
 impl DcModes {
+    pub fn to_logical(&self, x: i64, y: i64) -> [i64; 2] {
+        [
+            x + i64::from(self.window_origin[0]) - i64::from(self.viewport_origin[0]),
+            y + i64::from(self.window_origin[1]) - i64::from(self.viewport_origin[1]),
+        ]
+    }
     pub fn to_device(&self, x: i64, y: i64) -> [i64; 2] {
         [
             x - i64::from(self.window_origin[0]) + i64::from(self.viewport_origin[0]),

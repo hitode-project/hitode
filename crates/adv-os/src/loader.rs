@@ -637,13 +637,15 @@ impl<'a> Loader<'a> {
         drop(bytes);
 
         let size = align_up(pe.size_of_image, PAGE);
-        let relocs = pe.relocations().map_err(pe_err)?;
+        pe.relocations().map_err(pe_err)?;
         let base = if self.sys.vm.reserve_at(pe.image_base, size) {
             pe.image_base
         } else {
-            let has_code = pe.sections.iter().any(|s| s.is_executable());
             let stripped = pe.characteristics & file_flags::RELOCS_STRIPPED != 0;
-            if relocs.is_empty() && (has_code || stripped) {
+            // A valid image can be position-independent and need zero fixups.
+            // Native loading rejects relocation by the explicit stripped flag,
+            // not by the number of entries or the presence of executable code.
+            if stripped {
                 return Err(LoadError::NoRelocs(path.to_owned(), pe.image_base));
             }
             self.sys

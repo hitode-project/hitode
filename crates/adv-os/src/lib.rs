@@ -17,6 +17,7 @@ pub mod gdi;
 pub mod global;
 pub mod heap;
 pub mod identity;
+pub mod keyboard;
 pub mod loader;
 pub mod module;
 pub mod nls;
