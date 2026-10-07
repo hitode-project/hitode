@@ -78,6 +78,12 @@ impl Fixture {
         match id {
             gdi::GET_DC => {
                 self.surfaces.primary(&mut self.memory).unwrap();
+                // Raster operations consume the logical DC's saved modes too.
+                assert!(
+                    self.contexts
+                        .set_stretch_mode(&mut self.objects, WINDOW_DC, 1)
+                        .is_some()
+                );
                 WINDOW_DC
             }
             gdi::CREATE_DC => self
