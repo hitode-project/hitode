@@ -1,4 +1,4 @@
-//! Linux ARM64 entry/exit, immutable code ownership, and checked continuations.
+//! Linux/Android ARM64 entry/exit, immutable code ownership, and checked continuations.
 use super::{BUDGET, DISPATCH, Execution, FALLBACK, LOAD, STORE, Tier1Stats, emit};
 use crate::execution_abi::Tier1Frame;
 use crate::interpreter::{Execution as Interpreted, Interpreter, Step};
@@ -51,6 +51,7 @@ adv_tier1_enter:
 );
 unsafe extern "C" {
     fn adv_tier1_enter(frame: *mut Tier1Frame, entry: *const u8, window: *mut u8);
+    // Android uses the NDK compiler-rt archive already linked by build.rs.
     fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);
 }
 
@@ -100,15 +101,16 @@ impl Code {
                 code.pointer.as_ptr(),
                 bytes,
             );
+            // Clean data and invalidate instruction caches while still RW.
+            // The serial Rc owner publishes no entry until RX succeeds; code
+            // is immutable afterwards and never has a writable executable view.
+            __clear_cache(raw, raw.cast::<u8>().add(bytes).cast());
         }
         if unsafe { libc::mprotect(raw, len, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
             return Err(format!(
                 "publish Tier 1 code: {}",
                 std::io::Error::last_os_error()
             ));
-        }
-        unsafe {
-            __clear_cache(raw, raw.cast::<u8>().add(bytes).cast());
         }
         Ok(code)
     }
@@ -120,6 +122,40 @@ impl Drop for Code {
         }
     }
 }
+
+#[cfg(test)]
+mod publication_tests {
+    use super::Code;
+
+    #[test]
+    fn published_code_is_rx_and_new_instructions_are_visible() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for value in 1..=16u32 {
+            // Authored AArch64 MOV W0, #imm; RET. Cross a real host-page boundary
+            // so both 4 KiB and 16 KiB devices exercise full mapping protection.
+            let mut words = vec![0xd503201f; page / 4 + 1];
+            words[0] = 0x52800000 | (value << 5);
+            words[1] = 0xd65f03c0;
+            let code = Code::new(&words).unwrap();
+            assert_eq!(code.len, 2 * page);
+            let start = code.pointer.as_ptr() as usize;
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            let permissions = maps.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (low, high) = fields.next()?.split_once('-')?;
+                let low = usize::from_str_radix(low, 16).ok()?;
+                let high = usize::from_str_radix(high, 16).ok()?;
+                (low <= start && high >= start + code.len).then(|| fields.next().unwrap())
+            });
+            assert_eq!(permissions, Some("r-xp"));
+            // SAFETY: the immutable RX entry obeys the host ABI and returns u32.
+            let entry: unsafe extern "C" fn() -> u32 =
+                unsafe { std::mem::transmute(code.pointer.as_ptr()) };
+            assert_eq!(unsafe { entry() }, value);
+        }
+    }
+}
+
 struct Unit {
     code: Code,
     input: Vec<(u32, Vec<u8>)>,

@@ -75,11 +75,11 @@ pub(crate) struct Compiled {
     pub cache_stamp: std::cell::Cell<u64>,
     #[cfg(all(test, target_arch = "x86_64"))]
     disasm: String,
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     versioned_loops: usize,
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     vectorized_loops: usize,
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     invariant_body: bool,
 }
 
@@ -928,9 +928,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     } else {
         BTreeMap::new()
     };
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     let vectorized_loops = batches.iter().flatten().count();
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     let versioned_loops = plans.len();
     let return_hint = if returns.len() == 1 {
         returns.first().copied()
@@ -2221,11 +2221,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         cache_stamp: std::cell::Cell::new(0),
         #[cfg(all(test, target_arch = "x86_64"))]
         disasm,
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "x86_64"))]
         versioned_loops,
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "x86_64"))]
         vectorized_loops,
-        #[cfg(test)]
+        #[cfg(all(test, target_arch = "x86_64"))]
         invariant_body: invariant_id.is_some(),
     })
 }

@@ -2,7 +2,7 @@
 use super::Executor;
 
 impl Executor {
-    /// Explicitly select the experimental Linux ARM64 fixed-register lane.
+    /// Explicitly select the experimental Linux/Android ARM64 fixed-register lane.
     /// Select before compilation/execution; the default remains unchanged.
     pub fn set_arm64_tier1(&mut self, enabled: bool) -> Result<(), String> {
         if enabled == self.tier1.is_some() {

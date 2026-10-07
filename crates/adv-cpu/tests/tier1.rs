@@ -1,6 +1,9 @@
 //! Real ARM64 native execution against Tier 0 and the existing Cranelift JIT.
 //! Inputs are authored with the repository's assembler; no game data is used.
-#![cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#![cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 use adv_cpu::{CpuState, EXEC, Executor, READ, Region, RunOutcome, WRITE};
 use iced_x86::code_asm::*;
 const CODE: u32 = 0x10000;
