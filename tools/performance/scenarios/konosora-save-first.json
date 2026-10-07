@@ -1,0 +1,46 @@
+[
+  {
+    "at": 29,
+    "checkpoint": "title"
+  },
+  {
+    "at": 30,
+    "command": "mouse-down 358 620"
+  },
+  {
+    "at": 30.5,
+    "command": "mouse-up 358 620"
+  },
+  {
+    "at": 50,
+    "checkpoint": "story"
+  },
+  {
+    "at": 51,
+    "command": "move 968 582"
+  },
+  {
+    "at": 53,
+    "command": "mouse-down 968 582"
+  },
+  {
+    "at": 53.5,
+    "command": "mouse-up 968 582"
+  },
+  {
+    "at": 57,
+    "checkpoint": "save-menu"
+  },
+  {
+    "at": 59,
+    "command": "mouse-down 555 190"
+  },
+  {
+    "at": 59.5,
+    "command": "mouse-up 555 190"
+  },
+  {
+    "at": 63,
+    "checkpoint": "saved"
+  }
+]
