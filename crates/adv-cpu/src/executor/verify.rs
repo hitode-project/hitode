@@ -124,6 +124,31 @@ impl Verifier {
         state: &mut CpuState,
         memory: &mut Memory,
     ) -> Result<Trace, String> {
+        self.record_units(owner, stop, interpreter, state, memory, false)
+    }
+
+    /// Tier 1 retires each REP element separately, so its trace can undo and
+    /// compare one MOVS/STOS/LODS element at each repeated PC.
+    pub(crate) fn record_tier1(
+        &mut self,
+        owner: u32,
+        stop: u32,
+        interpreter: &mut Interpreter,
+        state: &mut CpuState,
+        memory: &mut Memory,
+    ) -> Result<Trace, String> {
+        self.record_units(owner, stop, interpreter, state, memory, true)
+    }
+
+    fn record_units(
+        &mut self,
+        owner: u32,
+        stop: u32,
+        interpreter: &mut Interpreter,
+        state: &mut CpuState,
+        memory: &mut Memory,
+        elements: bool,
+    ) -> Result<Trace, String> {
         let start = state.clone();
         let mut trace = Trace {
             owner,
@@ -146,7 +171,7 @@ impl Verifier {
             let Some(i) = decode(memory, state.eip) else {
                 break;
             };
-            let Some(footprint) = writes(&mut self.factory, &i, state, memory) else {
+            let Some(footprint) = writes(&mut self.factory, &i, state, memory, elements) else {
                 break;
             };
             let Some(old) = footprint
@@ -373,16 +398,42 @@ fn decode(memory: &Memory, pc: u32) -> Option<Instruction> {
 }
 
 /// Bytes the instruction may write, or `None` when the trace must stop:
-/// REP strings, unresolved addresses, code pages and memory shared with
-/// host threads, whose restore would not be private to this check.
+/// Unresolved addresses, code pages and memory shared with host threads cannot
+/// be restored privately. Only counted Tier 1 traces admit REP elements.
 fn writes(
     factory: &mut InstructionInfoFactory,
     i: &Instruction,
     state: &CpuState,
     memory: &Memory,
+    elements: bool,
 ) -> Option<Vec<(u32, usize)>> {
     if i.is_string_instruction() && (i.has_rep_prefix() || i.has_repne_prefix()) {
-        return None;
+        use iced_x86::{Code, OpKind};
+        if !elements
+            || !matches!(
+                i.code(),
+                Code::Movsb_m8_m8
+                    | Code::Movsw_m16_m16
+                    | Code::Movsd_m32_m32
+                    | Code::Stosb_m8_AL
+                    | Code::Stosw_m16_AX
+                    | Code::Stosd_m32_EAX
+                    | Code::Lodsb_AL_m8
+                    | Code::Lodsw_AX_m16
+                    | Code::Lodsd_EAX_m32
+            )
+            || (0..i.op_count())
+                .any(|n| matches!(i.op_kind(n), OpKind::MemorySegSI | OpKind::MemoryESDI))
+        {
+            return None;
+        }
+        if state.regs[1] == 0 {
+            return Some(Vec::new());
+        }
+        let mut element = *i;
+        element.set_has_rep_prefix(false);
+        element.set_has_repne_prefix(false);
+        return writes(factory, &element, state, memory, false);
     }
     let value = |r: Register, _: usize, _: usize| -> Option<u64> {
         if r == Register::FS {
@@ -519,5 +570,69 @@ mod tests {
             trace.check(&state, &memory),
             Some(Ok(Check::MxcsrFlags))
         ));
+    }
+
+    #[test]
+    fn counted_rep_trace_restores_overlap_and_checks_each_element() {
+        use iced_x86::code_asm::CodeAssembler;
+        for kind in 0..3 {
+            for count in [0, 3] {
+                for reverse in [false, true] {
+                    let mut a = CodeAssembler::new(32).unwrap();
+                    match kind {
+                        0 => a.rep().movsd(),
+                        1 => a.rep().stosd(),
+                        _ => a.rep().lodsd(),
+                    }
+                    .unwrap();
+                    let code = a.assemble(u64::from(CODE)).unwrap();
+                    let stop = CODE + code.len() as u32;
+                    let mut memory = Memory::new(CODE, 0x2000).unwrap();
+                    memory.protect(CODE, 0x2000, READ | WRITE).unwrap();
+                    memory.write(CODE, &code).unwrap();
+                    memory.protect(CODE, 4096, READ | EXEC).unwrap();
+                    let original: Vec<_> = (0..128).collect();
+                    memory.write(DATA, &original).unwrap();
+                    let mut state = CpuState {
+                        eip: CODE,
+                        regs: [
+                            0x12345678,
+                            count,
+                            0,
+                            0,
+                            DATA + 1024,
+                            0,
+                            DATA + 64,
+                            if reverse { DATA + 60 } else { DATA + 68 },
+                        ],
+                        eflags: 0x8d7 | u32::from(reverse) * 0x400,
+                        ..Default::default()
+                    };
+                    let before = state.clone();
+                    let mut interpreter = Interpreter::new();
+                    let trace = Verifier::new(true)
+                        .record_tier1(CODE, stop, &mut interpreter, &mut state, &mut memory)
+                        .unwrap();
+                    assert_eq!(state, before);
+                    assert_eq!(memory.read(DATA, 128).unwrap(), original);
+                    for steps in 1..=count.max(1) {
+                        assert_eq!(interpreter.run_chunk(&mut state, &mut memory, 1).units, 1);
+                        assert!(matches!(
+                            trace.check_at(steps as usize, &state, &memory),
+                            Some(Ok(Check::Equal))
+                        ));
+                        state.regs[1] ^= 1;
+                        assert!(
+                            trace
+                                .check_at(steps as usize, &state, &memory)
+                                .unwrap()
+                                .is_err()
+                        );
+                        state.regs[1] ^= 1;
+                    }
+                    assert_eq!(state.eip, stop);
+                }
+            }
+        }
     }
 }

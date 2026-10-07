@@ -1928,6 +1928,13 @@ fn full_width_multiply_divide_match_results_flags_and_divide_errors() {
                             equivalent(&machines[0], &machines[1], u32::MAX);
                             equivalent(&machines[0], &machines[2], u32::MAX);
                             if outcomes[0] != RunOutcome::ReachedStop {
+                                assert_eq!(
+                                    outcomes[0],
+                                    RunOutcome::Trap {
+                                        pc: CODE,
+                                        vector: 0
+                                    }
+                                );
                                 assert_eq!(machines[2].state.regs, before);
                                 assert_eq!(machines[2].state.eip, CODE);
                                 assert_eq!(machines[2].state.eflags, flags);
@@ -1941,7 +1948,12 @@ fn full_width_multiply_divide_match_results_flags_and_divide_errors() {
                 0,
                 "faults do not retire"
             );
-            assert!(machines[2].tier1_stats().native_instructions > 0);
+            if operation == 2 && form == 2 {
+                // DIV EDX always overflows, or divides by zero when EDX is zero.
+                assert_eq!(machines[2].tier1_stats().native_instructions, 0);
+            } else {
+                assert!(machines[2].tier1_stats().native_instructions > 0);
+            }
             assert_eq!(machines[2].stats.verification.mismatches, 0);
         }
     }
@@ -2209,4 +2221,171 @@ fn bit_scan_memory_fault_preserves_zero_flag_and_destination() {
     assert_eq!(outcomes[0], outcomes[2]);
     equivalent(&machines[0], &machines[1], u32::MAX);
     equivalent(&machines[0], &machines[2], u32::MAX);
+}
+
+#[test]
+fn overlapping_rep_is_verified_at_each_retired_element() {
+    for reverse in [false, true] {
+        let code = assemble(|a| {
+            a.rep().movsd().unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        for m in &mut machines {
+            reset(
+                m,
+                [
+                    0,
+                    3,
+                    0,
+                    0,
+                    0,
+                    0,
+                    DATA + 64,
+                    if reverse { DATA + 60 } else { DATA + 68 },
+                ],
+                0x8d7 | u32::from(reverse) * 0x400,
+            );
+            m.write(DATA, &(0u8..128).collect::<Vec<_>>()).unwrap();
+        }
+        for left in [2, 1, 0] {
+            for index in [0, 2] {
+                assert_eq!(machines[index].run(STOP, 1).unwrap(), RunOutcome::Budget);
+                assert_eq!(machines[index].state.regs[1], left);
+            }
+            equivalent(&machines[0], &machines[2], u32::MAX);
+        }
+        assert!(machines[2].stats.verification.verified >= 3);
+        assert_eq!(machines[2].stats.verification.inconclusive, 0);
+        for m in &mut machines {
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
+
+#[test]
+fn word_counter_loops_preserve_upper_ecx_and_wrap_without_flags() {
+    use iced_x86::{Code, Instruction};
+    for opcode in [
+        Code::Loop_rel8_32_CX,
+        Code::Loope_rel8_32_CX,
+        Code::Loopne_rel8_32_CX,
+    ] {
+        let mut code = assemble(|a| {
+            a.add_instruction(Instruction::with_branch(opcode, u64::from(CODE + 16)).unwrap())
+                .unwrap();
+            a.mov(eax, 1).unwrap();
+            a.jmp(u64::from(STOP)).unwrap();
+        });
+        let mut body = CodeAssembler::new(32).unwrap();
+        body.mov(eax, 2).unwrap();
+        body.ret().unwrap();
+        let mut padding = CodeAssembler::new(32).unwrap();
+        for _ in code.len()..16 {
+            padding.nop().unwrap();
+        }
+        code.extend(
+            padding
+                .assemble(u64::from(CODE) + code.len() as u64)
+                .unwrap(),
+        );
+        code.extend(body.assemble(u64::from(CODE + 16)).unwrap());
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        for count in [0, 1, 2, 0x12340000, 0x12340001, u32::MAX] {
+            for flags in [2, 0xcd7] {
+                for m in &mut machines {
+                    reset(m, [0, count, 0, 0, 0, 0, 0, 0], flags);
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(
+                        m.state.regs[1],
+                        count & 0xffff0000 | count.wrapping_sub(1) & 0xffff
+                    );
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+            }
+        }
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+    }
+}
+
+#[test]
+fn double_shift_and_bit_indices_read_aliases_before_writing() {
+    for operation in 0..4 {
+        let code = assemble(|a| {
+            match operation {
+                0 => a.shld(ecx, ecx, cl),
+                1 => a.shrd(cx, cx, cl),
+                2 => a.btc(ecx, ecx),
+                _ => a.bts(cx, cx),
+            }
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        for count in [0, 1, 15, 16, 17, 31, 32, 33, 255] {
+            for m in &mut machines {
+                reset(m, [0, 0x9876cd00 | count, 0, 0, 0, 0, 0, 0], 0xcd7);
+                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+        }
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+    }
+}
+
+#[test]
+fn string_fs_wraps_and_word_address_form_stays_in_tier0() {
+    use iced_x86::{Instruction, Register, RepPrefixKind};
+    for word in [false, true] {
+        let code = assemble(|a| {
+            a.add_instruction(
+                Instruction::with_lodsw(
+                    if word { 16 } else { 32 },
+                    Register::FS,
+                    RepPrefixKind::Repe,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            reset(
+                m,
+                [
+                    0xabcd0000,
+                    if word { 0x12340002 } else { 2 },
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xfffffffe,
+                    0,
+                ],
+                0xcd7,
+            );
+            m.state.fs_base = if word {
+                DATA.wrapping_sub(0xfffe)
+            } else {
+                DATA + 2
+            };
+            m.write(DATA - 2, &[0x34, 0x12, 0x78, 0x56]).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        assert_eq!(machines[2].state.regs[0], 0xabcd1234);
+        assert_eq!(
+            machines[2].tier1_stats().fallback_instructions,
+            if word { 2 } else { 0 }
+        );
+    }
 }
