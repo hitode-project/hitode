@@ -1,4 +1,4 @@
-//! Checked A/W fronts over the VFS's one guest attribute view.
+//! Checked A/W fronts over live guest NT attribute entries or the VFS view.
 use super::*;
 use adv_abi::{AnsiStr, WideStr, win32};
 
@@ -85,10 +85,78 @@ fn get(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
             return Outcome::Return(u32::MAX);
         }
     };
+    if let Some(outcome) = guest_attributes(env, &path, api) {
+        return outcome;
+    }
     match file_attributes_path(env, &path, api) {
         Ok(attributes) => Outcome::Return(attributes),
         Err(_) => Outcome::Return(u32::MAX),
     }
+}
+
+fn guest_attributes(env: &mut Env<'_>, path: &str, api: &'static str) -> Option<Outcome> {
+    // Inspect only the relevant exports. A hooked reader alone is not an
+    // attribute provider, and pristine NT entries retain the existing VFS path.
+    for (name, size, offset) in [
+        ("NtQueryAttributesFile", 40, 32),
+        ("NtQueryFullAttributesFile", 56, 48),
+    ] {
+        let target = match super::native::overridden(env, name) {
+            Ok(Some(target)) => target,
+            Ok(None) => continue,
+            Err(_) => {
+                unavailable(
+                    env,
+                    api,
+                    "live native attribute entry cannot be inspected",
+                    50,
+                );
+                return Some(Outcome::Return(u32::MAX));
+            }
+        };
+        let path = env.ext.get::<Win32>().vfs.normalize(path);
+        let attributes = match super::native::attributes(env, &path, size) {
+            Ok(attributes) => attributes,
+            Err(status) => {
+                set_last_error(env, super::native::win32_error(status));
+                return Some(Outcome::Return(u32::MAX));
+            }
+        };
+        return Some(Outcome::call(
+            target,
+            [attributes.object, attributes.extra],
+            move |env, resumed| {
+                let status = resumed.value();
+                if status == 0x103 {
+                    // A pending provider still owns the output memory. Do not
+                    // reclaim it or claim that its attributes are complete.
+                    adv_abi::warn_unavailable(
+                        env,
+                        api,
+                        "pending native attribute query requires completion support",
+                    );
+                    return Outcome::Fail("pending native file attribute query".into());
+                }
+                let result = if (status as i32) < 0 {
+                    Err(status)
+                } else {
+                    let pointer = attributes.extra + offset;
+                    adv_abi::guest::check_range(env.cpu, pointer, 4, adv_cpu::backend::Prot::READ)
+                        .and_then(|()| env.cpu.read_u32(pointer))
+                        .map_err(|_| 0xc0000005)
+                };
+                attributes.free(env);
+                match result {
+                    Ok(flags) => Outcome::Return(flags),
+                    Err(status) => {
+                        set_last_error(env, super::native::win32_error(status));
+                        Outcome::Return(u32::MAX)
+                    }
+                }
+            },
+        ));
+    }
+    None
 }
 
 /// One guest attribute view, also used by CRT access checks without opening files.

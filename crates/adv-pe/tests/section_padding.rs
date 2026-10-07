@@ -49,6 +49,27 @@ fn extra_raw_data_may_exceed_image_size_when_its_virtual_pages_fit() {
 }
 
 #[test]
+fn unaligned_image_size_keeps_the_last_virtual_page_without_rewriting_headers() {
+    // Native SEC_IMAGE accepts both the exact logical extent and one byte less
+    // when they still reserve the same final page. The raw tail is observable.
+    for size in [0x2100, 0x20ff] {
+        let pe = Pe::parse(&fixture::image(0x101, 0x200, Some(0x2000), size)).unwrap();
+        assert_eq!(pe.size_of_image, size);
+        assert_eq!(pe.image.len(), 0x3000);
+        assert_eq!(
+            u32::from_le_bytes(pe.image[0x98 + 56..0x98 + 60].try_into().unwrap()),
+            size
+        );
+        assert!(pe.image[0x2000..0x2200].iter().all(|byte| *byte == 0x5a));
+        assert!(pe.image[0x2200..].iter().all(|byte| *byte == 0));
+    }
+    let mut crossing = fixture::image(0x101, 0x200, Some(0x2000), 0x2100);
+    fixture::word(&mut crossing, fixture::TEXT_SECTION + 40 + 8, 0x1100);
+    assert!(matches!(Pe::parse(&crossing), Err(PeError::Malformed(_))));
+    assert!(Pe::parse(&fixture::image(0x101, 0x200, Some(0x2000), 0x2000)).is_err());
+}
+
+#[test]
 fn virtual_extent_image_bounds_and_rounding_overflow_are_rejected() {
     let cases = [
         fixture::image(0x1800, 0x200, None, 0x2000),

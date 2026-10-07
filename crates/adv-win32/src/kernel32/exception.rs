@@ -122,7 +122,7 @@ fn remove_vectored(env: &mut Env<'_>, handle: GuestPtr<()>) -> Outcome {
 }
 
 #[win32(kernel32, name = "RaiseException", level = implement)]
-fn raise(
+pub(super) fn raise(
     env: &mut Env<'_>,
     code: u32,
     flags: u32,

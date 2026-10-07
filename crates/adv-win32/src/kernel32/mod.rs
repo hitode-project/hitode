@@ -1,5 +1,6 @@
 //! kernel32.dll.
 
+mod activation;
 mod atom;
 pub(crate) mod child_process;
 mod environment;
@@ -19,6 +20,7 @@ mod memory;
 pub(crate) use memory::native_read_memory;
 pub(crate) use memory::native_write_memory;
 pub(crate) use memory::protect_memory;
+pub(crate) use memory::{allocate_local_memory, release_local_memory};
 pub(crate) use memory::{allocate_memory, allocation_extent, free_memory, memory_span};
 mod module;
 pub(crate) use module::native_get_procedure;
@@ -51,6 +53,7 @@ use adv_abi::Registry;
 pub(crate) const K32: &str = "kernel32.dll";
 
 pub fn register(reg: &mut Registry) {
+    activation::register(reg);
     registered_wait::register(reg);
     atom::register(reg);
     child_process::register(reg);

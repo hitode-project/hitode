@@ -376,6 +376,10 @@ public static class AbiMetadata
             bool ntCache = f.Length == 6 && f[0] == "ntdll.dll" && f[1] == "NtFlushInstructionCache"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
                 && f[5] == "ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|RegionSize:usize:u32:1";
+            bool ntRegistryOpen = f.Length == 6 && f[0] == "ntdll.dll"
+                && new[] { "NtOpenKey", "ZwOpenKey" }.Contains(f[1])
+                && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.NTSTATUS"
+                && f[5] == "KeyHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1";
             bool internalProcess = f.Length == 6 && f[0] == "kernel32.dll" && f[1] == "CreateProcessInternalW"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "hToken:Windows.Win32.Foundation.HANDLE:handle:1|lpApplicationName:Windows.Win32.Foundation.PCWSTR:str16:1|lpCommandLine:Windows.Win32.Foundation.PWSTR:str16:1|lpProcessAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|lpThreadAttributes:Windows.Win32.Security.SECURITY_ATTRIBUTES*:ptr:1|bInheritHandles:Windows.Win32.Foundation.BOOL:i32:1|dwCreationFlags:u32:u32:1|lpEnvironment:void*:ptr:1|lpCurrentDirectory:Windows.Win32.Foundation.PCWSTR:str16:1|lpStartupInfo:STARTUPINFOW*:ptr:1|lpProcessInformation:PROCESS_INFORMATION*:ptr:1|hNewToken:Windows.Win32.Foundation.HANDLE*:ptr:1";
@@ -417,7 +421,7 @@ public static class AbiMetadata
             // unimplemented entries retain strict generated thunks.
             int ntInitializerWords = f.Length == 6 && f[0] == "ntdll.dll" ? f[1] switch {
                 "NtQuerySection" or "NtQueryKey" or "NtQueryObject" or "NtReadVirtualMemory" or "NtQueryInformationFile" => 5,
-                "NtOpenKey" or "RtlQueryEnvironmentVariable_U" => 3,
+                "RtlQueryEnvironmentVariable_U" => 3,
                 "NtCreateKey" or "NtDuplicateObject" => 7,
                 "NtEnumerateKey" or "NtEnumerateValueKey" or "NtQueryVirtualMemory" => 6,
                 "NtSetInformationProcess" or "CsrClientCallServer" => 4,
@@ -438,7 +442,7 @@ public static class AbiMetadata
             bool eudc = f.Length == 6 && f[0] == "gdi32.dll" && f[1] == "EnableEUDC"
                 && f[3] == "i32" && f[4] == "Windows.Win32.Foundation.BOOL"
                 && f[5] == "fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1";
-            if ((!vcm && !drawDibOpen && !drawDib && !amErrorText && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntHeap && !ntDelay && !internalProcess && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
+            if ((!vcm && !drawDibOpen && !drawDib && !amErrorText && !d3dx && !d3dxEffect && !d3dxStack && !d3dxTexture && !ntPath && !ntDirectory && !ntLoaderLock && !ntStrings && !ntProcedure && !ntLibrary && !ntHeap && !ntDelay && !internalProcess && !ntRegistryOpen && !ntCache && !ntMemoryWrite && !ntAllocation && !ntThreadContext && !ntCreate && !ntQuery && !ntSet && !ntRead && !ntClose && !ntAllocate && !ntFree && !ntContinue && !ntInitializer && !directInput && !eudc) || f[2] != "stdcall")
                 throw new InvalidDataException("Invalid scoped SDK x86 signature: " + row);
             if (d3dx) {
                 int expected = f[1] switch { "D3DXMatrixMultiply" or "D3DXVec4Transform" or "D3DXVec3TransformCoord" or "D3DXVec3Transform" => 3, "D3DXMatrixTranspose" or "D3DXMatrixRotationY" => 2, "D3DXMatrixScaling" or "D3DXMatrixTranslation" or "D3DXMatrixRotationYawPitchRoll" => 4, "D3DXMatrixPerspectiveFovLH" => 5, "D3DXMatrixLookAtLH" => 4, "D3DXVec3Project" or "D3DXVec3CatmullRom" => 6, _ => 0 };
@@ -466,7 +470,7 @@ public static class AbiMetadata
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))
             {
                 var p = parameter.Split(':');
-                if (p.Length != 4 || !(drawDib ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntCache ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntMemoryWrite ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntAllocation ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntThreadContext ? new[] { "handle", "ptr" }.Contains(p[2]) : internalProcess ? new[] { "ptr", "handle", "u32", "i32", "str16" }.Contains(p[2]) : ntHeap ? new[] { "ptr", "u32" }.Contains(p[2]) : ntDelay ? new[] { "ptr", "u32" }.Contains(p[2]) : ntLibrary ? new[] { "ptr", "str16" }.Contains(p[2]) : ntProcedure ? new[] { "ptr", "u32" }.Contains(p[2]) : ntStrings ? new[] { "ptr", "u32", "str8" }.Contains(p[2]) : ntLoaderLock ? new[] { "ptr", "u32" }.Contains(p[2]) : ntDirectory ? new[] { "ptr", "str16", "u32" }.Contains(p[2]) : ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet || ntInitializer ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead || ntAllocate || ntFree || directInput ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntContinue ? new[] { "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect || d3dxStack ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dxTexture ? new[] { "ptr", "u32", "i32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
+                if (p.Length != 4 || !(drawDib ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntCache ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntMemoryWrite ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntAllocation ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntThreadContext ? new[] { "handle", "ptr" }.Contains(p[2]) : internalProcess ? new[] { "ptr", "handle", "u32", "i32", "str16" }.Contains(p[2]) : ntHeap ? new[] { "ptr", "u32" }.Contains(p[2]) : ntDelay ? new[] { "ptr", "u32" }.Contains(p[2]) : ntLibrary ? new[] { "ptr", "str16" }.Contains(p[2]) : ntProcedure ? new[] { "ptr", "u32" }.Contains(p[2]) : ntStrings ? new[] { "ptr", "u32", "str8" }.Contains(p[2]) : ntLoaderLock || ntRegistryOpen ? new[] { "ptr", "u32" }.Contains(p[2]) : ntDirectory ? new[] { "ptr", "str16", "u32" }.Contains(p[2]) : ntPath ? new[] { "ptr", "str16" }.Contains(p[2]) : ntCreate ? new[] { "ptr", "u32" }.Contains(p[2]) : ntQuery || ntSet || ntInitializer ? new[] { "handle", "ptr", "u32", "i32" }.Contains(p[2]) : ntRead || ntAllocate || ntFree || directInput ? new[] { "handle", "ptr", "u32" }.Contains(p[2]) : ntContinue ? new[] { "ptr", "u32" }.Contains(p[2]) : ntClose ? p[2] == "handle" : d3dx ? (p[2] == "ptr" || d3dxScalars && p[2] == "f32") : d3dxEffect || d3dxStack ? new[] { "ptr", "u32" }.Contains(p[2]) : d3dxTexture ? new[] { "ptr", "u32", "i32" }.Contains(p[2]) : new[] { "u32", "i32", "str8" }.Contains(p[2])) || p[3] != "1")
                     throw new InvalidDataException("Invalid SDK x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

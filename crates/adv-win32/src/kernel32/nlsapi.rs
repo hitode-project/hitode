@@ -12,6 +12,8 @@ use crate::util::{
 use crate::{Win32, stdcall};
 use adv_os::nls::{ctype1, is_valid_codepage, lead_byte_ranges};
 
+mod preferred_ui;
+
 /// Japanese (0x411) or Chinese PRC (0x804), following the code page.
 fn lcid(env: &Env<'_>) -> u32 {
     if env.ext.get::<Win32>().codec.acp == 936 {
@@ -349,6 +351,7 @@ fn compare_string_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    preferred_ui::register(reg);
     stdcall(reg, K32, "CompareStringA", 6, compare_string_a);
     stdcall(reg, K32, "CompareStringW", 6, compare_string_w);
     // Enumerates nothing: callers probing for a locale name find none and use their default.

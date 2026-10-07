@@ -7,7 +7,9 @@ use super::K32;
 use crate::stdcall;
 use crate::util::{err, set_last_error};
 use adv_os::Heaps;
+mod dep;
 mod global;
+pub(crate) use global::{allocate as allocate_local_memory, release as release_local_memory};
 mod locks;
 mod virtual_memory;
 pub(crate) use virtual_memory::native_read_memory;
@@ -25,8 +27,9 @@ const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 pub(super) const MAX_APPLICATION_ADDRESS: u32 = 0x7ffe_ffff;
 
 fn heap_create(env: &mut Env<'_>) -> Outcome {
+    let executable = env.arg(0) & 0x40000 != 0; // HEAP_CREATE_ENABLE_EXECUTE
     let heaps = env.ext.get_mut::<Heaps>();
-    match heaps.create(env.cpu, &mut env.sys.vm) {
+    match heaps.create_with_execute(env.cpu, &mut env.sys.vm, executable) {
         Ok(h) => Outcome::Return(h),
         Err(_) => Outcome::Return(0),
     }
@@ -136,6 +139,7 @@ fn heap_size(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    dep::register(reg);
     global::register(reg);
     locks::register(reg);
     stdcall(reg, K32, "HeapCreate", 3, heap_create);

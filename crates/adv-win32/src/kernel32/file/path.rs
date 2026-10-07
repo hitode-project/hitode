@@ -105,6 +105,52 @@ fn set_current(env: &mut Env<'_>, path: String) -> i32 {
     }
     1
 }
+// The guest VFS does not publish DOS 8.3 aliases. Windows permits a long
+// path to be returned unchanged when no short alias exists on the volume.
+// https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-getshortpathnamew
+pub(super) fn alias_path(
+    env: &mut Env<'_>,
+    name: &str,
+    output: u32,
+    cap: u32,
+    wide: bool,
+    long: bool,
+) -> Result<u32, MemFault> {
+    if name.is_empty() {
+        set_last_error(env, 123);
+        return Ok(0);
+    }
+    let api = match (wide, long) {
+        (true, false) => "kernel32.dll!GetShortPathNameW",
+        (false, false) => "kernel32.dll!GetShortPathNameA",
+        (true, true) => "kernel32.dll!GetLongPathNameW",
+        (false, true) => "kernel32.dll!GetLongPathNameA",
+    };
+    if file_attributes_path(env, name, api).is_err() {
+        return Ok(0);
+    }
+    path_string(env, name, cap, output, None, wide)
+}
+#[win32(kernel32, name = "GetShortPathNameA", level = implement)]
+fn short_a(env: &mut Env<'_>, input: AnsiStr, output: AnsiStr, cap: u32) -> Result<u32, MemFault> {
+    let name = ansi(env, input)?;
+    alias_path(env, &name, output.0.addr(), cap, false, false)
+}
+#[win32(kernel32, name = "GetShortPathNameW", level = implement)]
+fn short_w(env: &mut Env<'_>, input: WideStr, output: WideStr, cap: u32) -> Result<u32, MemFault> {
+    let name = wide(env, input)?;
+    alias_path(env, &name, output.0.addr(), cap, true, false)
+}
+#[win32(kernel32, name = "GetLongPathNameA", level = implement)]
+fn long_a(env: &mut Env<'_>, input: AnsiStr, output: AnsiStr, cap: u32) -> Result<u32, MemFault> {
+    let name = ansi(env, input)?;
+    alias_path(env, &name, output.0.addr(), cap, false, true)
+}
+#[win32(kernel32, name = "GetLongPathNameW", level = implement)]
+fn long_w(env: &mut Env<'_>, input: WideStr, output: WideStr, cap: u32) -> Result<u32, MemFault> {
+    let name = wide(env, input)?;
+    alias_path(env, &name, output.0.addr(), cap, true, true)
+}
 #[win32(kernel32, name = "GetFullPathNameA", level = implement)]
 fn full_a(
     env: &mut Env<'_>,
@@ -400,6 +446,10 @@ fn move_w(env: &mut Env<'_>, source: WideStr, target: WideStr) -> Result<Outcome
 pub(super) fn register(reg: &mut Registry) {
     name::register(reg);
     for api in [
+        long_a_ABI,
+        long_w_ABI,
+        short_a_ABI,
+        short_w_ABI,
         full_a_ABI,
         full_w_ABI,
         search_a_ABI,

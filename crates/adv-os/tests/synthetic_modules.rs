@@ -73,6 +73,73 @@ fn named(name: &str) -> ImportName {
     }
 }
 
+fn guest_override(machine: &mut Machine<JitCpu>, id: usize, name: &str) -> Option<u32> {
+    Loader::new(
+        &mut machine.cpu,
+        &mut machine.sys,
+        machine.ext.get_mut::<Modules>(),
+        &Empty,
+    )
+    .guest_override(id, name)
+    .unwrap()
+}
+
+#[test]
+fn guest_override_detects_live_inline_and_eat_edits_against_immutable_entries() {
+    let mut machine = machine(false);
+    let module = machine.load(&Empty, "comctl32.dll").unwrap();
+    let name = "InitCommonControls";
+    let entry = resolve(&mut machine, module, named(name));
+    assert_eq!(guest_override(&mut machine, module, name), None);
+    assert_eq!(guest_override(&mut machine, module, "NotAnExport"), None);
+    // Editing a separate published thunk does not change the copied PE entry.
+    // The reference bytes must come from the immutable emitter, not this page.
+    let thunk = machine.resolve_import("comctl32.dll", name).unwrap();
+    machine.cpu.protect(thunk & !4095, 4096, Prot::RWX).unwrap();
+    machine.cpu.write(thunk, &[0xc3]).unwrap();
+    assert_eq!(guest_override(&mut machine, module, name), None);
+    machine.cpu.protect(entry & !4095, 4096, Prot::RWX).unwrap();
+    machine.cpu.write(entry, &[0xc3]).unwrap();
+    assert_eq!(guest_override(&mut machine, module, name), Some(entry));
+    let image = adv_os::modules(&machine.ext).get(module);
+    let base = image.base;
+    let ExportTarget::Rva(original) = image.exports_by_name[name] else {
+        panic!("code export")
+    };
+    let directory = base + machine.cpu.read_u32(base + 0x80 + 120).unwrap();
+    let count = machine.cpu.read_u32(directory + 20).unwrap();
+    let table = base + machine.cpu.read_u32(directory + 28).unwrap();
+    let slot = (0..count)
+        .map(|index| table + index * 4)
+        .find(|slot| machine.cpu.read_u32(*slot).unwrap() == original)
+        .unwrap();
+    machine.cpu.protect(slot & !4095, 4096, Prot::RW).unwrap();
+    machine.cpu.write_u32(slot, original + 1).unwrap();
+    assert_eq!(guest_override(&mut machine, module, name), Some(entry + 1));
+    let forwarder = machine.cpu.read_u32(directory + 12).unwrap();
+    machine.cpu.write(base + forwarder, b"absent.F\0").unwrap();
+    machine.cpu.write_u32(slot, forwarder).unwrap();
+    let count = adv_os::modules(&machine.ext).iter().count();
+    let mut loader = Loader::new(
+        &mut machine.cpu,
+        &mut machine.sys,
+        machine.ext.get_mut::<Modules>(),
+        &Empty,
+    );
+    assert!(matches!(
+        loader.guest_override(module, name),
+        Err(adv_os::LoadError::Pe { .. })
+    ));
+    assert_eq!(loader.modules.iter().count(), count);
+    assert!(loader.modules.by_name("absent.dll").is_none());
+    assert!(loader.inits.is_empty());
+    // Capability filtering still applies to pristine diagnostic exports, while
+    // the override probe itself neither requires nor reports host availability.
+    let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
+    assert_eq!(guest_override(&mut machine, kernel, "FlsAlloc"), None);
+    assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+}
+
 fn dynamic(
     machine: &mut Machine<JitCpu>,
     id: usize,
