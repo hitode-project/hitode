@@ -226,6 +226,8 @@
       }
     ],
     "projection": "FILE* __cdecl _fsopen/_wfsopen(filename, mode, int share), three x86 slots; legacy CRT aliases only.",
+    "binary_write_oracle_source_sha256": "bfdf2b22338d5898076889140c74d41f46a9f83791c6cd48f88697d7c9a2177e",
+    "binary_write_profile": "Authored VC80/90 six-row no-UI probe covers A/W wb+SH_DENYNO creation, binary fwrite/flush/close and error-owner observations. Guest wb uses the existing FILE/VFS private overlay and preflights incoming writer sharing before creation/truncation; rb retains its reader sharing check. Text/update/append and other sharing modes remain explicit ENOSYS warnings. Existing VFS creates parent directories, so native missing-parent failure rows are comparison data, not a claim of equivalent guest directory behavior.",
     "profile": "Use the existing CRT stream and VFS owner; unsupported sharing modes must fail with qualified warning rather than fabricated success."
   },
   "stream_position": {
@@ -331,6 +333,8 @@
   "byte_stream_output": {
     "header": "ucrt/stdio.h:221-224,347-350",
     "header_sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "native_oracle_source_sha256": "9faf9f421f48d681fff8516eabb0f80e5c920119b9af07a636a9d428de5b974a",
+    "native_verification": "Authored VC80/90 18-row no-UI probe measures binary fputc unsigned-byte truncation/return, unchanged errno/DOS/LastError, rb write EOF with errno9 and preserved DOS/LastError, and NULL returning-invalid-handler behavior. Guest FILE metadata remains in the existing stream owner; explicit binary streams write one real byte. Text/Unicode orientation, closed/unknown/pseudo streams and unmeasured legacy NULL behavior warn/fail. No complete native buffering, FILE field, ferror or orientation equivalence is asserted.",
     "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fputc-fputwc",
     "scope": "Three existing CRT aliases: int __cdecl fputc/putc(int character, FILE* stream), two x86 argument words. Character is converted to unsigned char; success returns that byte and failure returns EOF(-1).",
     "profile": "Use existing shared FILE, binary write and CRT error owners. Unsupported text/orientation or non-owned/pseudo-stream profiles must explicitly warn and fail; do not invent a FILE layout or a private stream table."
