@@ -1,5 +1,5 @@
-//! Conservative writes for normal exits only. Faults and stateful helpers keep
-//! the full canonical writeback, including MMX/x87 aliases and arbitrary traps.
+//! Conservative state footprint for ordinary integer/SSE regions. Stateful
+//! helpers and MMX/x87 aliases retain the full canonical state contract.
 use super::*;
 use iced_x86::{InstructionInfoFactory, OpAccess};
 
@@ -38,6 +38,9 @@ pub(super) fn crosses_regions(instructions: &BTreeMap<u32, Instruction>) -> bool
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Summary {
+    /// Every referenced GPR, including implicit/address and write-only uses.
+    /// A write-only register still needs its entry value for an earlier fault.
+    pub gpr_used: u8,
     pub gpr: u8,
     pub xmm: u8,
     pub flags: bool,
@@ -59,6 +62,9 @@ impl Summary {
             // stateful or unsupported paths are deliberately excluded above.
             summary.flags |= instruction.rflags_modified() != 0;
             for register in factory.info(instruction).used_registers() {
+                if let Some(index) = reg_index(register.register().full_register32()) {
+                    summary.gpr_used |= 1 << index;
+                }
                 if !matches!(
                     register.access(),
                     OpAccess::Write
@@ -98,6 +104,7 @@ mod tests {
         // mov ah,1; mul ebx; push eax; paddb xmm0,xmm1
         let s = summary(&[0xb4, 1, 0xf7, 0xe3, 0x50, 0x66, 0x0f, 0xfc, 0xc1]).unwrap();
         assert_eq!(s.gpr, (1 << 0) | (1 << 2) | (1 << 4));
+        assert_eq!(s.gpr_used, (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4));
         assert_eq!(s.xmm, 1);
         assert!(s.flags);
     }
