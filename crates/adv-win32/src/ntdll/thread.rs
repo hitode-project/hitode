@@ -12,7 +12,13 @@ fn set_context(env: &mut Env<'_>, thread: Handle, context: GuestPtr<()>) -> Outc
     crate::kernel32::native_thread_context(env, thread.0, context.addr(), true)
 }
 
+#[win32(ntdll, name = "NtResumeThread", level = implement)]
+fn resume(env: &mut Env<'_>, thread: Handle, previous: GuestPtr<u32>) -> Outcome {
+    crate::kernel32::native_resume_thread(env, thread.0, previous.addr())
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_context_ABI);
     registry.register(set_context_ABI);
+    registry.register(resume_ABI);
 }
