@@ -24,6 +24,7 @@ mod path;
 mod random;
 mod scan;
 mod scalar_float;
+mod scalar_log;
 mod scalar_power;
 mod scalar_round;
 mod scalar_split;
@@ -135,6 +136,7 @@ pub fn register(r: &mut Registry) {
     time64::register(r);
     random::register(r);
     scalar_float::register(r);
+    scalar_log::register(r);
     scalar_power::register(r);
     scalar_round::register(r);
     scalar_split::register(r);
