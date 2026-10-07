@@ -2,10 +2,12 @@
 kernel32.dll
 user32.dll
 gdi32.dll
+msimg32.dll
 advapi32.dll
 winmm.dll
 ole32.dll
 oleaut32.dll
+oleacc.dll
 comdlg32.dll
 comctl32.dll
 shell32.dll
