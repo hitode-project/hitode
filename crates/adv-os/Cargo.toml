@@ -15,6 +15,10 @@ adv-pe.workspace = true
 thiserror.workspace = true
 log.workspace = true
 encoding_rs.workspace = true
+# Enable std only for the host I/O adapter; ISO's std feature also pulls in
+# unused clock, random-number and logging support for image authoring.
+hadris-iso = { version = "2.5.0", default-features = false, features = ["alloc", "sync"] }
+hadris-io = { version = "2.5.0", default-features = false, features = ["std", "sync"] }
 
 [lints]
 workspace = true

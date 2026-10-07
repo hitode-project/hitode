@@ -197,10 +197,20 @@ pub(super) fn supported(i: &Instruction) -> bool {
 }
 
 impl Emitter<'_> {
-    /// 8/16-bit ADD/SUB/AND/OR/XOR/CMP/TEST/INC/DEC. Lazy flags keep the
+    /// 8/16-bit ADD/SUB/AND/OR/XOR/CMP/TEST/INC/DEC/NEG. Lazy flags keep the
     /// operands shifted to bit 31 and record the shift in the kind's high byte,
     /// so ZF/SF/CF/OF need no width; PF and AF shift the result back.
     pub(super) fn narrow_alu(&mut self, i: &Instruction, size: usize) {
+        if i.mnemonic() == M::Neg {
+            let source = self.read(i, 0);
+            // A fault must expose the flags and memory preceding the NEG.
+            let ptr = self.destination(i);
+            let result = self.b.ins().ineg(source);
+            let zero = self.constant(0);
+            self.arithmetic_flags(zero, source, result, size, true);
+            self.write(i, ptr, result);
+            return;
+        }
         let shift = (32 - size * 8) as i64;
         let counter = self.counting(i);
         // The whole counter register: the shifts below drop its high half.

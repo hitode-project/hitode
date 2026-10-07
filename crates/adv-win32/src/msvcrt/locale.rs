@@ -3,8 +3,8 @@
 use super::*;
 use adv_abi::{AnsiStr, GuestPtr, guest::memory_failure, win32};
 
-mod ctype;
 mod conv;
+mod ctype;
 
 const CATEGORY_NAMES: [&str; 5] = [
     "LC_COLLATE",
@@ -70,7 +70,10 @@ pub(super) struct LocaleState {
 }
 pub(super) fn register(registry: &mut Registry) {
     for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
-        registry.register(adv_abi::Api { module, ..setlocale_ABI });
+        registry.register(adv_abi::Api {
+            module,
+            ..setlocale_ABI
+        });
     }
     registry.register(lc_handles_ABI);
     registry.register(lc_codepage_ABI);
@@ -81,15 +84,25 @@ pub(super) fn register(registry: &mut Registry) {
 /// Formatting observes the CRT module's LC_CTYPE, independently of Win32 ACP.
 pub(super) fn formatting_codepage(env: &Env<'_>) -> u32 {
     let module = crt_module(&env.sys.thunks.get(env.thunk).module);
-    env.ext.try_get::<CrtState>().and_then(|state| state.locales.get(module))
+    env.ext
+        .try_get::<CrtState>()
+        .and_then(|state| state.locales.get(module))
         .map_or(0, |state| state.categories[1].codepage)
+}
+
+/// Buffer comparisons consume the same module-owned LC_CTYPE byte conversion.
+pub(super) fn lowercase_bytes(env: &Env<'_>) -> Option<[u8; 256]> {
+    ctype::lowercase_bytes(formatting_codepage(env))
 }
 
 /// Decimal conversions observe NUMERIC and CTYPE independently. The existing
 /// four language profiles all publish decimal dot through localeconv.
 pub(super) fn scalar_float_profile(env: &Env<'_>) -> Option<([bool; 256], u8)> {
     let module = crt_module(&env.sys.thunks.get(env.thunk).module);
-    let state = env.ext.try_get::<CrtState>().and_then(|s| s.locales.get(module));
+    let state = env
+        .ext
+        .try_get::<CrtState>()
+        .and_then(|s| s.locales.get(module));
     let numeric = state.map_or(Locale::default(), |s| s.categories[3]);
     if !matches!(numeric.codepage, 0 | 932 | 936 | 1252) {
         return None;
@@ -278,8 +291,11 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         return memory_failure(error);
     }
     let monetary_codepage = conv::updated_monetary_codepage(&state, &categories);
-    let ever_non_c = state.ever_non_c || (!requested.0.is_null()
-        && categories.iter().any(|locale| locale.language != Language::C));
+    let ever_non_c = state.ever_non_c
+        || (!requested.0.is_null()
+            && categories
+                .iter()
+                .any(|locale| locale.language != Language::C));
     env.ext.get_mut::<CrtState>().locales.insert(
         module,
         LocaleState {

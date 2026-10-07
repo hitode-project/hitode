@@ -25,7 +25,12 @@ pub(super) fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
         },
     )
 }
-pub(super) fn invoke<B: Backend>(m: &mut Machine<B>, data: u32, api: adv_abi::Api, args: &[u32]) -> u32 {
+pub(super) fn invoke<B: Backend>(
+    m: &mut Machine<B>,
+    data: u32,
+    api: adv_abi::Api,
+    args: &[u32],
+) -> u32 {
     for (i, &arg) in args.iter().enumerate() {
         m.cpu.write_u32(data + 4 * (i as u32 + 1), arg).unwrap();
     }

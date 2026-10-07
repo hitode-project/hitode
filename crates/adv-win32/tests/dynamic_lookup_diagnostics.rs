@@ -346,10 +346,7 @@ fn failed_forwarders_keep_requested_and_target_names_and_rollback_guest_dependen
         "proxy.dll",
         0x500000,
         &[
-            export(
-                "NeedSDK",
-                Target::Forwarder("kernel32.FlsAlloc".into()),
-            ),
+            export("NeedSDK", Target::Forwarder("kernel32.FlsAlloc".into())),
             export(
                 "NeedGuest",
                 Target::Forwarder("owned.MissingFeature".into()),

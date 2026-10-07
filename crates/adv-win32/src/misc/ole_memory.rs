@@ -170,9 +170,17 @@ fn format_guid(bytes: &[u8; 16]) -> String {
     let d3 = u16::from_le_bytes([bytes[6], bytes[7]]);
     format!(
         "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-        d1, d2, d3,
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        d1,
+        d2,
+        d3,
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )
 }
 
@@ -337,12 +345,36 @@ pub(super) fn register(registry: &mut Registry) {
     stdcall(registry, "ole32.dll", "CoTaskMemAlloc", 1, task_alloc);
     stdcall(registry, "ole32.dll", "CoTaskMemRealloc", 2, task_realloc);
     stdcall(registry, "ole32.dll", "CoTaskMemFree", 1, task_free);
-    stdcall(registry, "ole32.dll", "StringFromCLSID", 2, string_from_clsid);
-    stdcall(registry, "ole32.dll", "StringFromGUID2", 3, string_from_guid2);
-    stdcall(registry, "ole32.dll", "CLSIDFromString", 2, clsid_from_string);
+    stdcall(
+        registry,
+        "ole32.dll",
+        "StringFromCLSID",
+        2,
+        string_from_clsid,
+    );
+    stdcall(
+        registry,
+        "ole32.dll",
+        "StringFromGUID2",
+        3,
+        string_from_guid2,
+    );
+    stdcall(
+        registry,
+        "ole32.dll",
+        "CLSIDFromString",
+        2,
+        clsid_from_string,
+    );
     stdcall(registry, "ole32.dll", "IIDFromString", 2, clsid_from_string);
     stdcall(registry, "ole32.dll", "CoCreateGuid", 1, co_create_guid);
-    stdcall(registry, "shell32.dll", "SHCLSIDFromString", 2, clsid_from_string);
+    stdcall(
+        registry,
+        "shell32.dll",
+        "SHCLSIDFromString",
+        2,
+        clsid_from_string,
+    );
     for (name, ordinal, argc, handler) in [
         (
             "SysAllocString",

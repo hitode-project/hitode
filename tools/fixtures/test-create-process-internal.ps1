@@ -1,0 +1,41 @@
+param(
+    [string]$Runner=(Join-Path $PSScriptRoot '../../target/debug/adv-run.exe'),
+    [string]$OutputDirectory=(Join-Path $PSScriptRoot '../../target/architecture-acceptance/create-process-internal'),
+    [switch]$NativeOnly
+)
+$ErrorActionPreference='Stop'
+$Runner=[IO.Path]::GetFullPath($Runner)
+$OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
+if(-not $OutputDirectory.Contains([IO.Path]::DirectorySeparatorChar+'target'+[IO.Path]::DirectorySeparatorChar+'architecture-acceptance'+[IO.Path]::DirectorySeparatorChar)){throw 'internal process evidence must stay inside target/architecture-acceptance'}
+$nativeDirectory=Join-Path $OutputDirectory 'native'
+New-Item -ItemType Directory -Force -Path $nativeDirectory | Out-Null
+$llvm='C:\Program Files\LLVM\bin';$sdk='C:\Program Files (x86)\Windows Kits\10';$version='10.0.26100.0'
+& (Join-Path $llvm 'clang-cl.exe') /nologo /c /O2 /GS- /Gs9999999 /Zl /clang:-fno-builtin /clang:--target=i686-pc-windows-msvc "/I$sdk/Include/$version/um" "/I$sdk/Include/$version/shared" "/I$sdk/Include/$version/ucrt" (Join-Path $PSScriptRoot 'create-process-internal.c') "/Fo$nativeDirectory/fixture.obj"
+if($LASTEXITCODE-ne 0){throw 'internal process fixture compile failed'}
+$fixture=Join-Path $nativeDirectory 'fixture.exe'
+& (Join-Path $llvm 'lld-link.exe') /nologo /machine:x86 /nodefaultlib /dynamicbase /base:0x400000 /safeseh:no /timestamp:0 "/libpath:$sdk/Lib/$version/um/x86" /subsystem:windows /entry:mainCRTStartup "/out:$fixture" "$nativeDirectory/fixture.obj" kernel32.lib
+if($LASTEXITCODE-ne 0){throw 'internal process fixture link failed'}
+& (Join-Path $llvm 'clang-cl.exe') /nologo /c /O2 /GS- /Zl /DCHILD /clang:--target=i686-pc-windows-msvc "/I$sdk/Include/$version/um" "/I$sdk/Include/$version/shared" "/I$sdk/Include/$version/ucrt" (Join-Path $PSScriptRoot 'create-process-internal.c') "/Fo$nativeDirectory/child.obj"
+if($LASTEXITCODE-ne 0){throw 'child fixture compile failed'}
+& (Join-Path $llvm 'lld-link.exe') /nologo /machine:x86 /nodefaultlib /dynamicbase /base:0x400000 /safeseh:no /timestamp:0 "/libpath:$sdk/Lib/$version/um/x86" /subsystem:windows /entry:mainCRTStartup "/out:$nativeDirectory/process-child.exe" "$nativeDirectory/child.obj" kernel32.lib
+if($LASTEXITCODE-ne 0){throw 'child fixture link failed'}
+$native=Start-Process -FilePath $fixture -WorkingDirectory $nativeDirectory -WindowStyle Hidden -PassThru
+try{if(-not $native.WaitForExit(10000)){throw 'native internal process fixture exceeded ten seconds'};if($native.ExitCode-ne 0){throw "native internal process fixture failed: $($native.ExitCode)"}}
+finally{try{if(-not $native.HasExited){$native.Kill();$native.WaitForExit(1000)|Out-Null}}finally{$native.Dispose()}}
+$reference=[IO.File]::ReadAllBytes((Join-Path $nativeDirectory 'create-process-internal.bin'))
+if($reference.Length-ne 16*4 -or [BitConverter]::ToUInt32($reference,0)-ne 0 -or [BitConverter]::ToUInt32($reference,13*4)-ne 37){throw 'native internal process data check failed'}
+if($NativeOnly){Write-Output 'native: 16 DWORDs of internal process creation, suspended creation, publication, resume and exit';exit 0}
+foreach($variant in @('interpreter','jit')){
+    $overlay=Join-Path $OutputDirectory "$variant-data";$report=Join-Path $OutputDirectory "$variant.json"
+    $arguments=@($fixture,'--hidden','--backend',$variant,'--seconds','10','--data-dir',$overlay,'--report',$report,'--api-mode','strict')
+    if($variant-eq 'jit'){$arguments+='--sync-compilation'}
+    & $Runner @arguments *> (Join-Path $OutputDirectory "$variant.log")
+    if($LASTEXITCODE-notin @(0,1)){throw "$variant internal process fixture could not complete"}
+    $actual=[IO.File]::ReadAllBytes((Join-Path $overlay 'overlay/create-process-internal.bin'))
+    if($actual.Length-ne $reference.Length){throw "$variant missing internal process results"}
+    for($i=0;$i-lt $reference.Length;$i+=4){if([BitConverter]::ToUInt32($actual,$i)-ne [BitConverter]::ToUInt32($reference,$i)){throw "$variant native mismatch at DWORD $($i/4): $([BitConverter]::ToUInt32($actual,$i)) vs $([BitConverter]::ToUInt32($reference,$i))"}}
+    $e=Get-Content -Raw $report|ConvertFrom-Json
+    if($e.guest_exit_code-ne 37 -or $e.api.processes.Count-ne 2 -or $e.api.processes[0].exit_code-ne 0 -or $e.api.processes[1].exit_code-ne 37 -or $e.api.acceptance_eligible-ne $true -or $e.api.warnings.Count-ne 0){throw "$variant strict internal process execution failed"}
+    Write-Output "${variant}: internal process results match native"
+}
+exit 0

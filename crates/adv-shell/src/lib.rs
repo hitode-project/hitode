@@ -20,6 +20,7 @@ struct Options {
     row_batching: bool,
     exe: PathBuf,
     data_dir: PathBuf,
+    cdroms: Vec<(char, PathBuf)>,
     jit: bool,
     compile_strategy: CompileStrategy,
     region_linking: bool,
@@ -81,6 +82,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --frames N              stop after N presented guest frames\n\
   --seconds N             stop after N seconds of host wall time\n\
   --data-dir PATH         guest write overlay (default: target/adv-data/<exe>)\n\
+  --cdrom D=PATH          attach a read-only ISO to guest drive D (repeatable)\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
   --trace PATH            write every completed guest API call to a local trace\n\
@@ -107,6 +109,7 @@ impl Options {
             row_batching: true,
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
+            cdroms: Vec::new(),
             jit: true,
             compile_strategy: CompileStrategy::Fast,
             region_linking: true,
@@ -149,6 +152,22 @@ impl Options {
                 }
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--cdrom" => {
+                    let mount = value()?;
+                    let (drive, path) = mount.split_once('=').ok_or("--cdrom requires D=PATH")?;
+                    let letter = drive.trim_end_matches(':').to_ascii_uppercase();
+                    if letter.len() != 1
+                        || !letter.as_bytes()[0].is_ascii_uppercase()
+                        || path.is_empty()
+                    {
+                        return Err("--cdrom requires one drive letter and an ISO path".into());
+                    }
+                    let letter = letter.as_bytes()[0] as char;
+                    if letter == 'C' || options.cdroms.iter().any(|(d, _)| *d == letter) {
+                        return Err("--cdrom drive is reserved or already configured".into());
+                    }
+                    options.cdroms.push((letter, PathBuf::from(path)));
+                }
                 "--no-time-skip" => options.time_skip = false,
                 "--api-mode" => {
                     options.api_mode = match value()?.as_str() {
@@ -992,6 +1011,9 @@ fn run_execution(
         options.codec,
     )?;
     runtime.set_codepage(options.codepage)?;
+    for (drive, image) in &options.cdroms {
+        runtime.mount_iso(*drive, image)?;
+    }
     runtime
         .machine
         .cpu

@@ -381,6 +381,28 @@
     "scope": "Three existing CRT aliases: int __cdecl fputc/putc(int character, FILE* stream), two x86 argument words. Character is converted to unsigned char; success returns that byte and failure returns EOF(-1).",
     "profile": "Use existing shared FILE, binary write and CRT error owners. Unsupported text/orientation or non-owned/pseudo-stream profiles must explicitly warn and fail; do not invent a FILE layout or a private stream table."
   },
+  "legacy_memory_compare": {
+    "header": "ucrt/corecrt_memory.h:28-32",
+    "header_sha256": "18ca520416579183bc369c0a8e555914db5c7577075b9359173fc6bc45595560",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memicmp-memicmp-l",
+    "projection": "int __cdecl _memicmp(void const*, void const*, size_t), three x86 argument words. Only the observed MSVCRT profile is advertised; the locale uses the existing module-owned LC_CTYPE byte casing and comparison consumes exactly count bytes, including embedded NULs.",
+    "native_msvcrt_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f",
+    "native_probe_source_sha256": "db71986db47eac0c9fa03cc6719f7bf9ff3084387d4b27614dc24ad691225171",
+    "native_probe_exe_sha256": "6f811d3eac5099a4d8ff33352618672867515579931ccd7e18683d5e7e3a0523",
+    "native_verification": "Authored x86 MSVCRT probe, 60 cases across initial C, CP932/936/1252 and restored C. C normalizes nonzero results to -1/+1; installed non-C profiles return the unsigned lowercase-byte difference. Zero count returns0 even with NULL buffers; positive-count NULL returns INT_MAX and errno22, preserving DOS errno/LastError. Embedded NUL bytes remain part of the comparison."
+  },
+  "legacy_access": {
+    "headers": [
+      "ucrt/corecrt_io.h:110-113",
+      "ucrt/corecrt_wio.h:95-98"
+    ],
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/access-waccess",
+    "projection": "int __cdecl _access(char const*, int) and int __cdecl _waccess(wchar_t const*, int); only the observed legacy msvcrt profile is advertised, with two x86 argument words and signed int return.",
+    "native_msvcrt_sha256": "23a918921c545140d189ce6dc68590bacdeb0ab2f3e3a9a2d722c5aff45ce64f",
+    "native_probe_source_sha256": "026416664f01764d555668a55ab60d86df912e657080b81b8c8882ee4b7ea207",
+    "native_probe_exe_sha256": "c458d6d8398e50325edd7c6b752dd548301be349c5412407857a58a578b5da10",
+    "native_verification": "Authored x86 MSVCRT probe, 112 cases: success preserves errno, DOS errno and LastError; missing leaf/parent set errno2 with DOS/LastError2/3; empty paths report errno2/DOS3; read-only write checks set errno13/DOS5 while preserving LastError. This legacy runtime accepts modes0..15 and rejects NULL or other modes with errno22/DOS0 while preserving LastError, unlike modern invalid-parameter-handler documentation. Guest access queries borrow the common VFS attribute view, so isolated resource layers remain writable through copy-on-write and synthetic system files remain read-only."
+  },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
     "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",

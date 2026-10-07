@@ -416,7 +416,10 @@ fn install_audio<B: Backend>(
             if shared {
                 // Child installation must not truncate the live parent's
                 // diagnostics when both inherit the same host environment.
-                let mut name = path.file_name().ok_or("invalid ADV_AUDIO_TRACE path")?.to_os_string();
+                let mut name = path
+                    .file_name()
+                    .ok_or("invalid ADV_AUDIO_TRACE path")?
+                    .to_os_string();
                 name.push(format!(".pid-{:08x}", m.sys.pid));
                 path.set_file_name(name);
             }
@@ -1091,7 +1094,15 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 let Some(orig_id) = com.identity::<Object>(&e.sys.objects, b) else {
                     return Ok(INVALID);
                 };
-                let (orig_storage, orig_len, orig_flags, orig_format, orig_vol, orig_pan, orig_freq) = match com
+                let (
+                    orig_storage,
+                    orig_len,
+                    orig_flags,
+                    orig_format,
+                    orig_vol,
+                    orig_pan,
+                    orig_freq,
+                ) = match com
                     .get_identity(&e.sys.objects, orig_id)
                     .and_then(|o| o.buffer.as_ref())
                 {
@@ -2854,7 +2865,11 @@ mod tests {
 
         // Duplicate orig -> dup
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, orig, DATA + 128]),
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[dev, orig, DATA + 128]
+            ),
             0
         );
         let dup = m.cpu.read_u32(DATA + 128).unwrap();
@@ -2867,7 +2882,10 @@ mod tests {
         let stream: adv_device::AudioStream = m.ext.get::<Sound>().audio.stream();
         let mut out = [0.0; 20];
         stream.read_stereo(&mut out, 1000);
-        assert_eq!(out, [1.0; 20], "both voices play concurrently and mix: 0.5 + 0.5 = 1.0");
+        assert_eq!(
+            out, [1.0; 20],
+            "both voices play concurrently and mix: 0.5 + 0.5 = 1.0"
+        );
 
         // Stop orig, dup keeps playing
         invoke(&mut m, "IDirectSoundBuffer8::Stop", &[orig]);
@@ -2876,12 +2894,34 @@ mod tests {
         assert_eq!(out, [0.5; 20], "dup continues playing after orig stops");
 
         // Adjust volume on dup, orig is unaffected
-        invoke(&mut m, "IDirectSoundBuffer8::SetVolume", &[dup, (-600i32) as u32]);
-        assert_eq!(m.ext.get::<Sound>().buffer(&m.sys.objects, dup).unwrap().volume, -600);
-        assert_eq!(m.ext.get::<Sound>().buffer(&m.sys.objects, orig).unwrap().volume, 0);
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::SetVolume",
+            &[dup, (-600i32) as u32],
+        );
+        assert_eq!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, dup)
+                .unwrap()
+                .volume,
+            -600
+        );
+        assert_eq!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, orig)
+                .unwrap()
+                .volume,
+            0
+        );
 
         // Seek on dup, orig cursor is unaffected
-        invoke(&mut m, "IDirectSoundBuffer8::SetCurrentPosition", &[dup, 50]);
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::SetCurrentPosition",
+            &[dup, 50],
+        );
         assert_eq!(position(&mut m, dup), 50);
         assert_eq!(position(&mut m, orig), 0);
 
@@ -2894,12 +2934,30 @@ mod tests {
         let p1 = m.cpu.read_u32(DATA + 132).unwrap();
         assert_eq!(p1, orig_storage);
         // Lock on dup while orig is locked must be independent (orig is locked, dup is not)
-        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, orig).unwrap().lock.is_some());
-        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, dup).unwrap().lock.is_none());
+        assert!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, orig)
+                .unwrap()
+                .lock
+                .is_some()
+        );
+        assert!(
+            m.ext
+                .get::<Sound>()
+                .buffer(&m.sys.objects, dup)
+                .unwrap()
+                .lock
+                .is_none()
+        );
 
         // Write new samples via orig lock
         m.cpu.write(p1, &[128; 100]).unwrap(); // silence
-        invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[orig, p1, 100, 0, 0]);
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::Unlock",
+            &[orig, p1, 100, 0, 0],
+        );
 
         // Lock dup to verify it points to the exact same shared memory
         invoke(
@@ -2909,7 +2967,11 @@ mod tests {
         );
         let dup_p1 = m.cpu.read_u32(DATA + 140).unwrap();
         assert_eq!(dup_p1, orig_storage);
-        invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[dup, dup_p1, 100, 0, 0]);
+        invoke(
+            &mut m,
+            "IDirectSoundBuffer8::Unlock",
+            &[dup, dup_p1, 100, 0, 0],
+        );
 
         // Clean up
         invoke(&mut m, "IDirectSoundBuffer8::Release", &[orig]);
@@ -2937,7 +2999,11 @@ mod tests {
 
         // Duplicate orig -> dup1
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, orig, DATA + 128]),
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[dev, orig, DATA + 128]
+            ),
             0
         );
         let dup1 = m.cpu.read_u32(DATA + 128).unwrap();
@@ -2970,7 +3036,11 @@ mod tests {
 
         // dup1 can be cloned to dup2 even after original is long dead!
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, dup1, DATA + 140]),
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[dev, dup1, DATA + 140]
+            ),
             0
         );
         let dup2 = m.cpu.read_u32(DATA + 140).unwrap();
@@ -3018,7 +3088,11 @@ mod tests {
         m.cpu.write_u32(DATA, 19).unwrap();
         m.cpu.write_u32(DATA + 4, 0x10).unwrap();
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &[dev, DATA, DATA + 128, 0]),
+            invoke(
+                &mut m,
+                "IDirectSound8::CreateSoundBuffer",
+                &[dev, DATA, DATA + 128, 0]
+            ),
             INVALID
         );
         assert!(
@@ -3031,7 +3105,11 @@ mod tests {
         for _ in 0..128 {
             m.cpu.write_u32(DATA + 128, 0xcccccccc).unwrap();
             assert_eq!(
-                invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &[dev, DATA, DATA + 128, 0]),
+                invoke(
+                    &mut m,
+                    "IDirectSound8::CreateSoundBuffer",
+                    &[dev, DATA, DATA + 128, 0]
+                ),
                 UNSUPPORTED
             );
             assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
@@ -3054,7 +3132,11 @@ mod tests {
         m.cpu.write_u32(DATA + 12, 0).unwrap();
         m.cpu.write_u32(DATA + 16, 0).unwrap();
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &[dev, DATA, DATA + 128, 0]),
+            invoke(
+                &mut m,
+                "IDirectSound8::CreateSoundBuffer",
+                &[dev, DATA, DATA + 128, 0]
+            ),
             0
         );
         let primary = m.cpu.read_u32(DATA + 128).unwrap();
@@ -3069,15 +3151,27 @@ mod tests {
             128
         );
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, primary, DATA + 132]),
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[dev, primary, DATA + 132]
+            ),
             0x88780032, // DSERR_INVALIDCALL
         );
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, primary, 0]),
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[dev, primary, 0]
+            ),
             INVALID,
         );
         assert_eq!(
-            invoke(&mut m, "IDirectSound8::DuplicateSoundBuffer", &[dev, 0, DATA + 132]),
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[dev, 0, DATA + 132]
+            ),
             INVALID,
         );
         invoke(&mut m, "IDirectSoundBuffer8::Release", &[primary]);

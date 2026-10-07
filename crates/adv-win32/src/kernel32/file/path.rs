@@ -91,16 +91,16 @@ fn current(env: &mut Env<'_>, cap: u32, output: u32, wide: bool) -> Result<u32, 
     path_string(env, &path, cap, output, None, wide)
 }
 fn set_current(env: &mut Env<'_>, path: String) -> i32 {
-    let w = env.ext.get_mut::<Win32>();
-    let mut path = w.vfs.normalize(&path);
-    if !w.vfs.is_dir(&path) {
+    if env
+        .ext
+        .get_mut::<Win32>()
+        .vfs
+        .set_current_directory(&path)
+        .is_err()
+    {
         set_last_error(env, err::PATH_NOT_FOUND);
         return 0;
     }
-    if path.len() > 3 {
-        path = path.trim_end_matches('\\').to_owned();
-    }
-    w.vfs.cwd = path;
     1
 }
 #[win32(kernel32, name = "GetFullPathNameA", level = implement)]

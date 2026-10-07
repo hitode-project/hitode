@@ -20,8 +20,8 @@ mod dc;
 mod dirty;
 mod fixed;
 mod format;
-mod memory;
 pub(crate) mod loading;
+mod memory;
 mod pacing;
 mod presentation;
 mod programmable;
@@ -29,9 +29,9 @@ mod readback;
 mod residency;
 mod stretch;
 mod targets;
-mod update_texture;
 #[cfg(test)]
 mod tests;
+mod update_texture;
 use std::collections::BTreeMap;
 
 const INVALID: u32 = 0x8876086c;

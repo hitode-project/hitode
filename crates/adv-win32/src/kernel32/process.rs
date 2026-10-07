@@ -301,6 +301,21 @@ fn set_unhandled_exception_filter(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(std::mem::replace(&mut w.unhandled_filter, f))
 }
 
+fn unhandled_exception_filter(env: &mut Env<'_>) -> Outcome {
+    let filter = env.ext.get::<Win32>().unhandled_filter;
+    if filter == 0 {
+        return Outcome::Return(0); // EXCEPTION_CONTINUE_SEARCH, without a guest filter.
+    }
+    let pointers = env.arg(0);
+    // The caller owns EXCEPTION_POINTERS and CONTEXT. A CRT frame filter may
+    // pass the dispatcher's records here, then resume their edited context when
+    // the registered top-level filter returns EXCEPTION_CONTINUE_EXECUTION.
+    Outcome::call(filter, [pointers], |_, result| {
+        Outcome::Return(result.value())
+    })
+    .unwindable()
+}
+
 const EXCEPTION_UNWINDING: u32 = 2;
 const EXCEPTION_EXIT_UNWIND: u32 = 4;
 const STATUS_UNWIND: u32 = 0xc000_0027;
@@ -342,7 +357,9 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     } else {
         match env.cpu.read_u32(record) {
             Ok(code) => code,
-            Err(error) => return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}")),
+            Err(error) => {
+                return Outcome::Fail(format!("RtlUnwind: unreadable exception code: {error}"));
+            }
         }
     };
     let heaps = env.ext.get_mut::<Heaps>();
@@ -383,11 +400,7 @@ fn rtl_unwind(env: &mut Env<'_>) -> Outcome {
     for (off, v) in regs {
         let _ = env.cpu.write_u32(c + off, v);
     }
-    let active = super::exception::phase::enter(
-        env,
-        super::exception::phase::Phase::Unwind,
-        code,
-    );
+    let active = super::exception::phase::enter(env, super::exception::phase::Phase::Unwind, code);
     unwind_step(
         env,
         Unwind {
@@ -622,10 +635,77 @@ fn set_thread_context(env: &mut Env<'_>) -> Outcome {
 }
 
 fn thread_context_api(env: &mut Env<'_>, set: bool) -> Outcome {
-    let (handle, pointer) = (env.arg(0), env.arg(1));
+    thread_context_front(env, env.arg(0), env.arg(1), set, ContextFront::Win32)
+}
+
+pub(crate) fn native_thread_context(
+    env: &mut Env<'_>,
+    handle: u32,
+    pointer: u32,
+    set: bool,
+) -> Outcome {
+    thread_context_front(
+        env,
+        handle,
+        pointer,
+        set,
+        ContextFront::Native(if set {
+            "ntdll.dll!NtSetContextThread"
+        } else {
+            "ntdll.dll!NtGetContextThread"
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ContextFront {
+    Win32,
+    Native(&'static str),
+}
+impl ContextFront {
+    fn api(self) -> &'static str {
+        match self {
+            Self::Native(api) => api,
+            Self::Win32 => "kernel32.dll!GetThreadContext",
+        }
+    }
+    fn success(self) -> Outcome {
+        Outcome::Return(if matches!(self, Self::Native(_)) {
+            0
+        } else {
+            1
+        })
+    }
+    fn error(self, env: &mut Env<'_>, error: processes::Error) -> Outcome {
+        if matches!(self, Self::Win32) {
+            return api_error(env, error, 0);
+        }
+        let status = match error.code {
+            5 => 0xc0000022,
+            6 => 0xc0000008,
+            8 => 0xc0000017,
+            87 => 0xc000000d,
+            998 => 0xc0000005,
+            50 => {
+                adv_abi::warn_unavailable(env, self.api(), &error.message);
+                0xc00000bb
+            }
+            _ => 0xc0000001,
+        };
+        Outcome::Return(status)
+    }
+}
+
+fn thread_context_front(
+    env: &mut Env<'_>,
+    handle: u32,
+    pointer: u32,
+    set: bool,
+    front: ContextFront,
+) -> Outcome {
     let identity = match thread_target(env, handle, if set { 0x10 } else { 8 }) {
         Ok(identity) => identity,
-        Err(error) => return api_error(env, error, 0),
+        Err(error) => return front.error(env, error),
     };
     if identity.process.pid == env.sys.pid
         && env
@@ -634,13 +714,12 @@ fn thread_context_api(env: &mut Env<'_>, set: bool) -> Outcome {
             .get(identity.context as usize)
             .is_none_or(|context| context.suspend_count == 0 || context.is_done())
     {
-        return api_error(
+        return front.error(
             env,
             processes::Error::new(
                 err::INVALID_PARAMETER,
                 "thread CONTEXT requires a suspended thread",
             ),
-            0,
         );
     }
     let protection = if set { Prot::READ } else { Prot::RW };
@@ -648,22 +727,21 @@ fn thread_context_api(env: &mut Env<'_>, set: bool) -> Outcome {
         || adv_abi::guest::check_range(env.cpu, pointer, thread_context::SIZE as u32, protection)
             .is_err()
     {
-        return api_error(
+        return front.error(
             env,
             processes::Error::new(998, "inaccessible thread CONTEXT"),
-            0,
         );
     }
     let mut bytes = [0; thread_context::SIZE];
     if env.cpu.read(pointer, &mut bytes).is_err() {
-        return api_error(
-            env,
-            processes::Error::new(998, "unreadable thread CONTEXT"),
-            0,
-        );
+        return front.error(env, processes::Error::new(998, "unreadable thread CONTEXT"));
     }
     if let Err(error) = thread_context::flags(&bytes) {
-        return api_error(env, error, 0);
+        if matches!(front, ContextFront::Native(_)) {
+            adv_abi::warn_unavailable(env, front.api(), &error.message);
+            return Outcome::Return(0xc00000bb);
+        }
+        return front.error(env, error);
     }
     processes::visit(
         env,
@@ -701,16 +779,13 @@ fn thread_context_api(env: &mut Env<'_>, set: bool) -> Outcome {
                 .is_err()
                     || env.cpu.write(pointer, &bytes).is_err()
                 {
-                    return api_error(
-                        env,
-                        processes::Error::new(998, "unwritable thread CONTEXT"),
-                        0,
-                    );
+                    return front
+                        .error(env, processes::Error::new(998, "unwritable thread CONTEXT"));
                 }
-                Outcome::Return(1)
+                front.success()
             }
-            Ok(None) => Outcome::Return(1),
-            Err(error) => api_error(env, error, 0),
+            Ok(None) => front.success(),
+            Err(error) => front.error(env, error),
         },
     )
 }
@@ -871,9 +946,13 @@ pub(super) fn register(reg: &mut Registry) {
         1,
         set_unhandled_exception_filter,
     );
-    stdcall(reg, K32, "UnhandledExceptionFilter", 1, |_| {
-        Outcome::Return(0)
-    });
+    stdcall(
+        reg,
+        K32,
+        "UnhandledExceptionFilter",
+        1,
+        unhandled_exception_filter,
+    );
     stdcall(reg, K32, "RtlUnwind", 4, rtl_unwind);
     stdcall(reg, K32, "SetErrorMode", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "OutputDebugStringA", 1, output_debug_string_a);

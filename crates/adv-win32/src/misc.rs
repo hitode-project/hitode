@@ -6,16 +6,16 @@ use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
-mod internet;
-pub(crate) mod imm;
 mod image_list;
+pub(crate) mod imm;
+mod internet;
 mod ole_memory;
-mod variant;
 mod property_sheet;
+mod shell_drop;
 mod shell_execute;
 mod shell_icon;
-mod shell_drop;
 mod theme;
+mod variant;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;

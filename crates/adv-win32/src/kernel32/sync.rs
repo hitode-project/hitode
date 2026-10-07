@@ -11,6 +11,9 @@ use super::K32;
 use crate::util::{err, out_u32, set_last_error};
 use crate::{Win32, stdcall};
 
+mod local;
+pub(crate) use local::detach_fls;
+
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
 const WAIT_FAILED: u32 = u32::MAX;
@@ -588,6 +591,7 @@ mod critical_tests {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    local::register(reg);
     stdcall(reg, K32, "InitializeSListHead", 1, |e| {
         let _ = e.cpu.write(e.arg(0), &[0; 8]);
         Outcome::Return(0)

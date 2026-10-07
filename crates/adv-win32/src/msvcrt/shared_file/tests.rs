@@ -541,11 +541,7 @@ fn writers<B: Backend>(cpu: B) {
             std::fs::write(&blocked, b"overlay must not truncate").unwrap();
         }
         if phase == 2 {
-            let file = env
-                .sys
-                .objects
-                .host_mut::<crate::FileObj>(handle)
-                .unwrap();
+            let file = env.sys.objects.host_mut::<crate::FileObj>(handle).unwrap();
             file.share = 3;
             file.access |= 0x10000;
         }

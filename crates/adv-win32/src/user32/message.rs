@@ -440,25 +440,41 @@ pub(super) fn call_proc_encoded(
     lp: u32,
     wide: bool,
 ) -> Outcome {
-    let api = if wide { "user32.dll!CallWindowProcW" } else { "user32.dll!CallWindowProcA" };
+    let api = if wide {
+        "user32.dll!CallWindowProcW"
+    } else {
+        "user32.dll!CallWindowProcA"
+    };
     if !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
-        adv_abi::warn_unavailable(env, api, "saved-procedure ANSI text conversion requires guest ACP 932/936/1252/65001");
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "saved-procedure ANSI text conversion requires guest ACP 932/936/1252/65001",
+        );
         crate::util::set_last_error(env, 50);
         return Outcome::Return(0);
     }
     if msg == wm::GETTEXT && wp != 0 {
         let size = wp.checked_mul(if wide { 2 } else { 1 });
         if wp as usize > crate::util::MAX_STR || size.is_none() {
-            adv_abi::warn_unavailable(env, api, "saved-procedure text capacity exceeds the bounded buffer profile");
+            adv_abi::warn_unavailable(
+                env,
+                api,
+                "saved-procedure text capacity exceeds the bounded buffer profile",
+            );
             crate::util::set_last_error(env, 87);
             return Outcome::Return(0);
         }
-        if adv_abi::guest::check_range(env.cpu, lp, size.unwrap(), adv_cpu::backend::Prot::WRITE).is_err() {
+        if adv_abi::guest::check_range(env.cpu, lp, size.unwrap(), adv_cpu::backend::Prot::WRITE)
+            .is_err()
+        {
             crate::util::set_last_error(env, 998);
             return Outcome::Return(0);
         }
     }
-    encoded_to(env, Some(proc), hwnd, msg, wp, lp, wide, |_, r| Outcome::Return(r))
+    encoded_to(env, Some(proc), hwnd, msg, wp, lp, wide, |_, r| {
+        Outcome::Return(r)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,7 +559,19 @@ fn encoded_to(
             crate::util::set_last_error(env, 87);
             return then(env, 0);
         };
-        return converted_text(env, proc, hwnd, msg, capacity, 0, lp, wp, wide, target_wide, then);
+        return converted_text(
+            env,
+            proc,
+            hwnd,
+            msg,
+            capacity,
+            0,
+            lp,
+            wp,
+            wide,
+            target_wide,
+            then,
+        );
     }
     if msg == wm::GETTEXTLENGTH || (combo && matches!(msg, 0x148 | 0x149)) {
         let query = if combo && msg != wm::GETTEXTLENGTH {
@@ -2170,12 +2198,22 @@ pub(super) fn def_window_proc_encoded(
             };
             let (width, height) = w.client_size();
             let brush = user(env).classes[w.class].background;
-            if brush == 0 { return then(env, 0); }
+            if brush == 0 {
+                return then(env, 0);
+            }
             let brush = if brush <= 31 {
                 super::system_colors::brush(env, brush - 1)
-            } else { brush };
-            let api = if wide { "user32.dll!DefWindowProcW" } else { "user32.dll!DefWindowProcA" };
-            return match crate::gdi32::raster::fill::erase_background(env, wp, width, height, brush, api) {
+            } else {
+                brush
+            };
+            let api = if wide {
+                "user32.dll!DefWindowProcW"
+            } else {
+                "user32.dll!DefWindowProcA"
+            };
+            return match crate::gdi32::raster::fill::erase_background(
+                env, wp, width, height, brush, api,
+            ) {
                 Outcome::Return(result) => then(env, result),
                 other => other,
             };

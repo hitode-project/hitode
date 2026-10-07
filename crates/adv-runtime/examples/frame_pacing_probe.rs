@@ -56,7 +56,9 @@ fn run() -> Result<(), String> {
         active += elapsed;
         max_step = max_step.max(elapsed);
         match outcome {
-            SliceResult::Complete(RunResult::HostRequest) => unreachable!("runtime services process requests internally"),
+            SliceResult::Complete(RunResult::HostRequest) => {
+                unreachable!("runtime services process requests internally")
+            }
             SliceResult::Yielded => {}
             SliceResult::Complete(RunResult::Idle { next_deadline }) => {
                 let requested = next_deadline

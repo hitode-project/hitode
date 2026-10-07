@@ -69,6 +69,14 @@ fn release_lock(env: &mut Env<'_>, handle: u32, outcome: Outcome) -> Outcome {
 }
 
 fn loader_mutex(env: &mut Env<'_>) -> Option<u32> {
+    let handle = native_loader_mutex(env);
+    if handle.is_none() {
+        set_last_error(env, err::NOT_ENOUGH_MEMORY);
+    }
+    handle
+}
+
+pub(crate) fn native_loader_mutex(env: &mut Env<'_>) -> Option<u32> {
     match env.ext.get::<Win32>().loader_lock {
         Some(handle) => Some(handle),
         None => {
@@ -77,7 +85,6 @@ fn loader_mutex(env: &mut Env<'_>) -> Option<u32> {
                 recursion: 0,
             });
             if handle == 0 {
-                set_last_error(env, err::NOT_ENOUGH_MEMORY);
                 return None;
             }
             env.ext.get_mut::<Win32>().loader_lock = Some(handle);
@@ -87,8 +94,21 @@ fn loader_mutex(env: &mut Env<'_>) -> Option<u32> {
 }
 
 fn locked(env: &mut Env<'_>, operation: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Outcome {
-    let Some(handle) = loader_mutex(env) else {
-        return Outcome::Return(0);
+    locked_profile(env, false, operation)
+}
+
+fn locked_profile(
+    env: &mut Env<'_>,
+    native: bool,
+    operation: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    let handle = if native {
+        native_loader_mutex(env)
+    } else {
+        loader_mutex(env)
+    };
+    let Some(handle) = handle else {
+        return Outcome::Return(if native { 0xc0000017 } else { 0 });
     };
     if env.sys.try_acquire_objects(&[handle], false).is_some() {
         let result = operation(env);
@@ -416,28 +436,49 @@ pub(super) fn module_path(env: &Env<'_>, id: ModuleId) -> Result<String, MemFaul
             // cwd to invent a DLL's missing name.
             ModuleKind::Host => Ok(format!("C:\\Windows\\system32\\{}", m.name)),
             ModuleKind::Image if !m.is_dll => Ok(w.exe_path()),
-            _ => Err(MemFault { addr: m.base, len: m.size }),
+            _ => Err(MemFault {
+                addr: m.base,
+                len: m.size,
+            }),
         };
     }
-    let fault = MemFault { addr: m.ldr_entry, len: m.ldr_size };
+    let fault = MemFault {
+        addr: m.ldr_entry,
+        len: m.ldr_size,
+    };
     let end = m.ldr_entry.checked_add(m.ldr_size).ok_or(fault)?;
     let header = m.ldr_entry.checked_add(0x24).ok_or(fault)?;
     let strings = m.ldr_entry.checked_add(0x80).ok_or(fault)?;
-    if strings > end { return Err(fault); }
+    if strings > end {
+        return Err(fault);
+    }
     adv_abi::guest::check_range(env.cpu, header, 8, Prot::READ)?;
     let mut descriptor = [0; 8];
     env.cpu.read(header, &mut descriptor)?;
     let length = u32::from(u16::from_le_bytes(descriptor[..2].try_into().unwrap()));
     let capacity = u32::from(u16::from_le_bytes(descriptor[2..4].try_into().unwrap()));
     let address = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
-    if length == 0 || length & 1 != 0 || capacity & 1 != 0 || length > capacity
-        || address < strings || address.checked_add(capacity).is_none_or(|end_of_string| end_of_string > end)
-    { return Err(fault); }
+    if length == 0
+        || length & 1 != 0
+        || capacity & 1 != 0
+        || length > capacity
+        || address < strings
+        || address
+            .checked_add(capacity)
+            .is_none_or(|end_of_string| end_of_string > end)
+    {
+        return Err(fault);
+    }
     adv_abi::guest::check_range(env.cpu, address, length, Prot::READ)?;
     let mut bytes = vec![0; length as usize];
     env.cpu.read(address, &mut bytes)?;
-    let words: Vec<_> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-    if words.contains(&0) { return Err(fault); }
+    let words: Vec<_> = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    if words.contains(&0) {
+        return Err(fault);
+    }
     String::from_utf16(&words).map_err(|_| fault)
 }
 
@@ -454,8 +495,16 @@ fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
     let path = match module_path(env, id) {
         Ok(path) => path,
         Err(_) => {
-            let api = if wide { "kernel32.dll!GetModuleFileNameW" } else { "kernel32.dll!GetModuleFileNameA" };
-            adv_abi::warn_unavailable(env, api, "published module path is unreadable or outside its owned LDR FullDllName storage");
+            let api = if wide {
+                "kernel32.dll!GetModuleFileNameW"
+            } else {
+                "kernel32.dll!GetModuleFileNameA"
+            };
+            adv_abi::warn_unavailable(
+                env,
+                api,
+                "published module path is unreadable or outside its owned LDR FullDllName storage",
+            );
             set_last_error(env, 998); // ERROR_NOACCESS; no mutable-cwd fallback
             return Outcome::Return(0);
         }
@@ -487,7 +536,52 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
             name: String::from_utf8_lossy(&cstr(env.cpu, name_p)).into_owned(),
         }
     };
-    locked(env, move |env| resolve_proc(env, h, sym, caller))
+    locked(env, move |env| {
+        resolve_proc(env, h, sym, caller, ProcedureFront::Win32)
+    })
+}
+
+pub(crate) fn native_get_procedure(
+    env: &mut Env<'_>,
+    module: u32,
+    name: ImportName,
+    output: u32,
+) -> Outcome {
+    let caller = env.caller();
+    locked_profile(env, true, move |env| {
+        resolve_proc(env, module, name, caller, ProcedureFront::Native(output))
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ProcedureFront {
+    Win32,
+    Native(u32),
+}
+
+fn procedure_result(env: &mut Env<'_>, front: ProcedureFront, address: u32) -> Outcome {
+    match front {
+        ProcedureFront::Win32 => Outcome::Return(address),
+        ProcedureFront::Native(output) => {
+            if adv_abi::guest::check_range(env.cpu, output, 4, Prot::WRITE).is_err()
+                || env.cpu.write_u32(output, address).is_err()
+            {
+                Outcome::Return(0xc0000005)
+            } else {
+                Outcome::Return(0)
+            }
+        }
+    }
+}
+
+fn procedure_error(env: &mut Env<'_>, front: ProcedureFront, error: u32, status: u32) -> Outcome {
+    match front {
+        ProcedureFront::Win32 => {
+            set_last_error(env, error);
+            Outcome::Return(0)
+        }
+        ProcedureFront::Native(_) => Outcome::Return(status),
+    }
 }
 
 fn record_lookup_failure(
@@ -545,7 +639,13 @@ fn missing_lookup_kind(env: &Env<'_>, module: &str, name: &str) -> DynamicLookup
     DynamicLookupKind::MissingExport
 }
 
-fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outcome {
+fn resolve_proc(
+    env: &mut Env<'_>,
+    h: u32,
+    sym: ImportName,
+    caller: u32,
+    front: ProcedureFront,
+) -> Outcome {
     let requested = module_of(env, h);
     let Some(id) = requested.filter(|&id| adv_os::modules(env.ext).get(id).executable_visible())
     else {
@@ -564,8 +664,7 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
         env.sys
             .trace
             .resolution(caller, "<invalid-hmodule>", &sym, 0);
-        set_last_error(env, err::MOD_NOT_FOUND);
-        return Outcome::Return(0);
+        return procedure_error(env, front, err::MOD_NOT_FOUND, 0xc0000135);
     };
     let name = adv_os::modules(env.ext).get(id).name.clone();
     let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
@@ -577,7 +676,7 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
         Ok((address, changes)) => {
             if inits.is_empty() {
                 env.sys.trace.resolution(caller, &name, &sym, address);
-                return Outcome::Return(address);
+                return procedure_result(env, front, address);
             }
             let success_name = name.clone();
             let success_sym = sym.clone();
@@ -588,7 +687,7 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
                     env.sys
                         .trace
                         .resolution(caller, &success_name, &success_sym, address);
-                    Outcome::Return(address)
+                    procedure_result(env, front, address)
                 }),
                 Box::new(move |env| {
                     record_lookup_failure(
@@ -604,7 +703,10 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
                     env.sys.trace.resolution(caller, &name, &sym, 0);
                     let (w, modules) = env.ext.get2_mut::<Win32, Modules>();
                     match Loader::new(env.cpu, env.sys, modules, &w.vfs).abort_resolution(changes) {
-                        Ok(ids) => unload(env, ids, 0, Some(err::PROC_NOT_FOUND)),
+                        Ok(ids) => match front {
+                            ProcedureFront::Win32 => unload(env, ids, 0, Some(err::PROC_NOT_FOUND)),
+                            ProcedureFront::Native(_) => unload(env, ids, 0xc0000142, None),
+                        },
                         Err(error) => Outcome::Fail(error.to_string()),
                     }
                 }),
@@ -621,8 +723,14 @@ fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32) -> Outc
             record_lookup_failure(env, name.clone(), &sym, caller, kind, e.to_string(), target);
             log::info!("GetProcAddress: {e}");
             env.sys.trace.resolution(caller, &name, &sym, 0);
-            set_last_error(env, err::PROC_NOT_FOUND);
-            Outcome::Return(0)
+            let status = match &e {
+                adv_os::LoadError::MissingExport { .. } => match sym {
+                    ImportName::Ordinal(_) => 0xc0000138,
+                    ImportName::Name { .. } => 0xc0000139,
+                },
+                _ => 0xc0000135,
+            };
+            procedure_error(env, front, err::PROC_NOT_FOUND, status)
         }
     }
 }

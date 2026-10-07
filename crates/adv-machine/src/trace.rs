@@ -12,8 +12,12 @@ use std::{cell::RefCell, rc::Rc};
 #[derive(Clone)]
 struct SharedSink(Rc<RefCell<Box<dyn Write>>>);
 impl Write for SharedSink {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.borrow_mut().write(bytes) }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.borrow_mut().flush() }
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
 }
 
 pub struct TraceRecord<'a> {
@@ -59,7 +63,9 @@ impl Trace {
 
     /// Process switch comment; ordinary single-process trace rows stay unchanged.
     pub fn process(&mut self, pid: u32) {
-        if let Some(w) = &mut self.sink { let _ = writeln!(w, "# process\t{pid:08x}"); }
+        if let Some(w) = &mut self.sink {
+            let _ = writeln!(w, "# process\t{pid:08x}");
+        }
     }
 
     pub fn enabled(&self) -> bool {

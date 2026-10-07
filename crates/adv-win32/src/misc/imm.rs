@@ -3,6 +3,8 @@
 //! absent association needs no fabricated handle or per-window context cache.
 use crate::{Win32, util::set_last_error};
 use adv_abi::{Env, GuestPtr, Handle, Registry, win32};
+use adv_cpu::backend::{GuestExt, Prot};
+use adv_os::global::Globals;
 
 const UNAVAILABLE: &str = "guest IME/input-context provider and host composition are unavailable";
 
@@ -97,6 +99,61 @@ fn associate(env: &mut Env<'_>, window: Handle, context: Handle) -> Handle {
     Handle(0)
 }
 
+#[win32(user32, name = "SendIMEMessageExA", level = safe_fail)]
+fn send_legacy_a(env: &mut Env<'_>, _window: Handle, message: i32) -> i32 {
+    legacy_message(env, message as u32, "user32.dll!SendIMEMessageExA")
+}
+
+#[win32(user32, name = "SendIMEMessageExW", level = safe_fail)]
+fn send_legacy_w(env: &mut Env<'_>, _window: Handle, message: i32) -> i32 {
+    legacy_message(env, message as u32, "user32.dll!SendIMEMessageExW")
+}
+
+fn legacy_message(env: &mut Env<'_>, message: u32, api: &str) -> i32 {
+    // LPARAM is an HGLOBAL containing the SDK's 32-byte x86 IMESTRUCT,
+    // not a pointer to the structure. Borrow the existing global-memory owner;
+    // this absent-provider path neither changes lock counts nor takes ownership.
+    let Some((pointer, size)) = env
+        .ext
+        .try_get::<Globals>()
+        .and_then(|globals| globals.get(&env.sys.objects, message))
+        .map(|block| (block.pointer, block.size))
+    else {
+        set_last_error(env, 6);
+        return 0;
+    };
+    if pointer == 0 {
+        set_last_error(env, 157); // ERROR_DISCARDED, matching GlobalLock.
+        return 0;
+    }
+    if size < 32 {
+        set_last_error(env, 87);
+        return 0;
+    }
+    if adv_abi::guest::check_range(env.cpu, pointer, 32, Prot::READ).is_err()
+        || adv_abi::guest::check_range(env.cpu, pointer + 4, 4, Prot::WRITE).is_err()
+    {
+        set_last_error(env, 998);
+        return 0;
+    }
+    let Ok(function) = env.cpu.read_u32(pointer) else {
+        set_last_error(env, 998);
+        return 0;
+    };
+    // ime.h specifies IME_RS_NOIME (2) in wParam when no IME is installed.
+    // Zero is a failed result, not a fabricated open state or conversion result.
+    if env.cpu.write_u32(pointer + 4, 2).is_err() {
+        set_last_error(env, 998);
+        return 0;
+    }
+    adv_abi::warn_unavailable(
+        env,
+        api,
+        &format!("{UNAVAILABLE}; legacy IME subfunction {function:#x}"),
+    );
+    0
+}
+
 pub(super) fn register(registry: &mut Registry) {
     for api in [
         get_conversion_ABI,
@@ -105,6 +162,8 @@ pub(super) fn register(registry: &mut Registry) {
         set_open_ABI,
         release_ABI,
         associate_ABI,
+        send_legacy_a_ABI,
+        send_legacy_w_ABI,
     ] {
         registry.register(api);
     }
