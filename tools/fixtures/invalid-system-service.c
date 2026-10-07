@@ -1,4 +1,5 @@
-/* Authored x86 INT 2E oracle with out-of-range service selectors.
+/* Authored x86 INT 2E WOW64 host reference with out-of-range service selectors.
+ * The guest uses a native x86 OS profile; this host result is not its contract.
  * Output contains only scalar status/exception/register invariants, no addresses.
  */
 #include <windows.h>

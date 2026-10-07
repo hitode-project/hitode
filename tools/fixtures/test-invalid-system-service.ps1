@@ -1,17 +1,17 @@
 <#
 .SYNOPSIS
-Verify authored raw x86 INT 2E illegal-instruction exceptions under native WOW64.
+Record authored raw x86 INT 2E illegal-instruction exceptions on a WOW64 host.
 .DESCRIPTION
 OutputDirectory stores authored binaries, 64 scalar outcomes and cmd.txt under
 target/investigations. Requires a 64-bit Windows OS running the authored x86 PE
-under WOW64. NativeOnly avoids guest replays; Runner replays interpreter/JIT.
+under WOW64. This is a native-only host reference, not an oracle for the guest's
+native x86 OS profile. NativeOnly is accepted for existing invocations.
 Checks illegal-instruction SEH, prefixed/unprefixed CD opcode PCs, registers/flags/stack and
 LastError preservation. No original samples or native DLLs are run.
 .EXAMPLE
 pwsh tools/fixtures/test-invalid-system-service.ps1 -NativeOnly
 #>
 param(
-    [string]$Runner=(Join-Path $PSScriptRoot '../../target/debug/adv-run.exe'),
     [string]$OutputDirectory=(Join-Path $PSScriptRoot '../../target/investigations/invalid-system-service'),
     [switch]$NativeOnly
 )
@@ -19,7 +19,6 @@ $ErrorActionPreference='Stop'
 if(-not $IsWindows -or -not [Environment]::Is64BitOperatingSystem){
     throw 'this native INT 2E oracle requires WOW64 on 64-bit Windows'
 }
-$Runner=[IO.Path]::GetFullPath($Runner)
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 if(-not $OutputDirectory.Contains([IO.Path]::DirectorySeparatorChar+'target'+[IO.Path]::DirectorySeparatorChar+'investigations'+[IO.Path]::DirectorySeparatorChar)){
     throw 'system service evidence must stay inside target/investigations'
@@ -60,35 +59,4 @@ for($case=0;$case-lt 4;$case++){
         if($values[$i]-ne $expected[$i]){throw "native WOW64 INT 2E invariant failed at DWORD $($case*16+$i)"}
     }
     Write-Output ("native case {0}: service=0x{1:x8} returned={2} eax=0x{3:x8} exception=0x{4:x8} count={5} record/context offsets={6}/{7}; flags/esp/ebx/ecx/edx/esi-edi/LastError={8}" -f $case,$values[0],$values[1],$values[2],$values[3],$values[8],$values[6],$values[7],($values[9..15] -join ','))
-}
-if($NativeOnly){exit 0}
-foreach($variant in @('interpreter','jit')){
-    $runDirectory=Join-Path $OutputDirectory $variant
-    New-Item -ItemType Directory -Force -Path $runDirectory | Out-Null
-    $copy=Join-Path $runDirectory 'fixture.exe'
-    Copy-Item -LiteralPath $fixture -Destination $copy
-    $overlay=Join-Path $runDirectory 'data'
-    $report=Join-Path $runDirectory 'report.json'
-    $arguments=@($copy,'--hidden','--backend',$variant,'--seconds','10','--data-dir',$overlay,'--report',$report,'--api-mode','strict')
-    if($variant-eq 'jit'){$arguments+='--sync-compilation'}
-    @(
-        "command: adv-run $($arguments -join ' ')",
-        'environment: inherited host environment; no sample input',
-        "runner_sha256: $((Get-FileHash -Algorithm SHA256 -LiteralPath $Runner).Hash)",
-        "fixture_sha256: $((Get-FileHash -Algorithm SHA256 -LiteralPath $copy).Hash)"
-    ) | Set-Content -LiteralPath (Join-Path $runDirectory 'cmd.txt')
-    & $Runner @arguments *> (Join-Path $runDirectory 'run.log')
-    if($LASTEXITCODE-ne 0){throw "$variant invalid system service fixture failed"}
-    $actual=[IO.File]::ReadAllBytes((Join-Path $overlay 'overlay/invalid-system-service.bin'))
-    if($actual.Length-ne $reference.Length){throw "$variant missing invalid system service results"}
-    for($i=0;$i-lt $reference.Length;$i+=4){
-        if([BitConverter]::ToUInt32($actual,$i)-ne [BitConverter]::ToUInt32($reference,$i)){
-            throw "$variant native mismatch at DWORD $($i/4)"
-        }
-    }
-    $e=Get-Content -Raw -LiteralPath $report|ConvertFrom-Json
-    if($e.guest_exit_code-ne 0 -or $e.api.acceptance_eligible-ne $true -or $e.api.warnings.Count-ne 0){
-        throw "$variant strict invalid system service execution failed"
-    }
-    Write-Output "${variant}: invalid system service results match native"
 }

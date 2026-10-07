@@ -1,6 +1,5 @@
 //! Win32 codes for precise x86 CPU stops. Faults retain the stopped PC;
 //! breakpoint addresses/CONTEXT follow native x86's one-byte PC adjustment;
-//! raw INT 2E follows the owned WOW64 illegal-instruction exception oracle.
 //! Continuing execution always requires the guest handler's disposition.
 //! Codes follow SDK ntstatus.h and Microsoft Learn's GetExceptionCode table.
 //! An authored x86 Windows oracle (target/exception-arithmetic-native/probe.c)
@@ -97,12 +96,6 @@ fn map_stop(
             record.count = 1; // Owned x86 native CC/CD03 oracle: Information[0]=0.
             BREAKPOINT
         }
-        Exception::Trap { vector: 0x2e, .. } => {
-            // WOW64 rejects the raw x86 system-service interrupt as an illegal
-            // instruction, preserving registers rather than returning a status.
-            record.address = int2e_address(cpu, pc)?;
-            ILLEGAL_INSTRUCTION
-        }
         Exception::Trap { vector, .. } => {
             return Err(format!("unmapped x86 CPU exception vector {vector}"));
         }
@@ -111,29 +104,27 @@ fn map_stop(
 }
 
 pub(super) fn normalize_context(record: &Record, state: &mut ArchitecturalState) {
-    if matches!(record.code, BREAKPOINT | ILLEGAL_INSTRUCTION) {
+    if record.code == BREAKPOINT {
         // CPU INT traps report the retired PC. Native Win32 x86 backs it up
         // exactly one byte for both CC and CD03: CD03 therefore points at03.
         // The handler must explicitly advance/edit this saved EIP to continue;
         // returning unchanged repeats CC just as on the owned native oracle.
-        // Raw INT 2E likewise resumes at its CD opcode until the guest edits EIP.
         state.eip = record.address;
     }
 }
 
-fn int2e_address(cpu: &dyn Guest, retired_pc: u32) -> Result<u32, String> {
+pub(super) fn raw_int2e_address(cpu: &dyn Guest, retired_pc: u32) -> Result<u32, String> {
     let address = retired_pc
         .checked_sub(2)
-        .ok_or_else(|| "WOW64 system-service interrupt PC underflow".to_owned())?;
+        .ok_or_else(|| "x86 system-service interrupt PC underflow".to_owned())?;
     let mut bytes = [0; 2];
     if cpu.accessible(address, 2, Prot::EXEC)
         && cpu.read(address, &mut bytes).is_ok()
         && bytes == [0xcd, 0x2e]
     {
-        // The native 66 CD2E case also reports the CD opcode, not its prefix.
         Ok(address)
     } else {
-        Err("WOW64 system-service classification requires an executed INT 2E instruction".into())
+        Err("x86 system-service classification requires an executed INT 2E instruction".into())
     }
 }
 
