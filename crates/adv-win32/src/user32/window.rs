@@ -230,6 +230,8 @@ pub struct ChoiceState {
 pub struct Window {
     pub hwnd: u32,
     pub class: usize,
+    /// Creation-time class DC policy; later class mutations affect new windows.
+    pub(crate) dc_style: u32,
     pub proc: u32,
     /// Encoding of string messages and CREATESTRUCT pointers seen by the procedure.
     pub unicode: bool,
@@ -705,6 +707,7 @@ impl Window {
         Self {
             hwnd,
             class,
+            dc_style: 0,
             proc,
             unicode: false,
             style,
@@ -1218,6 +1221,7 @@ fn create_window_inner(
         Rect::new(x, y, w, h),
         ctx,
     );
+    win.dc_style = u.classes[ci].style & 0x60; // CS_OWNDC | CS_CLASSDC.
     win.owner = if child {
         0
     } else {
@@ -1433,6 +1437,7 @@ fn destroy_boxed(env: &mut Env<'_>, hwnd: u32, initialized: bool, then: ThenBool
             super::clipboard::remove_windows(env, &removed, move |env| {
                 for h in all.iter().rev() {
                     super::message::sent::cancel_window(env, *h);
+                    crate::gdi32::raster::front::retire_window(env, *h);
                     let u = &mut env.ext.get_mut::<crate::Win32>().user;
                     u.remove_window(*h, &mut env.sys.objects);
                 }
