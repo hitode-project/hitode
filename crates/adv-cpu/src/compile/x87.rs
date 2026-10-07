@@ -482,9 +482,17 @@ impl Emitter<'_> {
             .iadd_imm(pointer, (FP + offset_of!(X87State, regs)) as i64)
     }
     fn x87_double(&mut self, slot: Value, tags: Value, range: i32, slow: ir::Block) -> Value {
+        #[cfg(test)]
+        testing::emitted(|counts| counts.tag_guards += 1);
         let tag = self.x87_tag(tags, slot);
         let empty = self.b.ins().icmp_imm(IntCC::Equal, tag, 3);
         self.x87_reject(empty, slow);
+        self.x87_decode_double(slot, range, slow)
+    }
+    /// Decode a slot whose nonempty tag has already been established.
+    fn x87_decode_double(&mut self, slot: Value, range: i32, slow: ir::Block) -> Value {
+        #[cfg(test)]
+        testing::emitted(|counts| counts.raw_decodes += 1);
         let pointer = self.x87_register_pointer(slot);
         let sig = self
             .b
@@ -527,6 +535,8 @@ impl Emitter<'_> {
         self.b.ins().bitcast(types::F64, MemFlags::new(), bits)
     }
     fn x87_write(&mut self, slot: Value, value: Value) -> Value {
+        #[cfg(test)]
+        testing::emitted(|counts| counts.raw_encodes += 1);
         let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), value);
         let abs = self.b.ins().ishl_imm(bits, 1);
         let zero = self.b.ins().icmp_imm(IntCC::Equal, abs, 0);
@@ -664,6 +674,8 @@ impl Emitter<'_> {
     /// Admit RC=nearest, masked exceptions and PC=53 or PC=24; the result is
     /// true for PC=24.
     fn x87_admit_arithmetic(&mut self, control: Value, slow: ir::Block) -> Value {
+        #[cfg(test)]
+        testing::emitted(|counts| counts.control_guards += 1);
         let masked = self.b.ins().band_imm(control, 0xf3f);
         let double = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x23f);
         let single = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x03f);
@@ -689,6 +701,8 @@ impl Emitter<'_> {
             .map(|(value, _)| self.b.ins().bitcast(types::I64, MemFlags::new(), value))
             .collect();
         if let Some(wide) = unknown.into_iter().reduce(|x, y| self.b.ins().bor(x, y)) {
+            #[cfg(test)]
+            testing::emitted(|counts| counts.precision_guards += 1);
             let wide = self.b.ins().band_imm(wide, tail);
             let wide = self.b.ins().icmp_imm(IntCC::NotEqual, wide, 0);
             let bad = self.b.ins().band(wide, single);
@@ -796,11 +810,32 @@ impl Emitter<'_> {
 pub(crate) mod testing {
     use super::*;
     use std::cell::Cell;
+    /// Lowered operations, including cold recovery code; never runtime counters.
+    #[derive(Clone, Copy, Default, Debug)]
+    pub(crate) struct Emission {
+        pub(crate) control_guards: u32,
+        pub(crate) precision_guards: u32,
+        pub(crate) tag_guards: u32,
+        pub(crate) raw_decodes: u32,
+        pub(crate) raw_encodes: u32,
+    }
     thread_local! {
         pub(crate) static FORCE_DEKKER: Cell<bool> = const { Cell::new(false) };
         pub(crate) static HELPER_ONLY: Cell<bool> = const { Cell::new(false) };
         pub(crate) static SINGLE_ONLY: Cell<bool> = const { Cell::new(false) };
         static CALLS: Cell<u64> = const { Cell::new(0) };
+        static EMISSION: Cell<Emission> = Cell::new(Emission::default());
+    }
+    pub(crate) fn emission() -> Emission {
+        EMISSION.get()
+    }
+    pub(crate) fn emitted(update: impl FnOnce(&mut Emission)) {
+        let mut counts = EMISSION.get();
+        update(&mut counts);
+        EMISSION.set(counts);
+    }
+    pub(crate) fn reset_emission() {
+        EMISSION.set(Emission::default());
     }
     pub(crate) fn calls() -> u64 {
         CALLS.get()

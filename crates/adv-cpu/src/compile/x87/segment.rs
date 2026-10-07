@@ -1,6 +1,7 @@
 //! A success-only straight-line lane. Rejection materializes the precise prefix
 //! and resumes at canonical single-instruction entries, never replaying a load
-//! or store. No resident state crosses a CFG edge, helper, or environment op.
+//! or store. No resident state crosses a CFG edge, helper, or environment
+//! restore. FLDCW updates control facts without changing the resident stack.
 //!
 //! Compilers interleave integer address and counter updates with x87 code, so a
 //! lane may also carry plain integer instructions. Their guards and shared/file
@@ -8,7 +9,7 @@
 //! the canonical path with the x87 prefix materialized.
 use super::*;
 
-/// x87 instructions per lane, and all instructions per lane.
+/// Numeric x87 operations per lane, and all instructions per lane.
 const LIMIT: usize = 8;
 const SPAN: usize = 24;
 
@@ -82,12 +83,8 @@ pub(in crate::compile) fn segments(
     };
     let floating = |i: &Instruction| {
         linear(i)
-            && crate::floating::fast::classify(i).is_some_and(|fast| {
-                !matches!(
-                    fast,
-                    Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus
-                )
-            })
+            && crate::floating::fast::classify(i)
+                .is_some_and(|fast| !matches!(fast, Fast::StoreControl | Fast::StoreStatus))
     };
     let integer =
         |i: &Instruction| linear(i) && i.flow_control() == FlowControl::Next && lane_integer(i);
@@ -97,7 +94,10 @@ pub(in crate::compile) fn segments(
             continue;
         }
         let mut run = vec![*i];
-        let mut count = 1;
+        let numeric = |i: &Instruction| {
+            floating(i) && crate::floating::fast::classify(i) != Some(Fast::LoadControl)
+        };
+        let mut count = usize::from(numeric(i));
         while count < LIMIT && run.len() < SPAN {
             let next = run.last().unwrap().next_ip32();
             if boundaries.contains(&next)
@@ -112,7 +112,7 @@ pub(in crate::compile) fn segments(
             else {
                 break;
             };
-            count += usize::from(floating(i));
+            count += usize::from(numeric(i));
             run.push(*i);
         }
         // Trailing integer instructions gain nothing from residency.
@@ -141,11 +141,40 @@ enum Recovery {
 }
 
 #[derive(Clone, Copy)]
+enum Narrow {
+    Unknown,
+    /// An exact 24-bit value regardless of the control word.
+    Always,
+    /// Narrow if the current admitted control word selects PC=24.
+    Admitted,
+}
+
+impl Narrow {
+    fn known(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    fn forget_control(self) -> Self {
+        match self {
+            Self::Admitted => Self::Unknown,
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Resident {
     value: Value,
     range: i32,
-    /// Known to fit a 24-bit significand whenever the lane runs at PC=24.
-    narrow: bool,
+    /// A 24-bit proof, either unconditional or tied to the current control word.
+    narrow: Narrow,
+}
+
+#[derive(Clone, Copy)]
+struct Control {
+    value: Value,
+    /// Some(single) proves masked exceptions and round-to-nearest at PC=24/53.
+    arithmetic: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -154,7 +183,7 @@ struct Prefix {
     top: u8,
     tags: Value,
     status: Value,
-    control: Value,
+    control: Control,
     values: [Option<Resident>; 8],
     dirty: [bool; 8],
     empty: [Option<bool>; 8],
@@ -188,7 +217,10 @@ impl Emitter<'_> {
             top: 0,
             tags: self.x87_word(offset_of!(X87State, tag)),
             status,
-            control: self.x87_word(offset_of!(X87State, control)),
+            control: Control {
+                value: self.x87_word(offset_of!(X87State, control)),
+                arithmetic: None,
+            },
             values: [None; 8],
             dirty: [false; 8],
             empty: [None; 8],
@@ -197,8 +229,6 @@ impl Emitter<'_> {
             dp: None,
         };
         let mut recoveries = Vec::with_capacity(instructions.len() * 2);
-        // PC=24 flag of the first admitted arithmetic; control is fixed in a lane.
-        let mut tail = None;
         for (index, i) in instructions.iter().enumerate() {
             self.at(i.ip32());
             // Mirror the canonical code's per-block fuel accounting.
@@ -238,8 +268,10 @@ impl Emitter<'_> {
                 let bad = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
                 self.x87_reject(bad, slow);
             }
-            prefix.status = self.b.ins().band_imm(prefix.status, !C1);
             let fast = crate::floating::fast::classify(i).unwrap();
+            if fast != Fast::LoadControl {
+                prefix.status = self.b.ins().band_imm(prefix.status, !C1);
+            }
             match fast {
                 Fast::Load(source) => {
                     let value = self.resident_source(&mut prefix, i, source, 1023, slow);
@@ -256,7 +288,7 @@ impl Emitter<'_> {
                     let constant = Resident {
                         value,
                         range: 0,
-                        narrow: true,
+                        narrow: Narrow::Always,
                     };
                     self.resident_write(&mut prefix, target, constant);
                 }
@@ -270,11 +302,16 @@ impl Emitter<'_> {
                     let slot = prefix.slot(0);
                     let value = self.resident_double(&mut prefix, slot, 1023, slow).value;
                     let (bits, rounded) = if integer {
-                        let rc = self.b.ins().band_imm(prefix.control, 0xc00);
-                        let nearest = self.b.ins().icmp_imm(IntCC::Equal, rc, 0);
-                        let truncate = self.b.ins().icmp_imm(IntCC::Equal, rc, 0xc00);
-                        let valid = self.b.ins().bor(nearest, truncate);
-                        self.x87_require(valid, slow);
+                        let nearest = if prefix.control.arithmetic.is_some() {
+                            self.b.ins().iconst(types::I8, 1)
+                        } else {
+                            let rc = self.b.ins().band_imm(prefix.control.value, 0xc00);
+                            let nearest = self.b.ins().icmp_imm(IntCC::Equal, rc, 0);
+                            let truncate = self.b.ins().icmp_imm(IntCC::Equal, rc, 0xc00);
+                            let valid = self.b.ins().bor(nearest, truncate);
+                            self.x87_require(valid, slow);
+                            nearest
+                        };
                         let rn = self.b.ins().nearest(value);
                         let rz = self.b.ins().trunc(value);
                         let rounded = self.b.ins().select(nearest, rn, rz);
@@ -304,9 +341,11 @@ impl Emitter<'_> {
                             value,
                         )
                     } else {
-                        let rc = self.b.ins().band_imm(prefix.control, 0xc00);
-                        let bad = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
-                        self.x87_reject(bad, slow);
+                        if prefix.control.arithmetic.is_none() {
+                            let rc = self.b.ins().band_imm(prefix.control.value, 0xc00);
+                            let bad = self.b.ins().icmp_imm(IntCC::NotEqual, rc, 0);
+                            self.x87_reject(bad, slow);
+                        }
                         let narrow = self.b.ins().fdemote(types::F32, value);
                         let bits = self.b.ins().bitcast(types::I32, MemFlags::new(), narrow);
                         let exponent = self.b.ins().ushr_imm(bits, 23);
@@ -323,10 +362,12 @@ impl Emitter<'_> {
                         (bits, self.b.ins().fpromote(types::F64, narrow))
                     };
                     let inexact = self.b.ins().fcmp(FloatCC::NotEqual, rounded, value);
-                    let unmasked = self.b.ins().band_imm(prefix.control, PE);
-                    let unmasked = self.b.ins().icmp_imm(IntCC::Equal, unmasked, 0);
-                    let bad = self.b.ins().band(inexact, unmasked);
-                    self.x87_reject(bad, slow);
+                    if prefix.control.arithmetic.is_none() {
+                        let unmasked = self.b.ins().band_imm(prefix.control.value, PE);
+                        let unmasked = self.b.ins().icmp_imm(IntCC::Equal, unmasked, 0);
+                        let bad = self.b.ins().band(inexact, unmasked);
+                        self.x87_reject(bad, slow);
+                    }
                     let a = self.b.ins().fabs(rounded);
                     let b = self.b.ins().fabs(value);
                     let up = self.b.ins().fcmp(FloatCC::GreaterThan, a, b);
@@ -354,9 +395,13 @@ impl Emitter<'_> {
                     reverse,
                     pop,
                 } => {
-                    let tail = match tail {
+                    let tail = match prefix.control.arithmetic {
                         Some(tail) => tail,
-                        None => *tail.insert(self.x87_admit_arithmetic(prefix.control, slow)),
+                        None => {
+                            let tail = self.x87_admit_arithmetic(prefix.control.value, slow);
+                            prefix.control.arithmetic = Some(tail);
+                            tail
+                        }
                     };
                     let target = prefix.slot(dest);
                     let a = self.resident_double(&mut prefix, target, RANGE, slow);
@@ -364,11 +409,29 @@ impl Emitter<'_> {
                     let (a, b) = if reverse { (b, a) } else { (a, b) };
                     let (value, inexact, up) = self.x87_rounded_arithmetic(
                         op,
-                        (a.value, a.narrow),
-                        (b.value, b.narrow),
+                        (a.value, a.narrow.known()),
+                        (b.value, b.narrow.known()),
                         tail,
                         slow,
                     );
+                    // Both input checks dominate this continuation. The proof
+                    // is conditional on this control word, not an unconditional
+                    // 24-bit representation when PC=53 admitted wider inputs.
+                    for slot in [
+                        Some(target),
+                        match source {
+                            Source::St(index) => Some(prefix.slot(index)),
+                            _ => None,
+                        },
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let value = prefix.values[slot].as_mut().unwrap();
+                        if !value.narrow.known() {
+                            value.narrow = Narrow::Admitted;
+                        }
+                    }
                     prefix.status = self.x87_round_flags(prefix.status, inexact, up);
                     // Inputs are bounded, so the result is normal/zero and finite.
                     // It can exceed +-400 and must be guarded before the next op.
@@ -376,7 +439,7 @@ impl Emitter<'_> {
                     let result = Resident {
                         value,
                         range: 1023,
-                        narrow: true,
+                        narrow: Narrow::Admitted,
                     };
                     self.resident_write(&mut prefix, target, result);
                     if pop {
@@ -420,7 +483,30 @@ impl Emitter<'_> {
                     };
                     self.resident_write(&mut prefix, slot, value);
                 }
-                Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus => unreachable!(),
+                Fast::LoadControl => {
+                    let (_, pointer) = self.x87_memory(i, 2, false, slow);
+                    let control = self.b.ins().load(types::I16, MemFlags::new(), pointer, 0);
+                    let control = self.b.ins().uextend(types::I32, control);
+                    let unmasked = self.b.ins().bnot(control);
+                    let pending = self.b.ins().band(prefix.status, unmasked);
+                    let pending = self.b.ins().band_imm(pending, 0x3f);
+                    let bad = self.b.ins().icmp_imm(IntCC::NotEqual, pending, 0);
+                    self.x87_reject(bad, slow);
+                    // Commit immediately: all later recovery paths must observe
+                    // this control word, while a fault above retains the old one.
+                    self.x87_store_word(offset_of!(X87State, control), control);
+                    prefix.control = Control {
+                        value: control,
+                        arithmetic: None,
+                    };
+                    for resident in prefix.values.iter_mut().flatten() {
+                        resident.narrow = resident.narrow.forget_control();
+                    }
+                    prefix.status = self.b.ins().band_imm(prefix.status, !0x8080);
+                    // FLDCW leaves C1, FIP/FDP/FOP and TOP/tag unchanged.
+                    continue;
+                }
+                Fast::StoreControl | Fast::StoreStatus => unreachable!(),
             }
             prefix.metadata = Some((i.ip32(), self.x87[&i.ip32()].1));
         }
@@ -611,6 +697,8 @@ impl Emitter<'_> {
             }
             return;
         }
+        #[cfg(test)]
+        testing::emitted(|counts| counts.tag_guards += 1);
         let physical = self.x87_slot(p.base_top, slot as u8);
         let tag = self.x87_tag(p.tags, physical);
         let bad = self
@@ -654,11 +742,12 @@ impl Emitter<'_> {
         } else {
             self.resident_empty(p, slot, false, slow);
             let physical = self.x87_slot(p.base_top, slot as u8);
-            let value = self.x87_double(physical, p.tags, range, slow);
+            // resident_empty already established the tag; decode only once.
+            let value = self.x87_decode_double(physical, range, slow);
             let resident = Resident {
                 value,
                 range,
-                narrow: false,
+                narrow: Narrow::Unknown,
             };
             p.values[slot] = Some(resident);
             p.empty[slot] = Some(false);
@@ -687,7 +776,11 @@ impl Emitter<'_> {
                 Source::I32 => 31,
                 _ => range,
             },
-            narrow: matches!(source, Source::F32 | Source::I16),
+            narrow: if matches!(source, Source::F32 | Source::I16) {
+                Narrow::Always
+            } else {
+                Narrow::Unknown
+            },
         }
     }
 
