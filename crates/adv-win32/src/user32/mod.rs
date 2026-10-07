@@ -12,6 +12,7 @@ pub mod display;
 mod encoding;
 mod enumeration;
 mod formatting;
+mod hit_test;
 pub(crate) mod hooks;
 pub mod host_input;
 pub(crate) mod image;
@@ -707,7 +708,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "IntersectRect", 3, intersect_rect);
     s(reg, "UnionRect", 3, union_rect);
     s(reg, "AttachThreadInput", 3, |_| Outcome::Return(1));
-    s(reg, "WindowFromPoint", 2, |_| Outcome::Return(0));
+    hit_test::register(reg);
     s(reg, "EnumWindows", 2, |_| Outcome::Return(1));
     s(reg, "EnumChildWindows", 3, |_| Outcome::Return(1));
     s(reg, "ChangeDisplaySettingsA", 2, |_| Outcome::Return(0));

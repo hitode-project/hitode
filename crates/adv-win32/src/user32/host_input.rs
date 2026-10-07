@@ -28,7 +28,7 @@ pub fn mouse_mapping(message: u32, buttons: u32, swapped: bool) -> (u32, u32) {
 /// its valid focus window; mouse messages use its valid capture window.
 pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
     let user = &mut env.ext.get_mut::<Win32>().user;
-    let Some((top, hwnd)) = target(user, &env.sys.objects, message) else {
+    let Some((top, mut hwnd)) = target(user, &env.sys.objects, message) else {
         return false;
     };
     let mut lparam = lparam;
@@ -48,6 +48,19 @@ pub fn post(env: &mut Env<'_>, message: u32, wparam: u32, lparam: u32) -> bool {
         let (ox, oy) = user.client_origin(&env.sys.objects, top);
         let (sx, sy) =
             super::input::set_cursor_position(user, (x.saturating_add(ox), y.saturating_add(oy)));
+        let thread = user.windows.get(&env.sys.objects, &top).unwrap().thread;
+        let captured = user
+            .queues
+            .get(&thread)
+            .is_some_and(|q| valid_window(user, &env.sys.objects, q.capture, thread));
+        if !captured && message != 0x20a && message != 0x20e {
+            // The host supplies top-level client coordinates. Ordinary mouse
+            // input belongs to the deepest child at that point, not its parent.
+            hwnd = super::hit_test::descendant(user, &env.sys.objects, top, (sx, sy));
+            if hwnd == 0 {
+                return false;
+            }
+        }
         if message == 0x20a || message == 0x20e {
             lparam = make_long(sx, sy);
         } else {
