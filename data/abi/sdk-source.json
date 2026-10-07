@@ -201,5 +201,11 @@
     "source": "Microsoft Learn ntifs declaration, SDK x86 import symbol and authored Microsoft Windows x86 caller",
     "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntallocatevirtualmemory",
     "native_verification": "38 DWORDs: actual suspended child, rounded extent, Win32 query/read/write/free interop, conflicting reservation, invalid protection/flags/zero size/pointers, unchanged outputs/LastError; three executors additionally cover isolated VM and rollback when caller loses output mappings"
+  },
+  "nt_write_virtual_memory": {
+    "scope": "NtWriteVirtualMemory; five x86 words, signed NTSTATUS, SIZE_T count; permission-preserving remote writes through the shared process/VM owner",
+    "source": "phnt ntmmapi.h primary declaration and authored Microsoft Windows x86 differential",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
+    "native_verification": "36 DWORDs cover readable/writable remote data, PROCESS_VM_WRITE-only handle, protection and partial-copy status/count/unchanged bytes, null source/target, zero-size handle bypass, optional/inaccessible count outputs, unchanged LastError and child exit"
   }
 }
