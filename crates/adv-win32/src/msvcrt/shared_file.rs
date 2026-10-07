@@ -1,5 +1,5 @@
 //! Shared-open fronts use the existing CRT FILE/process-heap owner and VFS.
-//! Binary read plus SH_DENYNO is the measured profile; other valid modes fail
+//! Binary read/write plus SH_DENYNO is the measured profile; other valid modes fail
 //! explicitly until the shared stdio owner implements their required semantics.
 use super::*;
 use adv_abi::{
@@ -140,11 +140,11 @@ fn open(env: &mut Env<'_>, filename: u32, mode: u32, share: i32, wide: bool) -> 
             "shared CRT deny/secure sharing modes are unavailable; only SH_DENYNO is supported",
         );
     }
-    if mode != "rb" {
+    if !matches!(mode.as_str(), "rb" | "wb") {
         return unsupported(
             env,
             errno,
-            "shared CRT text/update/write modes are unavailable; only binary read rb is supported",
+            "shared CRT text/update/append modes are unavailable; only binary rb/wb are supported",
         );
     }
     let guest = env
@@ -153,18 +153,20 @@ fn open(env: &mut Env<'_>, filename: u32, mode: u32, share: i32, wide: bool) -> 
         .vfs
         .normalize(&name)
         .to_lowercase();
+    let required_share = if mode == "wb" { 2 } else { 1 };
     if env
         .sys
         .objects
         .all_hosts::<crate::FileObj>()
         .any(|(_, file)| {
             file.guest_path.to_lowercase() == guest
-                && (file.share & 1 == 0 || file.access & (0x10000 | 0x10000000) != 0)
+                && (file.share & required_share == 0 || file.access & (0x10000 | 0x10000000) != 0)
         })
     {
         return fail(env, errno, 13, 32);
     }
-    let mut options = file_open_options(&mode).expect("validated binary read mode");
+    // Refuse conflicts before VFS write-path creation or OpenOptions truncation.
+    let mut options = file_open_options(&mode).expect("validated binary rb/wb mode");
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
