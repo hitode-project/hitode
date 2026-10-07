@@ -395,7 +395,7 @@ fn differences(interpreted: &ArchitecturalState, native: &ArchitecturalState) ->
         }
         for (physical, (a, b)) in a.regs.iter().zip(&b.regs).enumerate() {
             if a != b {
-                let _ = write!(text, " physical{physical}/mm{physical}");
+                let _ = write!(text, " raw80 physical{physical}/mm{physical}");
             }
         }
         diff.push(text);
