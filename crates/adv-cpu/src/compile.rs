@@ -92,6 +92,10 @@ impl Compiled {
     pub(crate) fn profile(&self) -> Option<&Profile> {
         self.input.profile.as_deref()
     }
+
+    pub(crate) fn shared_profile(&self) -> Option<Arc<Profile>> {
+        self.input.profile.clone()
+    }
     pub(crate) fn parallel_entry(&self) -> crate::parallel::Entry {
         assert!(!self.input.shadow_returns);
         self.entry

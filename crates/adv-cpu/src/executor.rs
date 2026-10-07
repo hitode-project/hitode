@@ -128,6 +128,9 @@ pub struct Executor {
     callee_attempts: HashMap<u32, BTreeSet<u32>>,
     /// `stats.native_blocks` at the last `scan_profiles`.
     scanned_blocks: u64,
+    /// Published units with a profile. A profile nothing else holds belongs to
+    /// retired code.
+    profiled: Vec<(u32, Arc<compile::Profile>)>,
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
     background_sender: Option<adv_sync::background::LocalSender>,
@@ -328,6 +331,7 @@ impl Executor {
             tier_attempted: BTreeSet::new(),
             callee_attempts: HashMap::new(),
             scanned_blocks: 0,
+            profiled: Vec::new(),
             async_compilation: false,
             compiler: None,
             background_sender: None,
@@ -473,6 +477,7 @@ impl Executor {
         self.automatic_regions.clear();
         self.native_heat.clear();
         self.callee_attempts.clear();
+        self.profiled.clear();
         self.tier_attempted.clear();
         self.hits.clear();
         self.demand.clear();
@@ -534,6 +539,9 @@ impl Executor {
             self.demand.remove(&pc);
         }
         self.stats.native_code_bytes += compiled.code_size;
+        if let Some(profile) = compiled.shared_profile() {
+            self.profiled.push((region.start, profile));
+        }
         self.code.compiled.insert(region.start, compiled);
         if region.compile_strategy == CompileStrategy::Fast {
             self.code.fast_regions.insert(region.start);
@@ -1120,15 +1128,13 @@ impl Executor {
         if !self.deferred_compilations.is_empty() {
             return;
         }
+        self.profiled.retain(|(_, profile)| Arc::strong_count(profile) > 1);
+        // Reading a counter is cheap; only hot units pay the eligibility lookups.
         let hottest = self
-            .code
-            .fast_regions
+            .profiled
             .iter()
-            .filter(|&&owner| self.may_tier_up(owner))
-            .filter_map(|&owner| {
-                let heat = self.code.compiled.get(&owner)?.profile()?.heat();
-                (heat >= HOT_BLOCKS).then_some((heat, owner))
-            })
+            .map(|(owner, profile)| (profile.heat(), *owner))
+            .filter(|&(heat, owner)| heat >= HOT_BLOCKS && self.may_tier_up(owner))
             .max();
         if let Some((_, owner)) = hottest {
             self.request_tier_up(owner);
