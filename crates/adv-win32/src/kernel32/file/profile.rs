@@ -85,6 +85,45 @@ fn contents(env: &mut Env<'_>, filename: &str) -> Result<Vec<u8>, ReadError> {
     env.sys.objects.close(handle);
     result
 }
+
+type ReadProfile = Box<dyn FnOnce(&mut Env<'_>, Result<Vec<u8>, ReadError>) -> Outcome>;
+
+fn with_contents(env: &mut Env<'_>, filename: String, then: ReadProfile) -> Outcome {
+    match super::native::active(env) {
+        Ok(false) => {
+            let result = contents(env, &filename);
+            then(env, result)
+        }
+        Ok(true) => {
+            let filename = env.ext.get::<Win32>().vfs.normalize(&filename);
+            super::native::read(
+                env,
+                filename,
+                MAX_FILE_BYTES,
+                Box::new(move |env, result| {
+                    let result = result.map_err(|status| {
+                        if status == super::native::FILE_TOO_LARGE {
+                            ReadError::Unsupported(
+                                "profile file exceeds the supported 16MiB bounded-reader budget",
+                                50,
+                            )
+                        } else {
+                            ReadError::Io(super::native::win32_error(status))
+                        }
+                    });
+                    then(env, result)
+                }),
+            )
+        }
+        Err(_) => then(
+            env,
+            Err(ReadError::Unsupported(
+                "native file hook export is invalid or requires unsupported forwarded initialization",
+                50,
+            )),
+        ),
+    }
+}
 fn decode(env: &Env<'_>, bytes: &[u8]) -> Result<Vec<u16>, ReadError> {
     if bytes.starts_with(&[0xff, 0xfe, 0, 0])
         || bytes.starts_with(&[0xfe, 0xff])
@@ -328,54 +367,62 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool, api: &'static str) -> 
             );
         }
     };
-    let data = match contents(env, &filename) {
-        Ok(bytes) => match decode(env, &bytes) {
-            Ok(data) => Some(data),
-            Err(ReadError::Unsupported(reason, error)) => {
-                return unavailable(env, api, reason, error);
+    with_contents(
+        env,
+        filename,
+        Box::new(move |env, result| {
+            let data = match result {
+                Ok(bytes) => match decode(env, &bytes) {
+                    Ok(data) => Some(data),
+                    Err(ReadError::Unsupported(reason, error)) => {
+                        return unavailable(env, api, reason, error);
+                    }
+                    Err(ReadError::Io(_)) => unreachable!(),
+                },
+                Err(ReadError::Io(error)) => {
+                    let default = match text(env, default, wide) {
+                        Ok(default) => default.unwrap_or_default(),
+                        Err(_) => {
+                            set_last_error(env, 998);
+                            return Outcome::Return(0);
+                        }
+                    };
+                    return output(
+                        env,
+                        Answer::Scalar(strip_default(default)),
+                        capacity,
+                        out,
+                        wide,
+                        Some(error),
+                    );
+                }
+                Err(ReadError::Unsupported(reason, error)) => {
+                    return unavailable(env, api, reason, error);
+                }
+            };
+            let answer = Ini::new(&data.unwrap()).query(app.as_deref(), key.as_deref());
+            match answer {
+                Some(answer) => output(env, answer, capacity, out, wide, None),
+                None => {
+                    let default = match text(env, default, wide) {
+                        Ok(default) => default.unwrap_or_default(),
+                        Err(_) => {
+                            set_last_error(env, 998);
+                            return Outcome::Return(0);
+                        }
+                    };
+                    output(
+                        env,
+                        Answer::Scalar(strip_default(default)),
+                        capacity,
+                        out,
+                        wide,
+                        Some(2),
+                    )
+                }
             }
-            Err(ReadError::Io(_)) => unreachable!(),
-        },
-        Err(ReadError::Io(error)) => {
-            let default = match text(env, default, wide) {
-                Ok(default) => default.unwrap_or_default(),
-                Err(_) => {
-                    set_last_error(env, 998);
-                    return Outcome::Return(0);
-                }
-            };
-            return output(
-                env,
-                Answer::Scalar(strip_default(default)),
-                capacity,
-                out,
-                wide,
-                Some(error),
-            );
-        }
-        Err(ReadError::Unsupported(reason, error)) => return unavailable(env, api, reason, error),
-    };
-    let answer = Ini::new(&data.unwrap()).query(app.as_deref(), key.as_deref());
-    match answer {
-        Some(answer) => output(env, answer, capacity, out, wide, None),
-        None => {
-            let default = match text(env, default, wide) {
-                Ok(default) => default.unwrap_or_default(),
-                Err(_) => {
-                    set_last_error(env, 998);
-                    return Outcome::Return(0);
-                }
-            };
-            output(
-                env,
-                Answer::Scalar(strip_default(default)),
-                capacity,
-                out,
-                wide,
-                Some(2),
-            )
-        }
-    }
+        }),
+    )
 }
 fn strip_default(mut default: Vec<u16>) -> Vec<u16> {
     while default.last() == Some(&32) {
@@ -392,7 +439,12 @@ fn output(
     lookup_error: Option<u32>,
 ) -> Outcome {
     let (bytes, length, error) = render(env, answer, capacity, wide, lookup_error.is_some());
-    if !bytes.is_empty() && env.cpu.write(out, &bytes).is_err() {
+    // Guest file callbacks may change the caller's output mapping while the
+    // profile operation is suspended. Revalidate before publishing any bytes.
+    if !bytes.is_empty()
+        && (check_range(env.cpu, out, bytes.len() as u32, Prot::WRITE).is_err()
+            || env.cpu.write(out, &bytes).is_err())
+    {
         set_last_error(env, 998);
         return Outcome::Return(0);
     }
@@ -513,32 +565,38 @@ fn get_int(env: &mut Env<'_>, pointers: [u32; 4], wide: bool, api: &'static str)
             return Outcome::Return(default);
         }
     };
-    let data = match contents(env, &filename).and_then(|bytes| decode(env, &bytes)) {
-        Ok(data) => data,
-        Err(ReadError::Io(error)) => {
-            set_last_error(env, error);
-            return Outcome::Return(default);
-        }
-        Err(ReadError::Unsupported(reason, error)) => {
-            unavailable(env, api, reason, error);
-            return Outcome::Return(default);
-        }
-    };
-    let (Some(app), Some(key)) = (app, key) else {
-        set_last_error(env, 2);
-        return Outcome::Return(default);
-    };
-    let Some(Answer::Scalar(value)) = Ini::new(&data).query(Some(&app), Some(&key)) else {
-        set_last_error(env, 2);
-        return Outcome::Return(default);
-    };
-    set_last_error(env, 0);
-    // A present empty value uses the caller's default but retains lookup success.
-    Outcome::Return(if value.is_empty() {
-        default
-    } else {
-        integer(&value)
-    })
+    with_contents(
+        env,
+        filename,
+        Box::new(move |env, result| {
+            let data = match result.and_then(|bytes| decode(env, &bytes)) {
+                Ok(data) => data,
+                Err(ReadError::Io(error)) => {
+                    set_last_error(env, error);
+                    return Outcome::Return(default);
+                }
+                Err(ReadError::Unsupported(reason, error)) => {
+                    unavailable(env, api, reason, error);
+                    return Outcome::Return(default);
+                }
+            };
+            let (Some(app), Some(key)) = (app, key) else {
+                set_last_error(env, 2);
+                return Outcome::Return(default);
+            };
+            let Some(Answer::Scalar(value)) = Ini::new(&data).query(Some(&app), Some(&key)) else {
+                set_last_error(env, 2);
+                return Outcome::Return(default);
+            };
+            set_last_error(env, 0);
+            // A present empty value uses the caller's default but retains lookup success.
+            Outcome::Return(if value.is_empty() {
+                default
+            } else {
+                integer(&value)
+            })
+        }),
+    )
 }
 
 // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-getprivateprofileintw

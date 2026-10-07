@@ -401,3 +401,201 @@ fn unsupported_flags_codepages_and_bad_paths_fail_without_publishing_attribute_c
     );
     assert!(!root.join("data/overlay/state.dat").exists());
 }
+
+struct AttributeProvider {
+    full: bool,
+    paths: Vec<String>,
+    allocations: Vec<u32>,
+    revoked_page: u32,
+}
+fn attribute_hook(env: &mut Env<'_>) -> Outcome {
+    let (object, output) = (env.arg(0), env.arg(1));
+    assert_eq!(env.cpu.read_u32(object).unwrap(), 24);
+    assert_eq!(env.cpu.read_u32(object + 4).unwrap(), 0);
+    assert_eq!(env.cpu.read_u32(object + 12).unwrap(), 0x40);
+    assert_eq!(env.cpu.read_u32(object + 16).unwrap(), 0);
+    assert_eq!(env.cpu.read_u32(object + 20).unwrap(), 0);
+    let name = env.cpu.read_u32(object + 8).unwrap();
+    let length = env.cpu.read_u16(name).unwrap();
+    assert_eq!(env.cpu.read_u16(name + 2).unwrap(), length + 2);
+    let pointer = env.cpu.read_u32(name + 4).unwrap();
+    let units: Vec<_> = (0..u32::from(length) / 2)
+        .map(|index| env.cpu.read_u16(pointer + index * 2).unwrap())
+        .collect();
+    assert_eq!(env.cpu.read_u16(pointer + u32::from(length)).unwrap(), 0);
+    let path = String::from_utf16(&units).unwrap();
+    assert!(path.starts_with(r"\??\C:\Game\"));
+    assert_eq!(output % 8, 0);
+    assert!(env.ext.get::<adv_os::Heaps>().owner(object).is_some());
+    let provider = env.ext.get_mut::<AttributeProvider>();
+    provider.paths.push(path);
+    provider.allocations.push(object);
+    let call = provider.paths.len();
+    let offset = if provider.full { 48 } else { 32 };
+    env.cpu.write_u32(output + offset, 0x21).unwrap();
+    if call == 4 {
+        let page = output & !4095;
+        env.cpu.protect(page, 4096, Prot::WRITE).unwrap();
+        env.ext.get_mut::<AttributeProvider>().revoked_page = page;
+    }
+    Outcome::Return(if call == 3 { 0xc0000034 } else { 0 })
+}
+fn install_attribute_hook(env: &mut Env<'_>) -> Outcome {
+    let names: &[&str] = if env.ext.get::<AttributeProvider>().full {
+        &["NtQueryFullAttributesFile"]
+    } else {
+        &["NtQueryAttributesFile", "NtQueryFullAttributesFile"]
+    };
+    for &name in names {
+        let entry = super::super::native::entry(env, name).unwrap();
+        let mut jump = vec![0xe9];
+        jump.extend((CODE + 0x600).wrapping_sub(entry + 5).to_le_bytes());
+        env.cpu.write(entry, &jump).unwrap();
+    }
+    Outcome::Return(0)
+}
+fn restore_attribute_page(env: &mut Env<'_>) -> Outcome {
+    let page = env.ext.get::<AttributeProvider>().revoked_page;
+    assert_ne!(page, 0);
+    env.cpu.protect(page, 4096, Prot::RW).unwrap();
+    Outcome::Return(0)
+}
+
+#[test]
+fn a_w_attributes_use_only_live_attribute_hooks_and_release_native_scratch() {
+    for full in [false, true] {
+        for jit in [false, true] {
+            let (mut machine, root) = fixture(
+                JitCpu::new(PARK_ADDR, jit).unwrap(),
+                "native-attribute-hook",
+            );
+            std::fs::write(root.join("game/ordinary.dat"), b"authored backing file").unwrap();
+            let expected_fast = machine
+                .ext
+                .get::<Win32>()
+                .vfs
+                .file_attributes("ordinary.dat")
+                .unwrap();
+            machine.ext.insert(AttributeProvider {
+                full,
+                paths: Vec::new(),
+                allocations: Vec::new(),
+                revoked_page: 0,
+            });
+            let registry = machine.sys.thunks.resolver_mut::<Registry>().unwrap();
+            for (name, argc, handler) in [
+                ("query", 2, attribute_hook as adv_machine::Handler),
+                ("install", 0, install_attribute_hook as adv_machine::Handler),
+                ("restore", 0, restore_attribute_page as adv_machine::Handler),
+            ] {
+                registry.add("attribute-provider", name, Conv::Stdcall { argc }, handler);
+            }
+            {
+                let (win32, modules) = machine.ext.get2_mut::<Win32, adv_os::Modules>();
+                adv_os::Loader::new(&mut machine.cpu, &mut machine.sys, modules, &win32.vfs)
+                    .load("ntdll.dll")
+                    .unwrap();
+            }
+            ansi(&mut machine, DATA + 0x300, b".\\virtual.cfg");
+            wide(&mut machine, DATA + 0x400, ".\\virtual-名.cfg");
+            ansi(&mut machine, DATA + 0x500, b".\\ordinary.dat");
+            assert!(
+                machine
+                    .ext
+                    .get::<Win32>()
+                    .vfs
+                    .file_attributes("virtual.cfg")
+                    .is_err()
+            );
+            let get_a = machine.resolve_import(K32, "GetFileAttributesA").unwrap();
+            let get_w = machine.resolve_import(K32, "GetFileAttributesW").unwrap();
+            let set_error = machine.resolve_import(K32, "SetLastError").unwrap();
+            let get_error = machine.resolve_import(K32, "GetLastError").unwrap();
+            let query = machine
+                .resolve_import("attribute-provider", "query")
+                .unwrap();
+            let install = machine
+                .resolve_import("attribute-provider", "install")
+                .unwrap();
+            let restore = machine
+                .resolve_import("attribute-provider", "restore")
+                .unwrap();
+            let mut hook = Asm::new(CODE + 0x600);
+            hook.jmp(query);
+            machine.cpu.write(CODE + 0x600, &hook.bytes).unwrap();
+            // A reader override alone must not reroute attribute queries.
+            let read_entry =
+                super::super::native::entry(&mut env(&mut machine), "NtReadFile").unwrap();
+            let mut jump = vec![0xe9];
+            jump.extend((CODE + 0x600).wrapping_sub(read_entry + 5).to_le_bytes());
+            machine.cpu.write(read_entry, &jump).unwrap();
+            let mut code = Asm::new(CODE);
+            code.bytes.extend([0x89, 0xe0]); // mov eax, esp
+            code.mov_mem_eax(OUT + 64);
+            code.push_imm(0x12345678).call(set_error);
+            call(&mut code, get_a, &[DATA + 0x500], OUT, get_error);
+            code.call(install);
+            code.push_imm(0x12345678).call(set_error);
+            call(&mut code, get_a, &[DATA + 0x300], OUT + 8, get_error);
+            call(&mut code, get_w, &[DATA + 0x400], OUT + 16, get_error);
+            // A failed hook controls even a path that the backing VFS contains.
+            call(&mut code, get_a, &[DATA + 0x500], OUT + 24, get_error);
+            call(&mut code, get_w, &[DATA + 0x400], OUT + 32, get_error);
+            code.call(restore);
+            code.bytes.extend([0x89, 0xe0]);
+            code.mov_mem_eax(OUT + 68);
+            code.bytes.extend([0x31, 0xc0]);
+            code.ret();
+            machine.cpu.write(CODE, &code.bytes).unwrap();
+            machine
+                .spawn("authored attribute hook", CODE, &[], 65536)
+                .unwrap();
+            let objects = machine.sys.objects.object_count();
+            let result = machine.run_virtual(1_000_000);
+            assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+            for (offset, expected) in [
+                (0, expected_fast),
+                (4, 0x12345678),
+                (8, 0x21),
+                (12, 0x12345678),
+                (16, 0x21),
+                (20, 0x12345678),
+                (24, u32::MAX),
+                (28, 2),
+                (32, u32::MAX),
+                (36, 998),
+            ] {
+                assert_eq!(
+                    machine.cpu.read_u32(OUT + offset).unwrap(),
+                    expected,
+                    "output {offset}"
+                );
+            }
+            assert_eq!(
+                machine.cpu.read_u32(OUT + 64).unwrap(),
+                machine.cpu.read_u32(OUT + 68).unwrap()
+            );
+            assert_eq!(machine.sys.objects.object_count(), objects);
+            let provider = machine.ext.get::<AttributeProvider>();
+            assert_eq!(
+                provider.paths,
+                [
+                    r"\??\C:\Game\virtual.cfg",
+                    r"\??\C:\Game\virtual-名.cfg",
+                    r"\??\C:\Game\ordinary.dat",
+                    r"\??\C:\Game\virtual-名.cfg",
+                ]
+            );
+            for allocation in &provider.allocations {
+                assert!(
+                    machine
+                        .ext
+                        .get::<adv_os::Heaps>()
+                        .owner(*allocation)
+                        .is_none(),
+                    "native scratch is released on success, NT failure and bad output"
+                );
+            }
+        }
+    }
+}
