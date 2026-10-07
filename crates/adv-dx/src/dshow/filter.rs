@@ -24,6 +24,7 @@ pub(crate) enum Role {
     VideoDecoder,
     AudioDecoder,
     AudioRenderer,
+    VideoRenderer,
 }
 
 /// Demuxed media owned by a splitter. Failed probes never attach a source;
@@ -177,6 +178,7 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
             (OUTPUT, "Out", MEDIATYPE_AUDIO),
         ],
         Role::AudioRenderer => &[(INPUT, "Audio Input pin (rendered)", MEDIATYPE_AUDIO)],
+        Role::VideoRenderer => &[(INPUT, "Video Input pin (rendered)", MEDIATYPE_VIDEO)],
     };
     for &(dir, name, major) in pins {
         if let Err(error) = new_pin(env, base, dir, name, major, None) {
@@ -373,7 +375,7 @@ fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     match method {
         "Connect" => Some(connect(env, pin, a1, env.arg(2))),
         "ReceiveConnection" => Some(receive_connection(env, pin, a1, env.arg(2))),
-        "Disconnect" => r(disconnect_host(env, pin)),
+        "Disconnect" => Some(disconnect(env, pin)),
         "ConnectedTo" => {
             let _ = env.cpu.write_u32(a1, 0);
             let peer = state(env).pins[&pin].peer;
@@ -787,9 +789,66 @@ fn describe(mt: &MediaType) -> String {
 
 pub(crate) fn disconnect(env: &mut Env<'_>, pin: u32) -> Outcome {
     match host_pin(env, pin) {
-        Some(pin) => Outcome::Return(disconnect_host(env, pin)),
+        Some(pin) => {
+            let hr = if state(env).pins[&pin].peer == 0 {
+                S_FALSE
+            } else {
+                S_OK
+            };
+            let calls = disconnect_owned(env, pin);
+            chain(
+                env,
+                calls,
+                Vec::new(),
+                Box::new(move |_, _| Outcome::Return(hr)),
+            )
+        }
         None => guest_call(env, pin, 5, vec![], |_, hr| Outcome::Return(hr)),
     }
+}
+
+/// Detach a host pin and return the guest releases owned by its connection.
+/// Host-to-host connections borrow their peer; guest peers, reader interfaces
+/// and memory input interfaces each hold a separate COM reference.
+pub(super) fn disconnect_owned(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
+    let p = &state(env).pins[&pin];
+    let (peer, mem, reader) = (p.peer, p.mem, p.reader);
+    let guest_peer = peer != 0 && host_pin(env, peer).is_none();
+    disconnect_host(env, pin);
+    state(env).pins.get_mut(&pin).unwrap().reader = 0;
+    let mut calls = VecDeque::new();
+    for pointer in [mem, reader] {
+        if pointer != 0 {
+            calls.push_back(Call(pointer, 2, vec![]));
+        }
+    }
+    if guest_peer {
+        calls.push_back(Call(peer, 2, vec![]));
+    }
+    calls
+}
+
+/// Graph removal disconnects both ends; individual IPin::Disconnect only owns
+/// its own end. Keep the host filter alive until these guest callbacks finish.
+pub(super) fn disconnect_filter(env: &mut Env<'_>, filter: u32) -> VecDeque<Call> {
+    let pins = state(env)
+        .filters
+        .get(&filter)
+        .map(|f| f.pins.clone())
+        .unwrap_or_default();
+    let mut calls = VecDeque::new();
+    for pin in pins {
+        let peer = state(env).pins[&pin].peer;
+        if peer != 0 {
+            if let Some(peer) = host_pin(env, peer) {
+                calls.extend(disconnect_owned(env, peer));
+            } else {
+                calls.push_back(Call(peer, 5, vec![]));
+            }
+        }
+        calls.extend(disconnect_owned(env, pin));
+    }
+    calls
 }
 
 fn disconnect_host(env: &mut Env<'_>, pin: u32) -> u32 {
@@ -890,7 +949,9 @@ fn read_source(
     }
     let length = (total - bytes.len() as u64).min(u64::from(READ_CHUNK)) as u32;
     let Some(buffer) = alloc(env, length) else {
-        return Outcome::Return(E_OUTOFMEMORY);
+        return guest_call(env, reader, 2, vec![], |_, _| {
+            Outcome::Return(E_OUTOFMEMORY)
+        });
     };
     let position = bytes.len() as u64;
     let args = vec![position as u32, (position >> 32) as u32, length, buffer];
@@ -980,7 +1041,8 @@ pub(super) fn attach_source(
             format: Vec::new(),
         };
         if let Err(error) = new_pin(env, filter, OUTPUT, name, major, Some(mt)) {
-            return Outcome::Return(error);
+            state(env).filters.get_mut(&filter).unwrap().source = None;
+            return guest_call(env, reader, 2, vec![], move |_, _| Outcome::Return(error));
         }
     }
     let p = state(env).pins.get_mut(&pin).unwrap();

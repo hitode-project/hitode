@@ -23,6 +23,7 @@ pub struct Runtime<B: Backend = JitCpu> {
 #[cfg(feature = "gpu")]
 pub struct NativeCapture {
     source: adv_device::gpu::NativeFrame,
+    composition: adv_device::surface::PendingFrame,
     readback: adv_device::gpu::Readback,
     completed: bool,
 }
@@ -218,6 +219,14 @@ impl<B: Backend> Runtime<B> {
             #[cfg(feature = "gpu")]
             adv_dx::d3d9::cancel_pending(&mut self.machine);
             return outcome;
+        }
+        if let Err(message) = adv_dx::dshow::pump_video(&mut self.machine) {
+            return SliceResult::Complete(RunResult::Failed(adv_machine::MachineError {
+                ctx: self.machine.sys.current,
+                pc: self.machine.cpu.reg(adv_cpu::backend::Reg::Eip),
+                message,
+                recent: self.machine.sys.recent_calls(),
+            }));
         }
         #[cfg(feature = "gpu")]
         match adv_dx::d3d9::pump(&mut self.machine) {
@@ -465,18 +474,21 @@ impl<B: Backend> Runtime<B> {
     pub fn begin_native_frame_capture(
         &mut self,
     ) -> Result<Option<NativeCapture>, adv_device::gpu::Error> {
-        let Some(source) = self
+        let Some(composition) = self
             .machine
             .ext
             .get::<Graphics<Snapshot>>()
-            .latest_native_frame()
+            .latest_frame()
+            .filter(|frame| frame.native().is_some())
             .cloned()
         else {
             return Ok(None);
         };
+        let source = composition.native().unwrap().clone();
         let readback = adv_dx::d3d9::readback_image(&mut self.machine.ext, &source.image)?;
         Ok(Some(NativeCapture {
             source,
+            composition,
             readback,
             completed: false,
         }))
@@ -490,7 +502,7 @@ impl<B: Backend> Runtime<B> {
         self.machine
             .ext
             .get_mut::<Graphics<Snapshot>>()
-            .capture_native_snapshot_pixels(&capture.source, bgra)
+            .capture_native_frame_pixels(&capture.composition, bgra)
     }
     /// Explicit export/diagnostic capture. Callers enqueue its fence job on the
     /// existing background service and consume the typed completion separately.

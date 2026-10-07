@@ -8,8 +8,8 @@ use adv_os::com::Iid;
 
 use super::*;
 
-pub(super) mod source;
 mod render;
+pub(super) mod source;
 
 pub(crate) const STOPPED: u32 = 0;
 pub(crate) const PAUSED: u32 = 1;
@@ -59,6 +59,9 @@ pub(crate) struct Graph {
     pub expected: u32,
     pub completed: u32,
     complete_sent: bool,
+    pub video: video::window::WindowState,
+    pub video_frame: Option<adv_device::surface::VideoFrame>,
+    pub video_geometry: Option<VideoWindowGeometry>,
 }
 
 impl Graph {
@@ -126,6 +129,9 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
             expected: 0,
             completed: 0,
             complete_sent: false,
+            video: video::window::WindowState::default(),
+            video_frame: None,
+            video_geometry: None,
         },
     );
     let com = state(env).com;
@@ -164,6 +170,8 @@ pub(crate) fn release_method(env: &mut Env<'_>, this: u32) -> Outcome {
 
 fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     stop_sessions(env, graph);
+    video::detach(env, graph);
+    g(env, graph).state = STOPPED;
     let members: Vec<(u32, Option<u32>)> = state(env).graphs[&graph]
         .members
         .iter()
@@ -173,22 +181,38 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     for &(filter, host) in &members {
         if host.is_none() {
             calls.push_back(Call(filter, 4, vec![]));
+        }
+    }
+    for &(_, host) in &members {
+        if let Some(host) = host {
+            calls.extend(filter::disconnect_filter(env, host));
+        }
+    }
+    for &(filter, host) in &members {
+        if host.is_none() {
             calls.push_back(Call(filter, 13, vec![0, 0]));
             calls.push_back(Call(filter, 2, vec![]));
         }
     }
     state(env).graphs.get_mut(&graph).unwrap().members.clear();
-    for (_, host) in members {
-        if let Some(host) = host {
-            if let Some(filter) = state(env).filters.get_mut(&host) {
-                filter.graph = 0;
-            }
-            release(env, host);
-        }
-    }
     let event = state(env).graphs[&graph].event;
-    env.sys.objects.close(event);
-    chain(env, calls, Vec::new(), then)
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |env, results| {
+            for (_, host) in members {
+                if let Some(host) = host {
+                    if let Some(filter) = state(env).filters.get_mut(&host) {
+                        filter.graph = 0;
+                    }
+                    release(env, host);
+                }
+            }
+            env.sys.objects.close(event);
+            then(env, results)
+        }),
+    )
 }
 
 fn graph_of(env: &Env<'_>, this: u32) -> Option<u32> {
@@ -297,10 +321,9 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         (Face::MediaSeeking, method) => seeking(env, graph, method),
         (Face::MediaPosition, method) => position_method(env, graph, method),
         (Face::BasicAudio, method) => audio_method(env, graph, method),
-        // Like quartz's plug-in distributor, the graph always answers these
-        // interfaces; with no video renderer of its own every call reports
-        // that no filter supports it.
-        (Face::BasicVideo | Face::VideoWindow, _) => r(super::E_NOINTERFACE),
+        (Face::BasicVideo | Face::VideoWindow, method) => {
+            video::window::call(env, graph, face, method)
+        }
         _ => None,
     }
 }
@@ -362,11 +385,26 @@ fn remove_filter(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
     };
     let member = g(env, graph).members.remove(index);
     if let Some(host) = member.host {
+        if state(env)
+            .filters
+            .get(&host)
+            .is_some_and(|f| f.role == filter::Role::VideoRenderer)
+        {
+            video::detach(env, graph);
+        }
+        let calls = filter::disconnect_filter(env, host);
         if let Some(f) = state(env).filters.get_mut(&host) {
             f.graph = 0;
         }
-        release(env, host);
-        return Outcome::Return(S_OK);
+        return chain(
+            env,
+            calls,
+            Vec::new(),
+            Box::new(move |env, _| {
+                release(env, host);
+                Outcome::Return(S_OK)
+            }),
+        );
     }
     let calls = VecDeque::from([Call(filter, 13, vec![0, 0]), Call(filter, 2, vec![])]);
     chain(
@@ -449,6 +487,12 @@ pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     let previous = g(env, graph).state;
     if previous == PAUSED {
         return then(env, Vec::new());
+    }
+    if previous == STOPPED {
+        let hr = video::auto_show(env, graph);
+        if hr != S_OK {
+            return Outcome::Return(hr);
+        }
     }
     each_guest_filter(
         env,
@@ -767,6 +811,17 @@ pub(crate) fn current(env: &Env<'_>, graph: u32) -> i64 {
         .stop
         .unwrap_or(if length > 0 { length } else { i64::MAX });
     graph_state.position(now).min(end)
+}
+
+/// Container duration is only an estimate (short MPEG-PS probes can report the
+/// first PES span). Clamping decoding to that estimate would strand a future
+/// frame forever and prevent EC_COMPLETE. Only an explicit segment stop bounds
+/// delivery; otherwise the decoder's actual EOF completes the stream.
+pub(crate) fn stream_position(env: &Env<'_>, graph: u32) -> i64 {
+    let graph = &env.ext.get::<State>().graphs[&graph];
+    graph
+        .position(env.sys.clock.now_us())
+        .min(graph.stop.unwrap_or(i64::MAX))
 }
 
 /// Seek every stream; flushing and new segments happen on the stream threads.

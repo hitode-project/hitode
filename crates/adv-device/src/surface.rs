@@ -118,6 +118,7 @@ pub struct GraphicsStats {
     pub text_scratch_growths: u64,
 }
 
+#[derive(Clone)]
 pub struct PendingFrame {
     width: u32,
     height: u32,
@@ -125,7 +126,8 @@ pub struct PendingFrame {
     format: PixelFormat,
     palette: Option<Arc<[[u8; 4]; 256]>>,
     serial: u64,
-    pixels: Vec<u8>,
+    pixels: Arc<Vec<u8>>,
+    video: Arc<[(u64, VideoLayer)]>,
     #[cfg(feature = "gpu")]
     native: Option<crate::gpu::NativeFrame>,
 }
@@ -138,7 +140,8 @@ impl Default for PendingFrame {
             format: PixelFormat::Bgra32,
             palette: None,
             serial: 0,
-            pixels: Vec::new(),
+            pixels: Arc::new(Vec::new()),
+            video: Arc::from([]),
             #[cfg(feature = "gpu")]
             native: None,
         }
@@ -156,17 +159,23 @@ impl PendingFrame {
         self.format = surface.format;
         self.palette.clone_from(&surface.palette);
         self.serial = serial;
-        self.pixels.resize(pixels.len(), 0);
+        if Arc::get_mut(&mut self.pixels).is_none() {
+            // A retained frame still owns this base. Do not copy its obsolete
+            // pixels merely to overwrite them with the next completed frame.
+            self.pixels = Arc::new(Vec::with_capacity(pixels.len()));
+        }
+        let output = Arc::get_mut(&mut self.pixels).unwrap();
+        output.resize(pixels.len(), 0);
         if surface.bottom_up {
             let pitch = surface.pitch as usize;
             for y in 0..surface.height as usize {
-                self.pixels[y * pitch..(y + 1) * pitch].copy_from_slice(
+                output[y * pitch..(y + 1) * pitch].copy_from_slice(
                     &pixels[(surface.height as usize - 1 - y) * pitch
                         ..(surface.height as usize - y) * pitch],
                 );
             }
         } else {
-            self.pixels.copy_from_slice(pixels);
+            output.copy_from_slice(pixels);
         }
     }
     /// Conversion is performed only by the display consumer, or an explicit capture.
@@ -198,7 +207,56 @@ impl PendingFrame {
                 }
             }
         }
+        self.compose_video(out)?;
         Ok(())
+    }
+    pub fn extent(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+    pub fn video_layers(&self) -> &[(u64, VideoLayer)] {
+        &self.video
+    }
+    pub fn shared_video_layers(&self) -> Arc<[(u64, VideoLayer)]> {
+        self.video.clone()
+    }
+    pub fn hide_cursor(&self) -> bool {
+        self.video_cursor_regions()
+            .is_ok_and(|regions| regions.iter().any(|region| region.hide_cursor))
+    }
+    pub fn video_cursor_regions(&self) -> Result<Vec<VideoCursorRegion>, String> {
+        let mut regions = Vec::new();
+        for (_, layer) in self.video.iter() {
+            if let Some(region) = layer
+                .layout(self.extent())?
+                .cursor_region(layer.hide_cursor)
+            {
+                regions.push(region);
+            }
+        }
+        Ok(regions)
+    }
+    fn compose_video(&self, out: &mut Snapshot) -> Result<(), String> {
+        for (_, layer) in self.video.iter() {
+            layer.compose(out)?;
+        }
+        Ok(())
+    }
+    /// Explicit native readback only: preserve the same immutable layer metadata
+    /// as the GPU presentation, even when a newer video sample arrives.
+    #[cfg(feature = "gpu")]
+    pub fn snapshot_native(&self, bgra: &[u8], out: &mut Snapshot) -> Result<(), String> {
+        if self.native.is_none() || bgra.len() != self.width as usize * self.height as usize * 4 {
+            return Err("native capture dimensions or byte length mismatch".into());
+        }
+        out.width = self.width;
+        out.height = self.height;
+        out.frames = self.serial;
+        out.bgra.clear();
+        out.bgra.extend_from_slice(bgra);
+        self.compose_video(out)
     }
     #[cfg(feature = "gpu")]
     pub fn native(&self) -> Option<&crate::gpu::NativeFrame> {
@@ -213,7 +271,9 @@ impl PendingFrame {
         self.format = PixelFormat::Bgra32;
         self.palette = None;
         self.serial = frame.serial;
-        self.pixels.clear();
+        if !self.pixels.is_empty() {
+            self.pixels = Arc::new(Vec::new());
+        }
         self.native = Some(frame);
     }
 }
@@ -363,6 +423,334 @@ pub struct BlitRect {
     pub h: u32,
 }
 
+/// A decoder-owned, immutable top-down BGRA image. Presentation does not own a
+/// decoder or clock, and retains at most the newest image for each layer.
+#[derive(Clone, Debug)]
+pub struct VideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bgra: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VideoLayer {
+    pub frame: VideoFrame,
+    pub source: Rect,
+    pub destination: BlitRect,
+    /// Opaque video-window border, painted atomically before the decoded image.
+    /// When supplied its rectangle covers the owner clip rectangle.
+    pub background: Option<(BlitRect, [u8; 4])>,
+    /// Owner client bounds, expressed in the presentation canvas.
+    pub clip: Rect,
+    /// Logical client extent for destination, background and clip coordinates.
+    /// The completed base frame may have a different backbuffer resolution.
+    pub canvas: (u32, u32),
+    pub visible: bool,
+    pub hide_cursor: bool,
+}
+
+/// Visible geometry in completed-frame pixels, shared by software capture and
+/// the GPU presenter. UVs crop the immutable decoder image without repacking it.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoRegion {
+    pub destination: Rect,
+    pub source_uv: [f32; 4],
+}
+#[derive(Clone, Copy, Debug)]
+pub struct VideoLayout {
+    pub video: Option<VideoRegion>,
+    pub background: Option<(Rect, [u8; 4])>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoCursorRegion {
+    pub rectangle: Rect,
+    pub hide_cursor: bool,
+}
+impl VideoCursorRegion {
+    /// Regions are ordered like paint commands; the uppermost window owns the
+    /// cursor, including when that window explicitly leaves its cursor visible.
+    pub fn hidden_at(regions: &[Self], x: i32, y: i32) -> bool {
+        regions
+            .iter()
+            .rev()
+            .find(|region| {
+                let dx = i64::from(x) - i64::from(region.rectangle.x);
+                let dy = i64::from(y) - i64::from(region.rectangle.y);
+                dx >= 0
+                    && dy >= 0
+                    && dx < i64::from(region.rectangle.w)
+                    && dy < i64::from(region.rectangle.h)
+            })
+            .is_some_and(|region| region.hide_cursor)
+    }
+}
+impl VideoLayout {
+    pub fn cursor_region(&self, hide_cursor: bool) -> Option<VideoCursorRegion> {
+        self.background
+            .map(|(rect, _)| rect)
+            .or_else(|| self.video.map(|video| video.destination))
+            .map(|rectangle| VideoCursorRegion {
+                rectangle,
+                hide_cursor,
+            })
+    }
+}
+impl VideoLayer {
+    pub fn layout(&self, extent: (u32, u32)) -> Result<VideoLayout, String> {
+        self.validate()?;
+        let mapped;
+        let layer = if self.canvas != extent {
+            mapped = self.mapped(extent)?;
+            &mapped
+        } else {
+            self
+        };
+        let video = layer.clipped_rect(extent).map(|rect| {
+            let sx = f64::from(layer.source.w) / f64::from(layer.destination.w);
+            let sy = f64::from(layer.source.h) / f64::from(layer.destination.h);
+            VideoRegion {
+                destination: rect,
+                source_uv: [
+                    ((f64::from(layer.source.x)
+                        + (f64::from(rect.x) - layer.destination.x as f64) * sx)
+                        / f64::from(layer.frame.width)) as f32,
+                    ((f64::from(layer.source.y)
+                        + (f64::from(rect.y) - layer.destination.y as f64) * sy)
+                        / f64::from(layer.frame.height)) as f32,
+                    (f64::from(rect.w) * sx / f64::from(layer.frame.width)) as f32,
+                    (f64::from(rect.h) * sy / f64::from(layer.frame.height)) as f32,
+                ],
+            }
+        });
+        Ok(VideoLayout {
+            video,
+            background: layer.background.and_then(|(rect, color)| {
+                layer.clip_rectangle(rect, extent).map(|rect| (rect, color))
+            }),
+        })
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        size(self.frame.width, self.frame.height)?;
+        size(self.canvas.0, self.canvas.1)?;
+        let row = self
+            .frame
+            .width
+            .checked_mul(4)
+            .ok_or("video row overflow")?;
+        let bytes = u64::from(self.frame.pitch) * u64::from(self.frame.height - 1) + u64::from(row);
+        if self.frame.pitch < row || bytes > self.frame.bgra.len() as u64 {
+            return Err("invalid video frame layout".into());
+        }
+        if self.source.w == 0
+            || self.source.h == 0
+            || self
+                .source
+                .x
+                .checked_add(self.source.w)
+                .is_none_or(|x| x > self.frame.width)
+            || self
+                .source
+                .y
+                .checked_add(self.source.h)
+                .is_none_or(|y| y > self.frame.height)
+            || self
+                .destination
+                .x
+                .checked_add(i64::from(self.destination.w))
+                .is_none()
+            || self
+                .destination
+                .y
+                .checked_add(i64::from(self.destination.h))
+                .is_none()
+        {
+            return Err("invalid video rectangle".into());
+        }
+        if let Some((rect, _)) = self.background
+            && (rect.x > i64::from(self.clip.x)
+                || rect.y > i64::from(self.clip.y)
+                || rect
+                    .x
+                    .checked_add(i64::from(rect.w))
+                    .is_none_or(|right| right < i64::from(self.clip.x) + i64::from(self.clip.w))
+                || rect
+                    .y
+                    .checked_add(i64::from(rect.h))
+                    .is_none_or(|bottom| bottom < i64::from(self.clip.y) + i64::from(self.clip.h)))
+        {
+            return Err("video background does not cover owner clip".into());
+        }
+        Ok(())
+    }
+    pub fn clipped_rect(&self, extent: (u32, u32)) -> Option<Rect> {
+        self.clip_rectangle(self.destination, extent)
+    }
+    fn map_rectangle(&self, rectangle: BlitRect, extent: (u32, u32)) -> Result<BlitRect, String> {
+        fn coordinate(value: i64, logical: u32, actual: u32) -> Result<i64, String> {
+            if logical == 0 {
+                return Err("empty logical video canvas".into());
+            }
+            i64::try_from((i128::from(value) * i128::from(actual)).div_euclid(i128::from(logical)))
+                .map_err(|_| "video coordinate overflow".into())
+        }
+        let x = coordinate(rectangle.x, self.canvas.0, extent.0)?;
+        let y = coordinate(rectangle.y, self.canvas.1, extent.1)?;
+        let right = coordinate(
+            rectangle
+                .x
+                .checked_add(i64::from(rectangle.w))
+                .ok_or("video rectangle overflow")?,
+            self.canvas.0,
+            extent.0,
+        )?;
+        let bottom = coordinate(
+            rectangle
+                .y
+                .checked_add(i64::from(rectangle.h))
+                .ok_or("video rectangle overflow")?,
+            self.canvas.1,
+            extent.1,
+        )?;
+        Ok(BlitRect {
+            x,
+            y,
+            w: u32::try_from(right - x).map_err(|_| "video width overflow")?,
+            h: u32::try_from(bottom - y).map_err(|_| "video height overflow")?,
+        })
+    }
+    fn mapped(&self, extent: (u32, u32)) -> Result<Self, String> {
+        size(extent.0, extent.1)?;
+        let mut layer = self.clone();
+        layer.destination = self.map_rectangle(self.destination, extent)?;
+        layer.background = self
+            .background
+            .map(|(rect, color)| self.map_rectangle(rect, extent).map(|rect| (rect, color)))
+            .transpose()?;
+        let clip = self.map_rectangle(
+            BlitRect {
+                x: i64::from(self.clip.x),
+                y: i64::from(self.clip.y),
+                w: self.clip.w,
+                h: self.clip.h,
+            },
+            extent,
+        )?;
+        layer.clip = Rect {
+            x: u32::try_from(clip.x).map_err(|_| "video clip overflow")?,
+            y: u32::try_from(clip.y).map_err(|_| "video clip overflow")?,
+            w: clip.w,
+            h: clip.h,
+        };
+        layer.canvas = extent;
+        Ok(layer)
+    }
+    fn clip_rectangle(&self, destination: BlitRect, extent: (u32, u32)) -> Option<Rect> {
+        if self.canvas != extent {
+            return self
+                .mapped(extent)
+                .ok()?
+                .clip_rectangle(self.map_rectangle(destination, extent).ok()?, extent);
+        }
+        if !self.visible || destination.w == 0 || destination.h == 0 {
+            return None;
+        }
+        let left = destination.x.max(i64::from(self.clip.x)).max(0);
+        let top = destination.y.max(i64::from(self.clip.y)).max(0);
+        let right = destination
+            .x
+            .checked_add(i64::from(destination.w))?
+            .min(i64::from(self.clip.x) + i64::from(self.clip.w))
+            .min(i64::from(self.canvas.0.min(extent.0)));
+        let bottom = destination
+            .y
+            .checked_add(i64::from(destination.h))?
+            .min(i64::from(self.clip.y) + i64::from(self.clip.h))
+            .min(i64::from(self.canvas.1.min(extent.1)));
+        (right > left && bottom > top).then_some(Rect {
+            x: left as u32,
+            y: top as u32,
+            w: (right - left) as u32,
+            h: (bottom - top) as u32,
+        })
+    }
+    fn pixel(&self, x: u32, y: u32) -> &[u8] {
+        // Sample pixel centres, matching the host GPU's nearest texture sampler.
+        // Clipping keeps the original destination origin and sampling phase.
+        let sx = u64::from(self.source.x)
+            + (((i64::from(x) - self.destination.x) as u64 * 2 + 1) * u64::from(self.source.w))
+                / (u64::from(self.destination.w) * 2);
+        let sy = u64::from(self.source.y)
+            + (((i64::from(y) - self.destination.y) as u64 * 2 + 1) * u64::from(self.source.h))
+                / (u64::from(self.destination.h) * 2);
+        let at = sy as usize * self.frame.pitch as usize + sx as usize * 4;
+        &self.frame.bgra[at..at + 4]
+    }
+    fn compose(&self, out: &mut Snapshot) -> Result<(), String> {
+        self.validate()?;
+        if self.canvas != (out.width, out.height) {
+            return self.mapped((out.width, out.height))?.compose(out);
+        }
+        if let Some((background, color)) = self.background
+            && let Some(rect) = self.clip_rectangle(background, (out.width, out.height))
+        {
+            for y in rect.y..rect.y + rect.h {
+                for x in rect.x..rect.x + rect.w {
+                    let at = (y as usize * out.width as usize + x as usize) * 4;
+                    out.bgra[at..at + 4].copy_from_slice(&color);
+                }
+            }
+        }
+        let Some(rect) = self.clipped_rect((out.width, out.height)) else {
+            return Ok(());
+        };
+        for y in rect.y..rect.y + rect.h {
+            for x in rect.x..rect.x + rect.w {
+                let at = (y as usize * out.width as usize + x as usize) * 4;
+                out.bgra[at..at + 4].copy_from_slice(self.pixel(x, y));
+            }
+        }
+        Ok(())
+    }
+    /// The shell uploads this clipped patch through its existing opaque pipeline.
+    /// CPU work touches decoded video only; a native base image stays on the GPU.
+    pub fn rasterize(
+        &self,
+        extent: (u32, u32),
+        out: &mut Snapshot,
+    ) -> Result<Option<Rect>, String> {
+        self.validate()?;
+        if self.canvas != extent {
+            return self.mapped(extent)?.rasterize(extent, out);
+        }
+        let video = self.clipped_rect(extent);
+        let Some(rect) = self
+            .background
+            .and_then(|(rect, _)| self.clip_rectangle(rect, extent))
+            .or(video)
+        else {
+            return Ok(None);
+        };
+        out.width = rect.w;
+        out.height = rect.h;
+        out.bgra.resize(rect.w as usize * rect.h as usize * 4, 0);
+        for y in 0..rect.h {
+            for x in 0..rect.w {
+                let at = (y as usize * rect.w as usize + x as usize) * 4;
+                let dx = rect.x + x;
+                let dy = rect.y + y;
+                if video.is_some_and(|v| dx >= v.x && dx < v.x + v.w && dy >= v.y && dy < v.y + v.h)
+                {
+                    out.bgra[at..at + 4].copy_from_slice(self.pixel(dx, dy));
+                } else {
+                    out.bgra[at..at + 4].copy_from_slice(&self.background.unwrap().1);
+                }
+            }
+        }
+        Ok(Some(rect))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Sampling {
     #[default]
@@ -384,30 +772,6 @@ pub struct BlitOptions {
     pub sampling: Sampling,
 }
 
-fn convert_bgra(s: &Surface, input: &[u8], output: &mut Vec<u8>) {
-    let stride = s.width as usize * 4;
-    output.resize(stride * s.height as usize, 0);
-    for (y, dst) in output.chunks_exact_mut(stride).enumerate() {
-        let row = if s.bottom_up {
-            s.height as usize - 1 - y
-        } else {
-            y
-        };
-        let src = &input[row * s.pitch as usize..];
-        if s.format == PixelFormat::Bgra32 {
-            dst.copy_from_slice(&src[..stride]);
-        } else {
-            for (pixel, raw) in dst
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(src.chunks_exact(s.format.bytes() as usize))
-            {
-                pixel.copy_from_slice(&s.decode_pixel(raw));
-            }
-        }
-    }
-}
 impl Surface {
     pub fn decode_pixel(&self, raw: &[u8]) -> [u8; 4] {
         decode_pixel(self.format, self.palette.as_deref(), raw)
@@ -536,6 +900,8 @@ pub struct Surfaces<P: Presenter> {
     primary: Option<u32>,
     deferred_presentation: bool,
     pending_frame: Option<PendingFrame>,
+    retained_frame: Option<PendingFrame>,
+    video_layers: Arc<[(u64, VideoLayer)]>,
     captured_serial: u64,
     conversion: Vec<u8>,
     blit_row: Vec<u8>,
@@ -577,6 +943,8 @@ impl<P: Presenter> Surfaces<P> {
             primary: None,
             deferred_presentation: false,
             pending_frame: None,
+            retained_frame: None,
+            video_layers: Arc::from([]),
             captured_serial: 0,
             conversion: Vec::new(),
             blit_row: Vec::new(),
@@ -720,6 +1088,78 @@ impl<P: Presenter> Surfaces<P> {
         Ok(())
     }
 
+    /// Publish a movie sample or a layout/visibility change independently of a
+    /// game Present. The retained base remains immutable beneath every layer.
+    pub fn set_video_layer(&mut self, key: u64, layer: Option<VideoLayer>) -> Result<u64, String> {
+        if let Some(layer) = &layer {
+            layer.validate()?;
+        } else if !self.video_layers.iter().any(|(id, _)| *id == key) {
+            return Ok(self.stats.presentations);
+        }
+        let serial = self
+            .stats
+            .presentations
+            .checked_add(1)
+            .ok_or("presentation serial exhausted")?;
+        let mut video = self.video_layers.to_vec();
+        video.retain(|(id, _)| *id != key);
+        if let Some(layer) = layer {
+            video.push((key, layer));
+            video.sort_by_key(|(id, _)| *id);
+        }
+        self.video_layers = Arc::from(video);
+        if self.retained_frame.is_none() {
+            let (width, height) = self
+                .video_layers
+                .last()
+                .map_or((self.width, self.height), |(_, v)| v.canvas);
+            let mut frame = PendingFrame {
+                width,
+                height,
+                pitch: width * 4,
+                ..Default::default()
+            };
+            Arc::make_mut(&mut frame.pixels).resize(width as usize * height as usize * 4, 0);
+            self.retained_frame = Some(frame);
+        }
+        let frame = self.retained_frame.as_mut().unwrap();
+        frame.serial = serial;
+        frame.video = self.video_layers.clone();
+        #[cfg(feature = "gpu")]
+        if let Some(native) = &mut frame.native {
+            native.serial = serial;
+        }
+        self.stats.presentations = serial;
+        if let Some((mailbox, wake)) = &mut self.frame_mailbox {
+            let overwritten = mailbox.publish(|slot| *slot = frame.clone());
+            self.stats.coalesced_frames += u64::from(overwritten);
+            if !overwritten {
+                wake.signal();
+            }
+        } else {
+            if self
+                .pending_frame
+                .as_ref()
+                .is_some_and(|old| old.serial != self.captured_serial)
+            {
+                self.stats.coalesced_frames += 1;
+            }
+            self.pending_frame = Some(frame.clone());
+            if !self.deferred_presentation {
+                self.capture_latest()?;
+            }
+        }
+        Ok(serial)
+    }
+
+    /// Pin pixels and overlay metadata together for an explicit capture.
+    pub fn latest_frame(&self) -> Option<&PendingFrame> {
+        self.frame_mailbox
+            .as_ref()
+            .and_then(|(mailbox, _)| mailbox.latest())
+            .or(self.pending_frame.as_ref())
+    }
+
     pub fn has_pending_frame(&self) -> bool {
         self.frame_mailbox
             .as_ref()
@@ -758,14 +1198,29 @@ impl<P: Presenter> Surfaces<P> {
         {
             return Err("native capture dimensions or byte length mismatch".into());
         }
+        let source = self.latest_frame().unwrap().clone();
+        self.capture_native_frame_pixels(&source, bgra)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn capture_native_frame_pixels(
+        &mut self,
+        source: &PendingFrame,
+        bgra: &[u8],
+    ) -> Result<bool, String> {
+        let mut snapshot = Snapshot::default();
+        source.snapshot_native(bgra, &mut snapshot)?;
+        if source.serial <= self.captured_serial || source.serial > self.stats.presentations {
+            return Ok(false);
+        }
         self.presenter.present(FrameView {
-            width,
-            height,
-            pitch: width * 4,
-            bgra,
-            serial,
+            width: snapshot.width,
+            height: snapshot.height,
+            pitch: snapshot.width * 4,
+            bgra: &snapshot.bgra,
+            serial: source.serial,
         })?;
-        self.captured_serial = serial;
+        self.captured_serial = source.serial;
         self.stats.host_captures += 1;
         Ok(true)
     }
@@ -787,6 +1242,13 @@ impl<P: Presenter> Surfaces<P> {
             .ok_or("native capture dimensions overflow")?;
         if bgra.len() != length {
             return Err("native capture dimensions or byte length mismatch".into());
+        }
+        if let Some(frame) = self
+            .latest_frame()
+            .filter(|frame| frame.serial == source.serial)
+            .cloned()
+        {
+            return self.capture_native_frame_pixels(&frame, bgra);
         }
         if source.serial <= self.captured_serial || source.serial > self.stats.presentations {
             return Ok(false);
@@ -823,33 +1285,23 @@ impl<P: Presenter> Surfaces<P> {
             self.stats.host_captures += 1;
             return Ok(true);
         }
-        let (pixels, pitch) = if frame.format == PixelFormat::Bgra32 {
-            (frame.pixels.as_slice(), frame.pitch)
-        } else {
-            self.conversion
-                .resize(frame.width as usize * frame.height as usize * 4, 0);
-            for y in 0..frame.height as usize {
-                for x in 0..frame.width as usize {
-                    let at = y * frame.pitch as usize + x * frame.format.bytes() as usize;
-                    self.conversion[(y * frame.width as usize + x) * 4
-                        ..(y * frame.width as usize + x + 1) * 4]
-                        .copy_from_slice(&decode_pixel(
-                            frame.format,
-                            frame.palette.as_deref(),
-                            &frame.pixels[at..],
-                        ));
-                }
-            }
-            self.stats.converted_pixels += u64::from(frame.width) * u64::from(frame.height);
-            (self.conversion.as_slice(), frame.width * 4)
+        let mut snapshot = Snapshot {
+            bgra: std::mem::take(&mut self.conversion),
+            ..Default::default()
         };
-        self.presenter.present(FrameView {
-            width: frame.width,
-            height: frame.height,
-            pitch,
-            bgra: pixels,
+        frame.snapshot(&mut snapshot)?;
+        if frame.format != PixelFormat::Bgra32 {
+            self.stats.converted_pixels += u64::from(frame.width) * u64::from(frame.height);
+        }
+        let result = self.presenter.present(FrameView {
+            width: snapshot.width,
+            height: snapshot.height,
+            pitch: snapshot.width * 4,
+            bgra: &snapshot.bgra,
             serial: frame.serial,
-        })?;
+        });
+        self.conversion = snapshot.bgra;
+        result?;
         self.captured_serial = frame.serial;
         self.stats.host_captures += 1;
         Ok(true)
@@ -1022,6 +1474,8 @@ impl<P: Presenter> Surfaces<P> {
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|frame| {
                 frame.store(s, pixels.as_ref(), self.stats.presentations);
+                frame.video = self.video_layers.clone();
+                self.retained_frame = Some(frame.clone());
             });
             self.stats.coalesced_frames += u64::from(overwritten);
             if !overwritten {
@@ -1029,7 +1483,7 @@ impl<P: Presenter> Surfaces<P> {
             }
             return Ok(());
         }
-        if self.deferred_presentation {
+        {
             if self
                 .pending_frame
                 .as_ref()
@@ -1037,33 +1491,18 @@ impl<P: Presenter> Surfaces<P> {
             {
                 self.stats.coalesced_frames += 1;
             }
-            self.pending_frame
-                .get_or_insert_with(PendingFrame::default)
-                .store(s, pixels.as_ref(), self.stats.presentations);
-            return Ok(());
+            let frame = self.pending_frame.get_or_insert_with(PendingFrame::default);
+            // Retiring this reference before writing keeps the pending slot's
+            // raw buffer reusable when no consumer still owns the previous base.
+            self.retained_frame = None;
+            frame.store(s, pixels.as_ref(), self.stats.presentations);
+            frame.video = self.video_layers.clone();
+            self.retained_frame = Some(frame.clone());
         }
-        self.stats.host_captures += 1;
-        self.captured_serial = self.stats.presentations;
-        if s.format != PixelFormat::Bgra32 || s.bottom_up {
-            convert_bgra(s, pixels.as_ref(), &mut self.conversion);
-            if s.format != PixelFormat::Bgra32 {
-                self.stats.converted_pixels += u64::from(s.width) * u64::from(s.height);
-            }
-            return self.presenter.present(FrameView {
-                width: s.width,
-                height: s.height,
-                pitch: s.width * 4,
-                bgra: &self.conversion,
-                serial: self.stats.presentations,
-            });
+        if !self.deferred_presentation {
+            self.capture_latest()?;
         }
-        self.presenter.present(FrameView {
-            width: s.width,
-            height: s.height,
-            pitch: s.pitch,
-            bgra: &pixels,
-            serial: self.stats.presentations,
-        })
+        Ok(())
     }
 
     /// A GPU-backed entry in the same surface-id space. Its pixels are not mapped
@@ -1267,12 +1706,16 @@ impl<P: Presenter> Surfaces<P> {
         }
         self.stats.presentations = serial;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
-            let overwritten = mailbox.publish(|slot| slot.store_native(frame));
+            let overwritten = mailbox.publish(|slot| {
+                slot.store_native(frame);
+                slot.video = self.video_layers.clone();
+                self.retained_frame = Some(slot.clone());
+            });
             self.stats.coalesced_frames += u64::from(overwritten);
             if !overwritten {
                 wake.signal();
             }
-        } else if self.deferred_presentation {
+        } else {
             if self
                 .pending_frame
                 .as_ref()
@@ -1280,9 +1723,10 @@ impl<P: Presenter> Surfaces<P> {
             {
                 self.stats.coalesced_frames += 1;
             }
-            self.pending_frame
-                .get_or_insert_with(PendingFrame::default)
-                .store_native(frame);
+            let slot = self.pending_frame.get_or_insert_with(PendingFrame::default);
+            slot.store_native(frame);
+            slot.video = self.video_layers.clone();
+            self.retained_frame = Some(slot.clone());
         }
         Ok(serial)
     }
