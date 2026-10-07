@@ -14,6 +14,8 @@ Errors identify an input by ordinal, never by path or by its contents.
 adv-run currently keeps at most 24 fallback and 24 x87 mnemonic/reason rows per
 report. Rankings therefore cover retained rows only. Missing x87 exact calls
 are counted as unattributed; omitted fallback counts cannot be reconstructed.
+Interpreter details keep the top 24 rows by instruction units, with explicit
+omitted counters. Older reports remain readable but their details are unknown.
 These are execution counts, not time measurements or Tier 1 coverage counts.
 Optional x87_control fields retain the complete PC/RC/mask distribution and
 independent guard counts. Reports predating those fields are counted separately.
@@ -35,6 +37,38 @@ REPORT_ROW_LIMIT = 24
 X87_REASONS = ("Control", "Pending", "Operand", "NoFastForm")
 INTERPRETER_REASONS = ("Uncovered", "Rejected", "Pending", "Interior", "Fallback", "Forced")
 VERIFY_COUNTERS = ("verified", "inconclusive", "mismatches", "mxcsr_flags")
+DETAIL_REASONS = {
+    "AutoJitDisabled", "Tier1", "NonExecutable", "BelowThreshold",
+    "PendingCompilation", "DeferredCompilation", "QueueCapacity", "RegionBoundary",
+    "UnregisteredEntry", "NotDiscovered", "DiscoveryBoundary", "DiscoveryMemory",
+    "DiscoverySize", "WorkBudget", "CompileFailure", "CachePolicy", "NoPublishedEntry",
+}
+DETAIL_BUCKETS = ("Uncovered", "Rejected")
+COUNT_KEYS = ("entries", "instructions")
+
+
+def detail_label(label: object) -> str:
+    parts = label.split("/") if isinstance(label, str) else []
+    if len(parts) < 2 or parts[0] not in DETAIL_BUCKETS:
+        raise ValueError("invalid interpreter detail label")
+    if len(parts) == 2 and parts[1] in DETAIL_REASONS:
+        return label
+    if (len(parts) == 4 and parts[1] == "Unsupported"
+            and mnemonic(parts[2]) == parts[2]
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,95}", parts[3])
+            and not re.search(r"(?:^|_)(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]{8,})(?:_|$)", parts[3])
+            and parts[3].split("_")[0].lower().startswith(parts[2].lower())):
+        return label
+    raise ValueError("invalid interpreter detail label")
+
+
+def entry_count(value: object) -> dict:
+    value = mapping(value)
+    return {key: count(required(value, key)) for key in COUNT_KEYS}
+
+
+def ranked_entries(values: dict) -> dict:
+    return dict(sorted(values.items(), key=lambda row: (-row[1]["instructions"], row[0])))
 
 
 def mapping(value: object) -> dict:
@@ -80,6 +114,10 @@ def aggregate(reports: Iterable[dict]) -> dict:
     pc64 = Counter()
     pc64_reports = 0
     interpreter = {reason: {"entries": 0, "instructions": 0} for reason in INTERPRETER_REASONS}
+    details = {}
+    omitted = {reason: dict.fromkeys(COUNT_KEYS, 0) for reason in DETAIL_BUCKETS}
+    unknown = {reason: dict.fromkeys(COUNT_KEYS, 0) for reason in DETAIL_BUCKETS}
+    omitted_rows = detail_reports = 0
     verification = dict.fromkeys(VERIFY_COUNTERS, 0)
     per_report = []
     helpers = fast = unattributed = fallback_limits = exact_limits = 0
@@ -155,6 +193,38 @@ def aggregate(reports: Iterable[dict]) -> dict:
                 values = mapping(values)
                 for key in ("entries", "instructions"):
                     interpreter[reason][key] += count(required(values, key))
+            detail_fields = ("interpreter_details", "interpreter_details_omitted",
+                             "interpreter_detail_rows_omitted")
+            if any(key in cliffs for key in detail_fields):
+                run_details = mapping(required(cliffs, detail_fields[0]))
+                run_omitted = mapping(required(cliffs, detail_fields[1]))
+                missing_rows = count(required(cliffs, detail_fields[2]))
+                if len(run_details) > REPORT_ROW_LIMIT or (missing_rows and len(run_details) != REPORT_ROW_LIMIT):
+                    raise ValueError("inconsistent interpreter detail row limit")
+                if set(run_omitted) != set(DETAIL_BUCKETS):
+                    raise ValueError("invalid omitted interpreter buckets")
+                totals = {reason: entry_count(run_omitted[reason]) for reason in DETAIL_BUCKETS}
+                if not missing_rows and any(sum(row.values()) for row in totals.values()):
+                    raise ValueError("omitted counters without omitted rows")
+                for reason in DETAIL_BUCKETS:
+                    for key in COUNT_KEYS:
+                        omitted[reason][key] += totals[reason][key]
+                for label, values in run_details.items():
+                    label = detail_label(label)
+                    values = entry_count(values)
+                    destination = details.setdefault(label, dict.fromkeys(COUNT_KEYS, 0))
+                    for key in COUNT_KEYS:
+                        destination[key] += values[key]
+                        totals[label.split("/")[0]][key] += values[key]
+                for reason in DETAIL_BUCKETS:
+                    if totals[reason] != entry_count(run_interpreter.get(reason, dict.fromkeys(COUNT_KEYS, 0))):
+                        raise ValueError("interpreter details do not reconcile with bucket totals")
+                omitted_rows += missing_rows
+                detail_reports += 1
+            else:
+                for reason in DETAIL_BUCKETS:
+                    for key, value in entry_count(run_interpreter.get(reason, dict.fromkeys(COUNT_KEYS, 0))).items():
+                        unknown[reason][key] += value
             run_verification = {key: count(required(verify, key)) for key in VERIFY_COUNTERS}
             for key, value in run_verification.items():
                 verification[key] += value
@@ -177,6 +247,9 @@ def aggregate(reports: Iterable[dict]) -> dict:
                                        key=lambda row: (-row[1]["instructions"], row[0]))),
             "interpreter_total": {key: sum(row[key] for row in interpreter.values())
                                   for key in ("entries", "instructions")},
+            "interpreter_details": ranked_entries(details),
+            "interpreter_details_omitted": omitted,
+            "interpreter_details_unknown": unknown,
             "x87_helper_calls": helpers,
             "x87_fast": fast,
             "x87_exact_total": helpers - fast,
@@ -194,6 +267,8 @@ def aggregate(reports: Iterable[dict]) -> dict:
             "producer_row_limit": REPORT_ROW_LIMIT,
             "fallback_reports_at_limit": fallback_limits,
             "x87_exact_reports_at_limit": exact_limits,
+            "interpreter_detail_reports": detail_reports,
+            "interpreter_detail_rows_omitted": omitted_rows,
         },
         "tier_verification": verification,
         "per_report": per_report,
@@ -233,6 +308,16 @@ def markdown(summary: dict) -> str:
                   "| 原因 | 入口数 | 指令单位数 |", "|---|---:|---:|"])
     lines.extend(f"| {reason} | {values['entries']} | {values['instructions']} |"
                  for reason, values in cliffs["interpreter"].items())
+    lines.extend(["", "解释器入口细分 Top 24（整批指令单位归于入口状态；不是逐条指令热度）", "",
+                  "| 入口原因 / 细分 / 形式 | 入口数 | 指令单位数 |", "|---|---:|---:|"])
+    lines.extend(f"| {label} | {values['entries']} | {values['instructions']} |"
+                 for label, values in list(cliffs["interpreter_details"].items())[:REPORT_ROW_LIMIT])
+    lines.extend(["", f"含细分的报告：{limits['interpreter_detail_reports']}；"
+                  f"源报告截断行数：{limits['interpreter_detail_rows_omitted']}。",
+                  "汇总 JSON 保留所有源报告已保留行；下表单列截断和旧报告缺失，不推断具体原因。", "",
+                  "| 大桶 | 源报告截断指令单位 | 旧报告未细分指令单位 |", "|---|---:|---:|"])
+    lines.extend(f"| {reason} | {cliffs['interpreter_details_omitted'][reason]['instructions']} | "
+                 f"{cliffs['interpreter_details_unknown'][reason]['instructions']} |" for reason in DETAIL_BUCKETS)
     lines.extend(["", f"x87 helper：{cliffs['x87_helper_calls']}；fast：{cliffs['x87_fast']}；"
                   f"exact：{cliffs['x87_exact_total']}；未归因 exact：{cliffs['x87_exact_unattributed']}。",
                   "", "| x87 原因 | 次数（保留行） |", "|---|---:|"])
