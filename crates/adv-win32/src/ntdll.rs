@@ -2,6 +2,8 @@
 mod path;
 mod directory;
 mod loader_lock;
+mod strings;
+mod procedure;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -201,6 +203,8 @@ pub fn register(reg: &mut Registry) {
     path::register(reg);
     directory::register(reg);
     loader_lock::register(reg);
+    strings::register(reg);
+    procedure::register(reg);
     stdcall(
         reg,
         NTDLL,

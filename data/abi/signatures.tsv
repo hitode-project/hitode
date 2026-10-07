@@ -3737,11 +3737,14 @@ msvcrt.dll	toupper	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	vsprintf	cdecl	i32	int	buffer:char*:str8:1|format:const char*:str8:1|arguments:va_list:ptr:1
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
+ntdll.dll	LdrGetProcedureAddress	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllHandle:void*:ptr:1|ProcedureName:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|ProcedureNumber:u32:u32:1|ProcedureAddress:void**:ptr:1
 ntdll.dll	LdrLockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Disposition:u32*:ptr:1|Cookie:void**:ptr:1
 ntdll.dll	LdrUnlockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Cookie:void*:ptr:1
 ntdll.dll	RtlDosPathNameToNtPathName_U	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1
+ntdll.dll	RtlEqualUnicodeString	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	String1:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|String2:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|CaseInSensitive:Windows.Win32.Foundation.BOOLEAN:u32:1
 ntdll.dll	RtlFreeUnicodeString	stdcall	void	void	UnicodeString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
 ntdll.dll	RtlGetCurrentDirectory_U	stdcall	u32	u32	BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1
+ntdll.dll	RtlInitAnsiString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PCSTR:str8:1
 ntdll.dll	RtlInitUnicodeString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PWSTR:str16:1
 ntdll.dll	RtlSetCurrentDirectory_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	PathName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
 ntdll.dll	ZwClose	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1

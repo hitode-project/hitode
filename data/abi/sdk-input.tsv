@@ -30,3 +30,6 @@ ntdll.dll	RtlSetCurrentDirectory_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS
 ntdll.dll	RtlGetCurrentDirectory_U	stdcall	u32	u32	BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1
 ntdll.dll	LdrLockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Disposition:u32*:ptr:1|Cookie:void**:ptr:1
 ntdll.dll	LdrUnlockLoaderLock	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Flags:u32:u32:1|Cookie:void*:ptr:1
+ntdll.dll	RtlEqualUnicodeString	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	String1:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|String2:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|CaseInSensitive:Windows.Win32.Foundation.BOOLEAN:u32:1
+ntdll.dll	RtlInitAnsiString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PCSTR:str8:1
+ntdll.dll	LdrGetProcedureAddress	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllHandle:void*:ptr:1|ProcedureName:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|ProcedureNumber:u32:u32:1|ProcedureAddress:void**:ptr:1

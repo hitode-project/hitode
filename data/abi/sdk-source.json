@@ -165,5 +165,20 @@
     "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib @12/@8 and phnt primary declarations",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
     "native_verification": "24 DWORDs cover recursion, acquisition dispositions, genuine two-thread contention, invalid flags/missing outputs, zero-cookie unlock and LastError; opaque host cookies are not compared or copied"
+  },
+  "rtl_counted_strings": {
+    "scope": "RtlEqualUnicodeString and RtlInitAnsiString",
+    "source": "Microsoft Learn WDM BOOLEAN declaration, SDK winternl.h ANSI initializer and SDK x86 ntdll.lib @12/@8",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlequalunicodestring",
+      "https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-rtlinitansistring"
+    ],
+    "native_verification": "24 DWORDs cover counted UTF-16 including embedded NUL and raw surrogate, invariant case, BOOLEAN low byte, ANSI borrowed buffer/null/empty descriptors, and unchanged LastError"
+  },
+  "ldr_get_procedure": {
+    "scope": "LdrGetProcedureAddress, four x86 stack words and signed NTSTATUS",
+    "source": "Microsoft Windows SDK 10.0.26100.0 x86 ntdll.lib @16, phnt primary declaration and authored x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "18 DWORDs cover callable named address identity, counted suffix, name overriding ordinal, entry/ordinal missing status, output zeroing, invalid zero ordinal, RTL target identity and unchanged LastError; loader ownership and diagnostic path shared with GetProcAddress"
   }
 }
