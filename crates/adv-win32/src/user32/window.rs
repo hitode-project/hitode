@@ -1002,6 +1002,45 @@ fn get_class_name_a(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(put_cstr(env.cpu, buf, cap, &name).unwrap_or(cap.saturating_sub(1)))
 }
 
+#[win32(user32, name = "GetClassNameW", level = state)]
+fn get_class_name_w(env: &mut Env<'_>, hwnd: AbiHandle, output: WideStr, capacity: i32) -> i32 {
+    let u = user(env);
+    let Some(window) = u.windows.get(&env.sys.objects, &hwnd.0) else {
+        set_last_error(env, 1400);
+        return 0;
+    };
+    // Native rejects a buffer with no room for a character and the terminator,
+    // without changing it. The signed API capacity is consumed as an unsigned size.
+    if (capacity as u32) < 2 {
+        set_last_error(env, 122);
+        return 0;
+    }
+    let units: Vec<_> = u.classes[window.class]
+        .name
+        .encode_utf16()
+        .take(capacity as u32 as usize - 1)
+        .collect();
+    let length = units.len();
+    let bytes: Vec<_> = units
+        .into_iter()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    if adv_abi::guest::check_range(
+        env.cpu,
+        output.0.addr(),
+        bytes.len() as u32,
+        adv_cpu::backend::Prot::WRITE,
+    )
+    .is_err()
+        || env.cpu.write(output.0.addr(), &bytes).is_err()
+    {
+        set_last_error(env, 998);
+        return 0;
+    }
+    length as i32
+}
+
 // ---- creation and destruction ----
 
 /// Parameters of a window being created.
@@ -2808,6 +2847,7 @@ pub fn register(reg: &mut Registry) {
     reg.register(get_class_info_ex_a_ABI);
     reg.register(get_class_info_ex_w_ABI);
     s(reg, "GetClassNameA", 3, get_class_name_a);
+    reg.register(get_class_name_w_ABI);
     s(reg, "CreateWindowExA", 12, create_window_ex_a);
     reg.register(create_window_ex_w_ABI);
     s(reg, "RegisterClassW", 1, |e| register_class_w(e, false));
@@ -2877,6 +2917,95 @@ pub fn register(reg: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_class_name_queries_share_window_identity_and_preserve_failed_outputs() {
+        use adv_cpu::{JitCpu, backend::Prot};
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        let mut registry = Registry::default();
+        crate::register(&mut registry);
+        assert!(registry.dynamic_available("user32.dll", "GetClassNameW"));
+        assert_eq!(
+            registry.get("user32.dll", "GetClassNameW").unwrap().conv,
+            adv_abi::Conv::Stdcall { argc: 3 }
+        );
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch/class-name-tests");
+        Win32::install(
+            &mut machine,
+            crate::Win32Config::new(&root, "fixture.exe", &root),
+        )
+        .unwrap();
+        machine.spawn("class query", PARK_ADDR, &[], 65536).unwrap();
+        let data = machine
+            .sys
+            .vm
+            .alloc(&mut machine.cpu, 4096, Prot::RW)
+            .unwrap();
+        let state = &mut machine.ext.get_mut::<Win32>().user;
+        let hwnd = state.desktop;
+        let class = state
+            .windows
+            .get(&machine.sys.objects, &hwnd)
+            .unwrap()
+            .class;
+        state.classes[class].name = "Window窓🎮".into();
+        let units: Vec<_> = state.classes[class].name.encode_utf16().collect();
+        let mut e = Env {
+            context: machine.sys.current,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        for cap in [-1, 2, 4, 1024] {
+            e.cpu.write(data, &[0xa5; 64]).unwrap();
+            set_last_error(&mut e, 0x4242);
+            let count = units.len().min(cap as u32 as usize - 1);
+            assert_eq!(
+                get_class_name_w(&mut e, AbiHandle(hwnd), WideStr(GuestPtr::new(data)), cap),
+                count as i32
+            );
+            let expected: Vec<_> = units[..count]
+                .iter()
+                .copied()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let mut actual = vec![0; expected.len() + 2];
+            e.cpu.read(data, &mut actual).unwrap();
+            assert_eq!(&actual[..expected.len()], expected);
+            assert_eq!(&actual[expected.len()..], &[0xa5; 2]);
+            assert_eq!(crate::util::last_error(&e), 0x4242);
+        }
+        for (handle, cap, error) in [
+            (hwnd, 0, 122),
+            (hwnd, 1, 122),
+            (0, 1024, 1400),
+            (0, 0, 1400),
+        ] {
+            e.cpu.write(data, &[0xa5; 16]).unwrap();
+            assert_eq!(
+                get_class_name_w(&mut e, AbiHandle(handle), WideStr(GuestPtr::new(data)), cap),
+                0
+            );
+            assert_eq!(crate::util::last_error(&e), error);
+            assert_eq!(e.cpu.read_u32(data).unwrap(), 0xa5a5a5a5);
+        }
+        e.cpu.protect(data, 4096, Prot::READ).unwrap();
+        assert_eq!(
+            get_class_name_w(&mut e, AbiHandle(hwnd), WideStr(GuestPtr::new(data)), 1024),
+            0
+        );
+        assert_eq!(crate::util::last_error(&e), 998);
+        assert_eq!(e.cpu.read_u32(data).unwrap(), 0xa5a5a5a5);
+    }
 
     #[test]
     fn saved_procedure_capacity_preflights_all_unique_entries() {
