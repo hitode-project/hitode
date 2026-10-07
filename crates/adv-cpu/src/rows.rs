@@ -324,8 +324,8 @@ fn different_rows_disjoint(a: Range, b: Range, rows: u32) -> bool {
 }
 
 /// Permission bytes already distinguish ordinary pages from shared audio,
-/// lazy file and COW aliases. Forbid every internal bit and executable pages,
-/// for both reads and writes, before exposing the direct native memory base.
+/// lazy file and COW aliases. Forbid internal barriers and executable pages,
+/// ignoring only the known derived grants in native metadata.
 fn ordinary(perms: &[u8], descriptor: &Descriptor, range: Range, rows: u32) -> bool {
     let (low, high) = range.bounds(rows);
     let base = i128::from(descriptor.memory_base);
@@ -339,9 +339,10 @@ fn ordinary(perms: &[u8], descriptor: &Descriptor, range: Range, rows: u32) -> b
     let Some(pages) = perms.get(first..=last) else {
         return false;
     };
+    let ordinary = READ | WRITE | crate::memory::FAST_READ | crate::memory::FAST_WRITE;
     pages
         .iter()
-        .all(|&permission| permission & required == required && permission & !(READ | WRITE) == 0)
+        .all(|&permission| permission & required == required && permission & !ordinary == 0)
 }
 
 fn admission(
@@ -947,10 +948,18 @@ mod tests {
         let descriptor = descriptor();
         let ordinary_range = access(0x10000, 0x10004, 4);
         assert!(ordinary(&[READ | WRITE], &descriptor, ordinary_range, 16));
+        let derived = crate::memory::FAST_READ | crate::memory::FAST_WRITE;
+        assert!(ordinary(
+            &[READ | WRITE | derived],
+            &descriptor,
+            ordinary_range,
+            16
+        ));
         for bit in [
             crate::memory::EXEC,
             crate::memory::SHARED,
             crate::memory::AUDIO,
+            0x80, // Unknown metadata bits must not silently bypass admission.
         ] {
             assert!(!ordinary(
                 &[READ | WRITE | bit],
