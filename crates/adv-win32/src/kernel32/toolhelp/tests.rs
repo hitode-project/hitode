@@ -80,6 +80,12 @@ fn machine<B: Backend>(cpu: B) -> Machine<B> {
         "Module32Next",
         "Module32FirstW",
         "Module32NextW",
+        "Process32First",
+        "Process32Next",
+        "Process32FirstW",
+        "Process32NextW",
+        "Heap32ListFirst",
+        "Heap32ListNext",
     ] {
         assert_eq!(
             registry.get(K32, name).unwrap().conv,
@@ -112,6 +118,125 @@ fn machine<B: Backend>(cpu: B) -> Machine<B> {
     m.cpu.map(0x590000, 4096, Prot::RX).unwrap();
     m.cpu.write(0x590000, b"MZ").unwrap();
     m
+}
+
+#[test]
+fn process_and_heap_snapshots_freeze_owned_state_and_share_aw_cursor_after_write_failures() {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap());
+    m.spawn("main", CODE, &[], 65536).unwrap();
+    let worker = m.spawn("worker", CODE, &[], 65536).unwrap();
+    let heap = m
+        .ext
+        .get_mut::<adv_os::Heaps>()
+        .create(&mut m.cpu, &mut m.sys.vm)
+        .unwrap();
+    let entry = m.resolve_import(K32, "CreateToolhelp32Snapshot").unwrap();
+    let handle = returned(create_snapshot(&mut env(&mut m, entry), 15, 0));
+    assert_ne!(handle, u32::MAX);
+    m.sys.terminate_context_stopped(worker, 0);
+    m.ext.get_mut::<Win32>().cfg.os.exe_name = "changed.exe".into();
+    assert!(
+        m.ext
+            .get_mut::<adv_os::Heaps>()
+            .destroy(&mut m.cpu, &mut m.sys.vm, heap)
+    );
+    let snapshot = m.sys.objects.host_mut::<ThreadSnapshot>(handle).unwrap();
+    assert_eq!(snapshot.rows.len(), 2);
+    assert_eq!(snapshot.processes[0].threads, 2);
+    assert_eq!(snapshot.processes[0].name, "fixture.exe");
+    assert_eq!(snapshot.heaps.len(), 2);
+    snapshot.processes.push(SnapshotProcess {
+        pid: 77,
+        parent: 12,
+        threads: 1,
+        name: "other.exe".into(),
+    });
+    let out = DATA + 256;
+    m.cpu.write(out, &[0xcc; PROCESS_W_BYTES]).unwrap();
+    m.cpu.write_u32(out, PROCESS_A_BYTES as u32).unwrap();
+    assert_eq!(
+        returned(process_entry(
+            &mut env(&mut m, entry),
+            handle,
+            GuestPtr::new(out),
+            true,
+            false
+        )),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(out + 20).unwrap(), 2);
+    assert_eq!(
+        m.cpu.read_u8(out + PROCESS_A_BYTES as u32 - 1).unwrap(),
+        0xcc
+    );
+    m.cpu.protect(DATA, 4096, Prot::READ).unwrap();
+    assert_eq!(
+        returned(process_entry(
+            &mut env(&mut m, entry),
+            handle,
+            GuestPtr::new(out),
+            false,
+            false
+        )),
+        0
+    );
+    assert_eq!(
+        m.sys
+            .objects
+            .host::<ThreadSnapshot>(handle)
+            .unwrap()
+            .process_cursor,
+        0
+    );
+    m.cpu.protect(DATA, 4096, Prot::RW).unwrap();
+    m.cpu.write_u32(out, PROCESS_W_BYTES as u32).unwrap();
+    assert_eq!(
+        returned(process_entry(
+            &mut env(&mut m, entry),
+            handle,
+            GuestPtr::new(out),
+            false,
+            true
+        )),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(out + 8).unwrap(), 77);
+    assert_eq!(
+        returned(process_entry(
+            &mut env(&mut m, entry),
+            handle,
+            GuestPtr::new(out),
+            true,
+            true
+        )),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(out + 8).unwrap(), m.sys.pid);
+    m.cpu.write_u32(out, 16).unwrap();
+    assert_eq!(
+        returned(heap_entry(
+            &mut env(&mut m, entry),
+            handle,
+            GuestPtr::new(out),
+            true
+        )),
+        1
+    );
+    assert_eq!(
+        returned(heap_entry(
+            &mut env(&mut m, entry),
+            handle,
+            GuestPtr::new(out),
+            false
+        )),
+        1
+    );
+    assert_eq!(m.cpu.read_u32(out + 8).unwrap(), heap);
+    let fresh = returned(create_snapshot(&mut env(&mut m, entry), 3, 0));
+    let snapshot = m.sys.objects.host::<ThreadSnapshot>(fresh).unwrap();
+    assert_eq!(snapshot.heaps.len(), 1);
+    assert_eq!(snapshot.processes[0].threads, 1);
+    assert_eq!(snapshot.processes[0].name, "changed.exe");
 }
 fn env<B: Backend>(m: &mut Machine<B>, entry: u32) -> Env<'_> {
     Env {
@@ -495,7 +620,7 @@ fn toolhelp_flags_empty_native_outputs_threads_and_unsupported_profiles_are_expl
             .is_some()
     );
     let entry = m.resolve_import(K32, "CreateToolhelp32Snapshot").unwrap();
-    for (flags, pid) in [(1, 0), (2, 0), (0x80000008, 0), (0x20, 0), (8, 0xdead)] {
+    for (flags, pid) in [(0x80000008, 0), (0x20, 0), (8, 0xdead)] {
         assert_eq!(
             returned(create_snapshot(&mut env(&mut m, entry), flags, pid)),
             u32::MAX
@@ -506,7 +631,7 @@ fn toolhelp_flags_empty_native_outputs_threads_and_unsupported_profiles_are_expl
     assert_ne!(thread_only, u32::MAX); // thread-only ignores the process argument
     let diagnostics = m.ext.get::<adv_abi::ApiDiagnostics>();
     assert_eq!(diagnostics.warnings.len(), 2);
-    assert_eq!(diagnostics.warnings.values().sum::<u64>(), 5);
+    assert_eq!(diagnostics.warnings.values().sum::<u64>(), 3);
     // UTF8 clipping is in bytes and retains complete scalars at both fixed
     // buffer limits. W remains available when the ANSI encoder is unsupported.
     m.ext.get_mut::<Win32>().codec = adv_os::Codec::new(65001);

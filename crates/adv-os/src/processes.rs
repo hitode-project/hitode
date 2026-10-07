@@ -91,6 +91,7 @@ pub enum Request {
 struct Shared {
     requests: VecDeque<Request>,
     directory: BTreeMap<u32, Weak<ProcessIdentity>>,
+    parents: BTreeMap<u32, u32>,
 }
 #[derive(Clone, Default)]
 pub struct Services(Rc<RefCell<Shared>>);
@@ -100,6 +101,26 @@ impl Services {
             .borrow_mut()
             .directory
             .insert(process.pid, Arc::downgrade(process));
+    }
+    pub fn register_child(&self, process: &Arc<ProcessIdentity>, parent: u32) {
+        self.register(process);
+        self.0.borrow_mut().parents.insert(process.pid, parent);
+    }
+    /// Live guest identities and their guest parents, in stable PID order.
+    pub fn live_processes(&self) -> Vec<(u32, u32)> {
+        let shared = self.0.borrow();
+        shared
+            .directory
+            .iter()
+            .filter_map(|(&pid, identity)| {
+                let identity = identity.upgrade()?;
+                identity
+                    .completion
+                    .exit_code()
+                    .is_none()
+                    .then(|| (pid, shared.parents.get(&pid).copied().unwrap_or(0)))
+            })
+            .collect()
     }
     pub fn find(&self, pid: u32) -> Option<Arc<ProcessIdentity>> {
         self.0.borrow().directory.get(&pid)?.upgrade()
@@ -158,4 +179,27 @@ pub fn visit<T: 'static>(
             .unwrap_or_else(|| Err(Error::new(50, "process request was not serviced")));
         complete(env, result)
     })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn live_catalog_preserves_guest_parents_and_excludes_exited_or_dropped_owners() {
+        let services = Services::default();
+        let parent = ProcessIdentity::new(11);
+        let child = ProcessIdentity::new(22);
+        services.register(&parent);
+        services.register_child(&child, parent.pid);
+        {
+            let temporary = ProcessIdentity::new(33);
+            services.register(&temporary);
+        }
+        assert_eq!(services.live_processes(), [(11, 0), (22, 11)]);
+        child.completion.complete(37);
+        assert_eq!(services.live_processes(), [(11, 0)]);
+        drop(parent);
+        assert!(services.live_processes().is_empty());
+    }
 }

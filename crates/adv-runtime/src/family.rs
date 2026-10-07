@@ -296,7 +296,9 @@ impl<B: Backend> Runtime<B> {
         self.family
             .publication
             .insert(pid, created.publication.clone());
-        self.family.services.register(&created.process);
+        self.family
+            .services
+            .register_child(&created.process, spec.parent);
         self.family.records.push(ProcessStatus {
             pid,
             parent: Some(spec.parent),
