@@ -84,7 +84,7 @@ fn rmw(i: &Instruction) -> bool {
         && matches!(i.memory_size().size(), 1 | 2 | 4)
         && address(i)
         && match i.mnemonic() {
-            M::Add | M::Sub | M::And | M::Or | M::Xor => rmw_source(i),
+            M::Add | M::Adc | M::Sub | M::Sbb | M::And | M::Or | M::Xor => rmw_source(i),
             M::Inc | M::Dec | M::Not | M::Neg => true,
             _ => false,
         }
@@ -124,7 +124,7 @@ pub(super) fn supported(i: &Instruction) -> bool {
                 && matches!(i.memory_size().size(), 1 | 2)
                 && address(i)
         }
-        M::Add | M::Sub | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
+        M::Add | M::Adc | M::Sub | M::Sbb | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
             let memory =
                 |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
             dst && (source(i, 1) || memory(1))
@@ -353,6 +353,10 @@ impl Emitter {
     /// Compute w11 and flags from w9/w10, retaining the unshifted operands
     /// for AF. Narrow operands align to bit 31 so host NZCV has x86 width.
     fn alu(&mut self, m: M, width: u32, flags: u8) {
+        if matches!(m, M::Adc | M::Sbb) {
+            self.carry_alu(m == M::Sbb, width, flags);
+            return;
+        }
         let logic = matches!(m, M::And | M::Or | M::Xor | M::Test);
         let sub = matches!(m, M::Sub | M::Cmp | M::Dec | M::Neg);
         let op = match m {
@@ -377,6 +381,41 @@ impl Emitter {
             self.lsr(11, 11, (32 - width * 8) as u8);
         }
         self.flags(flags, sub, logic, matches!(m, M::Inc | M::Dec));
+    }
+    /// Carry input is the canonical guest CF, never an earlier host NZCV.
+    fn carry_alu(&mut self, subtract: bool, width: u32, flags: u8) {
+        self.mask(13, 8, 1);
+        if width == 4 {
+            if subtract {
+                self.binary(0x6b00_0000, 31, 31, 13); // cmp wzr,w13
+            } else {
+                self.word(0x7100_05bf); // cmp w13,#1
+            }
+            self.binary(if subtract { 0x7a00_0000 } else { 0x3a00_0000 }, 11, 9, 10);
+            self.flags(flags, subtract, false, false);
+            return;
+        }
+        let bits = width * 8;
+        let mask = (1 << bits) - 1;
+        self.mask(9, 9, mask);
+        self.mask(10, 10, mask);
+        let op = if subtract { 0x4b00_0000 } else { 0x0b00_0000 };
+        self.binary(op, 11, 9, 10);
+        self.binary(op, 11, 11, 13);
+        // The bit above the narrow result is carry/borrow, even after wrap.
+        self.lsr(13, 11, bits as u8);
+        self.bfi(flags, 13, 0);
+        self.mask(11, 11, mask);
+        self.lsl(15, 11, (32 - bits) as u8);
+        self.binary(0x6a00_0000, 31, 15, 15);
+        self.flags(flags, subtract, false, true);
+        // Signed overflow uses the original operands, including when b+CF
+        // crosses the signed boundary. AF above likewise uses original b.
+        self.binary(0x4a00_0000, 15, 9, 11);
+        self.binary(0x4a00_0000, 16, if subtract { 9 } else { 11 }, 10);
+        self.binary(0x0a00_0000, 15, 15, 16);
+        self.lsr(15, 15, (bits - 1) as u8);
+        self.bfi(flags, 15, 11);
     }
     fn memory_rmw(&mut self, i: &Instruction) {
         let width = i.memory_size().size() as u32;
