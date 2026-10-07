@@ -234,6 +234,28 @@ fn get_keyboard_layout_name_a(env: &mut Env<'_>, out: AnsiStr) -> u32 {
 fn get_keyboard_layout_name_w(env: &mut Env<'_>, out: WideStr) -> u32 {
     layout_name(env, out.0.addr(), true)
 }
+fn map_virtual_key(env: &mut Env<'_>, code: u32, kind: u32, api: &str) -> u32 {
+    match adv_os::keyboard::map_virtual_key(user(env).keyboard_layout, code, kind) {
+        Some(value) => value,
+        None => {
+            adv_abi::warn_unavailable(
+                env,
+                api,
+                "the keyboard profile or mapping type is unavailable",
+            );
+            set_last_error(env, 50);
+            0
+        }
+    }
+}
+#[win32(user32, name = "MapVirtualKeyA", level = state)]
+fn map_virtual_key_a(env: &mut Env<'_>, code: u32, kind: u32) -> u32 {
+    map_virtual_key(env, code, kind, "user32.dll!MapVirtualKeyA")
+}
+#[win32(user32, name = "MapVirtualKeyW", level = state)]
+fn map_virtual_key_w(env: &mut Env<'_>, code: u32, kind: u32) -> u32 {
+    map_virtual_key(env, code, kind, "user32.dll!MapVirtualKeyW")
+}
 #[win32(user32,name="SwapMouseButton",level=state)]
 fn swap_mouse_button(env: &mut Env<'_>, swap: i32) -> u32 {
     u32::from(std::mem::replace(
@@ -252,6 +274,8 @@ pub(super) fn register(registry: &mut Registry) {
         get_keyboard_layout_list_ABI,
         get_keyboard_layout_name_a_ABI,
         get_keyboard_layout_name_w_ABI,
+        map_virtual_key_a_ABI,
+        map_virtual_key_w_ABI,
         swap_mouse_button_ABI,
     ] {
         registry.register(api);
@@ -260,6 +284,9 @@ pub(super) fn register(registry: &mut Registry) {
 
 #[cfg(test)]
 mod cursor_tests;
+
+#[cfg(test)]
+mod keymap_tests;
 
 #[cfg(test)]
 mod tests {
