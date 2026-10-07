@@ -720,7 +720,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
+            "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n",
             "  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
@@ -759,6 +759,7 @@ fn build_report(context: ReportContext<'_>) -> String {
         runtime.machine.sys.host_calls,
         stats.native_entries,
         stats.interpreter_entries,
+        cliffs_report(&stats.cliffs),
         stats.compilations,
         options.jit && options.async_compilation,
         stats.compile_time.as_secs_f64(),
@@ -1869,6 +1870,39 @@ pub fn run_cli() -> std::process::ExitCode {
 mod deadline_tests;
 
 /// Wall-time overlap includes the inline lane's API work; it is not CPU usage.
+/// Slow-path counters, each list cut to its most frequent entries.
+fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
+    const ROWS: usize = 24;
+    let counts = |rows: Vec<(String, u64)>| {
+        rows.into_iter()
+            .take(ROWS)
+            .map(|(key, n)| format!("{}:{n}", json(&key)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let interpreter = c
+        .interpreter_rows()
+        .into_iter()
+        .map(|(reason, n)| {
+            format!(
+                "{}:{{\"entries\":{},\"instructions\":{}}}",
+                json(&reason),
+                n.entries,
+                n.instructions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
+        c.x87_helper_calls,
+        c.x87_fast,
+        counts(c.x87_exact_rows()),
+        counts(c.fallback_rows()),
+        interpreter
+    )
+}
+
 fn parallel_report(p: &adv_runtime::ParallelStats) -> String {
     format!(
         "{{\"workers\":{},\"submitted\":{},\"completed\":{},\"worker_run_ns\":{},\"queue_wait_ns\":{},\"queue_wait_max_ns\":{},\"image_builds\":{},\"image_build_ns\":{},\"empty_jobs\":{},\"short_traps\":{},\"overlap_ns\":{},\"max_running\":{},\"traps\":{},\"cold_retries\":{},\"cache_misses\":{},\"quantum_returns\":{},\"quiescence_waits\":{},\"quiescence_wait_ns\":{},\"quiescence_wait_max_ns\":{}}}",

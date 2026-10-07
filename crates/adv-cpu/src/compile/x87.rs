@@ -828,6 +828,7 @@ pub(crate) mod testing {
             unclocked_bytes: 0,
             bulk_calls: 0,
             bulk_bytes: 0,
+            cliffs: Default::default(),
         };
         let interrupt = std::sync::atomic::AtomicBool::new(false);
         compiled

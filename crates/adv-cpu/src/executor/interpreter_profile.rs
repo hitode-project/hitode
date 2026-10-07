@@ -19,23 +19,7 @@ const ROWS: usize = 60;
 /// Instructions decoded from a block start in search of an unsupported one.
 const SCAN: usize = 64;
 
-/// Why a block ran in the interpreter.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) enum Reason {
-    /// No region owns the address.
-    #[default]
-    Uncovered,
-    /// Discovery tried the address and compiled nothing for it.
-    Rejected,
-    /// A region owns the address but has no native code yet.
-    Pending,
-    /// Native code owns the address but has no entry there.
-    Interior,
-    /// The native code just requested an interpreted instruction.
-    Fallback,
-    /// Single-stepping, a pending x87 exception, or an interpreter-only run.
-    Forced,
-}
+pub(crate) use crate::InterpreterReason as Reason;
 
 #[derive(Default)]
 struct Block {
