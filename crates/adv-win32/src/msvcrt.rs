@@ -712,28 +712,10 @@ fn call(e: &mut Env<'_>) -> Outcome {
             Ok(pointer) => pointer,
             Err(err) => return Outcome::Fail(err.to_string()),
         },
-        "memcmp" => {
-            let mut left = [0; 4096];
-            let mut right = [0; 4096];
-            let mut offset = 0;
-            let mut diff = 0;
-            while offset < c {
-                let n = (c - offset).min(4096) as usize;
-                if let Err(err) = e
-                    .cpu
-                    .read(a.wrapping_add(offset), &mut left[..n])
-                    .and_then(|_| e.cpu.read(b.wrapping_add(offset), &mut right[..n]))
-                {
-                    return Outcome::Fail(err.to_string());
-                }
-                if let Some((l, r)) = left[..n].iter().zip(&right[..n]).find(|(l, r)| l != r) {
-                    diff = i32::from(*l) - i32::from(*r);
-                    break;
-                }
-                offset += n as u32;
-            }
-            diff as u32
-        }
+        "memcmp" => match memory_ops::compare(e, a, b, c, None) {
+            Ok(difference) => difference as u32,
+            Err(error) => return Outcome::Fail(error.to_string()),
+        },
         "strlen" => match e.cpu.read_cstr(a, 16 * 1024 * 1024) {
             Ok(s) => s.len() as u32,
             Err(err) => return Outcome::Fail(err.to_string()),

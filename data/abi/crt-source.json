@@ -381,6 +381,12 @@
     "scope": "Three existing CRT aliases: int __cdecl fputc/putc(int character, FILE* stream), two x86 argument words. Character is converted to unsigned char; success returns that byte and failure returns EOF(-1).",
     "profile": "Use existing shared FILE, binary write and CRT error owners. Unsupported text/orientation or non-owned/pseudo-stream profiles must explicitly warn and fail; do not invent a FILE layout or a private stream table."
   },
+  "legacy_memory_compare": {
+    "header": "ucrt/corecrt_memory.h:28-32",
+    "header_sha256": "18ca520416579183bc369c0a8e555914db5c7577075b9359173fc6bc45595560",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/memicmp-memicmp-l",
+    "projection": "int __cdecl _memicmp(void const*, void const*, size_t), three x86 argument words. Only the observed MSVCRT profile is advertised; the locale uses the existing module-owned LC_CTYPE byte casing and comparison consumes exactly count bytes, including embedded NULs."
+  },
   "legacy_access": {
     "headers": [
       "ucrt/corecrt_io.h:110-113",
