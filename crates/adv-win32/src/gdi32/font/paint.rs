@@ -240,6 +240,12 @@ fn paint(
     ansi: bool,
     success: u32,
 ) -> Outcome {
+    if super::super::raster::front::pixels_unavailable(env, dc) {
+        let thunk = env.sys.thunks.get(env.thunk);
+        let api = format!("{}!{}", thunk.module, thunk.name);
+        super::super::raster::front::unavailable_pixels(env, dc, &api);
+        return Outcome::Return(0);
+    }
     let fail = |env: &mut Env<'_>, code| {
         set_last_error(env, code);
         Outcome::Return(0)
