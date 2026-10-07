@@ -402,6 +402,16 @@ fn outline_metrics_a(env: &mut Env<'_>, dc: Handle, size: u32, output: GuestPtr<
     if copied >= 4 {
         let returned = if failed_names { 0 } else { copied as u32 };
         bytes[..4].copy_from_slice(&returned.to_le_bytes());
+    } else {
+        // For a sub-DWORD prefix the native ANSI thunk exposes the underlying
+        // Unicode query size; it cannot replace a complete otmSize field.
+        let wide_required = 216u32
+            + metrics
+                .names
+                .iter()
+                .map(|name| (name.encode_utf16().count() as u32 + 1) * 2)
+                .sum::<u32>();
+        bytes[..4].copy_from_slice(&wide_required.to_le_bytes());
     }
     if adv_abi::guest::check_range(
         env.cpu,
