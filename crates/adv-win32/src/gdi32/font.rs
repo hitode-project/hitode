@@ -363,38 +363,121 @@ fn metrics_w(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> i32 {
 
 #[win32(gdi32, name = "GetOutlineTextMetricsA", level = implement)]
 fn outline_metrics_a(env: &mut Env<'_>, dc: Handle, size: u32, output: GuestPtr<u8>) -> Outcome {
-    const OUTLINE_SIZE: u32 = 212;
+    const OUTLINE_SIZE: usize = 212;
     if reject_dc(env, dc.0) {
         return Outcome::Return(0);
     }
-    if size == 0 || output.is_null() {
-        return Outcome::Return(OUTLINE_SIZE);
+    if size == 0 && !output.is_null() {
+        return Outcome::Return(0);
     }
     let request = font_request(env, dc.0);
-    match env.ext.get_mut::<Fonts>().text.metrics(&request) {
-        Ok(metrics) => {
-            let mut buf = vec![0u8; size as usize];
-            let packed = pack_metrics(&metrics);
-            let size_bytes = size.to_le_bytes();
-            let buf_len = buf.len();
-            let header_len = 4.min(buf_len);
-            buf[..header_len].copy_from_slice(&size_bytes[..header_len]);
-            if buf_len > 4 {
-                let copy_len = packed.len().min(buf_len - 4);
-                buf[4..4 + copy_len].copy_from_slice(&packed[..copy_len]);
-            }
-            if env.cpu.write(output.addr(), &buf).is_ok() {
-                Outcome::Return(size)
-            } else {
-                set_last_error(env, 87);
-                Outcome::Return(0)
-            }
+    let metrics = match env.ext.get_mut::<Fonts>().text.outline_metrics(&request) {
+        Ok(metrics) => metrics,
+        Err(TextError::Unavailable) => {
+            adv_abi::warn_unavailable(
+                env,
+                "gdi32.dll!GetOutlineTextMetricsA",
+                "selected-font outline metrics are unavailable on this text backend",
+            );
+            set_last_error(env, 50);
+            return Outcome::Return(0);
         }
-        _ => {
-            set_last_error(env, 87);
-            Outcome::Return(0)
-        }
+        Err(_) => return Outcome::Return(0),
+    };
+    let mut bytes = pack_outline_metrics(env, &metrics);
+    let required = bytes.len() as u32;
+    if output.is_null() {
+        return Outcome::Return(required);
     }
+    // Native GDI supports a prefix of the fixed structure, with zero name
+    // offsets. A buffer extending past that structure must fit all names;
+    // otherwise it publishes only the fixed fields with otmSize=0 and fails.
+    let failed_names = size as usize > OUTLINE_SIZE && size < required;
+    let copied = if size < required {
+        bytes[196..OUTLINE_SIZE].fill(0);
+        (size as usize).min(OUTLINE_SIZE)
+    } else {
+        bytes.len()
+    };
+    if copied >= 4 {
+        let returned = if failed_names { 0 } else { copied as u32 };
+        bytes[..4].copy_from_slice(&returned.to_le_bytes());
+    }
+    if adv_abi::guest::check_range(
+        env.cpu,
+        output.addr(),
+        copied as u32,
+        adv_cpu::backend::Prot::WRITE,
+    )
+    .is_err()
+        || env.cpu.write(output.addr(), &bytes[..copied]).is_err()
+    {
+        set_last_error(env, 87);
+        return Outcome::Return(0);
+    }
+    if failed_names {
+        set_last_error(env, 1003);
+        Outcome::Return(0)
+    } else {
+        Outcome::Return(copied as u32)
+    }
+}
+
+fn pack_outline_metrics(env: &Env<'_>, metrics: &text::OutlineMetrics) -> Vec<u8> {
+    // SDK x86 OUTLINETEXTMETRICA: the 56-byte TEXTMETRICA occupies 4..60,
+    // PANOSE follows its filler, and typographic ascent starts at byte 96.
+    let mut bytes = vec![0; 212];
+    bytes[4..60].copy_from_slice(&pack_metrics(&metrics.text));
+    bytes[61..71].copy_from_slice(&metrics.panose);
+    for (index, value) in [
+        metrics.selection,
+        metrics.embedding,
+        metrics.caret_rise as u32,
+        metrics.caret_run as u32,
+        metrics.italic_angle as u32,
+        metrics.em_units,
+        metrics.ascent as u32,
+        metrics.descent as u32,
+        metrics.line_gap,
+        metrics.cap_height,
+        metrics.x_height,
+        metrics.bounds.left as u32,
+        metrics.bounds.top as u32,
+        metrics.bounds.right as u32,
+        metrics.bounds.bottom as u32,
+        metrics.mac_ascent as u32,
+        metrics.mac_descent as u32,
+        metrics.mac_line_gap,
+        metrics.minimum_ppem,
+        metrics.subscript_size.x as u32,
+        metrics.subscript_size.y as u32,
+        metrics.subscript_offset.x as u32,
+        metrics.subscript_offset.y as u32,
+        metrics.superscript_size.x as u32,
+        metrics.superscript_size.y as u32,
+        metrics.superscript_offset.x as u32,
+        metrics.superscript_offset.y as u32,
+        metrics.strikeout_size,
+        metrics.strikeout_position as u32,
+        metrics.underline_size as u32,
+        metrics.underline_position as u32,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = 72 + index * 4;
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let codec = &env.ext.get::<Win32>().codec;
+    for (index, name) in metrics.names.iter().enumerate() {
+        let offset = bytes.len() as u32;
+        bytes[196 + index * 4..200 + index * 4].copy_from_slice(&offset.to_le_bytes());
+        bytes.extend(codec.encode(name));
+        bytes.push(0);
+    }
+    let required = bytes.len() as u32;
+    bytes[..4].copy_from_slice(&required.to_le_bytes());
+    bytes
 }
 
 #[win32(gdi32, name = "GetTextExtentPoint32A", level = implement)]
