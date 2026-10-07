@@ -732,6 +732,14 @@ fn write_target(env: &mut Env<'_>, address: u32, bytes: &[u8], debugger: bool) -
     }
 }
 
+fn native_transfer_count(env: &mut Env<'_>, pointer: u32, count: u32) {
+    // Windows preserves the transfer status even if this optional output is
+    // inaccessible. Capture source bytes before publishing an aliased count.
+    if pointer != 0 && adv_abi::guest::check_range(env.cpu, pointer, 4, Prot::WRITE).is_ok() {
+        let _ = env.cpu.write_u32(pointer, count);
+    }
+}
+
 /// Native transfers keep page permissions and best-effort the optional count.
 /// Unlike the Win32 debugger frontend, no execute-page write override is used.
 pub(crate) fn native_write_memory(
@@ -742,15 +750,8 @@ pub(crate) fn native_write_memory(
     size: u32,
     copied: u32,
 ) -> Outcome {
-    fn publish(env: &mut Env<'_>, pointer: u32, count: u32) {
-        // Windows preserves the transfer status even if this optional output is
-        // inaccessible. Capture source bytes before publishing an aliased count.
-        if pointer != 0 && adv_abi::guest::check_range(env.cpu, pointer, 4, Prot::WRITE).is_ok() {
-            let _ = env.cpu.write_u32(pointer, count);
-        }
-    }
     let fail = |env: &mut Env<'_>, status| {
-        publish(env, copied, 0);
+        native_transfer_count(env, copied, 0);
         Outcome::Return(status)
     };
     if size == 0 {
@@ -820,7 +821,88 @@ pub(crate) fn native_write_memory(
                     },
                 ),
             };
-            publish(caller, copied, count);
+            native_transfer_count(caller, copied, count);
+            Outcome::Return(status)
+        },
+    )
+}
+
+/// Native reads own the stopped target's bytes before publishing caller output.
+pub(crate) fn native_read_memory(
+    env: &mut Env<'_>,
+    handle: u32,
+    address: u32,
+    buffer: u32,
+    size: u32,
+    copied: u32,
+) -> Outcome {
+    let fail = |env: &mut Env<'_>, status| {
+        native_transfer_count(env, copied, 0);
+        Outcome::Return(status)
+    };
+    if size == 0 {
+        return fail(env, 0);
+    }
+    if size > MAX_TRANSFER {
+        adv_abi::warn_unavailable(
+            env,
+            "ntdll.dll!NtReadVirtualMemory",
+            "transfers beyond the bounded owned-payload limit are unavailable",
+        );
+        return fail(env, 0xc00000bb);
+    }
+    let target = match child_process::process_target(env, handle, VM_READ) {
+        Ok(target) => target,
+        Err(error) => {
+            return fail(
+                env,
+                if error.code == 5 {
+                    0xc0000022
+                } else {
+                    0xc0000008
+                },
+            );
+        }
+    };
+    if transfer_range(address, size).is_err() || transfer_range(buffer, size).is_err() {
+        return fail(env, 0xc0000005);
+    }
+    if !env.cpu.accessible(buffer, size, Prot::WRITE) {
+        return fail(env, 0x8000000d);
+    }
+    processes::visit(
+        env,
+        target.pid,
+        None,
+        move |remote| read_target(remote.cpu, address, size),
+        move |caller, result| {
+            let status = match result {
+                Ok(bytes) => {
+                    if !caller.cpu.accessible(buffer, size, Prot::WRITE)
+                        || caller.cpu.write(buffer, &bytes).is_err()
+                    {
+                        native_transfer_count(caller, copied, 0);
+                        return Outcome::Return(0x8000000d);
+                    }
+                    native_transfer_count(caller, copied, size);
+                    return Outcome::Return(0);
+                }
+                Err(error) => match error.code {
+                    5 => 0xc0000022,
+                    6 => 0xc0000008,
+                    8 => 0xc0000017,
+                    50 => {
+                        adv_abi::warn_unavailable(
+                            caller,
+                            "ntdll.dll!NtReadVirtualMemory",
+                            &error.message,
+                        );
+                        0xc00000bb
+                    }
+                    _ => 0x8000000d,
+                },
+            };
+            native_transfer_count(caller, copied, 0);
             Outcome::Return(status)
         },
     )

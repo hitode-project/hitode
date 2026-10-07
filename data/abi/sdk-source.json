@@ -268,5 +268,11 @@
     "source": "phnt ntpsapi.h and authored Microsoft Windows x86 oracle",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
     "native_verification": "20 DWORDs: invalid handle/output preserves state, actual old suspend count, NT/Win32 count interop, NULL output, completed valid thread reports zero without rescheduling, LastError unchanged, child exit 37"
+  },
+  "nt_read_virtual_memory_implementation": {
+    "scope": "NtReadVirtualMemory frontend; reuse the master supplemental declaration and common VM/process owner",
+    "source": "phnt ntmmapi.h and authored Microsoft Windows x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
+    "native_verification": "32 DWORDs cover real remote bytes, VM_READ-only handles, invalid handles/source/output and partial-copy atomic failure, zero-size handle bypass, optional/inaccessible count outputs, unchanged LastError and child exit 37"
   }
 }
