@@ -68,13 +68,25 @@ pub struct FindObj {
     pub next: usize,
 }
 
-/// One Toolhelp handle owner, with independently frozen thread/module rows and
+/// One Toolhelp handle owner, with independently frozen process/thread/module/heap rows and
 /// cursors. The existing public thread fields retain their meaning.
 pub struct ThreadSnapshot {
     pub rows: Vec<(u32, u32)>,
     pub cursor: usize,
     pub(crate) modules: Vec<SnapshotModule>,
     pub(crate) module_cursor: usize,
+    pub(crate) processes: Vec<SnapshotProcess>,
+    pub(crate) process_cursor: usize,
+    pub(crate) heaps: Vec<(u32, u32, u32)>,
+    pub(crate) heap_cursor: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotProcess {
+    pub pid: u32,
+    pub parent: u32,
+    pub threads: u32,
+    pub name: String,
 }
 
 #[derive(Clone)]

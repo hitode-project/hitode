@@ -89,6 +89,12 @@ pub struct Heaps {
 }
 
 impl Heaps {
+    /// Snapshot only handles owned by this guest process, in stable order.
+    pub fn handles(&self) -> Vec<u32> {
+        let mut handles: Vec<_> = self.heaps.keys().copied().collect();
+        handles.sort_unstable();
+        handles
+    }
     /// Create a heap; its handle is the address of a small reserved region (like Windows,
     /// where a heap handle points at the heap's header).
     pub fn create(&mut self, cpu: &mut dyn Guest, vm: &mut Vm) -> Result<u32, MemFault> {
