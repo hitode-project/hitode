@@ -91,7 +91,8 @@ fn integer_templates_match_both_existing_tiers_at_flag_boundaries() {
             }
         }
         assert!(machines[2].tier1_stats().native_instructions >= 100);
-        assert!(machines[2].tier1_stats().fallback_instructions >= 100);
+        // RET to the stop address is native too.
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
     }
 }
 #[test]
@@ -118,8 +119,8 @@ fn direct_loop_checked_memory_and_single_instruction_fallback_continue() {
     equivalent(&machines[0], &machines[1], 0x8d5);
     equivalent(&machines[0], &machines[2], 0x8d5);
     let stats = machines[2].tier1_stats();
-    assert_eq!(stats.fallback_instructions, 13);
-    assert_eq!(stats.inline_accesses, 2);
+    assert_eq!(stats.fallback_instructions, 12, "BSWAP only");
+    assert_eq!(stats.inline_accesses, 3, "store, load and RET");
     assert_eq!(stats.checked_accesses, 0);
     assert!(stats.direct_transfers >= 12);
     assert_eq!(stats.saves, stats.restores);
@@ -408,11 +409,87 @@ fn compile_latency_is_reported_for_both_native_tiers() {
     equivalent(&tiers[0], &tiers[1], 0x8d5);
     let tier1 = tiers[1].tier1_stats();
     assert_eq!(tier1.compilations, 1);
-    assert_eq!(tier1.inline_accesses, 60);
+    assert_eq!(tier1.inline_accesses, 61);
     println!(
         "compile latency (121 guest instructions): cranelift_ns={} tier1_ns={} tier1_code_bytes={}",
         tiers[0].stats.compile_time.as_nanos(),
         tier1.compile_time.as_nanos(),
         tier1.code_bytes
     );
+}
+
+#[test]
+fn calls_stack_and_memory_operands_match_both_existing_tiers() {
+    let code = assemble(|a| {
+        let mut leaf = a.create_label();
+        let mut top = a.create_label();
+        a.mov(ecx, 6).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.push(ecx).unwrap();
+        a.push(0x80u32).unwrap();
+        a.call(leaf).unwrap();
+        a.add(edx, eax).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+        a.push(esp).unwrap();
+        a.pop(ebp).unwrap();
+        a.ret().unwrap();
+        // leaf(flag, n): sums sign- and zero-extended bytes, releases its args.
+        a.set_label(&mut leaf).unwrap();
+        a.push(ebx).unwrap();
+        a.mov(ebx, dword_ptr(esp + 12)).unwrap();
+        a.movzx(eax, byte_ptr(ebx * 4 + DATA)).unwrap();
+        a.movsx(esi, word_ptr(ebx * 2 + DATA + 64)).unwrap();
+        a.add(eax, esi).unwrap();
+        a.add(eax, dword_ptr(esp + 8)).unwrap();
+        a.xor(eax, dword_ptr(DATA + 128)).unwrap();
+        a.cmp(dword_ptr(esp + 12), 3).unwrap();
+        a.test(dword_ptr(DATA + 128), edi).unwrap();
+        a.pop(ebx).unwrap();
+        a.ret_1(8).unwrap();
+    });
+    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+    let data: Vec<u8> = (0..160u32).map(|n| (n * 37 + 11) as u8).collect();
+    for m in &mut machines {
+        m.write(DATA, &data).unwrap();
+        reset(m, [0, 0, 0, 0, 0, 0, 0, 0x5a5a], 2);
+        assert_eq!(m.run(STOP, 10000).unwrap(), RunOutcome::ReachedStop);
+    }
+    equivalent(&machines[0], &machines[1], 0x8d5);
+    equivalent(&machines[0], &machines[2], 0x8d5);
+    assert_eq!(
+        machines[2].memory().read_data(STACK - 64, 64).unwrap(),
+        machines[0].memory().read_data(STACK - 64, 64).unwrap()
+    );
+    let stats = machines[2].tier1_stats();
+    assert_eq!(stats.fallback_instructions, 0);
+    assert!(stats.inline_accesses >= 6 * 10, "{stats:?}");
+}
+
+#[test]
+fn refused_stack_accesses_rerun_exactly_in_tier0() {
+    let code = assemble(|a| {
+        a.inc(eax).unwrap();
+        a.push(eax).unwrap();
+        a.inc(eax).unwrap();
+        a.call(u64::from(CODE + 64)).unwrap();
+    });
+    let mut reference = machine(&code, 0);
+    let mut tier = machine(&code, 2);
+    for m in [&mut reference, &mut tier] {
+        m.protect(STACK - 4096, 4096, READ).unwrap();
+        reset(m, [0; 8], 2);
+    }
+    let outcome = reference.run(STOP, 100).unwrap();
+    assert!(
+        matches!(outcome, RunOutcome::WriteFault { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(tier.run(STOP, 100).unwrap(), outcome);
+    equivalent(&reference, &tier, 0x8d5);
+    assert_eq!(
+        tier.state.regs[4], STACK,
+        "ESP is unchanged by the refused push"
+    );
+    assert_eq!(tier.tier1_stats().fallback_instructions, 1);
 }

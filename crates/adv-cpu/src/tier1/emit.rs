@@ -27,12 +27,16 @@ struct Fixup {
 /// frame in x0 and follows AAPCS64, so guest registers in x19-x28 survive.
 #[derive(Clone, Copy)]
 pub(super) struct Helpers {
-    /// `(frame, address) -> value | status << 32`; nonzero status leaves.
+    /// `(frame, address, kind) -> value | status << 32`, where kind is the
+    /// width in bytes plus `SIGNED`; nonzero status means nothing was read.
     pub load: u64,
     /// `(frame, address, value) -> 0` to continue, 1 after a store that
     /// must leave native code, 2 when not performed.
     pub store: u64,
 }
+
+/// Load kind flag: sign-extend the loaded value to 32 bits.
+pub(super) const SIGNED: u32 = 0x100;
 
 pub(super) struct Emitter {
     helpers: Helpers,
@@ -91,7 +95,22 @@ pub(super) fn supported(i: &Instruction) -> bool {
                     && address(i)
         }
         M::Lea => dst && i.op1_kind() == OpKind::Memory && address(i),
-        M::Add | M::Sub | M::Cmp | M::And | M::Or | M::Xor | M::Test => dst && source(i, 1),
+        M::Movzx | M::Movsx => {
+            dst && i.op1_kind() == OpKind::Memory
+                && matches!(i.memory_size().size(), 1 | 2)
+                && address(i)
+        }
+        M::Add | M::Sub | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
+            let memory =
+                |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
+            dst && (source(i, 1) || memory(1))
+                // Reading forms only; read-modify-write stays in Tier 0.
+                || matches!(i.mnemonic(), M::Cmp | M::Test) && memory(0) && source(i, 1)
+        }
+        M::Push => i.stack_pointer_increment() == -4 && source(i, 0),
+        M::Pop => dst && i.stack_pointer_increment() == 4,
+        M::Call => i.op0_kind() == OpKind::NearBranch32,
+        M::Ret => i.op_count() == 0 || i.op0_kind() == OpKind::Immediate16,
         M::Inc | M::Dec | M::Neg | M::Not => dst,
         M::Jmp => i.op0_kind() == OpKind::NearBranch32,
         _ => {
@@ -203,6 +222,46 @@ impl Emitter {
         self.word(0xf940_1767); // ldr x7,[x27,#40]
         self.load32(6, 48);
     }
+    /// Load `kind` from the address in w1 into w0. A refused load committed
+    /// nothing, so the whole instruction reruns exactly in Tier 0.
+    fn load(&mut self, pc: u32, kind: u32) {
+        self.constant(2, kind);
+        self.call(self.helpers.load);
+        self.word(0xd360_fc09); // lsr x9,x0,#32
+        let ok = self.words.len();
+        self.word(0);
+        self.constant(5, pc);
+        self.jump(Label::Exit(FALLBACK), Branch::B);
+        self.words[ok] = 0x3400_0009 | ((self.words.len() - ok) as u32) << 5; // cbz w9
+    }
+    /// Continue after the store helper. `commit` applies the instruction's
+    /// register effects once the store is performed; a refused store reruns
+    /// the instruction in Tier 0 and one that must leave dispatches `target`.
+    fn stored(&mut self, pc: u32, target: u32, link: bool, commit: impl Fn(&mut Self)) {
+        self.word(0x7100_081f); // cmp w0,#2
+        let refused = self.words.len();
+        self.word(0);
+        commit(self);
+        self.charge();
+        let leave = self.words.len();
+        self.word(0);
+        if link {
+            self.link();
+        }
+        self.jump(Label::Guest(target), Branch::B);
+        self.words[leave] = 0x3500_0000 | ((self.words.len() - leave) as u32) << 5; // cbnz w0
+        self.constant(5, target);
+        self.jump(Label::Exit(DISPATCH), Branch::B);
+        self.words[refused] = 0x5400_0000 | ((self.words.len() - refused) as u32) << 5; // b.eq
+        self.constant(5, pc);
+        self.jump(Label::Exit(FALLBACK), Branch::B);
+    }
+    fn esp_add(&mut self, n: u32) {
+        self.word(0x1100_0000 | n << 10 | 23 << 5 | 23); // add w23,w23,#n
+    }
+    fn esp_sub(&mut self, d: u8) {
+        self.word(0x5100_1000 | 23 << 5 | d as u32); // sub wd,w23,#4
+    }
     /// Branch over the next `words` instructions when w`r` is nonzero.
     fn skip_nonzero(&mut self, r: u8, words: u32) {
         self.word(0x3500_0000 | (words + 1) << 5 | r as u32);
@@ -307,6 +366,7 @@ impl Emitter {
             M::Mov if i.op1_kind() == OpKind::Memory => {
                 self.ea(i, true);
                 self.mov(1, 9);
+                self.constant(2, 4);
                 self.call(self.helpers.load);
                 self.word(0xd360_fc09); // lsr x9,x0,#32
                 self.skip_nonzero(9, 3);
@@ -353,6 +413,49 @@ impl Emitter {
                 return;
             }
             M::Mov => self.operand(d, i, 1),
+            M::Movzx | M::Movsx => {
+                self.ea(i, true);
+                self.mov(1, 9);
+                let signed = if i.mnemonic() == M::Movsx { SIGNED } else { 0 };
+                self.load(pc, i.memory_size().size() as u32 | signed);
+                self.mov(d, 0);
+            }
+            M::Push => {
+                self.esp_sub(1);
+                self.operand(2, i, 0);
+                self.call(self.helpers.store);
+                self.stored(pc, i.next_ip32(), false, |e| e.esp_sub(23));
+                return;
+            }
+            M::Pop => {
+                self.mov(1, 23);
+                self.load(pc, 4);
+                // POP ESP stores the loaded value after the increment.
+                self.esp_add(4);
+                self.mov(d, 0);
+            }
+            M::Call => {
+                self.esp_sub(1);
+                self.constant(2, i.next_ip32());
+                self.call(self.helpers.store);
+                self.stored(pc, i.near_branch32(), true, |e| e.esp_sub(23));
+                return;
+            }
+            M::Ret => {
+                self.mov(1, 23);
+                self.load(pc, 4);
+                let release = if i.op_count() == 0 {
+                    0
+                } else {
+                    u32::from(i.immediate16())
+                };
+                self.constant(10, 4 + release);
+                self.binary(0x0b00_0000, 23, 23, 10);
+                self.mov(5, 0);
+                self.charge();
+                self.jump(Label::Exit(DISPATCH), Branch::B);
+                return;
+            }
             M::Lea => {
                 self.ea(i, false);
                 self.mov(d, 9);
@@ -374,14 +477,29 @@ impl Emitter {
                 return;
             }
             m => {
-                self.mov(9, d);
-                if matches!(m, M::Inc | M::Dec) {
-                    self.constant(10, 1);
-                } else if m == M::Neg {
-                    self.mov(10, 9);
-                    self.constant(9, 0);
-                } else {
+                // Left operand in w9, right operand in w10.
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(10, 0);
+                    self.mov(9, d);
+                } else if i.op0_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(9, 0);
                     self.operand(10, i, 1);
+                } else {
+                    self.mov(9, d);
+                    match m {
+                        M::Inc | M::Dec => self.constant(10, 1),
+                        M::Neg => {
+                            self.mov(10, 9);
+                            self.constant(9, 0);
+                        }
+                        _ => self.operand(10, i, 1),
+                    }
                 }
                 let logic = matches!(m, M::And | M::Or | M::Xor | M::Test);
                 let sub = matches!(m, M::Sub | M::Cmp | M::Dec | M::Neg);

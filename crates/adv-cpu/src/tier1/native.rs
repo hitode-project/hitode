@@ -63,24 +63,30 @@ struct Entry {
     inline: u64,
 }
 
-/// Checked 4-byte guest load without leaving native code. The checks are the
-/// same as the LOAD exit, which reports the exact fault when this refuses.
-extern "C" fn load(entry: *mut Entry, address: u32) -> u64 {
+/// Checked 1/2/4-byte guest load without leaving native code, zero- or
+/// sign-extended by `kind`. The checks are the same as the Tier 0 access;
+/// on refusal nothing was read and the instruction reruns there.
+extern "C" fn load(entry: *mut Entry, address: u32, kind: u32) -> u64 {
     // SAFETY: called only by emitted code inside `run_block`, which derived
     // `memory` from its exclusive borrow and does not touch it until return.
     let (memory, inline) = unsafe { (&*(*entry).memory, &mut (*entry).inline) };
-    if !crate::interpreter::accessible(memory, address, 4, crate::READ) {
+    let width = (kind & 7) as u8;
+    if !crate::interpreter::accessible(memory, address, width, crate::READ) {
         return 1 << 32;
     }
-    match memory.read_data(address, 4) {
-        Ok(bytes) => {
-            *inline += 1;
-            u64::from(u32::from_le_bytes(
-                bytes.as_ref().try_into().expect("checked scalar size"),
-            ))
-        }
-        Err(_) => 1 << 32,
-    }
+    let Ok(bytes) = memory.read_data(address, width as usize) else {
+        return 1 << 32;
+    };
+    *inline += 1;
+    let mut raw = [0; 4];
+    raw[..bytes.len()].copy_from_slice(&bytes);
+    let value = u32::from_le_bytes(raw);
+    let unused = 32 - 8 * u32::from(width);
+    u64::from(if kind & emit::SIGNED != 0 {
+        ((value << unused) as i32 >> unused) as u32
+    } else {
+        value
+    })
 }
 
 /// Checked 4-byte guest store without leaving native code. A store to
@@ -242,10 +248,16 @@ impl Engine {
             if !emit::supported(&instruction) {
                 continue;
             }
-            if instruction.is_jcc_short_or_near() || instruction.mnemonic() == Mnemonic::Jmp {
+            if instruction.is_jcc_short_or_near()
+                || matches!(instruction.mnemonic(), Mnemonic::Jmp | Mnemonic::Call)
+            {
                 queue.push_back(instruction.near_branch32());
             }
-            if instruction.flow_control() != FlowControl::UnconditionalBranch {
+            // A call's return point is likely code; bytes after RET or JMP are not.
+            if !matches!(
+                instruction.flow_control(),
+                FlowControl::UnconditionalBranch | FlowControl::Return
+            ) {
                 queue.push_back(instruction.next_ip32());
             }
         }
