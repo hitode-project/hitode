@@ -754,6 +754,25 @@ impl Emitter {
         }
         let d = register(i.op0_register()).unwrap_or(31);
         match i.mnemonic() {
+            M::Mov if i.op0_kind() == OpKind::Register && i.op0_register().size() < 4 => {
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, i.memory_size().size() as u32);
+                    self.write_register(i.op0_register(), 0);
+                } else {
+                    self.operand(9, i, 1);
+                    self.write_register(i.op0_register(), 9);
+                }
+            }
+            M::Mov if i.op0_kind() == OpKind::Memory && i.memory_size().size() < 4 => {
+                self.ea(i, true);
+                self.mov(1, 9);
+                self.operand(2, i, 1);
+                self.store(i.memory_size().size() as u32);
+                self.stored(pc, Some(i.next_ip32()), false, |_| {});
+                return;
+            }
             M::Mov if i.op1_kind() == OpKind::Memory => {
                 self.ea(i, true);
                 self.mov(1, 9);
@@ -897,8 +916,16 @@ impl Emitter {
                 self.write_register(i.op1_register(), 9);
             }
             M::Push => {
+                if i.op0_kind() == OpKind::Memory {
+                    // Read with the original ESP before forming the push address.
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(2, 0);
+                } else {
+                    self.operand(2, i, 0);
+                }
                 self.esp_sub(1);
-                self.operand(2, i, 0);
                 self.store(4);
                 self.stored(pc, Some(i.next_ip32()), false, |e| e.esp_sub(23));
                 return;
@@ -922,6 +949,14 @@ impl Emitter {
                 // POP ESP stores the loaded value after the increment.
                 self.esp_add(4);
                 self.mov(d, 0);
+            }
+            M::Leave => {
+                self.mov(1, 24);
+                self.load(pc, 4);
+                // Neither ESP nor EBP changes if the checked read refuses.
+                self.mov(23, 24);
+                self.esp_add(4);
+                self.mov(24, 0);
             }
             M::Call => {
                 let target = if i.op0_kind() == OpKind::NearBranch32 {
@@ -1060,13 +1095,13 @@ impl Emitter {
                 if i.op1_kind() == OpKind::Memory {
                     self.ea(i, true);
                     self.mov(1, 9);
-                    self.load(pc, 4);
+                    self.load(pc, i.memory_size().size() as u32);
                     self.mov(10, 0);
-                    self.mov(9, d);
+                    self.read_register(9, i.op0_register(), false);
                 } else if i.op0_kind() == OpKind::Memory {
                     self.ea(i, true);
                     self.mov(1, 9);
-                    self.load(pc, 4);
+                    self.load(pc, i.memory_size().size() as u32);
                     self.mov(9, 0);
                     self.operand(10, i, 1);
                 } else {
@@ -1083,7 +1118,7 @@ impl Emitter {
                 let width = if i.op0_kind() == OpKind::Register {
                     i.op0_register().size() as u32
                 } else {
-                    4
+                    i.memory_size().size() as u32
                 };
                 self.alu(m, width, 8);
                 if !matches!(m, M::Cmp | M::Test) {

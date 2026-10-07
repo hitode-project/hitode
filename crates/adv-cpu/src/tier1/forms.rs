@@ -188,15 +188,15 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     match i.mnemonic() {
         M::Nop => true,
         M::Mov => {
-            dst && source(i, 1)
-                || dst
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_size().size() == 4
+            let memory = |op| {
+                i.op_kind(op) == OpKind::Memory
+                    && matches!(i.memory_size().size(), 1 | 2 | 4)
                     && address(i)
-                || i.op0_kind() == OpKind::Memory
-                    && i.memory_size().size() == 4
-                    && source(i, 1)
-                    && address(i)
+            };
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some()
+                && (rmw_source(i) || memory(1))
+                || memory(0) && rmw_source(i)
         }
         M::Lea => dst && i.op1_kind() == OpKind::Memory && address(i),
         M::Movzx | M::Movsx => {
@@ -252,18 +252,19 @@ pub(crate) fn supported(i: &Instruction) -> bool {
                 && register_part(i.op1_register()).is_some()
         }
         M::Add | M::Adc | M::Sub | M::Sbb | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
-            let memory =
-                |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
-            dst && (source(i, 1) || memory(1))
-                || !matches!(i.mnemonic(), M::Adc | M::Sbb)
-                    && i.op0_kind() == OpKind::Register
-                    && register_part(i.op0_register()).is_some_and(|(_, _, bits)| bits < 32)
-                    && rmw_source(i)
+            let memory = |op| {
+                i.op_kind(op) == OpKind::Memory
+                    && matches!(i.memory_size().size(), 1 | 2 | 4)
+                    && address(i)
+            };
+            i.op0_kind() == OpKind::Register && register_part(i.op0_register()).is_some()
+                && (rmw_source(i) || memory(1))
                 // Memory destinations that do not write use the same ALU.
-                || matches!(i.mnemonic(), M::Cmp | M::Test) && memory(0) && source(i, 1)
+                || matches!(i.mnemonic(), M::Cmp | M::Test) && memory(0) && rmw_source(i)
         }
-        M::Push => i.stack_pointer_increment() == -4 && source(i, 0),
+        M::Push => i.stack_pointer_increment() == -4 && (source(i, 0) || scalar32(i, 0)),
         M::Pop => dst && i.stack_pointer_increment() == 4,
+        M::Leave => i.code() == Code::Leaved,
         M::Call | M::Jmp => {
             i.op0_kind() == OpKind::NearBranch32
                 || dst
