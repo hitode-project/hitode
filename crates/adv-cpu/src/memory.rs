@@ -145,6 +145,22 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Search the existing page table in one bounded metadata slice pass. This
+    /// does not issue a guest access/protection query for every empty page.
+    pub(crate) fn next_mapped_page(&self, addr: u32, limit: u64) -> Option<u32> {
+        let begin = u64::from(addr).max(u64::from(self.base));
+        let end = limit.min(u64::from(self.base) + self.len as u64);
+        if begin >= end {
+            return None;
+        }
+        let first = ((begin - u64::from(self.base)) / PAGE_SIZE as u64) as usize;
+        let last = ((end - u64::from(self.base)) / PAGE_SIZE as u64) as usize;
+        self.mapped[first..last]
+            .iter()
+            .position(|&mapped| mapped)
+            .map(|offset| self.base + ((first + offset) * PAGE_SIZE) as u32)
+    }
+
     pub(crate) fn is_parallel(&self) -> bool {
         self.parallel_view || self.parallel.is_some()
     }

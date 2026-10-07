@@ -129,6 +129,12 @@ impl Vm {
             .filter(|&(b, s)| addr - b < s)
     }
 
+    /// First reservation beginning at or after `addr`. Uses the existing owner
+    /// index, so an unmapped guard or a reserved loader arena remains occupied.
+    pub fn next_reserved(&self, addr: u32) -> Option<u32> {
+        self.used.range(addr..).next().map(|(&base, _)| base)
+    }
+
     /// Unmap and release the region starting at `addr`. Unmapped pages (guards) are skipped.
     pub fn free(&mut self, cpu: &mut dyn Guest, addr: u32) -> Result<(), MemFault> {
         let size = self.used.get(&addr).copied().ok_or(MemFault { addr, len: 0 })?;

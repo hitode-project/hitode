@@ -585,6 +585,22 @@ impl Guest for Engine<'_> {
         }
         true
     }
+    fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
+        let regions = self.mem_regions().map_err(|_| MemFault { addr, len: 0 })?;
+        let mapped = regions
+            .iter()
+            .filter(|r| r.end >= u64::from(addr) && r.begin < limit)
+            .map(|r| r.begin.max(u64::from(addr)) as u32)
+            .min();
+        let file = self
+            .get_data()
+            .file_pages
+            .range(addr..)
+            .next()
+            .map(|(&page, _)| page)
+            .filter(|&page| u64::from(page) < limit);
+        Ok(mapped.into_iter().chain(file).min())
+    }
     fn map(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
         if self
             .get_data()
@@ -661,6 +677,9 @@ impl Guest for Engine<'_> {
 }
 
 impl Guest for UnicornCpu {
+    fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
+        self.uc.next_mapped_page(addr, limit)
+    }
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
         self.uc.capture_state()
     }

@@ -260,6 +260,13 @@ pub trait Guest {
     fn accessible(&self, _addr: u32, _len: u32, _prot: Prot) -> bool {
         false
     }
+    /// First actually mapped page in `[addr, limit)`, including pages with no
+    /// access permission and lazy file bindings. Bounds must be page-aligned.
+    /// Query the backend's existing mapping metadata without reading guest bytes.
+    /// Unsupported backends reject rather than claim an unknown range is free.
+    fn next_mapped_page(&self, addr: u32, _limit: u64) -> Result<Option<u32>, MemFault> {
+        Err(MemFault { addr, len: 0 })
+    }
     /// Map zeroed memory. Page-aligned `addr` and `size`. Allowed from inside trap handlers.
     fn map(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault>;
     fn protect(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault>;

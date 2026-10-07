@@ -124,6 +124,9 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
+        Ok(self.memory.next_mapped_page(addr, limit))
+    }
     fn quiesce_memory(&mut self) {
         self.memory.quiesce_workers();
     }
@@ -268,6 +271,9 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
+        Ok(self.inner.memory.next_mapped_page(addr, limit))
+    }
     fn quiesce_memory(&mut self) {
         self.inner.memory.quiesce_workers();
     }

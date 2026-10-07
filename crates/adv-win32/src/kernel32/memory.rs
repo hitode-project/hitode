@@ -285,6 +285,7 @@ fn page_protection(env: &Env<'_>, page: u32) -> Option<u32> {
 /// while their actual protection and allocation match.
 fn virtual_query(env: &mut Env<'_>) -> Outcome {
     const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
     const MEM_FREE: u32 = 0x1_0000;
     const MEM_PRIVATE: u32 = 0x2_0000;
     const MEM_MAPPED: u32 = 0x4_0000;
@@ -350,7 +351,37 @@ fn virtual_query(env: &mut Env<'_>) -> Outcome {
                     },
                 ]
             }
-            None => [page, 0, 0, PAGE, MEM_FREE, 0x01, 0],
+            None => {
+                // Query begins at the supplied page, including when it lies in
+                // the middle of a free gap. Reservations are occupied even when
+                // their guard/loader pages have no actual backend mapping.
+                let upper = u64::from(MAX_APPLICATION_ADDRESS) + 1;
+                let reserved = env.sys.vm.containing(page);
+                let limit = reserved
+                    .map_or_else(
+                        || env.sys.vm.next_reserved(page).map_or(upper, u64::from),
+                        |(base, size)| u64::from(base) + u64::from(size),
+                    )
+                    .min(upper);
+                let Ok(next) = env.cpu.next_mapped_page(page, limit) else {
+                    set_last_error(env, 998);
+                    return Outcome::Return(0);
+                };
+                let end = next.map_or(limit, u64::from);
+                [
+                    page,
+                    reserved.map_or(0, |(base, _)| base),
+                    0,
+                    (end - u64::from(page)) as u32,
+                    if reserved.is_some() {
+                        MEM_RESERVE
+                    } else {
+                        MEM_FREE
+                    },
+                    0,
+                    if reserved.is_some() { MEM_PRIVATE } else { 0 },
+                ]
+            }
         }
     };
     for (i, v) in info.into_iter().enumerate() {
