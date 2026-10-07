@@ -1014,9 +1014,15 @@ fn run(options: Options) -> Result<u8, String> {
 }
 
 fn compile_thread_count(cores: usize, guest_workers: usize) -> usize {
-    // Keep the small-host policy. Larger hosts can serve another compile
-    // without consuming the cores reserved for execution, audio and presentation.
-    let cap = if cores >= 8 { 4 } else { 3 };
+    // Keep the small-host policy. Larger desktop hosts can serve another
+    // compile without consuming the cores reserved for execution, audio and
+    // presentation. Phone SoCs count efficiency cores toward eight, so Android
+    // keeps three until headed device runs show a fourth worker helps there.
+    let cap = if cores >= 8 && !cfg!(target_os = "android") {
+        4
+    } else {
+        3
+    };
     cores
         .saturating_sub(guest_workers.saturating_add(1))
         .clamp(1, cap)
@@ -1032,7 +1038,8 @@ fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
             );
         }
         for cores in [8, 10, 16, 128] {
-            assert_eq!(compile_thread_count(cores, guests), 4);
+            let cap = if cfg!(target_os = "android") { 3 } else { 4 };
+            assert_eq!(compile_thread_count(cores, guests), cap);
             assert!(compile_thread_count(cores, guests) + guests + 1 <= cores);
         }
     }
