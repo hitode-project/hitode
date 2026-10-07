@@ -1,7 +1,12 @@
-//! BMP export of authoritative CPU surface storage; never read a stale GPU shadow.
+//! BMP/PNG export of authoritative CPU surface storage; never read a stale GPU shadow.
 use super::*;
 
-pub(crate) fn bmp(env: &mut Env<'_>, surface: u32, rect: Option<RECT>) -> Result<Vec<u8>, u32> {
+pub(crate) fn image(
+    env: &mut Env<'_>,
+    surface: u32,
+    rect: Option<RECT>,
+    file_format: u32,
+) -> Result<Vec<u8>, u32> {
     if env.ext.try_get::<State>().is_none() {
         return Err(INVALID);
     }
@@ -14,7 +19,7 @@ pub(crate) fn bmp(env: &mut Env<'_>, surface: u32, rect: Option<RECT>) -> Result
         adv_abi::warn_unavailable(
             env,
             "d3dx9_43.dll!D3DXSaveSurfaceToFileInMemory",
-            "BMP export requires CPU-readable A8R8G8B8/X8R8G8B8 surface storage",
+            "image export requires CPU-readable A8R8G8B8/X8R8G8B8 surface storage",
         );
         return Err(INVALID);
     }
@@ -45,7 +50,37 @@ pub(crate) fn bmp(env: &mut Env<'_>, surface: u32, rect: Option<RECT>) -> Result
         let row = &mut pixels[(y * width * 4) as usize..((y + 1) * width * 4) as usize];
         env.cpu.read(storage + offset, row).map_err(|_| INVALID)?;
     }
-    encode(width, height, &pixels, desc.Format == 21).ok_or(INVALID)
+    if file_format == 3 {
+        encode_png(width, height, &pixels, desc.Format == 21).ok_or(INVALID)
+    } else {
+        encode(width, height, &pixels, desc.Format == 21).ok_or(INVALID)
+    }
+}
+
+fn encode_png(width: u32, height: u32, bgra: &[u8], alpha: bool) -> Option<Vec<u8>> {
+    let mut pixels = Vec::with_capacity(bgra.len());
+    for p in bgra.chunks_exact(4) {
+        pixels.extend_from_slice(&[p[2], p[1], p[0]]);
+        if alpha {
+            pixels.push(p[3]);
+        }
+    }
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(if alpha {
+            png::ColorType::Rgba
+        } else {
+            png::ColorType::Rgb
+        });
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .ok()?
+            .write_image_data(&pixels)
+            .ok()?;
+    }
+    Some(bytes)
 }
 
 fn encode(width: u32, height: u32, bgra: &[u8], alpha: bool) -> Option<Vec<u8>> {

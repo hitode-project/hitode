@@ -79,6 +79,11 @@ void mainCRTStartup(void){
       an independent VFS policy, not part of this image-export fixture. */
    file=CreateFileW(path,GENERIC_READ,0,0,OPEN_EXISTING,0,0);check(file!=INVALID_HANDLE_VALUE);
    check(FAILED(savefile(path,0,s,0,0)));CloseHandle(file);
+   required(savefile(L"thumb-png.png",3,s,0,0));
+   file=CreateFileW(L"thumb-png.png",GENERIC_READ,1,0,OPEN_EXISTING,0,0);check(file!=INVALID_HANDLE_VALUE);if(file==INVALID_HANDLE_VALUE)finish();
+   check(ReadFile(file,filebytes,sizeof(filebytes),&filelength,0));CloseHandle(file);
+   check(filelength>8&&filebytes[0]==137&&filebytes[1]==80&&filebytes[2]==78&&filebytes[3]==71);
+   texture_roundtrip(d,&filebuffer);
  }
  check(FAILED(save(&b,0,s,0,&bad)));
  required(IDirect3DDevice9_CreateRenderTarget(d,4,3,21,0,0,FALSE,&target,0));
