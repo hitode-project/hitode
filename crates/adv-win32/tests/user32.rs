@@ -1690,6 +1690,69 @@ fn end_dialog_during_initialization_returns_without_showing_or_activating() {
 }
 
 #[test]
+fn message_box_waits_for_the_user_to_press_one_of_its_buttons() {
+    use adv_win32::user32::dialog::{self, DialogEvent};
+    let mut t = T::new();
+    let text = t.text("Run in full screen?");
+    let caption = t.text("Display");
+    let mut a = Asm::new(CODE);
+    // MB_YESNO | MB_DEFBUTTON2
+    let result = t.call(
+        &mut a,
+        "MessageBoxA",
+        &[I(0), I(text), I(caption), I(0x104)],
+    );
+    t.start(a);
+    // Nothing answers for the user: the guest blocks in the modal loop.
+    assert!(matches!(
+        t.m.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    let snapshot = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+    let [projected] = snapshot.dialogs.as_slice() else {
+        panic!("{snapshot:?}");
+    };
+    assert!(projected.modal);
+    assert_eq!(projected.text, "Display");
+    let label = projected
+        .controls
+        .iter()
+        .find(|c| c.class.eq_ignore_ascii_case("Static"))
+        .unwrap();
+    assert_eq!(label.text, "Run in full screen?");
+    let buttons: Vec<_> = projected
+        .controls
+        .iter()
+        .filter(|c| c.class.eq_ignore_ascii_case("Button"))
+        .map(|c| (c.target.id, c.text.as_str(), c.style & 0xf))
+        .collect();
+    assert_eq!(buttons, [(7, "No", 1), (6, "Yes", 0)]);
+    assert!(projected.controls.iter().all(|c| c.supported));
+    let yes = projected
+        .controls
+        .iter()
+        .find(|c| c.target.id == 6)
+        .unwrap();
+    let mut env = adv_machine::Env {
+        context: t.m.sys.current,
+        cpu: &mut t.m.cpu,
+        sys: &mut t.m.sys,
+        ext: &mut t.m.ext,
+        thunk: 0,
+    };
+    assert!(dialog::post_host_event(
+        &mut env,
+        DialogEvent::Click(yes.target)
+    ));
+    t.finish();
+    assert_eq!(t.u32(result), 6);
+    let after = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+    assert!(after.dialogs.is_empty());
+}
+
+#[test]
 fn auto_dialog_clicks_the_default_button_after_its_virtual_deadline() {
     for (extended, unicode) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut t = T::with_auto_dialog(Some(25));

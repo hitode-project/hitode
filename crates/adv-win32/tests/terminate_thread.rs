@@ -82,15 +82,14 @@ fn case(jit: bool, blocked: bool) {
         Clock::virtual_time(),
     )
     .unwrap();
-    Win32::install(
-        &mut machine,
-        Win32Config::new(
-            "/nonexistent/terminate-thread-probe",
-            "terminate-thread-probe.exe",
-            "/nonexistent/terminate-thread-probe-data",
-        ),
-    )
-    .unwrap();
+    let mut config = Win32Config::new(
+        "/nonexistent/terminate-thread-probe",
+        "terminate-thread-probe.exe",
+        "/nonexistent/terminate-thread-probe-data",
+    );
+    // Message boxes are modal dialogs; the headless policy answers them.
+    config.auto_dialog_ms = Some(0);
+    Win32::install(&mut machine, config).unwrap();
     machine.cpu.map(CODE, 0x3000, Prot::RX).unwrap();
     machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
     for (pointer, bytes) in [

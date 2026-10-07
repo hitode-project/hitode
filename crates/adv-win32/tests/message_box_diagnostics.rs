@@ -55,6 +55,8 @@ fn fixture<B: Backend>(cpu: B, codepage: u32) -> Machine<B> {
         "/nonexistent/message-box-probe-data",
     );
     config.os.codepage = codepage;
+    // Message boxes are modal dialogs; the headless policy answers them.
+    config.auto_dialog_ms = Some(0);
     Win32::install(&mut machine, config).unwrap();
     machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
     machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
@@ -138,7 +140,14 @@ fn text_and_defaults<B: Backend>(cpu: B, codepage: u32) {
     assert_eq!(diagnostics.dropped_message_boxes, 0);
     assert_eq!(diagnostics.stub_calls, 0);
     for (index, (record, style)) in diagnostics.message_boxes.iter().zip(styles).enumerate() {
-        let result = if matches!(style & 0xf, 3 | 4) { 6 } else { 1 };
+        // The headless policy presses each type's first (default) button.
+        let result = match style & 0xf {
+            2 => 3,
+            3 | 4 => 6,
+            5 => 4,
+            6 => 2,
+            _ => 1,
+        };
         assert_eq!(record.api, "user32.dll!MessageBoxA");
         assert_eq!(record.caller, callers[index]);
         assert_eq!(record.context, 0);
