@@ -285,6 +285,8 @@
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/floor-floorf-floorl",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ceil-ceilf-ceill",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fabs-fabsf-fabsl"
-    ]
+    ],
+    "native_oracle_source_sha256": "fffaf19a1e0de2acd6f263f4d4a042974ba2133ea5b60e2c4bac6631fd534a33",
+    "native_verification": "Authored VC80 probe measures 45 cases: finite rounding, signed zero, infinities, quiet-NaN payload/sign and EDOM, x87 rounding/control preservation, signaling-NaN invalid status and fabs denormal status. Guest tests cover typed binary64 arguments, x87 return and lower stack, caller stack cleanup and shared error ownership. Signaling-NaN and subnormal fabs status/exception handling remain qualified unsupported failures; custom matherr callbacks are outside the existing CRT profile."
   }
 }
