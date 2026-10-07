@@ -1,7 +1,7 @@
 use super::*;
 use adv_cpu::{
     JitCpu,
-    backend::{Backend, Reg},
+    backend::{Backend, Guest, Reg},
 };
 use adv_machine::{
     Clock, Machine,
@@ -363,4 +363,152 @@ fn process_and_remote_thread_waits_require_synchronize_before_acquiring_objects(
         waits(|| JitCpu::new(PARK_ADDR, jit).unwrap());
     }
     waits(|| UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+#[test]
+fn thread_timing_failure_and_group_affinity_preserve_outputs_and_check_access() {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), 0x1000);
+    let identity = m.sys.thread_identity(0).unwrap();
+    let query = m.sys.objects.insert(Object::RemoteThread {
+        identity: identity.clone(),
+        access: 0x800,
+    });
+    let set = m.sys.objects.insert(Object::RemoteThread {
+        identity,
+        access: 0x20,
+    });
+    let pseudo = u32::MAX - 1;
+    for (handle, error) in [(pseudo, 50), (query, 50), (set, 5), (0, 6)] {
+        m.cpu.write(OUT, &[0xa5; 32]).unwrap();
+        assert_eq!(
+            returned(call(
+                &mut m,
+                "GetThreadTimes",
+                &[handle, OUT, OUT + 8, OUT + 16, OUT + 24]
+            )),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m, 0)), error);
+        let mut bytes = [0; 32];
+        m.cpu.read(OUT, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa5; 32]);
+    }
+    for handle in [pseudo, query] {
+        assert_eq!(
+            returned(call(&mut m, "GetThreadGroupAffinity", &[handle, OUT])),
+            1
+        );
+        assert_eq!(m.cpu.read_u32(OUT).unwrap(), 1);
+        assert_eq!(m.cpu.read_u32(OUT + 4).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(OUT + 8).unwrap(), 0);
+    }
+    assert_eq!(
+        returned(call(&mut m, "GetThreadGroupAffinity", &[set, OUT])),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m, 0)), 5);
+    assert_eq!(
+        returned(call(&mut m, "SetThreadGroupAffinity", &[query, OUT, 0])),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m, 0)), 5);
+    for handle in [pseudo, set] {
+        assert_eq!(
+            returned(call(&mut m, "SetThreadGroupAffinity", &[handle, OUT, OUT])),
+            1
+        );
+        assert_eq!(
+            returned(call(&mut m, "SetThreadGroupAffinity", &[handle, OUT, 0])),
+            1
+        );
+    }
+    m.cpu.write_u32(OUT, 0).unwrap();
+    assert_eq!(
+        returned(call(&mut m, "SetThreadGroupAffinity", &[pseudo, OUT, 0])),
+        1
+    );
+    for words in [[2, 0, 0], [1, 1, 0], [1, 0x10000, 0], [1, 0, 1]] {
+        for (index, word) in words.into_iter().enumerate() {
+            m.cpu.write_u32(OUT + index as u32 * 4, word).unwrap();
+        }
+        m.cpu.write(OUT + 16, &[0xa5; 12]).unwrap();
+        assert_eq!(
+            returned(call(
+                &mut m,
+                "SetThreadGroupAffinity",
+                &[pseudo, OUT, OUT + 16]
+            )),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m, 0)), 87);
+        let mut bytes = [0; 12];
+        m.cpu.read(OUT + 16, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa5; 12]);
+    }
+}
+
+#[test]
+fn processor_topology_query_sizes_filtering_and_number_share_one_profile() {
+    let mut m = machine(JitCpu::new(PARK_ADDR, false).unwrap(), 0x1000);
+    m.cpu.write_u32(OUT, u32::MAX).unwrap();
+    assert_eq!(
+        returned(call(&mut m, "GetCurrentProcessorNumberEx", &[OUT])),
+        0
+    );
+    assert_eq!(m.cpu.read_u32(OUT).unwrap(), 0);
+    let length = OUT + 0x200;
+    for (relation, expected) in [(0, 44), (1, 44), (3, 44), (4, 76), (0xffff, 208)] {
+        m.cpu.write_u32(length, 0).unwrap();
+        assert_eq!(
+            returned(call(
+                &mut m,
+                "GetLogicalProcessorInformationEx",
+                &[relation, 0, length]
+            )),
+            0
+        );
+        assert_eq!(crate::util::last_error(&env(&mut m, 0)), 122);
+        assert_eq!(m.cpu.read_u32(length).unwrap(), expected);
+        m.cpu.write_u32(length, expected - 1).unwrap();
+        m.cpu.write(OUT, &[0xa5; 208]).unwrap();
+        assert_eq!(
+            returned(call(
+                &mut m,
+                "GetLogicalProcessorInformationEx",
+                &[relation, OUT, length]
+            )),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(OUT).unwrap(), 0xa5a5a5a5);
+        assert_eq!(
+            returned(call(
+                &mut m,
+                "GetLogicalProcessorInformationEx",
+                &[relation, OUT, length]
+            )),
+            1
+        );
+        let mut offset = 0;
+        while offset < expected {
+            let kind = m.cpu.read_u32(OUT + offset).unwrap();
+            assert!(relation == 0xffff || kind == relation);
+            let size = m.cpu.read_u32(OUT + offset + 4).unwrap();
+            assert_eq!(size, if kind == 4 { 76 } else { 44 });
+            let mask_offset = if kind == 4 { 72 } else { 32 };
+            assert_eq!(m.cpu.read_u32(OUT + offset + mask_offset).unwrap(), 1);
+            offset += size;
+        }
+        assert_eq!(offset, expected);
+    }
+    m.cpu.write_u32(length, 999).unwrap();
+    assert_eq!(
+        returned(call(
+            &mut m,
+            "GetLogicalProcessorInformationEx",
+            &[99, OUT, length]
+        )),
+        0
+    );
+    assert_eq!(crate::util::last_error(&env(&mut m, 0)), 87);
+    assert_eq!(m.cpu.read_u32(length).unwrap(), 999);
 }
