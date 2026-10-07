@@ -31,13 +31,14 @@ const MAX_WINDOW_LEASES: usize = 4096;
 enum WindowDcUse {
     Get,
     Paint(u32),
+    Erase,
 }
-#[derive(Clone, Copy)]
 struct WindowDcLease {
     context: u32,
     hwnd: u32,
     dc: u32,
     usage: WindowDcUse,
+    paint_before: Option<Option<Vec<[i32; 4]>>>,
 }
 pub fn install<B: Backend>(machine: &mut Machine<B>) {
     let gdi = machine.ext.get::<Win32>().gdi.clone();
@@ -210,6 +211,7 @@ fn acquire_window_dc(env: &mut Env<'_>, hwnd: u32, usage: WindowDcUse, api: &str
             hwnd,
             dc,
             usage,
+            paint_before: None,
         });
     Outcome::Return(dc)
 }
@@ -252,7 +254,14 @@ fn release_window_dc(env: &mut Env<'_>, hwnd: u32, dc: u32, usage: WindowDcUse) 
     }) else {
         return false;
     };
-    state.window_leases.remove(index);
+    let lease = state.window_leases.remove(index);
+    if let Some(previous) = lease.paint_before
+        && let Some(adv_os::gdi::GdiObj::Dc { clip, .. }) =
+            env.ext.get::<Win32>().gdi.get_mut(&mut env.sys.objects, dc)
+    {
+        clip.replace_paint_region(previous);
+    }
+    let state = env.ext.get::<State>();
     if !state.window_leases.iter().any(|lease| lease.dc == dc) {
         super::super::release_dc(env, dc);
     }
@@ -288,7 +297,7 @@ fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Ou
     else {
         return Outcome::Return(0);
     };
-    let (width, height) = window.client_size();
+    let old = crate::user32::update::snapshot(window);
     if let Err(error) = adv_abi::guest::check_range(env.cpu, paint.addr(), 64, Prot::WRITE) {
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
@@ -302,16 +311,91 @@ fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Ou
         Outcome::Return(dc) => dc,
         other => return other,
     };
+    set_paint_layer(env, dc, old.rects.clone());
     let mut bytes = [0u8; 64];
     bytes[..4].copy_from_slice(&dc.to_le_bytes());
-    bytes[16..20].copy_from_slice(&width.to_le_bytes());
-    bytes[20..24].copy_from_slice(&height.to_le_bytes());
+    let unerased = old.unerased && !old.rects.is_empty();
+    bytes[4..8].copy_from_slice(&u32::from(unerased).to_le_bytes());
+    for (field, value) in bytes[8..24]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(old.bounds())
+    {
+        *field = value.to_le_bytes();
+    }
     if let Err(error) = paint.write(env.cpu, bytes) {
         release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
     crate::user32::message::validate(env, hwnd.0);
+    if old.erase && !old.rects.is_empty() {
+        return crate::user32::message::send(
+            env,
+            hwnd.0,
+            crate::user32::window::wm::ERASEBKGND,
+            dc,
+            0,
+            move |env, handled| {
+                crate::user32::update::erased(env, hwnd.0, &old, handled != 0);
+                if !env
+                    .ext
+                    .get::<Win32>()
+                    .user
+                    .windows
+                    .contains_key(&env.sys.objects, &hwnd.0)
+                {
+                    release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
+                    return Outcome::Return(0);
+                }
+                if let Err(error) = GuestPtr::<u32>::new(paint.addr() + 4)
+                    .write(env.cpu, u32::from(unerased && handled == 0))
+                {
+                    release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
+                    return Outcome::Fail(format!("BeginPaint: {error}"));
+                }
+                Outcome::Return(dc)
+            },
+        );
+    }
     Outcome::Return(dc)
+}
+fn set_paint_layer(env: &mut Env<'_>, dc: u32, region: Vec<[i32; 4]>) {
+    let old = match env.ext.get::<Win32>().gdi.get_mut(&mut env.sys.objects, dc) {
+        Some(adv_os::gdi::GdiObj::Dc { clip, .. }) => clip.replace_paint_region(Some(region)),
+        _ => None,
+    };
+    env.ext
+        .get_mut::<State>()
+        .window_leases
+        .last_mut()
+        .unwrap()
+        .paint_before = Some(old);
+}
+pub(crate) fn erase_update(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    old: crate::user32::update::Snapshot,
+    then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
+) -> Outcome {
+    let dc = match acquire_window_dc(env, hwnd, WindowDcUse::Erase, "user32.dll!GetUpdateRect") {
+        Outcome::Return(0) => return Outcome::Return(0),
+        Outcome::Return(dc) => dc,
+        other => return other,
+    };
+    set_paint_layer(env, dc, old.rects.clone());
+    crate::user32::message::send(
+        env,
+        hwnd,
+        crate::user32::window::wm::ERASEBKGND,
+        dc,
+        0,
+        move |env, result| {
+            crate::user32::update::erased(env, hwnd, &old, result != 0);
+            release_window_dc(env, hwnd, dc, WindowDcUse::Erase);
+            then(env, result != 0)
+        },
+    )
 }
 /// End only the acquisition represented by this PAINTSTRUCT. The documented
 /// EndPaint return is always nonzero; an unmatched structure cannot retire a DC.

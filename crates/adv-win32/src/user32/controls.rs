@@ -134,7 +134,7 @@ fn set_button(env: &mut Env<'_>, hwnd: u32, f: impl FnOnce(u32) -> u32) {
         .get_mut(&mut env.sys.objects, &hwnd)
     {
         w.control.button = f(w.control.button);
-        w.needs_paint = true;
+        w.invalidate_client(true);
     }
 }
 
@@ -267,7 +267,7 @@ fn trackbar_proc(env: &mut Env<'_>) -> Outcome {
         }
     };
     if wp != 0 && matches!(msg, 0x405..=0x408) {
-        window.needs_paint = true;
+        window.invalidate_client(true);
     }
     Outcome::Return(result)
 }
@@ -434,7 +434,7 @@ fn combo_proc(env: &mut Env<'_>) -> Outcome {
             return Outcome::Return(u32::MAX);
         }
     };
-    window.needs_paint = true;
+    window.invalidate_client(true);
     Outcome::Return(result)
 }
 

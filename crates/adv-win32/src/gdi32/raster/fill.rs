@@ -245,6 +245,31 @@ fn paint_rectangles(
     }
 }
 
+/// The default USER background brush fills client device coordinates through
+/// the same brush/clip/pixel owner, independent of a retained MM_TEXT origin.
+pub(crate) fn erase_background(
+    env: &mut Env<'_>,
+    dc: u32,
+    width: i32,
+    height: i32,
+    brush: u32,
+    api: &str,
+) -> Outcome {
+    let Some(GdiObj::Dc { modes, .. }) = env.ext.get::<Win32>().gdi.get(&env.sys.objects, dc)
+    else {
+        return Outcome::Return(0);
+    };
+    let x = i64::from(modes.window_origin[0]) - i64::from(modes.viewport_origin[0]);
+    let y = i64::from(modes.window_origin[1]) - i64::from(modes.viewport_origin[1]);
+    paint_rectangles(
+        env,
+        Handle(dc),
+        Handle(brush),
+        &[[x, y, x + i64::from(width), y + i64::from(height)]],
+        api,
+    )
+}
+
 const CLR_INVALID: u32 = 0xffff_ffff;
 
 #[win32(gdi32, name = "SetPixel", level = implement)]

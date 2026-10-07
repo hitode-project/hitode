@@ -6,7 +6,7 @@ use adv_device::surface::{MemoryOperations, MemoryView, Snapshot, SurfaceStore};
 use adv_win32::gdi32::raster::front::{DrawingProvider, set_provider};
 use std::borrow::Cow;
 
-fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
+pub(super) fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
     MemoryView::new(
         cpu,
         MemoryOperations {

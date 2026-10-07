@@ -9,7 +9,7 @@ use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP, WINDOW_DC};
 pub(crate) mod clip;
 mod color_table;
 mod dib;
-mod fill;
+pub(crate) mod fill;
 pub mod front;
 pub use front::{DrawingProvider, install, register, set_provider};
 

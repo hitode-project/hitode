@@ -27,6 +27,7 @@ pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
 mod tab;
+pub(crate) mod update;
 pub mod window;
 
 use adv_abi::{Conv, Handle as AbiHandle, Registry, WideStr, win32};
@@ -528,6 +529,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    update::register(reg);
     formatting::register(reg);
     hooks::register(reg);
     monitor::register(reg);

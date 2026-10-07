@@ -4,6 +4,8 @@ pub struct DcClip {
     excluded: Vec<[i32; 4]>,
     /// Intersection limit in device units; origin changes never relocate it.
     intersection: Option<[i32; 4]>,
+    /// USER's current paint update region, separate from the application clip.
+    paint_region: Option<Vec<[i32; 4]>>,
 }
 impl DcClip {
     pub const MAX_RECTANGLES: usize = 64;
@@ -20,7 +22,25 @@ impl DcClip {
         true
     }
     pub fn is_default(&self) -> bool {
-        self.excluded.is_empty() && self.intersection.is_none()
+        self.excluded.is_empty() && self.intersection.is_none() && self.paint_region.is_none()
+    }
+    /// USER validates the bounded non-overlapping rectangle union before lending
+    /// it to this DC. Returning the previous layer supports nested BeginPaint.
+    pub fn replace_paint_region(&mut self, next: Option<Vec<[i32; 4]>>) -> Option<Vec<[i32; 4]>> {
+        std::mem::replace(&mut self.paint_region, next)
+    }
+    /// SaveDC captures the application's clipping state. The active USER paint
+    /// layer follows its lease and cannot be removed by restoring an older DC.
+    pub fn application_state(&self) -> Self {
+        Self {
+            excluded: self.excluded.clone(),
+            intersection: self.intersection,
+            paint_region: None,
+        }
+    }
+    pub fn restore_application(&mut self, saved: Self) {
+        self.excluded = saved.excluded;
+        self.intersection = saved.intersection;
     }
     pub fn intersect(&mut self, rect: [i32; 4]) {
         let [l, t, r, b] = rect;
@@ -41,6 +61,11 @@ impl DcClip {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         self.intersection
             .is_none_or(|[l, t, r, b]| x >= l && x < r && y >= t && y < b)
+            && self.paint_region.as_ref().is_none_or(|rects| {
+                rects
+                    .iter()
+                    .any(|&[l, t, r, b]| x >= l && x < r && y >= t && y < b)
+            })
             && !self
                 .excluded
                 .iter()
@@ -59,7 +84,33 @@ impl DcClip {
         if l >= r {
             return Vec::new();
         }
-        let mut spans = vec![(l, r)];
+        let mut spans = if let Some(rects) = &self.paint_region {
+            let mut spans = rects
+                .iter()
+                .filter_map(|&[a, t, z, b]| {
+                    if y < t || y >= b {
+                        return None;
+                    }
+                    let a = (a.max(0) as u32).max(l);
+                    let z = (z.max(0) as u32).min(r);
+                    (a < z).then_some((a, z))
+                })
+                .collect::<Vec<_>>();
+            spans.sort_unstable();
+            let mut joined: Vec<(u32, u32)> = Vec::new();
+            for (a, z) in spans {
+                if let Some(last) = joined.last_mut()
+                    && a <= last.1
+                {
+                    last.1 = last.1.max(z);
+                } else {
+                    joined.push((a, z));
+                }
+            }
+            joined
+        } else {
+            vec![(l, r)]
+        };
         for &[l, t, r, b] in &self.excluded {
             if y < t || y >= b {
                 continue;
@@ -141,5 +192,11 @@ impl DcClip {
             .iter()
             .flat_map(|r| [r[1], r[3]])
             .chain(self.intersection.into_iter().flat_map(|r| [r[1], r[3]]))
+            .chain(
+                self.paint_region
+                    .iter()
+                    .flatten()
+                    .flat_map(|r| [r[1], r[3]]),
+            )
     }
 }

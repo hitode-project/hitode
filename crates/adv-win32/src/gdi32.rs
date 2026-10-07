@@ -559,7 +559,7 @@ fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
                 bk_color: *bk_color,
                 bk_mode: *bk_mode,
                 modes: *modes,
-                clip: clip.clone(),
+                clip: clip.application_state(),
             });
             Outcome::Return(saved.len() as u32)
         }
@@ -616,7 +616,7 @@ fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
         *bk_color = state.bk_color;
         *bk_mode = state.bk_mode;
         *modes = state.modes;
-        *clip = state.clip;
+        clip.restore_application(state.clip);
     }
     Outcome::Return(1)
 }

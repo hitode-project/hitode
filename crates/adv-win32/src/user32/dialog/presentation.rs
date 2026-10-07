@@ -342,7 +342,7 @@ pub fn post_host_event(env: &mut Env<'_>, event: DialogEvent) -> bool {
                 .get_or_insert_with(TrackbarState::default);
             let value = value.clamp(track.min.min(track.max), track.min.max(track.max));
             track.value = value;
-            window.needs_paint = true;
+            window.invalidate_client(true);
             super::super::message::post(
                 env,
                 target.parent,
@@ -365,7 +365,7 @@ pub fn post_host_event(env: &mut Env<'_>, event: DialogEvent) -> bool {
                 .get_mut(&mut env.sys.objects, &target.hwnd)
                 .unwrap();
             window.text = text;
-            window.needs_paint = true;
+            window.invalidate_client(true);
             super::super::message::post(
                 env,
                 target.parent,

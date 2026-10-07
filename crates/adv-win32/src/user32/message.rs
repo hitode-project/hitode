@@ -858,7 +858,7 @@ pub fn queue_status(env: &mut Env<'_>) -> (u32, u32) {
     queue_status_for(env, env.context)
 }
 
-fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
+pub(super) fn queue_status_for(env: &mut Env<'_>, ctx: adv_machine::CtxId) -> (u32, u32) {
     let sent = u32::from(sent::pending(env, ctx)) * sent::QS_SEND;
     let now = env.sys.clock.now_us();
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
@@ -1973,7 +1973,7 @@ pub(super) fn def_window_proc_encoded(
                 .get_mut(&mut env.sys.objects, &hwnd)
             {
                 w.text = text;
-                w.needs_paint = true;
+                w.invalidate_client(true);
             }
             1
         }
@@ -2013,7 +2013,22 @@ pub(super) fn def_window_proc_encoded(
             validate(env, hwnd);
             0
         }
-        wm::ERASEBKGND => 1,
+        wm::ERASEBKGND => {
+            let Some(w) = user(env).windows.get(&env.sys.objects, &hwnd) else {
+                return then(env, 0);
+            };
+            let (width, height) = w.client_size();
+            let brush = user(env).classes[w.class].background;
+            if brush == 0 { return then(env, 0); }
+            let brush = if brush <= 31 {
+                super::system_colors::brush(env, brush - 1)
+            } else { brush };
+            let api = if wide { "user32.dll!DefWindowProcW" } else { "user32.dll!DefWindowProcA" };
+            return match crate::gdi32::raster::fill::erase_background(env, wp, width, height, brush, api) {
+                Outcome::Return(result) => then(env, result),
+                other => other,
+            };
+        }
         wm::NCHITTEST => 1, // HTCLIENT
         wm::MOUSEACTIVATE => 1,
         wm::ACTIVATE if wp & 0xffff != 0 => {
@@ -2051,7 +2066,7 @@ pub fn validate(env: &mut Env<'_>, hwnd: u32) {
         .windows
         .get_mut(&mut env.sys.objects, &hwnd)
     {
-        w.needs_paint = false;
+        super::update::clear(w);
         w.thread
     } else {
         return;
@@ -2067,29 +2082,6 @@ fn call_window_proc_a(env: &mut Env<'_>) -> Outcome {
 
 // ---- painting ----
 
-fn invalidate_rect(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
-    let u = &mut env.ext.get_mut::<crate::Win32>().user;
-    if hwnd == 0 {
-        u.windows
-            .for_each_mut(&mut env.sys.objects, |w| w.needs_paint = true);
-        return Outcome::Return(1);
-    }
-    match u.windows.get_mut(&mut env.sys.objects, &hwnd) {
-        Some(w) => {
-            w.needs_paint = true;
-            Outcome::Return(1)
-        }
-        None => Outcome::Return(0),
-    }
-}
-
-fn validate_rect(env: &mut Env<'_>) -> Outcome {
-    let hwnd = env.arg(0);
-    validate(env, hwnd);
-    Outcome::Return(1)
-}
-
 fn end_paint(env: &mut Env<'_>) -> Outcome {
     crate::gdi32::raster::front::end_paint_value(env, env.arg(0), env.arg(1))
 }
@@ -2103,7 +2095,7 @@ fn redraw_window(env: &mut Env<'_>) -> Outcome {
         .windows
         .get_mut(&mut env.sys.objects, &hwnd)
     {
-        w.needs_paint = true;
+        w.invalidate_client(true);
     }
     Outcome::Return(1)
 }
@@ -2135,8 +2127,6 @@ pub fn register(reg: &mut Registry) {
     s(reg, "KillTimer", 2, kill_timer);
     s(reg, "DefWindowProcA", 4, def_window_proc_a);
     s(reg, "CallWindowProcA", 5, call_window_proc_a);
-    s(reg, "InvalidateRect", 3, invalidate_rect);
-    s(reg, "ValidateRect", 2, validate_rect);
     s(reg, "EndPaint", 2, end_paint);
     s(reg, "RedrawWindow", 4, redraw_window);
 }

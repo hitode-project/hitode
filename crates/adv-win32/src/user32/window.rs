@@ -188,6 +188,7 @@ pub struct Class {
 /// Per-window state of built-in controls and dialogs.
 #[derive(Default)]
 pub struct ControlState {
+    pub(crate) update: super::update::UpdateRegion,
     pub(crate) scrolls: Option<[super::scroll::ScrollState; 2]>,
     /// Button check state (BST_*), and BST_PUSHED while the mouse is down.
     pub button: u32,
@@ -321,6 +322,9 @@ impl Windows {
 }
 
 impl Window {
+    pub(crate) fn invalidate_client(&mut self, erase: bool) {
+        super::update::invalidate_client(self, erase);
+    }
     pub fn visible(&self) -> bool {
         self.style & WS_VISIBLE != 0
     }
@@ -1573,7 +1577,7 @@ pub fn show_window(
         w.hidden_popup = false;
         if !was {
             w.style |= WS_VISIBLE;
-            w.needs_paint = true;
+            w.invalidate_client(true);
             msgs.push([hwnd, wm::SHOWWINDOW, 1, 0]);
         }
         if let Some(kind) = super::placement::show_state(w, cmd, (sw, sh), minimize_area) {
@@ -1727,7 +1731,7 @@ pub fn set_window_pos(
             w.rect = Rect::new(x, y, cx, cy);
             super::placement::position_changed(w);
             if flags & SWP_NOSIZE == 0 {
-                w.needs_paint = true;
+                w.invalidate_client(true);
             }
         }
         if flags & SWP_NOZORDER == 0
