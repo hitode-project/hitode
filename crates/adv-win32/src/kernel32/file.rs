@@ -138,7 +138,18 @@ fn read_contents(env: &Env<'_>, guest: &str) -> std::io::Result<Vec<u8>> {
 
 fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
     let (access, share, disposition) = (env.arg(1), env.arg(2), env.arg(4));
-    Outcome::Return(open_with_share(env, &path, access, disposition, share))
+    let inherit = match super::handle::security_inherit(env, env.arg(3)) {
+        Ok(inherit) => inherit,
+        Err(code) => {
+            set_last_error(env, code);
+            return Outcome::Return(INVALID_HANDLE_VALUE);
+        }
+    };
+    let handle = open_with_share(env, &path, access, disposition, share);
+    if handle != INVALID_HANDLE_VALUE {
+        super::handle::set_inherit(env, handle, inherit);
+    }
+    Outcome::Return(handle)
 }
 
 /// CreateFile's core for host callers (PAL's file API): open `path` with the given access
@@ -1271,7 +1282,11 @@ fn get_volume_information(env: &mut Env<'_>) -> Outcome {
 
 fn get_disk_free_space(env: &mut Env<'_>, wide: bool) -> Outcome {
     let root = env.arg(0);
-    let drive = if wide { drive_of_w(env, root) } else { drive_of(env, root) };
+    let drive = if wide {
+        drive_of_w(env, root)
+    } else {
+        drive_of(env, root)
+    };
     if drive != Some(b'C') {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
@@ -1290,7 +1305,11 @@ fn get_disk_free_space_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     const FREE: u64 = 64 << 30;
     const TOTAL: u64 = 256 << 30;
     let root = env.arg(0);
-    let drive = if wide { drive_of_w(env, root) } else { drive_of(env, root) };
+    let drive = if wide {
+        drive_of_w(env, root)
+    } else {
+        drive_of(env, root)
+    };
     if drive != Some(b'C') {
         set_last_error(env, err::PATH_NOT_FOUND);
         return Outcome::Return(0);
@@ -1333,8 +1352,20 @@ fn get_logical_drive_strings_w(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetLogicalDrives", 0, |_| Outcome::Return(1 << 2));
-    stdcall(reg, K32, "GetLogicalDriveStringsA", 2, get_logical_drive_strings_a);
-    stdcall(reg, K32, "GetLogicalDriveStringsW", 2, get_logical_drive_strings_w);
+    stdcall(
+        reg,
+        K32,
+        "GetLogicalDriveStringsA",
+        2,
+        get_logical_drive_strings_a,
+    );
+    stdcall(
+        reg,
+        K32,
+        "GetLogicalDriveStringsW",
+        2,
+        get_logical_drive_strings_w,
+    );
     stdcall(reg, K32, "GetDriveTypeA", 1, get_drive_type);
     stdcall(reg, K32, "GetDriveTypeW", 1, get_drive_type_w);
     stdcall(reg, K32, "QueryDosDeviceA", 3, query_dos_device_a);
@@ -1343,10 +1374,18 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "AreFileApisANSI", 0, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetFileApisToOEM", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "SetFileApisToANSI", 0, |_| Outcome::Return(0));
-    stdcall(reg, K32, "GetDiskFreeSpaceA", 5, |e| get_disk_free_space(e, false));
-    stdcall(reg, K32, "GetDiskFreeSpaceW", 5, |e| get_disk_free_space(e, true));
-    stdcall(reg, K32, "GetDiskFreeSpaceExA", 4, |e| get_disk_free_space_ex(e, false));
-    stdcall(reg, K32, "GetDiskFreeSpaceExW", 4, |e| get_disk_free_space_ex(e, true));
+    stdcall(reg, K32, "GetDiskFreeSpaceA", 5, |e| {
+        get_disk_free_space(e, false)
+    });
+    stdcall(reg, K32, "GetDiskFreeSpaceW", 5, |e| {
+        get_disk_free_space(e, true)
+    });
+    stdcall(reg, K32, "GetDiskFreeSpaceExA", 4, |e| {
+        get_disk_free_space_ex(e, false)
+    });
+    stdcall(reg, K32, "GetDiskFreeSpaceExW", 4, |e| {
+        get_disk_free_space_ex(e, true)
+    });
     stdcall(reg, K32, "CreateFileA", 7, |e| {
         let p = path_a(e, e.arg(0));
         create_file(e, p)

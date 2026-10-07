@@ -66,6 +66,9 @@ pub struct NativeContext {
     id: u64,
     failure: Arc<OnceLock<String>>,
     gate: Arc<submission::Gate>,
+    // Keep the software-device turn alive until its last process/compositor
+    // context is gone, including when the process that requested it exits.
+    _software: Option<Arc<SoftwareTurn>>,
 }
 
 impl NativeContext {
@@ -385,7 +388,8 @@ pub struct Gpu {
     frames: Vec<Image>,
     readbacks: Arc<AtomicUsize>,
     readback_limit: usize,
-    _software: Option<SoftwareTurn>,
+    // Keep the guard through destruction of this producer's resources too.
+    _software: Option<Arc<SoftwareTurn>>,
 }
 
 impl Gpu {
@@ -424,7 +428,7 @@ impl Gpu {
         surface: Option<&wgpu::Surface<'_>>,
         fallback: bool,
     ) -> Result<Self, Error> {
-        let software = fallback.then(SoftwareTurn::take);
+        let software = fallback.then(|| Arc::new(SoftwareTurn::take()));
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -462,6 +466,7 @@ impl Gpu {
             id: NEXT_RESOURCE.fetch_add(1, Ordering::Relaxed),
             failure,
             gate: submission::Gate::new().map_err(|error| Error::Unavailable(error.to_string()))?,
+            _software: software.clone(),
         };
         let error_scope = context
             .device
@@ -567,6 +572,50 @@ impl Gpu {
             readbacks: Arc::new(AtomicUsize::new(0)),
             readback_limit: MAX_READBACKS,
             _software: software,
+        })
+    }
+
+    /// A process-local command producer on this exact host device and queue.
+    /// Only immutable shader/layout data and the white fallback texture are
+    /// shared. Uploads, uniforms, caches, frame pools and transfer budgets start
+    /// fresh; no second adapter or device is requested.
+    pub fn fork(&self) -> Result<Self, Error> {
+        self.check()?;
+        let context = self.context.clone();
+        let upload = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("adv child vertex upload"),
+            size: 4096,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("adv child draw parameters"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Ok(Self {
+            context,
+            shader: self.shader.clone(),
+            layout: self.layout.clone(),
+            bindings: self.bindings.clone(),
+            pipelines: HashMap::new(),
+            pipeline_order: VecDeque::new(),
+            pipeline_limit: self.pipeline_limit,
+            programmable: program::Cache::default(),
+            samplers: HashMap::new(),
+            white: self.white.clone(),
+            upload,
+            upload_capacity: 4096,
+            uniform,
+            stats: Stats {
+                vertex_buffer_allocations: 1,
+                ..Stats::default()
+            },
+            frames: Vec::new(),
+            readbacks: Arc::new(AtomicUsize::new(0)),
+            readback_limit: self.readback_limit,
+            _software: self._software.clone(),
         })
     }
 

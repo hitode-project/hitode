@@ -87,7 +87,7 @@ fn run() -> Result<(), String> {
             SliceResult::Complete(RunResult::Exited(code)) => {
                 return Err(format!("guest exited {code} before decoded PCM"));
             }
-            SliceResult::Complete(RunResult::Failed(_)) => unreachable!(),
+            SliceResult::Complete(RunResult::Failed(_) | RunResult::HostRequest) => unreachable!(),
         }
     }
 }

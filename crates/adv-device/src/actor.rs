@@ -14,7 +14,7 @@ use adv_sync::{
 };
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
     sync::{
         Arc, OnceLock,
@@ -105,6 +105,15 @@ pub enum AudioEvent {
     Released {
         source: u64,
     },
+}
+impl AudioEvent {
+    /// Process namespacing uses the upper half of each source identity.
+    pub fn owner(&self) -> u32 {
+        let source = match self {
+            Self::Notification { source, .. } | Self::Released { source } => *source,
+        };
+        (source >> 32) as u32
+    }
 }
 pub(crate) enum Retired {
     Ring(Box<RingVoice>, Arc<RingState>),
@@ -207,6 +216,7 @@ struct Control {
     formats: BTreeMap<u64, (u32, Arc<SourceState>)>,
     rings: BTreeMap<u64, (u32, u32)>,
     pending_events: VecDeque<AudioEvent>,
+    retired_owners: BTreeSet<u32>,
     guest_us: u64,
 }
 /// Clone only within the execution thread. The SPSC endpoint itself is never cloned.
@@ -258,6 +268,7 @@ impl AudioControl {
                 formats: BTreeMap::new(),
                 rings: BTreeMap::new(),
                 pending_events: VecDeque::new(),
+                retired_owners: BTreeSet::new(),
                 guest_us: 0,
             })),
             stream,
@@ -314,7 +325,9 @@ impl AudioControl {
             }
         }
         while let Some(event) = local.events.pop() {
-            local.pending_events.push_back(event);
+            if !local.retired_owners.contains(&event.owner()) {
+                local.pending_events.push_back(event);
+            }
         }
         while let Some(command) = local.backlog.pop_front() {
             if let Err(command) = local.commands.push(command) {
@@ -326,6 +339,46 @@ impl AudioControl {
     pub fn take_events(&self) -> Vec<AudioEvent> {
         self.maintain();
         self.local.borrow_mut().pending_events.drain(..).collect()
+    }
+    /// Drain only one process's notices and release acknowledgements. Other
+    /// processes keep their events even when this frontend pumps first.
+    pub fn take_events_for_owner(&self, owner: u32) -> Vec<AudioEvent> {
+        self.maintain();
+        let mut local = self.local.borrow_mut();
+        let mut events = Vec::new();
+        for _ in 0..local.pending_events.len() {
+            let event = local.pending_events.pop_front().unwrap();
+            if event.owner() == owner {
+                events.push(event);
+            } else {
+                local.pending_events.push_back(event);
+            }
+        }
+        events
+    }
+    /// Retire every source owned by an exiting process, including movie PCM.
+    /// A saturated command queue returns false; repeat before dropping the
+    /// process. Accepted removals and later events remain safe on every retry.
+    pub fn remove_owner(&self, owner: u32) -> bool {
+        self.maintain();
+        let sources: Vec<u64> = {
+            let mut local = self.local.borrow_mut();
+            local.retired_owners.insert(owner);
+            local.pending_events.retain(|event| event.owner() != owner);
+            local
+                .rings
+                .keys()
+                .chain(local.formats.keys())
+                .copied()
+                .filter(|source| (source >> 32) as u32 == owner)
+                .collect()
+        };
+        let mut complete = true;
+        for source in sources {
+            complete &= self.remove_pcm(source);
+        }
+        self.maintain();
+        complete
     }
     pub fn playback_clock(&self) -> Arc<PlaybackClock> {
         self.stream.shared.clock.clone()
@@ -353,6 +406,9 @@ impl AudioControl {
     }
     pub fn add_ring(&self, source: u64, mut config: RingConfig) -> Result<Arc<RingState>, String> {
         let local = self.local.borrow();
+        if local.retired_owners.contains(&((source >> 32) as u32)) {
+            return Err("audio process owner has exited".into());
+        }
         if !local.rings.contains_key(&source) && local.rings.len() + local.formats.len() >= SOURCES
         {
             return Err("audio source limit".into());
@@ -455,6 +511,14 @@ impl AudioControl {
         true
     }
     pub fn push_pcm(&self, mut block: PcmBlock) -> Result<(), PcmBlock> {
+        if self
+            .local
+            .borrow()
+            .retired_owners
+            .contains(&((block.stream_id >> 32) as u32))
+        {
+            return Err(block);
+        }
         if block.sample_rate == 0
             || block.channels == 0
             || block.channels > 8

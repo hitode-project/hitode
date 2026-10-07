@@ -15,6 +15,7 @@ use crate::{Graphics, Snapshot};
 /// A running executable. Original game files are read-only; guest writes use `data_dir`.
 pub struct Runtime<B: Backend = JitCpu> {
     pub machine: Machine<B>,
+    pub(crate) family: crate::family::Family<B>,
 }
 
 /// One immutable presentation and its owned asynchronous pixel transfer.
@@ -180,7 +181,8 @@ impl<B: Backend> Runtime<B> {
         adv_dx::dshow::install(&mut machine);
         adv_dx::dxdiag::install(&mut machine);
         machine.start_process(exe).map_err(|e| e.to_string())?;
-        Ok(Self { machine })
+        let family = crate::family::Family::new(&mut machine, width, height, codec);
+        Ok(Self { machine, family })
     }
 
     /// Install reviewed codec-library bindings after loading, before guest execution.
@@ -192,25 +194,23 @@ impl<B: Backend> Runtime<B> {
         crate::codec_kernels::install(&mut self.machine, mode, signatures)
     }
 
-    /// Run until every context waits, the process exits, or a named failure occurs.
+    /// Run the process family until all processes wait, exit or fail.
     pub fn step(&mut self) -> RunResult {
         loop {
-            let outcome = self.machine.run();
-            match self.finish_step(SliceResult::Complete(outcome)) {
+            match self.step_family(None) {
                 SliceResult::Complete(outcome) => return outcome,
                 SliceResult::Yielded => {}
             }
         }
     }
 
-    /// Resume guest work for approximately `slice`, then service PCM even when guest
-    /// contexts remain runnable. Synchronous compilation/handlers can exceed this target.
+    /// Cooperatively run each process with a bounded slice. Host requests never
+    /// escape the supervisor and cannot execute another process inside a trap.
     pub fn step_for(&mut self, slice: Duration) -> SliceResult {
-        let outcome = self.machine.run_slice(slice);
-        self.finish_step(outcome)
+        self.step_family(Some(slice))
     }
 
-    fn finish_step(&mut self, outcome: SliceResult) -> SliceResult {
+    pub(crate) fn finish_step(&mut self, outcome: SliceResult) -> SliceResult {
         if matches!(
             outcome,
             SliceResult::Complete(RunResult::Exited(_) | RunResult::Failed(_))
@@ -770,6 +770,7 @@ mod tests {
             created_us: 0,
             initial_geometry_reported: false,
             destroying: false,
+            hidden_popup: false,
             control: ControlState::default(),
             auto_clicks: 0,
         };
@@ -792,7 +793,8 @@ mod tests {
         ));
         user.queue(0).focus = 0x10024;
         user.queue(0).capture = 0x10028;
-        Runtime { machine }
+        let family = crate::family::Family::new(&mut machine, 4, 2, crate::vorbis::Policy::Guest);
+        Runtime { machine, family }
     }
 
     #[test]

@@ -55,6 +55,11 @@ pub(crate) fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), MemFau
     if command_line == 0 {
         return Err(MemFault { addr: 0, len: 2 });
     }
+    let line = env
+        .ext
+        .try_get::<adv_os::processes::Parameters>()
+        .map(|p| p.command_line.clone())
+        .unwrap_or_else(|| format!("\"{}\"", env.ext.get::<Win32>().exe_path()));
     let (win32, heaps) = env.ext.get2_mut::<Win32, Heaps>();
     let image = win32.exe_path();
     let image_bytes: Vec<_> = image
@@ -84,12 +89,7 @@ pub(crate) fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), MemFau
     env.cpu.write_u32(parameters + 4, SIZE)?;
     env.cpu.write_u32(parameters + 8, NORMALIZED)?;
     unicode_string(env.cpu, parameters + IMAGE_PATH, image_pointer, &image)?;
-    unicode_string(
-        env.cpu,
-        parameters + COMMAND_LINE,
-        command_line,
-        &format!("\"{image}\""),
-    )?;
+    unicode_string(env.cpu, parameters + COMMAND_LINE, command_line, &line)?;
     env.cpu
         .write_u32(PEB_ADDR + peb::PROCESS_PARAMETERS, parameters)
 }

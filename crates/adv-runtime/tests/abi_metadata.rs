@@ -3,6 +3,10 @@ fn omission_reason(name: &str) -> &'static str {
     let (module, export) = name.split_once('!').expect("qualified export");
     if module == "msvcrt.dll" || module == "msvcr80.dll" || module == "msvcr90.dll" {
         "CRT outside Win32Metadata"
+    } else if module == "vcruntime140.dll" && matches!(export, "memset" | "memcpy" | "memmove") {
+        // These C runtime exports, like the legacy CRT exports above, are outside
+        // Win32Metadata. Keep this classification exact; check its x86 ABI below.
+        "CRT outside Win32Metadata"
     } else if module.contains("vorbis") {
         "codec ABI outside Windows SDK"
     } else if export.starts_with('#') {
@@ -93,6 +97,13 @@ fn all_fronts_signature_audit() {
                 .conv,
             adv_abi::Conv::Stdcall { argc: 1 }
         );
+        for name in ["memset", "memcpy", "memmove"] {
+            assert_eq!(
+                registry.get("vcruntime140.dll", name).unwrap().conv,
+                adv_abi::Conv::Cdecl { argc: 3 },
+                "vcruntime140.dll!{name}"
+            );
+        }
         let unknown = registry.missing_signatures();
         let mut categories = std::collections::BTreeMap::new();
         for name in &unknown {

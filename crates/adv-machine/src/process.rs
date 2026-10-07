@@ -64,3 +64,36 @@ impl Images {
         self.list.iter()
     }
 }
+
+/// A waitable terminal result, independent of the machine/address space lifetime.
+#[derive(Debug, Default)]
+pub struct Completion(std::sync::atomic::AtomicU64);
+impl Completion {
+    pub fn exit_code(&self) -> Option<u32> {
+        let value = self.0.load(std::sync::atomic::Ordering::Acquire);
+        (value >> 32 != 0).then_some(value as u32)
+    }
+    pub fn complete(&self, code: u32) {
+        let _ = self.0.compare_exchange(0, (1u64 << 32) | u64::from(code),
+            std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub completion: Completion,
+}
+impl ProcessIdentity {
+    pub fn new(pid: u32) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { pid, completion: Completion::default() })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ThreadIdentity {
+    pub process: std::sync::Arc<ProcessIdentity>,
+    pub context: crate::CtxId,
+    pub tid: u32,
+    pub completion: std::sync::Arc<Completion>,
+}

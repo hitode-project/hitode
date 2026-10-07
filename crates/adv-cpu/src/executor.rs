@@ -131,7 +131,7 @@ pub struct Executor {
     async_compilation: bool,
     compiler: Option<crate::compiler::Worker>,
     background_sender: Option<adv_sync::background::LocalSender>,
-    background_service: Option<adv_sync::background::Service>,
+    background_service: Option<std::rc::Rc<adv_sync::background::Service>>,
     background_wake: Option<adv_sync::WakeEvent>,
     completion_wake: Option<crate::compiler::CompletionWake>,
     interrupt: Arc<AtomicBool>,
@@ -399,6 +399,25 @@ impl Executor {
                 .write(addr, &descriptor_dpl(base, false, 3).to_le_bytes())?;
         }
         self.state.fs_base = base;
+        Ok(())
+    }
+
+    /// A new guest process shares host policy, never an execution context or code cache.
+    pub(crate) fn inherit_process_policy(&mut self, parent: &Self) -> Result<(), String> {
+        self.set_guest_workers(parent.guest_workers())?;
+        self.background_service = parent.background_service.clone();
+        self.auto_jit = parent.auto_jit;
+        self.auto_compile_strategy = parent.auto_compile_strategy;
+        self.tiered_compilation = parent.tiered_compilation;
+        self.async_compilation = parent.async_compilation;
+        self.region_linking = parent.region_linking;
+        self.profiling = parent.profiling;
+        self.cache_region_limit = parent.cache_region_limit;
+        self.cache_byte_limit = parent.cache_byte_limit;
+        self.set_shadow_returns(parent.shadow_returns.is_some())?;
+        self.set_compile_threads(parent.compile_threads)?;
+        self.host_interrupts = parent.host_interrupts;
+        self.rows = parent.rows.as_ref().map(|rows| rows.fork_empty().map(Box::new)).transpose()?;
         Ok(())
     }
 
@@ -1018,7 +1037,7 @@ impl Executor {
             .sender(crate::compiler::CAPACITY, crate::compiler::CAPACITY)
             .map_err(|error| error.to_string())?
             .into_local();
-        self.background_service = Some(builder.start().map_err(|error| error.to_string())?);
+        self.background_service = Some(std::rc::Rc::new(builder.start().map_err(|error| error.to_string())?));
         self.background_sender = Some(sender.clone());
         Ok(sender)
     }

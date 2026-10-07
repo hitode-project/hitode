@@ -295,9 +295,9 @@ impl FileSection {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SharedFiles {
-    files: RefCell<HashMap<FileIdentity, Weak<FileSection>>>,
+    files: Rc<RefCell<HashMap<FileIdentity, Weak<FileSection>>>>,
 }
 
 impl SharedFiles {

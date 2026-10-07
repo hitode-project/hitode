@@ -33,7 +33,10 @@ fn initialize(env: &mut Env<'_>) {
         return;
     }
     let mut state = Environment::default();
-    for entry in super::process::environment(env.ext.get::<Win32>()) {
+    let entries = env.ext.try_get::<adv_os::processes::Parameters>()
+        .map(|p| p.environment.clone())
+        .unwrap_or_else(|| super::process::environment(env.ext.get::<Win32>()));
+    for entry in entries {
         // The leading '=' of the per-drive current-directory entry is part of
         // its name, not the delimiter between its name and value.
         let at = entry[usize::from(entry.starts_with('='))..]

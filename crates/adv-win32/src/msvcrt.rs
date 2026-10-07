@@ -86,6 +86,9 @@ pub fn register(r: &mut Registry) {
     heap::register(r);
     locale::register(r);
     wide_string::register(r);
+    for name in ["memset", "memcpy", "memmove"] {
+        r.add("vcruntime140.dll", name, Conv::Cdecl { argc: 3 }, call);
+    }
     for (name, argc) in [
         ("malloc", 1),
         ("calloc", 2),
@@ -1811,6 +1814,101 @@ mod tests {
         .unwrap();
         install(&mut m).unwrap();
         m
+    }
+    #[test]
+    fn vcruntime_memset_fills_only_the_requested_bytes_returns_destination_and_is_cdecl() {
+        for jit in [false, true] {
+            let mut m = machine(jit);
+            let (code, data) = (0x400000, 0x500000);
+            let length = 4099;
+            let buffer = data + 64;
+            let destination = buffer + 7;
+            m.cpu.map(code, 4096, Prot::RX).unwrap();
+            m.cpu.map(data, 8192, Prot::RW).unwrap();
+            m.cpu.write(buffer, &vec![0xa5; length + 14]).unwrap();
+            let memset = m.resolve_import("vcruntime140.dll", "memset").unwrap();
+            let mut a = CodeAssembler::new(32).unwrap();
+            a.mov(dword_ptr((data + 4) as i32), esp).unwrap();
+            a.push(length as i32).unwrap();
+            a.push(0x1234).unwrap();
+            a.push(destination).unwrap();
+            a.call(u64::from(memset)).unwrap();
+            a.mov(dword_ptr(data as i32), eax).unwrap();
+            a.mov(dword_ptr((data + 8) as i32), esp).unwrap();
+            a.add(esp, 12).unwrap();
+            a.mov(dword_ptr((data + 12) as i32), esp).unwrap();
+            a.xor(eax, eax).unwrap();
+            a.ret().unwrap();
+            m.cpu
+                .write(code, &a.assemble(u64::from(code)).unwrap())
+                .unwrap();
+            m.spawn("vcruntime-memset", code, &[], 65536).unwrap();
+            let result = m.run();
+            assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+            assert_eq!(m.cpu.read_u32(data).unwrap(), destination);
+            let before = m.cpu.read_u32(data + 4).unwrap();
+            assert_eq!(
+                m.cpu.read_u32(data + 8).unwrap(),
+                before - 12,
+                "caller retains all three arguments"
+            );
+            assert_eq!(m.cpu.read_u32(data + 12).unwrap(), before);
+            let mut bytes = vec![0; length + 14];
+            m.cpu.read(buffer, &mut bytes).unwrap();
+            assert_eq!(&bytes[..7], &[0xa5; 7]);
+            assert_eq!(&bytes[7..7 + length], &vec![0x34; length]);
+            assert_eq!(&bytes[7 + length..], &[0xa5; 7]);
+        }
+    }
+    #[test]
+    fn vcruntime_memcpy_and_overlapping_memmove_preserve_bytes_and_cdecl_contract() {
+        for jit in [false, true] {
+            for (name, source_offset, destination_offset) in
+                [("memcpy", 0, 64), ("memmove", 0, 5), ("memmove", 5, 0)]
+            {
+                let mut m = machine(jit);
+                let (code, data) = (0x400000, 0x500000);
+                let buffer = data + 64;
+                let length = 21;
+                let source = buffer + source_offset as u32;
+                let destination = buffer + destination_offset as u32;
+                let bytes: Vec<_> = (0..128).map(|i| i as u8).collect();
+                let mut expected = bytes.clone();
+                expected.copy_within(source_offset..source_offset + length, destination_offset);
+                m.cpu.map(code, 4096, Prot::RX).unwrap();
+                m.cpu.map(data, 4096, Prot::RW).unwrap();
+                m.cpu.write(buffer, &bytes).unwrap();
+                let function = m.resolve_import("vcruntime140.dll", name).unwrap();
+                let mut a = CodeAssembler::new(32).unwrap();
+                a.mov(dword_ptr((data + 4) as i32), esp).unwrap();
+                a.push(length as i32).unwrap();
+                a.push(source).unwrap();
+                a.push(destination).unwrap();
+                a.call(u64::from(function)).unwrap();
+                a.mov(dword_ptr(data as i32), eax).unwrap();
+                a.mov(dword_ptr((data + 8) as i32), esp).unwrap();
+                a.add(esp, 12).unwrap();
+                a.mov(dword_ptr((data + 12) as i32), esp).unwrap();
+                a.xor(eax, eax).unwrap();
+                a.ret().unwrap();
+                m.cpu
+                    .write(code, &a.assemble(u64::from(code)).unwrap())
+                    .unwrap();
+                m.spawn("vcruntime-copy", code, &[], 65536).unwrap();
+                let result = m.run();
+                assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+                assert_eq!(m.cpu.read_u32(data).unwrap(), destination, "{name}");
+                let before = m.cpu.read_u32(data + 4).unwrap();
+                assert_eq!(m.cpu.read_u32(data + 8).unwrap(), before - 12, "{name}");
+                assert_eq!(m.cpu.read_u32(data + 12).unwrap(), before, "{name}");
+                let mut actual = vec![0; bytes.len()];
+                m.cpu.read(buffer, &mut actual).unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "{name}: {source_offset}->{destination_offset}"
+                );
+            }
+        }
     }
     #[test]
     fn ucrt_heap_apisets_share_allocations_and_preserve_contents_on_failed_growth() {

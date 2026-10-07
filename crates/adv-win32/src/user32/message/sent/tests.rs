@@ -168,6 +168,7 @@ fn run(m: &mut Machine<JitCpu>) {
             SliceResult::Complete(RunResult::Idle { .. }) => {
                 std::thread::sleep(Duration::from_millis(1))
             }
+            SliceResult::Complete(RunResult::HostRequest) => panic!("unexpected process request"),
             SliceResult::Yielded => {}
         }
     }

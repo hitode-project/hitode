@@ -9,7 +9,10 @@ Guest	kernel32.dll!InterlockedDecrement	SDK intrinsic absent from PInvoke metada
 Guest	kernel32.dll!InterlockedExchange	SDK intrinsic absent from PInvoke metadata
 Guest	kernel32.dll!InterlockedExchangeAdd	SDK intrinsic absent from PInvoke metadata
 Guest	kernel32.dll!InterlockedIncrement	SDK intrinsic absent from PInvoke metadata
+Guest	msvcr80.dll!??_U@YAPAXI@Z	CRT outside Win32Metadata
+Guest	msvcr80.dll!??_V@YAXPAX@Z	CRT outside Win32Metadata
 Guest	msvcr80.dll!__dllonexit	CRT outside Win32Metadata
+Guest	msvcr80.dll!__iob_func	CRT outside Win32Metadata
 Guest	msvcr80.dll!__p__commode	CRT outside Win32Metadata
 Guest	msvcr80.dll!__p__fmode	CRT outside Win32Metadata
 Guest	msvcr80.dll!__set_app_type	CRT outside Win32Metadata
@@ -18,14 +21,72 @@ Guest	msvcr80.dll!_encode_pointer	CRT outside Win32Metadata
 Guest	msvcr80.dll!_encoded_null	CRT outside Win32Metadata
 Guest	msvcr80.dll!_initterm	CRT outside Win32Metadata
 Guest	msvcr80.dll!_initterm_e	CRT outside Win32Metadata
+Guest	msvcr80.dll!_ismbblead	CRT outside Win32Metadata
+Guest	msvcr80.dll!_ismbbtrail	CRT outside Win32Metadata
 Guest	msvcr80.dll!_lock	CRT outside Win32Metadata
+Guest	msvcr80.dll!_makepath	CRT outside Win32Metadata
 Guest	msvcr80.dll!_malloc_crt	CRT outside Win32Metadata
+Guest	msvcr80.dll!_mbsinc	CRT outside Win32Metadata
+Guest	msvcr80.dll!_mbsnbcpy	CRT outside Win32Metadata
+Guest	msvcr80.dll!_setjmp3	CRT outside Win32Metadata
+Guest	msvcr80.dll!_splitpath	CRT outside Win32Metadata
+Guest	msvcr80.dll!_strdup	CRT outside Win32Metadata
+Guest	msvcr80.dll!_time32	CRT outside Win32Metadata
 Guest	msvcr80.dll!_unlock	CRT outside Win32Metadata
+Guest	msvcr80.dll!_wcsicmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!_wcsnicmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!_wfopen	CRT outside Win32Metadata
+Guest	msvcr80.dll!_wfopen_s	CRT outside Win32Metadata
 Guest	msvcr80.dll!calloc	CRT outside Win32Metadata
+Guest	msvcr80.dll!fclose	CRT outside Win32Metadata
+Guest	msvcr80.dll!feof	CRT outside Win32Metadata
+Guest	msvcr80.dll!fflush	CRT outside Win32Metadata
+Guest	msvcr80.dll!fopen	CRT outside Win32Metadata
+Guest	msvcr80.dll!fopen_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!fread	CRT outside Win32Metadata
 Guest	msvcr80.dll!free	CRT outside Win32Metadata
+Guest	msvcr80.dll!fseek	CRT outside Win32Metadata
+Guest	msvcr80.dll!ftell	CRT outside Win32Metadata
+Guest	msvcr80.dll!fwrite	CRT outside Win32Metadata
+Guest	msvcr80.dll!getenv	CRT outside Win32Metadata
 Guest	msvcr80.dll!malloc	CRT outside Win32Metadata
+Guest	msvcr80.dll!memcmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!memcpy	CRT outside Win32Metadata
+Guest	msvcr80.dll!memmove	CRT outside Win32Metadata
+Guest	msvcr80.dll!memset	CRT outside Win32Metadata
 Guest	msvcr80.dll!realloc	CRT outside Win32Metadata
+Guest	msvcr80.dll!strcat	CRT outside Win32Metadata
+Guest	msvcr80.dll!strcat_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!strchr	CRT outside Win32Metadata
+Guest	msvcr80.dll!strcmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!strcpy	CRT outside Win32Metadata
+Guest	msvcr80.dll!strcpy_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!strlen	CRT outside Win32Metadata
+Guest	msvcr80.dll!strncat	CRT outside Win32Metadata
+Guest	msvcr80.dll!strncat_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!strncmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!strncpy	CRT outside Win32Metadata
+Guest	msvcr80.dll!strncpy_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!strrchr	CRT outside Win32Metadata
+Guest	msvcr80.dll!strstr	CRT outside Win32Metadata
+Guest	msvcr80.dll!strtoul	CRT outside Win32Metadata
+Guest	msvcr80.dll!time	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcscat	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcscat_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcschr	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcscmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcscpy	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcscpy_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcslen	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcsncmp	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcsncpy	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcsncpy_s	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcsrchr	CRT outside Win32Metadata
+Guest	msvcr80.dll!wcsstr	CRT outside Win32Metadata
+Guest	msvcr90.dll!??_U@YAPAXI@Z	CRT outside Win32Metadata
+Guest	msvcr90.dll!??_V@YAXPAX@Z	CRT outside Win32Metadata
 Guest	msvcr90.dll!__dllonexit	CRT outside Win32Metadata
+Guest	msvcr90.dll!__iob_func	CRT outside Win32Metadata
 Guest	msvcr90.dll!__p__commode	CRT outside Win32Metadata
 Guest	msvcr90.dll!__p__fmode	CRT outside Win32Metadata
 Guest	msvcr90.dll!__set_app_type	CRT outside Win32Metadata
@@ -34,29 +95,111 @@ Guest	msvcr90.dll!_encode_pointer	CRT outside Win32Metadata
 Guest	msvcr90.dll!_encoded_null	CRT outside Win32Metadata
 Guest	msvcr90.dll!_initterm	CRT outside Win32Metadata
 Guest	msvcr90.dll!_initterm_e	CRT outside Win32Metadata
+Guest	msvcr90.dll!_ismbblead	CRT outside Win32Metadata
+Guest	msvcr90.dll!_ismbbtrail	CRT outside Win32Metadata
 Guest	msvcr90.dll!_lock	CRT outside Win32Metadata
+Guest	msvcr90.dll!_makepath	CRT outside Win32Metadata
 Guest	msvcr90.dll!_malloc_crt	CRT outside Win32Metadata
+Guest	msvcr90.dll!_mbsinc	CRT outside Win32Metadata
+Guest	msvcr90.dll!_mbsnbcpy	CRT outside Win32Metadata
+Guest	msvcr90.dll!_setjmp3	CRT outside Win32Metadata
+Guest	msvcr90.dll!_splitpath	CRT outside Win32Metadata
+Guest	msvcr90.dll!_strdup	CRT outside Win32Metadata
+Guest	msvcr90.dll!_time32	CRT outside Win32Metadata
 Guest	msvcr90.dll!_unlock	CRT outside Win32Metadata
+Guest	msvcr90.dll!_wcsicmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!_wcsnicmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!_wfopen	CRT outside Win32Metadata
+Guest	msvcr90.dll!_wfopen_s	CRT outside Win32Metadata
 Guest	msvcr90.dll!calloc	CRT outside Win32Metadata
+Guest	msvcr90.dll!fclose	CRT outside Win32Metadata
+Guest	msvcr90.dll!feof	CRT outside Win32Metadata
+Guest	msvcr90.dll!fflush	CRT outside Win32Metadata
+Guest	msvcr90.dll!fopen	CRT outside Win32Metadata
+Guest	msvcr90.dll!fopen_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!fread	CRT outside Win32Metadata
 Guest	msvcr90.dll!free	CRT outside Win32Metadata
+Guest	msvcr90.dll!fseek	CRT outside Win32Metadata
+Guest	msvcr90.dll!ftell	CRT outside Win32Metadata
+Guest	msvcr90.dll!fwrite	CRT outside Win32Metadata
+Guest	msvcr90.dll!getenv	CRT outside Win32Metadata
 Guest	msvcr90.dll!malloc	CRT outside Win32Metadata
+Guest	msvcr90.dll!memcmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!memcpy	CRT outside Win32Metadata
+Guest	msvcr90.dll!memmove	CRT outside Win32Metadata
+Guest	msvcr90.dll!memset	CRT outside Win32Metadata
 Guest	msvcr90.dll!realloc	CRT outside Win32Metadata
+Guest	msvcr90.dll!strcat	CRT outside Win32Metadata
+Guest	msvcr90.dll!strcat_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!strchr	CRT outside Win32Metadata
+Guest	msvcr90.dll!strcmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!strcpy	CRT outside Win32Metadata
+Guest	msvcr90.dll!strcpy_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!strlen	CRT outside Win32Metadata
+Guest	msvcr90.dll!strncat	CRT outside Win32Metadata
+Guest	msvcr90.dll!strncat_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!strncmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!strncpy	CRT outside Win32Metadata
+Guest	msvcr90.dll!strncpy_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!strrchr	CRT outside Win32Metadata
+Guest	msvcr90.dll!strstr	CRT outside Win32Metadata
+Guest	msvcr90.dll!strtoul	CRT outside Win32Metadata
+Guest	msvcr90.dll!time	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcscat	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcscat_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcschr	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcscmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcscpy	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcscpy_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcslen	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcsncmp	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcsncpy	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcsncpy_s	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcsrchr	CRT outside Win32Metadata
+Guest	msvcr90.dll!wcsstr	CRT outside Win32Metadata
+Guest	msvcrt.dll!??_U@YAPAXI@Z	CRT outside Win32Metadata
+Guest	msvcrt.dll!??_V@YAXPAX@Z	CRT outside Win32Metadata
 Guest	msvcrt.dll!_CIpow	CRT outside Win32Metadata
+Guest	msvcrt.dll!_XcptFilter	CRT outside Win32Metadata
 Guest	msvcrt.dll!__dllonexit	CRT outside Win32Metadata
 Guest	msvcrt.dll!__p__commode	CRT outside Win32Metadata
 Guest	msvcrt.dll!__p__fmode	CRT outside Win32Metadata
 Guest	msvcrt.dll!__set_app_type	CRT outside Win32Metadata
-Guest	msvcrt.dll!_adjust_fdiv	CRT outside Win32Metadata
+Guest	msvcrt.dll!__setusermatherr	CRT outside Win32Metadata
+Guest	msvcrt.dll!_beginthread	CRT outside Win32Metadata
 Guest	msvcrt.dll!_ftol	CRT outside Win32Metadata
 Guest	msvcrt.dll!_initterm	CRT outside Win32Metadata
 Guest	msvcrt.dll!_initterm_e	CRT outside Win32Metadata
+Guest	msvcrt.dll!_ismbblead	CRT outside Win32Metadata
+Guest	msvcrt.dll!_ismbbtrail	CRT outside Win32Metadata
 Guest	msvcrt.dll!_lock	CRT outside Win32Metadata
+Guest	msvcrt.dll!_makepath	CRT outside Win32Metadata
+Guest	msvcrt.dll!_mbsinc	CRT outside Win32Metadata
+Guest	msvcrt.dll!_mbsnbcpy	CRT outside Win32Metadata
+Guest	msvcrt.dll!_setjmp3	CRT outside Win32Metadata
+Guest	msvcrt.dll!_splitpath	CRT outside Win32Metadata
+Guest	msvcrt.dll!_strdup	CRT outside Win32Metadata
+Guest	msvcrt.dll!_time32	CRT outside Win32Metadata
 Guest	msvcrt.dll!_unlock	CRT outside Win32Metadata
+Guest	msvcrt.dll!_wcsicmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!_wcsnicmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!_wfopen	CRT outside Win32Metadata
+Guest	msvcrt.dll!_wfopen_s	CRT outside Win32Metadata
 Guest	msvcrt.dll!calloc	CRT outside Win32Metadata
 Guest	msvcrt.dll!ceil	CRT outside Win32Metadata
+Guest	msvcrt.dll!fclose	CRT outside Win32Metadata
+Guest	msvcrt.dll!feof	CRT outside Win32Metadata
+Guest	msvcrt.dll!fflush	CRT outside Win32Metadata
 Guest	msvcrt.dll!floor	CRT outside Win32Metadata
+Guest	msvcrt.dll!fopen	CRT outside Win32Metadata
+Guest	msvcrt.dll!fopen_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!fread	CRT outside Win32Metadata
 Guest	msvcrt.dll!free	CRT outside Win32Metadata
 Guest	msvcrt.dll!frexp	CRT outside Win32Metadata
+Guest	msvcrt.dll!fseek	CRT outside Win32Metadata
+Guest	msvcrt.dll!ftell	CRT outside Win32Metadata
+Guest	msvcrt.dll!fwrite	CRT outside Win32Metadata
+Guest	msvcrt.dll!getenv	CRT outside Win32Metadata
 Guest	msvcrt.dll!ldexp	CRT outside Win32Metadata
 Guest	msvcrt.dll!malloc	CRT outside Win32Metadata
 Guest	msvcrt.dll!memcmp	CRT outside Win32Metadata
@@ -65,9 +208,53 @@ Guest	msvcrt.dll!memmove	CRT outside Win32Metadata
 Guest	msvcrt.dll!memset	CRT outside Win32Metadata
 Guest	msvcrt.dll!qsort	CRT outside Win32Metadata
 Guest	msvcrt.dll!realloc	CRT outside Win32Metadata
+Guest	msvcrt.dll!strcat	CRT outside Win32Metadata
+Guest	msvcrt.dll!strcat_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!strchr	CRT outside Win32Metadata
 Guest	msvcrt.dll!strcmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!strcpy	CRT outside Win32Metadata
+Guest	msvcrt.dll!strcpy_s	CRT outside Win32Metadata
 Guest	msvcrt.dll!strlen	CRT outside Win32Metadata
+Guest	msvcrt.dll!strncat	CRT outside Win32Metadata
+Guest	msvcrt.dll!strncat_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!strncmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!strncpy	CRT outside Win32Metadata
+Guest	msvcrt.dll!strncpy_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!strrchr	CRT outside Win32Metadata
+Guest	msvcrt.dll!strstr	CRT outside Win32Metadata
+Guest	msvcrt.dll!strtoul	CRT outside Win32Metadata
+Guest	msvcrt.dll!time	CRT outside Win32Metadata
 Guest	msvcrt.dll!toupper	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcscat	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcscat_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcschr	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcscmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcscpy	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcscpy_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcslen	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcsncmp	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcsncpy	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcsncpy_s	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcsrchr	CRT outside Win32Metadata
+Guest	msvcrt.dll!wcsstr	CRT outside Win32Metadata
+Guest	ntdll.dll!NtClose	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtCreateSection	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtMapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtOpenFile	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtProtectVirtualMemory	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtQueryInformationProcess	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtQuerySystemInformation	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtSetInformationThread	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!NtUnmapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!RtlFormatCurrentUserKeyPath	documented legacy RTL export absent from pinned WinMD
+Guest	ntdll.dll!ZwCreateSection	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwMapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwOpenFile	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwProtectVirtualMemory	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwQueryInformationProcess	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwQuerySystemInformation	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwSetInformationThread	NT native API (WDK, outside the Win32 WinMD)
+Guest	ntdll.dll!ZwUnmapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
 Guest	oleaut32.dll!#149	ordinal alias (WinMD is name-based)
 Guest	oleaut32.dll!#150	ordinal alias (WinMD is name-based)
 Guest	oleaut32.dll!#2	ordinal alias (WinMD is name-based)
@@ -76,9 +263,20 @@ Guest	oleaut32.dll!#4	ordinal alias (WinMD is name-based)
 Guest	oleaut32.dll!#5	ordinal alias (WinMD is name-based)
 Guest	oleaut32.dll!#6	ordinal alias (WinMD is name-based)
 Guest	oleaut32.dll!#7	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#8	ordinal alias (WinMD is name-based)
+Guest	oleaut32.dll!#9	ordinal alias (WinMD is name-based)
+Guest	quartz.dll!<DirectShowStreamThread>	personality-internal guest entry
 Guest	user32.dll!<ButtonWndProc>	personality-internal guest entry
+Guest	user32.dll!<ComboWndProc>	personality-internal guest entry
+Guest	user32.dll!<DefaultWndProc>	personality-internal guest entry
+Guest	user32.dll!<DialogWndProc>	personality-internal guest entry
 Guest	user32.dll!<EditWndProc>	personality-internal guest entry
 Guest	user32.dll!<StaticWndProc>	personality-internal guest entry
+Guest	user32.dll!<TabWndProc>	personality-internal guest entry
+Guest	user32.dll!<TrackbarWndProc>	personality-internal guest entry
+Guest	vcruntime140.dll!memcpy	CRT outside Win32Metadata
+Guest	vcruntime140.dll!memmove	CRT outside Win32Metadata
+Guest	vcruntime140.dll!memset	CRT outside Win32Metadata
 Guest	winmm.dll!__pal_multimedia_timer_worker	personality-internal guest entry
 Guest	ws2_32.dll!#111	ordinal alias (WinMD is name-based)
 Guest	ws2_32.dll!#112	ordinal alias (WinMD is name-based)
@@ -94,7 +292,10 @@ Native	kernel32.dll!InterlockedDecrement	SDK intrinsic absent from PInvoke metad
 Native	kernel32.dll!InterlockedExchange	SDK intrinsic absent from PInvoke metadata
 Native	kernel32.dll!InterlockedExchangeAdd	SDK intrinsic absent from PInvoke metadata
 Native	kernel32.dll!InterlockedIncrement	SDK intrinsic absent from PInvoke metadata
+Native	msvcr80.dll!??_U@YAPAXI@Z	CRT outside Win32Metadata
+Native	msvcr80.dll!??_V@YAXPAX@Z	CRT outside Win32Metadata
 Native	msvcr80.dll!__dllonexit	CRT outside Win32Metadata
+Native	msvcr80.dll!__iob_func	CRT outside Win32Metadata
 Native	msvcr80.dll!__p__commode	CRT outside Win32Metadata
 Native	msvcr80.dll!__p__fmode	CRT outside Win32Metadata
 Native	msvcr80.dll!__set_app_type	CRT outside Win32Metadata
@@ -103,14 +304,72 @@ Native	msvcr80.dll!_encode_pointer	CRT outside Win32Metadata
 Native	msvcr80.dll!_encoded_null	CRT outside Win32Metadata
 Native	msvcr80.dll!_initterm	CRT outside Win32Metadata
 Native	msvcr80.dll!_initterm_e	CRT outside Win32Metadata
+Native	msvcr80.dll!_ismbblead	CRT outside Win32Metadata
+Native	msvcr80.dll!_ismbbtrail	CRT outside Win32Metadata
 Native	msvcr80.dll!_lock	CRT outside Win32Metadata
+Native	msvcr80.dll!_makepath	CRT outside Win32Metadata
 Native	msvcr80.dll!_malloc_crt	CRT outside Win32Metadata
+Native	msvcr80.dll!_mbsinc	CRT outside Win32Metadata
+Native	msvcr80.dll!_mbsnbcpy	CRT outside Win32Metadata
+Native	msvcr80.dll!_setjmp3	CRT outside Win32Metadata
+Native	msvcr80.dll!_splitpath	CRT outside Win32Metadata
+Native	msvcr80.dll!_strdup	CRT outside Win32Metadata
+Native	msvcr80.dll!_time32	CRT outside Win32Metadata
 Native	msvcr80.dll!_unlock	CRT outside Win32Metadata
+Native	msvcr80.dll!_wcsicmp	CRT outside Win32Metadata
+Native	msvcr80.dll!_wcsnicmp	CRT outside Win32Metadata
+Native	msvcr80.dll!_wfopen	CRT outside Win32Metadata
+Native	msvcr80.dll!_wfopen_s	CRT outside Win32Metadata
 Native	msvcr80.dll!calloc	CRT outside Win32Metadata
+Native	msvcr80.dll!fclose	CRT outside Win32Metadata
+Native	msvcr80.dll!feof	CRT outside Win32Metadata
+Native	msvcr80.dll!fflush	CRT outside Win32Metadata
+Native	msvcr80.dll!fopen	CRT outside Win32Metadata
+Native	msvcr80.dll!fopen_s	CRT outside Win32Metadata
+Native	msvcr80.dll!fread	CRT outside Win32Metadata
 Native	msvcr80.dll!free	CRT outside Win32Metadata
+Native	msvcr80.dll!fseek	CRT outside Win32Metadata
+Native	msvcr80.dll!ftell	CRT outside Win32Metadata
+Native	msvcr80.dll!fwrite	CRT outside Win32Metadata
+Native	msvcr80.dll!getenv	CRT outside Win32Metadata
 Native	msvcr80.dll!malloc	CRT outside Win32Metadata
+Native	msvcr80.dll!memcmp	CRT outside Win32Metadata
+Native	msvcr80.dll!memcpy	CRT outside Win32Metadata
+Native	msvcr80.dll!memmove	CRT outside Win32Metadata
+Native	msvcr80.dll!memset	CRT outside Win32Metadata
 Native	msvcr80.dll!realloc	CRT outside Win32Metadata
+Native	msvcr80.dll!strcat	CRT outside Win32Metadata
+Native	msvcr80.dll!strcat_s	CRT outside Win32Metadata
+Native	msvcr80.dll!strchr	CRT outside Win32Metadata
+Native	msvcr80.dll!strcmp	CRT outside Win32Metadata
+Native	msvcr80.dll!strcpy	CRT outside Win32Metadata
+Native	msvcr80.dll!strcpy_s	CRT outside Win32Metadata
+Native	msvcr80.dll!strlen	CRT outside Win32Metadata
+Native	msvcr80.dll!strncat	CRT outside Win32Metadata
+Native	msvcr80.dll!strncat_s	CRT outside Win32Metadata
+Native	msvcr80.dll!strncmp	CRT outside Win32Metadata
+Native	msvcr80.dll!strncpy	CRT outside Win32Metadata
+Native	msvcr80.dll!strncpy_s	CRT outside Win32Metadata
+Native	msvcr80.dll!strrchr	CRT outside Win32Metadata
+Native	msvcr80.dll!strstr	CRT outside Win32Metadata
+Native	msvcr80.dll!strtoul	CRT outside Win32Metadata
+Native	msvcr80.dll!time	CRT outside Win32Metadata
+Native	msvcr80.dll!wcscat	CRT outside Win32Metadata
+Native	msvcr80.dll!wcscat_s	CRT outside Win32Metadata
+Native	msvcr80.dll!wcschr	CRT outside Win32Metadata
+Native	msvcr80.dll!wcscmp	CRT outside Win32Metadata
+Native	msvcr80.dll!wcscpy	CRT outside Win32Metadata
+Native	msvcr80.dll!wcscpy_s	CRT outside Win32Metadata
+Native	msvcr80.dll!wcslen	CRT outside Win32Metadata
+Native	msvcr80.dll!wcsncmp	CRT outside Win32Metadata
+Native	msvcr80.dll!wcsncpy	CRT outside Win32Metadata
+Native	msvcr80.dll!wcsncpy_s	CRT outside Win32Metadata
+Native	msvcr80.dll!wcsrchr	CRT outside Win32Metadata
+Native	msvcr80.dll!wcsstr	CRT outside Win32Metadata
+Native	msvcr90.dll!??_U@YAPAXI@Z	CRT outside Win32Metadata
+Native	msvcr90.dll!??_V@YAXPAX@Z	CRT outside Win32Metadata
 Native	msvcr90.dll!__dllonexit	CRT outside Win32Metadata
+Native	msvcr90.dll!__iob_func	CRT outside Win32Metadata
 Native	msvcr90.dll!__p__commode	CRT outside Win32Metadata
 Native	msvcr90.dll!__p__fmode	CRT outside Win32Metadata
 Native	msvcr90.dll!__set_app_type	CRT outside Win32Metadata
@@ -119,29 +378,111 @@ Native	msvcr90.dll!_encode_pointer	CRT outside Win32Metadata
 Native	msvcr90.dll!_encoded_null	CRT outside Win32Metadata
 Native	msvcr90.dll!_initterm	CRT outside Win32Metadata
 Native	msvcr90.dll!_initterm_e	CRT outside Win32Metadata
+Native	msvcr90.dll!_ismbblead	CRT outside Win32Metadata
+Native	msvcr90.dll!_ismbbtrail	CRT outside Win32Metadata
 Native	msvcr90.dll!_lock	CRT outside Win32Metadata
+Native	msvcr90.dll!_makepath	CRT outside Win32Metadata
 Native	msvcr90.dll!_malloc_crt	CRT outside Win32Metadata
+Native	msvcr90.dll!_mbsinc	CRT outside Win32Metadata
+Native	msvcr90.dll!_mbsnbcpy	CRT outside Win32Metadata
+Native	msvcr90.dll!_setjmp3	CRT outside Win32Metadata
+Native	msvcr90.dll!_splitpath	CRT outside Win32Metadata
+Native	msvcr90.dll!_strdup	CRT outside Win32Metadata
+Native	msvcr90.dll!_time32	CRT outside Win32Metadata
 Native	msvcr90.dll!_unlock	CRT outside Win32Metadata
+Native	msvcr90.dll!_wcsicmp	CRT outside Win32Metadata
+Native	msvcr90.dll!_wcsnicmp	CRT outside Win32Metadata
+Native	msvcr90.dll!_wfopen	CRT outside Win32Metadata
+Native	msvcr90.dll!_wfopen_s	CRT outside Win32Metadata
 Native	msvcr90.dll!calloc	CRT outside Win32Metadata
+Native	msvcr90.dll!fclose	CRT outside Win32Metadata
+Native	msvcr90.dll!feof	CRT outside Win32Metadata
+Native	msvcr90.dll!fflush	CRT outside Win32Metadata
+Native	msvcr90.dll!fopen	CRT outside Win32Metadata
+Native	msvcr90.dll!fopen_s	CRT outside Win32Metadata
+Native	msvcr90.dll!fread	CRT outside Win32Metadata
 Native	msvcr90.dll!free	CRT outside Win32Metadata
+Native	msvcr90.dll!fseek	CRT outside Win32Metadata
+Native	msvcr90.dll!ftell	CRT outside Win32Metadata
+Native	msvcr90.dll!fwrite	CRT outside Win32Metadata
+Native	msvcr90.dll!getenv	CRT outside Win32Metadata
 Native	msvcr90.dll!malloc	CRT outside Win32Metadata
+Native	msvcr90.dll!memcmp	CRT outside Win32Metadata
+Native	msvcr90.dll!memcpy	CRT outside Win32Metadata
+Native	msvcr90.dll!memmove	CRT outside Win32Metadata
+Native	msvcr90.dll!memset	CRT outside Win32Metadata
 Native	msvcr90.dll!realloc	CRT outside Win32Metadata
+Native	msvcr90.dll!strcat	CRT outside Win32Metadata
+Native	msvcr90.dll!strcat_s	CRT outside Win32Metadata
+Native	msvcr90.dll!strchr	CRT outside Win32Metadata
+Native	msvcr90.dll!strcmp	CRT outside Win32Metadata
+Native	msvcr90.dll!strcpy	CRT outside Win32Metadata
+Native	msvcr90.dll!strcpy_s	CRT outside Win32Metadata
+Native	msvcr90.dll!strlen	CRT outside Win32Metadata
+Native	msvcr90.dll!strncat	CRT outside Win32Metadata
+Native	msvcr90.dll!strncat_s	CRT outside Win32Metadata
+Native	msvcr90.dll!strncmp	CRT outside Win32Metadata
+Native	msvcr90.dll!strncpy	CRT outside Win32Metadata
+Native	msvcr90.dll!strncpy_s	CRT outside Win32Metadata
+Native	msvcr90.dll!strrchr	CRT outside Win32Metadata
+Native	msvcr90.dll!strstr	CRT outside Win32Metadata
+Native	msvcr90.dll!strtoul	CRT outside Win32Metadata
+Native	msvcr90.dll!time	CRT outside Win32Metadata
+Native	msvcr90.dll!wcscat	CRT outside Win32Metadata
+Native	msvcr90.dll!wcscat_s	CRT outside Win32Metadata
+Native	msvcr90.dll!wcschr	CRT outside Win32Metadata
+Native	msvcr90.dll!wcscmp	CRT outside Win32Metadata
+Native	msvcr90.dll!wcscpy	CRT outside Win32Metadata
+Native	msvcr90.dll!wcscpy_s	CRT outside Win32Metadata
+Native	msvcr90.dll!wcslen	CRT outside Win32Metadata
+Native	msvcr90.dll!wcsncmp	CRT outside Win32Metadata
+Native	msvcr90.dll!wcsncpy	CRT outside Win32Metadata
+Native	msvcr90.dll!wcsncpy_s	CRT outside Win32Metadata
+Native	msvcr90.dll!wcsrchr	CRT outside Win32Metadata
+Native	msvcr90.dll!wcsstr	CRT outside Win32Metadata
+Native	msvcrt.dll!??_U@YAPAXI@Z	CRT outside Win32Metadata
+Native	msvcrt.dll!??_V@YAXPAX@Z	CRT outside Win32Metadata
 Native	msvcrt.dll!_CIpow	CRT outside Win32Metadata
+Native	msvcrt.dll!_XcptFilter	CRT outside Win32Metadata
 Native	msvcrt.dll!__dllonexit	CRT outside Win32Metadata
 Native	msvcrt.dll!__p__commode	CRT outside Win32Metadata
 Native	msvcrt.dll!__p__fmode	CRT outside Win32Metadata
 Native	msvcrt.dll!__set_app_type	CRT outside Win32Metadata
-Native	msvcrt.dll!_adjust_fdiv	CRT outside Win32Metadata
+Native	msvcrt.dll!__setusermatherr	CRT outside Win32Metadata
+Native	msvcrt.dll!_beginthread	CRT outside Win32Metadata
 Native	msvcrt.dll!_ftol	CRT outside Win32Metadata
 Native	msvcrt.dll!_initterm	CRT outside Win32Metadata
 Native	msvcrt.dll!_initterm_e	CRT outside Win32Metadata
+Native	msvcrt.dll!_ismbblead	CRT outside Win32Metadata
+Native	msvcrt.dll!_ismbbtrail	CRT outside Win32Metadata
 Native	msvcrt.dll!_lock	CRT outside Win32Metadata
+Native	msvcrt.dll!_makepath	CRT outside Win32Metadata
+Native	msvcrt.dll!_mbsinc	CRT outside Win32Metadata
+Native	msvcrt.dll!_mbsnbcpy	CRT outside Win32Metadata
+Native	msvcrt.dll!_setjmp3	CRT outside Win32Metadata
+Native	msvcrt.dll!_splitpath	CRT outside Win32Metadata
+Native	msvcrt.dll!_strdup	CRT outside Win32Metadata
+Native	msvcrt.dll!_time32	CRT outside Win32Metadata
 Native	msvcrt.dll!_unlock	CRT outside Win32Metadata
+Native	msvcrt.dll!_wcsicmp	CRT outside Win32Metadata
+Native	msvcrt.dll!_wcsnicmp	CRT outside Win32Metadata
+Native	msvcrt.dll!_wfopen	CRT outside Win32Metadata
+Native	msvcrt.dll!_wfopen_s	CRT outside Win32Metadata
 Native	msvcrt.dll!calloc	CRT outside Win32Metadata
 Native	msvcrt.dll!ceil	CRT outside Win32Metadata
+Native	msvcrt.dll!fclose	CRT outside Win32Metadata
+Native	msvcrt.dll!feof	CRT outside Win32Metadata
+Native	msvcrt.dll!fflush	CRT outside Win32Metadata
 Native	msvcrt.dll!floor	CRT outside Win32Metadata
+Native	msvcrt.dll!fopen	CRT outside Win32Metadata
+Native	msvcrt.dll!fopen_s	CRT outside Win32Metadata
+Native	msvcrt.dll!fread	CRT outside Win32Metadata
 Native	msvcrt.dll!free	CRT outside Win32Metadata
 Native	msvcrt.dll!frexp	CRT outside Win32Metadata
+Native	msvcrt.dll!fseek	CRT outside Win32Metadata
+Native	msvcrt.dll!ftell	CRT outside Win32Metadata
+Native	msvcrt.dll!fwrite	CRT outside Win32Metadata
+Native	msvcrt.dll!getenv	CRT outside Win32Metadata
 Native	msvcrt.dll!ldexp	CRT outside Win32Metadata
 Native	msvcrt.dll!malloc	CRT outside Win32Metadata
 Native	msvcrt.dll!memcmp	CRT outside Win32Metadata
@@ -150,9 +491,53 @@ Native	msvcrt.dll!memmove	CRT outside Win32Metadata
 Native	msvcrt.dll!memset	CRT outside Win32Metadata
 Native	msvcrt.dll!qsort	CRT outside Win32Metadata
 Native	msvcrt.dll!realloc	CRT outside Win32Metadata
+Native	msvcrt.dll!strcat	CRT outside Win32Metadata
+Native	msvcrt.dll!strcat_s	CRT outside Win32Metadata
+Native	msvcrt.dll!strchr	CRT outside Win32Metadata
 Native	msvcrt.dll!strcmp	CRT outside Win32Metadata
+Native	msvcrt.dll!strcpy	CRT outside Win32Metadata
+Native	msvcrt.dll!strcpy_s	CRT outside Win32Metadata
 Native	msvcrt.dll!strlen	CRT outside Win32Metadata
+Native	msvcrt.dll!strncat	CRT outside Win32Metadata
+Native	msvcrt.dll!strncat_s	CRT outside Win32Metadata
+Native	msvcrt.dll!strncmp	CRT outside Win32Metadata
+Native	msvcrt.dll!strncpy	CRT outside Win32Metadata
+Native	msvcrt.dll!strncpy_s	CRT outside Win32Metadata
+Native	msvcrt.dll!strrchr	CRT outside Win32Metadata
+Native	msvcrt.dll!strstr	CRT outside Win32Metadata
+Native	msvcrt.dll!strtoul	CRT outside Win32Metadata
+Native	msvcrt.dll!time	CRT outside Win32Metadata
 Native	msvcrt.dll!toupper	CRT outside Win32Metadata
+Native	msvcrt.dll!wcscat	CRT outside Win32Metadata
+Native	msvcrt.dll!wcscat_s	CRT outside Win32Metadata
+Native	msvcrt.dll!wcschr	CRT outside Win32Metadata
+Native	msvcrt.dll!wcscmp	CRT outside Win32Metadata
+Native	msvcrt.dll!wcscpy	CRT outside Win32Metadata
+Native	msvcrt.dll!wcscpy_s	CRT outside Win32Metadata
+Native	msvcrt.dll!wcslen	CRT outside Win32Metadata
+Native	msvcrt.dll!wcsncmp	CRT outside Win32Metadata
+Native	msvcrt.dll!wcsncpy	CRT outside Win32Metadata
+Native	msvcrt.dll!wcsncpy_s	CRT outside Win32Metadata
+Native	msvcrt.dll!wcsrchr	CRT outside Win32Metadata
+Native	msvcrt.dll!wcsstr	CRT outside Win32Metadata
+Native	ntdll.dll!NtClose	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtCreateSection	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtMapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtOpenFile	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtProtectVirtualMemory	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtQueryInformationProcess	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtQuerySystemInformation	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtSetInformationThread	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!NtUnmapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!RtlFormatCurrentUserKeyPath	documented legacy RTL export absent from pinned WinMD
+Native	ntdll.dll!ZwCreateSection	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwMapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwOpenFile	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwProtectVirtualMemory	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwQueryInformationProcess	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwQuerySystemInformation	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwSetInformationThread	NT native API (WDK, outside the Win32 WinMD)
+Native	ntdll.dll!ZwUnmapViewOfSection	NT native API (WDK, outside the Win32 WinMD)
 Native	oleaut32.dll!#149	ordinal alias (WinMD is name-based)
 Native	oleaut32.dll!#150	ordinal alias (WinMD is name-based)
 Native	oleaut32.dll!#2	ordinal alias (WinMD is name-based)
@@ -161,9 +546,20 @@ Native	oleaut32.dll!#4	ordinal alias (WinMD is name-based)
 Native	oleaut32.dll!#5	ordinal alias (WinMD is name-based)
 Native	oleaut32.dll!#6	ordinal alias (WinMD is name-based)
 Native	oleaut32.dll!#7	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#8	ordinal alias (WinMD is name-based)
+Native	oleaut32.dll!#9	ordinal alias (WinMD is name-based)
+Native	quartz.dll!<DirectShowStreamThread>	personality-internal guest entry
 Native	user32.dll!<ButtonWndProc>	personality-internal guest entry
+Native	user32.dll!<ComboWndProc>	personality-internal guest entry
+Native	user32.dll!<DefaultWndProc>	personality-internal guest entry
+Native	user32.dll!<DialogWndProc>	personality-internal guest entry
 Native	user32.dll!<EditWndProc>	personality-internal guest entry
 Native	user32.dll!<StaticWndProc>	personality-internal guest entry
+Native	user32.dll!<TabWndProc>	personality-internal guest entry
+Native	user32.dll!<TrackbarWndProc>	personality-internal guest entry
+Native	vcruntime140.dll!memcpy	CRT outside Win32Metadata
+Native	vcruntime140.dll!memmove	CRT outside Win32Metadata
+Native	vcruntime140.dll!memset	CRT outside Win32Metadata
 Native	vorbisfile.dll!#10	codec ABI outside Windows SDK
 Native	vorbisfile.dll!#11	codec ABI outside Windows SDK
 Native	vorbisfile.dll!#13	codec ABI outside Windows SDK

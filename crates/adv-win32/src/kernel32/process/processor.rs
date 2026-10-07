@@ -7,6 +7,7 @@ use adv_os::processor::Processors;
 
 fn process(env: &Env<'_>, handle: Handle) -> bool {
     handle.0 == u32::MAX
+        || matches!(env.sys.objects.get(handle.0), Some(Object::Process { identity, .. }) if identity.pid == env.sys.pid)
         || env
             .sys
             .objects
@@ -14,7 +15,9 @@ fn process(env: &Env<'_>, handle: Handle) -> bool {
             .is_some()
 }
 fn thread(env: &Env<'_>, handle: Handle) -> bool {
-    handle.0 == u32::MAX - 1 || matches!(env.sys.objects.get(handle.0), Some(Object::Thread { .. }))
+    handle.0 == u32::MAX - 1
+        || matches!(env.sys.objects.get(handle.0), Some(Object::Thread { .. }))
+        || matches!(env.sys.objects.get(handle.0), Some(Object::RemoteThread { identity, .. }) if identity.process.pid == env.sys.pid)
 }
 #[win32(kernel32, name = "GetProcessAffinityMask", level = implement)]
 fn get_affinity(

@@ -84,6 +84,7 @@ pub struct Sys {
     /// device output, not a guest thread role or an engine-specific frame loop.
     pub completed_frames: u32,
     pub pid: u32,
+    pub process_identity: std::sync::Arc<process::ProcessIdentity>,
     next_tid: u32,
     /// Mapped guest images, for backtraces and profiles; the OS layer's loader fills it.
     pub images: Images,
@@ -102,6 +103,8 @@ pub struct Sys {
     pub first_cpu_fault: Option<exception::CpuFaultSnapshot>,
     /// Most recent backend fault; recoverable faults do not hide later evidence.
     pub latest_cpu_fault: Option<exception::CpuFaultSnapshot>,
+    /// Personality terminal status for an unhandled guest exception.
+    pub guest_failure_code: Option<u32>,
     checkpoint_identity: std::sync::Arc<()>,
     next_frame_id: u64,
     /// The last host calls, for failure reports.
@@ -176,6 +179,33 @@ impl Env<'_> {
 }
 
 impl Sys {
+    /// Assign a distinct process identity before creating any guest context.
+    pub fn set_process_identity(&mut self, pid: u32) -> Result<(), &'static str> {
+        if !self.contexts.is_empty() || pid > u32::MAX - 0x1000 { return Err("process identity already published"); }
+        self.pid = pid;
+        self.next_tid = pid + 4;
+        self.process_identity = process::ProcessIdentity::new(pid);
+        Ok(())
+    }
+    pub fn thread_identity(&self, id: CtxId) -> Option<process::ThreadIdentity> {
+        let context = self.contexts.get(id as usize)?;
+        Some(process::ThreadIdentity { process: self.process_identity.clone(), context: id,
+            tid: context.tid, completion: context.completion.clone() })
+    }
+    pub fn suspend_context(&mut self, id: CtxId) -> Option<u32> {
+        let context = self.contexts.get_mut(id as usize)?;
+        if context.is_done() || context.suspend_count == 127 { return None; }
+        let old = context.suspend_count;
+        context.suspend_count += 1;
+        Some(old)
+    }
+    pub fn resume_context(&mut self, id: CtxId) -> Option<u32> {
+        let context = self.contexts.get_mut(id as usize)?;
+        if context.is_done() { return None; }
+        let old = context.suspend_count;
+        context.suspend_count = old.saturating_sub(1);
+        Some(old)
+    }
     /// Create a guest context that will start at `entry(args...)`. Its return ends the thread.
     pub fn spawn(
         &mut self,
@@ -225,6 +255,8 @@ impl Sys {
 
         let thread_handle = self.objects.insert(Object::Thread { ctx: id });
         self.contexts.push(Context {
+            suspend_count: 0,
+            completion: std::sync::Arc::new(process::Completion::default()),
             id,
             name: name.to_owned(),
             tid,
@@ -354,6 +386,7 @@ impl Sys {
     pub fn terminate_other_contexts(&mut self, exit_code: u32) {
         for context in &mut self.contexts {
             if context.id != self.current && !context.is_done() {
+                context.completion.complete(exit_code);
                 context.state = State::Done { exit_code };
                 context.frames.clear();
                 context.start = None;
@@ -365,16 +398,37 @@ impl Sys {
     /// continuations drop and its thread object becomes signaled through
     /// State::Done; no thread-detach work runs, as on Windows.
     pub fn terminate_context(&mut self, id: CtxId, exit_code: u32) -> bool {
+        if id == self.current {
+            return false;
+        }
+        self.terminate_context_stopped(id, exit_code)
+    }
+
+    /// Supervisor-only termination after all execution leases have returned.
+    /// Unlike a guest trap, this boundary may retire the currently loaded context.
+    pub fn terminate_context_stopped(&mut self, id: CtxId, exit_code: u32) -> bool {
         let Some(context) = self.contexts.get_mut(id as usize) else {
             return false;
         };
-        if id == self.current || context.is_done() {
+        if context.is_done() {
             return false;
         }
+        context.completion.complete(exit_code);
         context.state = State::Done { exit_code };
         context.frames.clear();
         context.start = None;
+        if self.contexts.iter().all(Context::is_done) {
+            self.process_identity.completion.complete(exit_code);
+        }
         true
+    }
+
+    /// Complete a process at a supervisor boundary, without guest detach calls.
+    pub fn terminate_process_stopped(&mut self, exit_code: u32) {
+        for id in 0..self.contexts.len() as CtxId {
+            self.terminate_context_stopped(id, exit_code);
+        }
+        self.process_identity.completion.complete(exit_code);
     }
 
     /// Grant already blocked event waits now, without running their continuations.
@@ -408,7 +462,7 @@ impl Sys {
         if self
             .contexts
             .get(context as usize)
-            .is_some_and(|c| matches!(c.state, State::Ready { .. }))
+            .is_some_and(|c| c.is_ready())
         {
             self.wakes
                 .wake_as(context, self.clock.now_us(), None, priority);
@@ -581,7 +635,7 @@ impl Sys {
         if !self.clock.is_virtual()
             || !self.only_polling()
             || !self.contexts.iter().enumerate().all(|(i, c)| {
-                !matches!(c.state, State::Ready { .. }) || polled.get(i) == Some(&true)
+                !c.is_ready() || polled.get(i) == Some(&true)
             })
         {
             return;
@@ -608,7 +662,7 @@ impl Sys {
         let mut ready = self
             .contexts
             .iter()
-            .filter(|c| matches!(c.state, State::Ready { .. }))
+            .filter(|c| c.is_ready())
             .peekable();
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
@@ -687,6 +741,7 @@ fn process_start(env: &mut Env<'_>) -> Outcome {
 
 /// Why a context stopped running inside a trap.
 enum Parked {
+    HostRequest { then: outcome::DeferredContinuation, origin: Origin },
     /// Return to the host after committing a frame-producing trap, without a guest wait.
     HostYield {
         resume_eip: u32,
@@ -834,6 +889,7 @@ fn apply(
             allow_time_skip,
         }),
         Outcome::Defer { .. } => unreachable!("deferred outcomes were resolved above"),
+        Outcome::HostRequest { then } => Err(Parked::HostRequest { then, origin }),
         Outcome::ExitThread(c) => Err(Parked::ExitThread(c)),
         Outcome::ExitProcess(c) => Err(Parked::ExitProcess(c)),
         Outcome::Fail(msg) => Err(Parked::Fail(msg)),
@@ -1110,6 +1166,8 @@ impl TrapHandler for Dispatch<'_> {
 
 #[derive(Debug)]
 pub enum RunResult {
+    /// An API has queued process-supervisor work; no guest wait or exit occurred.
+    HostRequest,
     /// Every live context is blocked. `next_deadline` is the earliest timed wake-up, if any.
     Idle {
         next_deadline: Option<u64>,
@@ -1127,7 +1185,7 @@ pub enum SliceResult {
     Complete(RunResult),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MachineError {
     pub ctx: CtxId,
     pub pc: u32,
@@ -1220,6 +1278,7 @@ impl<B: Backend> Machine<B> {
             frame: 0,
             completed_frames: 0,
             pid: 0x1000,
+            process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
             images: Images::default(),
             tls_images: Vec::new(),
@@ -1229,6 +1288,7 @@ impl<B: Backend> Machine<B> {
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,
+            guest_failure_code: None,
             checkpoint_identity: std::sync::Arc::new(()),
             next_frame_id: 0,
             recent: RecentCalls::new(32),
@@ -1364,6 +1424,18 @@ impl<B: Backend> Machine<B> {
     /// Disable for an independent consumer, retaining wake priority, context
     /// quantum, watchdog, interrupts and real waits. Per-frame Stats collection
     /// still hands off so its rows retain the original measurement boundaries.
+    /// Inherit execution policy, never guest state or accumulated measurements.
+    pub fn inherit_policy(&mut self, parent: &Self) {
+        self.execution_budget = parent.execution_budget;
+        self.scheduling_quantum = parent.scheduling_quantum;
+        self.latency_scheduling = parent.latency_scheduling;
+        self.frame_handoff = parent.frame_handoff;
+        self.time_skip_source = parent.time_skip_source.clone();
+        self.sys.stats.enabled = parent.sys.stats.enabled;
+        self.sys.call_limit = parent.sys.call_limit;
+        self.sys.trace = parent.sys.trace.clone();
+    }
+
     pub fn set_frame_handoff(&mut self, required: bool) {
         self.frame_handoff = required;
     }
@@ -1400,6 +1472,20 @@ impl<B: Backend> Machine<B> {
     /// Resolve `module!name` to a thunk address (for the loader).
     pub fn resolve_import(&mut self, module: &str, name: &str) -> Result<u32, MemFault> {
         self.sys.thunks.resolve(&mut self.cpu, module, name)
+    }
+
+    /// Supervisor access after all CPU leases have returned. Selecting a context
+    /// materializes its own registers; the next scheduler selection saves them.
+    pub fn visit_context<R>(&mut self, context: Option<CtxId>, task: impl FnOnce(&mut Env<'_>) -> R) -> Result<R, String> {
+        self.collect_at_boundary()?;
+        let prior = self.loaded;
+        if let Some(id) = context {
+            if self.sys.contexts.get(id as usize).is_none_or(|c| c.is_done()) { return Err("invalid target context".into()); }
+            self.switch_to(id).map_err(|e| e.to_string())?;
+        }
+        let result = task(&mut Env { context: self.sys.current, cpu: &mut self.cpu, sys: &mut self.sys, ext: &mut self.ext, thunk: 0 });
+        if let Some(prior) = prior { self.switch_to(prior).map_err(|e| e.to_string())?; }
+        Ok(result)
     }
 
     fn switch_to(&mut self, id: CtxId) -> Result<(), MemFault> {
@@ -1446,6 +1532,11 @@ impl<B: Backend> Machine<B> {
         let id = self.sys.current;
         let ctx = &mut self.sys.contexts[id as usize];
         match p {
+            Parked::HostRequest { then, origin } => {
+                ctx.state = State::Ready { resume: Some(ReadyResume::Deferred { then, origin }) };
+                ctx.yielded = false;
+                return Some(RunResult::HostRequest);
+            }
             Parked::HostYield { resume_eip } => {
                 // Both current backends park by replacing EIP with PARK_ADDR.
                 // Other registers already contain the committed trap result.
@@ -1498,14 +1589,18 @@ impl<B: Backend> Machine<B> {
                 ctx.yielded = false;
             }
             Parked::ExitThread(code) => {
+                ctx.completion.complete(code);
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
                 if self.sys.contexts.iter().all(Context::is_done) {
+                    self.sys.process_identity.completion.complete(code);
                     return Some(RunResult::Exited(code));
                 }
             }
             Parked::ExitProcess(code) => {
+                self.sys.process_identity.completion.complete(code);
                 self.cpu.quiesce_memory();
+                ctx.completion.complete(code);
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
                 self.sys.terminate_other_contexts(code);
@@ -1715,7 +1810,7 @@ impl<B: Backend> Machine<B> {
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
                 && self.sys.contexts.iter().enumerate().all(|(i, c)| {
-                    !matches!(c.state, State::Ready { .. }) || ran.get(i) == Some(&true)
+                    !c.is_ready() || ran.get(i) == Some(&true)
                 })
             {
                 self.sys.scheduling.polling_rounds += 1;
@@ -1731,7 +1826,7 @@ impl<B: Backend> Machine<B> {
             let selection = self.sys.wakes.pick(
                 &mut last,
                 contexts.len(),
-                |id| matches!(contexts[id as usize].state, State::Ready { .. }),
+                |id| contexts[id as usize].is_ready(),
                 latency_mode,
             );
             let Some(selection) = selection else {
@@ -1786,6 +1881,7 @@ impl<B: Backend> Machine<B> {
                 for peer in 0..self.sys.contexts.len() {
                     if peer == id as usize
                         || self.sys.contexts[peer].yielded
+                        || self.sys.contexts[peer].suspend_count != 0
                         || !matches!(self.sys.contexts[peer].state, State::Ready { resume: None })
                     {
                         continue;
@@ -2133,7 +2229,7 @@ impl<B: Backend> Machine<B> {
             .sys
             .contexts
             .iter()
-            .any(|c| matches!(c.state, State::Ready { .. }))
+            .any(|c| c.is_ready())
         {
             SliceResult::Yielded
         } else {

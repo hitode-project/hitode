@@ -363,6 +363,15 @@ impl crate::ExecutionTrap for Raw<'_> {
 }
 
 impl Backend for JitCpu {
+    fn new_process(&mut self) -> Result<Self, String> {
+        let mut child = Self::new(self.park, self.jit)?;
+        child.budget = self.budget;
+        let sender = self.background_sender()?;
+        child.inner.inherit_process_policy(&self.inner)?;
+        child.set_background_sender(sender)?;
+        Ok(child)
+    }
+
     type Context = Option<ExecutionContext>;
     fn guest_workers(&self) -> usize {
         self.inner.guest_workers()
@@ -553,6 +562,156 @@ impl Backend for JitCpu {
         let m = &mut self.inner;
         if m.memory.range(addr, len as usize).is_ok() {
             m.memory.touch(addr, len as usize);
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use crate::backend::GuestExt;
+    use adv_sync::background::{Priority, Task};
+    use std::rc::Rc;
+    use std::sync::mpsc;
+
+    const CODE: u32 = 0x400000;
+    const CALLER: u32 = CODE + 0x100;
+    const STOP: u32 = CODE + 0x2000;
+    const DATA: u32 = 0x410000;
+    const STACK: u32 = DATA + 0xf00;
+
+    fn load(cpu: &mut JitCpu, increment: u8, marker: u32) {
+        cpu.map(CODE, 4096, Prot::RW).unwrap();
+        cpu.map(DATA, 4096, Prot::RW).unwrap();
+        // add ebx,increment; ret
+        cpu.write(CODE, &[0x83, 0xc3, increment, 0xc3]).unwrap();
+        // top: call esi; dec ecx; jnz top; ret
+        cpu.write(CALLER, &[0xff, 0xd6, 0x49, 0x75, 0xfb, 0xc3])
+            .unwrap();
+        cpu.write_u32(DATA, marker).unwrap();
+        cpu.protect(CODE, 4096, Prot::RX).unwrap();
+        start(cpu, 10_000_000);
+    }
+
+    fn start(cpu: &mut JitCpu, iterations: u32) {
+        cpu.inner.state.eip = CALLER;
+        cpu.inner.state.regs = [0, iterations, 0, 0, STACK, 0, CODE, 0];
+        cpu.write_u32(STACK, STOP).unwrap();
+    }
+
+    fn run(cpu: &mut JitCpu, fuel: u64) -> RunOutcome {
+        cpu.inner.run(STOP, fuel).unwrap()
+    }
+
+    fn queue_compilation(cpu: &mut JitCpu) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cpu.stats().pending_compilations == 0 {
+            assert_eq!(run(cpu, 1000), RunOutcome::Budget);
+            assert!(
+                Instant::now() < deadline,
+                "child did not submit asynchronous work: {:?}",
+                cpu.stats()
+            );
+        }
+        assert_eq!(cpu.stats().compilations, 0, "the shared service is blocked");
+    }
+
+    fn promote_indirect_callee(cpu: &mut JitCpu) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let entries = cpu.stats().native_entries;
+            assert_eq!(run(cpu, 3000), RunOutcome::Budget);
+            let stats = cpu.stats();
+            // Before tier-up the indirect call and return transfer between
+            // native units. Capturing the observed callee keeps the whole
+            // 3000-block run inside one unit, including its local returns.
+            if stats.tier_up_publications != 0 && stats.native_entries - entries <= 2 {
+                assert_eq!(stats.compile_failures, 0);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "indirect callee never promoted: {stats:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn asynchronous_child_callees_keep_their_address_space_and_service_after_parent_drop() {
+        let mut parent = JitCpu::new(STOP, true).unwrap();
+        parent.disable_row_batching();
+        parent.set_execution_budget(Some(Duration::from_millis(17)));
+        parent.set_host_interrupts(false);
+        parent.set_profiling(true);
+        parent.set_auto_compile_strategy(CompileStrategy::Fast);
+        load(&mut parent, 1, 0x11111111);
+        promote_indirect_callee(&mut parent);
+        assert!(!parent.profile().is_empty());
+
+        let mut first = parent.new_process().unwrap();
+        let mut second = parent.new_process().unwrap();
+        let service = parent.background_sender().unwrap();
+        assert!(Rc::ptr_eq(&service, &first.background_sender().unwrap()));
+        assert!(Rc::ptr_eq(&service, &second.background_sender().unwrap()));
+        for child in [&first, &second] {
+            assert_eq!(child.execution_budget(), Some(Duration::from_millis(17)));
+            assert!(!child.accessible(CODE, 1, Prot::READ));
+            assert_eq!(child.stats().native_regions, 0);
+            assert_eq!(child.stats().tier_up_requests, 0);
+            assert!(child.profile().is_empty());
+        }
+        load(&mut first, 3, 0x22222222);
+        load(&mut second, 7, 0x77777777);
+
+        // Hold the shared worker at a known boundary so both children own
+        // queued snapshots when their parent goes away. The timeout bounds a
+        // broken service-lifetime implementation instead of hanging the test.
+        let (entered, started) = mpsc::channel();
+        let (release, unblock) = mpsc::channel();
+        service
+            .borrow_mut()
+            .try_submit(
+                Priority::Urgent,
+                Task::new(move || {
+                    entered.send(()).unwrap();
+                    let _ = unblock.recv_timeout(Duration::from_secs(5));
+                }),
+            )
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        queue_compilation(&mut first);
+        queue_compilation(&mut second);
+
+        parent.write(CODE, &[0x83, 0xc3, 11, 0xc3]).unwrap();
+        parent.write_u32(DATA, 0xaaaaaaaa).unwrap();
+        assert_eq!(first.read_u32(DATA).unwrap(), 0x22222222);
+        assert_eq!(second.read_u32(DATA).unwrap(), 0x77777777);
+        let dropped = Instant::now();
+        drop(parent);
+        assert!(
+            dropped.elapsed() < Duration::from_secs(2),
+            "parent joined the child's blocked compilation service"
+        );
+        release.send(()).unwrap();
+
+        for (child, increment, marker) in
+            [(&mut first, 3, 0x22222222), (&mut second, 7, 0x77777777)]
+        {
+            promote_indirect_callee(child);
+            assert!(
+                !child.profile().is_empty(),
+                "profiling policy is inherited independently"
+            );
+            start(child, 10_000);
+            assert_eq!(run(child, u64::MAX), RunOutcome::ReachedStop);
+            assert_eq!(child.inner.state.regs[3], 10_000 * increment);
+            assert_eq!(child.read_u32(DATA).unwrap(), marker);
+            assert_eq!(
+                child.stats().stale_compilations,
+                0,
+                "parent writes cannot invalidate a child's snapshot"
+            );
         }
     }
 }

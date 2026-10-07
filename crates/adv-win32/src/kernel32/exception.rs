@@ -1,6 +1,6 @@
 //! x86 Windows exception records and handler search. CPU stops and callback
 //! scheduling stay in adv-machine; all ABI layouts and dispositions live here.
-mod context;
+pub(super) mod context;
 
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{Backend, FaultKind, GuestExt, Prot, Reg};
@@ -346,6 +346,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
         search.nested = Some(search.nested.map_or(establisher, |n| n.max(establisher)));
     }
     if frame == u32::MAX {
+        env.sys.guest_failure_code = Some(search.record.code);
         return Outcome::Fail(format!(
             "unhandled Windows exception {:#010x} at {:#010x}",
             search.record.code, search.record.address

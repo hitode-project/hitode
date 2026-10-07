@@ -234,3 +234,63 @@ fn named_timer_aliases_share_state_and_last_close_destroys_deadline_and_name() {
     assert_eq!(f.invoke("CancelWaitableTimer", &[event]), 0);
     assert_eq!(f.error(), 6);
 }
+
+#[test]
+fn inherited_timer_alias_flags_preserve_real_deadlines_and_validate_security_before_creation() {
+    let mut f = Fixture::new();
+    let attributes = DATA + 192;
+    for (offset, value) in [(0, 12), (4, 0), (8, 1)] {
+        f.m.cpu.write_u32(attributes + offset, value).unwrap();
+    }
+    f.m.cpu
+        .write(DATA + 64, b"Local\\inherited-timer\0")
+        .unwrap();
+    let wide: Vec<u8> = "inherited-timer\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    f.m.cpu.write(DATA + 128, &wide).unwrap();
+    let original = f.invoke("CreateWaitableTimerA", &[attributes, 0, DATA + 64]);
+    assert_ne!(original, 0);
+    assert!(matches!(
+        f.m.sys.objects.get(original),
+        Some(Object::Timer { .. })
+    ));
+    assert_eq!(f.m.sys.objects.handle_flags(original), Some(1));
+    let second = f.invoke("CreateWaitableTimerW", &[0, 1, DATA + 128]);
+    assert_ne!(second, 0);
+    assert!(f.m.sys.objects.same_object(original, second));
+    assert_eq!(f.m.sys.objects.handle_flags(second), Some(0));
+    assert_eq!(
+        f.invoke(
+            "DuplicateHandle",
+            &[u32::MAX, original, u32::MAX, DATA + 256, 0, 1, 2]
+        ),
+        1
+    );
+    let duplicate = f.m.cpu.read_u32(DATA + 256).unwrap();
+    assert_eq!(f.m.sys.objects.handle_flags(duplicate), Some(1));
+    let start = f.m.sys.clock.now_us();
+    assert_eq!(f.set(original, -10_000, 0), 1);
+    assert_eq!(f.invoke("CloseHandle", &[original]), 1);
+    assert_eq!(f.m.sys.objects.handle_flags(original), None);
+    assert_eq!(f.wait(duplicate), 0x102);
+    f.m.sys.clock.advance_to(start + 1000);
+    assert_eq!(f.wait(duplicate), 0);
+    assert_eq!(
+        f.wait(second),
+        0x102,
+        "original auto-reset behavior remains shared"
+    );
+    let count = f.m.sys.objects.object_count();
+    f.m.cpu.write_u32(attributes + 4, 1).unwrap();
+    assert_eq!(
+        f.invoke("CreateWaitableTimerA", &[attributes, 0, DATA + 64]),
+        0
+    );
+    assert_eq!(f.error(), 50);
+    assert_eq!(f.m.sys.objects.object_count(), count);
+    assert_eq!(f.invoke("CreateWaitableTimerW", &[DATA + 8190, 0, 0]), 0);
+    assert_eq!(f.error(), 998);
+    assert_eq!(f.m.sys.objects.object_count(), count);
+}

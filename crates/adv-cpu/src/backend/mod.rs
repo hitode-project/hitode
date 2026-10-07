@@ -316,6 +316,11 @@ pub struct SegmentSetup {
 }
 
 pub trait Backend: Guest {
+    /// A fresh address space with the same execution policy. No memory or JIT
+    /// blocks may be aliased by this constructor. Optional for test backends.
+    fn new_process(&mut self) -> Result<Self, String> where Self: Sized {
+        Err("backend does not support independent guest processes".into())
+    }
     type Context;
 
     fn guest_workers(&self) -> usize {

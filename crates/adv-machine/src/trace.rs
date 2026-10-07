@@ -7,6 +7,14 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::{cell::RefCell, rc::Rc};
+
+#[derive(Clone)]
+struct SharedSink(Rc<RefCell<Box<dyn Write>>>);
+impl Write for SharedSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.borrow_mut().write(bytes) }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.borrow_mut().flush() }
+}
 
 pub struct TraceRecord<'a> {
     pub ctx: u32,
@@ -32,9 +40,9 @@ impl TraceRecord<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Trace {
-    sink: Option<Box<dyn Write>>,
+    sink: Option<SharedSink>,
     /// Trace every host call, not only those registered with `trace: true`.
     pub all: bool,
     variadic_noted: HashSet<(String, String)>,
@@ -43,10 +51,15 @@ pub struct Trace {
 impl Trace {
     pub fn to_writer(w: Box<dyn Write>) -> Self {
         Self {
-            sink: Some(w),
+            sink: Some(SharedSink(Rc::new(RefCell::new(w)))),
             all: false,
             variadic_noted: HashSet::new(),
         }
+    }
+
+    /// Process switch comment; ordinary single-process trace rows stay unchanged.
+    pub fn process(&mut self, pid: u32) {
+        if let Some(w) = &mut self.sink { let _ = writeln!(w, "# process\t{pid:08x}"); }
     }
 
     pub fn enabled(&self) -> bool {

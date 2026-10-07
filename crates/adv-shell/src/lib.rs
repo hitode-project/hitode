@@ -95,6 +95,10 @@ All guest code, including DLLs and callbacks, executes inside the guest CPU.";
 
 impl Options {
     fn parse() -> Result<Option<Self>, String> {
+        Self::parse_args(std::env::args().skip(1))
+    }
+
+    fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut exe = None;
         let mut data_dir = None;
         let mut options = Self {
@@ -136,7 +140,6 @@ impl Options {
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
         };
-        let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
             match arg.as_str() {
@@ -495,6 +498,12 @@ fn api_report(runtime: &Runtime) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     });
+    let processes = runtime.process_statuses().iter().map(|process| format!(
+        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}}}",
+        process.pid, process.parent.map_or_else(|| "null".into(), |v| v.to_string()), json(&process.image),
+        process.exit_code.map_or_else(|| "null".into(), |v| v.to_string()),
+        process.failure.as_deref().map_or_else(|| "null".into(), json)
+    )).collect::<Vec<_>>().join(", ");
     format!(
         concat!(
             "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, ",
@@ -505,7 +514,7 @@ fn api_report(runtime: &Runtime) -> String {
             "\"dynamic_lookup_failures\": [{}], \"dynamic_lookup_failure_count\": {}, ",
             "\"dropped_dynamic_lookup_failures\": {}, \"message_boxes\": [{}], ",
             "\"message_box_count\": {}, \"dropped_message_boxes\": {}, ",
-            "\"truncated_diagnostic_fields\": {}}}"
+            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}]}}"
         ),
         json(mode),
         runtime.api_acceptance_eligible(),
@@ -528,6 +537,7 @@ fn api_report(runtime: &Runtime) -> String {
         diagnostics.map_or(0, |d| d.message_box_count),
         diagnostics.map_or(0, |d| d.dropped_message_boxes),
         diagnostics.map_or(0, |d| d.truncated_diagnostic_fields),
+        processes,
     )
 }
 
@@ -1504,19 +1514,18 @@ fn run_execution(
             .map(|seconds| Duration::from_secs_f64(seconds).saturating_sub(started.elapsed()));
         let close_remaining =
             close_at.map(|at| Duration::from_secs(2).saturating_sub(at.elapsed()));
-        if let Some(remaining) = [time_remaining, close_remaining]
+        let slice = [time_remaining, close_remaining]
             .into_iter()
             .flatten()
             .min()
-        {
-            runtime
-                .machine
-                .set_execution_budget(Some(remaining.max(Duration::from_millis(1))));
-        }
+            .map_or(SOFT_SLICE, |remaining| remaining.min(SOFT_SLICE));
+        // A host deadline yields to the shell; it is not a guest failure or a
+        // process exit. Machine's soft slice already bounds CPU execution and
+        // collects leases without publishing a terminal process status.
         let step_started = Instant::now();
         let interrupts_before = runtime.machine.sys.scheduling.external_interrupts;
         let frame_yields_before = runtime.machine.sys.scheduling.frame_host_yields;
-        let outcome = runtime.step_for(SOFT_SLICE);
+        let outcome = runtime.step_for(slice);
         // Publish before an Idle wait: an engine may finish constructing its
         // menu and then wait indefinitely for the very first UI command.
         if let Some(worker) = window.as_mut()
@@ -1575,6 +1584,7 @@ fn run_execution(
             SliceResult::Complete(outcome) => outcome,
         };
         match outcome {
+            RunResult::HostRequest => unreachable!("runtime services process requests internally"),
             RunResult::Exited(code) => {
                 if options.frames.is_some_and(|limit| presented >= limit) {
                     stop_reason = "frame_limit";
@@ -1585,20 +1595,8 @@ fn run_execution(
                 break;
             }
             RunResult::Failed(error) => {
-                if options
-                    .seconds
-                    .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
-                    && error.message.contains("execution budget exhausted")
-                {
-                    stop_reason = "time_limit";
-                } else if close_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
-                    && error.message.contains("execution budget exhausted")
-                {
-                    stop_reason = "host_window_closed";
-                } else {
-                    failure = Some(format!("{error}\n{}", error.recent.join("\n")));
-                    stop_reason = "guest_failure";
-                }
+                failure = Some(format!("{error}\n{}", error.recent.join("\n")));
+                stop_reason = "guest_failure";
                 break;
             }
             RunResult::Idle { next_deadline } => {
@@ -1664,6 +1662,8 @@ fn run_execution(
             }
         }
     }
+    #[cfg(feature = "gpu")]
+    runtime.cancel_pending_graphics();
     runtime.machine.sys.trace.flush();
     if options.profile {
         let mut entries: Vec<_> = runtime.machine.cpu.profile().into_iter().collect();
@@ -1809,6 +1809,9 @@ pub fn run_cli() -> std::process::ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;
 
 /// Wall-time overlap includes the inline lane's API work; it is not CPU usage.
 fn parallel_report(p: &adv_runtime::ParallelStats) -> String {

@@ -44,6 +44,7 @@ impl RealProgress {
     }
 }
 
+#[derive(Clone)]
 pub enum ClockMode {
     /// Wall-clock time since machine start.
     Real {
@@ -55,6 +56,7 @@ pub enum ClockMode {
     Virtual(u64),
 }
 
+#[derive(Clone)]
 pub struct Clock {
     mode: ClockMode,
     /// Added to every reading so tick counts don't start at zero (some code treats 0 as unset).
@@ -125,7 +127,7 @@ impl Clock {
 
     /// Account the host's planned idle interval. An indefinite object/input
     /// wait permits elapsed wall time; no simulation was runnable in that time.
-    pub(crate) fn begin_wait(&mut self, deadline: Option<u64>) {
+    pub fn begin_wait(&mut self, deadline: Option<u64>) {
         self.now_us();
         self.allowance
             .set(deadline.map_or(Allowance::UnboundedWait, Allowance::Until));
@@ -133,7 +135,7 @@ impl Clock {
 
     /// Settle the prior wait before running contexts again. An early input wake
     /// consumes only actual elapsed time and leaves no future waiting credit.
-    pub(crate) fn begin_work(&mut self) {
+    pub fn begin_work(&mut self) {
         self.now_us();
         self.allowance.set(Allowance::Working);
     }

@@ -14,27 +14,24 @@ fn create(
     name: u32,
     wide: bool,
 ) -> Outcome {
-    if !attributes.is_null() {
-        let Ok([length, security, inherit]) = attributes.read(env.cpu) else {
-            return fail(env, 998);
-        };
-        if length != 12 {
-            return fail(env, 87);
+    let inherit = match super::handle::security_inherit(env, attributes.addr()) {
+        Ok(inherit) => inherit,
+        Err(error) => {
+            if error == 50 {
+                adv_abi::warn_unavailable(
+                    env,
+                    if wide {
+                        "CreateWaitableTimerW"
+                    } else {
+                        "CreateWaitableTimerA"
+                    },
+                    "custom timer security descriptors are not modeled",
+                );
+            }
+            return fail(env, error);
         }
-        if security != 0 || inherit != 0 {
-            adv_abi::warn_unavailable(
-                env,
-                if wide {
-                    "CreateWaitableTimerW"
-                } else {
-                    "CreateWaitableTimerA"
-                },
-                "custom security and inherited timer handles are not modeled",
-            );
-            return fail(env, 50);
-        }
-    }
-    super::file_mapping::sync_created(
+    };
+    let result = super::file_mapping::sync_created(
         env,
         Object::Timer {
             manual_reset: manual != 0,
@@ -44,7 +41,11 @@ fn create(
         },
         name,
         wide,
-    )
+    );
+    if let Outcome::Return(handle) = &result {
+        super::handle::set_inherit(env, *handle, inherit);
+    }
+    result
 }
 #[win32(kernel32, name = "CreateWaitableTimerA", level = implement)]
 fn create_a(

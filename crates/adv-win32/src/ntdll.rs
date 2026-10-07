@@ -16,6 +16,7 @@ const STATUS_SUCCESS: u32 = 0;
 
 pub(super) fn current_process(env: &Env<'_>, handle: u32) -> bool {
     handle == u32::MAX
+        || matches!(env.sys.objects.get(handle), Some(adv_machine::Object::Process { identity, .. }) if identity.pid == env.sys.pid)
         || env
             .sys
             .objects

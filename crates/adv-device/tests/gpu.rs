@@ -30,6 +30,58 @@ fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
 }
 
 #[test]
+fn child_gpu_reuses_host_context_and_survives_parent_teardown() {
+    let mut parent = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
+    parent.set_readback_limit(1).unwrap();
+    let mut child = parent.fork().unwrap();
+    let parent_target = parent.target(2, 1, false).unwrap();
+    let child_target = child.target(2, 1, false).unwrap();
+    assert!(!parent_target.image.shares_storage(&child_target.image));
+    parent
+        .clear(&parent_target, Some([1., 0., 0., 1.]), None)
+        .unwrap();
+    child
+        .clear(&child_target, Some([0., 0., 1., 1.]), None)
+        .unwrap();
+    // The device context is identical: either command producer can explicitly
+    // consume an image from it. Each frontend keeps its own transfer budget.
+    let mut parent_transfer = parent.readback(&parent_target.image, None).unwrap();
+    let mut child_transfer = child.readback(&child_target.image, None).unwrap();
+    assert!(matches!(
+        parent.readback(&parent_target.image, None),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        child.readback(&child_target.image, None),
+        Err(Error::Busy)
+    ));
+    parent_transfer.take_completion_job().unwrap()();
+    child_transfer.take_completion_job().unwrap()();
+    assert_eq!(
+        parent_transfer.poll().unwrap().unwrap(),
+        [0, 0, 255, 255].repeat(2)
+    );
+    assert_eq!(
+        child_transfer.poll().unwrap().unwrap(),
+        [255, 0, 0, 255].repeat(2)
+    );
+    assert_eq!(
+        read(&mut child, &parent_target.image),
+        [0, 0, 255, 255].repeat(2)
+    );
+    drop(parent_target);
+    drop(parent_transfer);
+    drop(parent);
+    child
+        .clear(&child_target, Some([0., 1., 0., 1.]), None)
+        .unwrap();
+    assert_eq!(
+        read(&mut child, &child_target.image),
+        [0, 255, 0, 255].repeat(2)
+    );
+}
+
+#[test]
 fn explicit_cancel_of_an_unqueued_map_releases_its_budget_without_waiting_or_losing_the_device() {
     let mut gpu = pollster::block_on(Gpu::request(true)).expect("software GPU adapter");
     gpu.set_readback_limit(1).unwrap();

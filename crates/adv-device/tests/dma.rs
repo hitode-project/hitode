@@ -91,6 +91,137 @@ impl SharedReadView for View {
         self.0.get(index).map_or(0, |v| v.load(Ordering::Relaxed))
     }
 }
+
+#[test]
+fn shared_process_audio_keeps_notices_and_retires_only_the_exiting_owner() {
+    use adv_device::{AudioEvent, mixer::PcmBlock};
+    let parent = AudioControl::new(false);
+    let child = parent.clone();
+    let parent_id = (0x1000_u64 << 32) | 1;
+    let child_id = (0x2000_u64 << 32) | 1;
+    let parent_view = sine(44100, 440.0, 4410);
+    let child_view = sine(44100, 220.0, 4410);
+    add(
+        &parent,
+        parent_id,
+        parent_view.clone(),
+        44100,
+        vec![(0, 77)],
+    );
+    add(&child, child_id, child_view.clone(), 44100, vec![(0, 77)]);
+    assert!(parent.play_ring(parent_id, true, 1));
+    assert!(child.play_ring(child_id, true, 1));
+    let mut reader = parent.stream().device_reader(44100, 2).unwrap();
+    reader.read(&mut [0.0; 512], 0);
+    let parent_events = parent.take_events_for_owner(0x1000);
+    assert!(parent_events.iter().any(|event| matches!(event,
+        AudioEvent::Notification { source, event: 77, .. } if *source == parent_id)));
+    let child_events = child.take_events_for_owner(0x2000);
+    assert!(child_events.iter().any(|event| matches!(event,
+        AudioEvent::Notification { source, event: 77, .. } if *source == child_id)));
+    assert!(parent_events.iter().all(|event| event.owner() == 0x1000));
+    assert!(child_events.iter().all(|event| event.owner() == 0x2000));
+    // Movie PCM uses the same namespace and must be retired with ring voices.
+    let movie_id = (0x1000_u64 << 32) | 2;
+    assert!(
+        parent
+            .push_pcm(PcmBlock {
+                stream_id: movie_id,
+                guest_pts_us: 0,
+                sample_rate: 44100,
+                channels: 1,
+                samples: vec![0.25; 4410],
+            })
+            .is_ok()
+    );
+    assert!(parent.remove_owner(0x1000));
+    no_alloc(|| {
+        reader.read(&mut [0.0; 512], 0);
+    });
+    child.maintain();
+    assert_eq!(Arc::strong_count(&parent_view), 1);
+    assert!(Arc::strong_count(&child_view) > 1);
+    assert!(child.active());
+    assert!(parent.take_events_for_owner(0x1000).is_empty());
+    assert!(
+        parent
+            .push_pcm(PcmBlock {
+                stream_id: movie_id,
+                guest_pts_us: 0,
+                sample_rate: 44100,
+                channels: 1,
+                samples: vec![0.25; 441],
+            })
+            .is_err()
+    );
+    assert!(child.remove_pcm(child_id));
+    reader.read(&mut [0.0; 512], 0);
+    assert!(parent.take_events_for_owner(0x1000).is_empty());
+    assert!(
+        child
+            .take_events_for_owner(0x2000)
+            .iter()
+            .any(|event| matches!(event,
+        AudioEvent::Released { source } if *source == child_id))
+    );
+}
+#[test]
+fn shared_movie_pcm_mixes_processes_and_child_keeps_playing_after_parent_exit() {
+    use adv_device::mixer::PcmBlock;
+    let parent = AudioControl::new(false);
+    let child = parent.clone();
+    let parent_movie = (0x1000_u64 << 32) | 2;
+    let child_movie = (0x2000_u64 << 32) | 2;
+    let mut reader = parent.stream().device_reader(1000, 2).unwrap();
+    let block = |stream_id, guest_pts_us, value| PcmBlock {
+        stream_id,
+        guest_pts_us,
+        sample_rate: 1000,
+        channels: 1,
+        samples: vec![value; 100],
+    };
+    parent
+        .push_pcm(block(parent_movie, 0, 0.125))
+        .unwrap_or_else(|_| panic!("parent movie PCM rejected"));
+    child
+        .push_pcm(block(child_movie, 0, 0.375))
+        .unwrap_or_else(|_| panic!("child movie PCM rejected"));
+    let mut output = [0.0; 20];
+    no_alloc(|| {
+        reader.read(&mut output, 0);
+    });
+    assert_eq!(output, [0.5; 20], "both movies must reach the same mixer");
+
+    assert!(parent.remove_owner(0x1000));
+    drop(parent);
+    no_alloc(|| {
+        reader.read(&mut output, 0);
+    });
+    child.maintain();
+    assert_eq!(output, [0.375; 20], "only the exiting movie is retired");
+    assert!(child.active());
+
+    // The surviving process can append movie packets through its control clone.
+    child
+        .push_pcm(block(child_movie, 100_000, 0.25))
+        .unwrap_or_else(|_| panic!("surviving movie PCM rejected"));
+    assert!(child.end_pcm(child_movie));
+    let mut boundary = [0.0; 180];
+    no_alloc(|| {
+        reader.read(&mut boundary, 0);
+    });
+    assert_eq!(&boundary[..160], &[0.375; 160]);
+    assert_eq!(&boundary[160..], &[0.25; 20]);
+    no_alloc(|| {
+        reader.read(&mut boundary, 0);
+        reader.read(&mut output, 0);
+    });
+    assert_eq!(boundary, [0.25; 180]);
+    assert_eq!(output, [0.0; 20]);
+    assert_eq!(child.stream().metrics().missing_output_frames, 0);
+    assert!(!child.active());
+}
+
 #[test]
 fn direct_ring_equal_rate_is_continuous() {
     let control = AudioControl::new(false);

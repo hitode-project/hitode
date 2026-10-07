@@ -275,6 +275,7 @@ pub struct Sound {
     /// Non-owning iteration index; payload and all references live in Objects.
     buffer_ids: BTreeMap<u64, ComIdentity<Object>>,
     pub audio: AudioControl,
+    owner: u32,
     next_audio_id: u64,
     next_storage_id: u64,
     storage_records: BTreeMap<u64, StorageRecord>,
@@ -292,10 +293,16 @@ pub struct Sound {
 }
 impl Sound {
     /// A mixer stream id for another front's owned PCM (movie audio).
-    pub(crate) fn allocate_audio_id(&mut self) -> u64 {
+    pub(crate) fn allocate_audio_id(&mut self) -> Option<u64> {
         let id = self.next_audio_id;
-        self.next_audio_id += 1;
-        id
+        self.next_audio_id = self.next_source_id()?;
+        Some(id)
+    }
+
+    fn next_source_id(&self) -> Option<u64> {
+        self.next_audio_id
+            .checked_add(1)
+            .filter(|next| (next >> 32) as u32 == self.owner)
     }
 
     fn buffer<'a>(&self, objects: &'a Objects, pointer: u32) -> Option<&'a Buffer> {
@@ -380,8 +387,34 @@ fn unavailable_create8(
     unavailable_create(env, device, output, outer)
 }
 pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
+    let audio = AudioControl::new(!m.sys.clock.is_virtual());
+    install_audio(m, audio, false)
+}
+
+/// Install process-local COM objects over the session's existing audio stream.
+/// The process identity must be assigned before this call.
+pub fn install_with_audio<B: Backend>(
+    m: &mut Machine<B>,
+    audio: AudioControl,
+) -> Result<(), String> {
+    install_audio(m, audio, true)
+}
+
+fn install_audio<B: Backend>(
+    m: &mut Machine<B>,
+    audio: AudioControl,
+    shared: bool,
+) -> Result<(), String> {
     let trace = std::env::var_os("ADV_AUDIO_TRACE")
         .map(|path| {
+            let mut path = std::path::PathBuf::from(path);
+            if shared {
+                // Child installation must not truncate the live parent's
+                // diagnostics when both inherit the same host environment.
+                let mut name = path.file_name().ok_or("invalid ADV_AUDIO_TRACE path")?.to_os_string();
+                name.push(format!(".pid-{:08x}", m.sys.pid));
+                path.set_file_name(name);
+            }
             std::fs::File::create(&path)
                 .map(std::io::BufWriter::new)
                 .map_err(|error| format!("cannot create ADV_AUDIO_TRACE {path:?}: {error}"))
@@ -390,6 +423,10 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     let trace_pcm_dir = if trace.is_some() {
         std::env::var_os("ADV_AUDIO_DUMP_DIR")
             .map(|path| {
+                let mut path = std::path::PathBuf::from(path);
+                if shared {
+                    path.push(format!("pid-{:08x}", m.sys.pid));
+                }
                 std::fs::create_dir_all(&path)
                     .map(|()| std::path::PathBuf::from(&path))
                     .map_err(|error| format!("cannot create ADV_AUDIO_DUMP_DIR {path:?}: {error}"))
@@ -422,7 +459,6 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         }
         tables[i] = table;
     }
-    let audio = AudioControl::new(!m.sys.clock.is_virtual());
     let playback_clock = audio.playback_clock();
     let com = Com::new(&mut m.sys.objects).ok_or("audio object namespace exhausted")?;
     m.ext.insert(Sound {
@@ -431,7 +467,8 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
         com,
         buffer_ids: BTreeMap::new(),
         audio,
-        next_audio_id: 1,
+        owner: m.sys.pid,
+        next_audio_id: (u64::from(m.sys.pid) << 32) | 1,
         next_storage_id: 1,
         storage_records: BTreeMap::new(),
         pending_release: BTreeMap::new(),
@@ -450,6 +487,18 @@ pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     classes.register(CLSID_DEVICE, create_class);
     classes.register(CLSID_DEVICE8, create_class8);
     Ok(())
+}
+
+/// Queue source retirement before releasing an exiting machine's guest memory.
+/// The supervisor retries a false result after servicing the shared audio stream.
+pub fn shutdown(ext: &mut adv_machine::Ext) -> bool {
+    let Some(sound) = ext.try_get_mut::<Sound>() else {
+        return true;
+    };
+    sound.enabled = false;
+    sound.pending_notices.clear();
+    sound.ready_notices.clear();
+    sound.audio.remove_owner(sound.owner)
 }
 
 fn create_class(e: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
@@ -768,7 +817,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     return Ok(INVALID);
                 }
                 let audio_id = e.ext.get::<Sound>().next_audio_id;
-                let Some(next_audio_id) = audio_id.checked_add(1) else {
+                let Some(next_audio_id) = e.ext.get::<Sound>().next_source_id() else {
                     return Ok(OUT_OF_MEMORY);
                 };
                 let Some(ptr) = object(e, Kind::Buffer, flags & 0x100 != 0)? else {
@@ -921,7 +970,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     return Ok(INVALID_CALL);
                 };
                 let audio_id = e.ext.get::<Sound>().next_audio_id;
-                let Some(next_audio_id) = audio_id.checked_add(1) else {
+                let Some(next_audio_id) = e.ext.get::<Sound>().next_source_id() else {
                     return Ok(OUT_OF_MEMORY);
                 };
                 let Some(ptr) = object(e, Kind::Buffer, orig_flags & 0x100 != 0)? else {
@@ -1412,7 +1461,7 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     }
     (s.queued_samples, s.nonzero_samples) = s.audio.stream().rendered_samples();
     let now = s.playback_clock.now_us(guest_now);
-    for event in s.audio.take_events() {
+    for event in s.audio.take_events_for_owner(s.owner) {
         match event {
             AudioEvent::Notification {
                 source,
@@ -1573,6 +1622,13 @@ mod tests {
         machine_with_limits(adv_machine::ObjectLimits::default())
     }
     fn machine_with_limits(limits: adv_machine::ObjectLimits) -> Machine<JitCpu> {
+        machine_for_process(limits, 0x1000, None)
+    }
+    fn machine_for_process(
+        limits: adv_machine::ObjectLimits,
+        pid: u32,
+        audio: Option<AudioControl>,
+    ) -> Machine<JitCpu> {
         let mut reg = Registry::default();
         adv_win32::register(&mut reg);
         adv_win32::ole32::register(&mut reg);
@@ -1583,6 +1639,7 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
+        m.sys.set_process_identity(pid).unwrap();
         // USER32's desktop is itself a common object; the requested budget
         // below describes resources available to this DirectSound fixture.
         m.sys.objects = Objects::with_limits(adv_machine::ObjectLimits {
@@ -1595,11 +1652,63 @@ mod tests {
             adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
         )
         .unwrap();
-        install(&mut m).unwrap();
+        match audio {
+            Some(audio) => install_with_audio(&mut m, audio).unwrap(),
+            None => install(&mut m).unwrap(),
+        }
         m.ext.get_mut::<Sound>().enabled = true;
         m.cpu.map(DATA, 4096, Prot::RW).unwrap();
         m.cpu.map(STACK, 4096, Prot::RW).unwrap();
         m
+    }
+
+    #[test]
+    fn child_sound_uses_shared_output_with_independent_source_namespace() {
+        let mut parent = machine();
+        let audio = parent.ext.get::<Sound>().audio.clone();
+        let mut child =
+            machine_for_process(adv_machine::ObjectLimits::default(), 0x2000, Some(audio));
+        assert!(Arc::ptr_eq(
+            &parent.ext.get::<Sound>().playback_clock,
+            &child.ext.get::<Sound>().playback_clock,
+        ));
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+        let parent_buffer = buffer(&mut parent, format, 1000);
+        let child_buffer = buffer(&mut child, format, 1000);
+        let parent_source = parent
+            .ext
+            .get::<Sound>()
+            .buffer(&parent.sys.objects, parent_buffer)
+            .unwrap()
+            .audio_id;
+        let child_source = child
+            .ext
+            .get::<Sound>()
+            .buffer(&child.sys.objects, child_buffer)
+            .unwrap()
+            .audio_id;
+        assert_eq!(parent_source, (0x1000_u64 << 32) | 1);
+        assert_eq!(child_source, (0x2000_u64 << 32) | 1);
+        let parent_movie = parent.ext.get_mut::<Sound>().allocate_audio_id().unwrap();
+        let child_movie = child.ext.get_mut::<Sound>().allocate_audio_id().unwrap();
+        assert_eq!(parent_movie, (0x1000_u64 << 32) | 2);
+        assert_eq!(child_movie, (0x2000_u64 << 32) | 2);
+        assert!(shutdown(&mut parent.ext));
+        drop(parent);
+        assert_eq!(
+            invoke(
+                &mut child,
+                "IDirectSoundBuffer8::Play",
+                &[child_buffer, 0, 0, 1]
+            ),
+            0
+        );
+        pump(&mut child).unwrap();
+        assert!(child.ext.get::<Sound>().audio.active());
     }
     fn invoke(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
         m.resolve_import("dsound.dll", name).unwrap();

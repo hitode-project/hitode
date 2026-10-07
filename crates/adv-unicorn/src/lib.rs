@@ -726,6 +726,12 @@ impl Guest for UnicornCpu {
 pub struct UcContext(unicorn_engine::Context);
 
 impl Backend for UnicornCpu {
+    fn new_process(&mut self) -> Result<Self, String> {
+        let mut child = Self::new(self.park).map_err(|e| e.to_string())?;
+        child.budget = self.budget;
+        Ok(child)
+    }
+
     type Context = UcContext;
 
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault> {

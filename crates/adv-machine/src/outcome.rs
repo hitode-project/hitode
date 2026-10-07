@@ -78,6 +78,8 @@ pub enum Outcome {
     /// Continue host work after handing a completed frame to the frontend. Real-time
     /// sliced execution may defer `then`; other modes run it inline.
     Defer { then: DeferredContinuation },
+    /// Leave the CPU and return to the process supervisor before resuming this call.
+    HostRequest { then: DeferredContinuation },
     /// The current context's thread ends (ExitThread).
     ExitThread(u32),
     /// The process ends (ExitProcess).
@@ -87,6 +89,10 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    pub fn host_request(then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Self {
+        Self::HostRequest { then: Box::new(then) }
+    }
+
     pub fn call(
         target: u32,
         args: impl Into<Vec<u32>>,

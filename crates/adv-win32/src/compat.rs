@@ -8,5 +8,4 @@ pub fn register(registry: &mut Registry) {
     crate::user32::compat::register(registry);
     crate::imm32::register_compat(registry);
     crate::ole32::register(registry);
-    crate::kernel32::unsupported_process::register(registry);
 }

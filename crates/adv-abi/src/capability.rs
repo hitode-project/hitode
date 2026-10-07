@@ -139,6 +139,16 @@ fn observe(env: &mut Env<'_>, mut scope: Scope, outcome: Outcome) -> Outcome {
                 }),
             }
         }
+        Outcome::HostRequest { then } => {
+            scope.arguments = Some(arguments(env, &scope));
+            Outcome::HostRequest {
+                then: Box::new(move |env| {
+                    push(env, scope);
+                    let outcome = then(env);
+                    finish(env, outcome)
+                }),
+            }
+        }
         Outcome::Defer { then } => {
             scope.arguments = Some(arguments(env, &scope));
             Outcome::Defer {

@@ -336,6 +336,31 @@ pub fn set_background(
     state.sender = Some(sender);
     state.wake = Some(std::sync::Arc::new(wake));
 }
+/// Assemble an installed child frontend with the parent's host-device and
+/// completion policy. Guest COM objects, vtables and pending work stay local.
+pub fn fork_host_state(parent: &Ext, child: &mut Ext) -> Result<(), String> {
+    let source = parent.get::<State>();
+    let destination = child.get_mut::<State>();
+    if destination.gpu.is_some() {
+        return Err("D3D9 child GPU already installed".into());
+    }
+    let gpu = source
+        .gpu
+        .as_ref()
+        .map(Gpu::fork)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    destination.provider = source.provider;
+    destination.sender = source.sender.clone();
+    destination.wake = source.wake.clone();
+    destination.copy = source.copy;
+    destination.shader_caps = source.shader_caps;
+    destination.shader_cache = source.shader_cache.clone();
+    if let Some(gpu) = gpu {
+        set_gpu(child, gpu)?;
+    }
+    Ok(())
+}
 pub fn readback_image(
     ext: &mut Ext,
     image: &adv_device::gpu::Image,

@@ -1,15 +1,16 @@
 //! Process, thread, environment, version, and error-reporting functions.
 
 use adv_abi::Registry;
-use adv_cpu::backend::{GuestExt, Reg};
-use adv_machine::{Env, Outcome};
-use adv_os::Heaps;
+use adv_cpu::backend::{GuestExt, Prot, Reg};
+use adv_machine::{Env, Object, Outcome, Wait, process::ThreadIdentity};
+use adv_os::{Heaps, processes};
 
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
-mod processor;
 mod parameters;
+mod processor;
+mod thread_context;
 pub(crate) use parameters::install as install_parameters;
 
 fn exit_process(env: &mut Env<'_>) -> Outcome {
@@ -17,22 +18,162 @@ fn exit_process(env: &mut Env<'_>) -> Outcome {
 }
 
 fn terminate_process(env: &mut Env<'_>) -> Outcome {
-    if env.arg(0) == u32::MAX {
-        return Outcome::ExitProcess(env.arg(1));
+    let code = env.arg(1);
+    let identity = match super::child_process::process_target(env, env.arg(0), 1) {
+        Ok(identity) => identity,
+        Err(error) => return api_error(env, error, 0),
+    };
+    if identity.completion.exit_code().is_some() {
+        return api_error(
+            env,
+            processes::Error::new(err::ACCESS_DENIED, "process has exited"),
+            0,
+        );
     }
-    Outcome::Fail(format!(
-        "TerminateProcess({:#x}) of another process",
-        env.arg(0)
-    ))
+    if identity.pid == env.sys.pid {
+        return Outcome::ExitProcess(code);
+    }
+    processes::visit(
+        env,
+        identity.pid,
+        None,
+        move |target| {
+            target.sys.terminate_process_stopped(code);
+            Ok(1)
+        },
+        |env, result| api_result(env, result, 0),
+    )
+}
+
+fn api_error(env: &mut Env<'_>, error: processes::Error, failure: u32) -> Outcome {
+    set_last_error(env, error.code);
+    Outcome::Return(failure)
+}
+
+fn api_result(env: &mut Env<'_>, result: Result<u32, processes::Error>, failure: u32) -> Outcome {
+    match result {
+        Ok(value) => Outcome::Return(value),
+        Err(error) => api_error(env, error, failure),
+    }
+}
+
+fn open_process(env: &mut Env<'_>) -> Outcome {
+    let (mut access, pid) = (env.arg(0), env.arg(2));
+    let identity = if pid == env.sys.pid {
+        Some(env.sys.process_identity.clone())
+    } else {
+        env.ext
+            .try_get::<processes::Services>()
+            .and_then(|services| services.find(pid))
+    };
+    let Some(identity) = identity else {
+        return api_error(
+            env,
+            processes::Error::new(err::INVALID_PARAMETER, "unknown process id"),
+            0,
+        );
+    };
+    if access & 0x1000_0000 != 0 {
+        access = 0x1f_ffff;
+    } // GENERIC_ALL
+    // Query-information grants the limited query operations too.
+    if access & 0x400 != 0 {
+        access |= 0x1000;
+    }
+    let handle = env.sys.objects.insert(Object::Process { identity, access });
+    if handle == 0 {
+        return api_error(
+            env,
+            processes::Error::new(err::NOT_ENOUGH_MEMORY, "process handle table full"),
+            0,
+        );
+    }
+    Outcome::Return(handle)
+}
+
+fn get_exit_code_process(env: &mut Env<'_>) -> Outcome {
+    let identity = match super::child_process::process_target(env, env.arg(0), 0x1000) {
+        Ok(identity) => identity,
+        Err(error) => return api_error(env, error, 0),
+    };
+    write_exit_code(
+        env,
+        env.arg(1),
+        identity.completion.exit_code().unwrap_or(259),
+    )
+}
+
+fn write_exit_code(env: &mut Env<'_>, out: u32, code: u32) -> Outcome {
+    if out == 0 {
+        return api_error(
+            env,
+            processes::Error::new(err::INVALID_PARAMETER, "null exit-code output"),
+            0,
+        );
+    }
+    if adv_abi::guest::check_range(env.cpu, out, 4, Prot::WRITE).is_err()
+        || env.cpu.write_u32(out, code).is_err()
+    {
+        return api_error(
+            env,
+            processes::Error::new(998, "unwritable exit-code output"),
+            0,
+        );
+    }
+    Outcome::Return(1)
+}
+
+fn thread_target(
+    env: &Env<'_>,
+    handle: u32,
+    access: u32,
+) -> Result<ThreadIdentity, processes::Error> {
+    match env.sys.objects.get(handle) {
+        _ if handle == u32::MAX - 1 => env.sys.thread_identity(env.context),
+        Some(Object::Thread { ctx }) => env.sys.thread_identity(*ctx),
+        Some(Object::RemoteThread {
+            identity,
+            access: granted,
+        }) => {
+            let permitted = if access == 0x40 {
+                granted & (0x40 | 0x800) != 0
+            } else {
+                granted & access == access
+            };
+            if !permitted {
+                return Err(processes::Error::new(
+                    err::ACCESS_DENIED,
+                    "thread handle access denied",
+                ));
+            }
+            return Ok(identity.clone());
+        }
+        _ => None,
+    }
+    .ok_or_else(|| processes::Error::new(err::INVALID_HANDLE, "invalid thread handle"))
+}
+
+fn flush_instruction_cache(env: &mut Env<'_>) -> Outcome {
+    // Memory writes invalidate translated blocks when they are committed; no
+    // additional host instruction-cache operation is needed for a guest range.
+    api_result(
+        env,
+        super::child_process::process_target(env, env.arg(0), 0).map(|_| 1),
+        0,
+    )
 }
 
 pub(crate) fn command_line(env: &mut Env<'_>, wide: bool) -> u32 {
+    let supplied = env
+        .ext
+        .try_get::<adv_os::processes::Parameters>()
+        .map(|p| p.command_line.clone());
     let (w, heaps) = env.ext.get2_mut::<Win32, Heaps>();
     let key = if wide { "cmdline_w" } else { "cmdline_a" };
     if let Some(&pointer) = w.statics.get(key) {
         return pointer;
     }
-    let line = format!("\"{}\"", w.exe_path());
+    let line = supplied.unwrap_or_else(|| format!("\"{}\"", w.exe_path()));
     let bytes = if wide {
         line.encode_utf16()
             .chain([0])
@@ -59,7 +200,12 @@ pub(crate) fn configure_codepage(
     }
     let codec = adv_os::Codec::new(codepage);
     if let Some(&pointer) = w.statics.get("cmdline_a") {
-        let mut bytes = codec.encode(&format!("\"{}\"", w.exe_path()));
+        let line = env
+            .ext
+            .try_get::<adv_os::processes::Parameters>()
+            .map(|p| p.command_line.clone())
+            .unwrap_or_else(|| format!("\"{}\"", w.exe_path()));
+        let mut bytes = codec.encode(&line);
         bytes.push(0);
         let length = bytes.len() as u32;
         if env
@@ -307,8 +453,32 @@ fn set_last_error_(env: &mut Env<'_>) -> Outcome {
 }
 
 fn create_thread(env: &mut Env<'_>) -> Outcome {
+    let inherit = match super::handle::security_inherit(env, env.arg(0)) {
+        Ok(inherit) => inherit,
+        Err(code) => {
+            return api_error(
+                env,
+                processes::Error::new(code, "invalid thread security attributes"),
+                0,
+            );
+        }
+    };
     let (stack, start, param, flags, tid_out) =
         (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
+    if flags & !(4 | 0x10000) != 0 {
+        return api_error(
+            env,
+            processes::Error::new(err::INVALID_PARAMETER, "unsupported thread creation flags"),
+            0,
+        );
+    }
+    if tid_out != 0 && adv_abi::guest::check_range(env.cpu, tid_out, 4, Prot::WRITE).is_err() {
+        return api_error(
+            env,
+            processes::Error::new(998, "unwritable thread-id output"),
+            0,
+        );
+    }
     let name = format!("T{}", env.sys.contexts.len());
     match super::module::spawn_thread(
         env,
@@ -318,61 +488,216 @@ fn create_thread(env: &mut Env<'_>) -> Outcome {
         if stack == 0 { 0x10_0000 } else { stack },
     ) {
         Ok(id) => {
+            if flags & 4 != 0 {
+                env.sys.suspend_context(id);
+            }
             let c = env.sys.context(id);
             let (tid, h) = (c.tid, c.thread_handle);
+            super::handle::set_inherit(env, h, inherit);
             log::info!(
                 "CreateThread: context {id} ({name}) at {start:#010x}({param:#x}) flags={flags:#x}"
             );
             out_u32(env.cpu, tid_out, tid);
             Outcome::Return(h)
         }
-        Err(e) => Outcome::Fail(format!("CreateThread: {e}")),
+        Err(error) => api_error(
+            env,
+            processes::Error::new(err::NOT_ENOUGH_MEMORY, format!("CreateThread: {error}")),
+            0,
+        ),
     }
 }
 
 fn suspend_thread(env: &mut Env<'_>) -> Outcome {
-    let h = env.arg(0);
-    log::info!("SuspendThread({h:#x}) from ctx {}", env.ctx().id);
-    Outcome::Return(0)
+    change_suspend_count(env, true)
 }
 
 fn resume_thread(env: &mut Env<'_>) -> Outcome {
-    let h = env.arg(0);
-    log::info!("ResumeThread({h:#x}) from ctx {}", env.ctx().id);
-    Outcome::Return(1)
+    change_suspend_count(env, false)
+}
+
+fn change_suspend_count(env: &mut Env<'_>, suspend: bool) -> Outcome {
+    let identity = match thread_target(env, env.arg(0), 2) {
+        Ok(identity) => identity,
+        Err(error) => return api_error(env, error, u32::MAX),
+    };
+    let pid = identity.process.pid;
+    let id = identity.context;
+    processes::visit(
+        env,
+        pid,
+        None,
+        move |target| {
+            let context = target.sys.contexts.get(id as usize).ok_or_else(|| {
+                processes::Error::new(err::INVALID_HANDLE, "thread context no longer exists")
+            })?;
+            if context.is_done() {
+                return Err(processes::Error::new(
+                    err::INVALID_HANDLE,
+                    "thread has exited",
+                ));
+            }
+            if suspend && context.suspend_count == 127 {
+                return Err(processes::Error::new(156, "maximum suspend count reached"));
+            }
+            let previous = if suspend {
+                target.sys.suspend_context(id)
+            } else {
+                target.sys.resume_context(id)
+            };
+            previous.ok_or_else(|| {
+                processes::Error::new(err::INVALID_HANDLE, "thread cannot be suspended or resumed")
+            })
+        },
+        move |env, result| {
+            if suspend && pid == env.sys.pid && id == env.context {
+                match result {
+                    Ok(previous) => Outcome::block_then_return(Wait::Yield, previous),
+                    Err(error) => api_error(env, error, u32::MAX),
+                }
+            } else {
+                api_result(env, result, u32::MAX)
+            }
+        },
+    )
 }
 
 fn terminate_thread(env: &mut Env<'_>) -> Outcome {
     let (h, code) = (env.arg(0), env.arg(1));
-    let target = match env.sys.objects.get(h) {
-        Some(adv_machine::Object::Thread { ctx }) => *ctx,
-        _ if h == u32::MAX - 1 => env.context,
-        _ => {
-            set_last_error(env, err::INVALID_HANDLE);
-            return Outcome::Return(0);
-        }
+    let identity = match thread_target(env, h, 1) {
+        Ok(identity) => identity,
+        Err(error) => return api_error(env, error, 0),
     };
-    if target == env.context {
-        return Outcome::ExitThread(code);
+    if identity.completion.exit_code().is_some() {
+        return Outcome::Return(1);
     }
-    // Already finished threads keep their exit code; TerminateThread still succeeds.
-    env.sys.terminate_context(target, code);
-    Outcome::Return(1)
+    if identity.process.pid == env.sys.pid {
+        if identity.context == env.context {
+            return Outcome::ExitThread(code);
+        }
+        env.sys.terminate_context(identity.context, code);
+        return Outcome::Return(1);
+    }
+    processes::visit(
+        env,
+        identity.process.pid,
+        None,
+        move |target| {
+            target.sys.terminate_context_stopped(identity.context, code);
+            Ok(1)
+        },
+        |env, result| api_result(env, result, 0),
+    )
 }
 
 fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
     let (h, out) = (env.arg(0), env.arg(1));
-    let code = match env.sys.objects.get(h) {
-        Some(adv_machine::Object::Thread { ctx }) => {
-            env.sys.context(*ctx).exit_code().unwrap_or(259)
-        } // STILL_ACTIVE
-        _ => {
-            set_last_error(env, err::INVALID_HANDLE);
-            return Outcome::Return(0);
-        }
+    let identity = match thread_target(env, h, 0x40) {
+        Ok(identity) => identity,
+        Err(error) => return api_error(env, error, 0),
     };
-    out_u32(env.cpu, out, code);
-    Outcome::Return(1)
+    write_exit_code(env, out, identity.completion.exit_code().unwrap_or(259))
+}
+
+fn get_thread_context(env: &mut Env<'_>) -> Outcome {
+    thread_context_api(env, false)
+}
+fn set_thread_context(env: &mut Env<'_>) -> Outcome {
+    thread_context_api(env, true)
+}
+
+fn thread_context_api(env: &mut Env<'_>, set: bool) -> Outcome {
+    let (handle, pointer) = (env.arg(0), env.arg(1));
+    let identity = match thread_target(env, handle, if set { 0x10 } else { 8 }) {
+        Ok(identity) => identity,
+        Err(error) => return api_error(env, error, 0),
+    };
+    if identity.process.pid == env.sys.pid
+        && env
+            .sys
+            .contexts
+            .get(identity.context as usize)
+            .is_none_or(|context| context.suspend_count == 0 || context.is_done())
+    {
+        return api_error(
+            env,
+            processes::Error::new(
+                err::INVALID_PARAMETER,
+                "thread CONTEXT requires a suspended thread",
+            ),
+            0,
+        );
+    }
+    let protection = if set { Prot::READ } else { Prot::RW };
+    if pointer == 0
+        || adv_abi::guest::check_range(env.cpu, pointer, thread_context::SIZE as u32, protection)
+            .is_err()
+    {
+        return api_error(
+            env,
+            processes::Error::new(998, "inaccessible thread CONTEXT"),
+            0,
+        );
+    }
+    let mut bytes = [0; thread_context::SIZE];
+    if env.cpu.read(pointer, &mut bytes).is_err() {
+        return api_error(
+            env,
+            processes::Error::new(998, "unreadable thread CONTEXT"),
+            0,
+        );
+    }
+    if let Err(error) = thread_context::flags(&bytes) {
+        return api_error(env, error, 0);
+    }
+    processes::visit(
+        env,
+        identity.process.pid,
+        Some(identity.context),
+        move |target| {
+            if target.ctx().suspend_count == 0 {
+                return Err(processes::Error::new(
+                    err::INVALID_PARAMETER,
+                    "thread CONTEXT requires a suspended thread",
+                ));
+            }
+            let mut state = target
+                .cpu
+                .capture_architecture()
+                .map_err(|error| processes::Error::new(50, error.to_string()))?;
+            if set {
+                thread_context::restore(&bytes, &mut state)?;
+                target.cpu.restore_architecture(&state).map_err(|error| {
+                    processes::Error::new(err::INVALID_PARAMETER, error.to_string())
+                })?;
+                Ok(None)
+            } else {
+                thread_context::capture(&state, bytes).map(Some)
+            }
+        },
+        move |env, result| match result {
+            Ok(Some(bytes)) => {
+                if adv_abi::guest::check_range(
+                    env.cpu,
+                    pointer,
+                    thread_context::SIZE as u32,
+                    Prot::WRITE,
+                )
+                .is_err()
+                    || env.cpu.write(pointer, &bytes).is_err()
+                {
+                    return api_error(
+                        env,
+                        processes::Error::new(998, "unwritable thread CONTEXT"),
+                        0,
+                    );
+                }
+                Outcome::Return(1)
+            }
+            Ok(None) => Outcome::Return(1),
+            Err(error) => api_error(env, error, 0),
+        },
+    )
 }
 
 /// MEMORYSTATUS / MEMORYSTATUSEX with 2 GiB physical, 2 GiB virtual.
@@ -455,15 +780,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetCurrentProcess", 0, |_| {
         Outcome::Return(u32::MAX)
     });
-    stdcall(reg, K32, "OpenProcess", 3, |e| {
-        let pid = e.arg(2);
-        if pid == e.sys.pid || pid == 0 {
-            Outcome::Return(u32::MAX)
-        } else {
-            set_last_error(e, 87);
-            Outcome::Return(0)
-        }
-    });
+    stdcall(reg, K32, "OpenProcess", 3, open_process);
     stdcall(reg, K32, "GetCurrentThread", 0, |_| {
         Outcome::Return(u32::MAX - 1)
     });
@@ -477,6 +794,16 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SuspendThread", 1, suspend_thread);
     stdcall(reg, K32, "ResumeThread", 1, resume_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);
+    stdcall(reg, K32, "GetExitCodeProcess", 2, get_exit_code_process);
+    stdcall(reg, K32, "GetThreadContext", 2, get_thread_context);
+    stdcall(reg, K32, "SetThreadContext", 2, set_thread_context);
+    stdcall(
+        reg,
+        K32,
+        "FlushInstructionCache",
+        3,
+        flush_instruction_cache,
+    );
     stdcall(reg, K32, "SetThreadPriority", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetThreadPriority", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "SetPriorityClass", 2, |_| Outcome::Return(1));
@@ -499,12 +826,8 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "IsDebuggerPresent", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "CheckRemoteDebuggerPresent", 2, |e| {
-        // This personality exposes its own process through the same pseudo
-        // handle returned by GetCurrentProcess and OpenProcess. A host
-        // debugger of the emulator is not a debugger of the virtual process.
-        if e.arg(0) != u32::MAX {
-            set_last_error(e, err::INVALID_HANDLE);
-            return Outcome::Return(0);
+        if let Err(error) = super::child_process::process_target(e, e.arg(0), 0x1000) {
+            return api_error(e, error, 0);
         }
         let out = e.arg(1);
         if out == 0 {
