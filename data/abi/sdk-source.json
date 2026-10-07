@@ -281,6 +281,12 @@
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
     "native_verification": "32 DWORDs cover real remote bytes, VM_READ-only handles, invalid handles/source/output and partial-copy atomic failure, zero-size handle bypass, optional/inaccessible count outputs, unchanged LastError and child exit 37"
   },
+  "zero_fixup_image_loading": {
+    "scope": "common PE image rebase policy and LdrLoadDll/LoadLibrary conflict statuses; no new ABI declaration",
+    "source": "Microsoft PE specification and authored Microsoft Windows x86 zero-fixup DLL oracle",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/debug/pe-format",
+    "native_verification": "19 DWORDs: zero-entry or absent relocation directory loads at an alternate base with a callable export, explicit RELOCS_STRIPPED fails with STATUS_CONFLICTING_ADDRESSES / ERROR_INVALID_ADDRESS; native failure preserves output and LastError"
+  },
   "nt_delay_execution": {
     "scope": "NtDelayExecution; two x86 stack words, byte BOOLEAN and signed 64-bit 100 ns interval, NTSTATUS",
     "source": "phnt ntexapi.h primary declaration, Microsoft WDM delay contract and authored Microsoft Windows x86 caller",

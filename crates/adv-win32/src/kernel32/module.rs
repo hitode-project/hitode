@@ -338,7 +338,8 @@ fn load_library_front(
                     Outcome::Return(0)
                 }
                 LibraryFront::Native(_) => Outcome::Return(match e {
-                    adv_os::LoadError::Pe { .. } | adv_os::LoadError::NoRelocs(..) => 0xc000007b,
+                    adv_os::LoadError::Pe { .. } => 0xc000007b,
+                    adv_os::LoadError::NoRelocs(..) => 0xc0000018,
                     adv_os::LoadError::NoSpace(..)
                     | adv_os::LoadError::TooManyHostModules
                     | adv_os::LoadError::Mem(_) => 0xc0000017,
@@ -352,7 +353,8 @@ fn load_library_front(
 
 fn load_error_code(error: &adv_os::LoadError) -> u32 {
     match error {
-        adv_os::LoadError::Pe { .. } | adv_os::LoadError::NoRelocs(..) => 193,
+        adv_os::LoadError::Pe { .. } => 193,
+        adv_os::LoadError::NoRelocs(..) => 487,
         adv_os::LoadError::NoSpace(..)
         | adv_os::LoadError::TooManyHostModules
         | adv_os::LoadError::Mem(_) => err::NOT_ENOUGH_MEMORY,
