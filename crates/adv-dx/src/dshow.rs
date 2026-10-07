@@ -8,12 +8,14 @@
 //! host and guest objects are interchangeable on either side of a connection.
 use std::collections::{BTreeMap, VecDeque};
 
-use adv_abi::Registry;
+use adv_abi::{AnsiStr, Registry, win32};
 use adv_cpu::backend::{GuestExt, MemFault, Prot};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use adv_os::com::{Com, Iid, QueryError};
 
+#[cfg(test)]
+mod error_text_tests;
 mod filter;
 mod graph;
 mod sample;
@@ -297,7 +299,18 @@ fn data(face: Face, slot: u16) -> u64 {
     ((face as u64) << 16) | u64::from(slot)
 }
 
+#[win32(quartz, name = "AMGetErrorTextA", level = safe_fail)]
+fn error_text_a(env: &mut Env<'_>, _hr: i32, _output: AnsiStr, _capacity: u32) -> u32 {
+    adv_abi::warn_unavailable(
+        env,
+        "quartz.dll!AMGetErrorTextA",
+        "DirectShow error-message lookup is unavailable; caller output is retained",
+    );
+    0
+}
+
 pub fn register(registry: &mut Registry) {
+    registry.register(error_text_a_ABI);
     for (face, interface) in FACES {
         for signature in adv_abi::signature::com_signatures()
             .iter()
