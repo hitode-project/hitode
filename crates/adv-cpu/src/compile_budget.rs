@@ -451,7 +451,7 @@ mod tests {
         memory.write(0x10000, bytes).unwrap();
         let mut region = Region::new(0x10000, bytes.len());
         region.compile_strategy = CompileStrategy::Fast;
-        Snapshot::capture(&region, &memory).unwrap()
+        Snapshot::capture(&region, &mut memory).unwrap()
     }
     #[test]
     fn memory_and_vector_costs_differ_and_speed_never_bypasses_the_limit() {
@@ -625,7 +625,7 @@ mod tests {
         let mut region = Region::new(0x10ff0, 16);
         region.compile_strategy = CompileStrategy::Fast;
         region.complete_tail = true;
-        let snapshot = Snapshot::capture(&region, &memory).unwrap();
+        let snapshot = Snapshot::capture(&region, &mut memory).unwrap();
         let fragments = plan(snapshot, 8).unwrap();
         let last = fragments.last().unwrap();
         let compiled = crate::compile::compile_snapshot(last).unwrap();

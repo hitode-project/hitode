@@ -140,6 +140,11 @@ impl Compiled {
     ) -> (u32, u64) {
         #[cfg(target_arch = "aarch64")]
         let _fp_environment = fp_environment::Guard::enter();
+        // Authored/private callers may reuse compiled code with another Memory
+        // window. Establish that owner's code barriers before its first entry.
+        for &(page, _) in &self.pages {
+            memory.watch_code(self.window_base + (page * 4096) as u32, 4096);
+        }
         bridge.memory = memory;
         assert!(!self.input.shadow_returns || controls.shadow.is_some());
         let shadow = controls
@@ -153,7 +158,7 @@ impl Compiled {
         // Helpers may promote file pages before this chain returns. Keep one
         // immutable metadata snapshot; raw Memory permissions remain free to
         // change without cloning a megabyte on each first-touch promotion.
-        let permissions = memory.fast.snapshot(&memory.perms);
+        let permissions = memory.native_permissions();
         let mut context = NativeContext {
             state,
             rows: controls
@@ -342,13 +347,18 @@ impl Snapshot {
         })
     }
 
-    pub fn capture(region: &Region, memory: &Memory) -> Result<Self, String> {
+    pub fn capture(region: &Region, memory: &mut Memory) -> Result<Self, String> {
         if region.len == 0 || region.len > 16 * 1024 || !memory.executable(region.start, region.len)
         {
             return Err("region must contain 1..16384 executable bytes".into());
         }
+        // Capture is owner-only. Selective grants are revoked before sampling;
+        // conservative native peers already forbid all executable stores.
+        memory.quiesce_code_observation();
         let mut region = region.clone();
         let origin = callee_origin(&mut region, memory);
+        let extent = (region.start - origin) as usize + region.len;
+        memory.watch_code(origin, extent + if region.complete_tail { 15 } else { 0 });
         let mut bytes = memory
             .read_data(origin, (region.start - origin) as usize + region.len)?
             .to_vec();
@@ -694,7 +704,7 @@ fn record_tail_dependencies(
 
 pub(crate) fn compile(
     region: &Region,
-    memory: &Memory,
+    memory: &mut Memory,
     shadow_returns: bool,
 ) -> Result<Compiled, String> {
     let mut input = Snapshot::capture(region, memory)?;
@@ -2232,10 +2242,10 @@ mod snapshot_tests {
             .unwrap();
         memory.write(0x10000, &[0xb8, 1, 0, 0, 0, 0xc3]).unwrap();
         let mut region = Region::new(0x10000, 6);
-        let strict = Snapshot::capture(&region, &memory).unwrap();
+        let strict = Snapshot::capture(&region, &mut memory).unwrap();
         assert_eq!(strict.bytes.len(), 6);
         region.complete_tail = true;
-        let old = Snapshot::capture(&region, &memory).unwrap();
+        let old = Snapshot::capture(&region, &mut memory).unwrap();
         assert_eq!(old.bytes.len(), 20);
         assert!(old.valid(&memory));
         // The compiler receives only the immutable old bytes, not this write.
@@ -2244,11 +2254,11 @@ mod snapshot_tests {
         assert_eq!(old.bytes[1], 1);
         let old_result = compile_snapshot(&old).unwrap();
         assert!(!old_result.valid(&memory));
-        let fresh = Snapshot::capture(&region, &memory).unwrap();
+        let fresh = Snapshot::capture(&region, &mut memory).unwrap();
         assert!(compile_snapshot(&fresh).unwrap().valid(&memory));
         memory.protect(0x10000, 4096, READ).unwrap();
         assert!(!fresh.valid(&memory));
-        assert!(Snapshot::capture(&region, &memory).is_err());
+        assert!(Snapshot::capture(&region, &mut memory).is_err());
     }
 
     #[test]
@@ -2258,7 +2268,7 @@ mod snapshot_tests {
         memory.write(0x10fff, &[0xb8]).unwrap();
         let mut region = Region::new(0x10fff, 1);
         region.complete_tail = true;
-        let old = Snapshot::capture(&region, &memory).unwrap();
+        let old = Snapshot::capture(&region, &mut memory).unwrap();
         assert_eq!(old.bytes, [0xb8]);
         assert_eq!(old.pages.len(), 2);
         let compiled = compile_snapshot(&old).unwrap();
@@ -2267,7 +2277,7 @@ mod snapshot_tests {
         memory.write(0x11000, &[91, 0, 0, 0]).unwrap();
         assert!(!old.valid(&memory));
         assert!(!compiled.valid(&memory));
-        let fresh = Snapshot::capture(&region, &memory).unwrap();
+        let fresh = Snapshot::capture(&region, &mut memory).unwrap();
         let compiled = compile_snapshot(&fresh).unwrap();
         assert!(compiled.entries.contains(&0x10fff));
         assert!(compiled.valid(&memory));
@@ -2280,7 +2290,7 @@ mod snapshot_tests {
         memory.write(0x10ff1, &[0x66; 15]).unwrap();
         let mut region = Region::new(0x10ff1, 1);
         region.complete_tail = true;
-        let old = Snapshot::capture(&region, &memory).unwrap();
+        let old = Snapshot::capture(&region, &mut memory).unwrap();
         // A malformed prefix sequence must not ask for an uncaptured version.
         compile_snapshot(&old).unwrap();
     }
@@ -2313,7 +2323,7 @@ mod tests {
             for parallel in [false, true] {
                 let mut region = Region::new(0x10000, bytes.len());
                 region.compile_strategy = strategy;
-                let mut input = Snapshot::capture(&region, &memory).unwrap();
+                let mut input = Snapshot::capture(&region, &mut memory).unwrap();
                 input.parallel = parallel;
                 let compiled = compile_snapshot(&input).unwrap();
                 assert_eq!(compiled.versioned_loops, 0);
@@ -2332,7 +2342,7 @@ mod tests {
         memory.map(0x10000, 4096, READ | EXEC).unwrap();
         memory.write(0x10000, &[0x8b, 0x06, 0xc3]).unwrap();
         memory.enable_native_protection().unwrap();
-        let compiled = compile(&Region::new(0x10000, 3), &memory, false).unwrap();
+        let compiled = compile(&Region::new(0x10000, 3), &mut memory, false).unwrap();
         assert_eq!(compiled.fault_sites.len(), 1, "{}", compiled.disasm);
         assert_eq!(compiled.fault_recipes.len(), 1);
         assert!(compiled.fault_recipes[0].valid());
@@ -2355,7 +2365,7 @@ mod tests {
             if policy {
                 region.entries.push(0x10003);
             }
-            let compiled = compile(&region, &memory, false).unwrap();
+            let compiled = compile(&region, &mut memory, false).unwrap();
             assert!(compiled.fault_sites.is_empty());
             assert!(compiled.fault_recipes.is_empty());
         }
@@ -2367,7 +2377,7 @@ mod tests {
         let mut memory = Memory::new(0x10000, 4096).unwrap();
         memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
         memory.write(0x10000, &[0x90, 0xc3]).unwrap();
-        let mut compiled = compile(&Region::new(0x10000, 2), &memory, false).unwrap();
+        let mut compiled = compile(&Region::new(0x10000, 2), &mut memory, false).unwrap();
         assert_eq!(compiled.unwind.len(), 2);
         assert!(crate::host_fault::registered(compiled.tail_entry));
         assert!(crate::host_fault::registered(compiled.entry as usize));
@@ -2398,7 +2408,7 @@ mod tests {
         machine.write(0x10000, &bytes).unwrap();
         machine.protect(0x10000, 4096, READ | EXEC).unwrap();
         let region = Region::new(0x10000, bytes.len());
-        let compiled = compile(&region, machine.memory(), false).unwrap();
+        let compiled = compile(&region, &mut machine.memory, false).unwrap();
         assert_eq!(compiled.versioned_loops, 1);
         assert_eq!(compiled.vectorized_loops, 1);
     }
@@ -2421,7 +2431,7 @@ mod tests {
         memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
         memory.write(0x10000, &bytes).unwrap();
         let region = Region::new(0x10000, bytes.len());
-        let mut snapshot = Snapshot::capture(&region, &memory).unwrap();
+        let mut snapshot = Snapshot::capture(&region, &mut memory).unwrap();
         let serial = compile_snapshot(&snapshot).unwrap();
         assert_eq!(serial.versioned_loops, 1);
         assert_eq!(serial.vectorized_loops, 0);
@@ -2517,8 +2527,12 @@ mod tests {
             let mut machine = crate::Executor::new(0x10000, 4096).unwrap();
             machine.write(0x10000, &bytes).unwrap();
             machine.protect(0x10000, 4096, READ | EXEC).unwrap();
-            let compiled =
-                compile(&Region::new(0x10000, bytes.len()), machine.memory(), false).unwrap();
+            let compiled = compile(
+                &Region::new(0x10000, bytes.len()),
+                &mut machine.memory,
+                false,
+            )
+            .unwrap();
             let divides: Vec<_> = compiled
                 .disasm
                 .lines()
