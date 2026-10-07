@@ -662,7 +662,14 @@ fn call(e: &mut Env<'_>) -> Outcome {
             e.sys.signal_waiters(handle);
             0
         }
-        "malloc" | "_malloc_crt" | "??_U@YAPAXI@Z" => allocate(e, a, false),
+        "malloc" | "_malloc_crt" | "??_U@YAPAXI@Z" => {
+            if a > CRT_ALLOCATION_LIMIT {
+                return Outcome::Return(0);
+            }
+            return crate::heap_lock::with_process_heap(e, move |e| {
+                Outcome::Return(allocate(e, a, false))
+            });
+        }
         "_encode_pointer" | "_decode_pointer" | "_encoded_null" => {
             let kernel = if name == "_decode_pointer" {
                 "DecodePointer"
@@ -679,27 +686,46 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 |_, value| Outcome::Return(value.value()),
             );
         }
-        "calloc" => a.checked_mul(b).map_or(0, |n| allocate(e, n, true)),
+        "calloc" => {
+            let Some(size) = a
+                .checked_mul(b)
+                .filter(|&size| size <= CRT_ALLOCATION_LIMIT)
+            else {
+                return Outcome::Return(0);
+            };
+            return crate::heap_lock::with_process_heap(e, move |e| {
+                Outcome::Return(allocate(e, size, true))
+            });
+        }
         "free" | "??_V@YAXPAX@Z" => {
-            if a != 0 {
+            if a == 0 {
+                return Outcome::Return(0);
+            }
+            return crate::heap_lock::with_process_heap(e, move |e| {
                 let heaps = e.ext.get_mut::<Heaps>();
                 heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
-            }
-            0
+                Outcome::Return(0)
+            });
         }
         "realloc" => {
-            if a == 0 {
-                allocate(e, b, false)
-            } else if b == 0 {
-                let heaps = e.ext.get_mut::<Heaps>();
-                heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
-                0
-            } else {
-                let heaps = e.ext.get_mut::<Heaps>();
-                heaps
-                    .realloc(e.cpu, &mut e.sys.vm, heaps.process_heap, a, b, false, false)
-                    .unwrap_or(0)
+            if a == 0 && b > CRT_ALLOCATION_LIMIT {
+                return Outcome::Return(0);
             }
+            return crate::heap_lock::with_process_heap(e, move |e| {
+                let address = if a == 0 {
+                    allocate(e, b, false)
+                } else if b == 0 {
+                    let heaps = e.ext.get_mut::<Heaps>();
+                    heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, a);
+                    0
+                } else {
+                    let heaps = e.ext.get_mut::<Heaps>();
+                    heaps
+                        .realloc(e.cpu, &mut e.sys.vm, heaps.process_heap, a, b, false, false)
+                        .unwrap_or(0)
+                };
+                Outcome::Return(address)
+            });
         }
         "memcpy" | "memmove" => match memory_ops::copy(e, a, b, c) {
             Ok(pointer) => pointer,

@@ -1,6 +1,7 @@
 //! Generated Global/Local APIs share one handle model and the existing Heaps.
 use crate::util::set_last_error;
 use adv_abi::{Env, GuestPtr, Handle, Registry, win32};
+use adv_machine::Outcome;
 use adv_os::{
     Heaps,
     global::{Block, Globals},
@@ -35,13 +36,42 @@ fn error(env: &mut Env<'_>, code: u32, result: u32) -> u32 {
 fn rounded(size: u32) -> Option<u32> {
     size.max(1).checked_add(7).map(|n| n & !7)
 }
+fn with_handle_heap(
+    env: &mut Env<'_>,
+    handle: u32,
+    body: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    let globals = env.ext.get::<Globals>();
+    let heaps = env.ext.get::<Heaps>();
+    let heap = if globals.get(&env.sys.objects, handle).is_some()
+        || globals.from_pointer(&env.sys.objects, handle).is_some()
+    {
+        Some(heaps.process_heap)
+    } else {
+        heaps.owner(handle)
+    };
+    match heap {
+        Some(heap) => crate::heap_lock::with_heap(env, heap, 0, body),
+        None => body(env),
+    }
+}
+fn allocate_front(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
+    if flags & !0x7f72 != 0
+        || !env.sys.objects.can_insert()
+        || rounded(size).is_none()
+        || (flags & 2 != 0 && size == 0)
+    {
+        return Outcome::Return(allocate(env, flags, size));
+    }
+    crate::heap_lock::with_process_heap(env, move |env| Outcome::Return(allocate(env, flags, size)))
+}
 #[win32(kernel32,name="GlobalAlloc",level=implement)]
-fn global_alloc(env: &mut Env<'_>, flags: u32, size: u32) -> Handle {
-    Handle(allocate(env, flags, size))
+fn global_alloc(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
+    allocate_front(env, flags, size)
 }
 #[win32(kernel32,name="LocalAlloc",level=implement)]
-fn local_alloc(env: &mut Env<'_>, flags: u32, size: u32) -> Handle {
-    Handle(allocate(env, flags, size))
+fn local_alloc(env: &mut Env<'_>, flags: u32, size: u32) -> Outcome {
+    allocate_front(env, flags, size)
 }
 pub(crate) fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
     if flags & !0x7f72 != 0 {
@@ -86,12 +116,14 @@ pub(crate) fn allocate(env: &mut Env<'_>, flags: u32, size: u32) -> u32 {
     }
 }
 #[win32(kernel32,name="GlobalFree",level=implement)]
-fn global_free(env: &mut Env<'_>, handle: Handle) -> Handle {
-    Handle(release(env, handle.0, false))
+fn global_free(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(release(env, handle.0, false))
+    })
 }
 #[win32(kernel32,name="LocalFree",level=implement)]
-fn local_free(env: &mut Env<'_>, handle: Handle) -> Handle {
-    Handle(release(env, handle.0, false))
+fn local_free(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    global_free(env, handle)
 }
 /// Used by EmptyClipboard to retire the same handle exactly once.
 pub(crate) fn release(env: &mut Env<'_>, handle: u32, clipboard: bool) -> u32 {
@@ -128,12 +160,14 @@ pub(crate) fn release(env: &mut Env<'_>, handle: u32, clipboard: bool) -> u32 {
     }
 }
 #[win32(kernel32,name="GlobalLock",level=implement)]
-fn global_lock(env: &mut Env<'_>, handle: Handle) -> GuestPtr<()> {
-    GuestPtr::new(lock(env, handle.0))
+fn global_lock(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(lock(env, handle.0))
+    })
 }
 #[win32(kernel32,name="LocalLock",level=implement)]
-fn local_lock(env: &mut Env<'_>, handle: Handle) -> GuestPtr<()> {
-    GuestPtr::new(lock(env, handle.0))
+fn local_lock(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    global_lock(env, handle)
 }
 fn lock(env: &mut Env<'_>, handle: u32) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
@@ -155,12 +189,16 @@ fn lock(env: &mut Env<'_>, handle: u32) -> u32 {
     }
 }
 #[win32(kernel32,name="GlobalUnlock",level=state)]
-fn global_unlock(env: &mut Env<'_>, handle: Handle) -> u32 {
-    unlock(env, handle.0, false)
+fn global_unlock(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(unlock(env, handle.0, false))
+    })
 }
 #[win32(kernel32,name="LocalUnlock",level=state)]
-fn local_unlock(env: &mut Env<'_>, handle: Handle) -> u32 {
-    unlock(env, handle.0, true)
+fn local_unlock(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(unlock(env, handle.0, true))
+    })
 }
 fn unlock(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
@@ -184,12 +222,14 @@ fn unlock(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
     }
 }
 #[win32(kernel32,name="GlobalSize",level=implement)]
-fn global_size(env: &mut Env<'_>, handle: Handle) -> u32 {
-    size(env, handle.0)
+fn global_size(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(size(env, handle.0))
+    })
 }
 #[win32(kernel32,name="LocalSize",level=implement)]
-fn local_size(env: &mut Env<'_>, handle: Handle) -> u32 {
-    size(env, handle.0)
+fn local_size(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    global_size(env, handle)
 }
 fn size(env: &mut Env<'_>, handle: u32) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
@@ -202,12 +242,14 @@ fn size(env: &mut Env<'_>, handle: u32) -> u32 {
     }
 }
 #[win32(kernel32,name="GlobalHandle",level=implement)]
-fn global_handle(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Handle {
-    Handle(handle(env, pointer.addr()))
+fn global_handle(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Outcome {
+    with_handle_heap(env, pointer.addr(), move |env| {
+        Outcome::Return(handle(env, pointer.addr()))
+    })
 }
 #[win32(kernel32,name="LocalHandle",level=implement)]
-fn local_handle(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Handle {
-    Handle(handle(env, pointer.addr()))
+fn local_handle(env: &mut Env<'_>, pointer: GuestPtr<()>) -> Outcome {
+    global_handle(env, pointer)
 }
 fn handle(env: &mut Env<'_>, pointer: u32) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
@@ -217,12 +259,16 @@ fn handle(env: &mut Env<'_>, pointer: u32) -> u32 {
         .unwrap_or_else(|| error(env, 6, 0))
 }
 #[win32(kernel32,name="GlobalFlags",level=state)]
-fn global_flags(env: &mut Env<'_>, handle: Handle) -> u32 {
-    flags(env, handle.0, false)
+fn global_flags(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(flags(env, handle.0, false))
+    })
 }
 #[win32(kernel32,name="LocalFlags",level=state)]
-fn local_flags(env: &mut Env<'_>, handle: Handle) -> u32 {
-    flags(env, handle.0, true)
+fn local_flags(env: &mut Env<'_>, handle: Handle) -> Outcome {
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(flags(env, handle.0, true))
+    })
 }
 fn flags(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
     let (heaps, globals) = env.ext.get2_mut::<Heaps, Globals>();
@@ -237,12 +283,22 @@ fn flags(env: &mut Env<'_>, handle: u32, local: bool) -> u32 {
     }
 }
 #[win32(kernel32,name="GlobalReAlloc",level=implement)]
-fn global_realloc(env: &mut Env<'_>, handle: Handle, size: u32, flags: u32) -> Handle {
-    Handle(resize(env, handle.0, size, flags, false))
+fn global_realloc(env: &mut Env<'_>, handle: Handle, size: u32, flags: u32) -> Outcome {
+    if flags & !0x7ff2 != 0 {
+        return Outcome::Return(resize(env, handle.0, size, flags, false));
+    }
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(resize(env, handle.0, size, flags, false))
+    })
 }
 #[win32(kernel32,name="LocalReAlloc",level=implement)]
-fn local_realloc(env: &mut Env<'_>, handle: Handle, size: u32, flags: u32) -> Handle {
-    Handle(resize(env, handle.0, size, flags, true))
+fn local_realloc(env: &mut Env<'_>, handle: Handle, size: u32, flags: u32) -> Outcome {
+    if flags & !0x7ff2 != 0 {
+        return Outcome::Return(resize(env, handle.0, size, flags, true));
+    }
+    with_handle_heap(env, handle.0, move |env| {
+        Outcome::Return(resize(env, handle.0, size, flags, true))
+    })
 }
 pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, local: bool) -> u32 {
     if flags & !0x7ff2 != 0 {
@@ -371,7 +427,10 @@ pub(super) fn resize(env: &mut Env<'_>, handle: u32, size: u32, flags: u32, loca
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adv_cpu::{JitCpu, backend::Guest};
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, GuestExt},
+    };
     use adv_machine::{Clock, Machine, ObjectLimits, Objects};
     fn fixture() -> Machine<JitCpu> {
         let mut registry = Registry::default();
@@ -502,5 +561,170 @@ mod tests {
         assert_eq!(lock(&mut env(&mut m), raw), raw);
         assert_eq!(super::handle(&mut env(&mut m), raw), raw);
         assert_eq!(release(&mut env(&mut m), raw, false), 0);
+    }
+
+    fn contended(
+        m: &mut Machine<JitCpu>,
+        heap: u32,
+        operation: impl FnOnce(&mut Env<'_>) -> Outcome,
+        unchanged: impl FnOnce(&mut Machine<JitCpu>),
+    ) -> u32 {
+        m.sys.current = 0;
+        assert!(matches!(
+            crate::heap_lock::lock(&mut env(m), heap),
+            Outcome::Return(1)
+        ));
+        m.sys.current = 1;
+        let Outcome::Block {
+            wait: adv_machine::Wait::Object { handle, .. },
+            then,
+            ..
+        } = operation(&mut env(m))
+        else {
+            panic!("Global/Local frontend must wait for its actual heap owner")
+        };
+        unchanged(m);
+        m.sys.current = 0;
+        assert!(matches!(
+            crate::heap_lock::unlock(&mut env(m), heap),
+            Outcome::Return(1)
+        ));
+        m.sys.current = 1;
+        assert!(m.sys.try_acquire(handle));
+        let Outcome::Return(value) = then(
+            &mut env(m),
+            adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+        ) else {
+            panic!("Global/Local frontend must finish after heap handoff")
+        };
+        value
+    }
+
+    #[test]
+    fn global_local_fronts_wait_for_process_and_private_heap_owners() {
+        let mut m = fixture();
+        m.spawn("globals waiter", adv_machine::layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        let heap = m.ext.get::<Heaps>().process_heap;
+        for local in [false, true] {
+            let handle = contended(
+                &mut m,
+                heap,
+                |env| {
+                    if local {
+                        local_alloc(env, 0x42, 32)
+                    } else {
+                        global_alloc(env, 0x42, 32)
+                    }
+                },
+                |_| {},
+            );
+            let pointer = lock(&mut env(&mut m), handle);
+            assert_ne!(pointer, 0);
+            m.cpu.write_u32(pointer, 0x13572468).unwrap();
+            unlock(&mut env(&mut m), handle, local);
+            assert_eq!(
+                contended(
+                    &mut m,
+                    heap,
+                    |env| {
+                        if local {
+                            local_realloc(env, Handle(handle), 64, 0x42)
+                        } else {
+                            global_realloc(env, Handle(handle), 64, 0x42)
+                        }
+                    },
+                    |m| {
+                        assert_eq!(size(&mut env(m), handle), 32);
+                        assert_eq!(m.cpu.read_u32(pointer).unwrap(), 0x13572468);
+                    }
+                ),
+                handle
+            );
+            let pointer = lock(&mut env(&mut m), handle);
+            unlock(&mut env(&mut m), handle, local);
+            assert_eq!(m.cpu.read_u32(pointer).unwrap(), 0x13572468);
+            for operation in [0, 1, 2, 3, 4] {
+                let value = contended(
+                    &mut m,
+                    heap,
+                    |env| match (local, operation) {
+                        (false, 0) => global_size(env, Handle(handle)),
+                        (true, 0) => local_size(env, Handle(handle)),
+                        (false, 1) => global_handle(env, GuestPtr::new(pointer)),
+                        (true, 1) => local_handle(env, GuestPtr::new(pointer)),
+                        (false, 2) => global_flags(env, Handle(handle)),
+                        (true, 2) => local_flags(env, Handle(handle)),
+                        (false, 3) => global_lock(env, Handle(handle)),
+                        (true, 3) => local_lock(env, Handle(handle)),
+                        (false, _) => global_unlock(env, Handle(handle)),
+                        (true, _) => local_unlock(env, Handle(handle)),
+                    },
+                    |_| {},
+                );
+                assert_eq!(
+                    value,
+                    match operation {
+                        0 => 64,
+                        1 => handle,
+                        3 => pointer,
+                        _ => 0,
+                    }
+                );
+            }
+            assert_eq!(
+                contended(
+                    &mut m,
+                    heap,
+                    |env| {
+                        if local {
+                            local_free(env, Handle(handle))
+                        } else {
+                            global_free(env, Handle(handle))
+                        }
+                    },
+                    |m| {
+                        assert_eq!(m.ext.get::<Heaps>().owner(pointer), Some(heap));
+                    }
+                ),
+                0
+            );
+            assert!(m.ext.get::<Heaps>().owner(pointer).is_none());
+        }
+
+        let private = m
+            .ext
+            .get_mut::<Heaps>()
+            .create(&mut m.cpu, &mut m.sys.vm)
+            .unwrap();
+        let raw = m
+            .ext
+            .get_mut::<Heaps>()
+            .alloc(&mut m.cpu, &mut m.sys.vm, private, 24, false)
+            .unwrap();
+        m.cpu.write_u32(raw, 0x24681357).unwrap();
+        let resized = contended(
+            &mut m,
+            private,
+            |env| local_realloc(env, Handle(raw), 48, 2),
+            |m| {
+                assert_eq!(m.ext.get_mut::<Heaps>().size(private, raw), Some(24));
+                assert_eq!(m.cpu.read_u32(raw).unwrap(), 0x24681357);
+            },
+        );
+        assert_eq!(m.ext.get::<Heaps>().owner(resized), Some(private));
+        assert_eq!(m.cpu.read_u32(resized).unwrap(), 0x24681357);
+        assert_eq!(
+            contended(
+                &mut m,
+                private,
+                |env| global_free(env, Handle(resized)),
+                |m| {
+                    assert_eq!(m.ext.get::<Heaps>().owner(resized), Some(private));
+                }
+            ),
+            0
+        );
+        assert!(m.ext.get::<Heaps>().owner(resized).is_none());
     }
 }
