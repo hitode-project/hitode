@@ -269,6 +269,9 @@ impl Worker {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler(&input)))
                     .unwrap_or_else(|_| Err("background compiler panicked".into()));
             let completed_at = Instant::now();
+            if let Ok(compiled) = &result {
+                compiled.record_ir_counts(completed_at.duration_since(started));
+            }
             active.fetch_sub(1, Ordering::Relaxed);
             job_stage.store(2, Ordering::Relaxed);
             let completion = Completion {
@@ -349,6 +352,9 @@ impl Worker {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compiler(&input)))
                     .unwrap_or_else(|_| Err("background compiler panicked".into()));
             let completed_at = Instant::now();
+            if let Ok(compiled) = &result {
+                compiled.record_ir_counts(completed_at.duration_since(started));
+            }
             active.fetch_sub(1, Ordering::Relaxed);
             job_stage.store(2, Ordering::Relaxed);
             let completion = Completion {

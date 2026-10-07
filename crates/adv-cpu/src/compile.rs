@@ -27,6 +27,7 @@ mod fault;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod fp_environment;
 mod invariants;
+mod ir_counts;
 mod loops;
 mod mmx;
 mod nest;
@@ -77,6 +78,7 @@ pub(crate) struct Compiled {
     pub code_size: usize,
     pub instruction_count: usize,
     pub decoded_bytes: usize,
+    ir_counts: Option<ir_counts::Summary>,
     pub direct_sites: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
@@ -105,6 +107,12 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    pub(crate) fn record_ir_counts(&self, service: std::time::Duration) {
+        if let Some(counts) = &self.ir_counts {
+            eprintln!("compile-ir: {}", counts.json(self.code_size, service));
+        }
+    }
+
     pub(crate) fn profile(&self) -> Option<&Profile> {
         self.input.profile.as_deref()
     }
@@ -728,10 +736,15 @@ pub(crate) fn compile(
 ) -> Result<Compiled, String> {
     let mut input = Snapshot::capture(region, memory)?;
     input.shadow_returns = shadow_returns;
-    compile_snapshot(&input)
+    let started = std::time::Instant::now();
+    let compiled = compile_snapshot(&input)?;
+    compiled.record_ir_counts(started.elapsed());
+    Ok(compiled)
 }
 
 pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> {
+    let ir_counts =
+        ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
     let bytes = &snapshot.bytes;
     let first_page = (region.start - snapshot.base) as usize / 4096;
@@ -1177,9 +1190,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // Fault recipes read their own source locations; keep them untagged.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    let source_map = diagnostics::instruction_map_enabled() && fault_pc.is_none();
+    let source_map =
+        (diagnostics::instruction_map_enabled() || ir_counts.is_some()) && fault_pc.is_none();
     #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
-    let source_map = diagnostics::instruction_map_enabled();
+    let source_map = diagnostics::instruction_map_enabled() || ir_counts.is_some();
     let mut nest_signature = module.make_signature();
     nest_signature.params.extend([AbiParam::new(ptr_ty); 4]);
     nest_signature.returns.push(AbiParam::new(types::I32));
@@ -1932,6 +1946,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
         e.b.seal_all_blocks();
         e.b.finalize();
+        ir_counts::Counts::function(ir_counts.as_ref(), func, region.start, &instructions);
     };
     // Kernels are finalized first: the region calls their absolute addresses,
     // since JIT allocations need not stay within a rel32 reach of each other.
@@ -1996,7 +2011,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let row_thunk = if nests.is_empty() {
         None
     } else {
-        let result = nest_emit::thunk(&mut module, &mut fb_ctx, &tail_signature)?;
+        let result = nest_emit::thunk(
+            &mut module,
+            &mut fb_ctx,
+            &tail_signature,
+            ir_counts.as_ref(),
+        )?;
         let id = result.0;
         kernel_functions.push(result);
         Some(id)
@@ -2183,6 +2203,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.seal_all_blocks();
         b.finalize();
     }
+    ir_counts::Counts::function(
+        ir_counts.as_ref(),
+        &wrapper.func,
+        region.start,
+        &instructions,
+    );
     module
         .define_function(wrapper_id, &mut wrapper)
         .map_err(|e| format!("{e:?}"))?;
@@ -2276,6 +2302,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
     }
     Ok(Compiled {
+        ir_counts: ir_counts.map(|counts| {
+            counts.into_inner().finish(
+                if opt_level == "speed" {
+                    "speed"
+                } else {
+                    "fast"
+                },
+                &instructions,
+            )
+        }),
         instruction_count: instructions.len(),
         decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
@@ -5570,6 +5606,8 @@ impl Emitter<'_> {
         })
     }
     fn materialize_flags(&mut self) -> Value {
+        let source = self.source;
+        self.mark_source(diagnostics::overhead_source(diagnostics::Overhead::Flags));
         let old = self.b.use_var(self.flags);
         let mut flags = self.b.ins().band_imm(old, !0x8d5_i64);
         for bit in [0, 2, 4, 6, 7, 11] {
@@ -5577,6 +5615,7 @@ impl Emitter<'_> {
             let value = self.b.ins().ishl_imm(value, i64::from(bit));
             flags = self.b.ins().bor(flags, value);
         }
+        self.mark_source(source);
         flags
     }
     /// Whether `result` is the instruction `opcode` applied to `a` and `b`.
