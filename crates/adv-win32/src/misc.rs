@@ -10,6 +10,7 @@ mod internet;
 pub(crate) mod imm;
 mod image_list;
 mod ole_memory;
+mod variant;
 mod property_sheet;
 mod shell_execute;
 mod shell_icon;
@@ -370,6 +371,7 @@ pub fn register(reg: &mut Registry) {
     });
     stdcall(reg, SHELL32, "SHGetFileInfoA", 5, |_| Outcome::Return(0));
     ole_memory::register(reg);
+    variant::register(reg);
     // Offline, with no error: the guest never reaches the network.
     stdcall(reg, SENSAPI, "IsNetworkAlive", 1, |e| {
         let flags = e.arg(0);

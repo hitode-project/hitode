@@ -407,7 +407,11 @@ fn shared<B: Backend>(cpu: B) {
     );
     let mut variant = [0; 16];
     machine.cpu.read(VARIANT, &mut variant).unwrap();
-    assert_eq!(variant, [0; 16]);
+    // Native VariantClear retires ownership and replaces only vt, retaining
+    // the reserved and union bytes rather than zeroing the entire VARIANT.
+    assert_eq!(&variant[..4], &[0; 4]);
+    assert_eq!(&variant[4..8], &0x77777777u32.to_le_bytes());
+    assert_eq!(&variant[12..16], &0x77777777u32.to_le_bytes());
     let mut readonly = [0; 16];
     machine.cpu.read(READ_ONLY, &mut readonly).unwrap();
     assert_eq!(readonly, [0xcd; 16]);
