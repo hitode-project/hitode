@@ -17,6 +17,9 @@ pub(super) fn register(reg: R) -> Option<usize> {
 }
 
 pub(super) fn supported(i: &Instruction) -> bool {
+    if i.code() == iced_x86::Code::Pextrw_r32_xmm_imm8 {
+        return reg_index(i.op0_register()).is_some() && register(i.op1_register()).is_some();
+    }
     if i.mnemonic() == M::Pinsrw {
         return i.op_count() == 3
             && register(i.op0_register()).is_some()
@@ -69,13 +72,15 @@ pub(super) fn supported(i: &Instruction) -> bool {
             | M::Pslld
             | M::Psraw
             | M::Psrad
+            | M::Psllq
+            | M::Psrlq
     ) || i.op_count() != 2
     {
         return false;
     }
     let shift = matches!(
         i.mnemonic(),
-        M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw | M::Psrad
+        M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw | M::Psrad | M::Psllq | M::Psrlq
     );
     for n in 0..2 {
         match i.op_kind(n) {
@@ -86,12 +91,15 @@ pub(super) fn supported(i: &Instruction) -> bool {
                         .iter()
                         .all(|&r| r == R::None || reg_index(r).is_some())
                     && (n == 1 || matches!(i.mnemonic(), M::Movdqa | M::Movdqu))
-                    && (!shift || matches!(i.mnemonic(), M::Psraw | M::Psrad)) => {}
+                    && (!shift
+                        || matches!(i.mnemonic(), M::Psraw | M::Psrad | M::Psllq | M::Psrlq)) => {}
             OpKind::Immediate8 if n == 1 && shift => {}
             _ => return false,
         }
     }
-    !shift || i.op1_kind() == OpKind::Immediate8 || matches!(i.mnemonic(), M::Psraw | M::Psrad)
+    !shift
+        || i.op1_kind() == OpKind::Immediate8
+        || matches!(i.mnemonic(), M::Psraw | M::Psrad | M::Psllq | M::Psrlq)
 }
 
 impl Emitter<'_> {
@@ -130,6 +138,14 @@ impl Emitter<'_> {
     }
 
     pub(super) fn simd_instruction(&mut self, i: &Instruction) {
+        if i.mnemonic() == M::Pextrw {
+            let source = self.vector_read(i, 1);
+            let source = self.vector_cast(source, types::I16X8);
+            let word = self.b.ins().extractlane(source, i.immediate8() & 7);
+            let value = self.b.ins().uextend(types::I32, word);
+            self.write(i, None, value);
+            return;
+        }
         if i.mnemonic() == M::Maskmovdqu {
             self.simd_masked_store(i);
             return;
@@ -164,7 +180,7 @@ impl Emitter<'_> {
         let a = self.vector_read(i, 0);
         let shift = matches!(
             i.mnemonic(),
-            M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw | M::Psrad
+            M::Psrlw | M::Psrld | M::Psllw | M::Pslld | M::Psraw | M::Psrad | M::Psllq | M::Psrlq
         );
         let ty = match i.mnemonic() {
             M::Pavgw
@@ -180,6 +196,7 @@ impl Emitter<'_> {
             | M::Psraw
             | M::Psllw => types::I16X8,
             M::Paddd | M::Psubd | M::Psrld | M::Pslld | M::Psrad | M::Packssdw => types::I32X4,
+            M::Psllq | M::Psrlq => types::I64X2,
             _ => types::I8X16,
         };
         let a = self.vector_cast(a, ty);
@@ -197,13 +214,32 @@ impl Emitter<'_> {
                 self.b.ins().ireduce(types::I32, count)
             };
             self.b.ins().sshr(a, count)
+        } else if matches!(i.mnemonic(), M::Psllq | M::Psrlq) && i.op1_kind() != OpKind::Immediate8
+        {
+            // The entire low quadword is the unsigned count. Host shifts mask
+            // it; select zero explicitly for every count at or above 64.
+            let source = self.vector_read(i, 1);
+            let source = self.vector_cast(source, types::I64X2);
+            let count = self.b.ins().extractlane(source, 0);
+            let large = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, count, 64);
+            let count = self.b.ins().ireduce(types::I32, count);
+            let shifted = if i.mnemonic() == M::Psllq {
+                self.b.ins().ishl(a, count)
+            } else {
+                self.b.ins().ushr(a, count)
+            };
+            let zero = self.b.ins().bxor(a, a);
+            self.b.ins().select(large, zero, shifted)
         } else if shift {
             let count = i.immediate8();
             if u32::from(count) >= ty.lane_bits() {
                 self.b.ins().bxor(a, a)
             } else {
                 let count = self.constant(u32::from(count));
-                if matches!(i.mnemonic(), M::Psrlw | M::Psrld) {
+                if matches!(i.mnemonic(), M::Psrlw | M::Psrld | M::Psrlq) {
                     self.b.ins().ushr(a, count)
                 } else {
                     self.b.ins().ishl(a, count)

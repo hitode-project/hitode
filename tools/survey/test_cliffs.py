@@ -42,6 +42,76 @@ def empty_fixture():
 
 
 class AggregateTests(unittest.TestCase):
+    def detailed_fixture(self):
+        report = empty_fixture()
+        report["cpu_cliffs"].update(
+            interpreter={"Rejected": {"entries": 2, "instructions": 11}},
+            interpreter_details={"Rejected/Unsupported/Cbw/Cbw": {"entries": 2, "instructions": 11}},
+            interpreter_details_omitted={reason: {"entries": 0, "instructions": 0}
+                                         for reason in ("Uncovered", "Rejected")},
+            interpreter_detail_rows_omitted=0)
+        return report
+
+    def test_details_merge_and_old_reports_remain_explicitly_unknown(self):
+        report = self.detailed_fixture()
+        old = empty_fixture()
+        old["cpu_cliffs"]["interpreter"] = {"Uncovered": {"entries": 3, "instructions": 20}}
+        result = aggregate([report, report, old])
+        self.assertEqual(result["cpu_cliffs"]["interpreter_details"]["Rejected/Unsupported/Cbw/Cbw"],
+                         {"entries": 4, "instructions": 22})
+        self.assertEqual(result["cpu_cliffs"]["interpreter_details_unknown"]["Uncovered"],
+                         {"entries": 3, "instructions": 20})
+        self.assertEqual(result["report_limits"]["interpreter_detail_reports"], 2)
+
+    def test_iced_forms_can_suffix_the_mnemonic_with_operand_size(self):
+        for label in ("Uncovered/Unsupported/Popa/Popaw", "Rejected/Unsupported/Ret/Retnd"):
+            report = self.detailed_fixture()
+            bucket = label.split("/")[0]
+            report["cpu_cliffs"]["interpreter"] = {bucket: {"entries": 2, "instructions": 11}}
+            report["cpu_cliffs"]["interpreter_details"] = {label: {"entries": 2, "instructions": 11}}
+            self.assertIn(label, aggregate([report])["cpu_cliffs"]["interpreter_details"])
+
+    def test_detail_truncation_reconciles_both_counters(self):
+        report = self.detailed_fixture()
+        cliffs = report["cpu_cliffs"]
+        cliffs["interpreter_details"] = {
+            f"Rejected/Unsupported/Op{i}/Op{i}_rm32": {"entries": 1, "instructions": 3}
+            for i in range(24)}
+        cliffs["interpreter_details_omitted"]["Rejected"] = {"entries": 5, "instructions": 7}
+        cliffs["interpreter_detail_rows_omitted"] = 2
+        cliffs["interpreter"]["Rejected"] = {"entries": 29, "instructions": 79}
+        result = aggregate([report])
+        self.assertEqual(result["cpu_cliffs"]["interpreter_details_omitted"]["Rejected"]["instructions"], 7)
+        self.assertIn("源报告截断行数：2", markdown(result))
+        cliffs["interpreter"]["Rejected"]["entries"] += 1
+        with self.assertRaisesRegex(ValueError, "reconcile"):
+            aggregate([report])
+
+    def test_detail_schema_rejects_partial_or_private_labels(self):
+        for label in ("Rejected/UnknownReason", "Uncovered/private/path", "Rejected/Unsupported/Mov/private",
+                      "Rejected/Unsupported/Mov/Mov_0x1234-operand", "Rejected/Unsupported/Mov/Mov_0x1234",
+                      "Rejected/Unsupported/Mov/Mov_12345678", "Forced/BelowThreshold"):
+            report = self.detailed_fixture()
+            report["cpu_cliffs"]["interpreter_details"] = {label: {"entries": 2, "instructions": 11}}
+            with self.assertRaises(ValueError) as caught:
+                aggregate([report])
+            self.assertNotIn("private", str(caught.exception))
+        for key in ("interpreter_details", "interpreter_details_omitted", "interpreter_detail_rows_omitted"):
+            report = self.detailed_fixture()
+            del report["cpu_cliffs"][key]
+            with self.assertRaises(ValueError):
+                aggregate([report])
+
+    def test_detail_limits_and_counter_types_are_checked(self):
+        for key, bad in (("interpreter_detail_rows_omitted", True),
+                         ("interpreter_detail_rows_omitted", 1),
+                         ("interpreter_details", []),
+                         ("interpreter_details_omitted", {})):
+            report = self.detailed_fixture()
+            report["cpu_cliffs"][key] = bad
+            with self.assertRaises(ValueError):
+                aggregate([report])
+
     def test_control_distribution_is_complete_and_guards_overlap(self):
         report = fixture()
         report["cpu_cliffs"]["x87_control"] = {
@@ -55,6 +125,19 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(counters["x87_control"]["PC=64/RC=nearest/masks=3f"], 10)
         self.assertEqual(counters["x87_control_rejections"], {"PC": 16, "RC": 6, "Masks": 6})
         self.assertIn("Control 细分覆盖 2", markdown(summary))
+
+    def test_control_and_entry_details_reconcile_in_the_same_report(self):
+        report = fixture()
+        report["cpu_cliffs"].update({key: value for key, value in self.detailed_fixture()["cpu_cliffs"].items()
+                                     if key.startswith("interpreter")})
+        report["cpu_cliffs"]["x87_control"] = {"PC=64/RC=nearest/masks=3f": 8}
+        report["cpu_cliffs"]["x87_control_rejections"] = {"PC": 8, "RC": 0, "Masks": 0}
+        summary = aggregate([report])
+        self.assertEqual(summary["cpu_cliffs"]["x87_control_rejections"]["PC"], 8)
+        self.assertEqual(summary["cpu_cliffs"]["interpreter_details"]["Rejected/Unsupported/Cbw/Cbw"],
+                         {"entries": 2, "instructions": 11})
+        self.assertIn("Control 细分覆盖 1", markdown(summary))
+        self.assertIn("Rejected/Unsupported/Cbw/Cbw", markdown(summary))
 
     def test_control_distribution_rejects_private_labels_and_inconsistent_counts(self):
         for label, value, guards in [

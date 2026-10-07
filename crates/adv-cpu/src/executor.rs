@@ -3,11 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::cliffs::InterpreterDetail;
 use crate::compile::{self, Compiled};
 use crate::trap::{Bridge, ExecutionTrap};
 use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 
 mod code_store;
+mod coverage;
 mod instruction_trace;
 mod interpreter_profile;
 mod parallel;
@@ -173,7 +175,7 @@ pub struct Executor {
     compile_threads: usize,
     automatic_regions: BTreeSet<u32>,
     hits: HashMap<u32, u32>,
-    attempted: BTreeSet<u32>,
+    attempted: BTreeMap<u32, InterpreterDetail>,
     cache_region_limit: usize,
     cache_byte_limit: usize,
     cache_clock: u64,
@@ -465,7 +467,7 @@ impl Executor {
             compile_threads: 0,
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
-            attempted: BTreeSet::new(),
+            attempted: BTreeMap::new(),
             cache_region_limit: 16384,
             cache_byte_limit: 128 * 1024 * 1024,
             cache_clock: 0,
@@ -843,8 +845,14 @@ impl Executor {
                     while self.compile_errors.len() > 64 {
                         self.compile_errors.pop_first();
                     }
-                    self.attempted.extend(region.entries.iter().copied());
-                    self.attempted.insert(region.start);
+                    self.attempted.extend(
+                        region
+                            .entries
+                            .iter()
+                            .map(|&pc| (pc, InterpreterDetail::WorkBudget)),
+                    );
+                    self.attempted
+                        .insert(region.start, InterpreterDetail::WorkBudget);
                     self.tier_attempted.insert(region.start);
                     return Ok(false);
                 }
@@ -958,6 +966,7 @@ impl Executor {
                 }
                 Err(crate::compiler::SubmitError::WorkLimit { work, limit }) => {
                     self.deferred_compilations.remove(&start);
+                    self.record_rejection(&region, InterpreterDetail::WorkBudget);
                     self.stats.compile_work_rejections += 1;
                     self.compile_errors.insert(
                         start,
@@ -1017,6 +1026,7 @@ impl Executor {
                     // A compilation failure must leave the original guest code
                     // executable by the interpreter; explicit compilation returns errors.
                     self.stats.compile_failures += 1;
+                    self.record_rejection(&completion.region, InterpreterDetail::CompileFailure);
                     self.compile_errors.insert(start, error);
                     while self.compile_errors.len() > 64 {
                         self.compile_errors.pop_first();
@@ -1392,7 +1402,7 @@ impl Executor {
             self.rejected_entries.remove(&pc);
             self.attempted.remove(&pc);
         }
-        if self.attempted.contains(&pc) {
+        if self.attempted.contains_key(&pc) {
             return Ok(());
         }
         let hits = self.hits.entry(pc).or_default();
@@ -1442,23 +1452,28 @@ impl Executor {
                     .chain(std::iter::once(input.region.start))
             }))
             .collect();
-        let Some(region) = crate::discovery::discover(
+        let region = match crate::discovery::discover(
             &mut self.memory,
             pc,
             stop,
             self.auto_compile_strategy,
             &boundaries,
-        ) else {
-            self.attempted.insert(pc);
-            return Ok(());
+        ) {
+            Ok(region) => region,
+            Err(reason) => {
+                self.attempted.insert(pc, reason);
+                return Ok(());
+            }
         };
         if self.async_compilation {
             if self.queue_region(region)? {
-                self.attempted.insert(pc);
+                self.attempted
+                    .insert(pc, InterpreterDetail::NoPublishedEntry);
             }
         } else {
             self.add_region(region)?;
-            self.attempted.insert(pc);
+            self.attempted
+                .insert(pc, InterpreterDetail::NoPublishedEntry);
         }
         Ok(())
     }
@@ -1725,6 +1740,26 @@ impl Executor {
                 .map_or((units, None), |trace| {
                     trace.prepare(units, &self.state, &self.memory)
                 });
+            let reason = {
+                use crate::InterpreterReason as Reason;
+                if interpreter_only || single_step || pending_fpu {
+                    Reason::Forced
+                } else if self.deferred_fallback == Some(pc) {
+                    Reason::Fallback
+                } else {
+                    match self.code.entry_owner.get(&pc) {
+                        Some(owner) if self.code.compiled.contains_key(owner) => Reason::Interior,
+                        Some(_) => Reason::Pending,
+                        None if self.attempted.contains_key(&pc) => Reason::Rejected,
+                        None => Reason::Uncovered,
+                    }
+                }
+            };
+            let detail = matches!(
+                reason,
+                crate::InterpreterReason::Uncovered | crate::InterpreterReason::Rejected
+            )
+            .then(|| self.interpreter_detail(pc));
             let tier1 =
                 self.run_tier1(stop, units, interpreter_only || single_step || pending_fpu)?;
             let (execution, last_units) = if let Some(result) = &tier1 {
@@ -1753,23 +1788,11 @@ impl Executor {
             let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
             self.stats.interpreter_entries += u64::from(interpreted);
             self.stats.interpreter_instructions += u64::from(interpreted_units);
-            let reason = {
-                use crate::InterpreterReason as Reason;
-                if interpreter_only || single_step || pending_fpu {
-                    Reason::Forced
-                } else if self.deferred_fallback == Some(pc) {
-                    Reason::Fallback
-                } else {
-                    match self.code.entry_owner.get(&pc) {
-                        Some(owner) if self.code.compiled.contains_key(owner) => Reason::Interior,
-                        Some(_) => Reason::Pending,
-                        None if self.attempted.contains(&pc) => Reason::Rejected,
-                        None => Reason::Uncovered,
-                    }
-                }
-            };
             if interpreted {
                 bridge.cliffs.interpreted(reason, interpreted_units);
+                if let Some(detail) = detail {
+                    bridge.cliffs.detail(reason, detail, interpreted_units);
+                }
                 if let Some(profile) = &mut self.interpreter_profile {
                     profile.record(pc, interpreted_units, reason, &self.memory);
                 }
