@@ -8,7 +8,7 @@ Keep normal and ADV_JIT_VERIFY=1 runs in separate invocations; cumulative
 checkpoints from the same run must not be added together.
 Output: Markdown tables (native fallback Top 20) or complete aggregate JSON on
 stdout. Only counters, mnemonic/reason labels and ordinal report numbers leave
-the tool; filenames, metadata, timings and verification reports are excluded.
+the tool; filenames, private metadata, run timings and verification reports are excluded.
 Errors identify an input by ordinal, never by path or by its contents.
 
 adv-run currently keeps at most 24 fallback and 24 x87 mnemonic/reason rows per
@@ -22,6 +22,8 @@ disjoint groups. Prefix histograms use decoded instructions; supported counts
 use retirement units (REP elements). All-supported prefixes are right-censored.
 Optional x87_control fields retain the complete PC/RC/mask distribution and
 independent guard counts. Reports predating those fields are counted separately.
+Optional compilation_schedule contains bounded aggregate duration/size histograms,
+waiting interpreter units and concurrency counters; old reports remain unmeasured.
 Optional x87_pc64 records all nearest/masked PC=64 Control rejections by
 opportunity class, including rejected operands and operations not evaluated.
 """
@@ -162,6 +164,64 @@ def merge_census(destination: dict, source: object, interpreter: dict) -> None:
     expected = [entry_count(interpreter.get(name, dict.fromkeys(COUNT_KEYS, 0))) for name in DETAIL_BUCKETS]
     if entries != sum(row["entries"] for row in expected) or units != sum(row["instructions"] for row in expected):
         raise ValueError("Tier 1 census does not reconcile with interpreter buckets")
+SCHEDULE_HISTOGRAMS = ("deferred_us", "queue_us", "service_us", "publication_us", "age_us",
+                       "instructions", "decoded_bytes", "window_bytes", "native_bytes", "waiting_units")
+SCHEDULE_COUNTERS = ("duplicate_requests", "capacity_rejections", "window_deferrals", "worker_full")
+SCHEDULE_GLOBALS = ("in_flight_at_submit", "active_at_start", "unfinished_age_us", "unfinished_waiting_units")
+
+
+def merge_histogram(destination: dict, raw: object) -> None:
+    """Validate and merge a fixed log2 histogram; never retain unknown fields."""
+    raw = mapping(raw)
+    values = {key: count(required(raw, key)) for key in ("count", "sum", "max")}
+    bins = required(raw, "log2_bins")
+    if not isinstance(bins, list) or len(bins) != 65:
+        raise ValueError("invalid compilation histogram bins")
+    bins = [count(n) for n in bins]
+    if sum(bins) != values["count"] or values["max"] > values["sum"]:
+        raise ValueError("inconsistent compilation histogram totals")
+    occupied = [i for i, n in enumerate(bins) if n]
+    if occupied and occupied[-1] != values["max"].bit_length():
+        raise ValueError("inconsistent compilation histogram maximum")
+    if not occupied and (values["sum"] or values["max"]):
+        raise ValueError("nonempty compilation histogram without samples")
+    destination.setdefault("log2_bins", [0] * 65)
+    for key in ("count", "sum"):
+        destination[key] = destination.get(key, 0) + values[key]
+    destination["max"] = max(destination.get("max", 0), values["max"])
+    destination["log2_bins"] = [a + b for a, b in zip(destination["log2_bins"], bins)]
+
+
+def merge_schedule(destination: dict, raw: object) -> None:
+    """Consume only anonymous scheduling counters from one final report."""
+    raw = mapping(raw)
+    if count(required(raw, "version")) != 1:
+        raise ValueError("unsupported compilation schedule version")
+    configuration = tuple(count(required(raw, key)) for key in ("compile_threads", "available_cores"))
+    configurations = destination.setdefault("configurations", [])
+    row = next((c for c in configurations if (c["compile_threads"], c["available_cores"]) == configuration), None)
+    if row is None:
+        row = dict(zip(("compile_threads", "available_cores"), configuration), reports=0)
+        configurations.append(row)
+    row["reports"] += 1
+    destination["report_count"] += 1
+    for key in SCHEDULE_COUNTERS:
+        destination[key] = destination.get(key, 0) + count(required(raw, key))
+    for key in SCHEDULE_GLOBALS:
+        merge_histogram(destination.setdefault(key, {}), required(raw, key))
+    for strategy in ("fast", "speed"):
+        source = mapping(required(raw, strategy))
+        target = destination.setdefault(strategy, {})
+        for key in SCHEDULE_HISTOGRAMS:
+            merge_histogram(target.setdefault(key, {}), required(source, key))
+        units = required(source, "interpreter_units_by_stage")
+        if not isinstance(units, list) or len(units) != 4:
+            raise ValueError("invalid compilation interpreter stages")
+        target["interpreter_units_by_stage"] = [a + count(b) for a, b in zip(
+            target.get("interpreter_units_by_stage", [0] * 4), units)]
+        if any(source[key]["count"] != source["service_us"]["count"]
+               for key in ("queue_us", "publication_us")):
+            raise ValueError("inconsistent compilation completion counts")
 
 
 def aggregate(reports: Iterable[dict]) -> dict:
@@ -184,10 +244,15 @@ def aggregate(reports: Iterable[dict]) -> dict:
     census_reports = 0
     verification = dict.fromkeys(VERIFY_COUNTERS, 0)
     per_report = []
+    schedule = {"report_count": 0, "unmeasured_reports": 0}
     helpers = fast = unattributed = fallback_limits = exact_limits = 0
     for index, report in enumerate(reports, 1):
         try:
             report = mapping(report)
+            if "compilation_schedule" in report:
+                merge_schedule(schedule, report["compilation_schedule"])
+            else:
+                schedule["unmeasured_reports"] += 1
             cliffs = mapping(required(report, "cpu_cliffs"))
             verify = mapping(required(report, "tier_verification"))
             run_helpers = count(required(cliffs, "x87_helper_calls"))
@@ -307,6 +372,7 @@ def aggregate(reports: Iterable[dict]) -> dict:
         raise ValueError("at least one report is required")
     return {
         "report_count": len(per_report),
+        "compilation_schedule": schedule,
         "cpu_cliffs": {
             "tier1_census": census,
             "tier1_census_reports": census_reports,

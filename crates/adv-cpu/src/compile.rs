@@ -75,6 +75,8 @@ pub(crate) struct Compiled {
     /// Entry forms deliberately left to the interpreter after code generation.
     pub excluded_entries: BTreeMap<u32, iced_x86::Code>,
     pub code_size: usize,
+    pub instruction_count: usize,
+    pub decoded_bytes: usize,
     pub direct_sites: usize,
     /// x87 instructions called from generated code by address.
     _x87: Box<[crate::floating::NativeX87]>,
@@ -2274,6 +2276,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
     }
     Ok(Compiled {
+        instruction_count: instructions.len(),
+        decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         unwind,
