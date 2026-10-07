@@ -109,6 +109,7 @@ pub(crate) struct Completion {
     pub blocks: u64,
     pub bulk_calls: u64,
     pub bulk_bytes: u64,
+    pub cliffs: crate::Cliffs,
     pub elapsed: Duration,
     pub queue_time: Duration,
     pub admission: Admission,
@@ -391,6 +392,7 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
         unclocked_bytes: 0,
         bulk_calls: 0,
         bulk_bytes: 0,
+        cliffs: Default::default(),
     };
     let mut entries = 0;
     let mut blocks = 0;
@@ -485,6 +487,7 @@ fn execute(job: Job, worker: usize, fence: &Fence, tsc: &Arc<AtomicU64>) -> Comp
         blocks,
         bulk_calls: bridge.bulk_calls,
         bulk_bytes: bridge.bulk_bytes,
+        cliffs: std::mem::take(&mut bridge.cliffs),
         elapsed,
         queue_time,
         admission,
