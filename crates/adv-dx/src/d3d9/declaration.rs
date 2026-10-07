@@ -79,9 +79,11 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
     let mut color = None;
     let mut uv = None;
     let mut size = 0;
+    let mut streams = [0; 3];
     for element in elements.iter().take_while(|e| !end(e)) {
-        if element[..2] != [0, 0] {
-            return Err("vertex declaration reads a stream other than 0");
+        let stream = u16::from_le_bytes([element[0], element[1]]);
+        if stream >= 16 {
+            return Err("vertex declaration stream is outside the bound stream range");
         }
         if element[5] != 0 {
             return Err("vertex declaration uses a tessellation method");
@@ -92,18 +94,22 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
         let bytes = match (element[6], element[7], element[4]) {
             (0, 0, 2) if position.is_none() => {
                 position = Some((offset, false));
+                streams[0] = stream;
                 12
             }
             (9, 0, 3) if position.is_none() => {
                 position = Some((offset, true));
+                streams[0] = stream;
                 16
             }
             (10, 0, 4) if color.is_none() => {
                 color = Some(offset);
+                streams[1] = stream;
                 4
             }
             (5, 0, 1) if uv.is_none() => {
                 uv = Some(offset);
+                streams[2] = stream;
                 8
             }
             _ => return Err("vertex declaration element has no fixed-function equivalent"),
@@ -117,6 +123,7 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
         position,
         color,
         uv,
+        streams,
         size,
     })
 }

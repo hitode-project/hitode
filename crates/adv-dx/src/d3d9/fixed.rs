@@ -6,6 +6,7 @@ use adv_device::gpu::{
     StencilOp, TextureOp, Topology, Vertex, Viewport,
 };
 use adv_device::surface::Rect;
+mod input;
 
 #[derive(Clone)]
 pub(super) struct Fixed {
@@ -20,15 +21,16 @@ pub(super) struct Fixed {
     pub(super) transforms: [[f32; 16]; 3],
     pub(super) clip_planes: [[f32; 4]; 6],
 }
-/// Byte offsets of the fixed-function inputs inside one vertex, from either
-/// an FVF code or a vertex declaration on stream 0.
+/// Byte offsets and source streams of the FVF-equivalent fixed inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Layout {
     pub transformed: bool,
     pub position: u32,
     pub color: Option<u32>,
     pub uv: Option<u32>,
-    /// Bytes from the vertex start through the end of the last input.
+    /// POSITION/POSITIONT, COLOR0 and TEXCOORD0 source stream numbers.
+    pub streams: [u16; 3],
+    /// Largest per-stream extent, also the vertex size for interleaved inputs.
     pub size: u32,
 }
 impl Layout {
@@ -51,6 +53,7 @@ impl Layout {
             position: 0,
             color,
             uv,
+            streams: [0; 3],
             size,
         })
     }
@@ -794,8 +797,65 @@ fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
 }
 pub(super) fn vertex_size(env: &Env<'_>, pointer: u32) -> Result<u32, u32> {
     layout(env, pointer)
-        .map(|layout| layout.size)
+        .and_then(|layout| {
+            if layout.streams != [0; 3] {
+                Err(rejected(
+                    UNAVAILABLE,
+                    "interleaved/UP vertex size requires stream-zero inputs",
+                ))
+            } else {
+                Ok(layout.size)
+            }
+        })
         .map_err(|error| error.code)
+}
+
+/// Draw-bound buffers supply every declared input stream. UP callers still
+/// supply only their explicit stream-zero pointer through prepare_checked.
+pub(super) fn prepare_bound(
+    env: &mut Env<'_>,
+    pointer: u32,
+    kind: i32,
+    count: u32,
+    start: u32,
+    indices: Option<&[u32]>,
+) -> Result<Draw, u32> {
+    if log::log_enabled!(log::Level::Debug)
+        && let Some(id) = device(env, pointer).and_then(|d| d.buffers.declaration)
+    {
+        log::debug!(
+            target: "adv_dx::d3d9::fixed::input",
+            "bound declaration {}",
+            super::declaration::describe(env, id)
+        );
+    }
+    prepare_input_checked(
+        env,
+        pointer,
+        kind,
+        count,
+        input::Input::Bound { start },
+        indices,
+    )
+    .map_err(|error| {
+        if error.code == UNAVAILABLE {
+            warn_rejected(
+                env,
+                if indices.is_some() {
+                    "IDirect3DDevice9::DrawIndexedPrimitive"
+                } else {
+                    "IDirect3DDevice9::DrawPrimitive"
+                },
+                pointer,
+                kind,
+                GuestPtr::new(0),
+                0,
+                error.code,
+                error.reason,
+            );
+        }
+        error.code
+    })
 }
 pub(super) fn primitive_length(kind: i32, count: u32) -> Result<u32, u32> {
     if count == 0 || count > 131_072 {
@@ -860,6 +920,26 @@ fn prepare_checked(
     stride: u32,
     indices: Option<&[u32]>,
 ) -> Result<Draw, Rejected> {
+    prepare_input_checked(
+        env,
+        pointer,
+        kind,
+        count,
+        input::Input::Up {
+            data: data.addr(),
+            stride,
+        },
+        indices,
+    )
+}
+fn prepare_input_checked(
+    env: &Env<'_>,
+    pointer: u32,
+    kind: i32,
+    count: u32,
+    source: input::Input,
+    indices: Option<&[u32]>,
+) -> Result<Draw, Rejected> {
     let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
     let f = &d.fixed;
     if !d.scene {
@@ -883,10 +963,6 @@ fn prepare_checked(
             "untransformed vertices require unsupported lighting",
         ));
     }
-    let minimum = layout.size;
-    if stride < minimum || stride > 2048 || data.is_null() {
-        return Err(rejected(INVALID, "vertex pointer or stride is invalid"));
-    }
     let length = primitive_length(kind, count)
         .map_err(|code| rejected(code, "invalid or excessive primitive count"))?;
     if indices.is_some_and(|v| v.len() != length as usize) {
@@ -899,27 +975,18 @@ fn prepare_checked(
     let last = indices
         .and_then(|v| v.iter().max().copied())
         .unwrap_or(length - 1);
-    let offset = first.checked_mul(stride).ok_or(INVALID)?;
-    let bytes = (last - first)
-        .checked_mul(stride)
-        .and_then(|n| n.checked_add(minimum))
-        .ok_or(INVALID)?;
-    let span = data.addr().checked_add(offset).ok_or(INVALID)?;
-    adv_abi::guest::check_range(env.cpu, span, bytes, Prot::READ)
-        .map_err(|_| rejected(INVALID, "vertex span is not readable"))?;
+    let mut input = input::Reader::new(env, pointer, layout, source, first, last)?;
     let mut vertices = Vec::with_capacity(length as usize);
-    let mut raw = vec![0; minimum as usize];
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
-        env.cpu
-            .read(data.addr() + index * stride, &mut raw)
-            .map_err(|_| rejected(INVALID, "vertex read failed"))?;
-        let word = |at: u32| -> [u8; 4] { raw[at as usize..at as usize + 4].try_into().unwrap() };
-        let float = |at: u32| f32::from_le_bytes(word(at));
+        input.read(env, index)?;
+        let word = |stream: u16, at: u32| input.word(stream, at);
+        let float = |stream, at| f32::from_le_bytes(word(stream, at));
         let at = layout.position;
-        let mut p = [float(at), float(at + 4), float(at + 8), 1.];
+        let ps = layout.streams[0];
+        let mut p = [float(ps, at), float(ps, at + 4), float(ps, at + 8), 1.];
         if layout.transformed {
-            let rhw = float(at + 12);
+            let rhw = float(ps, at + 12);
             if rhw == 0. || !rhw.is_finite() {
                 return Err(rejected(INVALID, "vertex RHW is zero or not finite"));
             }
@@ -946,7 +1013,7 @@ fn prepare_checked(
         }
         let mut color = [1.; 4];
         if let Some(at) = layout.color {
-            let argb = u32::from_le_bytes(word(at));
+            let argb = u32::from_le_bytes(word(layout.streams[1], at));
             color = [
                 ((argb >> 16) & 255) as f32 / 255.,
                 ((argb >> 8) & 255) as f32 / 255.,
@@ -954,7 +1021,9 @@ fn prepare_checked(
                 (argb >> 24) as f32 / 255.,
             ];
         }
-        let uv = layout.uv.map_or([0.; 2], |at| [float(at), float(at + 4)]);
+        let uv = layout.uv.map_or([0.; 2], |at| {
+            [float(layout.streams[2], at), float(layout.streams[2], at + 4)]
+        });
         if uv.iter().any(|v| !v.is_finite()) {
             return Err(rejected(
                 INVALID,

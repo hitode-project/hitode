@@ -597,9 +597,9 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     }
 }
 
-fn stream_data(env: &Env<'_>, this: u32) -> Result<(u32, u32, u32), u32> {
+pub(super) fn stream_data(env: &Env<'_>, this: u32, number: u16) -> Result<(u32, u32, u32), u32> {
     let d = device(env, this).ok_or(INVALID)?;
-    let stream = d.buffers.streams[0];
+    let stream = *d.buffers.streams.get(number as usize).ok_or(INVALID)?;
     let id = stream.buffer.ok_or(INVALID)?;
     let Some(Payload::Buffer(b)) = com(env).get_identity(&env.sys.objects, id) else {
         return Err(INVALID);
@@ -636,29 +636,7 @@ fn draw(env: &mut Env<'_>, this: GuestPtr<()>, kind: i32, start: u32, count: u32
             Err(e) => Outcome::Return(e),
         };
     }
-    let result = (|| {
-        let (data, stride, len) = stream_data(env, this.addr())?;
-        let size = fixed::vertex_size(env, this.addr())?;
-        let vertices = fixed::primitive_length(kind, count)?;
-        let first = start.checked_mul(stride).ok_or(INVALID)?;
-        let end = start
-            .checked_add(vertices - 1)
-            .and_then(|v| v.checked_mul(stride))
-            .and_then(|v| v.checked_add(size))
-            .ok_or(INVALID)?;
-        if end > len {
-            return Err(INVALID);
-        }
-        fixed::prepare(
-            env,
-            this.addr(),
-            kind,
-            count,
-            GuestPtr::new(data.checked_add(first).ok_or(INVALID)?),
-            stride,
-            None,
-        )
-    })();
+    let result = fixed::prepare_bound(env, this.addr(), kind, count, start, None);
     match result {
         Ok(draw) => submit(env, this.addr(), draw, None),
         Err(error) => Outcome::Return(error),
@@ -760,25 +738,7 @@ fn draw_indexed(
                 0,
             );
         }
-        let (data, stride, len) = stream_data(env, this.addr())?;
-        let size = fixed::vertex_size(env, this.addr())?;
-        let last = indices.iter().copied().max().ok_or(INVALID)?;
-        if last
-            .checked_mul(stride)
-            .and_then(|v| v.checked_add(size))
-            .is_none_or(|end| end > len)
-        {
-            return Err(INVALID);
-        }
-        fixed::prepare(
-            env,
-            this.addr(),
-            kind,
-            count,
-            GuestPtr::new(data),
-            stride,
-            Some(&indices),
-        )
+        fixed::prepare_bound(env, this.addr(), kind, count, 0, Some(&indices))
     })();
     match result {
         Ok(draw) => submit(env, this.addr(), draw, None),
