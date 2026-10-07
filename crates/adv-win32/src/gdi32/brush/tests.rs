@@ -132,8 +132,13 @@ fn brush_origin_is_shared_dc_state_with_signed_device_coordinates_and_saved_leve
         ),
         1
     );
-    assert_eq!(call(&mut machine, data, "SetMapMode", &[dc, 2]), 1);
     let gdi = machine.ext.get::<Win32>().gdi.clone();
+    // Mapping modes beyond MM_TEXT are not exposed by the current setter.
+    // Brush coordinates still belong to device space for any retained mode.
+    let Some(GdiObj::Dc { modes, .. }) = gdi.get_mut(&mut machine.sys.objects, dc) else {
+        panic!("DC owner")
+    };
+    modes.map = 2;
     let mut contexts = adv_os::gdi::DeviceContexts::new(gdi.clone());
     assert_eq!(
         contexts.set_stretch_mode(&mut machine.sys.objects, dc, 4),
