@@ -1,4 +1,6 @@
 //! Authored guest VARIANTs and guest IUnknown callbacks; no host COM objects.
+//! Native oracle: variant-native/probe.c, SHA256
+//! 95C683A4232E85413D59EE409CB47D38AEE5231EBD31B97EF53274AFCD5EA782.
 use adv_abi::{ApiDiagnostics, Registry};
 use adv_cpu::{
     JitCpu,
