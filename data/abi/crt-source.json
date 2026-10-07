@@ -328,6 +328,13 @@
     "scope": "Three existing CRT aliases: void __cdecl qsort(void* base, size_t number, size_t width, comparator). Four x86 argument words; comparator is int __cdecl(const void*, const void*) with signed ordering and two real array-element pointers. Equal-element relative order is unspecified.",
     "profile": "Use existing guest callbacks, memory and CRT error/invalid-parameter owners. Checked bounded in-place sorting must call the real guest comparator; unavailable input/range profiles warn and fail without fabricated sorted output."
   },
+  "byte_stream_output": {
+    "header": "ucrt/stdio.h:221-224,347-350",
+    "header_sha256": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+    "documentation": "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fputc-fputwc",
+    "scope": "Three existing CRT aliases: int __cdecl fputc/putc(int character, FILE* stream), two x86 argument words. Character is converted to unsigned char; success returns that byte and failure returns EOF(-1).",
+    "profile": "Use existing shared FILE, binary write and CRT error owners. Unsupported text/orientation or non-owned/pseudo-stream profiles must explicitly warn and fail; do not invent a FILE layout or a private stream table."
+  },
   "scalar_rounding": {
     "header": "ucrt/corecrt_math.h:512,530,539",
     "header_sha256": "ca2f0f25b2e07b3613984efd1135dd9f1d0786fabaa56da2ba3c83b1a23eb918",

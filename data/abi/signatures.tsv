@@ -3524,6 +3524,7 @@ msvcr80.dll	exit	cdecl	void	void	status:i32:i32:1
 msvcr80.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcr80.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
 msvcr80.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcr80.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr80.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcr80.dll	isalnum	cdecl	i32	int	character:int:i32:1
 msvcr80.dll	isalpha	cdecl	i32	int	character:int:i32:1
@@ -3540,6 +3541,7 @@ msvcr80.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|coun
 msvcr80.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr80.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr80.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcr80.dll	rand	cdecl	i32	int	
 msvcr80.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
@@ -3611,6 +3613,7 @@ msvcr90.dll	exit	cdecl	void	void	status:i32:i32:1
 msvcr90.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcr90.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
 msvcr90.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcr90.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr90.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcr90.dll	isalnum	cdecl	i32	int	character:int:i32:1
 msvcr90.dll	isalpha	cdecl	i32	int	character:int:i32:1
@@ -3628,6 +3631,7 @@ msvcr90.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|coun
 msvcr90.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcr90.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcr90.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcr90.dll	rand	cdecl	i32	int	
 msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
@@ -3684,6 +3688,7 @@ msvcrt.dll	exit	cdecl	void	void	status:i32:i32:1
 msvcrt.dll	fabs	cdecl	f64	double	value:double:f64:2
 msvcrt.dll	fgetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:fpos_t*:ptr:1
 msvcrt.dll	floor	cdecl	f64	double	value:double:f64:2
+msvcrt.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcrt.dll	fsetpos	cdecl	i32	int	stream:FILE*:ptr:1|position:const fpos_t*:ptr:1
 msvcrt.dll	isalnum	cdecl	i32	int	character:int:i32:1
 msvcrt.dll	isalpha	cdecl	i32	int	character:int:i32:1
@@ -3700,6 +3705,7 @@ msvcrt.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count
 msvcrt.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 msvcrt.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
+msvcrt.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcrt.dll	rand	cdecl	i32	int	
 msvcrt.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1

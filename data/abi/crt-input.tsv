@@ -282,3 +282,9 @@ msvcr90.dll	_CIpow	cdecl	void	void
 msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
 msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcrt.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcrt.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr80.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr80.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr90.dll	fputc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
+msvcr90.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
