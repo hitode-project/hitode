@@ -26,6 +26,8 @@ pub mod thunk;
 pub mod trace;
 pub mod vm;
 mod wake_queue;
+#[cfg(test)]
+mod spawn_tests;
 pub use wake_queue::WakePriority;
 
 use std::collections::VecDeque;
@@ -196,32 +198,44 @@ impl Sys {
         let base = self.vm.alloc_with_guard(cpu, stack_size, PAGE, Prot::RW)?;
         let (lo, hi) = (base + PAGE, base + PAGE + stack_size);
         let tid = self.next_tid;
-        self.next_tid += 4;
-
         let teb = teb_addr(id);
-        cpu.map(teb, PAGE, Prot::RW)?;
-        for (off, v) in [
-            (teb::EXCEPTION_LIST, u32::MAX),
-            (teb::STACK_BASE, hi),
-            (teb::STACK_LIMIT, lo),
-            (teb::SELF, teb),
-            (teb::PROCESS_ID, self.pid),
-            (teb::THREAD_ID, tid),
-            (teb::PEB, PEB_ADDR),
-        ] {
-            cpu.write_u32(teb + off, v)?;
-        }
+        let mut mapped_teb = false;
+        let result = (|| {
+            cpu.map(teb, PAGE, Prot::RW)?;
+            mapped_teb = true;
+            for (off, v) in [
+                (teb::EXCEPTION_LIST, u32::MAX),
+                (teb::STACK_BASE, hi),
+                (teb::STACK_LIMIT, lo),
+                (teb::SELF, teb),
+                (teb::PROCESS_ID, self.pid),
+                (teb::THREAD_ID, tid),
+                (teb::PEB, PEB_ADDR),
+            ] {
+                cpu.write_u32(teb + off, v)?;
+            }
 
-        self.setup_static_tls(cpu, teb)?;
-
-        // Initial stack: args, then the return pad as the return address.
-        let mut sp = hi - 0x10;
-        for &a in args.iter().rev() {
+            // Finish fallible stack writes before TLS acquires its storage.
+            let mut sp = hi - 0x10;
+            for &a in args.iter().rev() {
+                sp -= 4;
+                cpu.write_u32(sp, a)?;
+            }
             sp -= 4;
-            cpu.write_u32(sp, a)?;
-        }
-        sp -= 4;
-        cpu.write_u32(sp, thunk_addr(thunk::RETURN_PAD))?;
+            cpu.write_u32(sp, thunk_addr(thunk::RETURN_PAD))?;
+            self.setup_static_tls(cpu, teb)?;
+            Ok(sp)
+        })();
+        let sp = match result {
+            Ok(sp) => sp,
+            Err(error) => {
+                if mapped_teb {
+                    let _ = cpu.unmap(teb, PAGE);
+                }
+                let _ = self.vm.free(cpu, base);
+                return Err(error);
+            }
+        };
 
         let thread_handle = self.objects.insert(Object::Thread { ctx: id });
         self.contexts.push(Context {
@@ -237,6 +251,7 @@ impl Sys {
             yielded: false,
             thread_handle,
         });
+        self.next_tid += 4;
         Ok(id)
     }
 
