@@ -120,6 +120,58 @@ extern "C" fn store(entry: *mut Entry, address: u32, value: u32, kind: u32) -> u
     )
 }
 
+/// Stage a complete PUSHAD/POPAD transaction. No live guest register changes
+/// before success; POPAD deliberately does not read the saved ESP slot.
+extern "C" fn stack_all(entry: *mut Entry, pop: u32) -> u32 {
+    // SAFETY: the emitted caller spilled all GPRs to its private entry frame.
+    let entry = unsafe { &mut *entry };
+    let memory = unsafe { &mut *entry.memory };
+    let mut regs = entry.frame.regs;
+    let esp = regs[4];
+    if pop != 0 {
+        for (offset, index) in [7, 6, 5, 4, 3, 2, 1, 0].into_iter().enumerate() {
+            if index == 4 {
+                continue;
+            }
+            let address = esp.wrapping_add(offset as u32 * 4);
+            if !crate::interpreter::accessible(memory, address, 4, crate::READ) {
+                return 2;
+            }
+            let Ok(bytes) = memory.read_data(address, 4) else {
+                return 2;
+            };
+            regs[index] = u32::from_le_bytes(bytes.as_ref().try_into().expect("scalar read"));
+        }
+        regs[4] = esp.wrapping_add(32);
+        entry.frame.regs = regs;
+        entry.inline += 7;
+        return 0;
+    }
+    let Some(address) = esp.checked_sub(32) else {
+        return 2;
+    };
+    // A single private-range write avoids partially committed pushes. Shared
+    // stacks and wrapping ranges retain Tier 0's ordered store transaction.
+    if !crate::interpreter::accessible(memory, address, 32, crate::WRITE)
+        || memory.shared_range(address, 32)
+    {
+        return 2;
+    }
+    let mut bytes = [0; 32];
+    for (n, value) in regs.iter().rev().enumerate() {
+        bytes[n * 4..n * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let epoch = memory.epoch;
+    if memory.write(address, &bytes).is_err() {
+        return 2;
+    }
+    entry.frame.regs[4] = address;
+    entry.inline += 8;
+    u32::from(
+        memory.epoch != epoch || memory.executable(address, 1) || memory.executable(esp - 1, 1),
+    )
+}
+
 struct Code {
     pointer: NonNull<u8>,
     len: usize,
@@ -293,10 +345,11 @@ impl Engine {
                 continue;
             }
             if instruction.is_jcc_short_or_near()
+                || emit::counter_branch(&instruction).is_some()
                 || matches!(instruction.mnemonic(), Mnemonic::Jmp | Mnemonic::Call)
                     && instruction.op0_kind() == OpKind::NearBranch32
             {
-                queue.push_back(instruction.near_branch32());
+                queue.push_back(instruction.near_branch_target() as u32);
             }
             // A call's return point is likely code; bytes after RET or JMP are not.
             if !matches!(
@@ -314,6 +367,7 @@ impl Engine {
         let mut emitted = emit::Emitter::new(emit::Helpers {
             load: load as *const () as u64,
             store: store as *const () as u64,
+            stack_all: stack_all as *const () as u64,
         });
         for instruction in instructions.values() {
             emitted.instruction(instruction);
