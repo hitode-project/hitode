@@ -1779,6 +1779,9 @@ impl Executor {
                 crate::InterpreterReason::Uncovered | crate::InterpreterReason::Rejected
             )
             .then(|| self.interpreter_detail(pc));
+            if self.interpreter.census_enabled && detail.is_some() && self.tier1.is_none() {
+                self.interpreter.census = Some(Default::default());
+            }
             let tier1 =
                 self.run_tier1(stop, units, interpreter_only || single_step || pending_fpu)?;
             let (execution, last_units) = if let Some(result) = &tier1 {
@@ -1801,6 +1804,13 @@ impl Executor {
                     .then_some((&self.code.entry_owner, self.code.cache_revision)),
                 )
             };
+            if let Some(entry) = self.interpreter.census.take() {
+                bridge
+                    .cliffs
+                    .tier1_census
+                    .get_or_insert_with(Default::default)
+                    .record(reason, detail.unwrap(), entry);
+            }
             let interpreted_units = tier1
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);

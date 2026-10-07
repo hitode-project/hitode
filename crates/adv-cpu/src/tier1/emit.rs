@@ -1,8 +1,10 @@
 //! Bounded ARM64 templates for the versioned fixed-register entry ABI.
 //! These encodings deliberately cover only the declared integer subset; all
 //! other forms leave before the instruction and use the existing interpreter.
+use super::forms::{cmovcc, double_shift, imm, register, register_part, rmw, setcc, shift, string};
+pub(super) use super::forms::{counter_branch, supported};
 use super::{BUDGET, DISPATCH, FALLBACK, LOAD, STORE};
-use iced_x86::{Code, ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
+use iced_x86::{ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]
@@ -49,303 +51,6 @@ pub(super) struct Emitter {
     pub entries: BTreeMap<u32, usize>,
     exits: BTreeMap<u32, usize>,
     fixups: Vec<Fixup>,
-}
-
-pub(super) fn register(r: Register) -> Option<u8> {
-    use Register::*;
-    Some(match r {
-        EAX => 19,
-        ECX => 20,
-        EDX => 21,
-        EBX => 22,
-        ESP => 23,
-        EBP => 24,
-        ESI => 25,
-        EDI => 26,
-        _ => return Option::None,
-    })
-}
-fn register_part(r: Register) -> Option<(u8, u32, u32)> {
-    let full = register(r.full_register32())?;
-    let shift = u32::from(matches!(
-        r,
-        Register::AH | Register::CH | Register::DH | Register::BH
-    )) * 8;
-    let bits = r.size() as u32 * 8;
-    matches!(bits, 8 | 16 | 32).then_some((full, shift, bits))
-}
-fn setcc(m: M) -> bool {
-    matches!(
-        m,
-        M::Seto
-            | M::Setno
-            | M::Setb
-            | M::Setae
-            | M::Sete
-            | M::Setne
-            | M::Setbe
-            | M::Seta
-            | M::Sets
-            | M::Setns
-            | M::Setp
-            | M::Setnp
-            | M::Setl
-            | M::Setge
-            | M::Setle
-            | M::Setg
-    )
-}
-fn cmovcc(m: M) -> bool {
-    matches!(
-        m,
-        M::Cmovo
-            | M::Cmovno
-            | M::Cmovb
-            | M::Cmovae
-            | M::Cmove
-            | M::Cmovne
-            | M::Cmovbe
-            | M::Cmova
-            | M::Cmovs
-            | M::Cmovns
-            | M::Cmovp
-            | M::Cmovnp
-            | M::Cmovl
-            | M::Cmovge
-            | M::Cmovle
-            | M::Cmovg
-    )
-}
-fn shift(m: M) -> bool {
-    matches!(m, M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror)
-}
-fn double_shift(i: &Instruction) -> bool {
-    matches!(i.mnemonic(), M::Shld | M::Shrd)
-        && i.op1_kind() == OpKind::Register
-        && register_part(i.op1_register()).is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
-        && (i.op2_kind() == OpKind::Immediate8
-            || i.op2_kind() == OpKind::Register && i.op2_register() == Register::CL)
-}
-fn shift_count(i: &Instruction) -> bool {
-    i.op1_kind() == OpKind::Immediate8
-        || i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL
-}
-fn imm(i: &Instruction, op: u32) -> Option<u32> {
-    matches!(i.op_kind(op), OpKind::Immediate32 | OpKind::Immediate8to32)
-        .then(|| i.immediate(op) as u32)
-}
-fn source(i: &Instruction, op: u32) -> bool {
-    i.op_kind(op) == OpKind::Register && register(i.op_register(op)).is_some()
-        || imm(i, op).is_some()
-}
-fn scalar32(i: &Instruction, op: u32) -> bool {
-    i.op_kind(op) == OpKind::Register && register(i.op_register(op)).is_some()
-        || i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i)
-}
-fn rmw_source(i: &Instruction) -> bool {
-    i.op1_kind() == OpKind::Register && register(i.op1_register().full_register32()).is_some()
-        || matches!(
-            i.op1_kind(),
-            OpKind::Immediate8
-                | OpKind::Immediate16
-                | OpKind::Immediate32
-                | OpKind::Immediate8to16
-                | OpKind::Immediate8to32
-        )
-}
-fn rmw(i: &Instruction) -> bool {
-    i.op0_kind() == OpKind::Memory
-        && matches!(i.memory_size().size(), 1 | 2 | 4)
-        && address(i)
-        && match i.mnemonic() {
-            M::Add | M::Adc | M::Sub | M::Sbb | M::And | M::Or | M::Xor => rmw_source(i),
-            M::Inc | M::Dec | M::Not | M::Neg => true,
-            m if shift(m) => shift_count(i),
-            M::Shld | M::Shrd => i.memory_size().size() >= 2 && double_shift(i),
-            _ => false,
-        }
-}
-fn address(i: &Instruction) -> bool {
-    // Word addressing has different wrapping and remains in Tier 0.
-    (i.memory_base() == Register::None || register(i.memory_base()).is_some())
-        && (i.memory_index() == Register::None || register(i.memory_index()).is_some())
-        && i.memory_displ_size() != 2
-        && i.segment_prefix() != Register::GS
-}
-
-/// (width, reads ESI, writes EDI). Match codes rather than the SIMD MOVSD name.
-fn string(i: &Instruction) -> Option<(u32, bool, bool)> {
-    let form = match i.code() {
-        Code::Movsb_m8_m8 => (1, true, true),
-        Code::Movsw_m16_m16 => (2, true, true),
-        Code::Movsd_m32_m32 => (4, true, true),
-        Code::Stosb_m8_AL => (1, false, true),
-        Code::Stosw_m16_AX => (2, false, true),
-        Code::Stosd_m32_EAX => (4, false, true),
-        Code::Lodsb_AL_m8 => (1, true, false),
-        Code::Lodsw_AX_m16 => (2, true, false),
-        Code::Lodsd_EAX_m32 => (4, true, false),
-        _ => return None,
-    };
-    ((0..i.op_count()).all(|n| {
-        matches!(
-            i.op_kind(n),
-            OpKind::Register | OpKind::MemorySegESI | OpKind::MemoryESEDI
-        )
-    }) && i.segment_prefix() != Register::GS)
-        .then_some(form)
-}
-
-pub(super) fn counter_branch(i: &Instruction) -> Option<bool> {
-    Some(match i.code() {
-        Code::Loop_rel8_16_CX
-        | Code::Loop_rel8_32_CX
-        | Code::Loope_rel8_16_CX
-        | Code::Loope_rel8_32_CX
-        | Code::Loopne_rel8_16_CX
-        | Code::Loopne_rel8_32_CX
-        | Code::Jcxz_rel8_16
-        | Code::Jcxz_rel8_32 => true,
-        Code::Loop_rel8_16_ECX
-        | Code::Loop_rel8_32_ECX
-        | Code::Loope_rel8_16_ECX
-        | Code::Loope_rel8_32_ECX
-        | Code::Loopne_rel8_16_ECX
-        | Code::Loopne_rel8_32_ECX
-        | Code::Jecxz_rel8_16
-        | Code::Jecxz_rel8_32 => false,
-        _ => return None,
-    })
-}
-
-pub(super) fn supported(i: &Instruction) -> bool {
-    if i.has_lock_prefix() {
-        return false;
-    }
-    if string(i).is_some() {
-        return true;
-    }
-    if i.has_rep_prefix() || i.has_repne_prefix() {
-        return false;
-    }
-    if rmw(i) {
-        return true;
-    }
-    if counter_branch(i).is_some() {
-        return true;
-    }
-    let dst = i.op0_kind() == OpKind::Register && register(i.op0_register()).is_some();
-    match i.mnemonic() {
-        M::Nop => true,
-        M::Mov => {
-            dst && source(i, 1)
-                || dst
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_size().size() == 4
-                    && address(i)
-                || i.op0_kind() == OpKind::Memory
-                    && i.memory_size().size() == 4
-                    && source(i, 1)
-                    && address(i)
-        }
-        M::Lea => dst && i.op1_kind() == OpKind::Memory && address(i),
-        M::Movzx | M::Movsx => {
-            dst && i.op1_kind() == OpKind::Memory
-                && matches!(i.memory_size().size(), 1 | 2)
-                && address(i)
-                || i.op0_kind() == OpKind::Register
-                    && register_part(i.op0_register())
-                        .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
-                    && i.op1_kind() == OpKind::Register
-                    && register_part(i.op1_register())
-                        .is_some_and(|(_, _, bits)| matches!(bits, 8 | 16))
-        }
-        M::Imul => {
-            i.op_count() == 1 && scalar32(i, 0)
-                || dst
-                    && matches!(i.op_count(), 2 | 3)
-                    && (i.op1_kind() == OpKind::Register && register(i.op1_register()).is_some()
-                        || i.op1_kind() == OpKind::Memory
-                            && i.memory_size().size() == 4
-                            && address(i))
-                    && (i.op_count() == 2 || imm(i, 2).is_some())
-        }
-        M::Mul | M::Div | M::Idiv => scalar32(i, 0),
-        M::Bt | M::Bts | M::Btr | M::Btc => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register())
-                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
-                && (i.op1_kind() == OpKind::Immediate8
-                    || i.op1_kind() == OpKind::Register
-                        && register_part(i.op1_register()).is_some())
-        }
-        M::Bsf | M::Bsr => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register())
-                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
-                && (i.op1_kind() == OpKind::Register && register_part(i.op1_register()).is_some()
-                    || i.op1_kind() == OpKind::Memory && address(i))
-        }
-        M::Bswap => dst,
-        M::Cdq => true,
-        M::Pushad | M::Popad => true,
-        M::Shld | M::Shrd => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register())
-                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
-                && double_shift(i)
-        }
-        M::Xchg => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register()).is_some()
-                && i.op1_kind() == OpKind::Register
-                && register_part(i.op1_register()).is_some()
-        }
-        M::Add | M::Adc | M::Sub | M::Sbb | M::Cmp | M::And | M::Or | M::Xor | M::Test => {
-            let memory =
-                |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
-            dst && (source(i, 1) || memory(1))
-                || !matches!(i.mnemonic(), M::Adc | M::Sbb)
-                    && i.op0_kind() == OpKind::Register
-                    && register_part(i.op0_register()).is_some_and(|(_, _, bits)| bits < 32)
-                    && rmw_source(i)
-                // Memory destinations that do not write use the same ALU.
-                || matches!(i.mnemonic(), M::Cmp | M::Test) && memory(0) && source(i, 1)
-        }
-        M::Push => i.stack_pointer_increment() == -4 && source(i, 0),
-        M::Pop => dst && i.stack_pointer_increment() == 4,
-        M::Call | M::Jmp => {
-            i.op0_kind() == OpKind::NearBranch32
-                || dst
-                || i.op0_kind() == OpKind::Memory && i.memory_size().size() == 4 && address(i)
-        }
-        M::Ret => i.op_count() == 0 || i.op0_kind() == OpKind::Immediate16,
-        M::Inc | M::Dec | M::Neg | M::Not => {
-            i.op0_kind() == OpKind::Register && register_part(i.op0_register()).is_some()
-        }
-        m if shift(m) => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register()).is_some()
-                && shift_count(i)
-        }
-        _ if setcc(i.mnemonic()) => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register()).is_some_and(|(_, _, bits)| bits == 8)
-                || i.op0_kind() == OpKind::Memory && address(i)
-        }
-        _ if cmovcc(i.mnemonic()) => {
-            i.op0_kind() == OpKind::Register
-                && register_part(i.op0_register())
-                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
-                && (i.op1_kind() == OpKind::Register && register_part(i.op1_register()).is_some()
-                    || i.op1_kind() == OpKind::Memory && address(i))
-        }
-        _ => {
-            i.condition_code() != C::None
-                && i.is_jcc_short_or_near()
-                && i.op0_kind() == OpKind::NearBranch32
-        }
-    }
 }
 
 impl Emitter {
@@ -1049,6 +754,25 @@ impl Emitter {
         }
         let d = register(i.op0_register()).unwrap_or(31);
         match i.mnemonic() {
+            M::Mov if i.op0_kind() == OpKind::Register && i.op0_register().size() < 4 => {
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, i.memory_size().size() as u32);
+                    self.write_register(i.op0_register(), 0);
+                } else {
+                    self.operand(9, i, 1);
+                    self.write_register(i.op0_register(), 9);
+                }
+            }
+            M::Mov if i.op0_kind() == OpKind::Memory && i.memory_size().size() < 4 => {
+                self.ea(i, true);
+                self.mov(1, 9);
+                self.operand(2, i, 1);
+                self.store(i.memory_size().size() as u32);
+                self.stored(pc, Some(i.next_ip32()), false, |_| {});
+                return;
+            }
             M::Mov if i.op1_kind() == OpKind::Memory => {
                 self.ea(i, true);
                 self.mov(1, 9);
@@ -1192,8 +916,16 @@ impl Emitter {
                 self.write_register(i.op1_register(), 9);
             }
             M::Push => {
+                if i.op0_kind() == OpKind::Memory {
+                    // Read with the original ESP before forming the push address.
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, 4);
+                    self.mov(2, 0);
+                } else {
+                    self.operand(2, i, 0);
+                }
                 self.esp_sub(1);
-                self.operand(2, i, 0);
                 self.store(4);
                 self.stored(pc, Some(i.next_ip32()), false, |e| e.esp_sub(23));
                 return;
@@ -1217,6 +949,14 @@ impl Emitter {
                 // POP ESP stores the loaded value after the increment.
                 self.esp_add(4);
                 self.mov(d, 0);
+            }
+            M::Leave => {
+                self.mov(1, 24);
+                self.load(pc, 4);
+                // Neither ESP nor EBP changes if the checked read refuses.
+                self.mov(23, 24);
+                self.esp_add(4);
+                self.mov(24, 0);
             }
             M::Call => {
                 let target = if i.op0_kind() == OpKind::NearBranch32 {
@@ -1355,13 +1095,13 @@ impl Emitter {
                 if i.op1_kind() == OpKind::Memory {
                     self.ea(i, true);
                     self.mov(1, 9);
-                    self.load(pc, 4);
+                    self.load(pc, i.memory_size().size() as u32);
                     self.mov(10, 0);
-                    self.mov(9, d);
+                    self.read_register(9, i.op0_register(), false);
                 } else if i.op0_kind() == OpKind::Memory {
                     self.ea(i, true);
                     self.mov(1, 9);
-                    self.load(pc, 4);
+                    self.load(pc, i.memory_size().size() as u32);
                     self.mov(9, 0);
                     self.operand(10, i, 1);
                 } else {
@@ -1378,7 +1118,7 @@ impl Emitter {
                 let width = if i.op0_kind() == OpKind::Register {
                     i.op0_register().size() as u32
                 } else {
-                    4
+                    i.memory_size().size() as u32
                 };
                 self.alu(m, width, 8);
                 if !matches!(m, M::Cmp | M::Test) {

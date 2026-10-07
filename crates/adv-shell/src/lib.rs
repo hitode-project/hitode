@@ -1981,8 +1981,22 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
             )
         })
         .join(",");
+    let census = c.tier1_census.as_ref().map_or_else(|| "null".to_owned(), |census| {
+        let groups = ["PendingCompilation", "Uncovered", "Rejected"].into_iter()
+            .zip(&census.groups).map(|(name, c)| {
+                let rows = c.unsupported_rows();
+                let omitted_rows = rows.len().saturating_sub(ROWS);
+                let omitted_units: u64 = rows.iter().skip(ROWS).map(|(_, n)| n).sum();
+                let unsupported = counts(rows, ROWS);
+                let histogram = |values: &[u64]| values.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+                format!("{}:{{\"entries\":{},\"instructions\":{},\"supported_units\":{},\"unsupported_units\":{},\"prefix_units\":{},\"blocked_prefixes\":[{}],\"censored_prefixes\":[{}],\"unsupported\":{{{unsupported}}},\"omitted_rows\":{omitted_rows},\"omitted_units\":{omitted_units}}}",
+                    json(name), c.entries, c.instructions, c.supported_units, c.unsupported_units, c.prefix_units,
+                    histogram(&c.blocked_prefixes), histogram(&c.censored_prefixes))
+            }).collect::<Vec<_>>().join(",");
+        format!("{{{groups}}}")
+    });
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}},\"interpreter_details\":{{{details}}},\"interpreter_details_omitted\":{{{omitted}}},\"interpreter_detail_rows_omitted\":{omitted_rows},\"tier1_census\":{census}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows(), ROWS),

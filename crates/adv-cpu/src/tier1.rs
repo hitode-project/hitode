@@ -11,6 +11,9 @@
 )]
 use std::time::Duration;
 
+pub(crate) mod census;
+pub(crate) mod forms;
+
 pub(crate) const DISPATCH: u32 = 0;
 pub(crate) const FALLBACK: u32 = 1;
 pub(crate) const BUDGET: u32 = 2;

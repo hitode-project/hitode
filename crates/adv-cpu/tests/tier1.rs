@@ -2388,3 +2388,331 @@ fn counter_branch_program(opcode: iced_x86::Code) -> Vec<u8> {
     code.extend(body.assemble(u64::from(CODE + 16)).unwrap());
     code
 }
+
+#[test]
+fn narrow_moves_preserve_partial_registers_flags_and_exact_memory_width() {
+    let code = assemble(|a| {
+        a.mov(al, ah).unwrap();
+        a.mov(ch, al).unwrap();
+        a.mov(ax, cx).unwrap();
+        a.mov(bh, 0xe7u32).unwrap();
+        a.mov(si, 0x98abu32).unwrap();
+        a.mov(byte_ptr(DATA), ah).unwrap();
+        a.mov(word_ptr(DATA + 1), si).unwrap();
+        a.mov(byte_ptr(DATA + 3), 0xf3u32).unwrap();
+        a.mov(word_ptr(DATA + 4), 0xcdefu32).unwrap();
+        a.mov(dh, byte_ptr(DATA + 4095)).unwrap();
+        a.mov(bp, word_ptr(DATA + 4094)).unwrap();
+        a.ret().unwrap();
+    });
+    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+    machines[2].set_tier_verification(Some(true));
+    for flags in [2, 0x8d7, 0xcd7] {
+        for m in &mut machines {
+            reset(
+                m,
+                [
+                    0x1234abcd, 0xa5b5c5d5, 0x87654321, 0xffeeccdd, 0, 0xfeed0000, 0xbeef0000, 0,
+                ],
+                flags,
+            );
+            m.write(DATA, &[0x5a; 4096]).unwrap();
+            m.protect(DATA + 4096, 4096, 0).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        assert_eq!(machines[2].state.regs[5], 0xfeed5a5a);
+        assert_eq!(
+            machines[2].memory().read_data(DATA, 7).unwrap().as_ref(),
+            &[0xab, 0xab, 0x98, 0xf3, 0xef, 0xcd, 0x5a]
+        );
+    }
+    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+    assert_eq!(machines[2].stats.verification.mismatches, 0);
+}
+
+#[test]
+fn narrow_move_faults_preserve_the_instruction_and_resume_with_fs() {
+    for width in [1, 2] {
+        for store in [false, true] {
+            let code = assemble(|a| {
+                a.inc(ebx).unwrap();
+                match (width, store) {
+                    (1, false) => a.mov(ah, byte_ptr(esi).fs()),
+                    (2, false) => a.mov(ax, word_ptr(esi).fs()),
+                    (1, true) => a.mov(byte_ptr(esi).fs(), ah),
+                    _ => a.mov(word_ptr(esi).fs(), ax),
+                }
+                .unwrap();
+                a.ret().unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            for m in &mut machines {
+                reset(m, [0x1234abcd, 0, 0, 0, 0, 0, u32::MAX - 1, 0], 0x8d7);
+                m.state.fs_base = DATA + 4096 + 3 - width;
+                m.write(DATA + 4094, &[0x55; 4]).unwrap();
+                m.protect(DATA + 4096, 4096, if store { READ } else { 0 })
+                    .unwrap();
+            }
+            let expected = machines[0].run(STOP, 100).unwrap();
+            assert!(matches!(
+                expected,
+                RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+            ));
+            for m in &mut machines[1..] {
+                assert_eq!(m.run(STOP, 100).unwrap(), expected);
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+            assert_eq!(machines[2].state.regs[0], 0x1234abcd);
+            for m in &mut machines {
+                m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+        }
+    }
+}
+
+#[test]
+fn narrow_code_stores_revalidate_before_executing_the_successor() {
+    let replacement = assemble(|a| a.inc(ebx).unwrap());
+    assert_eq!(replacement.len(), 1);
+    let code = assemble(|a| {
+        a.mov(byte_ptr(CODE + 32), u32::from(replacement[0]))
+            .unwrap();
+        a.jmp(u64::from(CODE + 32)).unwrap();
+        for _ in 0..32 {
+            a.nop().unwrap();
+        }
+        a.ret().unwrap();
+    });
+    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+    for m in &mut machines {
+        m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    }
+    equivalent(&machines[0], &machines[1], u32::MAX);
+    equivalent(&machines[0], &machines[2], u32::MAX);
+    assert_eq!(machines[2].state.regs[3], 1);
+    assert!(machines[2].tier1_stats().invalidations > 0);
+}
+
+fn narrow_alu(a: &mut CodeAssembler, width: u32, operation: u32, source: u32) {
+    macro_rules! emit {
+        ($reg:expr, $other:expr, $mem:expr) => {{
+            macro_rules! binary {
+                ($name:ident) => {
+                    match source {
+                        0 => a.$name($reg, $other),
+                        1 => a.$name($reg, -1i32),
+                        _ => a.$name($reg, $mem),
+                    }
+                };
+            }
+            match operation {
+                0 => binary!(add),
+                1 => binary!(adc),
+                2 => binary!(sub),
+                3 => binary!(sbb),
+                4 => binary!(and),
+                5 => binary!(or),
+                6 => binary!(xor),
+                7 => binary!(cmp),
+                _ => match source {
+                    0 => a.test($reg, $other),
+                    1 => a.test($reg, -1i32),
+                    _ => a.test($mem, $reg),
+                },
+            }
+            .unwrap();
+        }};
+    }
+    if width == 1 {
+        emit!(ah, bh, byte_ptr(DATA + 4095));
+    } else {
+        emit!(ax, bx, word_ptr(DATA + 4094));
+    }
+}
+
+#[test]
+fn narrow_register_alu_memory_sources_and_carry_match_all_tiers() {
+    for width in [1, 2] {
+        for operation in 0..9 {
+            for source in 0..3 {
+                let code = assemble(|a| {
+                    narrow_alu(a, width, operation, source);
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                machines[2].set_tier_verification(Some(true));
+                for (left, right) in [
+                    (0, 0),
+                    (0, 0xffff),
+                    (0x7f7f, 0x0101),
+                    (0x8080, 0xffff),
+                    (0xffff, 0x0101),
+                    (0x7fff, 1),
+                    (0x8000, 1),
+                ] {
+                    for flags in [0x8d6, 0x8d7] {
+                        for m in &mut machines {
+                            reset(
+                                m,
+                                [0x12340000 | left, 0, 0, 0x56780000 | right, 0, 0, 0, 0],
+                                flags,
+                            );
+                            m.write(DATA + 4094, &(right as u16).to_le_bytes()).unwrap();
+                            m.protect(DATA + 4096, 4096, 0).unwrap();
+                            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                        }
+                        // Cranelift may clear undefined logical AF; Tier 1 must
+                        // still match Tier 0 preservation, including that bit.
+                        let mask = if matches!(operation, 4 | 5 | 6 | 8) {
+                            !0x10
+                        } else {
+                            u32::MAX
+                        };
+                        equivalent(&machines[0], &machines[1], mask);
+                        equivalent(&machines[0], &machines[2], u32::MAX);
+                    }
+                }
+                assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                assert_eq!(machines[2].stats.verification.mismatches, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn narrow_memory_comparisons_are_read_only_and_fault_before_flags_change() {
+    for width in [1, 2] {
+        for immediate in [false, true] {
+            for test in [false, true] {
+                let code = assemble(|a| {
+                    match (width, immediate, test) {
+                        (1, false, false) => a.cmp(byte_ptr(DATA + 4095), ah),
+                        (1, true, false) => a.cmp(byte_ptr(DATA + 4095), -1i32),
+                        (1, false, true) => a.test(byte_ptr(DATA + 4095), ah),
+                        (1, true, true) => a.test(byte_ptr(DATA + 4095), 0x80u32),
+                        (_, false, false) => a.cmp(word_ptr(DATA + 4095), ax),
+                        (_, true, false) => a.cmp(word_ptr(DATA + 4095), -1i32),
+                        (_, false, true) => a.test(word_ptr(DATA + 4095), ax),
+                        _ => a.test(word_ptr(DATA + 4095), 0x8000u32),
+                    }
+                    .unwrap();
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                for m in &mut machines {
+                    reset(m, [0xa5a58080, 0, 0, 0, 0, 0, 0, 0], 0xcd7);
+                    m.write(DATA + 4095, &[0x80, 0x7f]).unwrap();
+                    m.protect(DATA, 4096, READ).unwrap();
+                    m.protect(DATA + 4096, 4096, 0).unwrap();
+                }
+                let expected = machines[0].run(STOP, 100).unwrap();
+                for m in &mut machines[1..] {
+                    assert_eq!(m.run(STOP, 100).unwrap(), expected);
+                }
+                // TEST leaves AF undefined only after successful retirement.
+                let mask = if test && width == 1 { !0x10 } else { u32::MAX };
+                equivalent(&machines[0], &machines[1], mask);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                if width == 2 {
+                    assert!(matches!(expected, RunOutcome::ReadFault { .. }));
+                    assert_eq!(machines[2].state.eflags, 0xcd7);
+                    for m in &mut machines {
+                        m.protect(DATA + 4096, 4096, READ).unwrap();
+                        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    }
+                    equivalent(
+                        &machines[0],
+                        &machines[1],
+                        if test { !0x10 } else { u32::MAX },
+                    );
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                } else {
+                    assert_eq!(expected, RunOutcome::ReachedStop);
+                    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_push_uses_original_esp_and_leave_commits_after_the_read() {
+    let code = assemble(|a| {
+        a.push(dword_ptr(esp)).unwrap();
+        a.pop(edx).unwrap();
+        a.push(dword_ptr(esp - 4)).unwrap();
+        a.pop(ecx).unwrap();
+        a.push(dword_ptr(esi).fs()).unwrap();
+        a.pop(eax).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+    });
+    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+    machines[2].set_tier_verification(Some(true));
+    for m in &mut machines {
+        reset(m, [0, 0, 0, 0, 0, DATA + 256, u32::MAX - 1, 0], 0xcd7);
+        m.state.fs_base = DATA + 2;
+        m.write(DATA, &0x12345678u32.to_le_bytes()).unwrap();
+        m.write(DATA + 256, &0x87654321u32.to_le_bytes()).unwrap();
+        m.write(DATA + 260, &STOP.to_le_bytes()).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    }
+    equivalent(&machines[0], &machines[1], u32::MAX);
+    equivalent(&machines[0], &machines[2], u32::MAX);
+    assert_eq!(&machines[2].state.regs[..3], &[0x12345678, STOP, STOP]);
+    assert_eq!(machines[2].state.regs[4], DATA + 264);
+    assert_eq!(machines[2].state.regs[5], 0x87654321);
+    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+}
+
+#[test]
+fn memory_push_and_leave_faults_keep_stack_registers_restartable() {
+    for operation in 0..3 {
+        let code = assemble(|a| {
+            if operation == 2 {
+                a.leave().unwrap();
+            } else {
+                a.push(dword_ptr(DATA)).unwrap();
+            }
+            a.jmp(u64::from(STOP)).unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            reset(m, [0, 0, 0, 0, 0, DATA, 0, 0], 0x8d7);
+            m.write(DATA, &0x12345678u32.to_le_bytes()).unwrap();
+            if operation != 1 {
+                m.protect(DATA, 4096, 0).unwrap();
+            }
+            // With both accesses denied, PUSH must fault on its source first.
+            m.protect(STACK - 4096, 4096, READ).unwrap();
+        }
+        let expected = machines[0].run(STOP, 100).unwrap();
+        assert!(matches!(
+            expected,
+            RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+        ));
+        for m in &mut machines[1..] {
+            assert_eq!(m.run(STOP, 100).unwrap(), expected);
+        }
+        assert_eq!(machines[2].state.regs[4], STACK);
+        assert_eq!(machines[2].state.regs[5], DATA);
+        for m in &mut machines {
+            m.protect(DATA, 4096, READ | WRITE).unwrap();
+            m.protect(STACK - 4096, 4096, READ | WRITE).unwrap();
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        for m in &mut machines {
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
