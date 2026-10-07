@@ -145,7 +145,7 @@ fn add_ref(env: &mut Env<'_>) -> Outcome {
             .unwrap_or(0),
     )
 }
-fn retire(env: &mut Env<'_>, this: u32) -> u32 {
+pub(super) fn retire(env: &mut Env<'_>, this: u32) -> u32 {
     let Some(dead) = com(env).and_then(|c| c.release::<Buffer>(&mut env.sys.objects, this)) else {
         return 0;
     };
@@ -172,4 +172,9 @@ fn size(env: &mut Env<'_>) -> Outcome {
         .and_then(|c| c.get::<Buffer>(&env.sys.objects, env.arg(0)))
         .map_or(0, |b| b.size);
     Outcome::Return(value)
+}
+
+pub(super) fn contents(env: &Env<'_>, pointer: u32) -> Option<(u32, u32)> {
+    let b = com(env)?.get::<Buffer>(&env.sys.objects, pointer)?;
+    Some((b.data, b.size))
 }

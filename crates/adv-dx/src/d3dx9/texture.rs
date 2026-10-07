@@ -270,7 +270,7 @@ fn save_surface(env: &mut Env<'_>) -> Outcome {
         adv_abi::warn_unavailable(
             env,
             "d3dx9_43.dll!D3DXSaveSurfaceToFileInMemory",
-            "surface export supports BMP without a palette",
+            &format!("surface export supports BMP without a palette; requested format={format}"),
         );
         return Outcome::Return(INVALID);
     }
