@@ -12,7 +12,7 @@ use iced_x86::{
     CodeSize, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind,
     Register,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SPAN: i64 = 64 * 1024;
 
@@ -36,43 +36,76 @@ pub(super) struct Site {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
+    pub header: u32,
+    pub latch: u32,
+    /// Exclusive end of the selected, contiguous loop body.
+    pub end: u32,
+    /// Instruction boundaries which can enter a block inside the scope.
+    pub entries: BTreeSet<u32>,
     pub groups: Vec<Group>,
     pub sites: BTreeMap<u32, Site>,
 }
 
 /// Select single explicit memory operands whose address registers remain
-/// unchanged throughout the entire region, including partial/implicit writes.
-/// Only sites enclosed by an internal backward branch count toward the benefit
-/// gate: forward-only regions and loops with fewer than two proven sites return
-/// None. Unreachable instructions can only make this analysis more conservative.
+/// unchanged inside one loop, including partial/implicit writes. Setup, teardown,
+/// callees and other loops outside that scope do not constrain its addresses.
+/// The caller must prove the current addresses at the selected backedge before
+/// entering the clone, and leave the clone when control leaves this scope.
 pub(super) fn analyze(instructions: &BTreeMap<u32, Instruction>) -> Option<Plan> {
-    let loops: Vec<_> = instructions
-        .values()
-        .filter(|i| {
-            matches!(
-                i.flow_control(),
-                FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
-            ) && i.op0_kind() == OpKind::NearBranch32
-                && i.near_branch32() <= i.ip32()
-                && instructions.contains_key(&i.near_branch32())
+    let mut best = None;
+    for latch in instructions.values() {
+        if !matches!(
+            latch.flow_control(),
+            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+        ) || latch.op0_kind() != OpKind::NearBranch32
+            || latch.near_branch32() > latch.ip32()
+        {
+            continue;
+        }
+        let Some((plan, savings)) = analyze_loop(instructions, latch) else {
+            continue;
+        };
+        // Count removed read/write checks, not just instructions: an RMW site
+        // has two checks. Prefer fewer proof groups when savings are equal.
+        let score = (savings, std::cmp::Reverse(plan.groups.len()));
+        if best.as_ref().is_none_or(|(_, previous)| score > *previous) {
+            best = Some((plan, score));
+        }
+    }
+    best.map(|(plan, _)| plan)
+}
+
+fn analyze_loop(
+    instructions: &BTreeMap<u32, Instruction>,
+    latch: &Instruction,
+) -> Option<(Plan, usize)> {
+    let header = latch.near_branch32();
+    let end = latch.next_ip32();
+    if end <= latch.ip32() {
+        return None;
+    }
+    let body: Vec<_> = instructions.range(header..=latch.ip32()).collect();
+    if body.first().map(|entry| *entry.0) != Some(header)
+        || body
+            .windows(2)
+            .any(|pair| pair[0].1.next_ip32() != *pair[1].0)
+        || body.iter().any(|entry| {
+            let pc = *entry.0;
+            let i = entry.1;
+            i.ip32() != pc
+                || i.is_invalid()
+                // Start with one straight-line body and its direct backedge.
+                // Unknown callees, indirect control and nested/side branches
+                // cannot be covered by this bounded proof.
+                || (pc != latch.ip32() && i.flow_control() != FlowControl::Next)
         })
-        .map(|i| (i.near_branch32(), i.ip32()))
-        .collect();
-    if loops.is_empty() {
+    {
         return None;
     }
 
     let mut factory = InstructionInfoFactory::new();
     let mut clobbered = 0u8;
-    for i in instructions.values() {
-        // A guest callee can mutate registers not named by the call instruction.
-        // The first version deliberately requires the caller's region to omit it.
-        if matches!(
-            i.flow_control(),
-            FlowControl::Call | FlowControl::IndirectCall
-        ) {
-            return None;
-        }
+    for (_, i) in &body {
         for used in factory.info(i).used_registers() {
             if matches!(
                 used.access(),
@@ -88,12 +121,11 @@ pub(super) fn analyze(instructions: &BTreeMap<u32, Instruction>) -> Option<Plan>
     }
 
     type Key = (Option<usize>, Option<(usize, u32)>);
-    type Pending = (Group, Vec<(u32, i32, u32)>);
+    type Pending = (Group, Vec<(u32, i32, u32, usize)>);
     let mut pending: BTreeMap<Key, Pending> = BTreeMap::new();
-    for i in instructions.values() {
+    for (_, i) in &body {
         let pc = i.ip32();
-        if !loops.iter().any(|&(low, high)| low <= pc && pc <= high)
-            || matches!(i.mnemonic(), Mnemonic::Lea | Mnemonic::Nop)
+        if matches!(i.mnemonic(), Mnemonic::Lea | Mnemonic::Nop)
             || i.has_lock_prefix()
             || i.has_rep_prefix()
             || i.has_repne_prefix()
@@ -161,20 +193,51 @@ pub(super) fn analyze(instructions: &BTreeMap<u32, Instruction>) -> Option<Plan>
         entry.0.high = entry.0.high.max(high);
         entry.0.read |= read;
         entry.0.write |= write;
-        entry.1.push((pc, displacement, width as u32));
+        entry.1.push((
+            pc,
+            displacement,
+            width as u32,
+            usize::from(read) + usize::from(write),
+        ));
     }
 
     let mut plan = Plan {
+        header,
+        latch: latch.ip32(),
+        end,
+        entries: BTreeSet::from([header]),
         groups: Vec::new(),
         sites: BTreeMap::new(),
     };
+    // External side entries are safe: they execute the checked body until the
+    // selected latch proves their current addresses. Preserve their boundaries
+    // for a clone emitter using the original region's block structure.
+    for i in instructions.values() {
+        if i.op_count() != 0 && i.op0_kind() == OpKind::NearBranch32 {
+            let target = i.near_branch32();
+            if header <= target && target < end {
+                if !instructions.contains_key(&target) {
+                    return None;
+                }
+                plan.entries.insert(target);
+            }
+        }
+        if i.flow_control() != FlowControl::Next {
+            let next = i.next_ip32();
+            if header <= next && next < end && instructions.contains_key(&next) {
+                plan.entries.insert(next);
+            }
+        }
+    }
+    let mut savings = 0;
     for (group, sites) in pending.into_values() {
         if group.high - group.low > MAX_SPAN {
             continue;
         }
         let index = plan.groups.len();
         plan.groups.push(group);
-        for (pc, displacement, width) in sites {
+        for (pc, displacement, width, checks) in sites {
+            savings += checks;
             plan.sites.insert(
                 pc,
                 Site {
@@ -185,7 +248,7 @@ pub(super) fn analyze(instructions: &BTreeMap<u32, Instruction>) -> Option<Plan>
             );
         }
     }
-    (plan.sites.len() >= 2).then_some(plan)
+    (plan.sites.len() >= 2).then_some((plan, savings))
 }
 
 #[cfg(test)]
@@ -237,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_and_implicit_clobbers_invalidate_the_whole_region() {
+    fn partial_and_implicit_clobbers_inside_the_scope_invalidate_addresses() {
         for clobber in [0, 1] {
             let code = decode(|a| {
                 let mut top = a.create_label();
@@ -355,5 +418,179 @@ mod tests {
             });
             assert_eq!(analyze(&code).is_some(), displacement == 65532);
         }
+    }
+
+    #[test]
+    fn prologue_and_teardown_can_write_the_loop_base_and_call_callees() {
+        let code = decode(|a| {
+            let mut top = a.create_label();
+            let mut callee = a.create_label();
+            a.push(ebp).unwrap();
+            a.mov(ebp, esp).unwrap();
+            a.sub(esp, 16).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(ebp - 4)).unwrap();
+            a.mov(edx, dword_ptr(ebp - 8)).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(top).unwrap();
+            a.mov(ebp, 0x30000).unwrap();
+            a.call(callee).unwrap();
+            a.add(esp, 16).unwrap();
+            a.pop(ebp).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut callee).unwrap();
+            a.ret().unwrap();
+        });
+        let plan = analyze(&code).unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].base, Some(5));
+        assert_eq!(code[&plan.header].memory_displacement32(), (-4i32) as u32);
+        assert_eq!(
+            code[&plan.latch].flow_control(),
+            FlowControl::ConditionalBranch
+        );
+        assert_eq!(code[&plan.latch].near_branch32(), plan.header);
+        assert_eq!(code[&plan.end].op0_register(), Register::EBP);
+        assert_eq!(plan.sites.len(), 2);
+        assert!(
+            plan.sites
+                .keys()
+                .all(|pc| plan.header <= *pc && *pc < plan.end)
+        );
+    }
+
+    #[test]
+    fn reentry_with_a_different_base_and_partial_writes_outside_is_allowed() {
+        let code = decode(|a| {
+            let mut top = a.create_label();
+            a.mov(ebp, 0x20000).unwrap();
+            a.mov(esi, 3).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(ebp + esi * 4)).unwrap();
+            a.mov(edx, dword_ptr(ebp + esi * 4 + 4)).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(top).unwrap();
+            a.mov(bp, ax).unwrap();
+            a.mov(si, dx).unwrap();
+            a.mov(ebp, 0x30000).unwrap();
+            a.mov(ecx, 2).unwrap();
+            a.jmp(top).unwrap();
+        });
+        let plan = analyze(&code).unwrap();
+        assert_eq!(plan.groups[0].base, Some(5));
+        assert_eq!(plan.groups[0].index, Some((6, 4)));
+        assert_eq!(
+            code[&plan.latch].flow_control(),
+            FlowControl::ConditionalBranch
+        );
+        assert_eq!(code[&plan.end].op0_register(), Register::BP);
+        // The later reentry backedge contains the first loop's conditional
+        // branch and is not itself a straight-line candidate. Its new base is
+        // read by the caller's proof each time the selected latch is taken.
+        assert_eq!(plan.entries, BTreeSet::from([plan.header]));
+        assert_eq!(plan.sites.len(), 2);
+    }
+
+    #[test]
+    fn partial_base_and_index_writes_only_reject_when_inside_the_loop() {
+        for inside in [false, true] {
+            let code = decode(|a| {
+                let mut top = a.create_label();
+                if !inside {
+                    a.mov(bp, ax).unwrap();
+                    a.inc(si).unwrap();
+                }
+                a.set_label(&mut top).unwrap();
+                a.mov(eax, dword_ptr(ebp + esi * 4)).unwrap();
+                a.mov(edx, dword_ptr(ebp + esi * 4 + 4)).unwrap();
+                if inside {
+                    a.mov(bp, ax).unwrap();
+                    a.inc(si).unwrap();
+                }
+                a.dec(ecx).unwrap();
+                a.jnz(top).unwrap();
+                a.mov(bp, ax).unwrap();
+                a.inc(si).unwrap();
+            });
+            assert_eq!(analyze(&code).is_some(), !inside);
+        }
+    }
+
+    #[test]
+    fn picks_one_loop_by_saved_checks_instead_of_unioning_scopes() {
+        let code = decode(|a| {
+            let mut first = a.create_label();
+            let mut second = a.create_label();
+            a.set_label(&mut first).unwrap();
+            a.mov(eax, dword_ptr(ebp)).unwrap();
+            a.mov(edx, dword_ptr(ebp + 4)).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(first).unwrap();
+            a.mov(ebp, 0x30000).unwrap();
+            a.set_label(&mut second).unwrap();
+            a.add(dword_ptr(ebp + 8), 1).unwrap();
+            a.add(dword_ptr(ebp + 12), 1).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(second).unwrap();
+            a.ret().unwrap();
+        });
+        let plan = analyze(&code).unwrap();
+        assert_eq!(code[&plan.header].mnemonic(), Mnemonic::Add);
+        assert_eq!(plan.sites.len(), 2);
+        assert_eq!((plan.groups[0].low, plan.groups[0].high), (8, 16));
+        assert!(plan.groups[0].read && plan.groups[0].write);
+    }
+
+    #[test]
+    fn gaps_callees_indirect_control_and_internal_branches_are_rejected() {
+        for kind in 0..4 {
+            let mut code = decode(|a| {
+                let mut top = a.create_label();
+                let mut skip = a.create_label();
+                a.set_label(&mut top).unwrap();
+                a.mov(eax, dword_ptr(ebp)).unwrap();
+                match kind {
+                    0 => a.nop().unwrap(),
+                    1 => a.call(eax).unwrap(),
+                    2 => a.jmp(eax).unwrap(),
+                    _ => a.jz(skip).unwrap(),
+                }
+                a.set_label(&mut skip).unwrap();
+                a.mov(edx, dword_ptr(ebp + 4)).unwrap();
+                a.dec(ecx).unwrap();
+                a.jnz(top).unwrap();
+            });
+            if kind == 0 {
+                let missing = code
+                    .values()
+                    .find(|i| i.mnemonic() == Mnemonic::Nop)
+                    .unwrap()
+                    .ip32();
+                code.remove(&missing);
+            }
+            assert!(analyze(&code).is_none(), "unsupported control kind {kind}");
+        }
+    }
+
+    #[test]
+    fn external_side_entries_preserve_original_block_boundaries() {
+        let code = decode(|a| {
+            let mut top = a.create_label();
+            let mut side = a.create_label();
+            a.jz(side).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.mov(eax, dword_ptr(ebp)).unwrap();
+            a.set_label(&mut side).unwrap();
+            a.mov(edx, dword_ptr(ebp + 4)).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(top).unwrap();
+        });
+        let plan = analyze(&code).unwrap();
+        assert_eq!(plan.entries.len(), 2);
+        assert!(plan.entries.contains(&plan.header));
+        assert!(
+            plan.entries
+                .contains(&code.values().next().unwrap().near_branch32())
+        );
     }
 }

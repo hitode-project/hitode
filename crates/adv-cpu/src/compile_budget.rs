@@ -46,6 +46,12 @@ fn decoded(input: &Snapshot) -> BTreeMap<u32, Instruction> {
             instructions.insert(instruction.ip32(), instruction);
         }
     }
+    let private_callee = |pc: u32| {
+        region.reachable
+            && region.callees.contains(&pc)
+            && pc != region.start
+            && !region.entries.contains(&pc)
+    };
     let mut pending = region.entries.clone();
     if region.reachable && pending.is_empty() {
         pending.push(region.start);
@@ -59,7 +65,10 @@ fn decoded(input: &Snapshot) -> BTreeMap<u32, Instruction> {
         );
     }
     while let Some(target) = pending.pop() {
-        if instructions.contains_key(&target) || region.frontier.contains(&target) {
+        if instructions.contains_key(&target)
+            || region.frontier.contains(&target)
+            || private_callee(target)
+        {
             continue;
         }
         let Some(offset) = target
@@ -80,6 +89,7 @@ fn decoded(input: &Snapshot) -> BTreeMap<u32, Instruction> {
             && decoder.ip() < u64::from(region.start) + region.len as u64
             && !instructions.contains_key(&(decoder.ip() as u32))
             && !region.frontier.contains(&(decoder.ip() as u32))
+            && !private_callee(decoder.ip() as u32)
         {
             let i = decoder.decode();
             if i.op0_kind() == OpKind::NearBranch32 {
