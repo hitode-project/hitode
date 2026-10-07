@@ -1,6 +1,6 @@
 //! The personality has no Video Compression Manager driver-install backend.
 //! Declarations come from the scoped, pinned SDK input in data/abi/sdk-source.json.
-use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, win32};
+use adv_abi::{AnsiStr, GuestPtr, Handle, Registry, WideStr, win32};
 use adv_machine::Env;
 
 use crate::util::{MAX_STR, err, set_last_error};
@@ -57,4 +57,60 @@ fn remove(env: &mut Env<'_>, _kind: u32, _handler: u32, flags: u32) -> i32 {
 pub fn register(registry: &mut Registry) {
     registry.register(install_ABI);
     registry.register(remove_ABI);
+    registry.register(draw_dib_open_ABI);
+}
+
+#[win32(msvfw32, name = "DrawDibOpen", level = safe_fail)]
+fn draw_dib_open(env: &mut Env<'_>) -> Handle {
+    // A NULL DrawDib DC lets callers select their ordinary GDI fallback.
+    adv_abi::warn_unavailable(
+        env,
+        "msvfw32.dll!DrawDibOpen",
+        "DrawDib rendering is unavailable",
+    );
+    Handle(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::JitCpu;
+    use adv_machine::{Clock, Conv, Machine, Outcome, layout::PARK_ADDR};
+
+    #[test]
+    fn draw_dib_failure_is_callable_without_creating_a_device() {
+        let mut registry = Registry::default();
+        register(&mut registry);
+        let api = registry.get("msvfw32.dll", "DrawDibOpen").unwrap();
+        assert_eq!(api.conv, Conv::Stdcall { argc: 0 });
+        assert!(registry.dynamic_available("msvfw32.dll", "DrawDibOpen"));
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.spawn("drawdib", PARK_ADDR, &[], 65536).unwrap();
+        let count = machine.sys.objects.object_count();
+        let mut env = Env {
+            context: machine.sys.current,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        for _ in 0..2 {
+            assert!(matches!((api.handler)(&mut env), Outcome::Return(0)));
+        }
+        assert_eq!(env.sys.objects.object_count(), count);
+        assert_eq!(
+            env.ext
+                .get::<adv_abi::ApiDiagnostics>()
+                .warnings
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
 }
