@@ -373,11 +373,12 @@ fn extended_queries<B: Backend>(cpu: B) {
     let system_name = t.text("Button", true);
     let stock = t.out_ex(48);
     let sr = t.query_ex(true, 0, I(system_name), stock);
+    let (icon_atom, _) = t.class_ex("ClassIconState", false, CODE, 0);
     let window = t.call(
         "CreateWindowExA",
         &[
             I(0),
-            M(aa),
+            M(icon_atom),
             I(0),
             I(0),
             I(0),
@@ -394,7 +395,7 @@ fn extended_queries<B: Backend>(cpu: B) {
     let old_small = t.call("SetClassLongA", &[M(window), I((-34i32) as u32), I(1003)]);
     let large = t.call("GetClassLongA", &[M(window), I((-14i32) as u32)]);
     let changed = t.out_ex(48);
-    t.query_ex(false, CODE, M(aa), changed);
+    t.query_ex(false, CODE, M(icon_atom), changed);
     t.run();
     assert_eq!((t.value(mr), t.value(me)), (0, 1411));
     assert_eq!(t.value(missing), 48);
