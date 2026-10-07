@@ -128,8 +128,14 @@ fn draw_dib_native_palette_orientation_scaling_clip_and_default_size() {
                     }),
                 Some(3)
             );
-            let [dx, dy, dw, dh] = dst.map(|v| if v == -1 { 4 } else { v });
             let [sx, sy, sw, sh] = src;
+            let [dx, dy, mut dw, mut dh] = dst;
+            if dw == -1 {
+                dw = sw;
+            }
+            if dh == -1 {
+                dh = sh;
+            }
             let mut actual = [0; 144];
             m.cpu.read(pixels, &mut actual).unwrap();
             for y in 0..6 {

@@ -1,7 +1,7 @@
 //! DrawDib aliases borrow the ordinary object table and the existing DIB raster.
 #![allow(clippy::too_many_arguments)] // Fixed SDK signature.
 use adv_abi::{GuestPtr, Handle, Registry, win32};
-use adv_cpu::backend::{GuestExt, Prot};
+use adv_cpu::backend::Prot;
 use adv_machine::{Env, Namespace, Outcome};
 
 use crate::{Win32, gdi32::raster::front, util::set_last_error};
@@ -124,8 +124,9 @@ fn draw(
     } else {
         bits
     };
-    let width = if width == -1 { bitmap_width } else { width };
-    let height = if height == -1 { bitmap_height } else { height };
+    // Native defaults to the requested source extent, including a cropped DIB.
+    let width = if width == -1 { sw } else { width };
+    let height = if height == -1 { sh } else { height };
     if width < 0 || height < 0 {
         return unsupported(env, "mirrored DrawDib destinations are unavailable");
     }
