@@ -136,7 +136,6 @@ pub fn register(r: &mut Registry) {
         ("__set_app_type", 1),
         ("__p__fmode", 0),
         ("__p__commode", 0),
-        ("toupper", 1),
         ("qsort", 4),
         ("floor", 2),
         ("ceil", 2),
@@ -737,13 +736,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Fail("invalid initializer range".into());
             }
             return initializers(e, a, b, name == "_initterm_e");
-        }
-        "toupper" => {
-            if a <= 255 {
-                u32::from((a as u8).to_ascii_uppercase())
-            } else {
-                a
-            }
         }
         "qsort" => {
             if b < 2 || c == 0 {

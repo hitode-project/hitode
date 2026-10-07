@@ -58,13 +58,20 @@ impl Locale {
 #[derive(Clone, Default)]
 pub(super) struct LocaleState {
     categories: [Locale; 5],
+    // VC80's exported case functions enter a different EOF/error path after
+    // any non-C locale has been installed, even if LC_CTYPE later returns C.
+    // This latch limits the supported EOF profile; it does not emulate that
+    // CRT-version-specific slow-path result or introduce another locale owner.
+    ever_non_c: bool,
     buffer: u32,
     ctype_tables: HashMap<u32, u32>,
     monetary_codepage: u32,
     conversions: HashMap<conv::Profile, u32>,
 }
 pub(super) fn register(registry: &mut Registry) {
-    registry.register(setlocale_ABI);
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+        registry.register(adv_abi::Api { module, ..setlocale_ABI });
+    }
     registry.register(lc_handles_ABI);
     registry.register(lc_codepage_ABI);
     ctype::register(registry);
@@ -271,12 +278,15 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         return memory_failure(error);
     }
     let monetary_codepage = conv::updated_monetary_codepage(&state, &categories);
+    let ever_non_c = state.ever_non_c || (!requested.0.is_null()
+        && categories.iter().any(|locale| locale.language != Language::C));
     env.ext.get_mut::<CrtState>().locales.insert(
         module,
         LocaleState {
             categories,
             buffer: pointer,
             monetary_codepage,
+            ever_non_c,
             ..state
         },
     );
