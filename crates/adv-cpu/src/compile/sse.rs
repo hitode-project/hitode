@@ -1081,13 +1081,36 @@ mod tests {
                 assert_eq!(jit.state.xmm, reference.state.xmm, "{context}");
                 assert_eq!(jit.state.regs, reference.state.regs, "{context}");
                 assert_eq!(jit.state.eflags, reference.state.eflags, "{context}");
+                if matches!(
+                    name,
+                    "cvtps2dq"
+                        | "cvttps2dq"
+                        | "cvtpd2dq"
+                        | "cvttpd2dq"
+                        | "cvtdq2ps"
+                        | "cvtsi2ss"
+                        | "cvtsi2sd"
+                        | "cvtss2si"
+                        | "cvttss2si"
+                        | "cvtsd2si"
+                        | "cvttsd2si"
+                ) {
+                    assert_eq!(jit.state.mxcsr, reference.state.mxcsr, "{context}");
+                }
                 assert_eq!(
                     jit.memory().read(DATA + 32, 32).unwrap(),
                     reference.memory().read(DATA + 32, 32).unwrap(),
                     "{context}"
                 );
             }
-            assert_eq!(jit.stats.interpreter_entries, 0, "{name}");
+            if matches!(name, "cvtdq2ps" | "cvtsi2ss") {
+                // Inexact int32 -> binary32 lanes now require the guarded
+                // exact path so rounding and precision status stay observable.
+                assert!(jit.stats.interpreter_entries > 0, "{name}");
+                assert!(jit.stats.native_entries > 0, "{name}");
+            } else {
+                assert_eq!(jit.stats.interpreter_entries, 0, "{name}");
+            }
         }
         FOREIGN_NANS.store(false, Ordering::Relaxed);
     }
