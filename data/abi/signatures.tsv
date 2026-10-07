@@ -3787,10 +3787,12 @@ ntdll.dll	RtlFreeUnicodeString	stdcall	void	void	UnicodeString:Windows.Win32.Fou
 ntdll.dll	RtlGetCurrentDirectory_U	stdcall	u32	u32	BufferLength:u32:u32:1|Buffer:Windows.Win32.Foundation.PWSTR:str16:1
 ntdll.dll	RtlInitAnsiString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.ANSI_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PCSTR:str8:1
 ntdll.dll	RtlInitUnicodeString	stdcall	void	void	DestinationString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|SourceString:Windows.Win32.Foundation.PWSTR:str16:1
+ntdll.dll	RtlLockHeap	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	HeapHandle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	RtlNtStatusToDosError	stdcall	u32	u32	Status:Windows.Win32.Foundation.NTSTATUS:i32:1
 ntdll.dll	RtlQueryEnvironmentVariable_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Environment:void*:ptr:1|Name:UNICODE_STRING*:ptr:1|Value:UNICODE_STRING*:ptr:1
 ntdll.dll	RtlReleasePebLock	stdcall	void	void	
 ntdll.dll	RtlSetCurrentDirectory_U	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	PathName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1
+ntdll.dll	RtlUnlockHeap	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	HeapHandle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	ZwAllocateVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void**:ptr:1|ZeroBits:usize:u32:1|RegionSize:usize*:ptr:1|AllocationType:u32:u32:1|Protect:u32:u32:1
 ntdll.dll	ZwClose	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Handle:Windows.Win32.Foundation.HANDLE:handle:1
 ntdll.dll	ZwCreateFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:Windows.Win32.Foundation.HANDLE*:ptr:1|DesiredAccess:u32:u32:1|ObjectAttributes:OBJECT_ATTRIBUTES*:ptr:1|IoStatusBlock:IO_STATUS_BLOCK*:ptr:1|AllocationSize:LARGE_INTEGER*:ptr:1|FileAttributes:u32:u32:1|ShareAccess:u32:u32:1|CreateDisposition:u32:u32:1|CreateOptions:u32:u32:1|EaBuffer:void*:ptr:1|EaLength:u32:u32:1

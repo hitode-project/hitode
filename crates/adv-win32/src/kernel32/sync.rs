@@ -49,7 +49,7 @@ impl Drop for CriticalTicket {
     }
 }
 
-fn release_cs_wait(env: &mut Env<'_>, cs: u32) -> Result<(), String> {
+pub(crate) fn release_cs_wait(env: &mut Env<'_>, cs: u32) -> Result<(), String> {
     let waits = env.ext.get_or_default::<CriticalWaits>();
     if waits.0.get(&cs).is_some_and(|wait| wait.pending.get() != 0) {
         return Err(format!(

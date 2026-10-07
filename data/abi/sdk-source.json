@@ -339,5 +339,14 @@
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntexapi.h",
     "interval_documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kedelayexecutionthread",
     "native_verification": "18 DWORDs: bad/unaligned pointers, zero yield, expired and future absolute time, actual relative wait permits worker progress and exit 37, four-byte aligned interval and unchanged LastError"
+  },
+  "rtl_heap_lock": {
+    "scope": "RtlLockHeap and RtlUnlockHeap only; one x86 HANDLE stack word and BOOLEAN return (AL)",
+    "source": "phnt ntrtl.h primary declarations and SDK 10.0.26100.0 x86 ntdll.lib _RtlLockHeap@4 / _RtlUnlockHeap@4 symbols",
+    "documentation": [
+      "https://github.com/winsiderss/phnt/blob/master/ntrtl.h",
+      "https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heaplock"
+    ],
+    "native_verification": "Authored x86 heap-lock fixture checks valid BOOLEAN return, recursion, native/Win32 interop, serialized allocation waiting and NO_SERIALIZE behavior."
   }
 }
