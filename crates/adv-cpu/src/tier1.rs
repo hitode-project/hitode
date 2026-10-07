@@ -3,7 +3,10 @@
 //! helper calls from native code and an exit when a helper refuses. No hardware
 //! fault recovery, floating approximation or parallel guest execution is enabled.
 #![cfg_attr(
-    not(all(target_arch = "aarch64", target_os = "linux")),
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android")
+    )),
     allow(dead_code)
 )]
 use std::time::Duration;
@@ -32,9 +35,15 @@ pub struct Tier1Stats {
     pub invalidations: u64,
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 mod emit;
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 mod native;
 
 pub(crate) struct Execution {
@@ -44,15 +53,27 @@ pub(crate) struct Execution {
     pub last_units: u32,
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+))]
 pub(crate) use native::Engine;
 
-#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+)))]
 pub(crate) struct Engine;
-#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "android")
+)))]
 impl Engine {
     pub fn new() -> Result<Self, String> {
-        Err("ARM64 Tier 1 requires aarch64 Linux; other platforms are not validated".into())
+        Err(
+            "ARM64 Tier 1 requires aarch64 Linux or Android; other platforms are not supported"
+                .into(),
+        )
     }
     pub fn stats(&self) -> Tier1Stats {
         Tier1Stats::default()
