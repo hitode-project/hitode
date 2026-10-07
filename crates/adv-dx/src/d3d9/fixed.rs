@@ -200,6 +200,7 @@ impl Fixed {
                 (57, 0),
                 (58, u32::MAX),
                 (59, u32::MAX),
+                (128, 0), // WRAP0: texture coordinate wrapping is disabled.
                 (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
                 (137, 1),
                 (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
@@ -223,8 +224,13 @@ impl Fixed {
                 (208, 1),
                 (209, 1),
             ]),
-            stage_slots: std::array::from_fn(|_| {
-                BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)])
+            stage_slots: std::array::from_fn(|stage| {
+                let mut states =
+                    BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)]);
+                if stage != 0 {
+                    states.extend([(1, 1), (2, 2), (3, 1), (4, 1), (5, 2), (6, 1)]);
+                }
+                states
             }),
             stage: BTreeMap::from([
                 (1, 4),
@@ -456,6 +462,11 @@ fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> 
         53..=55 | 186..=188 => stencil_op(value).is_some(),
         24 | 57..=59 => true,
         168 => value <= 15,
+        128 => match value {
+            0 => true,
+            1..=15 => return UNAVAILABLE,
+            _ => false,
+        },
         171 | 209 => operation(value).is_some(),
         _ => return UNAVAILABLE,
     };
@@ -486,8 +497,31 @@ fn set_stage(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, kind: i32, value
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
+    if stage >= 8 {
+        return INVALID;
+    }
     if matches!(kind, 7..=10 | 22 | 23) {
-        if stage >= 8 {
+        f.stage_slots[stage as usize].insert(kind, value);
+        super::shaders::stateblocks::mark_fixed(
+            env,
+            this.addr(),
+            super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
+        );
+        return 0;
+    }
+    if stage != 0 {
+        // The fixed renderer stops at disabled stages. Store their arguments
+        // for Get/state blocks, but reject enabling an unimplemented combiner.
+        let valid = match kind {
+            1 | 4 => match value {
+                1 => true,
+                2..=26 => return UNAVAILABLE,
+                _ => false,
+            },
+            2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 6,
+            _ => return UNAVAILABLE,
+        };
+        if !valid {
             return INVALID;
         }
         f.stage_slots[stage as usize].insert(kind, value);
@@ -497,12 +531,6 @@ fn set_stage(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, kind: i32, value
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
         );
         return 0;
-    }
-    if stage == 1 && kind == 1 && value == 1 {
-        return 0;
-    }
-    if stage != 0 {
-        return UNAVAILABLE;
     }
     let valid = match kind {
         1 | 4 => matches!(value, 1 | 2 | 3 | 4 | 7 | 10),
@@ -547,16 +575,15 @@ fn get_stage(
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
     };
-    let value = if matches!(kind, 7..=10 | 22 | 23) && stage < 8 {
-        f.stage_slots[stage as usize][&kind]
-    } else if stage == 1 && kind == 1 {
-        1
-    } else if stage == 0 {
-        match f.stage.get(&kind) {
-            Some(&v) => v,
-            None => return INVALID,
-        }
+    if stage >= 8 {
+        return INVALID;
+    }
+    let states = if stage != 0 || matches!(kind, 7..=10 | 22 | 23) {
+        &f.stage_slots[stage as usize]
     } else {
+        &f.stage
+    };
+    let Some(&value) = states.get(&kind) else {
         return INVALID;
     };
     if output.write(env.cpu, value).is_ok() {
@@ -1271,6 +1298,7 @@ mod tests {
     use super::*;
     include!("fixed/stencil_tests.rs");
     include!("fixed/state_tests.rs");
+    include!("fixed/disabled_stage_tests.rs");
 
     #[test]
     fn programmable_raster_states_do_not_silently_change_the_fixed_path_contract() {
