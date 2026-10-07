@@ -12,6 +12,13 @@
   "documentation": [
     "https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
   ],
+  "tsf": {
+    "source": "Pinned Win32Metadata 71.0.26-preview; verified against Microsoft Windows SDK 10.0.26100.0",
+    "header": "um/msctf.h",
+    "header_sha256": "465438471d23eca2795a9706ecfc3e296c958f5520c722657a17490befccdeee",
+    "scope": "ITfThreadMgr 14, ITfDocumentMgr 9 and ITfContext 18 x86 IUnknown-based stdcall slots; generated directly from WinMD by the shared COM projection",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/msctf/nn-msctf-itfthreadmgr"
+  },
   "legacy_d3dx_effect": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
     "url": "https://www.nuget.org/packages/Microsoft.DXSDK.D3DX/9.29.952.8",

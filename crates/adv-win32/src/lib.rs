@@ -136,6 +136,7 @@ impl Win32 {
         gdi32::raster::install(m);
         kernel32::install_startup(m)?;
         m.ext.insert(heaps);
+        ole32::install(m);
         gdi32::font::install(m);
         user32::install(m)?;
         msvcrt::initialize_data(m)?;
