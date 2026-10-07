@@ -1,4 +1,7 @@
 //! ExtractIconEx calls originate in x86 guests; all PE/ICO input is authored here.
+#[path = "shell_icon/associated.rs"]
+mod associated;
+
 use adv_abi::Registry;
 use adv_cpu::{
     JitCpu,

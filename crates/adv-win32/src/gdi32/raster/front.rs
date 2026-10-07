@@ -3,7 +3,7 @@
 use super::*;
 use crate::{Win32, util::set_last_error};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
-use adv_cpu::backend::{Backend, Guest, Prot};
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine, Objects};
 
@@ -22,6 +22,23 @@ pub struct State {
     provider: Option<DrawingProvider>,
     /// Canvas bitmaps lent to another frontend, retired only by that owner.
     surface_dcs: std::collections::BTreeMap<u32, u32>,
+    /// Balanced USER acquisitions over the existing GDI/surface owner. Paint
+    /// leases belong to their PAINTSTRUCT, not to arbitrary guest HDC values.
+    window_leases: Vec<WindowDcLease>,
+}
+const MAX_WINDOW_LEASES: usize = 4096;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowDcUse {
+    Get,
+    Paint(u32),
+    Erase,
+}
+struct WindowDcLease {
+    context: u32,
+    hwnd: u32,
+    dc: u32,
+    usage: WindowDcUse,
+    paint_before: Option<Option<Vec<[i32; 4]>>>,
 }
 pub fn install<B: Backend>(machine: &mut Machine<B>) {
     let gdi = machine.ext.get::<Win32>().gdi.clone();
@@ -30,6 +47,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) {
         dcs: DeviceContexts::new(gdi),
         provider: None,
         surface_dcs: Default::default(),
+        window_leases: Vec::new(),
     });
 }
 pub fn set_provider(ext: &mut Ext, provider: DrawingProvider) {
@@ -56,6 +74,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
 pub fn register(registry: &mut Registry) {
     display::register(registry);
     super::fill::register(registry);
+    super::clip::register(registry);
     super::color_table::register(registry);
     for &(_, api) in BINDINGS {
         registry.register(api);
@@ -76,6 +95,19 @@ fn fail(env: &mut Env<'_>, code: u32) -> Outcome {
 }
 fn raster_call(
     env: &mut Env<'_>,
+    call: impl FnOnce(
+        &mut Raster,
+        &mut SurfaceStore,
+        &mut DeviceContexts,
+        &mut Objects,
+        &mut dyn SurfaceMemory,
+    ) -> Result<u32, String>,
+) -> Outcome {
+    raster_call_named(env, None, call)
+}
+fn raster_call_named(
+    env: &mut Env<'_>,
+    api: Option<&str>,
     call: impl FnOnce(
         &mut Raster,
         &mut SurfaceStore,
@@ -112,16 +144,24 @@ fn raster_call(
         return outcome;
     }
     match result {
-        Ok(0) if error != 0 => fail(env, error),
+        Ok(0) if error != 0 => {
+            if error == 50
+                && let Some(api) = api
+            {
+                adv_abi::warn_unavailable(
+                    env,
+                    api,
+                    "the coordinate mapping or translated device range is unavailable",
+                );
+            }
+            fail(env, error)
+        }
         Ok(value) => Outcome::Return(value),
         Err(error) => Outcome::Fail(format!("GDI raster: {error}")),
     }
 }
 
-pub(super) fn get_dc_value(env: &mut Env<'_>, hwnd: u32) -> Outcome {
-    if !available(env) {
-        return Outcome::Return(super::super::window_dc(env, hwnd));
-    }
+fn acquire_window_dc(env: &mut Env<'_>, hwnd: u32, usage: WindowDcUse, api: &str) -> Outcome {
     let size = if hwnd == 0 {
         Some(env.ext.get::<Win32>().user.screen)
     } else {
@@ -135,6 +175,56 @@ pub(super) fn get_dc_value(env: &mut Env<'_>, hwnd: u32) -> Outcome {
     let Some((width, height)) = size else {
         return fail(env, 1400);
     };
+    let raster = available(env);
+    let state = env.ext.get_mut::<State>();
+    if state.window_leases.len() == MAX_WINDOW_LEASES {
+        adv_abi::warn_unavailable(env, api, "window DC acquisition capacity is exhausted");
+        return fail(env, 50);
+    }
+    // The single display canvas cannot be rebound while another window or
+    // thread still owns it. Same-window reentry retains its GDI state instead.
+    if raster
+        && state.window_leases.iter().any(|lease| {
+            lease.dc == WINDOW_DC && (lease.hwnd != hwnd || lease.context != env.context)
+        })
+    {
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "simultaneous display DC acquisitions for different windows or threads are unavailable",
+        );
+        return fail(env, 50);
+    }
+    if state.window_leases.try_reserve(1).is_err() {
+        return fail(env, 8);
+    }
+    let dc = match acquire_window_dc_owner(env, hwnd, width, height, raster) {
+        Outcome::Return(0) => return Outcome::Return(0),
+        Outcome::Return(dc) => dc,
+        result => return result,
+    };
+    env.ext
+        .get_mut::<State>()
+        .window_leases
+        .push(WindowDcLease {
+            context: env.context,
+            hwnd,
+            dc,
+            usage,
+            paint_before: None,
+        });
+    Outcome::Return(dc)
+}
+fn acquire_window_dc_owner(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    width: i32,
+    height: i32,
+    raster: bool,
+) -> Outcome {
+    if !raster {
+        return Outcome::Return(super::super::window_dc(env, hwnd));
+    }
     let provider = env.ext.get::<State>().provider.unwrap();
     let primary = {
         let store = env.ext.get_mut::<SurfaceStore>();
@@ -157,30 +247,44 @@ pub(super) fn get_dc_value(env: &mut Env<'_>, hwnd: u32) -> Outcome {
     gdi.set_external_bitmap(&mut env.sys.objects, WINDOW_DC, primary);
     Outcome::Return(WINDOW_DC)
 }
+fn release_window_dc(env: &mut Env<'_>, hwnd: u32, dc: u32, usage: WindowDcUse) -> bool {
+    let state = env.ext.get_mut::<State>();
+    let Some(index) = state.window_leases.iter().rposition(|lease| {
+        lease.context == env.context && lease.hwnd == hwnd && lease.dc == dc && lease.usage == usage
+    }) else {
+        return false;
+    };
+    let lease = state.window_leases.remove(index);
+    if let Some(previous) = lease.paint_before
+        && let Some(adv_os::gdi::GdiObj::Dc { clip, .. }) =
+            env.ext.get::<Win32>().gdi.get_mut(&mut env.sys.objects, dc)
+    {
+        clip.replace_paint_region(previous);
+    }
+    let state = env.ext.get::<State>();
+    if !state.window_leases.iter().any(|lease| lease.dc == dc) {
+        super::super::release_dc(env, dc);
+    }
+    true
+}
 #[win32(user32, name = "GetDC", level = implement)]
 fn get_dc(env: &mut Env<'_>, hwnd: Handle) -> Outcome {
-    get_dc_value(env, hwnd.0)
+    acquire_window_dc(env, hwnd.0, WindowDcUse::Get, "user32.dll!GetDC")
 }
 #[win32(user32, name = "GetWindowDC", level = implement)]
 fn get_window_dc(env: &mut Env<'_>, hwnd: Handle) -> Outcome {
     // The renderer currently models client pixels for both DC accessors.
-    get_dc_value(env, hwnd.0)
+    acquire_window_dc(env, hwnd.0, WindowDcUse::Get, "user32.dll!GetWindowDC")
 }
 
 #[win32(user32, name = "ReleaseDC", level = implement)]
-fn release_dc(env: &mut Env<'_>, _hwnd: Handle, dc: Handle) -> Outcome {
-    if available(env) {
-        if dc.0 != WINDOW_DC {
-            return Outcome::Return(0);
-        }
-        env.ext
-            .get_mut::<Win32>()
-            .gdi
-            .remove_external_dc(&mut env.sys.objects, dc.0);
-        Outcome::Return(1)
-    } else {
-        Outcome::Return(u32::from(super::super::release_dc(env, dc.0)))
-    }
+fn release_dc(env: &mut Env<'_>, hwnd: Handle, dc: Handle) -> Outcome {
+    Outcome::Return(u32::from(release_window_dc(
+        env,
+        hwnd.0,
+        dc.0,
+        WindowDcUse::Get,
+    )))
 }
 #[win32(user32, name = "BeginPaint", level = implement)]
 fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Outcome {
@@ -193,28 +297,118 @@ fn begin_paint(env: &mut Env<'_>, hwnd: Handle, paint: GuestPtr<[u8; 64]>) -> Ou
     else {
         return Outcome::Return(0);
     };
-    let (width, height) = window.client_size();
+    let old = crate::user32::update::snapshot(window);
     if let Err(error) = adv_abi::guest::check_range(env.cpu, paint.addr(), 64, Prot::WRITE) {
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
-    let dc = match get_dc_value(env, hwnd.0) {
+    let dc = match acquire_window_dc(
+        env,
+        hwnd.0,
+        WindowDcUse::Paint(paint.addr()),
+        "user32.dll!BeginPaint",
+    ) {
         Outcome::Return(0) => return Outcome::Return(0),
         Outcome::Return(dc) => dc,
         other => return other,
     };
+    set_paint_layer(env, dc, old.rects.clone());
     let mut bytes = [0u8; 64];
     bytes[..4].copy_from_slice(&dc.to_le_bytes());
-    bytes[16..20].copy_from_slice(&width.to_le_bytes());
-    bytes[20..24].copy_from_slice(&height.to_le_bytes());
+    let unerased = old.unerased && !old.rects.is_empty();
+    bytes[4..8].copy_from_slice(&u32::from(unerased).to_le_bytes());
+    for (field, value) in bytes[8..24]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(old.bounds())
+    {
+        *field = value.to_le_bytes();
+    }
     if let Err(error) = paint.write(env.cpu, bytes) {
-        env.ext
-            .get_mut::<Win32>()
-            .gdi
-            .remove_external_dc(&mut env.sys.objects, dc);
+        release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
         return Outcome::Fail(format!("BeginPaint: {error}"));
     }
     crate::user32::message::validate(env, hwnd.0);
+    if old.erase && !old.rects.is_empty() {
+        return crate::user32::message::send(
+            env,
+            hwnd.0,
+            crate::user32::window::wm::ERASEBKGND,
+            dc,
+            0,
+            move |env, handled| {
+                crate::user32::update::erased(env, hwnd.0, &old, handled != 0);
+                if !env
+                    .ext
+                    .get::<Win32>()
+                    .user
+                    .windows
+                    .contains_key(&env.sys.objects, &hwnd.0)
+                {
+                    release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
+                    return Outcome::Return(0);
+                }
+                if let Err(error) = GuestPtr::<u32>::new(paint.addr() + 4)
+                    .write(env.cpu, u32::from(unerased && handled == 0))
+                {
+                    release_window_dc(env, hwnd.0, dc, WindowDcUse::Paint(paint.addr()));
+                    return Outcome::Fail(format!("BeginPaint: {error}"));
+                }
+                Outcome::Return(dc)
+            },
+        );
+    }
     Outcome::Return(dc)
+}
+fn set_paint_layer(env: &mut Env<'_>, dc: u32, region: Vec<[i32; 4]>) {
+    let old = match env.ext.get::<Win32>().gdi.get_mut(&mut env.sys.objects, dc) {
+        Some(adv_os::gdi::GdiObj::Dc { clip, .. }) => clip.replace_paint_region(Some(region)),
+        _ => None,
+    };
+    env.ext
+        .get_mut::<State>()
+        .window_leases
+        .last_mut()
+        .unwrap()
+        .paint_before = Some(old);
+}
+pub(crate) fn erase_update(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    old: crate::user32::update::Snapshot,
+    then: impl FnOnce(&mut Env<'_>, bool) -> Outcome + 'static,
+) -> Outcome {
+    let dc = match acquire_window_dc(env, hwnd, WindowDcUse::Erase, "user32.dll!GetUpdateRect") {
+        Outcome::Return(0) => return Outcome::Return(0),
+        Outcome::Return(dc) => dc,
+        other => return other,
+    };
+    set_paint_layer(env, dc, old.rects.clone());
+    crate::user32::message::send(
+        env,
+        hwnd,
+        crate::user32::window::wm::ERASEBKGND,
+        dc,
+        0,
+        move |env, result| {
+            crate::user32::update::erased(env, hwnd, &old, result != 0);
+            release_window_dc(env, hwnd, dc, WindowDcUse::Erase);
+            then(env, result != 0)
+        },
+    )
+}
+/// End only the acquisition represented by this PAINTSTRUCT. The documented
+/// EndPaint return is always nonzero; an unmatched structure cannot retire a DC.
+pub(crate) fn end_paint_value(env: &mut Env<'_>, hwnd: u32, paint: u32) -> Outcome {
+    if let Err(error) = adv_abi::guest::check_range(env.cpu, paint, 64, Prot::READ) {
+        return Outcome::Fail(format!("EndPaint: {error}"));
+    }
+    let dc = match env.cpu.read_u32(paint) {
+        Ok(dc) => dc,
+        Err(error) => return Outcome::Fail(format!("EndPaint: {error}")),
+    };
+    release_window_dc(env, hwnd, dc, WindowDcUse::Paint(paint));
+    Outcome::Return(1)
 }
 #[win32(gdi32, name = "CreateCompatibleDC", level = implement)]
 fn create_dc(env: &mut Env<'_>, source: Handle) -> Outcome {
@@ -376,6 +570,15 @@ fn delete_object(env: &mut Env<'_>, object: Handle) -> Outcome {
 }
 #[win32(gdi32, name = "DeleteDC", level = implement)]
 fn delete_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
+    if env
+        .ext
+        .get::<State>()
+        .window_leases
+        .iter()
+        .any(|lease| lease.dc == dc.0)
+    {
+        return Outcome::Return(0); // USER leases are balanced by their accessors.
+    }
     if available(env)
         && (dc.0 == WINDOW_DC || env.ext.get::<State>().surface_dcs.contains_key(&dc.0))
     {
@@ -404,7 +607,7 @@ fn bit_blt(
     if !available(env) {
         return fail(env, 6);
     }
-    raster_call(env, |r, s, d, o, m| {
+    raster_call_named(env, Some("gdi32.dll!BitBlt"), |r, s, d, o, m| {
         r.bit_blt(
             s,
             d,
@@ -440,7 +643,7 @@ fn stretch_blt(
     if !available(env) {
         return fail(env, 6);
     }
-    raster_call(env, |r, s, d, o, m| {
+    raster_call_named(env, Some("gdi32.dll!StretchBlt"), |r, s, d, o, m| {
         r.stretch_blt(
             s,
             d,
@@ -483,7 +686,7 @@ fn stretch_dib(
     if adv_abi::guest::check_range(env.cpu, info.addr(), 40, Prot::READ).is_err() {
         return fail(env, 87);
     }
-    raster_call(env, |r, s, d, o, m| {
+    raster_call_named(env, Some("gdi32.dll!StretchDIBits"), |r, s, d, o, m| {
         r.stretch_dib(
             s,
             d,

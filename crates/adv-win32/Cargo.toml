@@ -17,6 +17,7 @@ adv-device = { path = "../adv-device" }
 adv-pe.workspace = true
 log.workspace = true
 encoding_rs.workspace = true
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 
 [lints]
 workspace = true

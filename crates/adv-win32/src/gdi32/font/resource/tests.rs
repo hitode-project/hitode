@@ -48,6 +48,7 @@ mod windows {
     const CODE: u32 = 0x400000;
     const DATA: u32 = 0x410000;
     const MARKER: u32 = 0x12345678;
+    const PRIVATE_HIDDEN: u32 = FR_PRIVATE | FR_NOT_ENUM;
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     static NATIVE: Mutex<()> = Mutex::new(());
 
@@ -94,7 +95,13 @@ mod windows {
     fn invoke(machine: &mut Machine<JitCpu>, name: &str, path: Option<&str>) -> u32 {
         invoke_flags(machine, name, path, 0, 0)
     }
-    fn invoke_flags(machine: &mut Machine<JitCpu>, name: &str, path: Option<&str>, flags: u32, reserved: u32) -> u32 {
+    fn invoke_flags(
+        machine: &mut Machine<JitCpu>,
+        name: &str,
+        path: Option<&str>,
+        flags: u32,
+        reserved: u32,
+    ) -> u32 {
         let pointer = path.map_or(0, |path| {
             let bytes = if name.ends_with('W') {
                 path.encode_utf16()
@@ -121,6 +128,10 @@ mod windows {
         machine.cpu.write_u32(DATA + 2052, pointer).unwrap();
         machine.cpu.write_u32(DATA + 2056, flags).unwrap();
         machine.cpu.write_u32(DATA + 2060, reserved).unwrap();
+        machine
+            .cpu
+            .write_u32(machine.sys.context(0).teb + teb::LAST_ERROR, MARKER)
+            .unwrap();
         let result = handler(&mut Env {
             context: machine.sys.current,
             cpu: &mut machine.cpu,
@@ -133,7 +144,11 @@ mod windows {
                 .cpu
                 .read_u32(machine.sys.context(0).teb + teb::LAST_ERROR)
                 .unwrap(),
-            MARKER
+            if flags & !(FR_PRIVATE | FR_NOT_ENUM) == 0 {
+                MARKER
+            } else {
+                87
+            }
         );
         let Outcome::Return(value) = result else {
             panic!("resource call did not return");
@@ -218,27 +233,22 @@ mod windows {
                 invoke(&mut machine, "RemoveFontResourceW", Some("Fonts/字形.ttf")),
                 0
             );
-            for (flags, reserved) in [(0, 0), (0x10, 0), (0x20, 0), (0x40, 0), (PRIVATE_HIDDEN, 1)]
-            {
+            // Different valid modes cannot consume this hidden reference.
+            for flags in [0, FR_PRIVATE, FR_NOT_ENUM] {
                 assert_eq!(
-                    invoke_flags(
-                        &mut machine,
-                        "AddFontResourceExW",
-                        Some("Fonts/字形.ttf"),
-                        flags,
-                        reserved
-                    ),
+                    invoke_flags(&mut machine, "RemoveFontResourceExW", Some("Fonts/字形.ttf"), flags, 0),
                     0
                 );
+            }
+            for name in ["AddFontResourceExW", "RemoveFontResourceExW"] {
+                assert_eq!(invoke_flags(&mut machine, name, Some("Fonts/字形.ttf"), 0x40, 0), 0);
+            }
+            // The native oracle also accepts nonzero reserved values without
+            // dereferencing them; it shares the same path/flags reference.
+            for name in ["AddFontResourceExW", "RemoveFontResourceExW"] {
                 assert_eq!(
-                    invoke_flags(
-                        &mut machine,
-                        "RemoveFontResourceExW",
-                        Some("Fonts/字形.ttf"),
-                        flags,
-                        reserved
-                    ),
-                    0
+                    invoke_flags(&mut machine, name, Some("Fonts/字形.ttf"), PRIVATE_HIDDEN, 1),
+                    1
                 );
             }
             assert_eq!(

@@ -1120,6 +1120,13 @@ fn run_execution(
             std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?),
         ));
         runtime.machine.sys.trace.all = true;
+        // Every call must reach the host to be traced.
+        let machine = &mut runtime.machine;
+        machine
+            .sys
+            .thunks
+            .set_guest_code(&mut machine.cpu, false)
+            .map_err(|e| format!("{e:?}"))?;
     }
     runtime.set_host_keys(keys.clone());
     if let Some(worker) = window.as_mut() {

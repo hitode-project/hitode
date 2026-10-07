@@ -107,6 +107,7 @@ impl Backend {
     pub(super) fn add_resource(
         &mut self,
         bytes: &[u8],
+        enumerable: bool,
     ) -> Result<(FontResourceId, u32), TextError> {
         if bytes.is_empty()
             || self.resources.len() >= MAX_FONT_RESOURCES
@@ -146,21 +147,13 @@ impl Backend {
             Resource {
                 faces,
                 bytes: bytes.len(),
-                enumerable: true,
+                enumerable,
             },
         );
         self.next_resource = next;
         self.resource_bytes += bytes.len();
         self.store = Arc::default();
         Ok((id, count))
-    }
-    pub(super) fn add_hidden_resource(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<(FontResourceId, u32), TextError> {
-        let result = self.add_resource(bytes)?;
-        self.resources.get_mut(&result.0).unwrap().enumerable = false;
-        Ok(result)
     }
     pub(super) fn remove_resource(&mut self, id: FontResourceId) -> bool {
         let Some(resource) = self.resources.remove(&id) else {
@@ -254,7 +247,9 @@ impl Backend {
         }
         let mut output = Vec::new();
         let mut seen = BTreeSet::new();
-        let hidden: BTreeSet<_> = self.resources.values()
+        let hidden: BTreeSet<_> = self
+            .resources
+            .values()
             .filter(|resource| !resource.enumerable)
             .flat_map(|resource| resource.faces.iter().copied())
             .collect();

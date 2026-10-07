@@ -2,7 +2,10 @@
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_machine::{Env, Outcome};
 
+pub mod tsf;
+
 pub fn register(registry: &mut Registry) {
+    tsf::register(registry);
     for api in [
         initialize_ABI,
         initialize_ex_ABI,
@@ -12,6 +15,10 @@ pub fn register(registry: &mut Registry) {
     ] {
         registry.register(api);
     }
+}
+
+pub fn install<B: adv_cpu::backend::Backend>(machine: &mut adv_machine::Machine<B>) {
+    tsf::install(machine);
 }
 
 #[win32(ole32, name = "CoInitialize", level = state)]

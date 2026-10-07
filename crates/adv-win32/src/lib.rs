@@ -11,6 +11,7 @@
 
 mod advapi32;
 pub mod gdi32;
+mod guest_code;
 pub mod kernel32;
 pub mod codec_kernels;
 mod misc;
@@ -67,10 +68,22 @@ pub struct FindObj {
     pub next: usize,
 }
 
-/// Toolhelp thread snapshot: immutable (thread id, process id) rows and a cursor.
+/// One Toolhelp handle owner, with independently frozen thread/module rows and
+/// cursors. The existing public thread fields retain their meaning.
 pub struct ThreadSnapshot {
     pub rows: Vec<(u32, u32)>,
     pub cursor: usize,
+    pub(crate) modules: Vec<SnapshotModule>,
+    pub(crate) module_cursor: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotModule {
+    pub base: u32,
+    pub size: u32,
+    pub pid: u32,
+    pub name: String,
+    pub path: String,
 }
 
 pub struct Win32 {
@@ -124,6 +137,7 @@ impl Win32 {
         gdi32::raster::install(m);
         kernel32::install_startup(m)?;
         m.ext.insert(heaps);
+        ole32::install(m);
         gdi32::font::install(m);
         user32::install(m)?;
         msvcrt::initialize_data(m)?;
@@ -179,6 +193,7 @@ pub fn register(reg: &mut Registry) {
     winmm::register(reg);
     xinput::register(reg);
     ntdll::register(reg);
+    guest_code::install(reg);
 }
 
 /// `reg.add` for stdcall functions.

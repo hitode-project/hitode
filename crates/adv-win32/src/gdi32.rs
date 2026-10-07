@@ -106,6 +106,7 @@ pub fn window_dc(env: &mut Env<'_>, hwnd: u32) -> u32 {
             bk_color: 0xff_ffff,
             bk_mode: 2,
             modes: adv_os::gdi::DcModes::default(),
+            clip: Default::default(),
             saved: Vec::new(),
         },
     )
@@ -156,12 +157,18 @@ fn create_font_indirect_a(env: &mut Env<'_>, pointer: GuestPtr<[u8; 60]>) -> Out
 }
 
 fn add_logfont(env: &mut Env<'_>, raw: Vec<u8>) -> u32 {
-    let i32_at = |o: usize| i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
     let face_end = raw[28..]
         .iter()
         .position(|&b| b == 0)
         .map_or(60, |n| 28 + n);
     let face = env.ext.get::<Win32>().codec.decode(&raw[28..face_end]);
+    add_logfont_with_face(env, raw, face)
+}
+
+// Both creation encodings publish the same logical font payload. `raw` remains
+// LOGFONTA for GetObjectA; `face` owns the original decoded name for realization.
+fn add_logfont_with_face(env: &mut Env<'_>, raw: Vec<u8>, face: String) -> u32 {
+    let i32_at = |o: usize| i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
     let f = LogFont {
         height: i32_at(0),
         width: i32_at(4),
@@ -542,6 +549,7 @@ fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
             bk_mode,
             modes,
             saved,
+            clip,
             ..
         }) => {
             saved.push(adv_os::gdi::DcState {
@@ -551,6 +559,7 @@ fn save_dc(env: &mut Env<'_>, dc: Handle) -> Outcome {
                 bk_color: *bk_color,
                 bk_mode: *bk_mode,
                 modes: *modes,
+                clip: clip.application_state(),
             });
             Outcome::Return(saved.len() as u32)
         }
@@ -593,6 +602,7 @@ fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
         bk_color,
         bk_mode,
         modes,
+        clip,
         ..
     }) = get_mut(env, dc.0)
     {
@@ -606,6 +616,7 @@ fn restore_dc(env: &mut Env<'_>, dc: Handle, level: i32) -> Outcome {
         *bk_color = state.bk_color;
         *bk_mode = state.bk_mode;
         *modes = state.modes;
+        clip.restore_application(state.clip);
     }
     Outcome::Return(1)
 }

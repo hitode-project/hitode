@@ -26,6 +26,8 @@ pub mod thunk;
 pub mod trace;
 pub mod vm;
 mod wake_queue;
+#[cfg(test)]
+mod spawn_tests;
 pub use wake_queue::WakePriority;
 
 use std::collections::VecDeque;
@@ -46,7 +48,7 @@ pub use process::{Image, Images, InitCall, TlsImage};
 use sched::{Context, Frame, Origin, ReadyResume, State};
 pub use sched::{CtxId, Handle, Object, Objects, Wait};
 pub use stats::{FrameRow, Stats};
-pub use thunk::{Conv, Handler, HostFn, Resolver, ThunkTable};
+pub use thunk::{Conv, GuestCode, Handler, HostFn, Resolver, ThunkTable};
 pub use trace::{Trace, TraceRecord};
 pub use vm::Vm;
 
@@ -226,32 +228,44 @@ impl Sys {
         let base = self.vm.alloc_with_guard(cpu, stack_size, PAGE, Prot::RW)?;
         let (lo, hi) = (base + PAGE, base + PAGE + stack_size);
         let tid = self.next_tid;
-        self.next_tid += 4;
-
         let teb = teb_addr(id);
-        cpu.map(teb, PAGE, Prot::RW)?;
-        for (off, v) in [
-            (teb::EXCEPTION_LIST, u32::MAX),
-            (teb::STACK_BASE, hi),
-            (teb::STACK_LIMIT, lo),
-            (teb::SELF, teb),
-            (teb::PROCESS_ID, self.pid),
-            (teb::THREAD_ID, tid),
-            (teb::PEB, PEB_ADDR),
-        ] {
-            cpu.write_u32(teb + off, v)?;
-        }
+        let mut mapped_teb = false;
+        let result = (|| {
+            cpu.map(teb, PAGE, Prot::RW)?;
+            mapped_teb = true;
+            for (off, v) in [
+                (teb::EXCEPTION_LIST, u32::MAX),
+                (teb::STACK_BASE, hi),
+                (teb::STACK_LIMIT, lo),
+                (teb::SELF, teb),
+                (teb::PROCESS_ID, self.pid),
+                (teb::THREAD_ID, tid),
+                (teb::PEB, PEB_ADDR),
+            ] {
+                cpu.write_u32(teb + off, v)?;
+            }
 
-        self.setup_static_tls(cpu, teb)?;
-
-        // Initial stack: args, then the return pad as the return address.
-        let mut sp = hi - 0x10;
-        for &a in args.iter().rev() {
+            // Finish fallible stack writes before TLS acquires its storage.
+            let mut sp = hi - 0x10;
+            for &a in args.iter().rev() {
+                sp -= 4;
+                cpu.write_u32(sp, a)?;
+            }
             sp -= 4;
-            cpu.write_u32(sp, a)?;
-        }
-        sp -= 4;
-        cpu.write_u32(sp, thunk_addr(thunk::RETURN_PAD))?;
+            cpu.write_u32(sp, thunk_addr(thunk::RETURN_PAD))?;
+            self.setup_static_tls(cpu, teb)?;
+            Ok(sp)
+        })();
+        let sp = match result {
+            Ok(sp) => sp,
+            Err(error) => {
+                if mapped_teb {
+                    let _ = cpu.unmap(teb, PAGE);
+                }
+                let _ = self.vm.free(cpu, base);
+                return Err(error);
+            }
+        };
 
         let thread_handle = self.objects.insert(Object::Thread { ctx: id });
         self.contexts.push(Context {
@@ -269,6 +283,7 @@ impl Sys {
             yielded: false,
             thread_handle,
         });
+        self.next_tid += 4;
         Ok(id)
     }
 
@@ -1245,6 +1260,7 @@ impl<B: Backend> Machine<B> {
                 handler: process_start,
                 data: 0,
                 trace: false,
+                guest: None,
             },
         );
         assert_eq!(
@@ -1253,6 +1269,7 @@ impl<B: Backend> Machine<B> {
             "backend park address must be layout::PARK_ADDR"
         );
         cpu.map(THUNK_BASE, THUNK_SIZE, Prot::RX)?;
+        cpu.map(GUEST_CODE_BASE, GUEST_CODE_SIZE, Prot::RX)?;
         let mut pad = Asm::new(thunk_addr(thunk::RETURN_PAD));
         pad.trap().hlt();
         cpu.write(thunk_addr(thunk::RETURN_PAD), &pad.bytes)?;
@@ -1527,6 +1544,19 @@ impl<B: Backend> Machine<B> {
         })
     }
 
+    fn complete_process_exit(&mut self, code: u32) -> RunResult {
+        // Reports retain guest memory after exit, but physical pins must end
+        // with the guest process rather than wait for the executor's Drop.
+        match self.cpu.retire_locked_pages() {
+            Ok(()) => RunResult::Exited(code),
+            Err(error) => {
+                let message = format!("process exit could not release locked pages: {error:?}");
+                log::warn!("{message}");
+                self.fail(message)
+            }
+        }
+    }
+
     /// Record why the current context parked. `Some` ends the run.
     fn park(&mut self, p: Parked) -> Option<RunResult> {
         let id = self.sys.current;
@@ -1594,7 +1624,7 @@ impl<B: Backend> Machine<B> {
                 ctx.frames.clear();
                 if self.sys.contexts.iter().all(Context::is_done) {
                     self.sys.process_identity.completion.complete(code);
-                    return Some(RunResult::Exited(code));
+                    return Some(self.complete_process_exit(code));
                 }
             }
             Parked::ExitProcess(code) => {
@@ -1604,7 +1634,7 @@ impl<B: Backend> Machine<B> {
                 ctx.state = State::Done { exit_code: code };
                 ctx.frames.clear();
                 self.sys.terminate_other_contexts(code);
-                return Some(RunResult::Exited(code));
+                return Some(self.complete_process_exit(code));
             }
             Parked::Fail(msg) => return Some(self.fail(msg)),
             Parked::Exception(v) => {

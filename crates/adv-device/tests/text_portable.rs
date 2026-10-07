@@ -21,7 +21,7 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
     let codepages = 1u32 | (1 << 17);
     declared[478..482].copy_from_slice(&codepages.to_be_bytes());
     let mut text = Text::with_font_directories(&[]);
-    text.add_resource(&declared).unwrap();
+    text.add_file_resource(&declared, true).unwrap();
     let entries = text
         .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
         .unwrap();
@@ -473,7 +473,7 @@ fn hidden_resources_still_render_and_leave_other_font_owners_unchanged() {
     let mut text = Text::with_font_directories(&[]);
     let mut other = Text::with_font_directories(&[]);
     let request = font("ADV Collection Two");
-    let (id, count) = text.add_hidden_resource(COLLECTION).unwrap();
+    let (id, count) = text.add_file_resource(COLLECTION, false).unwrap();
     assert_eq!(count, 2);
     assert!(
         text.enumerate(None, FontEnumeration::Families)
@@ -491,7 +491,7 @@ fn hidden_resources_still_render_and_leave_other_font_owners_unchanged() {
     assert_eq!(held.metrics.advance_x, 36);
     assert!(other.metrics(&request).is_err());
     for bad in [&[][..], &[0x5a; 128][..]] {
-        assert!(text.add_hidden_resource(bad).is_err());
+        assert!(text.add_file_resource(bad, false).is_err());
     }
     assert!(Arc::ptr_eq(
         &held,
@@ -510,7 +510,7 @@ fn resources_enumerate_match_invalidate_and_keep_immutable_glyphs_alive() {
     let mut text = Text::with_font_directories(&[]);
     let request = font("ADV Collection Two");
     assert!(text.metrics(&request).is_err());
-    let (id, count) = text.add_resource(COLLECTION).unwrap();
+    let (id, count) = text.add_file_resource(COLLECTION, true).unwrap();
     assert_eq!(count, 2);
     assert_eq!(text.resource_stats(), (1, COLLECTION.len()));
     let list = text.enumerate(None, FontEnumeration::Families).unwrap();

@@ -69,6 +69,7 @@ dependencies = [
  "cranelift-module",
  "iced-x86",
  "libc",
+ "log",
  "serde_json",
  "thiserror 2.0.21",
  "unicorn-engine",
@@ -113,6 +114,7 @@ dependencies = [
  "iced-x86",
  "log",
  "naga",
+ "png",
  "pollster",
  "sha2",
 ]

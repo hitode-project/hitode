@@ -8,6 +8,7 @@ use crate::stdcall;
 use crate::util::{err, set_last_error};
 use adv_os::Heaps;
 mod global;
+mod locks;
 mod virtual_memory;
 pub(crate) use virtual_memory::protect_memory;
 
@@ -131,6 +132,7 @@ fn heap_size(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     global::register(reg);
+    locks::register(reg);
     stdcall(reg, K32, "HeapCreate", 3, heap_create);
     stdcall(reg, K32, "HeapDestroy", 1, heap_destroy);
     stdcall(reg, K32, "HeapAlloc", 3, heap_alloc);

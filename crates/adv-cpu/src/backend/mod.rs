@@ -70,6 +70,14 @@ pub struct MemFault {
     pub len: u32,
 }
 
+/// Physical page locking is optional and must never be inferred from residency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageLockError {
+    Unsupported,
+    /// A Win32 error from the backing page owner or its host pin operation.
+    Win32(u32),
+}
+
 /// Why [`Backend::run`] returned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -147,6 +155,22 @@ pub trait Guest {
     /// Establish an exclusive guest-memory boundary for composite atomics or
     /// mapping-sensitive host operations. Synchronous backends need no action.
     fn quiesce_memory(&mut self) {}
+    /// Pin the actual backing storage, without a per-page reference count.
+    /// Backends without an owned, physically pinnable window reject the request.
+    fn lock_pages(&mut self, _addr: u32, _len: u32) -> Result<(), PageLockError> {
+        Err(PageLockError::Unsupported)
+    }
+    fn unlock_pages(&mut self, _addr: u32, _len: u32) -> Result<(), PageLockError> {
+        Err(PageLockError::Unsupported)
+    }
+    /// Used to reject unsupported decommit without leaving a successful pin live.
+    fn has_locked_pages(&self, _addr: u32, _len: u32) -> bool {
+        false
+    }
+    /// Process teardown releases pins without retiring report-readable memory.
+    fn retire_locked_pages(&mut self) -> Result<(), PageLockError> {
+        Ok(())
+    }
     /// Capture architecture at a paused boundary, materializing floating aliases.
     /// This contains no scheduler, REP continuation, clock or host IRQ metadata.
     fn capture_architecture(&mut self) -> Result<ArchitecturalState, StateError> {
@@ -235,6 +259,13 @@ pub trait Guest {
     /// reads/writes, this includes page permissions. Unknown backends conservatively reject.
     fn accessible(&self, _addr: u32, _len: u32, _prot: Prot) -> bool {
         false
+    }
+    /// First actually mapped page in `[addr, limit)`, including pages with no
+    /// access permission and lazy file bindings. Bounds must be page-aligned.
+    /// Query the backend's existing mapping metadata without reading guest bytes.
+    /// Unsupported backends reject rather than claim an unknown range is free.
+    fn next_mapped_page(&self, addr: u32, _limit: u64) -> Result<Option<u32>, MemFault> {
+        Err(MemFault { addr, len: 0 })
     }
     /// Map zeroed memory. Page-aligned `addr` and `size`. Allowed from inside trap handlers.
     fn map(&mut self, addr: u32, size: u32, prot: Prot) -> Result<(), MemFault>;

@@ -4,6 +4,7 @@ use super::*;
 use adv_abi::{AnsiStr, GuestPtr, guest::memory_failure, win32};
 
 mod ctype;
+mod conv;
 
 const CATEGORY_NAMES: [&str; 5] = [
     "LC_COLLATE",
@@ -15,7 +16,7 @@ const CATEGORY_NAMES: [&str; 5] = [
 const BUFFER_BYTES: u32 = 1024;
 const LCID_OFFSET: u32 = BUFFER_BYTES - 6 * 4;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Language {
     C,
     Japanese,
@@ -57,14 +58,44 @@ impl Locale {
 #[derive(Clone, Default)]
 pub(super) struct LocaleState {
     categories: [Locale; 5],
+    // VC80's exported case functions enter a different EOF/error path after
+    // any non-C locale has been installed, even if LC_CTYPE later returns C.
+    // This latch limits the supported EOF profile; it does not emulate that
+    // CRT-version-specific slow-path result or introduce another locale owner.
+    ever_non_c: bool,
     buffer: u32,
     ctype_tables: HashMap<u32, u32>,
+    monetary_codepage: u32,
+    conversions: HashMap<conv::Profile, u32>,
 }
 pub(super) fn register(registry: &mut Registry) {
-    registry.register(setlocale_ABI);
+    for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
+        registry.register(adv_abi::Api { module, ..setlocale_ABI });
+    }
     registry.register(lc_handles_ABI);
     registry.register(lc_codepage_ABI);
     ctype::register(registry);
+    conv::register(registry);
+}
+
+/// Formatting observes the CRT module's LC_CTYPE, independently of Win32 ACP.
+pub(super) fn formatting_codepage(env: &Env<'_>) -> u32 {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    env.ext.try_get::<CrtState>().and_then(|state| state.locales.get(module))
+        .map_or(0, |state| state.categories[1].codepage)
+}
+
+/// Decimal conversions observe NUMERIC and CTYPE independently. The existing
+/// four language profiles all publish decimal dot through localeconv.
+pub(super) fn scalar_float_profile(env: &Env<'_>) -> Option<([bool; 256], u8)> {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    let state = env.ext.try_get::<CrtState>().and_then(|s| s.locales.get(module));
+    let numeric = state.map_or(Locale::default(), |s| s.categories[3]);
+    if !matches!(numeric.codepage, 0 | 932 | 936 | 1252) {
+        return None;
+    }
+    let codepage = state.map_or(0, |s| s.categories[1].codepage);
+    ctype::byte_spaces(codepage).map(|spaces| (spaces, b'.'))
 }
 
 fn default_language(acp: u32) -> Language {
@@ -246,11 +277,16 @@ fn setlocale(env: &mut Env<'_>, category: i32, requested: AnsiStr) -> Outcome {
         }
         return memory_failure(error);
     }
+    let monetary_codepage = conv::updated_monetary_codepage(&state, &categories);
+    let ever_non_c = state.ever_non_c || (!requested.0.is_null()
+        && categories.iter().any(|locale| locale.language != Language::C));
     env.ext.get_mut::<CrtState>().locales.insert(
         module,
         LocaleState {
             categories,
             buffer: pointer,
+            monetary_codepage,
+            ever_non_c,
             ..state
         },
     );
@@ -289,6 +325,7 @@ fn lc_codepage(env: &mut Env<'_>) -> u32 {
 
 pub(super) fn release_process_tables(env: &mut Env<'_>) -> Result<(), String> {
     ctype::release_tables(env)?;
+    conv::release_tables(env)?;
     let Some(state) = env.ext.try_get::<CrtState>() else {
         return Ok(());
     };

@@ -14,6 +14,8 @@ use crate::util::{
 use crate::{FileObj, FindObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 use adv_os::vfs::{DirEntry, wildcard};
 mod path;
+mod profile;
+mod attributes;
 #[cfg(test)]
 mod tests;
 
@@ -23,7 +25,6 @@ const CREATE_ALWAYS: u32 = 2;
 const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 
 fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u8]>>, ()> {
@@ -639,28 +640,6 @@ fn get_file_time(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn attributes(is_dir: bool) -> u32 {
-    if is_dir {
-        FILE_ATTRIBUTE_DIRECTORY
-    } else {
-        FILE_ATTRIBUTE_ARCHIVE
-    }
-}
-
-fn get_file_attributes(env: &mut Env<'_>, path: String) -> Outcome {
-    let guest = env.ext.get::<Win32>().vfs.normalize(&path);
-    if matches!(system_file(env, &guest), Ok(Some(_))) {
-        return Outcome::Return(FILE_ATTRIBUTE_ARCHIVE | 1);
-    }
-    match env.ext.get::<Win32>().vfs.lookup(&path) {
-        Some(p) => Outcome::Return(attributes(p.is_dir())),
-        None => {
-            set_last_error(env, err::FILE_NOT_FOUND);
-            Outcome::Return(u32::MAX)
-        }
-    }
-}
-
 pub(super) fn delete_file(env: &mut Env<'_>, path: String) -> Outcome {
     let guest = env.ext.get::<Win32>().vfs.normalize(&path);
     if matches!(system_file(env, &guest), Ok(Some(_))) {
@@ -804,12 +783,27 @@ pub(super) fn copy_file(
 }
 
 pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
-    let w = env.ext.get::<Win32>();
-    if w.vfs.lookup(&path).is_some() {
-        set_last_error(env, err::ALREADY_EXISTS);
-        return Outcome::Return(0);
+    match create_directory_path(env, &path) {
+        Ok(()) => Outcome::Return(1),
+        Err(code) => {
+            set_last_error(env, code);
+            Outcome::Return(0)
+        }
     }
-    let full = w.vfs.normalize(&path);
+}
+
+/// Kernel32 and CRT directory fronts share this checked, single-component VFS
+/// mutation. write_path may mirror already-existing guest parents in an overlay;
+/// it cannot make an absent guest parent valid for this operation.
+pub(crate) fn create_directory_path(env: &Env<'_>, path: &str) -> Result<(), u32> {
+    if path.is_empty() {
+        return Err(err::PATH_NOT_FOUND);
+    }
+    let w = env.ext.get::<Win32>();
+    if w.vfs.lookup(path).is_some() {
+        return Err(err::ALREADY_EXISTS);
+    }
+    let full = w.vfs.normalize(path);
     let parent = full.trim_end_matches('\\').rsplit_once('\\').map(|(p, _)| {
         if p.len() == 2 {
             format!("{p}\\")
@@ -818,23 +812,25 @@ pub(super) fn create_directory(env: &mut Env<'_>, path: String) -> Outcome {
         }
     });
     if !parent.is_some_and(|p| w.vfs.is_dir(&p)) {
-        set_last_error(env, err::PATH_NOT_FOUND);
-        return Outcome::Return(0);
+        return Err(err::PATH_NOT_FOUND);
     }
-    match w.vfs.write_path(&path).map(std::fs::create_dir) {
-        Some(Ok(())) => Outcome::Return(1),
-        _ => {
-            set_last_error(env, err::PATH_NOT_FOUND);
-            Outcome::Return(0)
-        }
-    }
+    let destination = w.vfs.write_path(path).ok_or(err::PATH_NOT_FOUND)?;
+    std::fs::create_dir(destination).map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => err::ALREADY_EXISTS,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => err::PATH_NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => err::ACCESS_DENIED,
+        std::io::ErrorKind::InvalidInput => 123, // ERROR_INVALID_NAME
+        std::io::ErrorKind::OutOfMemory => err::NOT_ENOUGH_MEMORY,
+        std::io::ErrorKind::StorageFull => 112, // ERROR_DISK_FULL
+        _ => io_code(&error),
+    })
 }
 
 /// WIN32_FIND_DATAA/W: attrs, 3 FILETIMEs, size hi/lo, 2 reserved, name[260], alt[14]
 /// (in bytes for A, UTF-16 units for W).
 fn fill_find_data(env: &mut Env<'_>, p: u32, e: &DirEntry, wide: bool) {
     zero(env.cpu, p, if wide { 592 } else { 320 });
-    let _ = env.cpu.write_u32(p, attributes(e.is_dir));
+    let _ = env.cpu.write_u32(p, e.attributes);
     let ft = filetime(e.modified);
     for off in [4, 12, 20] {
         write_filetime(env.cpu, p + off, ft);
@@ -951,14 +947,6 @@ impl Ini {
         }
     }
 
-    fn sections(&self) -> Vec<Vec<u8>> {
-        self.lines
-            .iter()
-            .filter_map(|l| section_name(l))
-            .map(<[u8]>::to_vec)
-            .collect()
-    }
-
     /// Line range of a section's body.
     fn section(&self, name: &[u8]) -> Option<(usize, usize)> {
         let start = self
@@ -1002,51 +990,6 @@ impl Ini {
     }
 }
 
-/// Copy a double-NUL-terminated list into `buf`, truncating like the API does.
-fn put_list(env: &mut Env<'_>, buf: u32, cap: u32, items: &[Vec<u8>]) -> u32 {
-    if cap < 2 {
-        return 0;
-    }
-    let mut out = Vec::new();
-    for it in items {
-        out.extend_from_slice(it);
-        out.push(0);
-    }
-    if out.len() + 1 > cap as usize {
-        out.truncate(cap as usize - 2);
-        out.extend_from_slice(&[0, 0]);
-        let _ = env.cpu.write(buf, &out);
-        return cap - 2;
-    }
-    out.push(0);
-    let _ = env.cpu.write(buf, &out);
-    out.len() as u32 - 1
-}
-
-fn get_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
-    let (sec_p, key_p, def_p, buf, cap) =
-        (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    let file = profile_path(env, env.arg(5));
-    let ini = Ini::load(env, &file);
-    if sec_p == 0 {
-        let secs = ini.sections();
-        return Outcome::Return(put_list(env, buf, cap, &secs));
-    }
-    let sec = cstr(env.cpu, sec_p);
-    if key_p == 0 {
-        let keys: Vec<Vec<u8>> = ini.entries(&sec).into_iter().map(|(_, k, _)| k).collect();
-        return Outcome::Return(put_list(env, buf, cap, &keys));
-    }
-    let key = cstr(env.cpu, key_p);
-    let v = ini
-        .get(&sec, &key)
-        .unwrap_or_else(|| trim(&cstr(env.cpu, def_p)).to_vec());
-    Outcome::Return(match put_cstr(env.cpu, buf, cap, &v) {
-        Some(n) => n,
-        None => cap.saturating_sub(1),
-    })
-}
-
 fn get_private_profile_int_a(env: &mut Env<'_>) -> Outcome {
     let (sec, key, def) = (
         cstr(env.cpu, env.arg(0)),
@@ -1069,6 +1012,11 @@ fn write_private_profile_string_a(env: &mut Env<'_>) -> Outcome {
     let (sec_p, key_p, val_p) = (env.arg(0), env.arg(1), env.arg(2));
     let file = profile_path(env, env.arg(3));
     let mut ini = match read_contents(env, &file) {
+        Ok(bytes) if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) => {
+            adv_abi::warn_unavailable(env, "kernel32.dll!WritePrivateProfileStringA", "Unicode profile-file writes are unavailable; preserving the existing encoded file");
+            set_last_error(env, 50);
+            return Outcome::Return(0);
+        }
         Ok(bytes) => Ini::from_bytes(&bytes),
         Err(error) => {
             io_error(env, &error);
@@ -1405,15 +1353,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetEndOfFile", 1, set_end_of_file);
     stdcall(reg, K32, "GetFileTime", 4, get_file_time);
     stdcall(reg, K32, "SetFileTime", 4, |_| Outcome::Return(1));
-    stdcall(reg, K32, "GetFileAttributesA", 1, |e| {
-        let p = path_a(e, e.arg(0));
-        get_file_attributes(e, p)
-    });
-    stdcall(reg, K32, "GetFileAttributesW", 1, |e| {
-        let p = path_w(e, e.arg(0));
-        get_file_attributes(e, p)
-    });
-    stdcall(reg, K32, "SetFileAttributesA", 2, |_| Outcome::Return(1));
+    attributes::register(reg);
     stdcall(reg, K32, "FindFirstFileA", 2, |e| {
         let p = path_a(e, e.arg(0));
         find_first_file(e, p, e.arg(1), false)
@@ -1441,13 +1381,8 @@ pub(super) fn register(reg: &mut Registry) {
         Outcome::Return(u32::from(find))
     });
     path::register(reg);
-    stdcall(
-        reg,
-        K32,
-        "GetPrivateProfileStringA",
-        6,
-        get_private_profile_string_a,
-    );
+    profile::register(reg);
+
     stdcall(
         reg,
         K32,

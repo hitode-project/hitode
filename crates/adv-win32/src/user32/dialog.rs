@@ -716,9 +716,35 @@ fn dialog_box(
     param: u32,
     wide: bool,
 ) -> Outcome {
+    dialog_box_then(
+        env,
+        inst,
+        t,
+        owner,
+        proc,
+        param,
+        wide,
+        Box::new(|_, result| Outcome::Return(result)),
+    )
+}
+
+/// Continuation receiving a modal dialog's result.
+pub type Done = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
+
+#[allow(clippy::too_many_arguments)]
+pub fn dialog_box_then(
+    env: &mut Env<'_>,
+    inst: u32,
+    t: Template,
+    owner: u32,
+    proc: u32,
+    param: u32,
+    wide: bool,
+    done: Done,
+) -> Outcome {
     if owner != 0 && !user(env).is_window(&env.sys.objects, owner) {
         crate::util::set_last_error(env, 1400);
-        return Outcome::Return(0);
+        return done(env, 0);
     }
     let owner = user(env).root(&env.sys.objects, owner);
     let owner_was_enabled = user(env)
@@ -747,7 +773,7 @@ fn dialog_box(
         move |env, dlg| {
             if dlg == 0 {
                 restore_owner(env, owner, owner_was_enabled);
-                return Outcome::Return(u32::MAX);
+                return done(env, u32::MAX);
             }
             if let Some(w) = env
                 .ext
@@ -758,7 +784,7 @@ fn dialog_box(
             {
                 w.control.modal = true;
             }
-            modal_loop(env, dlg, owner, owner_was_enabled)
+            modal_loop(env, dlg, owner, owner_was_enabled, done)
         },
     )
 }
@@ -776,29 +802,35 @@ fn restore_owner(env: &mut Env<'_>, owner: u32, was_enabled: bool) {
     }
 }
 
-fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> Outcome {
+fn modal_loop(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool, done: Done) -> Outcome {
     super::message::sent::drain(env, move |env| {
-        modal_loop_inner(env, dlg, owner, owner_enabled)
+        modal_loop_inner(env, dlg, owner, owner_enabled, done)
     })
 }
 
-fn modal_loop_inner(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool) -> Outcome {
+fn modal_loop_inner(
+    env: &mut Env<'_>,
+    dlg: u32,
+    owner: u32,
+    owner_enabled: bool,
+    done: Done,
+) -> Outcome {
     let state = user(env)
         .windows
         .get(&env.sys.objects, &dlg)
         .map(|w| (w.control.dialog_end, w.destroying));
-    let finish = move |env: &mut Env<'_>, result: u32| {
+    let finish = move |env: &mut Env<'_>, result: u32, done: Done| {
         destroy_window(env, dlg, move |env, _| {
             restore_owner(env, owner, owner_enabled);
             if owner != 0 {
-                return window::activate_window(env, owner, move |_| Outcome::Return(result));
+                return window::activate_window(env, owner, move |env| done(env, result));
             }
-            Outcome::Return(result)
+            done(env, result)
         })
     };
     match state {
-        None | Some((_, true)) => return finish(env, 0),
-        Some((Some(r), _)) => return finish(env, r),
+        None | Some((_, true)) => return finish(env, 0, done),
+        Some((Some(r), _)) => return finish(env, r, done),
         _ => {}
     }
     match next_any(env) {
@@ -806,17 +838,24 @@ fn modal_loop_inner(env: &mut Env<'_>, dlg: u32, owner: u32, owner_enabled: bool
             // Leave WM_QUIT for the application's own loop.
             let ctx = env.context;
             user_mut(env).queue(ctx).quit = Some(m.wparam);
-            finish(env, 0)
+            finish(env, 0, done)
         }
         Some(m) => dispatch(env, m, move |env, _| {
-            modal_loop(env, dlg, owner, owner_enabled)
+            modal_loop(env, dlg, owner, owner_enabled, done)
         }),
-        None => wait_for_message(env, move |env| modal_loop(env, dlg, owner, owner_enabled)),
+        None => wait_for_message(env, move |env| {
+            modal_loop(env, dlg, owner, owner_enabled, done)
+        }),
     }
 }
 
 fn end_dialog(env: &mut Env<'_>) -> Outcome {
     let (dlg, result) = (env.arg(0), env.arg(1));
+    end(env, dlg, result)
+}
+
+/// EndDialog: record the result and hide the dialog; its modal loop destroys it.
+pub fn end(env: &mut Env<'_>, dlg: u32, result: u32) -> Outcome {
     let Some(w) = env
         .ext
         .get::<crate::Win32>()

@@ -308,6 +308,13 @@ fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
     assert_eq!(diagnostics.stub_calls, 1);
     assert_eq!(diagnostics.recent_stubs[0].caller, caller);
     assert_eq!(diagnostics.recent_stubs[0].name, "DWriteCreateFactory");
+    assert_eq!(
+        diagnostics.warnings.get(&(
+            "dwrite.dll!DWriteCreateFactory".into(),
+            "API has no implemented frontend; using a generated ABI failure stub".into(),
+        )),
+        Some(&1),
+    );
     assert!(!diagnostics.acceptance_eligible(RunMode::Strict));
     assert!(
         machine
@@ -357,6 +364,7 @@ fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
         machine.ext.get::<ApiDiagnostics>().gaps["dwrite.dll!DWriteCreateFactory"],
         1
     );
+    assert_eq!(machine.ext.get::<ApiDiagnostics>().warnings.len(), 1);
 }
 
 #[test]

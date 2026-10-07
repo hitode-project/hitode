@@ -1,6 +1,9 @@
 use super::*;
 use adv_cpu::backend::Guest;
 
+#[path = "multi_stream_tests.rs"]
+mod multi_stream_tests;
+
 fn setup(env: &mut Env<'_>) -> (u32, Id) {
     let (device, id, _, resource) = super::super::tests::setup(env);
     let dead = com(env)

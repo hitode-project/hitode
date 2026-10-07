@@ -7,7 +7,7 @@ use adv_abi::{
     AnsiStr, ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, Handle, Registry, WideStr,
     win32,
 };
-use adv_cpu::backend::GuestExt;
+use adv_cpu::backend::{GuestExt, MemFault, Prot};
 use adv_machine::outcome::DeferredContinuation;
 use adv_machine::{Env, InitCall, Object, Outcome, Wait};
 use adv_os::{Loader, ModuleId, ModuleKind, Modules};
@@ -405,16 +405,40 @@ fn get_module_handle_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     }
 }
 
-/// Guest path of a module.
-fn module_path(env: &Env<'_>, id: ModuleId) -> String {
+/// Fixed guest path of a module. Published DLL names belong to their LDR block;
+/// resolving their original relative request against a later cwd is incorrect.
+pub(super) fn module_path(env: &Env<'_>, id: ModuleId) -> Result<String, MemFault> {
     let w = env.ext.get::<Win32>();
     let m = adv_os::modules(env.ext).get(id);
-    match m.kind {
-        ModuleKind::Host => format!("C:\\Windows\\system32\\{}", m.name),
-        ModuleKind::Image if !m.is_dll => w.exe_path(),
-        ModuleKind::Image => w.vfs.normalize(&m.path),
-        ModuleKind::DataFile => unreachable!("raw views have no executable path visibility"),
+    if m.ldr_entry == 0 {
+        return match m.kind {
+            // Stable configuration owners exist before publication. Never use
+            // cwd to invent a DLL's missing name.
+            ModuleKind::Host => Ok(format!("C:\\Windows\\system32\\{}", m.name)),
+            ModuleKind::Image if !m.is_dll => Ok(w.exe_path()),
+            _ => Err(MemFault { addr: m.base, len: m.size }),
+        };
     }
+    let fault = MemFault { addr: m.ldr_entry, len: m.ldr_size };
+    let end = m.ldr_entry.checked_add(m.ldr_size).ok_or(fault)?;
+    let header = m.ldr_entry.checked_add(0x24).ok_or(fault)?;
+    let strings = m.ldr_entry.checked_add(0x80).ok_or(fault)?;
+    if strings > end { return Err(fault); }
+    adv_abi::guest::check_range(env.cpu, header, 8, Prot::READ)?;
+    let mut descriptor = [0; 8];
+    env.cpu.read(header, &mut descriptor)?;
+    let length = u32::from(u16::from_le_bytes(descriptor[..2].try_into().unwrap()));
+    let capacity = u32::from(u16::from_le_bytes(descriptor[2..4].try_into().unwrap()));
+    let address = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+    if length == 0 || length & 1 != 0 || capacity & 1 != 0 || length > capacity
+        || address < strings || address.checked_add(capacity).is_none_or(|end_of_string| end_of_string > end)
+    { return Err(fault); }
+    adv_abi::guest::check_range(env.cpu, address, length, Prot::READ)?;
+    let mut bytes = vec![0; length as usize];
+    env.cpu.read(address, &mut bytes)?;
+    let words: Vec<_> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    if words.contains(&0) { return Err(fault); }
+    String::from_utf16(&words).map_err(|_| fault)
 }
 
 fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
@@ -427,7 +451,15 @@ fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
         set_last_error(env, err::MOD_NOT_FOUND);
         return Outcome::Return(0);
     }
-    let path = module_path(env, id);
+    let path = match module_path(env, id) {
+        Ok(path) => path,
+        Err(_) => {
+            let api = if wide { "kernel32.dll!GetModuleFileNameW" } else { "kernel32.dll!GetModuleFileNameA" };
+            adv_abi::warn_unavailable(env, api, "published module path is unreadable or outside its owned LDR FullDllName storage");
+            set_last_error(env, 998); // ERROR_NOACCESS; no mutable-cwd fallback
+            return Outcome::Return(0);
+        }
+    };
     let r = if wide {
         let u: Vec<u16> = path.encode_utf16().collect();
         put_wstr(env.cpu, buf, cap, &u)

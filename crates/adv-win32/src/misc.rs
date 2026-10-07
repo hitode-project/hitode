@@ -7,11 +7,15 @@ use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 mod internet;
+pub(crate) mod imm;
+mod image_list;
 mod ole_memory;
+mod variant;
 mod property_sheet;
 mod shell_execute;
 mod shell_icon;
 mod shell_drop;
+mod theme;
 
 use crate::util::{cstr, put_cstr, put_wstr, set_last_error};
 use adv_os::Codec;
@@ -21,7 +25,6 @@ use crate::{Win32, stdcall};
 const SHLWAPI: &str = "shlwapi.dll";
 const SHELL32: &str = "shell32.dll";
 const SHFOLDER: &str = "shfolder.dll";
-const IMM32: &str = "imm32.dll";
 const COMDLG32: &str = "comdlg32.dll";
 const SENSAPI: &str = "sensapi.dll";
 const COMCTL32: &str = "comctl32.dll";
@@ -299,6 +302,7 @@ fn sh_get_folder_path_w(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    theme::register(reg);
     internet::register(reg);
     shell_execute::register(reg);
     shell_icon::register(reg);
@@ -367,6 +371,7 @@ pub fn register(reg: &mut Registry) {
     });
     stdcall(reg, SHELL32, "SHGetFileInfoA", 5, |_| Outcome::Return(0));
     ole_memory::register(reg);
+    variant::register(reg);
     // Offline, with no error: the guest never reaches the network.
     stdcall(reg, SENSAPI, "IsNetworkAlive", 1, |e| {
         let flags = e.arg(0);
@@ -374,13 +379,7 @@ pub fn register(reg: &mut Registry) {
         set_last_error(e, 0);
         Outcome::Return(0)
     });
-    stdcall(reg, IMM32, "ImmReleaseContext", 2, |_| Outcome::Return(1));
-    stdcall(reg, IMM32, "ImmSetOpenStatus", 2, |_| Outcome::Return(1));
-    stdcall(reg, IMM32, "ImmGetOpenStatus", 1, |_| Outcome::Return(0));
-    stdcall(reg, IMM32, "ImmSetConversionStatus", 3, |_| {
-        Outcome::Return(1)
-    });
-    stdcall(reg, IMM32, "ImmAssociateContext", 2, |_| Outcome::Return(0));
+    imm::register(reg);
     stdcall(reg, "mpr.dll", "WNetGetUniversalNameA", 4, |_| {
         Outcome::Return(2250) // ERROR_NOT_CONNECTED
     });
@@ -403,27 +402,7 @@ pub fn register(reg: &mut Registry) {
     stdcall(reg, COMCTL32, "InitCommonControlsEx", 1, |_| {
         Outcome::Return(1)
     });
-    stdcall(reg, COMCTL32, "ImageList_Read", 1, |e| {
-        let pstm = e.arg(0);
-        Outcome::Return(if pstm != 0 { 0x0002_0001 } else { 0 })
-    });
-    stdcall(reg, COMCTL32, "ImageList_Destroy", 1, |_| {
-        Outcome::Return(1)
-    });
-    stdcall(reg, COMCTL32, "ImageList_Create", 5, |_| {
-        Outcome::Return(0x0002_0001)
-    });
-    stdcall(reg, COMCTL32, "ImageList_GetIconSize", 3, |e| {
-        let cx = e.arg(1);
-        let cy = e.arg(2);
-        if cx != 0 {
-            let _ = e.cpu.write_u32(cx, 16);
-        }
-        if cy != 0 {
-            let _ = e.cpu.write_u32(cy, 16);
-        }
-        Outcome::Return(1)
-    });
+    image_list::register(reg);
 }
 
 #[cfg(test)]

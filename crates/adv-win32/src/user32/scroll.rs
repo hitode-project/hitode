@@ -92,10 +92,11 @@ fn update(
         value.position = position;
     }
     value.clamp();
+    let result = value.position;
     if redraw {
-        window.needs_paint = true;
+        window.invalidate_client(true);
     }
-    value.position
+    result
 }
 fn header(env: &Env<'_>, pointer: u32) -> Option<(u32, u32)> {
     let mask = pointer.checked_add(4)?;

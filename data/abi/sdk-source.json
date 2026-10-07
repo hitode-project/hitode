@@ -80,17 +80,33 @@
     ]
   },
   "legacy_d3dx_math": {
-    "source": "Microsoft Learn legacy D3dx9math.h declarations (not present in pinned WinMD or installed modern SDK)",
-    "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixLookAtLH, D3DXVec3Project only",
-    "target": "x86 __stdcall, pointer return and 3/2/4/6 pointer arguments; matrix 64 bytes, vector 12 bytes; D3DVIEWPORT9 layout from pinned WinMD",
+    "source": "Microsoft Learn legacy D3dx9math.h declarations; Scaling/Translation additionally verified in Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package (not present in pinned WinMD or installed modern SDK)",
+    "scope": "d3dx9_43.dll: D3DXMatrixMultiply, D3DXMatrixTranspose, D3DXMatrixScaling, D3DXMatrixTranslation, D3DXMatrixLookAtLH, D3DXVec3Project, D3DXMatrixRotationYawPitchRoll, D3DXMatrixRotationY, D3DXMatrixPerspectiveFovLH, D3DXVec4Transform, D3DXVec3TransformCoord, D3DXVec3Transform, D3DXVec3CatmullRom only",
+    "target": "x86 __stdcall and pointer return. Existing helpers have 3/2/4/6 pointer arguments; Scaling/Translation have one matrix pointer and three 32-bit FLOAT stack values. Matrix 64 bytes, vector 12 bytes; D3DVIEWPORT9 layout from pinned WinMD",
+    "headers": {
+      "d3dx9math.h": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9"
+    },
     "native_abi_verification": "Authored x86 probe against installed Microsoft d3dx9_43.dll verifies pointer returns, stack convention, alias, row-vector and LH viewport conventions; no DLL or header is bundled",
     "oracle_dll_sha256": "0b28546be22c71834501f7d7185ede5d79742457331c7ee09efc14490dd64f5f",
     "documentation": [
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixmultiply",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixtranspose",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixscaling",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixtranslation",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixlookatlh",
-      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3project"
-    ]
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3project",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixrotationyawpitchroll",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixrotationy",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxmatrixperspectivefovlh",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec4transform",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3transformcoord",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3transform",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxvec3catmullrom"
+    ],
+    "pose_projection": "Same official d3dx9math.h header hash: WINAPI x86 stdcall; RotationYawPitchRoll ptr+3FLOAT (4 words), RotationY ptr+FLOAT(2), PerspectiveFovLH ptr+4FLOAT(5), Vec4Transform3pointers(3). Matrix64 bytes, vector4 16 bytes; pure CPU row-vector arithmetic, no shader/effect/capability change.",
+    "pose_oracle_source_sha256": "da63e284798101e1970e2fcc7c34a34875c6335eb730bf85e3e237bc5c99d5d7",
+    "vector3_projection": "Same verified SDK header: TransformCoord/Transform WINAPI three pointers; input Vector3 is12 bytes, Coord output12bytes with homogeneous division, Transform outputVector4 is16bytes. CatmullRom WINAPI five Vector3 pointers plus one32-bit FLOAT (6words), cubic parameter not clamped. Pure CPU arithmetic using shared vector/matrix helper.",
+    "vector3_oracle_source_sha256": "18377d6ca6258329b2011cb4c95d41ae93e094802826d6f79e529e765b6ee2bb"
   },
   "legacy_d3dx_effect": {
     "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet package",
@@ -115,5 +131,26 @@
       "https://learn.microsoft.com/en-us/windows/win32/gdi/enableeudc",
       "https://learn.microsoft.com/en-us/previous-versions/windows/embedded/ms901122(v=msdn.10)"
     ]
+  },
+  "legacy_d3dx_matrix_stack": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9math.h lines 1314-1405",
+    "header_sha256": "27ac937a3eb64f9ed917a4265ac4e1f6817a94bd15ca7a5cc1eb63c2cb9ea1d9",
+    "scope": "D3DXCreateMatrixStack export only; pure CPU matrix stack, no shader or effect pipeline changes",
+    "target": "x86 WINAPI stdcall, HRESULT return, DWORD Flags and LPD3DXMATRIXSTACK* ppStack (two 32-bit stack words)",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatematrixstack",
+    "native_oracle_source_sha256": "fe6063286513cc9a440f4d8e16759a4f9abb282b55e27f6294ec16d358e9df60",
+    "native_verification": "Authored x86 probe against installed d3dx9_43.dll: initialized identity, successful base Pop preserves the base matrix, guest-written GetTop survives Push/Pop, world right multiplication and local left multiplication, alias square, normalized/nonunit and zero axis, yaw/pitch/roll and final Release. GetTop storage may change after stack operations; no capacity-address pattern is emulated."
+  },
+  "legacy_d3dx_texture_memory": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9tex.h, image-info declaration lines319-322 and Ex texture lines1474-1489",
+    "header_sha256": "64dfa1f26d6df792f6cf261c79f737e6e5c7670787ba6abfe0f76aba348e9422",
+    "scope": "D3DXCreateTextureFromFileInMemoryEx and D3DXGetImageInfoFromFileInMemory only; texture resource loading, no shader/effect pipeline declaration changes",
+    "target": "x86 WINAPI stdcall, HRESULT return; Ex fifteen32-bit stack words, ImageInfo three; UINT/DWORD/D3DCOLOR unsigned, D3DFORMAT/D3DPOOL signed enum; D3DXIMAGE_INFO seven32-bit fields (28bytes), palette array pointer",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileinmemoryex",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetimageinfofromfileinmemory"
+    ],
+    "native_oracle_source_sha256": "5757b812129f1c7bd916755b0cdd6ac80861cdd6c62c4324321c176c0018083a",
+    "native_verification": "Authored hidden Windows fixture with seven PNG/BMP images: 28 observations of 28-byte SourceInfo formats, NULL Info success, NONPOW2 identity versus DEFAULT expansion, NONE/LINEAR same-source pixels and resource release. Decoder and real guest tests cover bounded DDS DXT1/3/5, CPU and shared GPU storage readback, outputs and final ownership. No game image or host DLL bytes bundled."
   }
 }

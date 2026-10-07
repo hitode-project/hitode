@@ -9,14 +9,17 @@ pub mod controls;
 pub mod dialog;
 pub mod display;
 mod enumeration;
+mod encoding;
 mod formatting;
 pub(crate) mod hooks;
 pub mod host_input;
 mod input;
+pub(crate) mod image;
 pub mod menu;
 pub mod message;
 mod monitor;
 mod placement;
+mod rectangle;
 mod resources;
 mod scroll;
 mod station;
@@ -24,9 +27,10 @@ pub(crate) mod strings;
 pub(crate) mod system_colors;
 mod system_parameters;
 mod tab;
+pub(crate) mod update;
 pub mod window;
 
-use adv_abi::{Conv, Registry};
+use adv_abi::{Conv, Handle as AbiHandle, Registry, WideStr, win32};
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
@@ -88,12 +92,8 @@ fn message_box(env: &mut Env<'_>, t: String, cap: String, ty: u32, api: &str) ->
         "{api} [{cap}] {t} (type {ty:#x}) from {:#010x}",
         env.caller()
     );
-    // IDOK for OK-style boxes, IDYES for yes/no.
-    let result = match ty & 0xf {
-        3 | 4 => 6,
-        _ => 1,
-    };
-    let record = adv_abi::MessageBoxCall {
+    let owner = env.arg(0);
+    let mut record = adv_abi::MessageBoxCall {
         sequence: 0,
         frame: env.sys.frame,
         api: format!("user32.dll!{api}"),
@@ -102,13 +102,135 @@ fn message_box(env: &mut Env<'_>, t: String, cap: String, ty: u32, api: &str) ->
         caption: cap,
         text: t,
         style: ty,
-        result,
+        result: 0,
         preceding_lookup_failure: None,
     };
-    env.ext
-        .get_or_default::<adv_abi::ApiDiagnostics>()
-        .record_message_box(record);
-    Outcome::Return(result)
+    let proc = match env
+        .sys
+        .thunks
+        .resolve(env.cpu, USER32, controls::MESSAGE_BOX_PROC)
+    {
+        Ok(proc) => proc,
+        Err(fault) => return Outcome::Fail(format!("MessageBox procedure: {fault:?}")),
+    };
+    // The user answers it like any other modal dialog: the choice may decide the
+    // game's window mode or settings, so nothing presses a button for them here.
+    // Only an explicit headless dialog policy does, as for every dialog.
+    let template = message_box_template(&record.caption, &record.text, ty);
+    dialog::dialog_box_then(
+        env,
+        0,
+        template,
+        owner,
+        proc,
+        0,
+        true,
+        Box::new(move |env, result| {
+            let result = if result == u32::MAX { 0 } else { result };
+            record.result = result;
+            env.ext
+                .get_or_default::<adv_abi::ApiDiagnostics>()
+                .record_message_box(record);
+            Outcome::Return(result)
+        }),
+    )
+}
+
+/// MessageBox buttons and their command IDs, by `MB_TYPEMASK`.
+fn message_box_buttons(ty: u32) -> &'static [(u32, &'static str)] {
+    const OK: (u32, &str) = (1, "OK");
+    const CANCEL: (u32, &str) = (2, "Cancel");
+    const ABORT: (u32, &str) = (3, "Abort");
+    const RETRY: (u32, &str) = (4, "Retry");
+    const IGNORE: (u32, &str) = (5, "Ignore");
+    const YES: (u32, &str) = (6, "Yes");
+    const NO: (u32, &str) = (7, "No");
+    const TRY_AGAIN: (u32, &str) = (10, "Try Again");
+    const CONTINUE: (u32, &str) = (11, "Continue");
+    match ty & 0xf {
+        1 => &[OK, CANCEL],
+        2 => &[ABORT, RETRY, IGNORE],
+        3 => &[YES, NO, CANCEL],
+        4 => &[YES, NO],
+        5 => &[RETRY, CANCEL],
+        6 => &[CANCEL, TRY_AGAIN, CONTINUE],
+        _ => &[OK],
+    }
+}
+
+/// A dialog template laid out like the system message box: wrapped text above a
+/// centered row of push buttons, the `MB_DEFBUTTONn` one being the default.
+fn message_box_template(caption: &str, text: &str, ty: u32) -> dialog::Template {
+    const MARGIN: i16 = 10;
+    const WRAP: i32 = 280;
+    const BUTTON: (i16, i16) = (50, 14);
+    const GAP: i16 = 6;
+    // Dialog units: an average character is 4 wide, a full-width one 8; a line is 8
+    // high, with a little leading for full-width glyphs.
+    let (mut width, mut rows) = (0, 0);
+    for line in text.split('\n') {
+        let line_width: i32 = line
+            .trim_end_matches('\r')
+            .chars()
+            .map(|c| if c.is_ascii() { 4 } else { 8 })
+            .sum();
+        width = width.max(line_width.min(WRAP));
+        rows += (line_width + WRAP - 1).max(WRAP) / WRAP;
+    }
+    let buttons = message_box_buttons(ty);
+    let default = ((ty >> 8) & 0xf) as usize;
+    let default = if default < buttons.len() { default } else { 0 };
+    let row = buttons.len() as i16 * (BUTTON.0 + GAP) - GAP;
+    let text_size = (width as i16, rows as i16 * 10);
+    let cx = text_size.0.max(row).max(120) + 2 * MARGIN;
+    let cy = MARGIN + text_size.1 + MARGIN + BUTTON.1 + 7;
+    let mut items = vec![dialog::Item {
+        // SS_LEFT | SS_NOPREFIX
+        style: 0x5000_0080,
+        ex_style: 0,
+        x: MARGIN,
+        y: MARGIN,
+        cx: cx - 2 * MARGIN,
+        cy: text_size.1,
+        id: 0xffff,
+        class: dialog::SzOrOrd::Ord(0x82),
+        title: dialog::SzOrOrd::Str(text.replace("\r\n", "\n").replace('\n', "\r\n")),
+        data: None,
+    }];
+    let mut x = (cx - row) / 2;
+    for (index, &(id, label)) in buttons.iter().enumerate() {
+        items.push(dialog::Item {
+            // WS_CHILD | WS_VISIBLE | WS_TABSTOP, BS_DEFPUSHBUTTON for the default.
+            style: 0x5001_0000 | u32::from(index == default),
+            ex_style: 0,
+            x,
+            y: cy - 7 - BUTTON.1,
+            cx: BUTTON.0,
+            cy: BUTTON.1,
+            id,
+            class: dialog::SzOrOrd::Ord(0x80),
+            title: dialog::SzOrOrd::Str(label.into()),
+            data: None,
+        });
+        x += BUTTON.0 + GAP;
+    }
+    // Default buttons first in tab order, so the initial focus is the default.
+    items[1..].rotate_left(default);
+    dialog::Template {
+        // WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_CENTER | DS_MODALFRAME | DS_SETFONT
+        style: 0x80c8_08c0,
+        // WS_EX_TOPMOST for MB_SYSTEMMODAL and MB_TOPMOST.
+        ex_style: if ty & 0x4_1000 != 0 { 0x8 } else { 0 },
+        x: 0,
+        y: 0,
+        cx,
+        cy,
+        menu: dialog::SzOrOrd::None,
+        class: dialog::SzOrOrd::None,
+        title: caption.into(),
+        font: Some((9, "MS Shell Dlg".into())),
+        items,
+    }
 }
 
 /// A single-monitor desktop of the configured size.
@@ -150,14 +272,18 @@ fn set_rect(env: &mut Env<'_>) -> Outcome {
 
 fn set_rect_empty(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
-    if p != 0 {
-        let _ = env.cpu.write(p, &[0u8; 16]);
+    if p == 0 {
+        return Outcome::Return(0);
     }
+    let _ = env.cpu.write(p, &[0u8; 16]);
     Outcome::Return(1)
 }
 
 fn is_rect_empty(env: &mut Env<'_>) -> Outcome {
     let p = env.arg(0);
+    if p == 0 {
+        return Outcome::Return(1);
+    }
     let l = env.cpu.read_u32(p).unwrap_or(0) as i32;
     let t = env.cpu.read_u32(p + 4).unwrap_or(0) as i32;
     let r = env.cpu.read_u32(p + 8).unwrap_or(0) as i32;
@@ -191,6 +317,9 @@ fn offset_rect(env: &mut Env<'_>) -> Outcome {
 
 fn intersect_rect(env: &mut Env<'_>) -> Outcome {
     let (dst, s1, s2) = (env.arg(0), env.arg(1), env.arg(2));
+    if dst == 0 || s1 == 0 || s2 == 0 {
+        return Outcome::Return(0);
+    }
     let l1 = env.cpu.read_u32(s1).unwrap_or(0) as i32;
     let t1 = env.cpu.read_u32(s1 + 4).unwrap_or(0) as i32;
     let r1 = env.cpu.read_u32(s1 + 8).unwrap_or(0) as i32;
@@ -224,6 +353,9 @@ fn intersect_rect(env: &mut Env<'_>) -> Outcome {
 
 fn union_rect(env: &mut Env<'_>) -> Outcome {
     let (dst, s1, s2) = (env.arg(0), env.arg(1), env.arg(2));
+    if dst == 0 || s1 == 0 || s2 == 0 {
+        return Outcome::Return(0);
+    }
     let l1 = env.cpu.read_u32(s1).unwrap_or(0) as i32;
     let t1 = env.cpu.read_u32(s1 + 4).unwrap_or(0) as i32;
     let r1 = env.cpu.read_u32(s1 + 8).unwrap_or(0) as i32;
@@ -294,7 +426,13 @@ fn load_user_object(env: &mut Env<'_>, kind: &str, inst: u32, name: u32) -> Outc
         if name >= 0x1_0000 {
             return Outcome::Return(0);
         }
-        return stock_object(env, window::SYSTEM_OBJECT_BASE + (name & 0xfff) * 4);
+        // One USER owner, with separate fixed stock identity ranges. Preserve
+        // the existing cursor values (also used by cursor_handle defaults).
+        let kind_offset = if kind == "icon" { 0x4000 } else { 0 };
+        return stock_object(
+            env,
+            window::SYSTEM_OBJECT_BASE + kind_offset + (name & 0xfff) * 4,
+        );
     }
     let id = crate::kernel32::res_id(crate::kernel32::int_or_str(env, name, false));
     let key = format!("{kind} {inst:#x} {id:?}");
@@ -347,7 +485,12 @@ fn stock_object(env: &mut Env<'_>, handle: u32) -> Outcome {
 
 fn load_cursor_a(env: &mut Env<'_>) -> Outcome {
     let (inst, name) = (env.arg(0), env.arg(1));
-    load_user_object(env, "cursor", inst, name)
+    Outcome::Return(image::load_cursor(env, inst, name, false).0)
+}
+
+#[win32(user32, name = "LoadCursorW", level = implement)]
+fn load_cursor_w(env: &mut Env<'_>, instance: AbiHandle, name: WideStr) -> AbiHandle {
+    image::load_cursor(env, instance.0, name.0.addr(), true)
 }
 
 fn load_cursor_from_file_a(env: &mut Env<'_>) -> Outcome {
@@ -357,23 +500,6 @@ fn load_cursor_from_file_a(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(0);
     }
     stock_object(env, window::SYSTEM_OBJECT_BASE + (32512 & 0xfff) * 4)
-}
-
-fn load_icon_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name) = (env.arg(0), env.arg(1));
-    load_user_object(env, "icon", inst, name)
-}
-
-fn load_image_a(env: &mut Env<'_>) -> Outcome {
-    let (inst, name, ty) = (env.arg(0), env.arg(1), env.arg(2));
-    match ty {
-        1 => load_user_object(env, "icon", inst, name),
-        2 => load_user_object(env, "cursor", inst, name),
-        _ => {
-            log::warn!("LoadImageA type {ty}: bitmaps not supported yet");
-            Outcome::Return(0)
-        }
-    }
 }
 
 fn create_icon_indirect(env: &mut Env<'_>) -> Outcome {
@@ -531,6 +657,7 @@ fn enum_display_monitors(env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    update::register(reg);
     formatting::register(reg);
     hooks::register(reg);
     monitor::register(reg);
@@ -539,7 +666,9 @@ pub fn register(reg: &mut Registry) {
     system_colors::register(reg);
     system_parameters::register(reg);
     window::register(reg);
+    encoding::register(reg);
     placement::register(reg);
+    rectangle::register(reg);
     message::register(reg);
     controls::register(reg);
     dialog::register(reg);
@@ -548,6 +677,7 @@ pub fn register(reg: &mut Registry) {
     enumeration::register(reg);
     menu::register(reg);
     input::register(reg);
+    image::register(reg);
     clipboard::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "MessageBoxA", 4, message_box_a);
@@ -586,10 +716,9 @@ pub fn register(reg: &mut Registry) {
     s(reg, "EnumDisplaySettingsW", 3, enum_display_settings);
     s(reg, "WINNLSEnableIME", 2, |_| Outcome::Return(1));
     s(reg, "LoadCursorA", 2, load_cursor_a);
+    reg.register(load_cursor_w_ABI);
     s(reg, "LoadCursorFromFileA", 1, load_cursor_from_file_a);
     s(reg, "LoadCursorFromFileW", 1, load_cursor_from_file_a);
-    s(reg, "LoadIconA", 2, load_icon_a);
-    s(reg, "LoadImageA", 6, load_image_a);
     s(reg, "CreateIconIndirect", 1, create_icon_indirect);
     s(reg, "DestroyIcon", 1, destroy_user_object);
     s(reg, "DestroyCursor", 1, destroy_user_object);

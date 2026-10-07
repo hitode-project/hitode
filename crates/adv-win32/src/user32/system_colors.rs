@@ -84,6 +84,10 @@ fn get_sys_color_brush(env: &mut Env<'_>, index: i32) -> Handle {
     }
 }
 
+pub(crate) fn brush(env: &mut Env<'_>, index: u32) -> u32 {
+    get_sys_color_brush(env, index as i32).0
+}
+
 pub fn register(registry: &mut Registry) {
     registry.register(get_sys_color_ABI);
     registry.register(get_sys_color_brush_ABI);

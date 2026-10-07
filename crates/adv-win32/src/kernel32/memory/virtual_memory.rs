@@ -58,7 +58,7 @@ fn state<'a>(env: &'a mut Env<'_>) -> &'a mut Allocations {
     }
     env.ext.get_mut::<Allocations>()
 }
-fn span(addr: u32, size: u32) -> Result<(u32, u32), Error> {
+pub(super) fn span(addr: u32, size: u32) -> Result<(u32, u32), Error> {
     if size == 0 {
         return Err(error(err::INVALID_PARAMETER));
     }
@@ -375,7 +375,14 @@ fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
             }),
     );
     if allocation.is_none() && protection.is_none() {
-        return Ok([page, 0, 0, limit - page, MEM_FREE, 0, 0]);
+        // Direct backend mappings, including PAGE_NOACCESS and lazy bindings,
+        // occupy the gap even when they have no VM reservation metadata.
+        let end = env
+            .cpu
+            .next_mapped_page(page, u64::from(limit))
+            .map_err(|_| error(NOACCESS))?
+            .unwrap_or(limit);
+        return Ok([page, 0, 0, end - page, MEM_FREE, 0, 0]);
     }
     let (base, _) = allocation.unwrap_or((page, PAGE));
     let limit = if allocation.is_none() {
@@ -383,7 +390,14 @@ fn query(env: &mut Env<'_>, addr: u32) -> Result<[u32; 7], Error> {
     } else {
         limit
     };
-    let mut end = page + PAGE;
+    let mut end = if protection.is_none() {
+        env.cpu
+            .next_mapped_page(page, u64::from(limit))
+            .map_err(|_| error(NOACCESS))?
+            .unwrap_or(limit)
+    } else {
+        page + PAGE
+    };
     while end < limit && page_protection(env, end) == protection {
         end += PAGE;
     }

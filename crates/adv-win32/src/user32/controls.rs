@@ -16,6 +16,7 @@ pub const EDIT_PROC: &str = "<EditWndProc>";
 pub const COMBO_PROC: &str = "<ComboWndProc>";
 pub const TRACKBAR_PROC: &str = "<TrackbarWndProc>";
 pub const DIALOG_PROC: &str = "<DialogWndProc>";
+pub const MESSAGE_BOX_PROC: &str = "<MessageBoxDlgProc>";
 
 const BM_GETCHECK: u32 = 0xf0;
 const BM_SETCHECK: u32 = 0xf1;
@@ -134,7 +135,7 @@ fn set_button(env: &mut Env<'_>, hwnd: u32, f: impl FnOnce(u32) -> u32) {
         .get_mut(&mut env.sys.objects, &hwnd)
     {
         w.control.button = f(w.control.button);
-        w.needs_paint = true;
+        w.invalidate_client(true);
     }
 }
 
@@ -267,7 +268,7 @@ fn trackbar_proc(env: &mut Env<'_>) -> Outcome {
         }
     };
     if wp != 0 && matches!(msg, 0x405..=0x408) {
-        window.needs_paint = true;
+        window.invalidate_client(true);
     }
     Outcome::Return(result)
 }
@@ -434,7 +435,7 @@ fn combo_proc(env: &mut Env<'_>) -> Outcome {
             return Outcome::Return(u32::MAX);
         }
     };
-    window.needs_paint = true;
+    window.invalidate_client(true);
     Outcome::Return(result)
 }
 
@@ -486,6 +487,29 @@ fn def_dlg_proc(env: &mut Env<'_>, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: 
     })
 }
 
+/// Dialog procedure of MessageBox: a button ends the box with its ID. Closing it
+/// (IDCANCEL) is honoured only when the box has Cancel, or is a lone OK.
+fn message_box_proc(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, msg, wp, _) = args(env);
+    match msg {
+        wm::INITDIALOG => Outcome::Return(1),
+        wm::COMMAND if wp >> 16 == 0 => {
+            let id = wp & 0xffff;
+            let u = user(env);
+            let has = |id| super::dialog::item(u, &env.sys.objects, hwnd, id) != 0;
+            let result = if has(id) {
+                id
+            } else if id == 2 && has(1) && !(3..=11).any(has) {
+                1
+            } else {
+                return Outcome::Return(0);
+            };
+            super::dialog::end(env, hwnd, result)
+        }
+        _ => Outcome::Return(0),
+    }
+}
+
 fn def_dlg_default(
     env: &mut Env<'_>,
     hwnd: u32,
@@ -512,6 +536,7 @@ pub fn register(reg: &mut Registry) {
     super::tab::register(reg);
     reg.register(def_dlg_proc_w_ABI);
     stdcall(reg, USER32, DIALOG_PROC, 4, dialog_proc);
+    stdcall(reg, USER32, MESSAGE_BOX_PROC, 4, message_box_proc);
     stdcall(reg, USER32, BUTTON_PROC, 4, button_proc);
     stdcall(reg, USER32, STATIC_PROC, 4, static_proc);
     stdcall(reg, USER32, EDIT_PROC, 4, edit_proc);

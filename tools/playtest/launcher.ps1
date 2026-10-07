@@ -90,11 +90,11 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $logs "$name-$stamp.log"
 $report = Join-Path $logs "$name-$stamp.json"
 
-# Built-in dialog controls are not drawn yet, so a startup dialog (SoftPAL's
-# first-run window mode prompt) would wait invisibly; press its default button.
+# Game dialogs and message boxes are shown to the player, never answered for
+# them: they can choose the window mode or other settings.
 # No console window, but no show-window override either: SW_HIDE in the startup
 # info would hide the game's first ShowWindow(SW_SHOWDEFAULT).
-$command = "`"`"$runner`" `"$exe`" --audio --codepage $cp --auto-dialog-ms 300 --data-dir `"$saves`" " +
+$command = "`"`"$runner`" `"$exe`" --audio --codepage $cp --data-dir `"$saves`" " +
     "--report `"$report`" 1> `"$log.out`" 2> `"$log`"`""
 $info = New-Object System.Diagnostics.ProcessStartInfo
 $info.FileName = $env:ComSpec

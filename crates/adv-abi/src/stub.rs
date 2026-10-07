@@ -260,6 +260,11 @@ pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
         failure_value: failure,
     };
     env.ext.get_or_default::<ApiDiagnostics>().record(call);
+    warn_unavailable(
+        env,
+        &format!("{}!{}", signature.module, signature.name),
+        "API has no implemented frontend; using a generated ABI failure stub",
+    );
     if mode == RunMode::Strict {
         return Outcome::Fail(format!(
             "unimplemented: {}!{} (strict ABI stub)",
