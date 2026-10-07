@@ -40,12 +40,7 @@ fn set_state_9(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 {
 }
 
 #[win32(xinput9_1_0, name = "XInputGetCapabilities", level = safe_fail)]
-fn get_capabilities_9(
-    _env: &mut Env<'_>,
-    index: u32,
-    flags: u32,
-    output: GuestPtr<()>,
-) -> u32 {
+fn get_capabilities_9(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
     // The legacy fixed capabilities apply to connected devices, not a
     // fabricated controller. The absent-device native result is still 1167.
     disconnected(index, flags, output)
@@ -62,11 +57,6 @@ fn set_state_13(_env: &mut Env<'_>, index: u32, vibration: GuestPtr<()>) -> u32 
 }
 
 #[win32(xinput1_3, name = "XInputGetCapabilities", level = safe_fail)]
-fn get_capabilities_13(
-    _env: &mut Env<'_>,
-    index: u32,
-    flags: u32,
-    output: GuestPtr<()>,
-) -> u32 {
+fn get_capabilities_13(_env: &mut Env<'_>, index: u32, flags: u32, output: GuestPtr<()>) -> u32 {
     disconnected(index, flags, output)
 }

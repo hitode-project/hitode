@@ -4,9 +4,9 @@ use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use std::collections::HashMap;
+mod byte_output;
 mod byte_set;
 mod byte_sort;
-mod byte_output;
 mod convert;
 mod cpp_alloc;
 mod data;
@@ -25,13 +25,13 @@ mod modern_string;
 mod onexit;
 mod path;
 mod random;
-mod scan;
 mod scalar_float;
 mod scalar_log;
 mod scalar_power;
 mod scalar_round;
 mod scalar_scale;
 mod scalar_split;
+mod scan;
 mod secure_memory;
 mod shared_file;
 mod startup;
@@ -83,12 +83,7 @@ fn invalid_parameter(env: &mut Env<'_>, function: &str, error: i32) -> Outcome {
     invalid_parameter_result(env, function, error, error as u32)
 }
 
-fn invalid_parameter_result(
-    env: &mut Env<'_>,
-    function: &str,
-    error: i32,
-    result: u32,
-) -> Outcome {
+fn invalid_parameter_result(env: &mut Env<'_>, function: &str, error: i32, result: u32) -> Outcome {
     invalid_parameter_then(env, function, error, move |_| Outcome::Return(result))
 }
 
@@ -331,9 +326,19 @@ pub fn register(r: &mut Registry) {
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
-        r.add(module, "_setjmp3", adv_machine::Conv::CdeclVariadic { fixed: 2 }, call);
+        r.add(
+            module,
+            "_setjmp3",
+            adv_machine::Conv::CdeclVariadic { fixed: 2 },
+            call,
+        );
     }
-    r.add("msvcrt.dll", "_setjmp3", adv_machine::Conv::CdeclVariadic { fixed: 2 }, call);
+    r.add(
+        "msvcrt.dll",
+        "_setjmp3",
+        adv_machine::Conv::CdeclVariadic { fixed: 2 },
+        call,
+    );
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
@@ -455,9 +460,19 @@ fn crt_open_file_options(
 ) -> std::io::Result<u32> {
     let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
     let host_path = if mode.starts_with('w') || mode.starts_with('a') {
-        e.ext.try_get::<crate::Win32>().ok_or_else(missing)?.vfs.write_path(name).ok_or_else(missing)?
+        e.ext
+            .try_get::<crate::Win32>()
+            .ok_or_else(missing)?
+            .vfs
+            .write_path(name)
+            .ok_or_else(missing)?
     } else {
-        e.ext.try_get::<crate::Win32>().ok_or_else(missing)?.vfs.lookup(name).ok_or_else(missing)?
+        e.ext
+            .try_get::<crate::Win32>()
+            .ok_or_else(missing)?
+            .vfs
+            .lookup(name)
+            .ok_or_else(missing)?
     };
     let file = opts.open(&host_path)?;
     let ptr = allocate(e, 32, true);
@@ -687,18 +702,14 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     .unwrap_or(0)
             }
         }
-        "memcpy" | "memmove" => {
-            match memory_ops::copy(e, a, b, c) {
-                Ok(pointer) => pointer,
-                Err(err) => return Outcome::Fail(err.to_string()),
-            }
-        }
-        "memset" => {
-            match memory_ops::fill(e, a, b as u8, c) {
-                Ok(pointer) => pointer,
-                Err(err) => return Outcome::Fail(err.to_string()),
-            }
-        }
+        "memcpy" | "memmove" => match memory_ops::copy(e, a, b, c) {
+            Ok(pointer) => pointer,
+            Err(err) => return Outcome::Fail(err.to_string()),
+        },
+        "memset" => match memory_ops::fill(e, a, b as u8, c) {
+            Ok(pointer) => pointer,
+            Err(err) => return Outcome::Fail(err.to_string()),
+        },
         "memcmp" => {
             let mut left = [0; 4096];
             let mut right = [0; 4096];
@@ -1114,8 +1125,16 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let (Ok(u1), Ok(u2)) = (e.cpu.read_u16(p1), e.cpu.read_u16(p2)) else {
                     return Outcome::Fail("CRT _wcsicmp unmapped".into());
                 };
-                let c1 = if u1 <= 127 { (u1 as u8).to_ascii_lowercase() as u16 } else { u1 };
-                let c2 = if u2 <= 127 { (u2 as u8).to_ascii_lowercase() as u16 } else { u2 };
+                let c1 = if u1 <= 127 {
+                    (u1 as u8).to_ascii_lowercase() as u16
+                } else {
+                    u1
+                };
+                let c2 = if u2 <= 127 {
+                    (u2 as u8).to_ascii_lowercase() as u16
+                } else {
+                    u2
+                };
                 if c1 != c2 {
                     return match c1.cmp(&c2) {
                         std::cmp::Ordering::Less => Outcome::Return(u32::MAX),
@@ -1141,8 +1160,16 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let (Ok(u1), Ok(u2)) = (e.cpu.read_u16(p1), e.cpu.read_u16(p2)) else {
                     return Outcome::Fail("CRT _wcsnicmp unmapped".into());
                 };
-                let c1 = if u1 <= 127 { (u1 as u8).to_ascii_lowercase() as u16 } else { u1 };
-                let c2 = if u2 <= 127 { (u2 as u8).to_ascii_lowercase() as u16 } else { u2 };
+                let c1 = if u1 <= 127 {
+                    (u1 as u8).to_ascii_lowercase() as u16
+                } else {
+                    u1
+                };
+                let c2 = if u2 <= 127 {
+                    (u2 as u8).to_ascii_lowercase() as u16
+                } else {
+                    u2
+                };
                 if c1 != c2 {
                     return match c1.cmp(&c2) {
                         std::cmp::Ordering::Less => Outcome::Return(u32::MAX),
@@ -1165,7 +1192,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut name_u16 = Vec::new();
             let mut p = filename_ptr;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 name_u16.push(u);
                 p += 2;
             }
@@ -1173,7 +1202,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut mode_u16 = Vec::new();
             let mut p = mode_ptr;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 mode_u16.push(u);
                 p += 2;
             }
@@ -1196,7 +1227,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut name_u16 = Vec::new();
             let mut p = filename_ptr;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 name_u16.push(u);
                 p += 2;
             }
@@ -1204,7 +1237,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut mode_u16 = Vec::new();
             let mut p = mode_ptr;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 mode_u16.push(u);
                 p += 2;
             }
@@ -1213,7 +1248,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
         }
         "fopen_s" => {
             let pfile = a;
-            let (Ok(name_bytes), Ok(mode_bytes)) = (e.cpu.read_cstr(b, 4096), e.cpu.read_cstr(c, 32)) else {
+            let (Ok(name_bytes), Ok(mode_bytes)) =
+                (e.cpu.read_cstr(b, 4096), e.cpu.read_cstr(c, 32))
+            else {
                 return Outcome::Fail("CRT fopen_s string unmapped".into());
             };
             let name_str = String::from_utf8_lossy(&name_bytes);
@@ -1231,7 +1268,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             }
         }
         "fopen" => {
-            let (Ok(name_bytes), Ok(mode_bytes)) = (e.cpu.read_cstr(a, 4096), e.cpu.read_cstr(b, 32)) else {
+            let (Ok(name_bytes), Ok(mode_bytes)) =
+                (e.cpu.read_cstr(a, 4096), e.cpu.read_cstr(b, 32))
+            else {
                 return Outcome::Fail("CRT fopen string unmapped".into());
             };
             let name_str = String::from_utf8_lossy(&name_bytes);
@@ -1434,8 +1473,13 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 let _ = e.cpu.write(dest, &[0]);
                 return Outcome::Return(34);
             }
-            let _ = e.cpu.write(dest.wrapping_add(dest_str.len() as u32), &src_str);
-            let _ = e.cpu.write(dest.wrapping_add((dest_str.len() + src_str.len()) as u32), &[0]);
+            let _ = e
+                .cpu
+                .write(dest.wrapping_add(dest_str.len() as u32), &src_str);
+            let _ = e.cpu.write(
+                dest.wrapping_add((dest_str.len() + src_str.len()) as u32),
+                &[0],
+            );
             0
         }
         "strncat_s" => {
@@ -1472,9 +1516,15 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(34);
             }
             if append_len > 0 {
-                let _ = e.cpu.write(dest.wrapping_add(dest_str.len() as u32), &src_str[..append_len]);
+                let _ = e.cpu.write(
+                    dest.wrapping_add(dest_str.len() as u32),
+                    &src_str[..append_len],
+                );
             }
-            let _ = e.cpu.write(dest.wrapping_add((dest_str.len() + append_len) as u32), &[0]);
+            let _ = e.cpu.write(
+                dest.wrapping_add((dest_str.len() + append_len) as u32),
+                &[0],
+            );
             0
         }
         "wcsncpy_s" => {
@@ -1496,7 +1546,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut src_units = Vec::new();
             let mut p = src;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 src_units.push(u);
                 p += 2;
             }
@@ -1511,9 +1563,14 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(34);
             }
             for i in 0..copy_len {
-                let _ = e.cpu.write(dest.wrapping_add((i * 2) as u32), &src_units[i].to_le_bytes());
+                let _ = e.cpu.write(
+                    dest.wrapping_add((i * 2) as u32),
+                    &src_units[i].to_le_bytes(),
+                );
             }
-            let _ = e.cpu.write(dest.wrapping_add((copy_len * 2) as u32), &[0, 0]);
+            let _ = e
+                .cpu
+                .write(dest.wrapping_add((copy_len * 2) as u32), &[0, 0]);
             0
         }
         "wcscpy_s" => {
@@ -1530,7 +1587,9 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut src_units = Vec::new();
             let mut p = src;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 src_units.push(u);
                 p += 2;
             }
@@ -1539,9 +1598,14 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(34);
             }
             for i in 0..src_units.len() {
-                let _ = e.cpu.write(dest.wrapping_add((i * 2) as u32), &src_units[i].to_le_bytes());
+                let _ = e.cpu.write(
+                    dest.wrapping_add((i * 2) as u32),
+                    &src_units[i].to_le_bytes(),
+                );
             }
-            let _ = e.cpu.write(dest.wrapping_add((src_units.len() * 2) as u32), &[0, 0]);
+            let _ = e
+                .cpu
+                .write(dest.wrapping_add((src_units.len() * 2) as u32), &[0, 0]);
             0
         }
         "wcscat_s" => {
@@ -1558,14 +1622,18 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let mut dest_len = 0usize;
             let mut p = dest;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 dest_len += 1;
                 p += 2;
             }
             let mut src_units = Vec::new();
             let mut p = src;
             while let Ok(u) = e.cpu.read_u16(p) {
-                if u == 0 { break; }
+                if u == 0 {
+                    break;
+                }
                 src_units.push(u);
                 p += 2;
             }
@@ -1574,9 +1642,15 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 return Outcome::Return(34);
             }
             for i in 0..src_units.len() {
-                let _ = e.cpu.write(dest.wrapping_add(((dest_len + i) * 2) as u32), &src_units[i].to_le_bytes());
+                let _ = e.cpu.write(
+                    dest.wrapping_add(((dest_len + i) * 2) as u32),
+                    &src_units[i].to_le_bytes(),
+                );
             }
-            let _ = e.cpu.write(dest.wrapping_add(((dest_len + src_units.len()) * 2) as u32), &[0, 0]);
+            let _ = e.cpu.write(
+                dest.wrapping_add(((dest_len + src_units.len()) * 2) as u32),
+                &[0, 0],
+            );
             0
         }
         "strstr" => {
@@ -1640,11 +1714,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     936 => (0x81..=0xfe).contains(&byte),
                     _ => (0x81..=0x9f).contains(&byte) || (0xe0..=0xfc).contains(&byte),
                 };
-            if is_lead {
-                1
-            } else {
-                0
-            }
+            if is_lead { 1 } else { 0 }
         }
         "_ismbbtrail" => {
             let acp = e.ext.get::<crate::Win32>().codec.acp;
@@ -1654,11 +1724,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
                     936 => (0x40..=0x7e).contains(&byte) || (0x80..=0xfe).contains(&byte),
                     _ => (0x40..=0x7e).contains(&byte) || (0x80..=0xfc).contains(&byte),
                 };
-            if is_trail {
-                1
-            } else {
-                0
-            }
+            if is_trail { 1 } else { 0 }
         }
         "_mbsnbcpy" => {
             let n = c as usize;
@@ -1724,24 +1790,32 @@ fn call(e: &mut Env<'_>) -> Outcome {
         "getenv" => 0,
         "_makepath" => {
             let mut out = Vec::new();
-            if b != 0 && let Ok(drive) = e.cpu.read_cstr(b, 260) {
+            if b != 0
+                && let Ok(drive) = e.cpu.read_cstr(b, 260)
+            {
                 out.extend_from_slice(&drive);
                 if drive.len() == 1 && drive[0] != b':' {
                     out.push(b':');
                 }
             }
-            if c != 0 && let Ok(dir) = e.cpu.read_cstr(c, 260) {
+            if c != 0
+                && let Ok(dir) = e.cpu.read_cstr(c, 260)
+            {
                 out.extend_from_slice(&dir);
                 if !dir.is_empty() && dir.last() != Some(&b'/') && dir.last() != Some(&b'\\') {
                     out.push(b'\\');
                 }
             }
             let d = e.arg(3);
-            if d != 0 && let Ok(fname) = e.cpu.read_cstr(d, 260) {
+            if d != 0
+                && let Ok(fname) = e.cpu.read_cstr(d, 260)
+            {
                 out.extend_from_slice(&fname);
             }
             let ext_ptr = e.arg(4);
-            if ext_ptr != 0 && let Ok(ext) = e.cpu.read_cstr(ext_ptr, 260) {
+            if ext_ptr != 0
+                && let Ok(ext) = e.cpu.read_cstr(ext_ptr, 260)
+            {
                 if !ext.is_empty() && ext[0] != b'.' {
                     out.push(b'.');
                 }
@@ -2229,4 +2303,3 @@ mod tests {
         }
     }
 }
-

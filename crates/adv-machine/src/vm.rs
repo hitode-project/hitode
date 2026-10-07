@@ -137,7 +137,11 @@ impl Vm {
 
     /// Unmap and release the region starting at `addr`. Unmapped pages (guards) are skipped.
     pub fn free(&mut self, cpu: &mut dyn Guest, addr: u32) -> Result<(), MemFault> {
-        let size = self.used.get(&addr).copied().ok_or(MemFault { addr, len: 0 })?;
+        let size = self
+            .used
+            .get(&addr)
+            .copied()
+            .ok_or(MemFault { addr, len: 0 })?;
         if cpu.unmap(addr, size).is_err() {
             for offset in (0..size).step_by(PAGE as usize) {
                 let _ = cpu.unmap(addr + offset, PAGE);

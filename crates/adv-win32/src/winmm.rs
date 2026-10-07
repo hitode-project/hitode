@@ -18,11 +18,11 @@ const SYNCHRONOUS: u32 = 0x100;
 // fail, and a subsequent timer API reaps an abandoned active payload. Without
 // another API, that bounded charge lasts until the process's Objects is dropped.
 const WORKER: &str = "__pal_multimedia_timer_worker";
-mod timer;
 mod joystick;
-mod wave_out;
 mod mci;
 mod midi;
+mod timer;
+mod wave_out;
 use timer::{Entry, Queue, Timer};
 
 #[derive(Default)]

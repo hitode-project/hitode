@@ -435,7 +435,13 @@ fn information_contexts_share_device_queries_and_retire_without_a_raster_canvas(
     assert!(machine.ext.get::<SurfaceStore>().primary_id().is_none());
     for dc in contexts {
         assert_ne!(
-            invoke(&mut machine, data, "gdi32.dll", "GetCurrentObject", &[dc, 6]),
+            invoke(
+                &mut machine,
+                data,
+                "gdi32.dll",
+                "GetCurrentObject",
+                &[dc, 6]
+            ),
             0
         );
         assert_eq!(
@@ -517,7 +523,13 @@ fn information_contexts_share_device_queries_and_retire_without_a_raster_canvas(
             0
         );
         assert_eq!(
-            invoke(&mut machine, data, "gdi32.dll", "GetCurrentObject", &[dc, 6]),
+            invoke(
+                &mut machine,
+                data,
+                "gdi32.dll",
+                "GetCurrentObject",
+                &[dc, 6]
+            ),
             0
         );
         assert_eq!(

@@ -10,8 +10,14 @@ pub(super) struct Reference {
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
-        add_a_ABI, add_w_ABI, remove_a_ABI, remove_w_ABI,
-        add_ex_a_ABI, add_ex_w_ABI, remove_ex_a_ABI, remove_ex_w_ABI,
+        add_a_ABI,
+        add_w_ABI,
+        remove_a_ABI,
+        remove_w_ABI,
+        add_ex_a_ABI,
+        add_ex_w_ABI,
+        remove_ex_a_ABI,
+        remove_ex_w_ABI,
     ] {
         registry.register(api);
     }
@@ -104,7 +110,10 @@ fn add(env: &mut Env<'_>, path: &str, flags: u32) -> i32 {
         return 0;
     };
     let fonts = env.ext.get_mut::<Fonts>();
-    let Ok((id, faces)) = fonts.text.add_file_resource(&bytes, flags & FR_NOT_ENUM == 0) else {
+    let Ok((id, faces)) = fonts
+        .text
+        .add_file_resource(&bytes, flags & FR_NOT_ENUM == 0)
+    else {
         return 0;
     };
     fonts.resources.insert(
@@ -125,7 +134,9 @@ fn remove(env: &mut Env<'_>, path: &str, flags: u32) -> i32 {
     let fonts = env.ext.get_mut::<Fonts>();
     let Some(reference) = fonts.resources.get_mut(&key) else {
         if flags & FR_NOT_ENUM != 0
-            && fonts.resources.contains_key(&(key.0.clone(), flags & !FR_NOT_ENUM))
+            && fonts
+                .resources
+                .contains_key(&(key.0.clone(), flags & !FR_NOT_ENUM))
         {
             // Windows can report success without consuming a visible reference
             // for this mismatched-flags corner. Preserve the documented owner

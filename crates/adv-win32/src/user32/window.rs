@@ -855,7 +855,11 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
         "user32.dll!GetClassInfoA"
     };
     if !wide && !matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001) {
-        adv_abi::warn_unavailable(env, api, "class query ANSI code page has no supported encoder");
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "class query ANSI code page has no supported encoder",
+        );
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
@@ -874,10 +878,16 @@ fn get_class_info(env: &mut Env<'_>, inst: u32, name: u32, out: u32, wide: bool)
     };
     let u = user(env);
     let c = &u.classes[i];
-    if c.unicode.is_some_and(|registered_wide| registered_wide != wide) {
+    if c.unicode
+        .is_some_and(|registered_wide| registered_wide != wide)
+    {
         // Native returns an A/W procedure thunk for a custom class queried via
         // the opposite encoding. A raw guest procedure is not that thunk.
-        adv_abi::warn_unavailable(env, api, "cross-encoding custom class procedure thunk is unavailable");
+        adv_abi::warn_unavailable(
+            env,
+            api,
+            "cross-encoding custom class procedure thunk is unavailable",
+        );
         set_last_error(env, 50);
         return Outcome::Return(0);
     }
@@ -2020,8 +2030,18 @@ fn procedure_encoding(env: &Env<'_>, proc: u32) -> Option<bool> {
 }
 
 fn stock_procedure(u: &User, proc: u32) -> bool {
-    proc != 0 && [u.procs.def_window, u.procs.def_dlg, u.procs.button, u.procs.static_,
-        u.procs.edit, u.procs.combo, u.procs.trackbar, u.procs.tab].contains(&proc)
+    proc != 0
+        && [
+            u.procs.def_window,
+            u.procs.def_dlg,
+            u.procs.button,
+            u.procs.static_,
+            u.procs.edit,
+            u.procs.combo,
+            u.procs.trackbar,
+            u.procs.tab,
+        ]
+        .contains(&proc)
 }
 
 fn procedure_boundary(env: &mut Env<'_>, api: &str, reason: &str) -> Outcome {
@@ -2038,7 +2058,11 @@ fn get_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, wide: bool) -> Outcom
     if idx == GWL_WNDPROC && w.unicode != wide {
         return procedure_boundary(
             env,
-            if wide { "user32.dll!GetWindowLongW" } else { "user32.dll!GetWindowLongA" },
+            if wide {
+                "user32.dll!GetWindowLongW"
+            } else {
+                "user32.dll!GetWindowLongA"
+            },
             "cross-encoding GWL_WNDPROC query requires an unavailable procedure thunk",
         );
     }
@@ -2059,11 +2083,18 @@ fn get_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, wide: bool) -> Outcom
                 if !can_capture_procedures(user(env), &[v]) {
                     return procedure_boundary(
                         env,
-                        if wide { "user32.dll!GetWindowLongW" } else { "user32.dll!GetWindowLongA" },
+                        if wide {
+                            "user32.dll!GetWindowLongW"
+                        } else {
+                            "user32.dll!GetWindowLongA"
+                        },
                         "saved procedure encoding metadata reached its bounded capacity",
                     );
                 }
-                *user_mut(env).saved_procedure_encodings.entry(v).or_default() |= if wide { 2 } else { 1 };
+                *user_mut(env)
+                    .saved_procedure_encodings
+                    .entry(v)
+                    .or_default() |= if wide { 2 } else { 1 };
             }
             Outcome::Return(v)
         }
@@ -2092,15 +2123,25 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
     if idx == GWL_HWNDPARENT {
         return procedure_boundary(
             env,
-            if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+            if wide {
+                "user32.dll!SetWindowLongW"
+            } else {
+                "user32.dll!SetWindowLongA"
+            },
             "GWL_HWNDPARENT reparent/owner lifecycle is unsupported",
         );
     }
     if idx == GWL_WNDPROC {
-        if current.unicode != wide || procedure_encoding(env, v).is_some_and(|target| target != wide) {
+        if current.unicode != wide
+            || procedure_encoding(env, v).is_some_and(|target| target != wide)
+        {
             return procedure_boundary(
                 env,
-                if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+                if wide {
+                    "user32.dll!SetWindowLongW"
+                } else {
+                    "user32.dll!SetWindowLongA"
+                },
                 "cross-encoding GWL_WNDPROC replacement requires an unavailable procedure thunk",
             );
         }
@@ -2111,7 +2152,11 @@ fn set_window_long(env: &mut Env<'_>, hwnd: u32, idx: i32, v: u32, wide: bool) -
         if !can_capture_procedures(user(env), &[current.proc, v]) {
             return procedure_boundary(
                 env,
-                if wide { "user32.dll!SetWindowLongW" } else { "user32.dll!SetWindowLongA" },
+                if wide {
+                    "user32.dll!SetWindowLongW"
+                } else {
+                    "user32.dll!SetWindowLongA"
+                },
                 "saved procedure encoding metadata reached its bounded capacity",
             );
         }
@@ -2170,15 +2215,27 @@ pub(super) fn call_window_proc(
     lp: u32,
     wide: bool,
 ) -> Outcome {
-    let api = if wide { "user32.dll!CallWindowProcW" } else { "user32.dll!CallWindowProcA" };
+    let api = if wide {
+        "user32.dll!CallWindowProcW"
+    } else {
+        "user32.dll!CallWindowProcA"
+    };
     if procedure_encoding(env, proc).is_some_and(|target| target != wide) {
-        return procedure_boundary(env, api, "saved/custom procedure A/W conversion thunk is unavailable");
+        return procedure_boundary(
+            env,
+            api,
+            "saved/custom procedure A/W conversion thunk is unavailable",
+        );
     }
     let u = user(env);
     let stock = stock_procedure(u, proc);
     if stock {
         let Some(target) = u.windows.get(&env.sys.objects, &hwnd) else {
-            return procedure_boundary(env, api, "shared built-in procedure requires a captured USER window");
+            return procedure_boundary(
+                env,
+                api,
+                "shared built-in procedure requires a captured USER window",
+            );
         };
         if target.unicode != wide {
             if matches!(msg, wm::SETTEXT | wm::GETTEXT | wm::GETTEXTLENGTH) {
@@ -2188,16 +2245,32 @@ pub(super) fn call_window_proc(
             // CREATE/NCCREATE do not read CREATESTRUCT strings, and destruction
             // has no encoding-sensitive payload. DialogWndProc instead invokes
             // an application DLGPROC first, so it cannot use this exception.
-            let creation_metadata = matches!(msg, wm::CREATE | wm::NCCREATE | wm::DESTROY | wm::NCDESTROY)
-                && [u.procs.def_window, u.procs.button, u.procs.static_, u.procs.edit,
-                    u.procs.combo, u.procs.trackbar, u.procs.tab].contains(&proc);
-            let numeric = matches!(msg, 0 | wm::MOVE | wm::SIZE | wm::SETFONT | wm::GETFONT
+            let creation_metadata =
+                matches!(msg, wm::CREATE | wm::NCCREATE | wm::DESTROY | wm::NCDESTROY)
+                    && [
+                        u.procs.def_window,
+                        u.procs.button,
+                        u.procs.static_,
+                        u.procs.edit,
+                        u.procs.combo,
+                        u.procs.trackbar,
+                        u.procs.tab,
+                    ]
+                    .contains(&proc);
+            let numeric = matches!(
+                msg,
+                0 | wm::MOVE | wm::SIZE | wm::SETFONT | wm::GETFONT
                 | wm::ENABLE | 0x000b /* WM_SETREDRAW */ | wm::PAINT | wm::ERASEBKGND
                 | wm::SETFOCUS | wm::KILLFOCUS | wm::GETDLGCODE
                 | wm::WINDOWPOSCHANGING | wm::WINDOWPOSCHANGED
-                | wm::KEYDOWN | wm::KEYUP | wm::SYSKEYDOWN | 0x0105 /* WM_SYSKEYUP */);
+                | wm::KEYDOWN | wm::KEYUP | wm::SYSKEYDOWN | 0x0105 /* WM_SYSKEYUP */
+            );
             if !creation_metadata && !numeric {
-                return procedure_boundary(env, api, "saved built-in message needs an unavailable A/W structure or character conversion");
+                return procedure_boundary(
+                    env,
+                    api,
+                    "saved built-in message needs an unavailable A/W structure or character conversion",
+                );
             }
         }
     }

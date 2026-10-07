@@ -423,7 +423,11 @@ impl Executor {
         self.set_shadow_returns(parent.shadow_returns.is_some())?;
         self.set_compile_threads(parent.compile_threads)?;
         self.host_interrupts = parent.host_interrupts;
-        self.rows = parent.rows.as_ref().map(|rows| rows.fork_empty().map(Box::new)).transpose()?;
+        self.rows = parent
+            .rows
+            .as_ref()
+            .map(|rows| rows.fork_empty().map(Box::new))
+            .transpose()?;
         Ok(())
     }
 
@@ -1047,7 +1051,9 @@ impl Executor {
             .sender(crate::compiler::CAPACITY, crate::compiler::CAPACITY)
             .map_err(|error| error.to_string())?
             .into_local();
-        self.background_service = Some(std::rc::Rc::new(builder.start().map_err(|error| error.to_string())?));
+        self.background_service = Some(std::rc::Rc::new(
+            builder.start().map_err(|error| error.to_string())?,
+        ));
         self.background_sender = Some(sender.clone());
         Ok(sender)
     }
@@ -1130,7 +1136,8 @@ impl Executor {
         if !self.deferred_compilations.is_empty() {
             return;
         }
-        self.profiled.retain(|(_, profile)| Arc::strong_count(profile) > 1);
+        self.profiled
+            .retain(|(_, profile)| Arc::strong_count(profile) > 1);
         // Reading a counter is cheap; only hot units pay the eligibility lookups.
         let hottest = self
             .profiled

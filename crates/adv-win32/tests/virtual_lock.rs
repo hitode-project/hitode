@@ -158,7 +158,14 @@ fn private_pages_really_pin_without_counts_and_retire_on_noaccess_release_and_pr
             // The process-memory implementation now supports real decommit:
             // the first page and its physical pin retire; the second stays live.
             ("VirtualFree", &[BUFFER, 4096, 0x4000], 1, MARKER, true, 2),
-            ("VirtualAlloc", &[BUFFER, 4096, 0x1000, 4], BUFFER, MARKER, true, 2),
+            (
+                "VirtualAlloc",
+                &[BUFFER, 4096, 0x1000, 4],
+                BUFFER,
+                MARKER,
+                true,
+                2,
+            ),
             (
                 "VirtualProtect",
                 &[BUFFER, 4096, 1, DATA + 0x800],

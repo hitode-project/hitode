@@ -90,7 +90,9 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn host_request(then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static) -> Self {
-        Self::HostRequest { then: Box::new(then) }
+        Self::HostRequest {
+            then: Box::new(then),
+        }
     }
 
     pub fn call(

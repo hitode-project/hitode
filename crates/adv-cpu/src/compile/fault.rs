@@ -378,8 +378,11 @@ fn epilogue(code: &[u8], mut offset: usize) -> bool {
                     && instruction.op1_kind() == OpKind::Memory
                     && instruction.memory_base() == R::RSP
                     && instruction.memory_index() == R::None
-                    && (matches!(instruction.op0_register(), R::RBX | R::RBP | R::RSI | R::RDI | R::R12 | R::R13 | R::R14 | R::R15)
-                        || (R::XMM6 as u32..=R::XMM15 as u32).contains(&(instruction.op0_register() as u32))) => {}
+                    && (matches!(
+                        instruction.op0_register(),
+                        R::RBX | R::RBP | R::RSI | R::RDI | R::R12 | R::R13 | R::R14 | R::R15
+                    ) || (R::XMM6 as u32..=R::XMM15 as u32)
+                        .contains(&(instruction.op0_register() as u32))) => {}
             M::Add
                 if instruction.op0_register() == R::RSP
                     && matches!(

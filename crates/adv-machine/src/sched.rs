@@ -192,8 +192,14 @@ impl Context {
 /// else a higher layer keeps behind a handle (files, enumerations, sections, ...)
 /// is a [`Object::Host`] payload, dropped when its last handle closes.
 pub enum Object {
-    Process { identity: std::sync::Arc<crate::process::ProcessIdentity>, access: u32 },
-    RemoteThread { identity: crate::process::ThreadIdentity, access: u32 },
+    Process {
+        identity: std::sync::Arc<crate::process::ProcessIdentity>,
+        access: u32,
+    },
+    RemoteThread {
+        identity: crate::process::ThreadIdentity,
+        access: u32,
+    },
     Event {
         manual_reset: bool,
         signaled: bool,
@@ -222,8 +228,16 @@ pub enum Object {
 impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Process { identity, access } => f.debug_tuple("Process").field(&identity.pid).field(access).finish(),
-            Self::RemoteThread { identity, access } => f.debug_tuple("RemoteThread").field(&identity.tid).field(access).finish(),
+            Self::Process { identity, access } => f
+                .debug_tuple("Process")
+                .field(&identity.pid)
+                .field(access)
+                .finish(),
+            Self::RemoteThread { identity, access } => f
+                .debug_tuple("RemoteThread")
+                .field(&identity.tid)
+                .field(access)
+                .finish(),
             Self::Event {
                 manual_reset,
                 signaled,

@@ -26,7 +26,11 @@ fn absent_controllers<B: Backend>(cpu: B) {
     let mut m = Machine::new(cpu, registry(), Clock::virtual_time()).unwrap();
     Win32::install(
         &mut m,
-        Win32Config::new("/nonexistent/xinput", "fixture.exe", "/nonexistent/xinput-data"),
+        Win32Config::new(
+            "/nonexistent/xinput",
+            "fixture.exe",
+            "/nonexistent/xinput-data",
+        ),
     )
     .unwrap();
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
@@ -90,7 +94,10 @@ fn absent_controllers<B: Backend>(cpu: B) {
     }
     let mut actual = [0; 32];
     m.cpu.read(BUFFER, &mut actual).unwrap();
-    assert_eq!(actual, [0xcd; 32], "failed queries preserve every output byte");
+    assert_eq!(
+        actual, [0xcd; 32],
+        "failed queries preserve every output byte"
+    );
     m.cpu.read(READ_ONLY, &mut actual).unwrap();
     assert_eq!(actual, [0x77; 32]);
     assert!(
@@ -119,8 +126,14 @@ fn selected_legacy_versions_are_typed_and_do_not_advertise_attached_devices() {
             ("XInputSetState", 2),
             ("XInputGetCapabilities", 3),
         ] {
-            assert_eq!(registry.level(dll, name), Some(ImplementationLevel::SafeFail));
-            assert_eq!(registry.get(dll, name).unwrap().conv, Conv::Stdcall { argc });
+            assert_eq!(
+                registry.level(dll, name),
+                Some(ImplementationLevel::SafeFail)
+            );
+            assert_eq!(
+                registry.get(dll, name).unwrap().conv,
+                Conv::Stdcall { argc }
+            );
             assert!(registry.dynamic_available(dll, name));
         }
     }

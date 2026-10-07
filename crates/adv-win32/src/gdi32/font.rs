@@ -10,18 +10,18 @@ use adv_device::text::{
 use adv_machine::Machine;
 use std::borrow::Cow;
 
+mod charset;
 mod enumeration;
 mod eudc;
-mod rectangle;
-mod paint;
-mod resource;
-mod widths;
-mod charset;
-mod logical;
 mod kerning;
+mod logical;
+mod paint;
+mod rectangle;
+mod resource;
 #[cfg(test)]
 #[path = "font/tests.rs"]
 mod tests;
+mod widths;
 
 const STOCK_FONT: u32 = 0x0190_0010 + 13;
 const GDI_ERROR: u32 = u32::MAX;
@@ -340,8 +340,7 @@ fn metrics_w(env: &mut Env<'_>, dc: Handle, output: GuestPtr<u8>) -> i32 {
             let mut bytes = [0; 60];
             bytes[..44].copy_from_slice(&common[..44]);
             for (index, character) in characters.into_iter().enumerate() {
-                bytes[44 + index * 2..46 + index * 2]
-                    .copy_from_slice(&character.to_le_bytes());
+                bytes[44 + index * 2..46 + index * 2].copy_from_slice(&character.to_le_bytes());
             }
             bytes[52..57].copy_from_slice(&common[48..53]);
             if env.cpu.write(output.addr(), &bytes).is_err() {

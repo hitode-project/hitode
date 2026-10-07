@@ -436,28 +436,49 @@ pub(super) fn module_path(env: &Env<'_>, id: ModuleId) -> Result<String, MemFaul
             // cwd to invent a DLL's missing name.
             ModuleKind::Host => Ok(format!("C:\\Windows\\system32\\{}", m.name)),
             ModuleKind::Image if !m.is_dll => Ok(w.exe_path()),
-            _ => Err(MemFault { addr: m.base, len: m.size }),
+            _ => Err(MemFault {
+                addr: m.base,
+                len: m.size,
+            }),
         };
     }
-    let fault = MemFault { addr: m.ldr_entry, len: m.ldr_size };
+    let fault = MemFault {
+        addr: m.ldr_entry,
+        len: m.ldr_size,
+    };
     let end = m.ldr_entry.checked_add(m.ldr_size).ok_or(fault)?;
     let header = m.ldr_entry.checked_add(0x24).ok_or(fault)?;
     let strings = m.ldr_entry.checked_add(0x80).ok_or(fault)?;
-    if strings > end { return Err(fault); }
+    if strings > end {
+        return Err(fault);
+    }
     adv_abi::guest::check_range(env.cpu, header, 8, Prot::READ)?;
     let mut descriptor = [0; 8];
     env.cpu.read(header, &mut descriptor)?;
     let length = u32::from(u16::from_le_bytes(descriptor[..2].try_into().unwrap()));
     let capacity = u32::from(u16::from_le_bytes(descriptor[2..4].try_into().unwrap()));
     let address = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
-    if length == 0 || length & 1 != 0 || capacity & 1 != 0 || length > capacity
-        || address < strings || address.checked_add(capacity).is_none_or(|end_of_string| end_of_string > end)
-    { return Err(fault); }
+    if length == 0
+        || length & 1 != 0
+        || capacity & 1 != 0
+        || length > capacity
+        || address < strings
+        || address
+            .checked_add(capacity)
+            .is_none_or(|end_of_string| end_of_string > end)
+    {
+        return Err(fault);
+    }
     adv_abi::guest::check_range(env.cpu, address, length, Prot::READ)?;
     let mut bytes = vec![0; length as usize];
     env.cpu.read(address, &mut bytes)?;
-    let words: Vec<_> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-    if words.contains(&0) { return Err(fault); }
+    let words: Vec<_> = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    if words.contains(&0) {
+        return Err(fault);
+    }
     String::from_utf16(&words).map_err(|_| fault)
 }
 
@@ -474,8 +495,16 @@ fn get_module_file_name(env: &mut Env<'_>, wide: bool) -> Outcome {
     let path = match module_path(env, id) {
         Ok(path) => path,
         Err(_) => {
-            let api = if wide { "kernel32.dll!GetModuleFileNameW" } else { "kernel32.dll!GetModuleFileNameA" };
-            adv_abi::warn_unavailable(env, api, "published module path is unreadable or outside its owned LDR FullDllName storage");
+            let api = if wide {
+                "kernel32.dll!GetModuleFileNameW"
+            } else {
+                "kernel32.dll!GetModuleFileNameA"
+            };
+            adv_abi::warn_unavailable(
+                env,
+                api,
+                "published module path is unreadable or outside its owned LDR FullDllName storage",
+            );
             set_last_error(env, 998); // ERROR_NOACCESS; no mutable-cwd fallback
             return Outcome::Return(0);
         }
@@ -507,7 +536,9 @@ fn get_proc_address(env: &mut Env<'_>) -> Outcome {
             name: String::from_utf8_lossy(&cstr(env.cpu, name_p)).into_owned(),
         }
     };
-    locked(env, move |env| resolve_proc(env, h, sym, caller, ProcedureFront::Win32))
+    locked(env, move |env| {
+        resolve_proc(env, h, sym, caller, ProcedureFront::Win32)
+    })
 }
 
 pub(crate) fn native_get_procedure(
@@ -608,7 +639,13 @@ fn missing_lookup_kind(env: &Env<'_>, module: &str, name: &str) -> DynamicLookup
     DynamicLookupKind::MissingExport
 }
 
-fn resolve_proc(env: &mut Env<'_>, h: u32, sym: ImportName, caller: u32, front: ProcedureFront) -> Outcome {
+fn resolve_proc(
+    env: &mut Env<'_>,
+    h: u32,
+    sym: ImportName,
+    caller: u32,
+    front: ProcedureFront,
+) -> Outcome {
     let requested = module_of(env, h);
     let Some(id) = requested.filter(|&id| adv_os::modules(env.ext).get(id).executable_visible())
     else {
