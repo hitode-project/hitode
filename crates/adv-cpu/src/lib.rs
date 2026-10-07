@@ -31,6 +31,7 @@ mod rows;
 mod shared_memory;
 mod state;
 mod strings;
+mod tier1;
 mod timestamp;
 mod trap;
 mod virtual_memory;
@@ -46,6 +47,7 @@ pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;
 pub use rows::RowStats;
 pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
+pub use tier1::Tier1Stats;
 pub use timestamp::TSC_FREQ;
 pub use trap::ExecutionTrap;
 

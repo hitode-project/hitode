@@ -10,6 +10,7 @@ use crate::{CompileStrategy, CpuState, Exit, Memory, Region};
 mod code_store;
 mod interpreter_profile;
 mod parallel;
+mod tier1;
 mod verify;
 mod warm;
 use code_store::CodeStore;
@@ -125,6 +126,7 @@ pub struct Executor {
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     interpreter: crate::interpreter::Interpreter,
+    tier1: Option<crate::tier1::Engine>,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
     tiered_compilation: bool,
@@ -346,6 +348,7 @@ impl Executor {
             region_linking: true,
             shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
+            tier1: None,
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
             tiered_compilation: true,
@@ -1420,7 +1423,7 @@ impl Executor {
             // Pending x87 exceptions must reach a waiting x87/MMX instruction
             // before it changes state. Native MMX assumes no pending #MF.
             let pending_fpu = self.state.x87.status & 0x80 != 0;
-            if !interpreter_only && !single_step && !pending_fpu {
+            if !interpreter_only && !single_step && !pending_fpu && self.tier1.is_none() {
                 self.discover(stop)?;
             }
             // Publications and queued regions can change the ranges during this
@@ -1438,6 +1441,7 @@ impl Executor {
             }
             let native = native.filter(|(_, code)| {
                 !interpreter_only
+                    && self.tier1.is_none()
                     && !single_step
                     && !pending_fpu
                     && code.entries.contains(&self.state.eip)
@@ -1632,7 +1636,11 @@ impl Executor {
             // decoded block. Transfers, exceptions, SMC and REP return here; native
             // publications change the revision used to build fallthrough boundaries.
             let units = self.state.fuel.min(256) as u32;
-            let (execution, last_units) = if self.profiling || single_step {
+            let tier1 =
+                self.run_tier1(stop, units, interpreter_only || single_step || pending_fpu)?;
+            let (execution, last_units) = if let Some(result) = &tier1 {
+                (result.execution, result.last_units)
+            } else if self.profiling || single_step {
                 let execution =
                     self.interpreter
                         .run_chunk(&mut self.state, &mut self.memory, units);
@@ -1650,8 +1658,12 @@ impl Executor {
                     .then_some((&self.code.entry_owner, self.code.cache_revision)),
                 )
             };
-            self.stats.interpreter_entries += 1;
-            self.stats.interpreter_instructions += u64::from(execution.units);
+            let interpreted_units = tier1
+                .as_ref()
+                .map_or(execution.units, |r| r.interpreted_units);
+            let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
+            self.stats.interpreter_entries += u64::from(interpreted);
+            self.stats.interpreter_instructions += u64::from(interpreted_units);
             let reason = {
                 use crate::InterpreterReason as Reason;
                 if interpreter_only || single_step || pending_fpu {
@@ -1667,9 +1679,11 @@ impl Executor {
                     }
                 }
             };
-            bridge.cliffs.interpreted(reason, execution.units);
-            if let Some(profile) = &mut self.interpreter_profile {
-                profile.record(pc, execution.units, reason, &self.memory);
+            if interpreted {
+                bridge.cliffs.interpreted(reason, interpreted_units);
+                if let Some(profile) = &mut self.interpreter_profile {
+                    profile.record(pc, interpreted_units, reason, &self.memory);
+                }
             }
             if !self.deferred_compilations.is_empty() && !self.code.entry_owner.contains_key(&pc) {
                 if self.demand.len() >= 65_536 {
@@ -1680,9 +1694,14 @@ impl Executor {
             self.state.fuel -= u64::from(execution.units);
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
-                p.interpreter_entries += 1;
-                p.interpreter_instructions += u64::from(execution.units);
-                p.interpreter_ns += timer.elapsed().as_nanos() as u64;
+                p.interpreter_entries += u64::from(interpreted);
+                p.interpreter_instructions += u64::from(interpreted_units);
+                if tier1.is_some() {
+                    p.native_entries += 1;
+                    p.native_ns += timer.elapsed().as_nanos() as u64;
+                } else {
+                    p.interpreter_ns += timer.elapsed().as_nanos() as u64;
+                }
             }
             self.deferred_fallback = None;
             let step = match execution.step {

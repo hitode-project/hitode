@@ -99,6 +99,10 @@ pub struct NativeRecoveryPoint {
 /// floating/extended instructions leave native code for one Tier 0 instruction.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) struct Tier1Frame {
     pub regs: [u32; 8],
     pub flags: u32,

@@ -1421,7 +1421,7 @@ struct Transaction {
     indirect_branch: Option<crate::IndirectBranch>,
 }
 
-fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
+pub(crate) fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
     memory
         .committed(address, width as usize)
         .is_ok_and(|range| {
