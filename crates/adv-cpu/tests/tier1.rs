@@ -499,3 +499,423 @@ fn refused_stack_accesses_rerun_exactly_in_tier0() {
     assert_eq!(stats.native_instructions, 1, "{stats:?}");
     assert_eq!(stats.inline_accesses, 0, "{stats:?}");
 }
+
+fn rmw_instruction(a: &mut CodeAssembler, width: u32, operation: u32, source: u32) {
+    macro_rules! emit {
+        ($mem:expr, $reg:expr) => {{
+            let mem = $mem;
+            match operation {
+                0 => {
+                    if source >= 2 {
+                        a.add(mem, if source == 2 { -1 } else { 0x81 })
+                    } else {
+                        a.add(mem, $reg)
+                    }
+                }
+                1 => {
+                    if source >= 2 {
+                        a.sub(mem, if source == 2 { -1 } else { 0x81 })
+                    } else {
+                        a.sub(mem, $reg)
+                    }
+                }
+                2 => {
+                    if source >= 2 {
+                        a.and(mem, if source == 2 { -1 } else { 0x81 })
+                    } else {
+                        a.and(mem, $reg)
+                    }
+                }
+                3 => {
+                    if source >= 2 {
+                        a.or(mem, if source == 2 { -1 } else { 0x81 })
+                    } else {
+                        a.or(mem, $reg)
+                    }
+                }
+                4 => {
+                    if source >= 2 {
+                        a.xor(mem, if source == 2 { -1 } else { 0x81 })
+                    } else {
+                        a.xor(mem, $reg)
+                    }
+                }
+                5 => a.inc(mem),
+                6 => a.dec(mem),
+                7 => a.not(mem),
+                8 => a.neg(mem),
+                _ => unreachable!(),
+            }
+            .unwrap();
+        }};
+    }
+    match width {
+        1 if source == 1 => emit!(byte_ptr(edi), ch),
+        1 => emit!(byte_ptr(edi), cl),
+        2 => emit!(word_ptr(edi), cx),
+        4 => emit!(dword_ptr(edi), ecx),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn memory_rmw_matches_both_tiers_at_each_width_and_flag_boundary() {
+    for width in [1, 2, 4] {
+        let sign = 1u32 << (width * 8 - 1);
+        let mask = u32::MAX >> (32 - width * 8);
+        for operation in 0..9 {
+            for source in 0..4 {
+                let code = assemble(|a| {
+                    rmw_instruction(a, width, operation, source);
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                for left in [0, 1, 15, 16, sign - 1, sign, mask - 1, mask] {
+                    for right in [0, 1, sign, mask] {
+                        for flags in [2, 0xcd7] {
+                            for m in &mut machines {
+                                // Distinct surrounding bytes detect accidental wide stores.
+                                m.write(DATA, &[0xa5; 12]).unwrap();
+                                m.write(DATA + 3, &left.to_le_bytes()[..width as usize])
+                                    .unwrap();
+                                let source_value = if width == 1 && source == 1 {
+                                    0xabcd_00a5 | right << 8
+                                } else {
+                                    right | !mask
+                                };
+                                reset(m, [0, source_value, 7, 9, 0, 11, 13, DATA + 3], flags);
+                                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                            }
+                            let flags_mask = if (2..=4).contains(&operation) {
+                                !0x10
+                            } else {
+                                u32::MAX
+                            };
+                            equivalent(&machines[0], &machines[1], flags_mask);
+                            equivalent(&machines[0], &machines[2], u32::MAX);
+                            assert_eq!(machines[2].stats.verification.mismatches, 0);
+                        }
+                    }
+                }
+                let stats = machines[2].tier1_stats();
+                assert_eq!(
+                    stats.fallback_instructions, 0,
+                    "{width}/{operation}/{source}: {stats:?}"
+                );
+                assert_eq!(stats.native_instructions, 128);
+                assert_eq!(stats.inline_accesses, 192);
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_rmw_refusals_preserve_state_and_retry_only_the_faulting_instruction() {
+    for width in [1, 2, 4] {
+        for operation in 0..9 {
+            for write in [false, true] {
+                let code = assemble(|a| {
+                    a.inc(esi).unwrap();
+                    rmw_instruction(a, width, operation, 0);
+                    a.ret().unwrap();
+                });
+                let address = DATA + 4096 - width / 2;
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                for m in &mut machines {
+                    reset(m, [7, 1, 9, 11, 0, 13, 0, address], 0xcd7);
+                    m.write(address, &0x7fff_ffffu32.to_le_bytes()).unwrap();
+                    m.protect(DATA + 4096, 4096, if write { READ } else { 0 })
+                        .unwrap();
+                }
+                let outcome = machines[0].run(STOP, 100).unwrap();
+                assert!(
+                    if write {
+                        matches!(outcome, RunOutcome::WriteFault { .. })
+                    } else {
+                        matches!(outcome, RunOutcome::ReadFault { .. })
+                    },
+                    "{outcome:?}"
+                );
+                for m in &mut machines[1..] {
+                    assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                let stats = machines[2].tier1_stats();
+                assert_eq!(stats.native_instructions, 1, "{stats:?}");
+                assert_eq!(stats.inline_accesses, u64::from(write), "{stats:?}");
+                assert_eq!(stats.checked_accesses, 0, "new forms must use FALLBACK");
+                for m in &mut machines {
+                    m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+                    assert_eq!(
+                        m.memory().read_data(address, 4).unwrap().as_ref(),
+                        &0x7fff_ffffu32.to_le_bytes()
+                    );
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(m.state.regs[6], 1, "committed prefix must not repeat");
+                }
+                equivalent(&machines[0], &machines[1], 0x8c5);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                for m in &machines[1..] {
+                    assert_eq!(
+                        machines[0].memory().read_data(address, 4).unwrap(),
+                        m.memory().read_data(address, 4).unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_rmw_executable_store_commits_once_and_charges_one_unit() {
+    for width in [1, 2, 4] {
+        for operation in 0..9 {
+            let code = assemble(|a| {
+                rmw_instruction(a, width, operation, 2);
+                a.mov(esi, 1).unwrap();
+                a.ret().unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            for (mode, m) in machines.iter_mut().enumerate() {
+                reset(m, [0, 1, 0, 0, 0, 0, 0, DATA], 0xcd7);
+                m.write(DATA, &0x7fff_ffffu32.to_le_bytes()).unwrap();
+                m.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
+                // Cranelift charges basic blocks; only Tier 0 and Tier 1
+                // share the single-instruction budget boundary.
+                if mode == 1 {
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                } else {
+                    assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
+                    assert_eq!(m.state.regs[6], 0);
+                }
+            }
+            equivalent(&machines[0], &machines[2], u32::MAX);
+            let stats = machines[2].tier1_stats();
+            assert_eq!(stats.native_instructions, 1, "{stats:?}");
+            assert_eq!(stats.inline_accesses, 2, "{stats:?}");
+            assert_eq!(stats.fallback_instructions, 0, "{stats:?}");
+            for m in &mut machines {
+                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                assert_eq!(m.state.regs[6], 1);
+            }
+            equivalent(&machines[0], &machines[1], !0x10);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+        }
+    }
+}
+
+#[test]
+fn memory_rmw_invalidates_modified_native_successor() {
+    for width in [1, 2, 4] {
+        let code = assemble(|a| {
+            match width {
+                1 => a.add(byte_ptr(CODE + 129), 1),
+                2 => a.add(word_ptr(CODE + 129), 1),
+                _ => a.add(dword_ptr(CODE + 129), 1),
+            }
+            .unwrap();
+            a.jmp(u64::from(CODE + 128)).unwrap();
+        });
+        let mut body = CodeAssembler::new(32).unwrap();
+        body.mov(eax, 127).unwrap();
+        body.ret().unwrap();
+        let body = body.assemble(u64::from(CODE + 128)).unwrap();
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            m.write(CODE + 128, &body).unwrap();
+            m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.state.regs[0], 128, "execute the modified immediate");
+        }
+        equivalent(&machines[0], &machines[1], 0x8d5);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        let stats = machines[2].tier1_stats();
+        assert!(stats.invalidations > 0, "{stats:?}");
+        assert_eq!(stats.native_instructions, 4);
+        assert_eq!(stats.fallback_instructions, 0);
+    }
+}
+
+fn indirect_instruction(a: &mut CodeAssembler, call: bool, memory: bool) {
+    match (call, memory) {
+        (false, false) => a.jmp(eax),
+        (false, true) => a.jmp(dword_ptr(edi)),
+        (true, false) => a.call(eax),
+        (true, true) => a.call(dword_ptr(edi)),
+    }
+    .unwrap();
+}
+
+#[test]
+fn indirect_branches_dispatch_runtime_targets_and_preserve_flags() {
+    for call in [false, true] {
+        for memory in [false, true] {
+            let code = assemble(|a| {
+                indirect_instruction(a, call, memory);
+                a.inc(ebx).unwrap();
+                a.ret().unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            machines[2].set_tier_verification(Some(true));
+            for target in [CODE + 128, CODE + 192] {
+                let mut body = CodeAssembler::new(32).unwrap();
+                body.inc(edx).unwrap();
+                body.ret().unwrap();
+                let body = body.assemble(u64::from(target)).unwrap();
+                for m in &mut machines {
+                    m.write(target, &body).unwrap();
+                    m.write(DATA, &target.to_le_bytes()).unwrap();
+                    reset(m, [target, 3, 5, 7, 0, 11, 13, DATA], 0xcd7);
+                    assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
+                    assert_eq!(m.state.eip, target);
+                    assert_eq!(m.state.eflags, 0xcd7);
+                    assert_eq!(m.state.regs[4], STACK - if call { 4 } else { 0 });
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                for m in &mut machines {
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(m.state.regs[2], 6);
+                    assert_eq!(m.state.regs[3], if call { 8 } else { 7 });
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                for m in &machines[1..] {
+                    assert_eq!(
+                        machines[0].memory().read_data(STACK - 4, 8).unwrap(),
+                        m.memory().read_data(STACK - 4, 8).unwrap()
+                    );
+                }
+            }
+            let stats = machines[2].tier1_stats();
+            assert_eq!(stats.fallback_instructions, 0, "{stats:?}");
+            assert_eq!(stats.native_instructions, if call { 10 } else { 6 });
+            assert_eq!(stats.direct_transfers, 0, "indirect branches dispatch");
+            assert!(machines[2].stats.verification.verified > 0);
+            assert_eq!(machines[2].stats.verification.mismatches, 0);
+        }
+    }
+}
+
+#[test]
+fn indirect_memory_target_refusal_does_not_push_or_retire() {
+    for call in [false, true] {
+        let code = assemble(|a| {
+            a.inc(esi).unwrap();
+            indirect_instruction(a, call, true);
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            reset(m, [0, 3, 5, 7, 0, 11, 0, DATA + 4094], 0xcd7);
+            m.write(DATA + 4094, &STOP.to_le_bytes()).unwrap();
+            m.write(STACK - 4, &0xa5a5_a5a5u32.to_le_bytes()).unwrap();
+            m.protect(DATA + 4096, 4096, 0).unwrap();
+        }
+        let outcome = machines[0].run(STOP, 100).unwrap();
+        assert!(matches!(outcome, RunOutcome::ReadFault { .. }));
+        for m in &mut machines[1..] {
+            assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        let stats = machines[2].tier1_stats();
+        assert_eq!(stats.native_instructions, 1);
+        assert_eq!(stats.inline_accesses, 0);
+        assert_eq!(stats.checked_accesses, 0);
+        for m in &mut machines {
+            assert_eq!(m.state.regs[4], STACK);
+            assert_eq!(
+                m.memory().read_data(STACK - 4, 4).unwrap().as_ref(),
+                &0xa5a5_a5a5u32.to_le_bytes()
+            );
+            m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.state.regs[6], 1);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
+
+#[test]
+fn indirect_call_push_refusal_preserves_target_stack_and_flags() {
+    for memory in [false, true] {
+        let code = assemble(|a| {
+            a.inc(esi).unwrap();
+            indirect_instruction(a, true, memory);
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            reset(m, [STOP, 3, 5, 7, 0, 11, 0, DATA], 0xcd7);
+            m.state.regs[4] = STACK + 2;
+            m.write(DATA, &STOP.to_le_bytes()).unwrap();
+            m.write(STACK - 2, &0xa5a5_a5a5u32.to_le_bytes()).unwrap();
+            m.protect(STACK, 4096, READ).unwrap();
+        }
+        let outcome = machines[0].run(STOP, 100).unwrap();
+        assert!(matches!(outcome, RunOutcome::WriteFault { .. }));
+        for m in &mut machines[1..] {
+            assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        let stats = machines[2].tier1_stats();
+        assert_eq!(stats.native_instructions, 1);
+        assert_eq!(stats.inline_accesses, u64::from(memory));
+        assert_eq!(stats.checked_accesses, 0);
+        for m in &mut machines {
+            assert_eq!(m.state.regs[4], STACK + 2);
+            assert_eq!(
+                m.memory().read_data(STACK - 2, 4).unwrap().as_ref(),
+                &0xa5a5_a5a5u32.to_le_bytes()
+            );
+            m.protect(STACK, 4096, READ | WRITE).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.state.regs[4], STACK - 2);
+            assert_eq!(m.state.regs[6], 1);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
+
+#[test]
+fn indirect_call_resolves_esp_alias_before_executable_stack_write() {
+    for memory in [false, true] {
+        let code = assemble(|a| {
+            if memory {
+                a.call(dword_ptr(esp - 4))
+            } else {
+                a.call(esp)
+            }
+            .unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        for m in &mut machines {
+            reset(m, [1, 3, 5, 7, 0, 11, 13, DATA], 0xcd7);
+            m.write(STACK - 4, &STACK.to_le_bytes()).unwrap();
+            m.protect(STACK - 4096, 8192, READ | WRITE | EXEC).unwrap();
+            assert_eq!(m.run(STACK, 1).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.state.regs[4], STACK - 4);
+            assert_eq!(m.state.eflags, 0xcd7);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        for m in &machines[1..] {
+            assert_eq!(
+                machines[0].memory().read_data(STACK - 4, 4).unwrap(),
+                m.memory().read_data(STACK - 4, 4).unwrap()
+            );
+        }
+        let stats = machines[2].tier1_stats();
+        assert_eq!(stats.native_instructions, 1);
+        assert_eq!(stats.inline_accesses, 1 + u64::from(memory));
+        assert_eq!(stats.fallback_instructions, 0);
+        assert_eq!(machines[2].stats.verification.mismatches, 0);
+    }
+}
