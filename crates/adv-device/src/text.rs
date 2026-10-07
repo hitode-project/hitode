@@ -648,6 +648,25 @@ impl Text {
             Ok(self.font(request)?.metrics())
         }
     }
+    /// Unicode range, default and break characters from the same realized font
+    /// that owns numeric metrics and glyph rasterization. These units cannot be
+    /// reconstructed by widening the encoded-byte metrics.
+    pub fn unicode_metrics(
+        &mut self,
+        request: &FontRequest,
+    ) -> Result<(TextMetrics, [u16; 4]), TextError> {
+        #[cfg(windows)]
+        {
+            self.font(request)?.unicode_metrics()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = request;
+            Err(TextError::Font(
+                "Unicode character metrics are not exposed by the portable font backend".into(),
+            ))
+        }
+    }
     /// Measure the entire run with the same owned font used for glyph requests.
     /// Individual glyph advances are insufficient for a shaped or kerned run.
     pub fn extent(

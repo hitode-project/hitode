@@ -421,6 +421,26 @@ impl Font {
             encoding: decode_encoding(m.tmCharSet),
         })
     }
+    pub(super) fn unicode_metrics(&self) -> Result<(TextMetrics, [u16; 4]), TextError> {
+        let mut wide = gdi::TEXTMETRICW::default();
+        // SAFETY: the font's existing private DC is selected, and wide is
+        // initialized writable storage for the complete native structure.
+        if unsafe { gdi::GetTextMetricsW(self.dc, &mut wide) } == 0 {
+            return Err(TextError::Font("GetTextMetricsW failed".into()));
+        }
+        // Numeric metrics, styles and realized charset are shared by A/W on
+        // this same selected font. Only the four character fields differ;
+        // return those native UTF-16 units without host-ACP conversion.
+        Ok((
+            self.metrics()?,
+            [
+                wide.tmFirstChar,
+                wide.tmLastChar,
+                wide.tmDefaultChar,
+                wide.tmBreakChar,
+            ],
+        ))
+    }
     pub(super) fn extent(&self, input: TextInput<'_>) -> Result<TextExtent, TextError> {
         let mut size = windows_sys::Win32::Foundation::SIZE::default();
         let result = match input {
