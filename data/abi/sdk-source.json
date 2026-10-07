@@ -149,6 +149,8 @@
     "documentation": [
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileinmemoryex",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetimageinfofromfileinmemory"
-    ]
+    ],
+    "native_oracle_source_sha256": "5757b812129f1c7bd916755b0cdd6ac80861cdd6c62c4324321c176c0018083a",
+    "native_verification": "Authored hidden Windows fixture with seven PNG/BMP images: 28 observations of 28-byte SourceInfo formats, NULL Info success, NONPOW2 identity versus DEFAULT expansion, NONE/LINEAR same-source pixels and resource release. Decoder and real guest tests cover bounded DDS DXT1/3/5, CPU and shared GPU storage readback, outputs and final ownership. No game image or host DLL bytes bundled."
   }
 }

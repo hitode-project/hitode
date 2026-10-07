@@ -114,6 +114,7 @@ dependencies = [
  "iced-x86",
  "log",
  "naga",
+ "png",
  "pollster",
  "sha2",
 ]

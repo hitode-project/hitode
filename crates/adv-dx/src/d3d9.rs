@@ -21,6 +21,7 @@ mod dirty;
 mod fixed;
 mod format;
 mod memory;
+pub(crate) mod loading;
 mod pacing;
 mod presentation;
 mod programmable;
@@ -1337,6 +1338,7 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
     let readback = readback::pump(&mut env);
     dc::reap_cancelled(&mut env);
     update_texture::reap_cancelled(&mut env);
+    loading::reap_cancelled(&mut env);
     Ok(readback || progress)
 }
 /// Process stop cancels map ownership and closes internal wait handles. Accepted
@@ -1360,6 +1362,7 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
     readback::cancel_pending(&mut env);
     dc::cancel_all(&mut env);
     update_texture::cancel_all(&mut env);
+    loading::cancel_all(&mut env);
 }
 #[win32(d3d9, name = "IDirect3DDevice9::Clear", level = implement)]
 fn clear(

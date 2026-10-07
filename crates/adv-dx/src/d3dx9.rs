@@ -6,6 +6,7 @@ use adv_machine::Env;
 mod binary;
 mod effect;
 mod matrix_stack;
+mod texture;
 mod preshader;
 
 type Matrix = [f32; 16];
@@ -32,6 +33,7 @@ pub fn register(registry: &mut Registry) {
     }
     effect::register(registry);
     matrix_stack::register(registry);
+    texture::register(registry);
 }
 
 fn product(left: Matrix, right: Matrix) -> Matrix {

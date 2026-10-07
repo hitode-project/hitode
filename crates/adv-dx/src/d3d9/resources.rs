@@ -481,7 +481,7 @@ fn back_buffer(
     Outcome::Return(0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::CreateTexture",level=implement)]
-fn create_texture(
+pub(super) fn create_texture(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     width: u32,
