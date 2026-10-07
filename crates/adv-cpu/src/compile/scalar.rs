@@ -134,6 +134,18 @@ pub(super) fn supported(i: &Instruction) -> bool {
         i.op_kind(n) == OpKind::Register && operand(i, n, &[operand_size(i, 0)])
     };
     match i.mnemonic() {
+        M::Shld | M::Shrd => {
+            i.op_count() == 3
+                && (operand(i, 0, &[2, 4])
+                    || i.op0_kind() == OpKind::Memory
+                        && matches!(i.memory_size().size(), 2 | 4)
+                        && [i.memory_base(), i.memory_index()]
+                            .iter()
+                            .all(|r| *r == R::None || r.is_gpr16()))
+                && register(i, 1)
+                && (i.op2_kind() == OpKind::Immediate8
+                    || i.op2_kind() == OpKind::Register && i.op2_register() == R::CL)
+        }
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
             i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && count(i)
         }
@@ -480,6 +492,10 @@ impl Emitter<'_> {
             self.signed_divide(i);
             return;
         }
+        if matches!(i.mnemonic(), M::Shld | M::Shrd) {
+            self.double_shift(i);
+            return;
+        }
         if matches!(i.mnemonic(), M::Shl | M::Sal | M::Shr | M::Sar) {
             self.scalar_shift(i);
             return;
@@ -710,6 +726,73 @@ impl Emitter<'_> {
         // DIV leaves arithmetic flags undefined; keep the prior values.
     }
 
+    fn double_shift(&mut self, i: &Instruction) {
+        let input = self.read(i, 0);
+        let source = self.read(i, 1);
+        let count = self.read(i, 2);
+        // Even a zero count reads and validates the entire memory destination.
+        let ptr = self.destination(i);
+        let count = self.b.ins().band_imm(count, 31);
+        let bits = (operand_size(i, 0) * 8) as i64;
+        let left = i.mnemonic() == M::Shld;
+        let low = self
+            .b
+            .ins()
+            .uextend(types::I64, if left { source } else { input });
+        let high = self
+            .b
+            .ins()
+            .uextend(types::I64, if left { input } else { source });
+        let high = self.b.ins().ishl_imm(high, bits);
+        let concat = self.b.ins().bor(low, high);
+        let result = if bits == 16 {
+            // Counts 17..31 are undefined: match the interpreter's deterministic
+            // rotation of the concatenated word operands on both host ISAs.
+            let concat = self.b.ins().ireduce(types::I32, concat);
+            let rotated = if left {
+                self.b.ins().rotl(concat, count)
+            } else {
+                self.b.ins().rotr(concat, count)
+            };
+            if left {
+                self.b.ins().ushr_imm(rotated, 16)
+            } else {
+                self.b.ins().band_imm(rotated, 0xffff)
+            }
+        } else {
+            let shifted = if left {
+                let shifted = self.b.ins().ishl(concat, count);
+                self.b.ins().ushr_imm(shifted, 32)
+            } else {
+                self.b.ins().ushr(concat, count)
+            };
+            self.b.ins().ireduce(types::I32, shifted)
+        };
+        let carry_shift = if left {
+            let width = self.constant((bits * 2) as u32);
+            self.b.ins().isub(width, count)
+        } else {
+            self.b.ins().iadd_imm(count, -1)
+        };
+        let carry = self.b.ins().ushr(concat, carry_shift);
+        let carry = self.b.ins().ireduce(types::I32, carry);
+        let carry = self.b.ins().band_imm(carry, 1);
+        let changed = self.b.ins().bxor(input, result);
+        let overflow = self.b.ins().ushr_imm(changed, bits - 1);
+        self.shift_result_flags(result, count, carry, overflow, bits);
+        // A zero-count RMW checks permissions but must not dirty guest memory.
+        let zero = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
+        let done = self.b.create_block();
+        let store = self.b.create_block();
+        self.b.ins().brif(zero, done, &[], store, &[]);
+        self.b.switch_to_block(store);
+        self.b.seal_block(store);
+        self.write(i, ptr, result);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+        self.b.seal_block(done);
+    }
+
     fn scalar_shift(&mut self, i: &Instruction) {
         // The group-2 /6 SAL encoding is SHL.
         let kind = if i.mnemonic() == M::Sal {
@@ -771,6 +854,18 @@ impl Emitter<'_> {
             M::Sar => self.constant(0),
             _ => unreachable!(),
         };
+        self.shift_result_flags(result, count, carry, overflow, bits);
+        self.write(i, ptr, result);
+    }
+
+    fn shift_result_flags(
+        &mut self,
+        result: Value,
+        count: Value,
+        carry: Value,
+        overflow: Value,
+        bits: i64,
+    ) {
         let one = self.b.ins().icmp_imm(IntCC::Equal, count, 1);
         let old_overflow = self.flag(11);
         let overflow = self.b.ins().select(one, overflow, old_overflow);
@@ -794,7 +889,6 @@ impl Emitter<'_> {
         }
         let no_shift = self.b.ins().icmp_imm(IntCC::Equal, count, 0);
         self.keep_flags_if(no_shift, saved);
-        self.write(i, ptr, result);
     }
 
     /// ROL/ROR change only CF, and OF for a one-bit rotate; a zero masked

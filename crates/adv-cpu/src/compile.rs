@@ -38,6 +38,7 @@ mod scalar;
 mod shadow;
 mod simd;
 mod sse;
+mod string;
 mod vector;
 mod write_summary;
 pub(crate) mod x87;
@@ -851,6 +852,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let mut entries = BTreeSet::from([region.start]);
     for instruction in instructions.values() {
         if crate::strings::operation(instruction).is_some()
+            || string::repeated(instruction)
             || (!supported(instruction) && crate::floating::native_x87(instruction))
         {
             entries.insert(instruction.ip32());
@@ -859,8 +861,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         if instruction.flow_control() != FlowControl::Next {
             entries.insert(instruction.next_ip32());
         }
-        if matches!(instruction.op0_kind(), OpKind::NearBranch32) {
-            entries.insert(instruction.near_branch32());
+        if matches!(
+            instruction.op0_kind(),
+            OpKind::NearBranch16 | OpKind::NearBranch32
+        ) {
+            entries.insert(instruction.near_branch_target() as u32);
         }
     }
     // A matching indirect call dispatches to a decoded callee internally.
@@ -898,6 +903,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         loops::survey(&instructions, &entries, |i| {
             supported(i)
                 && crate::strings::operation(i).is_none()
+                && !string::supported(i)
                 && !matches!(i.mnemonic(), M::Int | M::Rdtsc)
         })
     } else {
@@ -2747,7 +2753,7 @@ fn exclusive(i: &Instruction) -> bool {
 }
 
 pub(crate) fn supported(i: &Instruction) -> bool {
-    if crate::strings::operation(i).is_some() {
+    if crate::strings::operation(i).is_some() || string::supported(i) {
         return true;
     }
     // `rep ret` is the branch-predictor idiom for a plain return.
@@ -2804,6 +2810,8 @@ pub(crate) fn supported(i: &Instruction) -> bool {
             | M::Jp
             | M::Jnp
             | M::Loop
+            | M::Jecxz
+            | M::Jcxz
     ) {
         return simd::supported(i)
             || scalar::supported(i)
@@ -2833,6 +2841,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
                 }
             }
             OpKind::Immediate32 | OpKind::Immediate8to32 | OpKind::NearBranch32 => {}
+            OpKind::NearBranch16 if matches!(i.mnemonic(), M::Jcxz | M::Jecxz) => {}
             OpKind::Immediate16 if i.mnemonic() == M::Ret || narrow => {}
             OpKind::Immediate8 if narrow => {}
             OpKind::Immediate8to16 if narrow_alu(i.mnemonic()) || word_stack(i) => {}
@@ -4409,17 +4418,20 @@ impl Emitter<'_> {
             return addr;
         }
         let mut addr = self.constant(i.memory_displacement32());
-        if let Some(reg) = reg_index(i.memory_base()) {
-            let value = self.b.use_var(self.regs[reg]);
+        if i.memory_base() != R::None {
+            let value = self.read_register(i.memory_base());
             addr = self.b.ins().iadd(addr, value);
         }
-        if let Some(reg) = reg_index(i.memory_index()) {
-            let value = self.b.use_var(self.regs[reg]);
+        if i.memory_index() != R::None {
+            let value = self.read_register(i.memory_index());
             let scaled = self
                 .b
                 .ins()
                 .imul_imm(value, i64::from(i.memory_index_scale()));
             addr = self.b.ins().iadd(addr, scaled);
+        }
+        if i.memory_base().is_gpr16() || i.memory_index().is_gpr16() {
+            addr = self.b.ins().band_imm(addr, 0xffff);
         }
         if i.segment_prefix() == R::FS && i.mnemonic() != M::Lea {
             let fs = self.b.ins().load(
@@ -5714,7 +5726,13 @@ impl Emitter<'_> {
             self.b.switch_to_block(retry);
             self.direct(i.ip32());
             self.b.switch_to_block(fallback);
-            self.exit_const(Exit::Fallback, i.ip32());
+            if string::supported(i) {
+                // Bulk guards can decline a range, overlap or host-specific
+                // direction. Keep the checked element path native.
+                self.string_instruction(i);
+            } else {
+                self.exit_const(Exit::Fallback, i.ip32());
+            }
             self.b.switch_to_block(budget);
             self.exit_const(Exit::Budget, i.ip32());
             self.b.switch_to_block(read_fault);
@@ -5722,6 +5740,9 @@ impl Emitter<'_> {
             self.b.switch_to_block(write_fault);
             self.exit_const(Exit::WriteFault, i.ip32());
             return true;
+        }
+        if string::supported(i) {
+            return self.string_instruction(i);
         }
         if narrow_alu(i.mnemonic()) {
             let size = if i.op0_kind() == OpKind::Memory {
@@ -5928,17 +5949,26 @@ impl Emitter<'_> {
                 }
                 return true;
             }
-            M::Loop => {
-                // LOOP decrements ECX without touching flags.
+            M::Loop | M::Jecxz | M::Jcxz => {
                 let count = self.b.use_var(self.regs[1]);
-                let count = self.b.ins().iadd_imm(count, -1);
-                self.b.def_var(self.regs[1], count);
-                let condition = self.b.ins().icmp_imm(IntCC::NotEqual, count, 0);
+                let condition = if i.mnemonic() == M::Loop {
+                    // LOOP decrements ECX without touching flags.
+                    let count = self.b.ins().iadd_imm(count, -1);
+                    self.b.def_var(self.regs[1], count);
+                    self.b.ins().icmp_imm(IntCC::NotEqual, count, 0)
+                } else {
+                    let count = if i.mnemonic() == M::Jcxz {
+                        self.b.ins().band_imm(count, 0xffff)
+                    } else {
+                        count
+                    };
+                    self.b.ins().icmp_imm(IntCC::Equal, count, 0)
+                };
                 let yes = self.b.create_block();
                 let no = self.b.create_block();
                 self.b.ins().brif(condition, yes, &[], no, &[]);
                 self.b.switch_to_block(yes);
-                self.direct(i.near_branch32());
+                self.direct(i.near_branch_target() as u32);
                 self.b.switch_to_block(no);
                 self.direct(i.next_ip32());
                 return true;
