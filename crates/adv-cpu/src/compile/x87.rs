@@ -3,7 +3,7 @@
 //! Canonical 80-bit registers are materialized at every observable boundary.
 //! Bounded straight-line segments retain admitted binary64 values between ops.
 //! Only exact binary64 inputs
-//! are admitted; arithmetic additionally requires PC=53 or PC=24 with 24-bit
+//! are admitted; arithmetic additionally requires PC=53, exact PC=64, or PC=24 with 24-bit
 //! operands, RC=nearest, masked exceptions and the same 2^+-400 bounds as
 //! floating::fast. Error-free residuals and the 24-bit re-rounding reproduce
 //! PE/C1, including signed zero. Every rejection precedes guest writes
@@ -317,13 +317,13 @@ impl Emitter<'_> {
                 reverse,
                 pop,
             } => {
-                let single = self.x87_admit_arithmetic(control, slow);
+                let precision = self.x87_admit_arithmetic(control, slow);
                 let target = self.x87_slot(top, dest);
                 let a = (self.x87_double(target, tags, RANGE, slow), false);
                 let (b, at) = self.x87_source(i, source, top, tags, RANGE, slow);
                 let b = (b, matches!(source, Source::F32 | Source::I16));
                 let (a, b) = if reverse { (b, a) } else { (a, b) };
-                let (result, inexact, up) = self.x87_rounded_arithmetic(op, a, b, single, slow);
+                let (result, inexact, up) = self.x87_rounded_arithmetic(op, a, b, precision, slow);
                 status = self.x87_round_flags(status, inexact, up);
                 writes.push((target, result));
                 dp = at;
@@ -683,27 +683,29 @@ impl Emitter<'_> {
         }
         (value, Some(at))
     }
-    /// Admit RC=nearest, masked exceptions and PC=53 or PC=24; the result is
-    /// true for PC=24.
-    fn x87_admit_arithmetic(&mut self, control: Value, slow: ir::Block) -> Value {
+    /// Admit RC=nearest, masked exceptions and valid PC; return PC=24/PC=64.
+    fn x87_admit_arithmetic(&mut self, control: Value, slow: ir::Block) -> (Value, Value) {
         #[cfg(test)]
         testing::emitted(|counts| counts.control_guards += 1);
         let masked = self.b.ins().band_imm(control, 0xf3f);
         let double = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x23f);
         let single = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x03f);
+        let extended = self.b.ins().icmp_imm(IntCC::Equal, masked, 0x33f);
         let valid = self.b.ins().bor(double, single);
+        let valid = self.b.ins().bor(valid, extended);
         self.x87_require(valid, slow);
-        single
+        (single, extended)
     }
     /// One admitted arithmetic operation: (result, inexact, rounded up). PC=24
     /// rejects operands wider than 24 bits, except those known to be narrow,
     /// then re-rounds the binary64 result exactly as floating::fast does.
+    /// PC=64 rejects division and every nonzero add/subtract/product residual.
     fn x87_rounded_arithmetic(
         &mut self,
         op: Op,
         (a, a_narrow): (Value, bool),
         (b, b_narrow): (Value, bool),
-        single: Value,
+        (single, extended): (Value, Value),
         slow: ir::Block,
     ) -> (Value, Value, Value) {
         let tail = crate::floating::fast::SINGLE_TAIL as i64;
@@ -722,11 +724,16 @@ impl Emitter<'_> {
         }
         let zero = self.b.ins().f64const(0.0);
         if op == Op::Div {
+            self.x87_reject(extended, slow);
             let bad = self.b.ins().fcmp(FloatCC::Equal, b, zero);
             self.x87_reject(bad, slow);
         }
         let (result, error) = self.x87_arithmetic(op, a, b);
         let inexact = self.b.ins().fcmp(FloatCC::NotEqual, error, zero);
+        // With bounded inputs the residual is exact, including on Dekker hosts.
+        // No guest write occurs before this PC=64 exactness guard.
+        let bad = self.b.ins().band(extended, inexact);
+        self.x87_reject(bad, slow);
         let err_bits = self.b.ins().bitcast(types::I64, MemFlags::new(), error);
         let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), result);
         let signs = self.b.ins().bxor(err_bits, bits);

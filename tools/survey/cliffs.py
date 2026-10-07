@@ -17,6 +17,8 @@ are counted as unattributed; omitted fallback counts cannot be reconstructed.
 These are execution counts, not time measurements or Tier 1 coverage counts.
 Optional x87_control fields retain the complete PC/RC/mask distribution and
 independent guard counts. Reports predating those fields are counted separately.
+Optional x87_pc64 records all nearest/masked PC=64 Control rejections by
+opportunity class, including rejected operands and operations not evaluated.
 """
 from __future__ import annotations
 
@@ -75,6 +77,8 @@ def aggregate(reports: Iterable[dict]) -> dict:
     controls = Counter()
     control_guards = Counter(dict.fromkeys(("PC", "RC", "Masks"), 0))
     control_reports = 0
+    pc64 = Counter()
+    pc64_reports = 0
     interpreter = {reason: {"entries": 0, "instructions": 0} for reason in INTERPRETER_REASONS}
     verification = dict.fromkeys(VERIFY_COUNTERS, 0)
     per_report = []
@@ -131,6 +135,20 @@ def aggregate(reports: Iterable[dict]) -> dict:
                     raise ValueError("x87 control distribution exceeds exact counts")
                 control_guards.update(expected)
                 control_reports += 1
+            if "x87_pc64" in cliffs:
+                opportunities = mapping(cliffs["x87_pc64"])
+                observed = Counter()
+                for label, value in opportunities.items():
+                    parts = label.split("/") if isinstance(label, str) else []
+                    if len(parts) != 2 or parts[1] not in ("Other", "Operand", "Range", "Inexact", "Exact", "Zero"):
+                        raise ValueError("invalid x87 PC64 category")
+                    mnemonic(parts[0])
+                    observed[label] = count(value)
+                distribution = mapping(required(cliffs, "x87_control"))
+                if sum(observed.values()) != count(distribution.get("PC=64/RC=nearest/masks=3f", 0)):
+                    raise ValueError("inconsistent x87 PC64 coverage")
+                pc64.update(observed)
+                pc64_reports += 1
             for reason, values in run_interpreter.items():
                 if reason not in INTERPRETER_REASONS:
                     raise ValueError("invalid interpreter reason label")
@@ -169,6 +187,8 @@ def aggregate(reports: Iterable[dict]) -> dict:
             "x87_control_reports": control_reports,
             "x87_control": ranked(controls),
             "x87_control_rejections": dict(control_guards),
+            "x87_pc64_reports": pc64_reports,
+            "x87_pc64": ranked(pc64),
         },
         "report_limits": {
             "producer_row_limit": REPORT_ROW_LIMIT,
@@ -224,6 +244,10 @@ def markdown(summary: dict) -> str:
                   "", "| 控制字分类 | 次数 |", "|---|---:|"])
     lines.extend(f"| {label} | {value} |" for label, value in cliffs["x87_control"].items())
     lines.extend(f"| {label} 拒绝 | {value} |" for label, value in cliffs["x87_control_rejections"].items())
+    lines.extend(["", f"PC=64 候选细分覆盖 {cliffs['x87_pc64_reports']} 份报告；"
+                  "Exact 为正常结果精确，Zero 单列，Range 不作精确性判断。",
+                  "", "| 助记符 / 候选分类 | 次数 |", "|---|---:|"])
+    lines.extend(f"| {label} | {value} |" for label, value in cliffs["x87_pc64"].items())
     lines.extend(["", "Tier verification（报告序号按输入顺序；全零不证明启用了校验）", "",
                   "| 报告 | verified | inconclusive | mismatches | mxcsr_flags |",
                   "|---|---:|---:|---:|---:|"])

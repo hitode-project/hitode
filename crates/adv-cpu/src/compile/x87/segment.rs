@@ -178,7 +178,7 @@ struct Resident {
 struct Control {
     value: Value,
     /// Some(single) proves masked exceptions and round-to-nearest at PC=24/53.
-    arithmetic: Option<Value>,
+    arithmetic: Option<(Value, Value)>,
 }
 
 #[derive(Clone)]
@@ -404,12 +404,12 @@ impl Emitter<'_> {
                     reverse,
                     pop,
                 } => {
-                    let tail = match prefix.control.arithmetic {
-                        Some(tail) => tail,
+                    let precision = match prefix.control.arithmetic {
+                        Some(precision) => precision,
                         None => {
-                            let tail = self.x87_admit_arithmetic(prefix.control.value, slow);
-                            prefix.control.arithmetic = Some(tail);
-                            tail
+                            let precision = self.x87_admit_arithmetic(prefix.control.value, slow);
+                            prefix.control.arithmetic = Some(precision);
+                            precision
                         }
                     };
                     let target = prefix.slot(dest);
@@ -420,7 +420,7 @@ impl Emitter<'_> {
                         op,
                         (a.value, a.narrow.known()),
                         (b.value, b.narrow.known()),
-                        tail,
+                        precision,
                         slow,
                     );
                     // Both input checks dominate this continuation. The proof

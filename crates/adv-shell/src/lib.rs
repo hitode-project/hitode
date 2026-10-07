@@ -1920,12 +1920,13 @@ fn cliffs_report(c: &adv_runtime::Cliffs) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
+        "{{\"x87_helper_calls\":{},\"x87_fast\":{},\"x87_exact\":{{{}}},\"x87_control\":{{{}}},\"x87_control_rejections\":{{{}}},\"x87_pc64\":{{{}}},\"fallbacks\":{{{}}},\"interpreter\":{{{}}}}}",
         c.x87_helper_calls,
         c.x87_fast,
         counts(c.x87_exact_rows(), ROWS),
         counts(c.x87_control_rows(), usize::MAX),
         counts(c.x87_control_rejections(), usize::MAX),
+        counts(c.x87_pc64_rows(), usize::MAX),
         counts(c.fallback_rows(), ROWS),
         interpreter
     )

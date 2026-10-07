@@ -19,12 +19,23 @@ pub enum X87Cliff {
     NoFastForm,
     /// A pending unmasked exception or MMX mode.
     Pending,
-    /// A control word outside the arithmetic fast model (round to nearest,
-    /// masked exceptions, PC=24 or 53); loads and stores may still reject for
-    /// operand reasons under it.
+    /// A control word outside the general arithmetic model (round to nearest,
+    /// masked exceptions, PC=24 or 53), including failed exact-only PC=64 calls;
+    /// loads and stores may still reject for operand reasons under it.
     Control,
     /// Operands, tags or memory outside the fast model.
     Operand,
+}
+
+/// Read-only opportunity classification for rejected PC=64 arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum X87Pc64 {
+    Other,
+    Operand,
+    Range,
+    Inexact,
+    Exact,
+    Zero,
 }
 
 /// Why a block ran in the interpreter.
@@ -61,6 +72,8 @@ pub struct Cliffs {
     /// Control-classified rejections, keyed by PC, RC and exception mask bits.
     /// Kept separately so the truncated mnemonic list cannot hide controls.
     pub x87_control: HashMap<u16, u64>,
+    /// PC=64, nearest, fully masked Control rejections; no operand data.
+    pub x87_pc64: HashMap<(Mnemonic, X87Pc64), u64>,
     /// Native exits that handed the instruction at their PC to the interpreter.
     pub fallbacks: HashMap<Mnemonic, u64>,
     pub interpreter: HashMap<InterpreterReason, Count>,
@@ -75,6 +88,9 @@ impl Cliffs {
         }
         for (key, n) in other.x87_control {
             *self.x87_control.entry(key).or_default() += n;
+        }
+        for (key, n) in other.x87_pc64 {
+            *self.x87_pc64.entry(key).or_default() += n;
         }
         for (key, n) in other.fallbacks {
             *self.fallbacks.entry(key).or_default() += n;
@@ -112,6 +128,15 @@ impl Cliffs {
             let rc = ["nearest", "down", "up", "zero"][usize::from(cw >> 10 & 3)];
             (format!("PC={pc}/RC={rc}/masks={:02x}", cw & 0x3f), n)
         }))
+    }
+
+    /// Complete PC=64 opportunity distribution, without values or addresses.
+    pub fn x87_pc64_rows(&self) -> Vec<(String, u64)> {
+        rows(
+            self.x87_pc64
+                .iter()
+                .map(|(&(m, r), &n)| (format!("{m:?}/{r:?}"), n)),
+        )
     }
 
     /// Independent failed control guards; a call can fail more than one.
@@ -173,11 +198,14 @@ mod tests {
     fn control_distribution_merges_and_counts_overlapping_guards() {
         let mut a = Cliffs::default();
         a.x87_control.insert(0x033f, 10);
+        a.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 10);
         let mut b = Cliffs::default();
         b.x87_control.insert(0x033f, 2);
+        b.x87_pc64.insert((Mnemonic::Fadd, X87Pc64::Exact), 2);
         b.x87_control.insert(0x0b3e, 3);
         b.x87_control.insert(0x063f, 5);
         a.merge(b);
+        assert_eq!(a.x87_pc64_rows(), vec![("Fadd/Exact".into(), 12)]);
         assert_eq!(
             a.x87_control_rows(),
             vec![
