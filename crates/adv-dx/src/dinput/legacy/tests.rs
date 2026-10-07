@@ -6,7 +6,7 @@ use adv_cpu::{
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_win32::{
     Win32, Win32Config,
-    user32::window::{ControlState, Rect, WS_POPUP, WS_VISIBLE, Window},
+    user32::window::{Rect, WS_POPUP, WS_VISIBLE, Window},
 };
 
 const HWND: u32 = 0x10020;
@@ -44,33 +44,8 @@ fn fixture(jit: bool) -> (Machine<JitCpu>, u32) {
     )
     .unwrap();
     let rect = Rect::new(100, 50, 640, 480);
-    let window = Window {
-        hwnd: HWND,
-        class: 0,
-        proc: 0,
-        unicode: false,
-        style: WS_POPUP | WS_VISIBLE,
-        ex_style: 0,
-        parent: 0,
-        owner: 0,
-        id: 0,
-        instance: 0x400000,
-        rect,
-        placement: adv_win32::user32::PlacementState::new(rect),
-        text: String::new(),
-        extra: Vec::new(),
-        user_data: 0,
-        thread: 0,
-        children: Vec::new(),
-        font: 0,
-        needs_paint: false,
-        created_us: 0,
-        initial_geometry_reported: false,
-        destroying: false,
-        control: ControlState::default(),
-        auto_clicks: 0,
-        hidden_popup: false,
-    };
+    let mut window = Window::new(HWND, 0, 0, WS_POPUP | WS_VISIBLE, 0, 0, rect, 0);
+    window.instance = 0x400000;
     let user = &mut m.ext.get_mut::<Win32>().user;
     assert!(user.windows.insert(&mut m.sys.objects, HWND, window));
     user.top.push(HWND);

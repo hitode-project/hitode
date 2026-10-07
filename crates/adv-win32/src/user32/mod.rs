@@ -3,6 +3,7 @@
 //! formatting/message-box helpers Game.exe uses.
 
 mod accelerator;
+mod caret;
 pub(crate) mod clipboard;
 pub mod compat;
 pub mod controls;
@@ -677,6 +678,7 @@ pub fn register(reg: &mut Registry) {
     enumeration::register(reg);
     menu::register(reg);
     input::register(reg);
+    caret::register(reg);
     image::register(reg);
     clipboard::register(reg);
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
