@@ -14,6 +14,7 @@ pub type FileIdentity = (u64, u64);
 pub struct FileSection {
     file: RefCell<Option<File>>,
     virtual_data: Option<std::sync::Arc<[u8]>>,
+    optical_data: Option<super::OpticalFile>,
     file_len: Cell<u64>,
     writable: Cell<bool>,
     pages: RefCell<BTreeMap<u64, Rc<FilePage>>>,
@@ -129,6 +130,13 @@ impl FileSection {
 
     fn load_page(&self, index: u64) -> std::io::Result<[u8; 4096]> {
         let mut bytes = [0; 4096];
+        if let Some(file) = &self.optical_data {
+            file.read_at(
+                index.checked_mul(PAGE).ok_or(io::ErrorKind::InvalidInput)?,
+                &mut bytes,
+            )?;
+            return Ok(bytes);
+        }
         if let Some(data) = &self.virtual_data {
             let start = usize::try_from(
                 index
@@ -212,6 +220,7 @@ impl FileSection {
         Rc::new(Self {
             file: RefCell::new(None),
             virtual_data: None,
+            optical_data: None,
             file_len: Cell::new(0),
             writable: Cell::new(false),
             pages: RefCell::new(BTreeMap::new()),
@@ -222,6 +231,7 @@ impl FileSection {
         Rc::new(Self {
             file: RefCell::new(Some(file)),
             virtual_data: None,
+            optical_data: None,
             file_len: Cell::new(len),
             writable: Cell::new(writable),
             pages: RefCell::new(BTreeMap::new()),
@@ -348,6 +358,26 @@ impl SharedFiles {
             file: RefCell::new(None),
             file_len: Cell::new(data.len() as u64),
             virtual_data: Some(data),
+            optical_data: None,
+            writable: Cell::new(false),
+            pages: RefCell::new(BTreeMap::new()),
+        });
+        self.files.borrow_mut().insert(id, Rc::downgrade(&section));
+        section
+    }
+
+    /// Optical pages retain a bounded file owner and load only requested ranges.
+    pub fn optical(&self, file: super::OpticalFile) -> Rc<FileSection> {
+        let id = file.identity();
+        self.prune();
+        if let Some(section) = self.lookup(id) {
+            return section;
+        }
+        let section = Rc::new(FileSection {
+            file: RefCell::new(None),
+            virtual_data: None,
+            file_len: Cell::new(file.len()),
+            optical_data: Some(file),
             writable: Cell::new(false),
             pages: RefCell::new(BTreeMap::new()),
         });
@@ -525,6 +555,7 @@ mod tests {
         let backing = FileSection {
             file: RefCell::new(Some(file)),
             virtual_data: None,
+            optical_data: None,
             file_len: Cell::new(8192),
             writable: Cell::new(true),
             pages: RefCell::new(BTreeMap::from([(0, first.clone()), (1, second.clone())])),

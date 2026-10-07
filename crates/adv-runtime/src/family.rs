@@ -213,6 +213,14 @@ impl<B: Backend> Runtime<B> {
         });
         let exe_path = config.os.exe_path();
         Win32::install(&mut child, config).map_err(|e| Error::new(8, e.to_string()))?;
+        child
+            .ext
+            .insert(adv_dx::dinput::InputProvider(crate::boot::input_snapshot));
+        child
+            .ext
+            .get_mut::<Win32>()
+            .vfs
+            .inherit_optical(&self.machine.ext.get::<Win32>().vfs);
         {
             let parent = self.machine.ext.get::<Win32>();
             let win32 = child.ext.get_mut::<Win32>();

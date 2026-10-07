@@ -301,6 +301,21 @@ fn set_unhandled_exception_filter(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(std::mem::replace(&mut w.unhandled_filter, f))
 }
 
+fn unhandled_exception_filter(env: &mut Env<'_>) -> Outcome {
+    let filter = env.ext.get::<Win32>().unhandled_filter;
+    if filter == 0 {
+        return Outcome::Return(0); // EXCEPTION_CONTINUE_SEARCH, without a guest filter.
+    }
+    let pointers = env.arg(0);
+    // The caller owns EXCEPTION_POINTERS and CONTEXT. A CRT frame filter may
+    // pass the dispatcher's records here, then resume their edited context when
+    // the registered top-level filter returns EXCEPTION_CONTINUE_EXECUTION.
+    Outcome::call(filter, [pointers], |_, result| {
+        Outcome::Return(result.value())
+    })
+    .unwindable()
+}
+
 const EXCEPTION_UNWINDING: u32 = 2;
 const EXCEPTION_EXIT_UNWIND: u32 = 4;
 const STATUS_UNWIND: u32 = 0xc000_0027;
@@ -931,9 +946,13 @@ pub(super) fn register(reg: &mut Registry) {
         1,
         set_unhandled_exception_filter,
     );
-    stdcall(reg, K32, "UnhandledExceptionFilter", 1, |_| {
-        Outcome::Return(0)
-    });
+    stdcall(
+        reg,
+        K32,
+        "UnhandledExceptionFilter",
+        1,
+        unhandled_exception_filter,
+    );
     stdcall(reg, K32, "RtlUnwind", 4, rtl_unwind);
     stdcall(reg, K32, "SetErrorMode", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "OutputDebugStringA", 1, output_debug_string_a);

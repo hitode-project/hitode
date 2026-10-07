@@ -100,6 +100,13 @@ pub(super) fn byte_spaces(codepage: u32) -> Option<[bool; 256]> {
     table(codepage).map(|words| std::array::from_fn(|i| words[i + 1] & 8 != 0))
 }
 
+pub(super) fn lowercase_bytes(codepage: u32) -> Option<[u8; 256]> {
+    byte_flags(codepage, 0)?;
+    Some(std::array::from_fn(|byte| {
+        byte_case(codepage, byte as u8, false)
+    }))
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_ABI);
     for module in ["msvcrt.dll", "msvcr80.dll", "msvcr90.dll"] {
@@ -181,7 +188,11 @@ fn case(env: &mut Env<'_>, character: i32, upper: bool) -> Outcome {
             "CRT byte case conversion requires EOF or a byte; packed DBCS and other integers are unavailable",
         );
     };
-    let converted = if upper {
+    Outcome::Return(u32::from(byte_case(codepage, byte, upper)))
+}
+
+fn byte_case(codepage: u32, byte: u8, upper: bool) -> u8 {
+    if upper {
         match byte {
             b'a'..=b'z' => byte - 32,
             0xe0..=0xf6 | 0xf8..=0xfe if codepage == 1252 => byte - 32,
@@ -197,8 +208,7 @@ fn case(env: &mut Env<'_>, character: i32, upper: bool) -> Outcome {
             0x9f if codepage == 1252 => 0xff,
             _ => byte,
         }
-    };
-    Outcome::Return(u32::from(converted))
+    }
 }
 
 #[win32(msvcrt, name = "tolower", level = implement)]

@@ -90,6 +90,11 @@ pub(super) fn formatting_codepage(env: &Env<'_>) -> u32 {
         .map_or(0, |state| state.categories[1].codepage)
 }
 
+/// Buffer comparisons consume the same module-owned LC_CTYPE byte conversion.
+pub(super) fn lowercase_bytes(env: &Env<'_>) -> Option<[u8; 256]> {
+    ctype::lowercase_bytes(formatting_codepage(env))
+}
+
 /// Decimal conversions observe NUMERIC and CTYPE independently. The existing
 /// four language profiles all publish decimal dot through localeconv.
 pub(super) fn scalar_float_profile(env: &Env<'_>) -> Option<([bool; 256], u8)> {
