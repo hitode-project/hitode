@@ -417,7 +417,10 @@ struct Cached {
 }
 
 impl Cached {
-    fn valid(&self, memory: &Memory) -> bool {
+    fn valid(&self, memory: &mut Memory) -> bool {
+        for page in self.pages.iter().flatten() {
+            memory.watch_code(page.address, PAGE_SIZE);
+        }
         self.pages.iter().flatten().all(|p| p.matches(memory))
             // Also makes reuse with another Memory instance safe, and catches
             // shared executor writes before its dirty-page synchronization.
@@ -425,7 +428,8 @@ impl Cached {
     }
 }
 
-fn fetch(memory: &Memory, pc: u32) -> Cached {
+fn fetch(memory: &mut Memory, pc: u32) -> Cached {
+    memory.watch_code(pc, 15);
     let mut entry = Cached {
         decoded: Decoded::Stop(Step::InvalidInstruction { pc }),
         pc,
@@ -517,7 +521,10 @@ struct DecodedBlock {
 }
 
 impl DecodedBlock {
-    fn valid(&self, memory: &Memory) -> bool {
+    fn valid(&self, memory: &mut Memory) -> bool {
+        for page in &self.pages {
+            memory.watch_code(page.address, PAGE_SIZE);
+        }
         self.pages.iter().all(|page| page.matches(memory))
             && memory
                 .read_data(self.pc, self.bytes.len())
@@ -525,7 +532,7 @@ impl DecodedBlock {
     }
 
     fn fetch(
-        memory: &Memory,
+        memory: &mut Memory,
         start: u32,
         native: Option<(&BTreeMap<u32, u32>, u64)>,
         decodes: &mut u64,
@@ -2258,6 +2265,85 @@ fn condition_true(condition: ConditionCode, flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_fetch_and_cross_memory_cache_hits_watch_all_code_pages() {
+        const CODE: u32 = 0x10ffc;
+        fn memory() -> Memory {
+            let mut memory = Memory::new(0x10000, 3 * PAGE_SIZE).unwrap();
+            memory
+                .protect(0x10000, 3 * PAGE_SIZE, READ | WRITE | EXEC)
+                .unwrap();
+            // MOV crosses the page boundary; the block returns to its header.
+            memory
+                .write(CODE, &[0xb8, 7, 0, 0, 0, 0x43, 0xeb, 0xf8])
+                .unwrap();
+            memory
+        }
+        fn state() -> CpuState {
+            let mut state = CpuState::default();
+            state.eip = CODE;
+            state
+        }
+        fn watched(memory: &mut Memory) {
+            let permissions = memory.native_permissions();
+            assert_ne!(permissions[0] & EXEC, 0);
+            assert_ne!(permissions[1] & EXEC, 0);
+            assert_eq!(permissions[2] & EXEC, 0);
+        }
+        let mut interpreter = Interpreter::new();
+        let mut first = memory();
+        let versions = first.versions.clone();
+        let mut first_state = state();
+        assert_eq!(
+            interpreter.step(&mut first_state, &mut first),
+            Step::Executed
+        );
+        assert_eq!(first_state.regs[0], 7);
+        assert_eq!(first.versions, versions);
+        watched(&mut first);
+        let decodes = interpreter.decode_count();
+        let mut second = memory();
+        let mut second_state = state();
+        assert_eq!(
+            interpreter.step(&mut second_state, &mut second),
+            Step::Executed
+        );
+        assert_eq!(
+            interpreter.decode_count(),
+            decodes,
+            "reuse the decoded instruction"
+        );
+        watched(&mut second);
+        let epoch = second.epoch;
+        second.write(0x12000, &[9]).unwrap();
+        assert_eq!(second.epoch, epoch);
+        second.write(CODE + 1, &[8]).unwrap();
+        assert_ne!(second.epoch, epoch);
+        second_state.eip = CODE;
+        assert_eq!(
+            interpreter.step(&mut second_state, &mut second),
+            Step::Executed
+        );
+        assert_eq!(second_state.regs[0], 8);
+        assert_eq!(interpreter.decode_count(), decodes + 1);
+
+        let mut third = memory();
+        let (execution, _) = interpreter.run_block(&mut state(), &mut third, 64, 0, None);
+        assert_eq!(execution.units, 3);
+        let decodes = interpreter.decode_count();
+        let mut fourth = memory();
+        let mut fourth_state = state();
+        let (execution, _) = interpreter.run_block(&mut fourth_state, &mut fourth, 64, 0, None);
+        assert_eq!(execution.units, 3);
+        assert_eq!(fourth_state.eip, CODE);
+        assert_eq!(
+            interpreter.decode_count(),
+            decodes,
+            "reuse the full decoded block"
+        );
+        watched(&mut fourth);
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

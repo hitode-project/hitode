@@ -508,7 +508,7 @@ impl Executor {
 
     pub fn add_region(&mut self, region: Region) -> Result<(), String> {
         let start = Instant::now();
-        let compiled = compile::compile(&region, &self.memory, self.shadow_returns.is_some())?;
+        let compiled = compile::compile(&region, &mut self.memory, self.shadow_returns.is_some())?;
         self.stats.compilations += 1;
         self.stats.compile_time += start.elapsed();
         self.pending_regions.remove(&region.start);
@@ -708,7 +708,7 @@ impl Executor {
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
             return Ok(false);
         }
-        let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
+        let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
         let mut fragments = if let Some(limit) = limit {
             let budget = crate::compile_budget::background_budget(
@@ -1190,7 +1190,7 @@ impl Executor {
         // Direct leaves already inside this unit's immutable byte window do not
         // need a racy call-target hint. Admission still decodes the current bytes
         // and permits only a bounded, register-only leaf through its return.
-        let direct: BTreeSet<u32> = compile::Snapshot::capture(&old_region, &self.memory)
+        let direct: BTreeSet<u32> = compile::Snapshot::capture(&old_region, &mut self.memory)
             .map(|input| input.direct_leaf_callees().into_iter().collect())
             .unwrap_or_default();
         // Observed indirect call targets join the unit, so the calls and their
@@ -1324,7 +1324,7 @@ impl Executor {
             }))
             .collect();
         let Some(region) = crate::discovery::discover(
-            &self.memory,
+            &mut self.memory,
             pc,
             stop,
             self.auto_compile_strategy,
@@ -2735,7 +2735,7 @@ mod tiering_tests {
         m.protect(0x1000, 4096, crate::READ | crate::EXEC).unwrap();
         for (sequence, start) in [0x1000u32, 0x1100, 0x1200].into_iter().enumerate() {
             let region = Region::new(start, 2);
-            let snapshot = compile::Snapshot::capture(&region, &m.memory).unwrap();
+            let snapshot = compile::Snapshot::capture(&region, &mut m.memory).unwrap();
             m.deferred_compilations.insert(start, snapshot);
             m.deferred_order.insert(start, sequence as u64);
         }
@@ -3011,16 +3011,16 @@ mod tiering_tests {
             &[0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xc3],
         ];
         for leaf in cases {
-            let m = direct_leaf_machine(leaf, true);
+            let mut m = direct_leaf_machine(leaf, true);
             let region = crate::discovery::discover(
-                &m.memory,
+                &mut m.memory,
                 0x1100,
                 0x3000,
                 CompileStrategy::Fast,
                 &BTreeSet::new(),
             )
             .unwrap();
-            let input = compile::Snapshot::capture(&region, &m.memory).unwrap();
+            let input = compile::Snapshot::capture(&region, &mut m.memory).unwrap();
             assert!(input.direct_leaf_callees().is_empty(), "leaf {leaf:02x?}");
         }
 
@@ -3030,7 +3030,7 @@ mod tiering_tests {
         m.write(0x110f, &0x0du32.to_le_bytes()).unwrap();
         m.write(0x1120, &[0xc3]).unwrap();
         let region = crate::discovery::discover(
-            &m.memory,
+            &mut m.memory,
             0x1100,
             0x3000,
             CompileStrategy::Fast,
@@ -3039,7 +3039,7 @@ mod tiering_tests {
         .unwrap();
         assert!(region.start + region.len as u32 <= 0x1180);
         assert!(
-            compile::Snapshot::capture(&region, &m.memory)
+            compile::Snapshot::capture(&region, &mut m.memory)
                 .unwrap()
                 .direct_leaf_callees()
                 .is_empty()

@@ -9,7 +9,7 @@ const MAX_BYTES: usize = 16 * 1024;
 const MAX_INSTRUCTIONS: usize = 256;
 
 pub(crate) fn discover(
-    memory: &Memory,
+    memory: &mut Memory,
     entry: u32,
     stop: u32,
     strategy: CompileStrategy,
@@ -31,6 +31,7 @@ pub(crate) fn discover(
                 frontier.insert(pc);
                 break;
             }
+            memory.watch_code(pc, 15);
             let mut bytes = [0; 15];
             let mut available = 0;
             for offset in 0..15u32 {

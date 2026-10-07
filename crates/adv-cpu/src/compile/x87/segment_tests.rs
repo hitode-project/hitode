@@ -36,7 +36,7 @@ fn resident_stack_wrap_and_dead_raw_slots_match_every_budget_prefix() {
         actual_memory
             .write(DATA + 4, &0.7f32.to_le_bytes())
             .unwrap();
-        let compiled = compile(&Region::new(CODE, code.len()), &actual_memory, false).unwrap();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
         for budget in 0..=instructions.len() {
             let mut actual_memory = memory(&code);
             let mut expected_memory = memory(&code);
@@ -206,7 +206,7 @@ fn segment_planning_respects_real_entries_and_bounds_native_body_size() {
     let mut m = memory(&code);
     m.write(DATA, &1.3f32.to_le_bytes()).unwrap();
     m.write(DATA + 4, &0.7f32.to_le_bytes()).unwrap();
-    let compiled = compile(&region, &m, false).unwrap();
+    let compiled = compile(&region, &mut m, false).unwrap();
     let mut actual = state();
     actual.eip = split;
     let mut expected = actual.clone();
@@ -226,10 +226,10 @@ fn segment_planning_respects_real_entries_and_bounds_native_body_size() {
     );
     expected.fuel = actual.fuel;
     assert_eq!(actual, expected);
-    let m = memory(&code);
-    let resident = compile(&Region::new(CODE, code.len()), &m, false).unwrap();
+    let mut m = memory(&code);
+    let resident = compile(&Region::new(CODE, code.len()), &mut m, false).unwrap();
     testing::SINGLE_ONLY.set(true);
-    let single = compile(&Region::new(CODE, code.len()), &m, false);
+    let single = compile(&Region::new(CODE, code.len()), &mut m, false);
     testing::SINGLE_ONLY.set(false);
     let single = single.unwrap();
     assert!(
@@ -274,6 +274,8 @@ fn interleaved_data(m: &mut Memory) {
     m.write(DATA + 24, &0x1234u32.to_le_bytes()).unwrap();
     m.protect(DATA + 0x1000, 4096, 0).unwrap();
     m.protect(DATA + 0x2000, 4096, READ | WRITE | EXEC).unwrap();
+    // The moved integer stores deliberately exercise the SMC cold lane.
+    m.watch_code(DATA + 0x2000, 4096);
 }
 
 /// memory() with the last page as shared audio where the host supports it.
@@ -330,10 +332,10 @@ fn integer_lanes_match_single_instruction_code_for_every_budget_and_entry() {
 
 fn lane_matches_single(code: &[u8]) {
     let instructions = decoded(code);
-    let m = lane_memory(code);
-    let lanes = compile(&Region::new(CODE, code.len()), &m, false).unwrap();
+    let mut m = lane_memory(code);
+    let lanes = compile(&Region::new(CODE, code.len()), &mut m, false).unwrap();
     testing::SINGLE_ONLY.set(true);
-    let single = compile(&Region::new(CODE, code.len()), &m, false);
+    let single = compile(&Region::new(CODE, code.len()), &mut m, false);
     testing::SINGLE_ONLY.set(false);
     let single = single.unwrap();
     for i in &instructions {

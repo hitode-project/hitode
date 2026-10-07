@@ -390,7 +390,7 @@ mod tests {
         let mut memory = Memory::new(0x10000, 4096).unwrap();
         memory.protect(0x10000, 4096, READ | WRITE | EXEC).unwrap();
         memory.write(0x10000, &[0x90, 0xc3]).unwrap();
-        Snapshot::capture(&Region::new(0x10000, 2), &memory).unwrap()
+        Snapshot::capture(&Region::new(0x10000, 2), &mut memory).unwrap()
     }
 
     fn receive(worker: &mut Worker) -> Completion {
@@ -689,7 +689,7 @@ mod tests {
         let mut authored = Region::new(0x10000, 16384);
         authored.compile_strategy = crate::CompileStrategy::Fast;
         assert!(matches!(
-            worker.try_submit(Snapshot::capture(&authored, &memory).unwrap()),
+            worker.try_submit(Snapshot::capture(&authored, &mut memory).unwrap()),
             Err(SubmitError::WorkLimit {
                 work: 16384,
                 limit: 8
@@ -729,7 +729,7 @@ mod tests {
             memory.write(0x10000, &bytes).unwrap();
             let mut region = Region::new(0x10000, bytes.len());
             region.compile_strategy = strategy;
-            Snapshot::capture(&region, &memory).unwrap()
+            Snapshot::capture(&region, &mut memory).unwrap()
         };
         assert!(matches!(
             worker.try_submit(loop_input(64, crate::CompileStrategy::Speed)),
@@ -789,7 +789,7 @@ mod tests {
             memory.write(0x10000, &bytes).unwrap();
             let mut region = Region::new(0x10000, bytes.len());
             region.compile_strategy = strategy;
-            let input = Snapshot::capture(&region, &memory).unwrap();
+            let input = Snapshot::capture(&region, &mut memory).unwrap();
             let begun = WakeEvent::new().unwrap();
             let signal = begun.clone();
             let released = WakeEvent::new().unwrap();
@@ -870,7 +870,7 @@ mod tests {
                 memory.write(0x10000, &bytes).unwrap();
                 let mut region = Region::new(0x10000, bytes.len());
                 region.compile_strategy = strategy;
-                let mut input = Snapshot::capture(&region, &memory).unwrap();
+                let mut input = Snapshot::capture(&region, &mut memory).unwrap();
                 if strategy == crate::CompileStrategy::Fast {
                     input = crate::compile_budget::plan(input, limit).unwrap().remove(0);
                 }
@@ -921,7 +921,7 @@ mod tests {
         memory.write(0x10000, &[0x90; 16384]).unwrap();
         let mut authored = Region::new(0x10000, 16384);
         authored.compile_strategy = crate::CompileStrategy::Fast;
-        let input = Snapshot::capture(&authored, &memory).unwrap();
+        let input = Snapshot::capture(&authored, &mut memory).unwrap();
         let mut planning = Vec::new();
         for _ in 0..21 {
             let began = Instant::now();
