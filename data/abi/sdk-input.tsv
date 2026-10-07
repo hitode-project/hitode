@@ -68,3 +68,5 @@ kernel32.dll	CreateProcessInternalW	stdcall	i32	Windows.Win32.Foundation.BOOL	hT
 ntdll.dll	NtGetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|ThreadContext:CONTEXT*:ptr:1
 ntdll.dll	NtFlushInstructionCache	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|RegionSize:usize:u32:1
 ntdll.dll	NtSetContextThread	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ThreadHandle:Windows.Win32.Foundation.HANDLE:handle:1|ThreadContext:CONTEXT*:ptr:1
+ntdll.dll	LdrLoadDll	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DllPath:Windows.Win32.Foundation.PCWSTR:str16:1|DllCharacteristics:u32*:ptr:1|DllName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|DllHandle:void**:ptr:1
+ntdll.dll	NtDelayExecution	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	Alertable:Windows.Win32.Foundation.BOOLEAN:u32:1|DelayInterval:LARGE_INTEGER*:ptr:1

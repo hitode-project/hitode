@@ -2,9 +2,10 @@
 //! Headless icon identities without decoded pixels are never appended as images.
 use adv_abi::{GuestPtr, Handle, Registry, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
-use adv_machine::{Env, Namespace, Objects};
+use adv_machine::{Env, Namespace, Objects, Outcome};
 
 use crate::{Win32, util::set_last_error};
+mod stream;
 
 const COLOR32: u32 = 0x20;
 const MASK: u32 = 1;
@@ -275,15 +276,9 @@ fn replace_icon(env: &mut Env<'_>, handle: i32, index: i32, icon: Handle) -> i32
     }
 }
 
-#[win32(comctl32, name = "ImageList_Read", level = safe_fail)]
-fn read(env: &mut Env<'_>, _stream: GuestPtr<()>) -> i32 {
-    unsupported(
-        env,
-        "comctl32.dll!ImageList_Read",
-        "COM IStream image-list deserialization is unavailable",
-        50,
-        0,
-    )
+#[win32(comctl32, name = "ImageList_Read", level = implement)]
+fn read(env: &mut Env<'_>, stream: GuestPtr<()>) -> Outcome {
+    stream::read(env, stream.addr())
 }
 
 pub(super) fn register(registry: &mut Registry) {

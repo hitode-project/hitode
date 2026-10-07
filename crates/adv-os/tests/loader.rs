@@ -44,6 +44,27 @@ fn machine() -> Machine<UnicornCpu> {
 mod delay_fixture;
 
 #[test]
+fn absent_extensions_do_not_create_modules_without_a_system_provider() {
+    struct Empty;
+    impl FileSource for Empty {
+        fn read(&self, _: &str) -> Option<Vec<u8>> {
+            None
+        }
+    }
+    let mut guest = machine();
+    for name in ["missing.dll", "missing.drv", "missing.ocx", "missing.unt"] {
+        assert!(matches!(
+            guest.load(&Empty, name),
+            Err(adv_os::LoadError::NotFound(_))
+        ));
+        assert!(adv_os::modules(&guest.ext).by_name(name).is_none());
+    }
+    // An actual registered provider remains available without a guest file.
+    let id = guest.load(&Empty, "pal.dll").unwrap();
+    assert_eq!(adv_os::modules(&guest.ext).get(id).kind, ModuleKind::Host);
+}
+
+#[test]
 fn shipped_dll_wins_over_api_registration_unless_provider_is_explicit() {
     struct Files(Vec<u8>);
     impl FileSource for Files {

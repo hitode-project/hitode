@@ -273,5 +273,30 @@
     "source": "phnt ntpsapi.h primary declaration and authored Microsoft Windows x86 caller",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
     "native_verification": "30 DWORDs: actual suspended child, native get/set register changes read back by both NT and Win32, unrequested groups, restricted/closed handles and inaccessible pointer, unchanged LastError, original context restored and child exits 37"
+  },
+  "nt_resume_thread_implementation": {
+    "scope": "NtResumeThread frontend over the shared thread suspend count and process supervisor; reuse the supplemental master declaration",
+    "source": "phnt ntpsapi.h and authored Microsoft Windows x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
+    "native_verification": "20 DWORDs: invalid handle/output preserves state, actual old suspend count, NT/Win32 count interop, NULL output, completed valid thread reports zero without rescheduling, LastError unchanged, child exit 37"
+  },
+  "ldr_load_dll": {
+    "scope": "LdrLoadDll, four x86 stack words and signed NTSTATUS; default search with NULL or zero characteristics",
+    "source": "phnt ntldr.h primary declaration and authored Microsoft Windows x86 caller",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntldr.h",
+    "native_verification": "20 DWORDs: counted UTF-16 DLL name, missing DLL preserves output and LastError, actual DllMain LastError change and callable export, two genuine load references and final unload, failed initialization releases the image while preserving output"
+  },
+  "nt_read_virtual_memory_implementation": {
+    "scope": "NtReadVirtualMemory frontend; reuse the master supplemental declaration and common VM/process owner",
+    "source": "phnt ntmmapi.h and authored Microsoft Windows x86 oracle",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
+    "native_verification": "32 DWORDs cover real remote bytes, VM_READ-only handles, invalid handles/source/output and partial-copy atomic failure, zero-size handle bypass, optional/inaccessible count outputs, unchanged LastError and child exit 37"
+  },
+  "nt_delay_execution": {
+    "scope": "NtDelayExecution; two x86 stack words, byte BOOLEAN and signed 64-bit 100 ns interval, NTSTATUS",
+    "source": "phnt ntexapi.h primary declaration, Microsoft WDM delay contract and authored Microsoft Windows x86 caller",
+    "documentation": "https://github.com/winsiderss/phnt/blob/master/ntexapi.h",
+    "interval_documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kedelayexecutionthread",
+    "native_verification": "18 DWORDs: bad/unaligned pointers, zero yield, expired and future absolute time, actual relative wait permits worker progress and exit 37, four-byte aligned interval and unchanged LastError"
   }
 }

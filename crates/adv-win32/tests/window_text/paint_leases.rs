@@ -33,7 +33,7 @@ fn record<B: TestCpu>(t: &mut Fixture<B>, code: &mut Asm, name: &str, args: &[Ar
     code.mov_mem_eax(result);
     result
 }
-fn direct<B: TestCpu>(t: &mut Fixture<B>, name: &str, args: &[u32]) -> Outcome {
+pub(super) fn direct<B: TestCpu>(t: &mut Fixture<B>, name: &str, args: &[u32]) -> Outcome {
     let (module, name) = name.split_once('!').unwrap_or(("user32.dll", name));
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);

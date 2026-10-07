@@ -19,6 +19,25 @@ fn write(
         copied.addr(),
     )
 }
+#[win32(ntdll, name = "NtReadVirtualMemory", level = implement)]
+fn read(
+    env: &mut Env<'_>,
+    process: Handle,
+    address: GuestPtr<()>,
+    buffer: GuestPtr<()>,
+    size: u32,
+    copied: GuestPtr<u32>,
+) -> Outcome {
+    crate::kernel32::native_read_memory(
+        env,
+        process.0,
+        address.addr(),
+        buffer.addr(),
+        size,
+        copied.addr(),
+    )
+}
+
 // Every guest writer commits through the common code-mutation barrier, so
 // translated blocks are already invalidated before execution can resume. The
 // native x86 oracle also accepts arbitrary handles/ranges here. The mutation
@@ -31,5 +50,6 @@ fn flush(_env: &mut Env<'_>, _process: Handle, _address: GuestPtr<()>, _size: u3
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(write_ABI);
+    registry.register(read_ABI);
     registry.register(flush_ABI);
 }

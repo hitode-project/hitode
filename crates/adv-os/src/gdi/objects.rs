@@ -15,6 +15,8 @@ pub struct DcModes {
     pub window_origin: [i32; 2],
     /// Device viewport origin. MM_TEXT uses translation without scaling.
     pub viewport_origin: [i32; 2],
+    /// Brush alignment in client device coordinates, independent of mapping.
+    pub brush_origin: [i32; 2],
 }
 impl Default for DcModes {
     fn default() -> Self {
@@ -26,6 +28,7 @@ impl Default for DcModes {
             text_align: 0,
             window_origin: [0, 0],
             viewport_origin: [0, 0],
+            brush_origin: [0, 0],
         }
     }
 }
@@ -139,6 +142,12 @@ impl Gdi {
     }
     pub fn get_mut<'a>(&self, objects: &'a mut Objects, h: u32) -> Option<&'a mut GdiObj> {
         objects.owned_mut(objects.lookup_alias(self.namespace.get()?, h)?)
+    }
+
+    /// Display DC identity is independent of the shared primary surface handle.
+    pub fn is_window_dc(&self, objects: &Objects, dc: u32) -> bool {
+        matches!(self.get(objects, dc), Some(GdiObj::Dc { raster: false, hwnd, .. })
+            if *hwnd != 0 || dc == super::WINDOW_DC)
     }
     pub fn remove(&self, objects: &mut Objects, h: u32) -> Option<GdiObj> {
         objects.lookup_alias::<GdiObj>(self.namespace.get()?, h)?;

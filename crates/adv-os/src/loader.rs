@@ -495,11 +495,9 @@ impl<'a> Loader<'a> {
             }
             return self.load_image(key, &resolved, bytes, retain);
         }
-        // Anything the game doesn't ship that is a system PE extension (.dll, .drv, .ocx)
-        // is treated as a system module; absent non-system extensions (e.g. optional engine
-        // plugins like .unt) fail.
-        if key.ends_with(".dll") || key.ends_with(".drv") || key.ends_with(".ocx") {
-            log::info!("{path}: not in the game files, treating as a system module");
+        // An extension alone does not establish a system provider. Optional
+        // absent DLLs must fail rather than publish a fabricated module handle.
+        if is_host_module(self.sys, &key) {
             return self.load_host(key, path, retain);
         }
         Err(LoadError::NotFound(path.to_owned()))

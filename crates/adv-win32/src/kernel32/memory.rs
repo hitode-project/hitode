@@ -12,6 +12,7 @@ mod global;
 pub(crate) use global::{allocate as allocate_local_memory, release as release_local_memory};
 mod locks;
 mod virtual_memory;
+pub(crate) use virtual_memory::native_read_memory;
 pub(crate) use virtual_memory::native_write_memory;
 pub(crate) use virtual_memory::protect_memory;
 pub(crate) use virtual_memory::{

@@ -545,10 +545,60 @@ fn resume_thread(env: &mut Env<'_>) -> Outcome {
 }
 
 fn change_suspend_count(env: &mut Env<'_>, suspend: bool) -> Outcome {
-    let identity = match thread_target(env, env.arg(0), 2) {
+    change_suspend_front(env, env.arg(0), suspend, false, 0)
+}
+
+pub(crate) fn native_resume_thread(env: &mut Env<'_>, handle: u32, previous: u32) -> Outcome {
+    change_suspend_front(env, handle, false, true, previous)
+}
+
+fn suspend_error(env: &mut Env<'_>, error: processes::Error, native: bool) -> Outcome {
+    if !native {
+        return api_error(env, error, u32::MAX);
+    }
+    Outcome::Return(match error.code {
+        5 => 0xc0000022,
+        6 => 0xc0000008,
+        8 => 0xc0000017,
+        50 => {
+            adv_abi::warn_unavailable(env, "ntdll.dll!NtResumeThread", &error.message);
+            0xc00000bb
+        }
+        _ => 0xc0000001,
+    })
+}
+fn resume_result(env: &mut Env<'_>, previous: u32, count: u32) -> Outcome {
+    if previous != 0
+        && (adv_abi::guest::check_range(env.cpu, previous, 4, Prot::WRITE).is_err()
+            || env.cpu.write_u32(previous, count).is_err())
+    {
+        return Outcome::Return(0xc0000005);
+    }
+    Outcome::Return(0)
+}
+fn change_suspend_front(
+    env: &mut Env<'_>,
+    handle: u32,
+    suspend: bool,
+    native: bool,
+    previous: u32,
+) -> Outcome {
+    if native
+        && previous != 0
+        && adv_abi::guest::check_range(env.cpu, previous, 4, Prot::WRITE).is_err()
+    {
+        return Outcome::Return(0xc0000005);
+    }
+    let identity = match thread_target(env, handle, 2) {
         Ok(identity) => identity,
-        Err(error) => return api_error(env, error, u32::MAX),
+        Err(error) => return suspend_error(env, error, native),
     };
+    if native && identity.completion.exit_code().is_some() {
+        // The completed thread remains a valid handle; there is no execution to
+        // reschedule. Native x86 publishes a zero previous count in this state.
+        return resume_result(env, previous, 0);
+    }
+    let completion = identity.completion.clone();
     let pid = identity.process.pid;
     let id = identity.context;
     processes::visit(
@@ -560,6 +610,9 @@ fn change_suspend_count(env: &mut Env<'_>, suspend: bool) -> Outcome {
                 processes::Error::new(err::INVALID_HANDLE, "thread context no longer exists")
             })?;
             if context.is_done() {
+                if native {
+                    return Ok(0);
+                }
                 return Err(processes::Error::new(
                     err::INVALID_HANDLE,
                     "thread has exited",
@@ -578,6 +631,15 @@ fn change_suspend_count(env: &mut Env<'_>, suspend: bool) -> Outcome {
             })
         },
         move |env, result| {
+            if native {
+                return match result {
+                    Ok(count) => resume_result(env, previous, count),
+                    Err(error) if error.code == 6 && completion.exit_code().is_some() => {
+                        resume_result(env, previous, 0)
+                    }
+                    Err(error) => suspend_error(env, error, true),
+                };
+            }
             if suspend && pid == env.sys.pid && id == env.context {
                 match result {
                     Ok(previous) => Outcome::block_then_return(Wait::Yield, previous),
