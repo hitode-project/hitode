@@ -272,6 +272,74 @@ fn dialog_projection_owns_state_and_validates_control_input() {
     );
 }
 
+#[test]
+fn custom_windows_built_from_standard_controls_project_as_dialogs() {
+    use adv_win32::user32::dialog::{self, DialogEvent};
+    let mut t = T::new();
+    let mut a = Asm::new(CODE);
+    let proc = t.wndproc(|_| {});
+    let class = t.class(&mut a, proc);
+    let static_class = t.text("Static");
+    let button_class = t.text("Button");
+    // An engine's startup prompt: a custom top-level window holding a label,
+    // a check box and a push button, answered through the game's own loop.
+    let prompt = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, I(0), 0);
+    t.window(&mut a, static_class, WS_CHILD | WS_VISIBLE, M(prompt), 9999);
+    t.window(
+        &mut a,
+        button_class,
+        WS_CHILD | WS_VISIBLE | 3,
+        M(prompt),
+        10000,
+    );
+    let ok = t.window(
+        &mut a,
+        button_class,
+        WS_CHILD | WS_VISIBLE,
+        M(prompt),
+        10001,
+    );
+    // Neither a canvas with a custom child nor a window without a button to
+    // answer it is a dialog.
+    let canvas = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, I(0), 0);
+    t.window(&mut a, class, WS_CHILD | WS_VISIBLE, M(canvas), 1);
+    t.window(&mut a, button_class, WS_CHILD | WS_VISIBLE, M(canvas), 2);
+    let label = t.window(&mut a, class, WS_POPUP | WS_VISIBLE, I(0), 0);
+    t.window(&mut a, static_class, WS_CHILD | WS_VISIBLE, M(label), 1);
+    t.run(a);
+    let snapshot = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+    let [projected] = snapshot.dialogs.as_slice() else {
+        panic!("{snapshot:?}");
+    };
+    assert_eq!(projected.target.hwnd, t.u32(prompt));
+    let ids: Vec<_> = projected.controls.iter().map(|c| c.target.id).collect();
+    assert_eq!(ids, [9999, 10000, 10001]);
+    assert!(projected.controls.iter().all(|c| c.supported));
+    let ok = projected
+        .controls
+        .iter()
+        .find(|c| c.target.hwnd == t.u32(ok))
+        .unwrap()
+        .target;
+    let mut env = adv_machine::Env {
+        context: t.m.sys.current,
+        cpu: &mut t.m.cpu,
+        sys: &mut t.m.sys,
+        ext: &mut t.m.ext,
+        thunk: 0,
+    };
+    for queue in env.ext.get_mut::<Win32>().user.queues.values_mut() {
+        queue.posted.clear();
+    }
+    assert!(dialog::post_host_event(&mut env, DialogEvent::Click(ok)));
+    let posted: Vec<_> = env.ext.get::<Win32>().user.queues[&0]
+        .posted
+        .iter()
+        .map(|m| (m.hwnd, m.msg))
+        .collect();
+    assert_eq!(posted, [(ok.hwnd, 0xf5)]);
+}
+
 #[derive(Clone, Copy)]
 enum Arg {
     Imm(u32),

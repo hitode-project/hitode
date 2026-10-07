@@ -65,6 +65,47 @@ fn absent_extensions_do_not_create_modules_without_a_system_provider() {
 }
 
 #[test]
+fn absent_static_imports_bind_as_system_modules() {
+    // Windows refuses to start an image whose static import is missing, so a
+    // natively runnable image's absent import is a system DLL (wtsapi32, glu32,
+    // a VC++ redistributable). Dynamic probes of the same name still fail.
+    struct Files;
+    impl FileSource for Files {
+        fn read(&self, path: &str) -> Option<Vec<u8>> {
+            if path != "main.dll" {
+                return None;
+            }
+            let mut bytes = delay_fixture::image(true);
+            delay_fixture::word(&mut bytes, 0x98 + 96 + 13 * 8, 0);
+            delay_fixture::word(&mut bytes, 0x98 + 96 + 8, 0xa00);
+            delay_fixture::word(&mut bytes, 0x98 + 100 + 8, 40);
+            for (at, value) in [
+                (0xa00, 0xa40),
+                (0xa0c, 0xa60),
+                (0xa10, 0xa50),
+                (0xa40, 0xa80),
+                (0xa50, 0xa80),
+            ] {
+                delay_fixture::word(&mut bytes, at, value);
+            }
+            bytes[0xa60..0xa6d].copy_from_slice(b"wtsapi32.dll\0");
+            bytes[0xa82..0xa92].copy_from_slice(b"WTSSendMessageW\0");
+            Some(bytes)
+        }
+    }
+    let mut m = machine();
+    assert!(matches!(
+        m.load(&Files, "wtsapi32.dll"),
+        Err(adv_os::LoadError::NotFound(_))
+    ));
+    let id = m.load(&Files, "main.dll").unwrap();
+    let base = adv_os::modules(&m.ext).get(id).base;
+    let system = adv_os::modules(&m.ext).by_name("wtsapi32.dll").unwrap();
+    assert_eq!(adv_os::modules(&m.ext).get(system).kind, ModuleKind::Host);
+    assert!(is_thunk(m.cpu.read_u32(base + 0xa50).unwrap()));
+}
+
+#[test]
 fn shipped_dll_wins_over_api_registration_unless_provider_is_explicit() {
     struct Files(Vec<u8>);
     impl FileSource for Files {
@@ -123,11 +164,12 @@ fn shipped_dll_wins_over_api_registration_unless_provider_is_explicit() {
         Clock::virtual_time(),
     )
     .unwrap();
-    let id = explicit.load(&files, "missing\\PAL.dll").unwrap();
-    assert_eq!(
-        adv_os::modules(&explicit.ext).get(id).kind,
-        ModuleKind::Host
-    );
+    // Without a registered provider the absent explicit path is not found.
+    assert!(matches!(
+        explicit.load(&files, "missing\\PAL.dll"),
+        Err(adv_os::LoadError::NotFound(_))
+    ));
+    assert!(adv_os::modules(&explicit.ext).by_name("pal.dll").is_none());
 }
 
 #[test]
