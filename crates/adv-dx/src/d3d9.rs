@@ -26,6 +26,7 @@ mod pacing;
 mod presentation;
 mod programmable;
 mod readback;
+mod residency;
 mod stretch;
 mod targets;
 mod update_texture;
@@ -241,6 +242,7 @@ pub fn register(registry: &mut Registry) {
     resources::register(registry);
     fixed::register(registry);
     readback::register(registry);
+    residency::register(registry);
     stretch::register(registry);
     capabilities::register(registry);
     targets::register(registry);

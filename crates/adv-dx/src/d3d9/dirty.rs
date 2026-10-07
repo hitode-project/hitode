@@ -67,6 +67,14 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     if r.desc.Pool >= 2 || r.levels.iter().any(|level| level.lock.is_some()) {
         return Outcome::Return(0);
     }
+    let pointer = r.pointer;
+    let restored = residency::ensure(env, pointer);
+    if restored != 0 {
+        return Outcome::Return(restored);
+    }
+    let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
+        return Outcome::Return(INVALID);
+    };
     let Some((index, selected)) = r
         .levels
         .iter()
