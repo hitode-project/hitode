@@ -24,3 +24,5 @@ d3dx9_43.dll	D3DXVec3TransformCoord	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:p
 d3dx9_43.dll	D3DXVec3Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR3*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXVec3CatmullRom	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:ptr:1|pV0:const D3DXVECTOR3*:ptr:1|pV1:const D3DXVECTOR3*:ptr:1|pV2:const D3DXVECTOR3*:ptr:1|pV3:const D3DXVECTOR3*:ptr:1|s:FLOAT:f32:1
 d3dx9_43.dll	D3DXCreateMatrixStack	stdcall	i32	HRESULT	Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1
+d3dx9_43.dll	D3DXCreateTextureFromFileInMemoryEx	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|Width:UINT:u32:1|Height:UINT:u32:1|MipLevels:UINT:u32:1|Usage:DWORD:u32:1|Format:D3DFORMAT:i32:1|Pool:D3DPOOL:i32:1|Filter:DWORD:u32:1|MipFilter:DWORD:u32:1|ColorKey:D3DCOLOR:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1|pPalette:PALETTEENTRY*:ptr:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1
+d3dx9_43.dll	D3DXGetImageInfoFromFileInMemory	stdcall	i32	HRESULT	pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1

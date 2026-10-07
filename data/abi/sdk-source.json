@@ -138,5 +138,15 @@
     "scope": "D3DXCreateMatrixStack export only; pure CPU matrix stack, no shader or effect pipeline changes",
     "target": "x86 WINAPI stdcall, HRESULT return, DWORD Flags and LPD3DXMATRIXSTACK* ppStack (two 32-bit stack words)",
     "documentation": "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatematrixstack"
+  },
+  "legacy_d3dx_texture_memory": {
+    "source": "Microsoft.DXSDK.D3DX 9.29.952.8 official NuGet d3dx9tex.h, image-info declaration lines319-322 and Ex texture lines1474-1489",
+    "header_sha256": "64dfa1f26d6df792f6cf261c79f737e6e5c7670787ba6abfe0f76aba348e9422",
+    "scope": "D3DXCreateTextureFromFileInMemoryEx and D3DXGetImageInfoFromFileInMemory only; texture resource loading, no shader/effect pipeline declaration changes",
+    "target": "x86 WINAPI stdcall, HRESULT return; Ex fifteen32-bit stack words, ImageInfo three; UINT/DWORD/D3DCOLOR unsigned, D3DFORMAT/D3DPOOL signed enum; D3DXIMAGE_INFO seven32-bit fields (28bytes), palette array pointer",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileinmemoryex",
+      "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxgetimageinfofromfileinmemory"
+    ]
   }
 }
