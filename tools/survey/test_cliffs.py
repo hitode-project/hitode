@@ -1,12 +1,13 @@
 """Synthetic report tests: python -m unittest discover -s tools/survey -p test_cliffs.py.
 
-Input fixtures are generated in memory or the system temporary directory.
+Input fixtures are generated in memory or under CARGO_TARGET_DIR (default target).
 No real reports are used. Output is unittest's assertion summary.
 """
 from contextlib import redirect_stderr, redirect_stdout
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -110,6 +111,35 @@ class AggregateTests(unittest.TestCase):
             report["cpu_cliffs"][key] = bad
             with self.assertRaises(ValueError):
                 aggregate([report])
+
+    def test_control_distribution_is_complete_and_guards_overlap(self):
+        report = fixture()
+        report["cpu_cliffs"]["x87_control"] = {
+            "PC=64/RC=nearest/masks=3f": 5,
+            "PC=64/RC=zero/masks=32": 3,
+        }
+        report["cpu_cliffs"]["x87_control_rejections"] = {"PC": 8, "RC": 3, "Masks": 3}
+        summary = aggregate([report, report, fixture()])
+        counters = summary["cpu_cliffs"]
+        self.assertEqual(counters["x87_control_reports"], 2)
+        self.assertEqual(counters["x87_control"]["PC=64/RC=nearest/masks=3f"], 10)
+        self.assertEqual(counters["x87_control_rejections"], {"PC": 16, "RC": 6, "Masks": 6})
+        self.assertIn("Control 细分覆盖 2", markdown(summary))
+
+    def test_control_distribution_rejects_private_labels_and_inconsistent_counts(self):
+        for label, value, guards in [
+            (42, 8, {"PC": 8, "RC": 0, "Masks": 0}),
+            ("private-detail-marker", 8, {"PC": 8, "RC": 0, "Masks": 0}),
+            ("PC=64/RC=nearest/masks=3f", 8, {"PC": 7, "RC": 0, "Masks": 0}),
+            ("PC=64/RC=nearest/masks=3f", 16, {"PC": 16, "RC": 0, "Masks": 0}),
+            ("PC=64/RC=nearest/masks=3f", 7, {"PC": 7, "RC": 0, "Masks": 0}),
+        ]:
+            report = fixture()
+            report["cpu_cliffs"]["x87_control"] = {label: value}
+            report["cpu_cliffs"]["x87_control_rejections"] = guards
+            with self.assertRaises(ValueError) as caught:
+                aggregate([report])
+            self.assertNotIn("private-detail-marker", str(caught.exception))
 
     def test_merges_mnemonics_reasons_and_verification(self):
         first = fixture()
@@ -230,7 +260,9 @@ class AggregateTests(unittest.TestCase):
 
 class CliTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="adv-cliffs-test-")
+        scratch = Path(os.environ.get("CARGO_TARGET_DIR", Path(__file__).resolve().parents[2] / "target")) / "scratch" / "cliff-survey"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 

@@ -22,6 +22,9 @@ fn code_at(at: u32, build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
     a.assemble(u64::from(at)).unwrap()
 }
 fn pcm_code() -> Vec<u8> {
+    pcm_code_with_wait(false)
+}
+fn pcm_code_with_wait(wait: bool) -> Vec<u8> {
     code(|a| {
         let mut top = a.create_label();
         a.set_label(&mut top).unwrap();
@@ -29,7 +32,13 @@ fn pcm_code() -> Vec<u8> {
         a.add(ebx, eax).unwrap();
         a.fld(dword_ptr(esi)).unwrap();
         a.fmul(dword_ptr(SCALE as i32)).unwrap();
+        if wait {
+            a.wait().unwrap();
+        }
         a.fistp(dword_ptr(edi)).unwrap();
+        if wait {
+            a.wait().unwrap();
+        }
         a.add(esi, 4).unwrap();
         a.add(edi, 4).unwrap();
         a.dec(ecx).unwrap();
@@ -93,7 +102,7 @@ fn assert_pcm_registers(actual: &Executor, oracle: &Executor, exceptions: u32) {
 
 #[test]
 fn shared_float_execution_matches_pcm_with_linking_and_oracle() {
-    let bytes = pcm_code();
+    let bytes = pcm_code_with_wait(true);
     let mut off = machine(&bytes, true, false);
     let mut on = machine(&bytes, true, true);
     let mut uc = machine(&bytes, false, false);
@@ -121,7 +130,7 @@ fn shared_float_execution_matches_pcm_with_linking_and_oracle() {
 
 #[test]
 fn float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
-    let bytes = pcm_code();
+    let bytes = pcm_code_with_wait(true);
     let bits = [
         0x7fc0_1234u32,
         0x7f80_0000,

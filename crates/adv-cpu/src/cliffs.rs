@@ -84,6 +84,9 @@ pub struct Cliffs {
     pub x87_fast: u64,
     /// Helper calls that ran the exact model, by instruction and reason.
     pub x87_exact: HashMap<(Mnemonic, X87Cliff), u64>,
+    /// Control-classified rejections, keyed by PC, RC and exception mask bits.
+    /// Kept separately so the truncated mnemonic list cannot hide controls.
+    pub x87_control: HashMap<u16, u64>,
     /// Native exits that handed the instruction at their PC to the interpreter.
     pub fallbacks: HashMap<Mnemonic, u64>,
     pub interpreter: HashMap<InterpreterReason, Count>,
@@ -96,6 +99,9 @@ impl Cliffs {
         self.x87_fast += other.x87_fast;
         for (key, n) in other.x87_exact {
             *self.x87_exact.entry(key).or_default() += n;
+        }
+        for (key, n) in other.x87_control {
+            *self.x87_control.entry(key).or_default() += n;
         }
         for (key, n) in other.fallbacks {
             *self.fallbacks.entry(key).or_default() += n;
@@ -163,6 +169,30 @@ impl Cliffs {
                 .iter()
                 .map(|(&(m, r), &n)| (format!("{m:?}/{r:?}"), n)),
         )
+    }
+
+    /// Joint control distribution for Control rejections, without addresses.
+    pub fn x87_control_rows(&self) -> Vec<(String, u64)> {
+        rows(self.x87_control.iter().map(|(&cw, &n)| {
+            let pc = ["24", "reserved", "53", "64"][usize::from(cw >> 8 & 3)];
+            let rc = ["nearest", "down", "up", "zero"][usize::from(cw >> 10 & 3)];
+            (format!("PC={pc}/RC={rc}/masks={:02x}", cw & 0x3f), n)
+        }))
+    }
+
+    /// Independent failed control guards; a call can fail more than one.
+    pub fn x87_control_rejections(&self) -> Vec<(String, u64)> {
+        let mut counts = [0; 3];
+        for (&cw, &n) in &self.x87_control {
+            counts[0] += n * u64::from(!matches!(cw >> 8 & 3, 0 | 2));
+            counts[1] += n * u64::from(cw & 0xc00 != 0);
+            counts[2] += n * u64::from(cw & 0x3f != 0x3f);
+        }
+        ["PC", "RC", "Masks"]
+            .into_iter()
+            .zip(counts)
+            .map(|(key, n)| (key.to_owned(), n))
+            .collect()
     }
 
     /// Native-to-interpreter handoffs as (mnemonic, count), most frequent first.
@@ -245,5 +275,32 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn control_distribution_merges_and_counts_overlapping_guards() {
+        let mut a = Cliffs::default();
+        a.x87_control.insert(0x033f, 10);
+        let mut b = Cliffs::default();
+        b.x87_control.insert(0x033f, 2);
+        b.x87_control.insert(0x0b3e, 3);
+        b.x87_control.insert(0x063f, 5);
+        a.merge(b);
+        assert_eq!(
+            a.x87_control_rows(),
+            vec![
+                ("PC=64/RC=nearest/masks=3f".into(), 12),
+                ("PC=53/RC=down/masks=3f".into(), 5),
+                ("PC=64/RC=up/masks=3e".into(), 3),
+            ]
+        );
+        assert_eq!(
+            a.x87_control_rejections(),
+            vec![("PC".into(), 15), ("RC".into(), 8), ("Masks".into(), 3)]
+        );
+        // Every PC/RC/mask combination is retained, beyond the top-24 list.
+        a.x87_control = (0..64).map(|mask| (0x0300 | mask, 1)).collect();
+        assert_eq!(a.x87_control_rows().len(), 64);
+        assert_eq!(a.x87_control_rejections()[2].1, 63);
     }
 }
