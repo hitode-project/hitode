@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay normal/held-key play through the production frontend, with tracing off.
+"""Replay normal/held-key play through the production frontend.
 
 The JSON schedule is a list of {"at": seconds, "command": "key-down 17"} or
 {"at": seconds, "checkpoint": "normal", "reset_metrics": true} entries.
@@ -7,6 +7,12 @@ Checkpoints save the actual framebuffer and frontend/device report, then optiona
 start a new measurement window. Times are host time since process launch, and every
 command waits for its real acknowledgement; no release may overtake its key-down.
 All guest writes and evidence go to --output. Game assets are never modified.
+Use --audio --mute-audio --mode hidden (or window) to keep the real audio device
+path active while sending silence to hardware, without enabling capture or tracing.
+session.json records whether the hardware was requested to be muted.
+
+Tracing is off by default; --trace writes api.trace for compatibility diagnosis
+and marks the session unsuitable for performance comparison.
 """
 from __future__ import annotations
 
@@ -50,9 +56,34 @@ def load_schedule(path: Path) -> list[dict]:
     return steps
 
 
+def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str, str], list[str]]:
+    """Scrub inherited diagnostics, then explicitly enable requested audio modes."""
+    mute_audio = getattr(args, "mute_audio", False)
+    if mute_audio and (not args.audio or args.mode == "headless"):
+        raise ValueError("--mute-audio requires --audio and --mode hidden/window")
+    if args.capture_audio and (not args.audio or args.mode == "headless"):
+        raise ValueError("--capture-audio requires --audio and --mode hidden/window")
+    # Diagnostics can substantially change decoder throughput and scheduling.
+    environment = dict(os.environ)
+    removed = []
+    for name in ("ADV_AUDIO_TRACE", "ADV_AUDIO_DUMP_DIR", "ADV_PRINTF_DIAG_PATH", "ADV_PRINTF_DIAG_WORDS", "ADV_AUDIO_DUMP_CHUNKS", "ADV_AUDIO_CAPTURE", "ADV_AUDIO_CAPTURE_CALLBACK", "ADV_AUDIO_MUTE_DEVICE", "ADV_MMIO_TRACE", "ADV_JIT_DUMP_DIR"):
+        if environment.pop(name, None) is not None:
+            removed.append(name)
+    if mute_audio or args.capture_audio:
+        environment["ADV_AUDIO_MUTE_DEVICE"] = "1"
+    if args.capture_audio:
+        environment.update(ADV_AUDIO_CAPTURE_CALLBACK=str(output / "actual.f32"),
+                           ADV_AUDIO_TRACE=str(output / "sound.log"),
+                           ADV_AUDIO_DUMP_DIR=str(output / "source-dumps"),
+                           ADV_AUDIO_DUMP_CHUNKS="1",
+                           ADV_MMIO_TRACE=str(output / "mmio.log"))
+    return environment, removed
+
+
 def run(args: argparse.Namespace) -> None:
     steps = load_schedule(args.schedule)
     output = args.output.resolve()
+    environment, removed = launch_environment(args, output)
     output.mkdir(parents=True, exist_ok=False)
     if args.seed_data:
         # Copy an existing data root, never let acceptance mutate a user's save.
@@ -60,21 +91,6 @@ def run(args: argparse.Namespace) -> None:
                         ignore=shutil.ignore_patterns("*.lock"))
     executable = args.binary.resolve(strict=True)
     game = args.exe.resolve(strict=True)
-    # Diagnostics can substantially change decoder throughput and scheduling.
-    environment = dict(os.environ)
-    removed = []
-    for name in ("ADV_AUDIO_TRACE", "ADV_AUDIO_DUMP_DIR", "ADV_PRINTF_DIAG_PATH", "ADV_PRINTF_DIAG_WORDS", "ADV_AUDIO_DUMP_CHUNKS", "ADV_AUDIO_CAPTURE", "ADV_AUDIO_CAPTURE_CALLBACK", "ADV_AUDIO_MUTE_DEVICE", "ADV_MMIO_TRACE", "ADV_JIT_DUMP_DIR"):
-        if environment.pop(name, None) is not None:
-            removed.append(name)
-    if args.capture_audio:
-        if not args.audio or args.mode == "headless":
-            raise ValueError("--capture-audio requires --audio and --mode hidden/window")
-        environment.update(ADV_AUDIO_MUTE_DEVICE="1",
-                           ADV_AUDIO_CAPTURE_CALLBACK=str(output / "actual.f32"),
-                           ADV_AUDIO_TRACE=str(output / "sound.log"),
-                           ADV_AUDIO_DUMP_DIR=str(output / "source-dumps"),
-                           ADV_AUDIO_DUMP_CHUNKS="1",
-                           ADV_MMIO_TRACE=str(output / "mmio.log"))
     duration = max(15.0, float(steps[-1]["at"]) + args.tail_seconds)
     command = [str(executable), str(game), "--control-stdin", "--codepage", str(args.codepage),
                "--seconds", str(duration), "--auto-dialog-ms", "50",
@@ -90,14 +106,18 @@ def run(args: argparse.Namespace) -> None:
         command.append("--sync-compilation")
     if args.no_tiering:
         command.append("--no-tiering")
+    if args.trace:
+        command.extend(["--trace", str(output / "api.trace")])
     acknowledgement: queue.Queue[str | None] = queue.Queue()
     actions = []
     metadata = {"command": command, "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
                 "guest_exe_sha256": hashlib.sha256(game.read_bytes()).hexdigest(),
                 "schedule": steps, "removed_diagnostics": removed,
                 "audio_device_expected": args.audio and args.mode != "headless",
+                "muted": getattr(args, "mute_audio", False) or args.capture_audio,
                 "diagnostic_capture": args.capture_audio,
-                "suitable_for_performance_comparison": not args.capture_audio}
+                "diagnostic_api_trace": args.trace,
+                "suitable_for_performance_comparison": not (args.capture_audio or args.trace)}
     (output / "session.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     start = time.monotonic()
     with (output / "stdout.log").open("w", encoding="utf-8") as stdout, \
@@ -198,7 +218,10 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("headless", "hidden", "window"), default="headless")
     parser.add_argument("--codepage", choices=(932, 936), type=int, default=936)
     parser.add_argument("--audio", action="store_true")
+    parser.add_argument("--mute-audio", action="store_true",
+                        help="mute hardware output without diagnostics; requires --audio and --mode hidden/window")
     parser.add_argument("--capture-audio", action="store_true", help="capture actual callbacks and source PCM; hardware receives zeros; excludes performance comparisons")
+    parser.add_argument("--trace", action="store_true", help="write API trace in the session output for compatibility diagnosis; excludes performance comparisons")
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--sync-compilation", action="store_true")
     parser.add_argument("--no-tiering", action="store_true",

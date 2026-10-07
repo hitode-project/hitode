@@ -389,6 +389,7 @@ impl Executor {
             selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
             gdt_base: addr,
             gdt_limit: 127,
+            ldt_selector: 0,
         };
         Ok(())
     }
@@ -689,8 +690,9 @@ impl Executor {
             return Ok(false);
         }
         let policy = self.background_sender()?.borrow().work_policy();
-        // Dedicated threads keep the bounded slices: on a real sample, whole
-        // large regions compiled slower and ran no faster than their slices.
+        // Cold Fast work keeps the responsive slices. A dedicated compiler may
+        // optimize an already admitted whole loop under a separate finite cap;
+        // shared service jobs retain their original latency budget.
         let limit = policy.background_limit();
         if limit.is_none() && self.pending_regions.len() >= crate::compiler::CAPACITY {
             return Ok(false);
@@ -698,7 +700,12 @@ impl Executor {
         let mut snapshot = compile::Snapshot::capture(&region, &self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
         let mut fragments = if let Some(limit) = limit {
-            match crate::compile_budget::plan(snapshot, limit) {
+            let budget = crate::compile_budget::background_budget(
+                snapshot.region.compile_strategy,
+                limit,
+                self.compile_threads != 0,
+            );
+            match crate::compile_budget::plan_with_budget(snapshot, budget) {
                 Ok(fragments) => fragments,
                 Err(error) => {
                     self.stats.compile_work_rejections += 1;
@@ -1719,6 +1726,52 @@ mod responsive_compile_tests {
         m.state.eip = CODE;
         m.state.regs[1] = iterations;
         m.state.regs[4] = STACK;
+    }
+
+    #[test]
+    fn dedicated_pool_tiers_whole_loops_beyond_the_shared_speed_limit() {
+        let bytes = assemble(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            for _ in 0..64 {
+                a.mov(eax, dword_ptr(DATA)).unwrap();
+            }
+            a.dec(ecx).unwrap();
+            a.jnz(top).unwrap();
+            a.ret().unwrap();
+        });
+        let mut states = Vec::new();
+        for dedicated in [false, true] {
+            let (mut m, _service) = fixture(256);
+            m.set_compile_threads(usize::from(dedicated)).unwrap();
+            let unit = region(&mut m, &bytes);
+            assert!(m.queue_region(unit).unwrap());
+            drain(&mut m);
+            assert_eq!(m.stats.compile_slices, 0);
+            m.request_tier_up(CODE);
+            // Publication never removes the current Fast body while waiting.
+            assert_eq!(
+                m.code.regions[&CODE].compile_strategy,
+                CompileStrategy::Fast
+            );
+            drain(&mut m);
+            assert_eq!(
+                m.code.regions[&CODE].compile_strategy,
+                if dedicated {
+                    CompileStrategy::Speed
+                } else {
+                    CompileStrategy::Fast
+                }
+            );
+            assert_eq!(m.stats.compile_work_rejections, u64::from(!dedicated));
+            assert_eq!(m.stats.tier_up_publications, u64::from(dedicated));
+            m.write(DATA, &37u32.to_le_bytes()).unwrap();
+            seed(&mut m, 3);
+            assert_eq!(m.run(STOP, 20).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(m.state.regs[0], 37);
+            states.push(m.state.clone());
+        }
+        assert_eq!(states[0], states[1]);
     }
 
     #[test]

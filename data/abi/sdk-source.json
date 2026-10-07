@@ -12,6 +12,17 @@
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibclose",
     "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-drawdibdraw"
   ],
+  "directshow_error_text": {
+    "scope": "仅补充 quartz.dll!AMGetErrorTextA；不扩展 W 或其他 DirectShow 导出",
+    "source": "Microsoft Windows SDK 10.0.26100.0 um/errors.h 及 x86 quartz.lib",
+    "header_sha256": "822217c1ecfca68418c4fa287fa40800e0dc7b8b45457d693ab026696745af29",
+    "sdk_library_sha256": "7bd7299322fb1c40ea209f11edbe6d2e6bd47d010249762bf0b6bc75ec9d7265",
+    "declaration": "DWORD WINAPI AMGetErrorTextA(HRESULT hr, LPSTR pbuffer, DWORD MaxLen);",
+    "target": "x86 WINAPI 为 __stdcall，三个 32 位参数，HRESULT 为 i32，DWORD 返回值和容量为 u32；SDK 导入为 _AMGetErrorTextA@12",
+    "behavior": "错误文本查询失败返回零；当前无字符串表，显式告警并保留输出和 LastError，不改变影片 HRESULT 或图状态",
+    "native_verification": "自造未知 HRESULT 在容量 256/1/0 下均返回零并保留填充缓冲；已知消息容量不足也保留缓冲，未知码的原生 LastError 为 317",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/errors/nf-errors-amgeterrortexta"
+  },
   "drawdib_open": {
     "scope": "仅补充 msvfw32.dll!DrawDibOpen/Close/Draw，不扩展其他 DrawDib 函数",
     "declaration": "typedef HANDLE HDRAWDIB; extern HDRAWDIB VFWAPI DrawDibOpen(void);",

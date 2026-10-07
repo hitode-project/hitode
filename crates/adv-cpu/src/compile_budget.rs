@@ -13,6 +13,42 @@ pub const RESPONSIVE_WORK: usize = 128;
 /// the slice limit as one unit, including its Speed recompilation.
 const LOOP_ALLOWANCE: usize = 8;
 
+/// Every whole Fast loop admitted by responsive(256) costs at most 2048;
+/// its Speed recompilation costs at most four times as much. This is an
+/// absolute work cap for dedicated compiler threads, never a frame deadline.
+pub(crate) const DEDICATED_SPEED_WORK: usize = 8192;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Budget {
+    limit: usize,
+    loops: usize,
+    speed_fallback: bool,
+}
+
+/// Use the same selection when planning and immediately before submission.
+/// Call only when the service has a responsive limit: unrestricted clients
+/// retain their policy. A dedicated Speed job stays whole but remains bounded;
+/// shared-worker Speed and every Fast job keep the ordinary loop allowance.
+pub(crate) fn background_budget(
+    strategy: CompileStrategy,
+    responsive_limit: usize,
+    dedicated: bool,
+) -> Budget {
+    if dedicated && strategy == CompileStrategy::Speed {
+        Budget {
+            limit: DEDICATED_SPEED_WORK,
+            loops: 1,
+            speed_fallback: false,
+        }
+    } else {
+        Budget {
+            limit: responsive_limit,
+            loops: LOOP_ALLOWANCE,
+            speed_fallback: true,
+        }
+    }
+}
+
 fn successors(instruction: &Instruction) -> Vec<u32> {
     let mut next = Vec::with_capacity(2);
     if instruction.op0_kind() == OpKind::NearBranch32 {
@@ -242,24 +278,43 @@ pub(crate) fn work(input: &Snapshot) -> usize {
     )
 }
 
-/// The input's work and the most a single job for it may take under `limit`.
+/// The input's work and the most a single shared-worker job may take.
+#[cfg(test)]
 pub(crate) fn work_and_allowance(input: &Snapshot, limit: usize) -> (usize, usize) {
+    work_and_allowance_with_budget(
+        input,
+        background_budget(input.region.compile_strategy, limit, false),
+    )
+}
+
+pub(crate) fn work_and_allowance_with_budget(input: &Snapshot, budget: Budget) -> (usize, usize) {
     let instructions = decoded(input);
     let work = total(
         &instructions,
         input.region.compile_strategy,
         input.shadow_returns,
     );
-    (work, allowance(&instructions, limit, LOOP_ALLOWANCE))
+    (work, allowance(&instructions, budget.limit, budget.loops))
 }
 
 /// Partition Fast work while retaining exact guest instruction/edge semantics.
 /// Speed is deliberately never partially substituted for a live larger Fast unit.
+#[cfg(test)]
 pub(crate) fn plan(input: Snapshot, limit: usize) -> Result<Vec<Snapshot>, String> {
-    plan_within(input, limit, LOOP_ALLOWANCE)
+    let budget = background_budget(input.region.compile_strategy, limit, false);
+    plan_with_budget(input, budget)
 }
 
-fn plan_within(input: Snapshot, limit: usize, loops: usize) -> Result<Vec<Snapshot>, String> {
+pub(crate) fn plan_with_budget(input: Snapshot, budget: Budget) -> Result<Vec<Snapshot>, String> {
+    plan_within(input, budget.limit, budget.loops, budget.speed_fallback)
+}
+
+fn plan_within(
+    input: Snapshot,
+    limit: usize,
+    loops: usize,
+    speed_fallback: bool,
+) -> Result<Vec<Snapshot>, String> {
     let instructions = decoded(&input);
     if let Some(entry) = input
         .region
@@ -280,7 +335,8 @@ fn plan_within(input: Snapshot, limit: usize, loops: usize) -> Result<Vec<Snapsh
     }
     if input.region.compile_strategy == CompileStrategy::Speed {
         // Keeping a hot unit whole with its callees saves more than Speed.
-        if !input.region.callees.is_empty()
+        if speed_fallback
+            && !input.region.callees.is_empty()
             && total(&instructions, CompileStrategy::Fast, input.shadow_returns) <= whole
         {
             let mut input = input;
@@ -295,7 +351,7 @@ fn plan_within(input: Snapshot, limit: usize, loops: usize) -> Result<Vec<Snapsh
     if !input.region.callees.is_empty() {
         let mut input = input;
         input.region.callees.clear();
-        return plan_within(input, limit, loops);
+        return plan_within(input, limit, loops, speed_fallback);
     }
     let mut groups: Vec<BTreeSet<u32>> = Vec::new();
     let mut current = BTreeSet::new();
@@ -468,6 +524,79 @@ mod tests {
         assert!(plan(input(&straight), 16).unwrap().len() > 1);
     }
 
+    fn memory_loop(accesses: usize) -> Snapshot {
+        let mut bytes = [0x8b, 0x00].repeat(accesses);
+        bytes.push(0x49); // dec ecx
+        let displacement = -i32::try_from(bytes.len() + 6).unwrap();
+        bytes.extend([0x0f, 0x85]); // jnz begin
+        bytes.extend(displacement.to_le_bytes());
+        bytes.push(0xc3);
+        input(&bytes)
+    }
+
+    #[test]
+    fn dedicated_speed_admits_whole_hot_loops_with_an_absolute_cap() {
+        let mut hot = memory_loop(64);
+        hot.region.compile_strategy = CompileStrategy::Speed;
+        let shared = background_budget(CompileStrategy::Speed, 256, false);
+        let dedicated = background_budget(CompileStrategy::Speed, 256, true);
+        assert_eq!(work_and_allowance_with_budget(&hot, shared), (2116, 2048));
+        assert!(plan_with_budget(hot.clone(), shared).is_err());
+        assert_eq!(
+            work_and_allowance_with_budget(&hot, dedicated),
+            (2116, 8192)
+        );
+        let planned = plan_with_budget(hot, dedicated).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].region.compile_strategy, CompileStrategy::Speed);
+
+        let mut near_cap = memory_loop(253);
+        near_cap.region.compile_strategy = CompileStrategy::Speed;
+        assert_eq!(work(&near_cap), 8164);
+        assert_eq!(plan_with_budget(near_cap, dedicated).unwrap().len(), 1);
+        let mut over_cap = memory_loop(254);
+        over_cap.region.compile_strategy = CompileStrategy::Speed;
+        assert_eq!(
+            work_and_allowance_with_budget(&over_cap, dedicated),
+            (8196, 8192)
+        );
+        assert!(plan_with_budget(over_cap.clone(), dedicated).is_err());
+        // A dedicated Speed cap must not become a larger Fast-job budget via
+        // the shared service's legacy callee-preserving downgrade.
+        over_cap.region.callees = vec![over_cap.region.start];
+        assert!(plan_with_budget(over_cap, dedicated).is_err());
+    }
+
+    #[test]
+    fn dedicated_fast_preserves_responsive_slicing_and_loop_allowance() {
+        let original = memory_loop(64);
+        let shared = background_budget(CompileStrategy::Fast, 16, false);
+        let dedicated = background_budget(CompileStrategy::Fast, 16, true);
+        assert_eq!(shared, dedicated);
+        assert_eq!(
+            work_and_allowance_with_budget(&original, dedicated),
+            (529, 128)
+        );
+        let describe = |parts: Vec<Snapshot>| {
+            parts
+                .into_iter()
+                .map(|part| {
+                    (
+                        part.region.start,
+                        part.region.len,
+                        part.region.entries.clone(),
+                        part.region.frontier.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let shared_parts = plan_with_budget(original.clone(), shared).unwrap();
+        let dedicated_parts = plan_with_budget(original, dedicated).unwrap();
+        assert!(dedicated_parts.len() > 1);
+        assert!(dedicated_parts.iter().all(|part| work(part) <= 16));
+        assert_eq!(describe(shared_parts), describe(dedicated_parts));
+    }
+
     #[test]
     fn crossing_branches_and_overlapping_decode_roots_keep_the_original_graph() {
         // Jump into the immediate of a linear MOV; then branch back across a
@@ -477,7 +606,7 @@ mod tests {
         ];
         let original = input(&bytes);
         let expected = decoded(&original);
-        let fragments = plan_within(original, 16, 1).unwrap();
+        let fragments = plan_within(original, 16, 1, true).unwrap();
         let mut actual = BTreeMap::new();
         for fragment in fragments {
             assert!(work(&fragment) <= 16);

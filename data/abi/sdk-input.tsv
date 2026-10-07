@@ -1,4 +1,5 @@
 # Scoped x86 declarations omitted by pinned Win32Metadata; source/hash in sdk-source.json.
+quartz.dll	AMGetErrorTextA	stdcall	u32	u32	hr:Windows.Win32.Foundation.HRESULT:i32:1|pbuffer:Windows.Win32.Foundation.PSTR:str8:1|MaxLen:u32:u32:1
 gdi32.dll	EnableEUDC	stdcall	i32	Windows.Win32.Foundation.BOOL	fEnableEUDC:Windows.Win32.Foundation.BOOL:i32:1
 msvfw32.dll	ICInstall	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|lParam:i32:i32:1|szDesc:Windows.Win32.Foundation.PSTR:str8:1|wFlags:u32:u32:1
 msvfw32.dll	ICRemove	stdcall	i32	Windows.Win32.Foundation.BOOL	fccType:u32:u32:1|fccHandler:u32:u32:1|wFlags:u32:u32:1
