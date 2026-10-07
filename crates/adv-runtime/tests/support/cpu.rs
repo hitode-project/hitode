@@ -131,6 +131,9 @@ impl Guest for Cpu {
     fn accessible(&self, address: u32, len: u32, prot: Prot) -> bool {
         self.guest().accessible(address, len, prot)
     }
+    fn next_mapped_page(&self, address: u32, limit: u64) -> Result<Option<u32>, MemFault> {
+        self.guest().next_mapped_page(address, limit)
+    }
     fn map(&mut self, address: u32, size: u32, prot: Prot) -> Result<(), MemFault> {
         self.guest_mut().map(address, size, prot)
     }
