@@ -863,6 +863,11 @@ fn capture_native_after_stop(
 ) -> Result<(), String> {
     use adv_sync::background::{Priority, Task};
     use std::sync::mpsc::TrySendError;
+    // A report followed by a capture asks for the same frame again; its pixels
+    // are already materialized and the guest has not presented since.
+    if runtime.native_frame_serial() == Some(runtime.frame().frames) {
+        return Ok(());
+    }
     let deadline = Instant::now() + Duration::from_secs(20);
     let (serial, mut ticket) = loop {
         match runtime.begin_native_capture() {

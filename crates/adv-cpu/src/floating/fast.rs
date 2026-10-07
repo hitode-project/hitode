@@ -2,10 +2,13 @@
 //! loops. It applies only where the result is bit-identical to the
 //! transactional path: no pending exception, live MMX state committed, the
 //! touched stack slots valid, and every operand an exact double. Arithmetic
-//! also needs 53-bit precision, round-to-nearest and masked exceptions, and
-//! operands within 2^±400 so neither the result nor the error terms used for
-//! the precision flag can overflow, underflow or go denormal. Everything else
-//! returns `None` before any state changes and takes the transactional path.
+//! also needs round-to-nearest and masked exceptions, and operands within 2^±400
+//! so neither the result nor the error terms used for the precision flag can
+//! overflow, underflow or go denormal. Precision control 53 uses the binary64
+//! result directly. Precision control 24 additionally needs 24-bit operands:
+//! rounding their binary64 result again to 24 bits is then the correctly rounded
+//! result (53 >= 2 * 24 + 2), with the extended exponent range kept. Everything
+//! else returns `None` before any state changes and takes the transactional path.
 use super::{Memory, NativeX87, X87_DONE, X87_EXIT, reg_index};
 use crate::{CpuState, PAGE_SIZE, READ, WRITE, X87Register as Ext};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
@@ -419,6 +422,30 @@ fn rounded_up(error: f64, result: f64) -> bool {
     error != 0.0 && error.is_sign_negative() != result.is_sign_negative()
 }
 
+/// Precision control of an arithmetic-eligible control word: round to nearest,
+/// every exception masked, and PC=24 or PC=53.
+pub(crate) fn arithmetic_precision(control: u16) -> Option<u32> {
+    match control & 0x0f3f {
+        0x023f => Some(53),
+        0x003f => Some(24),
+        _ => None,
+    }
+}
+
+/// Fraction bits of a binary64 below a 24-bit significand.
+pub(crate) const SINGLE_TAIL: u64 = (1 << 29) - 1;
+
+/// Round a zero or normal binary64 to a 24-bit significand, nearest-even,
+/// keeping its exponent (x87 PC=24 does not narrow the exponent range).
+/// Returns the result and whether its magnitude grew; unchanged when exact.
+pub(crate) fn round_single_precision(value: f64) -> (f64, bool) {
+    let bits = value.to_bits();
+    let tail = bits & SINGLE_TAIL;
+    let up = tail + (bits >> 29 & 1) > 1 << 28;
+    let rounded = (bits & !SINGLE_TAIL) + if up { 1 << 29 } else { 0 };
+    (f64::from_bits(rounded), up)
+}
+
 /// Run `op` if it qualifies; `None` leaves every piece of state untouched.
 pub(super) fn execute(
     op: &NativeX87,
@@ -432,8 +459,6 @@ pub(super) fn execute(
         return None;
     }
     let control = x87.control;
-    // 53-bit precision, round to nearest, every exception masked.
-    let arithmetic_ok = control & 0x0f3f == 0x023f;
     let mut status = x87.status;
     let mut top = x87.top();
     // (logical index relative to the final top, value) writes, applied last.
@@ -547,9 +572,7 @@ pub(super) fn execute(
             reverse,
             pop,
         } => {
-            if !arithmetic_ok {
-                return None;
-            }
+            let precision = arithmetic_precision(control)?;
             let target = slot(top, usize::from(dest));
             if empty(target) {
                 return None;
@@ -562,10 +585,24 @@ pub(super) fn execute(
             if op == Op::Div && b == 0.0 {
                 return None;
             }
-            let (result, error) = arithmetic(op, a, b);
+            if precision == 24 && (a.to_bits() | b.to_bits()) & SINGLE_TAIL != 0 {
+                return None;
+            }
+            let (mut result, error) = arithmetic(op, a, b);
+            let mut inexact = error != 0.0;
+            let mut up = rounded_up(error, result);
+            if precision == 24 {
+                let (single, grew) = round_single_precision(result);
+                // No 24-bit value lies strictly between a changed result and
+                // the exact one, so the binary64 rounding decides C1 only when
+                // the 24-bit rounding left it unchanged.
+                if single != result {
+                    (result, inexact, up) = (single, true, grew);
+                }
+            }
             status &= !C1;
-            if error != 0.0 {
-                status |= PE | if rounded_up(error, result) { C1 } else { 0 };
+            if inexact {
+                status |= PE | if up { C1 } else { 0 };
             }
             writes[0] = (target, extended(result));
             dp = at.or(dp);

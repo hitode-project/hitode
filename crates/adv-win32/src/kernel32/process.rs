@@ -10,8 +10,17 @@ use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod parameters;
 mod processor;
+#[cfg(test)]
+mod tests;
 mod thread_context;
 pub(crate) use parameters::install as install_parameters;
+
+#[win32(kernel32, name = "GetConsoleWindow", level = state)]
+fn get_console_window(_env: &mut Env<'_>) -> Handle {
+    // Guest standard streams do not allocate a console window. Query that
+    // absence without borrowing a host console HWND or changing LastError.
+    Handle(0)
+}
 
 fn exit_process(env: &mut Env<'_>) -> Outcome {
     super::module::exit_process(env, env.arg(0))
@@ -932,6 +941,7 @@ fn get_computer_name_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(get_console_window_ABI);
     // A 32-bit Windows: not under WOW64.
     stdcall(reg, K32, "IsWow64Process", 2, |e| {
         let p = e.arg(1);
