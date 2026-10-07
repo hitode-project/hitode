@@ -10,7 +10,7 @@ use adv_os::processes::{
 
 use crate::{Win32, util::set_last_error};
 
-pub(super) fn process_target(
+pub(crate) fn process_target(
     env: &Env<'_>,
     handle: u32,
     access: u32,

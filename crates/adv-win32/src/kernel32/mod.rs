@@ -16,6 +16,7 @@ pub(crate) use file_mapping::prune as prune_file_mappings;
 pub use handle::ProcessHandle;
 mod memory;
 pub(crate) use memory::protect_memory;
+pub(crate) use memory::{allocate_memory, free_memory, memory_span};
 mod module;
 pub(crate) use module::native_get_procedure;
 pub(crate) use module::native_loader_mutex;

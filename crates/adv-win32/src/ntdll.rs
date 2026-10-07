@@ -1,9 +1,10 @@
 //! NT compatibility entry points over the existing virtual process, VFS and VM.
-mod path;
+mod allocation;
 mod directory;
 mod loader_lock;
-mod strings;
+mod path;
 mod procedure;
+mod strings;
 mod thread;
 
 use adv_abi::Registry;
@@ -207,6 +208,7 @@ pub fn register(reg: &mut Registry) {
     strings::register(reg);
     procedure::register(reg);
     thread::register(reg);
+    allocation::register(reg);
     stdcall(
         reg,
         NTDLL,

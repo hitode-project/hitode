@@ -195,5 +195,11 @@
     "source": "phnt primary ntpsapi.h declaration and authored Microsoft Windows x86 native caller",
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntpsapi.h",
     "native_verification": "authored suspended child: Win32/NT integer context identity, register changes, unrequested groups untouched, invalid handle/access/pointer statuses, unchanged LastError and child lifecycle"
+  },
+  "nt_remote_allocation": {
+    "scope": "NtAllocateVirtualMemory; six x86 stack words, signed NTSTATUS, current/remote process via the common VM owner",
+    "source": "Microsoft Learn ntifs declaration, SDK x86 import symbol and authored Microsoft Windows x86 caller",
+    "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntallocatevirtualmemory",
+    "native_verification": "38 DWORDs: actual suspended child, rounded extent, Win32 query/read/write/free interop, conflicting reservation, invalid protection/flags/zero size/pointers, unchanged outputs/LastError; three executors additionally cover isolated VM and rollback when caller loses output mappings"
   }
 }
