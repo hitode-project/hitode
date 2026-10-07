@@ -3,6 +3,8 @@ use super::*;
 use adv_abi::{AnsiStr, GuestPtr, WideStr, guest::check_range, win32};
 use adv_cpu::backend::{MemFault, Prot};
 
+mod name;
+
 fn ansi(env: &Env<'_>, path: AnsiStr) -> Result<String, MemFault> {
     Ok(env
         .ext
@@ -396,6 +398,7 @@ fn move_w(env: &mut Env<'_>, source: WideStr, target: WideStr) -> Result<Outcome
     Ok(copy_file(env, s, t, true, true))
 }
 pub(super) fn register(reg: &mut Registry) {
+    name::register(reg);
     for api in [
         full_a_ABI,
         full_w_ABI,

@@ -13,12 +13,7 @@ const MAX_INPUT_UNITS: usize = 65536;
 fn supported_cp(env: &Env<'_>) -> bool {
     matches!(env.ext.get::<Win32>().codec.acp, 932 | 936 | 1252 | 65001)
 }
-fn unavailable(env: &mut Env<'_>, wide: bool, reason: &str, error: u32) -> Outcome {
-    let api = if wide {
-        "kernel32.dll!GetPrivateProfileStringW"
-    } else {
-        "kernel32.dll!GetPrivateProfileStringA"
-    };
+fn unavailable(env: &mut Env<'_>, api: &str, reason: &str, error: u32) -> Outcome {
     adv_abi::warn_unavailable(env, api, reason);
     set_last_error(env, error);
     Outcome::Return(0)
@@ -239,7 +234,9 @@ fn render(
             (units, true)
         }
     };
-    let required = units.len() + 1;
+    // Even an empty enumeration needs room for the list terminators, although
+    // native Windows writes only the first NUL when the list is empty.
+    let required = units.len().max(usize::from(list)) + 1;
     let truncated = required > capacity as usize;
     let copied = if truncated {
         capacity.saturating_sub(if list { 2 } else { 1 }) as usize
@@ -276,7 +273,13 @@ fn render(
     )
 }
 
-fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
+fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool, sections_only: bool) -> Outcome {
+    let api = match (sections_only, wide) {
+        (false, false) => "kernel32.dll!GetPrivateProfileStringA",
+        (false, true) => "kernel32.dll!GetPrivateProfileStringW",
+        (true, false) => "kernel32.dll!GetPrivateProfileSectionNamesA",
+        (true, true) => "kernel32.dll!GetPrivateProfileSectionNamesW",
+    };
     let [app, key, default, out, capacity, filename] = pointers;
     let bytes = match capacity.checked_mul(if wide { 2 } else { 1 }) {
         Some(bytes) => bytes,
@@ -292,7 +295,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
     if !wide && !supported_cp(env) {
         return unavailable(
             env,
-            wide,
+            api,
             "profile ANSI argument/output conversion requires a supported guest ACP (932/936/1252/65001)",
             50,
         );
@@ -327,7 +330,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
         Err(()) => {
             return unavailable(
                 env,
-                wide,
+                api,
                 "profile filename contains an invalid UTF16 path",
                 1113,
             );
@@ -337,7 +340,7 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
         Ok(bytes) => match decode(env, &bytes) {
             Ok(data) => Some(data),
             Err(ReadError::Unsupported(reason, error)) => {
-                return unavailable(env, wide, reason, error);
+                return unavailable(env, api, reason, error);
             }
             Err(ReadError::Io(_)) => unreachable!(),
         },
@@ -358,11 +361,12 @@ fn get(env: &mut Env<'_>, pointers: [u32; 6], wide: bool) -> Outcome {
                 Some(error),
             );
         }
-        Err(ReadError::Unsupported(reason, error)) => return unavailable(env, wide, reason, error),
+        Err(ReadError::Unsupported(reason, error)) => return unavailable(env, api, reason, error),
     };
     let answer = Ini::new(&data.unwrap()).query(app.as_deref(), key.as_deref());
     match answer {
         Some(answer) => output(env, answer, capacity, out, wide, None),
+        None if sections_only => output(env, Answer::List(Vec::new()), capacity, out, wide, None),
         None => {
             let default = match text(env, default, wide) {
                 Ok(default) => default.unwrap_or_default(),
@@ -426,6 +430,7 @@ fn get_a(
             filename.0.addr(),
         ],
         false,
+        false,
     )
 }
 #[win32(kernel32,name="GetPrivateProfileStringW",level=implement)]
@@ -449,9 +454,33 @@ fn get_w(
             filename.0.addr(),
         ],
         true,
+        false,
     )
 }
+
+#[win32(kernel32, name = "GetPrivateProfileSectionNamesA", level = implement)]
+fn sections_a(env: &mut Env<'_>, out: AnsiStr, capacity: u32, filename: AnsiStr) -> Outcome {
+    get(
+        env,
+        [0, 0, 0, out.0.addr(), capacity, filename.0.addr()],
+        false,
+        true,
+    )
+}
+
+#[win32(kernel32, name = "GetPrivateProfileSectionNamesW", level = implement)]
+fn sections_w(env: &mut Env<'_>, out: WideStr, capacity: u32, filename: WideStr) -> Outcome {
+    get(
+        env,
+        [0, 0, 0, out.0.addr(), capacity, filename.0.addr()],
+        true,
+        true,
+    )
+}
+
 pub(super) fn register(registry: &mut Registry) {
     registry.register(get_a_ABI);
     registry.register(get_w_ABI);
+    registry.register(sections_a_ABI);
+    registry.register(sections_w_ABI);
 }

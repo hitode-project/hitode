@@ -1082,13 +1082,22 @@ mod tests {
                 window.rect = Rect::new(left, top, 800, 600);
                 window.style = style;
                 user.queue(0).capture = 0;
+                let origin = user.client_origin(&runtime.machine.sys.objects, 0x10020);
                 for (x, y) in [(0, 0), (400, 300), (-12, -34)] {
                     let packed = make_long(x, y);
+                    // The guest desktop starts at (0, 0). A partially offscreen
+                    // window cannot move the physical cursor into negative space.
+                    let expected_screen = ((x + origin.0).max(0), (y + origin.1).max(0));
+                    let local = (expected_screen.0 - origin.0, expected_screen.1 - origin.1);
                     assert!(runtime.post_input(0x200, 0, packed));
                     let user = &mut runtime.machine.ext.get_mut::<Win32>().user;
                     let message = user.queue(0).posted.pop_front().unwrap();
-                    assert_eq!((message.hwnd, message.lparam), (0x10020, packed));
+                    assert_eq!(
+                        (message.hwnd, message.lparam),
+                        (0x10020, make_long(local.0, local.1))
+                    );
                     let screen = user.cursor_pos;
+                    assert_eq!(screen, expected_screen);
                     invoke(&mut runtime, "GetCursorPos", &[data]);
                     assert_eq!(
                         (
@@ -1103,7 +1112,7 @@ mod tests {
                             runtime.machine.cpu.read_u32(data).unwrap() as i32,
                             runtime.machine.cpu.read_u32(data + 4).unwrap() as i32
                         ),
-                        (x, y)
+                        local
                     );
                     invoke(&mut runtime, "ClientToScreen", &[0x10020, data]);
                     assert_eq!(
@@ -1126,6 +1135,13 @@ mod tests {
                     assert_eq!(wheel.lparam, make_long(screen.0, screen.1));
                 }
                 runtime.machine.ext.get_mut::<Win32>().user.queue(0).capture = 0x10028;
+                let child_origin = runtime
+                    .machine
+                    .ext
+                    .get::<Win32>()
+                    .user
+                    .client_origin(&runtime.machine.sys.objects, 0x10028);
+                let screen = ((60 + origin.0).max(0), (80 + origin.1).max(0));
                 assert!(runtime.post_input(0x200, 0, make_long(60, 80)));
                 let message = runtime
                     .machine
@@ -1136,7 +1152,13 @@ mod tests {
                     .posted
                     .pop_front()
                     .unwrap();
-                assert_eq!((message.hwnd, message.lparam), (0x10028, make_long(20, 30)));
+                assert_eq!(
+                    (message.hwnd, message.lparam),
+                    (
+                        0x10028,
+                        make_long(screen.0 - child_origin.0, screen.1 - child_origin.1)
+                    )
+                );
             }
         }
     }
