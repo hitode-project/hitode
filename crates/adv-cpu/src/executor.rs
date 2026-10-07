@@ -385,10 +385,17 @@ impl Executor {
             gdt[offset..offset + 8].copy_from_slice(&descriptor_dpl(0, code, dpl).to_le_bytes());
         }
         self.memory.write(addr, &gdt)?;
+        let idt_base = addr + crate::backend::SegmentSetup::IDT_OFFSET;
+        self.memory.write(
+            idt_base,
+            &[0; crate::backend::SegmentSetup::IDT_LIMIT as usize + 1],
+        )?;
         self.state.segments = crate::SegmentState {
             selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
             gdt_base: addr,
             gdt_limit: 127,
+            idt_base,
+            idt_limit: crate::backend::SegmentSetup::IDT_LIMIT,
             ldt_selector: 0,
         };
         Ok(())

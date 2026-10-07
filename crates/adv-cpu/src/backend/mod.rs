@@ -342,8 +342,16 @@ pub trait TrapHandler {
 /// Flat 32-bit segments with a per-context FS base (TEB).
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSetup {
-    /// Guest address of one page reserved for the GDT. Never touched by guest code.
+    /// Guest address of one page reserved for descriptor tables. The GDT uses
+    /// the first 128 bytes; the upper half holds a zeroed, non-present IDT.
+    /// Actual guest exceptions use the owner's exception pipeline, not ring 0
+    /// handlers installed in this table.
     pub gdt_addr: u32,
+}
+
+impl SegmentSetup {
+    pub const IDT_OFFSET: u32 = 0x800;
+    pub const IDT_LIMIT: u16 = 256 * 8 - 1;
 }
 
 pub trait Backend: Guest {
@@ -382,7 +390,7 @@ pub trait Backend: Guest {
         Err("backend has no parallel execution workers".into())
     }
 
-    /// Install the GDT and load flat CS/DS/ES/SS. Must be called once before running.
+    /// Install the guest-owned GDT/IDT and load flat CS/DS/ES/SS before running.
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault>;
     /// Point FS at `base` (the current context's TEB).
     fn set_fs_base(&mut self, base: u32) -> Result<(), MemFault>;
