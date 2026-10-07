@@ -491,5 +491,8 @@ fn refused_stack_accesses_rerun_exactly_in_tier0() {
         tier.state.regs[4], STACK,
         "ESP is unchanged by the refused push"
     );
-    assert_eq!(tier.tier1_stats().fallback_instructions, 1);
+    // INC ran natively; the refused PUSH retired nothing in either tier.
+    let stats = tier.tier1_stats();
+    assert_eq!(stats.native_instructions, 1, "{stats:?}");
+    assert_eq!(stats.inline_accesses, 0, "{stats:?}");
 }
