@@ -336,6 +336,28 @@ impl Executor {
             Box::new(verifier)
         });
     }
+    /// Account one verified native exit; strict mode stops at a mismatch.
+    fn record_verification(
+        &mut self,
+        check: Option<Result<verify::Check, String>>,
+    ) -> Result<(), String> {
+        let stats = &mut self.stats.verification;
+        match check {
+            None => stats.inconclusive += 1,
+            Some(Ok(verify::Check::Equal)) => stats.verified += 1,
+            Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
+            Some(Err(report)) => {
+                stats.mismatches += 1;
+                if self.verifier.as_ref().is_some_and(|v| v.strict) {
+                    return Err(format!("tier verification: {report}"));
+                }
+                if stats.reports.len() < verify::REPORTS {
+                    stats.reports.push(report);
+                }
+            }
+        }
+        Ok(())
+    }
     /// Select helper threads before execution. Zero runs admitted batches inline.
     pub fn set_row_workers(&mut self, count: usize) -> Result<(), String> {
         if self.stats.native_entries != 0 || self.stats.interpreter_entries != 0 {
@@ -1599,21 +1621,8 @@ impl Executor {
                     },
                 );
                 if let Some(trace) = &trace {
-                    let stats = &mut self.stats.verification;
-                    match trace.check(&self.state, &self.memory) {
-                        None => stats.inconclusive += 1,
-                        Some(Ok(verify::Check::Equal)) => stats.verified += 1,
-                        Some(Ok(verify::Check::MxcsrFlags)) => stats.mxcsr_flags += 1,
-                        Some(Err(report)) => {
-                            stats.mismatches += 1;
-                            if self.verifier.as_ref().is_some_and(|v| v.strict) {
-                                return Err(format!("tier verification: {report}"));
-                            }
-                            if stats.reports.len() < verify::REPORTS {
-                                stats.reports.push(report);
-                            }
-                        }
-                    }
+                    let check = trace.check(&self.state, &self.memory);
+                    self.record_verification(check)?;
                 }
                 if let Some(timer) = timer {
                     let p = self.profile.entry(pc).or_default();
@@ -2609,7 +2618,9 @@ mod topology_tests {
             m.write(pc, &[0x40, 0xc3]).unwrap();
         }
         // Identical guest bytes need not compile to identical sizes at every
-        // address on every host, so size the budget to fit either region alone.
+        // address on every host, or even twice at one address (macOS ARM64
+        // varied by a few bytes), so the budget fits either region alone with
+        // slack but never both.
         let mut probe = machine();
         for pc in [0x1000, 0x1200] {
             probe.write(pc, &[0x40, 0xc3]).unwrap();
@@ -2617,7 +2628,7 @@ mod topology_tests {
         }
         let sizes = [0x1000, 0x1200].map(|pc| probe.code.compiled[&pc].code_size);
         eprintln!("region code sizes: {sizes:?}");
-        let size = sizes[0].max(sizes[1]);
+        let size = sizes[0].max(sizes[1]) + sizes[0].min(sizes[1]) / 2;
         discover(&mut m, 0x1000);
         m.set_code_cache_limits(8, size);
         discover(&mut m, 0x1200);

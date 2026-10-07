@@ -1005,7 +1005,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn protected_window_faults_only_in_child_process() {
         use std::os::unix::process::ExitStatusExt;
@@ -1017,7 +1017,7 @@ mod tests {
             "rollback-readonly-write",
         ] {
             let executable = std::env::current_exe().unwrap();
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
             let mut child = if let Some(runner) =
                 std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
             {
@@ -1029,7 +1029,7 @@ mod tests {
             } else {
                 std::process::Command::new(executable)
             };
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
             let mut child = std::process::Command::new(executable);
             let output = child
                 .args([
@@ -1051,7 +1051,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     #[ignore = "expected SIGSEGV; executed only by protected_window_faults_only_in_child_process"]
     fn fault_child() {

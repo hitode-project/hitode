@@ -2,7 +2,7 @@
 use super::Executor;
 
 impl Executor {
-    /// Explicitly select the experimental Linux ARM64 fixed-register lane.
+    /// Explicitly select the experimental Linux/Android ARM64 fixed-register lane.
     /// Select before compilation/execution; the default remains unchanged.
     pub fn set_arm64_tier1(&mut self, enabled: bool) -> Result<(), String> {
         if enabled == self.tier1.is_some() {
@@ -47,6 +47,20 @@ impl Executor {
             return Ok(None);
         };
         let before = engine.stats();
+        // Tier 1 owns the CPU serially, so the interpreted trace can be undone
+        // privately before the same entry runs natively.
+        let mut trace = None;
+        if let Some(verifier) = self.verifier.as_deref_mut()
+            && verifier.take_tier1(self.state.eip, before.compilations)
+        {
+            trace = Some(verifier.record(
+                self.state.eip,
+                stop,
+                &mut self.interpreter,
+                &mut self.state,
+                &mut self.memory,
+            )?);
+        }
         let execution = engine.run_block(
             &mut self.state,
             &mut self.memory,
@@ -57,6 +71,11 @@ impl Executor {
         let after = engine.stats();
         self.stats.native_entries += after.native_entries - before.native_entries;
         self.stats.linked_entries += after.direct_transfers - before.direct_transfers;
+        if let Some(trace) = trace {
+            let steps = execution.execution.units as usize;
+            let check = trace.check_at(steps, &self.state, &self.memory);
+            self.record_verification(check)?;
+        }
         Ok(Some(execution))
     }
 }

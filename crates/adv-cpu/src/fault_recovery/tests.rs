@@ -178,7 +178,7 @@ fn controlled_faults_preserve_prefix_and_continue() {
         "async_signal",
     ] {
         let executable = std::env::current_exe().unwrap();
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         let mut child = if let Some(runner) =
             std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
         {
@@ -188,7 +188,7 @@ fn controlled_faults_preserve_prefix_and_continue() {
         } else {
             Command::new(&executable)
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
         let mut child = Command::new(&executable);
         let result = child
             .arg("--exact")
@@ -308,6 +308,17 @@ fn run_case(case: &str) {
     }
     let outside = (case == "outside_guest").then(|| Reservation::new(16384).unwrap());
     let bus = (case == "outside_guest_bus").then(|| {
+        // Match the direct/PCM backends: Android's libc symbol needs API 30,
+        // while the syscall also works with this fixture's API 29 link target.
+        #[cfg(target_os = "android")]
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"adv-fault-probe".as_ptr(),
+                libc::MFD_CLOEXEC,
+            ) as libc::c_int
+        };
+        #[cfg(target_os = "linux")]
         let fd = unsafe { libc::memfd_create(c"adv-fault-probe".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0);
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
