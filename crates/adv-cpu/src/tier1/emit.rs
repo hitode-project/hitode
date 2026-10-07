@@ -37,6 +37,8 @@ pub(super) struct Helpers {
 
 /// Load kind flag: sign-extend the loaded value to 32 bits.
 pub(super) const SIGNED: u32 = 0x100;
+/// Store kind flag: validate write permission without writing (zero shifts).
+pub(super) const CHECK_WRITE: u32 = 0x100;
 
 pub(super) struct Emitter {
     helpers: Helpers,
@@ -59,6 +61,22 @@ pub(super) fn register(r: Register) -> Option<u8> {
         EDI => 26,
         _ => return Option::None,
     })
+}
+fn register_part(r: Register) -> Option<(u8, u32, u32)> {
+    let full = register(r.full_register32())?;
+    let shift = u32::from(matches!(
+        r,
+        Register::AH | Register::CH | Register::DH | Register::BH
+    )) * 8;
+    let bits = r.size() as u32 * 8;
+    matches!(bits, 8 | 16 | 32).then_some((full, shift, bits))
+}
+fn shift(m: M) -> bool {
+    matches!(m, M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror)
+}
+fn shift_count(i: &Instruction) -> bool {
+    i.op1_kind() == OpKind::Immediate8
+        || i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL
 }
 fn imm(i: &Instruction, op: u32) -> Option<u32> {
     matches!(i.op_kind(op), OpKind::Immediate32 | OpKind::Immediate8to32)
@@ -86,6 +104,7 @@ fn rmw(i: &Instruction) -> bool {
         && match i.mnemonic() {
             M::Add | M::Adc | M::Sub | M::Sbb | M::And | M::Or | M::Xor => rmw_source(i),
             M::Inc | M::Dec | M::Not | M::Neg => true,
+            m if shift(m) => shift_count(i),
             _ => false,
         }
 }
@@ -140,6 +159,11 @@ pub(super) fn supported(i: &Instruction) -> bool {
         }
         M::Ret => i.op_count() == 0 || i.op0_kind() == OpKind::Immediate16,
         M::Inc | M::Dec | M::Neg | M::Not => dst,
+        m if shift(m) => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register()).is_some()
+                && shift_count(i)
+        }
         _ => {
             i.condition_code() != C::None
                 && i.is_jcc_short_or_near()
@@ -212,6 +236,30 @@ impl Emitter {
             self.mov(d, r);
         } else {
             self.constant(d, imm(i, op).expect("admitted operand"));
+        }
+    }
+    fn read_register(&mut self, d: u8, r: Register, signed: bool) {
+        let (s, shift, bits) = register_part(r).expect("admitted register");
+        self.word(
+            (if signed { 0x1300_0000 } else { 0x5300_0000 })
+                | shift << 16
+                | (shift + bits - 1) << 10
+                | (s as u32) << 5
+                | d as u32,
+        );
+    }
+    fn write_register(&mut self, r: Register, s: u8) {
+        let (d, shift, bits) = register_part(r).expect("admitted register");
+        if bits == 32 {
+            self.mov(d, s);
+        } else {
+            self.word(
+                0x3300_0000
+                    | ((32 - shift) % 32) << 16
+                    | (bits - 1) << 10
+                    | (s as u32) << 5
+                    | d as u32,
+            );
         }
     }
     fn ea(&mut self, i: &Instruction, segment: bool) {
@@ -321,19 +369,30 @@ impl Emitter {
     fn flags(&mut self, dst: u8, subtract: bool, logic: bool, preserve_carry: bool) {
         // ADDS/SUBS/ANDS already produced NZCV. CSET reads it directly and
         // BFI replaces one guest bit, so no other EFLAGS bit is disturbed.
-        const EQ: u32 = 0;
         const CS: u32 = 2;
         const CC: u32 = 3;
-        const MI: u32 = 4;
         const VS: u32 = 6;
-        for (condition, guest) in [(MI, 7), (EQ, 6), (VS, 11)] {
-            self.cset14(condition);
-            self.bfi(dst, 14, guest);
-        }
+        self.szp(dst);
+        self.cset14(VS);
+        self.bfi(dst, 14, 11);
         if !preserve_carry {
             // ARM carry after subtraction is the inverse of x86 borrow.
             self.cset14(if subtract { CC } else { CS });
             self.bfi(dst, 14, 0);
+        }
+        // Logical AF is architecturally undefined; match Tier 0 preservation.
+        if !logic {
+            self.binary(0x4a00_0000, 14, 9, 10);
+            self.binary(0x4a00_0000, 14, 14, 11);
+            self.lsr(14, 14, 4);
+            self.bfi(dst, 14, 4);
+        }
+    }
+    /// NZCV describes the width-aligned result; w11 holds its low byte.
+    fn szp(&mut self, dst: u8) {
+        for (condition, guest) in [(4, 7), (0, 6)] {
+            self.cset14(condition);
+            self.bfi(dst, 14, guest);
         }
         // PF: even parity of the low result byte, folded into bit 0.
         for (n, shift) in [(11, 4), (14, 2), (14, 1)] {
@@ -342,13 +401,6 @@ impl Emitter {
         }
         self.word(0x5200_01ce); // eor w14,w14,#1
         self.bfi(dst, 14, 2);
-        // Logical AF is architecturally undefined; match Tier 0 preservation.
-        if !logic {
-            self.binary(0x4a00_0000, 14, 9, 10);
-            self.binary(0x4a00_0000, 14, 14, 11);
-            self.lsr(14, 14, 4);
-            self.bfi(dst, 14, 4);
-        }
     }
     /// Compute w11 and flags from w9/w10, retaining the unshifted operands
     /// for AF. Narrow operands align to bit 31 so host NZCV has x86 width.
@@ -417,6 +469,92 @@ impl Emitter {
         self.lsr(15, 15, (bits - 1) as u8);
         self.bfi(flags, 15, 11);
     }
+    /// Shift w9 by the masked count in w10 into w11. Match Tier 0's
+    /// deterministic preservation of AF, multi-bit OF and oversized SHL/SHR CF.
+    fn shift_value(&mut self, m: M, width: u32, flags: u8) {
+        let bits = width * 8;
+        let left = matches!(m, M::Shl | M::Sal | M::Rol);
+        let rotate = matches!(m, M::Rol | M::Ror);
+        self.mask(10, 10, 31);
+        self.mov(11, 9);
+        let zero = self.words.len();
+        self.word(0);
+        if rotate {
+            // Repeat a narrow value across 32 bits before the host rotate.
+            self.mov(15, 9);
+            if bits == 8 {
+                self.lsl(16, 15, 8);
+                self.binary(0x2a00_0000, 15, 15, 16);
+            }
+            if bits < 32 {
+                self.lsl(16, 15, 16);
+                self.binary(0x2a00_0000, 15, 15, 16);
+            }
+            if left {
+                self.binary(0x4b00_0000, 16, 31, 10);
+            } else {
+                self.mov(16, 10);
+            }
+            self.binary(0x1ac0_2c00, 11, 15, 16); // rorv
+        } else {
+            if m == M::Sar && bits < 32 {
+                self.word(0x1300_0000 | (bits - 1) << 10 | 9 << 5 | 9); // sbfx
+            }
+            self.binary(
+                if left {
+                    0x1ac0_2000
+                } else if m == M::Sar {
+                    0x1ac0_2800
+                } else {
+                    0x1ac0_2400
+                },
+                11,
+                9,
+                10,
+            );
+        }
+        if bits < 32 {
+            self.mask(11, 11, (1 << bits) - 1);
+        }
+        if rotate {
+            self.lsr(14, 11, if left { 0 } else { (bits - 1) as u8 });
+            self.bfi(flags, 14, 0);
+        } else {
+            if left {
+                self.constant(16, bits);
+                self.binary(0x4b00_0000, 16, 16, 10);
+            } else {
+                self.word(0x5100_0400 | 10 << 5 | 16); // sub w16,w10,#1
+            }
+            self.binary(0x1ac0_2400, 14, 9, 16);
+            if bits < 32 && m != M::Sar {
+                self.word(0x7100_001f | bits << 10 | 10 << 5); // cmp w10,#bits
+                self.word(0x5400_0048); // b.hi +8
+            }
+            self.bfi(flags, 14, 0);
+            self.lsl(15, 11, (32 - bits) as u8);
+            self.binary(0x6a00_0000, 31, 15, 15);
+            self.szp(flags);
+        }
+        self.word(0x7100_055f); // cmp w10,#1
+        let multiple = self.words.len();
+        self.word(0);
+        if left {
+            self.lsr(14, 11, (bits - 1) as u8);
+            self.binary(0x4a00_0000, 14, 14, flags);
+        } else if m == M::Shr {
+            self.lsr(14, 9, (bits - 1) as u8);
+        } else if m == M::Sar {
+            self.constant(14, 0);
+        } else {
+            self.lsr(14, 11, (bits - 1) as u8);
+            self.lsr(15, 11, (bits - 2) as u8);
+            self.binary(0x4a00_0000, 14, 14, 15);
+        }
+        self.bfi(flags, 14, 11);
+        self.words[zero] = 0x3400_000a | ((self.words.len() - zero) as u32) << 5;
+        self.words[multiple] = 0x5400_0001 | ((self.words.len() - multiple) as u32) << 5;
+    }
     fn memory_rmw(&mut self, i: &Instruction) {
         let width = i.memory_size().size() as u32;
         self.ea(i, true);
@@ -442,15 +580,27 @@ impl Emitter {
                 }
                 _ => self.constant(10, i.immediate(1) as u32),
             }
-            self.alu(i.mnemonic(), width, 12);
+            if shift(i.mnemonic()) {
+                self.shift_value(i.mnemonic(), width, 12);
+            } else {
+                self.alu(i.mnemonic(), width, 12);
+            }
         }
         // Frame scratch survives the helper. Guest flags remain in w8 until
         // the store succeeds; refusal may rerun the entire instruction.
         self.store32(12, 76);
         self.mov(2, 11);
+        self.constant(3, width);
+        if shift(i.mnemonic()) {
+            // Zero shifts check write permission but must not mutate memory.
+            self.word(0x7100_015f); // cmp w10,#0
+            self.cset14(0);
+            self.lsl(14, 14, CHECK_WRITE.trailing_zeros() as u8);
+            self.binary(0x2a00_0000, 3, 3, 14);
+        }
         self.ea(i, true);
         self.mov(1, 9);
-        self.store(width);
+        self.call(self.helpers.store);
         self.stored(i.ip32(), Some(i.next_ip32()), false, |e| e.load32(8, 76));
     }
     /// Resolve before changing ESP: CALL ESP and CALL [ESP - 4] must use
@@ -623,6 +773,16 @@ impl Emitter {
                 self.mov(d, 9);
             }
             M::Not => self.word(0x2a20_03e0 | (d as u32) << 16 | d as u32),
+            m if shift(m) => {
+                self.read_register(9, i.op0_register(), false);
+                if i.op1_kind() == OpKind::Register {
+                    self.mov(10, 20);
+                } else {
+                    self.constant(10, i.immediate8() as u32);
+                }
+                self.shift_value(m, i.op0_register().size() as u32, 8);
+                self.write_register(i.op0_register(), 11);
+            }
             M::Nop => {}
             M::Jmp => {
                 if i.op0_kind() != OpKind::NearBranch32 {

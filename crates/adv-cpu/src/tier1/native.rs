@@ -92,13 +92,17 @@ extern "C" fn load(entry: *mut Entry, address: u32, kind: u32) -> u64 {
 
 /// Checked 1/2/4-byte guest store without leaving native code. A store to
 /// executable memory or one that advances the epoch asks the code to leave.
-extern "C" fn store(entry: *mut Entry, address: u32, value: u32, width: u32) -> u32 {
+extern "C" fn store(entry: *mut Entry, address: u32, value: u32, kind: u32) -> u32 {
     // SAFETY: as for `load`.
     let (memory, inline) = unsafe { (&mut *(*entry).memory, &mut (*entry).inline) };
+    let width = kind & 7;
     // Memory::write is a host write API; guest permissions must be checked
     // before it so immutable code and guards cannot be bypassed.
     if !crate::interpreter::accessible(memory, address, width as u8, crate::WRITE) {
         return 2;
+    }
+    if kind & emit::CHECK_WRITE != 0 {
+        return 0;
     }
     let epoch = memory.epoch;
     if memory

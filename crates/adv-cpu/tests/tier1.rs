@@ -975,3 +975,192 @@ fn carry_register_and_memory_sources_match_full_flags() {
         }
     }
 }
+fn shift_instruction(
+    a: &mut CodeAssembler,
+    operation: u32,
+    width: u32,
+    form: u32,
+    immediate: Option<u32>,
+) {
+    macro_rules! emit {
+        ($dst:expr, $count:expr) => {
+            match operation {
+                0 => a.shl($dst, $count),
+                1 => a.shr($dst, $count),
+                2 => a.sar($dst, $count),
+                3 => a.rol($dst, $count),
+                _ => a.ror($dst, $count),
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! count {
+        ($dst:expr) => {
+            if let Some(n) = immediate {
+                emit!($dst, n);
+            } else {
+                emit!($dst, cl);
+            }
+        };
+    }
+    match (width, form) {
+        (1, 0) => count!(al),
+        (2, 0) => count!(ax),
+        (4, 0) => count!(eax),
+        (1, 1) => count!(byte_ptr(edi)),
+        (2, 1) => count!(word_ptr(edi)),
+        (4, 1) => count!(dword_ptr(edi)),
+        (1, 2) => count!(ah),
+        (1, _) => count!(cl),
+        (2, _) => count!(cx),
+        (4, _) => count!(ecx),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn shifts_and_rotates_match_all_flags_and_masked_counts() {
+    for operation in 0..5 {
+        for width in [1, 2, 4] {
+            for form in 0..4 {
+                if form == 2 && width != 1 {
+                    continue;
+                }
+                for immediate in [false, true] {
+                    let counts = [0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 255];
+                    // One code unit per count only for the immediate form.
+                    for encoded in if immediate { counts.to_vec() } else { vec![0] } {
+                        let code = assemble(|a| {
+                            shift_instruction(
+                                a,
+                                operation,
+                                width,
+                                form,
+                                immediate.then_some(encoded),
+                            );
+                            a.ret().unwrap();
+                        });
+                        let mut machines =
+                            [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                        machines[2].set_tier_verification(Some(true));
+                        let sign = 1u32 << (width * 8 - 1);
+                        for value in [0, 1, sign - 1, sign, sign + 1, u32::MAX] {
+                            for count in if immediate {
+                                vec![encoded]
+                            } else {
+                                counts.to_vec()
+                            } {
+                                for flags in [2, 0xcd7] {
+                                    for m in &mut machines {
+                                        reset(
+                                            m,
+                                            [
+                                                value,
+                                                (value & !255) | count,
+                                                5,
+                                                7,
+                                                0,
+                                                11,
+                                                13,
+                                                DATA + 3,
+                                            ],
+                                            flags,
+                                        );
+                                        m.write(DATA, &[0xa5; 12]).unwrap();
+                                        m.write(DATA + 3, &value.to_le_bytes()[..width as usize])
+                                            .unwrap();
+                                        assert_eq!(
+                                            m.run(STOP, 100).unwrap(),
+                                            RunOutcome::ReachedStop
+                                        );
+                                    }
+                                    equivalent(&machines[0], &machines[1], u32::MAX);
+                                    equivalent(&machines[0], &machines[2], u32::MAX);
+                                }
+                            }
+                        }
+                        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                        assert_eq!(machines[2].stats.verification.mismatches, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_shifts_check_zero_count_permissions_and_preserve_refused_state() {
+    for operation in 0..5 {
+        for width in [1, 2, 4] {
+            for count in [0, 1, 32, 255] {
+                for write in [false, true] {
+                    let code = assemble(|a| {
+                        a.inc(esi).unwrap();
+                        shift_instruction(a, operation, width, 1, None);
+                        a.ret().unwrap();
+                    });
+                    let address = DATA + 4096 - width / 2;
+                    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                    for m in &mut machines {
+                        reset(m, [7, count, 9, 11, 0, 13, 0, address], 0xcd7);
+                        m.write(address, &0x80008080u32.to_le_bytes()).unwrap();
+                        m.protect(DATA + 4096, 4096, if write { READ } else { 0 })
+                            .unwrap();
+                    }
+                    let outcome = machines[0].run(STOP, 100).unwrap();
+                    assert!(if write {
+                        matches!(outcome, RunOutcome::WriteFault { .. })
+                    } else {
+                        matches!(outcome, RunOutcome::ReadFault { .. })
+                    });
+                    for m in &mut machines[1..] {
+                        assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+                    }
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                    assert_eq!(machines[2].tier1_stats().native_instructions, 1);
+                    for m in &mut machines {
+                        m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+                        assert_eq!(
+                            m.memory().read_data(address, 4).unwrap().as_ref(),
+                            &0x80008080u32.to_le_bytes()
+                        );
+                        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                        assert_eq!(m.state.regs[6], 1);
+                    }
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                    for m in &machines[1..] {
+                        assert_eq!(
+                            machines[0].memory().read_data(address, 4).unwrap(),
+                            m.memory().read_data(address, 4).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_memory_shift_does_not_write_executable_page_or_advance_epoch() {
+    for count in [0, 32] {
+        let code = assemble(|a| {
+            a.shl(dword_ptr(edi), cl).unwrap();
+            a.ret().unwrap();
+        });
+        let mut m = machine(&code, 2);
+        reset(&mut m, [0, count, 0, 0, 0, 0, 0, CODE], 0xcd7);
+        m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.eflags, 0xcd7);
+        assert_eq!(
+            m.memory().read_data(CODE, code.len()).unwrap().as_ref(),
+            code.as_slice()
+        );
+        let stats = m.tier1_stats();
+        assert_eq!(stats.inline_accesses, 2, "one read and RET; no write");
+        assert_eq!(stats.invalidations, 0);
+        assert_eq!(stats.fallback_instructions, 0);
+    }
+}
