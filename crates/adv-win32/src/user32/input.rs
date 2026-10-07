@@ -4,6 +4,25 @@ use crate::util::set_last_error;
 use adv_abi::{AnsiStr, Env, GuestPtr, Handle, Registry, WideStr, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 
+#[win32(user32, name = "SetKeyboardState", level = state)]
+pub(super) fn set_keyboard_state(env: &mut Env<'_>, state: GuestPtr<u8>) -> i32 {
+    let mut keys = [0; 256];
+    if adv_abi::guest::check_range(env.cpu, state.addr(), 256, Prot::READ).is_err()
+        || env.cpu.read(state.addr(), &mut keys).is_err()
+    {
+        set_last_error(env, 998);
+        return 0;
+    }
+    // The queue owns logical down/toggle bits. This does not change physical
+    // input, other threads, or messages already waiting in the queue.
+    for key in &mut keys {
+        *key &= 0x81;
+    }
+    let context = env.context;
+    user_mut(env).queue(context).keyboard.0 = keys;
+    1
+}
+
 #[win32(user32, name = "GetCursorInfo", level = state)]
 fn get_cursor_info(env: &mut Env<'_>, out: GuestPtr<u8>) -> i32 {
     // Win32 CURSORINFO is 20 bytes: DWORD, DWORD, HCURSOR, POINT. Keep
@@ -121,6 +140,7 @@ fn swap_mouse_button(env: &mut Env<'_>, swap: i32) -> u32 {
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
+        set_keyboard_state_ABI,
         get_cursor_info_ABI,
         get_cursor_ABI,
         get_keyboard_layout_ABI,
