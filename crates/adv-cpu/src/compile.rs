@@ -863,6 +863,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         if instruction.flow_control() != FlowControl::Next {
             entries.insert(instruction.next_ip32());
         }
+        // An interpreted instruction returns with canonical state. Publish its
+        // decoded continuation so a cold form does not strand the supported
+        // remainder of this block in the interpreter on every execution.
+        if !supported(instruction) && !crate::floating::native_x87(instruction) {
+            entries.insert(instruction.next_ip32());
+        }
         if matches!(
             instruction.op0_kind(),
             OpKind::NearBranch16 | OpKind::NearBranch32
