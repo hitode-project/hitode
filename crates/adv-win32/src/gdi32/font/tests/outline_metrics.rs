@@ -60,6 +60,7 @@ fn selected_outline_fields_names_and_baseline_match_native() {
         let required = expected.len() as u32;
         // Independent native W query explains the ANSI thunk's sub-DWORD
         // prefix. Adjust only the host pointer-width-dependent fixed header.
+        // SAFETY: the independent oracle owns this font DC; output is NULL.
         let wide_required =
             unsafe { gdi::GetOutlineTextMetricsW(native.dc, 0, std::ptr::null_mut()) }
                 - std::mem::size_of::<gdi::OUTLINETEXTMETRICW>() as u32
@@ -176,12 +177,14 @@ fn selected_outline_fields_names_and_baseline_match_native() {
 #[cfg(windows)]
 fn outline_metrics_preflight_prevents_partial_guest_writes() {
     let (mut machine, data, dc) = fixture();
-    let readonly = machine
+    let pages = machine
         .sys
         .vm
-        .alloc(&mut machine.cpu, 4096, Prot::READ)
+        .alloc(&mut machine.cpu, 8192, Prot::RW)
         .unwrap();
-    let output = data + 4000;
+    let readonly = pages + 4096;
+    machine.cpu.protect(readonly, 4096, Prot::READ).unwrap();
+    let output = readonly - 96;
     for pointer in [readonly, u32::MAX - 3, output] {
         machine.cpu.write(output, &[0xa5; 96]).unwrap();
         assert_eq!(
