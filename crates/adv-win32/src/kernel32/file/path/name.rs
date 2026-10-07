@@ -36,6 +36,19 @@ fn existing(vfs: &adv_os::Vfs, path: &str) -> bool {
     vfs.lookup(path).is_some() || vfs.is_optical_path(path) && vfs.optical_entry(path).is_ok()
 }
 
+fn short_name_candidate(component: &str) -> bool {
+    let mut parts = component.split('.');
+    let base = parts.next().unwrap();
+    let extension = parts.next().unwrap_or("");
+    // Native name expansion skips components that are already long names.
+    // The shape check counts UTF-16 units, including spaces, rather than ANSI
+    // bytes; leading/multiple dots and a base longer than eight also skip it.
+    !base.is_empty()
+        && base.encode_utf16().count() <= 8
+        && extension.encode_utf16().count() <= 3
+        && parts.next().is_none()
+}
+
 fn resolve(env: &mut Env<'_>, path: &str, long: bool, api: &str) -> Result<String, u32> {
     if path.starts_with(r"\\") {
         unavailable(
@@ -111,7 +124,7 @@ fn resolve(env: &mut Env<'_>, path: &str, long: bool, api: &str) -> Result<Strin
             if separator.is_some() && !vfs.is_dir(&child) {
                 return Err(3);
             }
-            if long {
+            if long && short_name_candidate(component) {
                 match vfs.list(&parent) {
                     Some(entries) => {
                         let Some(entry) = entries
@@ -136,8 +149,8 @@ fn resolve(env: &mut Env<'_>, path: &str, long: bool, api: &str) -> Result<Strin
                     None => return Err(err::ACCESS_DENIED),
                 }
             } else {
-                // Windows permits returning the long-name path when a volume
-                // has no short names. Keep the exact usable input spelling.
+                // Keep already-long components unchanged. Short-name queries
+                // also retain this usable spelling on a volume with no aliases.
                 result.push_str(component);
             }
         }
@@ -311,7 +324,7 @@ mod tests {
             let usable = read(&mut machine, 0x410100, wide);
             assert!(machine.ext.get::<Win32>().vfs.lookup(&usable).is_some());
             let path = ".\\data folder\\..\\data folder\\LONG FILENAME.BIN";
-            let expected = ".\\Data Folder\\..\\Data Folder\\Long Filename.bin";
+            let expected = path;
             assert_eq!(
                 call(&mut machine, path, wide, true, 128, 0x410200),
                 expected.len() as u32
@@ -330,7 +343,7 @@ mod tests {
             );
             assert_eq!(
                 read(&mut machine, 0x410100, wide),
-                "C:\\Game\\Data Folder\\Long Filename.bin"
+                "C:\\Game\\data folder\\LONG FILENAME.BIN"
             );
         }
         drop(machine);
@@ -340,12 +353,12 @@ mod tests {
     #[test]
     fn names_count_guest_encoding_units_and_use_overlay_directory_spelling() {
         let (mut machine, root) = fixture("path-names-encoding");
-        std::fs::create_dir(root.join("game/Mixed Dir")).unwrap();
-        std::fs::write(root.join("game/Mixed Dir/表データ.dat"), b"base").unwrap();
-        std::fs::create_dir_all(root.join("data/overlay/mixed dir")).unwrap();
-        std::fs::write(root.join("data/overlay/mixed dir/表データ.dat"), b"overlay").unwrap();
-        let path = "MIXED DIR\\表データ.dat";
-        let expected = "mixed dir\\表データ.dat";
+        std::fs::create_dir(root.join("game/Mix Dir")).unwrap();
+        std::fs::write(root.join("game/Mix Dir/表データ.dat"), b"base").unwrap();
+        std::fs::create_dir_all(root.join("data/overlay/mix dir")).unwrap();
+        std::fs::write(root.join("data/overlay/mix dir/表データ.dat"), b"overlay").unwrap();
+        let path = "MIX DIR\\表データ.dat";
+        let expected = "mix dir\\表データ.dat";
         for wide in [false, true] {
             let length = if wide {
                 expected.encode_utf16().count()
@@ -359,14 +372,61 @@ mod tests {
             );
             assert_eq!(read(&mut machine, 0x410100, wide), expected);
         }
-        std::fs::write(root.join("game/Mixed Dir/😀.dat"), b"unicode").unwrap();
-        let path = "MIXED DIR\\😀.dat";
-        let expected = "mixed dir\\😀.dat";
+        std::fs::write(root.join("game/Mix Dir/😀.dat"), b"unicode").unwrap();
+        let path = "MIX DIR\\😀.dat";
+        let expected = "mix dir\\😀.dat";
         assert_eq!(
             call(&mut machine, path, true, true, 128, 0x410100),
             expected.encode_utf16().count() as u32
         );
         assert_eq!(read(&mut machine, 0x410100, true), expected);
+        drop(machine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_names_only_expand_short_shaped_components() {
+        let (mut machine, root) = fixture("path-names-native-shape");
+        // Authored native GetLongPathNameW oracle: only short-shaped components
+        // are enumerated; already-long names retain the exact supplied spelling.
+        let pairs = [
+            ("Mixed.bin", "MIXED.BIN", "Mixed.bin"),
+            ("LongFilename.bin", "longfilename.BIN", "longfilename.BIN"),
+            ("Mixed.long", "MIXED.LONG", "MIXED.LONG"),
+            ("A B.txt", "a b.TXT", "A B.txt"),
+            ("simple", "SIMPLE", "simple"),
+            ("Abcdefgh.bin", "ABCDEFGH.BIN", "Abcdefgh.bin"),
+            ("Abcdefghi.bi", "ABCDEFGHI.BI", "ABCDEFGHI.BI"),
+            ("Abcdefghi", "ABCDEFGHI", "ABCDEFGHI"),
+            ("Ab.Cd.ef", "AB.CD.EF", "AB.CD.EF"),
+            (".git", ".GIT", ".GIT"),
+            ("表表表表a.bin", "表表表表A.BIN", "表表表表a.bin"),
+        ];
+        for (stored, _, _) in pairs {
+            std::fs::write(root.join("game").join(stored), b"authored").unwrap();
+        }
+        for wide in [false, true] {
+            for (_, input, expected) in pairs {
+                let length = if wide {
+                    expected.encode_utf16().count()
+                } else {
+                    machine.ext.get::<Win32>().codec.encode(expected).len()
+                } as u32;
+                assert_eq!(call(&mut machine, input, wide, true, 128, 0x410100), length);
+                assert_eq!(read(&mut machine, 0x410100, wide), expected);
+            }
+        }
+        for (stored, input, expected) in [
+            ("😀😀😀a.bin", "😀😀😀A.BIN", "😀😀😀a.bin"),
+            ("😀😀😀😀a.bin", "😀😀😀😀A.BIN", "😀😀😀😀A.BIN"),
+        ] {
+            std::fs::write(root.join("game").join(stored), b"authored").unwrap();
+            assert_eq!(
+                call(&mut machine, input, true, true, 128, 0x410100),
+                expected.encode_utf16().count() as u32
+            );
+            assert_eq!(read(&mut machine, 0x410100, true), expected);
+        }
         drop(machine);
         std::fs::remove_dir_all(root).unwrap();
     }
