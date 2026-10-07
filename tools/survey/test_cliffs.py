@@ -88,7 +88,8 @@ class AggregateTests(unittest.TestCase):
 
     def test_detail_schema_rejects_partial_or_private_labels(self):
         for label in ("Rejected/UnknownReason", "Uncovered/private/path", "Rejected/Unsupported/Mov/private",
-                      "Rejected/Unsupported/Mov/Mov_0x1234-operand", "Forced/BelowThreshold"):
+                      "Rejected/Unsupported/Mov/Mov_0x1234-operand", "Rejected/Unsupported/Mov/Mov_0x1234",
+                      "Rejected/Unsupported/Mov/Mov_12345678", "Forced/BelowThreshold"):
             report = self.detailed_fixture()
             report["cpu_cliffs"]["interpreter_details"] = {label: {"entries": 2, "instructions": 11}}
             with self.assertRaises(ValueError) as caught:
