@@ -9,6 +9,7 @@ mod compile_budget;
 mod compiler;
 mod cpu_profile;
 mod discovery;
+pub mod execution_abi;
 mod executor;
 mod file_memory;
 mod floating;
