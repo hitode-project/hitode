@@ -1655,6 +1655,12 @@ impl<B: Backend> Machine<B> {
     }
 
     fn complete_process_exit(&mut self, code: u32) -> RunResult {
+        let code = self
+            .sys
+            .process_identity
+            .completion
+            .exit_status()
+            .unwrap_or(code);
         // Reports retain guest memory after exit, but physical pins must end
         // with the guest process rather than wait for the executor's Drop.
         match self.cpu.retire_locked_pages() {

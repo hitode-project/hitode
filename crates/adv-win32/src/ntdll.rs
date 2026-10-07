@@ -10,7 +10,9 @@ pub(crate) use peb_lock::install as install_peb_lock;
 mod procedure;
 mod registry;
 mod strings;
+mod termination;
 mod thread;
+mod thread_open;
 
 use adv_abi::Registry;
 use adv_cpu::backend::GuestExt;
@@ -219,6 +221,8 @@ pub fn register(reg: &mut Registry) {
     strings::register(reg);
     procedure::register(reg);
     thread::register(reg);
+    thread_open::register(reg);
+    termination::register(reg);
     allocation::register(reg);
     memory::register(reg);
     registry::register(reg);
