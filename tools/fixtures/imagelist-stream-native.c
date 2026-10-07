@@ -57,7 +57,7 @@ static HRESULT WINAPI read_stream(IStream *stream, void *buffer, ULONG count, UL
     DWORD call = probe->calls++;
     if (got > count) got = count;
     if (probe->max_piece && got > probe->max_piece) got = probe->max_piece;
-    if (probe->mode == 3) got = 0;
+    if (probe->mode == 3 || (probe->mode == 7 && call == 8)) got = 0;
     if (call < 16) { probe->requested[call] = count; probe->actual[call] = got; }
     bytes_copy(buffer, data + probe->position, got);
     probe->position += got;
@@ -65,7 +65,7 @@ static HRESULT WINAPI read_stream(IStream *stream, void *buffer, ULONG count, UL
         probe->count_outputs++;
         if (probe->mode != 6) *read = probe->mode == 5 ? count + 1 : got;
     }
-    if (probe->mode == 3) return E_FAIL;
+    if (probe->mode == 3 || (probe->mode == 7 && call == 8)) return E_FAIL;
     if (probe->mode == 2 || probe->mode == 4) return S_FALSE;
     return got == count || probe->mode == 1 ? S_OK : S_FALSE;
 }
@@ -205,6 +205,7 @@ void mainCRTStartup(void) {
     saved = word(2); put_word(2, 0x0100); probe_read("Read unknown version", 0, 0, 0); put_word(2, saved);
     flags = word(18);
     put_word(18, 0x10ff); probe_read("Read internal flags 0x10ff", 0, 0, 1);
+    probe_read("Read extended tail E_FAIL", 7, 0, 0);
     put_word(18, 0x00fe); probe_read("Read DDB flags 0xfe", 0, 0, 1);
     put_word(18, flags);
     saved = data[pixels + ((dword(50) - 1) * dword(46)) * 4 + 3];
