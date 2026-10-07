@@ -1821,6 +1821,95 @@ fn message_box_waits_for_the_user_to_press_one_of_its_buttons() {
 }
 
 #[test]
+fn message_box_ex_aw_keeps_unicode_modal_choice_diagnostics_and_five_word_abi() {
+    use adv_win32::user32::dialog::{self, DialogEvent};
+    for (api, unicode, language) in [("MessageBoxExA", false, 0), ("MessageBoxExW", true, 0xffff)] {
+        let mut t = T::new();
+        let message = if unicode {
+            "选择显示模式？"
+        } else {
+            "Choose display mode?"
+        };
+        let title = if unicode { "显示" } else { "Display" };
+        let text = if unicode {
+            t.wtext(message)
+        } else {
+            t.text(message)
+        };
+        let caption = if unicode {
+            t.wtext(title)
+        } else {
+            t.text(title)
+        };
+        assert_eq!(
+            t.m.sys
+                .thunks
+                .resolver()
+                .host_fn("user32.dll", api)
+                .unwrap()
+                .conv,
+            adv_abi::Conv::Stdcall { argc: 5 }
+        );
+        let mut code = Asm::new(CODE);
+        let result = t.call(
+            &mut code,
+            api,
+            &[I(0), I(text), I(caption), I(0x104), I(language)],
+        );
+        t.start(code);
+        assert!(matches!(
+            t.m.run(),
+            RunResult::Idle {
+                next_deadline: None
+            }
+        ));
+        let presentation = dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects).unwrap();
+        let projected = &presentation.dialogs[0];
+        assert!(projected.modal);
+        assert_eq!(projected.text, title);
+        assert!(
+            projected
+                .controls
+                .iter()
+                .any(|control| control.text == message)
+        );
+        let yes = projected
+            .controls
+            .iter()
+            .find(|control| control.target.id == 6)
+            .unwrap()
+            .target;
+        let mut env = adv_machine::Env {
+            context: t.m.sys.current,
+            cpu: &mut t.m.cpu,
+            sys: &mut t.m.sys,
+            ext: &mut t.m.ext,
+            thunk: 0,
+        };
+        assert!(dialog::post_host_event(&mut env, DialogEvent::Click(yes)));
+        t.finish();
+        assert_eq!(t.u32(result), 6);
+        let diagnostic =
+            t.m.ext
+                .get::<adv_abi::ApiDiagnostics>()
+                .message_boxes
+                .back()
+                .unwrap();
+        assert_eq!(diagnostic.api, format!("user32.dll!{api}"));
+        assert_eq!(
+            (&diagnostic.text, &diagnostic.caption, diagnostic.result),
+            (&message.to_owned(), &title.to_owned(), 6)
+        );
+        assert!(
+            dialog::presentation(t.m.ext.get::<Win32>(), &t.m.sys.objects)
+                .unwrap()
+                .dialogs
+                .is_empty()
+        );
+    }
+}
+
+#[test]
 fn auto_dialog_clicks_the_default_button_after_its_virtual_deadline() {
     for (extended, unicode) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut t = T::with_auto_dialog(Some(25));

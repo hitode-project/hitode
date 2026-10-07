@@ -31,7 +31,7 @@ mod tab;
 pub(crate) mod update;
 pub mod window;
 
-use adv_abi::{Conv, Handle as AbiHandle, Registry, WideStr, win32};
+use adv_abi::{AnsiStr, Conv, Handle as AbiHandle, Registry, WideStr, win32};
 use adv_cpu::backend::{Backend, GuestExt, MemFault};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::ResId;
@@ -73,19 +73,52 @@ pub(crate) fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), MemFault> {
 }
 
 fn message_box_a(env: &mut Env<'_>) -> Outcome {
+    message_box_a_named(env, "MessageBoxA")
+}
+
+fn message_box_a_named(env: &mut Env<'_>, api: &str) -> Outcome {
     let (text, caption, ty) = (env.arg(1), env.arg(2), env.arg(3));
     let c = env.ext.get::<Win32>().codec;
     let (t, cap) = (
         c.decode(&cstr(env.cpu, text)),
         c.decode(&cstr(env.cpu, caption)),
     );
-    message_box(env, t, cap, ty, "MessageBoxA")
+    message_box(env, t, cap, ty, api)
 }
 
 fn message_box_w(env: &mut Env<'_>) -> Outcome {
+    message_box_w_named(env, "MessageBoxW")
+}
+
+fn message_box_w_named(env: &mut Env<'_>, api: &str) -> Outcome {
     let t = String::from_utf16_lossy(&crate::util::wstr(env.cpu, env.arg(1)));
     let cap = String::from_utf16_lossy(&crate::util::wstr(env.cpu, env.arg(2)));
-    message_box(env, t, cap, env.arg(3), "MessageBoxW")
+    message_box(env, t, cap, env.arg(3), api)
+}
+
+// Microsoft Learn: current MessageBoxEx uses the system UI language and
+// otherwise behaves like MessageBox. Keep the fifth x86 stack word in its ABI.
+#[win32(user32, name = "MessageBoxExA", level = state)]
+fn message_box_ex_a(
+    env: &mut Env<'_>,
+    _owner: AbiHandle,
+    _text: AnsiStr,
+    _caption: AnsiStr,
+    _style: u32,
+    _language: u32,
+) -> Outcome {
+    message_box_a_named(env, "MessageBoxExA")
+}
+#[win32(user32, name = "MessageBoxExW", level = state)]
+fn message_box_ex_w(
+    env: &mut Env<'_>,
+    _owner: AbiHandle,
+    _text: WideStr,
+    _caption: WideStr,
+    _style: u32,
+    _language: u32,
+) -> Outcome {
+    message_box_w_named(env, "MessageBoxExW")
 }
 
 fn message_box(env: &mut Env<'_>, t: String, cap: String, ty: u32, api: &str) -> Outcome {
@@ -684,6 +717,8 @@ pub fn register(reg: &mut Registry) {
     let s = |reg: &mut Registry, name: &str, argc: u8, h| stdcall(reg, USER32, name, argc, h);
     s(reg, "MessageBoxA", 4, message_box_a);
     s(reg, "MessageBoxW", 4, message_box_w);
+    reg.register(message_box_ex_a_ABI);
+    reg.register(message_box_ex_w_ABI);
     s(reg, "MessageBeep", 1, |_| Outcome::Return(1));
     s(reg, "GetSystemMetrics", 1, get_system_metrics);
     // The guest has one standard enhanced keyboard, independent of the host
