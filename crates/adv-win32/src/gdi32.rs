@@ -11,6 +11,8 @@ use crate::Win32;
 mod batch;
 mod brush;
 pub mod font;
+#[cfg(test)]
+mod object_queries;
 mod palette;
 mod pen;
 pub mod raster;
@@ -128,16 +130,8 @@ pub fn create_font(env: &mut Env<'_>, height: i32, face: &str) -> u32 {
     let bytes = env.ext.get::<Win32>().codec.encode(face);
     let n = bytes.len().min(31);
     raw[28..28 + n].copy_from_slice(&bytes[..n]);
-    let f = LogFont {
-        height,
-        width: 0,
-        weight: 400,
-        italic: false,
-        charset: 1,
-        face: face.into(),
-        raw,
-    };
-    add(env, GdiObj::Font(f))
+    raw[23] = 1;
+    add_logfont_with_face(env, raw, face.into(), None)
 }
 
 #[win32(gdi32, name = "GetStockObject", level = state)]
@@ -163,13 +157,31 @@ fn add_logfont(env: &mut Env<'_>, raw: Vec<u8>) -> u32 {
         .position(|&b| b == 0)
         .map_or(60, |n| 28 + n);
     let face = env.ext.get::<Win32>().codec.decode(&raw[28..face_end]);
-    add_logfont_with_face(env, raw, face)
+    add_logfont_with_face(env, raw, face, None)
 }
 
 // Both creation encodings publish the same logical font payload. `raw` remains
 // LOGFONTA for GetObjectA; `face` owns the original decoded name for realization.
-fn add_logfont_with_face(env: &mut Env<'_>, raw: Vec<u8>, face: String) -> u32 {
+fn add_logfont_with_face(
+    env: &mut Env<'_>,
+    raw: Vec<u8>,
+    face: String,
+    wide: Option<[u8; 92]>,
+) -> u32 {
     let i32_at = |o: usize| i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+    let wide = wide.unwrap_or_else(|| {
+        let mut wide = [0; 92];
+        wide[..28].copy_from_slice(&raw[..28]);
+        for (slot, unit) in wide[28..]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(face.encode_utf16())
+        {
+            *slot = unit.to_le_bytes();
+        }
+        wide
+    });
     let f = LogFont {
         height: i32_at(0),
         width: i32_at(4),
@@ -178,6 +190,7 @@ fn add_logfont_with_face(env: &mut Env<'_>, raw: Vec<u8>, face: String) -> u32 {
         charset: raw[23],
         face,
         raw,
+        wide,
     };
     log::debug!("CreateFont({} h{} w{})", f.face, f.height, f.weight);
     add(env, GdiObj::Font(f))
@@ -315,7 +328,14 @@ pub(super) fn select_object_value(env: &mut Env<'_>, hdc: u32, h: u32) -> Outcom
 
 #[win32(gdi32, name = "GetObjectA", level = implement)]
 fn get_object_a(env: &mut Env<'_>, object: Handle, count: i32, output: GuestPtr<()>) -> Outcome {
-    let (h, size, out) = (object.0, count.max(0) as u32, output.addr());
+    get_object(env, object.0, count, output.addr(), false)
+}
+#[win32(gdi32, name = "GetObjectW", level = implement)]
+fn get_object_w(env: &mut Env<'_>, object: Handle, count: i32, output: GuestPtr<()>) -> Outcome {
+    get_object(env, object.0, count, output.addr(), true)
+}
+fn get_object(env: &mut Env<'_>, h: u32, count: i32, out: u32, wide: bool) -> Outcome {
+    let size = count.max(0) as u32;
     if let Some(bytes) = pen::describe(env, h) {
         if out == 0 {
             return Outcome::Return(16);
@@ -343,31 +363,65 @@ fn get_object_a(env: &mut Env<'_>, object: Handle, count: i32, output: GuestPtr<
             0
         });
     }
-    let bytes: Vec<u8> = match get(env, h) {
-        Some(GdiObj::Font(f)) => f.raw.clone(),
-        Some(GdiObj::Bitmap {
-            width,
-            height,
-            bpp,
-            bits,
-            stride,
-            ..
-        }) => {
-            // BITMAP: bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes, bmBitsPixel, bmBits.
-            let mut b = Vec::with_capacity(24);
-            for v in [0u32, *width as u32, height.unsigned_abs(), *stride] {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            b.extend_from_slice(&1u16.to_le_bytes());
-            b.extend_from_slice(&bpp.to_le_bytes());
-            b.extend_from_slice(&bits.to_le_bytes());
-            b
+    let stock = match font::describe_stock(env, h, wide) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            adv_abi::warn_unavailable(
+                env,
+                if wide {
+                    "gdi32.dll!GetObjectW"
+                } else {
+                    "gdi32.dll!GetObjectA"
+                },
+                &error.to_string(),
+            );
+            return Outcome::Return(0);
         }
-        Some(GdiObj::Brush { color }) => [0u32, *color, 0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        _ => return Outcome::Return(0),
+    };
+    let font = stock.is_some() || matches!(get(env, h), Some(GdiObj::Font(_)));
+    if wide && font && out != 0 && size > 92 {
+        adv_abi::warn_unavailable(
+            env,
+            "gdi32.dll!GetObjectW",
+            "extended logical font descriptors are unavailable",
+        );
+        return Outcome::Return(0);
+    }
+    let bytes: Vec<u8> = if let Some(stock) = stock {
+        stock
+    } else {
+        match get(env, h) {
+            Some(GdiObj::Font(f)) => {
+                if wide {
+                    f.wide.to_vec()
+                } else {
+                    f.raw.clone()
+                }
+            }
+            Some(GdiObj::Bitmap {
+                width,
+                height,
+                bpp,
+                bits,
+                stride,
+                ..
+            }) => {
+                // BITMAP: bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes, bmBitsPixel, bmBits.
+                let mut b = Vec::with_capacity(24);
+                for v in [0u32, *width as u32, height.unsigned_abs(), *stride] {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                b.extend_from_slice(&1u16.to_le_bytes());
+                b.extend_from_slice(&bpp.to_le_bytes());
+                b.extend_from_slice(&bits.to_le_bytes());
+                b
+            }
+            Some(GdiObj::Brush { color }) => [0u32, *color, 0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            _ => return Outcome::Return(0),
+        }
     };
     if out == 0 {
         return Outcome::Return(bytes.len() as u32);
@@ -943,6 +997,7 @@ pub fn register(reg: &mut Registry) {
         create_brush_indirect_ABI,
         create_pen_ABI,
         get_object_a_ABI,
+        get_object_w_ABI,
         create_bitmap_ABI,
         create_compatible_bitmap_ABI,
         get_device_caps_ABI,

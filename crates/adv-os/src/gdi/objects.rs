@@ -72,8 +72,10 @@ pub struct LogFont {
     pub italic: bool,
     pub charset: u8,
     pub face: String,
-    /// The raw LOGFONTA for GetObject.
+    /// The raw LOGFONTA for GetObjectA.
     pub raw: Vec<u8>,
+    /// LOGFONTW retains the Unicode creation field, including its fixed tail.
+    pub wide: [u8; 92],
 }
 
 #[derive(Clone, Debug)]

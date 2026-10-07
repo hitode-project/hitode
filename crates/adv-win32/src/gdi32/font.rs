@@ -209,6 +209,20 @@ fn request_for_handle(env: &Env<'_>, font: u32) -> FontRequest {
     }
 }
 
+pub(super) fn describe_stock(
+    env: &mut Env<'_>,
+    handle: u32,
+    wide: bool,
+) -> Result<Option<Vec<u8>>, TextError> {
+    if !matches!(handle.wrapping_sub(0x0190_0010), 10..=14 | 16 | 17) {
+        return Ok(None);
+    }
+    let request = request_for_handle(env, handle);
+    let logical = env.ext.get_mut::<Fonts>().text.logical_font(&request)?;
+    let bytes = enumeration::pack_logfont(env, &logical, wide);
+    Ok(Some(bytes[..if wide { 92 } else { 60 }].to_vec()))
+}
+
 /// USER control geometry measures the same logical font without creating a DC.
 pub(crate) fn metrics_for_logical_font(
     env: &mut Env<'_>,

@@ -895,6 +895,30 @@ impl Font {
     pub(super) fn metrics(&self) -> TextMetrics {
         self.metrics.clone()
     }
+    pub(super) fn logical_font(&self) -> FontRequest {
+        let mut logical = self.request.clone();
+        if logical.default.is_some() {
+            // Describe the already selected default face and cell size. Font
+            // discovery/profile selection has one owner in this provider.
+            logical.default = None;
+            logical.face = self
+                .primary
+                .info
+                .families
+                .first()
+                .map(|name| name.0.clone())
+                .unwrap_or_default();
+            logical.height = self.metrics.height;
+            logical.weight = self.metrics.weight;
+            logical.pitch = if self.primary.info.monospaced {
+                Pitch::Fixed
+            } else {
+                Pitch::Variable
+            };
+            logical.family = self.metrics.family;
+        }
+        logical
+    }
     pub(super) fn resolved_character(&self, code: u32) -> Result<FontResolution, TextError> {
         let (face, glyph) = self.resolve(code)?;
         let mapped = face

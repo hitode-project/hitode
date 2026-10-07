@@ -666,6 +666,18 @@ impl Text {
     ) -> Result<FontResolution, TextError> {
         self.font(request)?.resolved_character(code)
     }
+    /// Describe the logical font retained by the existing provider. Default
+    /// requests use the same selected face/profile as measurement and drawing.
+    pub fn logical_font(&mut self, request: &FontRequest) -> Result<FontRequest, TextError> {
+        #[cfg(windows)]
+        {
+            self.font(request)?.logical_font()
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(self.font(request)?.logical_font())
+        }
+    }
     pub fn metrics(&mut self, request: &FontRequest) -> Result<TextMetrics, TextError> {
         #[cfg(windows)]
         {
