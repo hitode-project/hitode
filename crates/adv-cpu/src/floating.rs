@@ -102,6 +102,10 @@ pub(crate) unsafe extern "C" fn x87_call(
         } else if state.x87.status & 0x80 != 0 || state.mmx_mode != 0 {
             X87Cliff::Pending
         } else if fast::arithmetic_precision(state.x87.control).is_none() {
+            *cliffs
+                .x87_control
+                .entry(state.x87.control & 0x0f3f)
+                .or_default() += 1;
             X87Cliff::Control
         } else {
             X87Cliff::Operand
