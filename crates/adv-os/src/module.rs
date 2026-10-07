@@ -2,6 +2,7 @@
 //! (kernel32, ...) with real, guest-readable synthetic PE images.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{cell::RefCell, rc::Rc};
 
 use adv_pe::{ExportTarget, ResourceDir};
 mod datafile;
@@ -106,9 +107,56 @@ pub struct Modules {
     ldr: u32,
     ldr_used: u32,
     ldr_free: Vec<(u32, u32)>,
+    system_layout: Rc<RefCell<BTreeMap<String, (u32, u32)>>>,
 }
 
 impl Modules {
+    /// A process family shares system-image addresses, never image bytes or
+    /// module references. Install this before loading any child system image.
+    pub fn inherit_system_image_layout(&mut self, source: &Self) -> Result<(), &'static str> {
+        if self.host_count() != 0 {
+            return Err("system image layout must be inherited before mapping host modules");
+        }
+        self.system_layout = source.system_layout.clone();
+        Ok(())
+    }
+
+    pub(crate) fn system_image_base(&self, name: &str) -> u32 {
+        let layout = self.system_layout.borrow();
+        layout.get(name).map_or_else(
+            || {
+                layout
+                    .values()
+                    .map(|&(base, span)| base + span)
+                    .max()
+                    .unwrap_or(adv_machine::layout::HOST_MODULE_BASE)
+            },
+            |&(base, _)| base,
+        )
+    }
+
+    pub(crate) fn reserve_system_image(&mut self, name: &str, base: u32, size: u32) -> bool {
+        use adv_machine::layout::{GRANULE, HOST_MODULE_BASE, HOST_MODULE_CAP};
+        let Some(span) = size
+            .checked_add(GRANULE - 1)
+            .map(|end| end & !(GRANULE - 1))
+        else {
+            return false;
+        };
+        let mut layout = self.system_layout.borrow_mut();
+        if let Some(&(resident, capacity)) = layout.get(name) {
+            return resident == base && span <= capacity;
+        }
+        if base
+            .checked_add(span)
+            .is_none_or(|end| end > HOST_MODULE_BASE + HOST_MODULE_CAP * GRANULE)
+        {
+            return false;
+        }
+        layout.insert(name.into(), (base, span));
+        true
+    }
+
     fn alloc_ldr(
         &mut self,
         cpu: &mut dyn adv_cpu::backend::Guest,
@@ -461,6 +509,16 @@ impl Modules {
             return Ok(());
         }
         let head = self.ldr + 0x1c;
+        if module.kind == ModuleKind::Host && module.name == "ntdll.dll" {
+            // Native process infrastructure initializes before ordinary DLLs,
+            // even when its synthetic image is published after static imports.
+            let first = cpu.read_u32(head)?;
+            cpu.write_u32(node, first)?;
+            cpu.write_u32(node + 4, head)?;
+            cpu.write_u32(first + 4, node)?;
+            cpu.write_u32(head, node)?;
+            return Ok(());
+        }
         let tail = cpu.read_u32(head + 4)?;
         cpu.write_u32(node, head)?;
         cpu.write_u32(node + 4, tail)?;

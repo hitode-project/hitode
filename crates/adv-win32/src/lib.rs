@@ -108,6 +108,12 @@ pub const STD_OUTPUT: u32 = 7;
 pub const STD_ERROR: u32 = 11;
 
 impl Win32 {
+    /// System infrastructure is readable before a suspended child runs its
+    /// loader gate or a caller redirects its initial thread context.
+    pub fn prepare_process_infrastructure<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
+        kernel32::prepare_system_modules(m)
+    }
+
     /// Create the Win32 state and the process heap and install them into the machine. The
     /// heaps are their own `Ext` entry: other personalities allocate from them too.
     pub fn install<B: Backend>(m: &mut Machine<B>, cfg: Win32Config) -> Result<(), MemFault> {

@@ -458,6 +458,132 @@ impl Snapshot {
         input
     }
 
+    /// Admit tiny direct leaves already fully captured in the caller's window.
+    /// Do not extend capture or relax any boundary except the admitted entry.
+    pub(crate) fn direct_leaf_callees(&self) -> Vec<u32> {
+        if !self.region.reachable {
+            return Vec::new();
+        }
+        let start = u64::from(self.region.start);
+        let end = start + self.region.len as u64;
+        let slice = |pc: u32| {
+            (start..end).contains(&u64::from(pc)).then(|| {
+                &self.bytes[(pc - self.origin) as usize..(end - u64::from(self.origin)) as usize]
+            })
+        };
+        let mut pending = self.region.entries.clone();
+        pending.push(self.region.start);
+        let mut visited = BTreeSet::new();
+        let mut candidates = BTreeSet::new();
+        while let Some(pc) = pending.pop() {
+            let Some(bytes) = slice(pc) else { continue };
+            let mut decoder = Decoder::with_ip(32, bytes, u64::from(pc), DecoderOptions::NONE);
+            while decoder.can_decode() {
+                let pc = decoder.ip() as u32;
+                if self.region.frontier.contains(&pc) || !visited.insert(pc) {
+                    break;
+                }
+                let i = decoder.decode();
+                if i.is_invalid() {
+                    break;
+                }
+                if i.op0_kind() == OpKind::NearBranch32 {
+                    if i.flow_control() == FlowControl::Call {
+                        candidates.insert(i.near_branch32());
+                    } else {
+                        pending.push(i.near_branch32());
+                    }
+                }
+                if !matches!(
+                    i.flow_control(),
+                    FlowControl::Next
+                        | FlowControl::Call
+                        | FlowControl::IndirectCall
+                        | FlowControl::ConditionalBranch
+                ) {
+                    break;
+                }
+            }
+        }
+        let mut factory = iced_x86::InstructionInfoFactory::new();
+        candidates
+            .into_iter()
+            .filter(|&target| {
+                if visited.contains(&target) {
+                    return false;
+                }
+                let Some(bytes) = slice(target) else {
+                    return false;
+                };
+                let mut decoder =
+                    Decoder::with_ip(32, bytes, u64::from(target), DecoderOptions::NONE);
+                for _ in 0..8 {
+                    if !decoder.can_decode()
+                        || (decoder.ip() != u64::from(target)
+                            && self.region.frontier.contains(&(decoder.ip() as u32)))
+                    {
+                        return false;
+                    }
+                    let i = decoder.decode();
+                    if i.is_invalid()
+                        || i.has_lock_prefix()
+                        || i.has_rep_prefix()
+                        || i.has_repne_prefix()
+                    {
+                        return false;
+                    }
+                    if i.code() == iced_x86::Code::Retnd {
+                        return true;
+                    }
+                    if i.flow_control() != FlowControl::Next
+                        || !supported(&i)
+                        || !matches!(
+                            i.mnemonic(),
+                            M::Nop
+                                | M::Mov
+                                | M::Movzx
+                                | M::Movsx
+                                | M::Add
+                                | M::Sub
+                                | M::And
+                                | M::Or
+                                | M::Xor
+                                | M::Cmp
+                                | M::Test
+                                | M::Inc
+                                | M::Dec
+                                | M::Neg
+                                | M::Not
+                                | M::Paddb
+                        )
+                    {
+                        return false;
+                    }
+                    let info = factory.info(&i);
+                    if !info.used_memory().is_empty()
+                        || info
+                            .used_registers()
+                            .iter()
+                            .any(|r| !r.register().is_gpr() && !r.register().is_xmm())
+                        || info.used_registers().iter().any(|r| {
+                            r.register().full_register32() == R::ESP
+                                && matches!(
+                                    r.access(),
+                                    iced_x86::OpAccess::Write
+                                        | iced_x86::OpAccess::CondWrite
+                                        | iced_x86::OpAccess::ReadWrite
+                                        | iced_x86::OpAccess::ReadCondWrite
+                                )
+                        })
+                    {
+                        return false;
+                    }
+                }
+                false
+            })
+            .collect()
+    }
+
     /// Straight-line code of each captured callee through its return. Any
     /// other transfer, or undecodable bytes, stays a transfer out of the unit.
     pub(crate) fn callee_code(&self, decoded: &BTreeMap<u32, Instruction>) -> Vec<Instruction> {
@@ -601,6 +727,12 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // Entry points can follow padding/data or overlap an earlier linear decode.
     // Decode direct targets independently, as the CPU would at the actual target PC.
+    let private_callee = |pc: u32| {
+        region.reachable
+            && region.callees.contains(&pc)
+            && pc != region.start
+            && !region.entries.contains(&pc)
+    };
     let mut pending: Vec<u32> = region.entries.clone();
     if region.reachable && pending.is_empty() {
         pending.push(region.start);
@@ -614,7 +746,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         );
     }
     while let Some(target) = pending.pop() {
-        if instructions.contains_key(&target) || region.frontier.contains(&target) {
+        if instructions.contains_key(&target)
+            || region.frontier.contains(&target)
+            || private_callee(target)
+        {
             continue;
         }
         let Some(offset) = target
@@ -635,6 +770,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             && decoder.ip() < u64::from(region.start) + region.len as u64
             && !instructions.contains_key(&(decoder.ip() as u32))
             && !region.frontier.contains(&(decoder.ip() as u32))
+            && !private_callee(decoder.ip() as u32)
         {
             let i = decoder.decode();
             record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &i, &mut pages);
@@ -796,13 +932,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         CompileStrategy::Speed => "speed",
         CompileStrategy::Fast => "none",
     };
-    let invariant_plan = (opt_level == "speed"
-        && !snapshot.parallel
-        && plans.is_empty()
-        && nests.is_empty()
-        && write_summary::Summary::for_region(&instructions).is_some())
-    .then(|| invariants::analyze(&instructions))
-    .flatten();
+    let invariant_plan =
+        (opt_level == "speed" && !snapshot.parallel && plans.is_empty() && nests.is_empty())
+            .then(|| invariants::analyze(&instructions))
+            .flatten()
+            .filter(|plan| {
+                let scope = instructions
+                    .range(plan.header..=plan.latch)
+                    .map(|(&pc, i)| (pc, *i))
+                    .collect();
+                write_summary::Summary::for_region(&scope).is_some()
+            });
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
     let mut builder = JITBuilder::with_flags(
@@ -1001,6 +1141,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .then_some(invariant_id)
             .flatten()
             .map(|id| module.declare_func_in_func(id, func));
+        let invariant_resume = invariant_body.then(|| module.declare_func_in_func(id, func));
         let nest_ref = module.declare_func_in_func(nest_id, func);
         let trap_ref = module.declare_func_in_func(host_id, func);
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
@@ -1019,9 +1160,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 .range(plans[index].header..=plans[index].latch)
                 .map(|(_, i)| i)
                 .collect(),
+            None if invariant_body => {
+                let plan = invariant_plan.as_ref().unwrap();
+                instructions
+                    .range(plan.header..=plan.latch)
+                    .map(|(_, i)| i)
+                    .collect()
+            }
             None => instructions.values().collect(),
         };
-        let write_summary = write_summary::Summary::for_region(&instructions);
+        let scoped_instructions = scope.iter().map(|&i| (i.ip32(), *i)).collect();
+        let write_summary = write_summary::Summary::for_region(&scoped_instructions);
         // CpuState stays canonical at every region boundary. A pure region
         // cannot change unreferenced GPRs, so do not load them or keep them
         // alive through its fault guards. Include write-only GPRs: a budget
@@ -1205,7 +1354,16 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             state,
             offset_of!(CpuState, eip) as i32,
         );
-        let blocks: BTreeMap<_, _> = entries.iter().map(|&pc| (pc, b.create_block())).collect();
+        let blocks: BTreeMap<_, _> = entries
+            .iter()
+            .filter(|&&pc| {
+                !invariant_body
+                    || invariant_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.header <= pc && pc <= plan.latch)
+            })
+            .map(|&pc| (pc, b.create_block()))
+            .collect();
         let fast_blocks: Vec<BTreeMap<_, _>> = plans
             .iter()
             .map(|plan| {
@@ -1269,6 +1427,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             b.append_block_param(hot_dispatch, ptr_ty);
         }
         let hot_exits = kernel.is_none()
+            && !invariant_body
             && write_summary.is_some()
             && write_summary::crosses_regions(&instructions);
         if !hot_exits && kernel.is_none() {
@@ -1298,9 +1457,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let mut e = Emitter {
             b,
             optimizing: opt_level == "speed",
+            memory_scratch: None,
             invariant_plan: invariant_plan.clone(),
             invariant_body,
             invariant_gate,
+            invariant_resume,
             row_hooks,
             nest_ref,
             written,
@@ -1573,6 +1734,19 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         // single generic merge makes kind/width and unused operands live on
         // every predecessor. Limit duplication and retain the generic exit for
         // dynamic recipes, including kernel fuel settlement.
+        // Keep recipe-specific arithmetic separate, then merge only its final
+        // EFLAGS word. Canonical stores and link probing are emitted once.
+        let cold_publish = e.optimizing.then(|| {
+            let block = e.b.create_block();
+            e.b.set_cold_block(block);
+            for _ in 0..3 {
+                e.b.append_block_param(block, types::I32);
+            }
+            if shadow_ref.is_some() {
+                e.b.append_block_param(block, ptr_ty);
+            }
+            block
+        });
         let flag_exits = std::mem::take(&mut e.flag_exits);
         for (recipe, block) in flag_exits
             .into_iter()
@@ -1591,22 +1765,29 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             }
             let reason = e.b.block_params(block)[0];
             let pc = e.b.block_params(block)[1];
-            e.save_state(pc);
-            if let Some(written) = e.written {
-                let value = e.b.use_var(written);
-                e.b.ins().store(
-                    MemFlags::trusted(),
-                    value,
-                    e.context,
-                    offset_of!(NativeContext, written) as i32,
-                );
-            }
-            if hot_exits || kernel.is_some() {
-                e.b.ins().return_(&[reason]);
+            let prediction = shadow_ref.map(|_| e.b.block_params(block)[2]);
+            if let Some(publish) = cold_publish {
+                let flags = e.materialize_flags();
+                let mut args = vec![reason.into(), pc.into(), flags.into()];
+                if let Some(prediction) = prediction {
+                    args.push(prediction.into());
+                }
+                e.b.ins().jump(publish, &args);
             } else {
-                let prediction = shadow_ref.map(|_| e.b.block_params(block)[2]);
-                e.chain_or_return(pc, None, Some(reason), prediction);
+                e.publish_cold_exit(pc, reason, None, prediction, hot_exits || kernel.is_some());
             }
+        }
+        if let Some(publish) = cold_publish {
+            e.b.switch_to_block(publish);
+            let params = e.b.block_params(publish).to_vec();
+            let prediction = shadow_ref.map(|_| params[3]);
+            e.publish_cold_exit(
+                params[1],
+                params[0],
+                Some(params[2]),
+                prediction,
+                hot_exits || kernel.is_some(),
+            );
         }
         // Normal transfers do not merge with fault/budget prefixes. Bound the
         // number of constant-target footers, sharing all remaining destinations.
@@ -2110,12 +2291,15 @@ mod tests {
         use iced_x86::code_asm::*;
         let mut a = CodeAssembler::new(32).unwrap();
         let mut top = a.create_label();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
         a.set_label(&mut top).unwrap();
         a.mov(eax, dword_ptr(ebp - 8)).unwrap();
         a.add(eax, dword_ptr(ebp - 4)).unwrap();
         a.mov(dword_ptr(esi), eax).unwrap();
         a.dec(dword_ptr(edi)).unwrap();
         a.jnz(top).unwrap();
+        a.pop(ebp).unwrap();
         a.ret().unwrap();
         let bytes = a.assemble(0x10000).unwrap();
         let mut memory = Memory::new(0x10000, 4096).unwrap();
@@ -2592,9 +2776,11 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
+    memory_scratch: Option<ir::StackSlot>,
     invariant_plan: Option<invariants::Plan>,
     invariant_body: bool,
     invariant_gate: Option<(ir::FuncRef, Variable)>,
+    invariant_resume: Option<ir::FuncRef>,
     row_hooks: Vec<nest_emit::Hook>,
     nest_ref: ir::FuncRef,
     written: Option<Variable>,
@@ -3079,7 +3265,51 @@ impl Emitter<'_> {
         self.flag_exits.insert(recipe, block);
         block
     }
+    fn publish_cold_exit(
+        &mut self,
+        pc: Value,
+        reason: Value,
+        flags: Option<Value>,
+        prediction: Option<Value>,
+        terminal: bool,
+    ) {
+        self.save_state_with_flags(pc, flags);
+        if let Some(written) = self.written {
+            let value = self.b.use_var(written);
+            self.b.ins().store(
+                MemFlags::trusted(),
+                value,
+                self.context,
+                offset_of!(NativeContext, written) as i32,
+            );
+        }
+        if let Some(entry) = self.invariant_resume {
+            // The proof ends at the selected loop boundary. Resume the
+            // checked body before any surrounding code can change a base.
+            let resume = self.b.create_block();
+            let returned = self.b.create_block();
+            let dispatch = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, reason, Exit::Dispatch as i64);
+            self.b.ins().brif(dispatch, resume, &[], returned, &[]);
+            self.b.switch_to_block(resume);
+            let address = self.b.ins().func_addr(self.ptr_ty, entry);
+            self.b
+                .ins()
+                .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+            self.b.switch_to_block(returned);
+            self.b.ins().return_(&[reason]);
+        } else if terminal {
+            self.b.ins().return_(&[reason]);
+        } else {
+            self.chain_or_return(pc, None, Some(reason), prediction);
+        }
+    }
     fn save_state(&mut self, pc: Value) {
+        self.save_state_with_flags(pc, None);
+    }
+    fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
         self.flush_mmx_effects();
         for (index, var) in self.mmx.iter().enumerate() {
             if let Some(var) = var {
@@ -3127,7 +3357,7 @@ impl Emitter<'_> {
                 .ins()
                 .store(MemFlags::trusted(), v, self.state, (i * 4) as i32);
         }
-        let flags = self.materialize_flags();
+        let flags = flags.unwrap_or_else(|| self.materialize_flags());
         self.b.ins().store(
             MemFlags::trusted(),
             flags,
@@ -3387,7 +3617,11 @@ impl Emitter<'_> {
         let Some((entry, attempted)) = self.invariant_gate else {
             return false;
         };
-        let groups = self.invariant_plan.as_ref().unwrap().groups.clone();
+        let plan = self.invariant_plan.as_ref().unwrap();
+        if pc != plan.header || self.pc != plan.latch {
+            return false;
+        }
+        let groups = plan.groups.clone();
         let attempt = self.b.create_block();
         let tried = self.b.use_var(attempted);
         self.b.ins().brif(tried, checked, &[], attempt, &[]);
@@ -4242,11 +4476,19 @@ impl Emitter<'_> {
         self.b.ins().jump(done, &[no_file.into()]);
         self.b.switch_to_block(cold);
         self.mark(diagnostics::Part::Slow);
-        for &p in &permissions {
-            let access = self.b.ins().band_imm(p, i64::from(WRITE));
-            let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
+        if self.optimizing {
+            // A single fault edge suffices: no access occurs between page
+            // checks and both failures report the original operand address.
+            let missing = self.denied(&permissions, WRITE, 0);
             self.guard(missing, Exit::WriteFault, Some(addr));
             self.b.set_cold_block(self.b.current_block().unwrap());
+        } else {
+            for &p in &permissions {
+                let access = self.b.ins().band_imm(p, i64::from(WRITE));
+                let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
+                self.guard(missing, Exit::WriteFault, Some(addr));
+                self.b.set_cold_block(self.b.current_block().unwrap());
+            }
         }
         self.guard(executable, Exit::Fallback, None);
         self.b.set_cold_block(self.b.current_block().unwrap());
@@ -4707,7 +4949,20 @@ impl Emitter<'_> {
         // any byte is read/written. Mixed file/AUDIO elements use checked Memory
         // helpers, which keep PCM subranges byte atomic.
         let mut combined = None;
-        for &position in &positions {
+        let compact = self.optimizing;
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        let compact = compact && hardware.is_none();
+        if compact {
+            let missing = self.denied(&permissions, permission, 0);
+            self.guard(missing, reason, Some(addr));
+            self.b.set_cold_block(self.b.current_block().unwrap());
+            combined = Some(
+                permissions[1..]
+                    .iter()
+                    .fold(permissions[0], |all, &p| self.b.ins().bor(all, p)),
+            );
+        }
+        for &position in positions.iter().filter(|_| !compact) {
             let p = self.permission(position);
             let access = self.b.ins().band_imm(p, i64::from(permission));
             let missing = self.b.ins().icmp_imm(IntCC::Equal, access, 0);
@@ -4762,11 +5017,7 @@ impl Emitter<'_> {
             self.b.ins().jump(done, &[result.into()]);
         }
         self.b.switch_to_block(overlay);
-        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
-            ir::StackSlotKind::ExplicitSlot,
-            16,
-            4,
-        ));
+        let slot = self.memory_buffer();
         let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
         let width = self.constant(size as u32);
         let function = if let Some(value) = value {
@@ -4850,16 +5101,31 @@ impl Emitter<'_> {
         let ty = self.b.func.dfg.value_type(value);
         self.direct_memory(addr, ty, Some(value));
     }
+    /// Synchronous memory helpers borrow at most 16 bytes until they return.
+    /// Consume a read immediately into SSA; no buffer pointer escapes or is
+    /// live across another helper. One slot therefore serves the whole function.
+    fn memory_buffer(&mut self) -> ir::StackSlot {
+        if self.optimizing
+            && let Some(slot) = self.memory_scratch
+        {
+            return slot;
+        }
+        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        if self.optimizing {
+            self.memory_scratch = Some(slot);
+        }
+        slot
+    }
     fn load_atomic(&mut self, pointer: Value, ty: ir::Type) -> Value {
         if ty.is_vector() {
             // Sixteen inlined byte loads keep many GPR values live and make
             // register allocation spill the ordinary copy loop. A bounded
             // Relaxed helper loads into a private stack buffer instead.
-            let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
-                ir::StackSlotKind::ExplicitSlot,
-                16,
-                4,
-            ));
+            let slot = self.memory_buffer();
             let destination = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
             self.b
                 .ins()
@@ -4918,11 +5184,7 @@ impl Emitter<'_> {
         self.store_atomic(pointer.address, value);
         self.b.ins().jump(done, &[]);
         self.b.switch_to_block(overlay);
-        let slot = self.b.create_sized_stack_slot(ir::StackSlotData::new(
-            ir::StackSlotKind::ExplicitSlot,
-            16,
-            4,
-        ));
+        let slot = self.memory_buffer();
         self.b.ins().stack_store(value, slot, 0);
         let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
         let width = self.constant(self.b.func.dfg.value_type(value).bytes());
