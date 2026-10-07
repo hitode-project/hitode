@@ -235,6 +235,25 @@ fn acquire_window_dc_owner(
     raster: bool,
     private: bool,
 ) -> Outcome {
+    // Complete the fallible surface binding before publishing a new private
+    // identity. A failed first acquisition must not retain a partial GDI DC.
+    let primary = if raster {
+        let provider = env.ext.get::<State>().provider.unwrap();
+        let store = env.ext.get_mut::<SurfaceStore>();
+        let mut memory = (provider.memory)(env.cpu);
+        if width > 0
+            && height > 0
+            && let Err(error) = store.configure_window(width as u32, height as u32, &mut memory)
+        {
+            return Outcome::Fail(format!("GetDC resize: {error}"));
+        }
+        match store.primary(&mut memory) {
+            Ok(id) => Some(id),
+            Err(error) => return Outcome::Fail(format!("GetDC: {error}")),
+        }
+    } else {
+        None
+    };
     let dc = if private {
         if let Some(&dc) = env.ext.get::<State>().private_dcs.get(&hwnd) {
             dc
@@ -251,23 +270,8 @@ fn acquire_window_dc_owner(
     } else {
         super::super::window_dc(env, hwnd)
     };
-    if !raster {
+    let Some(primary) = primary else {
         return Outcome::Return(dc);
-    }
-    let provider = env.ext.get::<State>().provider.unwrap();
-    let primary = {
-        let store = env.ext.get_mut::<SurfaceStore>();
-        let mut memory = (provider.memory)(env.cpu);
-        if width > 0
-            && height > 0
-            && let Err(error) = store.configure_window(width as u32, height as u32, &mut memory)
-        {
-            return Outcome::Fail(format!("GetDC resize: {error}"));
-        }
-        match store.primary(&mut memory) {
-            Ok(id) => id,
-            Err(error) => return Outcome::Fail(format!("GetDC: {error}")),
-        }
     };
     let gdi = &mut env.ext.get_mut::<Win32>().gdi;
     if !gdi.register_external_dc(&mut env.sys.objects, dc, hwnd) {
