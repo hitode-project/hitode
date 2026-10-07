@@ -7,6 +7,291 @@ fn decoded(code: &[u8]) -> Vec<Instruction> {
 }
 
 #[test]
+fn region_fact_emission_counts() {
+    for control_changes in [false, true] {
+        let code = bytes(|a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            for n in 0..6 {
+                if control_changes && n == 3 {
+                    a.fldcw(word_ptr(esi + 64)).unwrap();
+                }
+                a.fadd_2(st0, st1).unwrap();
+            }
+            a.fstp(qword_ptr(esi + 16)).unwrap();
+        });
+        testing::reset_emission();
+        let compiled = compile(&Region::new(CODE, code.len()), &mut memory(&code), false).unwrap();
+        let counts = testing::emission();
+        eprintln!(
+            "region facts control_changes={control_changes}: bytes={} {counts:?}",
+            compiled.code_size
+        );
+        let mut initial = state();
+        initial.x87.control = 0x007f;
+        compare(
+            &code,
+            initial,
+            |m| m.write(DATA + 64, &0x027fu16.to_le_bytes()).unwrap(),
+            Some(0),
+        );
+    }
+}
+
+#[test]
+fn control_changes_forget_conditional_precision_and_rounding_admission() {
+    let code = bytes(|a| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fldcw(word_ptr(esi + 64)).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esi + 16)).unwrap();
+    });
+    for (old, new) in [
+        (0x007f, 0x027f),
+        (0x027f, 0x007f),
+        (0x027f, 0x037f),
+        (0x027f, 0x0c7f),
+        (0x027f, 0x005f),
+    ] {
+        for wide in [false, true] {
+            let mut initial = state();
+            initial.x87.control = old;
+            let slot = initial.x87.top();
+            let value = if wide { 1.0 + f64::EPSILON } else { 1.25 };
+            initial.x87.regs[slot] = X87Register(crate::backend::x87::encode_f64(value));
+            initial.refresh_mmx();
+            compare(
+                &code,
+                initial,
+                |m| {
+                    m.write(DATA + 64, &u16::to_le_bytes(new)).unwrap();
+                },
+                None,
+            );
+        }
+    }
+}
+
+#[test]
+fn control_changes_and_faults_resume_with_the_precise_resident_prefix() {
+    for failure in 0..4 {
+        let code = bytes(|a| {
+            let offset = |index, normal| if failure == index { 4096 } else { normal };
+            a.fld(qword_ptr(esi + offset(0, 0))).unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            a.fldcw(word_ptr(esi + offset(1, 64))).unwrap();
+            a.fmul(qword_ptr(esi + offset(2, 8))).unwrap();
+            a.fstp(qword_ptr(esi + offset(3, 16))).unwrap();
+        });
+        let mut actual_memory = memory(&code);
+        let mut reference_memory = memory(&code);
+        for m in [&mut actual_memory, &mut reference_memory] {
+            m.write(DATA + 8, &1.5f64.to_le_bytes()).unwrap();
+            m.write(DATA + 64, &0x007fu16.to_le_bytes()).unwrap();
+            m.protect(DATA + 4096, 4096, 0).unwrap();
+        }
+        let compiled = compile(&Region::new(CODE, code.len()), &mut actual_memory, false).unwrap();
+        let mut actual = state();
+        actual.x87.control = 0x027f;
+        let mut expected = actual.clone();
+        let mut interpreter = Interpreter::new();
+        loop {
+            match interpreter.step(&mut expected, &mut reference_memory) {
+                Step::Executed => {}
+                Step::ReadFault { address, .. } | Step::WriteFault { address, .. } => {
+                    expected.fault_addr = address;
+                    break;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let exit = testing::run(&compiled, &mut actual, &mut actual_memory);
+        assert_eq!(
+            exit,
+            if failure == 3 {
+                Exit::WriteFault
+            } else {
+                Exit::ReadFault
+            } as u32
+        );
+        expected.fuel = actual.fuel;
+        assert_eq!(actual, expected);
+        // Repair the failing access and enter at its canonical restart. The
+        // resident facts must not survive the fault or apply to this new entry.
+        for m in [&mut actual_memory, &mut reference_memory] {
+            m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+            if failure == 1 {
+                m.write(DATA + 4096, &0x027fu16.to_le_bytes()).unwrap();
+            } else {
+                m.write(DATA + 4096, &1.5f64.to_le_bytes()).unwrap();
+            }
+        }
+        actual.fuel = 100;
+        while expected.eip < CODE + code.len() as u32 {
+            assert!(matches!(
+                interpreter.step(&mut expected, &mut reference_memory),
+                Step::Executed
+            ));
+        }
+        assert_eq!(
+            testing::run(&compiled, &mut actual, &mut actual_memory),
+            Exit::Dispatch as u32
+        );
+        expected.fuel = actual.fuel;
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual_memory.read_data(DATA, 8192).unwrap(),
+            reference_memory.read_data(DATA, 8192).unwrap()
+        );
+    }
+}
+
+#[test]
+fn wide_and_exceptional_stack_values_leave_fact_propagation_exact() {
+    let code = bytes(|a| {
+        a.fld1().unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.fldcw(word_ptr(esi + 64)).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(qword_ptr(esi + 16)).unwrap();
+    });
+    for control in [0x007f, 0x027f, 0x037f] {
+        for value in [
+            X87Register::from_parts((1 << 63) | 1, 0x3fff),
+            X87Register::from_parts(1 << 63, 0x43ff),
+            X87Register::from_parts(1 << 63, 0x7fff),
+            X87Register::from_parts(0xc000_0000_0000_1234, 0x7fff),
+            X87Register::from_parts(0x8000_0000_0000_1234, 0x7fff),
+            X87Register::from_parts(1, 0),
+            X87Register::from_parts(0, 0),
+            X87Register::from_parts(0, 0x8000),
+        ] {
+            let mut initial = state();
+            initial.x87.control = control;
+            let slot = initial.x87.top();
+            initial.x87.regs[slot] = value;
+            initial.x87.set_physical_tag(slot, value.tag());
+            initial.refresh_mmx();
+            compare(
+                &code,
+                initial,
+                |m| m.write(DATA + 64, &0x007fu16.to_le_bytes()).unwrap(),
+                None,
+            );
+        }
+    }
+}
+
+#[test]
+fn environment_restores_and_mmx_cut_resident_facts() {
+    for environment in 0..4 {
+        let code = bytes(|a| {
+            a.fld1().unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            match environment {
+                0 => {
+                    a.fnstenv(ptr(esi + 128)).unwrap();
+                    a.fldcw(word_ptr(esi + 64)).unwrap();
+                    a.fldenv(ptr(esi + 128)).unwrap();
+                }
+                1 => {
+                    a.fnsave(ptr(esi + 128)).unwrap();
+                    a.frstor(ptr(esi + 128)).unwrap();
+                }
+                2 => {
+                    a.fxsave(ptr(esi + 128)).unwrap();
+                    a.fldcw(word_ptr(esi + 64)).unwrap();
+                    a.fxrstor(ptr(esi + 128)).unwrap();
+                }
+                _ => {
+                    a.movq(mm0, qword_ptr(esi)).unwrap();
+                    a.emms().unwrap();
+                    a.fld1().unwrap();
+                    a.fld1().unwrap();
+                }
+            }
+            a.fmul_2(st0, st1).unwrap();
+            a.fstp(qword_ptr(esi + 16)).unwrap();
+        });
+        let instructions: BTreeMap<_, _> =
+            decoded(&code).into_iter().map(|i| (i.ip32(), i)).collect();
+        let plan = segments(&instructions, &[CODE]);
+        for lane in plan.starts.values() {
+            assert!(lane.iter().all(|i| !matches!(
+                i.mnemonic(),
+                M::Fldenv | M::Frstor | M::Fxrstor | M::Movq | M::Emms
+            )));
+        }
+        let mut runs = [false, true].map(|jit| {
+            let mut executor = crate::Executor::new(CODE, 0x6000).unwrap();
+            executor.protect(CODE, 0x6000, READ | WRITE).unwrap();
+            executor.write(CODE, &code).unwrap();
+            executor.protect(CODE, 4096, READ | EXEC).unwrap();
+            executor.write(DATA, &1.25f64.to_le_bytes()).unwrap();
+            executor.write(DATA + 64, &0x007fu16.to_le_bytes()).unwrap();
+            executor.enable_auto_jit(false);
+            if jit {
+                executor.add_region(Region::new(CODE, code.len())).unwrap();
+            }
+            executor.state = state();
+            assert_eq!(
+                executor.run(CODE + code.len() as u32, 100).unwrap(),
+                crate::RunOutcome::ReachedStop
+            );
+            executor
+        });
+        let expected = runs[0].state.clone();
+        runs[1].state.fuel = expected.fuel;
+        assert_eq!(runs[1].state, expected);
+        assert_eq!(
+            runs[1].memory().read(DATA, 1024).unwrap(),
+            runs[0].memory().read(DATA, 1024).unwrap()
+        );
+    }
+}
+
+#[test]
+fn code_observation_epoch_precedes_x87_instruction_effects() {
+    let code = bytes(|a| a.fld(dword_ptr(esi)).unwrap());
+    let unobserved = || {
+        let mut m = Memory::new(CODE, 0x6000).unwrap();
+        m.protect(CODE, 0x6000, READ | WRITE).unwrap();
+        m.write(CODE, &code).unwrap();
+        m.protect(CODE, 4096, READ | EXEC).unwrap();
+        m.write(DATA, &1.25f32.to_le_bytes()).unwrap();
+        m
+    };
+    let mut native = unobserved();
+    let mut reference = unobserved();
+    let before = native.epoch;
+    let compiled = compile(&Region::new(CODE, code.len()), &mut native, false).unwrap();
+    assert_eq!(
+        native.epoch,
+        before + 1,
+        "compile observes the previously unwatched code page"
+    );
+    assert_eq!(reference.epoch, before);
+    // Matching code observation removes the epoch discrepancy before either
+    // execution path runs; x87 loading itself does not change this epoch.
+    reference.watch_code(CODE, code.len());
+    let mut actual = state();
+    let mut expected = actual.clone();
+    assert!(matches!(
+        Interpreter::new().step(&mut expected, &mut reference),
+        Step::Executed
+    ));
+    assert_eq!(
+        testing::run(&compiled, &mut actual, &mut native),
+        Exit::Dispatch as u32
+    );
+    expected.fuel = actual.fuel;
+    assert_eq!(actual, expected);
+    assert_eq!(native.epoch, before + 1);
+    assert_eq!(native.epoch, reference.epoch);
+}
+
+#[test]
 fn resident_stack_wrap_and_dead_raw_slots_match_every_budget_prefix() {
     let code = bytes(|a| {
         a.fld(dword_ptr(esi)).unwrap();

@@ -1,12 +1,12 @@
 //! Windows hardware-fault recovery building blocks. Production JIT checks stay
 //! enabled until each access has a complete recovery recipe and a cold epilogue.
+pub(crate) use crate::fault_recipe as recipe;
 use crate::{CpuState, virtual_memory::Reservation};
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
-pub(crate) mod recipe;
 mod unwind;
 
 // The VEH copies a frozen architectural checkpoint without allocation or drop.
@@ -326,7 +326,7 @@ unsafe extern "C" fn dispatch(
                     .binary_search_by_key(&pc, |site| site.host_pc)
                     .unwrap();
                 let Some(recovered) =
-                    (unsafe { recipes[index].evaluate(&*session.state, context) })
+                    (unsafe { recipes[index].evaluate(&*session.state, &SavedRegisters(context)) })
                 else {
                     return 0;
                 };
@@ -392,6 +392,16 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn recipe_recoveries() -> u64 {
     RECIPE_RECOVERIES.with(Cell::get)
+}
+
+struct SavedRegisters(*const c_void);
+impl recipe::HostRegisters for SavedRegisters {
+    fn gpr(&self, register: u8) -> Option<u64> {
+        if self.0.is_null() {
+            return None;
+        }
+        unsafe { saved_gpr(self.0, register.into()) }
+    }
 }
 
 /// Read an OS-saved host register for future verified Reg/CFA recovery recipes.

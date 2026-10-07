@@ -1,5 +1,5 @@
-//! Stable host virtual address reservation. Guest permissions remain in our page table;
-//! committed host pages are RW so loaders can populate guest RX pages safely.
+//! Stable host virtual address reservation. The default software-checking backend
+//! keeps committed pages RW; the explicit direct backend protects a separate view.
 use std::cell::RefCell;
 #[cfg(windows)]
 use std::collections::BTreeMap;
@@ -8,6 +8,12 @@ use std::ops::Range;
 use std::ptr::NonNull;
 
 const GUEST_PAGE_SIZE: usize = 4096;
+
+mod direct;
+#[cfg(unix)]
+pub use direct::DirectFaultView;
+#[cfg(unix)]
+pub use direct::{FaultClassification, GuestAccess, GuestPageProtection};
 
 #[cfg(windows)]
 mod os {
@@ -216,6 +222,8 @@ pub struct Reservation {
     regions: RefCell<BTreeMap<usize, Region>>,
     #[cfg(unix)]
     pages: RefCell<UnixPages>,
+    #[cfg(unix)]
+    direct_alias: Option<direct::SharedAlias>,
 }
 
 // Keep this planner independent of Unix syscalls so the mixed 4/16 KiB policy
@@ -225,6 +233,7 @@ struct UnixPages {
     committed: Vec<bool>,
     host_page_size: usize,
     mapped_len: usize,
+    direct: Option<direct::DirectPages>,
 }
 
 #[cfg(any(unix, test))]
@@ -234,6 +243,7 @@ struct PagePlan {
     host_spans: Vec<Range<usize>>,
     // Decommitted bytes in host pages that must stay RW for live neighbours.
     clear_spans: Vec<Range<usize>>,
+    protection_changes: Vec<direct::HostChange>,
 }
 
 #[cfg(any(unix, test))]
@@ -250,6 +260,7 @@ impl UnixPages {
             committed: vec![false; len / GUEST_PAGE_SIZE],
             host_page_size,
             mapped_len,
+            direct: None,
         })
     }
 
@@ -278,6 +289,7 @@ impl UnixPages {
             guest_pages,
             host_spans: Vec::new(),
             clear_spans: Vec::new(),
+            protection_changes: Vec::new(),
         };
         for host in offset / self.host_page_size..=(end - 1) / self.host_page_size {
             let pages = self.host_guest_pages(host);
@@ -383,6 +395,8 @@ impl Reservation {
             )])),
             #[cfg(unix)]
             pages: RefCell::new(pages),
+            #[cfg(unix)]
+            direct_alias: None,
         })
     }
     pub fn commit(&self, offset: usize, len: usize) -> Result<(), String> {
@@ -448,6 +462,9 @@ impl Reservation {
     }
 
     fn commit_unix(&self, offset: usize, len: usize) -> Result<(), String> {
+        if self.direct_alias.is_some() {
+            return self.commit_direct(offset, len, GuestPageProtection::READ_WRITE);
+        }
         let end = self.bounds(offset, len)?;
         let mut pages = self.pages.borrow_mut();
         let plan = pages.plan(offset, end, true)?;
@@ -460,6 +477,9 @@ impl Reservation {
     }
 
     fn decommit_unix(&self, offset: usize, len: usize) -> Result<(), String> {
+        if self.direct_alias.is_some() {
+            return self.decommit_direct(offset, len);
+        }
         let end = self.bounds(offset, len)?;
         let mut pages = self.pages.borrow_mut();
         let plan = pages.plan(offset, end, false)?;
