@@ -1013,6 +1013,32 @@ fn run(options: Options) -> Result<u8, String> {
     result?
 }
 
+fn compile_thread_count(cores: usize, guest_workers: usize) -> usize {
+    // Keep the small-host policy. Larger hosts can serve another compile
+    // without consuming the cores reserved for execution, audio and presentation.
+    let cap = if cores >= 8 { 4 } else { 3 };
+    cores
+        .saturating_sub(guest_workers.saturating_add(1))
+        .clamp(1, cap)
+}
+
+#[test]
+fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
+    for guests in [1, 2] {
+        for cores in 0usize..8 {
+            assert_eq!(
+                compile_thread_count(cores, guests),
+                cores.saturating_sub(guests + 1).clamp(1, 3)
+            );
+        }
+        for cores in [8, 10, 16, 128] {
+            assert_eq!(compile_thread_count(cores, guests), 4);
+            assert!(compile_thread_count(cores, guests) + guests + 1 <= cores);
+        }
+    }
+    assert_eq!(compile_thread_count(0, usize::MAX), 1);
+}
+
 fn run_execution(
     options: Options,
     mut window: Option<frontend::Worker>,
@@ -1113,10 +1139,7 @@ fn run_execution(
     if options.jit && options.async_compilation {
         // Leave cores for the guest, presentation and audio threads.
         let threads = std::thread::available_parallelism().map_or(1, |cores| {
-            cores
-                .get()
-                .saturating_sub(options.guest_workers + 1)
-                .clamp(1, 3)
+            compile_thread_count(cores.get(), options.guest_workers)
         });
         runtime
             .machine

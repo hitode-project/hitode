@@ -481,6 +481,7 @@ mod tests {
             Err("diagnostic fixture".into())
         })
         .unwrap();
+        let admitted = Instant::now();
         let first = worker.try_submit(snapshot()).unwrap();
         started.wait();
         let first_stage = worker.stage(first);
@@ -494,8 +495,10 @@ mod tests {
             let completion = receive(&mut worker);
             assert_eq!(completion.ticket, ticket);
             assert_eq!(completion.active_at_start, 1);
-            assert!(completion.queue_wait > Duration::ZERO);
-            assert!(completion.duration > Duration::ZERO);
+            assert!(
+                completion.queue_wait + completion.duration
+                    <= completion.completed_at.duration_since(admitted)
+            );
             assert!(completion.completed_at <= Instant::now());
         }
         assert_eq!(first_stage.load(Ordering::Relaxed), 2);
