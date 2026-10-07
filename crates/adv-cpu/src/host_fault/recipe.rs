@@ -1,7 +1,11 @@
 //! Cold-only scalar recovery. No guest memory is read or instruction replayed.
-use super::saved_gpr;
 use crate::CpuState;
-use std::ffi::c_void;
+
+/// Architectural register access independent of the operating system context.
+/// Implementations read a frozen snapshot, never guest memory.
+pub(crate) trait HostRegisters {
+    fn gpr(&self, register: u8) -> Option<u64>;
+}
 
 pub(crate) const MAX_NODES: usize = 128;
 pub(crate) const MAX_DEPTH: usize = 24;
@@ -77,7 +81,7 @@ impl Recipe {
             }
             depths[index] = match node.source {
                 Source::Input(Input::Register(register)) if register >= 8 => return false,
-                Source::HostRegister(register) if register >= 16 => return false,
+                Source::HostRegister(register) if register >= 32 => return false,
                 Source::Calculate(operation, left, right) => {
                     if usize::from(left) >= index || usize::from(right) >= index {
                         return false;
@@ -103,10 +107,9 @@ impl Recipe {
     }
 
     /// All reads finish before the caller changes architectural state.
-    /// # Safety
-    /// `context` is the stopped thread's VEH CONTEXT. The execution owner proves
-    /// that no canonical field was committed before this first scalar load.
-    pub unsafe fn evaluate(&self, state: &CpuState, context: *const c_void) -> Option<Recovered> {
+    /// The execution owner proves all Input nodes still describe the entry
+    /// checkpoint. HostRegister nodes describe the actual stopped instruction.
+    pub fn evaluate(&self, state: &CpuState, registers: &impl HostRegisters) -> Option<Recovered> {
         if state.eip != self.entry_pc || !self.valid() {
             return None;
         }
@@ -122,12 +125,7 @@ impl Recipe {
                     Input::Carry => u64::from(state.eflags & 1),
                 },
                 Source::Constant(value) => value,
-                Source::HostRegister(register) => {
-                    if context.is_null() {
-                        return None;
-                    }
-                    unsafe { saved_gpr(context, register.into()) }?
-                }
+                Source::HostRegister(register) => registers.gpr(register)?,
                 Source::Calculate(operation, left, right) => {
                     let left = values[left as usize];
                     let right = values[right as usize];
@@ -257,6 +255,76 @@ mod tests {
         }];
         assert!(!recipe.valid());
     }
+    #[test]
+    fn pure_recipes_read_architectural_snapshots_without_an_os_context() {
+        struct Registers;
+        impl HostRegisters for Registers {
+            fn gpr(&self, register: u8) -> Option<u64> {
+                (register == 19).then_some(0xffff_fffd)
+            }
+        }
+        let state = CpuState {
+            eip: 7,
+            regs: [10, 11, 12, 13, 14, 15, 16, 17],
+            eflags: 0x203,
+            fuel: 99,
+            ..CpuState::default()
+        };
+        let mut nodes: Vec<_> = (0..8)
+            .map(|register| Node {
+                source: Source::Input(Input::Register(register)),
+                bits: 32,
+            })
+            .collect();
+        nodes.push(Node {
+            source: Source::Input(Input::Flags),
+            bits: 32,
+        });
+        for _ in 0..7 {
+            nodes.push(Node {
+                source: Source::Constant(0),
+                bits: 32,
+            });
+        }
+        nodes[13].source = Source::Input(Input::Carry);
+        nodes.push(Node {
+            source: Source::Input(Input::Fuel),
+            bits: 64,
+        });
+        nodes.push(Node {
+            source: Source::HostRegister(19),
+            bits: 32,
+        });
+        nodes.push(Node {
+            source: Source::Constant(8),
+            bits: 32,
+        });
+        nodes.push(Node {
+            source: Source::Calculate(Operation::Add, 17, 18),
+            bits: 32,
+        });
+        let mut outputs = std::array::from_fn(|index| index as u8);
+        outputs[17] = 19;
+        let mut recipe = Recipe {
+            entry_pc: 7,
+            nodes,
+            outputs,
+        };
+        let recovered = recipe.evaluate(&state, &Registers).unwrap();
+        assert_eq!(recovered.regs, state.regs);
+        assert_eq!(recovered.flags, state.eflags);
+        assert_eq!(recovered.fuel, state.fuel);
+        assert_eq!(recovered.address, 5);
+        assert_eq!(state.eip, 7);
+        recipe.entry_pc = 8;
+        assert!(recipe.evaluate(&state, &Registers).is_none());
+        recipe.entry_pc = 7;
+        recipe.nodes[17].source = Source::HostRegister(20);
+        assert!(recipe.evaluate(&state, &Registers).is_none());
+        recipe.nodes[17].source = Source::HostRegister(32);
+        assert!(!recipe.valid());
+    }
+
     #[test]
     fn deferred_overflow_parity_auxiliary_and_preserved_carry_are_exact() {
         assert_eq!(

@@ -9,7 +9,16 @@ mod compile_budget;
 mod compiler;
 mod cpu_profile;
 mod discovery;
+pub mod execution_abi;
 mod executor;
+#[path = "host_fault/recipe.rs"]
+#[allow(dead_code)]
+mod fault_recipe;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod fault_recovery;
 mod file_memory;
 mod floating;
 // The opt-in fault lane accepts only verified scalar recovery sites. Other
@@ -30,6 +39,7 @@ mod rows;
 mod shared_memory;
 mod state;
 mod strings;
+mod tier1;
 mod timestamp;
 mod trap;
 mod virtual_memory;
@@ -45,8 +55,14 @@ pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;
 pub use rows::RowStats;
 pub use state::{IndirectBranch, IndirectBranchKind, X87Register, X87State};
+pub use tier1::Tier1Stats;
 pub use timestamp::TSC_FREQ;
 pub use trap::ExecutionTrap;
+#[cfg(unix)]
+pub use virtual_memory::{
+    DirectFaultView, FaultClassification, GuestAccess, GuestPageProtection,
+    Reservation as DirectMemoryReservation,
+};
 
 /// Register order follows the x86 encoding: eax, ecx, edx, ebx, esp, ebp, esi, edi.
 #[repr(C)]
