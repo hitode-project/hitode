@@ -12,7 +12,7 @@ use adv_os::registry::{self as store, *};
 
 use crate::{Win32, stdcall};
 
-fn state<'a>(env: &'a mut Env<'_>) -> &'a mut VirtualRegistry {
+pub(crate) fn state<'a>(env: &'a mut Env<'_>) -> &'a mut VirtualRegistry {
     if env.ext.try_get::<VirtualRegistry>().is_none() {
         let path = env
             .ext
@@ -25,7 +25,7 @@ fn state<'a>(env: &'a mut Env<'_>) -> &'a mut VirtualRegistry {
     }
     env.ext.get_mut::<VirtualRegistry>()
 }
-fn opened(env: &mut Env<'_>, handle: u32) -> Result<OpenKey, u32> {
+pub(crate) fn opened(env: &mut Env<'_>, handle: u32) -> Result<OpenKey, u32> {
     state(env);
     env.ext
         .get::<VirtualRegistry>()
@@ -86,7 +86,7 @@ fn output(env: &Env<'_>, ptr: u32, optional: bool) -> Result<(), u32> {
     }
     Ok(())
 }
-fn desired_access(mut access: u32) -> Result<u32, u32> {
+pub(crate) fn desired_access(mut access: u32) -> Result<u32, u32> {
     if access & 0x300 == 0x300 {
         return Err(INVALID_PARAMETER);
     }

@@ -45,6 +45,16 @@ pub(super) fn close(env: &mut Env<'_>, handle: Handle) -> i32 {
     if matches!(handle.0, 0xffff_ffff | 0xffff_fffe) {
         return 0;
     }
+    // Win32 and NT key opens use the same Objects registry namespace. The
+    // predefined Win32 HKEY constants are not native handles.
+    if handle.0 & 0x8000_0000 == 0
+        && env
+            .ext
+            .try_get::<adv_os::registry::VirtualRegistry>()
+            .is_some_and(|registry| registry.close(&mut env.sys.objects, handle.0).is_ok())
+    {
+        return 0;
+    }
     if env.sys.objects.close(handle.0).is_none() {
         return INVALID_HANDLE;
     }

@@ -257,6 +257,17 @@
     "documentation": "https://github.com/winsiderss/phnt/blob/master/ntmmapi.h",
     "native_verification": "18 DWORDs: arbitrary/invalid/restricted handles and ranges accepted by native x86, unchanged LastError; authored routine executes 17, is patched through NtWriteVirtualMemory, then executes 29 on interpreter/JIT after flush. No game code or host protection patch is used."
   },
+  "native_registry_open": {
+    "scope": "NtOpenKey and ZwOpenKey; one common private registry owner and no host registry access",
+    "source": "Microsoft Learn WDM ZwOpenKey declaration, SDK x86 ntdll.lib _NtOpenKey@12/_ZwOpenKey@12, and documented user-mode Nt/Zw equivalence",
+    "sdk_library_sha256": "167fdee306171ad6bcaadb9471c6dcbf3159dab9e36ff7cab40c44e1ed8cbed2",
+    "target": "x86 NTAPI stdcall, signed 32-bit NTSTATUS, PHANDLE/ACCESS_MASK/POBJECT_ATTRIBUTES; 24-byte OBJECT_ATTRIBUTES and 8-byte counted UNICODE_STRING",
+    "native_verification": "Authored read-only root probe covers absolute/case-default/empty-relative opens, missing leaf and parent, closed or invalid root, bad structure length and counted name, output zeroing versus preservation and unchanged LastError; no registry values, host SID, or game bytes are recorded",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwopenkey",
+      "https://learn.microsoft.com/en-us/windows/win32/api/ntdef/ns-ntdef-_object_attributes"
+    ]
+  },
   "nt_set_context_thread": {
     "scope": "NtSetContextThread, HANDLE and x86 CONTEXT pointer; two stack words and signed NTSTATUS, same stopped-process architecture owner as Win32/NT get",
     "source": "phnt ntpsapi.h primary declaration and authored Microsoft Windows x86 caller",
