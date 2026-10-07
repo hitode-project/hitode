@@ -9,6 +9,8 @@ fn omission_reason(name: &str) -> &'static str {
         "CRT outside Win32Metadata"
     } else if module.contains("vorbis") {
         "codec ABI outside Windows SDK"
+    } else if module == "vcomp140.dll" && vcomp_conv(export).is_some() {
+        "OpenMP compiler runtime outside Win32Metadata"
     } else if export.starts_with('#') {
         "ordinal alias (WinMD is name-based)"
     } else if export.starts_with('<')
@@ -42,6 +44,19 @@ fn omission_reason(name: &str) -> &'static str {
         "NT native API (WDK, outside the Win32 WinMD)"
     } else {
         "uncategorized metadata gap"
+    }
+}
+
+// Wine's dlls/vcomp/vcomp.spec records these x86 contracts; the authored native
+// tools/fixtures/vcomp-serial.c probe verifies the installed Microsoft runtime.
+// Keep the scope exact, including the three fixed words before fork varargs.
+fn vcomp_conv(export: &str) -> Option<adv_abi::Conv> {
+    use adv_abi::Conv;
+    match export {
+        "_vcomp_fork" => Some(Conv::CdeclVariadic { fixed: 3 }),
+        "_vcomp_for_static_simple_init" => Some(Conv::Cdecl { argc: 6 }),
+        "_vcomp_for_static_end" => Some(Conv::Cdecl { argc: 0 }),
+        _ => None,
     }
 }
 
@@ -106,12 +121,20 @@ fn all_fronts_signature_audit() {
         }
         let unknown = registry.missing_signatures();
         let mut categories = std::collections::BTreeMap::new();
+        let mut uncategorized = Vec::new();
         for name in &unknown {
             let reason = omission_reason(name);
-            assert_ne!(
-                reason, "uncategorized metadata gap",
-                "new omission needs investigation: {name}"
-            );
+            if reason == "uncategorized metadata gap" {
+                uncategorized.push(name);
+            }
+            if let Some(conv) = name.strip_prefix("vcomp140.dll!").and_then(vcomp_conv) {
+                let export = name.split_once('!').unwrap().1;
+                assert_eq!(
+                    registry.get("vcomp140.dll", export).unwrap().conv,
+                    conv,
+                    "{name}"
+                );
+            }
             if let Some(argc) = native_argc(name.trim_start_matches("ntdll.dll!")) {
                 assert_eq!(
                     registry
@@ -125,6 +148,10 @@ fn all_fronts_signature_audit() {
             *categories.entry(reason).or_insert(0usize) += 1;
             report.push(format!("{policy:?}\t{name}\t{reason}"));
         }
+        assert!(
+            uncategorized.is_empty(),
+            "new omissions need investigation: {uncategorized:?}"
+        );
         eprintln!(
             "{policy:?}: unknown signatures {}: {categories:?}",
             unknown.len()
@@ -207,6 +234,37 @@ fn gdi_object_extent_and_text_output_bindings_are_generated_without_dispatch_dat
 #[test]
 fn shader_and_effect_fronts_match_the_complete_sdk_contract() {
     let registry = adv_runtime::boot::api_registry(adv_runtime::vorbis::Policy::Guest);
+    let buffers: Vec<_> = adv_abi::signature::com_signatures()
+        .iter()
+        .filter(|s| s.module == "ID3DXBuffer")
+        .collect();
+    assert_eq!(buffers.len(), 5);
+    for (slot, (signature, name)) in buffers
+        .iter()
+        .zip([
+            "QueryInterface",
+            "AddRef",
+            "Release",
+            "GetBufferPointer",
+            "GetBufferSize",
+        ])
+        .enumerate()
+    {
+        assert_eq!(signature.com_slot, Some(slot as u16));
+        assert_eq!(signature.name, name);
+        assert_eq!(
+            signature.conv,
+            Some(adv_abi::Conv::Stdcall {
+                argc: if slot == 0 { 3 } else { 1 },
+            })
+        );
+        let host = registry
+            .get("d3dx9_43.dll", &format!("ID3DXBuffer::{name}"))
+            .unwrap();
+        assert_eq!(Some(host.conv), signature.conv);
+    }
+    assert_eq!(buffers[3].return_kind, adv_abi::AbiKind::Pointer);
+    assert_eq!(buffers[4].return_kind, adv_abi::AbiKind::U32);
     let effects: Vec<_> = adv_abi::signature::com_signatures()
         .iter()
         .filter(|s| s.module == "ID3DXEffect")
@@ -221,11 +279,21 @@ fn shader_and_effect_fronts_match_the_complete_sdk_contract() {
         assert_eq!(Some(host.conv), signature.conv, "{name}");
         assert!(registry.level("d3dx9_43.dll", &name).is_some());
     }
-    for name in ["D3DXCreateEffect", "D3DXGetShaderOutputSemantics"] {
+    for name in [
+        "D3DXCreateEffect",
+        "D3DXGetShaderOutputSemantics",
+        "D3DXSaveSurfaceToFileInMemory",
+        "D3DXSaveSurfaceToFileW",
+    ] {
         let signature = adv_abi::signature::lookup("d3dx9_43.dll", name).unwrap();
         let host = registry.get("d3dx9_43.dll", name).unwrap();
         assert_eq!(Some(host.conv), signature.conv, "{name}");
         assert!(registry.is_implemented("d3dx9_43.dll", name));
+        if name.starts_with("D3DXSaveSurface") {
+            assert_eq!(signature.conv, Some(adv_abi::Conv::Stdcall { argc: 5 }));
+            assert_eq!(signature.return_kind, adv_abi::AbiKind::I32);
+            assert_eq!(signature.parameters.len(), 5);
+        }
     }
     #[cfg(feature = "gpu")]
     {
