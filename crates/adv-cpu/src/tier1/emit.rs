@@ -2,7 +2,7 @@
 //! These encodings deliberately cover only the declared integer subset; all
 //! other forms leave before the instruction and use the existing interpreter.
 use super::{BUDGET, DISPATCH, FALLBACK, LOAD, STORE};
-use iced_x86::{ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
+use iced_x86::{Code, ConditionCode as C, Instruction, Mnemonic as M, OpKind, Register};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]
@@ -34,6 +34,8 @@ pub(super) struct Helpers {
     /// must leave native code, 2 when refused. Kind is width plus CHECK_WRITE
     /// for permission-only probes, which return 0 without writing.
     pub store: u64,
+    /// `(frame, pop) -> store status`; stages all GPR effects in the frame.
+    pub stack_all: u64,
 }
 
 /// Load kind flag: sign-extend the loaded value to 32 bits.
@@ -117,6 +119,13 @@ fn cmovcc(m: M) -> bool {
 fn shift(m: M) -> bool {
     matches!(m, M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror)
 }
+fn double_shift(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), M::Shld | M::Shrd)
+        && i.op1_kind() == OpKind::Register
+        && register_part(i.op1_register()).is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+        && (i.op2_kind() == OpKind::Immediate8
+            || i.op2_kind() == OpKind::Register && i.op2_register() == Register::CL)
+}
 fn shift_count(i: &Instruction) -> bool {
     i.op1_kind() == OpKind::Immediate8
         || i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL
@@ -128,6 +137,10 @@ fn imm(i: &Instruction, op: u32) -> Option<u32> {
 fn source(i: &Instruction, op: u32) -> bool {
     i.op_kind(op) == OpKind::Register && register(i.op_register(op)).is_some()
         || imm(i, op).is_some()
+}
+fn scalar32(i: &Instruction, op: u32) -> bool {
+    i.op_kind(op) == OpKind::Register && register(i.op_register(op)).is_some()
+        || i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i)
 }
 fn rmw_source(i: &Instruction) -> bool {
     i.op1_kind() == OpKind::Register && register(i.op1_register().full_register32()).is_some()
@@ -148,6 +161,7 @@ fn rmw(i: &Instruction) -> bool {
             M::Add | M::Adc | M::Sub | M::Sbb | M::And | M::Or | M::Xor => rmw_source(i),
             M::Inc | M::Dec | M::Not | M::Neg => true,
             m if shift(m) => shift_count(i),
+            M::Shld | M::Shrd => i.memory_size().size() >= 2 && double_shift(i),
             _ => false,
         }
 }
@@ -159,11 +173,65 @@ fn address(i: &Instruction) -> bool {
         && i.segment_prefix() != Register::GS
 }
 
+/// (width, reads ESI, writes EDI). Match codes rather than the SIMD MOVSD name.
+fn string(i: &Instruction) -> Option<(u32, bool, bool)> {
+    let form = match i.code() {
+        Code::Movsb_m8_m8 => (1, true, true),
+        Code::Movsw_m16_m16 => (2, true, true),
+        Code::Movsd_m32_m32 => (4, true, true),
+        Code::Stosb_m8_AL => (1, false, true),
+        Code::Stosw_m16_AX => (2, false, true),
+        Code::Stosd_m32_EAX => (4, false, true),
+        Code::Lodsb_AL_m8 => (1, true, false),
+        Code::Lodsw_AX_m16 => (2, true, false),
+        Code::Lodsd_EAX_m32 => (4, true, false),
+        _ => return None,
+    };
+    ((0..i.op_count()).all(|n| {
+        matches!(
+            i.op_kind(n),
+            OpKind::Register | OpKind::MemorySegESI | OpKind::MemoryESEDI
+        )
+    }) && i.segment_prefix() != Register::GS)
+        .then_some(form)
+}
+
+pub(super) fn counter_branch(i: &Instruction) -> Option<bool> {
+    Some(match i.code() {
+        Code::Loop_rel8_16_CX
+        | Code::Loop_rel8_32_CX
+        | Code::Loope_rel8_16_CX
+        | Code::Loope_rel8_32_CX
+        | Code::Loopne_rel8_16_CX
+        | Code::Loopne_rel8_32_CX
+        | Code::Jcxz_rel8_16
+        | Code::Jcxz_rel8_32 => true,
+        Code::Loop_rel8_16_ECX
+        | Code::Loop_rel8_32_ECX
+        | Code::Loope_rel8_16_ECX
+        | Code::Loope_rel8_32_ECX
+        | Code::Loopne_rel8_16_ECX
+        | Code::Loopne_rel8_32_ECX
+        | Code::Jecxz_rel8_16
+        | Code::Jecxz_rel8_32 => false,
+        _ => return None,
+    })
+}
+
 pub(super) fn supported(i: &Instruction) -> bool {
-    if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repne_prefix() {
+    if i.has_lock_prefix() {
+        return false;
+    }
+    if string(i).is_some() {
+        return true;
+    }
+    if i.has_rep_prefix() || i.has_repne_prefix() {
         return false;
     }
     if rmw(i) {
+        return true;
+    }
+    if counter_branch(i).is_some() {
         return true;
     }
     let dst = i.op0_kind() == OpKind::Register && register(i.op0_register()).is_some();
@@ -193,12 +261,40 @@ pub(super) fn supported(i: &Instruction) -> bool {
                         .is_some_and(|(_, _, bits)| matches!(bits, 8 | 16))
         }
         M::Imul => {
-            dst && matches!(i.op_count(), 2 | 3)
-                && (i.op1_kind() == OpKind::Register && register(i.op1_register()).is_some()
-                    || i.op1_kind() == OpKind::Memory && i.memory_size().size() == 4 && address(i))
-                && (i.op_count() == 2 || imm(i, 2).is_some())
+            i.op_count() == 1 && scalar32(i, 0)
+                || dst
+                    && matches!(i.op_count(), 2 | 3)
+                    && (i.op1_kind() == OpKind::Register && register(i.op1_register()).is_some()
+                        || i.op1_kind() == OpKind::Memory
+                            && i.memory_size().size() == 4
+                            && address(i))
+                    && (i.op_count() == 2 || imm(i, 2).is_some())
         }
+        M::Mul | M::Div | M::Idiv => scalar32(i, 0),
+        M::Bt | M::Bts | M::Btr | M::Btc => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register())
+                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                && (i.op1_kind() == OpKind::Immediate8
+                    || i.op1_kind() == OpKind::Register
+                        && register_part(i.op1_register()).is_some())
+        }
+        M::Bsf | M::Bsr => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register())
+                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                && (i.op1_kind() == OpKind::Register && register_part(i.op1_register()).is_some()
+                    || i.op1_kind() == OpKind::Memory && address(i))
+        }
+        M::Bswap => dst,
         M::Cdq => true,
+        M::Pushad | M::Popad => true,
+        M::Shld | M::Shrd => {
+            i.op0_kind() == OpKind::Register
+                && register_part(i.op0_register())
+                    .is_some_and(|(_, _, bits)| matches!(bits, 16 | 32))
+                && double_shift(i)
+        }
         M::Xchg => {
             i.op0_kind() == OpKind::Register
                 && register_part(i.op0_register()).is_some()
@@ -209,6 +305,10 @@ pub(super) fn supported(i: &Instruction) -> bool {
             let memory =
                 |op| i.op_kind(op) == OpKind::Memory && i.memory_size().size() == 4 && address(i);
             dst && (source(i, 1) || memory(1))
+                || !matches!(i.mnemonic(), M::Adc | M::Sbb)
+                    && i.op0_kind() == OpKind::Register
+                    && register_part(i.op0_register()).is_some_and(|(_, _, bits)| bits < 32)
+                    && rmw_source(i)
                 // Memory destinations that do not write use the same ALU.
                 || matches!(i.mnemonic(), M::Cmp | M::Test) && memory(0) && source(i, 1)
         }
@@ -220,7 +320,9 @@ pub(super) fn supported(i: &Instruction) -> bool {
                 || i.op0_kind() == OpKind::Memory && i.memory_size().size() == 4 && address(i)
         }
         M::Ret => i.op_count() == 0 || i.op0_kind() == OpKind::Immediate16,
-        M::Inc | M::Dec | M::Neg | M::Not => dst,
+        M::Inc | M::Dec | M::Neg | M::Not => {
+            i.op0_kind() == OpKind::Register && register_part(i.op0_register()).is_some()
+        }
         m if shift(m) => {
             i.op0_kind() == OpKind::Register
                 && register_part(i.op0_register()).is_some()
@@ -308,8 +410,10 @@ impl Emitter {
     fn operand(&mut self, d: u8, i: &Instruction, op: u32) {
         if let Some(r) = register(i.op_register(op)).filter(|_| i.op_kind(op) == OpKind::Register) {
             self.mov(d, r);
+        } else if i.op_kind(op) == OpKind::Register {
+            self.read_register(d, i.op_register(op), false);
         } else {
-            self.constant(d, imm(i, op).expect("admitted operand"));
+            self.constant(d, i.immediate(op) as u32);
         }
     }
     fn read_register(&mut self, d: u8, r: Register, signed: bool) {
@@ -629,6 +733,69 @@ impl Emitter {
         self.words[zero] = 0x3400_000a | ((self.words.len() - zero) as u32) << 5;
         self.words[multiple] = 0x5400_0001 | ((self.words.len() - multiple) as u32) << 5;
     }
+    /// Concatenation matches Tier 0 even for undefined 16-bit counts 17..31.
+    /// w9 is the destination, w13 the source and w10 the count; w11 is output.
+    fn double_shift_value(&mut self, i: &Instruction, width: u32, flags: u8) {
+        let bits = width * 8;
+        let left = i.mnemonic() == M::Shld;
+        self.read_register(13, i.op1_register(), false);
+        if i.op2_kind() == OpKind::Register {
+            self.mov(10, 20);
+        } else {
+            self.constant(10, u32::from(i.immediate8()));
+        }
+        self.mask(10, 10, 31);
+        self.mov(11, 9);
+        let zero = self.words.len();
+        self.word(0);
+        let (high, low) = if left { (9, 13) } else { (13, 9) };
+        if bits == 32 {
+            self.word(0xd360_7c00 | high << 5 | 15); // lsl x15,xhigh,#32
+            self.binary(0xaa00_0000, 15, 15, low as u8);
+            self.binary(if left { 0x9ac0_2000 } else { 0x9ac0_2400 }, 11, 15, 10);
+            if left {
+                self.word(0xd360_fd6b);
+            } // lsr x11,x11,#32
+        } else {
+            self.lsl(15, high as u8, 16);
+            self.binary(0x2a00_0000, 15, 15, low as u8);
+            if left {
+                self.binary(0x4b00_0000, 16, 31, 10);
+            } else {
+                self.mov(16, 10);
+            }
+            self.binary(0x1ac0_2c00, 11, 15, 16);
+            if left {
+                self.lsr(11, 11, 16);
+            } else {
+                self.mask(11, 11, 0xffff);
+            }
+        }
+        if left {
+            self.constant(16, bits * 2);
+            self.binary(0x4b00_0000, 16, 16, 10);
+        } else {
+            self.word(0x5100_0550);
+        } // sub w16,w10,#1
+        self.binary(
+            if bits == 32 { 0x9ac0_2400 } else { 0x1ac0_2400 },
+            14,
+            15,
+            16,
+        );
+        self.bfi(flags, 14, 0);
+        self.lsl(15, 11, (32 - bits) as u8);
+        self.binary(0x6a00_0000, 31, 15, 15);
+        self.szp(flags);
+        self.word(0x7100_055f); // cmp w10,#1
+        let multiple = self.words.len();
+        self.word(0);
+        self.binary(0x4a00_0000, 14, 9, 11);
+        self.lsr(14, 14, (bits - 1) as u8);
+        self.bfi(flags, 14, 11);
+        self.words[zero] = 0x3400_000a | ((self.words.len() - zero) as u32) << 5;
+        self.words[multiple] = 0x5400_0001 | ((self.words.len() - multiple) as u32) << 5;
+    }
     fn memory_rmw(&mut self, i: &Instruction) {
         let width = i.memory_size().size() as u32;
         self.ea(i, true);
@@ -636,7 +803,9 @@ impl Emitter {
         self.load(i.ip32(), width);
         self.mov(9, 0);
         self.mov(12, 8);
-        if i.mnemonic() == M::Not {
+        if double_shift(i) {
+            self.double_shift_value(i, width, 12);
+        } else if i.mnemonic() == M::Not {
             self.word(0x2a29_03eb); // mvn w11,w9
         } else {
             match i.mnemonic() {
@@ -665,7 +834,7 @@ impl Emitter {
         self.store32(12, 76);
         self.mov(2, 11);
         self.constant(3, width);
-        if shift(i.mnemonic()) {
+        if shift(i.mnemonic()) || double_shift(i) {
             // Zero shifts check write permission but must not mutate memory.
             self.word(0x7100_015f); // cmp w10,#0
             self.cset14(0);
@@ -688,6 +857,59 @@ impl Emitter {
         } else {
             self.operand(5, i, 0);
         }
+    }
+    fn multiply_divide(&mut self, i: &Instruction) {
+        if i.op0_kind() == OpKind::Memory {
+            self.ea(i, true);
+            self.mov(1, 9);
+            self.load(i.ip32(), 4);
+            self.mov(10, 0);
+        } else {
+            self.operand(10, i, 0);
+        }
+        let signed = matches!(i.mnemonic(), M::Imul | M::Idiv);
+        if matches!(i.mnemonic(), M::Mul | M::Imul) {
+            self.binary(if signed { 0x9b20_7c00 } else { 0x9ba0_7c00 }, 11, 19, 10);
+            if signed {
+                self.word(0x9340_7d6f); // sxtw x15,w11
+                self.binary(0xeb00_0000, 31, 11, 15);
+            } else {
+                self.word(0xd360_fd6f); // lsr x15,x11,#32
+                self.word(0x7100_01ff); // cmp w15,#0
+            }
+            self.cset14(1);
+            self.bfi(8, 14, 0);
+            self.bfi(8, 14, 11);
+            self.mov(19, 11);
+            self.word(0xd360_fd75); // lsr x21,x11,#32
+            return;
+        }
+        // AArch64 integer divide cannot trap. Reject zero before computing;
+        // check the full quotient before touching EAX/EDX or retirement state.
+        self.constant(5, i.ip32());
+        self.word(0x7100_015f); // cmp w10,#0
+        self.jump(Label::Exit(FALLBACK), Branch::Equal);
+        self.word(0xd360_7ea9); // lsl x9,x21,#32
+        self.binary(0xaa00_0000, 9, 9, 19);
+        if signed {
+            self.word(0x9340_7d4a);
+        } // sxtw x10,w10
+        self.binary(if signed { 0x9ac0_0c00 } else { 0x9ac0_0800 }, 11, 9, 10);
+        if signed {
+            self.word(0x9340_7d6f);
+        }
+        // sxtw x15,w11
+        else {
+            self.mov(15, 11);
+        }
+        self.binary(0xeb00_0000, 31, 11, 15);
+        self.word(0x5400_0040); // b.eq +8
+        self.jump(Label::Exit(FALLBACK), Branch::B);
+        // MSUB computes the exact remainder, with the dividend's sign. Even
+        // INT64_MIN / -1 fails the fit check above (AArch64 returns INT64_MIN).
+        self.word(0x9b0a_a575); // msub x21,x11,x10,x9
+        self.mov(19, 11);
+        self.mov(21, 21); // clear the high host half of the guest GPR
     }
     fn condition(&mut self, c: C) {
         let (bit, invert) = match c {
@@ -725,6 +947,87 @@ impl Emitter {
             self.binary(0x4a00_0000, 9, 9, 17);
         }
     }
+    /// One iteration is one retirement unit. Reenter the ordinary instruction
+    /// guard between elements, keeping PC on REP until the final commit.
+    fn string_instruction(&mut self, i: &Instruction, width: u32, read: bool, write: bool) {
+        let repeat = i.has_rep_prefix() || i.has_repne_prefix();
+        if repeat {
+            self.skip_nonzero(20, 2);
+            self.charge();
+            self.jump(Label::Guest(i.next_ip32()), Branch::B);
+        }
+        if read {
+            self.mov(1, 25);
+            if i.segment_prefix() == Register::FS {
+                self.load32(9, 72);
+                self.binary(0x0b00_0000, 1, 1, 9);
+            }
+            self.load(i.ip32(), width);
+        }
+        let refused = if write {
+            self.mov(2, if read { 0 } else { 19 });
+            self.mov(1, 26);
+            self.store(width);
+            self.word(0x7100_081f); // cmp w0,#2
+            let at = self.words.len();
+            self.word(0);
+            Some(at)
+        } else {
+            self.write_register(
+                match width {
+                    1 => Register::AL,
+                    2 => Register::AX,
+                    _ => Register::EAX,
+                },
+                0,
+            );
+            None
+        };
+        // delta = width - 2 * width * DF; guest flags are unchanged.
+        self.lsr(9, 8, 10);
+        self.mask(9, 9, 1);
+        self.lsl(9, 9, (width.trailing_zeros() + 1) as u8);
+        self.constant(10, width);
+        self.binary(0x4b00_0000, 9, 10, 9);
+        if read {
+            self.binary(0x0b00_0000, 25, 25, 9);
+        }
+        if write {
+            self.binary(0x0b00_0000, 26, 26, 9);
+        }
+        if repeat {
+            self.word(0x5100_0694);
+        } // sub w20,w20,#1
+        self.charge();
+        let more = self.words.len();
+        if repeat {
+            self.word(0);
+        }
+        if write {
+            self.skip_nonzero(0, 1);
+        }
+        self.jump(Label::Guest(i.next_ip32()), Branch::B);
+        if write {
+            self.constant(5, i.next_ip32());
+            self.jump(Label::Exit(DISPATCH), Branch::B);
+        }
+        if repeat {
+            self.words[more] = 0x3500_0014 | ((self.words.len() - more) as u32) << 5;
+            if write {
+                self.skip_nonzero(0, 1);
+            }
+            self.jump(Label::Guest(i.ip32()), Branch::B);
+            if write {
+                self.constant(5, i.ip32());
+                self.jump(Label::Exit(DISPATCH), Branch::B);
+            }
+        }
+        if let Some(at) = refused {
+            self.words[at] = 0x5400_0000 | ((self.words.len() - at) as u32) << 5;
+            self.constant(5, i.ip32());
+            self.jump(Label::Exit(FALLBACK), Branch::B);
+        }
+    }
     pub fn instruction(&mut self, i: &Instruction) {
         let pc = i.ip32();
         self.entries.insert(pc, self.words.len() * 4);
@@ -734,6 +1037,10 @@ impl Emitter {
         self.jump(Label::Exit(BUDGET), Branch::Zero64(7));
         if !supported(i) {
             self.jump(Label::Exit(FALLBACK), Branch::B);
+            return;
+        }
+        if let Some((width, read, write)) = string(i) {
+            self.string_instruction(i, width, read, write);
             return;
         }
         if rmw(i) {
@@ -804,6 +1111,8 @@ impl Emitter {
                     self.mov(d, 0);
                 }
             }
+            M::Mul | M::Div | M::Idiv => self.multiply_divide(i),
+            M::Imul if i.op_count() == 1 => self.multiply_divide(i),
             M::Imul => {
                 if i.op1_kind() == OpKind::Memory {
                     self.ea(i, true);
@@ -828,6 +1137,54 @@ impl Emitter {
                 self.mov(d, 11);
             }
             M::Cdq => self.word(0x131f_7e75), // asr w21,w19,#31
+            M::Bt | M::Bts | M::Btr | M::Btc => {
+                self.read_register(9, i.op0_register(), false);
+                self.operand(10, i, 1);
+                self.mask(10, 10, i.op0_register().size() as u32 * 8 - 1);
+                self.binary(0x1ac0_2400, 14, 9, 10);
+                self.bfi(8, 14, 0);
+                if i.mnemonic() != M::Bt {
+                    self.constant(11, 1);
+                    self.binary(0x1ac0_2000, 11, 11, 10);
+                    self.binary(
+                        match i.mnemonic() {
+                            M::Bts => 0x2a00_0000,
+                            M::Btr => 0x0a20_0000,
+                            _ => 0x4a00_0000,
+                        },
+                        11,
+                        9,
+                        11,
+                    );
+                    self.write_register(i.op0_register(), 11);
+                }
+            }
+            M::Bsf | M::Bsr => {
+                if i.op1_kind() == OpKind::Memory {
+                    self.ea(i, true);
+                    self.mov(1, 9);
+                    self.load(pc, i.memory_size().size() as u32);
+                    self.mov(9, 0);
+                } else {
+                    self.read_register(9, i.op1_register(), false);
+                }
+                self.word(0x7100_013f); // cmp w9,#0
+                self.cset14(0);
+                self.bfi(8, 14, 6);
+                let zero = self.words.len();
+                self.word(0);
+                if i.mnemonic() == M::Bsf {
+                    self.word(0x5ac0_0129);
+                } // rbit w9,w9
+                self.word(0x5ac0_112b); // clz w11,w9
+                if i.mnemonic() == M::Bsr {
+                    self.constant(9, 31);
+                    self.binary(0x4b00_0000, 11, 9, 11);
+                }
+                self.write_register(i.op0_register(), 11);
+                self.words[zero] = 0x3400_0009 | ((self.words.len() - zero) as u32) << 5;
+            }
+            M::Bswap => self.word(0x5ac0_0800 | (d as u32) << 5 | d as u32),
             M::Xchg => {
                 self.read_register(9, i.op0_register(), false);
                 self.read_register(10, i.op1_register(), false);
@@ -839,6 +1196,19 @@ impl Emitter {
                 self.operand(2, i, 0);
                 self.store(4);
                 self.stored(pc, Some(i.next_ip32()), false, |e| e.esp_sub(23));
+                return;
+            }
+            M::Pushad | M::Popad => {
+                for n in 0..8 {
+                    self.store32(19 + n, u32::from(n) * 4);
+                }
+                self.constant(1, u32::from(i.mnemonic() == M::Popad));
+                self.call(self.helpers.stack_all);
+                self.stored(pc, Some(i.next_ip32()), false, |e| {
+                    for n in 0..8 {
+                        e.load32(19 + n, u32::from(n) * 4);
+                    }
+                });
                 return;
             }
             M::Pop => {
@@ -881,7 +1251,16 @@ impl Emitter {
                 self.ea(i, false);
                 self.mov(d, 9);
             }
-            M::Not => self.word(0x2a20_03e0 | (d as u32) << 16 | d as u32),
+            M::Not => {
+                self.read_register(9, i.op0_register(), false);
+                self.word(0x2a29_03eb); // mvn w11,w9
+                self.write_register(i.op0_register(), 11);
+            }
+            M::Shld | M::Shrd => {
+                self.read_register(9, i.op0_register(), false);
+                self.double_shift_value(i, i.op0_register().size() as u32, 8);
+                self.write_register(i.op0_register(), 11);
+            }
             m if shift(m) => {
                 self.read_register(9, i.op0_register(), false);
                 if i.op1_kind() == OpKind::Register {
@@ -931,6 +1310,38 @@ impl Emitter {
                 self.jump(Label::Guest(i.near_branch32()), Branch::B);
                 return;
             }
+            M::Loop | M::Loope | M::Loopne | M::Jcxz | M::Jecxz => {
+                let r = if counter_branch(i).unwrap() {
+                    Register::CX
+                } else {
+                    Register::ECX
+                };
+                self.read_register(9, r, false);
+                let zero = matches!(i.mnemonic(), M::Jcxz | M::Jecxz);
+                if !zero {
+                    self.word(0x5100_0529); // sub w9,w9,#1
+                    self.write_register(r, 9);
+                    self.read_register(9, r, false);
+                }
+                self.word(0x7100_013f); // cmp w9,#0
+                self.cset14(if zero { 0 } else { 1 });
+                self.mov(9, 14);
+                if matches!(i.mnemonic(), M::Loope | M::Loopne) {
+                    self.lsr(10, 8, 6);
+                    if i.mnemonic() == M::Loopne {
+                        self.word(0x5200_014a);
+                    } // eor w10,w10,#1
+                    self.binary(0x0a00_0000, 9, 9, 10);
+                }
+                self.charge();
+                self.link();
+                self.jump(
+                    Label::Guest(i.near_branch_target() as u32),
+                    Branch::Nonzero32(9),
+                );
+                self.jump(Label::Guest(i.next_ip32()), Branch::B);
+                return;
+            }
             _ if i.is_jcc_short_or_near() => {
                 self.charge();
                 self.link();
@@ -954,7 +1365,7 @@ impl Emitter {
                     self.mov(9, 0);
                     self.operand(10, i, 1);
                 } else {
-                    self.mov(9, d);
+                    self.read_register(9, i.op0_register(), false);
                     match m {
                         M::Inc | M::Dec => self.constant(10, 1),
                         M::Neg => {
@@ -964,9 +1375,14 @@ impl Emitter {
                         _ => self.operand(10, i, 1),
                     }
                 }
-                self.alu(m, 4, 8);
+                let width = if i.op0_kind() == OpKind::Register {
+                    i.op0_register().size() as u32
+                } else {
+                    4
+                };
+                self.alu(m, width, 8);
                 if !matches!(m, M::Cmp | M::Test) {
-                    self.mov(d, 11);
+                    self.write_register(i.op0_register(), 11);
                 }
             }
         }

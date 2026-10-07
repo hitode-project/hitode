@@ -53,6 +53,174 @@ fn equivalent(a: &Executor, b: &Executor, mask: u32) {
         b.memory().read_data(DATA, 4096).unwrap()
     );
 }
+
+fn string_instruction(a: &mut CodeAssembler, operation: u32, width: u32, repeat: u32) {
+    let a = match repeat {
+        1 => a.rep(),
+        2 => a.repne(),
+        _ => a,
+    };
+    match (operation, width) {
+        (0, 1) => a.movsb(),
+        (0, 2) => a.movsw(),
+        (0, _) => a.movsd(),
+        (1, 1) => a.stosb(),
+        (1, 2) => a.stosw(),
+        (1, _) => a.stosd(),
+        (_, 1) => a.lodsb(),
+        (_, 2) => a.lodsw(),
+        (_, _) => a.lodsd(),
+    }
+    .unwrap();
+}
+
+#[test]
+fn strings_match_all_widths_directions_repeats_and_empty_counts() {
+    for operation in 0..3 {
+        for width in [1, 2, 4] {
+            for repeat in 0..3 {
+                for use_fs in [false, true] {
+                    let code = assemble(|a| {
+                        string_instruction(a, operation, width, repeat);
+                        if use_fs {
+                            let mut instructions = a.take_instructions();
+                            instructions[0].set_segment_prefix(iced_x86::Register::FS);
+                            for i in instructions {
+                                a.add_instruction(i).unwrap();
+                            }
+                        }
+                        a.ret().unwrap();
+                    });
+                    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                    machines[2].set_tier_verification(Some(true));
+                    for count in [0, 1, 7] {
+                        for flags in [0x8d7, 0xcd7] {
+                            for m in &mut machines {
+                                reset(
+                                    m,
+                                    [0x9876abcd, count, 0, 0, 0, 0, DATA + 64, DATA + 256],
+                                    flags,
+                                );
+                                m.state.fs_base = if use_fs { 128 } else { 0 };
+                                let data: Vec<_> = (0..512).map(|n| (n * 13) as u8).collect();
+                                m.write(DATA, &data).unwrap();
+                                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                            }
+                            equivalent(&machines[0], &machines[1], u32::MAX);
+                            equivalent(&machines[0], &machines[2], u32::MAX);
+                        }
+                    }
+                    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                    assert_eq!(machines[2].stats.verification.mismatches, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_elements_resume_exactly_after_budget_stop_and_fault() {
+    for operation in 0..3 {
+        for width in [1, 2, 4] {
+            for reverse in [false, true] {
+                let code = assemble(|a| {
+                    string_instruction(a, operation, width, 1);
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                for m in &mut machines {
+                    let edge = if reverse {
+                        DATA + 4096 + width
+                    } else {
+                        DATA + 4096 - 2 * width
+                    };
+                    let (src, dst) = if operation == 2 {
+                        (edge, DATA + 128)
+                    } else {
+                        (
+                            if reverse {
+                                DATA + 4096 + 128
+                            } else {
+                                DATA + 128
+                            },
+                            edge,
+                        )
+                    };
+                    reset(
+                        m,
+                        [0x9876abcd, 4, 0, 0, 0, 0, src, dst],
+                        0x8d7 | u32::from(reverse) * 0x400,
+                    );
+                    m.write(DATA, &[0x35; 8192]).unwrap();
+                }
+                // Only Tier 0/1 promise exact element budgets, unlike block-charged Cranelift.
+                for index in [0, 2] {
+                    let m = &mut machines[index];
+                    assert_eq!(m.run(CODE, 1).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(m.state.regs[1], 4);
+                    assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
+                    assert_eq!(m.state.regs[1], 3);
+                    assert_eq!(m.state.eip, CODE);
+                }
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                for m in &mut machines {
+                    m.protect(if reverse { DATA } else { DATA + 4096 }, 4096, 0)
+                        .unwrap();
+                }
+                let outcomes: Vec<_> = machines
+                    .iter_mut()
+                    .map(|m| m.run(STOP, 100).unwrap())
+                    .collect();
+                assert_eq!(outcomes[0], outcomes[1]);
+                assert_eq!(outcomes[0], outcomes[2]);
+                assert!(matches!(
+                    outcomes[0],
+                    RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+                ));
+                for m in &mut machines {
+                    m.protect(DATA, 8192, READ | WRITE).unwrap();
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+                assert_eq!(machines[2].state.regs[1], 2);
+                for m in &mut machines {
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_executable_writes_commit_each_element_once() {
+    for operation in 0..2 {
+        let code = assemble(|a| {
+            string_instruction(a, operation, 4, 1);
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for (mode, m) in machines.iter_mut().enumerate() {
+            reset(m, [0x12345678, 3, 0, 0, 0, 0, DATA + 64, DATA], 2);
+            m.write(DATA + 64, &[0x37; 12]).unwrap();
+            m.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
+            if mode != 1 {
+                assert_eq!(m.run(STOP, 2).unwrap(), RunOutcome::Budget);
+                assert_eq!(m.state.eip, CODE);
+                assert_eq!(m.state.regs[1], 1);
+            }
+        }
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        assert_eq!(machines[2].tier1_stats().native_instructions, 2);
+        for m in &mut machines {
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+    }
+}
 #[test]
 fn integer_templates_match_both_existing_tiers_at_flag_boundaries() {
     for operation in 0..12 {
@@ -106,7 +274,7 @@ fn direct_loop_checked_memory_and_single_instruction_fallback_continue() {
         a.mov(eax, 0x12345678u32).unwrap();
         a.set_label(&mut top).unwrap();
         a.add(eax, 17).unwrap();
-        a.bswap(eax).unwrap();
+        a.rcl(eax, 1).unwrap();
         a.xor(edx, eax).unwrap();
         a.dec(ecx).unwrap();
         a.jne(top).unwrap();
@@ -122,7 +290,7 @@ fn direct_loop_checked_memory_and_single_instruction_fallback_continue() {
     equivalent(&machines[0], &machines[1], 0x8d5);
     equivalent(&machines[0], &machines[2], 0x8d5);
     let stats = machines[2].tier1_stats();
-    assert_eq!(stats.fallback_instructions, 12, "BSWAP only");
+    assert_eq!(stats.fallback_instructions, 12, "RCL only");
     assert_eq!(stats.inline_accesses, 3, "store, load and RET");
     assert_eq!(stats.checked_accesses, 0);
     assert!(stats.direct_transfers >= 12);
@@ -365,7 +533,7 @@ fn tier_verification_counts_tier1_steps_through_loops_memory_and_fallbacks() {
         a.mov(eax, 0x12345678u32).unwrap();
         a.set_label(&mut top).unwrap();
         a.add(eax, 17).unwrap();
-        a.bswap(eax).unwrap();
+        a.rcl(eax, 1).unwrap();
         a.mov(dword_ptr(edi), eax).unwrap();
         a.mov(ebx, dword_ptr(edi)).unwrap();
         a.xor(edx, ebx).unwrap();
@@ -1449,4 +1617,596 @@ fn multiply_and_carry_memory_source_faults_preserve_destination_and_flags() {
         equivalent(&machines[0], &machines[1], u32::MAX);
         equivalent(&machines[0], &machines[2], u32::MAX);
     }
+}
+
+fn double_shift_instruction(
+    a: &mut CodeAssembler,
+    left: bool,
+    word: bool,
+    memory: bool,
+    count: Option<u32>,
+) {
+    match (left, word, memory, count) {
+        (true, true, true, Some(n)) => a.shld(word_ptr(edi), dx, n),
+        (true, false, true, Some(n)) => a.shld(dword_ptr(edi), edx, n),
+        (true, true, false, Some(n)) => a.shld(ax, dx, n),
+        (true, false, false, Some(n)) => a.shld(eax, edx, n),
+        (false, true, true, Some(n)) => a.shrd(word_ptr(edi), dx, n),
+        (false, false, true, Some(n)) => a.shrd(dword_ptr(edi), edx, n),
+        (false, true, false, Some(n)) => a.shrd(ax, dx, n),
+        (false, false, false, Some(n)) => a.shrd(eax, edx, n),
+        (true, true, true, None) => a.shld(word_ptr(edi), dx, cl),
+        (true, false, true, None) => a.shld(dword_ptr(edi), edx, cl),
+        (true, true, false, None) => a.shld(ax, dx, cl),
+        (true, false, false, None) => a.shld(eax, edx, cl),
+        (false, true, true, None) => a.shrd(word_ptr(edi), dx, cl),
+        (false, false, true, None) => a.shrd(dword_ptr(edi), edx, cl),
+        (false, true, false, None) => a.shrd(ax, dx, cl),
+        (false, false, false, None) => a.shrd(eax, edx, cl),
+    }
+    .unwrap();
+}
+
+#[test]
+fn double_shifts_match_concatenation_flags_and_all_masked_counts() {
+    for left in [false, true] {
+        for word in [false, true] {
+            for memory in [false, true] {
+                for immediate in [false, true] {
+                    for count in [0, 1, 2, 15, 16, 17, 31, 32, 33, 255] {
+                        let code = assemble(|a| {
+                            double_shift_instruction(
+                                a,
+                                left,
+                                word,
+                                memory,
+                                immediate.then_some(count),
+                            );
+                            a.ret().unwrap();
+                        });
+                        let mut machines =
+                            [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                        machines[2].set_tier_verification(Some(true));
+                        for value in [0, 1, 0x80018001, 0x7fff7fff, u32::MAX] {
+                            for source in [0, 0xabcde123, u32::MAX] {
+                                for flags in [2, 0xcd7] {
+                                    for m in &mut machines {
+                                        reset(
+                                            m,
+                                            [value, count, source, 0, 0, 0, 0, DATA + 3],
+                                            flags,
+                                        );
+                                        m.write(DATA + 3, &value.to_le_bytes()).unwrap();
+                                        assert_eq!(
+                                            m.run(STOP, 100).unwrap(),
+                                            RunOutcome::ReachedStop
+                                        );
+                                    }
+                                    equivalent(&machines[0], &machines[1], u32::MAX);
+                                    equivalent(&machines[0], &machines[2], u32::MAX);
+                                }
+                            }
+                        }
+                        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                        assert_eq!(machines[2].stats.verification.mismatches, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn double_shift_memory_refusal_and_zero_count_do_not_commit() {
+    for left in [false, true] {
+        for word in [false, true] {
+            for count in [0, 1, 17, 32] {
+                let code = assemble(|a| {
+                    double_shift_instruction(a, left, word, true, None);
+                    a.ret().unwrap();
+                });
+                for permission in [0, READ, READ | WRITE | EXEC] {
+                    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                    for m in &mut machines {
+                        reset(m, [0, count, 0x87561234, 0, 0, 0, 0, DATA + 4095], 0xcd7);
+                        m.write(DATA + 4095, &0xabcd8765u32.to_le_bytes()).unwrap();
+                        m.protect(DATA + 4096, 4096, permission).unwrap();
+                    }
+                    let outcomes: Vec<_> = machines
+                        .iter_mut()
+                        .map(|m| m.run(STOP, 100).unwrap())
+                        .collect();
+                    assert_eq!(outcomes[0], outcomes[1]);
+                    assert_eq!(outcomes[0], outcomes[2]);
+                    for m in &mut machines {
+                        m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+                    }
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                    for m in &mut machines {
+                        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    }
+                    equivalent(&machines[0], &machines[1], u32::MAX);
+                    equivalent(&machines[0], &machines[2], u32::MAX);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn counter_branches_preserve_flags_and_wrap_the_selected_counter() {
+    for operation in 0..5 {
+        let code = assemble(|a| {
+            let mut taken = a.create_label();
+            match operation {
+                0 => a.jecxz(taken),
+                1 => a.jcxz(taken),
+                2 => a.loop_(taken),
+                3 => a.loope(taken),
+                _ => a.loopne(taken),
+            }
+            .unwrap();
+            a.mov(eax, 1).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut taken).unwrap();
+            a.mov(eax, 2).unwrap();
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        for count in [0, 1, 2, 0x10000, 0xffff0001, u32::MAX] {
+            for flags in [2, 0xcd7, 0xc97] {
+                for m in &mut machines {
+                    reset(m, [0, count, 0, 0, 0, 0, 0, 0], flags);
+                    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                    assert_eq!(m.state.eflags, flags);
+                }
+                equivalent(&machines[0], &machines[1], u32::MAX);
+                equivalent(&machines[0], &machines[2], u32::MAX);
+            }
+        }
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+        assert_eq!(machines[2].stats.verification.mismatches, 0);
+    }
+}
+
+#[test]
+fn pushad_popad_preserve_original_esp_and_skip_saved_esp() {
+    for pop in [false, true] {
+        let code = assemble(|a| {
+            if pop { a.popad() } else { a.pushad() }.unwrap();
+            a.jmp(u64::from(STOP)).unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        machines[2].set_tier_verification(Some(true));
+        for m in &mut machines {
+            reset(m, [3, 5, 7, 11, 0, 13, 17, 19], 0xcd7);
+            m.state.regs[4] = DATA + 128;
+            let words: Vec<_> = (0u32..8)
+                .flat_map(|n| (n * 0x11223344).to_le_bytes())
+                .collect();
+            m.write(DATA + 128, &words).unwrap();
+            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        }
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+        assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+        assert_eq!(machines[2].stats.verification.mismatches, 0);
+        assert_eq!(
+            machines[2].state.regs[4],
+            if pop { DATA + 160 } else { DATA + 96 }
+        );
+        if !pop {
+            assert_eq!(
+                machines[2].memory().read(DATA + 108, 4).unwrap(),
+                &(DATA + 128).to_le_bytes()
+            );
+        }
+    }
+}
+
+#[test]
+fn all_register_stack_faults_preserve_every_register_and_memory() {
+    for pop in [false, true] {
+        for split in [1, 4, 12, 16, 28, 31] {
+            let code = assemble(|a| {
+                if pop { a.popad() } else { a.pushad() }.unwrap();
+                a.jmp(u64::from(STOP)).unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            for m in &mut machines {
+                reset(m, [3, 5, 7, 11, 0, 13, 17, 19], 0xcd7);
+                m.state.regs[4] = if pop {
+                    DATA + 4096 - split
+                } else {
+                    DATA + 4096 + split
+                };
+                m.write(DATA, &[0xa5; 8192]).unwrap();
+                m.protect(DATA + 4096, 4096, 0).unwrap();
+            }
+            let original = machines[2].state.regs;
+            let outcomes: Vec<_> = machines
+                .iter_mut()
+                .map(|m| m.run(STOP, 100).unwrap())
+                .collect();
+            assert_eq!(outcomes[0], outcomes[1]);
+            assert_eq!(outcomes[0], outcomes[2]);
+            assert_eq!(machines[2].state.regs, original);
+            assert_eq!(machines[2].state.eip, CODE);
+            for m in &mut machines {
+                m.protect(DATA + 4096, 4096, READ | WRITE).unwrap();
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+            assert_eq!(
+                machines[2].memory().read(DATA, 8192).unwrap(),
+                &[0xa5; 8192]
+            );
+            for m in &mut machines {
+                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+            }
+            equivalent(&machines[0], &machines[1], u32::MAX);
+            equivalent(&machines[0], &machines[2], u32::MAX);
+        }
+    }
+}
+
+#[test]
+fn pushad_executable_stack_write_retires_once() {
+    let code = assemble(|a| {
+        a.pushad().unwrap();
+        a.jmp(u64::from(STOP)).unwrap();
+    });
+    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+    for (mode, m) in machines.iter_mut().enumerate() {
+        reset(m, [3, 5, 7, 11, 0, 13, 17, 19], 0xcd7);
+        m.state.regs[4] = DATA + 128;
+        m.protect(DATA, 4096, READ | WRITE | EXEC).unwrap();
+        if mode != 1 {
+            assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
+        }
+    }
+    equivalent(&machines[0], &machines[2], u32::MAX);
+    assert_eq!(machines[2].tier1_stats().native_instructions, 1);
+    for m in &mut machines {
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    }
+    equivalent(&machines[0], &machines[1], u32::MAX);
+    equivalent(&machines[0], &machines[2], u32::MAX);
+    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+}
+
+fn wide_arithmetic_instruction(a: &mut CodeAssembler, operation: u32, form: u32) {
+    match (operation, form) {
+        (0, 0) => a.mul(ebx),
+        (0, 1) => a.mul(eax),
+        (0, 2) => a.mul(edx),
+        (0, _) => a.mul(dword_ptr(edi)),
+        (1, 0) => a.imul(ebx),
+        (1, 1) => a.imul(eax),
+        (1, 2) => a.imul(edx),
+        (1, _) => a.imul(dword_ptr(edi)),
+        (2, 0) => a.div(ebx),
+        (2, 1) => a.div(eax),
+        (2, 2) => a.div(edx),
+        (2, _) => a.div(dword_ptr(edi)),
+        (_, 0) => a.idiv(ebx),
+        (_, 1) => a.idiv(eax),
+        (_, 2) => a.idiv(edx),
+        (_, _) => a.idiv(dword_ptr(edi)),
+    }
+    .unwrap();
+}
+
+#[test]
+fn full_width_multiply_divide_match_results_flags_and_divide_errors() {
+    let values = [0, 1, 2, 0x7fffffff, 0x80000000, 0xfffffffe, u32::MAX];
+    for operation in 0..4 {
+        for form in 0..4 {
+            let code = assemble(|a| {
+                wide_arithmetic_instruction(a, operation, form);
+                a.ret().unwrap();
+            });
+            let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+            machines[2].set_tier_verification(Some(true));
+            for low in values {
+                for high in values {
+                    for divisor in values {
+                        for flags in [2, 0xcd7] {
+                            for m in &mut machines {
+                                reset(m, [low, 0, high, divisor, 0, 0, 0, DATA], flags);
+                                m.write(DATA, &divisor.to_le_bytes()).unwrap();
+                            }
+                            let before = machines[2].state.regs;
+                            let outcomes: Vec<_> = machines
+                                .iter_mut()
+                                .map(|m| m.run(STOP, 100).unwrap())
+                                .collect();
+                            assert_eq!(outcomes[0], outcomes[1]);
+                            assert_eq!(outcomes[0], outcomes[2]);
+                            equivalent(&machines[0], &machines[1], u32::MAX);
+                            equivalent(&machines[0], &machines[2], u32::MAX);
+                            if outcomes[0] != RunOutcome::ReachedStop {
+                                assert_eq!(machines[2].state.regs, before);
+                                assert_eq!(machines[2].state.eip, CODE);
+                                assert_eq!(machines[2].state.eflags, flags);
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                machines[2].tier1_stats().fallback_instructions,
+                0,
+                "faults do not retire"
+            );
+            assert!(machines[2].tier1_stats().native_instructions > 0);
+            assert_eq!(machines[2].stats.verification.mismatches, 0);
+        }
+    }
+}
+
+#[test]
+fn wide_arithmetic_memory_fault_precedes_divide_error_and_preserves_inputs() {
+    for operation in 0..4 {
+        let code = assemble(|a| {
+            wide_arithmetic_instruction(a, operation, 3);
+            a.ret().unwrap();
+        });
+        let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+        for m in &mut machines {
+            reset(m, [0, 0, u32::MAX, 0, 0, 0, 0, DATA + 4095], 0xcd7);
+            m.protect(DATA + 4096, 4096, 0).unwrap();
+        }
+        let outcomes: Vec<_> = machines
+            .iter_mut()
+            .map(|m| m.run(STOP, 100).unwrap())
+            .collect();
+        assert!(matches!(outcomes[0], RunOutcome::ReadFault { .. }));
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert_eq!(outcomes[0], outcomes[2]);
+        equivalent(&machines[0], &machines[1], u32::MAX);
+        equivalent(&machines[0], &machines[2], u32::MAX);
+    }
+}
+
+fn narrow_alu_instruction(a: &mut CodeAssembler, operation: u32, form: u32, immediate: bool) {
+    macro_rules! emit {
+        ($dst:expr, $src:expr) => {
+            match operation {
+                0 => {
+                    if immediate {
+                        a.add($dst, -1)
+                    } else {
+                        a.add($dst, $src)
+                    }
+                }
+                1 => {
+                    if immediate {
+                        a.sub($dst, -1)
+                    } else {
+                        a.sub($dst, $src)
+                    }
+                }
+                2 => {
+                    if immediate {
+                        a.and($dst, -1)
+                    } else {
+                        a.and($dst, $src)
+                    }
+                }
+                3 => {
+                    if immediate {
+                        a.or($dst, -1)
+                    } else {
+                        a.or($dst, $src)
+                    }
+                }
+                4 => {
+                    if immediate {
+                        a.xor($dst, -1)
+                    } else {
+                        a.xor($dst, $src)
+                    }
+                }
+                5 => {
+                    if immediate {
+                        a.cmp($dst, -1)
+                    } else {
+                        a.cmp($dst, $src)
+                    }
+                }
+                6 => {
+                    if immediate {
+                        a.test($dst, -1)
+                    } else {
+                        a.test($dst, $src)
+                    }
+                }
+                7 => a.inc($dst),
+                8 => a.dec($dst),
+                9 => a.neg($dst),
+                _ => a.not($dst),
+            }
+            .unwrap()
+        };
+    }
+    match form {
+        0 => emit!(al, dh),
+        1 => emit!(ah, dl),
+        2 => emit!(ah, al),
+        _ => emit!(ax, dx),
+    }
+}
+
+#[test]
+fn narrow_alu_preserves_other_lanes_and_matches_full_flags() {
+    for operation in 0..11 {
+        for form in 0..4 {
+            for immediate in [false, true] {
+                let code = assemble(|a| {
+                    narrow_alu_instruction(a, operation, form, immediate);
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                machines[2].set_tier_verification(Some(true));
+                for left in [0, 1, 15, 16, 127, 128, 255, 0x7fff, 0x8000, 0xffff] {
+                    for right in [0, 1, 15, 16, 127, 128, 255, 0x7fff, 0x8000, 0xffff] {
+                        for flags in [2, 0xcd7] {
+                            let eax_value = 0xabcd0000
+                                | if form == 1 || form == 2 {
+                                    (left & 255) << 8 | right & 255
+                                } else {
+                                    left
+                                };
+                            let edx_value = if form == 0 { (right & 255) << 8 } else { right };
+                            for m in &mut machines {
+                                reset(m, [eax_value, 0, edx_value, 0, 0, 0, 0, 0], flags);
+                                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                            }
+                            // Cranelift uses a different value for undefined logical AF.
+                            let mask = if matches!(operation, 2 | 3 | 4 | 6) {
+                                !0x10
+                            } else {
+                                u32::MAX
+                            };
+                            equivalent(&machines[0], &machines[1], mask);
+                            equivalent(&machines[0], &machines[2], u32::MAX);
+                        }
+                    }
+                }
+                assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                assert_eq!(machines[2].stats.verification.mismatches, 0);
+            }
+        }
+    }
+}
+
+fn bit_instruction(a: &mut CodeAssembler, operation: u32, word: bool, immediate: Option<u32>) {
+    macro_rules! emit {
+        ($dst:expr, $index:expr) => {
+            match operation {
+                0 => a.bt($dst, $index),
+                1 => a.bts($dst, $index),
+                2 => a.btr($dst, $index),
+                _ => a.btc($dst, $index),
+            }
+            .unwrap()
+        };
+    }
+    match (word, immediate) {
+        (true, Some(n)) => emit!(ax, n),
+        (false, Some(n)) => emit!(eax, n),
+        (true, None) => emit!(ax, dx),
+        (false, None) => emit!(eax, edx),
+    }
+}
+
+#[test]
+fn register_bits_mask_indices_and_only_replace_carry() {
+    for operation in 0..4 {
+        for word in [false, true] {
+            for immediate in [false, true] {
+                for index in [0, 1, 15, 16, 31, 32, 63, 255] {
+                    let code = assemble(|a| {
+                        bit_instruction(a, operation, word, immediate.then_some(index));
+                        a.ret().unwrap();
+                    });
+                    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                    machines[2].set_tier_verification(Some(true));
+                    for value in [0, 1, 0xabcd8001, u32::MAX] {
+                        for flags in [2, 0xcd7] {
+                            for m in &mut machines {
+                                reset(m, [value, 0, index, 0, 0, 0, 0, 0], flags);
+                                assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                            }
+                            equivalent(&machines[0], &machines[1], u32::MAX);
+                            equivalent(&machines[0], &machines[2], u32::MAX);
+                        }
+                    }
+                    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                    assert_eq!(machines[2].stats.verification.mismatches, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scans_preserve_zero_destination_and_bswap_preserves_flags() {
+    for operation in 0..2 {
+        for word in [false, true] {
+            for form in 0..3 {
+                let code = assemble(|a| {
+                    match (operation, word, form) {
+                        (0, true, 0) => a.bsf(ax, dx),
+                        (0, false, 0) => a.bsf(eax, edx),
+                        (0, true, 1) => a.bsf(ax, ax),
+                        (0, false, 1) => a.bsf(eax, eax),
+                        (0, true, _) => a.bsf(ax, word_ptr(edi)),
+                        (0, false, _) => a.bsf(eax, dword_ptr(edi)),
+                        (_, true, 0) => a.bsr(ax, dx),
+                        (_, false, 0) => a.bsr(eax, edx),
+                        (_, true, 1) => a.bsr(ax, ax),
+                        (_, false, 1) => a.bsr(eax, eax),
+                        (_, true, _) => a.bsr(ax, word_ptr(edi)),
+                        (_, false, _) => a.bsr(eax, dword_ptr(edi)),
+                    }
+                    .unwrap();
+                    a.bswap(edx).unwrap();
+                    a.ret().unwrap();
+                });
+                let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+                machines[2].set_tier_verification(Some(true));
+                for value in [0, 1, 2, 0x8000, 0x10000, 0x80000000, 0x12345678, u32::MAX] {
+                    for flags in [2, 0xcd7] {
+                        for m in &mut machines {
+                            reset(
+                                m,
+                                [
+                                    if form == 1 { value } else { 0xabcde123 },
+                                    0,
+                                    value,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    DATA,
+                                ],
+                                flags,
+                            );
+                            m.write(DATA, &value.to_le_bytes()).unwrap();
+                            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+                        }
+                        equivalent(&machines[0], &machines[1], u32::MAX);
+                        equivalent(&machines[0], &machines[2], u32::MAX);
+                    }
+                }
+                assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+                assert_eq!(machines[2].stats.verification.mismatches, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn bit_scan_memory_fault_preserves_zero_flag_and_destination() {
+    let code = assemble(|a| {
+        a.bsf(eax, dword_ptr(edi)).unwrap();
+        a.ret().unwrap();
+    });
+    let mut machines = [machine(&code, 0), machine(&code, 1), machine(&code, 2)];
+    for m in &mut machines {
+        reset(m, [0xabcde123, 0, 0, 0, 0, 0, 0, DATA + 4095], 0xcd7);
+        m.protect(DATA + 4096, 4096, 0).unwrap();
+    }
+    let outcomes: Vec<_> = machines
+        .iter_mut()
+        .map(|m| m.run(STOP, 100).unwrap())
+        .collect();
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[0], outcomes[2]);
+    equivalent(&machines[0], &machines[1], u32::MAX);
+    equivalent(&machines[0], &machines[2], u32::MAX);
 }
