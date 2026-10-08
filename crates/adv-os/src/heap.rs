@@ -35,6 +35,7 @@ fn zero_memory(cpu: &mut dyn Guest, addr: u32, len: u32) -> Result<(), MemFault>
 pub struct Heap {
     synchronization: HeapSynchronization,
     executable: bool,
+    generate_exceptions: bool,
     free_by_addr: BTreeMap<u32, u32>,
     free_by_size: BTreeSet<(u32, u32)>,
     /// Block address -> (rounded size, requested size).
@@ -152,8 +153,21 @@ impl Heaps {
         serialized: bool,
         executable: bool,
     ) -> Result<u32, MemFault> {
+        self.create_with_policy(cpu, vm, serialized, executable, false)
+    }
+
+    /// Retain the allocation failure policy in the same owner as heap storage.
+    pub fn create_with_policy(
+        &mut self,
+        cpu: &mut dyn Guest,
+        vm: &mut Vm,
+        serialized: bool,
+        executable: bool,
+        generate_exceptions: bool,
+    ) -> Result<u32, MemFault> {
         let mut h = Heap {
             executable,
+            generate_exceptions,
             synchronization: HeapSynchronization {
                 serialized,
                 lock: None,
@@ -182,6 +196,13 @@ impl Heaps {
         self.heaps
             .get(&self.normalize(handle)?)
             .map(|heap| heap.synchronization)
+    }
+
+    /// Invalid or destroyed handles cannot borrow another heap's creation policy.
+    pub fn generates_exceptions(&self, handle: u32) -> Option<bool> {
+        self.heaps
+            .get(&self.normalize(handle)?)
+            .map(|heap| heap.generate_exceptions)
     }
 
     /// Publish a personality-owned lock only after its guest storage is initialized.
@@ -415,6 +436,26 @@ mod tests {
         let (mut guest, mut vm, mut heaps) = (MemoryGuest::default(), Vm::new(), Heaps::default());
         heaps.process_heap = heaps.create(&mut guest, &mut vm).unwrap();
         (guest, vm, heaps)
+    }
+
+    #[test]
+    fn allocation_failure_policy_belongs_to_one_live_heap() {
+        let (mut guest, mut vm, mut heaps) = heap();
+        let ordinary = heaps.process_heap;
+        let raising = heaps
+            .create_with_policy(&mut guest, &mut vm, false, true, true)
+            .unwrap();
+        assert_eq!(heaps.generates_exceptions(ordinary), Some(false));
+        assert_eq!(heaps.generates_exceptions(0), Some(false));
+        assert_eq!(heaps.generates_exceptions(raising), Some(true));
+        assert_eq!(heaps.generates_exceptions(0x12345678), None);
+        assert!(!heaps.synchronization(raising).unwrap().serialized);
+        heaps.process_heap = raising;
+        assert_eq!(heaps.generates_exceptions(0), Some(true));
+        assert!(heaps.destroy(&mut guest, &mut vm, raising));
+        assert_eq!(heaps.generates_exceptions(raising), None);
+        assert_eq!(heaps.generates_exceptions(0), None);
+        assert_eq!(heaps.generates_exceptions(ordinary), Some(false));
     }
 
     #[test]

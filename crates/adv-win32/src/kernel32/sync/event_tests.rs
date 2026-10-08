@@ -322,3 +322,58 @@ fn open_event_uses_case_sensitive_shared_namespace_and_rejects_wrong_types_or_ac
     assert_eq!(f.call("CloseHandle", &[event]), 1);
     assert_eq!(f.call("CloseHandle", &[mutex]), 1);
 }
+
+#[test]
+fn mutex_and_semaphore_native_entries_are_registered_and_share_release_state() {
+    let mut f = Fixture::new();
+    for (name, argc) in [
+        ("NtCreateMutant", 4),
+        ("NtOpenMutant", 3),
+        ("NtReleaseMutant", 2),
+        ("NtCreateSemaphore", 5),
+        ("NtOpenSemaphore", 3),
+        ("NtReleaseSemaphore", 3),
+    ] {
+        let entry = f.0.resolve_import("ntdll.dll", name).unwrap();
+        let thunk = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        assert_eq!(f.0.sys.thunks.get(thunk).f.conv, Conv::Stdcall { argc });
+    }
+    let mutex = f.call("CreateMutexA", &[0, 1, 0]);
+    assert_eq!(f.wait(mutex), WAIT_OBJECT_0);
+    f.0.cpu.write_u32(DATA + 0x700, 0x12345678).unwrap();
+    assert_eq!(
+        f.call("ntdll.dll!NtReleaseMutant", &[mutex, DATA + 0x700]),
+        0
+    );
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), u32::MAX);
+    assert_eq!(f.call("ReleaseMutex", &[mutex]), 1);
+    assert_eq!(
+        f.call("ntdll.dll!NtReleaseMutant", &[mutex, DATA + 0x700]),
+        0xc0000046
+    );
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), u32::MAX);
+    let semaphore = f.call("CreateSemaphoreW", &[0, 1, 2, 0]);
+    assert_eq!(f.wait(semaphore), WAIT_OBJECT_0);
+    assert_eq!(
+        f.call(
+            "ntdll.dll!NtReleaseSemaphore",
+            &[semaphore, 2, DATA + 0x700]
+        ),
+        0
+    );
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), 0);
+    assert_eq!(f.call("ReleaseSemaphore", &[semaphore, 1, DATA + 0x700]), 0);
+    assert_eq!(f.error(), 298);
+    assert_eq!(f.0.cpu.read_u32(DATA + 0x700).unwrap(), 0);
+    assert_eq!(
+        f.call(
+            "ntdll.dll!NtReleaseSemaphore",
+            &[semaphore, 0, DATA + 0x700]
+        ),
+        0xc000000d
+    );
+    assert!(matches!(
+        f.0.sys.objects.get(semaphore),
+        Some(Object::Semaphore { count: 2, max: 2 })
+    ));
+}

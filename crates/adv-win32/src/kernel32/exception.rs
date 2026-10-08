@@ -248,19 +248,23 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
 
 /// Raise a personality-owned status after its resource operation has released
 /// temporary locks. The exception follows the same live RTL/NT delivery path.
+/// `resume_eip` is the API's actual epilogue captured before any wait; waking
+/// retains the latest architecture and callback ancestry but may leave EIP parked.
 pub(crate) fn raise_status(
     env: &mut Env<'_>,
     code: u32,
     flags: u32,
     information: &[u32],
+    resume_eip: u32,
 ) -> Outcome {
     if information.len() > 15 {
         return Outcome::Fail("native status exception has too many parameters".into());
     }
-    let checkpoint = match env.checkpoint() {
+    let mut checkpoint = match env.checkpoint() {
         Ok(checkpoint) => checkpoint,
         Err(error) => return Outcome::Fail(error.to_string()),
     };
+    checkpoint.state.eip = resume_eip;
     let mut words = [0; 15];
     words[..information.len()].copy_from_slice(information);
     let address = checkpoint.state.eip;
@@ -427,11 +431,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
         search.nested = Some(search.nested.map_or(establisher, |n| n.max(establisher)));
     }
     if frame == u32::MAX {
-        env.sys.guest_failure_code = Some(search.record.code);
-        return Outcome::Fail(format!(
-            "unhandled Windows exception {:#010x} at {:#010x}",
-            search.record.code, search.record.address
-        ));
+        return native::unhandled(env, search);
     }
     if search.searched >= LIMIT
         || frame & 3 != 0

@@ -33,7 +33,13 @@ fn heap_create(env: &mut Env<'_>) -> Outcome {
     let serialized = flags & 1 == 0; // HEAP_NO_SERIALIZE
     let executable = flags & 0x40000 != 0; // HEAP_CREATE_ENABLE_EXECUTE
     let heaps = env.ext.get_mut::<Heaps>();
-    match heaps.create_with_options(env.cpu, &mut env.sys.vm, serialized, executable) {
+    match heaps.create_with_policy(
+        env.cpu,
+        &mut env.sys.vm,
+        serialized,
+        executable,
+        flags & 4 != 0,
+    ) {
         Ok(h) => Outcome::Return(h),
         Err(_) => Outcome::Return(0),
     }

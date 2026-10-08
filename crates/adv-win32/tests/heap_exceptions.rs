@@ -1,12 +1,12 @@
 //! Authored heap requests follow the native Windows oracle's exception contract.
 //! The companion C oracle covers allocation/reallocation success, overflow failure
 //! and vectored continuation; these guests additionally verify shared heap locks.
-use adv_abi::{ApiDiagnostics, Registry, RunMode};
+use adv_abi::{ApiDiagnostics, Conv, Registry, RunMode};
 use adv_cpu::{
     JitCpu,
     backend::{Guest, GuestExt, Prot, asm::Asm},
 };
-use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
+use adv_machine::{Clock, Env, Machine, Outcome, RunResult, Wait, layout::PARK_ADDR};
 use adv_os::{Heaps, Loader, Modules};
 use adv_pe::ImportName;
 use adv_win32::{Win32, Win32Config};
@@ -25,6 +25,12 @@ use Arg::{Stored as M, Value as I};
 fn fixture(jit: bool) -> Machine<JitCpu> {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
+    registry.add(
+        "test",
+        "hold_heap_until_waiter",
+        Conv::Stdcall { argc: 1 },
+        |env| hold_heap_until_waiter(env, env.arg(0)),
+    );
     let mut machine = Machine::new(
         JitCpu::new(PARK_ADDR, jit).unwrap(),
         registry,
@@ -44,6 +50,35 @@ fn fixture(jit: bool) -> Machine<JitCpu> {
     machine.cpu.map(CODE, 0x10000, Prot::RX).unwrap();
     machine.cpu.map(DATA, 0x2000, Prot::RW).unwrap();
     machine
+}
+
+fn hold_heap_until_waiter(env: &mut Env<'_>, heap: u32) -> Outcome {
+    let waiting = env.sys.contexts.iter().any(|context| {
+        context.id != env.context
+            && matches!(context.waiting_on(), Some(Wait::Object { .. }))
+            && context.blocked_thunk().is_some_and(|thunk| {
+                matches!(
+                    env.sys.thunks.get(thunk).name.as_str(),
+                    "HeapAlloc" | "HeapReAlloc" | "RtlAllocateHeap" | "RtlReAllocateHeap"
+                )
+            })
+            && context
+                .blocked_stack()
+                .is_some_and(|stack| env.cpu.read_u32(stack + 4).unwrap_or(0) == heap)
+    });
+    if waiting {
+        assert_eq!(
+            env.cpu.read_u32(heap + 0x24).unwrap(),
+            1,
+            "one real waiter counted"
+        );
+        assert_eq!(env.cpu.read_u32(heap + 0x28).unwrap(), 1);
+        assert_eq!(env.cpu.read_u32(heap + 0x2c).unwrap(), env.ctx().tid);
+        env.cpu.write_u32(DATA + 0xf00, 1).unwrap();
+        Outcome::Return(0)
+    } else {
+        Outcome::block(Wait::Yield, move |env, _| hold_heap_until_waiter(env, heap))
+    }
 }
 
 fn public(machine: &mut Machine<JitCpu>, module: &str, name: &str) -> u32 {
@@ -318,6 +353,234 @@ fn an_unhandled_heap_oom_uses_the_windows_exception_owner() {
         match result {
             RunResult::Failed(reason) => assert!(reason.message.contains("c0000017"), "{reason}"),
             other => panic!("unhandled allocation exception must fail: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn contended_heap_oom_resumes_the_actual_api_epilogue_after_its_wait() {
+    for jit in [false, true] {
+        for front in 0..3 {
+            for reallocating in [false, true] {
+                let mut machine = fixture(jit);
+                let heap = machine.ext.get::<Heaps>().process_heap;
+                let (alloc, realloc) = match front {
+                    0 => (
+                        api(&mut machine, "HeapAlloc"),
+                        api(&mut machine, "HeapReAlloc"),
+                    ),
+                    1 => (
+                        public(&mut machine, "kernel32.dll", "HeapAlloc"),
+                        public(&mut machine, "kernel32.dll", "HeapReAlloc"),
+                    ),
+                    _ => (
+                        public(&mut machine, "ntdll.dll", "RtlAllocateHeap"),
+                        public(&mut machine, "ntdll.dll", "RtlReAllocateHeap"),
+                    ),
+                };
+                let mut code = Asm::new(CODE);
+                initialize(&mut code, &mut machine, heap);
+                call(&mut code, alloc, &[I(heap), I(0), I(16)], DATA);
+                code.mov_eax_mem(DATA);
+                for offset in [0, 4, 8, 12] {
+                    code.bytes.extend([0xc7, 0x40, offset]);
+                    code.bytes.extend(0x3c3c3c3cu32.to_le_bytes());
+                }
+                call(
+                    &mut code,
+                    api(&mut machine, "CreateEventW"),
+                    &[I(0), I(0), I(0), I(0)],
+                    DATA + 0xf10,
+                );
+                let owner = CODE + 0x6000;
+                let mut worker = Asm::new(owner);
+                worker.push_imm(heap).call(api(&mut machine, "HeapLock"));
+                worker
+                    .mov_eax_mem(DATA + 0xf10)
+                    .push_eax()
+                    .call(api(&mut machine, "SetEvent"));
+                worker.push_imm(heap).call(
+                    machine
+                        .resolve_import("test", "hold_heap_until_waiter")
+                        .unwrap(),
+                );
+                worker.push_imm(heap).call(api(&mut machine, "HeapUnlock"));
+                worker.mov_mem_eax(DATA + 0xf30);
+                worker.bytes.extend([0x31, 0xc0]);
+                worker.ret_n(4);
+                machine.cpu.write(owner, &worker.bytes).unwrap();
+                call(
+                    &mut code,
+                    api(&mut machine, "CreateThread"),
+                    &[I(0), I(0), I(owner), I(0), I(0), I(0)],
+                    DATA + 0xf20,
+                );
+                call(
+                    &mut code,
+                    api(&mut machine, "WaitForSingleObject"),
+                    &[M(DATA + 0xf10), I(u32::MAX)],
+                    DATA + 0xf40,
+                );
+                if reallocating {
+                    call(
+                        &mut code,
+                        realloc,
+                        &[I(heap), I(4), M(DATA), I(u32::MAX)],
+                        DATA + 0x20,
+                    );
+                } else {
+                    call(&mut code, alloc, &[I(heap), I(4), I(u32::MAX)], DATA + 0x20);
+                }
+                code.mov_mem_imm(DATA + 0xf60, 1);
+                copy_observation(&mut code, DATA + 0x100);
+                call(
+                    &mut code,
+                    api(&mut machine, "WaitForSingleObject"),
+                    &[M(DATA + 0xf20), I(u32::MAX)],
+                    DATA + 0xf50,
+                );
+                require_success(&mut machine, code);
+                assert_eq!(
+                    machine.cpu.read_u32(DATA + 0xf00).unwrap(),
+                    1,
+                    "owner observed the blocked heap caller"
+                );
+                assert_eq!(
+                    machine.cpu.read_u32(DATA + 0xf60).unwrap(),
+                    1,
+                    "caller executed after its continued heap call"
+                );
+                assert_eq!(returned(&machine, DATA + 0x20), 0);
+                assert_eq!(returned(&machine, DATA + 0xf40), 0);
+                assert_eq!(returned(&machine, DATA + 0xf50), 0);
+                assert_eq!(machine.cpu.read_u32(DATA + 0xf30).unwrap(), 1);
+                check_observation(&machine, DATA + 0x100, 1);
+                let original = returned(&machine, DATA);
+                assert_eq!(
+                    machine.ext.get_mut::<Heaps>().size(heap, original),
+                    Some(16)
+                );
+                let mut bytes = [0; 16];
+                machine.cpu.read(original, &mut bytes).unwrap();
+                assert_eq!(bytes, [0x3c; 16]);
+            }
+        }
+    }
+}
+
+#[test]
+fn heap_create_exception_policy_is_inherited_and_invalid_heaps_cannot_claim_oom() {
+    for jit in [false, true] {
+        for front in 0..3 {
+            let mut machine = fixture(jit);
+            let process_heap = machine.ext.get::<Heaps>().process_heap;
+            let (alloc, realloc) = match front {
+                0 => (
+                    api(&mut machine, "HeapAlloc"),
+                    api(&mut machine, "HeapReAlloc"),
+                ),
+                1 => (
+                    public(&mut machine, "kernel32.dll", "HeapAlloc"),
+                    public(&mut machine, "kernel32.dll", "HeapReAlloc"),
+                ),
+                _ => (
+                    public(&mut machine, "ntdll.dll", "RtlAllocateHeap"),
+                    public(&mut machine, "ntdll.dll", "RtlReAllocateHeap"),
+                ),
+            };
+            let mut code = Asm::new(CODE);
+            initialize(&mut code, &mut machine, process_heap);
+            call(
+                &mut code,
+                api(&mut machine, "HeapCreate"),
+                &[I(4), I(4096), I(0)],
+                DATA,
+            );
+            call(
+                &mut code,
+                api(&mut machine, "HeapCreate"),
+                &[I(0), I(4096), I(0)],
+                DATA + 0x20,
+            );
+            call(&mut code, alloc, &[M(DATA), I(0), I(16)], DATA + 0x40);
+            code.mov_eax_mem(DATA + 0x40);
+            for offset in [0, 4, 8, 12] {
+                code.bytes.extend([0xc7, 0x40, offset]);
+                code.bytes.extend(0x3c3c3c3cu32.to_le_bytes());
+            }
+            call(
+                &mut code,
+                alloc,
+                &[M(DATA + 0x20), I(0), I(u32::MAX)],
+                DATA + 0x60,
+            );
+            copy_observation(&mut code, DATA + 0x100);
+            call(&mut code, alloc, &[M(DATA), I(0), I(u32::MAX)], DATA + 0x80);
+            copy_observation(&mut code, DATA + 0x140);
+            call(
+                &mut code,
+                realloc,
+                &[M(DATA), I(0), M(DATA + 0x40), I(u32::MAX)],
+                DATA + 0xa0,
+            );
+            copy_observation(&mut code, DATA + 0x180);
+            // Invalid owners do not inherit any valid heap's policy. Corrupt-heap
+            // exceptions are diagnosed rather than misreported as allocation OOM.
+            call(
+                &mut code,
+                alloc,
+                &[I(0x12345678), I(0), I(u32::MAX)],
+                DATA + 0xc0,
+            );
+            call(
+                &mut code,
+                alloc,
+                &[I(0x12345678), I(4), I(u32::MAX)],
+                DATA + 0xe0,
+            );
+            call(
+                &mut code,
+                realloc,
+                &[I(0x12345678), I(4), M(DATA + 0x40), I(u32::MAX)],
+                DATA + 0x200,
+            );
+            require_success(&mut machine, code);
+            let raising = returned(&machine, DATA);
+            let ordinary = returned(&machine, DATA + 0x20);
+            let original = returned(&machine, DATA + 0x40);
+            assert_ne!(raising, 0);
+            assert_ne!(ordinary, 0);
+            assert_ne!(original, 0);
+            let heaps = machine.ext.get::<Heaps>();
+            assert_eq!(heaps.generates_exceptions(raising), Some(true));
+            assert_eq!(heaps.generates_exceptions(ordinary), Some(false));
+            assert_eq!(heaps.generates_exceptions(process_heap), Some(false));
+            assert_eq!(heaps.generates_exceptions(0x12345678), None);
+            assert_eq!(machine.cpu.read_u32(DATA + 0x100).unwrap(), 0);
+            check_observation(&machine, DATA + 0x140, 1);
+            check_observation(&machine, DATA + 0x180, 2);
+            assert_eq!(machine.cpu.read_u32(OBSERVED).unwrap(), 2);
+            for offset in [0x60, 0x80, 0xa0, 0xc0, 0xe0, 0x200] {
+                assert_eq!(returned(&machine, DATA + offset), 0);
+            }
+            assert_eq!(
+                machine.ext.get_mut::<Heaps>().size(raising, original),
+                Some(16)
+            );
+            let mut bytes = [0; 16];
+            machine.cpu.read(original, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x3c; 16]);
+            let diagnostics = machine.ext.get::<ApiDiagnostics>();
+            for (name, expected_count) in [
+                ("ntdll.dll!RtlAllocateHeap", 2),
+                ("ntdll.dll!RtlReAllocateHeap", 1),
+            ] {
+                assert!(diagnostics.warnings.iter().any(|((api, reason), count)| {
+                    api == name
+                        && reason.contains("heap handle is not owned")
+                        && *count == expected_count
+                }));
+            }
         }
     }
 }
