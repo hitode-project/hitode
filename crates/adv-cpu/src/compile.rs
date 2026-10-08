@@ -15,7 +15,9 @@ use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+mod cache;
 pub(crate) mod coverage;
+pub(crate) use cache::restore_snapshot;
 mod diagnostics;
 #[cfg(all(
     any(
@@ -77,6 +79,7 @@ pub(crate) struct Compiled {
     perf_ranges: Vec<crate::perf_map::Registration>,
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
+    cache_image: Option<Result<Vec<u8>, String>>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     unwind: Vec<crate::host_fault::UnwindRegistration>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -145,6 +148,18 @@ impl Drop for Compiled {
 }
 
 impl Compiled {
+    /// Export relocatable native code captured before JIT finalization.
+    pub(crate) fn cache_bytes(&self) -> Result<Vec<u8>, String> {
+        self.cache_image
+            .as_ref()
+            .ok_or_else(|| "native cache capture is disabled".to_string())?
+            .clone()
+    }
+
+    pub(crate) fn discard_cache_image(&mut self) {
+        self.cache_image = None;
+    }
+
     pub(crate) fn record_ir_counts(&self, service: std::time::Duration) {
         if let Some(counts) = &self.ir_counts {
             eprintln!("compile-ir: {}", counts.json(self.code_size, service));
@@ -367,6 +382,8 @@ impl Profile {
 /// retained: only bounded instruction bytes and their page stamps are copied.
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
+    pub(crate) cache_capture: bool,
+    pub(crate) cache_location: Option<(u32, u32)>,
     parallel: bool,
     direct_memory: bool,
     direct_inline: bool,
@@ -396,6 +413,10 @@ struct PageStamp {
 }
 
 impl Snapshot {
+    pub(crate) fn cache_key(&self) -> Result<Vec<u8>, String> {
+        cache::key(self)
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -419,6 +440,10 @@ impl Snapshot {
         let first = (region.start - self.base) as usize / 4096;
         let last = ((self.origin - self.base) as usize + end) / 4096;
         Ok(Self {
+            cache_capture: self.cache_capture,
+            cache_location: self
+                .cache_location
+                .map(|(base, _)| (base, region.start - base)),
             parallel: self.parallel,
             direct_memory: self.direct_memory,
             direct_inline: self.direct_inline,
@@ -486,6 +511,8 @@ impl Snapshot {
             }
         }
         Ok(Self {
+            cache_capture: false,
+            cache_location: None,
             parallel: memory.is_parallel(),
             direct_memory: memory.direct_memory_enabled(),
             direct_inline: memory.direct_memory_inline(),
@@ -921,23 +948,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     // x87 stays in the region: guarded scalar lowering handles the exact subset,
     // and the remaining cases call the interpreter's transaction in place.
-    let x87: Box<[crate::floating::NativeX87]> = instructions
-        .values()
-        .filter(|i| !supported(i) && crate::floating::native_x87(i))
-        .map(|i| {
-            let start = (i.ip32() - snapshot.origin) as usize;
-            // Same FOP derivation as the interpreter's decoded entry.
-            let opcode = bytes[start..start + i.len()]
-                .windows(2)
-                .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
-                .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16);
-            crate::floating::NativeX87 {
-                instruction: *i,
-                opcode,
-                fast: crate::floating::fast::classify(i),
-            }
-        })
-        .collect();
+    let x87 = cache::x87_operations(snapshot, &instructions);
     let x87_segments = x87::segments(&instructions, &region.entries);
     let mut entries = BTreeSet::from([region.start]);
     for instruction in instructions.values() {
@@ -1091,56 +1102,27 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         }
         flags
     };
-    let mut builder = JITBuilder::with_flags(&backend_flags, default_libcall_names())
-        .map_err(|e| e.to_string())?;
-    builder.symbol("adv_trap_call", crate::trap::trap_call as *const u8);
-    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    builder.memory_provider(Box::new(crate::jit_memory::WindowsMemory::default()));
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
-    builder.memory_provider(Box::new(crate::jit_memory_android::AndroidMemory::default()));
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    builder.memory_provider(Box::new(crate::jit_memory_macos::MacMemory::default()));
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    builder.symbol(
-        "adv_direct_scalar",
-        crate::direct_memory::access as *const u8,
-    );
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "android",
-            all(target_os = "macos", target_arch = "aarch64")
-        ),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    builder.symbol(
-        "adv_direct_checked",
-        crate::direct_memory::checked as *const u8,
-    );
-    builder.symbol("adv_repeat", crate::strings::repeat as *const u8);
-    builder.symbol("adv_x87", x87::helper_address());
-    builder.symbol("adv_atomic_store", crate::atomic_memory::store as *const u8);
-    builder.symbol("adv_file_read", crate::file_memory::read as *const u8);
-    builder.symbol("adv_file_write", crate::file_memory::write as *const u8);
-    builder.symbol("adv_file_prepare", crate::file_memory::prepare as *const u8);
-    builder.symbol(
-        "adv_file_write_prepared",
-        crate::file_memory::write_prepared as *const u8,
-    );
-    builder.symbol("adv_range_ok", loops::range_ok as *const u8);
-    builder.symbol("adv_nest_run", crate::rows::run as *const u8);
-    builder.symbol(
-        "adv_read_timestamp",
-        crate::trap::read_timestamp as *const u8,
-    );
+    let cached_bindings = Arc::new(cache::Bindings::default());
+    let builder = cache::builder(
+        &backend_flags,
+        snapshot.profile.as_ref(),
+        cached_bindings.clone(),
+        &x87,
+    )?;
     let mut module = JITModule::new(builder);
+    let profile_ids = cache::declare_profile(&mut module, snapshot.profile.is_some())?;
+    let metadata_signature = module.make_signature();
+    let x87_ids = (0..x87.len())
+        .map(|index| {
+            module
+                .declare_function(
+                    &format!("adv_cache_x87_{index}"),
+                    Linkage::Import,
+                    &metadata_signature,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let ptr_ty = module.target_config().pointer_type();
     let mut ctx = module.make_context();
     let dump_dir = std::env::var_os("ADV_JIT_DUMP_DIR").filter(|_| {
@@ -1316,6 +1298,17 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let nest_id = module
         .declare_function("adv_nest_run", Linkage::Import, &nest_signature)
         .map_err(|e| e.to_string())?;
+    let kernel_imports = (0..plans.len())
+        .map(|index| {
+            module
+                .declare_function(
+                    &format!("adv_cache_kernel_{index}"),
+                    Linkage::Import,
+                    &tail_signature,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     // Builds the region function, or with `kernel` the separate function for
     // that versioned loop's clone. `kernels` holds each loop's finalized kernel
     // address for the region to call.
@@ -1348,6 +1341,32 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             .flatten()
             .map(|id| module.declare_func_in_func(id, func));
         let invariant_resume = invariant_body.then(|| module.declare_func_in_func(id, func));
+        let heat_ref = profile_ids
+            .as_ref()
+            .map(|(heat, _)| module.declare_func_in_func(*heat, func));
+        let call_refs = profile_ids
+            .as_ref()
+            .map_or_else(BTreeMap::new, |(_, calls)| {
+                instructions
+                    .values()
+                    .filter(|i| i.flow_control() == FlowControl::IndirectCall)
+                    .zip(calls)
+                    .map(|(i, cell)| (i.ip32(), module.declare_func_in_func(*cell, func)))
+                    .collect()
+            });
+        let kernel_refs = (0..kernels.len())
+            .map(|index| module.declare_func_in_func(kernel_imports[index], func))
+            .collect();
+        let x87_refs = x87
+            .iter()
+            .zip(&x87_ids)
+            .map(|(operation, id)| {
+                (
+                    operation.instruction.ip32(),
+                    (module.declare_func_in_func(*id, func), operation.opcode),
+                )
+            })
+            .collect();
         let nest_ref = module.declare_func_in_func(nest_id, func);
         let trap_ref = module.declare_func_in_func(host_id, func);
         let repeat_ref = module.declare_func_in_func(repeat_id, func);
@@ -1712,7 +1731,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             slot_vars,
             windows,
             fast: None,
-            kernels: kernels.to_vec(),
+            kernels: kernel_refs,
             batches: batches.clone(),
             lanes: None,
             coverage: coverage.clone(),
@@ -1750,26 +1769,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             x87_cold: None,
             x87_cold_reads: 0,
             parallel: snapshot.parallel,
-            heat: snapshot
-                .profile
-                .as_ref()
-                .map(|profile| &profile.heat as *const _ as usize),
-            call_sites: snapshot
-                .profile
-                .as_ref()
-                .map_or_else(BTreeMap::new, |profile| {
-                    instructions
-                        .values()
-                        .filter(|i| i.flow_control() == FlowControl::IndirectCall)
-                        .zip(&profile.calls)
-                        .map(|(i, cell)| (i.ip32(), cell as *const _ as usize))
-                        .collect()
-                }),
+            heat: heat_ref,
+            call_sites: call_refs,
             lane: None,
-            x87: x87
-                .iter()
-                .map(|op| (op.instruction.ip32(), (op as *const _ as usize, op.opcode)))
-                .collect(),
+            x87: x87_refs,
             atomic_store_ref,
             file_read_ref,
             file_write_ref,
@@ -1898,7 +1901,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
                 let remaining = e.b.ins().iadd_imm(budget, -1);
                 e.b.def_var(e.fuel, remaining);
                 if let Some(heat) = e.heat {
-                    let cell = e.b.ins().iconst(ptr_ty, heat as i64);
+                    let cell = e.b.ins().func_addr(ptr_ty, heat);
                     let count = e.b.ins().load(types::I64, MemFlags::trusted(), cell, 0);
                     let count = e.b.ins().iadd_imm(count, 1);
                     e.b.ins().store(MemFlags::trusted(), count, cell, 0);
@@ -2193,6 +2196,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             kernels[index] = address;
         }
     }
+    *cached_bindings.kernels.lock().unwrap() = kernels.clone();
     let thunk = row_thunk.map_or(0, |id| module.get_finalized_function(id) as usize);
     let descriptors: Box<[_]> = nests
         .iter()
@@ -2383,6 +2387,11 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     let wrapper_id = module
         .declare_function("guest_entry", Linkage::Local, &wrapper.func.signature)
         .map_err(|e| e.to_string())?;
+    cached_bindings.tail.store(tail_entry, Ordering::Relaxed);
+    let cached_tail_id = module
+        .declare_function("adv_cache_tail", Linkage::Import, &ctx.func.signature)
+        .map_err(|error| error.to_string())?;
+    let cached_tail_ref = module.declare_func_in_func(cached_tail_id, &mut wrapper.func);
     let callee = wrapper.func.import_signature(ctx.func.signature.clone());
     {
         let mut b = FunctionBuilder::new(&mut wrapper.func, &mut fb_ctx);
@@ -2390,7 +2399,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let args = b.block_params(entry).to_vec();
-        let address = b.ins().iconst(ptr_ty, tail_entry as i64);
+        let address = b.ins().func_addr(ptr_ty, cached_tail_ref);
         let call = b.ins().call_indirect(callee, address, &args);
         let result = b.inst_results(call)[0];
         b.ins().return_(&[result]);
@@ -2522,6 +2531,52 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     crate::gir::diagnostics::record(&instructions, region.start);
     #[cfg(feature = "gir-lower")]
     crate::gir::diagnostics::record_lower(&instructions, region.start, snapshot.base, snapshot.len);
+    let cache_image = cache::capture_enabled(snapshot).then(|| {
+        let absolute = !descriptors.is_empty() || poll_target.is_some() || coverage::enabled();
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        let absolute = absolute || !fault_sites.is_empty();
+        if absolute {
+            return Err("native region retains unsupported process-local metadata".into());
+        }
+        cache::capture(
+            snapshot,
+            &module,
+            id,
+            wrapper_id,
+            &ctx,
+            &wrapper,
+            &kernel_functions,
+            &instructions,
+            &pages,
+            &entries,
+            &excluded_entries,
+            code_size,
+            {
+                #[cfg(all(
+                    any(
+                        target_os = "linux",
+                        target_os = "android",
+                        all(target_os = "macos", target_arch = "aarch64")
+                    ),
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
+                {
+                    direct::cache_sites(ctx.compiled_code().unwrap(), &inline_drafts)
+                }
+                #[cfg(not(all(
+                    any(
+                        target_os = "linux",
+                        target_os = "android",
+                        all(target_os = "macos", target_arch = "aarch64")
+                    ),
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )))]
+                {
+                    Ok::<_, String>(Vec::new())
+                }
+            }?,
+        )
+    });
     Ok(Compiled {
         _poll_target: poll_target,
         #[cfg(any(test, feature = "gir-execute"))]
@@ -2540,6 +2595,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         instruction_count: instructions.len(),
         decoded_bytes: instructions.values().map(Instruction::len).sum(),
         module: Some(module),
+        cache_image,
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         unwind,
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
@@ -3255,8 +3311,8 @@ struct Emitter<'a> {
     /// fits when `addr - low < span`. Empty when its kernel starts.
     windows: Vec<BTreeMap<(u32, bool), (Variable, Variable)>>,
     fast: Option<usize>,
-    /// Finalized kernel addresses, one per plan, for the region to call.
-    kernels: Vec<usize>,
+    /// Relocatable imports of finalized kernels, one per plan.
+    kernels: Vec<ir::FuncRef>,
     /// Each loop's batch form, and in its kernel the batch being emitted.
     batches: Vec<Option<vector::Batch>>,
     lanes: Option<vector::Lanes>,
@@ -3293,17 +3349,17 @@ struct Emitter<'a> {
     trap_ref: ir::FuncRef,
     repeat_ref: ir::FuncRef,
     x87_ref: ir::FuncRef,
-    /// Guest PC -> address of its NativeX87, owned by the resulting Compiled.
-    x87: BTreeMap<u32, (usize, Option<u16>)>,
+    /// Guest PC -> symbol of its NativeX87, owned by the resulting Compiled.
+    x87: BTreeMap<u32, (ir::FuncRef, Option<u16>)>,
     x87_native: bool,
     x87_cold: Option<ir::Block>,
     x87_cold_reads: u8,
     /// Other guest threads may run native code at the same time.
     parallel: bool,
-    /// Address of the profile's block counter, for Fast code that may tier up.
-    heat: Option<usize>,
-    /// Indirect call site -> address of its profile target cell.
-    call_sites: BTreeMap<u32, usize>,
+    /// Symbol of the profile's block counter, for Fast code that may tier up.
+    heat: Option<ir::FuncRef>,
+    /// Indirect call site -> symbol of its profile target cell.
+    call_sites: BTreeMap<u32, ir::FuncRef>,
     /// Inside a resident x87 lane, every guard and shared/file access path of an
     /// integer instruction branches here before the instruction commits; the
     /// lane then materializes its prefix and re-executes canonically.
@@ -3559,7 +3615,7 @@ impl Emitter<'_> {
         let pc = self.constant(pc);
         self.exit(reason, pc);
     }
-    fn x87_instruction(&mut self, i: &Instruction, operation: usize) {
+    fn x87_instruction(&mut self, i: &Instruction, operation: ir::FuncRef) {
         let pc = self.constant(i.ip32());
         // MMX aliases require synchronization for correctness. XMM and integer
         // flag/partial-register effects retain the full lane for code quality:
@@ -3601,7 +3657,7 @@ impl Emitter<'_> {
         } else {
             self.save_state(pc);
         }
-        let operation = self.b.ins().iconst(self.ptr_ty, operation as i64);
+        let operation = self.b.ins().func_addr(self.ptr_ty, operation);
         let call = self
             .b
             .ins()
@@ -4361,7 +4417,7 @@ impl Emitter<'_> {
     fn call_kernel(&mut self, index: usize) {
         let header = self.constant(self.plans[index].header);
         self.save_state(header);
-        let address = self.b.ins().iconst(self.ptr_ty, self.kernels[index] as i64);
+        let address = self.b.ins().func_addr(self.ptr_ty, self.kernels[index]);
         let call = self
             .b
             .ins()
@@ -6291,7 +6347,7 @@ impl Emitter<'_> {
                     } else {
                         self.record_indirect(v, crate::IndirectBranchKind::Call);
                         if let Some(&cell) = self.call_sites.get(&self.pc) {
-                            let cell = self.b.ins().iconst(self.ptr_ty, cell as i64);
+                            let cell = self.b.ins().func_addr(self.ptr_ty, cell);
                             self.b.ins().store(MemFlags::trusted(), v, cell, 0);
                         }
                         self.indirect(v);

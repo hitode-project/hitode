@@ -37,6 +37,67 @@ pub use file_page::FilePage;
 pub mod x87;
 pub use adv_sync::shared::{SharedReadView, SharedRegion};
 
+/// Keep image metadata cheap while bounding snapshots waiting for the owner.
+#[derive(Clone)]
+pub(crate) struct CodeImageSink {
+    sender: std::sync::mpsc::SyncSender<crate::AotImage>,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    rejected: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CodeImageSink {
+    pub(crate) fn channel() -> (Self, std::sync::mpsc::Receiver<crate::AotImage>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+        (
+            Self {
+                sender,
+                bytes: Default::default(),
+                rejected: Default::default(),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn try_send(&self, mut image: crate::AotImage) {
+        use std::sync::atomic::Ordering;
+        let bytes = image.image.len();
+        // Reserve one maximum-sized snapshot for the main executable, which
+        // loads after its initial DLL dependencies have registered their images.
+        let limit = if image.primary { 32 } else { 24 } * 1024 * 1024;
+        if bytes != 0
+            && self
+                .bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(bytes).filter(|&total| total <= limit)
+                })
+                .is_err()
+        {
+            image.image.clear();
+            image.image.shrink_to_fit();
+            image.executable.clear();
+            image.seeds.clear();
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Err(error) = self.sender.try_send(image) {
+            let image = match error {
+                std::sync::mpsc::TrySendError::Full(image)
+                | std::sync::mpsc::TrySendError::Disconnected(image) => image,
+            };
+            self.release(image.image.len());
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: usize) {
+        self.bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn take_rejections(&self) -> u64 {
+        self.rejected.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Guest general-purpose registers plus EIP/EFLAGS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Reg {
@@ -152,6 +213,9 @@ impl FpuEnvironment {
 
 /// Registers and memory as seen from inside a trap handler.
 pub trait Guest {
+    /// Register mapped image metadata and optional static-discovery bytes.
+    /// Backends without image compilation can ignore this loader hint.
+    fn register_code_image(&mut self, _image: crate::AotImage) {}
     /// Establish an exclusive guest-memory boundary for composite atomics or
     /// mapping-sensitive host operations. Synchronous backends need no action.
     fn quiesce_memory(&mut self) {}

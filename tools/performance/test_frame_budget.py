@@ -4,6 +4,7 @@ Run: python -m unittest discover -s tools/performance -p test_frame_budget.py
 No game, Android device or GPU is required; output is unittest statistics.
 """
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,6 +23,21 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_shared_device_broker_accepts_the_callers_task_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "device.ps1"
+            helper.write_text("fixture")
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot"}), patch.object(budget.subprocess, "run") as invoke:
+                with budget.device_lock(None, root, helper):
+                    pass
+                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "aot")
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot; unexpected"}), patch.object(budget.subprocess, "run") as invoke:
+                with self.assertRaises(ValueError):
+                    with budget.device_lock(None, root, helper):
+                        pass
+                invoke.assert_not_called()
+
     def test_compile_overlap_is_explicit_and_worker_time_is_not_charged(self):
         row = frame(cpu={"compile_wait_execution_ns": 30_000_000, "compile_time": 2_000_000_000})
         self.assertEqual(budget.classify(row)["cause"], "cold.compile_pending_execution")

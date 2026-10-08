@@ -1,7 +1,9 @@
 //! Portable exact guest floating-point arithmetic.
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 fn main() {
+    cache_fingerprint();
     println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
     println!("cargo:rerun-if-env-changed=ANDROID_NDK_ROOT");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android")
@@ -51,6 +53,44 @@ fn main() {
     sources.sort();
     build.files(sources).compile("adv_softfloat");
     println!("cargo:rerun-if-changed=softfloat");
+}
+
+/// Reject native artifacts after any compiler, recovery ABI or dependency edit.
+fn cache_fingerprint() {
+    fn visit(path: &Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(path).expect("CPU source directory") {
+            let path = entry.expect("CPU source entry").path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(Path::new("src"), &mut files);
+    files.extend(["build.rs", "Cargo.toml", "../../Cargo.lock"].map(PathBuf::from));
+    files.sort();
+    let mut hash = Sha256::new();
+    for path in files {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let bytes = std::fs::read(&path).expect("cache fingerprint input");
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    for name in [
+        "TARGET",
+        "PROFILE",
+        "CARGO_CFG_TARGET_FEATURE",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ] {
+        hash.update(name.as_bytes());
+        hash.update(std::env::var(name).unwrap_or_default().as_bytes());
+    }
+    println!(
+        "cargo:rustc-env=ADV_CPU_CODE_CACHE_FINGERPRINT={:x}",
+        hash.finalize()
+    );
 }
 
 /// Android's libc does not export `__clear_cache`; use the NDK implementation.

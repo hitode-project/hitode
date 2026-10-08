@@ -12,6 +12,7 @@ adv-sync = { path = "../adv-sync" }
 libc = "0.2"
 log.workspace = true
 thiserror.workspace = true
+sha2 = "0.10"
 cranelift-codegen = "0.125"
 cranelift-frontend = "0.125"
 cranelift-jit = "0.125"
@@ -34,6 +35,7 @@ cross-dump = ["cranelift-codegen/arm64"]
 
 [build-dependencies]
 cc = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 adv-cpu = { path = ".", features = ["jit-verifier"] }

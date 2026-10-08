@@ -239,6 +239,40 @@ pub(in crate::compile) fn publish(
     if drafts.is_empty() {
         return Ok(None);
     }
+    let sites = sites(code, base, drafts)?;
+    // SAFETY: exact scalar instructions and a frame-only epilogue were checked;
+    // generated guards/checkpoints prove the architectural prefix and commit
+    // shape. Compiled drops the registration before freeing executable memory.
+    unsafe { Registration::publish(untag(base), code.code_buffer().len(), sites).map(Some) }
+}
+
+pub(in crate::compile) fn cache_sites(
+    code: &cranelift_codegen::CompiledCode,
+    drafts: &[Draft],
+) -> Result<Vec<super::super::cache::InlineSite>, String> {
+    if drafts.is_empty() {
+        return Ok(Vec::new());
+    }
+    sites(code, 0, drafts).map(|sites| {
+        sites
+            .into_iter()
+            .map(|site| super::super::cache::InlineSite {
+                offset: site.host_pc as u32,
+                recovery: site.recovery_pc as u32,
+                guest_pc: site.guest_pc,
+                next_pc: site.next_pc,
+                width: site.width,
+                write: site.write,
+            })
+            .collect()
+    })
+}
+
+fn sites(
+    code: &cranelift_codegen::CompiledCode,
+    base: usize,
+    drafts: &[Draft],
+) -> Result<Vec<Site>, String> {
     let bytes = code.code_buffer();
     let ranges = code.buffer.get_srclocs_sorted();
     let start = ranges
@@ -284,10 +318,7 @@ pub(in crate::compile) fn publish(
         return Err("inline scalar fault table is incomplete".into());
     }
     sites.sort_by_key(|site| site.host_pc);
-    // SAFETY: exact scalar instructions and a frame-only epilogue were checked;
-    // generated guards/checkpoints prove the architectural prefix and commit
-    // shape. Compiled drops the registration before freeing executable memory.
-    unsafe { Registration::publish(base, bytes.len(), sites).map(Some) }
+    Ok(sites)
 }
 
 fn untag(pointer: usize) -> usize {

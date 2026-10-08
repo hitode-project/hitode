@@ -6,6 +6,8 @@ Usage: frame_budget.py run --platform android|windows --binary RUNNER --output D
 Inputs: ADV_SAMPLES, checked-in frame-budget-*.json scenarios, optional save/font
 seeds. Android reuses replay-sample.py; Windows reuses play_session.py. Every run
 uses one frozen binary, independent overlay and cold/warm discovery profiles.
+--code-cache also transfers jit-code.bin; --aot enables bounded static discovery.
+ADV_DEVICE_TASK selects the shared broker task name (default bud).
 Output: summary.json/summary.md contain statistics only. Reports, actions, hashes,
 perf maps and failure logs stay under the explicit local artifact root. No APK,
 foreground change, server management, or native Windows comparison is performed.
@@ -302,7 +304,10 @@ def summarize(root: Path) -> dict:
 def device_lock(path: Path | None, root: Path, helper: Path | None = None):
     """Use the shared broker when supplied; otherwise retain legacy locking."""
     if helper is not None:
-        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)), ADV_DEVICE_TASK="bud")
+        task = os.environ.get("ADV_DEVICE_TASK", "bud")
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", task):
+            raise ValueError("invalid device task name")
+        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)), ADV_DEVICE_TASK=task)
         prefix = "$ErrorActionPreference='Stop'; . $env:ADV_DEVICE_HELPER; "
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command",
@@ -460,6 +465,8 @@ def run(args) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO)
     import hashlib
     plan = {"platform": args.platform, "heats": args.heats, "scenarios": scenarios,
+            "execution_options": {"code_cache": getattr(args, "code_cache", False),
+                "aot": getattr(args, "aot", False), "compile_threads": getattr(args, "compile_threads", None)},
             "source_revision": getattr(args, "binary_source_revision", None),
             "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
             "source_diff_sha256": hashlib.sha256(diff).hexdigest()}
@@ -467,6 +474,9 @@ def run(args) -> None:
         previous = load_json(root / "plan.json")
         if any(previous[key] != plan[key] for key in ("platform", "heats", "scenarios")):
             raise ValueError("resume requires unchanged scenarios and run conditions")
+        previous_options = previous.get("execution_options", {"code_cache": False, "aot": False, "compile_threads": None})
+        if previous_options != plan["execution_options"]:
+            raise ValueError("resume requires unchanged native cache, AOT and compiler settings")
     else:
         write_json(root / "plan.json", plan)
     adb = replay.Adb(args) if args.platform == "android" else None
@@ -499,6 +509,15 @@ def run(args) -> None:
                        "--binary", str(binary), "--schedule", str(root / f"{name}-schedule.json"),
                        "--output", str(output), "--codepage", str(scenario["codepage"]), "--auto-dialog-ms", "50"]
             command += ["--cold"] if heat == "cold" else ["--warm-profile", str(warm)]
+            if getattr(args, "code_cache", False):
+                command += ["--code-cache"]
+                native = root / f"{name}-cold" / ("jit-code.bin" if adb else "overlay/jit-code.bin")
+                if heat == "warm" and native.is_file():
+                    command += ["--warm-code-cache", str(native)]
+            if getattr(args, "aot", False):
+                command += ["--aot"]
+            if getattr(args, "compile_threads", None):
+                command += ["--compile-threads", str(args.compile_threads)]
             if not args.no_instrumentation:
                 command += ["--frame-budget"]
             if args.perf_map:
@@ -586,6 +605,9 @@ def main() -> None:
                          help="shared PowerShell Request-Device/Release-Device helper (task bud)")
     execute.add_argument("--perf-map", action="store_true")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
+    execute.add_argument("--code-cache", action="store_true", help="opt into native cache and reuse only its cold-run archive")
+    execute.add_argument("--aot", action="store_true", help="opt into bounded static image discovery")
+    execute.add_argument("--compile-threads", type=int, choices=range(1, 9))
     args = parser.parse_args()
     if args.command == "summarize":
         summarize(args.directory)

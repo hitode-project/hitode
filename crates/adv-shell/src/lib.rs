@@ -747,6 +747,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n  \"direct_memory\": {},\n",
+            "  \"code_cache\": {},\n  \"aot\": {},\n",
             "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
@@ -796,6 +797,8 @@ fn build_report(context: ReportContext<'_>) -> String {
             stats.direct_memory.checked_fallbacks,
             stats.direct_memory.code_writes
         ),
+        runtime.machine.cpu.executor().persistent_code_cache_json(),
+        stats.aot.json(),
         tier1_json,
         runtime.machine.cpu.executor().compilation_schedule_json(),
         stats.compilations,
@@ -1218,6 +1221,13 @@ fn run_execution(
     // Guest regions resident at the previous exit are compiled in the background
     // as soon as identical code is mapped, before the guest reaches them.
     let warm_path = options.data_dir.join("jit-warm.bin");
+    if options.jit && std::env::var("ADV_CODE_CACHE").as_deref() == Ok("1") {
+        runtime
+            .machine
+            .cpu
+            .executor_mut()
+            .set_persistent_code_cache(&options.data_dir.join("jit-code.bin"))?;
+    }
     if options.jit
         && options.async_compilation
         && runtime.machine.cpu.executor_mut().tier1_mode() != adv_runtime::Tier1Mode::Exclusive
@@ -1913,6 +1923,9 @@ fn run_execution(
         let profile = runtime.machine.cpu.executor().warm_profile();
         let _ = std::fs::create_dir_all(&options.data_dir)
             .and_then(|_| std::fs::write(&warm_path, profile));
+    }
+    if let Err(error) = runtime.machine.cpu.executor().save_persistent_code_cache() {
+        eprintln!("warning: native code cache save failed: {error}");
     }
     if native_frame {
         #[cfg(all(windows, feature = "gpu"))]

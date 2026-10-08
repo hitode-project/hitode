@@ -11,6 +11,8 @@
 //! * Initializers (TLS callbacks, DllMain) are returned as [`InitCall`]s, which the process
 //!   start thunk runs as a chain of guest calls on the main context.
 
+mod aot;
+
 use adv_cpu::backend::{Guest, GuestExt, MemFault, Prot};
 use adv_pe::{ExportTarget, ImportName, Pe, PeError, file_flags, scn};
 use thiserror::Error;
@@ -825,6 +827,7 @@ impl<'a> Loader<'a> {
             });
         }
         self.modules.complete_ldr(self.cpu, id)?;
+        aot::register(self.cpu, &mut pe, base, path);
         Ok(id)
     }
 

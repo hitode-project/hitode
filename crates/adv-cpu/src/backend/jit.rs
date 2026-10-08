@@ -93,14 +93,20 @@ impl JitCpu {
     }
     fn view<T>(&mut self, f: impl FnOnce(&mut View<'_>) -> T) -> T {
         let m = &mut self.inner;
+        let code_images = m.code_image_sink();
         let Executor { state, memory, .. } = m;
-        f(&mut View { state, memory })
+        f(&mut View {
+            state,
+            memory,
+            code_images,
+        })
     }
 }
 
 struct View<'a> {
     state: &'a mut CpuState,
     memory: &'a mut Memory,
+    code_images: Option<crate::backend::CodeImageSink>,
 }
 fn fault(addr: u32, len: usize) -> MemFault {
     MemFault {
@@ -124,6 +130,11 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 impl Guest for View<'_> {
+    fn register_code_image(&mut self, image: crate::AotImage) {
+        if let Some(sink) = &self.code_images {
+            sink.try_send(image);
+        }
+    }
     fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
         Ok(self.memory.next_mapped_page(addr, limit))
     }
@@ -271,6 +282,9 @@ impl Guest for View<'_> {
 }
 
 impl Guest for JitCpu {
+    fn register_code_image(&mut self, image: crate::AotImage) {
+        self.inner.register_code_image(image);
+    }
     fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
         Ok(self.inner.memory.next_mapped_page(addr, limit))
     }
@@ -373,6 +387,7 @@ impl Guest for JitCpu {
 
 struct Raw<'a> {
     handler: &'a mut dyn TrapHandler,
+    code_images: Option<crate::backend::CodeImageSink>,
 }
 impl crate::ExecutionTrap for Raw<'_> {
     fn guest_time_us(&mut self) -> Option<u64> {
@@ -385,9 +400,14 @@ impl crate::ExecutionTrap for Raw<'_> {
         vector: u32,
     ) -> Result<bool, String> {
         state.commit_mmx();
-        let action = self
-            .handler
-            .on_trap(&mut View { state, memory }, vector as u8);
+        let action = self.handler.on_trap(
+            &mut View {
+                state,
+                memory,
+                code_images: self.code_images.clone(),
+            },
+            vector as u8,
+        );
         Ok(action == TrapAction::Park)
     }
 }
@@ -523,7 +543,10 @@ impl Backend for JitCpu {
                     budget,
                 };
             }
-            let mut raw = Raw { handler };
+            let mut raw = Raw {
+                handler,
+                code_images: m.code_image_sink(),
+            };
             let result = m.run_with_traps(self.park, 32_768, &mut raw, !self.jit);
             match result {
                 Ok(RunOutcome::NativeReady) => {

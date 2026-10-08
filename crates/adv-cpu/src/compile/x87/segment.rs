@@ -582,14 +582,11 @@ impl Emitter<'_> {
             let pcs = self.b.ins().iconst(types::I64, pcs as i64);
             // Null and one are internal budget/integer sentinels, never
             // operation pointers.
-            let operation = self.b.ins().iconst(
-                self.ptr_ty,
-                match kind {
-                    Recovery::Budget => 0,
-                    Recovery::Integer => 1,
-                    Recovery::Floating => self.x87[&i.ip32()].0 as i64,
-                },
-            );
+            let operation = match kind {
+                Recovery::Budget => self.b.ins().iconst(self.ptr_ty, 0),
+                Recovery::Integer => self.b.ins().iconst(self.ptr_ty, 1),
+                Recovery::Floating => self.b.ins().func_addr(self.ptr_ty, self.x87[&i.ip32()].0),
+            };
             let mut args: Vec<ir::BlockArg> =
                 vec![p.status.into(), mask.into(), pcs.into(), operation.into()];
             for &slot in &dirty_slots {
