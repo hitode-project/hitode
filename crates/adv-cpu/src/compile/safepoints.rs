@@ -104,6 +104,30 @@ mod tests {
     use super::*;
     use iced_x86::code_asm::*;
 
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", target_arch = "aarch64")
+        ),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn direct_recovery_keeps_one_registered_body() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(eax, dword_ptr(ecx)).unwrap();
+        a.inc(eax).unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut owner = crate::Executor::new(0x10000, 0x20000).unwrap();
+        owner.set_direct_memory(true).unwrap();
+        owner.write(0x10000, &bytes).unwrap();
+        owner.protect(0x10000, 4096, READ | EXEC).unwrap();
+        let compiled =
+            compile(&Region::new(0x10000, bytes.len()), &mut owner.memory, false).unwrap();
+        // Run this filter with ADV_SAFEPOINT=poll to exercise the exclusion.
+        assert!(compiled._poll_target.is_none());
+    }
+
     #[test]
     fn forward_groups_are_bounded_and_every_nonforward_edge_polls() {
         let mut a = CodeAssembler::new(32).unwrap();

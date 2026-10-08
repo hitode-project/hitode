@@ -574,6 +574,10 @@ impl Reservation {
         self.direct_alias.as_ref().map(|alias| alias.pointer)
     }
 
+    pub(crate) fn direct_host_page_size(&self) -> usize {
+        self.pages.borrow().host_page_size
+    }
+
     /// Explicit opt-in; existing Reservation::new and Memory constructors keep
     /// software permissions and their existing RW mapping behavior unchanged.
     pub fn new_direct(len: usize) -> Result<Self, String> {
