@@ -66,6 +66,7 @@ pub(crate) struct Trace {
     cut: bool,
     /// Tier 1 promises exact sticky flags; Cranelift retains its diagnostic allowance.
     exact_mxcsr: bool,
+    exact_flags: bool,
     /// A zero-retirement trap can still commit status (for example #XM).
     stopped: Option<Stopped>,
 }
@@ -134,7 +135,7 @@ impl Verifier {
         state: &mut CpuState,
         memory: &mut Memory,
     ) -> Result<Trace, String> {
-        self.record_units(owner, stop, interpreter, state, memory, false)
+        self.record_units(owner, stop, interpreter, state, memory, false, MAX_STEPS)
     }
 
     /// Tier 1 retires each REP element separately, so its trace can undo and
@@ -147,7 +148,21 @@ impl Verifier {
         state: &mut CpuState,
         memory: &mut Memory,
     ) -> Result<Trace, String> {
-        self.record_units(owner, stop, interpreter, state, memory, true)
+        self.record_units(owner, stop, interpreter, state, memory, true, MAX_STEPS)
+    }
+
+    #[cfg(any(test, feature = "gir-execute"))]
+    pub(crate) fn record_gir(
+        &mut self,
+        owner: u32,
+        stop: u32,
+        interpreter: &mut Interpreter,
+        state: &mut CpuState,
+        memory: &mut Memory,
+    ) -> Result<Trace, String> {
+        let mut trace = self.record_units(owner, stop, interpreter, state, memory, true, 256)?;
+        trace.exact_flags = true;
+        Ok(trace)
     }
 
     fn record_units(
@@ -158,6 +173,7 @@ impl Verifier {
         state: &mut CpuState,
         memory: &mut Memory,
         elements: bool,
+        limit: usize,
     ) -> Result<Trace, String> {
         let start = state.clone();
         let mut trace = Trace {
@@ -167,16 +183,17 @@ impl Verifier {
             writes: Vec::new(),
             cut: true,
             exact_mxcsr: elements,
+            exact_flags: false,
             stopped: None,
         };
         let mut undefined = 0;
-        for step in 0..=MAX_STEPS {
+        for step in 0..=limit {
             trace.states.push((
                 state.clone().capture_architecture(),
                 trace.writes.len(),
                 undefined,
             ));
-            if step == MAX_STEPS || state.eip == stop {
+            if step == limit || state.eip == stop {
                 trace.cut = false;
                 break;
             }
@@ -299,7 +316,9 @@ impl Trace {
         memory: &Memory,
     ) -> Result<Check, Vec<String>> {
         let mut interpreted = interpreted.clone();
-        interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
+        if !self.exact_flags {
+            interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
+        }
         let mut mxcsr = false;
         if !self.exact_mxcsr
             && interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS

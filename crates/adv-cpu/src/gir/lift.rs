@@ -231,6 +231,16 @@ pub fn lift_with_limits(
                 next_pc: i.next_ip32(),
                 units: 1,
                 subprogress: 0,
+                indirect: match i.mnemonic() {
+                    M::Ret => Some(crate::IndirectBranchKind::Return),
+                    M::Call if i.op0_kind() != OpKind::NearBranch32 => {
+                        Some(crate::IndirectBranchKind::Call)
+                    }
+                    M::Jmp if i.op0_kind() != OpKind::NearBranch32 => {
+                        Some(crate::IndirectBranchKind::Jump)
+                    }
+                    _ => None,
+                },
             });
             b.region.snapshots.push(Snapshot {
                 state: b.state.clone(),

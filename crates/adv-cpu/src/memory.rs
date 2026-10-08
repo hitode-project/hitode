@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 mod direct;
 mod fast;
+#[cfg(any(test, feature = "gir-lower"))]
+pub(crate) mod gir;
 mod locks;
 
 pub(crate) use fast::FastPermissions;
