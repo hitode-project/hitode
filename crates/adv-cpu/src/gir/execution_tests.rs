@@ -9,7 +9,7 @@ use iced_x86::{Decoder, DecoderOptions, code_asm::*};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Barrier,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -253,20 +253,26 @@ fn gir_interrupt_and_revocation_poll_restore_exact_loop_prefix() {
     for revoke in [false, true] {
         let flag = Arc::new(AtomicBool::new(false));
         let notify = flag.clone();
+        let ready = Arc::new(Barrier::new(2));
+        let producer_ready = ready.clone();
         let mut m = memory(&bytes);
         let mut frame = lower::Frame::from_cpu(&cpu());
         let mut cache = LeaseCache::default();
         let mut lease = cache.acquire(&mut m).unwrap();
         let inactive = AtomicBool::new(false);
         let producer = std::thread::spawn(move || {
+            producer_ready.wait();
             std::thread::sleep(Duration::from_millis(1));
             notify.store(true, Ordering::Release);
         });
+        ready.wait();
         let status = code
             .run_lease(
                 &mut frame,
                 &mut lease,
-                100_000_000,
+                // Termination belongs to the asynchronous request. A finite
+                // budget can expire first when the notifier is descheduled.
+                u64::MAX,
                 if revoke { &inactive } else { &flag },
                 if revoke { &flag } else { &inactive },
                 u64::from(STOP),

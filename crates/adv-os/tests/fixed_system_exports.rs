@@ -76,6 +76,27 @@ fn resolve(
     .map(|(address, _)| address)
 }
 
+/// Static binding sees the whole fixed directory; discovery is capability-gated.
+fn bind(
+    machine: &mut Machine<JitCpu>,
+    module: usize,
+    name: &str,
+) -> Result<u32, adv_os::LoadError> {
+    Loader::new(
+        &mut machine.cpu,
+        &mut machine.sys,
+        machine.ext.get_mut::<Modules>(),
+        &Empty,
+    )
+    .resolve(
+        module,
+        &ImportName::Name {
+            hint: 0,
+            name: name.into(),
+        },
+    )
+}
+
 const NT_NAMES: [&str; 56] = [
     "NtQuerySystemInformation",
     "NtQueryInformationProcess",
@@ -136,7 +157,7 @@ const NT_NAMES: [&str; 56] = [
 ];
 
 #[test]
-fn fixed_names_are_image_code_and_unknown_names_remain_absent() {
+fn fixed_names_are_image_code_hidden_until_implemented_and_unknown_names_remain_absent() {
     for jit in [false, true] {
         let mut machine = machine(jit);
         let ntdll = machine.load(&Empty, "ntdll.dll").unwrap();
@@ -145,7 +166,7 @@ fn fixed_names_are_image_code_and_unknown_names_remain_absent() {
         assert_eq!(machine.cpu.read_u32(directory + 24).unwrap(), 2523);
         let mut count = 0;
         for name in NT_NAMES {
-            let address = resolve(&mut machine, ntdll, name).unwrap();
+            let address = bind(&mut machine, ntdll, name).unwrap();
             assert_eq!(
                 adv_os::modules(&machine.ext).containing(address),
                 Some(ntdll)
@@ -154,8 +175,13 @@ fn fixed_names_are_image_code_and_unknown_names_remain_absent() {
             count += 1;
         }
         assert_eq!(count, 56);
+        assert!(resolve(&mut machine, ntdll, "NtQueryInformationThread").is_err());
+        assert_eq!(
+            resolve(&mut machine, ntdll, "RtlAllocateHeap").unwrap(),
+            bind(&mut machine, ntdll, "RtlAllocateHeap").unwrap()
+        );
         assert!(resolve(&mut machine, ntdll, "UnknownOptionalExport").is_err());
-        assert!(resolve(&mut machine, ntdll, "NlsAnsiCodePage").is_err());
+        assert!(bind(&mut machine, ntdll, "NlsAnsiCodePage").is_err());
         assert_eq!(
             system_exports::lookup("ntdll.dll", "NlsAnsiCodePage")
                 .unwrap()
@@ -226,7 +252,8 @@ fn unknown_abi_fixed_exports_fail_by_name_without_returning() {
         let native = machine.load(&Empty, "ntdll.dll").unwrap();
         let name = "NtQueueApcThread";
         assert!(adv_abi::signature::lookup("ntdll.dll", name).is_none());
-        let entry = resolve(&mut machine, native, name).unwrap();
+        assert!(resolve(&mut machine, native, name).is_err());
+        let entry = bind(&mut machine, native, name).unwrap();
         machine
             .start_main(0x400000, entry, 65536, "authored")
             .unwrap();
