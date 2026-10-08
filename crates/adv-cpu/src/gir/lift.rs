@@ -199,16 +199,7 @@ pub(crate) fn tier2(
             run.insert(pc, i);
             pc = i.next_ip32();
         }
-        let region = lift_impl(
-            &run,
-            start,
-            super::cfg::Limits {
-                depth: 0,
-                instructions: run.len(),
-            },
-            false,
-        )?
-        .region;
+        let region = lift_linear(&run)?;
         ssa_instructions += run.len();
         operations.insert(
             start,
@@ -268,6 +259,46 @@ fn lift_impl(
     compact: bool,
 ) -> Result<Lifted, super::verify::Error> {
     let plan = super::cfg::discover(instructions, start, limits)?;
+    build_region(instructions, plan, limits, compact)
+}
+
+/// Native CFG planning has already bounded and split this straight-line run.
+/// Do not rediscover call contexts or predecessor maps for every integer span.
+fn lift_linear(instructions: &BTreeMap<u32, Instruction>) -> Result<Region, super::verify::Error> {
+    debug_assert!(
+        instructions
+            .values()
+            .all(|i| i.flow_control() == iced_x86::FlowControl::Next)
+    );
+    let plan = super::cfg::Plan {
+        blocks: vec![super::cfg::Planned {
+            instructions: instructions.keys().copied().collect(),
+            targets: BTreeMap::new(),
+            expected_return: None,
+            depth: 0,
+        }],
+        entry: BlockId(0),
+        inlined_calls: 0,
+        call_boundaries: BTreeMap::new(),
+    };
+    build_region(
+        instructions,
+        plan,
+        super::cfg::Limits {
+            depth: 0,
+            instructions: instructions.len(),
+        },
+        false,
+    )
+    .map(|lifted| lifted.region)
+}
+
+fn build_region(
+    instructions: &BTreeMap<u32, Instruction>,
+    plan: super::cfg::Plan,
+    limits: super::cfg::Limits,
+    compact: bool,
+) -> Result<Lifted, super::verify::Error> {
     let mut region = Region {
         entry: plan.entry,
         blocks: vec![],

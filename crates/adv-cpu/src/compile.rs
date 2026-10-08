@@ -7,8 +7,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variab
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use iced_x86::{
-    Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic as M, OpKind,
-    Register as R,
+    Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic as M, OpKind, Register as R,
 };
 
 use crate::linking::{NativeContext, Slot, Table};
@@ -377,7 +376,7 @@ pub(crate) struct Snapshot {
     direct_memory: bool,
     direct_inline: bool,
     pub region: Box<Region>,
-    base: u32,
+    pub(crate) base: u32,
     len: usize,
     /// Guest address of `bytes[0]`: the region start, or a callee below it.
     origin: u32,
@@ -741,7 +740,7 @@ impl Snapshot {
         code.into_values().collect()
     }
 
-    fn page_index(&self, address: u32) -> Option<usize> {
+    pub(crate) fn page_index(&self, address: u32) -> Option<usize> {
         let offset = address.checked_sub(self.base)? as usize;
         (offset < self.len).then_some(offset / 4096)
     }
@@ -781,33 +780,6 @@ fn callee_origin(region: &mut Region, memory: &Memory) -> u32 {
     origin
 }
 
-fn record_tail_dependencies(
-    region: &Region,
-    snapshot: &Snapshot,
-    bytes: &[u8],
-    offset: usize,
-    decoder: &Decoder<'_>,
-    instruction: &Instruction,
-    pages: &mut BTreeSet<usize>,
-) {
-    let start = (snapshot.origin - snapshot.base) as usize;
-    let read_start = (instruction.ip32() - snapshot.base) as usize;
-    let read_end = start + offset + decoder.position();
-    pages.extend(read_start / 4096..=(read_end - 1) / 4096);
-    if region.complete_tail && decoder.last_error() == DecoderError::NoMoreBytes {
-        // The next page's mapping/EXEC permission can make a previously
-        // truncated instruction compilable, even if none of its bytes
-        // could be read. Keep that negative dependency in the cache.
-        if let Some(address) = u64::from(snapshot.origin)
-            .checked_add(bytes.len() as u64)
-            .and_then(|address| u32::try_from(address).ok())
-            && let Some(page) = snapshot.page_index(address)
-        {
-            pages.insert(page);
-        }
-    }
-}
-
 pub(crate) fn compile(
     region: &Region,
     memory: &mut Memory,
@@ -835,105 +807,13 @@ fn compile_snapshot_with_inline(
         ir_counts::enabled().then(|| std::cell::RefCell::new(ir_counts::Counts::default()));
     let region = &snapshot.region;
     let bytes = &snapshot.bytes;
-    let first_page = (region.start - snapshot.base) as usize / 4096;
-    let mut pages: BTreeSet<usize> = if region.reachable {
-        BTreeSet::new()
-    } else {
-        (first_page..=((region.start - snapshot.base) as usize + region.len - 1) / 4096).collect()
-    };
-    let mut instructions = BTreeMap::new();
-    if !region.reachable {
-        let mut decoder =
-            Decoder::with_ip(32, bytes, u64::from(region.start), DecoderOptions::NONE);
-        while decoder.can_decode() && decoder.ip() < u64::from(region.start) + region.len as u64 {
-            let instruction = decoder.decode();
-            record_tail_dependencies(
-                region,
-                snapshot,
-                bytes,
-                0,
-                &decoder,
-                &instruction,
-                &mut pages,
-            );
-            instructions.insert(instruction.ip32(), instruction);
-        }
-    }
-    // Entry points can follow padding/data or overlap an earlier linear decode.
-    // Decode direct targets independently, as the CPU would at the actual target PC.
-    let private_callee = |pc: u32| {
-        region.reachable
-            && region.callees.contains(&pc)
-            && pc != region.start
-            && !region.entries.contains(&pc)
-    };
-    let mut pending: Vec<u32> = region.entries.clone();
-    if region.reachable && pending.is_empty() {
-        pending.push(region.start);
-    }
-    if !region.reachable {
-        pending.extend(
-            instructions
-                .values()
-                .filter(|i| i.op0_kind() == OpKind::NearBranch32)
-                .map(Instruction::near_branch32),
-        );
-    }
-    while let Some(target) = pending.pop() {
-        if instructions.contains_key(&target)
-            || region.frontier.contains(&target)
-            || private_callee(target)
-        {
-            continue;
-        }
-        let Some(offset) = target
-            .checked_sub(region.start)
-            .map(|n| n as usize)
-            .filter(|&n| n < region.len)
-        else {
-            continue;
-        };
-        let offset = offset + (region.start - snapshot.origin) as usize;
-        let mut decoder = Decoder::with_ip(
-            32,
-            &bytes[offset..],
-            u64::from(target),
-            DecoderOptions::NONE,
-        );
-        while decoder.can_decode()
-            && decoder.ip() < u64::from(region.start) + region.len as u64
-            && !instructions.contains_key(&(decoder.ip() as u32))
-            && !region.frontier.contains(&(decoder.ip() as u32))
-            && !private_callee(decoder.ip() as u32)
-        {
-            let i = decoder.decode();
-            record_tail_dependencies(region, snapshot, bytes, offset, &decoder, &i, &mut pages);
-            if i.op0_kind() == OpKind::NearBranch32 {
-                pending.push(i.near_branch32());
-            }
-            instructions.insert(i.ip32(), i);
-            if region.reachable
-                && (i.is_invalid()
-                    || matches!(
-                        i.flow_control(),
-                        FlowControl::UnconditionalBranch
-                            | FlowControl::IndirectBranch
-                            | FlowControl::Return
-                            | FlowControl::Exception
-                    ))
-            {
-                break;
-            }
-        }
-    }
-    let mut callee_code = BTreeSet::new();
-    for i in snapshot.callee_code(&instructions) {
-        callee_code.insert(i.ip32());
-        let first = (i.ip32() - snapshot.base) as usize / 4096;
-        let last = (i.ip32() - snapshot.base) as usize + i.len() - 1;
-        pages.extend(first..=last / 4096);
-        instructions.insert(i.ip32(), i);
-    }
+    let crate::gir::cfg::Native {
+        instructions,
+        pages,
+        callee_code,
+        mut entries,
+        returns,
+    } = crate::gir::cfg::Native::decode(snapshot)?;
     // x87 stays in the region: guarded scalar lowering handles the exact subset,
     // and the remaining cases call the interpreter's transaction in place.
     let x87: Box<[crate::floating::NativeX87]> = instructions
@@ -954,51 +834,6 @@ fn compile_snapshot_with_inline(
         })
         .collect();
     let x87_segments = x87::segments(&instructions, &region.entries);
-    let mut entries = BTreeSet::from([region.start]);
-    for instruction in instructions.values() {
-        if crate::strings::operation(instruction).is_some()
-            || string::repeated(instruction)
-            || (!supported(instruction) && crate::floating::native_x87(instruction))
-        {
-            entries.insert(instruction.ip32());
-            entries.insert(instruction.next_ip32());
-        }
-        if instruction.flow_control() != FlowControl::Next {
-            entries.insert(instruction.next_ip32());
-        }
-        // An interpreted instruction returns with canonical state. Publish its
-        // decoded continuation so a cold form does not strand the supported
-        // remainder of this block in the interpreter on every execution.
-        if !supported(instruction) && !crate::floating::native_x87(instruction) {
-            entries.insert(instruction.next_ip32());
-        }
-        if matches!(
-            instruction.op0_kind(),
-            OpKind::NearBranch16 | OpKind::NearBranch32
-        ) {
-            entries.insert(instruction.near_branch_target() as u32);
-        }
-    }
-    // A matching indirect call dispatches to a decoded callee internally.
-    entries.extend(region.callees.iter().copied());
-    for &entry in &region.entries {
-        if !instructions.contains_key(&entry) {
-            return Err(format!("entry {entry:#x} is not an instruction boundary"));
-        }
-        entries.insert(entry);
-    }
-    entries.retain(|pc| instructions.contains_key(pc));
-    let returns: BTreeSet<_> = instructions
-        .values()
-        .filter(|i| {
-            matches!(
-                i.flow_control(),
-                FlowControl::Call | FlowControl::IndirectCall
-            )
-        })
-        .map(Instruction::next_ip32)
-        .filter(|pc| entries.contains(pc))
-        .collect();
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_pc = snapshot
         .native_fault_reads
@@ -3120,6 +2955,16 @@ fn lockable(i: &Instruction) -> bool {
 fn exclusive(i: &Instruction) -> bool {
     i.has_lock_prefix()
         || i.mnemonic() == M::Xchg && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
+}
+
+/// Boundaries required by opaque operations and interpreter continuations.
+pub(crate) fn opaque_boundaries(i: &Instruction) -> (bool, bool) {
+    let native = supported(i);
+    let floating = !native && crate::floating::native_x87(i);
+    (
+        crate::strings::operation(i).is_some() || string::repeated(i) || floating,
+        !native && !floating,
+    )
 }
 
 pub(crate) fn supported(i: &Instruction) -> bool {
