@@ -415,9 +415,13 @@ fn guest_callback_can_block_on_another_context() {
     assert!(t.m.sys.context(1).is_done());
     let trace = String::from_utf8(buf.borrow().clone()).unwrap();
     assert_eq!(
-        trace.trim_end(),
+        trace.lines().next().unwrap(),
         format!("0\t0\ttest.dll!run_proc\t{PROC:x},0\t6b")
     );
+    let terminal = trace.lines().nth(1).unwrap();
+    assert!(terminal.starts_with("# terminal\tprocess\t0\t0\ttest.dll!exit\t\t6b\t"));
+    assert!(terminal.contains("\tCaller=Some(00400022)"));
+    assert_eq!(trace.lines().count(), 2);
 }
 
 #[test]
@@ -456,10 +460,11 @@ fn variadic_trace_marks_fixed_prefix_without_truncating_guest_arguments() {
     assert!(matches!(t.m.run_virtual(1_000_000), RunResult::Exited(43)));
     assert_eq!(t.m.cpu.read_u32(FLAG).unwrap(), 42);
     let trace = String::from_utf8(buf.borrow().clone()).unwrap();
-    assert_eq!(trace.lines().count(), 3);
+    assert_eq!(trace.lines().count(), 4);
     assert!(trace.starts_with("# signature\ttest.dll!variadic\tfixed_prefix=3\tvariadic=true\n"));
     assert!(trace.contains("0\t0\ttest.dll!variadic\t1,2,3\t2a\n"));
     assert!(trace.contains("0\t0\ttest.dll!variadic\t4,5,6\t2b\n"));
+    assert!(trace.contains("# terminal\tprocess\t0\t0\ttest.dll!exit\t\t2b\t"));
 }
 
 /// Sleep(0) polling while the only other context sleeps: virtual time must still advance.

@@ -916,10 +916,38 @@ fn apply(
         }),
         Outcome::Defer { .. } => unreachable!("deferred outcomes were resolved above"),
         Outcome::HostRequest { then } => Err(Parked::HostRequest { then, origin }),
-        Outcome::ExitThread(c) => Err(Parked::ExitThread(c)),
-        Outcome::ExitProcess(c) => Err(Parked::ExitProcess(c)),
+        Outcome::ExitThread(c) => {
+            trace_terminal(cpu, sys, &origin, "thread", c);
+            Err(Parked::ExitThread(c))
+        }
+        Outcome::ExitProcess(c) => {
+            trace_terminal(cpu, sys, &origin, "process", c);
+            Err(Parked::ExitProcess(c))
+        }
         Outcome::Fail(msg) => Err(Parked::Fail(msg)),
     }
+}
+
+fn trace_terminal(cpu: &dyn Guest, sys: &mut Sys, origin: &Origin, kind: &str, code: u32) {
+    if !sys.trace.enabled() {
+        return;
+    }
+    let binding = sys.thunks.get(origin.thunk);
+    let record = TraceRecord {
+        ctx: sys.current,
+        frame: sys.frame,
+        module: &binding.module,
+        name: &binding.name,
+        args: origin.trace_args.as_deref().unwrap_or(&[]),
+        ret: u64::from(code),
+    };
+    sys.trace.terminal(
+        &record,
+        kind,
+        origin.esp,
+        origin.ret_eip,
+        cpu.read_u32(origin.esp).ok(),
+    );
 }
 
 /// Return from the host call described by `origin`.

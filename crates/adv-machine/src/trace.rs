@@ -123,6 +123,25 @@ impl Trace {
         }
     }
 
+    /// A terminal outcome never produces a completed-call row. Retain its
+    /// original owner and continuation separately so clean exits are observable.
+    pub fn terminal(
+        &mut self,
+        record: &TraceRecord<'_>,
+        kind: &str,
+        esp: u32,
+        resume: u32,
+        caller: Option<u32>,
+    ) {
+        if let Some(w) = &mut self.sink {
+            let _ = writeln!(
+                w,
+                "# terminal\t{kind}\t{}\tOriginEsp={esp:08x}\tResume={resume:08x}\tCaller={caller:08x?}",
+                record.to_line(),
+            );
+        }
+    }
+
     /// A bounded diagnostic comment, independent of per-function trace flags.
     /// Escaped text cannot introduce extra call records or raw control lines.
     pub fn warning(
