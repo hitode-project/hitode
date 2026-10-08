@@ -332,7 +332,7 @@ def launch_script(command: list[str], remote: str, game: str, timeout: int) -> s
 
 def device_conditions(adb: Adb) -> dict:
     """Read aggregate thermal/display/scheduling conditions outside guest timing."""
-    text = adb.call("shell", "dumpsys battery; dumpsys power; dumpsys window windows; cat /proc/self/status",
+    text = adb.call("shell", "dumpsys battery; dumpsys power; dumpsys window; cat /proc/self/status",
                     idempotent=True).stdout
     def field(pattern: str) -> str | None:
         match = re.search(pattern, text, re.MULTILINE)
