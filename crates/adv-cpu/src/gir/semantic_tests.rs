@@ -476,7 +476,7 @@ fn guard_snapshots_observe_the_committed_prefix() {
         assert_eq!(outcome.frame.committed, if passes { 3 } else { 2 });
         let native = super::lower_cl::compile(&r, BASE, LENGTH, false).unwrap();
         assert_eq!(
-            native_prefix(&native, &bytes, &initial(), READ | WRITE, 10),
+            native_graph_prefix(&native, &r, &bytes, &initial(), READ | WRITE, 10),
             outcome.frame.committed
         );
         if !passes {
@@ -884,11 +884,30 @@ fn native_prefix(
     permission: u8,
     budget: u64,
 ) -> u64 {
+    native_graph_prefix(code, &graph(bytes), bytes, cpu, permission, budget)
+}
+fn native_graph_prefix(
+    code: &super::lower_cl::Code,
+    r: &Region,
+    bytes: &[u8],
+    cpu: &CpuState,
+    permission: u8,
+    budget: u64,
+) -> u64 {
     use super::lower_cl as cl;
     let mut m = memory(bytes, permission);
     let mut reference = memory(bytes, permission);
     let mut frame = cl::Frame::from_cpu(cpu);
     let status = code.run(&mut frame, &mut m, budget).unwrap();
+    let mut reference_eval = memory(bytes, permission);
+    let expected_prefix =
+        eval::evaluate(r, &mut reference_eval, &eval::Frame::from_cpu(cpu), budget).unwrap();
+    assert_eq!(
+        frame.committed, expected_prefix.frame.committed,
+        "native must reach the entire requested or failing prefix"
+    );
+    assert_eq!(frame.pc, expected_prefix.frame.pc);
+
     let mut expected = cpu.clone();
     let mut oracle = Interpreter::new();
     for _ in 0..frame.committed {
