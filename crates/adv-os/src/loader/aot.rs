@@ -91,6 +91,7 @@ mod tests {
 
     fn image() -> Pe {
         let mut pe = Pe {
+            nt_headers: 0,
             machine: 0x14c,
             characteristics: 0,
             timestamp: 0,
