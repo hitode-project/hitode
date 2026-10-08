@@ -53,6 +53,20 @@ fn ordinary(bits: u64, width: usize) -> bool {
     };
     bits & !sign == 0 || (bits & exponent != 0 && bits & exponent != exponent)
 }
+
+fn floating_result(value: u64, width: usize, status: u32) -> bool {
+    let (sign, minimum) = if width == 4 {
+        (1 << 31, 0x0080_0000)
+    } else {
+        (1 << 63, 0x0010_0000_0000_0000)
+    };
+    // Tier 0 detects tininess before rounding. A tiny inexact value can round
+    // up to the smallest normal, so checking only the rounded exponent and
+    // host UFC cannot prove its guest UE. Keep that boundary in Tier 0 too.
+    status & !0x10 == 0
+        && ordinary(value, width)
+        && !(status & 0x10 != 0 && value & !sign == minimum)
+}
 fn compare(a: u64, b: u64, width: usize) -> std::cmp::Ordering {
     let sign = if width == 4 { 1 << 31 } else { 1 << 63 };
     if a & !sign == 0 && b & !sign == 0 {
@@ -222,7 +236,7 @@ fn execute(entry: &mut Entry, i: &Instruction, address: u32) -> Option<u32> {
             };
             let width = if from == 2 { tw } else { sw };
             let (value, status) = calculate(0, b, op, width);
-            if status & !0x10 != 0 || to != 2 && !ordinary(value, tw) {
+            if status & !0x10 != 0 || to != 2 && !floating_result(value, tw, status) {
                 return None;
             }
             flags |= (status & 0x10) << 1;
@@ -332,7 +346,7 @@ fn execute(entry: &mut Entry, i: &Instruction, address: u32) -> Option<u32> {
                         _ => 4,
                     };
                     let (value, status) = calculate(a, b, op, width);
-                    if status & !0x10 != 0 || !ordinary(value, width) {
+                    if !floating_result(value, width, status) {
                         return None;
                     }
                     flags |= (status & 0x10) << 1;

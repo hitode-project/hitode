@@ -531,3 +531,71 @@ fn sse_host_fp_environment_survives_success_and_refusal() {
         equivalent(&machines[0], &machines[1], u32::MAX);
     }
 }
+
+#[test]
+fn sse_tininess_before_rounding_keeps_underflow_on_normal_results() {
+    for (code, width, minimum, almost_one) in [
+        (Code::Mulss_xmm_xmmm32, 4, 0x0080_0000, 0x3f7f_ffff),
+        (Code::Mulps_xmm_xmmm128, 4, 0x0080_0000, 0x3f7f_ffff),
+        (
+            Code::Mulsd_xmm_xmmm64,
+            8,
+            0x0010_0000_0000_0000,
+            0x3fef_ffff_ffff_ffff,
+        ),
+        (
+            Code::Mulpd_xmm_xmmm128,
+            8,
+            0x0010_0000_0000_0000,
+            0x3fef_ffff_ffff_ffff,
+        ),
+    ] {
+        for negative in [false, true] {
+            let sign = if negative {
+                if width == 4 { 1 << 31 } else { 1 << 63 }
+            } else {
+                0
+            };
+            let one = if width == 4 {
+                u64::from(1f32.to_bits())
+            } else {
+                1f64.to_bits()
+            };
+            let mut machines = three(&program(code, false, false, false, None));
+            for b in [one, almost_one] {
+                for m in &mut machines {
+                    seed(m, minimum | sign, b, width, 0x1f84);
+                }
+                let before = machines[2].tier1_stats().fallback_instructions;
+                check(&mut machines, false);
+                let inexact = b == almost_one;
+                assert_eq!(
+                    machines[2].state.mxcsr & 0x30,
+                    if inexact { 0x30 } else { 0 }
+                );
+                assert_eq!(
+                    machines[2].tier1_stats().fallback_instructions,
+                    before + u64::from(inexact)
+                );
+                assert_eq!(
+                    &machines[2].state.xmm[0][..width],
+                    &(minimum | sign).to_le_bytes()[..width]
+                );
+            }
+        }
+    }
+    // A normal binary64 value just below the binary32 normal boundary rounds
+    // to a normal single but still needs both guest UE and PE.
+    for code in [Code::Cvtsd2ss_xmm_xmmm64, Code::Cvtpd2ps_xmm_xmmm128] {
+        for sign in [1., -1.] {
+            let source = (sign * f64::from(f32::MIN_POSITIVE) * (1. - 2f64.powi(-25))).to_bits();
+            let mut machines = three(&program(code, false, false, false, None));
+            for m in &mut machines {
+                seed(m, 0, source, 8, 0x1f80);
+            }
+            check(&mut machines, false);
+            assert_eq!(machines[2].state.mxcsr & 0x30, 0x30);
+            assert_eq!(machines[2].tier1_stats().fallback_instructions, 1);
+        }
+    }
+}
