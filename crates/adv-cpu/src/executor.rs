@@ -15,14 +15,18 @@ mod interpreter_profile;
 mod parallel;
 mod schedule;
 pub use schedule::CompilationSchedule;
+mod aot;
+mod persistent;
 mod tier1;
 mod verify;
 mod warm;
+pub use aot::{AotImage, AotStats};
 use code_store::CodeStore;
 pub use verify::VerifyStats;
 
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
+    pub aot: AotStats,
     pub compilations: u64,
     pub compile_requests: u64,
     /// Regions queued from a warm-start profile.
@@ -60,6 +64,8 @@ pub struct Stats {
     pub interpreter_instructions: u64,
     pub interpreter_entries: u64,
     pub native_blocks: u64,
+    /// Opt-in exact Tier 0 retirement, excluding REP elements and oracle replay.
+    pub frame_retired_tier0: u64,
     pub invalidations: u64,
     /// Region candidates checked after changes to their code pages only.
     pub invalidation_candidates: u64,
@@ -135,7 +141,7 @@ pub struct Executor {
     pub(crate) memory: Memory,
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
-    interpreter: crate::interpreter::Interpreter,
+    pub(crate) interpreter: crate::interpreter::Interpreter,
     tier1: Option<crate::tier1::Engine>,
     tier1_mode: crate::Tier1Mode,
     auto_jit: bool,
@@ -168,6 +174,11 @@ pub struct Executor {
     /// Interpreter starts at unowned pcs while compilation work is deferred.
     demand: HashMap<u32, u64>,
     warm: Option<warm::Pending>,
+    aot: aot::State,
+    persistent_cache: Option<Arc<crate::code_cache::Cache>>,
+    cached_pending: Option<persistent::Pending>,
+    cache_images: Vec<(u32, u32, [u8; 32])>,
+    cache_guest: Option<[u8; 32]>,
     /// Dedicated compile threads; zero shares the background service.
     compile_threads: usize,
     automatic_regions: BTreeSet<u32>,
@@ -427,6 +438,11 @@ impl Executor {
             deferred_sequence: 0,
             demand: HashMap::new(),
             warm: None,
+            aot: aot::State::default(),
+            persistent_cache: None,
+            cached_pending: None,
+            cache_images: Vec::new(),
+            cache_guest: None,
             compile_threads: 0,
             automatic_regions: BTreeSet::new(),
             hits: HashMap::new(),
@@ -509,7 +525,8 @@ impl Executor {
         Ok(())
     }
 
-    /// A new guest process shares host policy, never an execution context or code cache.
+    /// A new guest process shares policy and the bounded disk archive, never
+    /// execution contexts or published native code. Its image identity is new.
     pub(crate) fn inherit_process_policy(&mut self, parent: &Self) -> Result<(), String> {
         self.set_guest_workers(parent.guest_workers())?;
         self.background_service = parent.background_service.clone();
@@ -517,6 +534,8 @@ impl Executor {
         self.auto_compile_strategy = parent.auto_compile_strategy;
         self.tiered_compilation = parent.tiered_compilation;
         self.async_compilation = parent.async_compilation;
+        self.persistent_cache = parent.persistent_cache.clone();
+        self.set_aot_enabled(parent.aot.enabled);
         self.set_tier1_mode(parent.tier1_mode)?;
         self.region_linking = parent.region_linking;
         self.profiling = parent.profiling;
@@ -807,6 +826,7 @@ impl Executor {
         }
         let mut snapshot = compile::Snapshot::capture(&region, &mut self.memory)?;
         snapshot.shadow_returns = self.shadow_returns.is_some();
+        self.locate_cache_input(&mut snapshot);
         let mut fragments = if let Some(limit) = limit {
             let budget = crate::compile_budget::background_budget(
                 snapshot.region.compile_strategy,
@@ -836,6 +856,13 @@ impl Executor {
         } else {
             vec![snapshot]
         };
+        if self.aot.is_admitting() {
+            fragments.truncate(
+                self.compile_threads
+                    .max(1)
+                    .saturating_sub(self.pending_regions.len()),
+            );
+        }
         // The owner may hold bounded immutable fragments waiting for a permit;
         // no submission waits and no single job contains the original giant unit.
         if self.deferred_compilations.len() + fragments.len() > 4096 {
@@ -851,6 +878,23 @@ impl Executor {
             }
         }
         for fragment in fragments {
+            self.mark_aot_fragment(&fragment.region);
+            if let Some(compiled) = self
+                .persistent_cache
+                .as_ref()
+                .and_then(|cache| cache.restore(&fragment))
+            {
+                if !self.aot.is_speculative(fragment.region.start) {
+                    self.witness_cache_input(&fragment);
+                }
+                if let Some((region, compiled)) =
+                    self.accept_aot_completion((*fragment.region).clone(), fragment, compiled)
+                {
+                    self.automatic_regions.insert(region.start);
+                    self.publish(region, compiled);
+                }
+                continue;
+            }
             if !self.pending_regions.contains_key(&fragment.region.start) {
                 self.schedule_deferred(fragment.region.start);
                 self.deferred_sequence += 1;
@@ -884,7 +928,11 @@ impl Executor {
                     .chain(std::iter::once(*start))
                     .map(|pc| self.demand.get(pc).copied().unwrap_or(0))
                     .sum();
-                (demand, self.deferred_order.get(start).copied().unwrap_or(0))
+                (
+                    !self.aot.is_speculative(**start),
+                    demand,
+                    self.deferred_order.get(start).copied().unwrap_or(0),
+                )
             })
             .map(|(&start, _)| start)
     }
@@ -904,6 +952,7 @@ impl Executor {
             if let Some(wake) = &self.completion_wake {
                 worker.set_waker(wake.clone());
             }
+            worker.set_code_cache(self.persistent_cache.clone());
             self.compiler = Some(worker);
             self.stats.compilation_schedule.compile_threads = self.compile_threads.max(1);
             self.stats.compilation_schedule.available_cores =
@@ -916,6 +965,7 @@ impl Executor {
             let snapshot = &self.deferred_compilations[&start];
             if !snapshot.valid(&self.memory) {
                 let snapshot = self.deferred_compilations.remove(&start).unwrap();
+                self.forget_aot_fragment(start);
                 self.stats.stale_compilations += 1;
                 self.attempted.remove(&start);
                 for pc in &snapshot.region.entries {
@@ -939,8 +989,10 @@ impl Executor {
                         .stats
                         .peak_pending_compilations
                         .max(self.pending_regions.len());
-                    self.automatic_regions.insert(region.start);
-                    self.index_region(region);
+                    if !self.aot.is_speculative(start) {
+                        self.automatic_regions.insert(region.start);
+                        self.index_region(region);
+                    }
                 }
                 Err(crate::compiler::SubmitError::Full) => {
                     self.stats.compilation_schedule.worker_full += 1;
@@ -951,7 +1003,11 @@ impl Executor {
                 }
                 Err(crate::compiler::SubmitError::WorkLimit { work, limit }) => {
                     self.deferred_compilations.remove(&start);
-                    self.record_rejection(&region, InterpreterDetail::WorkBudget);
+                    let speculative = self.aot.is_speculative(start);
+                    self.forget_aot_fragment(start);
+                    if !speculative {
+                        self.record_rejection(&region, InterpreterDetail::WorkBudget);
+                    }
                     self.stats.compile_work_rejections += 1;
                     self.compile_errors.insert(
                         start,
@@ -990,6 +1046,7 @@ impl Executor {
             self.pending_regions.remove(&start);
             self.stats.pending_compilations = self.pending_regions.len();
             if !completion.input.valid(&self.memory) {
+                self.forget_aot_fragment(start);
                 self.stats.stale_compilations += 1;
                 self.tier_attempted.remove(&start);
                 self.native_heat.remove(&start);
@@ -1000,19 +1057,33 @@ impl Executor {
             }
             match completion.result {
                 Ok(compiled) => {
+                    if !self.aot.is_speculative(start) {
+                        self.witness_cache_input(&completion.input);
+                    }
                     if completion.region.compile_strategy == CompileStrategy::Speed
                         && self.code.compiled.contains_key(&start)
                         && self.tier_attempted.contains(&start)
                     {
                         self.stats.tier_up_publications += 1;
                     }
-                    self.publish(completion.region, compiled);
+                    if let Some((region, compiled)) =
+                        self.accept_aot_completion(completion.region, completion.input, compiled)
+                    {
+                        self.publish(region, compiled);
+                    }
                 }
                 Err(error) => {
+                    let speculative = self.aot.is_speculative(start);
+                    self.forget_aot_fragment(start);
                     // A compilation failure must leave the original guest code
                     // executable by the interpreter; explicit compilation returns errors.
                     self.stats.compile_failures += 1;
-                    self.record_rejection(&completion.region, InterpreterDetail::CompileFailure);
+                    if !speculative {
+                        self.record_rejection(
+                            &completion.region,
+                            InterpreterDetail::CompileFailure,
+                        );
+                    }
                     self.compile_errors.insert(start, error);
                     while self.compile_errors.len() > 64 {
                         self.compile_errors.pop_first();
@@ -1114,6 +1185,8 @@ impl Executor {
         }
         if self.stats.compilations != 0
             || self.stats.compile_requests != 0
+            || !self.code.compiled.is_empty()
+            || self.aot.has_ready()
             || !self.pending_regions.is_empty()
             || !self.deferred_compilations.is_empty()
         {
@@ -1131,6 +1204,7 @@ impl Executor {
         self.async_compilation = enabled;
         if !enabled {
             self.schedule = Default::default();
+            self.reset_aot_compilations();
             self.tier_attempted.clear();
             self.pending_regions.clear();
             self.deferred_compilations.clear();
@@ -1341,8 +1415,12 @@ impl Executor {
             Ok(true) => {
                 // Keep Fast code AND its published metadata live while Speed is
                 // compiling. Failure must not demote hot code to interpretation.
-                self.code.insert_region(old_region);
-                self.tier_attempted.insert(owner);
+                if self.pending_regions.contains_key(&owner)
+                    || self.deferred_compilations.contains_key(&owner)
+                {
+                    self.code.insert_region(old_region);
+                    self.tier_attempted.insert(owner);
+                }
                 self.stats.tier_up_requests += 1;
             }
             Ok(false) => {} // Cold compilation owns the bounded queue first.
@@ -1409,6 +1487,7 @@ impl Executor {
             || self
                 .deferred_compilations
                 .values()
+                .filter(|input| !self.aot.is_speculative(input.region.start))
                 .any(|input| covers(&input.region))
         {
             self.stats.compilation_schedule.window_deferrals += 1;
@@ -1431,14 +1510,19 @@ impl Executor {
                             .chain(std::iter::once(region.start))
                     }),
             )
-            .chain(self.deferred_compilations.values().flat_map(|input| {
-                input
-                    .region
-                    .entries
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(input.region.start))
-            }))
+            .chain(
+                self.deferred_compilations
+                    .values()
+                    .filter(|input| !self.aot.is_speculative(input.region.start))
+                    .flat_map(|input| {
+                        input
+                            .region
+                            .entries
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(input.region.start))
+                    }),
+            )
             .collect();
         let region = match crate::discovery::discover(
             &mut self.memory,
@@ -1489,6 +1573,8 @@ impl Executor {
         self.state.refresh_mmx();
         self.state.fuel = budget;
         if !interpreter_only {
+            self.apply_aot()?;
+            self.apply_code_cache(stop);
             self.apply_warm()?;
             self.validate_stop(stop)?;
         }
@@ -1519,6 +1605,11 @@ impl Executor {
             }
             self.refresh()?;
             self.collect_compilations()?;
+            if !interpreter_only {
+                self.apply_aot()?;
+                self.apply_code_cache(stop);
+                self.admit_aot(self.state.eip, stop);
+            }
             let single_step = self.state.eflags & (1 << 8) != 0;
             // Pending x87 exceptions must reach a waiting x87/MMX instruction
             // before it changes state. Native MMX assumes no pending #MF.
@@ -1762,6 +1853,7 @@ impl Executor {
                 )
             );
             let wait_timer = (self.frame_timing && waiting).then(Instant::now);
+            let retired_before = self.interpreter.frame_retired;
             let tier1 = self.run_tier1(
                 stop,
                 units,
@@ -1801,6 +1893,15 @@ impl Executor {
             let interpreted_units = tier1
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);
+            if tier1.is_none()
+                && let Some(before) = retired_before
+            {
+                self.stats.frame_retired_tier0 += self
+                    .interpreter
+                    .frame_retired
+                    .unwrap()
+                    .saturating_sub(before);
+            }
             if let Some(timer) = wait_timer {
                 self.stats.compile_wait_execution_ns += timer.elapsed().as_nanos() as u64;
                 self.stats.compile_wait_units += u64::from(execution.units);

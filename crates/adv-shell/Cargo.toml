@@ -21,6 +21,9 @@ png = "0.17"
 wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl"] }
 pollster = { version = "0.4", optional = true }
 
+[target.'cfg(not(windows))'.dependencies]
+adv-device = { path = "../adv-device", optional = true }
+
 [dev-dependencies]
 pollster = "0.4"
 

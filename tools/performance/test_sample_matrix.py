@@ -1,6 +1,7 @@
 import copy
 import argparse
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -8,16 +9,69 @@ import unittest
 from unittest.mock import patch
 
 from sample_matrix import (analyze_report, diagnostic_completeness, milestones, quick_samples, run,
-                           validate_native_baseline)
+                           sample_exe, validate_native_baseline, import_warm_archives)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_relative_samples_are_read_only_inputs_under_the_samples_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "fixture.exe").write_bytes(b"fixture")
+            with patch.dict(os.environ, {"ADV_SAMPLES": str(root)}):
+                self.assertEqual(sample_exe({"exe": "fixture.exe"}), root / "fixture.exe")
+
+    def test_warm_archives_require_matching_inputs_and_copy_only_cache_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "cold"
+            overlay = source / "one" / "overlay"
+            overlay.mkdir(parents=True)
+            for name in ("jit-warm.bin", "jit-code.bin", "guest-save.dat"):
+                (overlay / name).write_bytes(b"fixture")
+            (source / "results.json").write_text(json.dumps({"binary_sha256": "host", "samples": [
+                {"id": "one", "guest_exe_sha256": "guest", "codepage": 932}]}))
+            destination = root / "hot"
+            destination.mkdir()
+            sample = {"id": "one", "codepage": 932}
+            for binary, guest in (("other", "guest"), ("host", "other")):
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    import_warm_archives(source, destination, sample, binary, guest)
+            inputs = import_warm_archives(source, destination, sample, "host", "guest")
+            self.assertEqual(set(inputs), {"jit-warm.bin", "jit-code.bin"})
+            self.assertEqual({p.name for p in (destination / "overlay").iterdir()}, set(inputs))
+
     def test_quick_gate_prefers_marked_samples_then_each_engines_first(self):
         samples = [{"id": "a1", "engine": "A"}, {"id": "a2", "engine": "A"},
                    {"id": "b1", "engine": "B"}, {"id": "n1"}]
         self.assertEqual(quick_samples(samples), {"a1", "b1", "n1"})
         samples[1]["quick"] = True
         self.assertEqual(quick_samples(samples), {"a2"})
+
+    def test_min_seconds_requires_a_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "samples.json"
+            manifest.write_text(json.dumps({"samples": [
+                {"id": "one", "exe": str(root / "x.exe"), "min_seconds": 5}]}), encoding="utf-8")
+            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, quick=False)
+            with self.assertRaisesRegex(ValueError, "min_seconds_reason"):
+                run(args)
+
+    def test_relative_exes_resolve_only_inside_adv_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            game = root / "samples" / "game" / "fixture.exe"
+            game.parent.mkdir(parents=True)
+            game.write_bytes(b"")
+            sample = {"id": "one", "exe": "game/fixture.exe"}
+            with patch.dict("os.environ", {"ADV_SAMPLES": str(root / "samples")}):
+                self.assertEqual(sample_exe(sample), game)
+                with self.assertRaisesRegex(ValueError, "escapes ADV_SAMPLES"):
+                    sample_exe({"id": "two", "exe": "../outside.exe"}, strict=False)
+            with patch.dict("os.environ", {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "needs ADV_SAMPLES"):
+                    sample_exe(sample)
+                self.assertEqual(sample_exe({"id": "abs", "exe": str(game)}), game)
 
     def test_quick_run_launches_only_the_gate_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -30,6 +84,9 @@ class CampaignTests(unittest.TestCase):
                 {"id": name, "exe": str(game), "engine": engine}
                 for name, engine in (("one", "A"), ("two", "A"), ("three", "B"))
             ]}), encoding="utf-8")
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data["samples"][2].update(min_seconds=5, min_seconds_reason="late first frame")
+            manifest.write_text(json.dumps(data), encoding="utf-8")
             launched = []
 
             def launch(command, **kwargs):
@@ -42,6 +99,8 @@ class CampaignTests(unittest.TestCase):
             with patch("sample_matrix.subprocess.Popen", side_effect=launch):
                 run(args)
             self.assertEqual(launched, ["one", "three"])
+            results = json.loads((root / "output" / "results.json").read_text())["samples"]
+            self.assertEqual([result["seconds"] for result in results], [1, 5])
             self.assertTrue(json.loads((root / "output" / "results.json").read_text())["quick_gate"])
             args.output, args.only = root / "other", ["two"]
             with self.assertRaisesRegex(ValueError, "no quick-gate samples"):

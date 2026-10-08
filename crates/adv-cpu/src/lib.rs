@@ -35,6 +35,7 @@ mod gir_capture;
 pub mod host_features;
 // The opt-in fault lane accepts only verified scalar recovery sites. Other
 // accesses and hosts retain the current checked execution lane.
+mod code_cache;
 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
 #[allow(dead_code)]
 mod host_fault;
@@ -65,7 +66,9 @@ pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
 pub use compile::coverage::report as loop_coverage;
 pub use compile_budget::RESPONSIVE_WORK as RESPONSIVE_COMPILE_WORK;
 pub use cpu_profile::SegmentState;
-pub use executor::{ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats};
+pub use executor::{
+    AotImage, AotStats, ExecutionContext, Executor, ProfileSample, RunOutcome, Stats, VerifyStats,
+};
 pub use host_features::HostFeatures;
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
 pub use parallel::ParallelStats;

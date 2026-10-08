@@ -12,13 +12,6 @@ impl AudioOutput {
         #[cfg(windows)]
         {
             let output = if enabled && !headless {
-                // Output reports startup and hotplug failures through log::warn!.
-                // Keep those diagnostics visible without adding logs to the player UI.
-                if let Err(error) = log::set_logger(&AUDIO_LOGGER) {
-                    eprintln!("audio: cannot install device diagnostics: {error}");
-                } else {
-                    log::set_max_level(log::LevelFilter::Warn);
-                }
                 Some(adv_device::Output::new(runtime.audio_stream()))
             } else {
                 None
@@ -43,7 +36,7 @@ impl AudioOutput {
             output.update();
             if output.is_running() {
                 // Permit a fresh warning if a recovered device fails again.
-                *AUDIO_LOGGER.last_warning.lock().unwrap() = None;
+                crate::logging::reset_audio_warning();
             }
         }
     }
@@ -106,32 +99,6 @@ fn cap_delay(delay: Option<Duration>, wake: Option<Instant>, now: Instant) -> Op
         let remaining = at.saturating_duration_since(now);
         Some(delay.map_or(remaining, |delay| delay.min(remaining)))
     })
-}
-
-#[cfg(windows)]
-struct AudioLogger {
-    last_warning: std::sync::Mutex<Option<String>>,
-}
-#[cfg(windows)]
-static AUDIO_LOGGER: AudioLogger = AudioLogger {
-    last_warning: std::sync::Mutex::new(None),
-};
-#[cfg(windows)]
-impl log::Log for AudioLogger {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn && metadata.target().starts_with("adv_device")
-    }
-    fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            let message = record.args().to_string();
-            let mut last = self.last_warning.lock().unwrap();
-            if last.as_ref() != Some(&message) {
-                eprintln!("audio: {message}");
-                *last = Some(message);
-            }
-        }
-    }
-    fn flush(&self) {}
 }
 
 #[cfg(test)]

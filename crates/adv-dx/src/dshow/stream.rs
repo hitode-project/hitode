@@ -30,6 +30,7 @@ pub(crate) struct Session {
     seen_generation: u32,
     stopping: bool,
     prerolled: bool,
+    ending: bool,
     ended: bool,
     discontinuity: bool,
     segment: i64,
@@ -124,6 +125,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             seen_generation: 0,
             stopping: false,
             prerolled: false,
+            ending: false,
             ended: false,
             discontinuity: true,
             segment: 0,
@@ -210,11 +212,12 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     let Some(s) = state(env).sessions.get(&id) else {
         return Outcome::Return(0);
     };
-    let (graph, stopping, generation, seen, ended, prerolled, splitter) = (
+    let (graph, stopping, generation, seen, ending, ended, prerolled, splitter) = (
         s.graph,
         s.stopping,
         s.generation,
         s.seen_generation,
+        s.ending,
         s.ended,
         s.prerolled,
         s.splitter,
@@ -225,6 +228,9 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     }
     if generation != seen {
         return begin_segment(env, id);
+    }
+    if ending {
+        return end_of_stream(env, id);
     }
     let paused = graph_state == Some(graph::PAUSED);
     if ended || (paused && prerolled) {
@@ -325,11 +331,17 @@ fn wait(env: &mut Env<'_>, id: u32, deadline: Option<u64>) -> Outcome {
 }
 
 fn finish(env: &mut Env<'_>, id: u32) -> Outcome {
+    let audio = state(env).sessions.get(&id).and_then(|s| s.audio);
+    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>())
+        && !sound.audio.remove_pcm(stream)
+    {
+        // Retain ownership until the mixer accepts removal, including aborts.
+        session(env, id).stopping = true;
+        let deadline = env.sys.clock.now_us() + POLL_US;
+        return wait(env, id, Some(deadline));
+    }
     if let Some(s) = state(env).sessions.remove(&id) {
         env.sys.objects.close(s.wake);
-        if let (Some(stream), Some(sound)) = (s.audio, env.ext.try_get_mut::<Sound>()) {
-            sound.audio.remove_pcm(stream);
-        }
     }
     Outcome::Return(0)
 }
@@ -351,14 +363,16 @@ fn abort_stream(env: &mut Env<'_>, id: u32, hresult: u32, reason: &str) -> Outco
 fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     let s = session(env, id);
     let flush = s.seen_generation != 0;
-    s.seen_generation = s.generation;
-    s.ended = false;
-    s.prerolled = false;
-    s.discontinuity = true;
-    s.pending_audio.clear();
     let (graph, splitter, video, audio) = (s.graph, s.splitter, s.video, s.audio);
+    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>())
+        && flush
+        && !sound.audio.flush_pcm(stream)
+    {
+        // Do not consume the generation or seek the decoder before admission.
+        let deadline = env.sys.clock.now_us() + POLL_US;
+        return wait(env, id, Some(deadline));
+    }
     let position = graph::stream_position(env, graph).max(0);
-    session(env, id).segment = position;
     let stop = state(env).graphs[&graph]
         .stop
         .unwrap_or_else(|| graph::duration(env, graph));
@@ -371,11 +385,14 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     {
         return abort_stream(env, id, E_FAIL, &format!("seek to {position}: {error}"));
     }
-    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>())
-        && flush
-    {
-        sound.audio.flush_pcm(stream);
-    }
+    let s = session(env, id);
+    s.seen_generation = s.generation;
+    s.ending = false;
+    s.ended = false;
+    s.prerolled = false;
+    s.discontinuity = true;
+    s.pending_audio.clear();
+    s.segment = position;
     let mut calls = VecDeque::new();
     if let Some(VideoTarget::Guest(pin)) = video {
         let peer = state(env).pins[&pin].peer;
@@ -407,11 +424,25 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
 
 fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
     let s = session(env, id);
-    s.ended = true;
+    s.ending = true;
     let (graph, video, audio) = (s.graph, s.video, s.audio);
-    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>()) {
-        sound.audio.end_pcm(stream);
+    // Pending PCM must precede End in the same FIFO; an accepted End cannot
+    // strand frames that were refused by the data queue on the previous pass.
+    let media_us = (graph::stream_position(env, graph).max(0) / 10) as u64;
+    push_audio(env, id, media_us);
+    if !session(env, id).pending_audio.is_empty() {
+        let deadline = env.sys.clock.now_us() + POLL_US;
+        return wait(env, id, Some(deadline));
     }
+    if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>()) {
+        if !sound.audio.end_pcm(stream) {
+            let deadline = env.sys.clock.now_us() + POLL_US;
+            return wait(env, id, Some(deadline));
+        }
+    }
+    let s = session(env, id);
+    s.ending = false;
+    s.ended = true;
     let renderer_audio = follow_audio(env, id);
     if renderer_audio {
         graph::notify(env, graph, EC_COMPLETE, 0, 0);
@@ -593,6 +624,7 @@ mod tests {
                 seen_generation: 1,
                 stopping: false,
                 prerolled: false,
+                ending: false,
                 ended: false,
                 discontinuity: true,
                 segment: 0,
@@ -653,5 +685,174 @@ mod tests {
             Outcome::Return(0)
         ));
         assert_error_only(&mut m, events, wake, VFW_E_UNSUPPORTED_STREAM);
+    }
+
+    fn audio_session() -> (
+        Machine<JitCpu>,
+        u32,
+        adv_device::AudioControl,
+        adv_device::DeviceReader,
+    ) {
+        let (mut m, graph, _, _) = failure_session();
+        crate::dsound::register(m.sys.thunks.resolver_mut::<adv_abi::Registry>().unwrap());
+        crate::dsound::install(&mut m).unwrap();
+        m.ext.get_mut::<Sound>().enabled = true;
+        let splitter = activate(&mut m, CLSID_MPEG1_SPLITTER, IID_IBASEFILTER);
+        let renderer = activate(&mut m, CLSID_DSOUND_RENDER, IID_IBASEFILTER);
+        let out = filter::new_pin(
+            &mut env(&mut m),
+            splitter,
+            filter::OUTPUT,
+            "Audio",
+            MEDIATYPE_AUDIO,
+            None,
+        )
+        .unwrap();
+        let input = m.ext.get::<State>().filters[&renderer].pins[0];
+        let state = m.ext.get_mut::<State>();
+        state.pins.get_mut(&out).unwrap().peer = input;
+        state.pins.get_mut(&input).unwrap().peer = out;
+        let g = state.graphs.get_mut(&graph).unwrap();
+        g.state = graph::RUNNING;
+        g.expected = 1;
+        let s = state.sessions.get_mut(&1).unwrap();
+        s.splitter = splitter;
+        s.video = None;
+        s.audio = Some(1);
+        let audio = m.ext.get::<Sound>().audio.clone();
+        assert!(
+            audio
+                .push_pcm(PcmBlock {
+                    stream_id: 1,
+                    guest_pts_us: 0,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples: vec![0.5; 1000]
+                })
+                .is_ok()
+        );
+        let reader = audio.stream().device_reader(1000, 2).unwrap();
+        for _ in 0..6144 {
+            assert!(audio.set_gain(1, 1.0));
+        }
+        assert!(!audio.set_gain(1, 1.0));
+        (m, graph, audio, reader)
+    }
+
+    fn recover(audio: &adv_device::AudioControl, reader: &mut adv_device::DeviceReader) {
+        for _ in 0..4 {
+            reader.read(&mut [0.0; 2], 0);
+            audio.maintain();
+        }
+    }
+
+    #[test]
+    fn saturated_finish_keeps_session_until_removal_is_accepted() {
+        let (mut m, _, audio, mut reader) = audio_session();
+        let wake = m.ext.get::<State>().sessions[&1].wake;
+        let outcome = finish(&mut env(&mut m), 1);
+        assert!(m.ext.get::<State>().sessions.contains_key(&1));
+        assert!(m.sys.objects.get(wake).is_some());
+        let Outcome::Block { then, .. } = outcome else {
+            panic!("removal must retry")
+        };
+        recover(&audio, &mut reader);
+        assert!(matches!(
+            then(
+                &mut env(&mut m),
+                adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout)
+            ),
+            Outcome::Return(0)
+        ));
+        reader.read(&mut [0.0; 2], 0);
+        assert!(!m.ext.get::<State>().sessions.contains_key(&1));
+        assert!(m.sys.objects.get(wake).is_none());
+        assert_eq!(audio.stream().metrics().removals, 1);
+    }
+
+    #[test]
+    fn saturated_seek_does_not_commit_segment_before_flush() {
+        let (mut m, _, audio, mut reader) = audio_session();
+        let s = m.ext.get_mut::<State>().sessions.get_mut(&1).unwrap();
+        s.generation = 2;
+        s.ended = true;
+        s.prerolled = true;
+        s.discontinuity = false;
+        s.pending_audio.push_back(AudioFrame {
+            pts_us: 0,
+            sample_rate: 1000,
+            channels: 1,
+            samples: vec![0.25],
+        });
+        let outcome = begin_segment(&mut env(&mut m), 1);
+        let s = &m.ext.get::<State>().sessions[&1];
+        assert_eq!(s.seen_generation, 1);
+        assert!(s.ended && s.prerolled && !s.discontinuity);
+        assert_eq!(s.pending_audio.len(), 1);
+        let Outcome::Block { then, .. } = outcome else {
+            panic!("flush must retry")
+        };
+        recover(&audio, &mut reader);
+        let _ = then(
+            &mut env(&mut m),
+            adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout),
+        );
+        reader.read(&mut [0.0; 2], 0);
+        assert_eq!(audio.stream().metrics().flushes, 1);
+    }
+
+    #[test]
+    fn saturated_end_retries_without_early_completion() {
+        let (mut m, graph, audio, mut reader) = audio_session();
+        let outcome = end_of_stream(&mut env(&mut m), 1);
+        assert!(!m.ext.get::<State>().sessions[&1].ended);
+        assert_eq!(m.ext.get::<State>().graphs[&graph].completed, 0);
+        let Outcome::Block { then, .. } = outcome else {
+            panic!("end must retry")
+        };
+        recover(&audio, &mut reader);
+        let _ = then(
+            &mut env(&mut m),
+            adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout),
+        );
+        reader.read(&mut [0.0; 2], 0);
+        assert!(m.ext.get::<State>().sessions[&1].ended);
+        assert_eq!(m.ext.get::<State>().graphs[&graph].completed, 1);
+        assert_eq!(audio.stream().metrics().ends, 1);
+    }
+
+    #[test]
+    fn end_retries_pending_pcm_before_sending_end() {
+        let (mut m, graph, audio, mut reader) = audio_session();
+        m.ext
+            .get_mut::<State>()
+            .sessions
+            .get_mut(&1)
+            .unwrap()
+            .pending_audio
+            .push_back(AudioFrame {
+                pts_us: 1_000_000,
+                sample_rate: 1000,
+                channels: 1,
+                samples: vec![0.25],
+            });
+        let outcome = end_of_stream(&mut env(&mut m), 1);
+        let s = &m.ext.get::<State>().sessions[&1];
+        assert!(!s.ended);
+        assert_eq!(s.pending_audio.len(), 1);
+        assert_eq!(m.ext.get::<State>().graphs[&graph].completed, 0);
+        let Outcome::Block { then, .. } = outcome else {
+            panic!("PCM must retry")
+        };
+        recover(&audio, &mut reader);
+        let _ = then(
+            &mut env(&mut m),
+            adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout),
+        );
+        reader.read(&mut [], 0);
+        let s = &m.ext.get::<State>().sessions[&1];
+        assert!(s.ended && s.pending_audio.is_empty());
+        assert_eq!(audio.stream().metrics().queued_blocks, 2);
+        assert_eq!(audio.stream().metrics().ends, 1);
     }
 }

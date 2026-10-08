@@ -4,6 +4,7 @@ Run: python -m unittest discover -s tools/performance -p test_frame_budget.py
 No game, Android device or GPU is required; output is unittest statistics.
 """
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,6 +23,73 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_native_cache_summary_keeps_statistics_without_private_payloads(self):
+        result = budget.execution_metrics({"native_entries": 4, "interpreter_entries": 6,
+            "code_cache": {"enabled": True, "hits": 3, "bytes": 128, "raw": "private native bytes"},
+            "aot": {"private_completions": 2, "publications": 1, "guest_pc": 12345}})
+        self.assertEqual(result["counts"], {"native_entries": 4, "interpreter_entries": 6})
+        self.assertEqual(result["code_cache"], {"enabled": True, "hits": 3, "bytes": 128})
+        self.assertEqual(result["aot"], {"private_completions": 2, "publications": 1})
+        self.assertNotIn("private native bytes", json.dumps(result))
+
+    def test_shared_device_broker_accepts_the_callers_task_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "device.ps1"
+            helper.write_text("fixture")
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot"}), patch.object(budget.subprocess, "run") as invoke:
+                with budget.device_lock(None, root, helper):
+                    pass
+                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "aot")
+            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot; unexpected"}), patch.object(budget.subprocess, "run") as invoke:
+                with self.assertRaises(ValueError):
+                    with budget.device_lock(None, root, helper):
+                        pass
+                invoke.assert_not_called()
+
+    def test_scene_check_can_push_combined_work_over_the_budget(self):
+        row = frame(wall_ns=40_000_000, active_ns=25_000_000, guest_exec_ns=22_000_000,
+                    hle_ns={"other": 4_000_000}, wait_ns=3_000_000,
+                    service_audio_ns=2_000_000, scene_check_ns=7_000_000)
+        self.assertEqual(budget.classify(row)["cause"], "observer.mixed_scene_work")
+        self.assertEqual(budget.classify(row | {"scene_check_ns": 0})["cause"], "unattributed")
+
+    def test_mixed_execution_and_wait_are_not_a_hidden_host_gap(self):
+        result = budget.classify(frame(wall_ns=50_000_000, active_ns=29_000_000,
+                                       guest_exec_ns=22_000_000, wait_ns=18_000_000))
+        self.assertEqual(result["cause"], "platform.mixed_wait_execution")
+
+    def test_runtime_pumps_are_work_outside_backend_and_not_hle(self):
+        row = frame(wall_ns=36_000_000, active_ns=15_000_000,
+                    guest_exec_ns=10_000_000, wait_ns=11_000_000, service_audio_ns=10_000_000)
+        result = budget.classify(row)
+        self.assertEqual(result["cause"], "host.audio_service")
+        row["service_audio_ns"] = 7_000_000
+        self.assertEqual(budget.classify(row)["cause"], "platform.mixed_wait_execution_services")
+        row["service_audio_ns"] = 0
+        row["scene_check_ns"] = 10_000_000
+        self.assertEqual(budget.classify(row)["cause"], "observer.scene_check")
+
+    def test_explicit_host_costs_and_observer_freezes_have_separate_causes(self):
+        for field, cause in (("scheduler_ns", "host.scheduler"), ("frontend_ns", "host.frontend_control"),
+                             ("control_pause_ns", "observer.control_pause")):
+            result = budget.classify(frame(**{field: 30_000_000}, active_ns=5_000_000))
+            self.assertEqual(result["cause"], cause)
+
+    def test_api_allowlist_and_retained_subset_totals(self):
+        row = budget.clean_row(frame(top_apis=[{"api": "kernel32.dll!ReadFile", "ns": 17, "calls": 2},
+                                               {"api": "private/path!bad", "ns": 999}]))
+        self.assertEqual(len(row["top_apis"]), 1)
+        self.assertEqual(budget.top_apis([row, row]), [{"api": "kernel32.dll!ReadFile", "ns": 34, "calls": 4}])
+
+    def test_native_partial_estimate_does_not_promote_rep_units_or_blocks(self):
+        row = frame(cpu={"retired_tier0_instructions": 100_000_000, "tier0_units": 999_000_000,
+                         "tier2_blocks": 999_000_000})
+        estimate = budget.native_estimate(row, 2_000_000_000)
+        self.assertEqual(estimate["native_time_lower_estimate_ns"], 50_000_000)
+        self.assertTrue(estimate["native_over_budget_estimate"])
+        self.assertEqual(estimate["retirement_coverage"], "tier0_only")
+        self.assertIsNone(budget.native_estimate(frame(cpu={"tier2_blocks": 999_000_000}), 1)["native_time_lower_estimate_ns"])
     def test_broker_sharing_error_retries_only_acquisition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -62,7 +130,7 @@ class FrameBudgetTests(unittest.TestCase):
         row = frame(cpu={"compile_wait_execution_ns": 30_000_000, "compile_time": 2_000_000_000})
         self.assertEqual(budget.classify(row)["cause"], "cold.compile_pending_execution")
         self.assertEqual(budget.classify(row)["confidence"], "measured_overlap")
-        self.assertEqual(budget.classify(frame(cpu={"compile_time": 2_000_000_000}))["cause"], "unattributed")
+        self.assertEqual(budget.classify(frame(cpu={"compile_time": 2_000_000_000}))["cause"], "structure.guest_execution")
 
     def test_largest_measured_cost_wins_before_count_hints(self):
         row = frame(hle_ns={"file": 32_000_000}, cpu={"sync_compile_ns": 20_000_000, "softfloat_calls": 99999})
@@ -78,7 +146,7 @@ class FrameBudgetTests(unittest.TestCase):
 
     def test_frequency_and_sparse_core_change_are_not_proof_of_throttling(self):
         result = budget.classify(frame(core=0, frequency_khz=300000))
-        self.assertEqual(result["cause"], "unattributed")
+        self.assertEqual(result["cause"], "structure.guest_execution")
         self.assertEqual(result["evidence"]["frequency_khz"], 300000)
 
     def test_wait_overshoot_distinguishes_requested_idle(self):

@@ -126,13 +126,13 @@ enum Command {
     Ring(u64, Box<RingVoice>, Arc<RingState>),
     Owned(u64, Box<OwnedVoice>),
     Pcm(PcmBlock),
-    Play(u64, bool, u64, u64),
+    Play(u64, bool, u64, u64, Option<u32>),
     Epoch(u64, u64),
-    Stop(u64),
-    Position(u64, u32, u64),
+    Stop(u64, Option<u64>),
+    Position(u64, u32, u64, Option<u64>),
     Written(u64, u32, u32),
     Gain(u64, [f32; 2]),
-    Retune(u64, u32, Converter),
+    Retune(u64, u32, Converter, Option<u64>),
     Notices(u64, Vec<(u32, u32)>),
     Pause(u64, bool),
     End(u64),
@@ -429,26 +429,50 @@ impl AudioControl {
         Ok(state)
     }
     pub fn play_ring(&self, source: u64, looping: bool, generation: u64) -> bool {
+        self.play_ring_at(source, looping, generation, None)
+    }
+    /// Admission is atomic: a rejected restart changes neither cursor nor epoch.
+    #[must_use]
+    pub fn play_ring_at(
+        &self,
+        source: u64,
+        looping: bool,
+        generation: u64,
+        position: Option<u32>,
+    ) -> bool {
         let now = self
             .stream
             .shared
             .clock
             .now_us(self.local.borrow().guest_us);
-        self.send(Command::Play(source, looping, generation, now))
+        self.send(Command::Play(source, looping, generation, now, position))
     }
     pub fn change_generation(&self, source: u64, generation: u64) -> bool {
         self.send(Command::Epoch(source, generation))
     }
     pub fn stop_ring(&self, source: u64) -> bool {
-        self.send(Command::Stop(source))
+        self.send(Command::Stop(source, None))
+    }
+    /// Commit the stop and notification epoch through a single queue slot.
+    #[must_use]
+    pub fn stop_ring_generation(&self, source: u64, generation: u64) -> bool {
+        self.send(Command::Stop(source, Some(generation)))
     }
     pub fn set_position(&self, source: u64, position: u32) -> bool {
+        self.position(source, position, None)
+    }
+    /// Commit the seek and notification epoch through a single queue slot.
+    #[must_use]
+    pub fn seek_ring(&self, source: u64, position: u32, generation: u64) -> bool {
+        self.position(source, position, Some(generation))
+    }
+    fn position(&self, source: u64, position: u32, generation: Option<u64>) -> bool {
         let now = self
             .stream
             .shared
             .clock
             .now_us(self.local.borrow().guest_us);
-        self.send(Command::Position(source, position, now))
+        self.send(Command::Position(source, position, now, generation))
     }
     pub fn written(&self, source: u64, offset: u32, len: u32) -> bool {
         if let Some(&(_, align)) = self.local.borrow().rings.get(&source) {
@@ -469,8 +493,20 @@ impl AudioControl {
         self.send(Command::Notices(source, entries))
     }
     pub fn set_frequency(&self, source: u64, frequency: u32) -> Result<(), String> {
+        self.retune(source, frequency, None)
+    }
+    /// A rejected retune leaves both the rate and notification epoch unchanged.
+    pub fn set_frequency_generation(
+        &self,
+        source: u64,
+        frequency: u32,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.retune(source, frequency, Some(generation))
+    }
+    fn retune(&self, source: u64, frequency: u32, generation: Option<u64>) -> Result<(), String> {
         let converter = Converter::new(frequency, self.stream.shared.rate.load(Ordering::Acquire))?;
-        if !self.send(Command::Retune(source, frequency, converter)) {
+        if !self.send(Command::Retune(source, frequency, converter, generation)) {
             return Err("audio command limit".into());
         }
         if let Some(rate) = self.local.borrow_mut().rings.get_mut(&source) {
@@ -655,7 +691,7 @@ impl Engine {
                 | Command::Owned(id, ..)
                 | Command::Play(id, ..)
                 | Command::Epoch(id, ..)
-                | Command::Stop(id)
+                | Command::Stop(id, ..)
                 | Command::Position(id, ..)
                 | Command::Written(id, ..)
                 | Command::Gain(id, ..)
@@ -717,8 +753,12 @@ impl Engine {
                                 Voice::Ring {
                                     voice, generation, ..
                                 },
-                                Command::Play(_, looping, epoch, issued),
+                                Command::Play(_, looping, epoch, issued, position),
                             ) => {
+                                if let Some(position) = position {
+                                    voice.stop();
+                                    voice.set_position(position);
+                                }
                                 *generation = epoch;
                                 voice.play(looping);
                                 if shared.clock.uses_device_time()
@@ -734,9 +774,27 @@ impl Engine {
                             (Voice::Ring { generation, .. }, Command::Epoch(_, epoch)) => {
                                 *generation = epoch
                             }
-                            (Voice::Ring { voice, .. }, Command::Stop(_)) => voice.stop(),
-                            (Voice::Ring { voice, .. }, Command::Position(_, position, issued)) => {
+                            (
+                                Voice::Ring {
+                                    voice, generation, ..
+                                },
+                                Command::Stop(_, epoch),
+                            ) => {
+                                voice.stop();
+                                if let Some(epoch) = epoch {
+                                    *generation = epoch;
+                                }
+                            }
+                            (
+                                Voice::Ring {
+                                    voice, generation, ..
+                                },
+                                Command::Position(_, position, issued, epoch),
+                            ) => {
                                 voice.set_position(position);
+                                if let Some(epoch) = epoch {
+                                    *generation = epoch;
+                                }
                                 if shared.clock.uses_device_time()
                                     && !shared.connected.load(Ordering::Acquire)
                                 {
@@ -764,15 +822,20 @@ impl Engine {
                                 shared.counters.ends.fetch_add(1, Ordering::Relaxed);
                             }
                             (
-                                Voice::Ring { voice, .. },
-                                Command::Retune(_, frequency, converter),
+                                Voice::Ring {
+                                    voice, generation, ..
+                                },
+                                Command::Retune(_, frequency, converter, epoch),
                             ) => {
                                 let old = voice.retune(frequency, converter);
+                                if let Some(epoch) = epoch {
+                                    *generation = epoch;
+                                }
                                 self.retire(Retired::Converter(old));
                             }
                             (
                                 Voice::Owned { voice, .. },
-                                Command::Retune(_, frequency, converter),
+                                Command::Retune(_, frequency, converter, _),
                             ) => {
                                 let old = voice.retune(frequency, converter);
                                 self.retire(Retired::Converter(old));
@@ -784,7 +847,7 @@ impl Engine {
                         }
                     } else {
                         match command {
-                            Command::Retune(_, _, converter) => {
+                            Command::Retune(_, _, converter, _) => {
                                 self.retire(Retired::Converter(converter))
                             }
                             Command::Notices(_, entries) => self.retire(Retired::Notices(entries)),
@@ -1151,5 +1214,126 @@ impl Drop for crate::DeviceReader {
         self.shared
             .engine
             .store(Box::into_raw(engine), Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_sync::shared::SharedReadView;
+
+    struct Samples;
+    impl SharedReadView for Samples {
+        fn len(&self) -> usize {
+            1000
+        }
+        fn load_u8(&self, _: usize) -> u8 {
+            192
+        }
+    }
+
+    fn drain(control: &AudioControl, reader: &mut crate::DeviceReader) {
+        for _ in 0..4 {
+            reader.read(&mut [], 0);
+            control.maintain();
+        }
+    }
+
+    #[test]
+    fn last_command_slot_commits_ring_control_and_epoch_atomically() {
+        for operation in 0..4 {
+            let control = AudioControl::new(false);
+            control
+                .add_ring(
+                    1,
+                    RingConfig {
+                        view: Arc::new(Samples),
+                        bytes: 1000,
+                        channels: 1,
+                        bits: 8,
+                        frequency: 1000,
+                        output_rate: 44100,
+                        notifications: vec![],
+                    },
+                )
+                .unwrap();
+            assert!(control.play_ring(1, true, 1));
+            let mut reader = control.stream().device_reader(1000, 2).unwrap();
+            for _ in 0..6143 {
+                assert!(control.set_gain(1, 1.0));
+            }
+            let submit = |epoch| match operation {
+                0 => control.seek_ring(1, 100, epoch),
+                1 => control.stop_ring_generation(1, epoch),
+                2 => control.set_frequency_generation(1, 2000, epoch).is_ok(),
+                _ => control.play_ring_at(1, true, epoch, Some(50)),
+            };
+            assert!(submit(2), "one slot must admit the whole transaction");
+            assert!(!submit(3), "a rejected transaction must have no effect");
+            drain(&control, &mut reader);
+            let Voice::Ring {
+                voice, generation, ..
+            } = reader.engine.voices[0].as_ref().unwrap()
+            else {
+                panic!("ring")
+            };
+            assert_eq!(*generation, 2);
+            match operation {
+                0 => assert_eq!(voice.position(), 100),
+                1 => assert!(!voice.playing),
+                2 => assert_eq!(voice.frequency(), 2000),
+                _ => {
+                    assert_eq!(voice.position(), 50);
+                    assert!(voice.playing);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_pcm_lifecycle_commands_keep_ownership_for_retry() {
+        let control = AudioControl::new(false);
+        assert!(
+            control
+                .push_pcm(PcmBlock {
+                    stream_id: 1,
+                    guest_pts_us: 0,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples: vec![0.5; 1000],
+                })
+                .is_ok()
+        );
+        let mut reader = control.stream().device_reader(1000, 2).unwrap();
+        for _ in 0..6144 {
+            assert!(control.set_gain(1, 1.0));
+        }
+        assert!(!control.end_pcm(1));
+        assert!(!control.flush_pcm(1));
+        assert!(!control.remove_pcm(1));
+        assert!(control.local.borrow().formats.contains_key(&1));
+        let Voice::Owned { voice, .. } = reader.engine.voices[0].as_ref().unwrap() else {
+            panic!("PCM")
+        };
+        assert!(!voice.ended);
+        drain(&control, &mut reader);
+        assert!(control.end_pcm(1));
+        reader.read(&mut [], 0);
+        let Voice::Owned { voice, .. } = reader.engine.voices[0].as_ref().unwrap() else {
+            panic!("PCM")
+        };
+        assert!(voice.ended);
+        assert!(control.flush_pcm(1));
+        reader.read(&mut [], 0);
+        assert!(reader.engine.voices.iter().all(Option::is_none));
+        assert!(!control.local.borrow().formats.contains_key(&1));
+        assert_eq!(control.stream().metrics().ends, 1);
+        assert_eq!(control.stream().metrics().flushes, 1);
+        assert!(
+            control
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, AudioEvent::Released { source: 1 }))
+        );
     }
 }

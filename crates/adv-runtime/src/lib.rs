@@ -11,7 +11,7 @@ pub use family::ProcessStatus;
 mod graphics;
 pub use adv_win32::winmm::mmio;
 mod report;
-pub use adv_abi::{DynamicLookupFailure, MessageBoxCall, RunMode};
+pub use adv_abi::{ApiDiagnostics, DynamicLookupFailure, MessageBoxCall, RunMode};
 pub use adv_cpu::{
     Cliffs, CompileStrategy, HostFeatures, ParallelStats, Tier1Mode, VerifyStats, loop_coverage,
 };

@@ -2,6 +2,8 @@
 mod audio;
 mod control;
 mod frontend;
+#[cfg(windows)]
+mod logging;
 #[cfg(all(windows, feature = "gpu"))]
 mod native_gpu;
 mod performance;
@@ -20,6 +22,7 @@ struct Options {
     row_batching: bool,
     exe: PathBuf,
     data_dir: PathBuf,
+    no_code_cache: bool,
     cdroms: Vec<(char, PathBuf)>,
     jit: bool,
     compile_strategy: CompileStrategy,
@@ -30,6 +33,7 @@ struct Options {
     headless: bool,
     hidden: bool,
     gpu_software: bool,
+    headless_gpu: bool,
     d3d9_sm2: bool,
     d3d9_sm3: bool,
     d3d9_shader_cache: Option<PathBuf>,
@@ -76,6 +80,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
+  --headless-gpu         opt in to a GPU frontend without a window\n\
   --d3d9-sm2             opt in to the SM2 capability milestone (default: off)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
@@ -83,6 +88,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --frames N              stop after N presented guest frames\n\
   --seconds N             stop after N seconds of host wall time\n\
   --data-dir PATH         guest write overlay (default: target/adv-data/<exe>)\n\
+  --no-code-cache         troubleshoot startup: bypass native cache and image precompilation\n\
   --cdrom D=PATH          attach a read-only ISO to guest drive D (repeatable)\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
@@ -111,6 +117,7 @@ impl Options {
             row_batching: true,
             exe: PathBuf::new(),
             data_dir: PathBuf::new(),
+            no_code_cache: false,
             cdroms: Vec::new(),
             jit: true,
             compile_strategy: CompileStrategy::Fast,
@@ -121,6 +128,7 @@ impl Options {
             headless: false,
             hidden: false,
             gpu_software: false,
+            headless_gpu: false,
             d3d9_sm2: false,
             d3d9_sm3: false,
             d3d9_shader_cache: None,
@@ -155,6 +163,7 @@ impl Options {
                 }
                 "--exe" => exe = Some(PathBuf::from(value()?)),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+                "--no-code-cache" => options.no_code_cache = true,
                 "--cdrom" => {
                     let mount = value()?;
                     let (drive, path) = mount.split_once('=').ok_or("--cdrom requires D=PATH")?;
@@ -222,6 +231,7 @@ impl Options {
                 "--headless" => options.headless = true,
                 "--hidden" => options.hidden = true,
                 "--gpu-software" => options.gpu_software = true,
+                "--headless-gpu" => options.headless_gpu = true,
                 "--d3d9-sm2" => options.d3d9_sm2 = true,
                 "--d3d9-sm3" => options.d3d9_sm3 = true,
                 "--d3d9-shader-cache" => options.d3d9_shader_cache = Some(value()?.into()),
@@ -271,8 +281,15 @@ impl Options {
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
         #[cfg(not(feature = "gpu"))]
-        if options.d3d9_sm2 || options.d3d9_sm3 || options.d3d9_shader_cache.is_some() {
+        if options.headless_gpu
+            || options.d3d9_sm2
+            || options.d3d9_sm3
+            || options.d3d9_shader_cache.is_some()
+        {
             return Err("D3D9 shader capability switches require the gpu feature".into());
+        }
+        if options.headless_gpu && !options.headless {
+            return Err("--headless-gpu requires --headless".into());
         }
         options.data_dir = data_dir.unwrap_or_else(|| {
             PathBuf::from("target/adv-data").join(options.exe.file_stem().unwrap_or_default())
@@ -451,6 +468,41 @@ fn cpu_fault_json(fault: Option<&adv_machine::exception::CpuFaultSnapshot>) -> S
     )
 }
 
+/// The report's personality gaps (docs/personality-contracts.md): rejected
+/// discovery probes and reviewed exports answered with their failure.
+fn personality_json(diagnostics: Option<&adv_runtime::ApiDiagnostics>) -> String {
+    let Some(d) = diagnostics else {
+        return "{\"rejected_probes\": [], \"dropped_rejected_probes\": 0, \"reviewed_calls\": {}}"
+            .into();
+    };
+    let probes = d
+        .rejected_probes
+        .iter()
+        .map(|(api, probe)| {
+            format!(
+                "{{\"api\": {}, \"class\": {}, \"count\": {}, \"first_caller\": {}}}",
+                json(api),
+                probe
+                    .class
+                    .map_or_else(|| "null".into(), |class| json(class.as_str())),
+                probe.count,
+                probe.first_caller
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reviewed = d
+        .reviewed_calls
+        .iter()
+        .map(|(api, count)| format!("{}: {count}", json(api)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{\"rejected_probes\": [{probes}], \"dropped_rejected_probes\": {}, \"reviewed_calls\": {{{reviewed}}}}}",
+        d.dropped_rejected_probes
+    )
+}
+
 fn api_report(runtime: &Runtime) -> String {
     let mode = match runtime.api_mode() {
         adv_runtime::RunMode::Strict => "strict",
@@ -542,7 +594,7 @@ fn api_report(runtime: &Runtime) -> String {
             "\"dynamic_lookup_failures\": [{}], \"dynamic_lookup_failure_count\": {}, ",
             "\"dropped_dynamic_lookup_failures\": {}, \"message_boxes\": [{}], ",
             "\"message_box_count\": {}, \"dropped_message_boxes\": {}, ",
-            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}]}}"
+            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}], \"personality\": {}}}"
         ),
         json(mode),
         runtime.api_acceptance_eligible(),
@@ -567,6 +619,7 @@ fn api_report(runtime: &Runtime) -> String {
         diagnostics.map_or(0, |d| d.dropped_message_boxes),
         diagnostics.map_or(0, |d| d.truncated_diagnostic_fields),
         processes,
+        personality_json(diagnostics),
     )
 }
 
@@ -747,6 +800,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"input_messages\": {},\n",
             "  \"parallel\": {},\n  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
             "  \"host_calls\": {},\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n  \"cpu_cliffs\": {},\n  \"tier_verification\": {},\n",
+            "  \"code_cache\": {},\n  \"aot\": {},\n",
             "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
@@ -788,6 +842,8 @@ fn build_report(context: ReportContext<'_>) -> String {
         stats.interpreter_entries,
         cliffs_report(&stats.cliffs),
         verification_report(&stats.verification),
+        runtime.machine.cpu.executor().persistent_code_cache_json(),
+        stats.aot.json(),
         tier1_json,
         runtime.machine.cpu.executor().compilation_schedule_json(),
         stats.compilations,
@@ -857,7 +913,7 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
-    #[cfg(all(windows, feature = "gpu"))]
+    #[cfg(feature = "gpu")]
     if runtime.has_native_frame() {
         return capture_native_after_stop(runtime, wake);
     }
@@ -901,7 +957,7 @@ fn acknowledge_scene_gate(
     control::acknowledge(result);
 }
 
-#[cfg(all(windows, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 fn capture_native_after_stop(
     runtime: &mut Runtime,
     wake: &window::WakeEvent,
@@ -1107,6 +1163,17 @@ fn compile_thread_budget_preserves_small_hosts_and_reserves_runtime_cores() {
     assert_eq!(compile_thread_count(0, usize::MAX), 1);
 }
 
+#[test]
+fn native_cache_is_default_and_has_one_diagnostic_bypass() {
+    let parse = |values: &[&str]| {
+        Options::parse_args(values.iter().map(|s| s.to_string()))
+            .unwrap()
+            .unwrap()
+    };
+    assert!(!parse(&["fixture.exe"]).no_code_cache);
+    assert!(parse(&["fixture.exe", "--no-code-cache"]).no_code_cache);
+}
+
 fn run_execution(
     options: Options,
     mut window: Option<frontend::Worker>,
@@ -1217,6 +1284,18 @@ fn run_execution(
     // Guest regions resident at the previous exit are compiled in the background
     // as soon as identical code is mapped, before the guest reaches them.
     let warm_path = options.data_dir.join("jit-warm.bin");
+    runtime
+        .machine
+        .cpu
+        .executor_mut()
+        .set_aot_enabled(options.jit && !options.no_code_cache);
+    if options.jit && !options.no_code_cache {
+        runtime
+            .machine
+            .cpu
+            .executor_mut()
+            .set_persistent_code_cache(&options.data_dir.join("jit-code.bin"))?;
+    }
     if options.jit
         && options.async_compilation
         && runtime.machine.cpu.executor_mut().tier1_mode() != adv_runtime::Tier1Mode::Exclusive
@@ -1294,9 +1373,13 @@ fn run_execution(
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
     }
-    #[cfg(all(windows, feature = "gpu"))]
-    {
-        let gpu = match window.as_mut().and_then(|worker| worker.gpu.take()) {
+    #[cfg(feature = "gpu")]
+    if cfg!(windows) || options.headless_gpu {
+        #[cfg(windows)]
+        let supplied_gpu = window.as_mut().and_then(|worker| worker.gpu.take());
+        #[cfg(not(windows))]
+        let supplied_gpu = None;
+        let gpu = match supplied_gpu {
             Some(gpu) => gpu,
             None => {
                 let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
@@ -1671,12 +1754,30 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
-        if let Some(completion) = scene_gate.observe(
+        let scene_check_before = runtime
+            .machine
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .map(|_| scene_gate.check_duration());
+        let completion = scene_gate.observe(
             runtime.presented_frames(),
             runtime.frame().width,
             &runtime.frame().bgra,
             Instant::now(),
-        ) {
+        );
+        if let Some(before) = scene_check_before {
+            runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_mut()
+                .unwrap()
+                .scene_check(scene_gate.check_duration().saturating_sub(before));
+        }
+        if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
         if options
@@ -1700,9 +1801,26 @@ fn run_execution(
         if scene_gate.frozen() {
             // Input is queued while frozen. Diagnostics share the same retained
             // wake event and remain responsive without running another guest frame.
+            let pause_started = runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_ref()
+                .map(|_| Instant::now());
             if !control.as_ref().is_some_and(control::Control::has_pending) {
                 wake.wait(Some(Duration::from_millis(50)))
                     .map_err(|e| e.to_string())?;
+            }
+            if let Some(at) = pause_started {
+                runtime
+                    .machine
+                    .sys
+                    .stats
+                    .frame_budget
+                    .as_mut()
+                    .unwrap()
+                    .control_pause(at.elapsed());
             }
             continue;
         }
@@ -1756,12 +1874,30 @@ fn run_execution(
         {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
-        if let Some(completion) = scene_gate.observe(
+        let scene_check_before = runtime
+            .machine
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .map(|_| scene_gate.check_duration());
+        let completion = scene_gate.observe(
             presented,
             runtime.frame().width,
             &runtime.frame().bgra,
             Instant::now(),
-        ) {
+        );
+        if let Some(before) = scene_check_before {
+            runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_mut()
+                .unwrap()
+                .scene_check(scene_gate.check_duration().saturating_sub(before));
+        }
+        if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
         if first_frame_seconds.is_none() && presented > 0 {
@@ -1917,17 +2053,20 @@ fn run_execution(
             }
         }
     }
-    #[cfg(all(windows, feature = "gpu"))]
+    #[cfg(feature = "gpu")]
     let native_frame = runtime.has_native_frame();
-    #[cfg(not(all(windows, feature = "gpu")))]
+    #[cfg(not(feature = "gpu"))]
     let native_frame = false;
     if options.jit && options.async_compilation {
         let profile = runtime.machine.cpu.executor().warm_profile();
         let _ = std::fs::create_dir_all(&options.data_dir)
             .and_then(|_| std::fs::write(&warm_path, profile));
     }
+    if let Err(error) = runtime.machine.cpu.executor().save_persistent_code_cache() {
+        eprintln!("warning: native code cache save failed: {error}");
+    }
     if native_frame {
-        #[cfg(all(windows, feature = "gpu"))]
+        #[cfg(feature = "gpu")]
         if options.screenshot.is_some() || options.report.is_some() {
             capture_native_after_stop(&mut runtime, &wake)?;
         }
@@ -2009,6 +2148,8 @@ fn run_execution(
 
 /// Run the desktop/headless command-line shell with the process arguments.
 pub fn run_cli() -> std::process::ExitCode {
+    #[cfg(windows)]
+    logging::init();
     if std::env::var("ADV_HOST_FEATURES_REPORT").is_ok_and(|value| value == "1") {
         eprintln!(
             "host_features detected={} enabled={}",
