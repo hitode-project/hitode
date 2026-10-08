@@ -5030,6 +5030,12 @@ impl Emitter<'_> {
         if let Some(ok) = ordinary {
             self.fast_memory_guard(addr, size, write, ok);
         }
+        if fast && !write {
+            // The pair/single-page guards already admit every ordinary read.
+            // A miss can use the transactional helper directly; rebuilding
+            // the exact permission graph only duplicates its validation.
+            return Some(self.finish_fast_read(addr, fast_address.unwrap(), ty, ordinary.unwrap()));
+        }
         let (offset, positions) = self.access_range(addr, size, reason);
         let address = fast_address.unwrap_or_else(|| {
             let host_offset = self.b.ins().uextend(self.ptr_ty, offset);
@@ -5121,7 +5127,7 @@ impl Emitter<'_> {
         let compact = hardware.is_none();
         #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
         let compact = true;
-        if compact {
+        if compact && write {
             let missing = self.denied(&permissions, permission, 0);
             self.guard(missing, reason, Some(addr));
             self.b.set_cold_block(self.b.current_block().unwrap());
@@ -5161,9 +5167,29 @@ impl Emitter<'_> {
         // pure PCM accesses instead of emitting a second per-width access
         // graph at every guest operand. Permission and code-write guards above
         // retain the original fault address, PC and restartable SSA prefix.
+        self.memory_completion(addr, ty, value, done);
+        self.b.switch_to_block(done);
+        self.b.seal_block(done);
+        self.mark(diagnostics::Part::Body);
+        (!write).then(|| self.b.block_params(done)[0])
+    }
+    /// Emit the bounded transactional helper in the current cold block.
+    fn memory_completion(
+        &mut self,
+        addr: Value,
+        ty: ir::Type,
+        value: Option<Value>,
+        done: ir::Block,
+    ) {
+        let write = value.is_some();
+        let reason = if write {
+            Exit::WriteFault
+        } else {
+            Exit::ReadFault
+        };
         let slot = self.memory_buffer();
         let buffer = self.b.ins().stack_addr(self.ptr_ty, slot, 0);
-        let width = self.constant(size as u32);
+        let width = self.constant(ty.bytes());
         let function = if let Some(value) = value {
             self.b.ins().stack_store(value, slot, 0);
             self.file_write_ref
@@ -5183,10 +5209,26 @@ impl Emitter<'_> {
             let result = self.b.ins().stack_load(ty, slot, 0);
             self.b.ins().jump(done, &[result.into()]);
         }
+    }
+    fn finish_fast_read(
+        &mut self,
+        addr: Value,
+        address: Value,
+        ty: ir::Type,
+        ordinary: ir::Block,
+    ) -> Value {
+        let done = self.b.create_block();
+        self.b.append_block_param(done, ty);
+        self.mark(diagnostics::Part::Slow);
+        self.memory_completion(addr, ty, None, done);
+        self.b.switch_to_block(ordinary);
+        self.b.seal_block(ordinary);
+        self.mark(diagnostics::Part::Body);
+        let result = self.b.ins().load(ty, MemFlags::new(), address, 0);
+        self.b.ins().jump(done, &[result.into()]);
         self.b.switch_to_block(done);
         self.b.seal_block(done);
-        self.mark(diagnostics::Part::Body);
-        (!write).then(|| self.b.block_params(done)[0])
+        self.b.block_params(done)[0]
     }
     fn direct_load(&mut self, addr: Value, ty: ir::Type) -> Value {
         self.direct_memory(addr, ty, None).unwrap()
