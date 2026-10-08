@@ -63,7 +63,7 @@ def clean_row(row: dict) -> dict:
     result = numeric_fields(row, ("serial", "wall_ns", "active_ns", "guest_exec_ns", "present_call_ns",
                                  "wait_ns", "wait_overshoot_ns", "wait_timeouts", "core", "frequency_khz",
                                  "scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
-                                 "service_audio_ns", "service_graphics_ns"))
+                                 "service_audio_ns", "service_graphics_ns", "scene_check_ns"))
     result.update(startup=row.get("startup") is True,
                   hle_ns=numeric_fields(row.get("hle_ns", {}), HLE_GROUPS),
                   native_reference="unmeasured")
@@ -134,7 +134,8 @@ def classify(row: dict) -> dict:
         if duration >= max(8_000_000, wall * .3):
             candidates.append((duration, cause, "residual_hint" if key == "frontend_ns" else "measured"))
     work = active + row.get("service_audio_ns", 0) + row.get("service_graphics_ns", 0)
-    for key, cause in (("service_audio_ns", "host.audio_service"), ("service_graphics_ns", "host.graphics_service")):
+    for key, cause in (("service_audio_ns", "host.audio_service"), ("service_graphics_ns", "host.graphics_service"),
+                       ("scene_check_ns", "observer.scene_check")):
         duration = row.get(key, 0)
         if duration >= max(8_000_000, work * .3):
             candidates.append((duration, cause, "measured"))
@@ -167,7 +168,7 @@ def classify(row: dict) -> dict:
     evidence.update(hle_ns=hle, wait_ns=row.get("wait_ns"), wait_overshoot_ns=overshoot,
                     core=row.get("core"), frequency_khz=row.get("frequency_khz"), top_apis=row.get("top_apis", []),
                     **numeric_fields(row, ("scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
-                                           "service_audio_ns", "service_graphics_ns")))
+                                           "service_audio_ns", "service_graphics_ns", "scene_check_ns")))
     return {"cause": cause, "confidence": confidence, "evidence": evidence}
 
 

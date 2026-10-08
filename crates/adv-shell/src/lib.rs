@@ -1682,12 +1682,30 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
-        if let Some(completion) = scene_gate.observe(
+        let scene_check_before = runtime
+            .machine
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .map(|_| scene_gate.check_duration());
+        let completion = scene_gate.observe(
             runtime.presented_frames(),
             runtime.frame().width,
             &runtime.frame().bgra,
             Instant::now(),
-        ) {
+        );
+        if let Some(before) = scene_check_before {
+            runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_mut()
+                .unwrap()
+                .scene_check(scene_gate.check_duration().saturating_sub(before));
+        }
+        if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
         if options

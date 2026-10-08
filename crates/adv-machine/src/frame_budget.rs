@@ -49,6 +49,7 @@ struct Row {
     scheduler_ns: u64,
     frontend_ns: u64,
     control_pause_ns: u64,
+    scene_check_ns: u64,
     accounting_excess_ns: u64,
     hle_ns: [u64; 4],
     top_apis: Vec<Api>,
@@ -67,7 +68,7 @@ impl Row {
             concat!(
                 "{{\"serial\":{},\"startup\":{},\"wall_ns\":{},\"active_ns\":{},\"guest_exec_ns\":{},",
                 "\"service_audio_ns\":{},\"service_graphics_ns\":{},",
-                "\"scheduler_ns\":{},\"frontend_ns\":{},\"control_pause_ns\":{},\"accounting_excess_ns\":{},",
+                "\"scheduler_ns\":{},\"frontend_ns\":{},\"control_pause_ns\":{},\"scene_check_ns\":{},\"accounting_excess_ns\":{},",
                 "\"hle_ns\":{{\"graphics\":{},\"file\":{},\"audio\":{},\"other\":{}}},\"top_apis\":[{}],",
                 "\"present_call_ns\":{},\"wait_ns\":{},\"wait_overshoot_ns\":{},\"wait_timeouts\":{},",
                 "\"cpu\":{},\"core\":{},\"frequency_khz\":{},\"native_reference\":\"unmeasured\"}}"
@@ -82,6 +83,7 @@ impl Row {
             self.scheduler_ns,
             self.frontend_ns,
             self.control_pause_ns,
+            self.scene_check_ns,
             self.accounting_excess_ns,
             self.hle_ns[0],
             self.hle_ns[1],
@@ -114,6 +116,7 @@ pub struct FrameBudget {
     scheduler_started: Option<Instant>,
     machine_ns: u64,
     control_pause_ns: u64,
+    scene_check_ns: u64,
     hle_ns: [u64; 4],
     present_call_ns: u64,
     wait_ns: u64,
@@ -147,6 +150,7 @@ impl FrameBudget {
             scheduler_started: None,
             machine_ns: 0,
             control_pause_ns: 0,
+            scene_check_ns: 0,
             hle_ns: [0; 4],
             present_call_ns: 0,
             wait_ns: 0,
@@ -215,6 +219,10 @@ impl FrameBudget {
     pub fn control_pause(&mut self, elapsed: Duration) {
         self.control_pause_ns += elapsed.as_nanos() as u64;
     }
+    /// Reuse the scene gate's existing timing; this adds no clock read.
+    pub fn scene_check(&mut self, elapsed: Duration) {
+        self.scene_check_ns += elapsed.as_nanos() as u64;
+    }
     pub fn wait(&mut self, requested: Option<Duration>, elapsed: Duration, timed_out: bool) {
         self.wait_ns += elapsed.as_nanos() as u64;
         if timed_out {
@@ -244,6 +252,7 @@ impl FrameBudget {
             + scheduler_ns
             + self.wait_ns
             + self.control_pause_ns
+            + self.scene_check_ns
             + delta.frontend_audio_ns
             + delta.frontend_render_ns;
         self.touched
@@ -269,6 +278,7 @@ impl FrameBudget {
             scheduler_ns,
             frontend_ns: wall_ns.saturating_sub(accounted_ns),
             control_pause_ns: self.control_pause_ns,
+            scene_check_ns: self.scene_check_ns,
             accounting_excess_ns: accounted_ns.saturating_sub(wall_ns),
             hle_ns: self.hle_ns,
             top_apis,
@@ -295,6 +305,7 @@ impl FrameBudget {
         self.timeouts = 0;
         self.machine_ns = 0;
         self.control_pause_ns = 0;
+        self.scene_check_ns = 0;
         if self.skipped_partial {
             self.skipped_partial = false;
         } else {
@@ -453,6 +464,7 @@ mod tests {
         b.machine_ns = 20_000_000;
         b.wait_ns = 10_000_000;
         b.control_pause_ns = 5_000_000;
+        b.scene_check(Duration::from_millis(1));
         b.last = Instant::now() - Duration::from_millis(50);
         b.mark_frame(1);
         b.finish(
@@ -466,7 +478,19 @@ mod tests {
         );
         let row = b.rows.back().unwrap();
         assert_eq!(row.scheduler_ns, 5_000_000);
-        assert!(row.frontend_ns >= 5_000_000 && row.frontend_ns < 6_000_000);
+        assert!(row.frontend_ns >= 4_000_000);
+        assert_eq!(row.scene_check_ns, 1_000_000);
+        assert_eq!(
+            row.wall_ns,
+            row.active_ns
+                + row.scheduler_ns
+                + row.frontend_ns
+                + row.wait_ns
+                + row.control_pause_ns
+                + row.scene_check_ns
+                + row.service_audio_ns
+                + row.service_graphics_ns
+        );
         assert_eq!(
             (row.service_audio_ns, row.service_graphics_ns),
             (8_000_000, 2_000_000)
@@ -475,7 +499,10 @@ mod tests {
         assert_eq!(row.top_apis[0].name, "fixture.dll!api6");
         assert!(b.apis.iter().all(|a| a.ns == 0 && a.calls == 0));
         assert!(b.touched.is_empty());
-        assert_eq!((b.machine_ns, b.control_pause_ns), (0, 0));
+        assert_eq!(
+            (b.machine_ns, b.control_pause_ns, b.scene_check_ns),
+            (0, 0, 0)
+        );
         assert!(
             Api {
                 name: "quote\"\n".into(),

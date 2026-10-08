@@ -34,6 +34,9 @@ class FrameBudgetTests(unittest.TestCase):
         self.assertEqual(result["cause"], "host.audio_service")
         row["service_audio_ns"] = 7_000_000
         self.assertEqual(budget.classify(row)["cause"], "platform.mixed_wait_execution_services")
+        row["service_audio_ns"] = 0
+        row["scene_check_ns"] = 10_000_000
+        self.assertEqual(budget.classify(row)["cause"], "observer.scene_check")
 
     def test_explicit_host_costs_and_observer_freezes_have_separate_causes(self):
         for field, cause in (("scheduler_ns", "host.scheduler"), ("frontend_ns", "host.frontend_control"),
