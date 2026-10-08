@@ -220,24 +220,52 @@ fn output_completion_never_masks_a_handler_failure() {
 
 #[test]
 fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     for jit in [false, true] {
         let mut r = Registry::default();
-        r.add("test", "slow", Conv::Stdcall { argc: 0 }, |env| {
-            std::thread::sleep(Duration::from_millis(15));
+        r.add("test", "present", Conv::Stdcall { argc: 0 }, |env| {
             env.sys.complete_frame();
+            env.ext
+                .get::<Arc<AtomicBool>>()
+                .store(true, Ordering::Release);
             Outcome::defer(|_| panic!("expired watchdog ran subsequent host work"))
         });
         let mut m = setup(JitCpu::new(PARK, jit).unwrap(), r);
         m.set_frame_handoff(false);
-        m.set_execution_budget(Some(Duration::from_millis(5)));
-        let slow = m.resolve_import("test", "slow").unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        m.cpu.executor_mut().set_host_interrupt_flag(flag.clone());
+        m.ext.insert(flag.clone());
+        let present = m.resolve_import("test", "present").unwrap();
         let mut a = Asm::new(CODE);
-        a.call(slow).ret();
+        a.call(present).ret();
         m.cpu.write(CODE, &a.bytes).unwrap();
         if jit {
             compile(&mut m.cpu, CODE, a.bytes.len());
         }
         m.spawn("producer", CODE, &[], 65536).unwrap();
+
+        // A short wall budget can expire during cold execution before the frame
+        // handler runs. Pause explicitly after it commits the frame and queues
+        // Defer, then expire the watchdog at that retained driver boundary.
+        while !flag.load(Ordering::Acquire) {
+            let result = m.run_slice(Duration::from_millis(200));
+            assert!(matches!(result, SliceResult::Yielded), "{result:?}");
+        }
+        assert_eq!(m.sys.completed_frames, 1);
+        assert_eq!(m.sys.host_calls, 1);
+        assert_eq!(m.sys.scheduling.external_interrupts, 1);
+        assert_eq!(m.sys.scheduling.frame_host_yields, 0);
+        assert!(m.sys.context(0).blocked_thunk().is_some());
+        let cpu_runs = m.sys.stats.total.cpu_runs;
+
+        // Hard expiration must win over the queued continuation and any frame
+        // handoff; no real-time sleep or startup-speed assumption is required.
+        m.set_execution_budget(Some(Duration::ZERO));
+        flag.store(false, Ordering::Release);
         let SliceResult::Complete(RunResult::Failed(error)) =
             m.run_slice(Duration::from_millis(200))
         else {
@@ -245,7 +273,9 @@ fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() 
         };
         assert!(error.message.contains("execution budget exhausted"));
         assert_eq!(m.sys.completed_frames, 1);
+        assert_eq!(m.sys.host_calls, 1);
         assert_eq!(m.sys.scheduling.frame_host_yields, 0);
+        assert_eq!(m.sys.stats.total.cpu_runs, cpu_runs);
     }
 }
 
