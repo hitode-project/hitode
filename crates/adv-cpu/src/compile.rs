@@ -2335,6 +2335,8 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     }
     #[cfg(feature = "gir-capture")]
     crate::gir_capture::record(region, snapshot.origin, bytes, &instructions);
+    #[cfg(feature = "gir-lift")]
+    crate::gir::diagnostics::record(&instructions, region.start);
     Ok(Compiled {
         ir_counts: ir_counts.map(|counts| {
             counts.into_inner().finish(
