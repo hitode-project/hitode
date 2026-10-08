@@ -64,6 +64,16 @@ pub(crate) struct Trace {
     /// The interpreter stopped before an instruction it could not trace, which
     /// native code may have executed; a difference is then inconclusive.
     cut: bool,
+    /// Tier 1 promises exact sticky flags; Cranelift retains its diagnostic allowance.
+    exact_mxcsr: bool,
+    /// A zero-retirement trap can still commit status (for example #XM).
+    stopped: Option<Stopped>,
+}
+
+struct Stopped {
+    steps: usize,
+    step: Step,
+    state: (ArchitecturalState, usize, u32),
 }
 
 struct Written {
@@ -156,6 +166,8 @@ impl Verifier {
             states: Vec::new(),
             writes: Vec::new(),
             cut: true,
+            exact_mxcsr: elements,
+            stopped: None,
         };
         let mut undefined = 0;
         for step in 0..=MAX_STEPS {
@@ -185,9 +197,20 @@ impl Verifier {
             if execution.step != Step::Executed || execution.units != 1 {
                 // Undo whatever a stopped instruction committed; no recorded
                 // state follows it, so its new bytes are never expected.
-                for (&(address, _), old) in footprint.iter().zip(old) {
-                    let new = old.clone();
+                for (&(address, len), old) in footprint.iter().zip(old) {
+                    let new = memory.read_data(address, len)?.into_owned();
                     trace.writes.push(Written { address, old, new });
+                }
+                if elements && execution.units == 0 {
+                    trace.stopped = Some(Stopped {
+                        steps: step,
+                        step: execution.step,
+                        state: (
+                            state.clone().capture_architecture(),
+                            trace.writes.len(),
+                            undefined,
+                        ),
+                    });
                 }
                 break;
             }
@@ -206,6 +229,32 @@ impl Verifier {
 }
 
 impl Trace {
+    /// Compare the delivered trap as well as any status committed without
+    /// retirement. A normal exit still compares the pre-trap retired prefix.
+    pub(crate) fn check_tier1(
+        &self,
+        steps: usize,
+        step: Step,
+        state: &CpuState,
+        memory: &Memory,
+    ) -> Option<Result<Check, String>> {
+        if step == Step::Executed {
+            return self.check_at(steps, state, memory);
+        }
+        let stopped = self.stopped.as_ref().filter(|s| s.steps == steps)?;
+        if stopped.step != step {
+            return Some(Err(format!(
+                "Tier 1 trap differs: {:?} versus {:?}",
+                step, stopped.step
+            )));
+        }
+        let native = state.clone().capture_architecture();
+        Some(
+            self.compare(&stopped.state, &native, memory)
+                .map_err(|diff| self.report(&native, &diff)),
+        )
+    }
+
     /// Compare the native exit with interpreted states at its PC. `None` when
     /// no interpreted state reached it, or none matched a cut trace.
     pub(crate) fn check(&self, state: &CpuState, memory: &Memory) -> Option<Result<Check, String>> {
@@ -252,7 +301,8 @@ impl Trace {
         let mut interpreted = interpreted.clone();
         interpreted.eflags = interpreted.eflags & !undefined | native.eflags & undefined;
         let mut mxcsr = false;
-        if interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS
+        if !self.exact_mxcsr
+            && interpreted.mxcsr & !MXCSR_FLAGS == native.mxcsr & !MXCSR_FLAGS
             && interpreted.mxcsr != native.mxcsr
         {
             interpreted.mxcsr = native.mxcsr;
@@ -644,6 +694,59 @@ mod tests {
             trace.check(&state, &memory),
             Some(Ok(Check::MxcsrFlags))
         ));
+    }
+
+    #[test]
+    fn tier1_mxcsr_sticky_bits_are_architectural_mismatches() {
+        let (mut trace, state, memory) = traced(&CODE_BYTES);
+        trace.cut = false;
+        trace.exact_mxcsr = true;
+        for bit in 0..6 {
+            let mut changed = state.clone();
+            changed.mxcsr ^= 1 << bit;
+            assert!(trace.check(&changed, &memory).unwrap().is_err());
+            assert!(
+                trace
+                    .check_at(trace.states.len() - 1, &changed, &memory)
+                    .unwrap()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_verifies_status_committed_by_an_unretired_sse_trap() {
+        use iced_x86::code_asm::*;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.comiss(xmm0, xmm1).unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let mut memory = Memory::new(CODE, 4096).unwrap();
+        memory.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+        memory.write(CODE, &code).unwrap();
+        let mut state = CpuState {
+            eip: CODE,
+            mxcsr: 0x1f00,
+            ..Default::default()
+        };
+        state.xmm[0][..4].copy_from_slice(&0x7fc12345u32.to_le_bytes());
+        let trace = Verifier::new(true)
+            .record_tier1(CODE, 0, &mut Interpreter::new(), &mut state, &mut memory)
+            .unwrap();
+        assert_eq!(state.mxcsr, 0x1f00);
+        let execution = Interpreter::new().run_chunk(&mut state, &mut memory, 1);
+        assert_eq!(execution.units, 0);
+        assert_eq!(state.mxcsr, 0x1f01);
+        assert!(matches!(
+            trace.check_tier1(0, execution.step, &state, &memory),
+            Some(Ok(Check::Equal))
+        ));
+        state.mxcsr ^= 1;
+        assert!(
+            trace
+                .check_tier1(0, execution.step, &state, &memory)
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
