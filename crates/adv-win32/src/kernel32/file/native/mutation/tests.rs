@@ -362,7 +362,9 @@ fn set(env: &mut Env<'_>) -> Outcome {
             env.cpu.write_u32(args[2] + 8, name.len() as u32).unwrap();
         } else {
             assert_eq!((args[4], args[3]), (13, 1));
-            env.cpu.write(args[2], &[0]).unwrap(); // Guest changes delete into cancel.
+            if mode == 3 {
+                env.cpu.write(args[2], &[0]).unwrap(); // Guest changes delete into cancel.
+            }
         }
         Outcome::Return(crate::ntdll::file::set(
             env,
@@ -378,13 +380,16 @@ fn closed(env: &mut Env<'_>) -> Outcome {
     let handle = env.arg(0);
     assert_eq!(handle, env.ext.get::<Provider>().handle);
     env.ext.get_mut::<Provider>().closes += 1;
+    let override_status = matches!(env.ext.get::<Provider>().mode, 4 | 5);
     let sleep = env
         .sys
         .thunks
         .resolve(env.cpu, "kernel32.dll", "Sleep")
         .unwrap();
     Outcome::call(sleep, [1], move |env, _| {
-        Outcome::Return(crate::ntdll::file::close(env, Handle(handle)) as u32)
+        let status = crate::ntdll::file::close(env, Handle(handle)) as u32;
+        assert_eq!(status, 0);
+        Outcome::Return(if override_status { 0xc0000022 } else { status })
     })
 }
 fn native<B: Backend>(machine: &mut Machine<B>, name: &str) -> u32 {
@@ -436,7 +441,13 @@ fn hooks<B: Backend>(cpu: B, mode: u32) {
             .resolve_import("authored-mutation-provider", "install")
             .unwrap(),
     );
-    if mode == 3 {
+    code.push_imm(0x13572468);
+    code.call(
+        machine
+            .resolve_import("kernel32.dll", "SetLastError")
+            .unwrap(),
+    );
+    if matches!(mode, 3 | 5) {
         code.push_imm(DATA);
         code.call(
             machine
@@ -468,12 +479,20 @@ fn hooks<B: Backend>(cpu: B, mode: u32) {
     );
     if mode == 2 {
         assert_eq!(machine.cpu.read_u32(DATA + 132).unwrap(), 5);
+    } else {
+        assert_eq!(machine.cpu.read_u32(DATA + 132).unwrap(), 0x13572468);
     }
     let p = machine.ext.get::<Provider>();
     assert_eq!((p.sets, p.closes), (1, 1));
     assert_eq!(machine.sys.objects.all_hosts::<crate::FileObj>().count(), 0);
-    assert_eq!(root.join("data/overlay/source.dat").exists(), mode != 1);
-    assert_eq!(root.join("data/overlay/hooked.dat").exists(), mode == 1);
+    assert_eq!(
+        root.join("data/overlay/source.dat").exists(),
+        matches!(mode, 2 | 3)
+    );
+    assert_eq!(
+        root.join("data/overlay/hooked.dat").exists(),
+        matches!(mode, 1 | 4)
+    );
     assert!(!root.join("data/overlay/target.dat").exists());
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
@@ -481,7 +500,7 @@ fn hooks<B: Backend>(cpu: B, mode: u32) {
 #[cfg(windows)]
 #[test]
 fn live_mutation_hooks_change_parameters_suspend_and_report_failures() {
-    for mode in 1..=3 {
+    for mode in 1..=5 {
         hooks(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
         hooks(UnicornCpu::new(PARK_ADDR).unwrap(), mode);
     }

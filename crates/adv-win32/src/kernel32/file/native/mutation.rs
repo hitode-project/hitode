@@ -191,7 +191,9 @@ fn mutate(env: &mut Env<'_>, path: String, class: u32, input: Vec<u8>) -> Outcom
                 close(
                     env,
                     handle,
-                    Box::new(move |env, closed| result(env, class, changed.and(closed))),
+                    // Win32 decides the mutation result from NtSetInformationFile;
+                    // native cleanup still runs, but its status is not propagated.
+                    Box::new(move |env, _closed| result(env, class, changed)),
                 )
             }),
         )
