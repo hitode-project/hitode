@@ -260,14 +260,6 @@ fn rtl_raise(env: &mut Env<'_>) -> Outcome {
 
 fn nt_raise(env: &mut Env<'_>) -> Outcome {
     let (record, context, first) = (env.arg(0), env.arg(1), env.arg(2));
-    if first as u8 == 0 {
-        adv_abi::warn_unavailable(
-            env,
-            "ntdll.dll!NtRaiseException",
-            "second-chance native exception delivery is unavailable",
-        );
-        return Outcome::Return(0xc00000bb);
-    }
     let record_value = match read_record(env, record) {
         Ok(record) => record,
         Err(_) => return Outcome::Return(0xc0000005),
@@ -291,7 +283,58 @@ fn nt_raise(env: &mut Env<'_>) -> Outcome {
         adv_abi::warn_unavailable(env, "ntdll.dll!NtRaiseException", &reason);
         return Outcome::Return(0xc00000bb);
     }
+    if first as u8 == 0 {
+        // With no guest debugger, a second-chance service request is terminal.
+        // It must not restart VEH/SEH or call the user-mode top-level filter.
+        // Use the existing Windows failure owner so child process exit status
+        // and diagnostics retain the supplied exception code.
+        return terminal(env, &record_value);
+    }
     super::dispatch_origin(env, checkpoint, record_value, Source::NativeService)
+}
+
+fn terminal(env: &mut Env<'_>, record: &Record) -> Outcome {
+    env.sys.guest_failure_code = Some(record.code);
+    Outcome::Fail(format!(
+        "unhandled Windows exception {:#010x} at {:#010x} (second chance)",
+        record.code, record.address
+    ))
+}
+
+/// Exhausted first-chance search reaches the same live NT service, with FALSE.
+/// The observer can still end the process; calling the original is terminal.
+pub(super) fn unhandled(env: &mut Env<'_>, search: Search) -> Outcome {
+    match crate::native::overridden(env, "NtRaiseException") {
+        Ok(Some(target)) => {
+            let scratch = search.scratch;
+            let owned = retain(
+                env,
+                Kind::NativeRaise,
+                scratch,
+                scratch + CONTEXT,
+                Payload::Search(search),
+            );
+            Outcome::call_on_stack(
+                target,
+                [scratch, scratch + CONTEXT, 0],
+                scratch,
+                move |env, _| {
+                    drop(owned);
+                    unsupported(
+                        env,
+                        "ntdll.dll!NtRaiseException",
+                        "second-chance delivery returned without completing the exception",
+                    )
+                },
+            )
+            .unwindable()
+        }
+        Ok(None) => match read_record(env, search.scratch) {
+            Ok(record) => terminal(env, &record),
+            Err(reason) => Outcome::Fail(reason),
+        },
+        Err(_) => crate::native::unavailable(env, "NtRaiseException"),
+    }
 }
 
 pub(super) fn continue_execution(

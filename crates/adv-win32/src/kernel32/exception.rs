@@ -431,11 +431,7 @@ fn search(env: &mut Env<'_>, mut search: Search) -> Outcome {
         search.nested = Some(search.nested.map_or(establisher, |n| n.max(establisher)));
     }
     if frame == u32::MAX {
-        env.sys.guest_failure_code = Some(search.record.code);
-        return Outcome::Fail(format!(
-            "unhandled Windows exception {:#010x} at {:#010x}",
-            search.record.code, search.record.address
-        ));
+        return native::unhandled(env, search);
     }
     if search.searched >= LIMIT
         || frame & 3 != 0
