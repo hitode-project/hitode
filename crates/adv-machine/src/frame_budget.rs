@@ -11,6 +11,32 @@ const CAPACITY: usize = 2048;
 const NORMAL_CAPACITY: usize = 16;
 const PERCENTILE_CAPACITY: usize = 4096;
 
+#[derive(Clone, Debug, Default)]
+struct Api {
+    name: String,
+    ns: u64,
+    calls: u64,
+}
+impl Api {
+    fn json(&self) -> String {
+        // Export names are untrusted input; never interpolate raw JSON strings.
+        let name = self
+            .name
+            .chars()
+            .map(|c| match c {
+                '\\' => "\\\\".into(),
+                '"' => "\\\"".into(),
+                c if c.is_control() => format!("\\u{:04x}", c as u32),
+                c => c.to_string(),
+            })
+            .collect::<String>();
+        format!(
+            "{{\"api\":\"{}\",\"ns\":{},\"calls\":{}}}",
+            name, self.ns, self.calls
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Row {
     serial: u64,
@@ -18,7 +44,15 @@ struct Row {
     wall_ns: u64,
     active_ns: u64,
     guest_exec_ns: u64,
+    service_audio_ns: u64,
+    service_graphics_ns: u64,
+    scheduler_ns: u64,
+    frontend_ns: u64,
+    control_pause_ns: u64,
+    scene_check_ns: u64,
+    accounting_excess_ns: u64,
     hle_ns: [u64; 4],
+    top_apis: Vec<Api>,
     present_call_ns: u64,
     wait_ns: u64,
     wait_overshoot_ns: u64,
@@ -33,7 +67,9 @@ impl Row {
         format!(
             concat!(
                 "{{\"serial\":{},\"startup\":{},\"wall_ns\":{},\"active_ns\":{},\"guest_exec_ns\":{},",
-                "\"hle_ns\":{{\"graphics\":{},\"file\":{},\"audio\":{},\"other\":{}}},",
+                "\"service_audio_ns\":{},\"service_graphics_ns\":{},",
+                "\"scheduler_ns\":{},\"frontend_ns\":{},\"control_pause_ns\":{},\"scene_check_ns\":{},\"accounting_excess_ns\":{},",
+                "\"hle_ns\":{{\"graphics\":{},\"file\":{},\"audio\":{},\"other\":{}}},\"top_apis\":[{}],",
                 "\"present_call_ns\":{},\"wait_ns\":{},\"wait_overshoot_ns\":{},\"wait_timeouts\":{},",
                 "\"cpu\":{},\"core\":{},\"frequency_khz\":{},\"native_reference\":\"unmeasured\"}}"
             ),
@@ -42,10 +78,22 @@ impl Row {
             self.wall_ns,
             self.active_ns,
             self.guest_exec_ns,
+            self.service_audio_ns,
+            self.service_graphics_ns,
+            self.scheduler_ns,
+            self.frontend_ns,
+            self.control_pause_ns,
+            self.scene_check_ns,
+            self.accounting_excess_ns,
             self.hle_ns[0],
             self.hle_ns[1],
             self.hle_ns[2],
             self.hle_ns[3],
+            self.top_apis
+                .iter()
+                .map(Api::json)
+                .collect::<Vec<_>>()
+                .join(","),
             self.present_call_ns,
             self.wait_ns,
             self.wait_overshoot_ns,
@@ -63,6 +111,12 @@ pub struct FrameBudget {
     previous: FrameRow,
     previous_cpu: Option<FrameCounters>,
     classes: Vec<usize>,
+    apis: Vec<Api>,
+    touched: Vec<usize>,
+    scheduler_started: Option<Instant>,
+    machine_ns: u64,
+    control_pause_ns: u64,
+    scene_check_ns: u64,
     hle_ns: [u64; 4],
     present_call_ns: u64,
     wait_ns: u64,
@@ -91,6 +145,12 @@ impl FrameBudget {
             previous,
             previous_cpu: cpu,
             classes: Vec::new(),
+            apis: Vec::new(),
+            touched: Vec::new(),
+            scheduler_started: None,
+            machine_ns: 0,
+            control_pause_ns: 0,
+            scene_check_ns: 0,
             hle_ns: [0; 4],
             present_call_ns: 0,
             wait_ns: 0,
@@ -129,12 +189,39 @@ impl FrameBudget {
         while self.classes.len() <= index {
             let f = thunks.get(self.classes.len() as u32);
             self.classes.push(classify(&f.module, &f.name));
+            self.apis.push(Api {
+                name: format!("{}!{}", f.module, f.name),
+                ..Default::default()
+            });
         }
+        let api = &mut self.apis[index];
+        if api.calls == 0 {
+            self.touched.push(index);
+        }
+        api.ns += ns;
+        api.calls += 1;
         self.hle_ns[self.classes[index]] += ns;
         // The full presenting handler/continuation is an inclusive subset of HLE.
         if self.pending.is_some() {
             self.present_call_ns += ns;
         }
+    }
+    pub fn enter_scheduler(&mut self) {
+        debug_assert!(self.scheduler_started.is_none());
+        self.scheduler_started = Some(Instant::now());
+    }
+    pub fn leave_scheduler(&mut self) {
+        if let Some(started) = self.scheduler_started.take() {
+            self.machine_ns += started.elapsed().as_nanos() as u64;
+        }
+    }
+    /// Explicit diagnostic freezes are not guest waits or scheduler work.
+    pub fn control_pause(&mut self, elapsed: Duration) {
+        self.control_pause_ns += elapsed.as_nanos() as u64;
+    }
+    /// Reuse the scene gate's existing timing; this adds no clock read.
+    pub fn scene_check(&mut self, elapsed: Duration) {
+        self.scene_check_ns += elapsed.as_nanos() as u64;
     }
     pub fn wait(&mut self, requested: Option<Duration>, elapsed: Duration, timed_out: bool) {
         self.wait_ns += elapsed.as_nanos() as u64;
@@ -146,18 +233,55 @@ impl FrameBudget {
         }
     }
     pub fn finish(&mut self, total: FrameRow, cpu: Option<FrameCounters>) {
-        let Some((serial, at)) = self.pending.take() else {
+        let Some((serial, _presented_at)) = self.pending.take() else {
             return;
         };
         let observer = Instant::now();
+        // Align wall and all cost counters at the same CPU-return boundary.
+        let at = observer;
+        if let Some(started) = self.scheduler_started.replace(at) {
+            self.machine_ns += at.saturating_duration_since(started).as_nanos() as u64;
+        } else {
+            self.scheduler_started = None;
+        }
         let delta = total.sub(&self.previous);
+        let active_ns = delta.run_ns + delta.resume_ns;
+        let wall_ns = at.saturating_duration_since(self.last).as_nanos() as u64;
+        let scheduler_ns = self.machine_ns.saturating_sub(active_ns);
+        let accounted_ns = active_ns
+            + scheduler_ns
+            + self.wait_ns
+            + self.control_pause_ns
+            + self.scene_check_ns
+            + delta.frontend_audio_ns
+            + delta.frontend_render_ns;
+        self.touched
+            .sort_unstable_by_key(|&i| (std::cmp::Reverse(self.apis[i].ns), i));
+        let top_apis = self
+            .touched
+            .iter()
+            .take(5)
+            .map(|&i| self.apis[i].clone())
+            .collect();
+        for i in self.touched.drain(..) {
+            self.apis[i].ns = 0;
+            self.apis[i].calls = 0;
+        }
         let row = Row {
             serial,
             startup: self.previous.frame == u32::MAX && !self.skipped_partial,
-            wall_ns: at.saturating_duration_since(self.last).as_nanos() as u64,
-            active_ns: delta.run_ns + delta.resume_ns,
+            wall_ns,
+            active_ns,
             guest_exec_ns: delta.run_ns.saturating_sub(delta.hook_ns),
+            service_audio_ns: delta.frontend_audio_ns,
+            service_graphics_ns: delta.frontend_render_ns,
+            scheduler_ns,
+            frontend_ns: wall_ns.saturating_sub(accounted_ns),
+            control_pause_ns: self.control_pause_ns,
+            scene_check_ns: self.scene_check_ns,
+            accounting_excess_ns: accounted_ns.saturating_sub(wall_ns),
             hle_ns: self.hle_ns,
+            top_apis,
             present_call_ns: self.present_call_ns,
             wait_ns: self.wait_ns,
             wait_overshoot_ns: self.overshoot_ns,
@@ -179,6 +303,9 @@ impl FrameBudget {
         self.wait_ns = 0;
         self.overshoot_ns = 0;
         self.timeouts = 0;
+        self.machine_ns = 0;
+        self.control_pause_ns = 0;
+        self.scene_check_ns = 0;
         if self.skipped_partial {
             self.skipped_partial = false;
         } else {
@@ -324,6 +451,68 @@ fn platform_sample() -> (Option<u32>, Option<u64>) {
 mod tests {
     use super::*;
     #[test]
+    fn api_top_five_and_scheduler_accounting_reset_at_cpu_return() {
+        let mut b = FrameBudget::new(FrameRow::default(), None);
+        b.apis = (0..7)
+            .map(|n| Api {
+                name: format!("fixture.dll!api{n}"),
+                ns: n * 100,
+                calls: 2,
+            })
+            .collect();
+        b.touched = (0..7).collect();
+        b.machine_ns = 20_000_000;
+        b.wait_ns = 10_000_000;
+        b.control_pause_ns = 5_000_000;
+        b.scene_check(Duration::from_millis(1));
+        b.last = Instant::now() - Duration::from_millis(50);
+        b.mark_frame(1);
+        b.finish(
+            FrameRow {
+                run_ns: 15_000_000,
+                frontend_audio_ns: 8_000_000,
+                frontend_render_ns: 2_000_000,
+                ..Default::default()
+            },
+            None,
+        );
+        let row = b.rows.back().unwrap();
+        assert_eq!(row.scheduler_ns, 5_000_000);
+        assert!(row.frontend_ns >= 4_000_000);
+        assert_eq!(row.scene_check_ns, 1_000_000);
+        assert_eq!(
+            row.wall_ns,
+            row.active_ns
+                + row.scheduler_ns
+                + row.frontend_ns
+                + row.wait_ns
+                + row.control_pause_ns
+                + row.scene_check_ns
+                + row.service_audio_ns
+                + row.service_graphics_ns
+        );
+        assert_eq!(
+            (row.service_audio_ns, row.service_graphics_ns),
+            (8_000_000, 2_000_000)
+        );
+        assert_eq!(row.top_apis.len(), 5);
+        assert_eq!(row.top_apis[0].name, "fixture.dll!api6");
+        assert!(b.apis.iter().all(|a| a.ns == 0 && a.calls == 0));
+        assert!(b.touched.is_empty());
+        assert_eq!(
+            (b.machine_ns, b.control_pause_ns, b.scene_check_ns),
+            (0, 0, 0)
+        );
+        assert!(
+            Api {
+                name: "quote\"\n".into(),
+                ..Default::default()
+            }
+            .json()
+            .contains("quote\\\"\\u000a")
+        );
+    }
+    #[test]
     fn counts_survive_ring_eviction_and_waits_are_separate() {
         let mut b = FrameBudget::new(FrameRow::default(), Some(FrameCounters::default()));
         for serial in 1..=2200 {
@@ -333,7 +522,7 @@ mod tests {
                 Duration::from_millis(42),
                 true,
             );
-            b.pending.as_mut().unwrap().1 = b.last + Duration::from_millis(50);
+            b.last = Instant::now() - Duration::from_millis(50);
             b.finish(
                 FrameRow {
                     run_ns: serial * 8_000_000,
@@ -359,7 +548,7 @@ mod tests {
         b.reset(FrameRow::default(), None);
         for serial in 1..=3000 {
             b.mark_frame(serial);
-            b.pending.as_mut().unwrap().1 = b.last + Duration::from_millis(16);
+            b.last = Instant::now() - Duration::from_millis(16);
             b.finish(FrameRow::default(), None);
         }
         assert_eq!((b.frames, b.over), (2999, 0));

@@ -16,8 +16,6 @@ mod parallel;
 mod schedule;
 pub use schedule::CompilationSchedule;
 mod aot;
-#[cfg(any(test, feature = "gir-execute"))]
-mod gir;
 mod persistent;
 mod tier1;
 mod verify;
@@ -66,6 +64,8 @@ pub struct Stats {
     pub interpreter_instructions: u64,
     pub interpreter_entries: u64,
     pub native_blocks: u64,
+    /// Opt-in exact Tier 0 retirement, excluding REP elements and oracle replay.
+    pub frame_retired_tier0: u64,
     pub invalidations: u64,
     /// Region candidates checked after changes to their code pages only.
     pub invalidation_candidates: u64,
@@ -155,11 +155,9 @@ pub struct Executor {
     pub(crate) memory: Memory,
     region_linking: bool,
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
-    interpreter: crate::interpreter::Interpreter,
+    pub(crate) interpreter: crate::interpreter::Interpreter,
     tier1: Option<crate::tier1::Engine>,
     tier1_mode: crate::Tier1Mode,
-    #[cfg(any(test, feature = "gir-execute"))]
-    gir: Option<crate::gir::execution::Engine>,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
     tiered_compilation: bool,
@@ -466,8 +464,6 @@ impl Executor {
             interpreter: crate::interpreter::Interpreter::new(),
             tier1: None,
             tier1_mode: crate::Tier1Mode::Off,
-            #[cfg(any(test, feature = "gir-execute"))]
-            gir: None,
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
             tiered_compilation: true,
@@ -521,11 +517,9 @@ impl Executor {
         if std::env::var("ADV_DIRECT_MEMORY").is_ok_and(|value| value == "1") {
             executor.set_direct_memory(true)?;
         }
-        #[cfg(feature = "gir-execute")]
         match std::env::var("ADV_GIR").as_deref() {
-            Ok("state-ssa") => executor.set_gir_state_ssa(true)?,
             Ok("off" | "" | "0") | Err(_) => {}
-            Ok(_) => return Err("unknown ADV_GIR selector (expected off or state-ssa)".into()),
+            Ok(_) => return Err("ADV_GIR execution has been removed; use the default GIR frontend or ADV_TIER2_FRONTEND=legacy for comparison".into()),
         }
         Ok(executor)
     }
@@ -632,10 +626,6 @@ impl Executor {
 
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
-        #[cfg(any(test, feature = "gir-execute"))]
-        if let Some(gir) = &mut self.gir {
-            gir.programs.clear();
-        }
         self.memory.quiesce_workers();
         self.code.clear_links();
         self.code.cache_revision += 1;
@@ -742,10 +732,6 @@ impl Executor {
     }
 
     fn retire_compiled(&mut self, start: u32) {
-        #[cfg(any(test, feature = "gir-execute"))]
-        if let Some(gir) = &mut self.gir {
-            gir.stats.invalidations += u64::from(gir.programs.remove(&start).is_some());
-        }
         if self.code.compiled.contains_key(&start) {
             self.memory.quiesce_workers();
         }
@@ -1156,13 +1142,6 @@ impl Executor {
             return Ok(());
         }
         self.observed_epoch = self.memory.epoch;
-        #[cfg(any(test, feature = "gir-execute"))]
-        if let Some(gir) = &mut self.gir {
-            let before = gir.programs.len();
-            gir.programs
-                .retain(|_, program| program.as_ref().is_none_or(|p| p.valid(&self.memory)));
-            gir.stats.invalidations += (before - gir.programs.len()) as u64;
-        }
         let mut affected = BTreeSet::new();
         for page in std::mem::take(&mut self.memory.dirty_pages) {
             if let Some(owners) = self.code.page_regions.get(&page) {
@@ -1706,23 +1685,7 @@ impl Executor {
                     && code.entries.contains(&self.state.eip)
                     && self.deferred_fallback != Some(self.state.eip)
             });
-            #[allow(unused_mut)]
-            let mut native = native.map(|(owner, _)| owner);
-            #[cfg(any(test, feature = "gir-execute"))]
-            if let Some(owner) = native
-                && let Some(status) = self.run_gir(owner, stop)?
-            {
-                use crate::gir::lower_cl as g;
-                match status {
-                    g::INTERRUPTED => return Ok(RunOutcome::Interrupted),
-                    g::READ_CHECK | g::WRITE_CHECK | g::UNSUPPORTED | g::GUARD => {
-                        self.deferred_fallback = Some(self.state.eip);
-                        bridge.cliffs.fallback(&self.memory, self.state.eip);
-                        native = None;
-                    }
-                    _ => continue,
-                }
-            }
+            let native = native.map(|(owner, _)| owner);
             if native.is_some()
                 && self.parallel.is_some()
                 && self.parallel_demand
@@ -1816,10 +1779,6 @@ impl Executor {
                     self.stats.shadow_overflows = shadow.overflows;
                 }
                 let completed = before - self.state.fuel;
-                #[cfg(any(test, feature = "gir-execute"))]
-                if let Some(gir) = &mut self.gir {
-                    gir.stats.other_units += completed;
-                }
                 if let Some((_, now)) = timed
                     && reserved != 0
                     && trace.is_none()
@@ -1937,6 +1896,7 @@ impl Executor {
                 )
             );
             let wait_timer = (self.frame_timing && waiting).then(Instant::now);
+            let retired_before = self.interpreter.frame_retired;
             let tier1 = self.run_tier1(
                 stop,
                 units,
@@ -1976,6 +1936,15 @@ impl Executor {
             let interpreted_units = tier1
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);
+            if tier1.is_none()
+                && let Some(before) = retired_before
+            {
+                self.stats.frame_retired_tier0 += self
+                    .interpreter
+                    .frame_retired
+                    .unwrap()
+                    .saturating_sub(before);
+            }
             if let Some(timer) = wait_timer {
                 self.stats.compile_wait_execution_ns += timer.elapsed().as_nanos() as u64;
                 self.stats.compile_wait_units += u64::from(execution.units);
@@ -2014,10 +1983,6 @@ impl Executor {
                 *self.demand.entry(pc).or_default() += 1;
             }
             self.state.fuel -= u64::from(execution.units);
-            #[cfg(any(test, feature = "gir-execute"))]
-            if let Some(gir) = &mut self.gir {
-                gir.stats.other_units += u64::from(execution.units);
-            }
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
                 p.interpreter_entries += u64::from(interpreted);
@@ -3243,6 +3208,12 @@ mod tiering_tests {
         m.state.regs[1] = 100_000;
         m.state.regs[4] = 0x4f00;
         m.state.regs[6] = 0x1000;
+        // Observe native heat only after Fast is published. A busy compiler
+        // must not let the finite fixture finish entirely in the interpreter.
+        m.hits.insert(0x1100, 31);
+        m.discover(0x3000).unwrap();
+        m.set_tiered_compilation(false);
+        collect(&mut m);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !m
             .code
@@ -3254,11 +3225,16 @@ mod tiering_tests {
             assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
             assert!(Instant::now() < deadline);
         }
+        // Keep the observed Fast profile alive until its heat is checked.
+        m.set_tiered_compilation(true);
         m.scan_profiles();
         collect(&mut m);
         let region = &m.code.regions[&0x1100];
         assert_eq!(region.callees, [0x1000]);
         assert_eq!(region.compile_strategy, CompileStrategy::Speed);
+        // Finish post-publication oracle samples before measuring steady-state
+        // entries: verification intentionally returns after each native block.
+        assert_eq!(m.run(0x3000, 1000).unwrap(), RunOutcome::Budget);
         // The call and its return no longer leave the unit.
         let entries = m.stats.native_entries;
         assert_eq!(m.run(0x3000, 3000).unwrap(), RunOutcome::Budget);
@@ -3484,6 +3460,32 @@ mod tiering_tests {
         assert_eq!(m.native_heat.get(&0x1000), Some(&1));
         assert!(!m.native_heat.contains_key(&0x1001));
         assert_eq!(m.state.regs[0], 0);
+    }
+}
+
+#[cfg(test)]
+mod removed_selector_tests {
+    use super::Executor;
+
+    #[test]
+    fn legacy_gir_execution_selector_fails_explicitly() {
+        if std::env::var("ADV_GIR").as_deref() != Ok("state-ssa") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "executor::removed_selector_tests::legacy_gir_execution_selector_fails_explicitly",
+                ])
+                .env("ADV_GIR", "state-ssa")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let error = Executor::new(0x10000, 4096)
+            .err()
+            .expect("removed execution selector must reject construction");
+        assert!(error.contains("ADV_GIR execution has been removed"));
+        assert!(error.contains("ADV_TIER2_FRONTEND=legacy"));
     }
 }
 

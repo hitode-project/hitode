@@ -1,5 +1,5 @@
-//! Usage: cargo run -p adv-win32 --release --example hle_wait_precision -- --data-dir DIR [--precise] [--interpreter].
-//! Inputs: owned data directory, optional host precision/backend switches.
+//! Usage: cargo run -p adv-win32 --release --example hle_wait_precision -- --data-dir DIR [--interpreter].
+//! Inputs: owned data directory, optional backend switch.
 //! Outputs: aggregate real-clock HLE wait distributions for authored API calls;
 //! no game, window, audio device or private guest state is involved.
 use adv_abi::Registry;
@@ -28,7 +28,6 @@ fn main() {
         .find(|pair| pair[0] == "--data-dir")
         .expect("--data-dir DIR is required")[1]
         .clone();
-    let precise = args.iter().any(|arg| arg == "--precise");
     let jit = !args.iter().any(|arg| arg == "--interpreter");
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
@@ -124,12 +123,7 @@ fn main() {
                 let delay = next_deadline
                     .map(|at| Duration::from_micros(at.saturating_sub(machine.sys.clock.now_us())));
                 let start = std::time::Instant::now();
-                let signaled = if precise {
-                    wake.wait_precise(delay)
-                } else {
-                    wake.wait(delay)
-                }
-                .unwrap();
+                let signaled = wake.wait(delay).unwrap();
                 machine
                     .sys
                     .stats

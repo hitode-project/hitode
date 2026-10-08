@@ -13,8 +13,6 @@ fn code_identity() -> u64 {
 
 mod direct;
 mod fast;
-#[cfg(any(test, feature = "gir-lower"))]
-pub(crate) mod gir;
 mod locks;
 
 pub(crate) use fast::FastPermissions;

@@ -4,7 +4,6 @@
 pub(crate) mod cfg;
 pub(crate) mod diagnostics;
 pub(crate) mod eval;
-pub(crate) mod hot;
 pub(crate) mod ir;
 pub(crate) mod lift;
 pub(crate) mod state_ssa;
@@ -13,7 +12,7 @@ pub(crate) mod verify;
 #[cfg(test)]
 mod semantic_tests;
 
-// Keep the original recovery experiments and measurement test paths intact.
+// Keep the standalone recovery prototypes test-only.
 #[cfg(all(
     test,
     any(
@@ -26,11 +25,3 @@ mod semantic_tests;
 ))]
 include!("prototype.rs");
 pub(crate) mod recovery;
-
-#[cfg(any(test, feature = "gir-lower"))]
-pub(crate) mod lower_cl;
-
-#[cfg(any(test, feature = "gir-execute"))]
-pub(crate) mod execution;
-#[cfg(test)]
-mod execution_tests;

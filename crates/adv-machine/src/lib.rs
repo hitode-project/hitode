@@ -2160,6 +2160,22 @@ impl<B: Backend> Machine<B> {
         started: Instant,
         hard_budget: Option<Duration>,
     ) -> SliceResult {
+        if let Some(budget) = &mut self.sys.stats.frame_budget {
+            budget.enter_scheduler();
+        }
+        let result = self.run_scheduler_inner(slice, started, hard_budget);
+        if let Some(budget) = &mut self.sys.stats.frame_budget {
+            budget.leave_scheduler();
+        }
+        result
+    }
+
+    fn run_scheduler_inner(
+        &mut self,
+        slice: Option<Duration>,
+        started: Instant,
+        hard_budget: Option<Duration>,
+    ) -> SliceResult {
         self.sys.clock.begin_work();
         if self.cpu.guest_workers() > 1 && self.sys.clock.is_virtual() {
             return SliceResult::Complete(

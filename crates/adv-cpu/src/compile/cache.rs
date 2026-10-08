@@ -12,7 +12,7 @@ pub(super) struct Bindings {
     pub kernels: std::sync::Mutex<Vec<usize>>,
 }
 
-const MAGIC: &[u8; 8] = b"ADVNAT02";
+const MAGIC: &[u8; 8] = b"ADVNAT03";
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
 const MAX_ITEMS: usize = 65_536;
 const MAX_KEY: usize = 256 * 1024;
@@ -197,6 +197,8 @@ fn isa_key() -> Result<&'static [u8], String> {
 pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     let mut w = Writer::default();
     w.bytes(MAGIC);
+    w.bytes(b"tier2-semantics-v1");
+    w.bool(snapshot.gir_frontend);
     w.bytes(env!("ADV_CPU_CODE_CACHE_FINGERPRINT").as_bytes());
     w.bytes(isa_key()?);
     w.bytes(std::env::consts::OS.as_bytes());
@@ -222,8 +224,6 @@ pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     w.bool(x87::enabled());
     w.bool(std::env::var_os("ADV_JIT_X87_SINGLE_ONLY").is_some_and(|value| value == "1"));
     w.bool(cfg!(feature = "gir-capture"));
-    w.bool(cfg!(feature = "gir-execute"));
-    w.bool(cfg!(feature = "gir-capture") && std::env::var_os("ADV_GIR_NATIVE").is_some());
     w.bool(coverage::enabled());
     w.bool(snapshot.cache_location.is_some());
     if let Some((base, relative)) = snapshot.cache_location {
@@ -872,8 +872,6 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
         .len();
     Ok(Compiled {
         _poll_target: None,
-        #[cfg(any(test, feature = "gir-execute"))]
-        gir_instructions: image.instructions.clone(),
         perf_ranges,
         module: owned.0.take(),
         cache_image: Some(Ok(bytes.to_vec())),
@@ -899,6 +897,10 @@ pub(crate) fn restore_snapshot(snapshot: &Snapshot, bytes: &[u8]) -> Result<Comp
         excluded_entries: image.excluded,
         code_size: image.code_size,
         instruction_count: image.instructions.len(),
+        #[cfg(test)]
+        gir_ssa_instructions: 0,
+        #[cfg(test)]
+        gir_opaque_instructions: 0,
         decoded_bytes: image.instructions.values().map(Instruction::len).sum(),
         ir_counts: None,
         direct_sites,

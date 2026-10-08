@@ -30,6 +30,7 @@ struct Options {
     headless: bool,
     hidden: bool,
     gpu_software: bool,
+    headless_gpu: bool,
     d3d9_sm2: bool,
     d3d9_sm3: bool,
     d3d9_shader_cache: Option<PathBuf>,
@@ -47,7 +48,6 @@ struct Options {
     profile: bool,
     control_stdin: bool,
     frame_budget: bool,
-    precise_waits: bool,
     audio: bool,
     codec: adv_runtime::vorbis::Policy,
     codec_kernels: adv_runtime::codec_kernels::Mode,
@@ -65,7 +65,6 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --no-row-batching       disable proven row batches for comparison\n\
   --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
-  --precise-waits         opt in to submillisecond Linux/Android host waits\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
   --no-region-linking     return to the dispatcher between native regions\n\
@@ -78,6 +77,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
+  --headless-gpu         opt in to a GPU frontend without a window\n\
   --d3d9-sm2             opt in to the SM2 capability milestone (default: off)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
@@ -123,6 +123,7 @@ impl Options {
             headless: false,
             hidden: false,
             gpu_software: false,
+            headless_gpu: false,
             d3d9_sm2: false,
             d3d9_sm3: false,
             d3d9_shader_cache: None,
@@ -147,7 +148,6 @@ impl Options {
             codec_signatures: None,
             api_mode: adv_runtime::RunMode::Strict,
             time_skip: true,
-            precise_waits: false,
         };
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
@@ -175,7 +175,6 @@ impl Options {
                     options.cdroms.push((letter, PathBuf::from(path)));
                 }
                 "--no-time-skip" => options.time_skip = false,
-                "--precise-waits" => options.precise_waits = true,
                 "--api-mode" => {
                     options.api_mode = match value()?.as_str() {
                         "strict" => adv_runtime::RunMode::Strict,
@@ -226,6 +225,7 @@ impl Options {
                 "--headless" => options.headless = true,
                 "--hidden" => options.hidden = true,
                 "--gpu-software" => options.gpu_software = true,
+                "--headless-gpu" => options.headless_gpu = true,
                 "--d3d9-sm2" => options.d3d9_sm2 = true,
                 "--d3d9-sm3" => options.d3d9_sm3 = true,
                 "--d3d9-shader-cache" => options.d3d9_shader_cache = Some(value()?.into()),
@@ -275,8 +275,15 @@ impl Options {
         }
         options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
         #[cfg(not(feature = "gpu"))]
-        if options.d3d9_sm2 || options.d3d9_sm3 || options.d3d9_shader_cache.is_some() {
+        if options.headless_gpu
+            || options.d3d9_sm2
+            || options.d3d9_sm3
+            || options.d3d9_shader_cache.is_some()
+        {
             return Err("D3D9 shader capability switches require the gpu feature".into());
+        }
+        if options.headless_gpu && !options.headless {
+            return Err("--headless-gpu requires --headless".into());
         }
         options.data_dir = data_dir.unwrap_or_else(|| {
             PathBuf::from("target/adv-data").join(options.exe.file_stem().unwrap_or_default())
@@ -755,7 +762,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"tier1\": {},\n  \"compilation_schedule\": {},\n  \"compilations\": {},\n  \"async_compilation\": {},\n  \"compile_seconds\": {:.6},\n  \"compile_requests\": {},\n  \"pending_compilations\": {},\n  \"peak_pending_compilations\": {},\n  \"stale_compilations\": {},\n  \"compile_failures\": {},\n  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
             "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
-            "  \"precise_waits\": {},\n  \"wait_diagnostics\": {},\n",
+            "  \"wait_diagnostics\": {},\n",
             "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
             "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {}\n}}\n"
         ),
@@ -824,7 +831,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         options.time_skip,
         runtime.machine.sys.scheduling.active_time_skips,
         runtime.machine.sys.scheduling.active_time_skip_us,
-        options.precise_waits,
         runtime
             .machine
             .sys
@@ -874,7 +880,7 @@ fn write_report(path: &std::path::Path, report: &str) -> Result<(), String> {
 }
 
 fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
-    #[cfg(all(windows, feature = "gpu"))]
+    #[cfg(feature = "gpu")]
     if runtime.has_native_frame() {
         return capture_native_after_stop(runtime, wake);
     }
@@ -918,7 +924,7 @@ fn acknowledge_scene_gate(
     control::acknowledge(result);
 }
 
-#[cfg(all(windows, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 fn capture_native_after_stop(
     runtime: &mut Runtime,
     wake: &window::WakeEvent,
@@ -1318,9 +1324,13 @@ fn run_execution(
         let producer = worker.take_frames();
         runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
     }
-    #[cfg(all(windows, feature = "gpu"))]
-    {
-        let gpu = match window.as_mut().and_then(|worker| worker.gpu.take()) {
+    #[cfg(feature = "gpu")]
+    if cfg!(windows) || options.headless_gpu {
+        #[cfg(windows)]
+        let supplied_gpu = window.as_mut().and_then(|worker| worker.gpu.take());
+        #[cfg(not(windows))]
+        let supplied_gpu = None;
+        let gpu = match supplied_gpu {
             Some(gpu) => gpu,
             None => {
                 let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
@@ -1695,12 +1705,30 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
-        if let Some(completion) = scene_gate.observe(
+        let scene_check_before = runtime
+            .machine
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .map(|_| scene_gate.check_duration());
+        let completion = scene_gate.observe(
             runtime.presented_frames(),
             runtime.frame().width,
             &runtime.frame().bgra,
             Instant::now(),
-        ) {
+        );
+        if let Some(before) = scene_check_before {
+            runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_mut()
+                .unwrap()
+                .scene_check(scene_gate.check_duration().saturating_sub(before));
+        }
+        if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
         if options
@@ -1724,9 +1752,26 @@ fn run_execution(
         if scene_gate.frozen() {
             // Input is queued while frozen. Diagnostics share the same retained
             // wake event and remain responsive without running another guest frame.
+            let pause_started = runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_ref()
+                .map(|_| Instant::now());
             if !control.as_ref().is_some_and(control::Control::has_pending) {
                 wake.wait(Some(Duration::from_millis(50)))
                     .map_err(|e| e.to_string())?;
+            }
+            if let Some(at) = pause_started {
+                runtime
+                    .machine
+                    .sys
+                    .stats
+                    .frame_budget
+                    .as_mut()
+                    .unwrap()
+                    .control_pause(at.elapsed());
             }
             continue;
         }
@@ -1780,12 +1825,30 @@ fn run_execution(
         {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
-        if let Some(completion) = scene_gate.observe(
+        let scene_check_before = runtime
+            .machine
+            .sys
+            .stats
+            .frame_budget
+            .as_ref()
+            .map(|_| scene_gate.check_duration());
+        let completion = scene_gate.observe(
             presented,
             runtime.frame().width,
             &runtime.frame().bgra,
             Instant::now(),
-        ) {
+        );
+        if let Some(before) = scene_check_before {
+            runtime
+                .machine
+                .sys
+                .stats
+                .frame_budget
+                .as_mut()
+                .unwrap()
+                .scene_check(scene_gate.check_duration().saturating_sub(before));
+        }
+        if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
         if first_frame_seconds.is_none() && presented > 0 {
@@ -1870,13 +1933,7 @@ fn run_execution(
                 // Every producer signals this same retained event. No UI/frame or
                 // stdin-specific blocking loop can hide another channel's wake.
                 let pending = control.as_ref().is_some_and(control::Control::has_pending);
-                let signaled = pending
-                    || if options.precise_waits {
-                        wake.wait_precise(delay)
-                    } else {
-                        wake.wait(delay)
-                    }
-                    .map_err(|e| e.to_string())?;
+                let signaled = pending || wake.wait(delay).map_err(|e| e.to_string())?;
                 let wake = if signaled {
                     window::WaitOutcome::Input
                 } else {
@@ -1947,9 +2004,9 @@ fn run_execution(
             }
         }
     }
-    #[cfg(all(windows, feature = "gpu"))]
+    #[cfg(feature = "gpu")]
     let native_frame = runtime.has_native_frame();
-    #[cfg(not(all(windows, feature = "gpu")))]
+    #[cfg(not(feature = "gpu"))]
     let native_frame = false;
     if options.jit && options.async_compilation {
         let profile = runtime.machine.cpu.executor().warm_profile();
@@ -1960,7 +2017,7 @@ fn run_execution(
         eprintln!("warning: native code cache save failed: {error}");
     }
     if native_frame {
-        #[cfg(all(windows, feature = "gpu"))]
+        #[cfg(feature = "gpu")]
         if options.screenshot.is_some() || options.report.is_some() {
             capture_native_after_stop(&mut runtime, &wake)?;
         }
