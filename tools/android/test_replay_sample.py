@@ -46,6 +46,19 @@ class DeviceConditionsTests(unittest.TestCase):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_precision_and_time_skip_switches_reach_device_runner(self):
+        args = argparse.Namespace(exe_relative="synthetic.exe", codepage=932,
+            codec="native", codec_kernels="native", no_tiering=False,
+            schedule_profile=False, auto_dialog_ms=None, font_diagnostics=False,
+            precise_waits=True, no_time_skip=True)
+        command = replay.runner_command(args, "/fixture", "/game", 10)
+        self.assertIn("--precise-waits", command)
+        self.assertIn("--no-time-skip", command)
+        args.precise_waits = args.no_time_skip = False
+        command = replay.runner_command(args, "/fixture", "/game", 10)
+        self.assertNotIn("--precise-waits", command)
+        self.assertNotIn("--no-time-skip", command)
+
     def test_scene_gate_ack_requires_the_exact_hash_new_frame_and_actual_release(self):
         command = "await-frame 0000000000000001 1000 hold 17"
         good = "control ok await-frame hash=0000000000000001 frame=5 start_frame=4 frozen=true release=17 release_posted=true receipt=6"

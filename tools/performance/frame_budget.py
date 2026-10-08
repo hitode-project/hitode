@@ -82,6 +82,27 @@ def execution_metrics(report: dict) -> dict:
             "capacity_rejections", "window_deferrals", "worker_full"))}
 
 
+def wait_metrics(report: dict) -> dict | None:
+    """Keep only fixed source labels and numeric distributions in shared summaries."""
+    raw = report.get("wait_diagnostics")
+    if not isinstance(raw, dict) or raw.get("schema") != "adv-wait-diagnostics-v1":
+        return None
+    sources = raw.get("sources") or {}
+    result = {}
+    for name in ("sleep", "sleep_ex", "object", "message", "multimedia_timer", "waitable_timer", "present", "yield", "other"):
+        row = sources.get(name) or {}
+        if not isinstance(row, dict):
+            continue
+        clean = numeric_fields(row, ("segments", "timeouts", "signaled", "skipped_segments", "wall_total_us", "retained",
+            "host_waits", "host_requested_ns", "host_elapsed_ns", "host_overshoot_ns"))
+        for key in ("requested_us", "wall_us", "guest_us", "lateness_us", "dispatch_queue_us",
+                    "host_requested_us", "host_elapsed_us", "host_overshoot_us"):
+            values = row.get(key)
+            clean[key] = numeric_fields(values, ("count", "p50", "p95", "p99", "max")) if isinstance(values, dict) else None
+        result[name] = clean
+    return {"sources": result, **numeric_fields(raw, ("capacity_per_source",))}
+
+
 def valid_budget(value: dict) -> None:
     if value.get("schema") != "adv-frame-budget-v1" or value.get("budget_ns") != BUDGET_NS:
         raise ValueError("unknown frame budget schema")
@@ -250,7 +271,10 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
                     raise ValueError("coalesced frame boundaries")
                 valid_budget(report["frame_budget"])
                 row.update(status="observed", reason=None, metrics=summarize_budget(report["frame_budget"]),
-                           execution=execution_metrics(report), config=baseline.report_config(report))
+                           execution=execution_metrics(report), config=baseline.report_config(report),
+                           wait_diagnostics=wait_metrics(report),
+                           precise_waits=report.get("precise_waits") is True,
+                           time_skip=numeric_fields(report.get("time_skip") or {}, ("jumps", "skipped_guest_us")))
                 if name == "ctrl":
                     row["fixed_segment"] = fixed_segment(directory, scenario, checkpoint)
                     if row["fixed_segment"] is None:
@@ -302,7 +326,8 @@ def summarize(root: Path) -> dict:
 def device_lock(path: Path | None, root: Path, helper: Path | None = None):
     """Use the shared broker when supplied; otherwise retain legacy locking."""
     if helper is not None:
-        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)), ADV_DEVICE_TASK="bud")
+        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)),
+                           ADV_DEVICE_TASK=os.environ.get("ADV_DEVICE_TASK", "bud"))
         prefix = "$ErrorActionPreference='Stop'; . $env:ADV_DEVICE_HELPER; "
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command",
@@ -460,12 +485,15 @@ def run(args) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO)
     import hashlib
     plan = {"platform": args.platform, "heats": args.heats, "scenarios": scenarios,
+            "precise_waits": getattr(args, "precise_waits", False),
+            "no_time_skip": getattr(args, "no_time_skip", False),
             "source_revision": getattr(args, "binary_source_revision", None),
             "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
             "source_diff_sha256": hashlib.sha256(diff).hexdigest()}
     if resume:
         previous = load_json(root / "plan.json")
-        if any(previous[key] != plan[key] for key in ("platform", "heats", "scenarios")):
+        if (any(previous[key] != plan[key] for key in ("platform", "heats", "scenarios"))
+                or any(previous.get(key, False) != plan[key] for key in ("precise_waits", "no_time_skip"))):
             raise ValueError("resume requires unchanged scenarios and run conditions")
     else:
         write_json(root / "plan.json", plan)
@@ -501,6 +529,10 @@ def run(args) -> None:
             command += ["--cold"] if heat == "cold" else ["--warm-profile", str(warm)]
             if not args.no_instrumentation:
                 command += ["--frame-budget"]
+            if getattr(args, "precise_waits", False):
+                command += ["--precise-waits"]
+            if getattr(args, "no_time_skip", False):
+                command += ["--no-time-skip"]
             if args.perf_map:
                 command += ["--perf-map"]
             seed = args.seed_root / name if args.seed_root else None
@@ -585,6 +617,8 @@ def main() -> None:
     execute.add_argument("--device-helper", type=Path, default=os.environ.get("ADV_DEVICE_HELPER"),
                          help="shared PowerShell Request-Device/Release-Device helper (task bud)")
     execute.add_argument("--perf-map", action="store_true")
+    execute.add_argument("--precise-waits", action="store_true", help="opt-in submillisecond host deadlines")
+    execute.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
     args = parser.parse_args()
     if args.command == "summarize":
