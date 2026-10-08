@@ -25,7 +25,11 @@ use std::collections::BTreeMap;
 pub(super) struct Operations(Box<[NativeX87]>);
 
 impl Operations {
-    pub fn new(instructions: &BTreeMap<u32, Instruction>, input: &[(u32, Vec<u8>)]) -> Self {
+    pub fn new(
+        instructions: &BTreeMap<u32, Instruction>,
+        input: &[(u32, Vec<u8>)],
+        _host_features: crate::HostFeatures,
+    ) -> Self {
         Self(
             instructions
                 .values()

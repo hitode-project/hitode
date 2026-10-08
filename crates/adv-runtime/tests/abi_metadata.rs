@@ -78,7 +78,13 @@ fn native_argc(export: &str) -> Option<u8> {
     match export {
         "LdrUnloadDll" => return Some(1),
         "RtlRaiseException" | "RtlRemoveVectoredExceptionHandler" => return Some(1),
-        "RtlAddVectoredExceptionHandler" => return Some(2),
+        "RtlAddVectoredExceptionHandler" | "RtlInterlockedPushEntrySList" => return Some(2),
+        "RtlEncodePointer"
+        | "RtlDecodePointer"
+        | "RtlInitializeSListHead"
+        | "RtlInterlockedPopEntrySList"
+        | "RtlInterlockedFlushSList"
+        | "RtlQueryDepthSList" => return Some(1),
         "RtlDispatchAPC" => return Some(3),
         "RtlExitUserThread" => return Some(1),
         "RtlCreateUserThread" => return Some(10),
@@ -99,7 +105,7 @@ fn native_argc(export: &str) -> Option<u8> {
         "Continue" | "FlushBuffersFile" => 8,
         "QueueApcThread" => 20,
         "TestAlert" => 0,
-        "WaitForSingleObject" | "OpenEvent" => 12,
+        "WaitForSingleObject" | "OpenEvent" | "RaiseException" => 12,
         "CreateEvent" | "WaitForMultipleObjects" => 20,
         "SetEvent" | "ResetEvent" => 8,
         "QueryVolumeInformationFile" => 20,

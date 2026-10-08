@@ -1,5 +1,6 @@
-//! Diagnostic-only Cranelift lowering of verified GIR, with checked memory.
+//! Cranelift lowering of verified GIR on a private serial mapping lease.
 use super::{ir::*, recovery, verify};
+use crate::memory::gir::{Lease, LeaseCache};
 use cranelift_codegen::ir::{
     self as cl, AbiParam, InstBuilder, MemFlags, Value as V, condcodes::IntCC as CC, types,
 };
@@ -7,6 +8,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const COMPLETE: u32 = 0;
 pub const BUDGET: u32 = 1;
@@ -15,6 +17,37 @@ pub const WRITE_CHECK: u32 = 3;
 pub const GUARD: u32 = 4;
 pub const INDIRECT: u32 = 5;
 pub const UNSUPPORTED: u32 = 6;
+pub const INTERRUPTED: u32 = 7;
+pub const REVOKED: u32 = 8;
+pub const STOP: u32 = 9;
+
+#[derive(Clone, Debug)]
+pub struct RangeProof {
+    pub memory: MemoryId,
+    pub address: u32,
+    pub width: usize,
+    pub write: bool,
+}
+
+impl RangeProof {
+    fn constants(r: &Region) -> Vec<Self> {
+        r.memory
+            .iter()
+            .enumerate()
+            .filter_map(|(n, m)| {
+                let ValueKind::Constant(address) = r.values[m.address.0].kind else {
+                    return None;
+                };
+                Some(Self {
+                    memory: MemoryId(n),
+                    address: address as u32,
+                    width: (m.width.bits() / 8) as usize,
+                    write: matches!(m.access, Access::Write { .. }),
+                })
+            })
+            .collect()
+    }
+}
 #[repr(C)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
@@ -24,6 +57,8 @@ pub struct Frame {
     pub committed: u64,
     pub address: u32,
     pub status: u32,
+    pub lease_epoch: u64,
+    pub last_indirect_branch: crate::IndirectBranch,
 }
 impl Frame {
     pub fn from_cpu(c: &crate::CpuState) -> Self {
@@ -31,6 +66,7 @@ impl Frame {
             gpr: c.regs,
             flags: c.eflags,
             pc: c.eip,
+            last_indirect_branch: c.last_indirect_branch,
             ..Self::default()
         }
     }
@@ -38,6 +74,7 @@ impl Frame {
         c.regs = self.gpr;
         c.eflags = self.flags;
         c.eip = self.pc;
+        c.last_indirect_branch = self.last_indirect_branch;
     }
 }
 pub struct Code {
@@ -53,6 +90,30 @@ pub struct Code {
     pub cold_blocks: usize,
     pub flags_materialized: usize,
     pub compile_us: u128,
+    pub proofs: Vec<RangeProof>,
+    // Code, cold recovery recipes and dependency identities have one owner.
+    pub recovery: recovery::Plan,
+    pub table: RecoveryTable,
+}
+
+/// B-route v1 metadata describes completed cold checkpoints. It is not a
+/// hardware-fault table: arbitrary hot PCs have no published recovery source.
+pub struct RecoveryTable {
+    pub version: u32,
+    pub code_id: u64,
+    pub code_version: u32,
+    pub returns: Vec<(u32, usize)>,
+    pub snapshots: Vec<Snapshot>,
+    pub values: Vec<Value>,
+    pub checkpoints: Vec<recovery::Dag>,
+    pub commits: Vec<CommitPoint>,
+    pub accesses: Vec<MemoryOp>,
+    pub dependencies: Vec<Dependency>,
+    pub page_dependencies: Vec<(usize, u64)>,
+    pub lease_epoch_offset: u32,
+    /// Every return checkpoint contains GPR/EFLAGS/PC/retirement/EA/reason.
+    /// Offsets are frame-relative, valid only after that cold block's stores.
+    pub checkpoint_offsets: [u32; 16],
 }
 impl Drop for Code {
     fn drop(&mut self) {
@@ -60,45 +121,66 @@ impl Drop for Code {
     }
 }
 impl Code {
-    /// The exclusive serial borrow freezes mappings for this diagnostic call.
-    /// Special/file/shared/code pages cannot enter ordinary machine accesses.
+    /// Diagnostic convenience wrapper; production reuses its lease table.
     pub fn run(
         &self,
         frame: &mut Frame,
         memory: &mut crate::Memory,
         budget: u64,
     ) -> Result<u32, String> {
-        if memory.base != self.base
-            || memory.len != self.len
-            || memory.is_parallel()
-            || memory.foreign_access_required()
-        {
-            return Err("diagnostic memory lease".into());
+        let mut cache = LeaseCache::default();
+        let mut lease = cache.acquire(memory)?;
+        self.run_lease(
+            frame,
+            &mut lease,
+            budget,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            u64::MAX,
+        )
+    }
+
+    pub fn proven(&self, lease: &Lease<'_>) -> bool {
+        lease.window() == (self.base, self.len)
+            && self
+                .proofs
+                .iter()
+                .all(|p| lease.allows(p.address, p.width, p.write))
+    }
+
+    pub fn run_lease(
+        &self,
+        frame: &mut Frame,
+        lease: &mut Lease<'_>,
+        budget: u64,
+        interrupt: &AtomicBool,
+        revoke: &AtomicBool,
+        stop: u64,
+    ) -> Result<u32, String> {
+        if !self.proven(lease) {
+            return Err("GIR entry mapping proof failed".into());
         }
-        let permissions: Vec<u8> = (0..memory.len / 4096)
-            .map(|p| {
-                let pc = memory.base.wrapping_add((p * 4096) as u32);
-                let perm = memory.perms[p];
-                if !memory.mapped[p]
-                    || perm & !(crate::READ | crate::WRITE) != 0
-                    || memory.file_page_copy_on_write(pc).is_some()
-                {
-                    0
-                } else {
-                    perm
-                }
-            })
-            .collect();
-        let f: unsafe extern "C" fn(*mut Frame, *mut u8, *const u8, u64) -> u32 =
-            unsafe { std::mem::transmute(self.entry) };
+        frame.lease_epoch = lease.epoch;
+        let f: unsafe extern "C" fn(
+            *mut Frame,
+            *mut u8,
+            *const u8,
+            u64,
+            &AtomicBool,
+            &AtomicBool,
+            u64,
+        ) -> u32 = unsafe { std::mem::transmute(self.entry) };
         // SAFETY: generated checks cover the full range and both endpoint
         // pages; width <= 4, mappings stay frozen, and no helpers can reenter.
         Ok(unsafe {
             f(
                 frame,
-                memory.ptr.as_ptr(),
-                permissions.as_ptr(),
+                lease.data(),
+                lease.permissions(),
                 frame.committed.saturating_add(budget),
+                interrupt,
+                revoke,
+                stop,
             )
         })
     }
@@ -113,9 +195,29 @@ pub fn compile_with_sharing(
     cross: bool,
     sharing: recovery::Sharing,
 ) -> Result<Code, String> {
+    compile_variant(r, base, len, cross, sharing, false)
+}
+
+pub fn compile_proven(r: &Region, base: u32, len: usize) -> Result<Code, String> {
+    compile_variant(r, base, len, false, recovery::Sharing::Compatible, true)
+}
+
+fn compile_variant(
+    r: &Region,
+    base: u32,
+    len: usize,
+    cross: bool,
+    sharing: recovery::Sharing,
+    proven: bool,
+) -> Result<Code, String> {
     verify::verify(r).map_err(|e| e.to_string())?;
     let plan = recovery::Plan::build(r, sharing);
     plan.verify(r).map_err(|e| e.to_string())?;
+    let proofs = if proven {
+        RangeProof::constants(r)
+    } else {
+        vec![]
+    };
     let began = std::time::Instant::now();
     #[allow(unused_mut)]
     let mut jit = JITBuilder::with_flags(
@@ -135,7 +237,7 @@ pub fn compile_with_sharing(
         .func
         .signature
         .params
-        .extend([AbiParam::new(types::I64); 4]);
+        .extend([AbiParam::new(types::I64); 7]);
     context
         .func
         .signature
@@ -145,14 +247,44 @@ pub fn compile_with_sharing(
         .declare_function("formal_gir", Linkage::Local, &context.func.signature)
         .map_err(|e| e.to_string())?;
     let mut fc = FunctionBuilderContext::new();
-    let (cold_edges, cold_blocks, flags_materialized) =
-        build(&mut context.func, &mut fc, r, &plan, base, len, sharing);
+    let (cold_edges, cold_blocks, flags_materialized, checkpoints) = build(
+        &mut context.func,
+        &mut fc,
+        r,
+        &plan,
+        base,
+        len,
+        sharing,
+        &proofs,
+    );
     let cross_function = cross.then(|| context.func.clone());
     context.set_disasm(true);
     module
         .define_function(id, &mut context)
         .map_err(|e| format!("{e:?}"))?;
     let code = context.compiled_code().unwrap();
+    static NEXT_CODE: AtomicU64 = AtomicU64::new(1);
+    let table = RecoveryTable {
+        version: 1,
+        code_id: NEXT_CODE.fetch_add(1, Ordering::Relaxed),
+        code_version: r.semantic_version,
+        returns: code
+            .buffer
+            .get_srclocs_sorted()
+            .iter()
+            .filter(|s| s.loc.bits() > 0 && s.loc.bits() <= cold_blocks as u32)
+            .map(|s| (s.start, s.loc.bits() as usize - 1))
+            .collect(),
+        snapshots: r.snapshots.clone(),
+        values: r.values.clone(),
+        checkpoints,
+        commits: r.commits.clone(),
+        accesses: r.memory.clone(),
+        dependencies: r.dependencies.clone(),
+        page_dependencies: vec![],
+        lease_epoch_offset: 56,
+        checkpoint_offsets: [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 52, 64, 68, 72],
+    };
     let (machine, blocks, vcode) = (
         code.code_buffer().to_vec(),
         code.bb_starts.clone(),
@@ -175,6 +307,9 @@ pub fn compile_with_sharing(
         cold_blocks,
         flags_materialized,
         compile_us,
+        proofs,
+        recovery: plan,
+        table,
     })
 }
 #[cfg(feature = "cross-dump")]
@@ -218,6 +353,10 @@ struct Emitter<'a> {
     data: V,
     perms: V,
     budget: V,
+    interrupt: V,
+    revoke: V,
+    stop: V,
+    proofs: &'a [RangeProof],
     retired: V,
     base: u32,
     len: usize,
@@ -590,6 +729,25 @@ impl Emitter<'_> {
         self.b.ins().brif(bad, cold, &args, good, &[]);
         self.b.switch_to_block(good);
     }
+    fn poll(&mut self, state: &StateMap, pc: V) {
+        let zero = self.c(0);
+        let stop = self.cmp(CC::Equal, pc, self.stop);
+        self.guard(stop, state, pc, zero, STOP);
+        let budget = self.cmp(CC::UnsignedGreaterThanOrEqual, self.retired, self.budget);
+        self.guard(budget, state, pc, zero, BUDGET);
+        // Atomic loads are observable effects, not readonly loop invariants.
+        // Poll only at instruction boundaries, never after an uncommitted store.
+        let interrupted = self
+            .b
+            .ins()
+            .atomic_load(types::I8, MemFlags::trusted(), self.interrupt);
+        self.guard(interrupted, state, pc, zero, INTERRUPTED);
+        let revoked = self
+            .b
+            .ins()
+            .atomic_load(types::I8, MemFlags::trusted(), self.revoke);
+        self.guard(revoked, state, pc, zero, REVOKED);
+    }
     fn target(&mut self, t: &Target) -> (cl::Block, Vec<cl::BlockArg>) {
         match t {
             Target::Block(e) => {
@@ -622,32 +780,34 @@ impl Emitter<'_> {
         // access width are rejected before either page table or data accesses.
         let base = self.c(u64::from(self.base));
         let offset = self.b.ins().isub(address, base);
-        let bound = self.c(self.len.saturating_sub(width) as u64);
-        let mut bad = self.cmp(CC::UnsignedGreaterThan, offset, bound);
-        let last = self.b.ins().iadd_imm(address, width as i64 - 1);
-        let max = self.c(u64::from(u32::MAX));
-        let wrap = self.cmp(CC::UnsignedGreaterThan, last, max);
-        bad = self.b.ins().bor(bad, wrap);
-        if self.len < width {
-            bad = self.c(1);
-        }
-        self.guard(bad, &snapshot.state, pc, address, status);
-        let last = self.b.ins().iadd_imm(offset, width as i64 - 1);
-        for at in [offset, last] {
-            let page = self.b.ins().ushr_imm(at, 12);
-            let pointer = self.b.ins().iadd(self.perms, page);
-            let p = self
-                .b
-                .ins()
-                .load(types::I8, MemFlags::trusted(), pointer, 0);
-            let p = self.b.ins().uextend(types::I64, p);
-            let required = if write { crate::WRITE } else { crate::READ };
-            let allowed = self.b.ins().band_imm(p, i64::from(required));
-            let bad = self
-                .b
-                .ins()
-                .icmp_imm(CC::NotEqual, allowed, i64::from(required));
+        if !self.proofs.iter().any(|p| p.memory == id) {
+            let bound = self.c(self.len.saturating_sub(width) as u64);
+            let mut bad = self.cmp(CC::UnsignedGreaterThan, offset, bound);
+            let last = self.b.ins().iadd_imm(address, width as i64 - 1);
+            let max = self.c(u64::from(u32::MAX));
+            let wrap = self.cmp(CC::UnsignedGreaterThan, last, max);
+            bad = self.b.ins().bor(bad, wrap);
+            if self.len < width {
+                bad = self.c(1);
+            }
             self.guard(bad, &snapshot.state, pc, address, status);
+            let last = self.b.ins().iadd_imm(offset, width as i64 - 1);
+            for at in [offset, last] {
+                let page = self.b.ins().ushr_imm(at, 12);
+                let pointer = self.b.ins().iadd(self.perms, page);
+                let p = self
+                    .b
+                    .ins()
+                    .load(types::I8, MemFlags::trusted(), pointer, 0);
+                let p = self.b.ins().uextend(types::I64, p);
+                let required = if write { crate::WRITE } else { crate::READ };
+                let allowed = self.b.ins().band_imm(p, i64::from(required));
+                let bad = self
+                    .b
+                    .ins()
+                    .icmp_imm(CC::NotEqual, allowed, i64::from(required));
+                self.guard(bad, &snapshot.state, pc, address, status);
+            }
         }
         let pointer = self.b.ins().iadd(self.data, offset);
         let ty = match m.width {
@@ -689,7 +849,7 @@ impl Emitter<'_> {
         self.values[m.output.0] = Some(self.b.ins().iadd_imm(old, 1));
     }
     fn cold_bodies(&mut self) {
-        for (block, dag) in self.cold.clone() {
+        for (index, (block, dag)) in self.cold.clone().into_iter().enumerate() {
             self.b.switch_to_block(block);
             self.values.fill(None);
             let params = self.b.block_params(block).to_vec();
@@ -721,7 +881,9 @@ impl Emitter<'_> {
                     .store(MemFlags::trusted(), v, self.frame, offset);
             }
             let status = self.b.ins().ireduce(types::I32, params[n + 3]);
+            self.b.set_srcloc(cl::SourceLoc::new(index as u32 + 1));
             self.b.ins().return_(&[status]);
+            self.b.set_srcloc(cl::SourceLoc::default());
         }
     }
 }
@@ -733,7 +895,8 @@ fn build<'a>(
     base: u32,
     len: usize,
     sharing: recovery::Sharing,
-) -> (usize, usize, usize) {
+    proofs: &'a [RangeProof],
+) -> (usize, usize, usize, Vec<recovery::Dag>) {
     let mut b = FunctionBuilder::new(function, context);
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
@@ -750,7 +913,7 @@ fn build<'a>(
         .collect();
     b.switch_to_block(entry);
     let params = b.block_params(entry).to_vec();
-    let [frame, data, perms, budget]: [V; 4] = params.try_into().unwrap();
+    let [frame, data, perms, budget, interrupt, revoke, stop]: [V; 7] = params.try_into().unwrap();
     let retired = b.ins().load(types::I64, MemFlags::trusted(), frame, 40);
     let mut e = Emitter {
         b,
@@ -764,6 +927,10 @@ fn build<'a>(
         data,
         perms,
         budget,
+        interrupt,
+        revoke,
+        stop,
+        proofs,
         retired,
         base,
         len,
@@ -810,9 +977,7 @@ fn build<'a>(
         if block == r.entry {
             let pc = e.b.ins().load(types::I32, MemFlags::trusted(), frame, 36);
             let pc = e.b.ins().uextend(types::I64, pc);
-            let bad = e.cmp(CC::UnsignedGreaterThanOrEqual, e.retired, e.budget);
-            let zero = e.c(0);
-            e.guard(bad, &current.entry_state, pc, zero, BUDGET);
+            e.poll(&current.entry_state, pc);
         }
         for op in &current.operations {
             match op {
@@ -826,12 +991,26 @@ fn build<'a>(
                     }
                 }
                 Operation::Memory(id) => e.memory(*id),
-                Operation::Commit { state, next_pc, .. } => {
+                Operation::Commit {
+                    point,
+                    state,
+                    next_pc,
+                } => {
                     e.retired = e.b.ins().iadd_imm(e.retired, 1);
                     let pc = e.get(*next_pc);
-                    let bad = e.cmp(CC::UnsignedGreaterThanOrEqual, e.retired, e.budget);
-                    let zero = e.c(0);
-                    e.guard(bad, state, pc, zero, BUDGET);
+                    if let Some(kind) = r.commits[point.0].indirect {
+                        // This diagnostic checkpoint is independent of guest
+                        // SSA state and is updated only at a committed transfer.
+                        let source =
+                            e.b.ins()
+                                .iconst(types::I32, i64::from(r.commits[point.0].pc));
+                        let target = e.b.ins().ireduce(types::I32, pc);
+                        let kind = e.b.ins().iconst(types::I32, kind as i64);
+                        for (value, offset) in [(source, 64), (target, 68), (kind, 72)] {
+                            e.b.ins().store(MemFlags::trusted(), value, e.frame, offset);
+                        }
+                    }
+                    e.poll(state, pc);
                 }
             }
         }
@@ -884,7 +1063,12 @@ fn build<'a>(
         }
     }
     e.cold_bodies();
-    let stats = (e.edges, e.cold.len(), e.materialized);
+    let stats = (
+        e.edges,
+        e.cold.len(),
+        e.materialized,
+        e.cold.iter().map(|(_, dag)| dag.clone()).collect(),
+    );
     e.b.seal_all_blocks();
     e.b.finalize();
     stats

@@ -191,6 +191,9 @@ static void t_memory_hooks(void){
 
 typedef LONG (WINAPI *NC)(PCONTEXT,BOOLEAN);
 typedef VOID (WINAPI *RR)(PEXCEPTION_RECORD);
+typedef LONG (WINAPI *NR)(PEXCEPTION_RECORD,PCONTEXT,BOOLEAN);
+static NR oNR; static DWORD cNR;
+static LONG WINAPI hNR(PEXCEPTION_RECORD r,PCONTEXT c,BOOLEAN f){cNR++;if(r->ExceptionCode==0xe0001234){r->NumberParameters=1;r->ExceptionInformation[0]=0x2468ace0;}return oNR(r,c,f);}
 static NC oNC; static RR oRR; static DWORD cVEH,cNC,cRR;
 static LONG WINAPI hNC(PCONTEXT c,BOOLEAN a){cNC++;return oNC(c,a);}
 static VOID WINAPI hRR(PEXCEPTION_RECORD r){cRR++;oRR(r);}
@@ -211,7 +214,7 @@ __declspec(naked) static void hKI(void){ __asm {
 } }
 static LONG WINAPI ownVEH(PEXCEPTION_POINTERS p){
  cVEH++;
- if(p->ExceptionRecord->ExceptionCode==0xe0001234)return EXCEPTION_CONTINUE_EXECUTION;
+ if(p->ExceptionRecord->ExceptionCode==0xe0001234)return p->ExceptionRecord->NumberParameters==1&&p->ExceptionRecord->ExceptionInformation[0]==0x2468ace0?EXCEPTION_CONTINUE_EXECUTION:EXCEPTION_CONTINUE_SEARCH;
  if(p->ExceptionRecord->ExceptionCode!=EXCEPTION_BREAKPOINT)return EXCEPTION_CONTINUE_SEARCH;
  vr=(DWORD)(UINT_PTR)p->ExceptionRecord; vc=(DWORD)(UINT_PTR)p->ContextRecord;
  p->ContextRecord->Eip++; return EXCEPTION_CONTINUE_EXECUTION;
@@ -222,11 +225,12 @@ static void t_exception_layout(void){
  int ok=veh&&ki&&MH_Initialize()==MH_OK&&MH_CreateHook(ki,hKI,&oKI)==MH_OK;
  ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtContinue"),hNC,(void**)&oNC)==MH_OK;
  ok=ok&&MH_CreateHook(GetProcAddress(nt,"RtlRaiseException"),hRR,(void**)&oRR)==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtRaiseException"),hNR,(void**)&oNR)==MH_OK;
  ok=ok&&MH_EnableHook(MH_ALL_HOOKS)==MH_OK;
  put(ok);if(!ok)return; __debugbreak();
  put(cKI);put(ka==vr);put(kb==vr);put(kb==vc);put(kc==vc);
  RaiseException(0xe0001234,0,0,NULL);
- put(cVEH);put(cNC);put(cRR);
+ put(cVEH);put(cNC);put(cRR);put(cKI);put(cNR);
  MH_DisableHook(MH_ALL_HOOKS);RemoveVectoredExceptionHandler(veh);
 }
 

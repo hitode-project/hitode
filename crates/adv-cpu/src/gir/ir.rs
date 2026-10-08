@@ -198,6 +198,8 @@ pub struct CommitPoint {
     pub next_pc: u32,
     pub units: u32,
     pub subprogress: u32,
+    /// Diagnostic transfer metadata is committed only after successful memory.
+    pub indirect: Option<crate::IndirectBranchKind>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dependency {

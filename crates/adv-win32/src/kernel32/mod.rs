@@ -6,6 +6,7 @@ pub(crate) mod child_process;
 mod environment;
 mod exception;
 pub(crate) use exception::install as install_exceptions;
+pub(crate) use exception::raise_status;
 pub(crate) use exception::uncaught_query_blocker;
 pub(crate) mod file;
 pub(crate) mod file_mapping;

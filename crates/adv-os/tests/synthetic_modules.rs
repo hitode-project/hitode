@@ -230,6 +230,150 @@ fn live_export_name_comparison_handles_long_prefixes_and_utf8_without_stale_resu
     }
 }
 
+#[test]
+fn export_hints_follow_current_headers_tables_ordinals_and_moved_names() {
+    let mut registry = Registry::default();
+    for name in ["A", "Target", "Z"] {
+        registry.add(
+            "authored_hints.dll",
+            name,
+            Conv::Stdcall { argc: 0 },
+            |_| Outcome::Return(1),
+        );
+    }
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    let module = machine.load(&Empty, "authored_hints.dll").unwrap();
+    let target = resolve(&mut machine, module, named("Target"));
+    let other = resolve(&mut machine, module, named("Z"));
+    assert_eq!(guest_override(&mut machine, module, "Target"), None);
+    let image = adv_os::modules(&machine.ext).get(module);
+    let (base, size) = (image.base, image.size);
+    let pe = machine.cpu.read_u32(base + 0x3c).unwrap();
+    let directory = base + machine.cpu.read_u32(base + pe + 120).unwrap();
+    let names = base + machine.cpu.read_u32(directory + 32).unwrap();
+    let ordinals = base + machine.cpu.read_u32(directory + 36).unwrap();
+    let functions = base + machine.cpu.read_u32(directory + 28).unwrap();
+    let pointers: Vec<_> = (0..3)
+        .map(|index| machine.cpu.read_u32(names + index * 4).unwrap())
+        .collect();
+    let indices: Vec<_> = (0..3)
+        .map(|index| machine.cpu.read_u16(ordinals + index * 2).unwrap())
+        .collect();
+    // Move the NT header, export directory and all three tables. The sorted,
+    // unique name table adds P before Target, invalidating its warmed index 1.
+    let relocated = size - 0x400;
+    machine.cpu.protect(base, 4096, Prot::RW).unwrap();
+    machine
+        .cpu
+        .protect((base + relocated) & !4095, 4096, Prot::RW)
+        .unwrap();
+    let header_size = 24
+        + usize::from(machine.cpu.read_u16(base + pe + 20).unwrap())
+        + usize::from(machine.cpu.read_u16(base + pe + 6).unwrap()) * 40;
+    machine
+        .cpu
+        .copy_memory(base + pe, base + 0x400, header_size)
+        .unwrap();
+    machine.cpu.write_u32(base + 0x3c, 0x400).unwrap();
+    machine
+        .cpu
+        .write_u32(base + 0x400 + 120, relocated)
+        .unwrap();
+    machine.cpu.write_u32(base + 0x400 + 124, 0xa0).unwrap();
+    machine
+        .cpu
+        .copy_memory(directory, base + relocated, 40)
+        .unwrap();
+    machine.cpu.write_u32(base + relocated + 24, 4).unwrap();
+    for (field, offset) in [(28, 0x40), (32, 0x50), (36, 0x70)] {
+        machine
+            .cpu
+            .write_u32(base + relocated + field, relocated + offset)
+            .unwrap();
+    }
+    machine
+        .cpu
+        .copy_memory(functions, base + relocated + 0x40, 12)
+        .unwrap();
+    machine.cpu.write(base + relocated + 0x90, b"P\0").unwrap();
+    for (index, pointer) in [pointers[0], relocated + 0x90, pointers[1], pointers[2]]
+        .into_iter()
+        .enumerate()
+    {
+        machine
+            .cpu
+            .write_u32(base + relocated + 0x50 + index as u32 * 4, pointer)
+            .unwrap();
+    }
+    for (index, ordinal) in [indices[0], indices[0], indices[1], indices[2]]
+        .into_iter()
+        .enumerate()
+    {
+        machine
+            .cpu
+            .write(
+                base + relocated + 0x70 + index as u32 * 2,
+                &ordinal.to_le_bytes(),
+            )
+            .unwrap();
+    }
+    assert_eq!(guest_override(&mut machine, module, "Target"), None);
+    for hint in [1, 2, u16::MAX] {
+        assert_eq!(
+            resolve(
+                &mut machine,
+                module,
+                ImportName::Name {
+                    hint,
+                    name: "Target".into()
+                }
+            ),
+            target
+        );
+    }
+    // Both the relocated ordinal and EAT are read after a matching hint.
+    machine
+        .cpu
+        .write(base + relocated + 0x74, &indices[2].to_le_bytes())
+        .unwrap();
+    assert_eq!(guest_override(&mut machine, module, "Target"), Some(other));
+    machine
+        .cpu
+        .write(base + relocated + 0x74, &indices[1].to_le_bytes())
+        .unwrap();
+    let slot = base + relocated + 0x40 + u32::from(indices[1]) * 4;
+    machine.cpu.write_u32(slot, target - base + 1).unwrap();
+    assert_eq!(
+        guest_override(&mut machine, module, "Target"),
+        Some(target + 1)
+    );
+    machine.cpu.write_u32(slot, target - base).unwrap();
+    // A warm hint cannot bypass current header or complete table bounds.
+    for (field, invalid) in [(base + 0x400, 0), (base + relocated + 32, size - 3)] {
+        let original = machine.cpu.read_u32(field).unwrap();
+        machine.cpu.write_u32(field, invalid).unwrap();
+        assert!(
+            Loader::new(
+                &mut machine.cpu,
+                &mut machine.sys,
+                machine.ext.get_mut::<Modules>(),
+                &Empty
+            )
+            .guest_override(module, "Target")
+            .is_err()
+        );
+        machine.cpu.write_u32(field, original).unwrap();
+        assert_eq!(guest_override(&mut machine, module, "Target"), None);
+    }
+    machine.cpu.write_u32(base + 0x3c, pe).unwrap();
+    assert_eq!(guest_override(&mut machine, module, "Target"), None);
+}
+
 fn dynamic(
     machine: &mut Machine<JitCpu>,
     id: usize,
