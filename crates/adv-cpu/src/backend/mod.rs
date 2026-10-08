@@ -355,6 +355,10 @@ impl SegmentSetup {
 }
 
 pub trait Backend: Guest {
+    /// Snapshot only at an explicitly enabled host frame boundary.
+    fn frame_counters(&self) -> Option<crate::frame_counters::FrameCounters> {
+        None
+    }
     /// A fresh address space with the same execution policy. No memory or JIT
     /// blocks may be aliased by this constructor. Optional for test backends.
     fn new_process(&mut self) -> Result<Self, String>

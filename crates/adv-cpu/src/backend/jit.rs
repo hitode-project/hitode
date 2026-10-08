@@ -393,6 +393,9 @@ impl crate::ExecutionTrap for Raw<'_> {
 }
 
 impl Backend for JitCpu {
+    fn frame_counters(&self) -> Option<crate::frame_counters::FrameCounters> {
+        Some(self.inner.frame_counters())
+    }
     fn new_process(&mut self) -> Result<Self, String> {
         let mut child = Self::new(self.park, self.jit)?;
         child.budget = self.budget;

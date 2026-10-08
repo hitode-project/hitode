@@ -42,7 +42,7 @@ pub struct FrameRow {
 }
 
 impl FrameRow {
-    fn sub(&self, o: &Self) -> Self {
+    pub(crate) fn sub(&self, o: &Self) -> Self {
         Self {
             frame: self.frame,
             guest_us: self.guest_us,
@@ -95,6 +95,7 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
 
 #[derive(Default)]
 pub struct Stats {
+    pub frame_budget: Option<crate::frame_budget::FrameBudget>,
     /// Take wall-clock timings and keep per-frame rows.
     pub enabled: bool,
     /// API timings without per-frame rows or forcing a frame handoff.
@@ -122,14 +123,23 @@ impl Stats {
     /// Start a timing, if enabled.
     #[inline]
     pub fn start(&self) -> Option<Instant> {
-        (self.enabled || self.services_enabled).then(Instant::now)
+        (self.enabled || self.services_enabled || self.frame_budget.is_some()).then(Instant::now)
     }
 
     /// Host handler or continuation time for `thunk`, inside or outside `Backend::run`.
     #[inline]
-    pub(crate) fn host(&mut self, t0: Option<Instant>, thunk: u32, in_run: bool) {
+    pub(crate) fn host(
+        &mut self,
+        t0: Option<Instant>,
+        thunk: u32,
+        in_run: bool,
+        thunks: &ThunkTable,
+    ) {
         let Some(t0) = t0 else { return };
         let ns = t0.elapsed().as_nanos() as u64;
+        if let Some(budget) = &mut self.frame_budget {
+            budget.host(ns, thunk, thunks);
+        }
         if in_run {
             self.total.hook_ns += ns;
         } else {
