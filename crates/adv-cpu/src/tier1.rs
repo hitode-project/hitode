@@ -52,6 +52,13 @@ pub struct Tier1Stats {
     pub resident_bytes: usize,
     pub cache_evictions: u64,
     pub cache_rejections: u64,
+    /// Cranelift revisions observed, including revisions with an empty cache.
+    pub publication_revisions: u64,
+    /// Nonempty whole-cache retirements caused by Cranelift publication.
+    pub publication_flushes: u64,
+    pub compile_misses: u64,
+    /// Entries returning through Tier 0, including unsupported native exits.
+    pub fallback_entries: u64,
     pub compilations: u64,
     pub compile_time: Duration,
     pub code_bytes: u64,

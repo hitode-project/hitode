@@ -4,7 +4,7 @@ use crate::execution_abi::Tier1Frame;
 use crate::interpreter::{Execution as Interpreted, Interpreter, Step};
 use crate::{CpuState, Memory};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(not(target_os = "macos"))]
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -318,7 +318,7 @@ impl Unit {
 
 pub(crate) struct Engine {
     entries: BTreeMap<u32, (Rc<Unit>, usize)>,
-    // Pin units until a whole-cache retirement, including overwritten entries.
+    // Pin units until retirement, including overwritten entries.
     // This keeps page-rounded accounting exact without scanning on each lookup.
     units: Vec<Rc<Unit>>,
     entry_limit: usize,
@@ -350,6 +350,26 @@ impl Engine {
         self.entries.clear();
         self.units.clear();
         self.stats.resident_bytes = 0;
+    }
+    fn retire_published(&mut self, boundaries: &BTreeMap<u32, u32>) {
+        // Inspect every pinned CFG, not only the current entry map: a later CFG
+        // can overwrite an entry while an older owner still branches through it.
+        let retired: BTreeSet<_> = self
+            .units
+            .iter()
+            .filter(|unit| unit.input.iter().any(|(pc, _)| boundaries.contains_key(pc)))
+            .map(Rc::as_ptr)
+            .collect();
+        if retired.is_empty() {
+            return;
+        }
+        self.stats.publication_flushes += u64::from(retired.len() == self.units.len());
+        self.stats.cache_evictions += retired.len() as u64;
+        self.entries
+            .retain(|_, (unit, _)| !retired.contains(&Rc::as_ptr(unit)));
+        self.units
+            .retain(|unit| !retired.contains(&Rc::as_ptr(unit)));
+        self.stats.resident_bytes = self.units.iter().map(|unit| unit.code.len).sum();
     }
     pub fn set_cache_limits(&mut self, entries: usize, bytes: usize) {
         self.entry_limit = entries;
@@ -494,13 +514,13 @@ impl Engine {
             return Err("Tier 1 requires an exclusive serial execution owner".into());
         }
         // Publications happen only on this serial owner between batches. Old
-        // CFGs may cross a newly published entry, so retire them before running
-        // again. New CFGs end at every Cranelift entry, including fallthroughs.
-        if let Some((_, revision)) = boundaries
+        // CFGs may cross a newly published entry, so retire conflicting owners
+        // before running again. Disjoint CFGs remain valid across publications.
+        if let Some((entries, revision)) = boundaries
             && self.native_revision != revision
         {
-            self.stats.cache_evictions += self.units.len() as u64;
-            self.clear();
+            self.stats.publication_revisions += 1;
+            self.retire_published(entries);
             self.native_revision = revision;
         }
         if self.epoch != memory.epoch
@@ -518,6 +538,8 @@ impl Engine {
         if !self.entries.contains_key(&state.eip)
             && !self.compile(memory, state.eip, boundaries.map(|(entries, _)| entries))?
         {
+            self.stats.compile_misses += 1;
+            self.stats.fallback_entries += 1;
             let execution = interpreter.run_chunk(state, memory, units.min(1));
             self.stats.fallback_instructions += u64::from(execution.units);
             return Ok(Execution {
@@ -571,6 +593,7 @@ impl Engine {
         let (step, extra, interpreted) = match frame.reason {
             DISPATCH | BUDGET => (Step::Executed, 0, 0),
             FALLBACK => {
+                self.stats.fallback_entries += 1;
                 let e = interpreter.run_chunk(state, memory, frame.remaining.min(1) as u32);
                 self.stats.fallback_instructions += u64::from(e.units);
                 (e.step, e.units, e.units)

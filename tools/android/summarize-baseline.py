@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -111,7 +112,32 @@ def report_config(report: dict) -> dict:
     return {name: report[name] for name in REPORT_CONFIG} | {
         "codec_provider": report["codec"]["provider"], "codec_kernel_mode": report["codec_kernels"]["mode"],
         "codec_kernels_installed": report["codec_kernels"].get("installed"), "workers": 1,
-        "time_skip_enabled": report.get("time_skip", {}).get("enabled")}
+        "time_skip_enabled": report.get("time_skip", {}).get("enabled"),
+        "tier1_mode": report.get("tier1", {}).get("mode", "off"),
+        "compile_threads": report.get("compilation_schedule", {}).get("compile_threads"),
+        "available_cores": report.get("compilation_schedule", {}).get("available_cores")}
+
+
+def execution_metrics(report: dict) -> dict:
+    """Keep aggregate execution counters and compiler histograms per observation."""
+    cliffs = report.get("cpu_cliffs", {})
+    return {"tier1": report.get("tier1"), "compilation_schedule": report.get("compilation_schedule"),
+            "interpreter": cliffs.get("interpreter"), "interpreter_details": cliffs.get("interpreter_details"),
+            "tier1_bridge": cliffs.get("tier1_bridge")}
+
+
+def condition_identity(metadata: dict) -> dict | None:
+    before, after = metadata.get("device_conditions_before"), metadata.get("device_conditions_after")
+    require(not metadata.get("device_conditions_error"), "device condition capture failed")
+    if before is None and after is None:
+        return None
+    require(isinstance(before, dict) and isinstance(after, dict), "incomplete device conditions")
+    fixed = ("screen", "foreground", "allowed_cpus")
+    for state in (before, after):
+        require(all(isinstance(state.get(key), str) and state[key] for key in fixed), "missing display/CPU state")
+        number(state.get("battery_temperature_c"), "battery temperature")
+    require(all(before[key] == after[key] for key in fixed), "screen/foreground/CPU state changed during run")
+    return {key: before[key] for key in fixed}
 
 
 def command_option(command: list, name: str) -> str:
@@ -181,7 +207,8 @@ def load_run(directory: Path) -> dict:
     command = metadata.get("command")
     require(isinstance(command, list) and all(isinstance(word, str) for word in command), "invalid runner command")
     config.update(codec_requested=command_option(command, "--codec"),
-                  codec_kernels_requested=command_option(command, "--codec-kernels"))
+                  codec_kernels_requested=command_option(command, "--codec-kernels"),
+                  cpu_mask_requested=command[1] if len(command) > 2 and command[0] == "taskset" else None)
     require(config["codec_kernels_requested"] == config["codec_kernel_mode"], "requested/reported kernel mode differs")
     require(config["codepage"] == binding["codepage"], "report codepage differs from binding")
     checkpoints = metadata.get("checkpoints")
@@ -200,7 +227,7 @@ def load_run(directory: Path) -> dict:
         require(sha256(png_path) == exact_hash(entry.get("png_sha256"), 64), f"{name}: PNG hash differs")
         report = valid_report(read_json(report_path), name)
         require(report_config(report) == {key: value for key, value in config.items()
-                if key not in ("codec_requested", "codec_kernels_requested")}, f"{name}: runtime configuration changed")
+                if key not in ("codec_requested", "codec_kernels_requested", "cpu_mask_requested")}, f"{name}: runtime configuration changed")
         require(report.get("frame_fnv1a64") == step["await"]["frame_fnv1a64"] == entry.get("frame_fnv1a64")
                 and report["frames"] == entry.get("frames"), f"{name}: checkpoint frame/hash differs")
         assert_report(report, step.get("assert", {}), name)
@@ -248,21 +275,26 @@ def load_run(directory: Path) -> dict:
                "gate_hash_max_seconds": number(gate.get("hash_max_seconds"), f"{name}.gate.hash_max"),
                "pending_compilations": number(report.get("pending_compilations"), f"{name}.pending_compilations"),
                "codec": report["codec"], "codec_kernels": report["codec_kernels"],
-               "measurement_elapsed_seconds_diagnostic_only": performance.get("measurement_elapsed_seconds")}
+               "measurement_elapsed_seconds_diagnostic_only": performance.get("measurement_elapsed_seconds"),
+               "execution_metrics": execution_metrics(report)}
         rows.append(row)
         previous_global, previous_gate, previous_window, previous_epoch = global_now, gate_now, window_now, epoch
     require(sum(row["active_frame_interval"]["samples"] for row in rows) > 0, "no active frame interval samples")
     require(final["frames"] >= rows[-1]["process_counters"]["frames"], "final frame counter decreased")
     identity = {"binary_sha256": exact_hash(metadata.get("binary_sha256"), 64), "scene_binding": binding,
                 "scene_reference_sha256": reference_sha, "schedule_sha256": exact_hash(metadata.get("schedule_sha256"), 64),
-                "runtime_config": config, "device": metadata.get("device"), "serial": metadata.get("serial")}
+                "runtime_config": config, "device": metadata.get("device"), "serial": metadata.get("serial"),
+                "device_conditions": condition_identity(metadata)}
     return {"run_directory": str(directory), "run_name": directory.name, "warm_mode": warmth,
             "warm_input_sha256": warm_input, "warm_output_sha256": metadata["warm_output_sha256"],
             "session_sha256": sha256(session_path), "actions_sha256": sha256(directory / "actions.json"),
             "final_report_sha256": metadata["final_report_sha256"], "final_png_sha256": metadata["final_png_sha256"],
             "identity": identity, "checkpoints": rows,
             "final_process_counters": counters(final, GLOBAL_COUNTERS, "final"),
-            "final_scene_gate": final.get("scene_gate"), "first_frame_seconds": final.get("first_frame_seconds")}
+            "final_scene_gate": final.get("scene_gate"), "first_frame_seconds": final.get("first_frame_seconds"),
+            "final_execution_metrics": execution_metrics(final),
+            "device_conditions_before": metadata.get("device_conditions_before"),
+            "device_conditions_after": metadata.get("device_conditions_after")}
 
 
 def summarize(directories: list[Path]) -> dict:
@@ -315,7 +347,8 @@ def table(summary: dict) -> str:
 
 
 def save(path: Path, content: str) -> None:
-    require(path.resolve().is_relative_to(REPO / "target"), "output must stay inside ignored target/")
+    root = Path(os.environ.get("ADV_ARTIFACT_ROOT", REPO / "target")).resolve()
+    require(path.resolve().is_relative_to(root), "output must stay inside ADV_ARTIFACT_ROOT (default: ignored target/)")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(content, encoding="utf-8")
