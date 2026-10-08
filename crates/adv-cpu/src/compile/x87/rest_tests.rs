@@ -19,6 +19,31 @@ fn ext(v: f64) -> X87Register {
 }
 
 #[test]
+fn a_zero_fused_division_residual_without_range_guards_is_not_a_proof() {
+    let a = f64::MIN_POSITIVE;
+    let b = (1.0 - f64::EPSILON) * 2f64.powi(-511);
+    let q = a / b;
+    assert!(q.is_normal());
+    // q*b differs from a by 2^-1126, which even fused binary64 rounds to zero.
+    // The exact path must still report PE, despite an unchanged rounded value.
+    assert_eq!(q.mul_add(b, -a), 0.0);
+    let code = bytes(|asm| asm.fdiv_2(st0, st1).unwrap());
+    let mut initial = input(ext(a), ext(b));
+    initial.x87.status &= !0x3f;
+    let mut expected = initial.clone();
+    assert_eq!(
+        Interpreter::new().step(&mut expected, &mut memory(&code)),
+        Step::Executed
+    );
+    assert_ne!(expected.x87.status & 0x20, 0);
+    for dekker in [false, true] {
+        testing::FORCE_DEKKER.set(dekker);
+        compare(&code, initial.clone(), |_| {}, Some(1));
+    }
+    testing::FORCE_DEKKER.set(false);
+}
+
+#[test]
 fn exact_division_requires_native_hits_and_protects_the_quotient_range() {
     for single in [false, true] {
         testing::SINGLE_ONLY.set(single);
