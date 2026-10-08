@@ -27,6 +27,14 @@ class FrameBudgetTests(unittest.TestCase):
                                        guest_exec_ns=22_000_000, wait_ns=18_000_000))
         self.assertEqual(result["cause"], "platform.mixed_wait_execution")
 
+    def test_runtime_pumps_are_work_outside_backend_and_not_hle(self):
+        row = frame(wall_ns=36_000_000, active_ns=15_000_000,
+                    guest_exec_ns=10_000_000, wait_ns=11_000_000, service_audio_ns=10_000_000)
+        result = budget.classify(row)
+        self.assertEqual(result["cause"], "host.audio_service")
+        row["service_audio_ns"] = 7_000_000
+        self.assertEqual(budget.classify(row)["cause"], "platform.mixed_wait_execution_services")
+
     def test_explicit_host_costs_and_observer_freezes_have_separate_causes(self):
         for field, cause in (("scheduler_ns", "host.scheduler"), ("frontend_ns", "host.frontend_control"),
                              ("control_pause_ns", "observer.control_pause")):

@@ -62,7 +62,8 @@ def clean_row(row: dict) -> dict:
     """Use an allowlist so future raw diagnostics cannot leak into shareable output."""
     result = numeric_fields(row, ("serial", "wall_ns", "active_ns", "guest_exec_ns", "present_call_ns",
                                  "wait_ns", "wait_overshoot_ns", "wait_timeouts", "core", "frequency_khz",
-                                 "scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns"))
+                                 "scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
+                                 "service_audio_ns", "service_graphics_ns"))
     result.update(startup=row.get("startup") is True,
                   hle_ns=numeric_fields(row.get("hle_ns", {}), HLE_GROUPS),
                   native_reference="unmeasured")
@@ -132,6 +133,11 @@ def classify(row: dict) -> dict:
         duration = row.get(key, 0)
         if duration >= max(8_000_000, wall * .3):
             candidates.append((duration, cause, "residual_hint" if key == "frontend_ns" else "measured"))
+    work = active + row.get("service_audio_ns", 0) + row.get("service_graphics_ns", 0)
+    for key, cause in (("service_audio_ns", "host.audio_service"), ("service_graphics_ns", "host.graphics_service")):
+        duration = row.get(key, 0)
+        if duration >= max(8_000_000, work * .3):
+            candidates.append((duration, cause, "measured"))
     if candidates:
         _, cause, confidence = max(candidates)
     elif active > BUDGET_NS and cpu.get("softfloat_calls", 0) >= 1000:
@@ -148,6 +154,9 @@ def classify(row: dict) -> dict:
     elif (wall > BUDGET_NS and row.get("wait_ns", 0) >= 1_000_000
           and active + row.get("wait_ns", 0) >= wall * .8):
         cause, confidence = "platform.mixed_wait_execution", "measured_combination"
+    elif (wall > BUDGET_NS and row.get("wait_ns", 0) >= 1_000_000
+          and work + row.get("wait_ns", 0) >= wall * .8):
+        cause, confidence = "platform.mixed_wait_execution_services", "measured_combination"
     elif active > BUDGET_NS and row.get("guest_exec_ns", 0) >= active * .6:
         cause, confidence = "structure.guest_execution", "residual_hint"
     else:
@@ -157,7 +166,8 @@ def classify(row: dict) -> dict:
         evidence[key] = cpu.get(key)
     evidence.update(hle_ns=hle, wait_ns=row.get("wait_ns"), wait_overshoot_ns=overshoot,
                     core=row.get("core"), frequency_khz=row.get("frequency_khz"), top_apis=row.get("top_apis", []),
-                    **numeric_fields(row, ("scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns")))
+                    **numeric_fields(row, ("scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
+                                           "service_audio_ns", "service_graphics_ns")))
     return {"cause": cause, "confidence": confidence, "evidence": evidence}
 
 

@@ -44,6 +44,8 @@ struct Row {
     wall_ns: u64,
     active_ns: u64,
     guest_exec_ns: u64,
+    service_audio_ns: u64,
+    service_graphics_ns: u64,
     scheduler_ns: u64,
     frontend_ns: u64,
     control_pause_ns: u64,
@@ -64,6 +66,7 @@ impl Row {
         format!(
             concat!(
                 "{{\"serial\":{},\"startup\":{},\"wall_ns\":{},\"active_ns\":{},\"guest_exec_ns\":{},",
+                "\"service_audio_ns\":{},\"service_graphics_ns\":{},",
                 "\"scheduler_ns\":{},\"frontend_ns\":{},\"control_pause_ns\":{},\"accounting_excess_ns\":{},",
                 "\"hle_ns\":{{\"graphics\":{},\"file\":{},\"audio\":{},\"other\":{}}},\"top_apis\":[{}],",
                 "\"present_call_ns\":{},\"wait_ns\":{},\"wait_overshoot_ns\":{},\"wait_timeouts\":{},",
@@ -74,6 +77,8 @@ impl Row {
             self.wall_ns,
             self.active_ns,
             self.guest_exec_ns,
+            self.service_audio_ns,
+            self.service_graphics_ns,
             self.scheduler_ns,
             self.frontend_ns,
             self.control_pause_ns,
@@ -235,7 +240,12 @@ impl FrameBudget {
         let active_ns = delta.run_ns + delta.resume_ns;
         let wall_ns = at.saturating_duration_since(self.last).as_nanos() as u64;
         let scheduler_ns = self.machine_ns.saturating_sub(active_ns);
-        let accounted_ns = active_ns + scheduler_ns + self.wait_ns + self.control_pause_ns;
+        let accounted_ns = active_ns
+            + scheduler_ns
+            + self.wait_ns
+            + self.control_pause_ns
+            + delta.frontend_audio_ns
+            + delta.frontend_render_ns;
         self.touched
             .sort_unstable_by_key(|&i| (std::cmp::Reverse(self.apis[i].ns), i));
         let top_apis = self
@@ -254,6 +264,8 @@ impl FrameBudget {
             wall_ns,
             active_ns,
             guest_exec_ns: delta.run_ns.saturating_sub(delta.hook_ns),
+            service_audio_ns: delta.frontend_audio_ns,
+            service_graphics_ns: delta.frontend_render_ns,
             scheduler_ns,
             frontend_ns: wall_ns.saturating_sub(accounted_ns),
             control_pause_ns: self.control_pause_ns,
@@ -446,13 +458,19 @@ mod tests {
         b.finish(
             FrameRow {
                 run_ns: 15_000_000,
+                frontend_audio_ns: 8_000_000,
+                frontend_render_ns: 2_000_000,
                 ..Default::default()
             },
             None,
         );
         let row = b.rows.back().unwrap();
         assert_eq!(row.scheduler_ns, 5_000_000);
-        assert!(row.frontend_ns >= 15_000_000);
+        assert!(row.frontend_ns >= 5_000_000 && row.frontend_ns < 6_000_000);
+        assert_eq!(
+            (row.service_audio_ns, row.service_graphics_ns),
+            (8_000_000, 2_000_000)
+        );
         assert_eq!(row.top_apis.len(), 5);
         assert_eq!(row.top_apis[0].name, "fixture.dll!api6");
         assert!(b.apis.iter().all(|a| a.ns == 0 && a.calls == 0));
