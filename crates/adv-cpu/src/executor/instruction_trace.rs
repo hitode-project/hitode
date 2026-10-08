@@ -19,6 +19,11 @@
 //! boundary, so unrelated execution does not consume the capture budget.
 //! ADV_INTERP_TRACE_START optionally delays observation until the exact PC is
 //! reached. It changes only diagnostics, not the executed instruction stream.
+//! ADV_INTERP_TRACE_WATCH_DWORD optionally observes one x86 DWORD at each
+//! interpreter dispatch, independent of the selected PC ranges. watch_change
+//! records the first readable value and later changes (including unreadability).
+//! previous_dispatch_pc and current_state delimit a candidate dispatch interval,
+//! not an exact store PC. Watch events share the START gate and total MAX budget.
 //! Configuration or IO errors warn and disable capture without failing execution.
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -47,6 +52,7 @@ struct Config {
     stack_words: usize,
     operands: bool,
     start: Option<u32>,
+    watch_dword: Option<u32>,
 }
 
 impl Config {
@@ -103,7 +109,25 @@ impl Config {
             stack_words,
             operands,
             start: None,
+            watch_dword: None,
         })
+    }
+
+    fn set_watch(&mut self, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        let address = match value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            Some(hex) => u32::from_str_radix(hex, 16),
+            None => value.parse::<u32>(),
+        }
+        .map_err(|e| e.to_string())?;
+        if u64::from(address) + 4 > ADDRESS_END {
+            return Err("watch DWORD extends beyond the x86 address space".into());
+        }
+        self.watch_dword = Some(address);
+        Ok(())
     }
 }
 
@@ -149,6 +173,8 @@ pub(crate) struct Trace {
     interval_observed: bool,
     armed: bool,
     failure: Option<String>,
+    previous_dispatch_pc: Option<u32>,
+    watch_value: Option<u32>,
 }
 
 impl Trace {
@@ -182,6 +208,14 @@ impl Trace {
                         }
                     }
                 }
+                if let Ok(watch) = std::env::var("ADV_INTERP_TRACE_WATCH_DWORD") {
+                    if let Err(error) = config.set_watch(&watch) {
+                        eprintln!(
+                            "warning: interpreter instruction trace disabled: invalid watch DWORD: {error}"
+                        );
+                        return None;
+                    }
+                }
                 Some(Box::new(Self::new(config)))
             }
             Err(error) => {
@@ -211,6 +245,8 @@ impl Trace {
             pending_resume: false,
             interval_observed: false,
             failure: None,
+            previous_dispatch_pc: None,
+            watch_value: None,
         }
     }
 
@@ -230,6 +266,10 @@ impl Trace {
                 return (units.min(distance.div_ceil(15) as u32), None);
             }
             self.armed = true;
+        }
+        self.watch(state, memory);
+        if self.disabled {
+            return (units, None);
         }
         if self.pending_resume {
             self.pending_resume = false;
@@ -286,6 +326,37 @@ impl Trace {
             units.min(distance.div_ceil(15).min(u64::from(u32::MAX)) as u32),
             None,
         )
+    }
+
+    fn watch(&mut self, state: &CpuState, memory: &Memory) {
+        let Some(address) = self.config.watch_dword else {
+            return;
+        };
+        let previous_pc = self.previous_dispatch_pc.replace(state.eip);
+        let mut bytes = [0; 4];
+        let value = (permitted(memory, address, bytes.len(), READ)
+            && memory.read_into(address, &mut bytes).is_ok())
+        .then(|| u32::from_le_bytes(bytes));
+        // An initially unreadable watch creates no output. A readable-to-null
+        // transition is observable without treating a diagnostic read as a fault.
+        if value == self.watch_value {
+            return;
+        }
+        let mut fields = format!(
+            "\"scope\":\"between_dispatches\",\"watch_address\":{address},\"previous_value\":"
+        );
+        scalar_json(&mut fields, self.watch_value.map(u64::from));
+        fields.push_str(",\"value\":");
+        scalar_json(&mut fields, value.map(u64::from));
+        fields.push_str(",\"previous_dispatch_pc\":");
+        scalar_json(&mut fields, previous_pc.map(u64::from));
+        let _ = write!(
+            fields,
+            ",\"current_state\":{}",
+            snapshot(state, memory, self.config.stack_words)
+        );
+        self.watch_value = value;
+        self.record("watch_change", &fields);
     }
 
     pub(super) fn complete(
