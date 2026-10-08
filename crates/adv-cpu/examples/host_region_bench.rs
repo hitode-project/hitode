@@ -3,7 +3,6 @@
 //! captures), ADV_REGION_BENCH_SAMPLES/LOOPS/REPEATS/PRIVATE_LIMIT. Output: anonymous
 //! CSV statistics, OS capabilities and current CPU; never code, PCs or file names.
 //! Compilation and one full-state differential warmup are outside measurement.
-//! With gir-execute, tier 3 explicitly measures the opt-in state-SSA lane.
 //! ADV_REGION_BENCH_DIRECT=off|legacy|inline selects the memory lane. With no
 //! benchmark selector, ADV_DIRECT_MEMORY=1 selects direct mode and
 //! ADV_DIRECT_MEMORY_INLINE=0 selects legacy; otherwise the default is off.
@@ -405,7 +404,8 @@ fn replayable(i: &Instruction, info: &mut InstructionInfoFactory) -> bool {
 }
 
 /// Captures lack runtime state. Select the first bounded contiguous register-only
-/// slice with at least eight instructions. Never infer missing memory or branches.
+/// slice with at least four instructions. Startup captures often alternate small
+/// register runs with memory accesses. Never infer missing memory or branches.
 fn private_slice(manifest: &str, bytes: &[u8]) -> Option<Vec<u8>> {
     let mut lines = manifest.lines();
     let header: Vec<u32> = lines
@@ -435,7 +435,7 @@ fn private_slice(manifest: &str, bytes: &[u8]) -> Option<Vec<u8>> {
         let tail = bytes.get(offset..)?;
         let i = Decoder::with_ip(32, tail, u64::from(pc), DecoderOptions::NONE).decode();
         if replayable(&i, &mut info) {
-            if count != 0 && offset != end && count >= 8 {
+            if count != 0 && offset != end && count >= 4 {
                 return Some(bytes.get(start..end)?.to_vec());
             }
             if count == 0 || offset != end {
@@ -448,13 +448,13 @@ fn private_slice(manifest: &str, bytes: &[u8]) -> Option<Vec<u8>> {
                 return Some(bytes.get(start..end)?.to_vec());
             }
         } else {
-            if count >= 8 {
+            if count >= 4 {
                 return Some(bytes.get(start..end)?.to_vec());
             }
             count = 0;
         }
     }
-    (count >= 8).then(|| bytes[start..end].to_vec())
+    (count >= 4).then(|| bytes[start..end].to_vec())
 }
 
 fn load_private(root: &Path, limit: usize, repeats: usize) -> Vec<Case> {
@@ -545,8 +545,6 @@ fn load_private(root: &Path, limit: usize, repeats: usize) -> Vec<Case> {
 
 fn setup(case: &Case, tier: u8, direct: DirectMode) -> Result<Executor, String> {
     let mut m = Executor::new(CODE, 0x21000)?;
-    #[cfg(feature = "gir-execute")]
-    m.set_gir_state_ssa(tier == 3)?;
     if tier != 0 && direct != DirectMode::Off {
         m.set_direct_memory(true)?;
     }
@@ -674,9 +672,6 @@ fn main() {
     } else {
         vec![0, 2]
     };
-    if cfg!(all(feature = "gir-execute", not(target_os = "macos"))) {
-        tiers.push(3);
-    }
     if std::env::var("ADV_REGION_BENCH_TIER0_ONLY").as_deref() == Ok("1") {
         tiers = vec![0];
     }
@@ -902,5 +897,26 @@ mod tests {
         let manifest = format!("{CODE}\t{CODE}\t{}\t40\n{}\n", bytes.len(), pcs.join("\t"));
         let slice = private_slice(&manifest, &bytes).unwrap();
         assert_eq!(Decoder::new(32, &slice, 0).into_iter().count(), 32);
+    }
+
+    #[test]
+    fn short_register_runs_need_four_instructions() {
+        for count in [3, 4] {
+            let mut a = CodeAssembler::new(32).unwrap();
+            for _ in 0..count {
+                a.add(eax, edx).unwrap();
+            }
+            let bytes = a.assemble(u64::from(CODE)).unwrap();
+            let pcs = Decoder::with_ip(32, &bytes, u64::from(CODE), 0)
+                .into_iter()
+                .map(|i| i.ip().to_string())
+                .collect::<Vec<_>>();
+            let manifest = format!(
+                "{CODE}\t{CODE}\t{}\t{count}\n{}\n",
+                bytes.len(),
+                pcs.join("\t")
+            );
+            assert_eq!(private_slice(&manifest, &bytes).is_some(), count == 4);
+        }
     }
 }

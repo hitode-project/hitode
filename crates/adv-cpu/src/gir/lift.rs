@@ -137,6 +137,114 @@ pub struct Lifted {
     pub call_boundaries: BTreeMap<super::cfg::Boundary, usize>,
 }
 
+/// Production regions keep their existing native execution contract. Integer
+/// runs carry GIR SSA across instructions; opaque operations share the same
+/// state variables with the established scalar, SIMD, x87 and kernel emitters.
+pub(crate) enum Tier2Operation {
+    Ssa {
+        region: Region,
+        instructions: Vec<Instruction>,
+    },
+    Opaque(Instruction),
+}
+
+pub(crate) struct Tier2 {
+    pub operations: BTreeMap<u32, Tier2Operation>,
+    pub ssa_instructions: usize,
+    pub opaque_instructions: usize,
+}
+
+/// Lift maximal contiguous integer runs without crossing native side entries.
+/// Specialized kernels remain opaque so their established proofs and vector
+/// lanes are preserved until those semantics have an explicit GIR form.
+pub(crate) fn tier2(
+    instructions: &BTreeMap<u32, Instruction>,
+    entries: &std::collections::BTreeSet<u32>,
+    opaque: &std::collections::BTreeSet<u32>,
+    opaque_memory: bool,
+) -> Result<Tier2, super::verify::Error> {
+    // Overlapping decode entries can merge after distinct linear prefixes.
+    // Keep their common suffix independently addressable by either stream.
+    let mut fallthroughs = std::collections::BTreeSet::new();
+    let mut merges = std::collections::BTreeSet::new();
+    for i in instructions
+        .values()
+        .filter(|i| i.flow_control() == iced_x86::FlowControl::Next)
+    {
+        if !fallthroughs.insert(i.next_ip32()) {
+            merges.insert(i.next_ip32());
+        }
+    }
+    let mut operations = BTreeMap::new();
+    let mut ssa_instructions = 0;
+    let mut opaque_instructions = 0;
+    let mut remaining = instructions.clone();
+    while let Some((&start, &first)) = remaining.first_key_value() {
+        if opaque.contains(&start) || !native_integer(&first, opaque_memory) {
+            remaining.remove(&start);
+            operations.insert(start, Tier2Operation::Opaque(first));
+            opaque_instructions += 1;
+            continue;
+        }
+        let mut run = BTreeMap::new();
+        let mut pc = start;
+        while let Some(&i) = remaining.get(&pc) {
+            if pc != start && (entries.contains(&pc) || merges.contains(&pc))
+                || opaque.contains(&pc)
+                || !native_integer(&i, opaque_memory)
+            {
+                break;
+            }
+            remaining.remove(&pc);
+            run.insert(pc, i);
+            pc = i.next_ip32();
+        }
+        let region = lift_impl(
+            &run,
+            start,
+            super::cfg::Limits {
+                depth: 0,
+                instructions: run.len(),
+            },
+            false,
+        )?
+        .region;
+        ssa_instructions += run.len();
+        operations.insert(
+            start,
+            Tier2Operation::Ssa {
+                region,
+                instructions: run.into_values().collect(),
+            },
+        );
+    }
+    Ok(Tier2 {
+        operations,
+        ssa_instructions,
+        opaque_instructions,
+    })
+}
+
+fn native_integer(i: &Instruction, opaque_memory: bool) -> bool {
+    if classify(i).is_err()
+        || i.flow_control() != iced_x86::FlowControl::Next
+        || opaque_memory && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory)
+    {
+        return false;
+    }
+    let full_destination = match i.op0_kind() {
+        OpKind::Register => i.op0_register().is_gpr32(),
+        OpKind::Memory => i.memory_size().size() == 4,
+        _ => false,
+    };
+    match i.mnemonic() {
+        M::Nop => true,
+        M::Mov | M::Lea | M::Movzx | M::Movsx => full_destination,
+        M::Add | M::Sub | M::Cmp | M::Inc | M::Dec | M::Neg | M::Not => full_destination,
+        _ => false,
+    }
+}
+
 /// Discover bounded call contexts, then build guest basic blocks with explicit
 /// instruction commits. State is threaded directly within each basic block.
 pub fn lift(
@@ -149,6 +257,15 @@ pub fn lift_with_limits(
     instructions: &BTreeMap<u32, Instruction>,
     start: u32,
     limits: super::cfg::Limits,
+) -> Result<Lifted, super::verify::Error> {
+    lift_impl(instructions, start, limits, true)
+}
+
+fn lift_impl(
+    instructions: &BTreeMap<u32, Instruction>,
+    start: u32,
+    limits: super::cfg::Limits,
+    compact: bool,
 ) -> Result<Lifted, super::verify::Error> {
     let plan = super::cfg::discover(instructions, start, limits)?;
     let mut region = Region {
@@ -261,7 +378,9 @@ pub fn lift_with_limits(
             Err(reason) => *rejected.entry(reason).or_default() += 1,
         }
     }
-    super::state_ssa::compact(&mut region);
+    if compact {
+        super::state_ssa::compact(&mut region);
+    }
     region.recovery = region
         .snapshots
         .iter()

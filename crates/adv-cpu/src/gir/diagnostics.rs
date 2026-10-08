@@ -76,25 +76,3 @@ pub fn record(instructions: &BTreeMap<u32, Instruction>, start: u32) {
         eprintln!("{}", census.line());
     }
 }
-
-#[cfg(feature = "gir-lower")]
-pub fn record_lower(instructions: &BTreeMap<u32, Instruction>, start: u32, base: u32, len: usize) {
-    if std::env::var("ADV_GIR_LOWER").as_deref() != Ok("1") {
-        return;
-    }
-    match lift::lift(instructions, start)
-        .map_err(|e| e.to_string())
-        .and_then(|l| super::lower_cl::compile(&l.region, base, len, cfg!(feature = "cross-dump")))
-    {
-        Ok(code) => eprintln!(
-            "gir_lower guest={} bytes={} arm64_bytes={:?} cold_edges={} cold_blocks={} flags_materialized={}",
-            instructions.len(),
-            code.machine.len(),
-            code.cross.as_ref().map(|c| c.0.len()),
-            code.cold_edges,
-            code.cold_blocks,
-            code.flags_materialized
-        ),
-        Err(_) => eprintln!("gir_lower failed=1"),
-    }
-}

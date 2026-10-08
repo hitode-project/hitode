@@ -326,8 +326,10 @@ def summarize(root: Path) -> dict:
 def device_lock(path: Path | None, root: Path, helper: Path | None = None):
     """Use the shared broker when supplied; otherwise retain legacy locking."""
     if helper is not None:
-        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)),
-                           ADV_DEVICE_TASK=os.environ.get("ADV_DEVICE_TASK", "bud"))
+        task = os.environ.get("ADV_DEVICE_TASK", "bud")
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", task):
+            raise ValueError("invalid device task name")
+        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)), ADV_DEVICE_TASK=task)
         prefix = "$ErrorActionPreference='Stop'; . $env:ADV_DEVICE_HELPER; "
         try:
             # Acquisition is idempotent for this task. A broker can briefly

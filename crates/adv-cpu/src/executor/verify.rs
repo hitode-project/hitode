@@ -151,20 +151,6 @@ impl Verifier {
         self.record_units(owner, stop, interpreter, state, memory, true, MAX_STEPS)
     }
 
-    #[cfg(any(test, feature = "gir-execute"))]
-    pub(crate) fn record_gir(
-        &mut self,
-        owner: u32,
-        stop: u32,
-        interpreter: &mut Interpreter,
-        state: &mut CpuState,
-        memory: &mut Memory,
-    ) -> Result<Trace, String> {
-        let mut trace = self.record_units(owner, stop, interpreter, state, memory, true, 256)?;
-        trace.exact_flags = true;
-        Ok(trace)
-    }
-
     fn record_units(
         &mut self,
         owner: u32,
