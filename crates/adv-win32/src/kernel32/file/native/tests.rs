@@ -6,6 +6,8 @@ use adv_cpu::{
     backend::{Guest, Prot},
 };
 use adv_machine::{Clock, Machine};
+use adv_os::{Loader, Modules};
+use adv_pe::ImportName;
 
 const OPAQUE_HANDLE: u32 = 0x123abc00;
 struct Provider {

@@ -9,6 +9,7 @@ This records virtual PCM and guest frame observations, not native Android output
 from __future__ import annotations
 
 import argparse
+import os
 import hashlib
 import json
 import math
@@ -29,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scene_schedule import (assert_report, await_command, digest_json, exact_hash,
                             load_scene, validate_reference)
 
-INPUT_COMMANDS = frozenset(("click", "move", "key", "key-down", "key-up", "menus",
+INPUT_COMMANDS = frozenset(("click", "move", "mouse-down", "mouse-up", "key", "key-down", "key-up", "menus",
                             "menu", "dialogs", "dialog", "dialog-track", "dialog-close",
                             "memory", "reset-metrics", "close"))
 RESERVED_CHECKPOINTS = frozenset(("final", "blocked", "session", "actions", "device",
@@ -236,7 +237,7 @@ def validate_report(report: dict, name: str) -> None:
 
 class Adb:
     def __init__(self, args: argparse.Namespace):
-        self.prefix = [str(args.adb), "-P", str(args.adb_port), "-s", args.serial]
+        self.prefix = [str(args.adb), "-H", "127.0.0.1", "-P", str(args.adb_port), "-s", args.serial]
         self.timeout = args.transfer_timeout
         self.transport_retries = []
 
@@ -269,12 +270,13 @@ class Adb:
                 if not result.returncode:
                     return result
                 message = f"adb {args[0]} failed ({result.returncode}): {result.stderr.strip()} {result.stdout.strip()}"
-            if not idempotent or attempt == 2 or not self.transient_transport_error(message):
+            before_dispatch = "cannot connect to daemon" in message.lower()
+            if (not idempotent and not before_dispatch) or attempt == 2 or not self.transient_transport_error(message):
                 if timed_out is not None:
                     raise timed_out
                 raise RuntimeError(message)
             self.transport_retries.append({"command": args[0], "retry": attempt + 1, "error": message})
-            time.sleep(.25 * (attempt + 1))
+            time.sleep(30)
         raise AssertionError("unreachable adb retry state")
 
     def shell(self, words: list[str]) -> str:
@@ -301,7 +303,9 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
         command.extend(["--schedule-profile", remote + "/schedule.tsv"])
     if args.auto_dialog_ms is not None:
         command.extend(["--auto-dialog-ms", str(args.auto_dialog_ms)])
-    environment = []
+    environment = ["ADV_TIER1=" + getattr(args, "tier1", "off")]
+    if getattr(args, "compile_threads", None) is not None:
+        environment.append("ADV_COMPILE_THREADS=" + str(args.compile_threads))
     if args.font_diagnostics:
         environment.append("ADV_TEXT_DIAGNOSTICS=1")
     if getattr(args, "font_profile", None):
@@ -310,6 +314,8 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
         environment += ["ADV_AUDIO_TRACE=" + remote + "/audio.log", "ADV_AUDIO_DUMP_DIR=" + remote + "/pcm"]
     if environment:
         command = ["env"] + (["-u", "ADV_AUDIO_DUMP_CHUNKS"] if getattr(args, "capture_pcm", False) else []) + environment + command
+    if getattr(args, "cpu_mask", None):
+        command = ["taskset", args.cpu_mask] + command
     return command
 
 
@@ -322,6 +328,22 @@ def launch_script(command: list[str], remote: str, game: str, timeout: int) -> s
             f"2>{shlex.quote(remote + '/stderr.log')}; "
             f"result=$?; printf '%s\\n' \"$result\" >{shlex.quote(remote + '/exit-code.txt')}; "
             f") | tee {shlex.quote(remote + '/stdout.log')}")
+
+
+def device_conditions(adb: Adb) -> dict:
+    """Read aggregate thermal/display/scheduling conditions outside guest timing."""
+    text = adb.call("shell", "dumpsys battery; dumpsys power; dumpsys window; cat /proc/self/status",
+                    idempotent=True).stdout
+    def field(pattern: str) -> str | None:
+        match = re.search(pattern, text, re.MULTILINE)
+        return match[1].strip() if match else None
+    temperature = field(r"^\s*temperature:\s*(\d+)\s*$")
+    focus = field(r"^\s*mCurrentFocus=(.*)$")
+    if focus:
+        focus = re.sub(r"Window\{[0-9a-f]+\s+", "Window{", focus)
+    return {"battery_temperature_c": int(temperature) / 10 if temperature else None,
+            "screen": field(r"^\s*mWakefulness=([A-Za-z]+)\s*$"),
+            "foreground": focus, "allowed_cpus": field(r"^Cpus_allowed_list:\s*(.*)$")}
 
 
 def run(args: argparse.Namespace) -> None:
@@ -348,8 +370,9 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError("checkpoint name is reserved for session evidence")
     args.exe_relative = relative_exe(args.exe_relative)
     output = args.output.resolve()
-    if not output.is_relative_to(REPO / "target"):
-        raise ValueError("--output must be inside this repository's ignored target directory")
+    artifact_root = Path(os.environ.get("ADV_ARTIFACT_ROOT", REPO / "target")).resolve()
+    if not output.is_relative_to(artifact_root):
+        raise ValueError("--output must be inside ADV_ARTIFACT_ROOT (default: ignored target/)")
     binary = args.binary.resolve(strict=True)
     game_dir = args.game_dir.absolute()
     if not game_dir.is_dir():
@@ -464,6 +487,8 @@ def run(args: argparse.Namespace) -> None:
         if cold or warm_profile:
             metadata["warm_profile_input_verified"] = True
         write_json(output / "session.json", metadata)
+        if getattr(args, "record_device_state", False):
+            metadata["device_conditions_before"] = device_conditions(adb)
         with (output / "stdout.log").open("w", encoding="utf-8") as stdout, \
                 (output / "adb-stderr.log").open("w", encoding="utf-8") as adb_stderr:
             started = time.monotonic()
@@ -589,6 +614,11 @@ def run(args: argparse.Namespace) -> None:
         error = caught
         metadata["error"] = f"{type(caught).__name__}: {caught}"
     finally:
+        if getattr(args, "record_device_state", False):
+            try:
+                metadata["device_conditions_after"] = device_conditions(adb)
+            except Exception as caught:
+                metadata["device_conditions_error"] = str(caught)
         # The remote directory remains available after failures/disconnection. Never
         # recursively pull game/data resources and never delete a reused source.
         evidence = ("final.json", "final.png", "stderr.log", "stdout.log", "exit-code.txt")
@@ -707,6 +737,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--codec-kernels", choices=("guest", "verify", "native"), default="native")
     parser.add_argument("--no-tiering", action="store_true")
+    parser.add_argument("--tier1", choices=("off", "bridge"), default="off")
+    parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
+    parser.add_argument("--record-device-state", action="store_true",
+                        help="record battery temperature, screen, foreground and CPU affinity before/after execution")
+    parser.add_argument("--cpu-mask", help="explicit hexadecimal taskset mask for the guest and compiler workers")
     parser.add_argument("--schedule-profile", action="store_true")
     parser.add_argument("--font-diagnostics", action="store_true",
                         help="record font requested/resolved/source in stderr; excludes performance comparisons")
@@ -725,6 +760,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid adb port or serial")
     if args.auto_dialog_ms is not None and not 0 <= args.auto_dialog_ms <= 60000:
         parser.error("--auto-dialog-ms must be within 0..60000")
+    if args.cpu_mask is not None and (not re.fullmatch(r"[0-9a-fA-F]{1,16}", args.cpu_mask) or int(args.cpu_mask, 16) == 0):
+        parser.error("--cpu-mask must be a nonzero hexadecimal mask")
     return args
 
 

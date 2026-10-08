@@ -68,7 +68,7 @@ fn data_declarations_have_width_and_cannot_be_function_bindings() {
 }
 
 #[test]
-fn dynamic_availability_requires_registered_behavior_or_an_explicit_proxy_contract() {
+fn dynamic_availability_keeps_fixed_existence_separate_from_implementation() {
     let mut registry = Registry::default();
     for mode in [RunMode::Strict, RunMode::Discovery] {
         registry.set_mode(mode);
@@ -76,13 +76,13 @@ fn dynamic_availability_requires_registered_behavior_or_an_explicit_proxy_contra
             registry.get("kernel32.dll", "FlsAlloc").is_some(),
             "metadata retains a static diagnostic handler"
         );
-        assert!(!registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+        assert!(registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+        assert!(!registry.is_implemented("kernel32.dll", "FlsAlloc"));
+        assert!(!registry.dynamic_available("kernel32.dll", "UnknownOptionalExport"));
         assert!(registry.dynamic_available("DWRITE.DLL", "DWriteCreateFactory"));
         assert!(registry.dynamic_available("d2d1.dll", "#1"));
-        assert!(
-            !registry.dynamic_available("kernel32.dll", "CreateFileW"),
-            "reviewed discovery return is not dynamic capability"
-        );
+        assert!(registry.dynamic_available("kernel32.dll", "CreateFileW"));
+        assert!(!registry.dynamic_available("d3d11.dll", "D3D11CreateDeviceAndSwapChain"));
     }
     registry.register(adv_abi::Api {
         module: "kernel32.dll",

@@ -135,9 +135,99 @@ fn guest_override_detects_live_inline_and_eat_edits_against_immutable_entries() 
     assert!(loader.inits.is_empty());
     // Capability filtering still applies to pristine diagnostic exports, while
     // the override probe itself neither requires nor reports host availability.
-    let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
-    assert_eq!(guest_override(&mut machine, kernel, "FlsAlloc"), None);
-    assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+    let controls = machine.load(&Empty, "comctl32.dll").unwrap();
+    assert_eq!(
+        guest_override(&mut machine, controls, "InitCommonControlsEx"),
+        None
+    );
+    assert!(dynamic(&mut machine, controls, named("InitCommonControlsEx")).is_err());
+}
+
+#[test]
+fn guest_override_reads_changed_export_names_and_ordinals_after_warm_lookups() {
+    let mut machine = machine(false);
+    let module = machine.load(&Empty, "comctl32.dll").unwrap();
+    let name = "InitCommonControls";
+    let entry = resolve(&mut machine, module, named(name));
+    assert_eq!(guest_override(&mut machine, module, name), None);
+    let image = adv_os::modules(&machine.ext).get(module);
+    let base = image.base;
+    let directory = base + machine.cpu.read_u32(base + 0x80 + 120).unwrap();
+    let names = base + machine.cpu.read_u32(directory + 32).unwrap();
+    let ordinals = base + machine.cpu.read_u32(directory + 36).unwrap();
+    let count = machine.cpu.read_u32(directory + 24).unwrap();
+    let index = (0..count)
+        .find(|index| {
+            let pointer = base + machine.cpu.read_u32(names + index * 4).unwrap();
+            machine.cpu.read_cstr(pointer, 128).unwrap() == name.as_bytes()
+        })
+        .unwrap();
+    let pointer = base + machine.cpu.read_u32(names + index * 4).unwrap();
+    machine
+        .cpu
+        .protect(pointer & !4095, 4096, Prot::RW)
+        .unwrap();
+    machine.cpu.write(pointer, b"?nitCommonControls\0").unwrap();
+    assert!(matches!(
+        Loader::new(
+            &mut machine.cpu,
+            &mut machine.sys,
+            machine.ext.get_mut::<Modules>(),
+            &Empty,
+        )
+        .guest_override(module, name),
+        Err(adv_os::LoadError::MissingExport { .. })
+    ));
+    machine.cpu.write(pointer, name.as_bytes()).unwrap();
+    assert_eq!(guest_override(&mut machine, module, name), None);
+    let slot = ordinals + index * 2;
+    let original = machine.cpu.read_u16(slot).unwrap();
+    let functions = base + machine.cpu.read_u32(directory + 28).unwrap();
+    let function_count = machine.cpu.read_u32(directory + 20).unwrap();
+    let (replacement, rva) = (0..function_count)
+        .filter(|candidate| *candidate != u32::from(original))
+        .find_map(|candidate| {
+            let rva = machine.cpu.read_u32(functions + candidate * 4).unwrap();
+            machine
+                .cpu
+                .accessible(base + rva, 1, Prot::EXEC)
+                .then_some((candidate as u16, rva))
+        })
+        .unwrap();
+    machine.cpu.protect(slot & !4095, 4096, Prot::RW).unwrap();
+    machine.cpu.write(slot, &replacement.to_le_bytes()).unwrap();
+    assert_ne!(base + rva, entry);
+    assert_eq!(guest_override(&mut machine, module, name), Some(base + rva));
+    machine.cpu.write(slot, &original.to_le_bytes()).unwrap();
+    assert_eq!(guest_override(&mut machine, module, name), None);
+}
+
+#[test]
+fn live_export_name_comparison_handles_long_prefixes_and_utf8_without_stale_results() {
+    let mut registry = Registry::default();
+    let first = format!("{}A", "prefix".repeat(30));
+    let second = format!("{}B", "prefix".repeat(30));
+    for name in [first.as_str(), second.as_str(), "unicode_é"] {
+        registry.add(
+            "authored_names.dll",
+            name,
+            Conv::Stdcall { argc: 0 },
+            |_| Outcome::Return(1),
+        );
+    }
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    let module = machine.load(&Empty, "authored_names.dll").unwrap();
+    let first_entry = resolve(&mut machine, module, named(&first));
+    let second_entry = resolve(&mut machine, module, named(&second));
+    assert_ne!(first_entry, second_entry);
+    for name in [first.as_str(), second.as_str(), "unicode_é"] {
+        assert_eq!(guest_override(&mut machine, module, name), None);
+    }
 }
 
 fn dynamic(
@@ -156,7 +246,7 @@ fn dynamic(
 }
 
 #[test]
-fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exports() {
+fn fixed_core_exports_exist_while_noncore_metadata_keeps_capability_policy() {
     let mut machine = machine(false);
     let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
     for name in ["FlsAlloc", "FlsFree", "FlsGetValue", "FlsSetValue"] {
@@ -169,14 +259,17 @@ fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exp
             .unwrap()
             .0;
         let ordinal = *ordinal;
-        assert!(dynamic(&mut machine, kernel, named(name)).is_err());
-        assert!(dynamic(&mut machine, kernel, ImportName::Ordinal(ordinal)).is_err());
+        assert_eq!(
+            dynamic(&mut machine, kernel, named(name)).unwrap(),
+            dynamic(&mut machine, kernel, ImportName::Ordinal(ordinal)).unwrap()
+        );
         assert_ne!(
             resolve(&mut machine, kernel, named(name)),
             0,
             "static diagnostics remain hookable"
         );
     }
+    assert!(dynamic(&mut machine, kernel, named("UnknownOptionalExport")).is_err());
     for (dll, name) in [
         ("dwrite.dll", "DWriteCreateFactory"),
         ("d3d11.dll", "D3D11CreateDevice"),
@@ -206,11 +299,11 @@ fn dynamic_capabilities_hide_pristine_metadata_stubs_without_removing_static_exp
 fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or_code() {
     for jit in [false, true] {
         let mut machine = machine(jit);
-        let kernel = machine.load(&Empty, "kernel32.dll").unwrap();
+        let kernel = machine.load(&Empty, "comctl32.dll").unwrap();
         let module = adv_os::modules(&machine.ext).get(kernel);
         let (base, size) = (module.base, module.size);
-        let original = resolve(&mut machine, kernel, named("FlsAlloc"));
-        assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+        let original = resolve(&mut machine, kernel, named("InitCommonControlsEx"));
+        assert!(dynamic(&mut machine, kernel, named("InitCommonControlsEx")).is_err());
         machine
             .cpu
             .protect(original & !4095, 4096, Prot::RWX)
@@ -220,7 +313,7 @@ fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or
             .write(original, &[0xb8, 99, 0, 0, 0, 0xc2, 4, 0])
             .unwrap();
         assert_eq!(
-            dynamic(&mut machine, kernel, named("FlsAlloc")).unwrap(),
+            dynamic(&mut machine, kernel, named("InitCommonControlsEx")).unwrap(),
             original
         );
         machine.cpu.map(0x400000, 4096, Prot::RX).unwrap();
@@ -233,7 +326,7 @@ fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or
         assert!(matches!(machine.run_virtual(100000), RunResult::Exited(99)));
         let directory = base + machine.cpu.read_u32(base + 0x80 + 120).unwrap();
         let ExportTarget::Rva(original_rva) =
-            adv_os::modules(&machine.ext).get(kernel).exports_by_name["FlsAlloc"]
+            adv_os::modules(&machine.ext).get(kernel).exports_by_name["InitCommonControlsEx"]
         else {
             panic!("code")
         };
@@ -245,12 +338,12 @@ fn dynamic_unimplemented_entries_become_visible_when_guest_hooks_the_live_eat_or
             .unwrap();
         machine.cpu.write_u32(slot, original_rva + 1).unwrap();
         assert_eq!(
-            dynamic(&mut machine, kernel, named("FlsAlloc")).unwrap(),
+            dynamic(&mut machine, kernel, named("InitCommonControlsEx")).unwrap(),
             original + 1
         );
         for invalid in [0, size] {
             machine.cpu.write_u32(slot, invalid).unwrap();
-            assert!(dynamic(&mut machine, kernel, named("FlsAlloc")).is_err());
+            assert!(dynamic(&mut machine, kernel, named("InitCommonControlsEx")).is_err());
         }
     }
 }

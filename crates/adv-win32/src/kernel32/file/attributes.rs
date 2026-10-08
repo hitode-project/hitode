@@ -85,16 +85,20 @@ fn get(env: &mut Env<'_>, pointer: u32, wide: bool) -> Outcome {
             return Outcome::Return(u32::MAX);
         }
     };
-    if let Some(outcome) = guest_attributes(env, &path, api) {
-        return outcome;
-    }
-    match file_attributes_path(env, &path, api) {
-        Ok(attributes) => Outcome::Return(attributes),
-        Err(_) => Outcome::Return(u32::MAX),
-    }
+    file_attributes_path_then(
+        env,
+        &path,
+        api,
+        Box::new(|_, result| Outcome::Return(result.unwrap_or(u32::MAX))),
+    )
 }
 
-fn guest_attributes(env: &mut Env<'_>, path: &str, api: &'static str) -> Option<Outcome> {
+pub(crate) fn file_attributes_path_then(
+    env: &mut Env<'_>,
+    path: &str,
+    api: &'static str,
+    then: native::operations::Done<u32>,
+) -> Outcome {
     // Inspect only the relevant exports. A hooked reader alone is not an
     // attribute provider, and pristine NT entries retain the existing VFS path.
     for (name, size, offset) in [
@@ -111,7 +115,7 @@ fn guest_attributes(env: &mut Env<'_>, path: &str, api: &'static str) -> Option<
                     "live native attribute entry cannot be inspected",
                     50,
                 );
-                return Some(Outcome::Return(u32::MAX));
+                return then(env, Err(50));
             }
         };
         let path = env.ext.get::<Win32>().vfs.normalize(path);
@@ -119,10 +123,10 @@ fn guest_attributes(env: &mut Env<'_>, path: &str, api: &'static str) -> Option<
             Ok(attributes) => attributes,
             Err(status) => {
                 set_last_error(env, super::native::win32_error(status));
-                return Some(Outcome::Return(u32::MAX));
+                return then(env, Err(super::native::win32_error(status)));
             }
         };
-        return Some(Outcome::call(
+        return Outcome::call(
             target,
             [attributes.object, attributes.extra],
             move |env, resumed| {
@@ -146,17 +150,16 @@ fn guest_attributes(env: &mut Env<'_>, path: &str, api: &'static str) -> Option<
                         .map_err(|_| 0xc0000005)
                 };
                 attributes.free(env);
-                match result {
-                    Ok(flags) => Outcome::Return(flags),
-                    Err(status) => {
-                        set_last_error(env, super::native::win32_error(status));
-                        Outcome::Return(u32::MAX)
-                    }
+                let result = result.map_err(super::native::win32_error);
+                if let Err(error) = result {
+                    set_last_error(env, error);
                 }
+                then(env, result)
             },
-        ));
+        );
     }
-    None
+    let result = file_attributes_path(env, path, api);
+    then(env, result)
 }
 
 /// One guest attribute view, also used by CRT access checks without opening files.
@@ -166,7 +169,14 @@ pub(crate) fn file_attributes_path(env: &mut Env<'_>, path: &str, api: &str) -> 
         return Ok(FILE_ATTRIBUTE_ARCHIVE | 1);
     }
     match env.ext.get::<Win32>().vfs.file_attributes(path) {
-        Ok(attributes) => Ok(attributes),
+        Ok(attributes) => {
+            crate::native::diagnose_bypass(
+                env,
+                api,
+                &["NtQueryAttributesFile", "NtQueryFullAttributesFile"],
+            );
+            Ok(attributes)
+        }
         Err(error) => {
             failed(env, api, path, &error);
             Err(crate::util::last_error(env))
@@ -198,6 +208,9 @@ fn set(env: &mut Env<'_>, pointer: u32, flags: u32, wide: bool) -> Outcome {
         );
         return Outcome::Return(0);
     }
+    if native::metadata::active(env, &["NtCreateFile", "NtOpenFile", "NtSetInformationFile"]) {
+        return native::metadata::attributes(env, &path, flags);
+    }
     let guest = env.ext.get::<Win32>().vfs.normalize(&path);
     if matches!(system_file(env, &guest), Ok(Some(_))) {
         unavailable(
@@ -209,7 +222,14 @@ fn set(env: &mut Env<'_>, pointer: u32, flags: u32, wide: bool) -> Outcome {
         return Outcome::Return(0);
     }
     match env.ext.get::<Win32>().vfs.set_file_normal(&path) {
-        Ok(()) => Outcome::Return(1),
+        Ok(()) => {
+            crate::native::diagnose_bypass(
+                env,
+                api,
+                &["NtOpenFile", "NtCreateFile", "NtSetInformationFile"],
+            );
+            Outcome::Return(1)
+        }
         Err(error) => {
             failed(env, api, &path, &error);
             Outcome::Return(0)

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{Guest, MemFault};
 
-use crate::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, THUNK_CAP, thunk_addr};
+use crate::layout::{GUEST_CODE_BASE, GUEST_CODE_SIZE, THUNK_CAP, THUNK_STRIDE, thunk_addr};
 use crate::{Env, Outcome};
 
 pub type Handler = fn(&mut Env<'_>) -> Outcome;
@@ -105,6 +105,7 @@ pub struct Thunk {
     pub guest_slot: Option<u32>,
     /// Registered host transport identity, distinct from a numeric system service.
     pub transport_token: Option<TransportToken>,
+    pristine: Vec<u8>,
 }
 
 /// Opaque word transported on the guest stack. Its identity survives ordinary
@@ -146,7 +147,7 @@ pub struct ThunkTable {
     /// Machine-internal functions, bound ahead of the resolver.
     internal: HashMap<(String, String), HostFn>,
     thunks: Vec<Thunk>,
-    by_name: HashMap<(String, String), u32>,
+    by_name: HashMap<String, HashMap<String, u32>>,
     /// Only successfully published ordinary bindings authorize transport.
     by_transport: HashMap<TransportToken, u32>,
     /// Next free byte of the guest code arena.
@@ -188,6 +189,11 @@ impl ThunkTable {
             requested: false,
             guest_slot: None,
             transport_token: None,
+            pristine: {
+                let mut pad = Asm::new(thunk_addr(RETURN_PAD));
+                pad.trap().hlt();
+                pad.bytes
+            },
         };
         Self {
             resolver,
@@ -208,6 +214,7 @@ impl ThunkTable {
                     requested: false,
                     guest_slot: None,
                     transport_token: None,
+                    pristine: Vec::new(),
                 },
             ],
             by_name: HashMap::new(),
@@ -224,17 +231,30 @@ impl ThunkTable {
     /// Immutable encoding of an existing binding, independent of guest hook
     /// writes to either its published entry or the original thunk page.
     pub fn pristine_entry(&self, index: u32) -> Vec<u8> {
-        let thunk = self.get(index);
-        match thunk.transport_token {
-            Some(token) => Self::emit(index, token, thunk.f.conv, thunk.guest_slot),
-            None if index == RETURN_PAD => {
-                let mut pad = Asm::new(thunk_addr(RETURN_PAD));
-                pad.trap().hlt();
-                pad.bytes
-            }
-            // The exception binding is diagnostic and has no callable entry.
-            None => Vec::new(),
-        }
+        self.pristine_entry_bytes(index).to_vec()
+    }
+
+    /// Borrow the encoding retained when this binding was first published.
+    pub fn pristine_entry_bytes(&self, index: u32) -> &[u8] {
+        &self.get(index).pristine
+    }
+
+    /// Inspect current bytes without allocating or trusting the mutable thunk page.
+    pub fn pristine_entry_matches(
+        &self,
+        cpu: &dyn Guest,
+        index: u32,
+        address: u32,
+    ) -> Result<bool, MemFault> {
+        let expected = self.pristine_entry_bytes(index);
+        let mut live = [0; THUNK_STRIDE as usize];
+        cpu.read(address, &mut live[..expected.len()])?;
+        Ok(&live[..expected.len()] == expected)
+    }
+
+    /// Exact published name in a canonical module; no alias or new binding lookup.
+    pub fn published_index(&self, module: &str, name: &str) -> Option<u32> {
+        self.by_name.get(module)?.get(name).copied()
     }
 
     /// Guest code replaces host traps for later bindings, and existing entries
@@ -374,7 +394,7 @@ impl ThunkTable {
             // Data imports are resolved by the image loader to RW/NX storage.
             return Err(MemFault { addr: 0, len: size });
         }
-        if let Some(&i) = self.by_name.get(&key) {
+        if let Some(i) = self.published_index(&key.0, &key.1) {
             self.thunks[i as usize].requested |= requested;
             return Ok(thunk_addr(i));
         }
@@ -412,10 +432,9 @@ impl ThunkTable {
             None => None,
         };
         let token = TransportToken::for_binding(index);
-        cpu.write(
-            thunk_addr(index),
-            &Self::emit(index, token, f.conv, guest_slot),
-        )?;
+        let pristine = Self::emit(index, token, f.conv, guest_slot);
+        assert!(pristine.len() <= THUNK_STRIDE as usize);
+        cpu.write(thunk_addr(index), &pristine)?;
         self.thunks.push(Thunk {
             module: key.0.clone(),
             name: name.to_owned(),
@@ -424,8 +443,9 @@ impl ThunkTable {
             requested,
             guest_slot,
             transport_token: Some(token),
+            pristine,
         });
-        self.by_name.insert(key, index);
+        self.by_name.entry(key.0).or_default().insert(key.1, index);
         self.by_transport.insert(token, index);
         Ok(thunk_addr(index))
     }

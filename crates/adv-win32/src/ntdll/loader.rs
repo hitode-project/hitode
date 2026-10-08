@@ -5,6 +5,9 @@ use adv_machine::{Env, Outcome};
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(load_ABI);
+    crate::stdcall(registry, "ntdll.dll", "LdrUnloadDll", 1, |env| {
+        crate::kernel32::native_unload_library(env, env.arg(0))
+    });
 }
 
 #[win32(ntdll, name = "LdrLoadDll", level = implement)]

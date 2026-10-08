@@ -38,6 +38,22 @@ pub fn verify(r: &Region) -> Result<(), Error> {
     if r.semantic_version != 1 || r.entry.0 >= r.blocks.len() {
         return Err(Error::region("semantic version or entry"));
     }
+    if r.recovery.len() != r.snapshots.len() {
+        return Err(Error::region("missing recovery DAG"));
+    }
+    for (dag, snapshot) in r.recovery.iter().zip(&r.snapshots) {
+        dag.verify(r, &snapshot.state)?;
+    }
+    let inlined = r
+        .blocks
+        .iter()
+        .filter(|b| b.inline_depth > 0)
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(op, Operation::Commit { .. }))
+        .count();
+    if inlined > r.inline_budget {
+        return Err(Error::region("inline instruction budget exceeded"));
+    }
     let mut defs = vec![None; r.values.len()];
     let mut memories = vec![false; r.memory.len()];
     let mut commits = vec![None; r.commits.len()];
@@ -61,12 +77,11 @@ pub fn verify(r: &Region) -> Result<(), Error> {
             }
             Ok(())
         };
-        if block.parameters.len() != 10 {
-            return Err(Error::at(
-                b,
-                0,
-                "v1 block needs complete state and token parameters",
-            ));
+        if block.inline_depth > r.inline_limit {
+            return Err(Error::at(b, 0, "inline depth exceeds region limit"));
+        }
+        if BlockId(b) == r.entry && block.parameters.len() != 10 {
+            return Err(Error::at(b, 0, "entry ABI parameter count"));
         }
         for (index, &id) in block.parameters.iter().enumerate() {
             define(id, 0)?;
@@ -75,7 +90,8 @@ pub fn verify(r: &Region) -> Result<(), Error> {
                     block: BlockId(b),
                     index,
                 })
-                || r.values[id.0].width != if index == 9 { Width::Token } else { Width::B32 }
+                || (BlockId(b) == r.entry
+                    && r.values[id.0].width != if index == 9 { Width::Token } else { Width::B32 })
             {
                 return Err(Error::at(b, 0, "parameter identity or width"));
             }
@@ -145,6 +161,14 @@ pub fn verify(r: &Region) -> Result<(), Error> {
                     "edge parameter count",
                 ));
             }
+            let valid_depth = match block.terminator {
+                Terminator::Call { .. } => target.inline_depth == block.inline_depth + 1,
+                Terminator::Return { .. } => target.inline_depth + 1 == block.inline_depth,
+                _ => target.inline_depth == block.inline_depth,
+            };
+            if !valid_depth {
+                return Err(Error::at(b, 0, "inline context edge depth"));
+            }
             predecessors[edge.block.0].push(b);
         }
     }
@@ -212,11 +236,8 @@ pub fn verify(r: &Region) -> Result<(), Error> {
             }
             Ok(())
         };
-        let mut state = StateMap {
-            gpr: std::array::from_fn(|n| block.parameters[n]),
-            flags: block.parameters[8],
-        };
-        let mut token = block.parameters[9];
+        let mut state = block.entry_state.clone();
+        let mut token = block.entry_token;
         let mut last_commit = None;
         let mut pending_commit = None;
         let mut wrote = false;
@@ -232,6 +253,9 @@ pub fn verify(r: &Region) -> Result<(), Error> {
                 ));
             }
             state_use(&s.state, pos)?;
+            for capture in r.recovery[id.0].captures() {
+                check_use(capture, pos)?;
+            }
             if s.commit.0 >= r.commits.len() {
                 return Err(Error::at(b, pos, "snapshot commit index"));
             }
@@ -384,7 +408,23 @@ pub fn verify(r: &Region) -> Result<(), Error> {
                     return Err(Error::at(b, pos, "edge argument width"));
                 }
             }
-            if e.arguments[..9] != state.values().collect::<Vec<_>>() || e.arguments[9] != token {
+            let target = &r.blocks[e.block.0];
+            let replacements: std::collections::BTreeMap<_, _> = target
+                .parameters
+                .iter()
+                .copied()
+                .zip(e.arguments.iter().copied())
+                .collect();
+            let resolve = |id: ValueId| replacements.get(&id).copied().unwrap_or(id);
+            if target.entry_state.gpr.map(resolve) != state.gpr
+                || resolve(target.entry_token) != token
+                || !super::state_ssa::same_flags(
+                    r,
+                    target.entry_state.flags,
+                    state.flags,
+                    &replacements,
+                )
+            {
                 return Err(Error::at(b, pos, "edge loses state or final token"));
             }
         }
@@ -490,6 +530,14 @@ fn type_valid(r: &Region, id: ValueId) -> bool {
                     && *code != iced_x86::ConditionCode::None
             }
             Pure::Nonzero(value) => w == Width::B1 && width(*value).is_some_and(Width::integer),
+            Pure::FlagBit { flags, bit } => {
+                w == Width::B1 && width(*flags) == Some(Width::B32) && FLAG_BITS.contains(bit)
+            }
+            Pure::FlagPack { bits, rest } => {
+                w == Width::B32
+                    && width(*rest) == Some(Width::B32)
+                    && bits.iter().all(|v| width(*v) == Some(Width::B1))
+            }
         },
         ValueKind::Flags(f) => {
             let expected = match f.kind {

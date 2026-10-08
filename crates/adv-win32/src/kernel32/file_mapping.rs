@@ -622,10 +622,30 @@ pub(crate) fn prune(env: &mut Env<'_>) {
 }
 
 pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide: bool) -> Outcome {
-    let name = match name(env, pointer, wide) {
+    let name = match sync_name(env, pointer, wide) {
         Ok(name) => name,
         Err(e) => return fail(env, e),
     };
+    match sync_create_named(env, object, name, true) {
+        Ok((handle, existed)) => {
+            set_last_error(env, if existed { 183 } else { 0 });
+            Outcome::Return(handle)
+        }
+        Err(error) => fail(env, error),
+    }
+}
+
+/// Win32 and native synchronization adapters share this process-owned name key.
+pub(super) fn sync_name(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Option<Vec<u16>>, u32> {
+    name(env, pointer, wide)
+}
+
+pub(super) fn sync_create_named(
+    env: &mut Env<'_>,
+    object: Object,
+    name: Option<Vec<u16>>,
+    open_if: bool,
+) -> Result<(u32, bool), u32> {
     let kind = match object {
         Object::Event { .. } => 1,
         Object::Mutex { .. } => 2,
@@ -640,7 +660,7 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
                     .upgrade()
                     .is_some_and(|section| section.handles.get() != 0) =>
             {
-                return fail(env, 6);
+                return Err(6);
             }
             Some(Named::Sync {
                 identity,
@@ -649,13 +669,13 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
                 let (id, existing) = (*identity, *existing);
                 if env.sys.objects.has_identity(id) {
                     if kind != existing {
-                        return fail(env, 6);
+                        return Err(6);
                     }
-                    let Some(handle) = env.sys.objects.alias_identity(id) else {
-                        return fail(env, 8);
-                    };
-                    set_last_error(env, 183);
-                    return Outcome::Return(handle);
+                    if !open_if {
+                        return Err(183);
+                    }
+                    let handle = env.sys.objects.alias_identity(id).ok_or(8u32)?;
+                    return Ok((handle, true));
                 }
             }
             _ => {}
@@ -663,7 +683,7 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
     }
     let handle = env.sys.objects.insert(object);
     if handle == 0 {
-        return fail(env, 8);
+        return Err(8);
     }
     if let Some(name) = name {
         let identity = env.sys.objects.identity(handle).unwrap();
@@ -671,8 +691,19 @@ pub(super) fn sync_created(env: &mut Env<'_>, object: Object, pointer: u32, wide
             .names
             .insert(name, Named::Sync { identity, kind });
     }
-    set_last_error(env, 0);
-    Outcome::Return(handle)
+    Ok((handle, false))
+}
+
+pub(super) fn sync_lookup_named(env: &mut Env<'_>, name: &[u16], kind: u32) -> Result<u32, u32> {
+    prune(env);
+    match state(env).names.get(name) {
+        Some(Named::Sync {
+            identity,
+            kind: existing,
+        }) if *existing == kind => Ok(*identity),
+        Some(_) => Err(6),
+        None => Err(2),
+    }
 }
 
 /// Open an existing process-owned mutex through the same namespace as Create.
@@ -696,14 +727,9 @@ pub(super) fn open_sync(
         Err(123) => return fail(env, 3),
         Err(error) => return fail(env, error),
     };
-    prune(env);
-    let identity = match state(env).names.get(&name) {
-        Some(Named::Sync {
-            identity,
-            kind: existing,
-        }) if *existing == kind => *identity,
-        Some(_) => return fail(env, 6),
-        None => return fail(env, 2),
+    let identity = match sync_lookup_named(env, &name, kind) {
+        Ok(identity) => identity,
+        Err(error) => return fail(env, error),
     };
     // Kernel aliases currently carry full access. Event opens record inherit
     // flags on the existing aliases; other fronts retain their supported profile.

@@ -8,8 +8,10 @@ use adv_os::{Heaps, processes};
 use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
+pub(crate) mod apc;
 #[cfg(test)]
 mod live_context_tests;
+pub(crate) mod native_thread;
 mod parameters;
 mod processor;
 #[cfg(test)]
@@ -55,6 +57,7 @@ pub(crate) fn terminate_process_owner(
     complete: impl FnOnce(&mut Env<'_>, Result<u32, processes::Error>) -> Outcome + 'static,
 ) -> Outcome {
     if pid == env.sys.pid {
+        apc::retire_all(env);
         return Outcome::ExitProcess(code);
     }
     processes::visit(
@@ -75,6 +78,7 @@ pub(crate) fn terminate_process_owner(
                 ));
             }
             target.sys.terminate_process_stopped(code);
+            apc::retire_all(target);
             Ok(1)
         },
         complete,
@@ -543,67 +547,19 @@ fn set_last_error_(env: &mut Env<'_>) -> Outcome {
 }
 
 fn create_thread(env: &mut Env<'_>) -> Outcome {
-    let inherit = match super::handle::security_inherit(env, env.arg(0)) {
-        Ok(inherit) => inherit,
-        Err(code) => {
-            return api_error(
-                env,
-                processes::Error::new(code, "invalid thread security attributes"),
-                0,
-            );
-        }
-    };
-    let (stack, start, param, flags, tid_out) =
-        (env.arg(1), env.arg(2), env.arg(3), env.arg(4), env.arg(5));
-    if flags & !(4 | 0x10000) != 0 {
-        return api_error(
-            env,
-            processes::Error::new(err::INVALID_PARAMETER, "unsupported thread creation flags"),
-            0,
-        );
-    }
-    if tid_out != 0 && adv_abi::guest::check_range(env.cpu, tid_out, 4, Prot::WRITE).is_err() {
-        return api_error(
-            env,
-            processes::Error::new(998, "unwritable thread-id output"),
-            0,
-        );
-    }
-    let name = format!("T{}", env.sys.contexts.len());
-    match super::module::spawn_thread(
-        env,
-        &name,
-        start,
-        param,
-        if stack == 0 { 0x10_0000 } else { stack },
-    ) {
-        Ok(id) => {
-            if flags & 4 != 0 {
-                env.sys.suspend_context(id);
-            }
-            let c = env.sys.context(id);
-            let (tid, h) = (c.tid, c.thread_handle);
-            super::handle::set_inherit(env, h, inherit);
-            log::info!(
-                "CreateThread: context {id} ({name}) at {start:#010x}({param:#x}) flags={flags:#x}"
-            );
-            out_u32(env.cpu, tid_out, tid);
-            Outcome::Return(h)
-        }
-        Err(error) => api_error(
-            env,
-            processes::Error::new(err::NOT_ENOUGH_MEMORY, format!("CreateThread: {error}")),
-            0,
-        ),
-    }
+    native_thread::create_front(env, false)
+}
+
+fn create_remote_thread(env: &mut Env<'_>) -> Outcome {
+    native_thread::create_front(env, true)
 }
 
 fn suspend_thread(env: &mut Env<'_>) -> Outcome {
-    change_suspend_count(env, true)
+    native_thread::suspend_front(env, true)
 }
 
 fn resume_thread(env: &mut Env<'_>) -> Outcome {
-    change_suspend_count(env, false)
+    native_thread::suspend_front(env, false)
 }
 
 fn change_suspend_count(env: &mut Env<'_>, suspend: bool) -> Outcome {
@@ -612,6 +568,10 @@ fn change_suspend_count(env: &mut Env<'_>, suspend: bool) -> Outcome {
 
 pub(crate) fn native_resume_thread(env: &mut Env<'_>, handle: u32, previous: u32) -> Outcome {
     change_suspend_front(env, handle, false, true, previous)
+}
+
+pub(crate) fn native_suspend_thread(env: &mut Env<'_>, handle: u32, previous: u32) -> Outcome {
+    change_suspend_front(env, handle, true, true, previous)
 }
 
 fn suspend_error(env: &mut Env<'_>, error: processes::Error, native: bool) -> Outcome {
@@ -715,6 +675,10 @@ fn change_suspend_front(
 }
 
 fn terminate_thread(env: &mut Env<'_>) -> Outcome {
+    native_thread::terminate_front(env)
+}
+
+fn terminate_thread_legacy(env: &mut Env<'_>) -> Outcome {
     let (h, code) = (env.arg(0), env.arg(1));
     let identity = match thread_target(env, h, 1) {
         Ok(identity) => identity,
@@ -725,9 +689,11 @@ fn terminate_thread(env: &mut Env<'_>) -> Outcome {
     }
     if identity.process.pid == env.sys.pid {
         if identity.context == env.context {
+            apc::retire(env, env.context);
             return Outcome::ExitThread(code);
         }
         env.sys.terminate_context(identity.context, code);
+        apc::retire(env, identity.context);
         return Outcome::Return(1);
     }
     processes::visit(
@@ -736,6 +702,7 @@ fn terminate_thread(env: &mut Env<'_>) -> Outcome {
         None,
         move |target| {
             target.sys.terminate_context_stopped(identity.context, code);
+            apc::retire(target, identity.context);
             Ok(1)
         },
         |env, result| api_result(env, result, 0),
@@ -752,10 +719,10 @@ fn get_exit_code_thread(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_thread_context(env: &mut Env<'_>) -> Outcome {
-    thread_context_api(env, false)
+    native_thread::context_front(env, false)
 }
 fn set_thread_context(env: &mut Env<'_>) -> Outcome {
-    thread_context_api(env, true)
+    native_thread::context_front(env, true)
 }
 
 fn thread_context_api(env: &mut Env<'_>, set: bool) -> Outcome {
@@ -1004,11 +971,15 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "ExitProcess", 1, exit_process);
     stdcall(reg, K32, "TerminateProcess", 2, terminate_process);
-    stdcall(reg, K32, "ExitThread", 1, |e| {
-        super::module::exit_thread(e, e.arg(0))
-    });
+    stdcall(reg, K32, "ExitThread", 1, native_thread::exit_front);
     stdcall(reg, K32, "TerminateThread", 2, terminate_thread);
     stdcall(reg, K32, "CreateThread", 6, create_thread);
+    stdcall(reg, K32, "CreateRemoteThread", 7, create_remote_thread);
+    stdcall(reg, K32, "QueueUserAPC", 3, apc::queue_front);
+    stdcall(reg, K32, "SleepEx", 2, |env| {
+        let args = [env.arg(0), env.arg(1)];
+        apc::sleep_front(env, args[0], args[1] != 0, true)
+    });
     stdcall(reg, K32, "SuspendThread", 1, suspend_thread);
     stdcall(reg, K32, "ResumeThread", 1, resume_thread);
     stdcall(reg, K32, "GetExitCodeThread", 2, get_exit_code_thread);

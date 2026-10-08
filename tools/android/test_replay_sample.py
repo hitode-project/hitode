@@ -31,6 +31,20 @@ class FakeProcess:
         self.returncode = -9
 
 
+class DeviceConditionsTests(unittest.TestCase):
+    def test_held_pointer_inputs_are_allowed_and_keep_their_acknowledgement(self):
+        for command in ("mouse-down", "mouse-up"):
+            self.assertIn(command, replay.INPUT_COMMANDS)
+            self.assertTrue(replay.valid_acknowledgement(command + " 400 380", "control ok " + command))
+
+    def test_temperature_and_display_state_do_not_include_window_identity(self):
+        class Device:
+            def call(self, *args, **kwargs):
+                return subprocess.CompletedProcess(args, 0, "  temperature: 271\n  mWakefulness=Awake\n  mCurrentFocus=Window{abc123 u0 fixture/app}\nCpus_allowed_list:\t0-6\n", "")
+        self.assertEqual(replay.device_conditions(Device()), {
+            "battery_temperature_c": 27.1, "screen": "Awake", "foreground": "Window{u0 fixture/app}", "allowed_cpus": "0-6"})
+
+
 class ReplayTests(unittest.TestCase):
     def test_scene_gate_ack_requires_the_exact_hash_new_frame_and_actual_release(self):
         command = "await-frame 0000000000000001 1000 hold 17"
@@ -151,7 +165,7 @@ class ReplayTests(unittest.TestCase):
                 replay.load_schedule(path)
 
     def run_mocked(self, *, bad_checkpoint=False, bad_exit=False, bad_ack=False, missing_final=False,
-                   font_diagnostics=False, failed_evidence=None, dialog_controls=False):
+                   font_diagnostics=False, failed_evidence=None, dialog_controls=False, experimental=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             binary = root / "adv-run"
@@ -177,6 +191,8 @@ class ReplayTests(unittest.TestCase):
                                       schedule_profile=False, font_diagnostics=font_diagnostics,
                                       auto_dialog_ms=None, tail_seconds=3,
                                       timeout_grace=15, ack_timeout=1, transfer_timeout=1)
+            if experimental:
+                args.tier1, args.compile_threads, args.cpu_mask = "bridge", 4, "7f"
             operations = []
             hashes = [replay.sha256(binary), replay.sha256(game / "game.exe")]
             good_report = {"frames": 4, "failure": None, "api": {"mode": "strict", "stub_calls": 0,
@@ -242,8 +258,10 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(metadata["seed_files"][0]["sha256"], replay.sha256(seed / "savedata.bin"))
             self.assertIn("-T", launch)
             self.assertIn("timeout -s KILL 30", launch[-1])
+            if experimental:
+                self.assertIn("taskset 7f env ADV_TIER1=bridge ADV_COMPILE_THREADS=4", launch[-1])
             if font_diagnostics:
-                self.assertIn("env ADV_TEXT_DIAGNOSTICS=1", launch[-1])
+                self.assertIn("ADV_TEXT_DIAGNOSTICS=1", launch[-1])
             else:
                 self.assertNotIn("ADV_TEXT_DIAGNOSTICS", launch[-1])
             self.assertTrue(metadata["remote_run_directory"].startswith("/data/local/tmp/adv-host-sample-"))
@@ -435,6 +453,7 @@ class ReplayTests(unittest.TestCase):
         replies = {
             "click 1 2": "click 1 2", "move 1 2": "move 1 2", "key 13": "key 13",
             "key-down 17": "key-down 17", "key-up 17": "key-up 17",
+            "mouse-down 1 2": "mouse-down 1 2", "mouse-up 1 2": "mouse-up 1 2",
             "menus": 'menus enabled=true "items"', "menu 40005": "menu 40005",
             "dialogs": 'dialogs "controls"', "dialog 1": "dialog 1",
             "dialog-track 1001 0": "dialog 1001", "dialog-close": "dialog-close",
@@ -474,6 +493,9 @@ class ReplayTests(unittest.TestCase):
         metadata, _, _ = self.run_mocked(missing_final=True)
         self.assertFalse(metadata["completed"])
         self.assertIn("final.json", metadata["error"])
+
+    def test_explicit_affinity_and_compiler_experiments_reach_the_device(self):
+        self.run_mocked(experimental=True)
 
     def test_font_diagnostics_is_opt_in_and_marks_performance_comparison_ineligible(self):
         metadata, _, _ = self.run_mocked(font_diagnostics=True)
@@ -533,6 +555,16 @@ class ReplayTests(unittest.TestCase):
             client.shell(["mkdir", "/run/new"])
         self.assertEqual(execute.call_count, 1)
         self.assertEqual(client.transport_retries, [])
+
+    def test_directory_creation_can_retry_when_server_connection_never_existed(self):
+        client = self.adb_client()
+        results = [subprocess.CompletedProcess([], 1, "", "cannot connect to daemon (10060)"),
+                   subprocess.CompletedProcess([], 0, "", "")]
+        with patch.object(replay.subprocess, "run", side_effect=results) as execute, \
+                patch.object(replay.time, "sleep") as sleep:
+            client.shell(["mkdir", "/run/new"])
+        self.assertEqual(execute.call_count, 2)
+        sleep.assert_called_once_with(30)
 
     def test_unidentified_subprocess_timeout_does_not_retry(self):
         client = self.adb_client()

@@ -242,6 +242,7 @@ fn allocate_bytes(env: &mut Env<'_>, bytes: &[u8]) -> Option<Identity<Block>> {
         return None;
     }
     let block = Block {
+        allocation: pointer,
         handle: 0,
         pointer,
         size,

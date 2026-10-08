@@ -297,7 +297,17 @@ const WRITE_NAME: &str = "文件.bin";
 
 fn empty_writer(env: &mut Env<'_>) -> Outcome {
     let stream = env.ext.get::<CrtState>().files.get(&env.arg(0)).unwrap();
-    assert_eq!(stream.metadata().unwrap().len(), 0);
+    assert_eq!(
+        env.sys
+            .objects
+            .host::<crate::FileObj>(stream.handle)
+            .unwrap()
+            .file
+            .metadata()
+            .unwrap()
+            .len(),
+        0
+    );
     Outcome::Return(1)
 }
 
