@@ -42,6 +42,8 @@ pub struct Stats {
     pub compile_time: Duration,
     pub sync_compile_time: Duration,
     pub compile_wait_execution_ns: u64,
+    /// Opt-in fallback lane timings, split by the existing entry reason.
+    pub frame_reason_ns: [u64; 6],
     pub compile_wait_units: u64,
     pub compilation_schedule: CompilationSchedule,
     pub native_code_bytes: usize,
@@ -1811,7 +1813,7 @@ impl Executor {
                     InterpreterDetail::PendingCompilation | InterpreterDetail::DeferredCompilation
                 )
             );
-            let wait_timer = (self.frame_timing && waiting).then(Instant::now);
+            let wait_timer = self.frame_timing.then(Instant::now);
             let retired_before = self.interpreter.frame_retired;
             let tier1 = self.run_tier1(
                 stop,
@@ -1862,8 +1864,19 @@ impl Executor {
                     .saturating_sub(before);
             }
             if let Some(timer) = wait_timer {
-                self.stats.compile_wait_execution_ns += timer.elapsed().as_nanos() as u64;
-                self.stats.compile_wait_units += u64::from(execution.units);
+                let elapsed = timer.elapsed().as_nanos() as u64;
+                // Tier 1 bridge time remains inclusive; frame reports identify
+                // that configuration rather than claiming pure Tier 0 time.
+                let index = crate::frame_counters::reason_index(if waiting {
+                    crate::InterpreterReason::Pending
+                } else {
+                    reason
+                });
+                self.stats.frame_reason_ns[index] += elapsed;
+                if waiting || reason == crate::InterpreterReason::Pending {
+                    self.stats.compile_wait_execution_ns += elapsed;
+                    self.stats.compile_wait_units += u64::from(execution.units);
+                }
             }
             let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
             if self.tier1_mode == crate::Tier1Mode::Bridge && tier1.is_some() {

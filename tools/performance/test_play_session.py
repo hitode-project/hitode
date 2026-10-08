@@ -37,6 +37,15 @@ class FakeProcess:
 
 
 class PlaySessionTests(unittest.TestCase):
+    def test_failure_preserves_the_frozen_scene_before_final_close(self):
+        commands = []
+        play_session.preserve_failure(commands.append, Path("fixture"))
+        self.assertEqual(commands[0], "key-up 17")
+        self.assertTrue(commands[1].startswith("report "))
+        self.assertTrue(commands[1].endswith("blocked.json"))
+        self.assertTrue(commands[2].endswith("blocked.png"))
+        self.assertNotIn("close", commands)
+
     def test_optical_mounts_and_pending_dialogs_reach_runner_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args(Path(directory))

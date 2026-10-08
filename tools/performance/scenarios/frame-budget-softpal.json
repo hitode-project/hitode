@@ -54,7 +54,13 @@
         "reset_metrics": true
       },
       {
-        "command": "click 650 410"
+        "command": "mouse-down 650 410"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 650 410"
       },
       {
         "checkpoint": "choice",
@@ -67,7 +73,13 @@
         "reset_metrics": true
       },
       {
-        "command": "click 400 333"
+        "command": "mouse-down 400 333"
+      },
+      {
+        "delay_ms": 1000
+      },
+      {
+        "command": "mouse-up 400 333"
       },
       {
         "delay_ms": 5000

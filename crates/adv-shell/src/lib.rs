@@ -923,6 +923,33 @@ fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> 
     runtime.capture_latest_frame().map(|_| ())
 }
 
+fn observe_scene_gate(
+    runtime: &mut Runtime,
+    wake: &window::WakeEvent,
+    gate: &mut control::SceneGate,
+) -> Result<Option<control::GateCompletion>, String> {
+    let before = gate.check_duration();
+    if gate.needs_frame_pixels(runtime.presented_frames(), runtime.frame().frames) {
+        // Both software composition and native presentation can defer CPU
+        // pixels until a diagnostic capture. Materialize the current frame
+        // before hashing; ordinary execution never asks for this readback.
+        let started = Instant::now();
+        let result = capture_diagnostic_frame(runtime, wake);
+        gate.frame_capture(started.elapsed());
+        result?;
+    }
+    let completion = gate.observe(
+        runtime.presented_frames(),
+        runtime.frame().width,
+        &runtime.frame().bgra,
+        Instant::now(),
+    );
+    if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
+        budget.scene_check(gate.check_duration().saturating_sub(before));
+    }
+    Ok(completion)
+}
+
 fn acknowledge_scene_gate(
     completion: control::GateCompletion,
     runtime: &mut Runtime,
@@ -1733,29 +1760,7 @@ fn run_execution(
                 control::acknowledge(result);
             }
         }
-        let scene_check_before = runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map(|_| scene_gate.check_duration());
-        let completion = scene_gate.observe(
-            runtime.presented_frames(),
-            runtime.frame().width,
-            &runtime.frame().bgra,
-            Instant::now(),
-        );
-        if let Some(before) = scene_check_before {
-            runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_mut()
-                .unwrap()
-                .scene_check(scene_gate.check_duration().saturating_sub(before));
-        }
+        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
@@ -1853,29 +1858,7 @@ fn run_execution(
         {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
-        let scene_check_before = runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map(|_| scene_gate.check_duration());
-        let completion = scene_gate.observe(
-            presented,
-            runtime.frame().width,
-            &runtime.frame().bgra,
-            Instant::now(),
-        );
-        if let Some(before) = scene_check_before {
-            runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_mut()
-                .unwrap()
-                .scene_check(scene_gate.check_duration().saturating_sub(before));
-        }
+        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {
             acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
         }
