@@ -5,7 +5,7 @@
 use adv_abi::Registry;
 use adv_cpu::{
     JitCpu,
-    backend::{Guest, GuestExt, Prot, asm::Asm},
+    backend::{Guest, Prot, asm::Asm},
 };
 use adv_machine::{Clock, Conv, Machine, Object, Outcome, RunResult, layout::PARK_ADDR};
 use adv_sync::WakeEvent;
@@ -32,6 +32,7 @@ fn main() {
     let jit = !args.iter().any(|arg| arg == "--interpreter");
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
+    adv_win32::user32::compat::register(&mut registry);
     registry.add("fixture", "done", Conv::Stdcall { argc: 0 }, |_| {
         Outcome::ExitProcess(0)
     });

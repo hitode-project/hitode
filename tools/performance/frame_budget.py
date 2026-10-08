@@ -96,7 +96,8 @@ def wait_metrics(report: dict) -> dict | None:
         clean = numeric_fields(row, ("segments", "timeouts", "signaled", "skipped_segments", "wall_total_us", "retained",
             "host_waits", "host_requested_ns", "host_elapsed_ns", "host_overshoot_ns"))
         for key in ("requested_us", "wall_us", "guest_us", "lateness_us", "dispatch_queue_us",
-                    "host_requested_us", "host_elapsed_us", "host_overshoot_us"):
+                    "host_requested_us", "host_elapsed_us", "host_overshoot_us",
+                    "timed_requested_us", "timed_wall_us", "timed_lateness_us"):
             values = row.get(key)
             clean[key] = numeric_fields(values, ("count", "p50", "p95", "p99", "max")) if isinstance(values, dict) else None
         result[name] = clean

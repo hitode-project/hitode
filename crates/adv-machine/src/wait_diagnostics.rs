@@ -72,7 +72,8 @@ impl Distribution {
                 "\"wall_total_us\":{},\"retained\":{},\"requested_us\":{},\"wall_us\":{},",
                 "\"guest_us\":{},\"lateness_us\":{},\"dispatch_queue_us\":{},",
                 "\"host_waits\":{},\"host_requested_ns\":{},\"host_elapsed_ns\":{},\"host_overshoot_ns\":{},",
-                "\"host_requested_us\":{},\"host_elapsed_us\":{},\"host_overshoot_us\":{}}}"
+                "\"host_requested_us\":{},\"host_elapsed_us\":{},\"host_overshoot_us\":{},",
+                "\"timed_requested_us\":{},\"timed_wall_us\":{},\"timed_lateness_us\":{}}}"
             ),
             self.count,
             self.timeouts,
@@ -92,6 +93,23 @@ impl Distribution {
             percentiles(self.host_samples.iter().filter_map(|s| s.requested_us)),
             percentiles(self.host_samples.iter().map(|s| s.wall_us)),
             percentiles(self.host_samples.iter().map(|s| s.late_us)),
+            percentiles(
+                self.samples
+                    .iter()
+                    .filter_map(|s| s.requested_us.filter(|r| *r > 0))
+            ),
+            percentiles(
+                self.samples
+                    .iter()
+                    .filter(|s| s.requested_us.is_some_and(|r| r > 0))
+                    .map(|s| s.wall_us)
+            ),
+            percentiles(
+                self.samples
+                    .iter()
+                    .filter(|s| s.requested_us.is_some_and(|r| r > 0))
+                    .map(|s| s.late_us)
+            ),
         )
     }
 }
@@ -333,5 +351,23 @@ mod tests {
             "{\"count\":1,\"p50\":5,\"p95\":5,\"p99\":5,\"max\":5}"
         );
         assert!(percentiles((1..=100).rev()).contains("\"p95\":95,\"p99\":99"));
+    }
+    #[test]
+    fn timed_distributions_exclude_yields_and_indefinite_idle() {
+        let mut row = Distribution::default();
+        for (requested_us, wall_us) in [(Some(0), 1), (None, 50_000), (Some(1000), 1100)] {
+            row.record(
+                Sample {
+                    requested_us,
+                    wall_us,
+                    ..Sample::default()
+                },
+                WakeReason::Timeout,
+                false,
+            );
+        }
+        let json = row.json();
+        assert!(json.contains("\"timed_requested_us\":{\"count\":1,\"p50\":1000"));
+        assert!(json.contains("\"timed_wall_us\":{\"count\":1,\"p50\":1100"));
     }
 }
