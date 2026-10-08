@@ -5,9 +5,12 @@
 //! (decimal or 0x hexadecimal). ADV_INTERP_TRACE_MAX bounds all JSONL events
 //! (default 4096, maximum 100000); ADV_INTERP_TRACE_STACK_WORDS selects 0..8
 //! DWORDs at ESP (default 4). Each executor creates a separate file on its first
-//! observation. Output contains integer state and opcode names, never code bytes
-//! or disassembly operands. Unreadable stack words are null. REP observations
-//! represent one element, not a completed repeated instruction.
+//! observation. ADV_INTERP_TRACE_OPERANDS=1 optionally adds explicit register,
+//! immediate and memory operand scalars (at most eight bytes), never code bytes
+//! or disassembly text. Memory after-values use the before effective address;
+//! unknown or unreadable scalars are null. Implicit memory is not observed.
+//! Unreadable stack words are null. REP observations represent one element,
+//! not a completed repeated instruction.
 //!
 //! instruction.after precedes trap dispatch. A separate resume observation is
 //! state at the next interpreter dispatch, possibly in a different CPU context;
@@ -21,7 +24,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced_x86::{Code, Decoder, DecoderOptions};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, Instruction, InstructionInfoFactory, OpKind, Register,
+};
 
 use super::RunOutcome;
 use crate::interpreter::Step;
@@ -36,6 +41,7 @@ struct Config {
     ranges: Vec<Range<u64>>,
     max: usize,
     stack_words: usize,
+    operands: bool,
 }
 
 impl Config {
@@ -44,6 +50,7 @@ impl Config {
         ranges: &str,
         max: &str,
         stack_words: &str,
+        operands: &str,
     ) -> Result<Self, String> {
         let directory = directory.canonicalize().map_err(|e| e.to_string())?;
         if !directory.is_dir()
@@ -57,6 +64,11 @@ impl Config {
         }
         let max = max.parse::<usize>().map_err(|e| e.to_string())?;
         let stack_words = stack_words.parse::<usize>().map_err(|e| e.to_string())?;
+        let operands = match operands {
+            "0" => false,
+            "1" => true,
+            _ => return Err("operands must be 0 or 1".into()),
+        };
         if !(1..=MAX_EVENTS).contains(&max) || stack_words > 8 {
             return Err("max must be 1..100000 and stack words must be 0..8".into());
         }
@@ -84,6 +96,7 @@ impl Config {
             ranges: parsed,
             max,
             stack_words,
+            operands,
         })
     }
 }
@@ -91,6 +104,33 @@ impl Config {
 pub(super) struct Before {
     opcode: Option<Code>,
     state: String,
+    operands: Option<OperandSnapshot>,
+}
+
+struct OperandSnapshot {
+    entries: Vec<Operand>,
+    before: String,
+}
+
+struct Operand {
+    index: u32,
+    kind: OpKind,
+    detail: OperandDetail,
+}
+
+enum OperandDetail {
+    Register(Register),
+    Immediate {
+        width: usize,
+        value: u64,
+        signed: Option<i64>,
+    },
+    Memory {
+        segment: Register,
+        address: Option<u32>,
+        width: usize,
+    },
+    Unknown,
 }
 
 pub(crate) struct Trace {
@@ -112,6 +152,7 @@ impl Trace {
             &read("ADV_INTERP_TRACE_RANGES", ""),
             &read("ADV_INTERP_TRACE_MAX", "4096"),
             &read("ADV_INTERP_TRACE_STACK_WORDS", "4"),
+            &read("ADV_INTERP_TRACE_OPERANDS", "0"),
         ) {
             Ok(config) => Some(Box::new(Self::new(config))),
             Err(error) => {
@@ -166,11 +207,22 @@ impl Trace {
         }
         let pc = u64::from(state.eip);
         if self.config.ranges.iter().any(|r| r.contains(&pc)) {
+            let instruction = instruction(memory, state.eip);
+            let operands = if self.config.operands {
+                instruction.map(|i| {
+                    let entries = operands(&i, state);
+                    let before = operand_snapshot(&entries, state, memory);
+                    OperandSnapshot { entries, before }
+                })
+            } else {
+                None
+            };
             return (
                 1,
                 Some(Before {
-                    opcode: opcode(memory, state.eip),
+                    opcode: instruction.map(|i| i.code()),
                     state: snapshot(state, memory, self.config.stack_words),
+                    operands,
                 }),
             );
         }
@@ -208,7 +260,24 @@ impl Trace {
         let opcode = before
             .opcode
             .map_or_else(|| "unavailable".into(), |c| format!("{c:?}"));
-        self.record("instruction", &format!("\"opcode\":\"{opcode}\",\"step\":\"{step:?}\",\"units\":{units},\"before\":{},\"after\":{}", before.state, snapshot(state, memory, self.config.stack_words)));
+        let mut fields = format!(
+            "\"opcode\":\"{opcode}\",\"step\":\"{step:?}\",\"units\":{units},\"before\":{},\"after\":{}",
+            before.state,
+            snapshot(state, memory, self.config.stack_words)
+        );
+        if self.config.operands {
+            if let Some(operands) = before.operands {
+                let _ = write!(
+                    fields,
+                    ",\"operands_before\":{},\"operands_after\":{}",
+                    operands.before,
+                    operand_snapshot(&operands.entries, state, memory)
+                );
+            } else {
+                fields.push_str(",\"operands_before\":null,\"operands_after\":null");
+            }
+        }
+        self.record("instruction", &fields);
         self.pending_resume = matches!(step, Step::Trap { .. });
     }
 
@@ -277,7 +346,7 @@ fn permitted(memory: &Memory, address: u32, len: usize, permission: u8) -> bool 
     })
 }
 
-fn opcode(memory: &Memory, pc: u32) -> Option<Code> {
+fn instruction(memory: &Memory, pc: u32) -> Option<Instruction> {
     let mut bytes = [0; 15];
     let mut len = 0;
     for offset in 0..15 {
@@ -293,7 +362,201 @@ fn opcode(memory: &Memory, pc: u32) -> Option<Code> {
         len += 1;
     }
     let i = Decoder::with_ip(32, &bytes[..len], u64::from(pc), DecoderOptions::NONE).decode();
-    (!i.is_invalid()).then_some(i.code())
+    (!i.is_invalid()).then_some(i)
+}
+
+fn register_scalar(state: &CpuState, register: Register) -> Option<u64> {
+    if register.is_gpr32() {
+        return state
+            .regs
+            .get(register.number())
+            .map(|value| u64::from(*value));
+    }
+    if register.is_gpr16() {
+        return state
+            .regs
+            .get(register.number())
+            .map(|value| u64::from(*value & 0xffff));
+    }
+    if register.is_gpr8() {
+        let shift = if matches!(
+            register,
+            Register::AH | Register::CH | Register::DH | Register::BH
+        ) {
+            8
+        } else {
+            0
+        };
+        return state
+            .regs
+            .get(register.full_register32().number())
+            .map(|value| u64::from((value >> shift) & 0xff));
+    }
+    if register.is_segment_register() {
+        return state
+            .segments
+            .selectors
+            .get(register.number())
+            .map(|value| u64::from(*value));
+    }
+    None
+}
+
+fn operands(instruction: &Instruction, state: &CpuState) -> Vec<Operand> {
+    let mut factory = InstructionInfoFactory::new();
+    let info = factory.info(instruction);
+    (0..instruction.op_count())
+        .map(|index| {
+            let kind = instruction.op_kind(index);
+            let detail = match kind {
+                OpKind::Register => OperandDetail::Register(instruction.op_register(index)),
+                OpKind::Memory => {
+                    // Match verification's flat segments and guest-owned FS base.
+                    let value = |register: Register, _: usize, _: usize| {
+                        if register == Register::FS {
+                            Some(u64::from(state.fs_base))
+                        } else if register.is_segment_register() {
+                            Some(0)
+                        } else if register.is_gpr32() || register.is_gpr16() || register.is_gpr8() {
+                            register_scalar(state, register)
+                        } else {
+                            None
+                        }
+                    };
+                    // Associate only this explicit operand. InstructionInfo also
+                    // applies architectural adjustments such as POP [ESP]'s
+                    // post-pop destination, unlike the encoded address alone.
+                    let mut used = info.used_memory().iter().filter(|used| {
+                        used.access() == info.op_access(index)
+                            && used.memory_size() == instruction.memory_size()
+                    });
+                    let address = if let Some(used_memory) = used.next() {
+                        if used.next().is_some() {
+                            None
+                        } else {
+                            used_memory.virtual_address(0, value)
+                        }
+                    } else {
+                        None
+                    };
+                    OperandDetail::Memory {
+                        segment: instruction.memory_segment(),
+                        address: address.map(|value| value as u32),
+                        width: instruction.memory_size().size(),
+                    }
+                }
+                OpKind::Immediate8 | OpKind::Immediate8_2nd => OperandDetail::Immediate {
+                    width: 1,
+                    value: instruction.immediate(index),
+                    signed: None,
+                },
+                OpKind::Immediate16 | OpKind::Immediate32 | OpKind::Immediate64 => {
+                    OperandDetail::Immediate {
+                        width: match kind {
+                            OpKind::Immediate16 => 2,
+                            OpKind::Immediate32 => 4,
+                            _ => 8,
+                        },
+                        value: instruction.immediate(index),
+                        signed: None,
+                    }
+                }
+                OpKind::Immediate8to16 => OperandDetail::Immediate {
+                    width: 2,
+                    value: u64::from(instruction.immediate8to16() as u16),
+                    signed: Some(i64::from(instruction.immediate8to16())),
+                },
+                OpKind::Immediate8to32 => OperandDetail::Immediate {
+                    width: 4,
+                    value: u64::from(instruction.immediate8to32() as u32),
+                    signed: Some(i64::from(instruction.immediate8to32())),
+                },
+                OpKind::Immediate8to64 => OperandDetail::Immediate {
+                    width: 8,
+                    value: instruction.immediate8to64() as u64,
+                    signed: Some(instruction.immediate8to64()),
+                },
+                OpKind::Immediate32to64 => OperandDetail::Immediate {
+                    width: 8,
+                    value: instruction.immediate32to64() as u64,
+                    signed: Some(instruction.immediate32to64()),
+                },
+                _ => OperandDetail::Unknown,
+            };
+            Operand {
+                index,
+                kind,
+                detail,
+            }
+        })
+        .collect()
+}
+
+fn operand_snapshot(operands: &[Operand], state: &CpuState, memory: &Memory) -> String {
+    let mut text = String::from("[");
+    for (index, operand) in operands.iter().enumerate() {
+        if index != 0 {
+            text.push(',');
+        }
+        let _ = write!(
+            text,
+            "{{\"index\":{},\"kind\":\"{:?}\"",
+            operand.index, operand.kind
+        );
+        match operand.detail {
+            OperandDetail::Register(register) => {
+                let _ = write!(
+                    text,
+                    ",\"register\":\"{register:?}\",\"width\":{},\"value\":",
+                    register.size()
+                );
+                scalar_json(&mut text, register_scalar(state, register));
+            }
+            OperandDetail::Immediate {
+                width,
+                value,
+                signed,
+            } => {
+                let _ = write!(text, ",\"width\":{width},\"value\":{value}");
+                if let Some(signed) = signed {
+                    let _ = write!(text, ",\"signed_value\":{signed}");
+                }
+            }
+            OperandDetail::Memory {
+                segment,
+                address,
+                width,
+            } => {
+                let _ = write!(
+                    text,
+                    ",\"segment\":\"{segment:?}\",\"width\":{width},\"ea\":"
+                );
+                scalar_json(&mut text, address.map(u64::from));
+                text.push_str(",\"scalar\":");
+                let value = address.and_then(|address| {
+                    if !(1..=8).contains(&width) || !permitted(memory, address, width, READ) {
+                        return None;
+                    }
+                    let mut bytes = [0; 8];
+                    memory.read_into(address, &mut bytes[..width]).ok()?;
+                    Some(u64::from_le_bytes(bytes))
+                });
+                scalar_json(&mut text, value);
+            }
+            OperandDetail::Unknown => text.push_str(",\"value\":null"),
+        }
+        text.push('}');
+    }
+    text.push(']');
+    text
+}
+
+fn scalar_json(text: &mut String, value: Option<u64>) {
+    if let Some(value) = value {
+        let _ = write!(text, "{value}");
+    } else {
+        text.push_str("null");
+    }
 }
 
 fn snapshot(state: &CpuState, memory: &Memory, stack_words: usize) -> String {
