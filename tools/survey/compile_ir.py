@@ -10,6 +10,9 @@ IR is counted before optimization across all generated functions; blocks belong
 to their first instruction. Shared flags/exits are overhead, not charged to an
 arbitrary mnemonic. Decoded counts include non-emitted instructions and clones
 can emit an instruction more than once. This is static size, not execution heat.
+Version 2 also attributes finalized bytes by retained source locations, including
+untagged prologues, alignment and pools. Optimizer movement limits attribution;
+version 1 has no byte breakdown and is never silently interpreted as zero.
 """
 from __future__ import annotations
 
@@ -32,15 +35,23 @@ COUNTERS = ("guest", "ir", "blocks", "functions", "native_bytes", "service_us")
 
 def validated(raw: object) -> dict:
     """Reject unknown fields and reconcile every request before aggregation."""
-    if not isinstance(raw, dict) or set(raw) != set(COUNTERS) | {"version", "strategy", "rows", "decoded"}:
+    if not isinstance(raw, dict):
         raise ValueError("invalid request schema")
-    if raw["version"] != 1 or raw["strategy"] not in ("fast", "speed"):
+    fields = set(COUNTERS) | {"version", "strategy", "rows", "decoded"}
+    if raw.get("version") == 2:
+        fields.add("native_rows")
+    if set(raw) != fields:
+        raise ValueError("invalid request schema")
+    if raw["version"] not in (1, 2) or raw["strategy"] not in ("fast", "speed"):
         raise ValueError("invalid request version or strategy")
     for key in COUNTERS:
         count(raw[key])
         if raw[key] >= 1 << 64:
             raise ValueError("counter out of range")
-    for key, width in (("rows", 5), ("decoded", 3)):
+    shapes = [("rows", 5), ("decoded", 3)]
+    if raw["version"] == 2:
+        shapes.append(("native_rows", 4))
+    for key, width in shapes:
         rows = raw[key]
         if not isinstance(rows, list):
             raise ValueError("invalid count rows")
@@ -49,19 +60,21 @@ def validated(raw: object) -> dict:
             if not isinstance(row, list) or len(row) != width:
                 raise ValueError("invalid count row")
             mnemonic(row[0])
-            if row[1] not in CLASSES or (width == 5 and row[2] not in PARTS):
+            if row[1] not in CLASSES or (width >= 4 and row[2] not in PARTS):
                 raise ValueError("invalid class or part")
-            label = tuple(row[:width - 2] if width == 5 else row[:2])
+            label = tuple(row[:3] if width >= 4 else row[:2])
             if label in seen:
                 raise ValueError("duplicate count row")
             seen.add(label)
-            for value in row[3:] if width == 5 else row[2:]:
+            for value in row[3:] if width >= 4 else row[2:]:
                 count(value)
     if (sum(r[3] for r in raw["rows"]) != raw["ir"]
             or sum(r[4] for r in raw["rows"]) != raw["blocks"]
             or sum(r[2] for r in raw["decoded"]) != raw["guest"]
             or any(r[4] > r[3] for r in raw["rows"])):
         raise ValueError("request counts do not reconcile")
+    if raw["version"] == 2 and sum(r[3] for r in raw["native_rows"]) != raw["native_bytes"]:
+        raise ValueError("native counts do not reconcile")
     return raw
 
 
@@ -93,6 +106,12 @@ def aggregate(logs) -> dict:
             for mnemonic_, class_, n in raw["decoded"]:
                 key = "/".join((mnemonic_, class_))
                 dest["decoded"][key] = dest["decoded"].get(key, 0) + n
+            if raw["version"] == 2:
+                dest["native_attributed_requests"] = dest.get("native_attributed_requests", 0) + 1
+                native = dest.setdefault("native_rows", {})
+                for mnemonic_, class_, part, size in raw["native_rows"]:
+                    key = "/".join((mnemonic_, class_, part))
+                    native[key] = native.get(key, 0) + size
             bucket = raw["ir"].bit_length()
             group = dest["service_by_ir"].setdefault(bucket, {})
             histogram(group, raw["service_us"])

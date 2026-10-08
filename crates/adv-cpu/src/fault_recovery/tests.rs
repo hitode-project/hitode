@@ -516,3 +516,71 @@ fn run_case(case: &str) {
         }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn inactive_sme_records_preserve_fpsimd_capture() {
+    let mut context: libc::ucontext_t = unsafe { std::mem::zeroed() };
+    // Linux/Android's AArch64 UAPI places the 16-byte-aligned, 4096-byte
+    // extension area immediately after pstate. libc keeps that area private.
+    let offset = (std::mem::offset_of!(libc::mcontext_t, pstate) + 8).next_multiple_of(16);
+    let records = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut context.uc_mcontext as *mut libc::mcontext_t)
+                .cast::<u8>()
+                .add(offset),
+            4096,
+        )
+    };
+    records[..4].copy_from_slice(&0x4650_8001u32.to_ne_bytes());
+    records[4..8].copy_from_slice(&528u32.to_ne_bytes());
+    records[8..12].copy_from_slice(&0x10u32.to_ne_bytes());
+    records[12..16].copy_from_slice(&0x0040_0000u32.to_ne_bytes());
+    records[16..528].fill(0x5a);
+    let mut control = 0;
+    let mut status = 0;
+    let mut vectors = [0u8; 512];
+    // Cover hosts with no SME records as well as each record independently.
+    for magics in [
+        &[][..],
+        &[0x5450_4902u32][..],
+        &[0x5436_6345][..],
+        &[0x5450_4902, 0x5436_6345][..],
+    ] {
+        records[528..].fill(0);
+        for (index, magic) in magics.iter().enumerate() {
+            let start = 528 + index * 16;
+            records[start..start + 4].copy_from_slice(&magic.to_ne_bytes());
+            records[start + 4..start + 8].copy_from_slice(&16u32.to_ne_bytes());
+            // Nonzero TPIDR2 is preserved too; it is not vector register data.
+            records[start + 8..start + 16].copy_from_slice(&64u64.to_ne_bytes());
+        }
+        assert_eq!(
+            unsafe {
+                adv_posix_fault_fp(
+                    std::ptr::addr_of!(context).cast(),
+                    &mut control,
+                    &mut status,
+                    vectors.as_mut_ptr(),
+                )
+            },
+            1
+        );
+        assert_eq!((control, status), (0x0040_0000, 0x10));
+        assert_eq!(vectors, [0x5a; 512]);
+    }
+    // A ZA payload means live matrix state, which this snapshot does not admit.
+    records[552..556].copy_from_slice(&16u32.to_ne_bytes());
+    records[548..552].copy_from_slice(&272u32.to_ne_bytes());
+    assert_eq!(
+        unsafe {
+            adv_posix_fault_fp(
+                std::ptr::addr_of!(context).cast(),
+                &mut control,
+                &mut status,
+                vectors.as_mut_ptr(),
+            )
+        },
+        0
+    );
+}
