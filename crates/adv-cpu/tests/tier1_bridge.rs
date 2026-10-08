@@ -359,7 +359,9 @@ mod native {
             assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         }
         equal(&pair[0], &pair[1]);
-        assert!(pair[1].memory().direct_memory_enabled());
+        // Re-selecting after execution succeeds only if the reservation is
+        // already active; switching a used checked owner would be rejected.
+        assert!(pair[1].set_direct_memory(true).is_ok());
         assert!(pair[1].tier1_stats().bridge_units > 0);
         assert!(pair[1].stats.interpreter_instructions > 0);
         assert_eq!(pair[1].stats.verification.mismatches, 0);
