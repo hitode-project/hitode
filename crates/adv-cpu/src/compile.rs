@@ -73,8 +73,6 @@ pub(crate) struct Compiled {
     /// Immutable absolute checked entry, initialized before publication. Code
     /// mappings need not be in ADRP/rel32 reach of the polling body.
     _poll_target: Option<Box<usize>>,
-    #[cfg(any(test, feature = "gir-execute"))]
-    pub gir_instructions: BTreeMap<u32, Instruction>,
     perf_ranges: Vec<crate::perf_map::Registration>,
     // Keeps executable pages alive until the entry pointer can no longer be called.
     module: Option<JITModule>,
@@ -2589,12 +2587,8 @@ fn compile_snapshot_with_inline(
     crate::gir_capture::record(region, snapshot.origin, bytes, &instructions);
     #[cfg(feature = "gir-lift")]
     crate::gir::diagnostics::record(&instructions, region.start);
-    #[cfg(feature = "gir-lower")]
-    crate::gir::diagnostics::record_lower(&instructions, region.start, snapshot.base, snapshot.len);
     Ok(Compiled {
         _poll_target: poll_target,
-        #[cfg(any(test, feature = "gir-execute"))]
-        gir_instructions: instructions.clone(),
         perf_ranges,
         ir_counts: ir_counts.map(|counts| {
             counts.into_inner().finish(

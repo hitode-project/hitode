@@ -3,7 +3,6 @@
 //! captures), ADV_REGION_BENCH_SAMPLES/LOOPS/REPEATS/PRIVATE_LIMIT. Output: anonymous
 //! CSV statistics, OS capabilities and current CPU; never code, PCs or file names.
 //! Compilation and one full-state differential warmup are outside measurement.
-//! With gir-execute, tier 3 explicitly measures the opt-in state-SSA lane.
 //! ADV_REGION_BENCH_DIRECT=off|legacy|inline selects the memory lane. With no
 //! benchmark selector, ADV_DIRECT_MEMORY=1 selects direct mode and
 //! ADV_DIRECT_MEMORY_INLINE=0 selects legacy; otherwise the default is off.
@@ -546,8 +545,6 @@ fn load_private(root: &Path, limit: usize, repeats: usize) -> Vec<Case> {
 
 fn setup(case: &Case, tier: u8, direct: DirectMode) -> Result<Executor, String> {
     let mut m = Executor::new(CODE, 0x21000)?;
-    #[cfg(feature = "gir-execute")]
-    m.set_gir_state_ssa(tier == 3)?;
     if tier != 0 && direct != DirectMode::Off {
         m.set_direct_memory(true)?;
     }
@@ -675,9 +672,6 @@ fn main() {
     } else {
         vec![0, 2]
     };
-    if cfg!(all(feature = "gir-execute", not(target_os = "macos"))) {
-        tiers.push(3);
-    }
     if std::env::var("ADV_REGION_BENCH_TIER0_ONLY").as_deref() == Ok("1") {
         tiers = vec![0];
     }

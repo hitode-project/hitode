@@ -15,8 +15,6 @@ mod interpreter_profile;
 mod parallel;
 mod schedule;
 pub use schedule::CompilationSchedule;
-#[cfg(any(test, feature = "gir-execute"))]
-mod gir;
 mod tier1;
 mod verify;
 mod warm;
@@ -154,8 +152,6 @@ pub struct Executor {
     interpreter: crate::interpreter::Interpreter,
     tier1: Option<crate::tier1::Engine>,
     tier1_mode: crate::Tier1Mode,
-    #[cfg(any(test, feature = "gir-execute"))]
-    gir: Option<crate::gir::execution::Engine>,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
     tiered_compilation: bool,
@@ -458,8 +454,6 @@ impl Executor {
             interpreter: crate::interpreter::Interpreter::new(),
             tier1: None,
             tier1_mode: crate::Tier1Mode::Off,
-            #[cfg(any(test, feature = "gir-execute"))]
-            gir: None,
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
             tiered_compilation: true,
@@ -509,11 +503,9 @@ impl Executor {
         if std::env::var("ADV_DIRECT_MEMORY").is_ok_and(|value| value == "1") {
             executor.set_direct_memory(true)?;
         }
-        #[cfg(feature = "gir-execute")]
         match std::env::var("ADV_GIR").as_deref() {
-            Ok("state-ssa") => executor.set_gir_state_ssa(true)?,
             Ok("off" | "" | "0") | Err(_) => {}
-            Ok(_) => return Err("unknown ADV_GIR selector (expected off or state-ssa)".into()),
+            Ok(_) => return Err("ADV_GIR execution has been removed; use the default GIR frontend or ADV_TIER2_FRONTEND=legacy for comparison".into()),
         }
         Ok(executor)
     }
@@ -620,10 +612,6 @@ impl Executor {
 
     /// Compile explicitly selected hot code. Cold code is executed by the shared-state interpreter.
     pub fn set_region(&mut self, region: Region) -> Result<(), String> {
-        #[cfg(any(test, feature = "gir-execute"))]
-        if let Some(gir) = &mut self.gir {
-            gir.programs.clear();
-        }
         self.memory.quiesce_workers();
         self.code.clear_links();
         self.code.cache_revision += 1;
@@ -730,10 +718,6 @@ impl Executor {
     }
 
     fn retire_compiled(&mut self, start: u32) {
-        #[cfg(any(test, feature = "gir-execute"))]
-        if let Some(gir) = &mut self.gir {
-            gir.stats.invalidations += u64::from(gir.programs.remove(&start).is_some());
-        }
         if self.code.compiled.contains_key(&start) {
             self.memory.quiesce_workers();
         }
@@ -1092,13 +1076,6 @@ impl Executor {
             return Ok(());
         }
         self.observed_epoch = self.memory.epoch;
-        #[cfg(any(test, feature = "gir-execute"))]
-        if let Some(gir) = &mut self.gir {
-            let before = gir.programs.len();
-            gir.programs
-                .retain(|_, program| program.as_ref().is_none_or(|p| p.valid(&self.memory)));
-            gir.stats.invalidations += (before - gir.programs.len()) as u64;
-        }
         let mut affected = BTreeSet::new();
         for page in std::mem::take(&mut self.memory.dirty_pages) {
             if let Some(owners) = self.code.page_regions.get(&page) {
@@ -1622,23 +1599,7 @@ impl Executor {
                     && code.entries.contains(&self.state.eip)
                     && self.deferred_fallback != Some(self.state.eip)
             });
-            #[allow(unused_mut)]
-            let mut native = native.map(|(owner, _)| owner);
-            #[cfg(any(test, feature = "gir-execute"))]
-            if let Some(owner) = native
-                && let Some(status) = self.run_gir(owner, stop)?
-            {
-                use crate::gir::lower_cl as g;
-                match status {
-                    g::INTERRUPTED => return Ok(RunOutcome::Interrupted),
-                    g::READ_CHECK | g::WRITE_CHECK | g::UNSUPPORTED | g::GUARD => {
-                        self.deferred_fallback = Some(self.state.eip);
-                        bridge.cliffs.fallback(&self.memory, self.state.eip);
-                        native = None;
-                    }
-                    _ => continue,
-                }
-            }
+            let native = native.map(|(owner, _)| owner);
             if native.is_some()
                 && self.parallel.is_some()
                 && self.parallel_demand
@@ -1732,10 +1693,6 @@ impl Executor {
                     self.stats.shadow_overflows = shadow.overflows;
                 }
                 let completed = before - self.state.fuel;
-                #[cfg(any(test, feature = "gir-execute"))]
-                if let Some(gir) = &mut self.gir {
-                    gir.stats.other_units += completed;
-                }
                 if let Some((_, now)) = timed
                     && reserved != 0
                     && trace.is_none()
@@ -1930,10 +1887,6 @@ impl Executor {
                 *self.demand.entry(pc).or_default() += 1;
             }
             self.state.fuel -= u64::from(execution.units);
-            #[cfg(any(test, feature = "gir-execute"))]
-            if let Some(gir) = &mut self.gir {
-                gir.stats.other_units += u64::from(execution.units);
-            }
             if let Some(timer) = timer {
                 let p = self.profile.entry(pc).or_default();
                 p.interpreter_entries += u64::from(interpreted);
@@ -3411,6 +3364,32 @@ mod tiering_tests {
         assert_eq!(m.native_heat.get(&0x1000), Some(&1));
         assert!(!m.native_heat.contains_key(&0x1001));
         assert_eq!(m.state.regs[0], 0);
+    }
+}
+
+#[cfg(test)]
+mod removed_selector_tests {
+    use super::Executor;
+
+    #[test]
+    fn legacy_gir_execution_selector_fails_explicitly() {
+        if std::env::var("ADV_GIR").as_deref() != Ok("state-ssa") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "executor::removed_selector_tests::legacy_gir_execution_selector_fails_explicitly",
+                ])
+                .env("ADV_GIR", "state-ssa")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let error = Executor::new(0x10000, 4096)
+            .err()
+            .expect("removed execution selector must reject construction");
+        assert!(error.contains("ADV_GIR execution has been removed"));
+        assert!(error.contains("ADV_TIER2_FRONTEND=legacy"));
     }
 }
 
