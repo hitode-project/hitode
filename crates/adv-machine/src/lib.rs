@@ -73,7 +73,7 @@ fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Res
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
-    /// Real time: where round-robin resumes after a run returned to let the host wait.
+    /// Real time: reusable scheduler slot where round-robin resumes after a host return.
     rr_last: Option<CtxId>,
     pub trace: Trace,
     pub thunks: ThunkTable,
@@ -130,7 +130,11 @@ pub struct Sys {
     /// Scheduler latency observations, independent of optional execution profiling.
     pub scheduling: scheduling::SchedulingStats,
     pub schedule_trace: schedule_trace::ScheduleTrace,
-    wakes: wake_queue::WakeQueue,
+    wakes: sched::ActiveContexts,
+    /// Stopped contexts whose execution storage still needs to be reclaimed.
+    finished_contexts: Vec<CtxId>,
+    #[cfg(test)]
+    scheduler_work: sched::SchedulerWork,
 }
 
 /// Ring buffer of recent host calls: (context, thunk index, guest return address).
@@ -241,14 +245,8 @@ impl Sys {
             addr: 0,
             len: stack_size,
         })?;
-        let slot = (0..MAX_CONTEXTS).find(|slot| {
-            self.contexts.iter().all(|context| {
-                context
-                    .storage
-                    .as_ref()
-                    .is_none_or(|storage| storage.slot != *slot)
-            })
-        });
+        let slot = (0..MAX_CONTEXTS)
+            .find(|slot| self.wakes.entries().iter().all(|entry| entry.slot != *slot));
         let Some(slot) = slot.filter(|_| self.objects.can_insert()) else {
             return Err(MemFault {
                 addr: 0,
@@ -329,6 +327,14 @@ impl Sys {
             yielded: false,
             thread_handle,
         });
+        self.wakes.insert(
+            id,
+            self.contexts[id as usize]
+                .storage
+                .as_ref()
+                .expect("new context owns execution storage")
+                .slot,
+        );
         self.next_tid += 4;
         Ok(id)
     }
@@ -365,18 +371,16 @@ impl Sys {
     /// Retire stopped execution storage without changing retained thread handles.
     /// Native leases are quiesced before any address can be allocated again.
     fn reclaim_finished_storage(&mut self, cpu: &mut dyn Guest) -> Result<(), MemFault> {
-        if !self
-            .contexts
-            .iter()
-            .any(|context| context.is_done() && context.storage.is_some())
-        {
+        if self.finished_contexts.is_empty() {
             return Ok(());
         }
         cpu.quiesce_memory();
-        for context in self.contexts.iter_mut().filter(|context| context.is_done()) {
-            let Some(storage) = context.storage.as_mut() else {
-                continue;
-            };
+        while let Some(&id) = self.finished_contexts.last() {
+            let context = &mut self.contexts[id as usize];
+            let storage = context
+                .storage
+                .as_mut()
+                .expect("retired context owns storage");
             while let Some(&(_, block)) = storage.tls_blocks.last() {
                 self.vm.free(cpu, block)?;
                 storage.tls_blocks.pop();
@@ -394,9 +398,22 @@ impl Sys {
             context.initial_registers.clear();
             context.bootstrap_pending = None;
             context.start = None;
-            self.wakes.retire(context.id);
+            self.finished_contexts.pop();
         }
         Ok(())
+    }
+
+    fn active_contexts(&self) -> impl Iterator<Item = &Context> {
+        self.wakes
+            .entries()
+            .iter()
+            .map(|entry| &self.contexts[entry.id as usize])
+    }
+
+    fn retire_context(&mut self, id: CtxId) {
+        if self.wakes.retire(id) {
+            self.finished_contexts.push(id);
+        }
     }
 
     /// Personality-owned image entry for callback returns.
@@ -532,18 +549,13 @@ impl Sys {
     /// No callback policy is embedded here; suspended host continuations drop
     /// with their context and thread objects become signaled through State::Done.
     pub fn terminate_other_contexts(&mut self, exit_code: u32) {
-        for context in &mut self.contexts {
-            if context.id != self.current && !context.is_done() {
-                context.completion.complete(exit_code);
-                context.state = State::Done { exit_code };
-                context.frames.clear();
-                context.start = None;
-                context.bootstrap_pending = None;
-                context.initial_registers.clear();
-                self.wakes.retire(context.id);
-                if let Some(diagnostics) = &mut self.stats.wait_diagnostics {
-                    diagnostics.retire(context.id);
-                }
+        let mut index = 0;
+        while index < self.wakes.entries().len() {
+            let id = self.wakes.entries()[index].id;
+            if id == self.current {
+                index += 1;
+            } else {
+                self.terminate_context_stopped(id, exit_code);
             }
         }
     }
@@ -573,11 +585,11 @@ impl Sys {
         context.start = None;
         context.bootstrap_pending = None;
         context.initial_registers.clear();
-        self.wakes.retire(id);
+        self.retire_context(id);
         if let Some(diagnostics) = &mut self.stats.wait_diagnostics {
             diagnostics.retire(id);
         }
-        if self.contexts.iter().all(Context::is_done) {
+        if self.wakes.entries().is_empty() {
             self.process_identity.completion.complete(exit_code);
         }
         true
@@ -585,7 +597,8 @@ impl Sys {
 
     /// Complete a process at a supervisor boundary, without guest detach calls.
     pub fn terminate_process_stopped(&mut self, exit_code: u32) {
-        for id in 0..self.contexts.len() as CtxId {
+        while let Some(entry) = self.wakes.entries().first() {
+            let id = entry.id;
             self.terminate_context_stopped(id, exit_code);
         }
         self.process_identity.completion.complete(exit_code);
@@ -630,7 +643,8 @@ impl Sys {
     }
     fn signal_waiters_with_priority(&mut self, h: Handle, priority: WakePriority) {
         let now = self.clock.now_us();
-        for i in 0..self.contexts.len() {
+        for index in 0..self.wakes.entries().len() {
+            let i = self.wakes.entries()[index].id as usize;
             let waiting = match &self.contexts[i].state {
                 State::Blocked {
                     wait: Wait::Object { handle, .. },
@@ -705,6 +719,10 @@ impl Sys {
     }
 
     fn poll_wait(&mut self, i: usize, now: u64) -> Option<WakeReason> {
+        #[cfg(test)]
+        self.scheduler_work
+            .polls
+            .set(self.scheduler_work.polls.get() + 1);
         let State::Blocked { wait, .. } = &self.contexts[i].state else {
             return None;
         };
@@ -752,7 +770,8 @@ impl Sys {
     fn wake(&mut self) {
         let now = self.clock.now_us();
         self.objects.expire_timers(now);
-        for i in 0..self.contexts.len() {
+        for index in 0..self.wakes.entries().len() {
+            let i = self.wakes.entries()[index].id as usize;
             let reason = self.poll_wait(i, now);
             if let Some(reason) = reason {
                 self.release_waiter(i, reason, now);
@@ -797,14 +816,14 @@ impl Sys {
     /// Virtual time: let every yielding context resume before recognizing a
     /// polling round. A single Sleep(0) or empty PeekMessage can precede a
     /// signal; it must not jump straight to another context's long timeout.
-    fn advance_if_only_polling(&mut self, polled: &mut [bool]) {
+    fn advance_if_only_polling(&mut self) {
         if !self.clock.is_virtual()
             || !self.only_polling()
             || !self
-                .contexts
+                .wakes
+                .entries()
                 .iter()
-                .enumerate()
-                .all(|(i, c)| !c.is_ready() || polled.get(i) == Some(&true))
+                .all(|entry| !self.contexts[entry.id as usize].is_ready() || entry.polled)
         {
             return;
         }
@@ -814,26 +833,24 @@ impl Sys {
             .map_or(soon, |deadline| deadline.min(soon));
         self.stats.total.polls += 1;
         self.clock.advance_to(t);
-        polled.fill(false);
+        self.wakes.clear_polled();
         self.wake();
     }
 
     /// Some context is ready, and every ready one is only yielding (a polling loop).
     fn only_polling(&self) -> bool {
         if self
-            .contexts
-            .iter()
+            .active_contexts()
             .any(|c| matches!(c.state, State::Running { .. }))
         {
             return false;
         }
-        let mut ready = self.contexts.iter().filter(|c| c.is_ready()).peekable();
+        let mut ready = self.active_contexts().filter(|c| c.is_ready()).peekable();
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
 
     fn next_deadline(&self) -> Option<u64> {
-        self.contexts
-            .iter()
+        self.active_contexts()
             .filter_map(|c| match &c.state {
                 State::Blocked {
                     wait: Wait::Until(t),
@@ -1613,8 +1630,11 @@ impl<B: Backend> Machine<B> {
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),
             scheduling: scheduling::SchedulingStats::default(),
-            wakes: wake_queue::WakeQueue::default(),
+            wakes: sched::ActiveContexts::default(),
+            finished_contexts: Vec::new(),
             rr_last: None,
+            #[cfg(test)]
+            scheduler_work: sched::SchedulerWork::default(),
         };
         Ok(Self {
             leases: std::collections::BTreeMap::new(),
@@ -1659,13 +1679,13 @@ impl<B: Backend> Machine<B> {
         let Some(source) = &self.time_skip_source else {
             return false;
         };
-        if !source() || self.sys.contexts.iter().any(|context| context.is_ready()) {
+        if !source() || self.sys.active_contexts().any(|context| context.is_ready()) {
             return false;
         }
         let Some(deadline) = self.sys.next_deadline() else {
             return false;
         };
-        let eligible = self.sys.contexts.iter().any(|context| {
+        let eligible = self.sys.active_contexts().any(|context| {
             let State::Blocked {
                 wait,
                 allow_time_skip: true,
@@ -1990,11 +2010,11 @@ impl<B: Backend> Machine<B> {
                 ctx.frames.clear();
                 ctx.bootstrap_pending = None;
                 ctx.start = None;
-                self.sys.wakes.retire(id);
+                self.sys.retire_context(id);
                 if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
                     diagnostics.retire(id);
                 }
-                if self.sys.contexts.iter().all(Context::is_done) {
+                if self.sys.wakes.entries().is_empty() {
                     self.sys.process_identity.completion.complete(code);
                     return Some(self.complete_process_exit(code));
                 }
@@ -2007,7 +2027,7 @@ impl<B: Backend> Machine<B> {
                 ctx.frames.clear();
                 ctx.bootstrap_pending = None;
                 ctx.start = None;
-                self.sys.wakes.retire(id);
+                self.sys.retire_context(id);
                 if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
                     diagnostics.retire(id);
                 }
@@ -2065,7 +2085,7 @@ impl<B: Backend> Machine<B> {
         }
         if had_leases
             && matches!(result, SliceResult::Complete(RunResult::Idle { .. }))
-            && self.sys.contexts.iter().any(Context::is_ready)
+            && self.sys.active_contexts().any(Context::is_ready)
         {
             result = SliceResult::Yielded;
         }
@@ -2194,8 +2214,7 @@ impl<B: Backend> Machine<B> {
         let frame_handoff = latency_mode && (self.frame_handoff || self.sys.stats.enabled);
         // Do not sleep the host after only one poller ran. Every currently ready
         // context must first get a turn in this scheduler invocation.
-        let mut ran = vec![false; self.sys.contexts.len()];
-        let mut polled = vec![false; self.sys.contexts.len()];
+        self.sys.wakes.begin_slice();
         loop {
             if let Err(error) = self.collect_parallel() {
                 return SliceResult::Complete(self.fail(error));
@@ -2228,17 +2247,17 @@ impl<B: Backend> Machine<B> {
                 }
                 continue;
             }
-            self.sys.advance_if_only_polling(&mut polled);
+            self.sys.advance_if_only_polling();
             // Real time: polling contexts would spin the host. Hand control back so the host
             // can wait (at most 1 ms) like the OS would schedule them.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
                 && self
                     .sys
-                    .contexts
+                    .wakes
+                    .entries()
                     .iter()
-                    .enumerate()
-                    .all(|(i, c)| !c.is_ready() || ran.get(i) == Some(&true))
+                    .all(|entry| !self.sys.contexts[entry.id as usize].is_ready() || entry.ran)
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
@@ -2252,8 +2271,15 @@ impl<B: Backend> Machine<B> {
             let contexts = &self.sys.contexts;
             let selection = self.sys.wakes.pick(
                 &mut last,
-                contexts.len(),
-                |id| contexts[id as usize].is_ready(),
+                MAX_CONTEXTS as usize,
+                |id| {
+                    #[cfg(test)]
+                    self.sys
+                        .scheduler_work
+                        .selections
+                        .set(self.sys.scheduler_work.selections.get() + 1);
+                    contexts[id as usize].is_ready()
+                },
                 latency_mode,
             );
             let Some(selection) = selection else {
@@ -2278,10 +2304,9 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Complete(RunResult::Idle { next_deadline });
             };
             let id = selection.id;
-            ran.resize(self.sys.contexts.len(), false);
-            ran[id as usize] = true;
-            polled.resize(self.sys.contexts.len(), false);
-            polled[id as usize] = self.sys.contexts[id as usize].yielded;
+            self.sys
+                .wakes
+                .mark_turn(id, self.sys.contexts[id as usize].yielded);
             if let Err(e) = self.switch_to(id) {
                 return SliceResult::Complete(self.fail(format!("context switch: {e}")));
             }
@@ -2342,7 +2367,8 @@ impl<B: Backend> Machine<B> {
                     duration = duration
                         .min(hard.saturating_sub(self.slice_elapsed.saturating_add(elapsed)));
                 }
-                for peer in 0..self.sys.contexts.len() {
+                for index in 0..self.sys.wakes.entries().len() {
+                    let peer = self.sys.wakes.entries()[index].id as usize;
                     if peer == id as usize
                         || self.sys.contexts[peer].bootstrap_pending.is_some()
                         || self.sys.contexts[peer].yielded
@@ -2471,7 +2497,7 @@ impl<B: Backend> Machine<B> {
                 .filter(|_| {
                     (slice.is_some() || self.cpu.guest_workers() > 1)
                         && !self.sys.clock.is_virtual()
-                        && self.sys.contexts.iter().any(|c| c.id != id && !c.is_done())
+                        && self.sys.active_contexts().any(|c| c.id != id)
                 })
                 .and_then(|quantum| {
                     let wake = self.sys.next_deadline().map(|deadline| {
@@ -2480,7 +2506,7 @@ impl<B: Backend> Machine<B> {
                     if !latency_mode {
                         Some(wake.map_or(quantum, |wake| quantum.min(wake)))
                     } else {
-                        let competitive = self.sys.contexts.iter().any(|c| {
+                        let competitive = self.sys.active_contexts().any(|c| {
                             c.id != id
                                 && matches!(
                                     c.state,
@@ -2527,8 +2553,7 @@ impl<B: Backend> Machine<B> {
             // message/signal wake clears yielded before it can demand a worker.
             let ready_peer = self
                 .sys
-                .contexts
-                .iter()
+                .active_contexts()
                 .any(|c| c.id != id && c.is_ready() && !c.yielded);
             self.cpu.set_parallel_demand(ready_peer);
             let calls_before = self.sys.host_calls;
@@ -2686,7 +2711,7 @@ impl<B: Backend> Machine<B> {
         }
         self.sys.scheduling.frame_host_yields += 1;
         self.sys.wake();
-        if self.sys.contexts.iter().any(|c| c.is_ready()) {
+        if self.sys.active_contexts().any(|c| c.is_ready()) {
             SliceResult::Yielded
         } else {
             let next_deadline = self.sys.next_deadline();

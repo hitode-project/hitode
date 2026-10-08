@@ -45,36 +45,41 @@ fn image_metadata_and_bgra_decode_match_authored_native_samples_and_reject_trunc
         (
             png::ColorType::Rgb,
             vec![40, 80, 120].repeat(3),
-            22,
+            Format::Rgb8,
             [120, 80, 40, 255],
         ),
         (
             png::ColorType::Rgba,
             vec![40, 80, 120, 160].repeat(3),
-            21,
+            Format::Rgba8,
             [120, 80, 40, 160],
         ),
         (
             png::ColorType::Grayscale,
             vec![40; 3],
-            50,
+            Format::Luma8,
             [40, 40, 40, 255],
         ),
         (
             png::ColorType::GrayscaleAlpha,
             vec![40, 160].repeat(3),
-            51,
+            Format::LumaAlpha8,
             [40, 40, 40, 160],
         ),
-        (png::ColorType::Indexed, vec![1; 3], 41, [120, 80, 40, 255]),
+        (
+            png::ColorType::Indexed,
+            vec![1; 3],
+            Format::Indexed8,
+            [120, 80, 40, 255],
+        ),
     ] {
         let bytes = png_bytes(color, &samples);
         let image = inspect(&bytes).unwrap();
         assert_eq!(
             (image.width, image.height, image.format, image.file_format),
-            (3, 1, format, 3)
+            (3, 1, format, FileFormat::Png)
         );
-        assert_eq!(decode(&bytes, image).unwrap(), bgra.repeat(3));
+        assert_eq!(decode(&bytes, image.file_format).unwrap(), bgra.repeat(3));
         assert!(inspect(&bytes[..16]).is_err());
     }
     // BC1 transparent code3, BC2 explicit nibble alpha, BC3 endpoints and alpha
@@ -92,14 +97,17 @@ fn image_metadata_and_bgra_decode_match_authored_native_samples_and_reject_trunc
         let bytes = dds(format, &block);
         let image = inspect(&bytes).unwrap();
         assert_eq!(
-            decode(&bytes, image).unwrap(),
+            decode(&bytes, image.file_format).unwrap(),
             [0, 0, 255, alpha].repeat(16)
         );
         assert!(inspect(&bytes[..bytes.len() - 1]).is_err());
     }
     let transparent = dds(0x31545844, &[0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     let image = inspect(&transparent).unwrap();
-    assert_eq!(decode(&transparent, image).unwrap(), vec![0; 64]);
+    assert_eq!(
+        decode(&transparent, image.file_format).unwrap(),
+        vec![0; 64]
+    );
     let mut oversized = dds(0x31545844, &color);
     oversized[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
     oversized[12..16].copy_from_slice(&u32::MAX.to_le_bytes());

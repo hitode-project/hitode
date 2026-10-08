@@ -1,7 +1,7 @@
 //! Explicit checkpointed scalar lane; every other instruction stays checked.
 use super::*;
 mod inline;
-pub(super) use inline::{Inline, publish};
+pub(super) use inline::{Inline, cache_sites, publish};
 
 pub(super) fn candidate(i: &Instruction) -> bool {
     if i.has_lock_prefix() || !matches!(i.memory_size().size(), 1 | 2 | 4) {

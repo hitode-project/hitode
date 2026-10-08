@@ -14,6 +14,9 @@ session.json records whether the hardware was requested to be muted.
 Tracing is off by default; --trace writes api.trace for compatibility diagnosis
 and marks the session unsuitable for performance comparison.
 --d3d9-sm2/--d3d9-sm3 explicitly opt into the runner's shader capability profiles.
+Native caching/static discovery are default; --no-code-cache diagnoses failures.
+--warm-code-cache
+imports a previous local archive into the new overlay. --cold clears both caches.
 """
 from __future__ import annotations
 
@@ -76,6 +79,8 @@ def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str
         if environment.pop(name, None) is not None:
             removed.append(name)
     environment.pop("ADV_PERF_MAP_DIR", None)
+    if getattr(args, "compile_threads", None):
+        environment["ADV_COMPILE_THREADS"] = str(args.compile_threads)
     if getattr(args, "perf_map", False):
         environment["ADV_PERF_MAP_DIR"] = str(output)
     if mute_audio or args.capture_audio:
@@ -110,6 +115,8 @@ def run(args: argparse.Namespace) -> None:
         command.extend(["--cdrom", mount])
     if getattr(args, "frame_budget", False):
         command.append("--frame-budget")
+    if getattr(args, "no_code_cache", False):
+        command.append("--no-code-cache")
     if getattr(args, "headless_gpu", False):
         command.append("--headless-gpu")
     if getattr(args, "no_time_skip", False):
@@ -131,9 +138,15 @@ def run(args: argparse.Namespace) -> None:
             command.append("--" + feature.replace("_", "-"))
     if getattr(args, "cold", False):
         (output / "overlay" / "jit-warm.bin").unlink(missing_ok=True)
+        (output / "overlay" / "jit-code.bin").unlink(missing_ok=True)
     if getattr(args, "warm_profile", None):
         (output / "overlay").mkdir(exist_ok=True)
         shutil.copy2(args.warm_profile, output / "overlay" / "jit-warm.bin")
+    if getattr(args, "warm_code_cache", None):
+        if getattr(args, "cold", False):
+            raise ValueError("cold replay cannot import native cache")
+        (output / "overlay").mkdir(exist_ok=True)
+        shutil.copy2(args.warm_code_cache, output / "overlay" / "jit-code.bin")
     acknowledgement: queue.Queue[str | None] = queue.Queue()
     actions = []
     metadata = {"command": command, "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -287,6 +300,9 @@ if __name__ == "__main__":
     warmth = parser.add_mutually_exclusive_group()
     warmth.add_argument("--cold", action="store_true")
     warmth.add_argument("--warm-profile", type=Path)
+    parser.add_argument("--warm-code-cache", type=Path)
+    parser.add_argument("--no-code-cache", action="store_true", help="diagnostic bypass of native caching and image precompilation")
+    parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
     parser.add_argument("--sync-compilation", action="store_true")
     parser.add_argument("--no-tiering", action="store_true",
                         help="disable Fast-to-Speed promotion for matched worker comparisons")
