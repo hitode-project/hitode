@@ -158,10 +158,13 @@ pub(super) fn release_native(
     if matches!(kind, Kind::Semaphore) && count as i32 <= 0 {
         return INVALID_PARAMETER;
     }
+    // The authored WoW64 control accepts writable unaligned LONG outputs for
+    // both releases. Probe the whole range; creation-handle alignment is a
+    // different contract and keeps the existing event transport's validator.
     if previous != 0
-        && let Err(status) = event::writable(env, previous)
+        && adv_abi::guest::check_range(env.cpu, previous, 4, adv_cpu::backend::Prot::WRITE).is_err()
     {
-        return status;
+        return ACCESS_VIOLATION;
     }
     let current = env.context;
     let (old, signal) = match (kind, env.sys.objects.get(handle)) {
@@ -366,4 +369,75 @@ pub(super) fn register(registry: &mut Registry) {
             previous,
         ))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::{
+        JitCpu,
+        backend::{Guest, GuestExt, Prot},
+    };
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+
+    #[test]
+    fn native_releases_probe_invalid_outputs_and_accept_writable_unaligned_longs() {
+        for (kind, object) in [
+            (
+                Kind::Mutant,
+                Object::Mutex {
+                    owner: Some(0),
+                    recursion: 1,
+                },
+            ),
+            (Kind::Semaphore, Object::Semaphore { count: 0, max: 1 }),
+        ] {
+            let mut machine = Machine::new(
+                JitCpu::new(PARK_ADDR, false).unwrap(),
+                Registry::default(),
+                Clock::virtual_time(),
+            )
+            .unwrap();
+            machine
+                .spawn("release caller", PARK_ADDR, &[], 65536)
+                .unwrap();
+            machine.cpu.map(0x410000, 4096, Prot::RW).unwrap();
+            machine.cpu.write(0x410000, &[0xa5; 8]).unwrap();
+            let handle = machine.sys.objects.insert(object);
+            let mut env = Env {
+                context: 0,
+                cpu: &mut machine.cpu,
+                sys: &mut machine.sys,
+                ext: &mut machine.ext,
+                thunk: 0,
+            };
+            assert_eq!(
+                release_native(&mut env, kind, handle, 1, 1),
+                ACCESS_VIOLATION
+            );
+            assert!(matches!(
+                env.sys.objects.get(handle),
+                Some(
+                    Object::Mutex {
+                        owner: Some(0),
+                        recursion: 1
+                    } | Object::Semaphore { count: 0, max: 1 }
+                )
+            ));
+            assert_eq!(release_native(&mut env, kind, handle, 1, 0x410001), 0);
+            assert_eq!(env.cpu.read_u32(0x410001).unwrap(), 0);
+            let mut bytes = [0; 8];
+            env.cpu.read(0x410000, &mut bytes).unwrap();
+            assert_eq!(bytes, [0xa5, 0, 0, 0, 0, 0xa5, 0xa5, 0xa5]);
+            assert!(matches!(
+                env.sys.objects.get(handle),
+                Some(
+                    Object::Mutex {
+                        owner: None,
+                        recursion: 0
+                    } | Object::Semaphore { count: 1, max: 1 }
+                )
+            ));
+        }
+    }
 }

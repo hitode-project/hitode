@@ -268,16 +268,28 @@ fn backing_instance_replacement_rename_and_overlay_switch_do_not_reuse_stale_nor
         invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]),
         128
     );
-    // Holding the old real backing instance prevents inode/file-index reuse.
+    // Retain the old instance to exercise native pending-delete lifetime.
     let old = std::fs::File::open(&owned).unwrap();
     let old_identity = adv_os::vfs::file_identity(&old).unwrap();
-    let delete = (machine.sys.thunks.resolver() as &dyn std::any::Any)
-        .downcast_ref::<Registry>()
-        .unwrap()
-        .get(K32, "DeleteFileA")
-        .unwrap()
-        .handler;
-    assert_eq!(invoke(&mut machine, delete, &[DATA + 0x400]), 1);
+    #[cfg(windows)]
+    {
+        let delete = (machine.sys.thunks.resolver() as &dyn std::any::Any)
+            .downcast_ref::<Registry>()
+            .unwrap()
+            .get(K32, "DeleteFileA")
+            .unwrap()
+            .handler;
+        assert_eq!(invoke(&mut machine, delete, &[DATA + 0x400]), 1);
+        assert_eq!(
+            invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]),
+            u32::MAX
+        );
+        // POSIX disposition unlinks the name although the retained FD lives on.
+        assert_eq!(error(&mut machine), 2);
+        drop(old);
+    }
+    #[cfg(not(windows))]
+    std::fs::remove_file(&owned).unwrap(); // Attribute lifetime, independent of host NT support.
     assert_eq!(
         invoke(&mut machine, get_a_ABI.handler, &[DATA + 0x400]),
         u32::MAX

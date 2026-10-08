@@ -18,8 +18,10 @@ fn trace(env: &mut Env<'_>, name: &str, args: &[u32], status: u32) {
 }
 pub(in crate::kernel32) mod bridge;
 pub(in crate::kernel32) mod copy;
+pub(crate) mod directory;
 pub(crate) mod find;
 pub(in crate::kernel32) mod metadata;
+pub(in crate::kernel32) mod mutation;
 pub(crate) mod operations;
 
 const CHUNK: u32 = 64 * 1024;
@@ -38,11 +40,19 @@ pub(crate) fn win32_error(status: u32) -> u32 {
     match status {
         0 => 0,
         ACCESS_VIOLATION => 998,
+        0xc0000004 => 24,
         0xc0000008 => 6,
         INVALID_PARAMETER => 87,
         NO_MEMORY | 0xc000009a => 8,
         0xc0000022 => 5,
         0xc0000043 => 32,
+        0xc00000ba => 5,
+        0xc0000056 => 5,
+        0xc0000121 => 5,
+        0xc00000d4 => 17,
+        0xc0000101 => 145,
+        0xc0000103 => 267,
+        0xc0000106 => 206,
         NOT_SUPPORTED => 50,
         0xc000007b => 193,
         0xc000000f | 0xc0000034 => 2,

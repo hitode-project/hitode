@@ -19,6 +19,11 @@ Assert ($plan.cpu_mask -eq 'auto')
 Assert ($plan.shell.Contains('ADV_SAFEPOINT=off'))
 $poll = & $runner @arguments -Safepoint poll -LockOwner spt | ConvertFrom-Json
 Assert ($poll.shell.Contains('ADV_SAFEPOINT=poll'))
+$event = & $runner @arguments -CodeValidity event -CompileBench | ConvertFrom-Json
+Assert ($event.shell.Contains('ADV_CODE_VALIDITY=event'))
+Assert ($event.shell.Contains('ADV_REGION_BENCH_COMPILE=1'))
+Assert (-not $event.shell.Contains('taskset'))
+Assert ($plan.shell.Contains('ADV_CODE_VALIDITY=legacy'))
 $plan = & $runner @arguments -SkipBuild -CpuMask 40 -Corpus 'local-corpus' | ConvertFrom-Json
 Assert $plan.skip_build
 Assert ($plan.shell.Contains('taskset 40 timeout 300'))

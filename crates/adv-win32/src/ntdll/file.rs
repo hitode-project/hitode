@@ -8,8 +8,10 @@ use adv_machine::Env;
 use crate::{FileObj, Win32, util};
 
 mod attributes;
+pub(crate) mod directory;
 pub(crate) mod enumeration;
 pub(crate) mod metadata;
+mod mutation;
 pub(crate) mod write;
 
 const ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
@@ -199,6 +201,12 @@ pub(crate) fn set(
     length: u32,
     class: i32,
 ) -> i32 {
+    if directory::contains(env, handle.0) {
+        return directory::set(env, handle, iosb, input, length, class);
+    }
+    if matches!(class, 10 | 13 | 64) {
+        return mutation::set(env, handle, iosb, input, length, class);
+    }
     if class == 4 || class == 20 {
         return metadata::set(env, handle, iosb, input, length, class);
     }
@@ -206,7 +214,7 @@ pub(crate) fn set(
         warn_unavailable(
             env,
             "ntdll.dll!ZwSetInformationFile",
-            "only basic/position/end-of-file information is implemented",
+            "only basic/position/end-of-file/rename/disposition information is implemented",
         );
         return if class == 0 {
             0xc000_0002u32 as i32
@@ -272,6 +280,9 @@ pub(crate) fn query(
     length: u32,
     class: i32,
 ) -> i32 {
+    if directory::contains(env, handle.0) {
+        return directory::query(env, handle, iosb, output, length, class);
+    }
     if class == 4 || class == 6 {
         return metadata::query(env, handle, iosb, output, length, class);
     }
@@ -525,30 +536,35 @@ pub(crate) fn create(
         return status;
     }
     if options & 1 != 0 {
-        if options & !0x21 != 0
-            || options & 0x20 == 0
-            || disposition != 1
-            || access & !0x8012_0089 != 0
-            || access & (GENERIC_READ | 1) == 0
-        {
-            return unavailable(
-                env,
-                "only synchronous read/list FILE_OPEN directory handles",
-            );
-        }
         if !allocation.is_null() || !ea_buffer.is_null() || ea_length != 0 {
             return unavailable(
                 env,
                 "directory allocation and extended attributes are unavailable",
             );
         }
+        if disposition != 1 && file_attributes & !0x90 != 0 {
+            return unavailable(env, "only default attributes for created directories");
+        }
         let path = match oa.path(env, "ntdll.dll!ZwCreateFile") {
             Ok(path) => path,
             Err(status) => return status,
         };
-        return enumeration::open(env, &path, output, iosb);
+        return directory::open(
+            env,
+            &path,
+            access,
+            share,
+            disposition,
+            options,
+            output,
+            iosb,
+        );
     }
-    if options & 0x30 == 0 || options & !0x874 != 0 {
+    let metadata_open = disposition == 1
+        && access & 0x10000 != 0
+        && access & (GENERIC_READ | GENERIC_WRITE | 7) == 0;
+    let allowed_options = 0x874 | if access & 0x10000 != 0 { 0x204000 } else { 0 };
+    if (options & 0x30 == 0 && !metadata_open) || options & !allowed_options != 0 {
         return unavailable(env, "only synchronous ordinary non-directory files");
     }
     let mapped_disposition = match disposition {
@@ -559,8 +575,8 @@ pub(crate) fn create(
         5 => 2, // FILE_OVERWRITE_IF -> CREATE_ALWAYS
         _ => return unavailable(env, "FILE_SUPERSEDE replacement semantics are unavailable"),
     };
-    if access & !(READ_ACCESS | WRITE_ACCESS) != 0
-        || access & (GENERIC_READ | GENERIC_WRITE | 0x183) == 0
+    if access & !(READ_ACCESS | WRITE_ACCESS | 0x10000) != 0
+        || access & (GENERIC_READ | GENERIC_WRITE | 0x10183) == 0
     {
         return unavailable(
             env,
@@ -606,7 +622,16 @@ pub(crate) fn create(
         return if options & 0x40 != 0 {
             FILE_IS_A_DIRECTORY
         } else {
-            unavailable(env, "native directory handles are unavailable")
+            directory::open(
+                env,
+                &guest,
+                access,
+                share,
+                disposition,
+                options,
+                output,
+                iosb,
+            )
         };
     }
     if disposition != 1 {
@@ -621,11 +646,17 @@ pub(crate) fn create(
         }
     }
     let requested = share_access(access);
-    if env.sys.objects.hosts::<FileObj>().any(|(_, file)| {
+    if env.sys.objects.all_hosts::<FileObj>().any(|(_, file)| {
         file.guest_path.eq_ignore_ascii_case(&guest)
             && (requested & !file.share != 0 || share_access(file.access) & !share != 0)
     }) {
         return SHARING_VIOLATION;
+    }
+    if access & 0x10000 != 0 {
+        if disposition != 1 {
+            return unavailable(env, "DELETE access is supported only for an existing file");
+        }
+        return mutation::open(env, &guest, access, share, output, iosb);
     }
     let previous_error = util::last_error(env);
     // The common opener selects copy-up from generic access. Keep that host

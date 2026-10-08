@@ -3,10 +3,13 @@ use super::*;
 use adv_cpu::backend::GuestExt;
 use adv_os::vfs::{DirEntry, wildcard};
 
-struct DirectoryObj {
-    path: String,
-    entries: Option<Vec<DirEntry>>,
-    next: usize,
+pub(super) struct DirectoryObj {
+    pub(super) path: String,
+    pub(super) entries: Option<Vec<DirEntry>>,
+    pub(super) next: usize,
+    pub(super) access: u32,
+    pub(super) share: u32,
+    pub(super) backing: Option<adv_os::vfs::FileStream>,
 }
 
 const MAX_ROWS: usize = 32768;
@@ -25,34 +28,6 @@ pub(super) fn register(registry: &mut Registry) {
         name: "ZwQueryDirectoryFile",
         ..query_ABI
     });
-}
-
-pub(super) fn open(
-    env: &mut Env<'_>,
-    path: &str,
-    output: GuestPtr<u32>,
-    iosb: GuestPtr<()>,
-) -> i32 {
-    if !env.ext.get::<Win32>().vfs.is_dir(path) {
-        return if env.ext.get::<Win32>().vfs.lookup(path).is_some() {
-            0xc000_0103u32 as i32
-        } else {
-            PATH_NOT_FOUND
-        };
-    }
-    let handle = env.sys.objects.insert_host(DirectoryObj {
-        path: path.to_owned(),
-        entries: None,
-        next: 0,
-    });
-    if handle == 0 {
-        return INSUFFICIENT_RESOURCES;
-    }
-    if output.write(env.cpu, handle).is_err() || completion(env, iosb, 0, 1) != 0 {
-        env.sys.objects.close(handle);
-        return ACCESS_VIOLATION;
-    }
-    0
 }
 
 fn expression(env: &Env<'_>, pointer: GuestPtr<()>) -> Result<String, i32> {
@@ -172,6 +147,9 @@ pub(crate) fn query(
             INVALID_HANDLE
         };
     };
+    if directory.access & (GENERIC_READ | 1) == 0 {
+        return ACCESS_DENIED;
+    }
     let first = directory.entries.is_none();
     if first {
         let pattern = match expression(env, name) {

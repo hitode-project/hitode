@@ -1,5 +1,5 @@
 /* Authored personality-layer probe: no sample code, assets or third-party protection logic.
-   Usage: personality-N.exe selects contract N (1..9, a..c). Writes scalar DWORDs
+   Usage: personality-N.exe selects contract N (1..9, a..e). Writes scalar DWORDs
    to probe-N.bin. Build and compare with personality_contract.py; no sample inputs. */
 #include <windows.h>
 #include <intrin.h>
@@ -289,12 +289,117 @@ static void t_loader_queries(void){
  MH_DisableHook(MH_ALL_HOOKS);FreeLibrary(m);
 }
 
+/* ---- 13: one mutant/semaphore owner for native and Win32 calls ---- */
+typedef LONG (WINAPI *NCM)(PHANDLE,ULONG,PVOID,BYTE);
+typedef LONG (WINAPI *NRM)(HANDLE,PLONG);
+typedef LONG (WINAPI *NCS)(PHANDLE,ULONG,PVOID,LONG,LONG);
+typedef LONG (WINAPI *NRS)(HANDLE,LONG,PLONG);
+static void t_owned_sync(void){
+ HMODULE nt=GetModuleHandleW(L"ntdll.dll");
+ NCM cm=(NCM)GetProcAddress(nt,"NtCreateMutant");NRM rm=(NRM)GetProcAddress(nt,"NtReleaseMutant");
+ NCS cs=(NCS)GetProcAddress(nt,"NtCreateSemaphore");NRS rs=(NRS)GetProcAddress(nt,"NtReleaseSemaphore");
+ HANDLE mutant,semaphore,output;LONG previous;
+ if(!cm||!rm||!cs||!rs){put(0xbad);return;}
+ put(cm(&mutant,0x1f0001,NULL,1));put(WaitForSingleObject(mutant,0));
+ previous=0x12345678;put(rm(mutant,&previous));put(previous);
+ previous=0x12345678;put(rm(mutant,&previous));put(previous);
+ previous=0x12345678;put(rm(mutant,&previous));put(previous);
+ put(ReleaseMutex(mutant));put(GetLastError());
+ put(cs(&semaphore,0x1f0003,NULL,1,2));
+ previous=0x12345678;put(rs(semaphore,0,&previous));put(previous);
+ previous=0x12345678;put(rs(semaphore,2,&previous));put(previous);
+ previous=0x12345678;put(rs(semaphore,1,&previous));put(previous);
+ previous=0x12345678;put(ReleaseSemaphore(semaphore,-1,&previous));put(GetLastError());put(previous);
+ output=(HANDLE)0x12345678;put(cs(&output,0x1f0003,NULL,-1,2));put((DWORD)(ULONG_PTR)output);
+ output=(HANDLE)0x12345678;put(cs(&output,0x1f0003,NULL,0,0));put((DWORD)(ULONG_PTR)output);
+ put(rs(semaphore,1,(LONG*)1));put(WaitForSingleObject(semaphore,0));put(WaitForSingleObject(semaphore,0));put(WaitForSingleObject(semaphore,0));
+ put(ReleaseMutex((HANDLE)0x12345678));put(GetLastError());
+ CloseHandle(mutant);CloseHandle(semaphore);
+}
+
+/* ---- 14: fixed path-mutation topology, fallback and deletion lifetime ---- */
+typedef struct {LONG Status;ULONG_PTR Information;} MUT_IO;
+typedef LONG (WINAPI *M_CLOSE)(HANDLE);
+typedef LONG (WINAPI *M_SET)(HANDLE,MUT_IO*,PVOID,ULONG,ULONG);
+typedef LONG (WINAPI *M_OPEN)(PHANDLE,ULONG,PVOID,MUT_IO*,ULONG,ULONG);
+typedef LONG (WINAPI *M_CREATE)(PHANDLE,ULONG,PVOID,MUT_IO*,PVOID,ULONG,ULONG,ULONG,ULONG,PVOID,ULONG);
+static M_CLOSE m_close;static M_SET m_set;static M_OPEN m_open;static M_CREATE m_create;
+static DWORD m_active,m_inject,m_status,m_forced,m_closes,m_opens,m_creates,m_od,m_os,m_oo,m_cd,m_cs,m_cp,m_co,m_ca,m_sets,m_class[2],m_flags[2];
+static LONG WINAPI mutation_close(HANDLE h){LONG status=m_close(h);if(m_active){m_closes++;if(m_active==1&&status>=0){m_forced++;return (LONG)0xc0000022;}}return status;}
+static LONG WINAPI mutation_open(PHANDLE h,ULONG d,PVOID a,MUT_IO*i,ULONG s,ULONG o){if(m_active){m_opens++;m_od=d;m_os=s;m_oo=o;}return m_open(h,d,a,i,s,o);}
+static LONG WINAPI mutation_create(PHANDLE h,ULONG d,PVOID a,MUT_IO*i,PVOID z,ULONG attrs,ULONG s,ULONG p,ULONG o,PVOID e,ULONG n){if(m_active){m_creates++;m_cd=d;m_cs=s;m_cp=p;m_co=o;m_ca=attrs;}return m_create(h,d,a,i,z,attrs,s,p,o,e,n);}
+static LONG WINAPI mutation_set(HANDLE h,MUT_IO*i,PVOID data,ULONG length,ULONG cls){
+ if(m_active){
+  if(m_sets<2){m_class[m_sets]=cls;m_flags[m_sets]=(cls==13||cls==10)&&length?*(BYTE*)data:length>=4?*(DWORD*)data:0;}m_sets++;
+  if(m_inject&&cls==64){i->Status=(LONG)m_status;i->Information=0;return (LONG)m_status;}
+ }
+ return m_set(h,i,data,length,cls);
+}
+static void mutation_reset(void){m_forced=m_closes=m_opens=m_creates=m_od=m_os=m_oo=m_cd=m_cs=m_cp=m_co=m_ca=m_sets=0;m_class[0]=m_class[1]=m_flags[0]=m_flags[1]=0;}
+static void mutation_file(LPCWSTR name){HANDLE h=CreateFileW(name,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,NULL);DWORD written;if(h==INVALID_HANDLE_VALUE||!WriteFile(h,"authored",8,&written,NULL)||written!=8||!CloseHandle(h))ExitProcess(92);}
+static void mutation_operation(DWORD operation){
+ WCHAR source[]=L"fixture-op-0-src.txt",target[]=L"fixture-op-0-dst.txt";DWORD result,error,attrs;BOOL open_ok,set_ok,state_ok;
+ source[11]=target[11]=(WCHAR)(L'0'+operation);
+ if(operation<2)mutation_file(source);else if(operation==3&&!CreateDirectoryW(source,NULL))ExitProcess(93);
+ mutation_reset();m_active=1;SetLastError(0x13572468);
+ result=operation==0?DeleteFileW(source):operation==1?MoveFileW(source,target):operation==2?CreateDirectoryW(source,NULL):RemoveDirectoryW(source);
+ error=GetLastError();m_active=0;attrs=GetFileAttributesW(source);
+ open_ok=operation==2?m_opens==0&&m_creates==1&&m_cd==0x100001&&m_cs==3&&m_cp==2&&m_co==0x204021&&m_ca==0x80:m_opens==1&&m_creates==0&&m_od==(operation==0?0x10080:0x110080)&&m_os==7&&m_oo==(operation==0?0x204040:operation==1?0x204020:0x204021);
+ set_ok=operation==2?m_sets==0:operation==1?m_sets==1&&m_class[0]==10&&m_flags[0]==0:m_sets==1&&m_class[0]==64&&m_flags[0]==3;
+ state_ok=operation==2?attrs!=INVALID_FILE_ATTRIBUTES&&(attrs&FILE_ATTRIBUTE_DIRECTORY)!=0:attrs==INVALID_FILE_ATTRIBUTES;
+ state_ok=state_ok&&((GetFileAttributesW(target)!=INVALID_FILE_ATTRIBUTES)==(operation==1));
+ put(result!=0);put(error==0x13572468);put(open_ok);put(set_ok);put(m_closes==1&&m_forced==1);put(state_ok);
+}
+static void mutation_fallback(DWORD index,DWORD status){
+ WCHAR name[]=L"fixture-fallback-A.txt";DWORD result,error,attrs;BOOL success=(LONG)status>=0,blocked=status==0xc0000121;
+ name[17]=(WCHAR)(L'A'+index);mutation_file(name);mutation_reset();m_status=status;m_inject=1;m_active=3;SetLastError(0x13572468);
+ result=DeleteFileW(name);error=GetLastError();m_active=m_inject=0;attrs=GetFileAttributesW(name);
+ put((result!=0)==!blocked&&error==(blocked?5:0x13572468)&&m_sets==(success||blocked?1:2)&&m_class[0]==64&&m_flags[0]==3&&(success||blocked||(m_class[1]==13&&m_flags[1]==1))&&m_closes==1&&((attrs!=INVALID_FILE_ATTRIBUTES)==(success||blocked)));
+}
+static void mutation_snapshot(LPCWSTR name,HANDLE remaining,DWORD expected_error){
+ DWORD attrs,error,opened,open_error,read=0;HANDLE h;BYTE bytes[8];BOOL readable=FALSE;
+ attrs=GetFileAttributesW(name);error=GetLastError();h=CreateFileW(name,GENERIC_READ,7,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);opened=h!=INVALID_HANDLE_VALUE;open_error=GetLastError();if(opened)CloseHandle(h);
+ if(remaining){SetFilePointer(remaining,0,NULL,FILE_BEGIN);readable=ReadFile(remaining,bytes,8,&read,NULL);}
+ put(attrs==INVALID_FILE_ATTRIBUTES&&error==expected_error&&!opened&&open_error==expected_error);
+ put(remaining?readable&&read==8:!readable&&read==0);
+}
+static void mutation_lifetime(DWORD classic){
+ WCHAR name[]=L"fixture-life-0.txt";HANDLE original,independent,duplicate,deletion;MUT_IO io;BYTE disposition=1;DWORD result,error;
+ name[13]=(WCHAR)(L'0'+classic);mutation_file(name);
+ original=CreateFileW(name,GENERIC_READ|DELETE,7,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);independent=CreateFileW(name,GENERIC_READ|DELETE,7,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+ if(original==INVALID_HANDLE_VALUE||independent==INVALID_HANDLE_VALUE||!DuplicateHandle(GetCurrentProcess(),original,GetCurrentProcess(),&duplicate,0,FALSE,DUPLICATE_SAME_ACCESS))ExitProcess(94);
+ if(classic){deletion=CreateFileW(name,DELETE,7,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);if(deletion==INVALID_HANDLE_VALUE)ExitProcess(95);SetLastError(0x13572468);result=m_set(deletion,&io,&disposition,1,13);error=GetLastError();CloseHandle(deletion);}
+ else{SetLastError(0x13572468);result=DeleteFileW(name);error=GetLastError();}
+ put((classic?result==0:result!=0)&&error==0x13572468);
+ mutation_snapshot(name,original,classic?5:2);CloseHandle(independent);mutation_snapshot(name,original,classic?5:2);CloseHandle(original);mutation_snapshot(name,duplicate,classic?5:2);CloseHandle(duplicate);mutation_snapshot(name,NULL,2);
+}
+static void mutation_selection(DWORD operation){
+ WCHAR source[]=L"fixture-select-0-src.txt",target[]=L"fixture-select-0-dst.txt";DWORD result,error,attrs;BOOL changed;
+ source[15]=target[15]=(WCHAR)(L'0'+operation);
+ if(operation<2)mutation_file(source);else if(operation==2&&!CreateDirectoryW(source,NULL))ExitProcess(96);
+ mutation_reset();m_active=1;SetLastError(0x13572468);
+ result=operation==0?DeleteFileW(source):operation==1?MoveFileW(source,target):operation==2?RemoveDirectoryW(source):CreateDirectoryW(source,NULL);
+ error=GetLastError();m_active=0;attrs=GetFileAttributesW(source);
+ changed=operation==3?attrs!=INVALID_FILE_ATTRIBUTES&&(attrs&FILE_ATTRIBUTE_DIRECTORY):attrs==INVALID_FILE_ATTRIBUTES;
+ put(result!=0&&error==0x13572468&&m_opens==0&&m_creates==0&&m_closes==1&&m_forced==1&&changed&&((GetFileAttributesW(target)!=INVALID_FILE_ATTRIBUTES)==(operation==1)));
+}
+static void t_mutation_contract(void){
+ HMODULE nt=GetModuleHandleW(L"ntdll.dll");DWORD i;
+ static DWORD statuses[]={0xc0000003,0xc000000d,0xc00000bb,0xc0000022,0xc0000121,0xc0000043,0,0x40000000,0x80000002,0x80000005,0xc0000001,0xc0000008,0xc0000005};
+ int ok=MH_Initialize()==MH_OK;
+ ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtClose"),mutation_close,(PVOID*)&m_close)==MH_OK&&MH_CreateHook(GetProcAddress(nt,"NtSetInformationFile"),mutation_set,(PVOID*)&m_set)==MH_OK&&MH_CreateHook(GetProcAddress(nt,"NtOpenFile"),mutation_open,(PVOID*)&m_open)==MH_OK&&MH_CreateHook(GetProcAddress(nt,"NtCreateFile"),mutation_create,(PVOID*)&m_create)==MH_OK&&MH_EnableHook(MH_ALL_HOOKS)==MH_OK;
+ put(ok);if(!ok)return;for(i=0;i<4;i++)mutation_operation(i);for(i=0;i<sizeof(statuses)/sizeof(statuses[0]);i++)mutation_fallback(i,statuses[i]);mutation_lifetime(0);mutation_lifetime(1);
+ /* A hook on the other entry must not change the frontend's fixed topology. */
+ MH_DisableHook(GetProcAddress(nt,"NtOpenFile"));for(i=0;i<3;i++)mutation_selection(i);
+ MH_EnableHook(GetProcAddress(nt,"NtOpenFile"));MH_DisableHook(GetProcAddress(nt,"NtCreateFile"));mutation_selection(3);MH_DisableHook(MH_ALL_HOOKS);
+}
+
 
 void mainCRTStartup(void){
   char cl[MAX_PATH]; char t; int len=(int)GetModuleFileNameA(NULL,cl,MAX_PATH);
   main_ret=_ReturnAddress();
   t=len>5?cl[len-5]:'0'; /* probe-N.exe */
   switch(t){case '1':t_threads();break;case '2':t_file_hooks();break;case '3':t_identity();break;
-    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;case 'c':t_loader_queries();break;default:ExitProcess(91);}
+    case '4':t_exports();break;case '5':t_context();break;case '6':t_heap_hooks();break;case '7':t_loader_hooks();break;case '8':t_ansi_names();break;case '9':t_memory_hooks();break;case 'a':t_exception_layout();break;case 'b':t_unload_hook();break;case 'c':t_loader_queries();break;case 'd':t_owned_sync();break;case 'e':t_mutation_contract();break;default:ExitProcess(91);}
   save(t); ExitProcess(0);
 }
