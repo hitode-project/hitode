@@ -13,6 +13,121 @@ use crate::outcome::{Continuation, DeferredContinuation, WakeReason};
 pub type CtxId = u32;
 pub type Handle = u32;
 
+/// Live scheduler entries, separate from the append-only context identity table.
+/// WakeQueue uses reusable execution slots, so its scans and stamps stay bounded
+/// by the execution pool rather than the number of threads ever created.
+#[derive(Default)]
+pub(crate) struct ActiveContexts {
+    entries: Vec<ActiveContext>,
+    slots: Vec<Option<CtxId>>,
+    queue: crate::wake_queue::WakeQueue,
+}
+
+pub(crate) struct ActiveContext {
+    pub id: CtxId,
+    pub slot: u32,
+    pub ran: bool,
+    pub polled: bool,
+}
+
+impl ActiveContexts {
+    pub fn entries(&self) -> &[ActiveContext] {
+        &self.entries
+    }
+
+    pub fn insert(&mut self, id: CtxId, slot: u32) {
+        assert!(slot < crate::layout::MAX_CONTEXTS);
+        self.slots
+            .resize(self.slots.len().max(slot as usize + 1), None);
+        assert!(self.slots[slot as usize].replace(id).is_none());
+        self.entries.push(ActiveContext {
+            id,
+            slot,
+            ran: false,
+            polled: false,
+        });
+    }
+
+    pub fn retire(&mut self, id: CtxId) -> bool {
+        let Ok(index) = self.entries.binary_search_by_key(&id, |entry| entry.id) else {
+            return false;
+        };
+        let slot = self.entries[index].slot;
+        self.queue.retire(slot);
+        self.slots[slot as usize] = None;
+        self.entries.retain(|entry| entry.id != id);
+        true
+    }
+
+    pub fn wake(&mut self, id: CtxId, observed_us: u64, deadline_us: Option<u64>) {
+        if let Ok(index) = self.entries.binary_search_by_key(&id, |entry| entry.id) {
+            self.queue
+                .wake(self.entries[index].slot, observed_us, deadline_us);
+        }
+    }
+
+    pub fn wake_as(
+        &mut self,
+        id: CtxId,
+        observed_us: u64,
+        deadline_us: Option<u64>,
+        priority: crate::WakePriority,
+    ) {
+        if let Ok(index) = self.entries.binary_search_by_key(&id, |entry| entry.id) {
+            self.queue
+                .wake_as(self.entries[index].slot, observed_us, deadline_us, priority);
+        }
+    }
+
+    pub fn pick(
+        &mut self,
+        after: &mut Option<u32>,
+        count: usize,
+        ready: impl Fn(CtxId) -> bool,
+        prefer_wakes: bool,
+    ) -> Option<crate::wake_queue::Selection> {
+        let slots = &self.slots;
+        let mut selection = self.queue.pick(
+            after,
+            count.min(slots.len()),
+            |slot| slots[slot as usize].is_some_and(&ready),
+            prefer_wakes,
+        )?;
+        selection.id = slots[selection.id as usize].expect("selected slot owns a live context");
+        Some(selection)
+    }
+
+    pub fn begin_slice(&mut self) {
+        for entry in &mut self.entries {
+            entry.ran = false;
+            entry.polled = false;
+        }
+    }
+
+    pub fn mark_turn(&mut self, id: CtxId, yielded: bool) {
+        let index = self
+            .entries
+            .binary_search_by_key(&id, |entry| entry.id)
+            .expect("selected context is active");
+        self.entries[index].ran = true;
+        self.entries[index].polled = yielded;
+    }
+
+    pub fn clear_polled(&mut self) {
+        for entry in &mut self.entries {
+            entry.polled = false;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SchedulerWork {
+    pub polls: std::cell::Cell<usize>,
+    pub selections: std::cell::Cell<usize>,
+    pub scratch: std::cell::Cell<usize>,
+}
+
 /// What a blocked context waits for. Times are guest microseconds ([`crate::Clock`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wait {
@@ -386,5 +501,309 @@ pub(crate) fn poll_objects(
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod active_tests {
+    use crate::*;
+    use adv_cpu::JitCpu;
+
+    struct Empty;
+    impl Resolver for Empty {
+        fn host_fn(&self, _: &str, _: &str) -> Option<HostFn> {
+            None
+        }
+        fn provides(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    fn machine() -> Machine<JitCpu> {
+        Machine::new(
+            JitCpu::new(layout::PARK_ADDR, false).unwrap(),
+            Empty,
+            Clock::real(),
+        )
+        .unwrap()
+    }
+
+    fn churn(machine: &mut Machine<JitCpu>, count: u32) -> Vec<(CtxId, Handle, u32, u32)> {
+        let mut retained = Vec::new();
+        for code in 1..=count {
+            let id = machine
+                .spawn("short", layout::PARK_ADDR, &[], 65536)
+                .unwrap();
+            let ctx = machine.sys.context(id);
+            let (handle, tid) = (ctx.thread_handle, ctx.tid);
+            assert!(machine.sys.terminate_context_stopped(id, code));
+            if code == 1 || code == count / 2 || code == count {
+                retained.push((id, handle, tid, code));
+            } else {
+                assert!(machine.sys.objects.close(handle).is_some());
+            }
+        }
+        machine
+            .sys
+            .reclaim_finished_storage(&mut machine.cpu)
+            .unwrap();
+        retained
+    }
+
+    #[test]
+    fn scheduler_work_is_bounded_after_sequential_thread_exits() {
+        let mut machine = machine();
+        let keeper = machine
+            .spawn("keeper", layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        assert_eq!(machine.sys.suspend_context(keeper), Some(0));
+        let retained = churn(&mut machine, 4096);
+        machine.sys.scheduler_work = Default::default();
+        assert!(matches!(
+            machine.run_slice(Duration::from_secs(1)),
+            SliceResult::Complete(RunResult::Idle {
+                next_deadline: None
+            })
+        ));
+        for (id, handle, tid, code) in retained {
+            let context = machine.sys.context(id);
+            assert_eq!(context.id, id);
+            assert_eq!(context.tid, tid);
+            assert_eq!(context.exit_code(), Some(code));
+            assert!(
+                matches!(machine.sys.objects.get(handle), Some(Object::Thread { ctx }) if *ctx == id)
+            );
+            assert_eq!(
+                machine
+                    .sys
+                    .thread_identity(id)
+                    .unwrap()
+                    .completion
+                    .exit_code(),
+                Some(code)
+            );
+            assert!(machine.sys.try_acquire(handle));
+            assert_eq!(
+                machine.sys.try_acquire_objects(&[handle], true),
+                Some(WakeReason::Objects {
+                    index: 0,
+                    abandoned: false
+                })
+            );
+        }
+        // One slice and six handle waits should inspect only the one live context.
+        assert!(
+            machine.sys.scheduler_work.polls.get() <= 7,
+            "poll visits: {}",
+            machine.sys.scheduler_work.polls.get()
+        );
+        assert!(
+            machine.sys.scheduler_work.selections.get() <= 2,
+            "selection visits: {}",
+            machine.sys.scheduler_work.selections.get()
+        );
+        assert!(
+            machine.sys.scheduler_work.scratch.get() <= 2,
+            "slice scratch entries: {}",
+            machine.sys.scheduler_work.scratch.get()
+        );
+        assert_eq!(machine.sys.contexts.len(), 4097);
+        assert_eq!(machine.sys.wakes.entries().len(), 1);
+        assert!(machine.sys.finished_contexts.is_empty());
+        assert!(machine.sys.wakes.slots.len() <= layout::MAX_CONTEXTS as usize);
+    }
+
+    #[test]
+    fn sparse_execution_slots_do_not_visit_retired_contexts() {
+        let mut machine = machine();
+        for _ in 0..layout::MAX_CONTEXTS {
+            machine
+                .spawn("live", layout::PARK_ADDR, &[], 65536)
+                .unwrap();
+        }
+        let keeper = layout::MAX_CONTEXTS - 1;
+        machine.sys.suspend_context(keeper).unwrap();
+        for id in 0..keeper {
+            assert!(machine.sys.terminate_context_stopped(id, id));
+        }
+        machine
+            .sys
+            .reclaim_finished_storage(&mut machine.cpu)
+            .unwrap();
+        machine.sys.scheduler_work = Default::default();
+        assert!(matches!(
+            machine.run_slice(Duration::from_secs(1)),
+            SliceResult::Complete(RunResult::Idle { .. })
+        ));
+        assert_eq!(machine.sys.scheduler_work.polls.get(), 1);
+        assert_eq!(machine.sys.scheduler_work.selections.get(), 2);
+        assert_eq!(machine.sys.scheduler_work.scratch.get(), 0);
+        assert_eq!(machine.sys.wakes.entries().len(), 1);
+        let replacement = machine
+            .spawn("replacement", layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        assert_eq!(
+            machine
+                .sys
+                .context(replacement)
+                .storage
+                .as_ref()
+                .unwrap()
+                .slot,
+            0
+        );
+        assert_eq!(machine.sys.wakes.entries().len(), 2);
+    }
+
+    #[test]
+    fn reused_slots_keep_wake_identity_and_normal_progress() {
+        let mut active = super::ActiveContexts::default();
+        for slot in 0..3 {
+            active.insert(10_000 + slot, slot);
+        }
+        active.wake_as(10_001, 0, Some(0), WakePriority::Audio);
+        active.mark_turn(10_001, true);
+        assert!(active.retire(10_001));
+        active.insert(20_000, 1);
+        let replacement = active.entries().last().unwrap();
+        assert!(!replacement.ran && !replacement.polled);
+        active.wake(10_002, 5, Some(3));
+        let mut cursor = None;
+        let pick = active
+            .pick(&mut cursor, layout::MAX_CONTEXTS as usize, |_| true, true)
+            .unwrap();
+        assert_eq!(pick.id, 10_002);
+        assert!(pick.promoted);
+        assert_eq!(pick.wake.unwrap().deadline_us, Some(3));
+        assert_eq!(cursor, None);
+        assert_eq!(
+            active
+                .pick(&mut cursor, layout::MAX_CONTEXTS as usize, |_| true, true)
+                .unwrap()
+                .id,
+            10_000
+        );
+        let pick = active
+            .pick(&mut cursor, layout::MAX_CONTEXTS as usize, |_| true, true)
+            .unwrap();
+        assert_eq!(pick.id, 20_000);
+        assert!(pick.wake.is_none() && !pick.promoted);
+        let mut counts = [0; 3];
+        let mut streak = 0;
+        for time in 0..900 {
+            active.wake_as(10_000, time, None, WakePriority::Audio);
+            let pick = active
+                .pick(&mut cursor, layout::MAX_CONTEXTS as usize, |_| true, true)
+                .unwrap();
+            let slot = active
+                .entries()
+                .iter()
+                .find(|entry| entry.id == pick.id)
+                .unwrap()
+                .slot;
+            counts[slot as usize] += 1;
+            streak = if pick.promoted { streak + 1 } else { 0 };
+            assert!(streak <= 8);
+        }
+        assert!(counts[1] >= 50 && counts[2] >= 50, "{counts:?}");
+    }
+
+    #[test]
+    fn parked_thread_and_process_exits_retire_the_active_index() {
+        let mut machine = machine();
+        for _ in 0..3 {
+            machine
+                .spawn("live", layout::PARK_ADDR, &[], 65536)
+                .unwrap();
+        }
+        machine.sys.current = 1;
+        assert!(machine.park(crate::Parked::ExitThread(7)).is_none());
+        assert_eq!(machine.sys.wakes.entries().len(), 2);
+        machine.sys.current = 2;
+        assert!(matches!(
+            machine.park(crate::Parked::ExitProcess(21)),
+            Some(RunResult::Exited(21))
+        ));
+        assert!(machine.sys.wakes.entries().is_empty());
+        assert_eq!(machine.sys.finished_contexts.len(), 3);
+        machine
+            .sys
+            .reclaim_finished_storage(&mut machine.cpu)
+            .unwrap();
+        assert!(machine.sys.finished_contexts.is_empty());
+        assert_eq!(machine.sys.context(1).exit_code(), Some(7));
+        for id in [0, 2] {
+            assert_eq!(machine.sys.context(id).exit_code(), Some(21));
+        }
+        assert!(
+            machine
+                .sys
+                .contexts
+                .iter()
+                .all(|context| context.storage.is_none())
+        );
+    }
+
+    #[test]
+    fn failed_reclaim_keeps_pending_storage_for_retry() {
+        let mut machine = machine();
+        machine
+            .spawn("keeper", layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        let retired = machine
+            .spawn("short", layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        assert!(machine.sys.terminate_context_stopped(retired, 9));
+        let storage = machine.sys.contexts[retired as usize]
+            .storage
+            .as_mut()
+            .unwrap();
+        let directory = storage.tls_directory;
+        storage.tls_directory = layout::PARK_ADDR;
+        assert!(
+            machine
+                .spawn("failed", layout::PARK_ADDR, &[], 65536)
+                .is_err()
+        );
+        assert_eq!(machine.sys.contexts.len(), 2);
+        assert_eq!(machine.sys.wakes.entries().len(), 1);
+        assert_eq!(machine.sys.finished_contexts, [retired]);
+        machine.sys.contexts[retired as usize]
+            .storage
+            .as_mut()
+            .unwrap()
+            .tls_directory = directory;
+        let replacement = machine
+            .spawn("retry", layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        assert_eq!(replacement, 2);
+        assert!(machine.sys.finished_contexts.is_empty());
+        assert!(machine.sys.context(retired).storage.is_none());
+        assert_eq!(machine.sys.context(retired).exit_code(), Some(9));
+    }
+
+    #[test]
+    #[ignore = "local scheduler microbenchmark; no game or timing assertion"]
+    fn scheduler_slice_after_ten_thousand_exits() {
+        let mut machine = machine();
+        let keeper = machine
+            .spawn("keeper", layout::PARK_ADDR, &[], 65536)
+            .unwrap();
+        machine.sys.suspend_context(keeper).unwrap();
+        churn(&mut machine, 10_000);
+        let slices = 10_000;
+        let started = Instant::now();
+        for _ in 0..slices {
+            assert!(matches!(
+                machine.run_slice(Duration::from_secs(1)),
+                SliceResult::Complete(RunResult::Idle { .. })
+            ));
+        }
+        eprintln!(
+            "scheduler benchmark: history={} active=1 slices={} ns_per_slice={:.1}",
+            machine.sys.contexts.len(),
+            slices,
+            started.elapsed().as_nanos() as f64 / f64::from(slices)
+        );
     }
 }
