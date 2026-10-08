@@ -446,8 +446,13 @@ fn rejects_unclaimable_dispatches(state: *mut CpuState, window: usize) {
     // Every case must return before capture touches this deliberately unusable
     // context pointer. This also detects accidental widening of the claim gate.
     let fake_context = std::ptr::dangling_mut::<c_void>();
+    let unsupported_signal = if cfg!(target_os = "macos") {
+        libc::SIGILL
+    } else {
+        libc::SIGBUS
+    };
     for (signal, pc, host_address, access, host_context) in [
-        (libc::SIGBUS, pc, window + 4, 0, fake_context),
+        (unsupported_signal, pc, window + 4, 0, fake_context),
         (libc::SIGSEGV, pc + 1, window + 4, 0, fake_context),
         (libc::SIGSEGV, pc, window + 4, usize::MAX - 1, fake_context),
         (libc::SIGSEGV, pc, window + 4, 1, fake_context),
