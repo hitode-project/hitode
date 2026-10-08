@@ -582,10 +582,11 @@ mod tests {
         }
         let bytes = a.assemble(u64::from(CODE)).unwrap();
         let pcs = Decoder::with_ip(32, &bytes, u64::from(CODE), 0)
+            .into_iter()
             .map(|i| i.ip().to_string())
             .collect::<Vec<_>>();
         let manifest = format!("{CODE}\t{CODE}\t{}\t40\n{}\n", bytes.len(), pcs.join("\t"));
         let slice = private_slice(&manifest, &bytes).unwrap();
-        assert_eq!(Decoder::new(32, &slice, 0).count(), 32);
+        assert_eq!(Decoder::new(32, &slice, 0).into_iter().count(), 32);
     }
 }

@@ -15,6 +15,7 @@ Assert $plan.build_only
 Assert ($plan.adb_port -eq 5037)
 Assert ($plan.cargo_arguments -contains 'host_region_bench')
 Assert ($plan.cargo_arguments -contains '--locked')
+Assert ($plan.cpu_mask -eq 'auto')
 $plan = & $runner @arguments -SkipBuild -CpuMask 40 -Corpus 'local-corpus' | ConvertFrom-Json
 Assert $plan.skip_build
 Assert ($plan.shell.Contains('taskset 40 timeout 300'))
@@ -26,5 +27,11 @@ try { & $runner @arguments -BuildOnly -SkipBuild | Out-Null } catch { $rejected 
 Assert $rejected
 $rejected = $false
 try { & $runner @arguments -CpuMask '80;exit' | Out-Null } catch { $rejected = $true }
+Assert $rejected
+. $runner @arguments | Out-Null
+$choices = @(Get-CpuChoices @('Cpus_allowed_list: 0-2,4', '0 800', '1 900', '2 900', '4 1800', '7 2400'))
+Assert (($choices.core -join ',') -eq '4,2,1,0')
+$rejected = $false
+try { Get-CpuChoices @('0 800') | Out-Null } catch { $rejected = $true }
 Assert $rejected
 Write-Output "Region benchmark plan checks: $assertions passed."

@@ -2,7 +2,7 @@
 .SYNOPSIS
 Build and run the anonymous, headless ARM64 region benchmark.
 .DESCRIPTION
-Inputs: an optional locally staged private capture Corpus, hexadecimal CpuMask,
+Inputs: an optional locally staged private capture Corpus, hexadecimal/auto CpuMask,
 isolated TargetDir/Output and the shared atomic DeviceLock directory. Output:
 anonymous benchmark CSV/log, commands and binary/runner SHA-256. No APK or UI.
 BuildOnly and WhatIf never access a device. SkipBuild reuses this task's ELF.
@@ -18,7 +18,7 @@ param(
     [Parameter(Mandatory)][string]$TargetDir,
     [Parameter(Mandatory)][string]$Output,
     [string]$Corpus = '',
-    [ValidatePattern('^[0-9a-fA-F]+$')][string]$CpuMask = '80',
+    [ValidatePattern('^(auto|[0-9a-fA-F]+)$')][string]$CpuMask = 'auto',
     [string]$DeviceLock = $env:ADV_DEVICE_LOCK,
     [ValidateRange(1, 31)][int]$Samples = 7,
     [ValidateRange(1, 100000)][int]$Loops = 10000,
@@ -35,6 +35,22 @@ $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 $Output = [IO.Path]::GetFullPath($Output)
 $cargoArgs = @('ndk', '-t', 'arm64-v8a', '--platform', '29', 'build', '--locked', '-p', 'adv-cpu', '--release', '--example', 'host_region_bench', '--target-dir', $TargetDir)
+function Get-CpuChoices([string[]]$Inventory) {
+    $allowedLine = ($Inventory | Where-Object { $_ -match '^Cpus_allowed_list:' } | Select-Object -First 1)
+    if (-not $allowedLine) { throw 'Cannot read allowed CPU range.' }
+    $allowed = @{}
+    foreach ($part in ($allowedLine -replace '^Cpus_allowed_list:\s*', '').Trim().Split(',')) {
+        $bounds = $part.Split('-')
+        $first = [int]$bounds[0]
+        $last = if ($bounds.Count -eq 2) { [int]$bounds[1] } else { $first }
+        foreach ($core in $first..$last) { $allowed[$core] = $true }
+    }
+    @($Inventory | ForEach-Object {
+        if ($_ -match '^(\d+) (\d+)$' -and $allowed.ContainsKey([int]$Matches[1])) {
+            [pscustomobject]@{ core = [int]$Matches[1]; frequency = [long]$Matches[2] }
+        }
+    } | Sort-Object -Property @{ Expression = 'frequency'; Descending = $true }, @{ Expression = 'core'; Descending = $true })
+}
 function Get-Command([string]$Remote) {
     $corpusEnv = if ($Corpus) { "ADV_GIR_LIFT_CORPUS='$Remote/corpus' " } else { '' }
     "unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS; ${corpusEnv}ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit taskset $CpuMask timeout $TimeoutSeconds '$Remote/host_region_bench'"
@@ -67,10 +83,10 @@ if (-not $SkipBuild) {
     }
 }
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Benchmark ELF missing.' }
-@('cargo ' + ($cargoArgs -join ' '), "cpu_mask=$CpuMask", 'frequency_locked=false',
+@(('cargo ' + ($cargoArgs -join ' ')), "cpu_mask=$CpuMask", 'frequency_locked=false',
     "samples=$Samples loops=$Loops repeats=$Repeats private_limit=$PrivateLimit",
-    'binary_sha256=' + (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash,
-    'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash) |
+    ('binary_sha256=' + (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash),
+    ('runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash)) |
     Set-Content -LiteralPath (Join-Path $Output 'cmd.txt') -Encoding utf8
 if ($BuildOnly) { Write-Output 'Region benchmark cross-build complete.'; return }
 $adb = Join-Path $Sdk 'platform-tools/adb.exe'
@@ -112,6 +128,23 @@ try {
     Invoke-Adb @('-s', $device, 'push', $binary, "$remote/host_region_bench") | Out-Null
     if ($Corpus) { Invoke-Adb @('-s', $device, 'push', $Corpus, "$remote/corpus") | Out-Null }
     Invoke-Adb @('-s', $device, 'shell', 'chmod', '700', "$remote/host_region_bench") | Out-Null
+    if ($CpuMask -eq 'auto') {
+        # Android shell cpusets can exclude online big cores. Read this shell's
+        # actual affinity and choose its fastest permitted CPU without changing
+        # cpusets, frequency policy or foreground state.
+        $inventory = @(Invoke-Adb @('-s', $device, 'shell', 'grep Cpus_allowed_list /proc/self/status; for p in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do c=${p%/cpufreq}; c=${c##*/cpu}; echo "$c $(cat $p/scaling_max_freq)"; done'))
+        $inventory | Set-Content -LiteralPath (Join-Path $Output 'affinity.txt')
+        $choices = @(Get-CpuChoices $inventory)
+        if (-not $choices.Count -or $choices[0].core -ge 63) { throw 'No supported permitted CPU.' }
+        $masks = @($choices | ForEach-Object { ([long]1 -shl $_.core).ToString('x') })
+        # Online/allowed does not guarantee bindability on vendor kernels.
+        # Probe only a no-op, in descending maximum-frequency order, before guest work.
+        $probe = 'for mask in ' + ($masks -join ' ') + '; do if taskset "$mask" true >/dev/null 2>&1; then echo "$mask"; break; fi; done'
+        $CpuMask = (Invoke-Adb @('-s', $device, 'shell', $probe) | Out-String).Trim()
+        if ($CpuMask -notin $masks) { throw 'No CPU accepted an affinity probe.' }
+        $selected = $choices[[Array]::IndexOf($masks, $CpuMask)]
+        Add-Content -LiteralPath (Join-Path $Output 'cmd.txt') -Value "probe_mask_sequence=$($masks -join ',') selected_core=$($selected.core) selected_max_khz=$($selected.frequency) resolved_cpu_mask=$CpuMask"
+    }
     # Record the bound core's policy/frequency as context; never change it.
     Invoke-Adb @('-s', $device, 'shell', 'cat /sys/devices/system/cpu/online; for p in /sys/devices/system/cpu/cpufreq/policy*; do echo policy; cat $p/related_cpus $p/scaling_max_freq $p/scaling_cur_freq $p/scaling_governor; done') |
         Set-Content -LiteralPath (Join-Path $Output 'frequency-before.txt')
