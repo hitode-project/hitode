@@ -66,9 +66,10 @@ pub(in crate::kernel32) fn create(
         5 => 4, // TRUNCATE_EXISTING -> FILE_OVERWRITE
         _ => return Some(failed(env, 87, INVALID_HANDLE_VALUE)),
     };
+    // DELETE is forwarded unchanged; NtCreateFile owns its existing-file rule.
     if inherit
-        || access & !0xc012_019f != 0
-        || access & 0xc000_0007 == 0
+        || access & !0xc013_019f != 0
+        || access & 0xc001_0007 == 0
         || flags & 0xe7ff_0000 != 0
         || env.arg(6) != 0
     {

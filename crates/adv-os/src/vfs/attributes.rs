@@ -27,6 +27,27 @@ impl Stamp {
 pub(super) struct Attributes {
     normal: RefCell<BTreeMap<FileIdentity, Stamp>>,
 }
+/// std::fs::metadata retries ACCESS_DENIED through FindFirstFile, which still
+/// lists a delete-pending name. Native GetFileAttributes opens the instance and
+/// reports STATUS_DELETE_PENDING, so ask the host query first.
+#[cfg(windows)]
+fn host_query(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileAttributesW(name: *const u16) -> u32;
+    }
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: name is a NUL-terminated UTF-16 buffer that outlives the call.
+    if unsafe { GetFileAttributesW(name.as_ptr()) } == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn host_query(_: &Path) -> io::Result<()> {
+    Ok(())
+}
 fn identity(path: &Path, metadata: &Metadata) -> io::Result<FileIdentity> {
     #[cfg(windows)]
     {
@@ -132,6 +153,7 @@ impl Vfs {
             return Ok(self.optical_entry(guest)?.attributes);
         }
         let path = self.lookup(guest).ok_or(io::ErrorKind::NotFound)?;
+        host_query(&path)?;
         self.attributes.read(&path, &std::fs::metadata(&path)?)
     }
     /// Publish NORMAL only after verifying a live ordinary VFS instance. Host

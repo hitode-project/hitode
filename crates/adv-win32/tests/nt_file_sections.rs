@@ -111,6 +111,8 @@ fn nt_file_views_outlive_handles_obey_shared_open_rules_and_round_protection() {
             machine.cpu.write_u32(ATTRS + offset, value).unwrap();
         }
         machine.cpu.write_u32(FAILED_FILE, 0x12345678).unwrap();
+        machine.cpu.write_u32(FAILED_IOSB, 0x11111111).unwrap();
+        machine.cpu.write_u32(FAILED_IOSB + 4, 0x22222222).unwrap();
         let mut code = Asm::new(CODE);
         // Allocate before mapping so a later allocation cannot reuse the
         // unmapped view address and invalidate the final unmap assertion.
@@ -285,9 +287,11 @@ fn nt_file_views_outlive_handles_obey_shared_open_rules_and_round_protection() {
         assert!(!machine.cpu.accessible(view, 1, Prot::READ));
         assert_ne!(machine.cpu.read_u32(OWNER).unwrap(), u32::MAX);
         assert_eq!(machine.cpu.read_u32(RESULTS + 32).unwrap(), 0xc0000043);
-        assert_eq!(machine.cpu.read_u32(FAILED_FILE).unwrap(), 0x12345678);
-        assert_eq!(machine.cpu.read_u32(FAILED_IOSB).unwrap(), 0xc0000043);
-        assert_eq!(machine.cpu.read_u32(FAILED_IOSB + 4).unwrap(), 0);
+        // Native x86 clears FileHandle once OBJECT_ATTRIBUTES were accepted,
+        // but a failed open never writes the IOSB.
+        assert_eq!(machine.cpu.read_u32(FAILED_FILE).unwrap(), 0);
+        assert_eq!(machine.cpu.read_u32(FAILED_IOSB).unwrap(), 0x11111111);
+        assert_eq!(machine.cpu.read_u32(FAILED_IOSB + 4).unwrap(), 0x22222222);
         assert_eq!(machine.cpu.read_u32(RESULTS + 36).unwrap(), 1);
         let allocation = machine.cpu.read_u32(ALLOCATION).unwrap();
         assert_ne!(allocation, 0);

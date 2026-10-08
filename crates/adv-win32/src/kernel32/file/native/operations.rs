@@ -65,15 +65,62 @@ pub(crate) fn open(
     options: u32,
     then: Done<u32>,
 ) -> Outcome {
+    let use_open = disposition == 1
+        && matches!(overridden(env, "NtCreateFile"), Ok(None))
+        && matches!(overridden(env, "NtOpenFile"), Ok(Some(_)));
+    open_at(
+        env,
+        path,
+        access,
+        share,
+        disposition,
+        options,
+        use_open,
+        then,
+    )
+}
+
+/// Frontends with a verified NtOpenFile boundary keep it even when both native
+/// entries are observed. Hook presence must not select their operation kind.
+pub(crate) fn open_existing(
+    env: &mut Env<'_>,
+    path: &str,
+    access: u32,
+    share: u32,
+    options: u32,
+    then: Done<u32>,
+) -> Outcome {
+    open_at(env, path, access, share, 1, options, true, then)
+}
+
+pub(crate) fn create(
+    env: &mut Env<'_>,
+    path: &str,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    then: Done<u32>,
+) -> Outcome {
+    open_at(env, path, access, share, disposition, options, false, then)
+}
+
+fn open_at(
+    env: &mut Env<'_>,
+    path: &str,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    use_open: bool,
+    then: Done<u32>,
+) -> Outcome {
     let path = env.ext.get::<Win32>().vfs.normalize(path);
     let attrs = match attributes(env, &path, 16) {
         Ok(attrs) => attrs,
         Err(status) => return then(env, Err(status)),
     };
     let (out, object, iosb) = (attrs.extra, attrs.object, attrs.extra + 8);
-    let use_open = disposition == 1
-        && matches!(overridden(env, "NtCreateFile"), Ok(None))
-        && matches!(overridden(env, "NtOpenFile"), Ok(Some(_)));
     let name = if use_open {
         "NtOpenFile"
     } else {
