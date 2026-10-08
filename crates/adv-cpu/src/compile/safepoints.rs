@@ -63,11 +63,20 @@ impl Plan {
 }
 
 impl Emitter<'_> {
+    /// The cell is pinned with Compiled and never changes after publication.
+    /// Loading an absolute pointer avoids a local-symbol ADRP range assumption.
+    pub(super) fn poll_checked_address(&mut self) -> Value {
+        let (_, cell) = self.poll.expect("poll body owns a checked target cell");
+        let cell = self.b.ins().iconst(self.ptr_ty, cell as i64);
+        self.b
+            .ins()
+            .load(self.ptr_ty, MemFlags::trusted().with_readonly(), cell, 0)
+    }
     /// Fund the entire next acyclic group, but debit only executed blocks.
     /// A short residual budget uses the original checked body, without a Rust
     /// round trip, instruction replay, extra fuel, or a growing native stack.
     pub(super) fn poll_budget(&mut self, pc: Value) {
-        let Some((plan, checked)) = self.poll else {
+        let Some((plan, _)) = self.poll else {
             return;
         };
         let fuel = self.b.use_var(self.fuel);
@@ -82,7 +91,7 @@ impl Emitter<'_> {
         self.b.ins().brif(enough, ready, &[], residual, &[]);
         self.b.switch_to_block(residual);
         self.save_state(pc);
-        let address = self.b.ins().func_addr(self.ptr_ty, checked);
+        let address = self.poll_checked_address();
         self.b
             .ins()
             .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);

@@ -62,6 +62,9 @@ pub(crate) struct NativeRun<'a> {
 }
 
 pub(crate) struct Compiled {
+    /// Immutable absolute checked entry, initialized before publication. Code
+    /// mappings need not be in ADRP/rel32 reach of the polling body.
+    _poll_target: Option<Box<usize>>,
     #[cfg(any(test, feature = "gir-execute"))]
     pub gir_instructions: BTreeMap<u32, Instruction>,
     perf_ranges: Vec<crate::perf_map::Registration>,
@@ -1113,6 +1116,10 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         && write_summary::Summary::for_region(&instructions).is_some())
     .then(|| safepoints::Plan::new(&instructions, &entries))
     .flatten();
+    let mut poll_target = poll_plan.as_ref().map(|_| Box::new(0usize));
+    let poll_cell = poll_target
+        .as_deref()
+        .map(|target| std::ptr::from_ref(target) as usize);
     let poll_id = poll_plan
         .as_ref()
         .map(|_| {
@@ -1257,7 +1264,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         let poll = polling_body.then(|| {
             (
                 poll_plan.as_ref().expect("poll body has a bounded plan"),
-                module.declare_func_in_func(id, func),
+                poll_cell.expect("poll body owns an absolute target cell"),
             )
         });
         // Shadow returns always target the checked entry. An external callee
@@ -2224,6 +2231,9 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     // platform-ABI trampoline. Region-to-region transfers already use slots.
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let body_entry = module.get_finalized_function(id) as usize;
+    if let Some(target) = poll_target.as_deref_mut() {
+        *target = body_entry;
+    }
     let tail_entry = module.get_finalized_function(poll_id.unwrap_or(id)) as usize;
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
@@ -2409,6 +2419,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     #[cfg(feature = "gir-lower")]
     crate::gir::diagnostics::record_lower(&instructions, region.start, snapshot.base, snapshot.len);
     Ok(Compiled {
+        _poll_target: poll_target,
         #[cfg(any(test, feature = "gir-execute"))]
         gir_instructions: instructions.clone(),
         perf_ranges,
@@ -3066,7 +3077,7 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
-    poll: Option<(&'a safepoints::Plan, ir::FuncRef)>,
+    poll: Option<(&'a safepoints::Plan, usize)>,
     poll_block: u32,
     memory_scratch: Option<ir::StackSlot>,
     invariant_plan: Option<invariants::Plan>,

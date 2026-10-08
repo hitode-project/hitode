@@ -117,7 +117,8 @@ try {
             $locked = $true
         } catch {
             if (-not (Test-Path -LiteralPath $DeviceLock -PathType Container)) { throw }
-            Start-Sleep -Seconds 30
+            # Short device sessions can otherwise fit entirely between retries.
+            Start-Sleep -Seconds 1
         }
     }
     $clock = [Diagnostics.Stopwatch]::StartNew()
