@@ -175,7 +175,8 @@ static void parent_main(void) {
     trace[48] = WaitForSingleObject(duplicate, INFINITE); /* WAIT_OBJECT_0=0 */
     trace[49] = GetExitCodeProcess(duplicate, &code);
     trace[50] = code; /* 37 */
-    trace[51] = WaitForSingleObject(first.hThread, 0);
+    /* Process completion may precede thread signaling; wait for final thread state. */
+    trace[51] = WaitForSingleObject(first.hThread, 5000);
     trace[52] = GetExitCodeThread(first.hThread, &code);
     trace[53] = code;
     trace[54] = CloseHandle(first.hThread);
