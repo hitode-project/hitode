@@ -57,7 +57,6 @@ mod time;
 mod timer;
 mod toolhelp;
 pub(crate) use thread_handles::{find_thread, publish_thread, thread_access};
-pub(crate) use time::delay_until;
 pub use time::filetime_now;
 pub(crate) use time::{civil_from_days, days_from_civil};
 

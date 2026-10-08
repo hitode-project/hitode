@@ -2,7 +2,7 @@
 
 use adv_abi::{GuestPtr, Registry, types::FILETIME, win32};
 use adv_cpu::backend::{Guest, GuestExt};
-use adv_machine::{Env, Outcome, Wait};
+use adv_machine::{Env, Outcome};
 
 use super::K32;
 use crate::{Win32, stdcall, util::write_units};
@@ -382,14 +382,6 @@ fn query_performance_frequency(
 #[win32(kernel32, name = "Sleep", level = implement)]
 pub(crate) fn sleep(env: &mut Env<'_>, ms: u32) -> Outcome {
     super::apc::sleep_front(env, ms, false, false)
-}
-
-pub(crate) fn delay_until(env: &mut Env<'_>, until: u64) -> Outcome {
-    if until <= env.sys.clock.now_us() {
-        Outcome::block_then_return(Wait::Yield, 0)
-    } else {
-        Outcome::block_then_return(Wait::Until(until), 0)
-    }
 }
 
 fn file_time_to_system_time(env: &mut Env<'_>) -> Outcome {
