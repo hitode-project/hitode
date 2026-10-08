@@ -43,6 +43,32 @@ def empty_fixture():
 
 
 class AggregateTests(unittest.TestCase):
+    def test_bridge_retirements_are_separate_and_old_reports_unmeasured(self):
+        report = fixture()
+        report["cpu_cliffs"]["tier1_bridge"] = {
+            "entries": 2, "instructions": 500,
+            "details": {"Rejected/PendingCompilation": {"entries": 1, "instructions": 256},
+                        "Interior": {"entries": 1, "instructions": 244}}}
+        result = aggregate([report, fixture(), report])
+        c = result["cpu_cliffs"]
+        self.assertEqual(c["tier1_bridge"]["instructions"], 1000)
+        self.assertEqual(c["tier1_bridge_reports"], 2)
+        self.assertEqual(c["tier1_bridge_unmeasured_reports"], 1)
+        self.assertEqual(c["interpreter_total"]["instructions"], 360)
+        self.assertIn("1000", markdown(result))
+        self.assertNotIn("private", markdown(result))
+
+    def test_bridge_rejects_bad_totals_and_private_labels(self):
+        for label, units in [("Uncovered/BelowThreshold", 9), ("private/path", 10),
+                             ("Forced", 10), ("Fallback", 10)]:
+            report = fixture()
+            report["cpu_cliffs"]["tier1_bridge"] = {
+                "entries": 1, "instructions": 10,
+                "details": {label: {"entries": 1, "instructions": units}}}
+            with self.assertRaises(ValueError) as caught:
+                aggregate([report])
+            self.assertNotIn("private", str(caught.exception))
+
     def census_fixture(self):
         report = empty_fixture()
         c = report["cpu_cliffs"]

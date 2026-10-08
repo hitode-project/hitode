@@ -11,6 +11,28 @@
 )]
 use std::time::Duration;
 
+/// Selection is fixed before execution. Bridge preserves the caller's automatic
+/// and asynchronous Cranelift policy; Exclusive retains the original opt-in lane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tier1Mode {
+    #[default]
+    Off,
+    Exclusive,
+    Bridge,
+}
+
+impl std::str::FromStr for Tier1Mode {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "exclusive" => Ok(Self::Exclusive),
+            "bridge" => Ok(Self::Bridge),
+            _ => Err("ADV_TIER1 must be bridge, exclusive or off".into()),
+        }
+    }
+}
+
 pub(crate) mod census;
 pub(crate) mod forms;
 mod x87;
@@ -23,6 +45,13 @@ pub(crate) const STORE: u32 = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct Tier1Stats {
+    /// Retired native units selected as a Cranelift waiting bridge, excluding fallback.
+    pub bridge_units: u64,
+    pub bridge_entries: u64,
+    /// Live RX mappings, including page rounding; code_bytes is cumulative emission.
+    pub resident_bytes: usize,
+    pub cache_evictions: u64,
+    pub cache_rejections: u64,
     pub compilations: u64,
     pub compile_time: Duration,
     pub code_bytes: u64,
@@ -78,6 +107,8 @@ pub(crate) struct Engine;
     any(target_os = "linux", target_os = "android")
 )))]
 impl Engine {
+    pub fn record_bridge(&mut self, _units: u32) {}
+    pub fn set_cache_limits(&mut self, _entries: usize, _bytes: usize) {}
     pub fn new() -> Result<Self, String> {
         Err(
             "ARM64 Tier 1 requires aarch64 Linux or Android; other platforms are not supported"
@@ -94,6 +125,7 @@ impl Engine {
         _interpreter: &mut crate::interpreter::Interpreter,
         _units: u32,
         _stop: u32,
+        _boundaries: Option<(&std::collections::BTreeMap<u32, u32>, u64)>,
     ) -> Result<Execution, String> {
         unreachable!("unsupported Tier 1 cannot be selected")
     }

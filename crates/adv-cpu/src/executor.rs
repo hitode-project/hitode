@@ -145,6 +145,7 @@ pub struct Executor {
     shadow_returns: Option<Box<crate::linking::shadow::Stack>>,
     interpreter: crate::interpreter::Interpreter,
     tier1: Option<crate::tier1::Engine>,
+    tier1_mode: crate::Tier1Mode,
     auto_jit: bool,
     auto_compile_strategy: CompileStrategy,
     tiered_compilation: bool,
@@ -404,12 +405,8 @@ impl Executor {
             || !self.code.compiled.is_empty()
             || !self.pending_regions.is_empty()
             || !self.deferred_compilations.is_empty()
-            || self.tier1.is_some()
         {
-            return Err(
-                "direct memory must be selected before compilation and execution, without Tier 1"
-                    .into(),
-            );
+            return Err("direct memory must be selected before compilation and execution".into());
         }
         self.memory.enable_direct_memory()
     }
@@ -445,6 +442,7 @@ impl Executor {
             shadow_returns: None,
             interpreter: crate::interpreter::Interpreter::new(),
             tier1: None,
+            tier1_mode: crate::Tier1Mode::Off,
             auto_jit: false,
             auto_compile_strategy: CompileStrategy::Fast,
             tiered_compilation: true,
@@ -550,6 +548,7 @@ impl Executor {
         self.auto_compile_strategy = parent.auto_compile_strategy;
         self.tiered_compilation = parent.tiered_compilation;
         self.async_compilation = parent.async_compilation;
+        self.set_tier1_mode(parent.tier1_mode)?;
         self.region_linking = parent.region_linking;
         self.profiling = parent.profiling;
         self.cache_region_limit = parent.cache_region_limit;
@@ -1554,7 +1553,11 @@ impl Executor {
             // Pending x87 exceptions must reach a waiting x87/MMX instruction
             // before it changes state. Native MMX assumes no pending #MF.
             let pending_fpu = self.state.x87.status & 0x80 != 0;
-            if !interpreter_only && !single_step && !pending_fpu && self.tier1.is_none() {
+            if !interpreter_only
+                && !single_step
+                && !pending_fpu
+                && self.tier1_mode != crate::Tier1Mode::Exclusive
+            {
                 self.discover(stop)?;
             }
             // Publications and queued regions can change the ranges during this
@@ -1572,7 +1575,7 @@ impl Executor {
             }
             let native = native.filter(|(_, code)| {
                 !interpreter_only
-                    && self.tier1.is_none()
+                    && self.tier1_mode != crate::Tier1Mode::Exclusive
                     && !single_step
                     && !pending_fpu
                     && code.entries.contains(&self.state.eip)
@@ -1782,8 +1785,15 @@ impl Executor {
             if self.interpreter.census_enabled && detail.is_some() && self.tier1.is_none() {
                 self.interpreter.census = Some(Default::default());
             }
-            let tier1 =
-                self.run_tier1(stop, units, interpreter_only || single_step || pending_fpu)?;
+            let tier1 = self.run_tier1(
+                stop,
+                units,
+                interpreter_only
+                    || single_step
+                    || pending_fpu
+                    || (self.tier1_mode == crate::Tier1Mode::Bridge
+                        && (self.parallel.is_some() || self.deferred_fallback == Some(pc))),
+            )?;
             let (execution, last_units) = if let Some(result) = &tier1 {
                 (result.execution, result.last_units)
             } else if self.profiling || single_step || observed.is_some() {
@@ -1815,6 +1825,12 @@ impl Executor {
                 .as_ref()
                 .map_or(execution.units, |r| r.interpreted_units);
             let interpreted = tier1.as_ref().is_none_or(|r| r.interpreted);
+            if self.tier1_mode == crate::Tier1Mode::Bridge && tier1.is_some() {
+                let native_units = execution.units - interpreted_units;
+                if native_units != 0 {
+                    bridge.cliffs.bridged(reason, detail, native_units);
+                }
+            }
             self.stats.interpreter_entries += u64::from(interpreted);
             self.stats.interpreter_instructions += u64::from(interpreted_units);
             if interpreted {
