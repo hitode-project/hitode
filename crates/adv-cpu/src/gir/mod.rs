@@ -4,6 +4,7 @@
 pub(crate) mod cfg;
 pub(crate) mod diagnostics;
 pub(crate) mod eval;
+pub(crate) mod hot;
 pub(crate) mod ir;
 pub(crate) mod lift;
 pub(crate) mod state_ssa;

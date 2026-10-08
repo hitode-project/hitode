@@ -7,7 +7,7 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const COMPLETE: u32 = 0;
@@ -20,6 +20,7 @@ pub const UNSUPPORTED: u32 = 6;
 pub const INTERRUPTED: u32 = 7;
 pub const REVOKED: u32 = 8;
 pub const STOP: u32 = 9;
+pub const CALL: u32 = 10;
 
 #[derive(Clone, Debug)]
 pub struct RangeProof {
@@ -59,6 +60,8 @@ pub struct Frame {
     pub status: u32,
     pub lease_epoch: u64,
     pub last_indirect_branch: crate::IndirectBranch,
+    pub tail_entries: u64,
+    pub tail_calls: u64,
 }
 impl Frame {
     pub fn from_cpu(c: &crate::CpuState) -> Self {
@@ -80,9 +83,12 @@ impl Frame {
 pub struct Code {
     module: Option<JITModule>,
     entry: *const u8,
+    tail: Option<*const u8>,
+    link_count: usize,
     base: u32,
     len: usize,
     pub machine: Vec<u8>,
+    pub code_bytes: usize,
     pub blocks: Vec<u32>,
     pub vcode: String,
     pub cross: Option<(Vec<u8>, Vec<u32>, String)>,
@@ -94,6 +100,42 @@ pub struct Code {
     // Code, cold recovery recipes and dependency identities have one owner.
     pub recovery: recovery::Plan,
     pub table: RecoveryTable,
+}
+
+/// One immutable invocation shared by every tail in an owner-held family.
+/// No guest state lives here: the eleven-argument Tail signature carries it.
+#[repr(C)]
+struct Invocation {
+    frame: *mut Frame,
+    data: *mut u8,
+    perms: *const u8,
+    budget: u64,
+    interrupt: *const AtomicBool,
+    revoke: *const AtomicBool,
+    stop: u64,
+    links: *const usize,
+}
+
+#[cfg(test)]
+#[test]
+fn invocation_layout_matches_the_tail_bridge() {
+    use std::mem::{offset_of, size_of};
+    assert_eq!(size_of::<Invocation>(), 64);
+    assert_eq!(offset_of!(Invocation, frame), 0);
+    assert_eq!(offset_of!(Invocation, data), 8);
+    assert_eq!(offset_of!(Invocation, perms), 16);
+    assert_eq!(offset_of!(Invocation, budget), 24);
+    assert_eq!(offset_of!(Invocation, interrupt), 32);
+    assert_eq!(offset_of!(Invocation, revoke), 40);
+    assert_eq!(offset_of!(Invocation, stop), 48);
+    assert_eq!(offset_of!(Invocation, links), 56);
+}
+
+pub(super) fn tail_signature() -> cl::Signature {
+    let mut sig = cl::Signature::new(cranelift_codegen::isa::CallConv::Tail);
+    sig.params.extend([AbiParam::new(types::I64); 11]);
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
 }
 
 /// B-route v1 metadata describes completed cold checkpoints. It is not a
@@ -157,10 +199,47 @@ impl Code {
         revoke: &AtomicBool,
         stop: u64,
     ) -> Result<u32, String> {
+        self.run_linked(frame, lease, budget, interrupt, revoke, stop, &[])
+    }
+
+    pub fn tail_entry(&self) -> usize {
+        self.tail.expect("state-argument body") as usize
+    }
+
+    pub fn run_linked(
+        &self,
+        frame: &mut Frame,
+        lease: &mut Lease<'_>,
+        budget: u64,
+        interrupt: &AtomicBool,
+        revoke: &AtomicBool,
+        stop: u64,
+        links: &[usize],
+    ) -> Result<u32, String> {
         if !self.proven(lease) {
             return Err("GIR entry mapping proof failed".into());
         }
         frame.lease_epoch = lease.epoch;
+        if self.tail.is_some() {
+            if links.len() < self.link_count {
+                return Err("GIR tail family is incomplete".into());
+            }
+            let invocation = Invocation {
+                frame,
+                data: lease.data(),
+                perms: lease.permissions(),
+                budget: frame.committed.saturating_add(budget),
+                interrupt,
+                revoke,
+                stop,
+                links: links.as_ptr(),
+            };
+            // SAFETY: the family owns all immutable entries until this lease
+            // returns; the C wrapper converts to the uniform Tail convention.
+            let f: unsafe extern "C" fn(*const Invocation) -> u32 =
+                unsafe { std::mem::transmute(self.entry) };
+            return Ok(unsafe { f(&invocation) });
+        }
         let f: unsafe extern "C" fn(
             *mut Frame,
             *mut u8,
@@ -195,11 +274,57 @@ pub fn compile_with_sharing(
     cross: bool,
     sharing: recovery::Sharing,
 ) -> Result<Code, String> {
-    compile_variant(r, base, len, cross, sharing, false)
+    compile_variant(r, base, len, cross, sharing, false, None, 0)
 }
 
 pub fn compile_proven(r: &Region, base: u32, len: usize) -> Result<Code, String> {
-    compile_variant(r, base, len, false, recovery::Sharing::Compatible, true)
+    compile_variant(
+        r,
+        base,
+        len,
+        false,
+        recovery::Sharing::Compatible,
+        true,
+        None,
+        0,
+    )
+}
+
+pub fn compile_linked(
+    r: &Region,
+    base: u32,
+    len: usize,
+    links: &BTreeMap<u32, usize>,
+    entry_pc: u32,
+) -> Result<Code, String> {
+    compile_variant(
+        r,
+        base,
+        len,
+        false,
+        recovery::Sharing::Compatible,
+        false,
+        Some(links),
+        entry_pc,
+    )
+}
+
+pub fn compile_proven_tail(
+    r: &Region,
+    base: u32,
+    len: usize,
+    entry_pc: u32,
+) -> Result<Code, String> {
+    compile_variant(
+        r,
+        base,
+        len,
+        false,
+        recovery::Sharing::Compatible,
+        true,
+        Some(&BTreeMap::new()),
+        entry_pc,
+    )
 }
 
 fn compile_variant(
@@ -209,6 +334,8 @@ fn compile_variant(
     cross: bool,
     sharing: recovery::Sharing,
     proven: bool,
+    links: Option<&BTreeMap<u32, usize>>,
+    entry_pc: u32,
 ) -> Result<Code, String> {
     verify::verify(r).map_err(|e| e.to_string())?;
     let plan = recovery::Plan::build(r, sharing);
@@ -243,6 +370,9 @@ fn compile_variant(
         .signature
         .returns
         .push(AbiParam::new(types::I32));
+    if links.is_some() {
+        context.func.signature = tail_signature();
+    }
     let id = module
         .declare_function("formal_gir", Linkage::Local, &context.func.signature)
         .map_err(|e| e.to_string())?;
@@ -256,6 +386,8 @@ fn compile_variant(
         len,
         sharing,
         &proofs,
+        links,
+        entry_pc,
     );
     let cross_function = cross.then(|| context.func.clone());
     context.set_disasm(true);
@@ -291,15 +423,66 @@ fn compile_variant(
         code.vcode.clone().unwrap(),
     );
     module.finalize_definitions().map_err(|e| e.to_string())?;
-    let entry = module.get_finalized_function(id);
+    let body_entry = module.get_finalized_function(id);
+    let mut code_bytes = machine.len();
+    let entry = if links.is_some() {
+        let mut wrapper = module.make_context();
+        wrapper
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(types::I64));
+        wrapper
+            .func
+            .signature
+            .returns
+            .push(AbiParam::new(types::I32));
+        let wrapper_id = module
+            .declare_function("gir_entry", Linkage::Local, &wrapper.func.signature)
+            .map_err(|e| e.to_string())?;
+        let sig = wrapper.func.import_signature(tail_signature());
+        {
+            let mut b = FunctionBuilder::new(&mut wrapper.func, &mut fc);
+            let block = b.create_block();
+            b.append_block_params_for_function_params(block);
+            b.switch_to_block(block);
+            let invocation = b.block_params(block)[0];
+            let frame = b.ins().load(types::I64, MemFlags::trusted(), invocation, 0);
+            let mut args = Vec::new();
+            for n in 0..9 {
+                let v = b.ins().load(types::I32, MemFlags::trusted(), frame, n * 4);
+                args.push(b.ins().uextend(types::I64, v));
+            }
+            args.push(b.ins().load(types::I64, MemFlags::trusted(), frame, 40));
+            args.push(invocation);
+            // Different JIT allocations need not be in rel32 reach on x64.
+            let address = b.ins().iconst(types::I64, body_entry as i64);
+            let call = b.ins().call_indirect(sig, address, &args);
+            let status = b.inst_results(call)[0];
+            b.ins().return_(&[status]);
+            b.seal_all_blocks();
+            b.finalize();
+        }
+        module
+            .define_function(wrapper_id, &mut wrapper)
+            .map_err(|e| format!("{e:?}"))?;
+        code_bytes += wrapper.compiled_code().unwrap().code_buffer().len();
+        module.finalize_definitions().map_err(|e| e.to_string())?;
+        module.get_finalized_function(wrapper_id)
+    } else {
+        body_entry
+    };
     let compile_us = began.elapsed().as_micros();
     let cross = cross_function.and_then(cross_compile);
     Ok(Code {
         module: Some(module),
         entry,
+        tail: links.map(|_| body_entry),
+        link_count: links.and_then(|m| m.values().max()).map_or(0, |n| n + 1),
         base,
         len,
         machine,
+        code_bytes,
         blocks,
         vcode,
         cross,
@@ -362,6 +545,9 @@ struct Emitter<'a> {
     len: usize,
     edges: usize,
     materialized: usize,
+    invocation: Option<V>,
+    links: Option<&'a BTreeMap<u32, usize>>,
+    tails: Vec<(cl::Block, usize, bool)>,
 }
 impl Emitter<'_> {
     fn c(&mut self, n: u64) -> V {
@@ -749,6 +935,9 @@ impl Emitter<'_> {
         self.guard(revoked, state, pc, zero, REVOKED);
     }
     fn target(&mut self, t: &Target) -> (cl::Block, Vec<cl::BlockArg>) {
+        self.target_kind(t, COMPLETE)
+    }
+    fn target_kind(&mut self, t: &Target, complete_status: u32) -> (cl::Block, Vec<cl::BlockArg>) {
         match t {
             Target::Block(e) => {
                 let mut args: Vec<_> = e.arguments.iter().map(|&v| self.get(v).into()).collect();
@@ -756,10 +945,25 @@ impl Emitter<'_> {
                 (self.blocks[e.block.0], args)
             }
             Target::Exit(e) => {
+                if e.reason == ExitReason::Complete
+                    && let ValueKind::Constant(pc) = self.r.values[e.pc.0].kind
+                    && let Some(&slot) = self.links.and_then(|m| m.get(&(pc as u32)))
+                {
+                    let mut args: Vec<cl::BlockArg> =
+                        e.state.gpr.iter().map(|&v| self.get(v).into()).collect();
+                    args.push(self.get(e.state.flags).into());
+                    args.push(self.retired.into());
+                    let block = self.b.create_block();
+                    for _ in 0..10 {
+                        self.b.append_block_param(block, types::I64);
+                    }
+                    self.tails.push((block, slot, complete_status == CALL));
+                    return (block, args);
+                }
                 let pc = self.get(e.pc);
                 let address = self.c(0);
                 let status = match e.reason {
-                    ExitReason::Complete => COMPLETE,
+                    ExitReason::Complete => complete_status,
                     ExitReason::Unsupported(_) => UNSUPPORTED,
                     ExitReason::Indirect => INDIRECT,
                     ExitReason::Guard => GUARD,
@@ -886,6 +1090,47 @@ impl Emitter<'_> {
             self.b.set_srcloc(cl::SourceLoc::default());
         }
     }
+
+    fn tail_bodies(&mut self) {
+        let Some(invocation) = self.invocation else {
+            return;
+        };
+        let sig = self.b.import_signature(tail_signature());
+        for (block, slot, call) in self.tails.clone() {
+            self.b.switch_to_block(block);
+            let mut args = self.b.block_params(block).to_vec();
+            args.push(invocation);
+            let links = self
+                .b
+                .ins()
+                .load(types::I64, MemFlags::trusted(), invocation, 56);
+            let address =
+                self.b
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), links, (slot * 8) as i32);
+            let offset = std::mem::offset_of!(Frame, tail_entries) as i32;
+            let count = self
+                .b
+                .ins()
+                .load(types::I64, MemFlags::trusted(), self.frame, offset);
+            let count = self.b.ins().iadd_imm(count, 1);
+            self.b
+                .ins()
+                .store(MemFlags::trusted(), count, self.frame, offset);
+            if call {
+                let offset = std::mem::offset_of!(Frame, tail_calls) as i32;
+                let count = self
+                    .b
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), self.frame, offset);
+                let count = self.b.ins().iadd_imm(count, 1);
+                self.b
+                    .ins()
+                    .store(MemFlags::trusted(), count, self.frame, offset);
+            }
+            self.b.ins().return_call_indirect(sig, address, &args);
+        }
+    }
 }
 fn build<'a>(
     function: &'a mut cl::Function,
@@ -896,6 +1141,8 @@ fn build<'a>(
     len: usize,
     sharing: recovery::Sharing,
     proofs: &'a [RangeProof],
+    links: Option<&'a BTreeMap<u32, usize>>,
+    entry_pc: u32,
 ) -> (usize, usize, usize, Vec<recovery::Dag>) {
     let mut b = FunctionBuilder::new(function, context);
     let entry = b.create_block();
@@ -913,8 +1160,24 @@ fn build<'a>(
         .collect();
     b.switch_to_block(entry);
     let params = b.block_params(entry).to_vec();
-    let [frame, data, perms, budget, interrupt, revoke, stop]: [V; 7] = params.try_into().unwrap();
-    let retired = b.ins().load(types::I64, MemFlags::trusted(), frame, 40);
+    let invocation = links.map(|_| params[10]);
+    let controls: Vec<_> = if let Some(invocation) = invocation {
+        (0..7)
+            .map(|n| {
+                b.ins()
+                    .load(types::I64, MemFlags::trusted(), invocation, n * 8)
+            })
+            .collect()
+    } else {
+        params.clone()
+    };
+    let [frame, data, perms, budget, interrupt, revoke, stop]: [V; 7] =
+        controls.try_into().unwrap();
+    let retired = if invocation.is_some() {
+        params[9]
+    } else {
+        b.ins().load(types::I64, MemFlags::trusted(), frame, 40)
+    };
     let mut e = Emitter {
         b,
         r,
@@ -936,13 +1199,20 @@ fn build<'a>(
         len,
         edges: 0,
         materialized: 0,
+        invocation,
+        links,
+        tails: vec![],
     };
     let mut args = vec![];
     for n in 0..9 {
-        let v =
-            e.b.ins()
-                .load(types::I32, MemFlags::trusted(), frame, n * 4);
-        let v = e.b.ins().uextend(types::I64, v);
+        let v = if invocation.is_some() {
+            params[n as usize]
+        } else {
+            let v =
+                e.b.ins()
+                    .load(types::I32, MemFlags::trusted(), frame, n * 4);
+            e.b.ins().uextend(types::I64, v)
+        };
         args.push(v.into());
     }
     let zero = e.c(0);
@@ -975,8 +1245,12 @@ fn build<'a>(
         e.retired = *e.b.block_params(e.blocks[block.0]).last().unwrap();
         let current = &r.blocks[block.0];
         if block == r.entry {
-            let pc = e.b.ins().load(types::I32, MemFlags::trusted(), frame, 36);
-            let pc = e.b.ins().uextend(types::I64, pc);
+            let pc = if invocation.is_some() {
+                e.c(u64::from(entry_pc))
+            } else {
+                let pc = e.b.ins().load(types::I32, MemFlags::trusted(), frame, 36);
+                e.b.ins().uextend(types::I64, pc)
+            };
             e.poll(&current.entry_state, pc);
         }
         for op in &current.operations {
@@ -1015,8 +1289,12 @@ fn build<'a>(
             }
         }
         match &current.terminator {
-            Terminator::Jump(t) | Terminator::Call { callee: t, .. } => {
+            Terminator::Jump(t) => {
                 let (b, a) = e.target(t);
+                e.b.ins().jump(b, &a);
+            }
+            Terminator::Call { callee, .. } => {
+                let (b, a) = e.target_kind(callee, CALL);
                 e.b.ins().jump(b, &a);
             }
             Terminator::Exit(exit) => {
@@ -1062,6 +1340,7 @@ fn build<'a>(
             }
         }
     }
+    e.tail_bodies();
     e.cold_bodies();
     let stats = (
         e.edges,

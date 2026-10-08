@@ -974,11 +974,7 @@ fn run(options: Options) -> Result<u8, String> {
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
     }
-    // Headless replay has no host pixel/input coordinates. A process-wide DPI
-    // policy imposed by the launcher must not prevent the CLI from starting.
-    if !options.headless {
-        window::initialize_dpi()?;
-    }
+    window::initialize_dpi()?;
     let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
     let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
     let mut background =
@@ -1119,6 +1115,7 @@ fn run_execution(
     keys: std::sync::Arc<adv_sync::input::KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<u8, String> {
+    window::initialize_dpi()?;
     let started = Instant::now();
     let mut runtime = Runtime::with_codec(
         &options.exe,
