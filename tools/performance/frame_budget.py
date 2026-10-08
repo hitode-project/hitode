@@ -331,9 +331,19 @@ def device_lock(path: Path | None, root: Path, helper: Path | None = None):
                            ADV_DEVICE_TASK=os.environ.get("ADV_DEVICE_TASK", "bud"))
         prefix = "$ErrorActionPreference='Stop'; . $env:ADV_DEVICE_HELPER; "
         try:
-            subprocess.run(["powershell", "-NoProfile", "-Command",
-                            prefix + "Request-Device -Task $env:ADV_DEVICE_TASK"],
-                           env=environment, check=True)
+            # Acquisition is idempotent for this task. A broker can briefly
+            # hold owner.txt while handing over the reservation; no guest run
+            # has started yet, so retrying that helper cannot duplicate work.
+            for attempt in range(4):
+                try:
+                    subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    prefix + "Request-Device -Task $env:ADV_DEVICE_TASK"],
+                                   env=environment, check=True)
+                    break
+                except subprocess.CalledProcessError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(2)
             yield time.monotonic() + 1100
         finally:
             subprocess.run(["powershell", "-NoProfile", "-Command",

@@ -22,6 +22,20 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_broker_sharing_error_retries_only_acquisition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "device.ps1"
+            helper.touch()
+            error = budget.subprocess.CalledProcessError(1, ["powershell"])
+            with patch.object(budget.subprocess, "run", side_effect=[error, Mock(), Mock()]) as run, patch.object(budget.time, "sleep") as sleep:
+                with budget.device_lock(None, root, helper):
+                    pass
+                self.assertEqual(run.call_count, 3)
+                self.assertIn("Request-Device", run.call_args_list[1].args[0][-1])
+                self.assertIn("Release-Device", run.call_args_list[2].args[0][-1])
+                sleep.assert_called_once_with(2)
+
     def test_wait_summary_keeps_numeric_data_and_drops_private_labels(self):
         report = {"wait_diagnostics": {"schema": "adv-wait-diagnostics-v1", "sources": {
             "sleep": {"segments": 3, "private": "hidden", "requested_us": {"p50": 16000, "private": "hidden"}},
