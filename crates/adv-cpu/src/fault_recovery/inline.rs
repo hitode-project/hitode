@@ -376,7 +376,7 @@ pub(crate) unsafe fn with_protection<R>(
     Ok((result, context.pending.get()))
 }
 
-/// Called only after the POSIX boundary filters synchronous SIGSEGV causes.
+/// Called only after the POSIX boundary filters synchronous memory faults.
 pub(super) unsafe fn dispatch(
     signal: i32,
     pc: usize,
@@ -384,7 +384,7 @@ pub(super) unsafe fn dispatch(
     access: usize,
     host_context: *mut c_void,
 ) -> usize {
-    if signal != libc::SIGSEGV {
+    if signal != libc::SIGSEGV && !(cfg!(target_os = "macos") && signal == libc::SIGBUS) {
         return 0;
     }
     // Exact immutable lookup precedes any TLS or CpuState access, and its reader
