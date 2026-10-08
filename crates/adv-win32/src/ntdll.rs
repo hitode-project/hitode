@@ -24,6 +24,7 @@ use adv_os::Heaps;
 use crate::stdcall;
 pub(crate) mod file;
 mod heap;
+pub(crate) use heap::{allocate_shared as heap_allocate, reallocate_shared as heap_reallocate};
 mod open;
 mod section;
 

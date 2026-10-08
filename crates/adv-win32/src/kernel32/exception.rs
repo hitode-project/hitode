@@ -246,6 +246,37 @@ fn dispatch(env: &mut Env<'_>, checkpoint: Checkpoint, record: Record) -> Outcom
     dispatch_origin(env, checkpoint, record, native::Source::Raise)
 }
 
+/// Raise a personality-owned status after its resource operation has released
+/// temporary locks. The exception follows the same live RTL/NT delivery path.
+pub(crate) fn raise_status(
+    env: &mut Env<'_>,
+    code: u32,
+    flags: u32,
+    information: &[u32],
+) -> Outcome {
+    if information.len() > 15 {
+        return Outcome::Fail("native status exception has too many parameters".into());
+    }
+    let checkpoint = match env.checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Outcome::Fail(error.to_string()),
+    };
+    let mut words = [0; 15];
+    words[..information.len()].copy_from_slice(information);
+    let address = checkpoint.state.eip;
+    dispatch(
+        env,
+        checkpoint,
+        Record {
+            code,
+            flags,
+            address,
+            count: information.len(),
+            information: words,
+        },
+    )
+}
+
 fn dispatch_origin(
     env: &mut Env<'_>,
     checkpoint: Checkpoint,

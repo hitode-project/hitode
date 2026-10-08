@@ -44,17 +44,6 @@ fn heap_destroy(env: &mut Env<'_>) -> Outcome {
     crate::heap_lock::destroy(env, h)
 }
 
-fn alloc(env: &mut Env<'_>, heap: u32, size: u32, zero: bool) -> u32 {
-    let heaps = env.ext.get_mut::<Heaps>();
-    let p = heaps
-        .alloc(env.cpu, &mut env.sys.vm, heap, size, zero)
-        .unwrap_or(0);
-    if p == 0 {
-        set_last_error(env, err::NOT_ENOUGH_MEMORY);
-    }
-    p
-}
-
 pub(crate) fn free(env: &mut Env<'_>, heap: u32, p: u32) -> bool {
     if p == 0 {
         return true;
@@ -129,9 +118,7 @@ fn global_allocation_block(env: &Env<'_>, allocation: u32) -> Option<adv_os::glo
 fn heap_alloc(env: &mut Env<'_>) -> Outcome {
     let (h, flags, size) = (env.arg(0), env.arg(1), env.arg(2));
     crate::native::route(env, "RtlAllocateHeap", [h, flags, size], move |env| {
-        crate::heap_lock::with_heap(env, h, flags, move |env| {
-            Outcome::Return(alloc(env, h, size, flags & HEAP_ZERO_MEMORY != 0))
-        })
+        crate::ntdll::heap_allocate(env, h, flags, size)
     })
 }
 
@@ -155,7 +142,7 @@ fn heap_free(env: &mut Env<'_>) -> Outcome {
 fn heap_realloc(env: &mut Env<'_>) -> Outcome {
     let (h, flags, p, size) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     crate::native::route(env, "RtlReAllocateHeap", [h, flags, p, size], move |env| {
-        crate::heap_lock::with_heap(env, h, flags, move |env| reallocate(env, h, flags, p, size))
+        crate::ntdll::heap_reallocate(env, h, flags, p, size)
     })
 }
 
