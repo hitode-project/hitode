@@ -180,7 +180,8 @@ fn create_suspended_thread_counts_gate_execution_and_partial_context_changes_are
             &[M(DATA)],
             DATA + 40,
         );
-        // Before yielding, a live thread is not a valid context target.
+        // A live thread's read visits its quiesced architecture without adding
+        // an external suspend count or consuming the pending worker execution.
         call(
             &mut machine,
             &mut code,
@@ -232,7 +233,7 @@ fn create_suspended_thread_counts_gate_execution_and_partial_context_changes_are
             "integer capture preserves unrequested control fields"
         );
         assert_eq!(word(&machine, 40), 1);
-        assert_eq!((word(&machine, 44), word(&machine, 48)), (0, 87));
+        assert_eq!((word(&machine, 44), word(&machine, 48)), (1, 0));
         assert_eq!(
             (word(&machine, 52), word(&machine, 56), word(&machine, 60)),
             (0, 37, 1)

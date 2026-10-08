@@ -1,4 +1,4 @@
-//! Partial i386 CONTEXT for the suspended-thread APIs. The SEH restore contract
+//! Partial i386 CONTEXT for stopped-owner thread access. The SEH restore contract
 //! remains a separate exact-flags operation.
 use adv_cpu::backend::ArchitecturalState;
 use adv_cpu::{X87Register, X87State};
