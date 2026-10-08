@@ -90,26 +90,107 @@ mod native {
         static RESULT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
         RESULT
             .get_or_init(|| {
-                // Set this before runtime font/DC creation and the first HWND. PMv2
-                // gives us physical pixels and prevents Windows bitmap stretching.
+                // Set the process default before font/DC creation and the first
+                // HWND. A manifest or compatibility setting may have fixed it.
                 unsafe {
                     if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
                         != 0
-                        || AreDpiAwarenessContextsEqual(
-                            GetThreadDpiAwarenessContext(),
-                            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-                        ) != 0
                     {
                         Ok(())
                     } else {
-                        Err(format!(
-                            "SetProcessDpiAwarenessContext failed: {}",
-                            GetLastError()
-                        ))
+                        let error = GetLastError();
+                        if error == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED {
+                            Ok(()) // An existing process default needs a thread override.
+                        } else {
+                            Err(format!("SetProcessDpiAwarenessContext failed: {error}"))
+                        }
                     }
                 }
             })
-            .clone()
+            .clone()?;
+        // Thread overrides are not inherited by new threads. Check every caller,
+        // including the execution thread that creates runtime fonts and DCs.
+        unsafe {
+            if AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            ) == 0
+                && SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+                    .is_null()
+            {
+                return Err(format!(
+                    "SetThreadDpiAwarenessContext failed: {}",
+                    GetLastError()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod dpi_tests {
+        use super::*;
+
+        #[test]
+        fn dpi_initialization_handles_fixed_process_default_and_each_thread() {
+            const CHILD: &str = "ADV_SHELL_DPI_TEST_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "window::native::dpi_tests::dpi_initialization_handles_fixed_process_default_and_each_thread",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+            // Use a separate process so no other tests inherit this fixed default.
+            unsafe {
+                if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) == 0 {
+                    assert_eq!(
+                        GetLastError(),
+                        windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+                    );
+                }
+                assert!(!SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE).is_null());
+                assert_eq!(
+                    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2),
+                    0
+                );
+                assert_eq!(
+                    GetLastError(),
+                    windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+                );
+            }
+            initialize_dpi().unwrap();
+            for _ in 0..2 {
+                std::thread::spawn(|| unsafe {
+                    assert!(
+                        !SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE).is_null()
+                    );
+                    for _ in 0..2 {
+                        initialize_dpi().unwrap();
+                        assert_ne!(
+                            AreDpiAwarenessContextsEqual(
+                                GetThreadDpiAwarenessContext(),
+                                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                            ),
+                            0
+                        );
+                    }
+                })
+                .join()
+                .unwrap();
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

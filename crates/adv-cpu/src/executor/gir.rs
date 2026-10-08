@@ -2,7 +2,7 @@
 use super::Executor;
 use crate::gir::{
     execution::{Engine, Program, Stats},
-    lower_cl as lower,
+    hot, lower_cl as lower,
 };
 
 impl Executor {
@@ -41,9 +41,56 @@ impl Executor {
             .is_some_and(|p| !p.valid(&self.memory))
         {
             engine.programs.remove(&owner);
+            engine.promoted.remove(&owner);
             engine.stats.invalidations += 1;
         }
-        if let std::collections::btree_map::Entry::Vacant(slot) = engine.programs.entry(owner) {
+        if engine.heat.get(&owner).copied().unwrap_or(0) >= hot::HOT
+            && engine.promoted.insert(owner)
+        {
+            // Only immutable, currently valid snapshots participate. Heat is
+            // sampled outside generated code and never authorizes an entry.
+            let mut candidates: Vec<_> = self
+                .code
+                .compiled
+                .iter()
+                .filter_map(|(&entry, native)| {
+                    let heat = engine
+                        .heat
+                        .get(&entry)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(native.profile().map_or(0, |p| p.heat()));
+                    (native.valid(&self.memory) && (entry == owner || heat >= hot::HOT))
+                        .then_some((entry, heat, native))
+                })
+                .collect();
+            candidates
+                .sort_by_key(|&(entry, heat, _)| (entry != owner, std::cmp::Reverse(heat), entry));
+            candidates.truncate(hot::MAX_REGIONS);
+            let candidates = candidates
+                .into_iter()
+                .map(|(entry, heat, native)| hot::Candidate {
+                    entry,
+                    heat,
+                    instructions: native.gir_instructions.clone(),
+                    pages: native.pages.clone(),
+                })
+                .collect();
+            if let Ok(selection) = hot::select(candidates, owner) {
+                let merged = selection.merged;
+                // A singleton already uses the same Tail ABI; rebuilding it
+                // without new code would only add synchronous compile latency.
+                if (merged != 0 || selection.units.len() > 1)
+                    && let Ok(program) = Program::compile_family(selection, &mut self.memory)
+                {
+                    engine.stats.promotions += 1;
+                    engine.stats.merged_regions += merged as u64;
+                    engine.stats.code_bytes += program.code_bytes as u64;
+                    engine.publish(owner, Some(program));
+                }
+            }
+        }
+        if !engine.programs.contains_key(&owner) {
             let native = &self.code.compiled[&owner];
             let program = Program::compile(
                 &native.gir_instructions,
@@ -54,7 +101,8 @@ impl Executor {
             .ok();
             engine.stats.admitted += u64::from(program.is_some());
             engine.stats.rejected += u64::from(program.is_none());
-            slot.insert(program);
+            engine.stats.code_bytes += program.as_ref().map_or(0, |p| p.code_bytes as u64);
+            engine.publish(owner, program);
         }
         let Some(program) = engine.programs[&owner].as_ref() else {
             return Ok(None);
@@ -74,7 +122,19 @@ impl Executor {
                 )
             })
             .transpose()?;
-        let budget = self.state.fuel.min(256);
+        // Verification retains a bounded oracle prefix. Normal Speed work is
+        // not sliced; wall deadlines keep the existing measured allowance.
+        let allowance = if trace.is_some() {
+            256
+        } else {
+            self.deadline.map_or(u64::MAX, |deadline| {
+                let left = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_micros() as u64;
+                (left / 2).saturating_mul(self.native_rate).max(256)
+            })
+        };
+        let budget = self.state.fuel.min(allowance);
         let mut frame = lower::Frame::from_cpu(&self.state);
         let (status, proven) = program.run(
             &mut frame,
@@ -93,13 +153,34 @@ impl Executor {
         self.state.fuel -= frame.committed;
         engine.stats.entries += 1;
         engine.stats.units += frame.committed;
+        let heat = engine.heat.entry(owner).or_default();
+        *heat = heat.saturating_add(frame.committed);
+        engine.stats.tails += frame.tail_entries;
+        engine.stats.boundaries[0] += frame.tail_entries - frame.tail_calls;
+        engine.stats.boundaries[2] += frame.tail_calls;
+        let boundary = match status {
+            lower::COMPLETE => 0,
+            lower::CALL => 2,
+            lower::INDIRECT => match frame.last_indirect_branch.kind {
+                crate::IndirectBranchKind::Call => 2,
+                crate::IndirectBranchKind::Return => 3,
+                _ => 1,
+            },
+            lower::BUDGET if budget < self.state.fuel + frame.committed => 4,
+            lower::UNSUPPORTED => 5,
+            lower::BUDGET => 6,
+            lower::READ_CHECK | lower::WRITE_CHECK | lower::GUARD => 7,
+            lower::INTERRUPTED | lower::REVOKED => 8,
+            _ => 9,
+        };
+        engine.stats.boundaries[boundary] += 1;
         engine.stats.proven += u64::from(proven);
         engine.stats.checked += u64::from(!proven);
         engine.stats.cold += u64::from(matches!(
             status,
             lower::READ_CHECK | lower::WRITE_CHECK | lower::UNSUPPORTED | lower::GUARD
         ));
-        self.stats.native_entries += 1;
+        self.stats.native_entries += 1 + frame.tail_entries;
         self.stats.native_blocks += frame.committed;
         if let Some(trace) = trace {
             let check = trace.check_at(frame.committed as usize, &self.state, &self.memory);

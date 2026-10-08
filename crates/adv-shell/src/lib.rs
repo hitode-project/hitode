@@ -1101,6 +1101,7 @@ fn run_execution(
     keys: std::sync::Arc<adv_sync::input::KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<u8, String> {
+    window::initialize_dpi()?;
     let started = Instant::now();
     let mut runtime = Runtime::with_codec(
         &options.exe,
