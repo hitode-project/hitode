@@ -388,50 +388,72 @@ fn comparison_stopping_in_first_page_never_initializes_later_file_pages() {
 
 #[test]
 fn plain_operand_permission_faults_do_not_start_lazy_io_or_cow() {
-    for write in [false, true] {
-        let code = program(|a| {
-            if write {
-                a.movdqu(ptr(DATA as i32 + 4094), xmm0).unwrap();
-            } else {
-                a.movdqu(xmm0, ptr(DATA as i32 + 4094)).unwrap();
+    for strategy in [
+        adv_cpu::CompileStrategy::Fast,
+        adv_cpu::CompileStrategy::Speed,
+    ] {
+        for dynamic in [false, true] {
+            for blocked in [0, 4096] {
+                for write in [false, true] {
+                    let code = program(|a| {
+                        let operand = if dynamic {
+                            ptr(edx)
+                        } else {
+                            ptr(DATA as i32 + 4094)
+                        };
+                        if write {
+                            a.movdqu(operand, xmm0).unwrap();
+                        } else {
+                            a.movdqu(xmm0, operand).unwrap();
+                        }
+                        a.ret().unwrap();
+                    });
+                    let mut cpu = fixture(&code, false);
+                    cpu.executor_mut().state.regs[2] = DATA + 4094;
+                    let mut region = Region::new(CODE, code.len());
+                    region.compile_strategy = strategy;
+                    cpu.executor_mut().add_region(region).unwrap();
+                    let calls = Rc::new(Cell::new(0));
+                    let pages: Vec<_> = (0..2)
+                        .map(|_| {
+                            let count = calls.clone();
+                            FilePage::lazy(move || {
+                                count.set(count.get() + 1);
+                                Ok([0x31; 4096])
+                            })
+                        })
+                        .collect();
+                    cpu.map_file_pages(DATA, &pages, Prot::RW, true).unwrap();
+                    cpu.protect(
+                        DATA + blocked,
+                        4096,
+                        if write { Prot::READ } else { Prot(0) },
+                    )
+                    .unwrap();
+                    let before = cpu.executor().state.clone();
+                    let expected = if write {
+                        RunOutcome::WriteFault {
+                            pc: CODE,
+                            address: DATA + 4094,
+                        }
+                    } else {
+                        RunOutcome::ReadFault {
+                            pc: CODE,
+                            address: DATA + 4094,
+                        }
+                    };
+                    assert_eq!(cpu.executor_mut().run(STOP, 100).unwrap(), expected);
+                    assert_eq!(calls.get(), 0);
+                    assert_eq!(cpu.executor().state.regs, before.regs);
+                    assert_eq!(cpu.executor().state.xmm, before.xmm);
+                    assert_eq!(cpu.executor().state.eflags, before.eflags);
+                    for address in [DATA, DATA + 4096] {
+                        assert_eq!(cpu.file_page_copy_on_write(address), Some(true));
+                    }
+                    assert_eq!(cpu.stats().interpreter_instructions, 0);
+                }
             }
-            a.ret().unwrap();
-        });
-        let mut cpu = fixture(&code, true);
-        let calls = Rc::new(Cell::new(0));
-        let pages: Vec<_> = (0..2)
-            .map(|_| {
-                let count = calls.clone();
-                FilePage::lazy(move || {
-                    count.set(count.get() + 1);
-                    Ok([0x31; 4096])
-                })
-            })
-            .collect();
-        cpu.map_file_pages(DATA, &pages, Prot::RW, true).unwrap();
-        cpu.protect(DATA + 4096, 4096, if write { Prot::READ } else { Prot(0) })
-            .unwrap();
-        let before = cpu.executor().state.clone();
-        let expected = if write {
-            RunOutcome::WriteFault {
-                pc: CODE,
-                address: DATA + 4094,
-            }
-        } else {
-            RunOutcome::ReadFault {
-                pc: CODE,
-                address: DATA + 4094,
-            }
-        };
-        assert_eq!(cpu.executor_mut().run(STOP, 100).unwrap(), expected);
-        assert_eq!(calls.get(), 0);
-        assert_eq!(cpu.executor().state.regs, before.regs);
-        assert_eq!(cpu.executor().state.xmm, before.xmm);
-        assert_eq!(cpu.executor().state.eflags, before.eflags);
-        for address in [DATA, DATA + 4096] {
-            assert_eq!(cpu.file_page_copy_on_write(address), Some(true));
         }
-        assert_eq!(cpu.stats().interpreter_instructions, 0);
     }
 }
 

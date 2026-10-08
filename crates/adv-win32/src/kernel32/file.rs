@@ -480,6 +480,10 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
+    if f.access & (0x8000_0000 | 0x1000_0000 | 1) == 0 {
+        set_last_error(env, err::ACCESS_DENIED);
+        return Outcome::Return(0);
+    }
     let mut data = vec![0u8; n as usize];
     let got = match read_coherent(f, &env.ext.get::<Win32>().vfs.sections, &mut data) {
         Ok(got) => got,
@@ -498,6 +502,11 @@ fn read_file(env: &mut Env<'_>) -> Outcome {
 
 fn write_file(env: &mut Env<'_>) -> Outcome {
     let (h, buf, n, written) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if !matches!(h, STD_OUTPUT | STD_ERROR)
+        && let Some(outcome) = native::bridge::write(env)
+    {
+        return outcome;
+    }
     let mut data = vec![0u8; n as usize];
     let _ = env.cpu.read(buf, &mut data);
     if matches!(h, STD_OUTPUT | STD_ERROR) {
@@ -510,6 +519,10 @@ fn write_file(env: &mut Env<'_>) -> Outcome {
         set_last_error(env, err::INVALID_HANDLE);
         return Outcome::Return(0);
     };
+    if f.access & (GENERIC_WRITE | 0x1000_0000 | 2) == 0 {
+        set_last_error(env, err::ACCESS_DENIED);
+        return Outcome::Return(0);
+    }
     let section = &env.ext.get::<Win32>().vfs.sections;
     let content = if section.has_entries() {
         f.file.cached_identity().and_then(|id| section.lookup(id))

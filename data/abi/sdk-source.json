@@ -394,5 +394,11 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxsavesurfacetofile"
     ],
     "verification": "Runtime signature audit and repository-authored D3DX surface save fixtures"
+  },
+  "native_write_file": {
+    "scope": "ntdll.dll!NtWriteFile and ZwWriteFile, synchronous file writes over the shared VFS file object",
+    "source": "Microsoft Learn wdm.h ZwWriteFile declaration",
+    "target": "x86 NTAPI (__stdcall), NTSTATUS and nine 32-bit arguments; same pointer and handle ABI as NtReadFile",
+    "documentation": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwwritefile"
   }
 }

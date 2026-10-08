@@ -12,10 +12,16 @@ use std::{
 #[path = "support/cpu.rs"]
 mod backend;
 
+fn target_directory(root: &std::path::Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"))
+}
+
 #[test]
 fn isolated_processes_match_windows_and_survive_loader_exit() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let directory = root.join("target/guest-processes-oracle");
+    let directory = target_directory(&root).join("guest-processes-oracle");
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(root.join("tools/fixtures/build-guest-processes.ps1"))

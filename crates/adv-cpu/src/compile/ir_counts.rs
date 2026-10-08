@@ -14,6 +14,7 @@ type Label = (String, &'static str, &'static str);
 #[derive(Default)]
 pub(super) struct Counts {
     rows: BTreeMap<Label, (u64, u64)>,
+    native_rows: BTreeMap<Label, u64>,
     functions: u64,
 }
 
@@ -32,6 +33,32 @@ thread_local! {
 }
 
 impl Counts {
+    pub(super) fn native(
+        counts: Option<&RefCell<Self>>,
+        code: &cranelift_codegen::CompiledCode,
+        origin: u32,
+        instructions: &BTreeMap<u32, Instruction>,
+    ) {
+        let Some(counts) = counts else { return };
+        let mut counts = counts.borrow_mut();
+        let mut tagged = 0;
+        for range in code.buffer.get_srclocs_sorted() {
+            let bytes = u64::from(range.end - range.start);
+            tagged += bytes;
+            *counts
+                .native_rows
+                .entry(label(range.loc, origin, instructions))
+                .or_default() += bytes;
+        }
+        // Prologues, alignment, constant pools and unlocated instructions are
+        // accounted for explicitly; optimized ranges are not an IR cost model.
+        let untagged = code.code_buffer().len() as u64 - tagged;
+        *counts
+            .native_rows
+            .entry(label(ir::SourceLoc::default(), origin, instructions))
+            .or_default() += untagged;
+    }
+
     pub(super) fn function(
         counts: Option<&RefCell<Self>>,
         function: &ir::Function,
@@ -119,7 +146,7 @@ impl Summary {
         let blocks: u64 = self.counts.rows.values().map(|r| r.1).sum();
         let guest: u64 = self.decoded.values().sum();
         let mut text = format!(
-            "{{\"version\":1,\"strategy\":\"{}\",\"guest\":{guest},\"ir\":{ir},\"blocks\":{blocks},\"functions\":{},\"native_bytes\":{native_bytes},\"service_us\":{},\"rows\":[",
+            "{{\"version\":2,\"strategy\":\"{}\",\"guest\":{guest},\"ir\":{ir},\"blocks\":{blocks},\"functions\":{},\"native_bytes\":{native_bytes},\"service_us\":{},\"rows\":[",
             self.strategy,
             self.counts.functions,
             service.as_micros()
@@ -135,6 +162,14 @@ impl Summary {
                 "[\"{mnemonic}\",\"{class}\",\"{part}\",{ir},{blocks}]"
             )
             .unwrap();
+        }
+        text.push_str("],\"native_rows\":[");
+        for (index, ((mnemonic, class, part), bytes)) in self.counts.native_rows.iter().enumerate()
+        {
+            if index != 0 {
+                text.push(',');
+            }
+            write!(text, "[\"{mnemonic}\",\"{class}\",\"{part}\",{bytes}]").unwrap();
         }
         text.push_str("],\"decoded\":[");
         for (index, ((mnemonic, class), count)) in self.decoded.iter().enumerate() {
@@ -211,6 +246,15 @@ mod tests {
                         .map(|row| row[2].as_u64().unwrap())
                         .sum::<u64>(),
                     49
+                );
+                assert_eq!(
+                    raw["native_rows"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row[3].as_u64().unwrap())
+                        .sum::<u64>(),
+                    compiled.code_size as u64
                 );
                 assert_eq!(
                     raw["rows"]

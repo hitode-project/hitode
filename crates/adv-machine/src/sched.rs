@@ -112,8 +112,11 @@ pub struct Context {
     pub teb: u32,
     pub stack_lo: u32,
     pub stack_hi: u32,
-    /// Initial ESP/EIP, consumed the first time the context is scheduled.
+    /// Initial ESP/EIP, consumed when the register image is first materialized.
     pub(crate) start: Option<(u32, u32)>,
+    /// One-shot process bootstrap, consumed only by an actual scheduler selection.
+    /// The binding identifies its continuation origin, independently of mutable EIP.
+    pub(crate) bootstrap_pending: Option<u32>,
     pub(crate) frames: Vec<Frame>,
     pub(crate) state: State,
     /// Its last block was a yield (Sleep(0)): it is polling, not waiting on anything.
