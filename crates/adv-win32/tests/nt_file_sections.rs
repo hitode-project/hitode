@@ -2,9 +2,10 @@
 use adv_abi::Registry;
 use adv_cpu::{
     JitCpu,
-    backend::{Guest, GuestExt, Prot, asm::Asm},
+    backend::{Backend, Guest, GuestExt, Prot, asm::Asm},
 };
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
+use adv_unicorn::UnicornCpu;
 use adv_win32::{Win32, Win32Config};
 
 const CODE: u32 = 0x400000;
@@ -35,8 +36,8 @@ enum Arg {
 }
 use Arg::{Stored as S, Value as V};
 
-fn call(
-    machine: &mut Machine<JitCpu>,
+fn call<B: Backend>(
+    machine: &mut Machine<B>,
     code: &mut Asm,
     dll: &str,
     name: &str,
@@ -302,5 +303,230 @@ fn nt_file_views_outlive_handles_obey_shared_open_rules_and_round_protection() {
         assert!(!machine.cpu.accessible(allocation, 8192, Prot::WRITE));
         assert_eq!(machine.sys.objects.hosts::<adv_win32::FileObj>().count(), 0);
         assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+}
+
+fn data_view_extent<B: Backend>(cpu: B, fixed: bool) {
+    const REQUESTED: u32 = 0x3000_0000;
+    const BLOCKED: u32 = 0x3100_0000;
+    const NEXT_VIEW: u32 = DATA + 0x40;
+    const NEXT_ALLOCATION: u32 = DATA + 0x44;
+    const REUSED: u32 = DATA + 0x48;
+    const QUERY: u32 = DATA + 0x100;
+    let mut registry = Registry::default();
+    adv_win32::register(&mut registry);
+    let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+    Win32::install(
+        &mut machine,
+        Win32Config::new(
+            "/nonexistent/data-view",
+            "fixture.exe",
+            "/nonexistent/data-view-data",
+        ),
+    )
+    .unwrap();
+    machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
+    machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
+    // Even an independently tracked owner inside the unused last granule must
+    // retain the fixed-view conflict rule; it is not exposed as view memory.
+    assert!(machine.sys.vm.reserve_at(BLOCKED + 0x3000, 4096));
+    let mut code = Asm::new(CODE);
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "CreateFileMappingW",
+        &[V(u32::MAX), V(0), V(4), V(0), V(0x3000), V(0)],
+        SECTION,
+    );
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "MapViewOfFileEx",
+        &[
+            S(SECTION),
+            V(2),
+            V(0),
+            V(0),
+            V(0x1001),
+            V(if fixed { REQUESTED } else { 0 }),
+        ],
+        VIEW,
+    );
+    for (delta, output) in [(0, QUERY), (0x2000, QUERY + 0x40)] {
+        code.mov_eax_mem(VIEW).add_eax_imm(delta).mov_mem_eax(HEAD);
+        call(
+            &mut machine,
+            &mut code,
+            "kernel32.dll",
+            "VirtualQuery",
+            &[S(HEAD), V(output), V(28)],
+            output + 28,
+        );
+    }
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "VirtualAlloc",
+        &[S(HEAD), V(4096), V(0x2000), V(1)],
+        RESULTS,
+    );
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "GetLastError",
+        &[],
+        RESULTS + 4,
+    );
+    code.mov_eax_mem(VIEW)
+        .add_eax_imm(0x10000)
+        .mov_mem_eax(HEAD);
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "VirtualAlloc",
+        &[if fixed { S(HEAD) } else { V(0) }, V(4096), V(0x2000), V(1)],
+        NEXT_ALLOCATION,
+    );
+    // A mapped view remains unavailable, and a non-granule-aligned request is
+    // rejected independently of the new page-rounded owner extent.
+    code.mov_eax_mem(VIEW).add_eax_imm(1).mov_mem_eax(HEAD);
+    for (index, base) in [S(VIEW), S(HEAD), V(BLOCKED)].into_iter().enumerate() {
+        let output = RESULTS + 8 + index as u32 * 8;
+        call(
+            &mut machine,
+            &mut code,
+            "kernel32.dll",
+            "MapViewOfFileEx",
+            &[S(SECTION), V(2), V(0), V(0), V(0x1001), base],
+            output,
+        );
+        call(
+            &mut machine,
+            &mut code,
+            "kernel32.dll",
+            "GetLastError",
+            &[],
+            output + 4,
+        );
+    }
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "UnmapViewOfFile",
+        &[S(VIEW)],
+        RESULTS + 32,
+    );
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "VirtualQuery",
+        &[S(VIEW), V(QUERY + 0x80), V(28)],
+        QUERY + 0x80 + 28,
+    );
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "MapViewOfFileEx",
+        &[S(SECTION), V(2), V(0), V(0), V(0x1001), S(VIEW)],
+        NEXT_VIEW,
+    );
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "UnmapViewOfFile",
+        &[S(NEXT_VIEW)],
+        RESULTS + 36,
+    );
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "VirtualAlloc",
+        &[S(VIEW), V(4096), V(0x2000), V(1)],
+        REUSED,
+    );
+    for (index, address) in [REUSED, NEXT_ALLOCATION].into_iter().enumerate() {
+        call(
+            &mut machine,
+            &mut code,
+            "kernel32.dll",
+            "VirtualFree",
+            &[S(address), V(0), V(0x8000)],
+            RESULTS + 40 + index as u32 * 4,
+        );
+    }
+    call(
+        &mut machine,
+        &mut code,
+        "kernel32.dll",
+        "CloseHandle",
+        &[S(SECTION)],
+        RESULTS + 48,
+    );
+    code.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.spawn("data view extent", CODE, &[], 65536).unwrap();
+    let result = machine.run_virtual(1_000_000);
+    assert!(
+        matches!(result, RunResult::Exited(0)),
+        "fixed={fixed}: {result:?}"
+    );
+    let base = machine.cpu.read_u32(VIEW).unwrap();
+    assert_ne!(base, 0);
+    assert_eq!(base & 0xffff, 0);
+    if fixed {
+        assert_eq!(base, REQUESTED);
+    }
+    let words = |address| -> [u32; 7] {
+        std::array::from_fn(|index| machine.cpu.read_u32(address + index as u32 * 4).unwrap())
+    };
+    assert_eq!(words(QUERY), [base, base, 4, 0x2000, 0x1000, 4, 0x40000]);
+    let tail = words(QUERY + 0x40);
+    assert_eq!(tail[0], base + 0x2000);
+    assert_eq!(tail[4], 0x10000);
+    assert!(tail[3] >= 0xe000);
+    assert_eq!(machine.cpu.read_u32(RESULTS).unwrap(), 0);
+    assert_eq!(machine.cpu.read_u32(RESULTS + 4).unwrap(), 487);
+    let next = machine.cpu.read_u32(NEXT_ALLOCATION).unwrap();
+    assert_ne!(next, 0);
+    assert_eq!(next & 0xffff, 0);
+    assert!(next >= base + 0x10000 || next + 0x1000 <= base);
+    if fixed {
+        assert_eq!(next, base + 0x10000);
+    }
+    for (offset, error) in [(8, 487), (16, 1132), (24, 487)] {
+        assert_eq!(machine.cpu.read_u32(RESULTS + offset).unwrap(), 0);
+        assert_eq!(machine.cpu.read_u32(RESULTS + offset + 4).unwrap(), error);
+    }
+    assert_eq!(words(QUERY + 0x80)[4], 0x10000);
+    assert_eq!(machine.cpu.read_u32(NEXT_VIEW).unwrap(), base);
+    assert_eq!(machine.cpu.read_u32(REUSED).unwrap(), base);
+    for offset in [32, 36, 40, 44, 48] {
+        assert_eq!(machine.cpu.read_u32(RESULTS + offset).unwrap(), 1);
+    }
+    for offset in [0, 0x40, 0x80] {
+        assert_eq!(machine.cpu.read_u32(QUERY + offset + 28).unwrap(), 28);
+    }
+    assert!(machine.sys.vm.containing(base).is_none());
+    assert!(machine.sys.vm.containing(base + 0x2000).is_none());
+    assert!(!machine.cpu.accessible(base, 0x2000, Prot::default()));
+}
+
+#[test]
+fn auto_and_fixed_data_views_publish_the_same_extent_and_preserve_granule_conflicts() {
+    for fixed in [false, true] {
+        for jit in [false, true] {
+            data_view_extent(JitCpu::new(PARK_ADDR, jit).unwrap(), fixed);
+        }
+        data_view_extent(UnicornCpu::new(PARK_ADDR).unwrap(), fixed);
     }
 }
