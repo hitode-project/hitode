@@ -7,6 +7,7 @@ isolated TargetDir/Output and the shared atomic DeviceLock directory. Output:
 anonymous benchmark CSV/log, commands and binary/runner SHA-256. No APK or UI.
 DirectMemory selects one or more off/legacy/inline lanes on the same binary
 under one device lock. LockOwner labels that lock for the calling task.
+Lock acquisition retries once per second without touching an existing owner.
 BuildOnly and WhatIf never access a device. SkipBuild reuses this task's ELF.
 The caller owns TEMP/TMP and storage policy. Existing adb server port 5037 only.
 .EXAMPLE
@@ -119,7 +120,7 @@ try {
             $locked = $true
         } catch {
             if (-not (Test-Path -LiteralPath $DeviceLock -PathType Container)) { throw }
-            Start-Sleep -Seconds 30
+            Start-Sleep -Seconds 1
         }
     }
     $clock = [Diagnostics.Stopwatch]::StartNew()
