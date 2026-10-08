@@ -464,7 +464,8 @@ pub(super) fn pc64_opportunity(
     else {
         return X87Pc64::Other;
     };
-    // Division needs a separate quotient-residual proof and is not a candidate.
+    // Keep division in Other for compatibility with this legacy add/sub/mul
+    // census. The opt-in form census reports division rejections separately.
     if op == Op::Div {
         return X87Pc64::Other;
     }
