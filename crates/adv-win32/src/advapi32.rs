@@ -288,6 +288,24 @@ fn set_value(env: &mut Env<'_>, wide: bool) -> Outcome {
         if count != 0 {
             env.cpu.read(ptr, &mut bytes).map_err(|_| NOACCESS)?
         }
+        // Windows tolerates a count that excludes one immediately following
+        // terminator. Preserve zero-length, already terminated, odd UTF-16 and
+        // genuinely unterminated data; an inaccessible next unit is optional.
+        let unit = if wide { 2 } else { 1 };
+        if string_type(kind)
+            && count != 0
+            && count % unit == 0
+            && bytes[count - unit..].iter().any(|&byte| byte != 0)
+            && let Some(next) = ptr.checked_add(count as u32)
+            && env.cpu.accessible(next, unit as u32, Prot::READ)
+        {
+            let mut terminator = [0; 2];
+            if env.cpu.read(next, &mut terminator[..unit]).is_ok()
+                && terminator[..unit].iter().all(|&byte| byte == 0)
+            {
+                bytes.resize(count + unit, 0);
+            }
+        }
         if !wide && string_type(kind) {
             bytes = env
                 .ext
