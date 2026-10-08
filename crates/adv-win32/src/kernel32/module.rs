@@ -962,8 +962,15 @@ fn record_lookup_failure(
     reason: String,
     target: Option<(String, String)>,
 ) {
+    // Hidden fixed code names fail by design; only fixed data or a name the
+    // registry advertises as discoverable proves the structure is broken.
+    let registry = (env.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<Registry>();
     let core = match sym {
-        ImportName::Name { name, .. } => adv_abi::system_exports::lookup(&module, name).is_some(),
+        ImportName::Name { name, .. } => adv_abi::system_exports::lookup(&module, name)
+            .is_some_and(|export| {
+                export.kind == adv_abi::system_exports::Kind::DataUnsupported
+                    || registry.is_none_or(|registry| registry.dynamic_available(&module, name))
+            }),
         ImportName::Ordinal(_) => false,
     };
     let host = adv_os::modules(env.ext)

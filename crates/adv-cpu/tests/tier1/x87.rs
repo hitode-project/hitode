@@ -305,7 +305,7 @@ fn x87_cross_page_faults_preserve_stack_and_memory_then_resume() {
 }
 
 #[test]
-fn x87_fs_sib_address_and_self_modifying_store_dispatch_with_live_state() {
+fn x87_fs_sib_address_and_same_page_data_store_dispatch_with_live_state() {
     let code = assemble(|a| {
         a.mov(esi, DATA - 128).unwrap();
         a.mov(ecx, 2).unwrap();
@@ -328,6 +328,39 @@ fn x87_fs_sib_address_and_self_modifying_store_dispatch_with_live_state() {
             3f64.to_le_bytes()
         );
     }
+    assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
+    // The store targets padding beyond RET. Event validation retains the
+    // original unit after checking its unchanged decoded input.
+    if std::env::var("ADV_CODE_VALIDITY").as_deref() == Ok("event") {
+        assert_eq!(machines[2].tier1_stats().invalidations, 0);
+        assert_eq!(machines[2].tier1_stats().compilations, 1);
+    } else {
+        assert!(machines[2].tier1_stats().invalidations > 0);
+    }
+}
+
+#[test]
+fn x87_store_patches_next_native_immediate_without_replaying_live_state() {
+    let code = assemble(|a| {
+        a.fld(qword_ptr(DATA as i32)).unwrap();
+        a.fstp(dword_ptr(edi)).unwrap();
+        a.mov(eax, 0x1234).unwrap();
+        a.ret().unwrap();
+    });
+    let target =
+        iced_x86::Decoder::with_ip(32, &code, u64::from(CODE), iced_x86::DecoderOptions::NONE)
+            .into_iter()
+            .find(|i| i.mnemonic() == iced_x86::Mnemonic::Mov)
+            .unwrap();
+    let mut machines = three(&code);
+    for m in &mut machines {
+        seed(m, 0x27f, 3);
+        m.state.regs[7] = target.ip32() + 1;
+        m.write(DATA, &3f64.to_le_bytes()).unwrap();
+        m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+    }
+    assert_eq!(compare(&mut machines), RunOutcome::ReachedStop);
+    assert_eq!(machines[2].state.regs[0], 3f32.to_bits());
     assert_eq!(machines[2].tier1_stats().fallback_instructions, 0);
     assert!(machines[2].tier1_stats().invalidations > 0);
 }

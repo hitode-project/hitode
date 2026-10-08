@@ -31,6 +31,9 @@ Assert ($defaults.runs[0].shell.Contains('ADV_SAFEPOINT=off')) 'Safepoints must 
 Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Temporary device files must share the owned directory.'
 $poll = & $runner -WhatIf -Safepoint poll -Output $output | ConvertFrom-Json
 Assert ($poll.runs[0].shell.Contains('ADV_SAFEPOINT=poll')) 'Poll mode did not reach the device.'
+$event = & $runner -WhatIf -CodeValidity event -Output $output | ConvertFrom-Json
+Assert ($event.runs[0].shell.Contains('ADV_CODE_VALIDITY=event')) 'Event validity did not reach the device.'
+Assert ($defaults.runs[0].shell.Contains('ADV_CODE_VALIDITY=legacy')) 'Event validity must remain opt-in.'
 Assert (-not ($defaults.cargo_arguments -contains '--features')) 'Default Cargo features changed.'
 Assert ($defaults.runs[0].shell.Contains('ADV_GIR=off')) 'GIR must not inherit the host selector.'
 $gir = & $runner -WhatIf -TestName gir_execution -Gir state-ssa -Features gir-execute -JitVerify strict -Output $output | ConvertFrom-Json

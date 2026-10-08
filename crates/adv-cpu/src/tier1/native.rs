@@ -296,6 +296,77 @@ mod publication_tests {
     }
 }
 
+#[cfg(test)]
+mod validity_tests {
+    use super::*;
+
+    #[test]
+    fn events_preserve_data_and_disjoint_units_but_retire_changed_code() {
+        let mut memory = Memory::new(0x10000, 3 * crate::PAGE_SIZE).unwrap();
+        memory
+            .protect(
+                0x10000,
+                3 * crate::PAGE_SIZE,
+                crate::READ | crate::WRITE | crate::EXEC,
+            )
+            .unwrap();
+        let mut engine = Engine::new().unwrap();
+        engine.event_validity = true;
+        for pc in [0x10000, 0x12000] {
+            // MOV EAX,7; JMP EAX ends discovery without sampling page padding.
+            memory.write(pc, &[0xb8, 7, 0, 0, 0, 0xff, 0xe0]).unwrap();
+            assert!(engine.compile(&mut memory, pc, None).unwrap());
+        }
+        engine.refresh(&mut memory);
+        let first = Rc::as_ptr(&engine.entries[&0x10000].0);
+        let other = Rc::as_ptr(&engine.entries[&0x12000].0);
+        memory.write(0x10080, &[42]).unwrap();
+        memory.dirty_pages.clear();
+        engine.refresh(&mut memory);
+        assert_eq!(Rc::as_ptr(&engine.entries[&0x10000].0), first);
+        assert_eq!(engine.stats.compilations, 2);
+        memory.write(0x10001, &[9]).unwrap();
+        memory.dirty_pages.clear();
+        engine.refresh(&mut memory);
+        assert!(!engine.entries.contains_key(&0x10000));
+        assert_eq!(Rc::as_ptr(&engine.entries[&0x12000].0), other);
+        assert_eq!(engine.stats.invalidations, 1);
+        memory
+            .protect(0x12000, crate::PAGE_SIZE, crate::READ)
+            .unwrap();
+        engine.refresh(&mut memory);
+        assert!(engine.entries.is_empty());
+        assert!(engine.units.is_empty());
+        assert_eq!(engine.stats.resident_bytes, 0);
+    }
+
+    #[test]
+    fn new_memory_identity_revalidates_even_when_epoch_matches() {
+        fn memory(value: u8) -> Memory {
+            let mut m = Memory::new(0x10000, crate::PAGE_SIZE).unwrap();
+            m.protect(
+                0x10000,
+                crate::PAGE_SIZE,
+                crate::READ | crate::WRITE | crate::EXEC,
+            )
+            .unwrap();
+            m.write(0x10000, &[0xb8, value, 0, 0, 0, 0xff, 0xe0])
+                .unwrap();
+            m
+        }
+        let mut first = memory(7);
+        let mut engine = Engine::new().unwrap();
+        engine.event_validity = true;
+        assert!(engine.compile(&mut first, 0x10000, None).unwrap());
+        engine.refresh(&mut first);
+        let mut second = memory(9);
+        second.epoch = first.epoch;
+        engine.refresh(&mut second);
+        assert!(engine.entries.is_empty());
+        assert_eq!(engine.stats.invalidations, 1);
+    }
+}
+
 struct Unit {
     // Field order retires the diagnostic range before Code unmaps its storage.
     _perf_range: Option<crate::perf_map::Registration>,
@@ -325,6 +396,8 @@ pub(crate) struct Engine {
     entry_limit: usize,
     byte_limit: usize,
     epoch: u64,
+    validity: crate::code_validity::CodeValidity<usize>,
+    event_validity: bool,
     native_revision: u64,
     poll: bool,
     stats: Tier1Stats,
@@ -337,6 +410,8 @@ impl Engine {
             entry_limit: 4096,
             byte_limit: 16 * 1024 * 1024,
             epoch: 0,
+            validity: Default::default(),
+            event_validity: crate::code_validity::enabled(),
             native_revision: 0,
             poll: crate::safepoint::enabled(),
             stats: Tier1Stats::default(),
@@ -352,6 +427,7 @@ impl Engine {
     fn clear(&mut self) {
         self.entries.clear();
         self.units.clear();
+        self.validity.clear();
         self.stats.resident_bytes = 0;
     }
     fn retire_published(&mut self, boundaries: &BTreeMap<u32, u32>) {
@@ -368,6 +444,9 @@ impl Engine {
         }
         self.stats.publication_flushes += u64::from(retired.len() == self.units.len());
         self.stats.cache_evictions += retired.len() as u64;
+        for &unit in &retired {
+            self.validity.remove(unit as usize);
+        }
         self.entries
             .retain(|_, (unit, _)| !retired.contains(&Rc::as_ptr(unit)));
         self.units
@@ -411,7 +490,10 @@ impl Engine {
                 };
                 // An external writer can change shared backing without this
                 // owner's epoch. Such code must stay on the Tier 0 path.
-                if !memory.executable(at, 1) || memory.shared_range(at, 1) {
+                if !memory.executable(at, 1)
+                    || memory.shared_range(at, 1)
+                    || (self.event_validity && memory.externally_mutable_code(at, 1))
+                {
                     break;
                 }
                 memory.watch_code(at, 1);
@@ -507,10 +589,53 @@ impl Engine {
             self.entries
                 .insert(*pc, (unit.clone(), emitted.entries[pc]));
         }
+        if self.event_validity {
+            self.validity.insert(
+                Rc::as_ptr(&unit) as usize,
+                unit.input.iter().flat_map(|(pc, bytes)| {
+                    let first = *pc & !(crate::PAGE_SIZE as u32 - 1);
+                    let last =
+                        (u64::from(*pc) + bytes.len() as u64 - 1) & !(crate::PAGE_SIZE as u64 - 1);
+                    (u64::from(first)..=last)
+                        .step_by(crate::PAGE_SIZE)
+                        .map(|page| page as u32)
+                }),
+                memory,
+            );
+        }
         self.units.push(unit);
         self.epoch = memory.epoch;
         self.stats.compile_time += timer.elapsed();
         Ok(true)
+    }
+
+    fn refresh(&mut self, memory: &mut Memory) {
+        let affected = self.validity.refresh(memory);
+        if affected.is_empty() {
+            return;
+        }
+        let retired: BTreeSet<_> =
+            self.units
+                .iter()
+                .filter_map(|unit| {
+                    let id = Rc::as_ptr(unit) as usize;
+                    (affected.contains(&id)
+                        && (!unit.valid(memory)
+                            || unit.input.iter().any(|(pc, bytes)| {
+                                memory.externally_mutable_code(*pc, bytes.len())
+                            })))
+                    .then_some(id)
+                })
+                .collect();
+        self.stats.invalidations += retired.len() as u64;
+        for &id in &retired {
+            self.validity.remove(id);
+        }
+        self.entries
+            .retain(|_, (unit, _)| !retired.contains(&(Rc::as_ptr(unit) as usize)));
+        self.units
+            .retain(|unit| !retired.contains(&(Rc::as_ptr(unit) as usize)));
+        self.stats.resident_bytes = self.units.iter().map(|unit| unit.code.len).sum();
     }
     pub fn run_block(
         &mut self,
@@ -535,7 +660,9 @@ impl Engine {
             self.retire_published(entries);
             self.native_revision = revision;
         }
-        if self.epoch != memory.epoch
+        if self.event_validity {
+            self.refresh(memory);
+        } else if self.epoch != memory.epoch
             || self
                 .entries
                 .get(&state.eip)

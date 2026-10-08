@@ -99,6 +99,44 @@ pub fn has_module(module: &str) -> bool {
     exports(module).next().is_some()
 }
 
+/// Follow catalog forwarders to the code or data export that owns the entry.
+/// Unknown or cyclic chains return None; the loader reports those itself.
+pub fn final_target(module: &str, name: &str) -> Option<(&'static str, &'static str)> {
+    let mut export = lookup(module, name)?;
+    for _ in 0..8 {
+        let Kind::Forwarder(target) = export.kind else {
+            return Some((export.module, export.name));
+        };
+        let (dll, function) = target.rsplit_once('.')?;
+        export = lookup(&format!("{dll}.dll"), function)?;
+    }
+    None
+}
+
+type Sources = BTreeMap<(String, String), Vec<(&'static str, &'static str)>>;
+
+/// Catalog names whose forwarder chain ends at this export.
+pub fn forwarded_from(module: &str, name: &str) -> &'static [(&'static str, &'static str)] {
+    static SOURCES: OnceLock<Sources> = OnceLock::new();
+    let sources = SOURCES.get_or_init(|| {
+        let mut sources: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for export in catalog().values().flat_map(BTreeMap::values) {
+            if matches!(export.kind, Kind::Forwarder(_))
+                && let Some((module, name)) = final_target(export.module, export.name)
+            {
+                sources
+                    .entry((module.to_owned(), name.to_owned()))
+                    .or_default()
+                    .push((export.module, export.name));
+            }
+        }
+        sources
+    });
+    sources
+        .get(&(module.to_ascii_lowercase(), name.to_owned()))
+        .map_or(&[], Vec::as_slice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
