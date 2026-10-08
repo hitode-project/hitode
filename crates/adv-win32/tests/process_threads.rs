@@ -341,6 +341,9 @@ fn two_hundred_and_one_thousand_sequential_thread_calls_preserve_old_exit_codes(
         for count in [200u32, 1000] {
             let services = Services::default();
             let mut machine = machine(jit, 0x1000, &services);
+            // This is a lifetime test, not a per-process throughput deadline.
+            // Keep a bounded allowance for 1000 interpreter mapping lifetimes.
+            machine.set_execution_budget(Some(std::time::Duration::from_secs(20)));
             let mut worker = Asm::new(WORKER);
             worker.mov_eax_esp(4).ret_n(4);
             machine.cpu.write(WORKER, &worker.bytes).unwrap();
@@ -481,6 +484,102 @@ fn terminal_registration_declines_unhandled_exceptions_and_unwind_notifications(
         assert_eq!(word(&machine, 0), 1);
         assert_eq!(word(&machine, 8), 1);
         assert_eq!(machine.sys.guest_failure_code, Some(0xe1234567));
+    }
+}
+
+#[test]
+fn create_thread_observes_live_native_hooks_parameter_changes_and_failure_status() {
+    for jit in [false, true] {
+        for deny in [false, true] {
+            let services = Services::default();
+            let mut machine = machine(jit, 0x1000, &services);
+            Win32::prepare_process_infrastructure(&mut machine).unwrap();
+            let binding = machine
+                .resolve_import("ntdll.dll", "NtCreateThreadEx")
+                .unwrap();
+            let index =
+                (binding - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+            let original = machine.sys.thunks.pristine_entry(index);
+            let trampoline = CODE + 0x3000;
+            machine.cpu.write(trampoline, &original).unwrap();
+            let modules = adv_os::modules(&machine.ext);
+            let ntdll = modules.get(modules.by_name("ntdll.dll").unwrap());
+            let entry = match ntdll.exports_by_name.get("NtCreateThreadEx").unwrap() {
+                adv_pe::ExportTarget::Rva(rva) => ntdll.base + rva,
+                _ => panic!("native create entry must be owned code"),
+            };
+            let hook = CODE + 0x2000;
+            let mut detour = Asm::new(hook);
+            detour
+                .mov_eax_mem(DATA + 0x200)
+                .add_eax_imm(1)
+                .mov_mem_eax(DATA + 0x200);
+            if deny {
+                detour.bytes.push(0xb8); // mov eax,STATUS_ACCESS_DENIED
+                detour.bytes.extend_from_slice(&0xc0000022u32.to_le_bytes());
+                detour.ret_n(44);
+            } else {
+                // NtCreateThreadEx's sixth argument is the real start parameter.
+                detour.bytes.extend_from_slice(&[0xc7, 0x44, 0x24, 24]);
+                detour.bytes.extend_from_slice(&77u32.to_le_bytes());
+                detour.jmp(trampoline);
+            }
+            machine.cpu.write(hook, &detour.bytes).unwrap();
+            let mut patch = Asm::new(entry);
+            patch.jmp(hook);
+            machine.cpu.write(entry, &patch.bytes).unwrap();
+            let mut worker = Asm::new(WORKER);
+            worker.mov_eax_esp(4).ret_n(4);
+            machine.cpu.write(WORKER, &worker.bytes).unwrap();
+            let mut code = Asm::new(CODE);
+            call(&mut machine, &mut code, "SetLastError", &[I(0x12345678)], 0);
+            call(
+                &mut machine,
+                &mut code,
+                "CreateThread",
+                &[I(0), I(0), I(WORKER), I(11), I(0), I(0)],
+                DATA,
+            );
+            call(&mut machine, &mut code, "GetLastError", &[], DATA + 4);
+            if !deny {
+                call(
+                    &mut machine,
+                    &mut code,
+                    "WaitForSingleObject",
+                    &[M(DATA), I(u32::MAX)],
+                    DATA + 8,
+                );
+                call(
+                    &mut machine,
+                    &mut code,
+                    "GetExitCodeThread",
+                    &[M(DATA), I(DATA + 12)],
+                    DATA + 16,
+                );
+            }
+            call(&mut machine, &mut code, "ExitProcess", &[I(0)], 0);
+            run(&mut machine, None, &services, code);
+            assert_eq!(
+                word(&machine, 0x200),
+                1,
+                "the live native export is called once"
+            );
+            if deny {
+                assert_eq!((word(&machine, 0), word(&machine, 4)), (0, 5));
+                assert_eq!(
+                    machine.sys.contexts.len(),
+                    1,
+                    "denied native create has no thread side effect"
+                );
+            } else {
+                assert_ne!(word(&machine, 0), 0);
+                assert_eq!(word(&machine, 4), 0x12345678);
+                assert_eq!(
+                    (word(&machine, 8), word(&machine, 12), word(&machine, 16)),
+                    (0, 77, 1)
+                );
+            }
+        }
     }
 }
 

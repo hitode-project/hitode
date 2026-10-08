@@ -16,7 +16,7 @@ pub(crate) use file::{create_directory_path, file_attributes_path};
 pub(crate) use file::{open_with_share, read_coherent};
 pub(crate) use file_mapping::prune as prune_file_mappings;
 pub use handle::ProcessHandle;
-mod memory;
+pub(crate) mod memory;
 pub(crate) use memory::MAX_APPLICATION_ADDRESS;
 pub(crate) use memory::native_read_memory;
 pub(crate) use memory::native_write_memory;
@@ -38,6 +38,11 @@ mod process;
 pub(crate) use environment::entries as environment_entries;
 pub(crate) use process::install_parameters;
 pub(crate) use process::native_resume_thread;
+pub(crate) use process::native_suspend_thread;
+pub(crate) use process::native_thread::{
+    create_native as native_create_thread, rtl_create_native as native_rtl_create_thread,
+    terminate_native as native_terminate_thread,
+};
 pub(crate) use process::native_thread_context;
 pub(crate) use process::terminate_process_owner;
 pub(crate) use process::{command_line, configure_codepage};
