@@ -26,6 +26,7 @@ mod direct;
 mod fault;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod fp_environment;
+mod guards;
 mod invariants;
 mod ir_counts;
 mod loops;
@@ -1580,6 +1581,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
             dispatch,
             shared_exit,
             flag_exits: BTreeMap::new(),
+            guard_exits: BTreeMap::new(),
             pc: region.start,
             return_hint,
             local_return_hint,
@@ -1813,6 +1815,7 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
         switch.emit(&mut e.b, target, outside);
         e.b.switch_to_block(outside);
         e.exit_predicted(Exit::Dispatch, target, prediction);
+        e.emit_guard_exits();
         // Merge only compatible flag recipes at specialized cold exits. A
         // single generic merge makes kind/width and unused operands live on
         // every predecessor. Limit duplication and retain the generic exit for
@@ -2992,6 +2995,7 @@ struct Emitter<'a> {
     dispatch: ir::Block,
     shared_exit: ir::Block,
     flag_exits: BTreeMap<(u32, u32), ir::Block>,
+    guard_exits: BTreeMap<guards::Key, (Exit, ir::Block)>,
     /// Additional guarded paths pay off after the optimizing tier folds them.
     optimizing: bool,
     pc: u32,
@@ -3703,6 +3707,9 @@ impl Emitter<'_> {
             self.b.ins().brif(bad, lane, &[], ok, &[]);
             self.b.switch_to_block(ok);
             self.b.seal_block(ok);
+            return;
+        }
+        if self.shared_guard(bad, reason, addr) {
             return;
         }
         let fail = self.b.create_block();
