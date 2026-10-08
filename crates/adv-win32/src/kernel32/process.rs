@@ -9,6 +9,7 @@ use super::K32;
 use crate::util::{cstr, err, out_u32, put_cstr, set_last_error, wstr, zero};
 use crate::{STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 pub(crate) mod apc;
+mod error_mode;
 #[cfg(test)]
 mod live_context_tests;
 pub(crate) mod native_thread;
@@ -942,6 +943,7 @@ fn get_computer_name_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    error_mode::register(reg);
     pointer::register(reg);
     reg.register(get_console_window_ABI);
     // A 32-bit Windows: not under WOW64.
@@ -1056,7 +1058,6 @@ pub(super) fn register(reg: &mut Registry) {
         unhandled_exception_filter,
     );
     stdcall(reg, K32, "RtlUnwind", 4, rtl_unwind);
-    stdcall(reg, K32, "SetErrorMode", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "OutputDebugStringA", 1, output_debug_string_a);
     stdcall(reg, K32, "OutputDebugStringW", 1, output_debug_string_w);
     stdcall(reg, K32, "GetLastError", 0, get_last_error);

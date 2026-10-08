@@ -165,10 +165,14 @@ pub(super) fn supported(i: &Instruction) -> bool {
                     || i.op0_kind() == OpKind::Register && register(i, 1))
         }
         M::Xlatb => i.code() == Code::Xlat_m8 && i.memory_base() == R::EBX,
-        M::Xchg => i.op_count() == 2 && operand(i, 0, &[4]) && register(i, 1),
+        M::Xchg => i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && register(i, 1),
         M::Xadd | M::Cmpxchg => i.op_count() == 2 && operand(i, 0, &[1, 2, 4]) && register(i, 1),
         M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Lahf | M::Sahf => i.op_count() == 0,
         M::Bswap => i.code() == Code::Bswap_r32,
+        M::Pusha | M::Pushad | M::Popa | M::Popad => matches!(
+            i.code(),
+            Code::Pushaw | Code::Pushad | Code::Popaw | Code::Popad
+        ),
         M::Pushf | M::Pushfd | M::Popf | M::Popfd => matches!(
             i.code(),
             Code::Pushfw | Code::Pushfd | Code::Popfw | Code::Popfd
@@ -178,9 +182,16 @@ pub(super) fn supported(i: &Instruction) -> bool {
         M::Leave => i.code() == Code::Leaved,
         M::Adc | M::Sbb => {
             i.op_count() == 2
-                && source32(i, 0)
-                && (source32(i, 1)
-                    || matches!(i.op1_kind(), OpKind::Immediate32 | OpKind::Immediate8to32))
+                && operand(i, 0, &[1, 2, 4])
+                && (operand(i, 1, &[operand_size(i, 0)])
+                    || matches!(
+                        i.op1_kind(),
+                        OpKind::Immediate8
+                            | OpKind::Immediate16
+                            | OpKind::Immediate32
+                            | OpKind::Immediate8to16
+                            | OpKind::Immediate8to32
+                    ))
         }
         M::Mul | M::Div | M::Idiv => i.op_count() == 1 && source32(i, 0),
         M::Imul => match i.op_count() {
@@ -328,6 +339,10 @@ impl Emitter<'_> {
     }
 
     pub(super) fn scalar_instruction(&mut self, i: &Instruction) {
+        if matches!(i.mnemonic(), M::Pusha | M::Pushad | M::Popa | M::Popad) {
+            self.stack_all(i);
+            return;
+        }
         if matches!(i.mnemonic(), M::Clc | M::Stc | M::Cmc) {
             let carry = match i.mnemonic() {
                 M::Clc => self.constant(0),
@@ -564,11 +579,14 @@ impl Emitter<'_> {
 
     fn add_with_carry(&mut self, i: &Instruction) {
         let a = self.read(i, 0);
-        let b = self.read(i, 1);
+        let source = self.read(i, 1);
+        let size = operand_size(i, 0);
+        let b = self.carry_operand(source, size);
         let ptr = self.destination(i);
         let carry = self.flag(0);
         let sum = self.b.ins().iadd(a, b);
         let result = self.b.ins().iadd(sum, carry);
+        let result = self.carry_operand(result, size);
         // Carry is result < a, or result == a with an incoming carry.
         // Use the original b for AF/OF, including b == UINT32_MAX and CF=1.
         let less = self.b.ins().icmp(IntCC::UnsignedLessThan, result, a);
@@ -577,7 +595,7 @@ impl Emitter<'_> {
         let equal = self.b.ins().uextend(types::I32, equal);
         let equal_and_carry = self.b.ins().band(equal, carry);
         let carry_out = self.b.ins().bor(less, equal_and_carry);
-        self.flags(a, b, result, false, false, true);
+        self.arithmetic_flags(a, b, result, size, false);
         let zero = self.constant(0);
         for (var, value) in self.lazy[4..].iter().zip([carry_out, zero, zero]) {
             self.b.def_var(*var, value);
@@ -587,12 +605,15 @@ impl Emitter<'_> {
 
     fn subtract_with_borrow(&mut self, i: &Instruction) {
         let a = self.read(i, 0);
-        let b = self.read(i, 1);
+        let source = self.read(i, 1);
+        let size = operand_size(i, 0);
+        let b = self.carry_operand(source, size);
         // Validate a memory destination before changing any architectural state.
         let ptr = self.destination(i);
         let carry = self.flag(0);
         let difference = self.b.ins().isub(a, b);
         let result = self.b.ins().isub(difference, carry);
+        let result = self.carry_operand(result, size);
         // CF must account for a borrow even when b + carry wraps at UINT32_MAX.
         let less = self.b.ins().icmp(IntCC::UnsignedLessThan, a, b);
         let less = self.b.ins().uextend(types::I32, less);
@@ -601,12 +622,21 @@ impl Emitter<'_> {
         let equal_and_carry = self.b.ins().band(equal, carry);
         let borrow = self.b.ins().bor(less, equal_and_carry);
         // The original operands and final result also give SBB's AF and OF.
-        self.flags(a, b, result, true, false, false);
+        self.arithmetic_flags(a, b, result, size, true);
         let zero = self.constant(0);
         for (var, value) in self.lazy[4..].iter().zip([borrow, zero, zero]) {
             self.b.def_var(*var, value);
         }
         self.write(i, ptr, result);
+    }
+
+    /// Mask sign-extended immediates and results before the width's CF test.
+    fn carry_operand(&mut self, value: Value, size: usize) -> Value {
+        match size {
+            1 => self.b.ins().band_imm(value, 0xff),
+            2 => self.b.ins().band_imm(value, 0xffff),
+            _ => value,
+        }
     }
 
     fn signed_divide(&mut self, i: &Instruction) {
@@ -981,13 +1011,72 @@ impl Emitter<'_> {
         self.b.def_var(self.lazy[3], kind);
     }
 
-    /// XCHG r/m32, r32. Memory is always the first operand.
+    /// XCHG r/m8/16/32, r8/16/32. Capture both aliases before either write.
     fn exchange(&mut self, i: &Instruction) {
         let a = self.read(i, 0);
         let b = self.read(i, 1);
         let ptr = self.destination(i);
         self.write(i, ptr, b);
         self.write_register(i.op1_register(), a);
+    }
+
+    /// Match the interpreter's whole-instruction transaction: validate every
+    /// access before committing registers or stack bytes. POPA skips the SP slot.
+    fn stack_all(&mut self, i: &Instruction) {
+        let width = if matches!(i.code(), Code::Pushaw | Code::Popaw) {
+            2
+        } else {
+            4
+        };
+        let stack = self.b.use_var(self.regs[4]);
+        if matches!(i.mnemonic(), M::Pusha | M::Pushad) {
+            let values: Vec<_> = self.regs.iter().map(|r| self.b.use_var(*r)).collect();
+            let pointers: Vec<_> = (1..=8)
+                .map(|n| {
+                    let address = self.b.ins().iadd_imm(stack, -((n * width) as i64));
+                    self.pointer(address, width)
+                })
+                .collect();
+            for (pointer, value) in pointers.into_iter().zip(values) {
+                let value = if width == 2 {
+                    self.b.ins().ireduce(types::I16, value)
+                } else {
+                    value
+                };
+                self.store_memory(pointer, value);
+            }
+            let stack = self.b.ins().iadd_imm(stack, -((8 * width) as i64));
+            self.b.def_var(self.regs[4], stack);
+        } else {
+            let registers = [R::DI, R::SI, R::BP, R::SP, R::BX, R::DX, R::CX, R::AX];
+            let values: Vec<_> = registers
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| *n != 3)
+                .map(|(n, r)| {
+                    let address = self.b.ins().iadd_imm(stack, (n * width) as i64);
+                    let value = self.direct_load(address, integer_type(width));
+                    let value = if width == 2 {
+                        self.b.ins().uextend(types::I32, value)
+                    } else {
+                        value
+                    };
+                    (*r, value)
+                })
+                .collect();
+            for (register, value) in values {
+                self.write_register(
+                    if width == 2 {
+                        register
+                    } else {
+                        register.full_register32()
+                    },
+                    value,
+                );
+            }
+            let stack = self.b.ins().iadd_imm(stack, (8 * width) as i64);
+            self.b.def_var(self.regs[4], stack);
+        }
     }
 
     fn exchange_add(&mut self, i: &Instruction) {

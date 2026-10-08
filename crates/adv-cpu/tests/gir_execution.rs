@@ -97,3 +97,37 @@ fn gir_unrepresented_fp_exits_before_instruction_and_continues() {
     }
     assert_eq!(m.stats.verification.mismatches, 0);
 }
+
+#[test]
+fn gir_hot_cycle_merges_published_regions_without_speed_slices() {
+    for strict in [false, true] {
+        let next = CODE + 0x100;
+        let mut m = machine(|a| {
+            a.inc(eax).unwrap();
+            a.jmp(u64::from(next)).unwrap();
+        });
+        m.set_gir_state_ssa(true).unwrap();
+        m.set_tier_verification(strict.then_some(true));
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(u64::from(CODE)).unwrap();
+        a.jmp(u64::from(STOP)).unwrap();
+        let bytes = a.assemble(u64::from(next)).unwrap();
+        m.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
+        m.write(next, &bytes).unwrap();
+        m.add_region(Region::new(next, bytes.len())).unwrap();
+        m.state.regs[1] = 1000;
+        assert_eq!(m.run(STOP, 10_000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], 1000);
+        assert_eq!(m.state.regs[1], 0);
+        let stats = m.gir_stats();
+        assert!(stats.promotions > 0 && stats.merged_regions > 0);
+        if !strict {
+            assert_eq!(stats.boundaries[4], 0);
+        }
+        assert_eq!(m.stats.verification.mismatches, 0);
+        if strict {
+            assert_eq!(m.stats.verification.inconclusive, 0);
+        }
+    }
+}

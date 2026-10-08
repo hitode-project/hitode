@@ -227,7 +227,9 @@ fn gir_checkpoint_layout_and_entry_modes_are_explicit() {
     assert_eq!(offset_of!(lower::Frame, committed), 40);
     assert_eq!(offset_of!(lower::Frame, lease_epoch), 56);
     assert_eq!(offset_of!(lower::Frame, last_indirect_branch), 64);
-    assert_eq!(size_of::<lower::Frame>(), 80);
+    assert_eq!(offset_of!(lower::Frame, tail_entries), 80);
+    assert_eq!(offset_of!(lower::Frame, tail_calls), 88);
+    assert_eq!(size_of::<lower::Frame>(), 96);
     let mut state = cpu();
     assert!(super::execution::Engine::mode_allowed(&state));
     state.eflags |= 1 << 8;
@@ -401,4 +403,129 @@ fn gir_direct_checked_alias_survives_mixed_host_page_permissions() {
     assert!(proven);
     assert_eq!(status, lower::COMPLETE);
     assert_eq!(frame.gpr[3], 7);
+}
+
+#[test]
+fn gir_tail_family_preserves_every_budget_and_fault_prefix() {
+    use super::hot::{Selection, Unit};
+    let split = BASE + 0x100;
+    let first = assemble(|a| {
+        a.add(eax, 3).unwrap();
+        a.adc(ebx, 7).unwrap();
+        a.jmp(u64::from(split)).unwrap();
+    });
+    let mut a = CodeAssembler::new(32).unwrap();
+    a.sbb(edx, eax).unwrap();
+    a.mov(dword_ptr(DATA as i32), edx).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(u64::from(BASE)).unwrap();
+    a.jmp(u64::from(STOP)).unwrap();
+    let second = a.assemble(u64::from(split)).unwrap();
+    let mut bytes = first.clone();
+    bytes.resize(0x100, 0x90);
+    bytes.extend_from_slice(&second);
+    for writable in [false, true] {
+        for budget in 0..=28 {
+            let mut m = memory(&bytes);
+            if !writable {
+                m.protect(DATA, 4096, READ).unwrap();
+            }
+            let instructions = iced_x86::Decoder::with_ip(
+                32,
+                &second,
+                u64::from(split),
+                iced_x86::DecoderOptions::NONE,
+            )
+            .into_iter()
+            .map(|i| (i.ip32(), i))
+            .collect();
+            let p = Program::compile_family(
+                Selection {
+                    units: vec![
+                        Unit {
+                            entry: BASE,
+                            instructions: decoded(&first),
+                        },
+                        Unit {
+                            entry: split,
+                            instructions,
+                        },
+                    ],
+                    pages: vec![(0, m.versions[0])],
+                    merged: 0,
+                },
+                &mut m,
+            )
+            .unwrap();
+            let (frame, status, _) = run(&p, &mut m, &mut LeaseCache::default(), budget);
+            oracle_prefix(&bytes, &frame, &m);
+            if !writable && budget > 4 {
+                assert_eq!(status, lower::WRITE_CHECK);
+                assert_eq!(frame.committed, 4);
+                assert_eq!(frame.pc, split + 2);
+            }
+            if budget > 3 {
+                assert!(frame.tail_entries > 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn gir_tail_family_checks_secondary_code_generation_and_entry_interrupt() {
+    use super::hot::{Selection, Unit};
+    let first = assemble(|a| {
+        a.jmp(u64::from(BASE + 4096)).unwrap();
+    });
+    let second = assemble(|a| {
+        a.inc(eax).unwrap();
+    });
+    let mut m = memory(&first);
+    m.write(BASE + 4096, &second).unwrap();
+    m.watch_code(BASE + 4096, second.len());
+    let instructions = iced_x86::Decoder::with_ip(
+        32,
+        &second,
+        u64::from(BASE + 4096),
+        iced_x86::DecoderOptions::NONE,
+    )
+    .into_iter()
+    .map(|i| (i.ip32(), i))
+    .collect();
+    let p = Program::compile_family(
+        Selection {
+            units: vec![
+                Unit {
+                    entry: BASE,
+                    instructions: decoded(&first),
+                },
+                Unit {
+                    entry: BASE + 4096,
+                    instructions,
+                },
+            ],
+            pages: vec![(0, m.versions[0]), (1, m.versions[1])],
+            merged: 0,
+        },
+        &mut m,
+    )
+    .unwrap();
+    let mut frame = lower::Frame::from_cpu(&cpu());
+    let (status, _) = p
+        .run(
+            &mut frame,
+            &mut m,
+            &mut LeaseCache::default(),
+            10,
+            &AtomicBool::new(true),
+            &AtomicBool::new(false),
+            STOP,
+        )
+        .unwrap();
+    assert_eq!(status, lower::INTERRUPTED);
+    assert_eq!(frame.committed, 0);
+    m.protect(BASE + 4096, 4096, READ | EXEC).unwrap();
+    let (frame, status, _) = run(&p, &mut m, &mut LeaseCache::default(), 10);
+    assert_eq!(status, lower::REVOKED);
+    assert_eq!(frame.committed, 0);
 }
