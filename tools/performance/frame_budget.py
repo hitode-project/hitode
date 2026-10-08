@@ -50,7 +50,7 @@ REASONS = ("uncovered", "rejected", "pending", "interior", "fallback", "forced")
 HLE_GROUPS = ("graphics", "file", "audio", "other")
 CPU_FIELDS = ("tier0_units", "tier1_units", "tier2_blocks", "native_entries", "interpreter_entries",
               "sync_compile_ns", "compile_wait_execution_ns", "compile_wait_units", "invalidations",
-              "recompilations", "compilations", "x87_helpers", "softfloat_calls")
+              "recompilations", "compilations", "x87_helpers", "softfloat_calls", "retired_tier0_instructions")
 
 
 def numeric_fields(value: dict, names) -> dict:
@@ -61,13 +61,19 @@ def numeric_fields(value: dict, names) -> dict:
 def clean_row(row: dict) -> dict:
     """Use an allowlist so future raw diagnostics cannot leak into shareable output."""
     result = numeric_fields(row, ("serial", "wall_ns", "active_ns", "guest_exec_ns", "present_call_ns",
-                                 "wait_ns", "wait_overshoot_ns", "wait_timeouts", "core", "frequency_khz"))
+                                 "wait_ns", "wait_overshoot_ns", "wait_timeouts", "core", "frequency_khz",
+                                 "scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
+                                 "service_audio_ns", "service_graphics_ns", "scene_check_ns"))
     result.update(startup=row.get("startup") is True,
                   hle_ns=numeric_fields(row.get("hle_ns", {}), HLE_GROUPS),
                   native_reference="unmeasured")
     cpu = row.get("cpu")
     result["cpu"] = None if cpu is None else numeric_fields(cpu, CPU_FIELDS) | {
         "reasons": numeric_fields(cpu.get("reasons", {}), REASONS)}
+    result["top_apis"] = [dict(api=item["api"], **numeric_fields(item, ("ns", "calls")))
+                          for item in row.get("top_apis", [])[:5]
+                          if isinstance(item, dict) and isinstance(item.get("api"), str)
+                          and re.fullmatch(r"[A-Za-z0-9_.-]+![A-Za-z0-9_?@$.:<>-]+", item["api"])]
     return result
 
 
@@ -144,6 +150,17 @@ def classify(row: dict) -> dict:
     overshoot = row.get("wait_overshoot_ns", 0)
     if overshoot >= 1_000_000 and (wall - overshoot <= BUDGET_NS or overshoot >= wall * .3):
         candidates.append((overshoot, "platform.wait_overshoot", "measured"))
+    for key, cause in (("scheduler_ns", "host.scheduler"), ("frontend_ns", "host.frontend_control"),
+                       ("control_pause_ns", "observer.control_pause")):
+        duration = row.get(key, 0)
+        if duration >= max(8_000_000, wall * .3):
+            candidates.append((duration, cause, "residual_hint" if key == "frontend_ns" else "measured"))
+    work = active + row.get("service_audio_ns", 0) + row.get("service_graphics_ns", 0)
+    for key, cause in (("service_audio_ns", "host.audio_service"), ("service_graphics_ns", "host.graphics_service"),
+                       ("scene_check_ns", "observer.scene_check")):
+        duration = row.get(key, 0)
+        if duration >= max(8_000_000, work * .3):
+            candidates.append((duration, cause, "measured"))
     if candidates:
         _, cause, confidence = max(candidates)
     elif active > BUDGET_NS and cpu.get("softfloat_calls", 0) >= 1000:
@@ -157,18 +174,48 @@ def classify(row: dict) -> dict:
         cause, confidence = "structure.tier2_execution", "residual_hint"
     elif row.get("wait_ns", 0) >= wall * .5 and wall > BUDGET_NS:
         cause, confidence = "platform.wait_or_idle", "intent_unknown"
+    elif (wall > BUDGET_NS and row.get("wait_ns", 0) >= 1_000_000
+          and active + row.get("wait_ns", 0) >= wall * .8):
+        cause, confidence = "platform.mixed_wait_execution", "measured_combination"
+    elif (wall > BUDGET_NS and row.get("wait_ns", 0) >= 1_000_000
+          and work + row.get("wait_ns", 0) >= wall * .8):
+        cause, confidence = "platform.mixed_wait_execution_services", "measured_combination"
+    elif (wall > BUDGET_NS and row.get("scene_check_ns", 0) >= 1_000_000
+          and wall - row["scene_check_ns"] <= BUDGET_NS
+          and work + row.get("wait_ns", 0) + row["scene_check_ns"] >= wall * .8):
+        cause, confidence = "observer.mixed_scene_work", "measured_combination"
+    elif active > BUDGET_NS and row.get("guest_exec_ns", 0) >= active * .6:
+        cause, confidence = "structure.guest_execution", "residual_hint"
     else:
         cause, confidence = "unattributed", "insufficient"
     for key in ("sync_compile_ns", "compile_wait_execution_ns", "compile_wait_units", "softfloat_calls",
                 "interpreter_entries", "invalidations", "recompilations", "tier2_blocks"):
         evidence[key] = cpu.get(key)
     evidence.update(hle_ns=hle, wait_ns=row.get("wait_ns"), wait_overshoot_ns=overshoot,
-                    core=row.get("core"), frequency_khz=row.get("frequency_khz"))
+                    core=row.get("core"), frequency_khz=row.get("frequency_khz"), top_apis=row.get("top_apis", []),
+                    **numeric_fields(row, ("scheduler_ns", "frontend_ns", "control_pause_ns", "accounting_excess_ns",
+                                           "service_audio_ns", "service_graphics_ns", "scene_check_ns")))
     return {"cause": cause, "confidence": confidence, "evidence": evidence}
 
 
-def summarize_budget(budget: dict) -> dict:
+def native_estimate(row: dict, rate: int | None) -> dict:
+    """Keep a confirmed Tier 0 subset separate from the missing native retirement.
+
+    The fastest authored x64 rate deliberately minimizes estimated time. This
+    conditional estimate is not an ARM64 hardware bound and never excludes a frame.
+    """
+    count = (row.get("cpu") or {}).get("retired_tier0_instructions")
+    ns = count * 1_000_000_000 // rate if count is not None and rate else None
+    return {"retired_guest_instructions_lower_bound": count,
+            "retirement_coverage": "tier0_only" if count is not None else "unmeasured",
+            "native_time_lower_estimate_ns": ns,
+            "native_over_budget_estimate": ns is not None and ns > BUDGET_NS}
+
+
+def summarize_budget(budget: dict, native_rate: int | None = None) -> dict:
     rows = [dict(clean_row(row), attribution=classify(row)) for row in budget["rows"]]
+    for row in rows:
+        row.update(native_estimate(row, native_rate))
     over_rows = [r for r in rows if r["wall_ns"] > budget["budget_ns"]]
     return {key: budget[key] for key in (
         "frames", "over_budget_frames", "active_over_budget_frames", "max_wall_ns", "max_active_ns",
@@ -177,9 +224,24 @@ def summarize_budget(budget: dict) -> dict:
         "retained_over_budget_frames": len(over_rows),
         "dropped_over_budget_rows": max(0, budget["over_budget_frames"] - len(over_rows)),
         "cause_distribution_retained": dict(Counter(r["attribution"]["cause"] for r in over_rows)),
-        "longest": dict(clean_row(budget["longest"]), attribution=classify(budget["longest"])) if budget.get("longest") else None,
-        "native_reference": {"status": "unmeasured", "excluded_frames": 0}, "rows": rows,
+        "top_apis_retained": top_apis(over_rows),
+        "longest": dict(clean_row(budget["longest"]), attribution=classify(budget["longest"]),
+                        **native_estimate(budget["longest"], native_rate)) if budget.get("longest") else None,
+        "native_reference": {"status": "partial_estimate" if native_rate else "unmeasured", "excluded_frames": 0,
+                             "instructions_per_second": native_rate,
+                             "over_budget_estimate_retained": [r["serial"] for r in over_rows if r["native_over_budget_estimate"]]},
+        "rows": rows,
     }
+
+
+def top_apis(rows: list[dict]) -> list[dict]:
+    """Aggregate retained frame top-five subsets, never claim full API totals."""
+    times, calls = Counter(), Counter()
+    for row in rows:
+        for api in row.get("top_apis", []):
+            times[api["api"]] += api.get("ns", 0)
+            calls[api["api"]] += api.get("calls", 0)
+    return [dict(api=api, ns=ns, calls=calls[api]) for api, ns in times.most_common(5)]
 
 
 def load_json(path: Path, default=None):
@@ -227,7 +289,7 @@ def fixed_segment(directory: Path, scenario: dict, checkpoint: str) -> dict | No
     return None
 
 
-def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> list[dict]:
+def summarize_run(directory: Path, scenario: dict, heat: str, platform: str, native_rate: int | None = None) -> list[dict]:
     result = []
     metadata = load_json(directory / "session.json", {})
     for name in SCENES:
@@ -271,7 +333,7 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
                 if report["frame_budget"]["coalesced_frames"]:
                     raise ValueError("coalesced frame boundaries")
                 valid_budget(report["frame_budget"])
-                row.update(status="observed", reason=None, metrics=summarize_budget(report["frame_budget"]),
+                row.update(status="observed", reason=None, metrics=summarize_budget(report["frame_budget"], native_rate),
                            execution=execution_metrics(report), config=baseline.report_config(report),
                            wait_diagnostics=wait_metrics(report),
                            time_skip=numeric_fields(report.get("time_skip") or {}, ("jumps", "skipped_guest_us")))
@@ -288,7 +350,7 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
     if fallback and result[0]["status"] != "observed":
         result[0]["reason"] = "guest_failure" if fallback.get("failure") else "title_endpoint_not_reached"
         if fallback.get("frame_budget"):
-            result[0]["startup_observation"] = summarize_budget(fallback["frame_budget"])
+            result[0]["startup_observation"] = summarize_budget(fallback["frame_budget"], native_rate)
     return result
 
 
@@ -304,6 +366,18 @@ def markdown(rows: list[dict]) -> str:
         elapsed = f"{segment['seconds']:.3f}" if segment else "—"
         causes = ", ".join(f"{k}:{v}" for k, v in metrics.get("cause_distribution_retained", {}).items()) or "—"
         text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {row['status']} | {counts} | {number('max_wall_ns')} | {number('max_active_ns')} | {number('p99_wall_ns')} | {elapsed} | {causes} |")
+    text += ["", "## 超预算保留帧的 API 前五名", "", "只累计每帧前五名子集；次数包含 handler 与 continuation 服务段。", "",
+             "| 游戏 | 场景 | 冷/热 | API | 累计 ms | 服务段数 |", "|---|---|---|---|---:|---:|"]
+    for row in rows:
+        for api in row.get("metrics", {}).get("top_apis_retained", []):
+            text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {api['api']} | {api['ns']/1e6:.3f} | {api['calls']} |")
+    text += ["", "## 原生部分估算", "", "仅 Tier 0 已确认退休指令；Tier 1/2 未计。使用最快合成 x64 速率的条件下界估算，不排除任何帧。", "",
+             "| 游戏 | 场景 | 冷/热 | native_over_budget_estimate（保留 serial） |", "|---|---|---|---|"]
+    for row in rows:
+        reference = row.get("metrics", {}).get("native_reference", {})
+        if reference.get("status") == "partial_estimate":
+            serials = reference["over_budget_estimate_retained"]
+            text.append(f"| {row['game']} | {row['scene']} | {row['heat']} | {', '.join(map(str, serials)) or '无'} |")
     return "\n".join(text) + "\n"
 
 
@@ -312,7 +386,7 @@ def summarize(root: Path) -> dict:
     rows = []
     for scenario in plan["scenarios"]:
         for heat in plan["heats"]:
-            rows += summarize_run(root / f"{scenario['id']}-{heat}", scenario, heat, plan["platform"])
+            rows += summarize_run(root / f"{scenario['id']}-{heat}", scenario, heat, plan["platform"], plan.get("native_instructions_per_second"))
     summary = {"schema": "adv-frame-budget-summary-v1", "budget_ms": 33.3,
                "source_revision": plan["source_revision"], "source_diff_sha256": plan["source_diff_sha256"],
                "analysis_tool_sha256": digest(Path(__file__)),
@@ -501,9 +575,18 @@ def run(args) -> None:
             "source_revision": getattr(args, "binary_source_revision", None),
             "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
             "source_diff_sha256": hashlib.sha256(diff).hexdigest()}
+    calibration_path = getattr(args, "native_rate", None)
+    if calibration_path:
+        calibration = load_json(calibration_path)
+        rate = calibration.get("instructions_per_second")
+        if calibration.get("schema") != "adv-native-rate-v1" or type(rate) is not int or rate <= 0:
+            raise ValueError("invalid native calibration")
+        plan.update(native_instructions_per_second=rate, native_calibration_sha256=digest(calibration_path))
+    plan["headless_gpu"] = getattr(args, "headless_gpu", False)
     if resume:
         previous = load_json(root / "plan.json")
-        if (any(previous[key] != plan[key] for key in ("platform", "heats", "scenarios"))
+        if (any(previous.get(key) != plan.get(key) for key in ("platform", "heats", "scenarios", "headless_gpu",
+                                                             "native_instructions_per_second", "native_calibration_sha256"))
                 or any(previous.get(key, False) != plan[key] for key in ("no_time_skip",))):
             raise ValueError("resume requires unchanged scenarios and run conditions")
     else:
@@ -540,6 +623,8 @@ def run(args) -> None:
             command += ["--cold"] if heat == "cold" else ["--warm-profile", str(warm)]
             if not args.no_instrumentation:
                 command += ["--frame-budget"]
+            if getattr(args, "headless_gpu", False):
+                command += ["--headless-gpu"]
             if getattr(args, "no_time_skip", False):
                 command += ["--no-time-skip"]
             if args.perf_map:
@@ -628,6 +713,8 @@ def main() -> None:
     execute.add_argument("--perf-map", action="store_true")
     execute.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
+    execute.add_argument("--headless-gpu", action="store_true", help="explicit portable GPU frontend; requires a gpu runner")
+    execute.add_argument("--native-rate", type=Path, help="native_instruction_rate JSON for a conditional Tier 0 lower estimate")
     args = parser.parse_args()
     if args.command == "summarize":
         summarize(args.directory)
