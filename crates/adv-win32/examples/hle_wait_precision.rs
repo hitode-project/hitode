@@ -1,4 +1,4 @@
-//! Usage: cargo run -p adv-win32 --release --example wait_precision -- --data-dir DIR [--precise] [--interpreter].
+//! Usage: cargo run -p adv-win32 --release --example hle_wait_precision -- --data-dir DIR [--precise] [--interpreter].
 //! Inputs: owned data directory, optional host precision/backend switches.
 //! Outputs: aggregate real-clock HLE wait distributions for authored API calls;
 //! no game, window, audio device or private guest state is involved.
