@@ -109,7 +109,8 @@ pub(super) fn thunk(
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let args = b.block_params(entry).to_vec();
-        let call = b.ins().call_indirect(callee, args[2], &args[..2]);
+        let state = contract::load(&mut b, ptr, args[0], args[1]);
+        let call = b.ins().call_indirect(callee, args[2], &state);
         let result = b.inst_results(call)[0];
         b.ins().return_(&[result]);
         b.seal_all_blocks();

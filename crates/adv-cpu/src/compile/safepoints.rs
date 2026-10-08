@@ -92,9 +92,7 @@ impl Emitter<'_> {
         self.b.switch_to_block(residual);
         self.save_state(pc);
         let address = self.poll_checked_address();
-        self.b
-            .ins()
-            .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        self.tail_to(address, pc);
         self.b.switch_to_block(ready);
     }
 }

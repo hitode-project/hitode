@@ -15,6 +15,7 @@ use crate::linking::{NativeContext, Slot, Table};
 use crate::{CompileStrategy, CpuState, EXEC, Exit, Memory, READ, Region, WRITE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+mod contract;
 pub(crate) mod coverage;
 mod diagnostics;
 #[cfg(all(
@@ -1197,10 +1198,7 @@ fn compile_snapshot_with_inline(
     }
     #[cfg(all(test, target_arch = "x86_64"))]
     ctx.set_disasm(true);
-    ctx.func.signature = module.make_signature();
-    ctx.func.signature.call_conv = cranelift_codegen::isa::CallConv::Tail;
-    ctx.func.signature.params.extend([AbiParam::new(ptr_ty); 2]);
-    ctx.func.signature.returns.push(AbiParam::new(types::I32));
+    ctx.func.signature = contract::signature(&module);
     let tail_signature = ctx.func.signature.clone();
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
@@ -1415,15 +1413,6 @@ fn compile_snapshot_with_inline(
         };
         let scoped_instructions = scope.iter().map(|&i| (i.ip32(), *i)).collect();
         let write_summary = write_summary::Summary::for_region(&scoped_instructions);
-        // CpuState stays canonical at every region boundary. A pure region
-        // cannot change unreferenced GPRs, so do not load them or keep them
-        // alive through its fault guards. Include write-only GPRs: a budget
-        // exit or fault may precede their first write, including side entries.
-        let footprint = write_summary.filter(|_| {
-            opt_level == "speed" && kernel.is_none() && !snapshot.parallel && nests.is_empty()
-        });
-        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        let footprint = footprint.filter(|_| !snapshot.native_fault_reads);
         let mut b = FunctionBuilder::new(func, fb_ctx);
         let prologue = b.create_block();
         b.append_block_params_for_function_params(prologue);
@@ -1534,9 +1523,6 @@ fn compile_snapshot_with_inline(
             b.def_var(attempted, zero);
             (entry, attempted)
         });
-        for var in lazy {
-            b.def_var(var, zero);
-        }
         let written = track_writes.then(|| {
             let var = b.declare_var(types::I32);
             b.def_var(var, zero);
@@ -1567,37 +1553,22 @@ fn compile_snapshot_with_inline(
         };
         let fuel = b.declare_var(types::I64);
         for (i, reg) in regs.iter().enumerate() {
-            if footprint.is_some_and(|summary| summary.gpr_used & (1 << i) == 0) {
-                b.def_var(*reg, zero);
-                continue;
-            }
-            let v = b
+            let value = b
                 .ins()
-                .load(types::I32, MemFlags::trusted(), state, (i * 4) as i32);
-            b.def_var(*reg, v);
+                .extractlane(params[contract::GPRS + i / 4], (i % 4) as u8);
+            b.def_var(*reg, value);
         }
-        let f = b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            state,
-            offset_of!(CpuState, eflags) as i32,
-        );
+        let f = b.ins().extractlane(params[contract::FLAGS], 0);
         b.def_var(flags, f);
-        let carry = b.ins().band_imm(f, 1);
-        b.def_var(lazy[4], carry);
-        let f = b.ins().load(
-            types::I64,
-            MemFlags::trusted(),
-            state,
-            offset_of!(CpuState, fuel) as i32,
-        );
-        b.def_var(fuel, f);
-        let pc = b.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            state,
-            offset_of!(CpuState, eip) as i32,
-        );
+        for (i, var) in lazy.iter().enumerate() {
+            let lane = i + 1;
+            let value = b
+                .ins()
+                .extractlane(params[contract::FLAGS + lane / 4], (lane % 4) as u8);
+            b.def_var(*var, value);
+        }
+        b.def_var(fuel, params[contract::FUEL]);
+        let pc = params[contract::PC];
         let blocks: BTreeMap<_, _> = entries
             .iter()
             .filter(|&&pc| {
@@ -1737,6 +1708,9 @@ fn compile_snapshot_with_inline(
             fuel,
             state,
             mem: params[1],
+            abi_state: params[contract::GPRS..contract::GPRS + 4]
+                .try_into()
+                .unwrap(),
             perms,
             interrupt,
             context: params[0],
@@ -1757,7 +1731,6 @@ fn compile_snapshot_with_inline(
             coverage: coverage.clone(),
             range_ok_ref,
             site: None,
-            unchanged: footprint.map_or(0, |summary| !summary.gpr),
             frames: BTreeMap::new(),
             kernel: None,
             dispatch,
@@ -1855,10 +1828,9 @@ fn compile_snapshot_with_inline(
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_return: None,
         };
-        // The initial entry carries canonical flags, whereas runtime indirect
-        // transfers carry the guest instruction's lazy flags. Do not merge the
-        // two paths before a normal exit: that would force every return through
-        // a generic flags materialization.
+        // External and local transfers share the lazy state contract. Keep the
+        // entry switch separate from dynamic local predecessors so a known
+        // local recipe is not widened before a normal exit.
         if hot_exits {
             e.interrupt_at(pc, true);
             let entry_miss = e.b.create_block();
@@ -2100,7 +2072,7 @@ fn compile_snapshot_with_inline(
             e.b.switch_to_block(block);
             e.mmx_effects = None;
             let pc = e.constant(target);
-            e.save_hot_state(pc);
+            e.save_link_state();
             let hash = e.constant(crate::linking::hash(target));
             if shadow_ref.is_some() {
                 let absent = e.b.ins().iconst(ptr_ty, 0);
@@ -2114,7 +2086,7 @@ fn compile_snapshot_with_inline(
             e.b.switch_to_block(hot_dispatch);
             e.mmx_effects = None;
             let pc = e.b.block_params(hot_dispatch)[0];
-            e.save_hot_state(pc);
+            e.save_link_state();
             let high = e.b.ins().ushr_imm(pc, 16);
             let mixed = e.b.ins().bxor(pc, high);
             let mixed = e.b.ins().imul_imm(mixed, 0x9e37_79b1_u32 as i64);
@@ -2456,7 +2428,8 @@ fn compile_snapshot_with_inline(
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let args = b.block_params(entry).to_vec();
+        let params = b.block_params(entry).to_vec();
+        let args = contract::load(&mut b, ptr_ty, params[0], params[1]);
         let address = b.ins().iconst(ptr_ty, tail_entry as i64);
         let call = b.ins().call_indirect(callee, address, &args);
         let result = b.inst_results(call)[0];
@@ -3304,6 +3277,7 @@ struct Emitter<'a> {
     lazy: [Variable; 7],
     state: Value,
     mem: Value,
+    abi_state: [Value; 4],
     perms: Value,
     interrupt: Value,
     context: Value,
@@ -3336,7 +3310,6 @@ struct Emitter<'a> {
     site: Option<(u32, Value, u32)>,
     /// Registers this body never writes: CpuState already holds their exact
     /// values at every exit. Includes the invariant registers of a kernel.
-    unchanged: u8,
     /// In a kernel, the host address of each unchanged base register.
     frames: BTreeMap<usize, Variable>,
     /// In a kernel: its loop, the counter value that ends the iterations its
@@ -3466,8 +3439,8 @@ impl Emitter<'_> {
         let prepare = self.b.create_block();
         self.b.ins().brif(bad, returned, &[], prepare, &[]);
         self.b.switch_to_block(prepare);
-        // State was saved before reaching the chain candidate. Return directly
-        // so an interrupt never charges the next region or grows the Rust stack.
+        // Only a Rust exit publishes the incoming architectural prefix. A
+        // successful link carries it directly through the native arguments.
         let pending = self
             .b
             .ins()
@@ -3480,6 +3453,7 @@ impl Emitter<'_> {
             .ins()
             .brif(pending, interrupted, &[], search_ready, &[]);
         self.b.switch_to_block(interrupted);
+        self.save_state(pc);
         let interrupted_reason = self.constant(Exit::Interrupted as u32);
         self.b.ins().return_(&[interrupted_reason]);
         self.b.switch_to_block(search_ready);
@@ -3594,10 +3568,9 @@ impl Emitter<'_> {
                 offset_of!(NativeContext, fault_reads) as i32,
             );
         }
-        self.b
-            .ins()
-            .return_call_indirect(self.tail_ref, entry, &[self.context, self.mem]);
+        self.tail_to(entry, pc);
         self.b.switch_to_block(returned);
+        self.save_state(pc);
         let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
         self.b.ins().return_(&[reason]);
     }
@@ -3820,9 +3793,7 @@ impl Emitter<'_> {
             self.b.ins().brif(dispatch, resume, &[], returned, &[]);
             self.b.switch_to_block(resume);
             let address = self.b.ins().func_addr(self.ptr_ty, entry);
-            self.b
-                .ins()
-                .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+            self.tail_to(address, pc);
             self.b.switch_to_block(returned);
             self.b.ins().return_(&[reason]);
         } else if terminal {
@@ -3834,7 +3805,7 @@ impl Emitter<'_> {
     fn save_state(&mut self, pc: Value) {
         self.save_state_with_flags(pc, None);
     }
-    fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
+    fn save_extended_state(&mut self) {
         self.flush_mmx_effects();
         for (index, var) in self.mmx.iter().enumerate() {
             if let Some(var) = var {
@@ -3873,10 +3844,10 @@ impl Emitter<'_> {
                 );
             }
         }
+    }
+    fn save_state_with_flags(&mut self, pc: Value, flags: Option<Value>) {
+        self.save_extended_state();
         for (i, reg) in self.regs.iter().enumerate() {
-            if self.unchanged & 1 << i != 0 {
-                continue;
-            }
             let v = self.b.use_var(*reg);
             self.b
                 .ins()
@@ -3903,18 +3874,12 @@ impl Emitter<'_> {
             offset_of!(CpuState, eip) as i32,
         );
     }
-    fn save_hot_state(&mut self, pc: Value) {
+    fn save_link_state(&mut self) {
         let Some(summary) = self.write_summary else {
-            self.save_state(pc);
+            self.save_extended_state();
             return;
         };
         for index in 0..8 {
-            if summary.gpr & (1 << index) != 0 {
-                let value = self.b.use_var(self.regs[index]);
-                self.b
-                    .ins()
-                    .store(MemFlags::trusted(), value, self.state, (index * 4) as i32);
-            }
             if summary.xmm & (1 << index) != 0 {
                 let value = self
                     .b
@@ -3927,28 +3892,6 @@ impl Emitter<'_> {
                 );
             }
         }
-        if summary.flags {
-            let flags = self.materialize_flags();
-            self.b.ins().store(
-                MemFlags::trusted(),
-                flags,
-                self.state,
-                offset_of!(CpuState, eflags) as i32,
-            );
-        }
-        let fuel = self.b.use_var(self.fuel);
-        self.b.ins().store(
-            MemFlags::trusted(),
-            fuel,
-            self.state,
-            offset_of!(CpuState, fuel) as i32,
-        );
-        self.b.ins().store(
-            MemFlags::trusted(),
-            pc,
-            self.state,
-            offset_of!(CpuState, eip) as i32,
-        );
     }
     fn reload_state(&mut self) {
         for (index, var) in self.mmx.iter().enumerate() {
@@ -4187,9 +4130,7 @@ impl Emitter<'_> {
         let target = self.constant(pc);
         self.save_state(target);
         let address = self.b.ins().func_addr(self.ptr_ty, entry);
-        self.b
-            .ins()
-            .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        self.tail_to(address, target);
         true
     }
 
@@ -4430,10 +4371,8 @@ impl Emitter<'_> {
         let header = self.constant(self.plans[index].header);
         self.save_state(header);
         let address = self.b.ins().iconst(self.ptr_ty, self.kernels[index] as i64);
-        let call = self
-            .b
-            .ins()
-            .call_indirect(self.tail_ref, address, &[self.context, self.mem]);
+        let args = self.tail_arguments(header);
+        let call = self.b.ins().call_indirect(self.tail_ref, address, &args);
         let reason = self.b.inst_results(call)[0];
         let resume = self.b.create_block();
         let leave = self.b.create_block();
@@ -4533,7 +4472,6 @@ impl Emitter<'_> {
         self.b.def_var(stop_var, stop);
         self.kernel = Some((index, stop_var, entry));
         let plan = &self.plans[index];
-        self.unchanged = plan.invariant;
         let bases: BTreeSet<usize> = plan
             .proven
             .values()
