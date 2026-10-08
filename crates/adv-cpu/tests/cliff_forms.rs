@@ -146,7 +146,7 @@ fn narrow_carry_forms_match_interpreter_and_unicorn_flags_and_aliases() {
                         for carry in [0, 1] {
                             let mut state = initial();
                             let word = matches!(form, 2 | 5 | 8 | 10 | 12 | 14);
-                            let lanes = |value| {
+                            let lanes = |value: u32| {
                                 if word {
                                     value & 0xffff
                                 } else {
