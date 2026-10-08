@@ -6,17 +6,52 @@
   "codepage": 932,
   "schedule": [
     {
-      "at": 30,
-      "checkpoint": "startup"
+      "at": 8,
+      "command": "click 640 360"
     },
     {
-      "at": 31,
+      "at": 9,
+      "command": "key-down 13"
+    },
+    {
+      "at": 9.3,
+      "command": "key-up 13"
+    },
+    {
+      "at": 10,
+      "command": "key-down 17"
+    },
+    {
+      "at": 20,
+      "command": "key-up 17"
+    },
+    {
+      "at": 22,
+      "checkpoint": "title",
+      "reset_metrics": true
+    },
+    {
+      "at": 23,
+      "command": "key-down 13"
+    },
+    {
+      "at": 23.3,
+      "command": "key-up 13"
+    },
+    {
+      "at": 33,
+      "checkpoint": "transition",
+      "reset_metrics": true
+    },
+    {
+      "at": 34,
       "command": "close"
     }
   ],
   "scenes": {
     "title": {
-      "unavailable": "android_d3d_scene_gate_unavailable"
+      "checkpoint": "title",
+      "measurement": "startup_observation"
     },
     "normal": {
       "unavailable": "scene_not_gated"
@@ -25,7 +60,8 @@
       "unavailable": "no_fixed_endpoint"
     },
     "transition": {
-      "unavailable": "scene_not_gated"
+      "checkpoint": "transition",
+      "measurement": "post_enter_observation"
     }
   }
 }
