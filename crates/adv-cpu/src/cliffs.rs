@@ -90,6 +90,7 @@ pub struct Count {
 
 #[derive(Default, Clone, Debug)]
 pub struct Cliffs {
+    pub(crate) x87_forms: crate::floating::fast::diagnostics::Census,
     pub tier1_census: Option<crate::Tier1Census>,
     pub x87_helper_calls: u64,
     /// Helper calls completed by the host-double fast path.
@@ -109,6 +110,7 @@ pub struct Cliffs {
 
 impl Cliffs {
     pub(crate) fn merge(&mut self, other: Cliffs) {
+        self.x87_forms.merge(other.x87_forms);
         if let Some(census) = other.tier1_census {
             self.tier1_census
                 .get_or_insert_with(Default::default)
@@ -186,6 +188,7 @@ impl Cliffs {
 
     /// Exact-model x87 calls as (`mnemonic/reason`, count), most frequent first.
     pub fn x87_exact_rows(&self) -> Vec<(String, u64)> {
+        self.x87_forms.report();
         rows(
             self.x87_exact
                 .iter()

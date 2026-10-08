@@ -126,6 +126,7 @@ pub(crate) unsafe extern "C" fn x87_call(
             .x87_exact
             .entry((operation.instruction.mnemonic(), reason))
             .or_default() += 1;
+        cliffs.x87_forms.record(operation, state, memory);
         let epoch = memory.epoch;
         match execute(
             &operation.instruction,

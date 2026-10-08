@@ -13,6 +13,7 @@
 use super::{Memory, NativeX87, X87_DONE, X87_EXIT, reg_index};
 use crate::{CpuState, PAGE_SIZE, READ, WRITE, X87Register as Ext};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
+pub(crate) mod diagnostics;
 
 const PE: u16 = 0x20;
 const C0: u16 = 0x100;
