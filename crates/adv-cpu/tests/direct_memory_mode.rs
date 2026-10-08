@@ -41,6 +41,7 @@ fn direct_memory_executes_scalars_and_recovers_protection_faults() {
     const DATA: u32 = 0x20000;
     let mut assembler = CodeAssembler::new(32).unwrap();
     assembler.inc(ebx).unwrap();
+    let write_pc = CODE + assembler.assemble(u64::from(CODE)).unwrap().len() as u32;
     assembler.mov(dword_ptr(ecx), edx).unwrap();
     assembler.mov(eax, dword_ptr(ecx)).unwrap();
     assembler.inc(esi).unwrap();
@@ -51,7 +52,11 @@ fn direct_memory_executes_scalars_and_recovers_protection_faults() {
     executor.protect(CODE, 4096, READ | WRITE | EXEC).unwrap();
     executor.protect(DATA, 4096, READ | WRITE).unwrap();
     executor.write(CODE, &code).unwrap();
-    executor.add_region(Region::new(CODE, code.len())).unwrap();
+    // The counter assertions below require native reentry at the pending
+    // store after a permission fault, without replaying the committed INC.
+    let mut region = Region::new(CODE, code.len());
+    region.entries.push(write_pc);
+    executor.add_region(region).unwrap();
     executor.state.regs[1] = DATA;
     executor.state.regs[2] = 0x12345678;
     executor.state.eip = CODE;
