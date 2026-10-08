@@ -26,7 +26,7 @@ def digest(path: Path) -> str:
 
 def evaluate(test: int, values: list[int]) -> list[str]:
     """Return violated contracts; never print pointers or binary contents."""
-    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38, 13: 30}
+    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38, 13: 30, 14: 56}
     if len(values) != expected_lengths[test]:
         return ["missing_results"]
     failures = []
@@ -105,6 +105,17 @@ def evaluate(test: int, values: list[int]) -> list[str]:
         check("semaphore_output_fault", v[24] == 0xc0000005)
         check("semaphore_shared_count", v[25:28] == [0, 0, 258])
         check("mutant_invalid_handle", v[28:30] == [0, 6])
+    elif test == 14:
+        check("mutation_setup", v[0] == 1)
+        for index, name in enumerate(("delete", "move", "create_directory", "remove_directory")):
+            check(name, v[1+index*6:7+index*6] == [1]*6)
+        statuses = ("invalid_info", "invalid_parameter", "unsupported", "access_denied", "cannot_delete",
+                    "sharing_violation", "success", "informational", "misalignment_warning", "overflow_warning",
+                    "unsuccessful", "invalid_handle", "access_violation")
+        for index, name in enumerate(statuses):
+            check("fallback_" + name, v[25+index] == 1)
+        check("posix_lifetime", v[38:47] == [1]*9)
+        check("classic_lifetime", v[47:56] == [1]*9)
     return failures
 
 
@@ -153,7 +164,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--native-only", action="store_true")
-    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11,12,13")
+    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14")
     args = parser.parse_args()
     output = args.output.resolve()
     if "target" not in output.parts or "investigations" not in output.parts:
