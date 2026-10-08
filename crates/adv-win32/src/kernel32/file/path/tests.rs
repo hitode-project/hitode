@@ -1,4 +1,4 @@
-//! Public path fronts diagnose remaining bypasses, and profiles honor close hooks.
+//! Remaining temp-path bypasses and operation-specific native file boundaries.
 use super::*;
 use adv_abi::{Conv, Handle};
 use adv_cpu::{
@@ -212,7 +212,9 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
     let provider = machine.ext.get::<Provider>();
     if mode == 0 {
         assert_eq!(provider.calls, 0);
-        assert_eq!(provider.warnings, [0, 1, 2, 2]);
+        // RemoveDirectory owns an NtOpenFile operation, even when only the
+        // distinct NtCreateFile entry is hooked. It no longer bypasses a hook.
+        assert_eq!(provider.warnings, [0, 1, 1, 1]);
         assert_eq!(machine.cpu.read_u32(DATA + 512).unwrap(), 0);
         assert_eq!(machine.cpu.read_u32(DATA + 516).unwrap(), 79);
         assert_ne!(machine.cpu.read_u32(DATA + 520).unwrap(), 0);
@@ -228,7 +230,7 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
                 .any(|(api, _)| api == "kernel32.dll!GetTempFileNameA")
         );
         assert!(
-            warnings
+            !warnings
                 .keys()
                 .any(|(api, _)| api == "kernel32.dll!RemoveDirectory")
         );
@@ -255,7 +257,8 @@ fn guest<B: Backend>(cpu: B, mode: u32) {
 }
 
 #[test]
-fn remaining_path_mutations_diagnose_bypasses_and_profile_reads_route_close_only_hooks() {
+fn temp_path_mutations_diagnose_bypasses_directory_opens_ignore_create_hooks_and_profiles_route_close()
+ {
     for mode in 0..3 {
         guest(JitCpu::new(PARK_ADDR, false).unwrap(), mode);
         guest(UnicornCpu::new(PARK_ADDR).unwrap(), mode);

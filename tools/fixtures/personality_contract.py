@@ -26,7 +26,7 @@ def digest(path: Path) -> str:
 
 def evaluate(test: int, values: list[int]) -> list[str]:
     """Return violated contracts; never print pointers or binary contents."""
-    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38}
+    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38, 13: 30, 14: 60}
     if len(values) != expected_lengths[test]:
         return ["missing_results"]
     failures = []
@@ -92,6 +92,32 @@ def evaluate(test: int, values: list[int]) -> list[str]:
         check("native_invalid_flags", v[32:34] == [0xc000000d, 1])
         check("native_altered", v[34:36] == [0, 1])
         check("inner_lookup_hook", v[36:38] == [1, 1])
+    elif test == 13:
+        check("mutant_recursion", v[:6] == [0, 0, 0, 0xffffffff, 0, 0])
+        check("mutant_not_owned", v[6:10] == [0xc0000046, 0x12345678, 0, 288])
+        check("semaphore_create", v[10] == 0)
+        check("semaphore_zero_release", v[11:13] == [0xc000000d, 0x12345678])
+        check("semaphore_limit", v[13:15] == [0xc0000047, 0x12345678])
+        check("semaphore_previous_count", v[15:17] == [0, 1])
+        check("semaphore_negative_release", v[17:20] == [0, 87, 0x12345678])
+        check("semaphore_invalid_initial", v[20:22] == [0xc000000d, 0])
+        check("semaphore_invalid_maximum", v[22:24] == [0xc000000d, 0])
+        check("semaphore_output_fault", v[24] == 0xc0000005)
+        check("semaphore_shared_count", v[25:28] == [0, 0, 258])
+        check("mutant_invalid_handle", v[28:30] == [0, 6])
+    elif test == 14:
+        check("mutation_setup", v[0] == 1)
+        for index, name in enumerate(("delete", "move", "create_directory", "remove_directory")):
+            check(name, v[1+index*6:7+index*6] == [1]*6)
+        statuses = ("invalid_info", "invalid_parameter", "unsupported", "access_denied", "cannot_delete",
+                    "sharing_violation", "success", "informational", "misalignment_warning", "overflow_warning",
+                    "unsuccessful", "invalid_handle", "access_violation")
+        for index, name in enumerate(statuses):
+            check("fallback_" + name, v[25+index] == 1)
+        check("posix_lifetime", v[38:47] == [1]*9)
+        check("classic_lifetime", v[47:56] == [1]*9)
+        for index, name in enumerate(("delete", "move", "remove_directory", "create_directory")):
+            check("selection_" + name, v[56+index] == 1)
     return failures
 
 
@@ -140,7 +166,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--native-only", action="store_true")
-    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11,12")
+    parser.add_argument("--tests", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14")
     args = parser.parse_args()
     output = args.output.resolve()
     if "target" not in output.parts or "investigations" not in output.parts:

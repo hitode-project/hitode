@@ -164,8 +164,10 @@ fn file_backing(
     maximum: u64,
 ) -> Result<Rc<FileSection>, u32> {
     let source = env.sys.objects.host::<FileObj>(handle).ok_or(6u32)?;
-    if source.access & (GENERIC_READ | 0x10000000) == 0
-        || (writable && source.access & (GENERIC_WRITE | 0x10000000) == 0)
+    // NT checks the mapped FILE_READ_DATA / FILE_WRITE_DATA rights, so a
+    // specific-rights NtOpenFile handle backs sections like GENERIC_* ones.
+    if source.access & (GENERIC_READ | 0x10000000 | 1) == 0
+        || (writable && source.access & (GENERIC_WRITE | 0x10000000 | 2) == 0)
     {
         return Err(5);
     }
@@ -268,7 +270,7 @@ pub(super) fn prepare_retarget_handles(
             let position = file.file.stream_position().map_err(|e| io_error(&e))?;
             let mut replacement = std::fs::OpenOptions::new()
                 .read(true)
-                .write(file.access & (GENERIC_WRITE | 0x10000000) != 0)
+                .write(file.access & (GENERIC_WRITE | 0x10000000 | 2 | 4) != 0)
                 .open(destination)
                 .map_err(|e| io_error(&e))?;
             replacement
