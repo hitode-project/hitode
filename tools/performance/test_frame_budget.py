@@ -22,6 +22,13 @@ def frame(**changes):
 
 
 class FrameBudgetTests(unittest.TestCase):
+    def test_scene_check_can_push_combined_work_over_the_budget(self):
+        row = frame(wall_ns=40_000_000, active_ns=25_000_000, guest_exec_ns=22_000_000,
+                    hle_ns={"other": 4_000_000}, wait_ns=3_000_000,
+                    service_audio_ns=2_000_000, scene_check_ns=7_000_000)
+        self.assertEqual(budget.classify(row)["cause"], "observer.mixed_scene_work")
+        self.assertEqual(budget.classify(row | {"scene_check_ns": 0})["cause"], "unattributed")
+
     def test_mixed_execution_and_wait_are_not_a_hidden_host_gap(self):
         result = budget.classify(frame(wall_ns=50_000_000, active_ns=29_000_000,
                                        guest_exec_ns=22_000_000, wait_ns=18_000_000))

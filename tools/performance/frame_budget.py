@@ -180,6 +180,10 @@ def classify(row: dict) -> dict:
     elif (wall > BUDGET_NS and row.get("wait_ns", 0) >= 1_000_000
           and work + row.get("wait_ns", 0) >= wall * .8):
         cause, confidence = "platform.mixed_wait_execution_services", "measured_combination"
+    elif (wall > BUDGET_NS and row.get("scene_check_ns", 0) >= 1_000_000
+          and wall - row["scene_check_ns"] <= BUDGET_NS
+          and work + row.get("wait_ns", 0) + row["scene_check_ns"] >= wall * .8):
+        cause, confidence = "observer.mixed_scene_work", "measured_combination"
     elif active > BUDGET_NS and row.get("guest_exec_ns", 0) >= active * .6:
         cause, confidence = "structure.guest_execution", "residual_hint"
     else:
