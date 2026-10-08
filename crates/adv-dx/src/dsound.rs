@@ -1351,14 +1351,20 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if !(100..=200000).contains(&freq) {
                 return Ok(INVALID);
             }
-            buf.base = buf.cursor(now);
+            let base = buf.cursor(now);
+            let generation = buf.generation.wrapping_add(1);
+            if s.audio
+                .set_frequency_generation(buf.audio_id, freq, generation)
+                .is_err()
+            {
+                return Ok(INVALID_CALL);
+            }
+            buf.base = base;
             buf.anchor = now;
             buf.frequency = freq;
             buf.queued_frames = 0;
             buf.notice_bytes = u64::from(buf.base);
-            s.audio.set_frequency(buf.audio_id, freq)?;
-            buf.generation = buf.generation.wrapping_add(1);
-            s.audio.change_generation(buf.audio_id, buf.generation);
+            buf.generation = generation;
             0
         }
         "SetFormat" => {
@@ -1376,30 +1382,34 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if b >= buf.len {
                 return Ok(INVALID);
             }
-            buf.base = b / buf.format.align() * buf.format.align();
+            let base = b / buf.format.align() * buf.format.align();
+            let generation = buf.generation.wrapping_add(1);
+            if !s.audio.seek_ring(buf.audio_id, base, generation) {
+                return Ok(INVALID_CALL);
+            }
+            buf.base = base;
             buf.anchor = now;
             buf.queued_frames = 0;
             buf.notice_bytes = u64::from(buf.base);
-            s.audio.set_position(buf.audio_id, buf.base);
-            buf.generation = buf.generation.wrapping_add(1);
-            s.audio.change_generation(buf.audio_id, buf.generation);
+            buf.generation = generation;
             0
         }
         "Play" => {
             if b != 0 || c != 0 || args[3] & !1 != 0 {
                 return Ok(INVALID);
             }
-            if !buf.looping && buf.len != 0 && buf.progress(now) >= u64::from(buf.len) {
-                buf.playing = false;
-                buf.base = 0;
-                s.audio.stop_ring(buf.audio_id);
-                s.audio.set_position(buf.audio_id, 0);
-            }
-            if !buf.playing {
+            let ended = !buf.looping && buf.len != 0 && buf.progress(now) >= u64::from(buf.len);
+            let starting = !buf.playing || ended;
+            let generation = if starting {
+                buf.generation.wrapping_add(1)
+            } else {
+                buf.generation
+            };
+            let base = if ended { 0 } else { buf.base };
+            if starting {
                 // A fresh start is a new playback generation. A naturally ended
                 // buffer can retain unconsumed PCM in the device latency window;
                 // it must not survive reuse of the same DirectSound object.
-                buf.generation = buf.generation.wrapping_add(1);
                 if let Some(trace) = s.trace.as_mut() {
                     let mut bytes = vec![0; buf.len as usize];
                     if buf.len != 0 {
@@ -1417,7 +1427,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         "start us={now} id={a:08x} generation={generation} storage={:08x} bytes={} hash={hash:016x} base={} loop={} rate={} channels={} bits={}",
                         buf.storage_addr(),
                         buf.len,
-                        buf.base,
+                        base,
                         args[3] & 1,
                         buf.frequency,
                         buf.format.channels,
@@ -1465,20 +1475,32 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         fnv1a64: hash,
                     });
                 }
+            }
+            let looping = args[3] & 1 != 0;
+            if !s
+                .audio
+                .play_ring_at(buf.audio_id, looping, generation, ended.then_some(0))
+            {
+                return Ok(INVALID_CALL);
+            }
+            if starting {
+                buf.base = base;
                 buf.anchor = now;
                 buf.queued_frames = 0;
-                buf.notice_bytes = u64::from(buf.base);
+                buf.notice_bytes = u64::from(base);
             }
+            buf.generation = generation;
             buf.playing = true;
-            buf.looping = args[3] & 1 != 0;
-            s.audio.play_ring(buf.audio_id, buf.looping, buf.generation);
+            buf.looping = looping;
             0
         }
         "Stop" => {
+            let generation = buf.generation.wrapping_add(1);
+            if !s.audio.stop_ring_generation(buf.audio_id, generation) {
+                return Ok(INVALID_CALL);
+            }
             buf.stop(now);
-            s.audio.stop_ring(buf.audio_id);
-            buf.generation = buf.generation.wrapping_add(1);
-            s.audio.change_generation(buf.audio_id, buf.generation);
+            buf.generation = generation;
             for &(offset, handle) in &buf.notifications {
                 if offset == u32::MAX {
                     s.ready_notices.push(handle);
@@ -2709,6 +2731,135 @@ mod tests {
             m.cpu.read_u8(storage).is_err(),
             "the pending removal is retried internally, without a second Release call"
         );
+    }
+    #[test]
+    fn saturated_controls_preserve_buffer_state_and_stop_notifications() {
+        let mut m = machine();
+        let b = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            1000,
+        );
+        let source = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .audio_id;
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]),
+            0
+        );
+        let event = m.sys.objects.insert(WaitObject::Event {
+            manual_reset: false,
+            signaled: false,
+        });
+        let sound = m.ext.get::<Sound>();
+        sound
+            .com
+            .get_mut::<Object>(&mut m.sys.objects, b)
+            .unwrap()
+            .buffer
+            .as_mut()
+            .unwrap()
+            .notifications
+            .push((u32::MAX, event));
+        let audio = sound.audio.clone();
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        for _ in 0..6144 {
+            assert!(audio.set_gain(source, 1.0));
+        }
+        assert!(!audio.set_gain(source, 1.0));
+        let before = {
+            let buf = m.ext.get::<Sound>().buffer(&m.sys.objects, b).unwrap();
+            (
+                buf.playing,
+                buf.looping,
+                buf.base,
+                buf.anchor,
+                buf.frequency,
+                buf.generation,
+            )
+        };
+        for (name, args) in [
+            ("Stop", vec![b]),
+            ("SetCurrentPosition", vec![b, 100]),
+            ("Play", vec![b, 0, 0, 0]),
+            ("SetFrequency", vec![b, 2000]),
+        ] {
+            assert_eq!(
+                invoke(&mut m, &format!("IDirectSoundBuffer8::{name}"), &args),
+                INVALID_CALL,
+                "{name} must report backpressure"
+            );
+            let buf = m.ext.get::<Sound>().buffer(&m.sys.objects, b).unwrap();
+            assert_eq!(
+                (
+                    buf.playing,
+                    buf.looping,
+                    buf.base,
+                    buf.anchor,
+                    buf.frequency,
+                    buf.generation
+                ),
+                before
+            );
+        }
+        assert!(m.ext.get::<Sound>().ready_notices.is_empty());
+        for _ in 0..4 {
+            reader.read(&mut [0.0; 2], 0);
+            audio.maintain();
+        }
+        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Stop", &[b]), 0);
+        reader.read(&mut [0.0; 2], 0);
+        pump(&mut m).unwrap();
+        assert!(!audio.active());
+        assert!(matches!(
+            m.sys.objects.get(event),
+            Some(WaitObject::Event { signaled: true, .. })
+        ));
+    }
+
+    #[test]
+    fn seek_with_one_command_slot_commits_position_and_generation_together() {
+        let mut m = machine();
+        let b = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            1000,
+        );
+        let (source, voice) = {
+            let buf = m.ext.get::<Sound>().buffer(&m.sys.objects, b).unwrap();
+            (buf.audio_id, buf.voice.clone().unwrap())
+        };
+        let audio = m.ext.get::<Sound>().audio.clone();
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        for _ in 0..6143 {
+            assert!(audio.set_gain(source, 1.0));
+        }
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::SetCurrentPosition", &[b, 100]),
+            0
+        );
+        let generation = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .generation;
+        for _ in 0..4 {
+            reader.read(&mut [0.0; 2], 0);
+            audio.maintain();
+        }
+        assert_eq!(voice.cursor(0, generation), Some(100));
     }
     #[test]
     fn notifications_wrap_and_natural_stop_signal_real_events() {
