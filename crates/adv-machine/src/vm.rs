@@ -81,6 +81,16 @@ impl Vm {
         Some(addr)
     }
 
+    /// Reserve exactly `size` bytes at a free granule-aligned address. Like a
+    /// Windows section view, the rest of the last granule is neither part of the
+    /// region nor available to later reservations.
+    pub fn reserve_exact(&mut self, size: u32) -> Option<u32> {
+        let granules = size.max(1).checked_add(GRANULE - 1)? & !(GRANULE - 1);
+        let addr = self.find_free(granules)?;
+        self.used.insert(addr, size.max(1));
+        Some(addr)
+    }
+
     /// Reserve and map `size` bytes (rounded up to a granule).
     pub fn alloc(&mut self, cpu: &mut dyn Guest, size: u32, prot: Prot) -> Result<u32, MemFault> {
         let addr = self.reserve(size).ok_or(MemFault { addr: 0, len: size })?;
@@ -222,6 +232,15 @@ mod tests {
         vm.free(&mut guest, address).unwrap();
         assert_eq!(vm.region(address), None);
         assert_eq!(vm.reserve(GRANULE), Some(address));
+    }
+
+    #[test]
+    fn exact_reservations_leave_the_granule_tail_unreserved_but_unusable() {
+        let mut vm = Vm::new();
+        let view = vm.reserve_exact(0x3000).unwrap();
+        assert_eq!(vm.region(view), Some(0x3000));
+        assert_eq!(vm.containing(view + 0x3000), None);
+        assert_eq!(vm.reserve(PAGE), Some(view + GRANULE));
     }
 
     #[test]

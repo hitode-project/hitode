@@ -174,6 +174,21 @@ impl Guest for View<'_> {
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.memory.file_page_copy_on_write(addr)
     }
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.memory
+            .map_private_copy_pages(addr, bytes, prot.0)
+            .map_err(|_| fault(addr, bytes.len()))
+    }
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        self.memory
+            .privatize_copy_pages(addr, len as usize)
+            .map_err(|_| fault(addr, len as usize))
+    }
     fn map_file_pages(
         &mut self,
         addr: u32,
@@ -309,6 +324,17 @@ impl Guest for JitCpu {
     }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.executor().memory.file_page_copy_on_write(addr)
+    }
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.view(|g| g.map_private_copy_pages(addr, bytes, prot))
+    }
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        self.view(|g| g.privatize_copy_pages(addr, len))
     }
     fn map_file_pages(
         &mut self,

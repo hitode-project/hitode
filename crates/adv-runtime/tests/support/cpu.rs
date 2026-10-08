@@ -91,6 +91,17 @@ impl Guest for Cpu {
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.guest().file_page_copy_on_write(addr)
     }
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.guest_mut().map_private_copy_pages(addr, bytes, prot)
+    }
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        self.guest_mut().privatize_copy_pages(addr, len)
+    }
     fn map_file_pages(
         &mut self,
         addr: u32,

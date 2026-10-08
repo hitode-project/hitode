@@ -487,7 +487,7 @@ pub(crate) fn map_section(
     }
     let reserved = span.div_ceil(GRANULE) * GRANULE;
     let address = if base == 0 {
-        match env.sys.vm.reserve(span as u32) {
+        match env.sys.vm.reserve_exact(span as u32) {
             Some(addr) => addr,
             None => return fail(env, 8),
         }

@@ -201,6 +201,15 @@ fn protect(env: &mut Env<'_>) -> Outcome {
         }
         core(env, |env| {
             crate::kernel32::protect_memory(env, address, count, protection, old)
+        })
+        .map_err(|status| {
+            // Native rejects COPY for private memory as parameter 4. The
+            // shared core already publishes PAGE_NOACCESS to OldProtection.
+            if status == 0xc000000d && matches!(protection, 8 | 0x80) {
+                0xc00000f2
+            } else {
+                status
+            }
         })?;
         env.cpu.write_u32(base, page).map_err(|_| 0xc0000005u32)?;
         env.cpu

@@ -74,6 +74,7 @@ pub struct HookData {
     budget_active: bool,
     budget_expired: Arc<AtomicBool>,
     file_pages: BTreeMap<u32, FileBinding>,
+    private_copy_pages: BTreeMap<u32, bool>,
 }
 
 /// The raw engine as trap handlers see it. A local type, so the guest interface defined in
@@ -128,6 +129,7 @@ impl UnicornCpu {
             budget_active: false,
             budget_expired: Arc::default(),
             file_pages: BTreeMap::new(),
+            private_copy_pages: BTreeMap::new(),
         };
         let mut uc = Guarded::new_with_data(Arch::X86, Mode::MODE_32, data)?;
         // Keep one hook for the lifetime of the engine. Adding/removing it per slice
@@ -217,6 +219,16 @@ impl UnicornCpu {
                     }
                 }
                 if ty == MemType::WRITE {
+                    if Engine::from_mut(uc).accessible(addr as u32, size as u32, Prot::WRITE) {
+                        for (_, copy) in uc
+                            .get_data_mut()
+                            .private_copy_pages
+                            .range_mut(start..)
+                            .take_while(|(page, _)| u64::from(**page) < end)
+                        {
+                            *copy = false;
+                        }
+                    }
                     for (_, binding) in uc
                         .get_data_mut()
                         .file_pages
@@ -384,6 +396,9 @@ impl Guest for Engine<'_> {
         Ok(())
     }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
+        if let Some(copy) = self.get_data().private_copy_pages.get(&(addr & !4095)) {
+            return Some(*copy);
+        }
         self.get_data()
             .file_pages
             .get(&(addr & !4095))
@@ -499,6 +514,59 @@ impl Guest for Engine<'_> {
         if !data.is_empty() {
             self.ctl_remove_cache(u64::from(addr), end)
                 .map_err(|_| fault)?;
+            for (_, copy) in self
+                .get_data_mut()
+                .private_copy_pages
+                .range_mut((addr & !4095)..)
+                .take_while(|(page, _)| u64::from(**page) < end)
+            {
+                *copy = false;
+            }
+        }
+        Ok(())
+    }
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        let len = u32::try_from(bytes.len()).map_err(|_| MemFault {
+            addr,
+            len: u32::MAX,
+        })?;
+        self.map(addr, len, prot)?;
+        if let Err(error) = self.write(addr, bytes) {
+            let _ = self.unmap(addr, len);
+            return Err(error);
+        }
+        for index in 0..len / 4096 {
+            let page = addr + index * 4096;
+            self.get_data_mut().private_copy_pages.insert(page, true);
+        }
+        Ok(())
+    }
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        if !addr.is_multiple_of(4096)
+            || len == 0
+            || !len.is_multiple_of(4096)
+            || u64::from(addr) + u64::from(len) > 1u64 << 32
+            || !self.accessible(addr, len, Prot::default())
+            || (0..len / 4096).any(|index| {
+                !self
+                    .get_data()
+                    .private_copy_pages
+                    .contains_key(&(addr + index * 4096))
+            })
+        {
+            return Err(MemFault { addr, len });
+        }
+        for index in 0..len / 4096 {
+            *self
+                .get_data_mut()
+                .private_copy_pages
+                .get_mut(&(addr + index * 4096))
+                .unwrap() = false;
         }
         Ok(())
     }
@@ -671,6 +739,7 @@ impl Guest for Engine<'_> {
             } else {
                 self.mem_unmap(page.into(), 4096).map_err(|_| fault)?;
             }
+            self.get_data_mut().private_copy_pages.remove(&page);
         }
         Ok(())
     }
@@ -697,6 +766,17 @@ impl Guest for UnicornCpu {
     }
     fn file_page_copy_on_write(&self, addr: u32) -> Option<bool> {
         self.uc.file_page_copy_on_write(addr)
+    }
+    fn map_private_copy_pages(
+        &mut self,
+        addr: u32,
+        bytes: &[u8],
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.uc.map_private_copy_pages(addr, bytes, prot)
+    }
+    fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+        self.uc.privatize_copy_pages(addr, len)
     }
     fn map_file_pages(
         &mut self,
@@ -949,6 +1029,23 @@ impl Backend for UnicornCpu {
 mod file_page_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn private_copy_pages_allow_execution_and_track_host_stores_per_page() {
+        let mut cpu = UnicornCpu::new(0x8000).unwrap();
+        cpu.map_private_copy_pages(0x10000, &[0x37; 8192], Prot::RX)
+            .unwrap();
+        assert_eq!(cpu.file_page_copy_on_write(0x10000), Some(true));
+        cpu.protect(0x10000, 4096, Prot::RWX).unwrap();
+        assert_eq!(cpu.file_page_copy_on_write(0x10000), Some(true));
+        cpu.write(0x10000, &[0x19]).unwrap();
+        assert_eq!(cpu.file_page_copy_on_write(0x10000), Some(false));
+        assert_eq!(cpu.file_page_copy_on_write(0x11000), Some(true));
+        cpu.unmap(0x10000, 4096).unwrap();
+        assert_eq!(cpu.file_page_copy_on_write(0x10000), None);
+        cpu.map(0x10000, 4096, Prot::RW).unwrap();
+        assert_eq!(cpu.file_page_copy_on_write(0x10000), None);
+    }
 
     #[test]
     fn cross_page_host_write_is_atomic_on_lazy_io_failure_and_retries() {

@@ -242,7 +242,7 @@ fn reservation<B: Backend>(make: impl Fn() -> B) {
     );
     release(&mut env(&mut m), REMOTE, 0, MEM_RELEASE).unwrap();
     let info = query(&mut env(&mut m), REMOTE).unwrap();
-    assert_eq!(info, [REMOTE, 0, 0, 0x7e000000 - REMOTE, MEM_FREE, 0, 0]);
+    assert_eq!(info, [REMOTE, 0, 0, 0x7e000000 - REMOTE, MEM_FREE, 1, 0]);
     assert_eq!(
         allocate(&mut env(&mut m), REMOTE, PAGE, MEM_COMMIT, 4)
             .unwrap_err()
@@ -262,6 +262,59 @@ fn reservations_commit_decommit_and_query_the_actual_page_states() {
         reservation(|| JitCpu::new(PARK_ADDR, jit).unwrap());
     }
     reservation(|| UnicornCpu::new(PARK_ADDR).unwrap());
+}
+
+fn private_copy_rejected<B: Backend>(cpu: B) {
+    let mut machine = machine(cpu, 0x1000);
+    for protection in [8, 0x80] {
+        for ty in [MEM_RESERVE, MEM_RESERVE | MEM_COMMIT] {
+            assert_eq!(
+                allocate(&mut env(&mut machine), REMOTE, PAGE, ty, protection)
+                    .unwrap_err()
+                    .code,
+                err::INVALID_PARAMETER
+            );
+            assert!(machine.sys.vm.containing(REMOTE).is_none());
+        }
+    }
+    allocate(
+        &mut env(&mut machine),
+        REMOTE,
+        2 * PAGE,
+        MEM_RESERVE | MEM_COMMIT,
+        4,
+    )
+    .unwrap();
+    machine.cpu.write(REMOTE, b"preserved").unwrap();
+    for protection in [8, 0x80] {
+        machine.cpu.write_u32(OLD, 0x24681357).unwrap();
+        assert_eq!(
+            returned(protect_memory(
+                &mut env(&mut machine),
+                REMOTE,
+                PAGE,
+                protection,
+                OLD
+            )),
+            0
+        );
+        assert_eq!(
+            crate::util::last_error(&env(&mut machine)),
+            err::INVALID_PARAMETER
+        );
+        assert_eq!(word(&machine, OLD), 1);
+        assert_eq!(query(&mut env(&mut machine), REMOTE).unwrap()[5], 4);
+        assert_eq!(bytes(&machine, REMOTE, 9), b"preserved");
+    }
+}
+
+/// Authored x86 Windows oracle: native-cow-1 private cases 40 through 45.
+#[test]
+fn private_copy_requests_fail_without_reserving_or_changing_pages() {
+    for jit in [false, true] {
+        private_copy_rejected(JitCpu::new(PARK_ADDR, jit).unwrap());
+    }
+    private_copy_rejected(UnicornCpu::new(PARK_ADDR).unwrap());
 }
 
 fn failures<B: Backend>(make: impl Fn() -> B) {
@@ -504,5 +557,51 @@ fn native_windows_confirms_partial_counts_recommit_and_executable_writes() {
             previous, 0x20,
             "debugger writes restore executable protection"
         );
+    }
+}
+
+/// Free address space and image views as native VirtualQuery describes them.
+#[cfg(windows)]
+#[test]
+fn native_windows_confirms_free_and_image_query_protections() {
+    use std::ffi::c_void;
+    #[repr(C)]
+    #[derive(Default)]
+    struct Basic {
+        base: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition: u16,
+        size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualAlloc(address: *mut c_void, size: usize, ty: u32, protection: u32)
+        -> *mut c_void;
+        fn VirtualFree(address: *mut c_void, size: usize, ty: u32) -> i32;
+        fn VirtualQuery(address: *const c_void, info: *mut Basic, size: usize) -> usize;
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+    let size = std::mem::size_of::<Basic>();
+    // SAFETY: Queries only describe addresses; the reservation is released
+    // before its now-free range is described and never dereferenced.
+    unsafe {
+        let region = VirtualAlloc(std::ptr::null_mut(), PAGE as usize, MEM_RESERVE, 4);
+        assert!(!region.is_null());
+        assert_ne!(VirtualFree(region, 0, MEM_RELEASE), 0);
+        let mut free = Basic::default();
+        assert_eq!(VirtualQuery(region, &mut free, size), size);
+        assert_eq!(
+            (free.state, free.protect, free.allocation_base),
+            (MEM_FREE, 1, 0)
+        );
+        let image = GetModuleHandleW(std::ptr::null());
+        let mut view = Basic::default();
+        assert_eq!(VirtualQuery(image, &mut view, size), size);
+        assert_eq!(view.allocation_base, image as usize);
+        assert_eq!((view.allocation_protect, view.kind), (0x80, 0x100_0000));
     }
 }
