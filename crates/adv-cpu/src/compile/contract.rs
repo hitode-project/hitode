@@ -97,3 +97,80 @@ impl Emitter<'_> {
             .return_call_indirect(self.tail_ref, address, &args);
     }
 }
+
+/// A cold return entered both by a checked guard and by a registered fault.
+/// Its only input is an explicit stack slot, never a live guest or host GPR.
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+#[derive(Clone, Copy)]
+pub(super) struct RecoveryExit {
+    block: ir::Block,
+    result: ir::StackSlot,
+}
+
+#[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+impl RecoveryExit {
+    const MARKER: u32 = 2;
+
+    pub fn new(b: &mut FunctionBuilder<'_>) -> Self {
+        let block = b.create_block();
+        b.set_cold_block(block);
+        let result = b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            4,
+            2,
+        ));
+        Self { block, result }
+    }
+
+    pub fn jump(self, b: &mut FunctionBuilder<'_>) {
+        let reason = b.ins().iconst(types::I32, Exit::ReadFault as i64);
+        b.ins().stack_store(reason, self.result, 0);
+        b.ins().jump(self.block, &[]);
+    }
+
+    pub fn publish(self, b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: Value) {
+        let address = b.ins().stack_addr(ptr, self.result, 0);
+        let cell = b.ins().load(
+            ptr,
+            MemFlags::trusted(),
+            context,
+            offset_of!(NativeContext, recovery_slot) as i32,
+        );
+        // Only a registered hardware-read session reaches this publication.
+        // The backend owns the stack address, including outgoing-call space.
+        b.ins().store(MemFlags::trusted(), address, cell, 0);
+    }
+
+    pub fn emit(self, b: &mut FunctionBuilder<'_>, ptr: ir::Type) {
+        b.switch_to_block(self.block);
+        b.set_srcloc(ir::SourceLoc::new(Self::MARKER));
+        let address = b.ins().stack_addr(ptr, self.result, 0);
+        // Atomic loads cannot be forwarded from a normal predecessor's store.
+        // The signal path writes this private slot before resuming this block.
+        let reason = b
+            .ins()
+            .atomic_load(types::I32, MemFlags::trusted(), address);
+        b.ins().return_(&[reason]);
+        b.set_srcloc(ir::SourceLoc::default());
+    }
+
+    pub fn location(self, code: &cranelift_codegen::CompiledCode) -> Option<usize> {
+        let marker = code
+            .buffer
+            .get_srclocs_sorted()
+            .iter()
+            .filter(|range| range.loc.bits() == Self::MARKER)
+            .map(|range| range.start)
+            .min()?;
+        // The marker is the sole memory effect in an otherwise empty return
+        // block. Enter the backend's block start, including address formation
+        // and register-allocation edits, instead of inspecting epilogue bytes.
+        let start = code
+            .bb_starts
+            .iter()
+            .copied()
+            .filter(|offset| *offset <= marker)
+            .max()?;
+        Some(start as usize)
+    }
+}

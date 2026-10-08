@@ -244,6 +244,8 @@ impl Compiled {
             stop: controls.stop,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            recovery_slot: std::ptr::null(),
             linked_entries: 0,
             shadow,
             direct: memory.direct_engine_pointer(),
@@ -321,13 +323,23 @@ impl Compiled {
             )
         }
         .ok()?;
+        let recovery_slot = std::cell::Cell::new(0);
+        context.recovery_slot = &recovery_slot;
         let result = unsafe {
-            crate::host_fault::with_native_session(state, &[region], window, guest_base, |state| {
-                context.state = state;
-                context.fault_reads = 1;
-                (self.entry)(context, pointer)
-            })
+            crate::host_fault::with_native_session(
+                state,
+                &[region],
+                window,
+                guest_base,
+                &recovery_slot,
+                |state| {
+                    context.state = state;
+                    context.fault_reads = 1;
+                    (self.entry)(context, pointer)
+                },
+            )
         };
+        context.recovery_slot = std::ptr::null();
         match result {
             Ok((result, _)) => Some(result),
             Err(_) => {
@@ -943,9 +955,17 @@ fn compile_snapshot_with_inline(
     };
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let invariant_plan = invariant_plan.filter(|_| !snapshot.native_fault_reads);
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    let recovery_cfg = snapshot.native_fault_reads;
+    #[cfg(not(all(windows, target_arch = "x86_64", target_env = "msvc")))]
+    let recovery_cfg = false;
     let backend_flags = [
         ("opt_level", opt_level),
         ("preserve_frame_pointers", "true"),
+        (
+            "machine_code_cfg_info",
+            if recovery_cfg { "true" } else { "false" },
+        ),
         (
             "enable_verifier",
             if verifier_enabled() { "true" } else { "false" },
@@ -1925,11 +1945,7 @@ fn compile_snapshot_with_inline(
         }
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
         if let Some(block) = e.fault_return {
-            e.b.switch_to_block(block);
-            e.b.set_srcloc(ir::SourceLoc::new(fault::RETURN_SOURCE));
-            let reason = e.constant(Exit::ReadFault as u32);
-            e.b.ins().return_(&[reason]);
-            e.b.set_srcloc(ir::SourceLoc::default());
+            block.emit(&mut e.b, ptr_ty);
             fault_draft = e.fault_draft.take();
         }
         #[cfg(all(
@@ -3217,7 +3233,7 @@ struct Emitter<'a> {
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     fault_draft: Option<fault::Pending>,
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    fault_return: Option<ir::Block>,
+    fault_return: Option<contract::RecoveryExit>,
 }
 
 impl Emitter<'_> {
@@ -5187,7 +5203,7 @@ impl Emitter<'_> {
             self.b.append_block_param(done, ty);
         }
         #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-        if let Some((enabled, _)) = hardware {
+        if let Some((enabled, recovery)) = hardware {
             let classify = self.b.create_block();
             let checked = self.b.create_block();
             let raw = self.b.create_block();
@@ -5203,6 +5219,7 @@ impl Emitter<'_> {
                 .band_imm(combined, i64::from(crate::memory::SHARED));
             self.b.ins().brif(shared, checked, &[], raw, &[]);
             self.b.switch_to_block(raw);
+            recovery.publish(&mut self.b, self.ptr_ty, self.context);
             self.b.set_srcloc(ir::SourceLoc::new(fault::LOAD_SOURCE));
             let result = self.b.ins().load(
                 ty,
@@ -5371,7 +5388,7 @@ impl Emitter<'_> {
         &mut self,
         address: Value,
         width: usize,
-    ) -> Option<(Value, ir::Block)> {
+    ) -> Option<(Value, contract::RecoveryExit)> {
         let variable = self.fault_mode?;
         let outputs = std::array::from_fn(|index| match index {
             0..=7 => self.b.use_var(self.regs[index]),
@@ -5380,6 +5397,7 @@ impl Emitter<'_> {
             16 => self.b.use_var(self.fuel),
             _ => address,
         });
+        let recovery = contract::RecoveryExit::new(&mut self.b);
         let draft = fault::Draft::capture(
             &mut self.b,
             &self.fault_seeds,
@@ -5388,18 +5406,17 @@ impl Emitter<'_> {
             self.fault_entry,
             self.pc,
             width,
+            recovery,
         )?;
         let enabled = self.b.use_var(variable);
         let disabled = self.b.ins().iconst(types::I8, 0);
         self.b.def_var(variable, disabled);
-        let recovery = self.b.create_block();
-        self.b.set_cold_block(recovery);
         self.fault_return = Some(recovery);
         self.fault_draft = Some(draft);
         Some((enabled, recovery))
     }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    fn checked_read_guard(&mut self, bad: Value, address: Value, recovery: ir::Block) {
+    fn checked_read_guard(&mut self, bad: Value, address: Value, recovery: contract::RecoveryExit) {
         let failed = self.b.create_block();
         self.b.set_cold_block(failed);
         let continued = self.b.create_block();
@@ -5413,7 +5430,7 @@ impl Emitter<'_> {
         );
         let pc = self.constant(self.pc);
         self.save_state(pc);
-        self.b.ins().jump(recovery, &[]);
+        recovery.jump(&mut self.b);
         self.b.switch_to_block(continued);
     }
     fn direct_store(&mut self, addr: Value, value: Value) {

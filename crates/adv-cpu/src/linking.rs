@@ -158,6 +158,9 @@ pub(crate) struct NativeContext {
     /// transfers clear this flag before entering another checked region.
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     pub fault_reads: u8,
+    /// Private session cell receiving the IR-owned recovery stack address.
+    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+    pub recovery_slot: *const std::cell::Cell<usize>,
     pub linked_entries: u64,
     /// Exclusive metadata borrowed for this chain. Cleared before/after native
     /// execution, so it cannot retain a target across publication or retirement.

@@ -651,6 +651,8 @@ fn execute(batch: &Batch) {
             stop: 0,
             #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
             fault_reads: 0,
+            #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+            recovery_slot: std::ptr::null(),
             linked_entries: 0,
             shadow: std::ptr::null_mut(),
             direct: std::ptr::null(),
@@ -1112,6 +1114,8 @@ mod tests {
                 stop: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 fault_reads: 0,
+                #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+                recovery_slot: std::ptr::null(),
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
                 direct: std::ptr::null(),
@@ -1198,6 +1202,8 @@ mod tests {
                 stop: 0,
                 #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
                 fault_reads: 0,
+                #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+                recovery_slot: std::ptr::null(),
                 linked_entries: 0,
                 shadow: std::ptr::null_mut(),
                 direct: std::ptr::null(),

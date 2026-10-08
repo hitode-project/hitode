@@ -98,6 +98,7 @@ pub(crate) struct FaultSite {
     pub guest_pc: u32,
     pub width: usize,
     pub access: Access,
+    pub recovery_result: Option<u32>,
 }
 
 /// Retains an immutable borrow of the actual code owner for an entire native
@@ -145,8 +146,9 @@ impl<'a> CodeRegion<'a> {
     }
     /// # Safety
     /// Every recipe describes the exact first scalar load of a fresh native
-    /// entry. Its machine PC and same-frame epilogue have been verified against
-    /// finalized code, and that code's owner remains borrowed for this session.
+    /// entry. Its machine PC and same-frame return come from finalized IR
+    /// metadata. Before that load, the IR publishes its private result-slot
+    /// address to the native session. The owner stays borrowed for the session.
     pub(crate) unsafe fn with_recipes(
         owner: &'a dyn Any,
         start: usize,
@@ -199,6 +201,7 @@ impl Checkpoint {
 struct Session<'a> {
     state: *mut CpuState,
     checkpoint: Option<&'a Checkpoint>,
+    recovery_slot: Option<&'a Cell<usize>>,
     regions: &'a [CodeRegion<'a>],
     window: (usize, usize),
     guest_base: u32,
@@ -245,6 +248,7 @@ pub(crate) fn with_session<R>(
     session(
         state,
         Some(checkpoint),
+        None,
         regions,
         (window.ptr.as_ptr() as usize, window.len),
         guest_base,
@@ -256,19 +260,31 @@ pub(crate) fn with_session<R>(
 /// The execution owner pins this reservation for the entire closure. Store
 /// only its address bounds: Rust helpers may borrow the enclosing Memory
 /// mutably, so no overlapping `&Reservation` is held across a native call.
+/// Before any registered fault, generated IR must publish the address of its
+/// live, writable result stack slot to `recovery_slot` on this same thread.
 pub(crate) unsafe fn with_native_session<R>(
     state: &mut CpuState,
     regions: &[CodeRegion<'_>],
     window: (usize, usize),
     guest_base: u32,
+    recovery_slot: &Cell<usize>,
     run: impl FnOnce(*mut CpuState) -> R,
 ) -> Result<(R, u64), String> {
-    session(state, None, regions, window, guest_base, run)
+    session(
+        state,
+        None,
+        Some(recovery_slot),
+        regions,
+        window,
+        guest_base,
+        run,
+    )
 }
 
 fn session<R>(
     state: &mut CpuState,
     checkpoint: Option<&Checkpoint>,
+    recovery_slot: Option<&Cell<usize>>,
     regions: &[CodeRegion<'_>],
     window: (usize, usize),
     guest_base: u32,
@@ -278,6 +294,7 @@ fn session<R>(
     let mut session = Session {
         state,
         checkpoint,
+        recovery_slot,
         regions,
         window,
         guest_base,
@@ -359,6 +376,17 @@ unsafe extern "C" fn dispatch(
             if start < session.window.0 || end > window_end || !(start..end).contains(&address) {
                 return 0;
             }
+            let return_slot = if let Some(result) = site.recovery_result {
+                let Some(address) = session.recovery_slot.map(Cell::get) else {
+                    return 0;
+                };
+                if address == 0 || address % 4 != 0 {
+                    return 0;
+                }
+                Some((address as *mut u32, result))
+            } else {
+                None
+            };
             // SAFETY: all recipe inputs have been staged before these writes;
             // legacy checkpoints are distinct allocations. CpuState has no
             // owning fields and no Rust references escape the stopped worker.
@@ -378,6 +406,11 @@ unsafe extern "C" fn dispatch(
                 }
                 (*session.state).eip = site.guest_pc;
                 (*session.state).fault_addr = operand;
+                if let Some((slot, result)) = return_slot {
+                    // The exact-PC registration owns this stopped frame and
+                    // uses the stack address published by its own IR.
+                    slot.write_volatile(result);
+                }
             }
             session.recovered.set(session.recovered.get() + 1);
             site.recovery_pc
@@ -755,6 +788,7 @@ mod tests {
                 guest_pc: PC,
                 width: if wide { 16 } else { 4 },
                 access,
+                recovery_result: None,
             },
             module: Some(module),
             unwind,
