@@ -25,6 +25,7 @@ pub mod code_signature;
 pub mod constants;
 pub mod guest;
 pub mod ordinals;
+pub mod personality;
 pub mod signature;
 pub mod stub;
 pub mod system_exports;
@@ -34,10 +35,11 @@ pub mod trace;
 pub mod types;
 
 pub use guest::{AnsiStr, Arguments, GuestArg, GuestPtr, GuestReturn, Handle, WideStr};
+pub use personality::ExportClass;
 pub use signature::{AbiKind, Parameter, Signature};
 pub use stub::{
-    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RunMode, StubCall,
-    warn_structural, warn_unavailable,
+    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RejectedProbe,
+    RunMode, StubCall, warn_structural, warn_unavailable,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +81,8 @@ pub struct Registry {
     data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
     replacements: std::collections::BTreeSet<String>,
+    /// Development probe: discovery exposes the whole fixed core catalog.
+    expose_fixed_exports: bool,
 }
 
 impl Default for Registry {
@@ -90,6 +94,8 @@ impl Default for Registry {
             data: HashMap::new(),
             mode: RunMode::Strict,
             replacements: Default::default(),
+            expose_fixed_exports: std::env::var_os("ADV_PERSONALITY_STRICT")
+                .is_some_and(|value| value == "1"),
         }
     }
 }
@@ -259,6 +265,14 @@ impl Registry {
     pub fn set_mode(&mut self, mode: RunMode) {
         self.mode = mode;
     }
+    /// ADV_PERSONALITY_STRICT=1 restores whole-catalog discovery for probing
+    /// which names a title asks for; calls to missing behavior still fail.
+    pub fn set_expose_fixed_exports(&mut self, expose: bool) {
+        self.expose_fixed_exports = expose;
+    }
+    pub fn exposes_fixed_exports(&self) -> bool {
+        self.expose_fixed_exports
+    }
 
     pub fn get(&self, module: &str, name: &str) -> Option<HostFn> {
         let canonical = self.canonical_name(module, name);
@@ -311,6 +325,15 @@ impl Registry {
                 .then(|| self.fns.get(&("kernel32.dll".to_owned(), name.to_owned())))
                 .flatten()
             })
+            .or_else(|| {
+                // A fixed forwarder shares its target's ABI, so a frontend
+                // registered under the forwarding name implements the target.
+                system_exports::forwarded_from(&module, name)
+                    .iter()
+                    .find_map(|(source, alias)| {
+                        self.fns.get(&((*source).to_owned(), (*alias).to_owned()))
+                    })
+            })
     }
 
     /// An explicit implementation wins over a named or SDK ordinal alias.
@@ -344,28 +367,48 @@ impl Registry {
         self.registered_entry(module, name).is_some() || self.data(module, name).is_some()
     }
 
-    /// Fixed personality exports expose existence, independently of behavior.
-    /// Other DLLs advertise registered behavior or reviewed proxy exceptions;
-    /// signature metadata alone never promises their dynamic capability.
-    pub fn dynamic_available(&self, module: &str, name: &str) -> bool {
+    /// The personality class of a declared export, or None for a name the
+    /// personality never declares. Fixed forwarders are classified by their
+    /// final target; a frontend under either name implements both.
+    pub fn classify(&self, module: &str, name: &str) -> Option<ExportClass> {
         let name = self.canonical_name(module, name).unwrap_or(name);
-        if system_exports::has_module(module) {
-            return system_exports::lookup(module, name).is_some_and(|export| {
-                !matches!(export.kind, system_exports::Kind::DataUnsupported)
-                    || self.data(module, name).is_some()
-            });
+        let (target, target_name) = if system_exports::has_module(module) {
+            let export = system_exports::lookup(module, name)?;
+            if export.kind == system_exports::Kind::DataUnsupported {
+                return Some(if self.data(module, name).is_some() {
+                    ExportClass::Implemented
+                } else {
+                    ExportClass::DataUnsupported
+                });
+            }
+            system_exports::final_target(module, export.name).unwrap_or((module, name))
+        } else {
+            (module, name)
+        };
+        if self.is_implemented(module, name) || self.is_implemented(target, target_name) {
+            Some(ExportClass::Implemented)
+        } else if personality::is_reviewed(module, name)
+            || personality::is_reviewed(target, target_name)
+        {
+            Some(ExportClass::Reviewed)
+        } else if system_exports::has_module(module) || signature::lookup(module, name).is_some() {
+            Some(ExportClass::Hidden)
+        } else {
+            None
         }
-        self.is_implemented(module, name)
-            || include_str!("../../../data/abi/dynamic_exports.tsv")
-                .lines()
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .any(|line| {
-                    let mut fields = line.split('\t');
-                    fields
-                        .next()
-                        .is_some_and(|dll| dll.eq_ignore_ascii_case(module))
-                        && fields.next() == Some(name)
-                })
+    }
+
+    /// Discovery exposes only callable capability, so a title's own fallback
+    /// for an older Windows still runs. ADV_PERSONALITY_STRICT=1 additionally
+    /// exposes hidden fixed core names.
+    pub fn dynamic_available(&self, module: &str, name: &str) -> bool {
+        match self.classify(module, name) {
+            Some(class) if class.discoverable() => true,
+            Some(ExportClass::Hidden) => {
+                self.expose_fixed_exports && system_exports::has_module(module)
+            }
+            _ => false,
+        }
     }
     pub fn len(&self) -> usize {
         self.fns.len() + self.data.len()

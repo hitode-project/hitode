@@ -68,22 +68,33 @@ fn data_declarations_have_width_and_cannot_be_function_bindings() {
 }
 
 #[test]
-fn dynamic_availability_keeps_fixed_existence_separate_from_implementation() {
+fn dynamic_availability_exposes_fixed_names_only_with_capability() {
     let mut registry = Registry::default();
+    registry.set_expose_fixed_exports(false);
     for mode in [RunMode::Strict, RunMode::Discovery] {
         registry.set_mode(mode);
         assert!(
             registry.get("kernel32.dll", "FlsAlloc").is_some(),
             "metadata retains a static diagnostic handler"
         );
-        assert!(registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+        // Structure keeps the name; discovery hides it until it is callable.
+        assert!(adv_abi::system_exports::is_core_export(
+            "kernel32.dll",
+            "FlsAlloc"
+        ));
+        assert!(!registry.dynamic_available("kernel32.dll", "FlsAlloc"));
         assert!(!registry.is_implemented("kernel32.dll", "FlsAlloc"));
         assert!(!registry.dynamic_available("kernel32.dll", "UnknownOptionalExport"));
         assert!(registry.dynamic_available("DWRITE.DLL", "DWriteCreateFactory"));
         assert!(registry.dynamic_available("d2d1.dll", "#1"));
-        assert!(registry.dynamic_available("kernel32.dll", "CreateFileW"));
+        assert!(!registry.dynamic_available("kernel32.dll", "CreateFileW"));
         assert!(!registry.dynamic_available("d3d11.dll", "D3D11CreateDeviceAndSwapChain"));
     }
+    // ADV_PERSONALITY_STRICT restores whole-catalog discovery, never data stubs.
+    registry.set_expose_fixed_exports(true);
+    assert!(registry.dynamic_available("kernel32.dll", "FlsAlloc"));
+    assert!(!registry.dynamic_available("kernel32.dll", "UnknownOptionalExport"));
+    registry.set_expose_fixed_exports(false);
     registry.register(adv_abi::Api {
         module: "kernel32.dll",
         name: "FlsAlloc",
@@ -96,6 +107,28 @@ fn dynamic_availability_keeps_fixed_existence_separate_from_implementation() {
         registry.level("kernel32.dll", "FlsAlloc"),
         Some(ImplementationLevel::SafeFail)
     );
+}
+
+#[test]
+fn a_frontend_under_a_forwarding_name_implements_its_fixed_target() {
+    let mut registry = Registry::default();
+    registry.set_expose_fixed_exports(false);
+    assert_eq!(
+        adv_abi::system_exports::final_target("kernel32.dll", "SetThreadpoolTimer"),
+        Some(("ntdll.dll", "TpSetTimer"))
+    );
+    assert!(!registry.dynamic_available("ntdll.dll", "TpSetTimer"));
+    registry.register(adv_abi::Api {
+        module: "kernel32.dll",
+        name: "SetThreadpoolTimer",
+        conv: Conv::Stdcall { argc: 4 },
+        handler: |_| Outcome::Return(0),
+        level: ImplementationLevel::Implement,
+    });
+    // The loader binds kernel32's forwarder to ntdll; both names are callable.
+    assert!(registry.is_implemented("ntdll.dll", "TpSetTimer"));
+    assert!(registry.dynamic_available("ntdll.dll", "TpSetTimer"));
+    assert!(registry.dynamic_available("kernel32.dll", "SetThreadpoolTimer"));
 }
 
 #[test]
@@ -292,7 +325,7 @@ fn guest_pointers_reject_null_overflow_and_protected_writes() {
 fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
     let mut machine = machine(Registry::default());
     let thunk = machine
-        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .resolve_import("dsound.dll", "DirectSoundCreate")
         .unwrap();
     let mut code = Asm::new(CODE);
     code.push_imm(DATA)
@@ -307,10 +340,10 @@ fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
     let diagnostics = machine.ext.get::<ApiDiagnostics>();
     assert_eq!(diagnostics.stub_calls, 1);
     assert_eq!(diagnostics.recent_stubs[0].caller, caller);
-    assert_eq!(diagnostics.recent_stubs[0].name, "DWriteCreateFactory");
+    assert_eq!(diagnostics.recent_stubs[0].name, "DirectSoundCreate");
     assert_eq!(
         diagnostics.warnings.get(&(
-            "dwrite.dll!DWriteCreateFactory".into(),
+            "dsound.dll!DirectSoundCreate".into(),
             "API has no implemented frontend; using a generated ABI failure stub".into(),
         )),
         Some(&1),
@@ -321,7 +354,7 @@ fn strict_stub_stops_and_records_exact_caller_without_returning_success() {
             .sys
             .thunks
             .iter()
-            .any(|(_, t)| t.name == "DWriteCreateFactory" && !t.implemented)
+            .any(|(_, t)| t.name == "DirectSoundCreate" && !t.implemented)
     );
 }
 
@@ -331,7 +364,7 @@ fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
     registry.set_mode(RunMode::Discovery);
     let mut machine = machine(registry);
     let thunk = machine
-        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .resolve_import("dsound.dll", "DirectSoundCreate")
         .unwrap();
     machine.cpu.write_u32(DATA, 0xdead_beef).unwrap();
     let mut code = Asm::new(CODE);
@@ -361,10 +394,43 @@ fn discovery_returns_failure_sets_thread_error_and_preserves_stdcall_stack() {
         120
     );
     assert_eq!(
-        machine.ext.get::<ApiDiagnostics>().gaps["dwrite.dll!DWriteCreateFactory"],
+        machine.ext.get::<ApiDiagnostics>().gaps["dsound.dll!DirectSoundCreate"],
         1
     );
     assert_eq!(machine.ext.get::<ApiDiagnostics>().warnings.len(), 1);
+}
+
+#[test]
+fn reviewed_export_returns_its_failure_contract_in_strict_mode_without_a_stub_call() {
+    let mut machine = machine(Registry::default());
+    let thunk = machine
+        .resolve_import("dwrite.dll", "DWriteCreateFactory")
+        .unwrap();
+    machine.cpu.write_u32(DATA, 0xdead_beef).unwrap();
+    let mut code = Asm::new(CODE);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 16)
+        .push_imm(DATA)
+        .push_imm(DATA + 32)
+        .push_imm(0)
+        .call(thunk)
+        .mov_mem_eax(DATA + 4);
+    code.bytes.extend_from_slice(&[0x89, 0xe0]);
+    code.mov_mem_eax(DATA + 20);
+    assert!(matches!(execute(&mut machine, code), RunResult::Exited(0)));
+    assert_eq!(machine.cpu.read_u32(DATA + 4).unwrap(), 0x8000_4001);
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), 0xdead_beef);
+    assert_eq!(
+        machine.cpu.read_u32(DATA + 16).unwrap(),
+        machine.cpu.read_u32(DATA + 20).unwrap()
+    );
+    let diagnostics = machine.ext.get::<ApiDiagnostics>();
+    assert_eq!(diagnostics.stub_calls, 0);
+    assert_eq!(
+        diagnostics.reviewed_calls["dwrite.dll!DWriteCreateFactory"],
+        1
+    );
+    assert!(diagnostics.acceptance_eligible(RunMode::Strict));
 }
 
 #[test]

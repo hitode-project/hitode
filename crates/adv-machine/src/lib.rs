@@ -28,6 +28,7 @@ pub mod stats;
 pub mod thunk;
 pub mod trace;
 pub mod vm;
+pub mod wait_diagnostics;
 mod wake_queue;
 pub use wake_queue::WakePriority;
 
@@ -540,6 +541,9 @@ impl Sys {
                 context.bootstrap_pending = None;
                 context.initial_registers.clear();
                 self.wakes.retire(context.id);
+                if let Some(diagnostics) = &mut self.stats.wait_diagnostics {
+                    diagnostics.retire(context.id);
+                }
             }
         }
     }
@@ -570,6 +574,9 @@ impl Sys {
         context.bootstrap_pending = None;
         context.initial_registers.clear();
         self.wakes.retire(id);
+        if let Some(diagnostics) = &mut self.stats.wait_diagnostics {
+            diagnostics.retire(id);
+        }
         if self.contexts.iter().all(Context::is_done) {
             self.process_identity.completion.complete(exit_code);
         }
@@ -771,6 +778,9 @@ impl Sys {
         };
         if let Some(deadline) = deadline {
             self.scheduling.timed_wake(now, deadline);
+        }
+        if let Some(diagnostics) = &mut self.stats.wait_diagnostics {
+            diagnostics.wake(i as CtxId, reason, now);
         }
         self.wakes.wake(i as CtxId, now, deadline);
         self.schedule_trace
@@ -1682,6 +1692,9 @@ impl<B: Backend> Machine<B> {
             return false;
         }
         self.sys.scheduling.active_time_skips += 1;
+        if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
+            diagnostics.skip(advanced);
+        }
         self.sys.scheduling.active_time_skip_us = self
             .sys
             .scheduling
@@ -1916,6 +1929,18 @@ impl<B: Backend> Machine<B> {
                 origin,
                 ..
             } => {
+                if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
+                    let now = self.sys.clock.now_us();
+                    diagnostics.begin(
+                        id,
+                        origin.thunk,
+                        &self.sys.thunks,
+                        &self.sys.objects,
+                        &Wait::Yield,
+                        now,
+                    );
+                    diagnostics.wake(id, WakeReason::Timeout, now);
+                }
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Woke {
                         then,
@@ -1932,6 +1957,16 @@ impl<B: Backend> Machine<B> {
                 origin,
                 allow_time_skip,
             } => {
+                if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
+                    diagnostics.begin(
+                        id,
+                        origin.thunk,
+                        &self.sys.thunks,
+                        &self.sys.objects,
+                        &wait,
+                        self.sys.clock.now_us(),
+                    );
+                }
                 let (kind, resource) = match &wait {
                     Wait::Until(at) => (1, *at),
                     Wait::Object { handle, .. } => (2, u64::from(*handle)),
@@ -1956,6 +1991,9 @@ impl<B: Backend> Machine<B> {
                 ctx.bootstrap_pending = None;
                 ctx.start = None;
                 self.sys.wakes.retire(id);
+                if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
+                    diagnostics.retire(id);
+                }
                 if self.sys.contexts.iter().all(Context::is_done) {
                     self.sys.process_identity.completion.complete(code);
                     return Some(self.complete_process_exit(code));
@@ -1970,6 +2008,9 @@ impl<B: Backend> Machine<B> {
                 ctx.bootstrap_pending = None;
                 ctx.start = None;
                 self.sys.wakes.retire(id);
+                if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
+                    diagnostics.retire(id);
+                }
                 self.sys.terminate_other_contexts(code);
                 return Some(self.complete_process_exit(code));
             }
@@ -2243,6 +2284,10 @@ impl<B: Backend> Machine<B> {
             polled[id as usize] = self.sys.contexts[id as usize].yielded;
             if let Err(e) = self.switch_to(id) {
                 return SliceResult::Complete(self.fail(format!("context switch: {e}")));
+            }
+
+            if let Some(diagnostics) = &mut self.sys.stats.wait_diagnostics {
+                diagnostics.dispatch(id);
             }
 
             self.sys.schedule_trace.event(

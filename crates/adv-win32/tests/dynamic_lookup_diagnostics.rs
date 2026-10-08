@@ -1,5 +1,5 @@
 //! Genuine guest GPA calls over authored DLLs; diagnostics never turn probes into calls.
-use adv_abi::{ApiDiagnostics, DynamicLookupKind, Registry, RunMode};
+use adv_abi::{ApiDiagnostics, DynamicLookupKind, ExportClass, Registry, RunMode};
 use adv_cpu::{
     JitCpu,
     backend::{Backend, Guest, GuestExt, Prot, asm::Asm},
@@ -172,7 +172,7 @@ fn optional<B: Backend>(cpu: B, label: &str, mode: RunMode) {
     let kernel = test.host("kernel32.dll");
     let comctl = test.host("comctl32.dll");
     let d2d = test.host("d2d1.dll");
-    let known = test.text("AddDllDirectory");
+    let known = test.text("Beep");
     let optional = test.text("AuthoredOptionalFeatureThatDoesNotExist");
     let implemented = test.text("TlsAlloc");
     let probes = [
@@ -238,20 +238,29 @@ fn optional<B: Backend>(cpu: B, label: &str, mode: RunMode) {
         }
     }
     assert_eq!(records[0].module, "kernel32.dll");
-    assert_eq!(records[0].name, "AddDllDirectory");
+    assert_eq!(records[0].name, "Beep");
     assert_eq!(records[0].failure_module.as_deref(), Some("kernel32.dll"));
-    assert_eq!(records[0].failure_name.as_deref(), Some("AddDllDirectory"));
+    assert_eq!(records[0].failure_name.as_deref(), Some("Beep"));
     assert_eq!(records[2].name, "#65535");
     assert_eq!(records[3].module, "<invalid-hmodule>");
     assert_eq!(records[4].module, "comctl32.dll");
     assert_eq!(records[4].name, "#2");
     assert_eq!(records[5].module, "data.dll");
+    let rejected = &test.machine.ext.get::<ApiDiagnostics>().rejected_probes;
+    let hidden = &rejected["kernel32.dll!Beep"];
+    assert_eq!(
+        (hidden.class, hidden.count, hidden.first_caller),
+        (Some(ExportClass::Hidden), 1, probes[0].0.caller)
+    );
+    let optional = &rejected["kernel32.dll!AuthoredOptionalFeatureThatDoesNotExist"];
+    assert_eq!((optional.class, optional.count), (None, 1));
+    assert!(!rejected.keys().any(|api| api.starts_with("data.dll!")));
     assert!(
         test.machine
             .sys
             .thunks
             .iter()
-            .filter(|(_, thunk)| thunk.name == "AddDllDirectory")
+            .filter(|(_, thunk)| thunk.name == "Beep")
             .all(|(_, thunk)| !thunk.requested)
     );
 }
@@ -286,7 +295,7 @@ fn guest_system_named_dll_missing_sdk_export_is_a_guest_missing_export() {
         &[export("Existing", Target::Code(vec![0xc3]))],
     );
     test.host("C:\\Windows\\system32\\kernel32.dll");
-    let name = test.text("AddDllDirectory");
+    let name = test.text("Beep");
     let probe = test.probe(I(guest), I(name));
     test.run();
     assert_eq!(test.value(&probe.0), 0);
@@ -312,7 +321,7 @@ fn a_live_guest_hook_on_an_unimplemented_sdk_export_still_resolves_without_a_fai
         let host = test.host("kernel32.dll");
         let id = adv_os::modules(&test.machine.ext).by_handle(host).unwrap();
         let ExportTarget::Rva(rva) =
-            adv_os::modules(&test.machine.ext).get(id).exports_by_name["AddDllDirectory"]
+            adv_os::modules(&test.machine.ext).get(id).exports_by_name["Beep"]
         else {
             panic!("host diagnostic entry")
         };
@@ -320,7 +329,7 @@ fn a_live_guest_hook_on_an_unimplemented_sdk_export_still_resolves_without_a_fai
             .cpu
             .write(host + rva, &[0xb8, 42, 0, 0, 0, 0xc2, 4, 0])
             .unwrap();
-        let name = test.text("AddDllDirectory");
+        let name = test.text("Beep");
         let probe = test.probe(I(host), I(name));
         test.run();
         assert_eq!(test.value(&probe.0), host + rva);
@@ -346,10 +355,7 @@ fn failed_forwarders_keep_requested_and_target_names_and_rollback_guest_dependen
         "proxy.dll",
         0x500000,
         &[
-            export(
-                "NeedSDK",
-                Target::Forwarder("kernel32.AddDllDirectory".into()),
-            ),
+            export("NeedSDK", Target::Forwarder("kernel32.Beep".into())),
             export(
                 "NeedGuest",
                 Target::Forwarder("owned.MissingFeature".into()),
@@ -383,7 +389,7 @@ fn failed_forwarders_keep_requested_and_target_names_and_rollback_guest_dependen
     assert_eq!(records[0].module, "proxy.dll");
     assert_eq!(records[0].name, "NeedSDK");
     assert_eq!(records[0].failure_module.as_deref(), Some("kernel32.dll"));
-    assert_eq!(records[0].failure_name.as_deref(), Some("AddDllDirectory"));
+    assert_eq!(records[0].failure_name.as_deref(), Some("Beep"));
     assert_eq!(records[1].kind, DynamicLookupKind::MissingExport);
     assert_eq!(records[1].failure_module.as_deref(), Some("owned.dll"));
     assert_eq!(records[1].failure_name.as_deref(), Some("MissingFeature"));

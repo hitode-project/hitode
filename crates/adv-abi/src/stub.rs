@@ -1,5 +1,5 @@
 //! Stubs return only a reviewed failure contract. No fabricated success or output objects.
-use crate::{Registry, signature, trace};
+use crate::{ExportClass, Registry, personality, signature, trace};
 use adv_machine::{Env, Outcome, layout::teb};
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -90,7 +90,20 @@ pub struct ApiDiagnostics {
     pub message_box_count: u64,
     pub dropped_message_boxes: u64,
     pub truncated_diagnostic_fields: u64,
+    /// Reviewed exports answered with their failure contract; not stub calls.
+    pub reviewed_calls: BTreeMap<String, u64>,
+    /// Discovery probes the personality rejected, keyed by `module!name`.
+    pub rejected_probes: BTreeMap<String, RejectedProbe>,
+    pub dropped_rejected_probes: u64,
     sequence: u64,
+}
+
+/// One rejected name; the class is None for a name the personality never declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedProbe {
+    pub class: Option<ExportClass>,
+    pub count: u64,
+    pub first_caller: u32,
 }
 
 fn bounded_text(text: String, characters: usize, truncated: &mut u64) -> String {
@@ -223,6 +236,25 @@ impl ApiDiagnostics {
         self.message_boxes.push_back(message);
     }
 
+    /// Guest-chosen names are unbounded, so distinct entries are capped.
+    pub fn record_rejected_probe(&mut self, api: String, class: Option<ExportClass>, caller: u32) {
+        if let Some(probe) = self.rejected_probes.get_mut(&api) {
+            probe.count = probe.count.saturating_add(1);
+        } else if self.rejected_probes.len() < 256 {
+            let api = bounded_text(api, 256, &mut self.truncated_diagnostic_fields);
+            self.rejected_probes.insert(
+                api,
+                RejectedProbe {
+                    class,
+                    count: 1,
+                    first_caller: caller,
+                },
+            );
+        } else {
+            self.dropped_rejected_probes = self.dropped_rejected_probes.saturating_add(1);
+        }
+    }
+
     fn record(&mut self, call: StubCall) {
         *self
             .gaps
@@ -253,9 +285,48 @@ pub fn failure_value(signature: &signature::Signature) -> Option<u32> {
         })
 }
 
+/// What a reviewed export returns: its registered failure, or nothing for a
+/// void ABI. None means the review is incomplete and the export stays a stub.
+pub fn reviewed_failure(signature: &signature::Signature) -> Option<u32> {
+    if !personality::is_reviewed(signature.module, signature.name) || !signature.callable() {
+        return None;
+    }
+    if signature.return_kind == signature::AbiKind::Void {
+        return Some(0);
+    }
+    failure_value(signature)
+}
+
+fn return_failure(env: &mut Env<'_>, value: u32) -> Outcome {
+    const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
+    let last_error = env.ctx().teb + teb::LAST_ERROR;
+    if let Err(fault) =
+        crate::GuestPtr::<u32>::new(last_error).write(env.cpu, ERROR_CALL_NOT_IMPLEMENTED)
+    {
+        return crate::guest::memory_failure(fault);
+    }
+    Outcome::Return(value)
+}
+
 pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
     let thunk = env.sys.thunks.get(env.thunk);
     let signature = &signature::signatures()[thunk.f.data as usize];
+    if let Some(value) = reviewed_failure(signature) {
+        // Discoverable on purpose, so the contract holds in every run mode;
+        // diagnostics count it without changing what the title observes.
+        let api = format!("{}!{}", signature.module, signature.name);
+        *env.ext
+            .get_or_default::<ApiDiagnostics>()
+            .reviewed_calls
+            .entry(api.clone())
+            .or_default() += 1;
+        warn_unavailable(
+            env,
+            &api,
+            "reviewed export has no frontend; returning its registered failure",
+        );
+        return return_failure(env, value);
+    }
     let mode = (env.sys.thunks.resolver() as &dyn Any)
         .downcast_ref::<Registry>()
         .expect("ABI registry resolved stub")
@@ -293,11 +364,7 @@ pub(crate) fn dispatch(env: &mut Env<'_>) -> Outcome {
             signature.module, signature.name
         ));
     };
-    let last_error = env.ctx().teb + teb::LAST_ERROR;
-    if let Err(fault) = crate::GuestPtr::<u32>::new(last_error).write(env.cpu, 120) {
-        return crate::guest::memory_failure(fault);
-    }
-    Outcome::Return(value)
+    return_failure(env, value)
 }
 
 /// Existence metadata cannot authorize a return through an unknown ABI.
