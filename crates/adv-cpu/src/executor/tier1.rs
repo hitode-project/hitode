@@ -42,7 +42,9 @@ impl Executor {
         } else {
             None
         };
-        if mode == Tier1Mode::Exclusive || self.tier1_mode == Tier1Mode::Exclusive {
+        if mode == Tier1Mode::Exclusive
+            || (mode == Tier1Mode::Off && self.tier1_mode == Tier1Mode::Exclusive)
+        {
             self.set_async_compilation(false);
             self.auto_jit = false;
         }
@@ -137,6 +139,11 @@ mod tests {
             m.set_arm64_tier1(true).unwrap();
             assert_eq!(m.tier1_mode(), Tier1Mode::Exclusive);
             assert!(!m.auto_jit && !m.async_compilation);
+            m.enable_auto_jit(true);
+            m.set_async_compilation(true);
+            m.set_tier1_mode(Tier1Mode::Bridge).unwrap();
+            assert!(m.auto_jit && m.async_compilation);
+            m.set_arm64_tier1(true).unwrap();
             m.set_arm64_tier1(false).unwrap();
             assert_eq!(m.tier1_mode(), Tier1Mode::Off);
         } else {
