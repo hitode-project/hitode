@@ -157,6 +157,19 @@ class FrameBudgetTests(unittest.TestCase):
                 self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "bud")
                 sleep.assert_not_called()
 
+    def test_pcm_failure_is_explicit_without_exporting_raw_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            budget.write_json(root / "title.json", {"frames": 1})
+            scenario = {"id": "fixture", "scenario_sha256": "fixture", "schedule": [],
+                        "scenes": {"title": {"checkpoint": "title"}}}
+            with patch.object(budget.baseline, "valid_report", side_effect=ValueError("checkpoint: missing PCM frames; private details")):
+                rows = budget.summarize_run(root, scenario, "cold", "android")
+            self.assertEqual(rows[0]["status"], "blocked")
+            self.assertEqual(rows[0]["reason"], "pcm_incomplete")
+            self.assertNotIn("private details", json.dumps(rows))
+            self.assertNotIn("metrics", rows[0])
+
     def test_deployment_reserves_cleanup_time_before_another_transfer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

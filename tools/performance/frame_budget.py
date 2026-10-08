@@ -255,8 +255,9 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
                     row["fixed_segment"] = fixed_segment(directory, scenario, checkpoint)
                     if row["fixed_segment"] is None:
                         row.update(status="skipped", reason="fixed_endpoint_not_verified")
-            except (ValueError, RuntimeError, KeyError, TypeError, AssertionError):
-                row.update(status="blocked", reason="checkpoint_validation_failed")
+            except (ValueError, RuntimeError, KeyError, TypeError, AssertionError) as error:
+                reason = "pcm_incomplete" if "missing PCM frames" in str(error) else "checkpoint_validation_failed"
+                row.update(status="blocked", reason=reason)
         result.append(row)
     # Keep startup failures useful without promoting their frames to a reached scene.
     fallback = load_json(directory / "blocked.json") or load_json(directory / "final.json")
