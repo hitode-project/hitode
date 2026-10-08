@@ -5,7 +5,6 @@
 #include <windows.h>
 
 typedef BOOL (WINAPI *QUERY)(DWORD, HANDLE, PVOID, ULONG, PVOID, SIZE_T, SIZE_T *);
-typedef LONG (WINAPI *VERSION)(POSVERSIONINFOW);
 static QUERY query;
 static DWORD output[4096], used = 16;
 static BYTE bytes[256];
@@ -53,11 +52,11 @@ void mainCRTStartup(void) {
     DWORD written;
     HMODULE main_module = GetModuleHandleW(NULL);
     OSVERSIONINFOW os = {0};
-    VERSION version = (VERSION)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
     query = (QUERY)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "QueryActCtxW");
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     os.dwOSVersionInfoSize = sizeof(os);
-    version(&os);
+    /* Advisory compatibility version, independent of the queried SxS contract. */
+    GetVersionExW(&os);
     output[0] = 1; output[1] = os.dwMajorVersion;
     output[2] = os.dwMinorVersion; output[3] = os.dwBuildNumber;
     SetLastError(0x12345678);

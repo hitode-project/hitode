@@ -1,11 +1,13 @@
 """Build and validate authored x86 Windows default activation queries.
 
 Usage: python tools/fixtures/query_actctx.py --output
-       <target/investigations/query-actctx/run-name>
+       <target/investigations/query-actctx/run-name> [--runner <adv-run.exe>]
 Inputs: adjacent C/manifest fixtures, repository patch_crt.c, LLVM, Windows SDK.
 Outputs: two isolated native runs (unbound default and manifest control), scalar
 summary.json, logs, and cmd.txt with commands, environment and source/PE hashes.
 The control demonstrates that NULL current handles do not imply absent SxS.
+An optional runner checks the same default fixture with interpreter and JIT.
+The version scalars report the compatibility version, not the host kernel build.
 No game input, XML binding, guest code/pointers or manifest paths are printed.
 """
 from __future__ import annotations
@@ -154,6 +156,7 @@ def build(output: Path) -> tuple[list[Path], list[list[str]]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--runner", type=Path)
     args = parser.parse_args()
     output = args.output.resolve()
     if "target" not in output.parts or "investigations" not in output.parts:
@@ -162,28 +165,49 @@ def main() -> int:
         parser.error("use a fresh output directory")
     output.mkdir(parents=True, exist_ok=True)
     fixtures, commands = build(output)
-    environment = {key: os.environ.get(key) for key in ("TEMP", "TMP", "CARGO_TARGET_DIR")}
+    environment = {key: os.environ.get(key) for key in ("TEMP", "TMP", "CARGO_TARGET_DIR", "PATH")}
     source = Path(__file__).with_name("query-actctx.c")
+    runner = args.runner.resolve() if args.runner else None
+    cases = [("native", False, fixtures[0]), ("native", True, fixtures[1])]
+    if runner:
+        cases += [(backend, False, fixtures[0]) for backend in ("interpreter", "jit")]
     records = []
-    for manifest, fixture in zip((False, True), fixtures):
-        directory = output / ("native-manifest" if manifest else "native-default")
+    for backend, manifest, fixture in cases:
+        directory = output / f"{backend}-{'manifest' if manifest else 'default'}"
         directory.mkdir()
         exe = directory / "authored.exe"
         shutil.copyfile(fixture, exe)
         command = [str(exe)]
+        result = directory / "result.bin"
+        if backend != "native":
+            command = [str(runner), str(exe), "--headless", "--backend", backend,
+                       "--seconds", "10", "--data-dir", str(directory / "data"),
+                       "--report", str(directory / "report.json"), "--api-mode", "strict",
+                       "--sync-compilation"]
+            result = directory / "data/overlay/result.bin"
         evidence = {"command": command, "cwd": str(directory), "environment": environment,
-                    "source_sha256": digest(source), "fixture_sha256": digest(exe)}
+                    "source_sha256": digest(source), "fixture_sha256": digest(exe),
+                    "runner_sha256": digest(runner) if runner else None}
         (directory / "cmd.txt").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
         code = run(command, directory, directory / "run.log", timeout=20)
         try:
-            record = decode((directory / "result.bin").read_bytes())
+            record = decode(result.read_bytes())
             failures = evaluate(record, manifest)
         except (OSError, ValueError) as error:
             record = {}
             failures = ["missing_results" if isinstance(error, OSError) else str(error)]
         if code:
             failures.append("process_exit")
-        records.append({"manifest": manifest, "exit_code": code, **record, "failures": failures})
+        if backend != "native":
+            report = directory / "report.json"
+            if not report.exists():
+                failures.append("missing_diagnostics")
+            else:
+                runtime = json.loads(report.read_text(encoding="utf-8"))
+                if runtime["guest_exit_code"] != 0 or not runtime["api"]["acceptance_eligible"]:
+                    failures.append("runtime_diagnostics")
+        records.append({"backend": backend, "manifest": manifest, "exit_code": code,
+                        **record, "failures": failures})
     (output / "cmd.txt").write_text(json.dumps({"build_commands": commands,
         "environment": environment, "source_sha256": digest(source),
         "fixture_sha256": [digest(p) for p in fixtures]}, indent=2), encoding="utf-8")
