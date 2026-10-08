@@ -78,5 +78,10 @@
     "ctrl": {
       "unavailable": "no_fixed_endpoint"
     }
-  }
+  },
+  "deploy_directories": [
+    "plugin",
+    "savedata",
+    "savedata_cn"
+  ]
 }

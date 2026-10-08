@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+import time
 
 import frame_budget as budget
 from scene_schedule import load_scene, validate_reference
@@ -125,6 +126,69 @@ class FrameBudgetTests(unittest.TestCase):
         self.assertIn("--frame-budget", command)
         self.assertIn("ADV_PERF_MAP_DIR=/private/run", command)
         self.assertNotIn("--profile", command)
+
+    def test_deployment_pushes_independent_files_with_a_shared_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "fixture.txt").write_text("fixture", encoding="utf-8")
+            (root / "data" / "resource.txt").write_text("resource", encoding="utf-8")
+            adb = Mock()
+            budget.deploy_game(adb, root, "/private/game", {}, time.monotonic() + 1000)
+            self.assertEqual(adb.push.call_count, 2)
+            self.assertTrue(all(call.args[0].is_file() for call in adb.push.call_args_list))
+            self.assertLessEqual(adb.timeout, 120)
+            self.assertTrue(adb.call.call_args.kwargs["idempotent"])
+
+    def test_broker_releases_on_failure_without_legacy_lock_or_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "device.ps1"
+            helper.touch()
+            with patch.object(budget.subprocess, "run") as invoke, patch.object(budget.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "fixture"):
+                    with budget.device_lock(None, root, helper) as deadline:
+                        self.assertGreater(deadline, time.monotonic())
+                        raise RuntimeError("fixture")
+                self.assertEqual(invoke.call_count, 2)
+                self.assertIn("Request-Device", invoke.call_args_list[0].args[0][-1])
+                self.assertIn("Release-Device", invoke.call_args_list[1].args[0][-1])
+                self.assertNotIn("-Done", invoke.call_args_list[1].args[0][-1])
+                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "bud")
+                sleep.assert_not_called()
+
+    def test_deployment_reserves_cleanup_time_before_another_transfer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "fixture.txt").touch()
+            adb = Mock()
+            with self.assertRaises(TimeoutError):
+                budget.deploy_game(adb, root, "/private/game", {}, time.monotonic() + 300)
+            adb.push.assert_not_called()
+
+    def test_resume_retries_deployment_without_replacing_guest_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "fixture-cold"
+            output.mkdir()
+            (output / "cmd.txt").write_text("failed deployment", encoding="utf-8")
+            budget.preserve_undeployed(output, root)
+            self.assertFalse(output.exists())
+            self.assertEqual(len(list(root.glob("fixture-cold-undeployed-*"))), 1)
+            output.mkdir()
+            (output / "session.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                budget.preserve_undeployed(output, root)
+            self.assertTrue((output / "session.json").is_file())
+
+    def test_resume_rejects_a_move_outside_the_explicit_run_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "outside"
+            output.mkdir()
+            with self.assertRaises(ValueError):
+                budget.preserve_undeployed(output, root / "intended")
+            self.assertTrue(output.is_dir())
 
 
 if __name__ == "__main__":

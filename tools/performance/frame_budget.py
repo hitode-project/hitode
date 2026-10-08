@@ -226,6 +226,8 @@ def summarize_run(directory: Path, scenario: dict, heat: str, platform: str) -> 
         row["run_status"] = ("failed" if metadata.get("error") or any(metadata.get(k) not in (0, None) for k in
             ("exit_code", "remote_exit_code", "adb_exit_code")) else "incomplete" if
             metadata.get("completed") is False or metadata.get("evidence_complete") is False else "complete")
+        if not metadata:
+            row["run_status"] = "not_run"
         if corrupt:
             row.update(status="blocked", reason="invalid_checkpoint_json")
         if report:
@@ -296,8 +298,23 @@ def summarize(root: Path) -> dict:
 
 
 @contextmanager
-def device_lock(path: Path, root: Path):
-    """Acquire atomically, never recover another owner's lock; preserve 60s gaps."""
+def device_lock(path: Path | None, root: Path, helper: Path | None = None):
+    """Use the shared broker when supplied; otherwise retain legacy locking."""
+    if helper is not None:
+        environment = dict(os.environ, ADV_DEVICE_HELPER=str(helper.resolve(strict=True)), ADV_DEVICE_TASK="bud")
+        prefix = "$ErrorActionPreference='Stop'; . $env:ADV_DEVICE_HELPER; "
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            prefix + "Request-Device -Task $env:ADV_DEVICE_TASK"],
+                           env=environment, check=True)
+            yield time.monotonic() + 1100
+        finally:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            prefix + "Release-Device -Task $env:ADV_DEVICE_TASK"],
+                           env=environment, check=True, timeout=30)
+        return
+    if path is None:
+        raise ValueError("a broker helper or legacy device lock is required")
     stamp = root / "last-lock-end.txt"
     while True:
         if stamp.exists():
@@ -317,6 +334,13 @@ def device_lock(path: Path, root: Path):
             except FileExistsError:
                 acquired = False
         if acquired:
+            # A previous lease can end during PowerShell startup. Recheck after
+            # mkdir, release this empty directory, and cool down outside the lock.
+            remaining = 60 - (time.time() - float(stamp.read_text())) if stamp.exists() else 0
+            if remaining > 0:
+                path.rmdir()
+                time.sleep(remaining)
+                continue
             break
         print("device lock occupied; retry in 30s", flush=True)
         time.sleep(30)
@@ -366,21 +390,59 @@ def prepare_font(source: Path | None, remote: str, output: Path, adb) -> list[st
     return ["--font-profile", path, "--font-manifest", str(manifest)]
 
 
+def deploy_game(adb, game: Path, destination: str, scenario: dict, deadline: float) -> None:
+    """Push files independently so a large game does not hit one directory timeout."""
+    files = replay.inventory(game)
+    directories = scenario.get("deploy_directories")
+    if directories is not None:
+        files = [row for row in files if "/" not in row["path"] or row["path"].split("/", 1)[0] in directories]
+    parents = sorted({str(Path(row["path"]).parent).replace("\\", "/") for row in files})
+    for offset in range(0, len(parents), 32):
+        set_transfer_deadline(adb, deadline)
+        words = ["mkdir", "-p", *[destination + "/" + parent for parent in parents[offset:offset + 32]]]
+        adb.call("shell", replay.shell_words(words), idempotent=True)
+    for row in files:
+        set_transfer_deadline(adb, deadline)
+        adb.push(game / row["path"], destination + "/" + row["path"])
+
+
+def set_transfer_deadline(adb, deadline: float) -> None:
+    remaining = deadline - time.monotonic() - 240
+    if remaining <= 90:
+        raise TimeoutError("deployment exhausted this device-lock window")
+    # Three transport attempts and two 30-second backoffs must fit the window.
+    adb.timeout = min(120, (remaining - 60) / 3)
+
+
+def preserve_undeployed(output: Path, root: Path) -> None:
+    """Preserve a failed pre-launch attempt; never overwrite actual guest evidence."""
+    target = output.with_name(output.name + "-undeployed-" + uuid.uuid4().hex)
+    if ((output / "session.json").exists() or not output.resolve().is_relative_to(root.resolve())
+            or not target.resolve().is_relative_to(root.resolve())):
+        raise ValueError("refusing to replace guest evidence or move outside the run root")
+    output.rename(target)
+
+
 def run(args) -> None:
     if args.heats not in (["cold"], ["cold", "warm"]):
         raise ValueError("heats must be cold, or cold followed by warm")
     root = args.output.resolve()
     artifact = Path(os.environ.get("ADV_ARTIFACT_ROOT", REPO / "target")).resolve()
-    if not root.is_relative_to(artifact) or root.exists():
+    resume = getattr(args, "resume", False)
+    if not root.is_relative_to(artifact) or (root.exists() and not resume):
         raise ValueError("output must be a fresh directory below ADV_ARTIFACT_ROOT")
     samples = Path(os.environ["ADV_SAMPLES"]).resolve(strict=True)
     binary = args.binary.resolve(strict=True)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=resume)
     frozen = root / "frozen"
-    frozen.mkdir()
-    shutil.copy2(binary, frozen / binary.name)
-    for dll in binary.parent.glob("*.dll"):
-        shutil.copy2(dll, frozen / dll.name)
+    frozen.mkdir(exist_ok=resume)
+    if resume:
+        if digest(binary) != digest(frozen / binary.name):
+            raise ValueError("resume requires the original frozen runner")
+    else:
+        shutil.copy2(binary, frozen / binary.name)
+        for dll in binary.parent.glob("*.dll"):
+            shutil.copy2(dll, frozen / dll.name)
     binary = frozen / binary.name
     scenarios = []
     for name in args.games:
@@ -397,9 +459,15 @@ def run(args) -> None:
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO)
     import hashlib
     plan = {"platform": args.platform, "heats": args.heats, "scenarios": scenarios,
-            "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
+            "source_revision": getattr(args, "binary_source_revision", None),
+            "tool_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO).decode().strip(),
             "source_diff_sha256": hashlib.sha256(diff).hexdigest()}
-    write_json(root / "plan.json", plan)
+    if resume:
+        previous = load_json(root / "plan.json")
+        if any(previous[key] != plan[key] for key in ("platform", "heats", "scenarios")):
+            raise ValueError("resume requires unchanged scenarios and run conditions")
+    else:
+        write_json(root / "plan.json", plan)
     adb = replay.Adb(args) if args.platform == "android" else None
     for scenario in scenarios:
         name = scenario["id"]
@@ -407,8 +475,21 @@ def run(args) -> None:
         remote = "/data/local/tmp/adv-host-bud-" + uuid.uuid4().hex
         deployed = False
         remote_created = False
+        deployment_file = root / f"{name}-deployment.json"
+        if resume and deployment_file.is_file():
+            deployment = load_json(deployment_file)
+            remote = deployment["remote"]
+            if not re.fullmatch(r"/data/local/tmp/adv-host-bud-[0-9a-f]{32}", remote):
+                raise ValueError("invalid owned deployment receipt")
+            deployed, remote_created = deployment["complete"], True
         for heat in args.heats:
             output = root / f"{name}-{heat}"
+            if resume and output.exists():
+                if getattr(args, "retry_undeployed", False) and not (output / "session.json").exists():
+                    preserve_undeployed(output, root)
+                else:
+                    print(f"{name} {heat}: preserving previous attempt", flush=True)
+                    continue
             warm = root / f"{name}-cold" / ("jit-warm.bin" if adb else "overlay/jit-warm.bin")
             if heat == "warm" and not warm.is_file():
                 print(f"{name} warm skipped: no cold profile", flush=True)
@@ -426,21 +507,20 @@ def run(args) -> None:
                 command += ["--seed-data", str(seed)]
             print(f"{name} {heat} starting", flush=True)
             if adb:
-                with device_lock(args.device_lock, artifact) as deadline:
+                helper = getattr(args, "device_helper", None)
+                lease = device_lock(args.device_lock, artifact, helper) if helper else device_lock(args.device_lock, artifact)
+                with lease as deadline:
                     try:
                         if not deployed:
-                            adb.shell(["mkdir", remote])
-                            remote_created = True
-                            for attempt in range(3):
-                                try:
-                                    adb.push(game, remote + "/game")
-                                    deployed = True
-                                    break
-                                except (RuntimeError, subprocess.TimeoutExpired):
-                                    adb.call("shell", "rm -rf " + remote + "/game", idempotent=True)
-                                    if attempt == 2 or time.monotonic() + 360 >= deadline:
-                                        raise
-                                    time.sleep(30)
+                            if not remote_created:
+                                set_transfer_deadline(adb, deadline)
+                                adb.shell(["mkdir", remote])
+                                remote_created = True
+                                write_json(deployment_file, {"remote": remote, "complete": False})
+                            deploy_game(adb, game, remote + "/game", scenario, deadline)
+                            deployed = True
+                            write_json(deployment_file, {"remote": remote, "complete": True})
+                        set_transfer_deadline(adb, deadline)
                         command += prepare_font(args.font_profile_source, remote, root, adb)
                         command += ["--adb", str(args.adb), "--serial", args.serial,
                                     "--game-dir", str(game), "--exe-relative", scenario["exe"],
@@ -462,6 +542,8 @@ def run(args) -> None:
                         for target in cleanup:
                             try:
                                 cleanup_remote(adb, target)
+                                if target == remote:
+                                    deployment_file.unlink(missing_ok=True)
                             except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                                 errors.append({"remote": target, "error": str(error)})
                         if errors:
@@ -489,6 +571,9 @@ def main() -> None:
     execute.add_argument("--platform", choices=("android", "windows"), required=True)
     execute.add_argument("--binary", type=Path, required=True)
     execute.add_argument("--output", type=Path, required=True)
+    execute.add_argument("--resume", action="store_true", help="preserve attempted runs and continue an unchanged plan")
+    execute.add_argument("--retry-undeployed", action="store_true", help="with resume, retain then retry attempts that never launched a replay session")
+    execute.add_argument("--binary-source-revision", help="explicit source revision of the supplied runner, if known")
     execute.add_argument("--games", nargs="+", default=["majiro", "bgi", "softpal", "kirikiri", "himawari"])
     execute.add_argument("--heats", nargs="+", choices=("cold", "warm"), default=["cold", "warm"])
     execute.add_argument("--seed-root", type=Path)
@@ -496,6 +581,8 @@ def main() -> None:
     execute.add_argument("--adb", type=Path, default=Path("adb"))
     execute.add_argument("--serial", default=os.environ.get("ANDROID_SERIAL"))
     execute.add_argument("--device-lock", type=Path)
+    execute.add_argument("--device-helper", type=Path, default=os.environ.get("ADV_DEVICE_HELPER"),
+                         help="shared PowerShell Request-Device/Release-Device helper (task bud)")
     execute.add_argument("--perf-map", action="store_true")
     execute.add_argument("--no-instrumentation", action="store_true", help="paired overhead control only")
     args = parser.parse_args()
@@ -503,8 +590,8 @@ def main() -> None:
         summarize(args.directory)
     else:
         args.adb_port, args.transfer_timeout = 5037, 120
-        if args.platform == "android" and (not args.serial or not args.device_lock):
-            parser.error("Android requires --serial and --device-lock; the existing server must already be running")
+        if args.platform == "android" and (not args.serial or not (args.device_helper or args.device_lock)):
+            parser.error("Android requires --serial and --device-helper (or a legacy --device-lock); the server must already be running")
         run(args)
 
 
