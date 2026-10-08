@@ -78,7 +78,13 @@ fn native_argc(export: &str) -> Option<u8> {
     match export {
         "LdrUnloadDll" => return Some(1),
         "RtlRaiseException" | "RtlRemoveVectoredExceptionHandler" => return Some(1),
-        "RtlAddVectoredExceptionHandler" => return Some(2),
+        "RtlAddVectoredExceptionHandler" | "RtlInterlockedPushEntrySList" => return Some(2),
+        "RtlEncodePointer"
+        | "RtlDecodePointer"
+        | "RtlInitializeSListHead"
+        | "RtlInterlockedPopEntrySList"
+        | "RtlInterlockedFlushSList"
+        | "RtlQueryDepthSList" => return Some(1),
         "RtlDispatchAPC" => return Some(3),
         "RtlExitUserThread" => return Some(1),
         "RtlCreateUserThread" => return Some(10),

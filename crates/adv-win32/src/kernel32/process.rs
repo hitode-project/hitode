@@ -13,6 +13,7 @@ pub(crate) mod apc;
 mod live_context_tests;
 pub(crate) mod native_thread;
 mod parameters;
+mod pointer;
 mod processor;
 #[cfg(test)]
 mod tests;
@@ -941,6 +942,7 @@ fn get_computer_name_a(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    pointer::register(reg);
     reg.register(get_console_window_ABI);
     // A 32-bit Windows: not under WOW64.
     stdcall(reg, K32, "IsWow64Process", 2, |e| {
@@ -1057,8 +1059,6 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "SetErrorMode", 1, |_| Outcome::Return(0));
     stdcall(reg, K32, "OutputDebugStringA", 1, output_debug_string_a);
     stdcall(reg, K32, "OutputDebugStringW", 1, output_debug_string_w);
-    stdcall(reg, K32, "EncodePointer", 1, |e| Outcome::Return(e.arg(0)));
-    stdcall(reg, K32, "DecodePointer", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "GetLastError", 0, get_last_error);
     stdcall(reg, K32, "SetLastError", 1, set_last_error_);
     stdcall(reg, K32, "GlobalMemoryStatus", 1, global_memory_status);
