@@ -28,7 +28,7 @@ class Contracts(unittest.TestCase):
         self.assertEqual(evaluate(9, values), ["alloc_ex"])
 
     def test_exception_frame_and_continuation_are_both_required(self):
-        values = [1, 1, 1, 0, 1, 0, 2, 2, 1]
+        values = [1, 1, 1, 0, 1, 0, 2, 2, 1, 2, 1]
         self.assertEqual(evaluate(10, values), [])
         values[4] = 0
         values[7] = 0

@@ -454,12 +454,26 @@ mod critical_tests {
     fn contended_critical_sections_park_wake_recurse_and_release_their_event() {
         const CODE: u32 = 0x400000;
         const CS: u32 = 0x410000;
+        fn hold_until_waiters(env: &mut Env<'_>) -> Outcome {
+            let ready = env.ext.get_or_default::<CriticalWaits>().0.get(&CS).is_some_and(|wait| {
+                wait.pending.get() == 2
+                    && env.sys.contexts.iter().filter(|context| matches!(context.waiting_on(), Some(Wait::Object { handle, .. }) if *handle == wait.event)).count() == 2
+            });
+            if ready {
+                Outcome::Return(0)
+            } else {
+                Outcome::block(Wait::Yield, |env, _| hold_until_waiters(env))
+            }
+        }
         for workers in [1, 2] {
             let mut registry = Registry::default();
             register(&mut registry);
-            registry.add("test", "hold", Conv::Stdcall { argc: 0 }, |e| {
-                Outcome::block_then_return(Wait::Until(e.sys.clock.now_us() + 3000), 0)
-            });
+            registry.add(
+                "test",
+                "hold",
+                Conv::Stdcall { argc: 0 },
+                hold_until_waiters,
+            );
             registry.add("test", "probe", Conv::Stdcall { argc: 0 }, |e| {
                 let wait = &e.ext.get_or_default::<CriticalWaits>().0[&CS];
                 assert_eq!(wait.pending.get(), 2);
@@ -744,4 +758,16 @@ pub(super) fn register(reg: &mut Registry) {
             .write_u32(teb + adv_machine::layout::teb::TLS_SLOTS + 4 * i, v);
         Outcome::Return(1)
     });
+    // Only these known leaf implementations can be reused as RTL providers.
+    // Copying arbitrary Win32 frontends could route back into their own alias.
+    for (front, native) in [
+        ("InitializeSListHead", "RtlInitializeSListHead"),
+        ("InterlockedPushEntrySList", "RtlInterlockedPushEntrySList"),
+        ("InterlockedPopEntrySList", "RtlInterlockedPopEntrySList"),
+        ("InterlockedFlushSList", "RtlInterlockedFlushSList"),
+        ("QueryDepthSList", "RtlQueryDepthSList"),
+    ] {
+        let leaf = reg.get(K32, front).expect("registered SList owner");
+        reg.add_with_data("ntdll.dll", native, leaf.conv, leaf.handler, leaf.data);
+    }
 }

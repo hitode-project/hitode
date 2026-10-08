@@ -896,7 +896,7 @@ impl<'a> Loader<'a> {
         module: ModuleId,
         name: &str,
     ) -> Result<Option<u32>, LoadError> {
-        let image = self.modules.get(module);
+        let (image, hints) = self.modules.export_search(module);
         if image.kind != ModuleKind::Host || !image.lifetime.mapped {
             return Ok(None);
         }
@@ -914,11 +914,29 @@ impl<'a> Loader<'a> {
         {
             return Ok(None);
         }
-        let live = mapped_export_inner(self.cpu, image.base, image.size, MappedName::Name(name))
-            .ok_or_else(|| LoadError::MissingExport {
-                module: image.name.clone(),
-                name: name.to_owned(),
-            })?;
+        let hint = hints.get(name).copied();
+        let live = match mapped_export_inner(
+            self.cpu,
+            image.base,
+            image.size,
+            MappedName::Name { name, hint },
+        ) {
+            Some(resolved) => {
+                if let Some(found) = resolved.hint
+                    && hint != Some(found)
+                {
+                    hints.insert(name.to_owned(), found);
+                }
+                resolved.target
+            }
+            None => {
+                hints.remove(name);
+                return Err(LoadError::MissingExport {
+                    module: image.name.clone(),
+                    name: name.to_owned(),
+                });
+            }
+        };
         let rva = match live {
             ExportTarget::Rva(rva) => rva,
             ExportTarget::Forwarder(_) if &live == original => return Ok(None),
@@ -1142,15 +1160,23 @@ fn mapped_export(
     symbol: &ImportName,
 ) -> Option<ExportTarget> {
     let symbol = match symbol {
-        ImportName::Name { name, .. } => MappedName::Name(name),
+        ImportName::Name { name, hint } => MappedName::Name {
+            name,
+            hint: Some(u32::from(*hint)),
+        },
         ImportName::Ordinal(ordinal) => MappedName::Ordinal(*ordinal),
     };
-    mapped_export_inner(cpu, base, size, symbol)
+    mapped_export_inner(cpu, base, size, symbol).map(|resolved| resolved.target)
 }
 
 enum MappedName<'a> {
-    Name(&'a str),
+    Name { name: &'a str, hint: Option<u32> },
     Ordinal(u16),
+}
+
+struct MappedExport {
+    target: ExportTarget,
+    hint: Option<u32>,
 }
 
 // Preserve the bounded live-name search, including changed name pointers and
@@ -1210,7 +1236,7 @@ fn mapped_export_inner(
     base: u32,
     size: u32,
     symbol: MappedName<'_>,
-) -> Option<ExportTarget> {
+) -> Option<MappedExport> {
     let range =
         |rva: u32, len: u32| (rva.checked_add(len)? <= size).then_some(base.checked_add(rva)?);
     let word = |rva| cpu.read_u32(range(rva, 4)?).ok();
@@ -1245,23 +1271,32 @@ fn mapped_export_inner(
     range(functions, count.checked_mul(4)?)?;
     range(names, named.checked_mul(4)?)?;
     range(ordinals, named.checked_mul(2)?)?;
-    let index = match symbol {
-        MappedName::Ordinal(ordinal) => u32::from(ordinal).checked_sub(ordinal_base)?,
-        MappedName::Name(name) => {
+    let (index, hint) = match symbol {
+        MappedName::Ordinal(ordinal) => (u32::from(ordinal).checked_sub(ordinal_base)?, None),
+        MappedName::Name { name, hint } => {
             let (mut low, mut high) = (0, named);
-            let mut found = None;
-            while low < high {
+            // Windows import hints locate a name, never a function RVA. All
+            // current headers and table ranges have already been validated.
+            let mut found = hint.filter(|&hint| {
+                hint < named
+                    && word(names + hint * 4).is_some_and(|rva| {
+                        mapped_name_order(cpu, base, size, rva, name)
+                            == Some(std::cmp::Ordering::Equal)
+                    })
+            });
+            while found.is_none() && low < high {
                 let middle = low + (high - low) / 2;
                 match mapped_name_order(cpu, base, size, word(names + middle * 4)?, name)? {
                     std::cmp::Ordering::Less => high = middle,
                     std::cmp::Ordering::Greater => low = middle + 1,
                     std::cmp::Ordering::Equal => {
-                        found = Some(u32::from(short(ordinals + middle * 2)?));
+                        found = Some(middle);
                         break;
                     }
                 }
             }
-            found?
+            let found = found?;
+            (u32::from(short(ordinals + found * 2)?), Some(found))
         }
     };
     if index >= count {
@@ -1272,11 +1307,12 @@ fn mapped_export_inner(
         return None;
     }
     range(rva, 1)?;
-    if rva >= dir && rva < dir + dir_size {
-        Some(ExportTarget::Forwarder(string(rva, dir + dir_size - rva)?))
+    let target = if rva >= dir && rva < dir + dir_size {
+        ExportTarget::Forwarder(string(rva, dir + dir_size - rva)?)
     } else {
-        Some(ExportTarget::Rva(rva))
-    }
+        ExportTarget::Rva(rva)
+    };
+    Some(MappedExport { target, hint })
 }
 
 /// A host directory seen by the guest as `guest_root` (e.g. `C:\Game`). Guest paths are

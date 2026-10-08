@@ -10,11 +10,13 @@ pub(super) enum Source {
     Hardware,
     Raise,
     NativeRaise,
+    NativeService,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Ki,
     Continue,
+    NativeRaise,
 }
 enum Payload {
     Search(Search),
@@ -105,52 +107,85 @@ pub(super) fn register(reg: &mut Registry) {
     );
     crate::stdcall(reg, "ntdll.dll", "RtlRaiseException", 1, rtl_raise);
     crate::stdcall(reg, "ntdll.dll", "NtContinue", 2, nt_continue);
+    crate::stdcall(reg, "ntdll.dll", "NtRaiseException", 3, nt_raise);
 }
 
 pub(super) fn deliver(env: &mut Env<'_>, search: Search, source: Source) -> Outcome {
-    let name = if source == Source::Hardware {
-        "KiUserExceptionDispatcher"
-    } else {
-        "RtlRaiseException"
-    };
-    if source != Source::NativeRaise {
-        match crate::native::overridden(env, name) {
+    if source == Source::Raise {
+        match crate::native::overridden(env, "RtlRaiseException") {
             Ok(Some(target)) => {
                 let scratch = search.scratch;
-                if source == Source::Raise {
-                    // The actual RTL call captures its own context and returns
-                    // through the hook. Only then finish the Win32 front call.
-                    return Outcome::call_on_stack(target, [scratch], scratch, move |_, _| {
-                        drop(search._phase);
-                        Outcome::ResumeExecution(search.checkpoint.unwind_callbacks())
-                    })
-                    .unwindable();
-                }
-                let context = scratch + CONTEXT;
-                let owned = retain(env, Kind::Ki, scratch, context, Payload::Search(search));
-                let jump = match env
-                    .sys
-                    .thunks
-                    .resolve(env.cpu, "<win32>", "<exception_jump>")
-                {
-                    Ok(jump) => jump,
-                    Err(error) => return Outcome::Fail(error.to_string()),
-                };
-                return Outcome::call_on_stack(jump, [scratch, context, target], scratch, move |env, _| {
-                    drop(owned);
-                    unsupported(
-                        env,
-                        name,
-                        "exception dispatcher returned instead of continuing its captured context",
-                    )
+                // The actual RTL call captures its own context and returns
+                // through the hook. Only then finish the Win32 front call.
+                return Outcome::call_on_stack(target, [scratch], scratch, move |_, _| {
+                    drop(search._phase);
+                    Outcome::ResumeExecution(search.checkpoint.unwind_callbacks())
                 })
                 .unwindable();
             }
-            Err(_) => return crate::native::unavailable(env, name),
+            Err(_) => return crate::native::unavailable(env, "RtlRaiseException"),
             Ok(None) => {}
         }
     }
-    super::search(env, search)
+    if matches!(source, Source::Raise | Source::NativeRaise) {
+        match crate::native::overridden(env, "NtRaiseException") {
+            Ok(Some(target)) => {
+                let scratch = search.scratch;
+                let context = scratch + CONTEXT;
+                let owned = retain(
+                    env,
+                    Kind::NativeRaise,
+                    scratch,
+                    context,
+                    Payload::Search(search),
+                );
+                return Outcome::call_on_stack(
+                    target,
+                    [scratch, context, 1],
+                    scratch,
+                    move |env, _| {
+                        drop(owned);
+                        unsupported(
+                            env,
+                            "NtRaiseException",
+                            "native exception delivery returned without continuing its context",
+                        )
+                    },
+                )
+                .unwindable();
+            }
+            Err(_) => return crate::native::unavailable(env, "NtRaiseException"),
+            Ok(None) => {}
+        }
+    }
+    // Both hardware stops and raised software exceptions enter the same raw
+    // dispatcher. The authored native fixture observes both deliveries.
+    match crate::native::overridden(env, "KiUserExceptionDispatcher") {
+        Ok(Some(target)) => {
+            let scratch = search.scratch;
+            let context = scratch + CONTEXT;
+            let owned = retain(env, Kind::Ki, scratch, context, Payload::Search(search));
+            let jump = match env
+                .sys
+                .thunks
+                .resolve(env.cpu, "<win32>", "<exception_jump>")
+            {
+                Ok(jump) => jump,
+                Err(error) => return Outcome::Fail(error.to_string()),
+            };
+            Outcome::call_on_stack(jump, [scratch, context, target], scratch, move |env, _| {
+                drop(owned);
+                unsupported(
+                    env,
+                    "KiUserExceptionDispatcher",
+                    "exception dispatcher returned instead of continuing its captured context",
+                )
+            })
+            .unwindable()
+        }
+        Err(_) => crate::native::unavailable(env, "KiUserExceptionDispatcher"),
+        Ok(None) => super::search(env, search),
+    }
 }
 
 fn ki(env: &mut Env<'_>) -> Outcome {
@@ -221,6 +256,42 @@ fn rtl_raise(env: &mut Env<'_>) -> Outcome {
         Err(error) => return Outcome::Fail(error.to_string()),
     };
     super::dispatch_origin(env, checkpoint, record, Source::NativeRaise)
+}
+
+fn nt_raise(env: &mut Env<'_>) -> Outcome {
+    let (record, context, first) = (env.arg(0), env.arg(1), env.arg(2));
+    if first as u8 == 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "ntdll.dll!NtRaiseException",
+            "second-chance native exception delivery is unavailable",
+        );
+        return Outcome::Return(0xc00000bb);
+    }
+    let record_value = match read_record(env, record) {
+        Ok(record) => record,
+        Err(_) => return Outcome::Return(0xc0000005),
+    };
+    let mut bytes = [0; context::SIZE];
+    if !env
+        .cpu
+        .accessible(context, context::SIZE as u32, Prot::READ)
+        || env.cpu.read(context, &mut bytes).is_err()
+    {
+        return Outcome::Return(0xc0000005);
+    }
+    let mut checkpoint = match take(env, Kind::NativeRaise, record, context) {
+        Some(Payload::Search(search)) => search.checkpoint,
+        _ => match env.checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return Outcome::Fail(error.to_string()),
+        },
+    };
+    if let Err(reason) = context::decode(&bytes, &mut checkpoint.state) {
+        adv_abi::warn_unavailable(env, "ntdll.dll!NtRaiseException", &reason);
+        return Outcome::Return(0xc00000bb);
+    }
+    super::dispatch_origin(env, checkpoint, record_value, Source::NativeService)
 }
 
 pub(super) fn continue_execution(

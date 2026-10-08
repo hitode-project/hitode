@@ -2000,6 +2000,13 @@ fn run_execution(
 
 /// Run the desktop/headless command-line shell with the process arguments.
 pub fn run_cli() -> std::process::ExitCode {
+    if std::env::var("ADV_HOST_FEATURES_REPORT").is_ok_and(|value| value == "1") {
+        eprintln!(
+            "host_features detected={} enabled={}",
+            adv_runtime::HostFeatures::detected(),
+            adv_runtime::HostFeatures::get()
+        );
+    }
     match Options::parse().and_then(|options| options.map_or(Ok(0), run)) {
         Ok(code) => std::process::ExitCode::from(code),
         Err(error) => {
