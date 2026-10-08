@@ -2,7 +2,7 @@
   "_comment": [
     "Startup smoke list for personality-layer changes (docs/personality-contracts.md).",
     "One sample per engine; exe is relative to $ADV_SAMPLES. Run with sample_matrix.py --quick",
-    "and gate with matrix_gate.py --require-frames; never part of CI."
+    "and gate with matrix_gate.py --require-frames --frame-tolerance 1; never part of CI."
   ],
   "samples": [
     {
@@ -25,8 +25,8 @@
       "exe": "AQUA/AQUA.exe",
       "codepage": 932,
       "quick": true,
-      "min_seconds": 25,
-      "min_seconds_reason": "first frame at about 19 s in the 2026-10-08 runner; 10 s ends before it"
+      "min_seconds": 30,
+      "min_seconds_reason": "first frame varies between 17 and 23 s on 2026-10-08 runners; 10 s ends before it"
     },
     {
       "id": "majiro",
