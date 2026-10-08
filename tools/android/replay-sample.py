@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scene_schedule import (assert_report, await_command, digest_json, exact_hash,
                             load_scene, validate_reference)
 
-INPUT_COMMANDS = frozenset(("click", "move", "key", "key-down", "key-up", "menus",
+INPUT_COMMANDS = frozenset(("click", "move", "mouse-down", "mouse-up", "key", "key-down", "key-up", "menus",
                             "menu", "dialogs", "dialog", "dialog-track", "dialog-close",
                             "memory", "reset-metrics", "close"))
 RESERVED_CHECKPOINTS = frozenset(("final", "blocked", "session", "actions", "device",

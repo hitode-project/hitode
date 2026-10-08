@@ -32,6 +32,11 @@ class FakeProcess:
 
 
 class DeviceConditionsTests(unittest.TestCase):
+    def test_held_pointer_inputs_are_allowed_and_keep_their_acknowledgement(self):
+        for command in ("mouse-down", "mouse-up"):
+            self.assertIn(command, replay.INPUT_COMMANDS)
+            self.assertTrue(replay.valid_acknowledgement(command + " 400 380", "control ok " + command))
+
     def test_temperature_and_display_state_do_not_include_window_identity(self):
         class Device:
             def call(self, *args, **kwargs):
@@ -448,6 +453,7 @@ class ReplayTests(unittest.TestCase):
         replies = {
             "click 1 2": "click 1 2", "move 1 2": "move 1 2", "key 13": "key 13",
             "key-down 17": "key-down 17", "key-up 17": "key-up 17",
+            "mouse-down 1 2": "mouse-down 1 2", "mouse-up 1 2": "mouse-up 1 2",
             "menus": 'menus enabled=true "items"', "menu 40005": "menu 40005",
             "dialogs": 'dialogs "controls"', "dialog 1": "dialog 1",
             "dialog-track 1001 0": "dialog 1001", "dialog-close": "dialog-close",
