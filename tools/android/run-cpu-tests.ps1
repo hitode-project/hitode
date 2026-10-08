@@ -10,6 +10,7 @@ AllTests selects every integration target and unfiltered unit tests, continues
 after failures and records empty platform targets. DirectMemory and JitVerify
 configure the CPU; Tier1 records the shell selector (fixtures select their modes).
 Safepoint selects off/poll independently of verification and direct memory.
+CodeValidity selects legacy/event code-cache validation on the device.
 Features adds explicit Cargo features; Gir selects the opt-in state-SSA lane and
 includes gir-execute. Build with that feature and Gir=off to reuse one ELF set.
 .EXAMPLE
@@ -38,6 +39,7 @@ param(
     [switch]$DirectMemory,
     [ValidateSet('off', 'bridge')][string]$Tier1 = 'off',
     [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
+    [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
     [string[]]$Features = @(),
     [ValidateSet('off', 'state-ssa')][string]$Gir = 'off'
 )
@@ -92,7 +94,7 @@ function Get-DeviceCommand($remote, $run) {
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_SAFEPOINT=$Safepoint ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{

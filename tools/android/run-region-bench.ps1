@@ -11,6 +11,8 @@ Lock acquisition retries once per second without touching an existing owner.
 BuildOnly and WhatIf never access a device. SkipBuild reuses this task's ELF.
 The caller owns TEMP/TMP and storage policy. Existing adb server port 5037 only.
 Safepoint selects off/poll; LockOwner identifies the caller in the shared lock.
+CodeValidity selects legacy/event cache validation; CompileBench measures cold
+Fast/Speed compilation with 1/2/4 synchronous host compiler workers.
 .EXAMPLE
 ./tools/android/run-region-bench.ps1 -BuildOnly -TargetDir $env:CARGO_TARGET_DIR -Output $env:ADV_BENCH_OUTPUT
 .EXAMPLE
@@ -27,6 +29,8 @@ param(
     [ValidatePattern('^[a-zA-Z0-9_-]+$')][string]$LockOwner = 'feat',
     [ValidateSet('off', 'legacy', 'inline')][string[]]$DirectMemory = @('off'),
     [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
+    [ValidateSet('legacy', 'event')][string]$CodeValidity = 'legacy',
+    [switch]$CompileBench,
     [ValidateRange(1, 31)][int]$Samples = 7,
     [ValidateRange(1, 100000)][int]$Loops = 10000,
     [ValidateRange(1, 1000)][int]$Repeats = 4,
@@ -60,7 +64,11 @@ function Get-CpuChoices([string[]]$Inventory) {
 }
 function Get-Command([string]$Remote, [string]$Mode = 'off') {
     $corpusEnv = if ($Corpus) { "ADV_GIR_LIFT_CORPUS='$Remote/corpus' " } else { '' }
-    "unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}ADV_SAFEPOINT=$Safepoint ADV_REGION_BENCH_DIRECT=$Mode ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit taskset $CpuMask timeout $TimeoutSeconds '$Remote/host_region_bench'"
+    $compileEnv = if ($CompileBench) { 'ADV_REGION_BENCH_COMPILE=1 ' } else { 'ADV_REGION_BENCH_COMPILE=0 ' }
+    # Compiler workers inherit affinity: a single-core taskset would serialize
+    # the 1/2/4-thread throughput experiment. Execution stays on the chosen core.
+    $affinity = if ($CompileBench) { '' } else { "taskset $CpuMask " }
+    "unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}${compileEnv}ADV_CODE_VALIDITY=$CodeValidity ADV_SAFEPOINT=$Safepoint ADV_REGION_BENCH_DIRECT=$Mode ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit ${affinity}timeout $TimeoutSeconds '$Remote/host_region_bench'"
 }
 if ($WhatIf) {
     [ordered]@{ build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs;
@@ -173,7 +181,8 @@ try {
             if ($attempt -eq 4) { throw 'Benchmark transport failed before execution.' }
             Start-Sleep -Seconds 30
         }
-        if ($code -ne 0 -or $log -notmatch '# completed accepted=') { throw "Benchmark failed in $mode; see benchmark CSV." }
+        $marker = if ($CompileBench) { 'compile_total,all,Speed,4,' } else { '# completed accepted=' }
+        if ($code -ne 0 -or $log -notmatch $marker) { throw "Benchmark failed in $mode; see benchmark CSV." }
     }
     Write-Output 'Region benchmark completed; anonymous statistics saved in bench.csv.'
 } finally {

@@ -18,8 +18,8 @@ impl Executor {
     /// missing native entries may use Tier 1; forced and Cranelift fallback exits
     /// retain Tier 0. Each entry returns within 256 instruction/REP units, so
     /// publication, interrupts, deadlines and fuel are checked at that boundary.
-    /// Both caches watch Memory code pages and independently validate their code;
-    /// consuming Cranelift's dirty-page list cannot invalidate Tier 1's epoch.
+    /// Both caches watch Memory code pages and independently observe page stamps;
+    /// consuming Cranelift's dirty-page list cannot hide Tier 1 invalidations.
     /// Bridge CFGs end before published Cranelift entries. A publication revision
     /// retires conflicting Tier 1 CFGs before they can cross a new entry;
     /// unrelated publications keep existing CFGs and their pinned mappings.
