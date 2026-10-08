@@ -64,7 +64,7 @@ class Contracts(unittest.TestCase):
                                                "semaphore_invalid_initial", "semaphore_output_fault"])
 
     def test_mutations_require_fixed_topology_fallback_and_distinct_lifetimes(self):
-        values = [1]*56
+        values = [1]*60
         self.assertEqual(evaluate(14, values), [])
         self.assertEqual(evaluate(14, values[:-1]), ["missing_results"])
         values[3] = 0
@@ -72,8 +72,9 @@ class Contracts(unittest.TestCase):
         values[35] = 0
         values[38] = 0
         values[53] = 0
+        values[56] = 0
         self.assertEqual(evaluate(14, values), ["delete", "fallback_cannot_delete",
-                                               "fallback_unsuccessful", "posix_lifetime", "classic_lifetime"])
+                                               "fallback_unsuccessful", "posix_lifetime", "classic_lifetime", "selection_delete"])
 
 
 if __name__ == "__main__":

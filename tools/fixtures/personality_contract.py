@@ -26,7 +26,7 @@ def digest(path: Path) -> str:
 
 def evaluate(test: int, values: list[int]) -> list[str]:
     """Return violated contracts; never print pointers or binary contents."""
-    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38, 13: 30, 14: 56}
+    expected_lengths = {1: 3, 2: 16, 3: 7, 4: 9, 5: 6, 6: 9, 7: 5, 8: 4, 9: 21, 10: 11, 11: 3, 12: 38, 13: 30, 14: 60}
     if len(values) != expected_lengths[test]:
         return ["missing_results"]
     failures = []
@@ -116,6 +116,8 @@ def evaluate(test: int, values: list[int]) -> list[str]:
             check("fallback_" + name, v[25+index] == 1)
         check("posix_lifetime", v[38:47] == [1]*9)
         check("classic_lifetime", v[47:56] == [1]*9)
+        for index, name in enumerate(("delete", "move", "remove_directory", "create_directory")):
+            check("selection_" + name, v[56+index] == 1)
     return failures
 
 

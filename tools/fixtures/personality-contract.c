@@ -373,12 +373,25 @@ static void mutation_lifetime(DWORD classic){
  put((classic?result==0:result!=0)&&error==0x13572468);
  mutation_snapshot(name,original,classic?5:2);CloseHandle(independent);mutation_snapshot(name,original,classic?5:2);CloseHandle(original);mutation_snapshot(name,duplicate,classic?5:2);CloseHandle(duplicate);mutation_snapshot(name,NULL,2);
 }
+static void mutation_selection(DWORD operation){
+ WCHAR source[]=L"fixture-select-0-src.txt",target[]=L"fixture-select-0-dst.txt";DWORD result,error,attrs;BOOL changed;
+ source[15]=target[15]=(WCHAR)(L'0'+operation);
+ if(operation<2)mutation_file(source);else if(operation==2&&!CreateDirectoryW(source,NULL))ExitProcess(96);
+ mutation_reset();m_active=1;SetLastError(0x13572468);
+ result=operation==0?DeleteFileW(source):operation==1?MoveFileW(source,target):operation==2?RemoveDirectoryW(source):CreateDirectoryW(source,NULL);
+ error=GetLastError();m_active=0;attrs=GetFileAttributesW(source);
+ changed=operation==3?attrs!=INVALID_FILE_ATTRIBUTES&&(attrs&FILE_ATTRIBUTE_DIRECTORY):attrs==INVALID_FILE_ATTRIBUTES;
+ put(result!=0&&error==0x13572468&&m_opens==0&&m_creates==0&&m_closes==1&&m_forced==1&&changed&&((GetFileAttributesW(target)!=INVALID_FILE_ATTRIBUTES)==(operation==1)));
+}
 static void t_mutation_contract(void){
  HMODULE nt=GetModuleHandleW(L"ntdll.dll");DWORD i;
  static DWORD statuses[]={0xc0000003,0xc000000d,0xc00000bb,0xc0000022,0xc0000121,0xc0000043,0,0x40000000,0x80000002,0x80000005,0xc0000001,0xc0000008,0xc0000005};
  int ok=MH_Initialize()==MH_OK;
  ok=ok&&MH_CreateHook(GetProcAddress(nt,"NtClose"),mutation_close,(PVOID*)&m_close)==MH_OK&&MH_CreateHook(GetProcAddress(nt,"NtSetInformationFile"),mutation_set,(PVOID*)&m_set)==MH_OK&&MH_CreateHook(GetProcAddress(nt,"NtOpenFile"),mutation_open,(PVOID*)&m_open)==MH_OK&&MH_CreateHook(GetProcAddress(nt,"NtCreateFile"),mutation_create,(PVOID*)&m_create)==MH_OK&&MH_EnableHook(MH_ALL_HOOKS)==MH_OK;
- put(ok);if(!ok)return;for(i=0;i<4;i++)mutation_operation(i);for(i=0;i<sizeof(statuses)/sizeof(statuses[0]);i++)mutation_fallback(i,statuses[i]);mutation_lifetime(0);mutation_lifetime(1);MH_DisableHook(MH_ALL_HOOKS);
+ put(ok);if(!ok)return;for(i=0;i<4;i++)mutation_operation(i);for(i=0;i<sizeof(statuses)/sizeof(statuses[0]);i++)mutation_fallback(i,statuses[i]);mutation_lifetime(0);mutation_lifetime(1);
+ /* A hook on the other entry must not change the frontend's fixed topology. */
+ MH_DisableHook(GetProcAddress(nt,"NtOpenFile"));for(i=0;i<3;i++)mutation_selection(i);
+ MH_EnableHook(GetProcAddress(nt,"NtOpenFile"));MH_DisableHook(GetProcAddress(nt,"NtCreateFile"));mutation_selection(3);MH_DisableHook(MH_ALL_HOOKS);
 }
 
 
