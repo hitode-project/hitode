@@ -21,6 +21,7 @@ Assert $plan.skip_build
 Assert ($plan.shell.Contains('taskset 40 timeout 300'))
 Assert ($plan.shell.Contains('ADV_GIR_LIFT_CORPUS='))
 Assert ($plan.shell.Contains('unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_HOST_FEATURES'))
+Assert ($plan.shell.Contains('ADV_PERF_MAP_DIR;'))
 Assert ($plan.cooldown_seconds -eq 60 -and $plan.cleanup)
 $rejected = $false
 try { & $runner @arguments -BuildOnly -SkipBuild | Out-Null } catch { $rejected = $true }
