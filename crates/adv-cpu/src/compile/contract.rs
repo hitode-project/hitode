@@ -1,35 +1,29 @@
-//! One register-passed state contract for native regions and loop kernels.
+//! One state and control contract for native regions and loop kernels.
 //!
-//! Cranelift Tail has six integer argument registers on both supported hosts.
-//! Two vector arguments carry all guest GPRs; EFLAGS occupies the fifth integer
-//! register. CpuState is canonical only at a Rust/helper boundary.
+//! Two pointer Tail arguments carry the context and guest memory window.
+//! Guest state is canonical at region boundaries; hot exits publish only
+//! their write footprint. Region bodies and loop kernels share this ABI.
 use super::*;
-
-pub(super) const PC: usize = 2;
-pub(super) const FUEL: usize = 3;
-pub(super) const GPRS: usize = 4;
-pub(super) const FLAGS: usize = 6;
 
 pub(super) fn signature(module: &JITModule) -> ir::Signature {
     let ptr = module.target_config().pointer_type();
     let mut signature = module.make_signature();
     signature.call_conv = cranelift_codegen::isa::CallConv::Tail;
     signature.params.extend([AbiParam::new(ptr); 2]);
-    signature.params.push(AbiParam::new(types::I32));
-    signature.params.push(AbiParam::new(types::I64));
-    signature.params.extend([AbiParam::new(types::I32X4); 2]);
-    signature.params.push(AbiParam::new(types::I32));
     signature.returns.push(AbiParam::new(types::I32));
     signature
 }
 
-/// The C entry and row thunk are the only callers starting from canonical state.
-pub(super) fn load(
-    b: &mut FunctionBuilder<'_>,
-    ptr: ir::Type,
-    context: Value,
-    memory: Value,
-) -> Vec<Value> {
+fn requested(b: &mut FunctionBuilder<'_>, interrupt: Value) -> Value {
+    let pending = b
+        .ins()
+        .atomic_load(types::I8, MemFlags::trusted(), interrupt);
+    b.ins().icmp_imm(IntCC::NotEqual, pending, 0)
+}
+
+/// Rust entries start from canonical state. Linked entries have already polled
+/// their outgoing edge, so repeating this check in every Tail body is wasteful.
+pub(super) fn guard_entry(b: &mut FunctionBuilder<'_>, ptr: ir::Type, context: Value) {
     let state = b.ins().load(
         ptr,
         MemFlags::trusted(),
@@ -48,33 +42,6 @@ pub(super) fn load(
         state,
         offset_of!(CpuState, fuel) as i32,
     );
-    let low = b.ins().load(types::I32X4, MemFlags::trusted(), state, 0);
-    let high = b.ins().load(types::I32X4, MemFlags::trusted(), state, 16);
-    let flags = b.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        state,
-        offset_of!(CpuState, eflags) as i32,
-    );
-    vec![context, memory, pc, fuel, low, high, flags]
-}
-
-fn requested(b: &mut FunctionBuilder<'_>, interrupt: Value) -> Value {
-    let pending = b
-        .ins()
-        .atomic_load(types::I8, MemFlags::trusted(), interrupt);
-    b.ins().icmp_imm(IntCC::NotEqual, pending, 0)
-}
-
-/// Rust entries start from canonical state. Linked entries have already polled
-/// their outgoing edge, so repeating this check in every Tail body is wasteful.
-pub(super) fn guard_entry(
-    b: &mut FunctionBuilder<'_>,
-    ptr: ir::Type,
-    context: Value,
-    pc: Value,
-    fuel: Value,
-) {
     let interrupt = b.ins().load(
         ptr,
         MemFlags::trusted(),
@@ -103,41 +70,10 @@ pub(super) fn guard_entry(
 }
 
 impl Emitter<'_> {
-    pub(super) fn gpr_arguments(&mut self) -> [Value; 2] {
-        let mut vectors = self.abi_state;
-        let written = self.write_summary.map_or(0xff, |summary| summary.gpr);
-        for index in 0..8 {
-            if written & (1 << index) != 0 {
-                let value = self.b.use_var(self.regs[index]);
-                vectors[index / 4] =
-                    self.b
-                        .ins()
-                        .insertlane(vectors[index / 4], value, (index % 4) as u8);
-            }
-        }
-        vectors
-    }
-
-    pub(super) fn tail_arguments(&mut self, pc: Value) -> Vec<Value> {
-        let fuel = self.b.use_var(self.fuel);
-        let vectors = self.gpr_arguments();
-        let flags = self.materialize_flags();
-        vec![
-            self.context,
-            self.mem,
-            pc,
-            fuel,
-            vectors[0],
-            vectors[1],
-            flags,
-        ]
-    }
-
-    pub(super) fn tail_to(&mut self, address: Value, pc: Value) {
-        let args = self.tail_arguments(pc);
+    pub(super) fn tail_to(&mut self, address: Value) {
         self.b
             .ins()
-            .return_call_indirect(self.tail_ref, address, &args);
+            .return_call_indirect(self.tail_ref, address, &[self.context, self.mem]);
     }
 }
 
@@ -186,15 +122,18 @@ impl RecoveryExit {
 
     pub fn emit(self, b: &mut FunctionBuilder<'_>, ptr: ir::Type) {
         b.switch_to_block(self.block);
-        b.set_srcloc(ir::SourceLoc::new(Self::MARKER));
+        b.set_srcloc(ir::SourceLoc::default());
         let address = b.ins().stack_addr(ptr, self.result, 0);
+        // Address expressions can be hoisted or shared with the hot path.
+        // Mark only the non-hoistable memory effect, never its operands.
+        b.set_srcloc(ir::SourceLoc::new(Self::MARKER));
         // Atomic loads cannot be forwarded from a normal predecessor's store.
         // The signal path writes this private slot before resuming this block.
         let reason = b
             .ins()
             .atomic_load(types::I32, MemFlags::trusted(), address);
-        b.ins().return_(&[reason]);
         b.set_srcloc(ir::SourceLoc::default());
+        b.ins().return_(&[reason]);
     }
 
     pub fn location(self, code: &cranelift_codegen::CompiledCode) -> Option<usize> {
@@ -297,8 +236,7 @@ impl Emitter<'_> {
         let prepare = self.b.create_block();
         self.b.ins().brif(bad, returned, &[], prepare, &[]);
         self.b.switch_to_block(prepare);
-        // Only a Rust exit publishes the incoming architectural prefix. A
-        // successful link carries it directly through the native arguments.
+        // Both hot footers and cold exits have published canonical state.
         let pending = requested(&mut self.b, self.interrupt);
         let interrupted = self.b.create_block();
         self.b.set_cold_block(interrupted);
@@ -307,7 +245,6 @@ impl Emitter<'_> {
             .ins()
             .brif(pending, interrupted, &[], search_ready, &[]);
         self.b.switch_to_block(interrupted);
-        self.save_state(pc);
         let interrupted_reason = self.constant(Exit::Interrupted as u32);
         self.b.ins().return_(&[interrupted_reason]);
         self.b.switch_to_block(search_ready);
@@ -357,10 +294,14 @@ impl Emitter<'_> {
             .b
             .ins()
             .iadd_imm(address, offset_of!(Slot, entry) as i64);
-        let entry = self
-            .b
-            .ins()
-            .atomic_load(self.ptr_ty, MemFlags::trusted(), entry_address);
+        // The whole table is immutable for this borrowed chain. Publication
+        // and retirement happen between calls, not concurrently with this load.
+        let entry = self.b.ins().load(
+            self.ptr_ty,
+            MemFlags::trusted().with_readonly(),
+            entry_address,
+            0,
+        );
         let absent = self.b.ins().icmp_imm(IntCC::Equal, entry, 0);
         let occupied = self.b.create_block();
         self.b.ins().brif(absent, returned, &[], occupied, &[]);
@@ -422,9 +363,8 @@ impl Emitter<'_> {
                 offset_of!(NativeContext, fault_reads) as i32,
             );
         }
-        self.tail_to(entry, pc);
+        self.tail_to(entry);
         self.b.switch_to_block(returned);
-        self.save_state(pc);
         let reason = reason.unwrap_or_else(|| self.constant(Exit::Dispatch as u32));
         self.b.ins().return_(&[reason]);
     }

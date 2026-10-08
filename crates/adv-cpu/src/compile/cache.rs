@@ -175,7 +175,7 @@ fn isa_key() -> Result<&'static [u8], String> {
 pub(super) fn key(snapshot: &Snapshot) -> Result<Vec<u8>, String> {
     let mut w = Writer::default();
     w.bytes(MAGIC);
-    w.bytes(b"gir-register-contract-v2");
+    w.bytes(b"gir-canonical-contract-v3");
     w.bytes(&crate::code_cache::host_build_identity()?);
     w.bytes(env!("ADV_CPU_CODE_CACHE_FINGERPRINT").as_bytes());
     w.bytes(isa_key()?);

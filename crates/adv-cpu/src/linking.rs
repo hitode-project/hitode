@@ -1,7 +1,5 @@
 //! Versioned native entry slots. Only the owning execution thread publishes or
 //! retires code, between native calls. Generated tail calls never own code pages.
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 pub(crate) mod shadow;
 
 pub(crate) const PROBES: usize = 8;
@@ -15,7 +13,7 @@ pub(crate) fn hash(pc: u32) -> u32 {
 #[repr(C)]
 pub(crate) struct Slot {
     pub pc: u32,
-    pub entry: AtomicUsize,
+    pub entry: usize,
 }
 
 #[derive(Default)]
@@ -34,25 +32,20 @@ impl Table {
         }
         let mut capacity = (entries.len() * 4).next_power_of_two().max(256);
         loop {
-            let mut slots: Vec<_> = (0..capacity)
-                .map(|_| Slot {
-                    pc: 0,
-                    entry: AtomicUsize::new(0),
-                })
-                .collect();
+            let mut slots: Vec<_> = (0..capacity).map(|_| Slot { pc: 0, entry: 0 }).collect();
             let mask = capacity - 1;
             let mut complete = true;
             for &(pc, entry) in &entries {
                 let first = hash(pc) as usize & mask;
                 let index = (0..PROBES)
                     .map(|offset| (first + offset) & mask)
-                    .find(|&index| slots[index].entry.load(Ordering::Relaxed) == 0);
+                    .find(|&index| slots[index].entry == 0);
                 let Some(index) = index else {
                     complete = false;
                     break;
                 };
                 slots[index].pc = pc;
-                slots[index].entry.store(entry, Ordering::Release);
+                slots[index].entry = entry;
             }
             if complete {
                 self.slots = slots;
@@ -72,7 +65,7 @@ impl Table {
         let first = hash(pc) as usize & mask;
         for offset in 0..PROBES {
             let slot = &mut self.slots[(first + offset) & mask];
-            let current = slot.entry.get_mut();
+            let current = &mut slot.entry;
             if *current == 0 {
                 if (self.len + 1) * 2 > mask + 1 {
                     return false;
@@ -99,7 +92,7 @@ impl Table {
         let first = hash(pc) as usize & mask;
         let Some(mut hole) = (0..PROBES)
             .map(|offset| (first + offset) & mask)
-            .take_while(|&index| self.slots[index].entry.load(Ordering::Relaxed) != 0)
+            .take_while(|&index| self.slots[index].entry != 0)
             .find(|&index| self.slots[index].pc == pc)
         else {
             return;
@@ -108,7 +101,7 @@ impl Table {
         let mut next = hole;
         loop {
             next = (next + 1) & mask;
-            let entry = *self.slots[next].entry.get_mut();
+            let entry = self.slots[next].entry;
             if entry == 0 {
                 break;
             }
@@ -116,14 +109,16 @@ impl Table {
             // Move a key only when the hole lies on its own probe path.
             if next.wrapping_sub(home) & mask >= next.wrapping_sub(hole) & mask {
                 self.slots[hole].pc = self.slots[next].pc;
-                *self.slots[hole].entry.get_mut() = entry;
+                self.slots[hole].entry = entry;
                 hole = next;
             }
         }
         self.slots[hole].pc = 0;
-        *self.slots[hole].entry.get_mut() = 0;
+        self.slots[hole].entry = 0;
     }
 
+    /// The caller keeps this table borrowed throughout native execution.
+    /// Parallel workers borrow an immutable image; all updates require &mut.
     pub fn parts(&self) -> (*const Slot, u32) {
         if self.slots.is_empty() {
             (std::ptr::null(), 0)
@@ -156,7 +151,7 @@ mod tests {
         let slots = unsafe { std::slice::from_raw_parts(slots, mask as usize + 1) };
         (0..PROBES)
             .map(|offset| &slots[(hash(pc) as usize + offset) & mask as usize])
-            .map(|slot| (slot.pc, slot.entry.load(Ordering::Acquire)))
+            .map(|slot| (slot.pc, slot.entry))
             .take_while(|&(_, entry)| entry != 0)
             .find(|&(key, _)| key == pc)
             .map(|(_, entry)| entry)

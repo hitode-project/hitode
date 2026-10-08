@@ -3491,7 +3491,7 @@ mod publication_tests {
         unsafe { std::slice::from_raw_parts(pointer, mask as usize + 1) }
             .iter()
             .filter_map(|slot| {
-                let entry = slot.entry.load(Ordering::Acquire);
+                let entry = slot.entry;
                 (entry != 0).then_some((slot.pc, entry))
             })
             .collect()
