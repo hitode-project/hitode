@@ -205,7 +205,7 @@ pub(super) fn x87(i: &Instruction) -> bool {
         && (i.op0_kind() != OpKind::Memory || address(i))
 }
 
-/// Legacy integer vectors only: no AVX, floating arithmetic or MXCSR effects.
+/// Legacy vectors without floating arithmetic or MXCSR effects.
 /// Keep address/prefix guards shared with the platform-independent census.
 pub(super) fn simd(i: &Instruction) -> bool {
     let vector = |op: u32| {
@@ -222,7 +222,17 @@ pub(super) fn simd(i: &Instruction) -> bool {
             i.op_count() == 2 && (vector(0) && scalar32(i, 1) || scalar32(i, 0) && vector(1))
         }
         M::Movq => i.op_count() == 2 && (same() || memory(0) && vector(1)),
-        M::Movaps | M::Movups | M::Movdqa | M::Movdqu | M::Movss => {
+        M::Movntps | M::Movntpd | M::Movntdq => {
+            i.op_count() == 2 && memory(0) && vector(1) && i.op1_register().size() == 16
+        }
+        M::Movaps
+        | M::Movups
+        | M::Movapd
+        | M::Movupd
+        | M::Movdqa
+        | M::Movdqu
+        | M::Movss
+        | M::Movsd => {
             i.op_count() == 2
                 && (same() || memory(0) && vector(1))
                 && (0..2)
@@ -235,6 +245,18 @@ pub(super) fn simd(i: &Instruction) -> bool {
                 && i.op_count() == 3
                 && i.op2_kind() == OpKind::Immediate8
         }
+        M::Andps
+        | M::Andpd
+        | M::Andnps
+        | M::Andnpd
+        | M::Orps
+        | M::Orpd
+        | M::Xorps
+        | M::Xorpd
+        | M::Unpcklps
+        | M::Unpckhps
+        | M::Unpcklpd
+        | M::Unpckhpd => i.op_count() == 2 && same() && i.op0_register().size() == 16,
         M::Psrlw | M::Psrld | M::Psrlq | M::Psllw | M::Pslld | M::Psllq | M::Psraw | M::Psrad => {
             i.op_count() == 2 && (same() || vector(0) && i.op1_kind() == OpKind::Immediate8)
         }
@@ -271,6 +293,77 @@ pub(super) fn simd(i: &Instruction) -> bool {
     }
 }
 
+/// Floating forms with transactional runtime guards in the SSE helper.
+pub(super) fn sse(i: &Instruction) -> bool {
+    let xmm = |n| {
+        i.op_kind(n) == OpKind::Register
+            && (Register::XMM0..=Register::XMM7).contains(&i.op_register(n))
+    };
+    let gpr = |n| i.op_kind(n) == OpKind::Register && register(i.op_register(n)).is_some();
+    let mem =
+        |n, width| i.op_kind(n) == OpKind::Memory && i.memory_size().size() == width && address(i);
+    let source = |n, width| xmm(n) || mem(n, width);
+    if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repne_prefix() {
+        return false;
+    }
+    match i.mnemonic() {
+        M::Ldmxcsr | M::Stmxcsr => i.op_count() == 1 && mem(0, 4),
+        M::Addss
+        | M::Subss
+        | M::Mulss
+        | M::Divss
+        | M::Sqrtss
+        | M::Minss
+        | M::Maxss
+        | M::Comiss
+        | M::Ucomiss
+        | M::Cvtss2sd => i.op_count() == 2 && xmm(0) && source(1, 4),
+        M::Addsd
+        | M::Subsd
+        | M::Mulsd
+        | M::Divsd
+        | M::Sqrtsd
+        | M::Minsd
+        | M::Maxsd
+        | M::Comisd
+        | M::Ucomisd
+        | M::Cvtsd2ss => i.op_count() == 2 && xmm(0) && source(1, 8),
+        M::Addps
+        | M::Subps
+        | M::Mulps
+        | M::Divps
+        | M::Sqrtps
+        | M::Minps
+        | M::Maxps
+        | M::Addpd
+        | M::Subpd
+        | M::Mulpd
+        | M::Divpd
+        | M::Sqrtpd
+        | M::Minpd
+        | M::Maxpd
+        | M::Cvtdq2ps
+        | M::Cvtps2dq
+        | M::Cvttps2dq
+        | M::Cvtpd2ps
+        | M::Cvtpd2dq
+        | M::Cvttpd2dq => i.op_count() == 2 && xmm(0) && source(1, 16),
+        M::Cvtps2pd | M::Cvtdq2pd => i.op_count() == 2 && xmm(0) && source(1, 8),
+        M::Cvtsi2ss | M::Cvtsi2sd => i.op_count() == 2 && xmm(0) && (gpr(1) || mem(1, 4)),
+        M::Cvtss2si | M::Cvttss2si => i.op_count() == 2 && gpr(0) && source(1, 4),
+        M::Cvtsd2si | M::Cvttsd2si => i.op_count() == 2 && gpr(0) && source(1, 8),
+        M::Cmpss | M::Cmpsd | M::Cmpps | M::Cmppd => {
+            let width = match i.mnemonic() {
+                M::Cmpss => 4,
+                M::Cmpsd => 8,
+                _ => 16,
+            };
+            i.op_count() == 3 && xmm(0) && source(1, width) && i.op2_kind() == OpKind::Immediate8
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn supported(i: &Instruction) -> bool {
     if i.has_lock_prefix() {
         return false;
@@ -281,7 +374,7 @@ pub(crate) fn supported(i: &Instruction) -> bool {
     if i.has_rep_prefix() || i.has_repne_prefix() {
         return false;
     }
-    if x87(i) || simd(i) {
+    if x87(i) || simd(i) || sse(i) {
         return true;
     }
     if rmw(i) {
@@ -421,7 +514,7 @@ mod simd_tests {
                 Instruction::with2(Code::Movss_xmm_xmmm32, Register::XMM0, Register::XMM1).unwrap(),
             ),
             (
-                false,
+                true,
                 Instruction::with2(Code::Addps_xmm_xmmm128, Register::XMM0, Register::XMM1)
                     .unwrap(),
             ),

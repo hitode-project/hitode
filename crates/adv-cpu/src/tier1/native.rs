@@ -280,6 +280,7 @@ struct Unit {
     input: Vec<(u32, Vec<u8>)>,
     // Descriptors embedded in native calls share the immutable code lifetime.
     _x87: super::x87::Operations,
+    _sse: super::sse::Operations,
 }
 impl Unit {
     fn valid(&self, memory: &Memory) -> bool {
@@ -406,16 +407,22 @@ impl Engine {
             return Ok(false);
         }
         let x87 = super::x87::Operations::new(&instructions, &input);
+        let sse = super::sse::Operations::new(&instructions);
         let mut emitted = emit::Emitter::new(emit::Helpers {
             load: load as *const () as u64,
             store: store as *const () as u64,
             stack_all: stack_all as *const () as u64,
             x87: super::x87::call as *const () as u64,
+            sse: super::sse::call as *const () as u64,
             vector_load: super::simd::load as *const () as u64,
             vector_store: super::simd::store as *const () as u64,
         });
         for instruction in instructions.values() {
-            emitted.instruction(instruction, x87.get(instruction.ip32()));
+            emitted.instruction(
+                instruction,
+                x87.get(instruction.ip32()),
+                sse.get(instruction.ip32()),
+            );
         }
         let emitted = emitted.finish()?;
         let code = Code::new(&emitted.words)?;
@@ -436,6 +443,7 @@ impl Engine {
             code,
             input,
             _x87: x87,
+            _sse: sse,
         });
         for pc in instructions.keys() {
             self.entries
