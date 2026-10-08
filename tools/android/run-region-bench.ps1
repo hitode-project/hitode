@@ -10,6 +10,7 @@ under one device lock. LockOwner labels that lock for the calling task.
 Lock acquisition retries once per second without touching an existing owner.
 BuildOnly and WhatIf never access a device. SkipBuild reuses this task's ELF.
 The caller owns TEMP/TMP and storage policy. Existing adb server port 5037 only.
+Safepoint selects off/poll; LockOwner identifies the caller in the shared lock.
 .EXAMPLE
 ./tools/android/run-region-bench.ps1 -BuildOnly -TargetDir $env:CARGO_TARGET_DIR -Output $env:ADV_BENCH_OUTPUT
 .EXAMPLE
@@ -25,6 +26,7 @@ param(
     [string]$DeviceLock = $env:ADV_DEVICE_LOCK,
     [ValidatePattern('^[a-zA-Z0-9_-]+$')][string]$LockOwner = 'feat',
     [ValidateSet('off', 'legacy', 'inline')][string[]]$DirectMemory = @('off'),
+    [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
     [ValidateRange(1, 31)][int]$Samples = 7,
     [ValidateRange(1, 100000)][int]$Loops = 10000,
     [ValidateRange(1, 1000)][int]$Repeats = 4,
@@ -58,7 +60,7 @@ function Get-CpuChoices([string[]]$Inventory) {
 }
 function Get-Command([string]$Remote, [string]$Mode = 'off') {
     $corpusEnv = if ($Corpus) { "ADV_GIR_LIFT_CORPUS='$Remote/corpus' " } else { '' }
-    "unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}ADV_REGION_BENCH_DIRECT=$Mode ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit taskset $CpuMask timeout $TimeoutSeconds '$Remote/host_region_bench'"
+    "unset ADV_JIT_VERIFY ADV_DIRECT_MEMORY ADV_DIRECT_MEMORY_INLINE ADV_HOST_FEATURES ADV_REGION_BENCH_EXPORT_CORPUS ADV_INTERP_PROFILE_DIR ADV_INTERP_TRACE_DIR ADV_TIER1_CENSUS ADV_PERF_MAP_DIR; ${corpusEnv}ADV_SAFEPOINT=$Safepoint ADV_REGION_BENCH_DIRECT=$Mode ADV_REGION_BENCH_SAMPLES=$Samples ADV_REGION_BENCH_LOOPS=$Loops ADV_REGION_BENCH_REPEATS=$Repeats ADV_REGION_BENCH_PRIVATE_LIMIT=$PrivateLimit taskset $CpuMask timeout $TimeoutSeconds '$Remote/host_region_bench'"
 }
 if ($WhatIf) {
     [ordered]@{ build_only = [bool]$BuildOnly; skip_build = [bool]$SkipBuild; cargo_arguments = $cargoArgs;
@@ -120,6 +122,7 @@ try {
             $locked = $true
         } catch {
             if (-not (Test-Path -LiteralPath $DeviceLock -PathType Container)) { throw }
+            # Short device sessions can otherwise fit entirely between retries.
             Start-Sleep -Seconds 1
         }
     }

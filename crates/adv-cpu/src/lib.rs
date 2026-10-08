@@ -60,6 +60,7 @@ mod parallel;
 mod parallel_memory;
 mod perf_map;
 mod rows;
+mod safepoint;
 mod shared_memory;
 mod state;
 mod strings;

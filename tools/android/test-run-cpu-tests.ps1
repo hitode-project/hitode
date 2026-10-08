@@ -27,9 +27,12 @@ $defaults = & $runner -WhatIf -Sdk '' -Ndk '' -Output $output | ConvertFrom-Json
 Assert (($defaults.targets -join ',') -eq 'execution_contract,host_interrupts,loop_versioning,address_space') 'Default integration targets changed.'
 Assert ($defaults.runs.Count -eq 4) 'Default run count changed.'
 Assert ($defaults.cargo_arguments -contains '--locked') 'Build must use the lockfile.'
+Assert ($defaults.runs[0].shell.Contains('ADV_SAFEPOINT=off')) 'Safepoints must remain opt-in.'
+Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Temporary device files must share the owned directory.'
+$poll = & $runner -WhatIf -Safepoint poll -Output $output | ConvertFrom-Json
+Assert ($poll.runs[0].shell.Contains('ADV_SAFEPOINT=poll')) 'Poll mode did not reach the device.'
 Assert (-not ($defaults.cargo_arguments -contains '--features')) 'Default Cargo features changed.'
 Assert ($defaults.runs[0].shell.Contains('ADV_GIR=off')) 'GIR must not inherit the host selector.'
-Assert ($defaults.runs[0].shell.Contains("TMPDIR='/data/local/tmp/adv-host-cpu-DRYRUN'")) 'Device temporary files must stay in the owned directory.'
 $gir = & $runner -WhatIf -TestName gir_execution -Gir state-ssa -Features gir-execute -JitVerify strict -Output $output | ConvertFrom-Json
 Assert ($gir.features.Count -eq 1 -and $gir.features[0] -eq 'gir-execute') 'GIR feature must be present exactly once.'
 Assert ($gir.runs[0].shell.Contains('ADV_GIR=state-ssa')) 'GIR selector did not reach the device.'

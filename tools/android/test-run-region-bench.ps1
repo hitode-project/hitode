@@ -16,6 +16,9 @@ Assert ($plan.adb_port -eq 5037)
 Assert ($plan.cargo_arguments -contains 'host_region_bench')
 Assert ($plan.cargo_arguments -contains '--locked')
 Assert ($plan.cpu_mask -eq 'auto')
+Assert ($plan.shell.Contains('ADV_SAFEPOINT=off'))
+$poll = & $runner @arguments -Safepoint poll -LockOwner spt | ConvertFrom-Json
+Assert ($poll.shell.Contains('ADV_SAFEPOINT=poll'))
 $plan = & $runner @arguments -SkipBuild -CpuMask 40 -Corpus 'local-corpus' | ConvertFrom-Json
 Assert $plan.skip_build
 Assert ($plan.shell.Contains('taskset 40 timeout 300'))

@@ -40,6 +40,7 @@ mod nest_emit;
 // Retain the analysis tests; observable exits cannot discard guest state.
 #[cfg(test)]
 mod register_liveness;
+mod safepoints;
 mod scalar;
 mod shadow;
 mod simd;
@@ -68,6 +69,9 @@ pub(crate) struct NativeRun<'a> {
 }
 
 pub(crate) struct Compiled {
+    /// Immutable absolute checked entry, initialized before publication. Code
+    /// mappings need not be in ADRP/rel32 reach of the polling body.
+    _poll_target: Option<Box<usize>>,
     #[cfg(any(test, feature = "gir-execute"))]
     pub gir_instructions: BTreeMap<u32, Instruction>,
     perf_ranges: Vec<crate::perf_map::Registration>,
@@ -1170,6 +1174,31 @@ fn compile_snapshot_with_inline(
     let id = module
         .declare_function("guest_region", Linkage::Local, &ctx.func.signature)
         .map_err(|e| e.to_string())?;
+    // Stateful helpers and existing loop kernels keep their established fuel
+    // and recovery contracts. Direct recovery metadata describes one body,
+    // so it cannot yet be shared by the checked and polling copies.
+    // Recompute the plan from the final region CFG.
+    let poll_plan = (crate::safepoint::enabled()
+        && !snapshot.direct_memory
+        && !snapshot.parallel
+        && plans.is_empty()
+        && invariant_plan.is_none()
+        && versioned
+        && write_summary::Summary::for_region(&instructions).is_some())
+    .then(|| safepoints::Plan::new(&instructions, &entries))
+    .flatten();
+    let mut poll_target = poll_plan.as_ref().map(|_| Box::new(0usize));
+    let poll_cell = poll_target
+        .as_deref()
+        .map(|target| std::ptr::from_ref(target) as usize);
+    let poll_id = poll_plan
+        .as_ref()
+        .map(|_| {
+            module
+                .declare_function("guest_poll", Linkage::Local, &tail_signature)
+                .map_err(|e| e.to_string())
+        })
+        .transpose()?;
     let invariant_id = invariant_plan
         .as_ref()
         .map(|_| {
@@ -1310,7 +1339,14 @@ fn compile_snapshot_with_inline(
                     kernels: &[usize],
                     track_writes: bool,
                     descriptors: &[usize],
-                    invariant_body: bool| {
+                    invariant_body: bool,
+                    polling_body: bool| {
+        let poll = polling_body.then(|| {
+            (
+                poll_plan.as_ref().expect("poll body has a bounded plan"),
+                poll_cell.expect("poll body owns an absolute target cell"),
+            )
+        });
         // Shadow returns always target the checked entry. An external callee
         // can change a base register, invalidating the old invocation's proof.
         let shadow_ref = (snapshot.shadow_returns && kernel.is_none())
@@ -1648,6 +1684,8 @@ fn compile_snapshot_with_inline(
                 )
             });
         let mut e = Emitter {
+            poll,
+            poll_block: region.start,
             b,
             optimizing: opt_level == "speed",
             memory_scratch: None,
@@ -1824,6 +1862,7 @@ fn compile_snapshot_with_inline(
             }
             e.b.switch_to_block(block);
             e.pc = start;
+            e.poll_block = start;
             if kernel.is_some() && fast.is_none() {
                 e.begin_mmx_block();
                 e.exit_const(Exit::Dispatch, start);
@@ -1860,8 +1899,10 @@ fn compile_snapshot_with_inline(
             }
             // A kernel charges its blocks when it leaves (`settle_fuel`).
             if fast.is_none() {
-                let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
-                e.guard(zero, Exit::Budget, None);
+                if e.poll.is_none() {
+                    let zero = e.b.ins().icmp_imm(IntCC::Equal, budget, 0);
+                    e.guard(zero, Exit::Budget, None);
+                }
                 let remaining = e.b.ins().iadd_imm(budget, -1);
                 e.b.def_var(e.fuel, remaining);
                 if let Some(heat) = e.heat {
@@ -2102,6 +2143,7 @@ fn compile_snapshot_with_inline(
             row,
             &[],
             false,
+            false,
         );
         let kernel_id = module
             .declare_function(
@@ -2192,6 +2234,7 @@ fn compile_snapshot_with_inline(
             false,
             &addresses,
             true,
+            false,
         );
         #[cfg(feature = "cross-dump")]
         let cross = dump_dir.as_ref().map(|_| invariant_ctx.func.clone());
@@ -2222,7 +2265,27 @@ fn compile_snapshot_with_inline(
         false,
         &addresses,
         false,
+        false,
     );
+    if let Some(poll_id) = poll_id {
+        let mut poll_ctx = module.make_context();
+        poll_ctx.func.signature = tail_signature.clone();
+        emit(
+            &mut module,
+            &mut poll_ctx.func,
+            &mut fb_ctx,
+            None,
+            &kernels,
+            false,
+            &addresses,
+            false,
+            true,
+        );
+        module
+            .define_function(poll_id, &mut poll_ctx)
+            .map_err(|e| format!("{e:?}"))?;
+        kernel_functions.push((poll_id, poll_ctx));
+    }
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     let fault_draft = fault_draft.and_then(|pending| pending.resolve(&mut ctx.func));
     #[cfg(feature = "cross-dump")]
@@ -2269,7 +2332,11 @@ fn compile_snapshot_with_inline(
     // Finalize the Tail entry first, then call its absolute address from the
     // platform-ABI trampoline. Region-to-region transfers already use slots.
     module.finalize_definitions().map_err(|e| e.to_string())?;
-    let tail_entry = module.get_finalized_function(id) as usize;
+    let body_entry = module.get_finalized_function(id) as usize;
+    if let Some(target) = poll_target.as_deref_mut() {
+        *target = body_entry;
+    }
+    let tail_entry = module.get_finalized_function(poll_id.unwrap_or(id)) as usize;
     #[cfg(all(
         any(
             target_os = "linux",
@@ -2279,7 +2346,7 @@ fn compile_snapshot_with_inline(
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     let inline_registration =
-        direct::publish(ctx.compiled_code().unwrap(), tail_entry, &inline_drafts)?;
+        direct::publish(ctx.compiled_code().unwrap(), body_entry, &inline_drafts)?;
     #[cfg(all(
         any(
             target_os = "linux",
@@ -2299,9 +2366,9 @@ fn compile_snapshot_with_inline(
     // Optional native-PC attribution for external sampling. Addresses are
     // process-local; this does not enable execution profiling or disable links.
     let recorded =
-        diagnostics::record_body(region, opt_level, tail_entry, code_size, instructions.len());
+        diagnostics::record_body(region, opt_level, body_entry, code_size, instructions.len());
     if let Some(ranges) = source_ranges {
-        diagnostics::record_instructions(region, recorded, tail_entry, ranges, &instructions);
+        diagnostics::record_instructions(region, recorded, body_entry, ranges, &instructions);
     }
     for (id, kernel_ctx) in &kernel_functions {
         let base = module.get_finalized_function(*id) as usize;
@@ -2404,7 +2471,7 @@ fn compile_snapshot_with_inline(
     #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
     for (address, length, info) in [
         (
-            tail_entry,
+            body_entry,
             ctx.compiled_code().unwrap().code_buffer().len(),
             body_unwind,
         ),
@@ -2480,6 +2547,7 @@ fn compile_snapshot_with_inline(
     #[cfg(feature = "gir-lower")]
     crate::gir::diagnostics::record_lower(&instructions, region.start, snapshot.base, snapshot.len);
     Ok(Compiled {
+        _poll_target: poll_target,
         #[cfg(any(test, feature = "gir-execute"))]
         gir_instructions: instructions.clone(),
         perf_ranges,
@@ -3170,6 +3238,8 @@ struct GuestPointer {
 }
 
 struct Emitter<'a> {
+    poll: Option<(&'a safepoints::Plan, usize)>,
+    poll_block: u32,
     memory_scratch: Option<ir::StackSlot>,
     invariant_plan: Option<invariants::Plan>,
     invariant_body: bool,
@@ -3994,7 +4064,11 @@ impl Emitter<'_> {
             .fast
             .and_then(|index| self.fast_blocks[index].get(&pc).copied());
         if let Some(block) = clone.or_else(|| self.blocks.get(&pc).copied()) {
-            if pc <= self.pc {
+            if self
+                .poll
+                .is_some_and(|(plan, _)| plan.crosses(self.poll_block, pc))
+                || pc <= self.pc
+            {
                 let target = self.constant(pc);
                 self.interrupt_at(target, false);
                 if self.kernel.is_none()
@@ -4686,6 +4760,7 @@ impl Emitter<'_> {
         }
     }
     fn interrupt_at(&mut self, pc: Value, respect_stops: bool) {
+        self.poll_budget(pc);
         let pending = self
             .b
             .ins()

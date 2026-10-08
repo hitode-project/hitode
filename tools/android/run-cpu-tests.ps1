@@ -9,6 +9,7 @@ Device runs retain build/test logs, hashes and result counts in Output.
 AllTests selects every integration target and unfiltered unit tests, continues
 after failures and records empty platform targets. DirectMemory and JitVerify
 configure the CPU; Tier1 records the shell selector (fixtures select their modes).
+Safepoint selects off/poll independently of verification and direct memory.
 Features adds explicit Cargo features; Gir selects the opt-in state-SSA lane and
 includes gir-execute. Build with that feature and Gir=off to reuse one ELF set.
 .EXAMPLE
@@ -36,6 +37,7 @@ param(
     [ValidateSet('off', '1', 'strict')][string]$JitVerify = 'off',
     [switch]$DirectMemory,
     [ValidateSet('off', 'bridge')][string]$Tier1 = 'off',
+    [ValidateSet('off', 'poll')][string]$Safepoint = 'off',
     [string[]]$Features = @(),
     [ValidateSet('off', 'state-ssa')][string]$Gir = 'off'
 )
@@ -90,7 +92,7 @@ function Get-DeviceCommand($remote, $run) {
     $verify = if ($JitVerify -eq 'off') { '' } else { "ADV_JIT_VERIFY=$JitVerify " }
     $direct = if ($DirectMemory) { 'ADV_DIRECT_MEMORY=1 ' } else { '' }
     $entry = if ($run.PSObject.Properties['executable']) { $run.executable } else { $run.target }
-    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
+    "cd '$remote' && $clear && TMPDIR='$remote' CARGO_TARGET_DIR='$remote/target' ADV_SAFEPOINT=$Safepoint ADV_GIR=$Gir ADV_TIER1=$Tier1 $direct${verify}timeout $TimeoutSeconds './$entry' $($run.filter) --test-threads=1 --nocapture"
 }
 if ($WhatIf) {
     [ordered]@{
@@ -183,6 +185,7 @@ try {
         "ADV_JIT_VERIFY=$JitVerify (device only)"
         "ADV_DIRECT_MEMORY=$([int][bool]$DirectMemory) (device only)"
         "ADV_TIER1=$Tier1 (shell selector; CPU fixtures select their own mode)"
+        "ADV_SAFEPOINT=$Safepoint (device only)"
         "ADV_GIR=$Gir (device only)"
         'runner_sha256=' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         'guest_executable_sha256=not-applicable (synthetic tests)'
@@ -245,6 +248,8 @@ try {
     Write-Output "CPU test evidence: $Output"
 } finally {
     if ($remote -and $remote -match '^/data/local/tmp/adv-host-cpu-[a-f0-9]{32}$') {
+        # Cleanup has its own bounded transport retries even after a run timeout.
+        $deviceClock = $null
         try { Invoke-AdbRetry @('-s', $Serial, 'shell', 'rm', '-rf', $remote) 'Device cleanup' }
         catch { Write-Warning "Owned device directory cleanup needs retry: $remote" }
     }
