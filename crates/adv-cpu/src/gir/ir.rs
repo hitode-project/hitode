@@ -89,6 +89,14 @@ pub enum Pure {
         code: ConditionCode,
     },
     Nonzero(ValueId),
+    FlagBit {
+        flags: ValueId,
+        bit: u32,
+    },
+    FlagPack {
+        bits: [ValueId; 6],
+        rest: ValueId,
+    },
 }
 
 pub const CF: u32 = 1;
@@ -97,6 +105,7 @@ pub const AF: u32 = 16;
 pub const ZF: u32 = 64;
 pub const SF: u32 = 128;
 pub const OF: u32 = 2048;
+pub const FLAG_BITS: [u32; 6] = [CF, PF, AF, ZF, SF, OF];
 pub const ARITHMETIC: u32 = CF | PF | AF | ZF | SF | OF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +319,9 @@ impl Terminator {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
+    pub entry_state: StateMap,
+    pub entry_token: ValueId,
+    pub inline_depth: usize,
     pub parameters: Vec<ValueId>,
     pub operations: Vec<Operation>,
     pub terminator: Terminator,
@@ -322,8 +334,11 @@ pub struct Region {
     pub memory: Vec<MemoryOp>,
     pub commits: Vec<CommitPoint>,
     pub snapshots: Vec<Snapshot>,
+    pub recovery: Vec<super::recovery::Dag>,
     pub dependencies: Vec<Dependency>,
     pub semantic_version: u32,
+    pub inline_limit: usize,
+    pub inline_budget: usize,
 }
 
 impl ValueKind {
@@ -336,7 +351,8 @@ impl ValueKind {
                 }
                 Pure::Insert { base, value, .. } => vec![*base, *value],
                 Pure::Select { condition, yes, no } => vec![*condition, *yes, *no],
-                Pure::Condition { flags, .. } => vec![*flags],
+                Pure::Condition { flags, .. } | Pure::FlagBit { flags, .. } => vec![*flags],
+                Pure::FlagPack { bits, rest } => bits.iter().copied().chain([*rest]).collect(),
             },
             Self::Flags(f) => vec![f.preserved, f.lhs, f.rhs, f.carry, f.result],
             _ => vec![],
