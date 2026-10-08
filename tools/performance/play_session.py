@@ -94,9 +94,11 @@ def run(args: argparse.Namespace) -> None:
     game = args.exe.resolve(strict=True)
     duration = max(15.0, float(steps[-1]["at"]) + args.tail_seconds)
     command = [str(executable), str(game), "--control-stdin", "--codepage", str(args.codepage),
-               "--seconds", str(duration), "--auto-dialog-ms", "50",
+               "--seconds", str(duration), "--auto-dialog-ms", str(getattr(args, "auto_dialog_ms", 50)),
                "--data-dir", str(output / "overlay"), "--report", str(output / "final.json"),
                "--screenshot", str(output / "final.png")]
+    for mount in getattr(args, "cdrom", []):
+        command.extend(["--cdrom", mount])
     if args.mode != "window":
         command.append("--" + args.mode)
     if args.audio:
@@ -217,6 +219,10 @@ if __name__ == "__main__":
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--schedule", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--cdrom", action="append", default=[], metavar="DRIVE=IMAGE",
+                        help="mount an image in the guest; repeat for multiple drives")
+    parser.add_argument("--auto-dialog-ms", type=int, default=50,
+                        help="automatic dialog delay; zero leaves dialogs pending")
     parser.add_argument("--seed-data", type=Path, help="copy an existing runtime data root into the isolated overlay")
     parser.add_argument("--guest-workers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--mode", choices=("headless", "hidden", "window"), default="headless")
@@ -236,4 +242,6 @@ if __name__ == "__main__":
     options = parser.parse_args()
     if not math.isfinite(options.tail_seconds) or not 0 <= options.tail_seconds <= 3600:
         parser.error("tail seconds must be finite and within 0..3600")
+    if options.auto_dialog_ms < 0:
+        parser.error("auto dialog delay must be nonnegative")
     run(options)
