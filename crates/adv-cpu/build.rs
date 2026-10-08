@@ -72,6 +72,12 @@ fn cache_fingerprint() {
     files.extend(["build.rs", "Cargo.toml", "../../Cargo.lock"].map(PathBuf::from));
     files.sort();
     let mut hash = Sha256::new();
+    let compiler = std::process::Command::new(std::env::var_os("RUSTC").expect("Rust compiler"))
+        .arg("-vV")
+        .output()
+        .expect("Rust compiler version for native cache ABI");
+    assert!(compiler.status.success(), "Rust compiler version failed");
+    hash.update(compiler.stdout);
     for path in files {
         println!("cargo:rerun-if-changed={}", path.display());
         let bytes = std::fs::read(&path).expect("cache fingerprint input");
