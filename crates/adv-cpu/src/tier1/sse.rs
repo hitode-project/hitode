@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 
 pub(super) struct Operations(Box<[Instruction]>);
 impl Operations {
-    pub fn new(instructions: &BTreeMap<u32, Instruction>) -> Self {
+    pub fn new(
+        instructions: &BTreeMap<u32, Instruction>,
+        _host_features: crate::HostFeatures,
+    ) -> Self {
         Self(
             instructions
                 .values()
