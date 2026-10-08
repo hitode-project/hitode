@@ -2195,6 +2195,14 @@ pub(crate) fn compile_snapshot(snapshot: &Snapshot) -> Result<Compiled, String> 
     module
         .define_function(wrapper_id, &mut wrapper)
         .map_err(|e| format!("{e:?}"))?;
+    for context in std::iter::once(&ctx)
+        .chain(std::iter::once(&wrapper))
+        .chain(kernel_functions.iter().map(|(_, context)| context))
+    {
+        if let Some(code) = context.compiled_code() {
+            ir_counts::Counts::native(ir_counts.as_ref(), code, region.start, &instructions);
+        }
+    }
     code_size += wrapper
         .compiled_code()
         .map_or(0, |code| code.code_buffer().len());

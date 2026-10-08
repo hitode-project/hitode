@@ -13,6 +13,22 @@ def request(ir=2, service=10, strategy="fast"):
 
 
 class CompileIrTests(unittest.TestCase):
+    def test_native_bytes_and_legacy_absence(self):
+        raw = request()
+        raw.update(version=2, native_rows=[["Mov", "int.mem", "check", 12],
+                                          ["Overhead", "overhead", "untagged", 4]])
+        result = aggregate([[PREFIX + json.dumps(r) for r in [raw, request()]]])["fast"]
+        self.assertEqual(result["native_attributed_requests"], 1)
+        self.assertEqual(sum(result["native_rows"].values()), 16)
+        self.assertNotIn("native_rows", aggregate([[PREFIX + json.dumps(request())]])["fast"])
+        for rows in [[["Mov", "int.mem", "check", 15]],
+                     [["0x12345678", "int.mem", "check", 16]],
+                     [["Mov", "int.mem", "invalid", 16]],
+                     [["Mov", "int.mem", "check", 8]] * 2]:
+            raw["native_rows"] = rows
+            with self.assertRaises(ValueError):
+                validated(raw)
+
     def test_strategy_histograms_and_linear_correlation(self):
         rows = [request(2, 10), request(4, 20), request(8, 40), request(strategy="speed")]
         result = aggregate([["ignored line\n"] + [PREFIX+json.dumps(row) for row in rows]])
