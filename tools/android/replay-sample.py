@@ -281,6 +281,10 @@ def runner_command(args: argparse.Namespace, remote: str, game: str, duration: f
                "--codec-kernels", args.codec_kernels]
     if getattr(args, "frame_budget", False):
         command.append("--frame-budget")
+    if getattr(args, "precise_waits", False):
+        command.append("--precise-waits")
+    if getattr(args, "no_time_skip", False):
+        command.append("--no-time-skip")
     if args.no_tiering:
         command.append("--no-tiering")
     if args.schedule_profile:
@@ -761,6 +765,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codec", choices=("guest", "native"), default="native")
     parser.add_argument("--codec-kernels", choices=("guest", "verify", "native"), default="native")
     parser.add_argument("--frame-budget", action="store_true", help="bounded per-frame diagnostics in reports")
+    parser.add_argument("--precise-waits", action="store_true", help="opt-in submillisecond host deadlines")
+    parser.add_argument("--no-time-skip", action="store_true", help="disable existing Ctrl idle-time skipping")
     parser.add_argument("--perf-map", action="store_true", help="local-only HP JIT symbol map and publication events")
     parser.add_argument("--no-tiering", action="store_true")
     parser.add_argument("--tier1", choices=("off", "bridge"), default="off")

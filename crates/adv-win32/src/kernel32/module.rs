@@ -4,8 +4,8 @@
 use std::collections::VecDeque;
 
 use adv_abi::{
-    AnsiStr, ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, Handle, Registry, WideStr,
-    win32,
+    AnsiStr, ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, ExportClass, Handle,
+    Registry, WideStr, win32,
 };
 use adv_cpu::backend::{GuestExt, MemFault, Prot};
 use adv_machine::outcome::DeferredContinuation;
@@ -962,26 +962,45 @@ fn record_lookup_failure(
     reason: String,
     target: Option<(String, String)>,
 ) {
+    let registry = (env.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<Registry>();
+    let class = |module: &str, name: &str| registry.and_then(|r| r.classify(module, name));
+    let is_host = |module: &str| {
+        adv_os::modules(env.ext)
+            .by_name(module)
+            .is_some_and(|id| adv_os::modules(env.ext).get(id).kind == ModuleKind::Host)
+    };
+    let requested = sym.to_string();
     // Hidden fixed code names fail by design; only fixed data or a name the
     // registry advertises as discoverable proves the structure is broken.
-    let registry = (env.sys.thunks.resolver() as &dyn std::any::Any).downcast_ref::<Registry>();
-    let core = match sym {
-        ImportName::Name { name, .. } => adv_abi::system_exports::lookup(&module, name)
-            .is_some_and(|export| {
-                export.kind == adv_abi::system_exports::Kind::DataUnsupported
-                    || registry.is_none_or(|registry| registry.dynamic_available(&module, name))
-            }),
-        ImportName::Ordinal(_) => false,
-    };
-    let host = adv_os::modules(env.ext)
-        .by_name(&module)
-        .is_some_and(|id| adv_os::modules(env.ext).get(id).kind == ModuleKind::Host);
-    if core && host {
+    let structural = matches!(sym, ImportName::Name { .. })
+        && adv_abi::system_exports::lookup(&module, &requested).is_some()
+        && registry.is_none_or(|_| {
+            class(&module, &requested)
+                .is_some_and(|class| class == ExportClass::DataUnsupported || class.discoverable())
+        });
+    // A forwarded probe is rejected for its final target's class.
+    let (rejected_module, rejected_name) = target
+        .as_ref()
+        .map_or((module.as_str(), requested.as_str()), |(module, name)| {
+            (module.as_str(), name.as_str())
+        });
+    let rejected = is_host(rejected_module).then(|| {
+        (
+            format!("{rejected_module}!{rejected_name}"),
+            class(rejected_module, rejected_name),
+        )
+    });
+    if structural && is_host(&module) {
         adv_abi::warn_structural(
             env,
             &format!("{module}!{sym}"),
             "fixed Windows personality export could not be resolved",
         );
+    }
+    if let Some((api, rejected_class)) = rejected {
+        env.ext
+            .get_or_default::<ApiDiagnostics>()
+            .record_rejected_probe(api, rejected_class, caller);
     }
     let (failure_module, failure_name) = match target {
         Some((module, name)) => (Some(module), Some(name)),
